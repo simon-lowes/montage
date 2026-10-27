@@ -21,6 +21,7 @@
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QRadioButton>
+#include <QInputDialog>
 #include <QTreeWidgetItemIterator>
 #include <atomic>
 #include <thread>
@@ -16653,6 +16654,111 @@ print("added " + ui["name"])
         state()->undo();  // the group
         QVERIFY(state()->sequence()->colorGroups.empty());
         QCOMPARE(edit::clipById(*state()->sequence(), a)->colorGroup, Id(0));
+        state()->newProject();
+    }
+
+    void groupShotsInTheClipsPanel() {
+        // Eight stills cut between two angles; Group Shots from the menu makes an angle group of each inside one scene,
+        // shown as rows in the Clips panel, where they are locked, split, joined and dragged into. Running it again
+        // leaves the locked group as it was.
+        state()->newProject();
+        QTemporaryDir dir;
+        std::vector<Id> shots;
+        QVERIFY(state()->edit("Shots", [&](Project& p, Sequence& s) {
+            for (int i = 0; i < 8; ++i) {
+                QImage img(160, 90, QImage::Format_RGB888);
+                const int lift = (i * 7) % 12;  // each shot exposed a little differently
+                for (int y = 0; y < 90; ++y)
+                    for (int x = 0; x < 160; ++x)
+                        img.setPixel(x, y, i % 2 == 0 ? (x < 80 ? qRgb(200 + lift, 40 + lift, 30) : qRgb(30, 50 + lift, 190))
+                                                      : (y < 45 ? qRgb(40 + lift, 170 + lift, 60) : qRgb(120 + lift, 120 + lift, 120)));
+                const QString file = dir.filePath(QStringLiteral("shot%1.png").arg(i));
+                if (!img.save(file)) return false;
+                MediaItem m;
+                m.id = p.newId();
+                if (!probeMedia(file.toStdString(), m)) return false;
+                p.media.push_back(m);
+                Clip c = makeClip(p, p.media.back(), TrackKind::Video, s);
+                c.start = i * 10;
+                c.duration = 10;
+                shots.push_back(c.id);
+                if (!edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok) return false;
+            }
+            return true;
+        }));
+        QMenu* menu = win_->findChild<QMenu*>("colorGroupMenu");
+        emit menu->aboutToShow();
+        QAction* group = menu->findChild<QAction*>("groupShots");
+        QVERIFY(group);
+        whenModal<QInputDialog>(this, [](QInputDialog* d) {
+            d->setIntValue(50);
+            d->accept();
+        });
+        group->trigger();
+        auto groupOf = [&](Id clip) { return edit::clipById(*state()->sequence(), clip)->colorGroup; };
+        const Id first = groupOf(shots[0]), second = groupOf(shots[1]);
+        QVERIFY(first && second && first != second);
+        for (size_t i = 0; i < shots.size(); ++i) QCOMPARE(groupOf(shots[i]), i % 2 ? second : first);
+        const ColorGroup* scene = findColorGroup(*state()->sequence(), findColorGroup(*state()->sequence(), first)->parent);
+        QVERIFY(scene);
+        QCOMPARE(scene->kind, std::string("scene"));
+        QCOMPARE(findColorGroup(*state()->sequence(), second)->parent, scene->id);
+        const Id sceneId = scene->id;
+        // The panel shows the scene holding both angles, four shots in each, and nothing left ungrouped.
+        auto* panel = win_->findChild<ClipStripPanel*>();
+        QVERIFY(panel->groupsShown());
+        panel->rebuild();
+        QTreeWidget* tree = panel->groupTree();
+        QCOMPARE(tree->topLevelItemCount(), 2);
+        QTreeWidgetItem* sceneRow = tree->topLevelItem(0);
+        QVERIFY2(sceneRow->text(0).contains("8 shot"), qPrintable(sceneRow->text(0)));
+        QCOMPARE(sceneRow->childCount(), 2);
+        auto rowOf = [&](Id id) -> QTreeWidgetItem* {
+            for (QTreeWidgetItemIterator it(tree); *it; ++it)
+                if (Id((*it)->data(0, Qt::UserRole).toULongLong()) == id) return *it;
+            return nullptr;
+        };
+        auto select = [&](const std::vector<Id>& ids) {
+            tree->clearSelection();
+            for (Id id : ids) rowOf(id)->setSelected(true);
+        };
+        QCOMPARE(rowOf(first)->childCount(), 4);
+        QCOMPARE(tree->topLevelItem(1)->childCount(), 0);  // Not grouped
+        // The first angle locked.
+        select({first});
+        QVERIFY(panel->lockSelected(true));
+        QVERIFY(findColorGroup(*state()->sequence(), first)->locked);
+        panel->rebuild();
+        QVERIFY(rowOf(first)->text(0).contains("locked"));
+        // Two shots of the second split off into a group of their own, then joined back.
+        select({shots[1], shots[3]});
+        QVERIFY(panel->splitSelected());
+        const Id split = groupOf(shots[1]);
+        QVERIFY(split != second);
+        QCOMPARE(groupOf(shots[3]), split);
+        QCOMPARE(colorGroupMembers(*state()->sequence(), second).size(), size_t(2));
+        panel->rebuild();
+        select({second, split});
+        QVERIFY(panel->joinSelected());
+        QVERIFY(!findColorGroup(*state()->sequence(), split));
+        QCOMPARE(colorGroupMembers(*state()->sequence(), second).size(), size_t(4));
+        // A shot dragged out to Not Grouped, and back into its group.
+        panel->rebuild();
+        QVERIFY(panel->moveInto({shots[5]}, 0));
+        QCOMPARE(groupOf(shots[5]), Id(0));
+        panel->rebuild();
+        QCOMPARE(tree->topLevelItem(tree->topLevelItemCount() - 1)->childCount(), 1);
+        QVERIFY(panel->moveInto({shots[5]}, second));
+        QCOMPARE(groupOf(shots[5]), second);
+        // Grouped again at the highest sensitivity: the locked angle and its scene stay as they were.
+        QVERIFY(win_->groupShots(1.0) >= 1);
+        for (size_t i = 0; i < shots.size(); i += 2) QCOMPARE(groupOf(shots[i]), first);
+        QVERIFY(findColorGroup(*state()->sequence(), first)->locked);
+        QCOMPARE(findColorGroup(*state()->sequence(), first)->parent, sceneId);
+        for (size_t i = 1; i < shots.size(); i += 2) QVERIFY(groupOf(shots[i]) && groupOf(shots[i]) != first);
+        // One undo takes the second run back.
+        state()->undo();
+        QCOMPARE(groupOf(shots[1]), second);
         state()->newProject();
     }
 

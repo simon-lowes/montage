@@ -241,6 +241,7 @@ add_library(montage_engine STATIC
   render/Gallery.h render/Gallery.cpp
   render/LinedScript.h render/LinedScript.cpp
   render/LoudnessReport.h render/LoudnessReport.cpp
+  render/ShotGroups.h render/ShotGroups.cpp
   render/FilmLists.h render/FilmLists.cpp
   render/PaperworkOutput.h render/PaperworkOutput.cpp
   render/ImageSubtitles.h render/ImageSubtitles.cpp

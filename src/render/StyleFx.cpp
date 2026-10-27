@@ -2,9 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 
 #include "Processing.h"
+#include "audio/RoomResponse.h"
+#include "core/MaskPath.h"
 
 namespace montage::sfx {
 
@@ -499,6 +504,440 @@ void lensFlare(const Effect& e, FrameTime t, Image& img) {
                     lum = std::max(lum, double(add));
                 }
                 p[3] = std::min(1.0f, p[3] + float(lum));  // light shows on transparent areas too
+            }
+        }
+    });
+}
+
+// ---- Light Rays ----------------------------------------------------------------------
+
+void lightRays(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    (void)pixelScale;  // (the rays' reach is a share of the way to the centre, the same at any size)
+    const int W = img.width, H = img.height;
+    if (W <= 0 || H <= 0) return;
+    const bool follow = e.p("follow", t, 0) > 0.5;
+    double cx = e.p("pos_x", t, 0.5) * W, cy = e.p("pos_y", t, 0.25) * H;
+    if (follow) {
+        const MaskBox box = maskBox(e, t);
+        cx = box.x * W, cy = box.y * H;
+    }
+    cx = std::clamp(std::isfinite(cx) ? cx : W / 2.0, -4.0 * W, 5.0 * W), cy = std::clamp(std::isfinite(cy) ? cy : H / 2.0, -4.0 * H, 5.0 * H);
+    const double threshold = std::max(0.0, e.p("threshold", t, 0.8)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
+    const double length = std::clamp(e.p("length", t, 60) / 100, 0.0, 1.0), decay = std::clamp(e.p("decay", t, 50) / 100, 0.0, 1.0);
+    const double block = std::clamp(e.p("block", t, 0) / 100, 0.0, 1.0);
+    const float tint[3] = {float(e.p("color.r", t, 1.0)), float(e.p("color.g", t, 0.95)), float(e.p("color.b", t, 0.85))};
+    if (intensity <= 0 || length <= 0) return;
+    // The light: what is above the threshold, tinted.
+    Image rays(W, H);
+    bool any = false;
+    for (int y = 0; y < H; ++y) {
+        const float* p = img.row(y);
+        float* q = rays.row(y);
+        for (int x = 0; x < W; ++x, p += 4, q += 4) {
+            const float a = p[3];
+            const double l = a > 0 ? lumaOf(p) / a : 0.0;
+            const double k = std::isfinite(l) && l > threshold ? (l - threshold) / l : 0.0;
+            for (int c = 0; c < 3; ++c) q[c] = k > 0 ? float(p[c] * k * tint[c]) : 0.0f;
+            q[3] = 0;
+            any = any || k > 0;
+        }
+    }
+    if (!any) return;
+    // Three passes of eight samples along the line to the centre, each pass's spacing eight times the last, so
+    // together they reach `length` of the way; nearer samples count more as `decay` rises.
+    constexpr int kSamples = 8, kPasses = 3;
+    const double first = length / (std::pow(double(kSamples), kPasses) - 1);
+    const double rate = decay * 6 / length;  // (at full decay, light from the far end is e^-6 of light from beside)
+    for (int pass = 0; pass < kPasses; ++pass) {
+        const double step = first * std::pow(double(kSamples), pass);
+        double w[kSamples], sum = 0;
+        for (int j = 0; j < kSamples; ++j) sum += w[j] = std::exp(-rate * j * step);
+        for (double& v : w) v /= sum;
+        const Image from = rays;
+        parallelRows(H, [&](int y0, int y1) {
+            float s[4];
+            for (int y = y0; y < y1; ++y) {
+                float* q = rays.row(y);
+                for (int x = 0; x < W; ++x, q += 4) {
+                    double acc[3] = {0, 0, 0};
+                    const double px = x + 0.5, py = y + 0.5;
+                    for (int j = 0; j < kSamples; ++j) {
+                        const double f = j * step;
+                        sample(from, px + (cx - px) * f, py + (cy - py) * f, s, Edge::Transparent);
+                        for (int c = 0; c < 3; ++c) acc[c] += w[j] * s[c];
+                    }
+                    for (int c = 0; c < 3; ++c) q[c] = float(acc[c]);
+                }
+            }
+        });
+    }
+    // Shadows Block Rays: how much light gets through from the centre's side, the darker parts on the way taking it
+    // (each 1/160 of the frame's longer side of a thing below the threshold lets through 1 - block of it).
+    std::vector<float> through;
+    int tw = 0, th = 0;
+    if (block > 0) {
+        // (worked out on a small copy: it changes slowly)
+        const double shrink = std::min(1.0, 320.0 / std::max(W, H));
+        tw = std::max(1, int(std::lround(W * shrink))), th = std::max(1, int(std::lround(H * shrink)));
+        std::vector<float> pass(size_t(tw) * size_t(th));
+        parallelRows(th, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < tw; ++x) {
+                    // (the average of the pixels it covers, so a thin dark thing is not missed)
+                    const int ax = std::min(W - 1, int(x / shrink)), bx = std::max(ax + 1, std::min(W, int((x + 1) / shrink)));
+                    const int ay = std::min(H - 1, int(y / shrink)), by = std::max(ay + 1, std::min(H, int((y + 1) / shrink)));
+                    double sum = 0;
+                    for (int sy = ay; sy < by; ++sy)
+                        for (int sx = ax; sx < bx; ++sx) {
+                            const float* p = img.at(sx, sy);
+                            const double l = p[3] > 0 ? lumaOf(p) / p[3] : 0.0;
+                            sum += std::isfinite(l) ? std::clamp(l / std::max(threshold, 1e-3), 0.0, 1.0) : 1.0;
+                        }
+                    pass[size_t(y) * size_t(tw) + size_t(x)] = float(1 - block * (1 - sum / ((bx - ax) * (by - ay))));
+                }
+        });
+        through.assign(pass.size(), 1.0f);
+        const double scx = cx * shrink, scy = cy * shrink;
+        parallelRows(th, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < tw; ++x) {
+                    const double px = x + 0.5, py = y + 0.5, reach = std::hypot(scx - px, scy - py) * length;
+                    const int steps = std::max(1, int(std::ceil(reach)));
+                    double logT = 0;
+                    for (int j = 1; j <= steps; ++j) {  // (from beside the pixel: the near side of a dark thing is lit)
+                        const double f = length * j / steps;
+                        const int sx = int(std::floor(px + (scx - px) * f)), sy = int(std::floor(py + (scy - py) * f));
+                        if (sx < 0 || sy < 0 || sx >= tw || sy >= th) break;
+                        // (each 1/160 of the frame's longer side taking its share, at any size)
+                        logT += std::log(std::max(1e-4f, pass[size_t(sy) * size_t(tw) + size_t(sx)])) * (reach / steps) / std::max(tw, th) * 160;
+                    }
+                    through[size_t(y) * size_t(tw) + size_t(x)] = float(std::exp(logT));
+                }
+        });
+    }
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            const float* q = rays.row(y);
+            for (int x = 0; x < W; ++x, p += 4, q += 4) {
+                float k = float(intensity);
+                if (!through.empty()) {
+                    // (bilinear from the small copy)
+                    const double fx = std::clamp((x + 0.5) * tw / W - 0.5, 0.0, tw - 1.0), fy = std::clamp((y + 0.5) * th / H - 0.5, 0.0, th - 1.0);
+                    const int x0 = int(fx), y0 = int(fy), x1 = std::min(tw - 1, x0 + 1), y1 = std::min(th - 1, y0 + 1);
+                    const double ax = fx - x0, ay = fy - y0;
+                    auto at = [&](int xi, int yi) { return double(through[size_t(yi) * size_t(tw) + size_t(xi)]); };
+                    k *= float((at(x0, y0) * (1 - ax) + at(x1, y0) * ax) * (1 - ay) + (at(x0, y1) * (1 - ax) + at(x1, y1) * ax) * ay);
+                }
+                float most = 0;
+                for (int c = 0; c < 3; ++c) {
+                    const float add = q[c] * k;
+                    p[c] += add;
+                    most = std::max(most, add);
+                }
+                p[3] = std::min(1.0f, p[3] + most);  // light shows on transparent areas too
+            }
+        }
+    });
+}
+
+// ---- Aperture Glare ----------------------------------------------------------------------
+
+namespace {
+
+using Cf = std::complex<float>;
+
+// The aperture's transform: kApN square, the aperture kApR pixels in radius (its corners'), centred on the origin.
+constexpr int kApN = 1024;
+constexpr double kApR = 32;
+constexpr double kBinsPerLambdaOverD = kApN / (2 * kApR);
+
+int nextPow2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// A 2D transform in place of an n x n grid, rows then columns (unscaled both ways).
+void fft2(std::vector<Cf>& a, int n, bool inverse) {
+    parallelRows(n, [&](int y0, int y1) {
+        std::vector<Cf> row(static_cast<size_t>(n));
+        for (int y = y0; y < y1; ++y) {
+            std::copy_n(a.begin() + std::ptrdiff_t(y) * n, n, row.begin());
+            fftInPlace(row, inverse);
+            std::copy(row.begin(), row.end(), a.begin() + std::ptrdiff_t(y) * n);
+        }
+    });
+    parallelRows(n, [&](int x0, int x1) {
+        std::vector<Cf> col(static_cast<size_t>(n));
+        for (int x = x0; x < x1; ++x) {
+            for (int y = 0; y < n; ++y) col[size_t(y)] = a[size_t(y) * size_t(n) + size_t(x)];
+            fftInPlace(col, inverse);
+            for (int y = 0; y < n; ++y) a[size_t(y) * size_t(n) + size_t(x)] = col[size_t(y)];
+        }
+    });
+}
+
+// Whether a point (in units of the corners' radius) is inside the aperture.
+bool insideAperture(const ApertureShape& a, double x, double y) {
+    const double r = std::hypot(x, y);
+    if (r > 1) return false;
+    const int n = std::max(3, a.blades);
+    const double sector = 2 * M_PI / n;
+    double angle = std::fmod(std::atan2(y, x) + 2 * M_PI, sector);
+    const double polygon = std::cos(M_PI / n) / std::cos(angle - M_PI / n);  // the straight blade's distance
+    return r <= polygon + std::clamp(a.rounding, 0.0, 1.0) * (1 - polygon);
+}
+
+// The aperture's Fourier transform (kApN square, bins wrapped), for its blades and rounding (the rotation turns the
+// pattern, so it is left to sampling). Kept for the last few shapes.
+std::shared_ptr<const std::vector<Cf>> apertureTransform(const ApertureShape& shape) {
+    ApertureShape key = shape;
+    key.rotation = 0;
+    key.blades = std::max(3, key.blades);
+    key.rounding = std::round(std::clamp(key.rounding, 0.0, 1.0) * 1000) / 1000;
+    static std::mutex lock, building;
+    static std::vector<std::pair<ApertureShape, std::shared_ptr<const std::vector<Cf>>>> kept;
+    auto find = [&]() -> std::shared_ptr<const std::vector<Cf>> {
+        const std::lock_guard<std::mutex> g(lock);
+        for (const auto& [k, v] : kept)
+            if (k == key) return v;
+        return nullptr;
+    };
+    if (auto found = find()) return found;
+    // (one built at a time, so threads wanting the same one wait for it rather than each making it)
+    const std::lock_guard<std::mutex> one(building);
+    if (auto found = find()) return found;
+    auto grid = std::make_shared<std::vector<Cf>>(size_t(kApN) * kApN, Cf(0, 0));
+    // The opening, 4 x 4 samples a pixel at its edge.
+    const int reach = int(std::ceil(kApR)) + 1;
+    for (int y = -reach; y <= reach; ++y)
+        for (int x = -reach; x <= reach; ++x) {
+            int in = 0;
+            for (int sy = 0; sy < 4; ++sy)
+                for (int sx = 0; sx < 4; ++sx)
+                    in += insideAperture(key, (x - 0.375 + 0.25 * sx) / kApR, (y - 0.375 + 0.25 * sy) / kApR);
+            if (in) (*grid)[size_t((y + kApN) % kApN) * kApN + size_t((x + kApN) % kApN)] = Cf(float(in / 16.0), 0);
+        }
+    fft2(*grid, kApN, false);
+    const std::lock_guard<std::mutex> g(lock);
+    kept.insert(kept.begin(), {key, grid});
+    if (kept.size() > 4) kept.pop_back();
+    return grid;
+}
+
+// The transform at a fractional bin (bilinear on the complex amplitude: its zeros fall between bins), 0 beyond.
+Cf transformAt(const std::vector<Cf>& f, double u, double v) {
+    const double edge = kApN / 2.0 - 2;
+    if (std::fabs(u) >= edge || std::fabs(v) >= edge) return 0;
+    const int u0 = int(std::floor(u)), v0 = int(std::floor(v));
+    const float au = float(u - u0), av = float(v - v0);
+    auto at = [&](int i, int j) { return f[size_t((j + kApN) % kApN) * kApN + size_t((i + kApN) % kApN)]; };
+    return (at(u0, v0) * (1 - au) + at(u0 + 1, v0) * au) * (1 - av) + (at(u0, v0 + 1) * (1 - au) + at(u0 + 1, v0 + 1) * au) * av;
+}
+
+// CIE 1931 colour matching functions (the multi-lobe Gaussian fit of Wyman, Sloan and Shirley, 2013).
+void cieXyz(double nm, double xyz[3]) {
+    auto g = [nm](double mu, double s1, double s2) {
+        const double d = (nm - mu) / (nm < mu ? s1 : s2);
+        return std::exp(-0.5 * d * d);
+    };
+    xyz[0] = 1.056 * g(599.8, 37.9, 31.0) + 0.362 * g(442.0, 16.0, 26.7) - 0.065 * g(501.1, 20.4, 26.2);
+    xyz[1] = 0.821 * g(568.8, 46.9, 40.5) + 0.286 * g(530.9, 16.3, 31.1);
+    xyz[2] = 1.217 * g(437.0, 11.8, 36.0) + 0.681 * g(459.0, 26.0, 13.8);
+}
+
+struct GlareKernel {
+    ApertureShape shape;
+    int radius = 0, fftSize = 0;
+    std::vector<Cf> spectrum[3];  // each channel's kernel transformed, fftSize square
+};
+
+// The kernel transformed for convolving at `fftSize`, kept for the last few.
+std::shared_ptr<const GlareKernel> glareKernel(const ApertureShape& shape, int radius, int fftSize) {
+    static std::mutex lock, building;
+    static std::vector<std::shared_ptr<const GlareKernel>> kept;
+    auto find = [&]() -> std::shared_ptr<const GlareKernel> {
+        const std::lock_guard<std::mutex> g(lock);
+        for (const auto& k : kept)
+            if (k->shape == shape && k->radius == radius && k->fftSize == fftSize) return k;
+        return nullptr;
+    };
+    if (auto found = find()) return found;
+    const std::lock_guard<std::mutex> one(building);
+    if (auto found = find()) return found;
+    auto k = std::make_shared<GlareKernel>();
+    k->shape = shape, k->radius = radius, k->fftSize = fftSize;
+    const std::vector<float> rgb = apertureKernel(shape, radius);
+    const int size = 2 * radius + 1;
+    for (int c = 0; c < 3; ++c) {
+        std::vector<Cf>& s = k->spectrum[c];
+        s.assign(size_t(fftSize) * fftSize, Cf(0, 0));
+        for (int y = 0; y < size; ++y)
+            for (int x = 0; x < size; ++x)
+                s[size_t((y - radius + fftSize) % fftSize) * fftSize + size_t((x - radius + fftSize) % fftSize)] =
+                    Cf(rgb[(size_t(y) * size + size_t(x)) * 3 + size_t(c)], 0);
+        fft2(s, fftSize, false);
+    }
+    const std::lock_guard<std::mutex> g(lock);
+    kept.insert(kept.begin(), k);
+    // (kept to about 256 MB)
+    size_t bytes = 0;
+    for (size_t i = 0; i < kept.size(); ++i) {
+        bytes += 3 * size_t(kept[i]->fftSize) * size_t(kept[i]->fftSize) * sizeof(Cf);
+        if (i > 0 && bytes > (size_t(256) << 20)) {
+            kept.resize(i);
+            break;
+        }
+    }
+    return k;
+}
+
+}  // namespace
+
+std::vector<double> apertureDiffraction(const ApertureShape& a, double nm, int size, double perLambdaOverD) {
+    size = std::max(1, size | 1);
+    std::vector<double> out(size_t(size) * size, 0.0);
+    const auto f = apertureTransform(a);
+    const double scale = kBinsPerLambdaOverD / std::max(1e-6, perLambdaOverD) * (550.0 / nm);  // bins a pixel
+    const int ss = std::clamp(int(std::ceil(scale)), 1, 4);  // (samples a pixel each way, where bins are finer than pixels)
+    const double cs = std::cos(-a.rotation * kDeg), sn = std::sin(-a.rotation * kDeg), half = size / 2;
+    parallelRows(size, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < size; ++x) {
+                double sum = 0;
+                for (int sy = 0; sy < ss; ++sy)
+                    for (int sx = 0; sx < ss; ++sx) {
+                        const double dx = x - half + (sx + 0.5) / ss - 0.5, dy = y - half + (sy + 0.5) / ss - 0.5;
+                        sum += std::norm(transformAt(*f, (dx * cs - dy * sn) * scale, (dx * sn + dy * cs) * scale));
+                    }
+                out[size_t(y) * size + size_t(x)] = sum;
+            }
+    });
+    double total = 0;
+    for (double v : out) total += v;
+    if (total > 0)
+        for (double& v : out) v /= total;
+    return out;
+}
+
+std::vector<float> apertureKernel(const ApertureShape& a, int radius) {
+    radius = std::max(1, radius);
+    const int size = 2 * radius + 1;
+    std::vector<double> rgb(size_t(size) * size * 3, 0.0);
+    // Eight wavelengths of equal energy, each into linear Rec.709 (its negative parts dropped).
+    for (int i = 0; i < 8; ++i) {
+        const double nm = 400 + 300.0 * i / 7;
+        double xyz[3];
+        cieXyz(nm, xyz);
+        const double w[3] = {std::max(0.0, 3.2406 * xyz[0] - 1.5372 * xyz[1] - 0.4986 * xyz[2]),
+                             std::max(0.0, -0.9689 * xyz[0] + 1.8758 * xyz[1] + 0.0415 * xyz[2]),
+                             std::max(0.0, 0.0557 * xyz[0] - 0.2040 * xyz[1] + 1.0570 * xyz[2])};
+        const std::vector<double> pattern = apertureDiffraction(a, nm, size, radius / 20.0);
+        for (size_t k = 0; k < pattern.size(); ++k)
+            for (int c = 0; c < 3; ++c) rgb[k * 3 + size_t(c)] += w[c] * pattern[k];
+    }
+    // (round: the transform reaches every wavelength's pattern out to the radius, not into the square's corners)
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x)
+            if (std::hypot(x - radius, y - radius) > radius + 0.5)
+                for (int c = 0; c < 3; ++c) rgb[(size_t(y) * size + size_t(x)) * 3 + size_t(c)] = 0;
+    std::vector<float> out(rgb.size());
+    for (int c = 0; c < 3; ++c) {
+        double total = 0;
+        for (size_t k = size_t(c); k < rgb.size(); k += 3) total += rgb[k];
+        for (size_t k = size_t(c); k < rgb.size(); k += 3) out[k] = float(total > 0 ? rgb[k] / total : 0);
+        // (what float rounding left over goes to the centre, so each channel sums to 1)
+        double sum = 0;
+        for (size_t k = size_t(c); k < out.size(); k += 3) sum += out[k];
+        out[(size_t(radius) * size + size_t(radius)) * 3 + size_t(c)] += float(1 - sum);
+    }
+    return out;
+}
+
+void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const int W = img.width, H = img.height;
+    if (W <= 0 || H <= 0) return;
+    const double threshold = std::max(0.0, e.p("threshold", t, 1.0)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
+    ApertureShape shape;
+    shape.blades = std::clamp(int(std::lround(e.p("blades", t, 6))), 3, 16);
+    shape.rounding = std::round(std::clamp(e.p("rounding", t, 0) / 100, 0.0, 1.0) * 100) / 100;
+    // (the pattern repeats every 360 / blades degrees, so a turn by a whole step makes the same kernel)
+    const double step = shape.rounding >= 1 ? 360.0 : 360.0 / shape.blades;
+    shape.rotation = std::round(std::fmod(std::fmod(e.p("rotation", t, 0), step) + step, step) * 10) / 10;
+    const int radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * std::min(pixelScale, 2.0))));
+    if (intensity <= 0) return;
+    // The highlights: the light above the threshold.
+    std::vector<float> bright(size_t(W) * H * 3, 0.0f);
+    bool any = false;
+    for (int y = 0; y < H; ++y) {
+        const float* p = img.row(y);
+        for (int x = 0; x < W; ++x, p += 4) {
+            const float a = p[3];
+            const double l = a > 0 ? lumaOf(p) / a : 0.0;
+            if (!std::isfinite(l) || !(l > threshold)) continue;
+            const double k = (l - threshold) / l;
+            for (int c = 0; c < 3; ++c) bright[(size_t(y) * W + size_t(x)) * 3 + size_t(c)] = float(p[c] * k);
+            any = true;
+        }
+    }
+    if (!any) return;
+    // Convolved by FFT in tiles (overlap-add): red and green as one complex picture, blue as another.
+    const int K = 2 * radius + 1, M = nextPow2(K + std::max(K / 2, 128)), T = M - K + 1;
+    const auto kernel = glareKernel(shape, radius, M);
+    std::vector<float> glare(size_t(W) * H * 3, 0.0f);
+    std::vector<Cf> rg(size_t(M) * M), b(size_t(M) * M), out(size_t(M) * M);
+    for (int ty = 0; ty < H; ty += T)
+        for (int tx = 0; tx < W; tx += T) {
+            const int tw = std::min(T, W - tx), th = std::min(T, H - ty);
+            bool lit = false;
+            std::fill(rg.begin(), rg.end(), Cf(0, 0));
+            std::fill(b.begin(), b.end(), Cf(0, 0));
+            for (int y = 0; y < th; ++y)
+                for (int x = 0; x < tw; ++x) {
+                    const float* s = &bright[(size_t(ty + y) * W + size_t(tx + x)) * 3];
+                    rg[size_t(y) * M + size_t(x)] = Cf(s[0], s[1]);
+                    b[size_t(y) * M + size_t(x)] = Cf(s[2], 0);
+                    lit = lit || s[0] > 0 || s[1] > 0 || s[2] > 0;
+                }
+            if (!lit) continue;
+            fft2(rg, M, false);
+            fft2(b, M, false);
+            // Each half of rg's transform from its symmetry, through its own channel's kernel.
+            for (int v = 0; v < M; ++v)
+                for (int u = 0; u < M; ++u) {
+                    const size_t i = size_t(v) * M + size_t(u), j = size_t((M - v) % M) * M + size_t((M - u) % M);
+                    const Cf r = (rg[i] + std::conj(rg[j])) * 0.5f, g = (rg[i] - std::conj(rg[j])) * Cf(0, -0.5f);
+                    out[i] = r * kernel->spectrum[0][i] + Cf(0, 1) * g * kernel->spectrum[1][i];
+                    b[i] *= kernel->spectrum[2][i];
+                }
+            fft2(out, M, true);
+            fft2(b, M, true);
+            const float norm = 1.0f / (float(M) * float(M));
+            for (int y = -radius; y < th + radius; ++y) {
+                const int oy = ty + y;
+                if (oy < 0 || oy >= H) continue;
+                for (int x = -radius; x < tw + radius; ++x) {
+                    const int ox = tx + x;
+                    if (ox < 0 || ox >= W) continue;
+                    const size_t i = size_t((y + M) % M) * M + size_t((x + M) % M);
+                    float* g = &glare[(size_t(oy) * W + size_t(ox)) * 3];
+                    g[0] += out[i].real() * norm, g[1] += out[i].imag() * norm, g[2] += b[i].real() * norm;
+                }
+            }
+        }
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < W; ++x, p += 4) {
+                const float* g = &glare[(size_t(y) * W + size_t(x)) * 3];
+                float most = 0;
+                for (int c = 0; c < 3; ++c) {
+                    const float add = std::max(0.0f, g[c]) * float(intensity);  // (FFT rounding can dip below 0)
+                    p[c] += add;
+                    most = std::max(most, add);
+                }
+                p[3] = std::min(1.0f, p[3] + most);
             }
         }
     });

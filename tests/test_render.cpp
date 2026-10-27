@@ -45,6 +45,8 @@
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
+#include "render/ShotGroups.h"
+#include "render/StyleFx.h"
 #include "render/Particles.h"
 #include "render/Titles.h"
 #include "core/Expression.h"
@@ -3652,6 +3654,146 @@ colorspaces:
         QVERIFY2((at(10, 10, 10), near(c[2], 1)), qPrintable(at(10, 10, 10)));
         key.params["track"] = 2.0;
         QVERIFY2((at(10, 10, 10), near(c[0], 1) && near(c[2], 0)), qPrintable(at(10, 10, 10)));
+    }
+
+    void lightRaysAndApertureGlare() {
+        Project p;
+        auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            if (!findEffectInfo(type)) qFatal("no effect %s", type);
+            Effect e = makeEffect(p, type);
+            for (const auto& [k, v] : params) e.params[k] = v;
+            return e;
+        };
+        QCOMPARE(effectDomain("light_rays"), EffectDomain::Linear);
+        QCOMPARE(effectDomain("aperture_glare"), EffectDomain::Linear);
+        // A round aperture's pattern is the Airy pattern: its first dark ring at 1.22 lambda / D, growing with the
+        // wavelength.
+        sfx::ApertureShape round;
+        round.rounding = 1;
+        for (double nm : {550.0, 700.0}) {
+            const int size = 201, c = 100;
+            const std::vector<double> airy = sfx::apertureDiffraction(round, nm, size, 20);
+            int i = 1;
+            while (i + 1 < c && !(airy[size_t(c) * size + size_t(c + i)] < airy[size_t(c) * size + size_t(c + i - 1)] &&
+                                  airy[size_t(c) * size + size_t(c + i)] <= airy[size_t(c) * size + size_t(c + i + 1)]))
+                ++i;
+            const double a = airy[size_t(c) * size + size_t(c + i - 1)], b = airy[size_t(c) * size + size_t(c + i)],
+                         d = airy[size_t(c) * size + size_t(c + i + 1)];
+            const double ring = i + 0.5 * (a - d) / (a - 2 * b + d);  // (the minimum between the samples)
+            const double expected = 1.22 * 20 * nm / 550;
+            QVERIFY2(std::fabs(ring - expected) < 0.02 * expected, qPrintable(QStringLiteral("%1 nm: %2 px, %3 expected").arg(nm).arg(ring).arg(expected)));
+        }
+        // Six blades give six spikes and seven give fourteen.
+        for (int blades : {6, 7}) {
+            sfx::ApertureShape shape;
+            shape.blades = blades;
+            shape.rotation = 10;
+            const int size = 301, c = 150;
+            const std::vector<double> pattern = sfx::apertureDiffraction(shape, 550, size, 4);
+            constexpr int kSteps = 1440;
+            std::vector<double> ring(kSteps);
+            for (int k = 0; k < kSteps; ++k) {
+                const double a = 2 * M_PI * k / kSteps, x = c + 80 * std::cos(a), y = c + 80 * std::sin(a);
+                const int x0 = int(x), y0 = int(y);
+                const double fx0 = x - x0, fy0 = y - y0;
+                auto at = [&](int xi, int yi) { return pattern[size_t(yi) * size + size_t(xi)]; };
+                ring[size_t(k)] = (at(x0, y0) * (1 - fx0) + at(x0 + 1, y0) * fx0) * (1 - fy0) + (at(x0, y0 + 1) * (1 - fx0) + at(x0 + 1, y0 + 1) * fx0) * fy0;
+            }
+            std::vector<double> sorted = ring;
+            std::nth_element(sorted.begin(), sorted.begin() + kSteps / 2, sorted.end());
+            const double median = sorted[kSteps / 2];
+            int spikes = 0;
+            const int window = kSteps / (8 * blades);
+            for (int k = 0; k < kSteps; ++k) {
+                bool peak = ring[size_t(k)] > 4 * median;
+                for (int j = -window; j <= window && peak; ++j)
+                    if (j && ring[size_t((k + j + kSteps) % kSteps)] >= ring[size_t(k)]) peak = false;
+                spikes += peak;
+            }
+            QCOMPARE(spikes, blades % 2 ? 2 * blades : blades);
+        }
+        // Each channel of the kernel sums to 1.
+        sfx::ApertureShape seven;
+        seven.blades = 7;
+        seven.rounding = 0.3;
+        const std::vector<float> kernel = sfx::apertureKernel(seven, 40);
+        QCOMPARE(kernel.size(), size_t(81 * 81 * 3));
+        for (int ch = 0; ch < 3; ++ch) {
+            double sum = 0;
+            for (size_t k = size_t(ch); k < kernel.size(); k += 3) sum += kernel[k];
+            QVERIFY2(std::fabs(sum - 1) < 1e-6, qPrintable(QString::number(sum - 1)));
+        }
+        // So a picture with nothing above the threshold is unchanged, and a highlight's light above it is spread
+        // without being lost.
+        Image calm(256, 256);
+        for (int y = 0; y < 256; ++y)
+            for (int x = 0; x < 256; ++x) {
+                float* q = calm.at(x, y);
+                q[0] = q[1] = q[2] = float(x) / 256, q[3] = 1;
+            }
+        Image same = calm;
+        applyVideoEffect(fx("aperture_glare", {{"threshold", 1.0}, {"size", 40}}), 0, same, 1);
+        QVERIFY(same.px == calm.px);
+        Image point(256, 256);
+        for (int y = 0; y < 256; ++y)
+            for (int x = 0; x < 256; ++x) point.at(x, y)[3] = 1;
+        std::fill_n(point.at(128, 128), 3, 5.0f);
+        Image glared = point;
+        applyVideoEffect(fx("aperture_glare", {{"threshold", 1.0}, {"size", 40}, {"intensity", 1.0}}), 0, glared, 1);
+        for (int ch = 0; ch < 3; ++ch) {
+            double added = 0;
+            for (int y = 0; y < 256; ++y)
+                for (int x = 0; x < 256; ++x) added += glared.at(x, y)[ch] - point.at(x, y)[ch];
+            QVERIFY2(std::fabs(added - 4) < 0.04, qPrintable(QString::number(added)));
+        }
+        // Six straight blades (a corner at 0 degrees): a spike straight down, little between the spikes, nothing beyond the
+        // kernel's 40 px.
+        QVERIFY(glared.at(128, 148)[1] > 20 * glared.at(148, 128)[1] && glared.at(188, 128)[1] < 1e-6f);
+
+        // Light Rays: a bright point gives a ray straight out from the centre, beyond the point, and nothing towards
+        // the centre or to the side.
+        Image dark(320, 180);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) dark.at(x, y)[3] = 1;
+        Image lit = dark;
+        for (int y = 59; y <= 61; ++y)
+            for (int x = 219; x <= 221; ++x) std::fill_n(lit.at(x, y), 3, 8.0f);
+        Image rays = lit;
+        applyVideoEffect(fx("light_rays", {{"pos_x", 0.5}, {"pos_y", 0.5}}), 0, rays, 1);
+        auto added = [&](const Image& a, int x, int y) { return a.at(x, y)[1] - lit.at(x, y)[1]; };
+        QVERIFY2(added(rays, 250, 45) > 0.005f, qPrintable(QString::number(added(rays, 250, 45))));  // on the line from (160, 90) through (220, 60)
+        QVERIFY(added(rays, 250, 55) < 1e-4f && added(rays, 250, 35) < 1e-4f);                         // beside it
+        QVERIFY(added(rays, 190, 75) < 1e-4f);                                                         // between it and the centre
+        QVERIFY(added(rays, 250, 45) > added(rays, 280, 30));                                          // fading further out
+        // Nothing above the threshold, or no intensity: unchanged.
+        Image none = dark;
+        applyVideoEffect(fx("light_rays", {}), 0, none, 1);
+        QVERIFY(none.px == dark.px);
+        Image off = lit;
+        applyVideoEffect(fx("light_rays", {{"intensity", 0.0}}), 0, off, 1);
+        QVERIFY(off.px == lit.px);
+        // Centred on the mask as tracked (the mask then not a limit): from (96, 90), the ray runs on to the right.
+        Image level = dark;
+        for (int y = 89; y <= 91; ++y)
+            for (int x = 219; x <= 221; ++x) std::fill_n(level.at(x, y), 3, 8.0f);
+        Image followed = level;
+        applyVideoEffect(fx("light_rays", {{"follow", 1.0}, {"pos_x", 0.9}, {"mask.shape", 1.0}, {"mask.x", 0.3}, {"mask.y", 0.5}, {"mask.w", 0.05}, {"mask.h", 0.05}}),
+                         0, followed, 1);
+        QVERIFY(followed.at(250, 90)[1] > 0.005f && followed.at(190, 90)[1] < 1e-4f);
+        // Shadows Block Rays: a dark bar across the ray stops it beyond the bar.
+        Image white = dark;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) std::fill_n(white.at(x, y), 3, 1.0f);
+        for (int y = 89; y <= 91; ++y)
+            for (int x = 219; x <= 221; ++x) std::fill_n(white.at(x, y), 3, 8.0f);
+        for (int y = 70; y < 110; ++y)
+            for (int x = 240; x < 246; ++x) std::fill_n(white.at(x, y), 3, 0.0f);
+        Image open = white, blocked = white;
+        applyVideoEffect(fx("light_rays", {{"threshold", 1.0}, {"pos_y", 0.5}}), 0, open, 1);
+        applyVideoEffect(fx("light_rays", {{"threshold", 1.0}, {"pos_y", 0.5}, {"block", 100.0}}), 0, blocked, 1);
+        const float beyondOpen = open.at(260, 90)[1] - 1, beyondBlocked = blocked.at(260, 90)[1] - 1;
+        QVERIFY2(beyondOpen > 0.005f && beyondBlocked < 0.1f * beyondOpen, qPrintable(QStringLiteral("%1 %2").arg(beyondOpen).arg(beyondBlocked)));
+        QVERIFY(blocked.at(230, 90)[1] - 1 > 0.5f * (open.at(230, 90)[1] - 1));  // (before the bar the ray is there)
     }
 
     void distortAndStylize() {
@@ -10417,6 +10559,207 @@ colorspaces:
         QVERIFY(near(atTime(2), inverted) && near(atTime(12), inverted));
     }
 
+    void groupShotsByAngleAndScene() {
+        // A cut of 42 stills: a first scene of three angles (a wide room, and two close-ups facing each other) intercut
+        // 30 times, then a second scene of two exterior angles intercut 12 times. Each shot is its own file, framed a
+        // little differently, exposed a little differently, grainy, with something passing through it.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180;
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<double> u(0, 1);
+        auto angleColour = [](int angle, double x, double y) -> std::array<double, 3> {
+            switch (angle) {
+                case 0:  // wide: a brown wall, a bright window on the right, a dark floor
+                    if (y > 0.7) return {0.18, 0.12, 0.08};
+                    return x > 0.6 && y < 0.6 ? std::array<double, 3>{0.92, 0.95, 1.0} : std::array<double, 3>{0.45, 0.30, 0.20};
+                case 1: {  // a face on the left against blue-grey
+                    const double dx = (x - 0.35) / 0.18, dy = (y - 0.45) / 0.32;
+                    return dx * dx + dy * dy < 1 ? std::array<double, 3>{0.85, 0.62, 0.50} : std::array<double, 3>{0.20, 0.25, 0.32};
+                }
+                case 2: {  // a face on the right against beige
+                    const double dx = (x - 0.65) / 0.18, dy = (y - 0.45) / 0.32;
+                    return dx * dx + dy * dy < 1 ? std::array<double, 3>{0.80, 0.58, 0.48} : std::array<double, 3>{0.75, 0.68, 0.55};
+                }
+                case 3:  // exterior: sky over grass
+                    return y < 0.5 ? std::array<double, 3>{0.45, 0.65, 0.95} : std::array<double, 3>{0.25, 0.55, 0.20};
+                default:  // a grey building against the sky
+                    return x > 0.3 && x < 0.7 && y > 0.15 ? std::array<double, 3>{0.55, 0.55, 0.52} : std::array<double, 3>{0.50, 0.70, 0.95};
+            }
+        };
+        std::vector<int> truth, truthScene;
+        auto addShot = [&](int angle) {
+            const double ox = (u(rng) - 0.5) * 0.08, oy = (u(rng) - 0.5) * 0.08, gain = 0.9 + 0.2 * u(rng);
+            const double bx = u(rng) * 0.8, by = u(rng) * 0.8;
+            const std::array<double, 3> thing = {u(rng), u(rng), u(rng)};
+            QImage img(320, 180, QImage::Format_RGB888);
+            std::normal_distribution<double> grain(0, 0.02);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    const double fx = x / 320.0, fy = y / 180.0;
+                    std::array<double, 3> c = angleColour(angle, fx + ox, fy + oy);
+                    if (fx > bx && fx < bx + 0.2 && fy > by && fy < by + 0.25) c = thing;
+                    auto v = [&](double ch) { return int(std::clamp((ch * gain + grain(rng)) * 255, 0.0, 255.0)); };
+                    img.setPixel(x, y, qRgb(v(c[0]), v(c[1]), v(c[2])));
+                }
+            const QString file = dir.filePath(QStringLiteral("shot%1.png").arg(truth.size(), 2, 10, QChar('0')));
+            QVERIFY(img.save(file));
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(file.toStdString(), m));
+            p.media.push_back(m);
+            Clip c = makeClip(p, p.media.back(), TrackKind::Video, s);
+            c.start = FrameTime(truth.size()) * 12;
+            c.duration = 12;
+            s.videoTracks[0].clips.push_back(c);
+            truth.push_back(angle);
+            truthScene.push_back(angle < 3 ? 0 : 1);
+        };
+        for (int i = 0, last = -1; i < 30; ++i) {
+            int a = int(u(rng) * 3);
+            if (a == last) a = (a + 1) % 3;
+            addShot(a);
+            last = a;
+        }
+        for (int i = 0; i < 12; ++i) addShot(3 + i % 2);
+
+        const std::vector<ShotTraits> traits = shotTraits(p, s);
+        QCOMPARE(traits.size(), size_t(42));
+        GroupShotsOptions o;
+        ShotGrouping found = planShotGroups(traits, o);
+        auto labels = [&](const ShotGrouping& g) {
+            std::vector<int> angle(truth.size(), -1), scene(truth.size(), -1);
+            for (size_t a = 0; a < g.angles.size(); ++a)
+                for (Id c : g.angles[a].clips)
+                    for (size_t i = 0; i < traits.size(); ++i)
+                        if (traits[i].clip == c) angle[i] = int(a), scene[i] = g.angles[a].scene;
+            return std::make_pair(angle, scene);
+        };
+        auto [angle, scene] = labels(found);
+        const double ari = adjustedRandIndex(truth, angle);
+        QVERIFY2(ari >= 0.95, qPrintable(QStringLiteral("%1 with %2 groups").arg(ari).arg(found.angles.size())));
+        QCOMPARE(adjustedRandIndex(truthScene, scene), 1.0);
+        QCOMPARE(found.scenes.size(), size_t(2));
+        // Raising the sensitivity only ever splits groups.
+        std::vector<int> coarser;
+        for (int k = 0; k <= 10; ++k) {
+            o.sensitivity = k / 10.0;
+            const std::vector<int> finer = labels(planShotGroups(traits, o)).first;
+            if (!coarser.empty())
+                for (size_t i = 0; i < finer.size(); ++i)
+                    for (size_t j = 0; j < finer.size(); ++j)
+                        if (finer[i] == finer[j]) QVERIFY2(coarser[i] == coarser[j], qPrintable(QStringLiteral("merged at %1").arg(o.sensitivity)));
+            coarser = finer;
+        }
+        // Applied: three angle groups in one scene group, two in another.
+        o.sensitivity = 0.5;
+        QVERIFY(edit::applyShotGrouping(p, s, found).ok);
+        QCOMPARE(int(std::count_if(s.colorGroups.begin(), s.colorGroups.end(), [](const ColorGroup& g) { return g.kind == "scene"; })), 2);
+        QCOMPARE(int(std::count_if(s.colorGroups.begin(), s.colorGroups.end(), [](const ColorGroup& g) { return g.kind == "angle"; })), int(found.angles.size()));
+        const Id firstClip = s.videoTracks[0].clips[0].id;
+        const ColorGroup* wideGroup = colorGroupOf(s, s.videoTracks[0].clips[0]);
+        QVERIFY(wideGroup && wideGroup->kind == "angle" && findColorGroup(s, wideGroup->parent)->kind == "scene");
+        const Id wide = wideGroup->id, firstScene = wideGroup->parent;
+        // A grade on one angle group reaches its shots and no others; one on the scene reaches its three angles.
+        Effect lift = makeEffect(p, "color_correct");
+        lift.params["gain"] = 1.5;
+        findColorGroup(s, wide)->pre.push_back(lift);
+        Effect cool = makeEffect(p, "color_correct");
+        cool.params["temperature"] = -30.0;
+        findColorGroup(s, firstScene)->post.push_back(cool);
+        for (size_t i = 0; i < s.videoTracks[0].clips.size(); ++i) {
+            const Clip& c = s.videoTracks[0].clips[i];
+            const std::vector<const Effect*> chain = gradeChain(s, c);
+            const bool hasLift = std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return e->id == lift.id; });
+            const bool hasCool = std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return e->id == cool.id; });
+            QCOMPARE(hasLift, c.colorGroup == wide);
+            QCOMPARE(hasCool, truthScene[i] == 0);
+            if (hasLift) QVERIFY(chain.front()->id == lift.id || chain.front()->id == cool.id);
+        }
+        QCOMPARE(colorGroupMembers(s, wide).size(), size_t(std::count(truth.begin(), truth.end(), 0)));
+        QCOMPARE(colorGroupMembers(s, firstScene, true).size(), size_t(30));
+        {
+            // In the picture: the wide group's lift shows on its shots and not on a close-up's.
+            Sequence plain = s;
+            for (ColorGroup& g : plain.colorGroups) g.pre.clear(), g.post.clear();
+            RenderOptions ro;
+            auto at = [&](const Sequence& q, FrameTime t) { return renderProgramFrame(p, q, t, ro).at(20, 20)[0]; };
+            const size_t close = size_t(std::find(truth.begin(), truth.end(), 1) - truth.begin());
+            QVERIFY(at(s, 6) > at(plain, 6) * 1.2);
+            Sequence noScene = s;
+            findColorGroup(noScene, firstScene)->post.clear();
+            QVERIFY(std::fabs(at(noScene, FrameTime(close) * 12 + 6) - at(plain, FrameTime(close) * 12 + 6)) < 1e-5);
+        }
+        // Saved and read back.
+        const QString file = dir.filePath("grouped.montage");
+        QVERIFY(saveProject(p, file.toStdString()));
+        Project back;
+        QVERIFY(loadProject(file.toStdString(), back));
+        QVERIFY(back.active()->colorGroups == s.colorGroups);
+
+        // Locked, the wide group stays as it is when grouped again at another sensitivity; the unlocked groups that
+        // keep most of their shots keep their grades.
+        QVERIFY(edit::setColorGroupLocked(s, wide, true).ok);
+        const std::vector<Id> wideShots = colorGroupMembers(s, wide);
+        const ColorGroup lockedBefore = *findColorGroup(s, wide);
+        for (double again : {0.95, 0.1}) {
+            o.sensitivity = again;
+            const std::vector<ShotTraits> rest = shotTraits(p, s);
+            QCOMPARE(rest.size(), size_t(42) - wideShots.size());
+            QVERIFY(edit::applyShotGrouping(p, s, planShotGroups(rest, o, keptShots(s), &s)).ok);
+            QVERIFY(findColorGroup(s, wide) && *findColorGroup(s, wide) == lockedBefore);
+            QCOMPARE(colorGroupMembers(s, wide), wideShots);
+        }
+        o.sensitivity = 0.5;
+        QVERIFY(edit::applyShotGrouping(p, s, planShotGroups(shotTraits(p, s), o, keptShots(s), &s)).ok);
+        QVERIFY(findColorGroup(s, firstScene) && !findColorGroup(s, firstScene)->post.empty());
+        // (the close-ups found again in the wide's scene, which keeps its grade)
+        QCOMPARE(colorGroupMembers(s, firstScene, true).size(), size_t(30));
+
+        // Split, join, lock and nest by hand.
+        const Id close = s.videoTracks[0].clips[size_t(std::find(truth.begin(), truth.end(), 1) - truth.begin())].colorGroup;
+        const std::vector<Id> closeShots = colorGroupMembers(s, close);
+        QVERIFY(closeShots.size() >= 2);
+        Id split = 0;
+        QVERIFY(edit::splitColorGroup(p, s, {closeShots.front()}, &split).ok);
+        QCOMPARE(colorGroupMembers(s, split), std::vector<Id>{closeShots.front()});
+        QCOMPARE(findColorGroup(s, split)->parent, findColorGroup(s, close)->parent);
+        QVERIFY(!edit::splitColorGroup(p, s, {closeShots.front()}).ok);  // (all of its group)
+        QVERIFY(edit::joinColorGroups(s, close, {split}).ok);
+        QVERIFY(!findColorGroup(s, split));
+        QCOMPARE(colorGroupMembers(s, close), closeShots);
+        QVERIFY(!edit::setColorGroupParent(s, firstScene, close).ok);  // (a scene inside its own angle)
+        QVERIFY(!edit::joinColorGroups(s, close, {firstScene}).ok);
+        QVERIFY(edit::deleteColorGroup(s, firstScene).ok);
+        QCOMPARE(findColorGroup(s, close)->parent, Id(0));
+        QVERIFY(firstClip);
+
+        // A look made by hand for shots in both scenes leaves the scenes apart.
+        std::vector<Id> look;
+        for (size_t i : {2, 6, 32, 36}) look.push_back(s.videoTracks[0].clips[i].id);
+        QVERIFY(edit::makeColorGroup(p, s, look, "Flashback").ok);
+        o.sensitivity = 0.5;
+        QCOMPARE(planShotGroups(shotTraits(p, s), o, keptShots(s), &s).scenes.size(), size_t(2));
+        // A loop of groups (from a file edited by hand) does not hang the edits, and is broken when read.
+        Sequence looped = s;
+        findColorGroup(looped, close)->parent = wide;
+        findColorGroup(looped, wide)->parent = close;
+        const Id other = std::find_if(looped.colorGroups.begin(), looped.colorGroups.end(), [&](const ColorGroup& g) { return g.id != close && g.id != wide; })->id;
+        (void)edit::setColorGroupParent(looped, other, close);
+        (void)edit::joinColorGroups(looped, close, {other});
+        Project loopedProject = p;
+        *loopedProject.active() = looped;
+        QVERIFY(saveProject(loopedProject, file.toStdString()));
+        QVERIFY(loadProject(file.toStdString(), back));
+        QVERIFY(!findColorGroup(*back.active(), close)->parent || !findColorGroup(*back.active(), wide)->parent);
+        // A frame that cannot be read, or a value that is not a number, still gives a distance.
+        ShotTraits odd = traits[0];
+        odd.histogram[0] = std::numeric_limits<float>::quiet_NaN();
+        QVERIFY(std::isfinite(shotDistance(odd, traits[1])));
+        QCOMPARE(clusterShots({{0, NAN, 0.2}, {NAN, 0, NAN}, {0.2, NAN, 0}}, 0.5).size(), size_t(3));
+    }
+
     void colorGroupGrades() {
         // Two grey shots in a group: its pre-clip grade (gain x2) before each one's own (invert on the second), its
         // post-clip grade (tint) after.
@@ -13116,7 +13459,8 @@ colorspaces:
 
     // The GPU compositor draws a frame the same as the CPU renderer: media through its input transform, the colour
     // effects it has (a LUT, Color Correct, Curves, Hue Curves), scaled, rotated and cropped layers in every blend mode,
-    // a cross dissolve, a layer made on the CPU, and the display conversion. Skipped where there is no GPU.
+    // a cross dissolve, a layer made on the CPU (and one with Light Rays and Aperture Glare), and the display
+    // conversion. Skipped where there is no GPU.
     void gpuCompositorMatchesCpu() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -13314,6 +13658,21 @@ colorspaces:
         compare(20, o, "color space transform");
         QVERIFY(gpu::stats().cpuLayers > 0);
         graded->effects.erase(graded->effects.begin() + 1);
+        // Light Rays and Aperture Glare are worked out on the CPU too, and the layer they make drawn there.
+        {
+            Clip* generated = s.videoTracks[2].clips.empty() ? nullptr : &s.videoTracks[2].clips[0];
+            QVERIFY(generated);
+            Effect rays = makeEffect(p, "light_rays");
+            rays.params["threshold"] = 0.5;
+            Effect glare = makeEffect(p, "aperture_glare");
+            glare.params["threshold"] = 0.6;
+            glare.params["size"] = 20.0;
+            generated->effects = {rays, glare};
+            gpu::resetStats();
+            compare(20, o, "light rays and aperture glare");
+            QVERIFY(gpu::stats().cpuLayers > 0);
+            generated->effects.clear();
+        }
         // As grade nodes in series, one with a window and a qualifier at 60 %, one faded to 50 %; then beside another
         // through a parallel mixer, which the GPU leaves to the CPU.
         const Id topId = r2.created[0];

@@ -107,7 +107,7 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         for (CaptionTrack& t : s.captionTracks) fn(t.id);
         for (Bus& b : s.buses) fn(b.id), fxs(b.effects);
         fxs(s.masterEffects);
-        for (ColorGroup& g : s.colorGroups) fn(g.id), fn(g.postId), fxs(g.pre), fxs(g.post);
+        for (ColorGroup& g : s.colorGroups) fn(g.id), fn(g.postId), fn(g.parent), fxs(g.pre), fxs(g.post);
         for (SharedNode& n : s.sharedNodes) fn(n.id), fxs(n.effects);
         for (AdrCue& c : s.adrCues) fn(c.id), fn(c.clip);
         for (TemplateField& f : s.fields) fn(f.clip), fn(f.effect);

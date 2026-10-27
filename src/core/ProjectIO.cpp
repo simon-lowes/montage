@@ -1,5 +1,6 @@
 #include "ProjectIO.h"
 #include "Automation.h"
+#include "ColorGroups.h"
 #include "AdaptiveHdrMetadata.h"
 #include "Surround.h"
 #include "FilmCount.h"
@@ -752,7 +753,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
             QJsonArray pre, post;
             for (const auto& e : g.pre) pre.append(effectToJson(e));
             for (const auto& e : g.post) post.append(effectToJson(e));
-            groups.append(QJsonObject{{"id", double(g.id)}, {"postId", double(g.postId)}, {"name", qs(g.name)}, {"pre", pre}, {"post", post}});
+            QJsonObject go{{"id", double(g.id)}, {"postId", double(g.postId)}, {"name", qs(g.name)}, {"pre", pre}, {"post", post}};
+            if (g.parent) go["parent"] = double(g.parent);
+            if (!g.kind.empty()) go["kind"] = qs(g.kind);
+            if (g.locked) go["locked"] = true;
+            groups.append(go);
         }
         o["colorGroups"] = groups;
     }
@@ -933,7 +938,19 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         g.name = go.value("name").toString().toStdString();
         for (const auto& e : go.value("pre").toArray()) g.pre.push_back(effectFromJson(e));
         for (const auto& e : go.value("post").toArray()) g.post.push_back(effectFromJson(e));
+        g.parent = Id(i64(go.value("parent")));
+        g.kind = go.value("kind").toString().toStdString();
+        g.locked = go.value("locked").toBool(false);
         if (g.id && g.postId) s.colorGroups.push_back(std::move(g));
+    }
+    // A group inside itself (a file edited by hand, or two merged edits) is taken out of the loop.
+    for (ColorGroup& g : s.colorGroups) {
+        size_t steps = 0;
+        for (const ColorGroup* q = findColorGroup(s, g.parent); q && steps <= s.colorGroups.size(); q = findColorGroup(s, q->parent), ++steps)
+            if (q->id == g.id) {
+                g.parent = 0;
+                break;
+            }
     }
     for (const auto& nv : o.value("sharedNodes").toArray()) {
         const QJsonObject no = nv.toObject();

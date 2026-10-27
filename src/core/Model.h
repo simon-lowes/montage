@@ -471,6 +471,12 @@ struct ColorGroup {
     Id postId = 0;  // the owner of its post-clip effects
     std::string name;
     std::vector<Effect> pre, post;
+    // Groups made by Group Shots (render/ShotGroups.h): an angle group (its shots from one camera position) inside a
+    // scene group (`parent`), whose grades wrap the angle's. A group made by hand has no kind. Running Group Shots
+    // again remakes the groups it made, except locked ones.
+    Id parent = 0;
+    std::string kind;  // "" by hand, "angle", "scene"
+    bool locked = false;
     bool operator==(const ColorGroup&) const = default;
 };
 

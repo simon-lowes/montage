@@ -8015,6 +8015,139 @@ private slots:
         QVERIFY(call("montage_color_group", {{"action", "create"}, {"clips", QJsonArray{}}}).value("isError").toBool());
     }
 
+    void mcpGroupShots() {
+        // Six stills cut between two angles, grouped by angle and scene over MCP; a group split, joined, locked and
+        // nested by montage_color_group, and the locked one kept when grouping runs again.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        std::vector<double> shots;
+        for (int i = 0; i < 6; ++i) {
+            QImage img(160, 90, QImage::Format_RGB888);
+            const int lift = (i * 5) % 10;
+            for (int y = 0; y < 90; ++y)
+                for (int x = 0; x < 160; ++x)
+                    img.setPixel(x, y, i % 2 == 0 ? (x < 80 ? qRgb(200 + lift, 40, 30) : qRgb(30, 50, 190 + lift))
+                                                  : (y < 45 ? qRgb(40, 170 + lift, 60) : qRgb(120 + lift, 120, 120)));
+            const std::string file = path(("group-shot" + std::to_string(i) + ".png").c_str());
+            QVERIFY(img.save(QString::fromStdString(file)));
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(file, m));
+            p.media.push_back(m);
+            Clip c = makeClip(p, p.media.back(), TrackKind::Video, s);
+            c.start = i * 10;
+            c.duration = 10;
+            shots.push_back(double(c.id));
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        }
+        const QString project = QString::fromStdString(path("group-shots-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* name, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", name}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) {
+            QString t;
+            for (const QJsonValue& v : r.value("content").toArray()) t += v.toObject().value("text").toString();
+            return t;
+        };
+        auto groupOf = [&](double clip) {
+            Project q;
+            if (!loadProject(project.toStdString(), q)) return Id(0);
+            const Clip* c = edit::clipById(*q.active(), Id(clip));
+            return c ? c->colorGroup : Id(0);
+        };
+        QVERIFY(call("montage_group_shots", {{"sensitivity", 1.5}}).value("isError").toBool());
+        // A dry run changes nothing.
+        QJsonObject r = call("montage_group_shots", {{"dry_run", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("angles").toArray().size(), 2);
+        QCOMPARE(r.value("structuredContent").toObject().value("scenes").toInt(), 1);
+        QCOMPARE(groupOf(shots[0]), Id(0));
+        r = call("montage_group_shots", {});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QJsonArray groups = r.value("structuredContent").toObject().value("groups").toArray();
+        QCOMPARE(groups.size(), 3);  // two angles in a scene
+        const Id first = groupOf(shots[0]), second = groupOf(shots[1]);
+        QVERIFY(first && second && first != second);
+        for (int i = 0; i < 6; ++i) QCOMPARE(groupOf(shots[i]), i % 2 ? second : first);
+        // Split off, joined back, locked, taken out of its scene and put back.
+        r = call("montage_color_group", {{"action", "split"}, {"clips", QJsonArray{shots[1]}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id split = groupOf(shots[1]);
+        QVERIFY(split && split != second);
+        r = call("montage_color_group", {{"action", "join"}, {"group", double(second)}, {"groups", QJsonArray{double(split)}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(groupOf(shots[1]), second);
+        r = call("montage_color_group", {{"action", "lock"}, {"group", double(first)}});
+        QVERIFY2(text(r).contains("locked"), qPrintable(text(r)));
+        double scene = 0;
+        for (const QJsonValue& v : r.value("structuredContent").toObject().value("groups").toArray())
+            if (v.toObject().value("kind").toString() == "scene") scene = v.toObject().value("id").toDouble();
+        QVERIFY(scene > 0);
+        r = call("montage_color_group", {{"action", "nest"}, {"group", double(second)}, {"parent", 0}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_color_group", {{"action", "nest"}, {"group", double(second)}, {"parent", scene}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(call("montage_color_group", {{"action", "nest"}, {"group", scene}, {"parent", double(second)}}).value("isError").toBool());  // a loop
+        QVERIFY(call("montage_color_group", {{"action", "nest"}, {"group", double(second)}}).value("isError").toBool());  // no parent given
+        // A grade for the scene, through one of its shots.
+        r = call("montage_add_effect", {{"clip", shots[1]}, {"effect", "film_look"}, {"group_stage", "post"}, {"group", scene}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Scene"), qPrintable(text(r)));
+        QVERIFY(call("montage_add_effect", {{"clip", shots[1]}, {"effect", "film_look"}, {"group_stage", "post"}, {"group", double(first)}}).value("isError").toBool());
+        // Grouped again at the lowest sensitivity, where everything would be one angle: the locked group stays.
+        r = call("montage_group_shots", {{"sensitivity", 0.0}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        for (int i = 0; i < 6; i += 2) QCOMPARE(groupOf(shots[i]), first);
+        for (int i = 1; i < 6; i += 2) QVERIFY(groupOf(shots[i]) && groupOf(shots[i]) != first);
+    }
+
+    void mcpLightRaysAndGlare() {
+        // Light Rays and Aperture Glare added over MCP, with their parameters, and run in the render.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90;
+        Clip c = makeGeneratorClip(p, "color", 10);
+        c.generator.params["color.r"] = 1.0, c.generator.params["color.g"] = 1.0, c.generator.params["color.b"] = 1.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const double clip = double(s.videoTracks[0].clips[0].id);
+        const QString project = QString::fromStdString(path("light-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* name, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", name}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_add_effect", {{"clip", clip}, {"effect", "aperture_glare"}, {"params", QJsonObject{{"blades", 7}, {"size", 30}, {"threshold", 0.5}}}});
+        QVERIFY(!r.value("isError").toBool());
+        r = call("montage_add_effect", {{"clip", clip}, {"effect", "light_rays"}, {"params", QJsonObject{{"pos_x", 0.2}, {"block", 50}}}});
+        QVERIFY(!r.value("isError").toBool());
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        const Clip* back = edit::clipById(*q.active(), Id(clip));
+        QVERIFY(back && back->effects.size() == 2);
+        QCOMPARE(back->effects[0].type, std::string("aperture_glare"));
+        QCOMPARE(back->effects[0].p("blades", 0, 0), 7.0);
+        QCOMPARE(back->effects[1].p("pos_x", 0, 0), 0.2);
+        // White above both thresholds: the glare and the rays add light.
+        RenderOptions o;
+        const Image frame = renderProgramFrame(q, *q.active(), 0, o);
+        QVERIFY2(frame.at(80, 45)[1] > 1.2f, qPrintable(QString::number(frame.at(80, 45)[1])));
+    }
+
     void mcpSpellCheck() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

@@ -734,8 +734,10 @@ private:
                 if (edit::transitionRange(t, tr, a, b) && f >= a && f < b) return nullptr;
             }
         }
-        const ColorGroup* group = found ? colorGroupOf(seq_, *found) : nullptr;
-        if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || (group && (!group->pre.empty() || !group->post.empty())) ||
+        bool grouped = false;  // (a colour group's grades run on it)
+        if (found)
+            for (const ColorGroup* g : colorGroupsOf(seq_, *found)) grouped = grouped || !g->pre.empty() || !g->post.empty();
+        if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped ||
             found->blendMode != "normal" || found->speed != 1.0 ||
             found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
             return nullptr;

@@ -1368,11 +1368,10 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
     // (Its colour group's, and its own and its shared nodes' that take part.)
     std::vector<const Effect*> redactions;
-    if (const ColorGroup* cg = colorGroupOf(seq, c)) {
+    for (const ColorGroup* cg : colorGroupsOf(seq, c))
         for (const auto* v : {&cg->pre, &cg->post})
             for (const Effect& e : *v)
                 if (e.enabled && e.type == "redact_faces") redactions.push_back(&e);
-    }
     for (const Effect* e : liveEffects(seq, c))
         if (e->type == "redact_faces") redactions.push_back(e);
     for (const Effect* e : redactions) applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
@@ -1387,13 +1386,16 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     const bool graph = !c.grade.empty();
     bool graphRan = false;
     auto in = [](const Effect* e, const std::vector<Effect>& v) { return !v.empty() && e >= v.data() && e < v.data() + v.size(); };
-    const ColorGroup* group = colorGroupOf(seq, c);
+    const std::vector<const ColorGroup*> groups = colorGroupsOf(seq, c);
+    auto inGroups = [&](const Effect* e, bool post) {
+        return std::any_of(groups.begin(), groups.end(), [&](const ColorGroup* g) { return in(e, post ? g->post : g->pre); });
+    };
     auto runGraph = [&] {
         if (graph && !graphRan) applyGradeGraph(seq, c, lt, src, pixelScale, sourceSeconds, ranAlready);
         graphRan = true;
     };
     for (const Effect* e : chain) {
-        const bool pre = group && in(e, group->pre), post = group && in(e, group->post), mine = in(e, c.effects);
+        const bool pre = inGroups(e, false), post = inGroups(e, true), mine = in(e, c.effects);
         if (graph) {
             if (post) runGraph();  // (before the group's post-clip grade)
             if (!pre && !post && !mine) continue;  // a shared node's: in the graph
@@ -2269,13 +2271,16 @@ bool gpuChainOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::fu
     const bool graph = !c.grade.empty();
     bool graphRan = false, ok = true;
     auto in = [](const Effect* e, const std::vector<Effect>& v) { return !v.empty() && e >= v.data() && e < v.data() + v.size(); };
-    const ColorGroup* group = colorGroupOf(seq, c);
+    const std::vector<const ColorGroup*> groups = colorGroupsOf(seq, c);
+    auto inGroups = [&](const Effect* e, bool post) {
+        return std::any_of(groups.begin(), groups.end(), [&](const ColorGroup* g) { return in(e, post ? g->post : g->pre); });
+    };
     auto runGraph = [&] {
         if (graph && !graphRan) ok = ok && gpuGradeOps(seq, c, lt, ranAlready, ops, w, h, pixelScale);
         graphRan = true;
     };
     for (const Effect* e : gradeChain(seq, c)) {
-        const bool pre = group && in(e, group->pre), post = group && in(e, group->post), mine = in(e, c.effects);
+        const bool pre = inGroups(e, false), post = inGroups(e, true), mine = in(e, c.effects);
         if (graph) {
             if (post) runGraph();
             if (!pre && !post && !mine) continue;

@@ -510,7 +510,7 @@ Image chartFrame(const Project& p, const Sequence& s, const Clip& c, FrameTime a
             break;
         }
     convertColor(img, source, sequenceColorSpace(s), s.hdrPeakNits);
-    if (const ColorGroup* g = colorGroupOf(s, c))
+    for (const ColorGroup* g : colorGroupsOf(s, c))
         for (const Effect& e : g->pre)
             if (e.enabled) applyVideoEffect(e, lt, img, double(img.width) / mw, sec);
     return img;

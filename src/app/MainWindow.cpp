@@ -226,6 +226,7 @@
 #include "render/Hdr10Plus.h"
 #include "render/AdaptiveHdr.h"
 #include "render/Versions.h"
+#include "render/ShotGroups.h"
 #include "media/MicBleed.h"
 #include "media/Sofa.h"
 #include "render/MusicEdit.h"
@@ -648,6 +649,7 @@ void MainWindow::buildPanels() {
     galleryDock_ = makeDock(tr("Gallery"), "gallery", gallery_);
     clipStrip_ = new ClipStripPanel(state_, this);
     clipsDock_ = makeDock(tr("Clips"), "clips", clipStrip_);
+    connect(clipStrip_, &ClipStripPanel::groupShotsRequested, this, [this](double sensitivity) { groupShots(sensitivity); });
     connect(gallery_, &GalleryPanel::compareRequested, this, [this](const QImage& still, const QString& label) {
         if (masterBeside_) {
             masterBeside_ = false;
@@ -1521,6 +1523,12 @@ void MainWindow::buildMenus() {
             join->addAction(QString::fromStdString(g.name), this, [this, id] { addToColorGroup(id); });
         }
         groupM->addAction(tr("Remove Selection from Group"), this, [this] { removeFromColorGroup(); })->setObjectName(QStringLiteral("removeFromColorGroup"));
+        groupM->addAction(tr("Group Shots by Angle and Scene…"), this, [this] {
+            bool ok = false;
+            const int sensitivity = QInputDialog::getInt(this, tr("Group Shots"), tr("Sensitivity (more groups as it rises):"),
+                                                         clipStrip_ ? int(std::lround(clipStrip_->sensitivity() * 100)) : 50, 0, 100, 5, &ok);
+            if (ok) groupShots(sensitivity / 100.0);
+        })->setObjectName(QStringLiteral("groupShots"));
         if (s->colorGroups.empty()) return;
         groupM->addSeparator();
         QMenu* rename = groupM->addMenu(tr("Rename Group"));
@@ -6435,6 +6443,35 @@ bool MainWindow::addToColorGroup(Id group) {
 bool MainWindow::removeFromColorGroup() {
     const std::vector<Id> sel = state_->selectedClips();
     return state_->edit(tr("Remove from Colour Group"), [&](Project&, Sequence& s) { return edit::removeFromColorGroup(s, sel).ok; });
+}
+
+int MainWindow::groupShots(double sensitivity, bool scenes) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // Describing and comparing the shots reads frames: done on a copy, then the grouping applied in one undo step.
+    const auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    GroupShotsOptions o;
+    o.sensitivity = std::clamp(sensitivity, 0.0, 1.0);
+    o.scenes = scenes;
+    ShotGrouping plan;
+    if (!runWithProgress(this, state_, tr("Describing each shot..."), [&, project](const auto& progress, const auto* cancel, std::string*) {
+            const Sequence* sq = project->findSequence(seqId);
+            if (!sq) return false;
+            plan = planShotGroups(shotTraits(*project, *sq, {}, false, progress, cancel), o, keptShots(*sq), sq);
+            return true;
+        }))
+        return 0;
+    const int angles = int(plan.angles.size()), sceneCount = int(plan.scenes.size());
+    if (!angles) {
+        state_->message(tr("No shots to group: every picture clip is in a group made by hand or a locked one"), 5000);
+        return 0;
+    }
+    if (!state_->apply(tr("Group Shots"), [&](Project& p, Sequence& sq) { return edit::applyShotGrouping(p, sq, plan); }))
+        return 0;  // (the reason shown)
+    state_->message(tr("Grouped the shots into %n angle group(s)", "", angles) + (sceneCount ? tr(" in %n scene(s)", "", sceneCount) : QString()), 5000);
+    if (clipStrip_ && angles) clipStrip_->setGroupsShown(true);
+    return angles;
 }
 
 int MainWindow::queueTrimPasses(const QString& folder) {

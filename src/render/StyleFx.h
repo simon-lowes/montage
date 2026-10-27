@@ -30,6 +30,28 @@ void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale);
 // through the frame's centre. Added to the picture.
 void lensFlare(const Effect& e, FrameTime t, Image& img);
 
+// Light Rays: light above a threshold in the picture (scene light, the linear domain), tinted, streaming out from a
+// centre (Light X and Y, keyed, or the effect's mask as tracked when `follow` is on): blurred along the lines through
+// the centre in three passes of growing length, fading with `decay`; with Shadows Block Rays, the picture's darker
+// parts cut the rays crossing them. Added to the picture.
+void lightRays(const Effect& e, FrameTime t, Image& img, double pixelScale);
+
+// Aperture Glare: the diffraction a lens's aperture makes of the highlights (spikes and a soft glow round them).
+struct ApertureShape {
+    int blades = 6;        // 3 or more
+    double rounding = 0;   // 0 straight blades .. 1 round
+    double rotation = 0;   // degrees
+    bool operator==(const ApertureShape&) const = default;
+};
+// The far-field diffraction pattern of the aperture at one wavelength (nm): the squared magnitude of its Fourier
+// transform, on a grid `size` pixels square (odd, centred), `perLambdaOverD` pixels to each lambda / D at 550 nm (the
+// pattern grows with the wavelength), summing to 1.
+std::vector<double> apertureDiffraction(const ApertureShape& a, double nm, int size, double perLambdaOverD);
+// The glare kernel: the pattern at eight wavelengths from 400 to 700 nm summed into linear Rec.709 RGB (size x size x
+// 3, `size` = 2 * radius + 1, round), each channel summing to 1. lambda / D at 550 nm is radius / 20 pixels.
+std::vector<float> apertureKernel(const ApertureShape& a, int radius);
+void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale);
+
 // Smooth noise in 3D, about -1..1 (value noise, quintic-smoothed).
 double valueNoise(double x, double y, double z, uint32_t seed = 0);
 

@@ -166,6 +166,7 @@
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
 #include "render/LoudnessReport.h"
+#include "render/ShotGroups.h"
 #include "render/AutoTrims.h"
 #include "render/TrimPasses.h"
 #include "media/Segmenter.h"
@@ -2684,6 +2685,7 @@ void McpServer::Impl::addTools() {
             "mask_smooth":{"type":"boolean","default":false},
             "pins":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["position","stiff","bend","overlap"]},"x":{"type":"number"},"y":{"type":"number"},"to_x":{"type":"number"},"to_y":{"type":"number"},"path":{"type":"array","items":{"type":"object"}},"radius":{"type":"number"},"amount":{"type":"number"},"angle":{"type":"number"},"scale":{"type":"number"},"depth":{"type":"number"}},"required":["x","y"]},"description":"mesh_warp's pins"},
             "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
+            "group":{"type":["number","string"],"description":"group_stage: which of the clip's groups (its id or name, such as the scene group round its angle group); default the clip's own"},
             "node":{"type":"integer","description":"Into the clip's corrector node with this key (montage_grade_nodes); a shared node's goes into the shared node"},
             "shared":{"type":"number","description":"Into this shared node (montage_grade_nodes), seen by every clip using it"}},
             "required":["project","clip","effect"]})json",
@@ -2883,6 +2885,14 @@ void McpServer::Impl::addTools() {
                 const QString stage = str(a, "group_stage");
                 ColorGroup* g = findColorGroup(l.seq(), c.colorGroup);
                 if (!g) throw ArgError{"That clip is in no colour group (see montage_color_group)"};
+                if (a.contains("group")) {
+                    const QJsonValue v = a.value("group");
+                    g = nullptr;
+                    for (const ColorGroup* x : colorGroupsOf(l.seq(), c))
+                        if ((v.isDouble() && x->id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(x->name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                            g = findColorGroup(l.seq(), x->id);
+                    if (!g) throw ArgError{"The clip is in no colour group of that id or name (see montage_color_group)"};
+                }
                 if (stage != "pre" && stage != "post") throw ArgError{"\"group_stage\" is pre or post"};
                 if (audioClip || runsBeforeGrade(type))
                     throw ArgError{"A colour group takes picture effects that work the same on each clip (that one works on each clip's picture as it comes: add it to the clips)"};
@@ -3365,10 +3375,15 @@ void McpServer::Impl::addTools() {
         "Grade shots together, as Resolve's groups do: a colour group's pre-clip grade runs on each member before the "
         "clip's own effects (to match the shots) and its post-clip grade after them (the group's look). `action`: list "
         "(the groups, their members and grades), create (a group of `clips`, named `name`), add (`clips` join `group`), "
-        "remove (`clips` leave their groups), rename (`group` to `name`) or delete (`group`; its clips keep their own "
-        "grades). Add grades with montage_add_effect and `group_stage`.",
-        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["list","create","add","remove","rename","delete"],"default":"list"},
+        "remove (`clips` leave their groups), rename (`group` to `name`), delete (`group`; its clips keep their own "
+        "grades), split (`clips` out of their group into a new one beside it, with a copy of its grades), join (the groups "
+        "`groups` into `group`), lock or unlock (`group`: a locked group stays as it is when montage_group_shots runs "
+        "again) or nest (`group` inside `parent`, a scene group whose grades wrap its own; 0 none). Add grades with "
+        "montage_add_effect and `group_stage` (`group` for a scene group's).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["list","create","add","remove","rename","delete","split","join","lock","unlock","nest"],"default":"list"},
             "clips":{"type":"array","items":{"type":"number"}},"group":{"type":["number","string"],"description":"Its id or name"},
+            "groups":{"type":"array","items":{"type":["number","string"]},"description":"join: the groups joined into group"},
+            "parent":{"type":["number","string"],"description":"nest: the scene group (0 none)"},
             "name":{"type":"string"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3376,10 +3391,10 @@ void McpServer::Impl::addTools() {
             const QString action = str(a, "action", "list");
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
-            auto groupArg = [&]() -> Id {
-                const QJsonValue v = a.value("group");
+            auto groupArg = [&](const QJsonValue& v = {}) -> Id {  // (`group` when none is given)
+                const QJsonValue v2 = v.isUndefined() || v.isNull() ? a.value("group") : v;
                 for (const ColorGroup& g : s.colorGroups)
-                    if ((v.isDouble() && g.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(g.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                    if ((v2.isDouble() && g.id == Id(v2.toDouble())) || (v2.isString() && QString::fromStdString(g.name).compare(v2.toString(), Qt::CaseInsensitive) == 0))
                         return g.id;
                 throw ArgError{"No such colour group (see action list)"};
             };
@@ -3398,7 +3413,22 @@ void McpServer::Impl::addTools() {
                 const edit::Result r = edit::renameColorGroup(s, g, name);
                 if (!r.ok && !r.error.empty()) return fail(QString::fromStdString(r.error));
             } else if (action == "delete") check(edit::deleteColorGroup(s, groupArg()));
-            else if (action != "list") throw ArgError{"\"action\" is list, create, add, remove, rename or delete"};
+            else if (action == "split") {
+                Id created = 0;
+                check(edit::splitColorGroup(l.project, s, clips, &created));
+            } else if (action == "join") {
+                std::vector<Id> others;
+                for (const QJsonValue& v : a.value("groups").toArray()) others.push_back(groupArg(v));
+                check(edit::joinColorGroups(s, groupArg(), others));
+            } else if (action == "lock" || action == "unlock") {
+                const edit::Result r = edit::setColorGroupLocked(s, groupArg(), action == "lock");
+                if (!r.ok && !r.error.empty()) return fail(QString::fromStdString(r.error));
+            } else if (action == "nest") {
+                const QJsonValue v = a.value("parent");
+                if (v.isUndefined() || v.isNull()) throw ArgError{"\"parent\" is needed: the scene group to put it in (0 none)"};
+                const edit::Result r = edit::setColorGroupParent(s, groupArg(), v.isDouble() && v.toDouble() == 0 ? Id(0) : groupArg(v));
+                if (!r.ok && !r.error.empty()) return fail(QString::fromStdString(r.error));
+            } else if (action != "list") throw ArgError{"\"action\" is list, create, add, remove, rename, delete, split, join, lock, unlock or nest"};
             if (action != "list") save(l);
             QJsonArray groups;
             QString text = s.colorGroups.empty() ? QStringLiteral("No colour groups.") : QString();
@@ -3407,11 +3437,63 @@ void McpServer::Impl::addTools() {
                 for (Id id : colorGroupMembers(s, g.id)) members.append(double(id));
                 for (const Effect& e : g.pre) pre.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
                 for (const Effect& e : g.post) post.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
-                groups.append(QJsonObject{{"id", double(g.id)}, {"name", QString::fromStdString(g.name)}, {"clips", members}, {"pre", pre}, {"post", post}});
-                text += QStringLiteral("%1 (%2): %3 clip(s), %4 pre-clip and %5 post-clip effect(s)\n")
-                            .arg(QString::fromStdString(g.name)).arg(g.id).arg(members.size()).arg(pre.size()).arg(post.size());
+                groups.append(QJsonObject{{"id", double(g.id)}, {"name", QString::fromStdString(g.name)}, {"clips", members}, {"pre", pre}, {"post", post},
+                                          {"kind", g.kind.empty() ? QStringLiteral("manual") : QString::fromStdString(g.kind)},
+                                          {"parent", g.parent ? QJsonValue(double(g.parent)) : QJsonValue()}, {"locked", g.locked}});
+                text += QStringLiteral("%1 (%2%3%4): %5 clip(s), %6 pre-clip and %7 post-clip effect(s)\n")
+                            .arg(QString::fromStdString(g.name)).arg(g.id)
+                            .arg(g.kind.empty() ? QString() : QStringLiteral(", ") + QString::fromStdString(g.kind))
+                            .arg(g.locked ? QStringLiteral(", locked") : QString())
+                            .arg(members.size()).arg(pre.size()).arg(post.size());
             }
             return ok(text.trimmed(), QJsonObject{{"groups", groups}});
+        });
+
+    add("montage_group_shots", "Group shots by angle and scene",
+        "Group the active sequence's shots for grading by camera angle and by scene, as colour groups: each shot is "
+        "described by colour (L*a*b* histograms of its middle frame and of its median over the shot), layout (a 32 x 18 "
+        "thumbnail), camera metadata, its source file and the faces in it, and clustered by average linkage. `sensitivity` "
+        "0 to 1 (default 0.5) sets how alike shots must be to share an angle group: raising it only ever splits groups. "
+        "Angle groups the cut goes back and forth between go in a scene group (or the media's scene metadata names "
+        "them; `scenes` false for none), whose grades wrap the angles'. Running it again remakes the groups it made "
+        "(a group that keeps most of its shots keeps its grades); groups made by hand and locked ones stay. "
+        "`visual_index` also compares Find Shots' embeddings where the media has them (CLIP ViT-B/32, whose training "
+        "data is not disclosed). Returns the groups.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"sensitivity":{"type":"number","default":0.5},
+            "scenes":{"type":"boolean","default":true},"visual_index":{"type":"boolean","default":false},
+            "dry_run":{"type":"boolean","default":false,"description":"Return the groups without making them"}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            GroupShotsOptions o;
+            o.sensitivity = a.value("sensitivity").toDouble(0.5);
+            if (!(o.sensitivity >= 0 && o.sensitivity <= 1)) throw ArgError{"\"sensitivity\" must be between 0 and 1"};
+            o.scenes = a.value("scenes").toBool(true);
+            o.visualIndex = a.value("visual_index").toBool(false);
+            const std::vector<ShotTraits> shots = shotTraits(l.project, s, {}, o.visualIndex, [this](double f) { progress(f, "Describing shots"); });
+            if (shots.empty()) return fail("No shots to group (picture clips from media, outside groups made by hand or locked)");
+            const ShotGrouping g = planShotGroups(shots, o, keptShots(s), &s);
+            QJsonArray angles;
+            for (const ShotGrouping::Angle& x : g.angles) {
+                QJsonArray clips;
+                for (Id c : x.clips) clips.append(double(c));
+                angles.append(QJsonObject{{"clips", clips}, {"scene", x.scene}});
+            }
+            if (a.value("dry_run").toBool(false))
+                return ok(QStringLiteral("%1 angle group(s) in %2 scene(s) (not made)").arg(g.angles.size()).arg(g.scenes.size()),
+                          QJsonObject{{"angles", angles}, {"scenes", int(g.scenes.size())}});
+            check(edit::applyShotGrouping(l.project, s, g));
+            save(l);
+            QJsonArray groups;
+            for (const ColorGroup& cg : s.colorGroups) {
+                if (cg.kind.empty()) continue;
+                QJsonArray members;
+                for (Id id : colorGroupMembers(s, cg.id)) members.append(double(id));
+                groups.append(QJsonObject{{"id", double(cg.id)}, {"name", QString::fromStdString(cg.name)}, {"kind", QString::fromStdString(cg.kind)},
+                                          {"parent", cg.parent ? QJsonValue(double(cg.parent)) : QJsonValue()}, {"locked", cg.locked}, {"clips", members}});
+            }
+            return ok(QStringLiteral("%1 shot(s) in %2 angle group(s) and %3 scene group(s)").arg(shots.size()).arg(g.angles.size()).arg(g.scenes.size()),
+                      QJsonObject{{"groups", groups}});
         });
 
     add("montage_spell_check", "Check spelling",

@@ -296,6 +296,10 @@ public:
     void exportIamfDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
+    // Clip › Colour Group › Group Shots by Angle and Scene (render/ShotGroups.h), in the background then one undo step:
+    // the sequence's shots (all but those in groups made by hand or locked) regrouped at `sensitivity` (0 few broad
+    // groups, 1 many close ones), with scene groups round the angle groups when `scenes`. How many angle groups it made.
+    int groupShots(double sensitivity = 0.5, bool scenes = true);
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
     // chapter markers there were); `ask` shows them first to rename, drop or re-space. How many were added.
     int suggestChapterMarkers(double minSeconds = 30, bool ask = true);

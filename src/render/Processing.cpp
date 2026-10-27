@@ -1907,8 +1907,8 @@ EffectDomain effectDomain(const std::string& type) {
         for (const char* t : {"color_correct", "curves", "hue_curves", "color_warper", "cdl", "lut", "hue_sat", "levels"})
             m[t] = EffectDomain::Log;
         for (const char* t : {"gaussian_blur", "directional_blur", "channel_blur", "glow", "depth_blur", "depth_fog", "lens_flare",
-                              "tilt_shift", "chromatic_aberration", "relight", "vignette", "drop_shadow", "rgb_mixer", "mosaic",
-                              "focus_repair"})
+                              "light_rays", "aperture_glare", "tilt_shift", "chromatic_aberration", "relight", "vignette", "drop_shadow",
+                              "rgb_mixer", "mosaic", "focus_repair"})
             m[t] = EffectDomain::Linear;
         for (const char* t : {"posterize", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
                               "screen_key", "broadcast_safe", "noise", "depth_map"})
@@ -1998,6 +1998,11 @@ void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixel
     if (e.type == "paint") {
         // Its mask is not a limit: it is what tracked strokes follow.
         paintStrokes(e, t, img);
+        return;
+    }
+    if (e.type == "light_rays" && e.p("follow", t, 0) > 0.5) {
+        // Nor for rays from the mask's track: it is where they come from.
+        applyEffectUnmasked(e, t, img, pixelScale);
         return;
     }
     if (!hasMask(e, t)) {
@@ -2375,6 +2380,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "duotone") sfx::duotone(e, t, img);
     else if (ty == "vhs") sfx::vhs(e, t, img, pixelScale);
     else if (ty == "lens_flare") sfx::lensFlare(e, t, img);
+    else if (ty == "light_rays") sfx::lightRays(e, t, img, pixelScale);
+    else if (ty == "aperture_glare") sfx::apertureGlare(e, t, img, pixelScale);
     else if (ty == "tilt_shift") sfx::tiltShift(e, t, img, pixelScale);
     else if (ty == "camera_shake") sfx::cameraShake(e, t, img, pixelScale);
     else if (ty == "depth_map" || ty == "depth_fog" || ty == "depth_blur")

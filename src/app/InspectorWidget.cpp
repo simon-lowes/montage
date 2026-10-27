@@ -197,8 +197,8 @@ QString InspectorWidget::signature() const {
                 for (const auto& e : sn->effects) sig += QString(";%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
         }
     }
-    // Its colour group: rebuild when it joins or leaves one, or the group's effects change.
-    if (const ColorGroup* g = colorGroupOf(*s, *c)) {
+    // Its colour groups: rebuild when it joins or leaves one, or a group's effects change.
+    for (const ColorGroup* g : colorGroupsOf(*s, *c)) {
         sig += QString("|G%1:%2:").arg(g->id).arg(QString::fromStdString(g->name));
         for (const auto* chain : {&g->pre, &g->post}) {
             for (const auto& e : *chain) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
@@ -676,21 +676,25 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     else buildEffectStack(clipId, kind, clip.effects, localTime);
     // ---- Its colour group's grades, before and after its own (core/ColorGroups.h) --------
     const Sequence* seqNow = state_->sequence();
-    if (const ColorGroup* g = kind == TrackKind::Video && seqNow ? colorGroupOf(*seqNow, clip) : nullptr) {
-        const QString name = QString::fromStdString(g->name);
-        const int members = int(colorGroupMembers(*seqNow, g->id).size());
-        const std::vector<Effect> pre = g->pre, post = g->post;  // copies: building can change the project
-        const Id preOwner = g->id, postOwner = g->postId;
+    // (a scene group's around its angle group's, as they run; copies: building can change the project)
+    std::vector<std::pair<ColorGroup, int>> shown;
+    if (kind == TrackKind::Video && seqNow)
+        for (const ColorGroup* g : colorGroupsOf(*seqNow, clip)) shown.push_back({*g, int(colorGroupMembers(*seqNow, g->id, true).size())});
+    for (size_t gi = 0; gi < shown.size(); ++gi) {
+        const ColorGroup& g = shown[gi].first;
+        const int members = shown[gi].second;
+        const QString name = QString::fromStdString(g.name);
+        const bool inner = gi + 1 == shown.size();  // (the clip's own group; the others are around it)
         for (int stage = 0; stage < 2; ++stage) {
             QFormLayout* f = addSection(stage == 0 ? tr("Group Pre-Clip: %1").arg(name) : tr("Group Post-Clip: %1").arg(name));
             auto* note = new QLabel(stage == 0 ? tr("Runs on each of the group's %n clip(s) before its own effects, to match the shots.", "", members)
                                                : tr("Runs on each of the group's %n clip(s) after its own effects: the group's look.", "", members),
                                     content_);
-            note->setObjectName(stage == 0 ? QStringLiteral("colorGroupPre") : QStringLiteral("colorGroupPost"));
+            note->setObjectName(QString(inner ? "colorGroup%1" : "outerColorGroup%1").arg(stage == 0 ? "Pre" : "Post"));
             note->setWordWrap(true);
             note->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
             f->addRow(note);
-            buildEffectStack(stage == 0 ? preOwner : postOwner, TrackKind::Video, stage == 0 ? pre : post, localTime);
+            buildEffectStack(stage == 0 ? g.id : g.postId, TrackKind::Video, stage == 0 ? g.pre : g.post, localTime);
         }
     }
 }
