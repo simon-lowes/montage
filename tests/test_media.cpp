@@ -30491,6 +30491,16 @@ if ui["pressed"] == "add":
             QVERIFY(std::fabs(depth[50 * 101 + 50] - 5) < 1e-5f && depth[0] == 0);
         }
 
+        // A splat far larger than the picture, in front of the camera, covers all of it (not only the first tile).
+        {
+            SplatCloud c = cloudOf(1, 0);
+            c.positions = {0, 0, 0};
+            c.scales = {1e12f, 1e12f, 1e-3f};
+            const Image img = renderSplats(c, identity4(), lookAt({0, 0, 5}, {0, 0, 0}, 500, 101, 101), 101, 101);
+            QVERIFY2(std::fabs(img.at(0, 0)[3] - 0.5f) < 1e-3f && std::fabs(img.at(100, 100)[3] - 0.5f) < 1e-3f,
+                     qPrintable(QString("%1 %2").arg(img.at(0, 0)[3]).arg(img.at(100, 100)[3])));
+        }
+
         // Two overlapping splats, red behind blue: from the front blue over red, from behind red over blue.
         {
             SplatCloud c = cloudOf(2, 0);
@@ -30575,6 +30585,18 @@ if ui["pressed"] == "add":
             float xyz[3];
             std::memcpy(xyz, b.constData() + at, sizeof xyz);
             QVERIFY(xyz[0] == random.positions[0] && xyz[1] == -random.positions[1] && xyz[2] == -random.positions[2]);
+        }
+        // A splat whose colour or harmonics are not numbers is hidden when read, its colour made 0.
+        {
+            SplatCloud bad = cloudOf(3, 1);
+            bad.colors[0] = std::numeric_limits<float>::infinity();
+            bad.sh[2 * 9 + 4] = std::numeric_limits<float>::quiet_NaN();
+            QVERIFY2(saveSplats(bad, path("notnumbers.ply"), &err), err.c_str());
+            SplatCloud back;
+            QVERIFY2(loadSplats(path("notnumbers.ply"), back, &err), err.c_str());
+            QVERIFY(back.opacities[0] == 0 && back.opacities[1] > 0 && back.opacities[2] == 0);
+            for (const float v : back.colors) QVERIFY(std::isfinite(v));
+            for (const float v : back.sh) QVERIFY(std::isfinite(v));
         }
         for (const int version : {2, 3, 4}) {
             const std::string file = path(("cloud_v" + std::to_string(version) + ".spz").c_str());
@@ -30862,7 +30884,7 @@ if ui["pressed"] == "add":
             r = call("montage_add_model", {{"project", project}, {"file", QString::fromStdString(path("run_0002.ply"))},
                                            {"camera_file", MONTAGE_TEST_DATA_DIR "/models/camera.usda"}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
-            QCOMPARE(r.value("structuredContent").toObject().value("frames").toInt(), 3);
+            QCOMPARE(r.value("structuredContent").toObject().value("frames").toInt(), 2);  // from run_0002 to run_0003
             r = call("montage_add_model", {{"project", project}, {"file", QString::fromStdString(path("random.spz"))}, {"camera", 1}});
             QVERIFY(r.value("isError").toBool());
             Project back;

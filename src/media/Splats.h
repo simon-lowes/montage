@@ -50,9 +50,9 @@ std::shared_ptr<const SplatCloud> cachedSplats(const std::string& path, std::str
 // cloud's space, from the eye towards the splat).
 std::array<float, 3> splatColor(const SplatCloud& cloud, size_t i, const std::array<double, 3>& dir);
 
-// The file of a numbered run that `file` belongs to that is showing `seconds` in, at `fps` files a second, from the
-// run's first (looping, or holding the last); `file` itself when it is not in a run. `frames`: the run's length (1).
-std::string splatFrameFile(const std::string& file, double seconds, double fps, bool loop, int* frames = nullptr,
-                           std::string* first = nullptr);
+// The file of a numbered run that `file` belongs to that is showing `seconds` in, at `fps` files a second, from
+// `file` to the run's last (looping, or holding the last); `file` itself when it is not in a run. `frames`: how many
+// files that is (1).
+std::string splatFrameFile(const std::string& file, double seconds, double fps, bool loop, int* frames = nullptr);
 
 }  // namespace montage

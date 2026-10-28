@@ -12,6 +12,7 @@ namespace {
 
 constexpr int kTile = 16;
 constexpr double kBlur = 0.3;  // px², added to each splat's covariance on the screen
+constexpr size_t kMaxEntries = size_t(1) << 27;  // splats in all the tiles together (512 MB of indices)
 
 using M3 = std::array<double, 9>;  // row-major
 
@@ -101,8 +102,9 @@ void eachTask(int n, int threads, const std::function<void(int)>& fn) {
     if (threads == 1) {
         for (int i = 0; i < n; ++i) fn(i);
     } else if (threads <= 0) {
-        parallelRows(n, [&](int a, int b) {
-            for (int i = a; i < b; ++i) fn(i);
+        // (As 16 rows a task, since the shared workers split no finer than 16 rows a band.)
+        parallelRows(n * 16, [&](int a, int b) {
+            for (int i = (a + 15) / 16; i < (b + 15) / 16; ++i) fn(i);
         });
     } else {
         std::atomic<int> next{0};
@@ -163,8 +165,10 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             const double mid = (a + c) / 2, widest = mid + std::sqrt(std::max(0.0, mid * mid - det));
             const double r = std::sqrt(2 * std::log(255 * opacity) * widest);
             if (!(s.x + r >= 0 && s.x - r <= w && s.y + r >= 0 && s.y - r <= h)) continue;
-            d.tx0 = std::clamp(int(std::floor((s.x - r) / kTile)), 0, tilesX - 1), d.tx1 = std::clamp(int(std::floor((s.x + r) / kTile)), 0, tilesX - 1);
-            d.ty0 = std::clamp(int(std::floor((s.y - r) / kTile)), 0, tilesY - 1), d.ty1 = std::clamp(int(std::floor((s.y + r) / kTile)), 0, tilesY - 1);
+            // (Clamped to the picture before they are whole numbers: a huge splat's reach may be past what an int holds.)
+            auto tileOf = [](double v, double size, int tiles) { return std::clamp(int(std::floor(std::clamp(v, 0.0, size) / kTile)), 0, tiles - 1); };
+            d.tx0 = tileOf(s.x - r, w, tilesX), d.tx1 = tileOf(s.x + r, w, tilesX);
+            d.ty0 = tileOf(s.y - r, h, tilesY), d.ty1 = tileOf(s.y + r, h, tilesY);
             const double dir[3] = {p[0] - view.eye[0], p[1] - view.eye[1], p[2] - view.eye[2]};
             const double dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
             const std::array<float, 3> col = splatColor(cloud, i, dl > 0 ? std::array<double, 3>{dir[0] / dl, dir[1] / dl, dir[2] / dl}
@@ -177,6 +181,25 @@ Image renderSplats(const SplatCloud& cloud, const Mat4& place, const ModelCamera
             d.shown = true;
         }
     });
+
+    // At most kMaxEntries splats in all the tiles together (a few huge splats in a small file could otherwise ask for
+    // more memory than there is): past that the farthest are left out.
+    size_t entries = 0;
+    for (const Drawn& d : drawn)
+        if (d.shown) entries += size_t(d.tx1 - d.tx0 + 1) * size_t(d.ty1 - d.ty0 + 1);
+    if (entries > kMaxEntries) {
+        std::vector<uint32_t> order;
+        for (size_t i = 0; i < drawn.size(); ++i)
+            if (drawn[i].shown) order.push_back(uint32_t(i));
+        std::sort(order.begin(), order.end(), [&](uint32_t p, uint32_t q) { return drawn[p].depth < drawn[q].depth || (drawn[p].depth == drawn[q].depth && p < q); });
+        entries = 0;
+        for (const uint32_t i : order) {
+            Drawn& d = drawn[i];
+            const size_t n = size_t(d.tx1 - d.tx0 + 1) * size_t(d.ty1 - d.ty0 + 1);
+            if (entries + n > kMaxEntries) d.shown = false;
+            else entries += n;
+        }
+    }
 
     // The splats each tile holds, nearest first (equal depths in the file's order).
     std::vector<size_t> start(size_t(tilesX) * size_t(tilesY) + 1, 0);

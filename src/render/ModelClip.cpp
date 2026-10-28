@@ -277,7 +277,10 @@ bool clipCamera(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (error && file.empty()) *error = "Choose the file to take the camera from";
             return false;
         }
-        const double sec = lt / seq.fpsValue();
+        // At the clip's time sped up, offset and looped as the model's animation is, so it keeps step with it.
+        double sec = lt / seq.fpsValue() * P("anim_speed", 100) / 100 + P("anim_offset", 0);
+        const double d = model->animations.empty() ? 0 : model->animations[0].duration;
+        if (P("loop", 1) > 0.5 && d > 0) sec = sec - d * std::floor(sec / d);
         if (!fileCameraOf(*model, poseModel(*model, model->animations.empty() ? -1 : 0, sec), sec, file, g, lt, seq, scale, cam, error)) return false;
     } else {
         // In front of the frame: the plane z = 0 at one sequence pixel a unit, y up, the camera on +z looking back.
@@ -429,15 +432,14 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         return false;
     }
     // The file of a numbered run showing now (at the run's own rate, sped up and offset as an animation is), sized by
-    // the run's first file so that it stays put as it plays.
+    // the file chosen so that it stays put as it plays.
     const double fps = seq.fpsValue();
     const double sec = lt / fps * P("anim_speed", 100) / 100 + P("anim_offset", 0);
     const double rate = P("frames_fps", 0) > 0 ? P("frames_fps", 0) : fps;
-    std::string first = file;
-    const std::string now = P("frames", 1) > 0.5 ? splatFrameFile(file, sec, rate, P("loop", 1) > 0.5, nullptr, &first) : file;
+    const std::string now = P("frames", 1) > 0.5 ? splatFrameFile(file, sec, rate, P("loop", 1) > 0.5) : file;
     cloud = cachedSplats(now, error);
     if (!cloud) return false;
-    std::shared_ptr<const SplatCloud> base = first == now ? cloud : cachedSplats(first);
+    std::shared_ptr<const SplatCloud> base = file == now ? cloud : cachedSplats(file);
     if (!base) base = cloud;
     const std::array<double, 3> lo{base->lo[0], base->lo[1], base->lo[2]}, hi{base->hi[0], base->hi[1], base->hi[2]};
     const long mode = std::lround(P("camera", 0));

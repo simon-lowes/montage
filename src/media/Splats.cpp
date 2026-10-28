@@ -88,8 +88,13 @@ void finish(SplatCloud& c) {
         const double l = std::sqrt(double(q[0]) * q[0] + double(q[1]) * q[1] + double(q[2]) * q[2] + double(q[3]) * q[3]);
         bool sound = l > 1e-12 && std::isfinite(l);
         for (int a = 0; a < 3; ++a)
-            sound = sound && std::isfinite(c.positions[i * 3 + size_t(a)]) && std::isfinite(c.scales[i * 3 + size_t(a)]);
+            sound = sound && std::isfinite(c.positions[i * 3 + size_t(a)]) && std::isfinite(c.scales[i * 3 + size_t(a)]) &&
+                    std::isfinite(c.colors[i * 3 + size_t(a)]);
+        const size_t k = size_t(c.shCoefficients()) * 3;
+        for (size_t j = 0; j < k && sound; ++j) sound = std::isfinite(c.sh[i * k + j]);
         if (!sound) {
+            std::fill(c.colors.begin() + std::ptrdiff_t(i * 3), c.colors.begin() + std::ptrdiff_t(i * 3 + 3), 0.0f);
+            std::fill(c.sh.begin() + std::ptrdiff_t(i * k), c.sh.begin() + std::ptrdiff_t(i * k + k), 0.0f);
             std::fill(q, q + 4, 0.0f), q[3] = 1;
             for (int a = 0; a < 3; ++a) c.positions[i * 3 + size_t(a)] = 0, c.scales[i * 3 + size_t(a)] = 0;
             c.opacities[i] = 0;
@@ -698,9 +703,8 @@ std::array<float, 3> splatColor(const SplatCloud& c, size_t i, const std::array<
     return {float(std::max(0.0, v[0])), float(std::max(0.0, v[1])), float(std::max(0.0, v[2]))};
 }
 
-std::string splatFrameFile(const std::string& file, double seconds, double fps, bool loop, int* frames, std::string* first) {
+std::string splatFrameFile(const std::string& file, double seconds, double fps, bool loop, int* frames) {
     if (frames) *frames = 1;
-    if (first) *first = file;
     // The run, found once while its folder is unchanged.
     struct Run {
         std::string file, stamp;
@@ -742,12 +746,14 @@ std::string splatFrameFile(const std::string& file, double seconds, double fps, 
         const QString number = padded ? QStringLiteral("%1").arg(n, int(digits.size()), 10, QLatin1Char('0')) : QString::number(n);
         return QDir(fi.absolutePath()).filePath(match.captured(1) + number + match.captured(3)).toStdString();
     };
-    const int count = run.seq.frames();
+    // From the file chosen to the run's end (a file chosen part way in starts there, and an unrelated capture numbered
+    // just before it is not played).
+    const int from = std::clamp(digits.toInt(), run.seq.first, run.seq.last);
+    const int count = run.seq.last - from + 1;
     if (frames) *frames = count;
-    if (first) *first = name(run.seq.first);
     auto n = int64_t(std::floor(std::clamp(seconds * fps, -1e15, 1e15) + 1e-6));
     n = loop ? ((n % count) + count) % count : std::clamp<int64_t>(n, 0, count - 1);
-    return name(run.seq.first + int(n));
+    return name(from + int(n));
 }
 
 }  // namespace montage
