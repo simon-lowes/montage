@@ -228,7 +228,7 @@ void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Ef
             const ColorSpace rolled{"trim-pq-" + to->id, "", to->primaries, Transfer::Pq, false};
             convertColor(img, from, rolled, master);
             if (const double headroom = sdrHeadroomNits(*to); fromPeak > headroom) rollOffPq(img, fromPeak, headroom);
-            convertColor(img, rolled, *to, std::min(fromPeak, sdrHeadroomNits(*to)));  // (rolled off already)
+            convertColor(img, rolled, *to, sdrHeadroomNits(*to));  // (rolled off already: no more)
         } else if (to->transfer == Transfer::Pq && from.hdr() && (fromPeak > peak || master > peak)) {
             // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
             convertColor(img, from, *to, master);

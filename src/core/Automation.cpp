@@ -305,7 +305,8 @@ bool coalesceTrim(Param& lane, double& still, Param& trim) {
         const FrameTime span = at[i + 1] - at[i];
         const int n = int(std::min<FrameTime>(span - 1, 63));
         std::vector<Keyframe> seg{keys.back()};
-        for (int j = 1; j < n; ++j) seg.push_back(key(at[i] + FrameTime(double(span) * j / n)));
+        if (span > 2) seg.push_back(key(at[i] + 1));  // (a point part way into its frame takes effect by the next)
+        for (int j = 2; j < n; ++j) seg.push_back(key(at[i] + FrameTime(double(span) * j / n)));
         seg.push_back(key(at[i + 1] - 1));
         seg.push_back(key(at[i + 1]));
         thinKeys(seg, 1e-4);

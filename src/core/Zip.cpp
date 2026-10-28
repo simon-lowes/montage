@@ -230,10 +230,11 @@ bool ZipReader::open(std::string bytes) {
         // Zip64: the locator just before points at the Zip64 end record.
         if (eocd < 20 || le32(b, eocd - 20) != 0x07064b50) return false;
         const uint64_t at = le64(b, eocd - 20 + 8);
-        if (at + 56 > b.size() || le32(b, size_t(at)) != 0x06064b50) return false;
+        if (at > b.size() || b.size() - at < 56 || le32(b, size_t(at)) != 0x06064b50) return false;  // (64-bit: no wrap)
         count = le64(b, size_t(at) + 32);
         cdOffset = le64(b, size_t(at) + 48);
     }
+    if (cdOffset > b.size()) return false;
     size_t p = size_t(cdOffset);
     for (uint64_t n = 0; n < count; ++n) {
         if (p + 46 > b.size() || le32(b, p) != 0x02014b50) return false;

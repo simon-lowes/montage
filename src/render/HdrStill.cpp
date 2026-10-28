@@ -14,6 +14,7 @@
 
 #include "ColorSpace.h"
 #include "media/GainMap.h"
+#include "media/ThreadScheduling.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -637,6 +638,7 @@ bool encodeStill(const Av1Picture& pic, int quality, std::initializer_list<const
         else av_dict_set_int(&opts, "crf", crf, 0);
         if (std::string(name) == "libx265") av_dict_set(&opts, "x265-params", "log-level=error:info=0", 0);
         if (std::string(name) == "libaom-av1") av_dict_set(&opts, "still-picture", "1", 0);
+        const KeepThreadScheduling keep;  // (SVT-AV1 would leave this thread real-time)
         const int rc = avcodec_open2(ctx, codec, &opts);
         av_dict_free(&opts);
         if (rc >= 0) {

@@ -375,17 +375,18 @@ void throughShutter(Image& img, double t, bool blur, double shutter, Moved moved
 // showing and placing its pins on the mesh the picture was drawn with.
 struct LastMesh {
     int w = 0, h = 0;
+    double pixelScale = 1;  // (the drawing's, which the solve it made was keyed by)
     std::shared_ptr<const WarpMesh> mesh;
 };
 std::mutex lastMeshLock;
 std::map<Id, LastMesh> lastMeshes;
 
-void rememberMesh(const Effect& e, int w, int h, const WarpMesh& m) {
+void rememberMesh(const Effect& e, int w, int h, double pixelScale, const WarpMesh& m) {
     std::lock_guard<std::mutex> g(lastMeshLock);
     if (lastMeshes.size() > 64 && !lastMeshes.count(e.id)) lastMeshes.clear();
     LastMesh& last = lastMeshes[e.id];
-    if (last.w == w && last.h == h && last.mesh && last.mesh->rest == m.rest && last.mesh->tris == m.tris) return;
-    last = {w, h, std::make_shared<const WarpMesh>(m)};
+    if (last.w == w && last.h == h && last.pixelScale == pixelScale && last.mesh && last.mesh->rest == m.rest && last.mesh->tris == m.tris) return;
+    last = {w, h, pixelScale, std::make_shared<const WarpMesh>(m)};
 }
 
 WarpMesh meshFor(const Effect& e, int w, int h) {
@@ -724,7 +725,7 @@ void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale) {
         return;
     const WarpMesh mesh = buildWarpMesh(W, H, int(std::lround(e.p("density", t, 2000))),
                                         std::lround(e.p("mesh_from", t, 0)) == 0 ? &img : nullptr, std::max(0.0, e.p("expand", t, 3)) * pixelScale);
-    if (std::lround(e.p("mesh_from", t, 0)) == 0) rememberMesh(e, W, H, mesh);
+    if (std::lround(e.p("mesh_from", t, 0)) == 0) rememberMesh(e, W, H, pixelScale, mesh);
     auto moved = [&](double time) { return solveWarp(mesh, meshWarpPins(e, time, W, H, pixelScale)); };
     throughShutter(img, double(t), blur, shutter, moved, [&](const Image& src, double time, Image& out) {
         const std::vector<WarpPin> pins = meshWarpPins(e, time, W, H, pixelScale);
@@ -755,7 +756,7 @@ std::vector<MeshPoint> meshWarpMoved(const Effect& e, double t, int w, int h, do
             const double sx = double(last.w) / w, sy = double(last.h) / h;
             std::vector<MeshPoint> there;
             for (const MeshPoint& p : rest) there.push_back({p[0] * sx, p[1] * sy});
-            std::vector<MeshPoint> out = meshWarpMoved(e, t, last.w, last.h, pixelScale * sx, there);
+            std::vector<MeshPoint> out = meshWarpMoved(e, t, last.w, last.h, last.pixelScale, there);
             for (MeshPoint& p : out) p = {p[0] / sx, p[1] / sy};
             return out;
         }

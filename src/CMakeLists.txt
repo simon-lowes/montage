@@ -133,6 +133,7 @@ add_library(montage_engine STATIC
   media/Pulldown.h media/Pulldown.cpp
   media/Psd.h media/Psd.cpp
   media/GainMap.h media/GainMap.cpp
+  media/ThreadScheduling.h
   media/DualSystem.h media/DualSystem.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/AutoDuck.h media/AutoDuck.cpp

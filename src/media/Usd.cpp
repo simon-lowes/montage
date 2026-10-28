@@ -1142,7 +1142,7 @@ private:
     template <class Int>
     bool compressedInts(Reader& r, size_t count, std::vector<Int>& out) {
         if (count > kMaxElements) return bad("too many values");
-        if (!spend(count * sizeof(Int) * 2 + 16)) return false;  // (what it unpacks to, and the values)
+        if (!spend(count * sizeof(Int))) return false;  // (the values kept)
         const uint64_t size = r.get<uint64_t>();
         if (!r.ok || size > b_.size() - r.pos) return bad("compressed integers lie outside the file");
         const uint8_t* p = r.take(size_t(size));
@@ -1992,6 +1992,7 @@ private:
         return n;
     }
     bool mayCopy(const Prim& target) {
+        if (copied_ == SIZE_MAX) return false;  // (refused once: no more)
         const size_t n = primBytes(target, 0);
         if (n > (size_t(1) << 31) - copied_) {
             if (copied_ != SIZE_MAX) note("The scene's references copy in more than 2 GB: the rest are not composed");

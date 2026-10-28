@@ -277,15 +277,16 @@ Result applyShotGrouping(Project& p, Sequence& s, const ShotGrouping& found) {
     for (Track& t : s.videoTracks)
         for (Clip& c : t.clips)
             if (remade.count(c.colorGroup) && (placed.count(c.id) || !reused.count(c.colorGroup))) c.colorGroup = 0;
-    // (the grades of the groups that go, for the new groups made of their shots)
+    // (the grades of the groups remade, for the new groups made of their shots: a group split evenly is reused by one
+    // half, its grade copied to the other)
     std::map<Id, ColorGroup> gone;
     for (const ColorGroup& g : s.colorGroups)
-        if (remade.count(g.id) && !reused.count(g.id) && (!g.pre.empty() || !g.post.empty())) gone[g.id] = g;
+        if (remade.count(g.id) && (!g.pre.empty() || !g.post.empty())) gone[g.id] = g;
     std::erase_if(s.colorGroups, [&](const ColorGroup& g) { return remade.count(g.id) && !reused.count(g.id); });
     for (ColorGroup& g : s.colorGroups)
         if (g.parent && !findColorGroup(s, g.parent)) g.parent = 0;
-    // A new group takes the grade of the graded group that went that held most of its shots (so a group split in
-    // two keeps its grade in both halves).
+    // A new group takes the grade of the graded group remade that held most of its shots (so a group split in two
+    // keeps its grade in both halves).
     auto make = [&](const std::string& kind, const std::string& name, const std::vector<Id>& clips) {
         ColorGroup g;
         g.id = p.newId();
