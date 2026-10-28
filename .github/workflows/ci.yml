@@ -91,6 +91,21 @@ jobs:
               || { rm -f "$d/$name"; echo "::warning::Could not download $name; the sample model test will be skipped"; }
           done
           [ "$(ls "$d" | wc -l)" -eq 3 ] && echo "MONTAGE_TEST_GLTF_SAMPLES=$d" >> "$GITHUB_ENV" || true
+      - name: Sample USD scenes for the USD test
+        run: |
+          d="$HOME/usd-samples"
+          mkdir -p "$d"
+          base="https://raw.githubusercontent.com/lighttransport/tinyusdz/c9f177148f7dcddde33f4f8d6e82599f151d8803/models"
+          # (from the tinyusdz project, Apache-2.0; pinned to one commit, and each file is checked by its hash)
+          for f in cube-previewsurface.usda:b3c573a7df10c5afec49b6aeb2acd0bd14d0c6d0494bfa38e2a1bf52f9e5c03d \
+                   cube-previewsurface.usdc:aaf566ee46573643c6339d4792f63cdda453cdf29dcc2bf33e0052d8c1827df5 \
+                   texture-cat-plane.usdz:54b6c54819b0735ac39b6dd833c5f999d282d418ffec0b247a2e9a303d064a48; do
+            name="${f%%:*}"
+            curl -fsSL --retry 3 -o "$d/$name" "$base/$name" \
+              && [ "$(sha256sum "$d/$name" | cut -d' ' -f1)" = "${f#*:}" ] \
+              || { rm -f "$d/$name"; echo "::warning::Could not download $name; the sample USD scene test will be skipped"; }
+          done
+          [ "$(ls "$d" | wc -l)" -eq 3 ] && echo "MONTAGE_TEST_USD_SAMPLES=$d" >> "$GITHUB_ENV" || true
       - name: Cache the AI models
         uses: actions/cache@v4
         with:

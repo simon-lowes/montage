@@ -1,6 +1,8 @@
 #include "Title3D.h"
 #include "Titles.h"
 
+#include "media/Model3D.h"
+
 #include <QFont>
 #include <QFontMetricsF>
 #include <QPainterPath>
@@ -270,8 +272,28 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     cam.nearest = std::max(1.0, cam.f * 0.05);  // nothing nearer than this is drawn
     const double k = std::clamp(g.p("scale", t, 100), 1.0, 2000.0) / 100;
     const double depth = std::max(0.0, g.p("depth", t, 40)) * px * k;
-    const M3 R = rotation(rx, ry, rz);
-    const V3 T{g.p("pos_x", t) * px, -g.p("pos_y", t) * px, -cam.f - depth / 2 - away * H};
+    M3 R = rotation(rx, ry, rz);
+    V3 T{g.p("pos_x", t) * px, -g.p("pos_y", t) * px, -cam.f - depth / 2 - away * H};
+    // Or through a camera in a USD or glTF file: the title stands in the file's scene, its face in the plane z = 0
+    // about the origin, `units` sequence pixels a scene unit; the camera moves as the file's animation moves it.
+    if (const std::string file = g.s("camera_file"); !file.empty())
+        if (const std::shared_ptr<const Model> model = cachedModel(file)) {
+            const int index = int(std::lround(g.p("camera_index", t, 1))) - 1;
+            const ModelPose pose = poseModel(*model, model->animations.empty() ? -1 : 0, sec);
+            std::array<double, 3> at;
+            std::array<std::array<double, 3>, 3> axes;
+            if (index >= 0 && size_t(index) < model->cameras.size() && modelCameraPlace(pose, model->cameras[size_t(index)], at, axes)) {
+                const ModelCameraInfo& fc = model->cameras[size_t(index)];
+                modelCameraLens(fc, sec, W, H, cam.f, cam.cx, cam.cy);
+                const double u = std::clamp(g.p("units", t, 100), 1e-6, 1e9) * px;  // raster pixels a scene unit
+                cam.nearest = std::max(1e-3, fc.nearClip * u);
+                M3 view;  // world to camera: rows the camera's right, up and back
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j) view.m[i][j] = axes[size_t(i)][size_t(j)];
+                R = view * R;
+                T = view * V3{g.p("pos_x", t) * px - at[0] * u, -g.p("pos_y", t) * px - at[1] * u, -depth / 2 - away * H - at[2] * u};
+            }
+        }
     auto toCamera = [&](V3 p) { return R * (p * k) + T; };
     Lighting light;
     const double az = g.p("light_angle", t, -40) * kDeg, el = std::clamp(g.p("light_height", t, 40), -90.0, 90.0) * kDeg;

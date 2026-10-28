@@ -44,6 +44,7 @@
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "render/Expressions.h"
+#include "render/ModelClip.h"
 #include "render/Titles.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
@@ -1234,12 +1235,25 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     if (ok && !text.isEmpty()) placeTitleInScene(owner, eid, text);
                 });
             });
-            connect(save, &QPushButton::clicked, this, [this, cs] {
+            connect(save, &QPushButton::clicked, this, [this, cs, owner] {
+                QString filter;
                 const QString chan = QFileDialog::getSaveFileName(window(), tr("Export Camera"), QStringLiteral("camera.chan"),
-                                                                  tr("Nuke camera (*.chan)"));
+                                                                  tr("Nuke camera (*.chan);;USD scene with the placed models (*.usda)"), &filter);
                 if (chan.isEmpty()) return;
-                const QString ply = QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ".ply";
                 std::string err;
+                if (chan.endsWith(QLatin1String(".usda"), Qt::CaseInsensitive) || filter.contains(QLatin1String("usda"))) {
+                    // The camera, its points and the models placed in the shot, in one USD scene.
+                    const Sequence* s = state_->sequence();
+                    std::vector<SolvedSceneMesh> models;
+                    for (size_t i = 0; s && i < s->videoTracks.size(); ++i)
+                        for (const Clip& k : s->videoTracks[i].clips)
+                            if (k.id == owner) models = solvedSceneModels(state_->project(), *s, i, k);
+                    const QString usd = chan.endsWith(QLatin1String(".usda"), Qt::CaseInsensitive) ? chan : QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ".usda";
+                    if (!writeSolveUsda(cs, usd.toStdString(), models, &err)) state_->message(QString::fromStdString(err), 6000);
+                    else state_->message(tr("Wrote %1").arg(QFileInfo(usd).fileName()), 4000);
+                    return;
+                }
+                const QString ply = QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ".ply";
                 if (!writeNukeChan(cs, chan.toStdString(), 1, &err) || !writePointsPly(cs, ply.toStdString(), &err))
                     state_->message(QString::fromStdString(err), 6000);
                 else

@@ -57,6 +57,7 @@ struct Inflater {
     int bitCount = 0;
     std::string& out;
     bool error = false;
+    size_t limit = SIZE_MAX;  // the most `out` may hold
 
     Inflater(const uint8_t* d, size_t n, std::string& o) : in(d), size(n), out(o) {}
 
@@ -95,7 +96,7 @@ struct Inflater {
         if (pos + 4 > size) return false;
         const unsigned len = in[pos] | (in[pos + 1] << 8), nlen = in[pos + 2] | (in[pos + 3] << 8);
         pos += 4;
-        if (len != (~nlen & 0xFFFF) || pos + len > size) return false;
+        if (len != (~nlen & 0xFFFF) || pos + len > size || out.size() + len > limit) return false;
         out.append(reinterpret_cast<const char*>(in + pos), len);
         pos += len;
         return true;
@@ -110,6 +111,7 @@ struct Inflater {
             int sym = decode(lencode);
             if (sym < 0) return false;
             if (sym < 256) {
+                if (out.size() >= limit) return false;
                 out.push_back(char(sym));
             } else if (sym == 256) {
                 return true;
@@ -120,7 +122,7 @@ struct Inflater {
                 const int d = decode(distcode);
                 if (d < 0 || d >= 30) return false;
                 const size_t dist = dbase[d] + size_t(bits(dext[d]));
-                if (error || dist > out.size()) return false;
+                if (error || dist > out.size() || out.size() + len > limit) return false;
                 const size_t from = out.size() - dist;
                 for (size_t k = 0; k < len; ++k) out.push_back(out[from + k]);  // may overlap what it writes
             }
@@ -185,9 +187,11 @@ uint64_t le64(const std::string& b, size_t at) { return uint64_t(le32(b, at)) | 
 
 }  // namespace
 
-bool inflateRaw(const uint8_t* data, size_t size, std::string& out, size_t expected) {
-    if (expected) out.reserve(out.size() + expected);
+bool inflateRaw(const uint8_t* data, size_t size, std::string& out, size_t expected, size_t limit) {
+    // (deflate makes at most 258 bytes of every 2 bits: no more is reserved whatever a header says)
+    if (expected) out.reserve(out.size() + std::min(expected, size * 1032 + 64));
     Inflater f(data, size, out);
+    if (limit) f.limit = out.size() + limit;
     int last;
     do {
         last = f.bits(1);
@@ -291,7 +295,7 @@ bool ZipReader::read(const Entry& e, std::string& out, std::string* error) const
     if (e.method == 0) {
         out.assign(reinterpret_cast<const char*>(src), size_t(e.compressedSize));
     } else if (e.method == 8) {
-        if (!inflateRaw(src, size_t(e.compressedSize), out, size_t(e.size))) {
+        if (!inflateRaw(src, size_t(e.compressedSize), out, size_t(e.size), size_t(e.size))) {
             if (error) *error = e.name + ": corrupt compressed data";
             return false;
         }

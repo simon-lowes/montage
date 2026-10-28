@@ -76,6 +76,85 @@ Mat4 trsMatrix(const std::array<double, 3>& t, const std::array<double, 4>& q, c
     return m;
 }
 
+Mat4 ModelXformOp::matrix() const {
+    constexpr double kDeg = 3.14159265358979323846 / 180;
+    auto v = [&](size_t i, double fallback) { return i < value.size() && std::isfinite(value[i]) ? value[i] : fallback; };
+    auto axis = [&](int a, double deg) {
+        std::array<double, 4> q{0, 0, 0, std::cos(deg * kDeg / 2)};
+        q[size_t(a)] = std::sin(deg * kDeg / 2);
+        return trsMatrix({0, 0, 0}, q, {1, 1, 1});
+    };
+    Mat4 m = identity4();
+    switch (kind) {
+        case Kind::Translate: m = trsMatrix({v(0, 0), v(1, 0), v(2, 0)}, {0, 0, 0, 1}, {1, 1, 1}); break;
+        case Kind::Scale: m = trsMatrix({0, 0, 0}, {0, 0, 0, 1}, {v(0, 1), v(1, 1), v(2, 1)}); break;
+        case Kind::RotateX: m = axis(0, v(0, 0)); break;
+        case Kind::RotateY: m = axis(1, v(0, 0)); break;
+        case Kind::RotateZ: m = axis(2, v(0, 0)); break;
+        case Kind::Orient: {
+            std::array<double, 4> q{v(0, 0), v(1, 0), v(2, 0), v(3, 1)};
+            const double l = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+            for (double& c : q) c = l > 0 ? c / l : 0;
+            if (l <= 0) q[3] = 1;
+            m = trsMatrix({0, 0, 0}, q, {1, 1, 1});
+            break;
+        }
+        case Kind::Transform:
+            for (size_t i = 0; i < 16; ++i) m[i] = v(i, m[i]);
+            break;
+        default: {
+            // rotateABC turns about A first, then B, then C: C * B * A on column vectors. The angles are always (x, y, z).
+            static const int order[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+            const int* o = order[int(kind) - int(Kind::RotateXYZ)];
+            m = axis(o[2], v(size_t(o[2]), 0)) * axis(o[1], v(size_t(o[1]), 0)) * axis(o[0], v(size_t(o[0]), 0));
+        }
+    }
+    if (!inverse) return m;
+    // (any of these is affine; a projective transform is taken as affine)
+    return inverse4(m);
+}
+
+double ModelCameraInfo::focalAt(double seconds) const {
+    if (focalTimes.empty() || focalTimes.size() != focalLengths.size()) return focalLength;
+    if (seconds <= focalTimes.front()) return focalLengths.front();
+    if (seconds >= focalTimes.back()) return focalLengths.back();
+    const size_t hi = size_t(std::upper_bound(focalTimes.begin(), focalTimes.end(), seconds) - focalTimes.begin());
+    const double t0 = focalTimes[hi - 1], t1 = focalTimes[hi];
+    const double u = t1 > t0 ? (seconds - t0) / (t1 - t0) : 0;
+    return focalLengths[hi - 1] + (focalLengths[hi] - focalLengths[hi - 1]) * u;
+}
+
+void modelCameraLens(const ModelCameraInfo& c, double seconds, double w, double h, double& f, double& cx, double& cy) {
+    const double ha = c.horizontalAperture > 0 ? c.horizontalAperture : 20.955, va = c.verticalAperture > 0 ? c.verticalAperture : 15.2908;
+    const double k = w / h >= ha / va ? h / va : w / ha;  // pixels a unit of film
+    const double focal = c.focalAt(seconds);
+    f = (focal > 0 ? focal : 50) * k;
+    cx = w / 2 - c.horizontalOffset * k;
+    cy = h / 2 + c.verticalOffset * k;  // (the film's offset is up, the picture's y down)
+}
+
+bool modelCameraPlace(const ModelPose& pose, const ModelCameraInfo& c, std::array<double, 3>& position,
+                      std::array<std::array<double, 3>, 3>& axes) {
+    if (c.node < 0 || size_t(c.node) >= pose.world.size()) return false;
+    const Mat4& m = pose.world[size_t(c.node)];
+    // Made square to each other (under a sheared or unevenly scaled parent), the way it looks kept exactly.
+    auto unit = [](std::array<double, 3> v, bool& ok) {
+        const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        ok = ok && l > 1e-12 && std::isfinite(l);
+        return ok ? std::array<double, 3>{v[0] / l, v[1] / l, v[2] / l} : v;
+    };
+    auto cross = [](const std::array<double, 3>& a, const std::array<double, 3>& b) {
+        return std::array<double, 3>{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    };
+    bool ok = true;
+    const std::array<double, 3> back = unit({m[8], m[9], m[10]}, ok);
+    const std::array<double, 3> right = unit(cross({m[4], m[5], m[6]}, back), ok);
+    if (!ok) return false;
+    axes = {right, cross(back, right), back};
+    position = {m[12], m[13], m[14]};
+    return true;
+}
+
 size_t Model::triangles() const {
     size_t n = 0;
     for (const ModelMesh& m : meshes)
@@ -108,6 +187,16 @@ bool decodeTexture(const QByteArray& bytes, bool srgb, ModelTexture& out) {
     l.rgba.resize(size_t(l.width) * size_t(l.height) * 4);
     for (int y = 0; y < l.height; ++y) std::memcpy(l.rgba.data() + size_t(y) * size_t(l.width) * 4, img.constScanLine(y), size_t(l.width) * 4);
     out.levels.push_back(std::move(l));
+    buildModelTextureMips(out);
+    return true;
+}
+
+}  // namespace
+
+void buildModelTextureMips(ModelTexture& out) {
+    if (out.levels.empty()) return;
+    out.levels.resize(1);
+    const bool srgb = out.srgb;
     // Each level averaged from the last in linear light, then put back in 8 bits.
     std::array<uint8_t, 4096> encode{};  // linear 0..1 in 4096 steps to sRGB
     for (int i = 0; i < 4096; ++i) {
@@ -134,8 +223,9 @@ bool decodeTexture(const QByteArray& bytes, bool srgb, ModelTexture& out) {
                 }
         out.levels.push_back(std::move(b));
     }
-    return true;
 }
+
+namespace {
 
 // The files read while a model loads (for its cache to see when one changes), when asked for.
 thread_local std::vector<std::string>* filesRead = nullptr;
@@ -478,6 +568,38 @@ bool loadGltf(const std::string& path, const QByteArray& bytes, Model& out, std:
         n.skin = g.skin ? int(cgltf_skin_index(data, g.skin)) : -1;
         n.weights.assign(g.weights, g.weights + g.weights_count);
     }
+    // Cameras, and lights (KHR_lights_punctual), where the nodes hold them.
+    for (cgltf_size i = 0; i < data->nodes_count; ++i) {
+        const cgltf_node& g = data->nodes[i];
+        if (const cgltf_camera* gc = g.camera) {
+            ModelCameraInfo c;
+            c.name = gc->name ? gc->name : (g.name ? g.name : "Camera " + std::to_string(out.cameras.size() + 1));
+            c.node = int(i);
+            if (gc->type == cgltf_camera_type_perspective) {
+                const cgltf_camera_perspective& pc = gc->data.perspective;
+                c.verticalAperture = 24;
+                c.focalLength = 12 / std::tan(std::clamp(double(pc.yfov), 1e-3, 3.1) / 2);
+                c.horizontalAperture = pc.has_aspect_ratio && pc.aspect_ratio > 0 ? 24 * double(pc.aspect_ratio) : 36;
+                c.nearClip = pc.znear > 0 ? pc.znear : 0.01;
+                c.farClip = pc.has_zfar && pc.zfar > c.nearClip ? pc.zfar : 1e6;
+            } else {
+                c.orthographic = true;
+            }
+            out.cameras.push_back(c);
+        }
+        if (const cgltf_light* gl = g.light) {
+            ModelLightInfo l;
+            l.name = gl->name ? gl->name : (g.name ? g.name : "Light " + std::to_string(out.lights.size() + 1));
+            l.node = int(i);
+            l.kind = gl->type == cgltf_light_type_directional ? ModelLightInfo::Kind::Distant : ModelLightInfo::Kind::Point;
+            for (int k = 0; k < 3; ++k) l.color[size_t(k)] = gl->color[k] * gl->intensity;
+            if (gl->type == cgltf_light_type_spot && gl->spot_outer_cone_angle > 0) {
+                l.coneAngle = double(gl->spot_outer_cone_angle) * 180 / 3.14159265358979323846;
+                l.coneSoftness = std::clamp(1 - double(gl->spot_inner_cone_angle / gl->spot_outer_cone_angle), 0.0, 1.0);
+            }
+            out.lights.push_back(l);
+        }
+    }
     const cgltf_scene* scene = data->scene ? data->scene : data->scenes_count ? &data->scenes[0] : nullptr;
     if (scene)
         for (cgltf_size k = 0; k < scene->nodes_count; ++k) out.roots.push_back(int(cgltf_node_index(data, scene->nodes[k])));
@@ -642,7 +764,13 @@ bool loadObj(const std::string& path, const QByteArray& bytes, Model& out, std::
 
 bool isModelPath(const std::string& path) {
     const QString s = QFileInfo(QString::fromStdString(path)).suffix().toLower();
-    return s == "gltf" || s == "glb" || s == "obj";
+    return s == "gltf" || s == "glb" || s == "obj" || s == "usd" || s == "usda" || s == "usdc" || s == "usdz";
+}
+
+std::string readModelFile(const std::string& path) { return readWhole(QString::fromStdString(path)).toStdString(); }
+
+bool decodeModelTexture(const std::string& bytes, bool srgb, ModelTexture& out) {
+    return decodeTexture(QByteArray::fromStdString(bytes), srgb, out);
 }
 
 bool loadModel(const std::string& path, Model& out, std::string* error) {
@@ -654,6 +782,16 @@ bool loadModel(const std::string& path, Model& out, std::string* error) {
         return false;
     }
     const QString suffix = QFileInfo(QString::fromStdString(path)).suffix().toLower();
+    const bool usd = bytes.startsWith("#usda") || bytes.startsWith("PXR-USDC") || suffix == "usdz" || suffix == "usd" || suffix == "usda" || suffix == "usdc";
+    if (usd) {
+        if (!loadUsdModel(path, out, error)) return false;
+        finish(out);
+        if (out.triangles() == 0 && out.cameras.empty()) {  // (a scene of a camera alone is looked through)
+            if (error) *error = path + " has no meshes to draw";
+            return false;
+        }
+        return true;
+    }
     const bool gltf = bytes.startsWith("glTF") || suffix == "gltf" || suffix == "glb" || bytes.trimmed().startsWith("{");
     if (!(gltf ? loadGltf(path, bytes, out, error) : loadObj(path, bytes, out, error))) return false;
     finish(out);
@@ -792,7 +930,9 @@ ModelPose poseModel(const Model& m, int animation, double seconds) {
         for (const ModelAnimation::Channel& c : a.channels) {
             if (c.node < 0 || size_t(c.node) >= nodes.size() || c.sampler < 0 || size_t(c.sampler) >= a.samplers.size()) continue;
             ModelNode& n = nodes[size_t(c.node)];
-            const std::vector<double> v = sample(a.samplers[size_t(c.sampler)], seconds, c.path == ModelAnimation::Channel::Path::Rotation);
+            const bool orient = c.path == ModelAnimation::Channel::Path::Op && c.op >= 0 && size_t(c.op) < n.ops.size() &&
+                                n.ops[size_t(c.op)].kind == ModelXformOp::Kind::Orient;
+            const std::vector<double> v = sample(a.samplers[size_t(c.sampler)], seconds, c.path == ModelAnimation::Channel::Path::Rotation || orient);
             switch (c.path) {
                 case ModelAnimation::Channel::Path::Translation:
                     if (v.size() >= 3) n.translation = {v[0], v[1], v[2]}, n.hasMatrix = false;
@@ -805,6 +945,9 @@ ModelPose poseModel(const Model& m, int animation, double seconds) {
                     break;
                 case ModelAnimation::Channel::Path::Weights:
                     pose.weights[size_t(c.node)].assign(v.begin(), v.end());
+                    break;
+                case ModelAnimation::Channel::Path::Op:
+                    if (c.op >= 0 && size_t(c.op) < n.ops.size()) n.ops[size_t(c.op)].value = v;
                     break;
             }
         }
@@ -823,9 +966,13 @@ ModelPose poseModel(const Model& m, int animation, double seconds) {
         }
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             const ModelNode& n = nodes[*it];
-            const Mat4 local = n.hasMatrix ? n.matrix : trsMatrix(n.translation, n.rotation, n.scale);
+            Mat4 local = n.hasMatrix ? n.matrix : trsMatrix(n.translation, n.rotation, n.scale);
+            if (!n.ops.empty()) {
+                local = identity4();
+                for (const ModelXformOp& op : n.ops) local = local * op.matrix();
+            }
             const int p = n.parent;
-            pose.world[*it] = p >= 0 && size_t(p) < nodes.size() && done[size_t(p)] == 1 ? pose.world[size_t(p)] * local : local;
+            pose.world[*it] = p >= 0 && size_t(p) < nodes.size() && done[size_t(p)] == 1 && !n.resetsParent ? pose.world[size_t(p)] * local : local;
             done[*it] = 1;
         }
     }

@@ -1,0 +1,27 @@
+#usda 1.0
+(
+    upAxis = "Y"
+)
+
+def "Box" (
+    references = @cube.usda@
+)
+{
+}
+
+def Camera "Cam"
+{
+    float focalLength = 50
+    float horizontalAperture = 36
+    float verticalAperture = 20.25
+    float2 clippingRange = (0.1, 1000)
+    double3 xformOp:translate = (0, 0, 8)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+}
+
+def DistantLight "Sun"
+{
+    float inputs:intensity = 3.14159265
+    float inputs:angle = 0
+    bool inputs:shadow:enable = 0
+}

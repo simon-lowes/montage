@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "Decoder.h"
+#include "Usd.h"
 #include "core/LinearSolve.h"
 
 namespace montage {
@@ -1237,6 +1238,101 @@ bool writePointsPly(const CameraSolve& s, const std::string& path, std::string* 
     const double k = s.oriented ? 1 : -1;  // (as writeNukeChan turns a scene with no ground)
     for (const SolvedPoint& p : s.points) f << p.X.x << ' ' << k * p.X.y << ' ' << k * p.X.z << '\n';
     if (!f) {
+        if (error) *error = "Cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
+bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::vector<SolvedSceneMesh>& models, std::string* error) {
+    using usd::formatNumber;
+    auto f3 = [](double x, double y, double z, bool single) {
+        return "(" + formatNumber(x, single) + ", " + formatNumber(y, single) + ", " + formatNumber(z, single) + ")";
+    };
+    // A scene with no ground turned as writeNukeChan turns it: y and z the other way.
+    const double k = s.oriented ? 1 : -1;
+    const M3 flip{1, 0, 0, 0, -1, 0, 0, 0, -1};
+    int first = -1, last = -1;
+    for (size_t i = 0; i < s.cameras.size(); ++i)
+        if (s.cameras[i].valid) last = int(i), first = first < 0 ? int(i) : first;
+    std::ostringstream o;
+    const double fps = s.fps > 0 ? s.fps : 24;
+    o << "#usda 1.0\n(\n    defaultPrim = \"Solve\"\n    doc = \"Montage camera solve\"\n    upAxis = \"Y\"\n    metersPerUnit = 1\n"
+      << "    timeCodesPerSecond = " << formatNumber(fps) << "\n    framesPerSecond = " << formatNumber(fps) << "\n";
+    if (first >= 0) o << "    startTimeCode = 0\n    endTimeCode = " << last << "\n";
+    o << ")\n\ndef Xform \"Solve\"\n{\n";
+    // The camera: USD's looks along -z, y up; its matrix's rows are its axes and position (row vectors).
+    const double filmWidth = 36, filmHeight = s.width > 0 ? filmWidth * s.height / s.width : 24;
+    o << "    def Camera \"Camera\"\n    {\n";
+    o << "        float focalLength = " << formatNumber(s.width > 0 ? s.focal * filmWidth / s.width : 50, true) << "\n";
+    o << "        float horizontalAperture = " << formatNumber(filmWidth, true) << "\n";
+    o << "        float verticalAperture = " << formatNumber(filmHeight, true) << "\n";
+    o << "        float2 clippingRange = (0.001, 1000000)\n";
+    if (first >= 0) {
+        o << "        matrix4d xformOp:transform.timeSamples = {\n";
+        for (size_t i = 0; i < s.cameras.size(); ++i) {
+            const SolvedCamera& c = s.cameras[i];
+            if (!c.valid) continue;
+            const M3 R = s.oriented ? c.R : mul(c.R, flip);
+            const M3 M = mul(transpose(R), flip);  // camera to world, columns its x, y, z
+            o << "            " << i << ": (";
+            for (int a = 0; a < 3; ++a) o << "(" << formatNumber(M[size_t(a)]) << ", " << formatNumber(M[size_t(3 + a)]) << ", " << formatNumber(M[size_t(6 + a)]) << ", 0), ";
+            o << "(" << formatNumber(c.C.x) << ", " << formatNumber(k * c.C.y) << ", " << formatNumber(k * c.C.z) << ", 1)),\n";
+        }
+        o << "        }\n        uniform token[] xformOpOrder = [\"xformOp:transform\"]\n";
+    }
+    o << "    }\n";
+    // The points.
+    o << "\n    def Points \"Points\"\n    {\n        point3f[] points = [";
+    for (size_t i = 0; i < s.points.size(); ++i) {
+        const Vec3& X = s.points[i].X;
+        o << (i ? ", " : "") << f3(X.x, k * X.y, k * X.z, true);
+    }
+    o << "]\n        float[] widths = [0.01] (\n            interpolation = \"constant\"\n        )\n    }\n";
+    // The models, each with its material.
+    if (!models.empty()) {
+        o << "\n    def Scope \"Models\"\n    {\n";
+        for (size_t m = 0; m < models.size(); ++m) {
+            const SolvedSceneMesh& mesh = models[m];
+            const std::string name = "Model_" + std::to_string(m + 1);
+            o << "        def Mesh \"" << name << "\" (\n            prepend apiSchemas = [\"MaterialBindingAPI\"]\n        )\n        {\n";
+            if (!mesh.name.empty()) o << "            string montage:name = " << usd::quoted(mesh.name) << "\n";
+            o << "            uniform bool doubleSided = " << (mesh.doubleSided ? 1 : 0) << "\n";
+            o << "            int[] faceVertexCounts = [";
+            for (size_t t = 0; t < mesh.indices.size() / 3; ++t) o << (t ? ", 3" : "3");
+            o << "]\n            int[] faceVertexIndices = [";
+            for (size_t i = 0; i < mesh.indices.size() / 3 * 3; ++i) o << (i ? ", " : "") << mesh.indices[i];
+            o << "]\n            point3f[] points = [";
+            for (size_t i = 0; i + 2 < mesh.positions.size(); i += 3)
+                o << (i ? ", " : "") << f3(mesh.positions[i], k * mesh.positions[i + 1], k * mesh.positions[i + 2], true);
+            o << "]\n";
+            if (!mesh.normals.empty() && mesh.normals.size() == mesh.positions.size()) {
+                o << "            normal3f[] normals = [";
+                for (size_t i = 0; i + 2 < mesh.normals.size(); i += 3)
+                    o << (i ? ", " : "") << f3(mesh.normals[i], k * mesh.normals[i + 1], k * mesh.normals[i + 2], true);
+                o << "] (\n                interpolation = \"vertex\"\n            )\n";
+            }
+            o << "            uniform token subdivisionScheme = \"none\"\n";
+            o << "            rel material:binding = </Solve/Looks/" << name << ">\n        }\n";
+        }
+        o << "    }\n\n    def Scope \"Looks\"\n    {\n";
+        for (size_t m = 0; m < models.size(); ++m) {
+            const SolvedSceneMesh& mesh = models[m];
+            const std::string name = "Model_" + std::to_string(m + 1);
+            o << "        def Material \"" << name << "\"\n        {\n            token outputs:surface.connect = </Solve/Looks/" << name
+              << "/Surface.outputs:surface>\n\n            def Shader \"Surface\"\n            {\n"
+              << "                uniform token info:id = \"UsdPreviewSurface\"\n"
+              << "                color3f inputs:diffuseColor = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
+              << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n"
+              << "                float inputs:metallic = " << formatNumber(mesh.metallic, true) << "\n"
+              << "                float inputs:roughness = " << formatNumber(mesh.roughness, true) << "\n"
+              << "                token outputs:surface\n            }\n        }\n";
+        }
+        o << "    }\n";
+    }
+    o << "}\n";
+    std::ofstream f(path, std::ios::binary);
+    if (!(f << o.str()) || !f.flush()) {
         if (error) *error = "Cannot write " + path;
         return false;
     }

@@ -1158,7 +1158,8 @@ std::vector<EffectInfo> buildCatalog() {
                           str("font", "Font", StringKind::Font, "Sans Serif"),
                           str("path_data", "Path (SVG Data)", StringKind::Text)}};
         c.push_back(title);
-        // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera.
+        // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera (or a camera in a
+        // USD or glTF file).
         EffectInfo title3d{"title3d", "3D Title", EffectCategory::Generator, "Titles",
                            {
                                num("size", "Font Size (px)", 4, 1000, 120, 1),
@@ -1186,16 +1187,21 @@ std::vector<EffectInfo> buildCatalog() {
                                num("anim_in_dur", "In Duration (s)", 0.05, 10, 0.8, 0.05),
                                choice("anim_out", "Animate Out", {"None", "Fade", "Spin", "Flip Up", "Swing In", "Zoom From Far"}, 0),
                                num("anim_out_dur", "Out Duration (s)", 0.05, 10, 0.8, 0.05),
+                               num("camera_index", "The File's Camera Number", 1, 999, 1, 1),
+                               num("units", "Size in the File's Scene (px a unit)", 0.001, 100000, 100, 0.1),
                            },
                            {str("text", "Text", StringKind::MultilineText, "3D Title"),
-                            str("font", "Font", StringKind::Font, "Sans Serif")}};
+                            str("font", "Font", StringKind::Font, "Sans Serif"),
+                            str("camera_file", "Look Through a Camera in (USD, glTF)", StringKind::File)}};
         c.push_back(title3d);
-        // A glTF or OBJ model in the shot (render/ModelClip.h): through its own camera (pixels) or the camera the 3D
-        // Camera Tracker solved on another track (the solved scene's units, its ground at height 0).
+        // A glTF, OBJ or USD model in the shot (render/ModelClip.h): through its own camera (pixels), the camera the 3D
+        // Camera Tracker solved on another track (the solved scene's units, its ground at height 0) or a camera in the
+        // file (the file's units, everything where the file puts it).
         c.push_back({"model3d", "3D Model", EffectCategory::Generator, "Titles",
                      {
-                         choice("camera", "Camera", {"Its Own", "Solved by the 3D Camera Tracker"}, 0),
+                         choice("camera", "Camera", {"Its Own", "Solved by the 3D Camera Tracker", "The File's Camera"}, 0),
                          num("camera_track", "Solved Footage Track (0: nearest below)", 0, 99, 0, 1),
+                         num("camera_index", "The File's Camera Number", 1, 999, 1, 1),
                          num("fov", "Lens (field of view °)", 5, 120, 35, 0.5),
                          num("size", "Size (px, own camera)", 1, 20000, 400, 1),
                          pct("scale", "Scale (solved camera, of its own units)", 0.01, 100000, 100),
@@ -1210,7 +1216,7 @@ std::vector<EffectInfo> buildCatalog() {
                          pct("anim_speed", "Animation Speed", -1000, 1000, 100),
                          num("anim_offset", "Animation Offset (s)", -3600, 3600, 0, 0.01),
                          boolean("loop", "Loop the Animation", true),
-                         choice("light_kind", "Light", {"Sun", "Point", "Spot"}, 0),
+                         choice("light_kind", "Light", {"Sun", "Point", "Spot", "The File's Lights"}, 0),
                          num("light_angle", "Light Direction (°)", -180, 180, -40, 1),
                          num("light_height", "Light Height (°)", -90, 90, 45, 1),
                          num("light_distance", "Light Distance (model sizes)", 0.1, 100, 3, 0.1),
@@ -1228,7 +1234,7 @@ std::vector<EffectInfo> buildCatalog() {
                          boolean("depth_merge", "Hide Behind Nearer Things (Merge by Depth)", false),
                          pct("opacity", "Opacity", 0, 100, 100),
                      },
-                     {str("file", "Model (glTF, GLB, OBJ)", StringKind::File)}});
+                     {str("file", "Model (glTF, GLB, OBJ, USD)", StringKind::File)}});
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
         for (const TitleTemplate& tpl : titleTemplates()) {
             EffectInfo t = title;
