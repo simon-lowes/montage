@@ -150,6 +150,53 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
                 h.addData(QByteArray::fromStdString(effectToJsonString(e)));
             }
         }
+    // And what its compositing graph brings in (core/CompositeGraph.h; the graph itself is in the clip's settings):
+    // media and generators as its inputs place them, what other tracks show, the clips its trackers follow, the shared
+    // nodes its grades use.
+    for (const CompositeNode& n : c.composite.nodes) {
+        if (!n.enabled || depth >= 4) continue;
+        h.addData("|node" + QByteArray::number(n.key));
+        if (n.kind == "input" && (n.source == "media" || n.source == "generator")) {
+            Clip in;
+            in.start = c.start;
+            in.duration = c.duration;
+            in.mediaId = n.source == "media" ? n.media : 0;
+            in.sourceIn = n.offset;
+            if (n.source == "generator") in.generator = n.generator;
+            addClipAt(h, p, seq, in, t, o, depth + 1);
+        } else if (n.kind == "input" && n.source == "track" && n.track >= 0 && size_t(n.track) < seq.videoTracks.size()) {
+            // (as a frame keys its tracks: a transition by its kind, settings, place and both its clips)
+            const Track& tr = seq.videoTracks[size_t(n.track)];
+            bool inTransition = false;
+            for (const Transition& x : tr.transitions) {
+                FrameTime a, b;
+                if (!edit::transitionRange(tr, x, a, b) || t < a || t >= b) continue;
+                h.addData("|transition" + QByteArray::fromStdString(x.type) + QByteArray::number(qint64(t - a)) + '/' + QByteArray::number(qint64(b - a)));
+                for (const auto& [name, prm] : x.params.params) h.addData(QByteArray::fromStdString(name) + QByteArray::number(prm.at(0), 'g', 12));
+                for (Id clip : {x.clipA, x.clipB})
+                    for (const Clip& y : tr.clips)
+                        if (y.id == clip) addClipAt(h, p, seq, y, t, o, depth + 1);
+                if (x.type == "smooth_cut") h.addData(QByteArray::number(qint64(a)) + '-' + QByteArray::number(qint64(b)));
+                inTransition = true;
+                break;
+            }
+            for (const Clip& x : tr.clips)
+                if (!inTransition && x.enabled && x.contains(t)) addClipAt(h, p, seq, x, t, o, depth + 1);
+        } else if (n.kind == "track") {
+            if (const Clip* f = edit::clipById(seq, n.follow)) {
+                Clip k = *f;
+                k.id = 0;
+                h.addData(QByteArray::fromStdString(clipToJsonString(k)) + QByteArray::number(qint64(t - f->start)));
+            }
+        } else if (n.kind == "grade") {
+            for (const GradeNode& g : n.grade.nodes)
+                if (const SharedNode* sn = findSharedNode(seq, g.shared))
+                    for (Effect e : sn->effects) {
+                        e.id = 0;
+                        h.addData(QByteArray::fromStdString(effectToJsonString(e)));
+                    }
+        }
+    }
     h.addData(QByteArray::number(qint64(t - c.start)));
     if (const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr) {
         if (m->kind == MediaKind::Sequence) {
@@ -324,7 +371,7 @@ std::vector<std::pair<FrameTime, FrameTime>> rangesToRender(const Sequence& seq)
     for (const Track& t : seq.videoTracks) {
         if (t.muted) continue;
         for (const Clip& c : t.clips)
-            if (c.enabled && (!c.effects.empty() || !c.grade.empty() || (c.isGenerator() && c.generator.type != "color" && c.generator.type != "adjustment")))
+            if (c.enabled && (!c.effects.empty() || !c.grade.empty() || !c.composite.empty() || (c.isGenerator() && c.generator.type != "color" && c.generator.type != "adjustment")))
                 spans.push_back({c.start, c.end()});
         for (const Transition& tr : t.transitions) {
             FrameTime a = 0, b = 0;

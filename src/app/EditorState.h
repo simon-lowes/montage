@@ -127,6 +127,10 @@ public:
     // Inspector, or 0 (none picked: the Inspector shows every node). A choice of what to work on, not an edit.
     int selectedGradeNode() const;
     void selectGradeNode(int key);
+    // The compositing node picked in the Composite panel (core/CompositeGraph.h), likewise: the Inspector then shows its
+    // settings and effects.
+    int selectedCompositeNode() const;
+    void selectCompositeNode(int key);
 
     // ---- Playhead (stored in the active sequence) ------------------------
     FrameTime playhead() const;
@@ -273,6 +277,7 @@ signals:
     void maskObjectChanged();         // a different object chosen in an object mask
     void paintEffectChanged();        // painting on the monitor started, stopped or moved to another effect
     void gradeNodeSelected();         // a different colour node picked
+    void compositeNodeSelected();     // a different compositing node picked
     void playheadChanged(montage::FrameTime t);
     void sequenceSwitched();          // a different sequence became active / project replaced
     void historyChanged();
@@ -345,6 +350,8 @@ private:
     int meshPinKind_ = 0;
     Id gradeNodeClip_ = 0;           // the clip whose colour node is picked, and the node
     int gradeNodeKey_ = 0;
+    Id compositeNodeClip_ = 0;       // likewise the compositing node
+    int compositeNodeKey_ = 0;
     int targetVideo_ = 0;
     int targetAudio_ = 0;
     bool snapping_ = true;

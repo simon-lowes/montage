@@ -1,4 +1,5 @@
 #include "EditOps.h"
+
 #include "Adr.h"
 
 #include "ProjectIO.h"
@@ -13,6 +14,7 @@
 #include <sstream>
 
 #include "AudioChannels.h"
+#include "CompositeGraph.h"
 #include "Effects.h"
 #include "GradeGraph.h"
 
@@ -149,6 +151,14 @@ void shiftKeyframes(Clip& c, FrameTime delta) {
         if (e.type == "paint" && strokes != e.strings.end()) shiftFrameLines(strokes->second, 1, delta);
     }
     for (auto& [target, e] : c.trims) shiftParamKeys(e, delta);
+    // Its compositing nodes', with a media input's frame and a Track node's reference frame kept where they were.
+    for (CompositeNode& n : c.composite.nodes) {
+        for (auto& e : n.effects) shiftParamKeys(e, delta);
+        shiftParamKeys(n.generator, delta);
+        if (n.kind == "input" && n.source == "media") n.offset = std::max(0.0, n.offset - double(delta));
+        if (Effect* st = n.kind == "track" ? compositeSettings(n) : nullptr; st && st->params.count("reference"))
+            st->params["reference"].value = std::max(0.0, st->params["reference"].value + double(delta));
+    }
 }
 
 Clip subClip(const Clip& c, FrameTime from, FrameTime to) {
@@ -207,6 +217,7 @@ Id splitClip(Project& p, Track& t, size_t index, FrameTime frame) {
     Clip left = subClip(orig, orig.start, frame);
     Clip right = subClip(orig, frame, orig.end());
     right.id = p.newId();
+    freshCompositeIds(p, right);
     // Linked partners split at the same frame should stay linked to each
     // other but not to the left halves; callers splitting several tracks
     // fix up link groups (see razorAll). A single split keeps the group.
@@ -235,6 +246,7 @@ void clearRange(Project& p, Track& t, FrameTime a, FrameTime b) {
             Clip right = subClip(c, b, c.end());
             if (c.start < a) {
                 right.id = p.newId();  // the left part kept the id
+                freshCompositeIds(p, right);
                 for (auto& tr : t.transitions)
                     if (tr.clipA == c.id) tr.clipA = right.id;
             }
@@ -302,6 +314,9 @@ Result overwrite(Project& p, Sequence& s, TrackRef r, Clip clip) {
     if (t->locked) return Result::fail("Track is locked");
     if (clip.start < 0) return Result::fail("Clip would start before 0");
     if (clip.id == 0) clip.id = p.newId();
+    // A copy of a clip with compositing nodes gets its own (each node's id owns its effects).
+    if (std::any_of(clip.composite.nodes.begin(), clip.composite.nodes.end(), [&](const CompositeNode& n) { return compositeNodeByOwner(s, n.id); }))
+        freshCompositeIds(p, clip);
     clearRange(p, *t, clip.start, clip.end());
     Id id = clip.id;
     t->clips.push_back(std::move(clip));
@@ -1339,6 +1354,7 @@ Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& ite
             c.linkGroup = g->second;
         }
         for (auto& e : c.effects) e.id = p.newId();
+        freshCompositeIds(p, c);
         remapSharedNodes(c, adoptSharedNodes(p, s, it.sharedNodes));
         Result r = overwrite(p, s, it.track, c);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
@@ -1445,6 +1461,7 @@ Result pasteRange(Project& p, Sequence& s, const SequenceRange& r, FrameTime at,
             c.linkGroup = g->second;
         }
         for (auto& e : c.effects) e.id = p.newId();
+        freshCompositeIds(p, c);
         remapSharedNodes(c, adoptSharedNodes(p, s, it.sharedNodes));
         const Result placed = overwrite(p, s, mapped(it.track), c);
         if (placed.ok) res.created.push_back(c.id);
@@ -2324,6 +2341,11 @@ std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin) {
     }
     for (auto& n : s.sharedNodes)
         if (n.id == owner) return &n.effects;
+    Clip* holder = nullptr;
+    if (CompositeNode* n = compositeNodeByOwner(s, owner, &holder)) {  // a compositing node's (core/CompositeGraph.h)
+        if (origin) *origin = holder->start;
+        return &n->effects;
+    }
     return nullptr;
 }
 
@@ -2332,6 +2354,9 @@ Effect* ownedEffect(Sequence& s, Id owner, Id effect, FrameTime* origin) {
     if (!chain) return nullptr;
     for (Effect& e : *chain)
         if (e.id == effect) return &e;
+    // A compositing input's generator (a title, a model) is its node's too.
+    if (CompositeNode* n = compositeNodeByOwner(s, owner); n && n->source == "generator" && n->generator.id == effect)
+        return &n->generator;
     return nullptr;
 }
 

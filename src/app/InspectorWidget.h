@@ -72,6 +72,8 @@ private:
                           const std::function<FrameTime()>& localTime, int node = -1, bool addMenu = true);
     // A clip's colour nodes (core/GradeGraph.h): the picked one, or each in turn, then the effects outside them.
     void buildGradeNodes(const Clip& clip, const std::function<FrameTime()>& localTime);
+    // The picked node of a clip's compositing graph (core/CompositeGraph.h): its settings, generator and effects.
+    void buildCompositeNode(const Clip& clip, const std::function<FrameTime()>& localTime);
     void buildChain(Id owner);
     void addEffectMenu(TrackKind kind, Id owner, int node = 0);
 

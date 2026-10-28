@@ -53,6 +53,7 @@
 #include "core/Cfb.h"
 #include "core/MaskPath.h"
 #include "core/Automation.h"
+#include "core/CompositeGraph.h"
 #include "core/EditOps.h"
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
@@ -10365,6 +10366,101 @@ private slots:
         // Flattened: a stack again.
         r = nodes({{"project", project}, {"clip", id}, {"action", "flatten"}});
         QVERIFY(r.value("structuredContent").toObject().value("nodes").toArray().isEmpty());
+    }
+
+    void compositeGraphOverMcp() {
+        Project q = makeDefaultProject();
+        q.active()->width = 320, q.active()->height = 180;
+        for (int i = 0; i < 2; ++i) {
+            Clip c = makeGeneratorClip(q, "color", 30);
+            c.generator.params["color.r"] = i ? 1.0 : 0.25;
+            edit::overwrite(q, *q.active(), {TrackKind::Video, i}, c);
+        }
+        const double id = double(q.active()->videoTracks[0].clips[0].id);
+        const QString project = QString::fromStdString(path("composite.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto graph = [&](QJsonObject args) {
+            args["project"] = project;
+            args["clip"] = id;
+            return call("montage_composite_graph", args);
+        };
+        // A merge (the clip's graph made first: its input into the output), a layer of V2 over it at half opacity.
+        QJsonObject r = graph({{"action", "add"}, {"kind", "merge"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const int merge = r.value("structuredContent").toObject().value("created").toInt();
+        QCOMPARE(r.value("structuredContent").toObject().value("nodes").toArray().size(), 2);
+        r = graph({{"action", "add"}, {"kind", "input"}, {"after", merge}});
+        const int layer = r.value("structuredContent").toObject().value("created").toInt();
+        QVERIFY(layer > 0);
+        QVERIFY(graph({{"action", "set"}, {"node", layer}, {"source", "track"}, {"track", 0}}).value("isError").toBool());  // (its own)
+        r = graph({{"action", "set"}, {"node", layer}, {"source", "track"}, {"track", 1}, {"label", "Above"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = graph({{"action", "set"}, {"node", merge}, {"settings", QJsonObject{{"opacity", 50}}}, {"blend", "screen"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject m;
+        for (const QJsonValue v : r.value("structuredContent").toObject().value("nodes").toArray())
+            if (v.toObject().value("key").toInt() == merge) m = v.toObject();
+        QCOMPARE(m.value("blend").toString(), QString("screen"));
+        QCOMPARE(m.value("settings").toObject().value("opacity").toDouble(), 50.0);
+        // A key after the layer, and a keyer into it; a merge takes no effects.
+        r = graph({{"action", "add"}, {"kind", "key"}, {"after", layer}});
+        const int key = r.value("structuredContent").toObject().value("created").toInt();
+        QJsonArray links = r.value("structuredContent").toObject().value("links").toArray();
+        QVERIFY(links.contains(QJsonObject{{"from", layer}, {"to", key}, {"input", 0}}));
+        QVERIFY(links.contains(QJsonObject{{"from", key}, {"to", merge}, {"input", 1}}));
+        r = call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "chroma_key"}, {"composite_node", key}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "invert"}, {"composite_node", merge}}).value("isError").toBool());
+        r = graph({{"action", "list"}});
+        QJsonObject k;
+        for (const QJsonValue v : r.value("structuredContent").toObject().value("nodes").toArray())
+            if (v.toObject().value("key").toInt() == key) k = v.toObject();
+        QCOMPARE(k.value("effects").toArray().size(), 2);
+        QCOMPARE(k.value("effects").toArray()[1].toObject().value("type").toString(), QString("chroma_key"));
+        // Refused: a loop, an unknown action, a node that is not there.
+        QVERIFY(graph({{"action", "connect"}, {"from", merge}, {"to", key}, {"input", 0}}).value("isError").toBool());
+        QVERIFY(graph({{"action", "paint"}}).value("isError").toBool());
+        QVERIFY(graph({{"action", "remove"}, {"node", 42}}).value("isError").toBool());
+        // As JSON (a preset): cleared, then applied again with fresh ids.
+        const QString json = graph({{"action", "get_json"}}).value("structuredContent").toObject().value("graph").toString();
+        QVERIFY(json.contains("\"merge\""));
+        QVERIFY(!graph({{"action", "clear"}}).value("isError").toBool());
+        QVERIFY(graph({{"action", "list"}}).value("structuredContent").toObject().value("nodes").toArray().isEmpty());
+        r = graph({{"action", "apply_json"}, {"graph", json}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("nodes").toArray().size(), 4);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& c = back.active()->videoTracks[0].clips[0];
+        QCOMPARE(c.composite.nodes.size(), size_t(4));
+        QVERIFY(validComposite(c.composite));
+
+        // Interchange gets the rendered clip: a file beside the export with the graph's picture, in the clip's place.
+        const QString otio = QString::fromStdString(path("composite.otio"));
+        r = call("montage_export_timeline", {{"project", project}, {"format", "otio"}, {"output", otio}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QDir baked(QString::fromStdString(path("composite Composites")));
+        const QStringList movs = baked.entryList({"*.mov"}, QDir::Files);
+        QCOMPARE(movs.size(), 1);
+        QFile f(otio);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(f.readAll());
+        QVERIFY2(text.contains(QUrl::fromLocalFile(baked.filePath(movs[0])).toString()), qPrintable(text.left(600)));
+        MediaItem rendered;
+        QVERIFY(probeMedia(baked.filePath(movs[0]).toStdString(), rendered));
+        QCOMPARE(rendered.width, 320);
+        QVERIFY(rendered.hasVideo && rendered.duration > 0);
+        // (the project itself keeps its graph)
+        QVERIFY(loadProject(project.toStdString(), back) && !back.active()->videoTracks[0].clips[0].composite.empty());
     }
 
     void captionStyleOverMcp() {

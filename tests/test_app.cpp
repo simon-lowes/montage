@@ -185,6 +185,7 @@
 #include "Theme.h"
 #include <QAccessible>
 #include <QFileDialog>
+#include "CompositeNodePanel.h"
 #include "GradeNodePanel.h"
 #include "CompareDialog.h"
 #include "MergeDialog.h"
@@ -242,6 +243,7 @@
 #include "TranscriptPanel.h"
 #include "core/AutoTag.h"
 #include "core/ClipAnimation.h"
+#include "core/CompositeGraph.h"
 #include "core/EditOps.h"
 #include "core/GradeVersions.h"
 #include "core/MergeClips.h"
@@ -5567,6 +5569,98 @@ private slots:
         QVERIFY(panel->flatten());
         QVERIFY(clip()->grade.empty());
         QCOMPARE(clip()->effects.size(), size_t(2));
+        dock->setFloating(false);
+        dock->hide();
+        state()->setSelection({}, false);
+    }
+
+    void compositePanelEditsTheGraph() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        auto* dock = win_->findChild<QDockWidget*>("composite");
+        QVERIFY(dock);
+        dock->setFloating(true);
+        dock->resize(760, 340);
+        dock->show();
+        auto* panel = win_->findChild<CompositeNodePanel*>();
+        QVERIFY(panel);
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        QCOMPARE(panel->clip(), red);
+        auto clip = [&] { return edit::clipById(*state()->sequence(), red); };
+        auto linkInto = [&](int to, int input) { return compositeLinkInto(clip()->composite, to, input); };
+        // A merge: the clip's graph made (its input into the output) and the merge after it, in one undo step.
+        QVERIFY(panel->addNode("merge"));
+        QCOMPARE(clip()->composite.nodes.size(), size_t(2));
+        const int merge = panel->selectedNode();
+        QCOMPARE(findCompositeNode(clip()->composite, merge)->kind, std::string("merge"));
+        state()->undo();
+        QVERIFY(clip()->composite.empty());
+        state()->redo();
+        QCOMPARE(clip()->composite.nodes.size(), size_t(2));
+        // A title merged over the clip; the Inspector shows the picked node's settings, the title's own among them.
+        panel->selectNode(merge);
+        QVERIFY(panel->addInput("generator", 0, -1, "title"));
+        const int title = panel->selectedNode();
+        QVERIFY(linkInto(merge, 1) && linkInto(merge, 1)->from == title);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(!inspector->findChild<QLabel*>("compositeNote"));
+        // A click on a node picks it; on nothing, none (the Inspector then says how many there are).
+        QTest::mouseClick(panel->canvas(), Qt::LeftButton, {}, panel->nodeCentre(merge).toPoint());
+        QCOMPARE(panel->selectedNode(), merge);
+        QTest::mouseClick(panel->canvas(), Qt::LeftButton, {}, QPoint(4, panel->canvas()->height() - 4));
+        QCOMPARE(panel->selectedNode(), 0);
+        QApplication::processEvents();
+        QVERIFY(inspector->findChild<QLabel*>("compositeNote"));
+        // Unlinked, then linked again by a drag from the title's output to the merge's free input.
+        QVERIFY(panel->disconnectInput(merge, 1));
+        QVERIFY(!linkInto(merge, 1));
+        QApplication::processEvents();
+        const QPoint out = panel->portPoint(title, true, 0).toPoint(), into = panel->portPoint(merge, false, 1).toPoint();
+        QTest::mousePress(panel->canvas(), Qt::LeftButton, {}, out);
+        QMouseEvent m(QEvent::MouseMove, into, panel->canvas()->mapToGlobal(into), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(panel->canvas(), &m);
+        QTest::mouseRelease(panel->canvas(), Qt::LeftButton, {}, into);
+        QVERIFY(linkInto(merge, 1) && linkInto(merge, 1)->from == title);
+        QVERIFY(!panel->canvas()->grab().isNull());  // (drawn: nodes, links, ports, the output)
+        // A loop is refused, the graph unchanged.
+        const CompositeGraph linked = clip()->composite;
+        QVERIFY(!panel->connectNodes({merge, title, 0}));
+        QCOMPARE(clip()->composite, linked);
+        // Ctrl+D on the canvas switches the picked node off; renamed.
+        panel->selectNode(title);
+        panel->canvas()->setFocus();
+        QTest::keyClick(panel->canvas(), Qt::Key_D, Qt::ControlModifier);
+        QVERIFY(!findCompositeNode(clip()->composite, title)->enabled);
+        QVERIFY(panel->renameSelected("Name"));
+        QCOMPARE(compositeNodeName(*findCompositeNode(clip()->composite, title)), std::string("Name"));
+        // Saved as a preset, the graph removed, the preset applied: the same graph, with its own ids.
+        QTemporaryDir dir;
+        const QString file = dir.filePath("look.json");
+        QVERIFY(panel->savePreset("Look", file));
+        const CompositeGraph before = clip()->composite;
+        QVERIFY(panel->clearGraph());
+        QVERIFY(clip()->composite.empty());
+        QVERIFY(panel->applyPreset(file));
+        QCOMPARE(clip()->composite.links, before.links);
+        QCOMPARE(clip()->composite.nodes.size(), before.nodes.size());
+        QVERIFY(clip()->composite.nodes[0].id != before.nodes[0].id);
+        // Saved with the project and read again.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(state()->project()), back));
+        QCOMPARE(edit::clipById(*back.findSequence(state()->sequence()->id), red)->composite, clip()->composite);
+        // Undone: the graph as it was before the preset, then before it was removed.
+        state()->undo();
+        QVERIFY(clip()->composite.empty());
+        state()->undo();
+        QCOMPARE(clip()->composite, before);
+        // Delete on the canvas removes the picked node.
+        state()->setSelection({red}, false);
+        panel->selectNode(title);
+        panel->canvas()->setFocus();
+        QTest::keyClick(panel->canvas(), Qt::Key_Delete);
+        QVERIFY(!findCompositeNode(clip()->composite, title));
         dock->setFloating(false);
         dock->hide();
         state()->setSelection({}, false);

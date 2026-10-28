@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "Captions.h"
+#include "CompositeGraph.h"
 #include "GradeGraph.h"
 #include "EditOps.h"
 #include "GradeGraph.h"
@@ -553,6 +554,7 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         }
         for (Effect* e : {&piece.generator, &piece.motion, &piece.audio, &piece.timing}) renew(*e);
         for (Effect& e : piece.effects) renew(e);
+        freshCompositeIds(p, piece);
         remapSharedNodes(piece, sharedIds);
         return piece;
     };

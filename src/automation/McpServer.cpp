@@ -24,6 +24,7 @@
 
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
+#include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/TakeLanes.h"
@@ -2067,6 +2068,165 @@ void McpServer::Impl::addTools() {
             return ok(lines.join('\n'), out);
         });
 
+    add("montage_composite_graph", "Compositing nodes",
+        "A picture clip's compositing node graph: its output becomes the clip's picture. "
+        "Node kinds: input (no inputs; `source` clip: the clip as its track shows it, media: bin item `media` placed as a "
+        "new clip, from `offset` frames in, track: what video `track` (0 = V1, not the clip's own) shows, generator: "
+        "`generator` type such as title, model3d, color, with `generator_params`/`generator_strings`); merge (input 0 the "
+        "background, then each layer over those before it, `blend` one of the blend modes or depth: deep pictures and 3D "
+        "models merged at their own depths; settings opacity); transform (settings as a clip's Transform: pos_x, pos_y, "
+        "scale, rotation, anchor_x, crop_left..., opacity); mask (input 0 the picture, input 1 an optional mask picture; "
+        "settings matte 0 alpha 1 luma 2 inverted alpha 3 inverted luma, and mask.* shapes as montage_add_effect's); key "
+        "(its keyers: a Keyer to begin with); track (moves its input as clip `follow`'s transform moves from settings "
+        "reference (a clip frame): follow 0 position, 1 + scale, 2 + rotation, 3 through that clip's Corner Pin); effect "
+        "(any video effects); grade (colour effects, or a clip's whole grade with its colour nodes via action grade_from). "
+        "`action`: list; add (`kind`, after node `after`, default the one feeding the output: a one-input node goes in "
+        "series, a merge takes it as its background, an input becomes the next layer of merge `after`; a clip without a "
+        "graph gets one: an input of itself into the output); remove (`node`); connect (`from`, `to` 0 the output, "
+        "`input`); disconnect (`to`, `input`); set (`node`: `label`, `enabled`, `x`/`y`, `source`, `media`, `track`, "
+        "`offset`, `generator`, `blend`, `follow`, `settings` numbers; with `effect` and `params`, that effect of the "
+        "node's); grade_from (`node`, clip `from`); clear (no graph); get_json / apply_json (`graph`: the graph as JSON "
+        "text, a preset). Add effects to a node with montage_add_effect's `composite_node`.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["list","add","remove","connect","disconnect","set","grade_from","clear","get_json","apply_json"]},
+            "kind":{"type":"string","enum":["input","merge","transform","mask","key","track","effect","grade"]},
+            "node":{"type":"integer"},"after":{"type":"integer"},"from":{"type":"number"},"to":{"type":"integer"},"input":{"type":"integer"},
+            "label":{"type":"string"},"enabled":{"type":"boolean"},"x":{"type":"number"},"y":{"type":"number"},
+            "source":{"type":"string","enum":["clip","media","track","generator"]},"media":{"type":"number"},"track":{"type":"integer"},
+            "offset":{"type":"number"},"generator":{"type":"string"},
+            "generator_params":{"type":"object","additionalProperties":{"type":"number"}},
+            "generator_strings":{"type":"object","additionalProperties":{"type":"string"}},
+            "blend":{"type":"string"},"follow":{"type":"number"},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}},
+            "effect":{"type":"number"},"params":{"type":"object","additionalProperties":{"type":"number"}},
+            "graph":{"type":"string"}},"required":["project","clip","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            const Clip& picked = clipArg(l, a);
+            const auto loc = edit::locate(s, picked.id);
+            if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"A compositing graph is a picture clip's"};
+            const Id id = picked.id;
+            auto nodeArg = [&](const char* key = "node") {
+                if (!a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a node's key (see action list)").arg(key)};
+                return a.value(key).toInt();
+            };
+            edit::Result r;
+            int made = 0;
+            if (action == "add") {
+                r = edit::addCompositeNode(l.project, s, id, need(a, "kind").toStdString(), a.value("after").toInt(), &made);
+            } else if (action == "remove") {
+                r = edit::removeCompositeNode(s, id, nodeArg());
+            } else if (action == "connect") {
+                r = edit::connectCompositeNodes(s, id, {nodeArg("from"), a.value("to").toInt(), a.value("input").toInt()});
+            } else if (action == "disconnect") {
+                r = edit::disconnectCompositeNodes(s, id, nodeArg("to"), a.value("input").toInt());
+            } else if (action == "set") {
+                const int key = nodeArg();
+                const CompositeNode* n = findCompositeNode(edit::clipById(s, id)->composite, key);
+                if (!n) throw ArgError{"No such node (see action list)"};
+                CompositeNode changed = *n;
+                if (a.contains("label")) changed.label = str(a, "label").toStdString();
+                if (a.contains("enabled")) changed.enabled = a.value("enabled").toBool();
+                if (a.contains("x")) changed.x = a.value("x").toDouble();
+                if (a.contains("y")) changed.y = a.value("y").toDouble();
+                if (a.contains("source")) changed.source = str(a, "source").toStdString();
+                if (a.contains("media")) changed.media = Id(a.value("media").toDouble());
+                if (a.contains("track")) changed.track = a.value("track").toInt(-1);
+                if (a.contains("offset")) changed.offset = a.value("offset").toDouble();
+                if (a.contains("generator")) {
+                    const std::string type = str(a, "generator").toStdString();
+                    const EffectInfo* info = findEffectInfo(type);
+                    if (!info || info->category != EffectCategory::Generator)
+                        throw ArgError{QStringLiteral("No generator \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
+                    if (changed.generator.type != type) changed.generator = makeEffect(type, 0);
+                }
+                const QJsonObject gp = a.value("generator_params").toObject(), gs = a.value("generator_strings").toObject();
+                for (auto it = gp.begin(); it != gp.end(); ++it) changed.generator.params[it.key().toStdString()] = Param(it.value().toDouble());
+                for (auto it = gs.begin(); it != gs.end(); ++it) changed.generator.strings[it.key().toStdString()] = it.value().toString().toStdString();
+                if (a.contains("blend")) changed.blend = str(a, "blend").toStdString();
+                if (a.contains("follow")) changed.follow = Id(a.value("follow").toDouble());
+                r = edit::setCompositeNode(l.project, s, id, changed);
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                bool changedAny = r.ok;
+                const QJsonObject settings = a.value("settings").toObject();
+                if (!settings.isEmpty()) {
+                    std::vector<std::pair<std::string, double>> values;
+                    for (auto it = settings.begin(); it != settings.end(); ++it) values.push_back({it.key().toStdString(), it.value().toDouble()});
+                    check(edit::setCompositeNodeParams(s, id, key, values));
+                    changedAny = true;
+                }
+                if (a.contains("effect")) {
+                    CompositeNode* m = findCompositeNode(edit::clipById(s, id)->composite, key);
+                    Effect* e = nullptr;
+                    for (Effect& x : m->effects)
+                        if (x.id == Id(a.value("effect").toDouble())) e = &x;
+                    if (!e) throw ArgError{"No such effect on the node (see action list)"};
+                    const QJsonObject params = a.value("params").toObject();
+                    for (auto it = params.begin(); it != params.end(); ++it) e->params[it.key().toStdString()] = Param(it.value().toDouble());
+                    changedAny = changedAny || !params.isEmpty();
+                }
+                r = changedAny ? edit::Result{} : edit::Result::fail("");
+            } else if (action == "grade_from") {
+                if (!a.value("from").isDouble()) throw ArgError{"\"from\" must be the clip whose grade to take"};
+                r = edit::gradeNodeFromClip(l.project, s, id, nodeArg(), Id(a.value("from").toDouble()));
+            } else if (action == "clear") {
+                r = edit::removeComposite(s, id);
+            } else if (action == "apply_json") {
+                CompositeGraph g;
+                if (!compositeGraphFromJsonString(need(a, "graph").toStdString(), g)) throw ArgError{"\"graph\" is not a compositing graph's JSON (see get_json)"};
+                r = edit::applyComposite(l.project, s, id, g);
+            } else if (action != "list" && action != "get_json") {
+                throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
+            }
+            if (!r.ok) return fail(r.error.empty() ? QStringLiteral("Nothing to change") : QString::fromStdString(r.error));
+            if (action != "list" && action != "get_json") save(l);
+            const Clip& c = *edit::clipById(s, id);
+            if (action == "get_json")
+                return ok(QString::fromStdString(compositeGraphToJsonString(c.composite)),
+                          QJsonObject{{"graph", QString::fromStdString(compositeGraphToJsonString(c.composite))}});
+            QJsonArray nodes, links, order;
+            QStringList lines;
+            for (const CompositeNode& n : c.composite.nodes) {
+                QJsonObject o{{"key", n.key}, {"id", double(n.id)}, {"kind", QString::fromStdString(n.kind)},
+                              {"name", QString::fromStdString(compositeNodeName(n))}, {"enabled", n.enabled}, {"x", n.x}, {"y", n.y}};
+                QString what;
+                if (n.kind == "input") {
+                    o["source"] = QString::fromStdString(n.source);
+                    if (n.source == "media") o["media"] = double(n.media), o["offset"] = n.offset;
+                    if (n.source == "track") o["track"] = n.track;
+                    if (n.source == "generator") o["generator"] = QString::fromStdString(n.generator.type);
+                    what = QString::fromStdString(n.source == "generator" ? n.generator.type : n.source);
+                }
+                if (n.kind == "merge") o["blend"] = QString::fromStdString(n.blend), what = QString::fromStdString(n.blend);
+                if (n.kind == "track") o["follow"] = double(n.follow);
+                if (const Effect* st = compositeSettings(n)) {
+                    QJsonObject settings;
+                    for (const auto& [name, prm] : st->params) settings[QString::fromStdString(name)] = prm.value;
+                    o["settings"] = settings;
+                }
+                QJsonArray fx;
+                for (size_t i = compositeSettings(n) ? 1 : 0; i < n.effects.size(); ++i) {
+                    const Effect& e = n.effects[i];
+                    const EffectInfo* info = findEffectInfo(e.type);
+                    fx.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)},
+                                          {"name", QString::fromStdString(info ? info->displayName : e.type)}, {"enabled", e.enabled}});
+                }
+                o["effects"] = fx;
+                if (!n.grade.empty()) o["grade_nodes"] = int(n.grade.nodes.size());
+                nodes.append(o);
+                lines << QStringLiteral("%1 (%2)%3%4").arg(QString::fromStdString(compositeNodeName(n))).arg(n.key)
+                             .arg(what.isEmpty() ? QString() : QStringLiteral(": ") + what).arg(n.enabled ? "" : " off");
+            }
+            for (const CompositeLink& k : c.composite.links) links.append(QJsonObject{{"from", k.from}, {"to", k.to}, {"input", k.input}});
+            for (int k : compositeOrder(c.composite)) order.append(k);
+            if (c.composite.empty()) lines << QStringLiteral("No compositing graph: the clip's picture as it comes (action add)");
+            QJsonObject out{{"nodes", nodes}, {"links", links}, {"order", order}};
+            if (made) out["created"] = made;
+            return ok(lines.join('\n'), out);
+        });
+
     add("montage_animate_clip", "Animate a clip",
         "Give a picture clip (video, still, title, shape) an animation preset, as CapCut's In / Out / Combo: in plays "
         "over its first seconds, out over its last, combo repeats all through. Drawn on top of the clip's own transform, "
@@ -2741,6 +2901,7 @@ void McpServer::Impl::addTools() {
             "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
             "group":{"type":["number","string"],"description":"group_stage: which of the clip's groups (its id or name, such as the scene group round its angle group); default the clip's own"},
             "node":{"type":"integer","description":"Into the clip's corrector node with this key (montage_grade_nodes); a shared node's goes into the shared node"},
+            "composite_node":{"type":"integer","description":"Into the clip's compositing node with this key (montage_composite_graph): an input, key, effect or grade node runs it on its picture"},
             "shared":{"type":"number","description":"Into this shared node (montage_grade_nodes), seen by every clip using it"}},
             "required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
@@ -2953,6 +3114,18 @@ void McpServer::Impl::addTools() {
                 (stage == "pre" ? g->pre : g->post).push_back(e);
                 save(l);
                 return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(displayName), stage, QString::fromStdString(g->name)),
+                          QJsonObject{{"effect_id", double(e.id)}});
+            }
+            if (a.contains("composite_node")) {
+                CompositeNode* n = findCompositeNode(c.composite, a.value("composite_node").toInt());
+                if (!n) throw ArgError{"No compositing node with that key on the clip (see montage_composite_graph)"};
+                if (audioClip || findEffectInfo(type) == nullptr || findEffectInfo(type)->category != EffectCategory::VideoFilter)
+                    throw ArgError{"A compositing node takes video effects"};
+                if (n->kind == "merge" || n->kind == "mask" || n->kind == "track")
+                    throw ArgError{"A merge, mask or track node has its settings only (put effects on an effect node after it)"};
+                n->effects.push_back(e);
+                save(l);
+                return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(compositeNodeName(*n))),
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             if (a.contains("node") || a.contains("shared")) {
@@ -11853,7 +12026,10 @@ void McpServer::Impl::addTools() {
                     const QJsonValue bake = av.value("bake");
                     o.avid.bake = bake.isString() ? bake.toString().compare("true", Qt::CaseInsensitive) == 0 || bake.toString() == "1" : bake.toBool(false);
                 }
-                if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
+                // (a copy with each compositing graph's clip rendered beside the export)
+                Project baked = l.project;
+                if (o.picture && !bakeCompositeClips(baked, l.seq().id, out.toStdString(), &err)) return fail(QString::fromStdString(err));
+                if (!exportAaf(baked, *baked.findSequence(l.seq().id), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;
                 for (const std::string& m : r.mediaFiles) files.append(QString::fromStdString(m));
@@ -11869,12 +12045,17 @@ void McpServer::Impl::addTools() {
                               + (o.avid.enabled ? QStringLiteral(" (media in %1)").arg(QString::fromStdString(r.mediaFolder)) : QString()),
                           res);
             }
-            const std::string text = f == "otio" ? exportOtio(l.project, l.seq())
-                                     : f == "xml" ? exportFcp7Xml(l.project, l.seq())
-                                     : f == "fcpxml" ? exportFcpXml(l.project, l.seq())
-                                     : f == "edl" ? exportEdl(l.project, l.seq())
-                                                  : throw ArgError{"format must be edl, otio, xml, fcpxml or aaf"};
+            if (f != "otio" && f != "xml" && f != "fcpxml" && f != "edl") throw ArgError{"format must be edl, otio, xml, fcpxml or aaf"};
             const QString out = absolute(need(a, "output"));
+            // A copy with each compositing graph's clip rendered to a file beside the export.
+            Project baked = l.project;
+            std::string bakeErr;
+            if (!bakeCompositeClips(baked, l.seq().id, out.toStdString(), &bakeErr)) return fail(QString::fromStdString(bakeErr));
+            const Sequence& bs = *baked.findSequence(l.seq().id);
+            const std::string text = f == "otio" ? exportOtio(baked, bs)
+                                     : f == "xml" ? exportFcp7Xml(baked, bs)
+                                     : f == "fcpxml" ? exportFcpXml(baked, bs)
+                                                     : exportEdl(baked, bs);
             QFile file(out);
             if (!file.open(QIODevice::WriteOnly) || file.write(text.data(), qint64(text.size())) != qint64(text.size()))
                 return fail(QStringLiteral("Cannot write %1").arg(out));

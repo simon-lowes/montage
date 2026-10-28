@@ -22,6 +22,10 @@ std::string objectMaskToJsonString(const ObjectMask& m);
 bool clipFromJsonString(const std::string& json, Clip& out);
 // One effect (with its parameters and keyframes) as JSON, as in project files.
 std::string effectToJsonString(const Effect& e);
+// A clip's compositing graph (core/CompositeGraph.h) as JSON text, as a project keeps it (a preset), and back; false
+// when the text is not one.
+std::string compositeGraphToJsonString(const CompositeGraph& g);
+bool compositeGraphFromJsonString(const std::string& json, CompositeGraph& out);
 bool effectFromJsonString(const std::string& json, Effect& out);
 bool projectFromJson(const std::string& json, Project& out, std::string* error = nullptr,
                      const std::string& projectPath = {});

@@ -1,6 +1,7 @@
 #include "InspectorWidget.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
+#include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
 
 #include <QAbstractItemView>
@@ -139,6 +140,7 @@ InspectorWidget::InspectorWidget(EditorState* state, QWidget* parent) : QScrollA
     connect(state_, &EditorState::playheadChanged, this, &InspectorWidget::refreshValues);
     connect(state_, &EditorState::maskObjectChanged, this, &InspectorWidget::refreshValues);
     connect(state_, &EditorState::gradeNodeSelected, this, &InspectorWidget::rebuild);
+    connect(state_, &EditorState::compositeNodeSelected, this, &InspectorWidget::rebuild);
     rebuild();
 }
 
@@ -196,6 +198,15 @@ QString InspectorWidget::signature() const {
             for (const std::string& b : n.blend) sig += QString::fromStdString(b) + ',';
             if (const SharedNode* sn = findSharedNode(*s, n.shared))
                 for (const auto& e : sn->effects) sig += QString(";%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+        }
+    }
+    // Its compositing nodes: rebuild when one is added, removed, picked, renamed or switched, or its effects change.
+    if (!c->composite.empty()) {
+        sig += QString("|K%1").arg(state_->selectedCompositeNode());
+        for (const CompositeNode& n : c->composite.nodes) {
+            sig += QString(":%1%2%3%4/%5").arg(n.key).arg(QString::fromStdString(n.kind)).arg(n.enabled ? "+" : "-")
+                       .arg(QString::fromStdString(n.label)).arg(QString::fromStdString(n.source + n.generator.type));
+            for (const auto& e : n.effects) sig += QString(";%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
         }
     }
     // Its colour groups: rebuild when it joins or leaves one, or a group's effects change.
@@ -675,6 +686,8 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     // ---- Effect stack (in colour nodes, when the clip has them) -------------------------
     if (kind == TrackKind::Video && !clip.grade.empty()) buildGradeNodes(clip, localTime);
     else buildEffectStack(clipId, kind, clip.effects, localTime);
+    // ---- Its compositing node graph's picked node -----------------------------------------
+    if (kind == TrackKind::Video && !clip.composite.empty()) buildCompositeNode(clip, localTime);
     // ---- Its colour group's grades, before and after its own (core/ColorGroups.h) --------
     const Sequence* seqNow = state_->sequence();
     // (a scene group's around its angle group's, as they run; copies: building can change the project)
@@ -784,6 +797,52 @@ void InspectorWidget::buildGradeNodes(const Clip& clip, const std::function<Fram
         addSection(tr("Outside the Nodes"));
         buildEffectStack(clipId, TrackKind::Video, effects, localTime, 0);
     }
+}
+
+void InspectorWidget::buildCompositeNode(const Clip& clip, const std::function<FrameTime()>& localTime) {
+    const int picked = state_->selectedCompositeNode();
+    const CompositeNode* found = findCompositeNode(clip.composite, picked);
+    auto note = [this](QFormLayout* f, const QString& text, const char* name) {
+        auto* l = new QLabel(text, content_);
+        l->setObjectName(QString::fromLatin1(name));
+        l->setWordWrap(true);
+        l->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+        f->addRow(l);
+    };
+    if (!found) {
+        QFormLayout* f = addSection(tr("Composite"));
+        note(f, tr("%n compositing node(s) make this clip's picture. Pick one in the Composite panel to see its settings.", "",
+                   int(clip.composite.nodes.size())),
+             "compositeNote");
+        return;
+    }
+    const CompositeNode n = *found;  // a copy: building can change the project
+    QFormLayout* f = addSection(tr("Composite: %1").arg(QString::fromStdString(compositeNodeName(n))));
+    if (!n.enabled) note(f, tr("Switched off: it passes its first input on unchanged."), "compositeNodeOff");
+    if (n.kind == "grade" && !n.grade.empty())
+        note(f, tr("Grades in its %n colour node(s), as copied from a clip.", "", int(n.grade.nodes.size())), "compositeGradeNote");
+    if (n.kind == "input" && n.source == "generator") {
+        // The generator's own settings (the title's text, the model's file...).
+        if (const EffectInfo* info = findEffectInfo(n.generator.type)) {
+            Target t;
+            const Id owner = n.id, effectId = n.generator.id;
+            t.resolve = [owner, effectId](Sequence& s) -> Effect* { return edit::ownedEffect(s, owner, effectId); };
+            t.time = localTime;
+            t.origin = [this, owner]() -> FrameTime {
+                FrameTime origin = 0;
+                if (const Sequence* s = state_->sequence()) edit::effectChain(const_cast<Sequence&>(*s), owner, &origin);
+                return origin;
+            };
+            t.key = QString("p%1:%2").arg(owner).arg(effectId);
+            t.owner = owner;
+            t.effect = effectId;
+            QFormLayout* g = addSection(QString::fromStdString(info->displayName));
+            addParamRows(g, *info, t);
+        }
+    }
+    // Its settings and effects (a merge, mask or track node keeps only its settings).
+    const bool more = n.kind != "merge" && n.kind != "mask" && n.kind != "track";
+    buildEffectStack(n.id, TrackKind::Video, n.effects, localTime, -1, more);
 }
 
 void InspectorWidget::buildChain(Id owner) {

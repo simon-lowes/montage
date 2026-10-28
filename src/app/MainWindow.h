@@ -63,6 +63,7 @@ class MediaBinWidget;
 class RenderQueue;
 class EffectsBrowser;
 class InspectorWidget;
+class CompositeNodePanel;
 class GradeNodePanel;
 class GalleryPanel;
 class ClipStripPanel;
@@ -696,6 +697,8 @@ private:
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* nodesDock_ = nullptr;
     GradeNodePanel* gradeNodes_ = nullptr;
+    CompositeNodePanel* compositeNodes_ = nullptr;
+    QDockWidget* compositeDock_ = nullptr;
     QDockWidget* galleryDock_ = nullptr;
     GalleryPanel* gallery_ = nullptr;
     QDockWidget* clipsDock_ = nullptr;

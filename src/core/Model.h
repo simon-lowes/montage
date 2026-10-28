@@ -327,6 +327,40 @@ struct GradeGraph {
     bool empty() const { return nodes.empty(); }
     bool operator==(const GradeGraph&) const = default;
 };
+// A clip's compositing node graph (core/CompositeGraph.h): pictures brought in, joined
+// by merges and changed by transforms, masks, keys, trackers, effects and grades, its output the clip's picture.
+struct CompositeNode {
+    int key = 0;                   // 1, 2, 3...: unique in the clip, what links name
+    Id id = 0;                     // the owner of its effects (edit::effectChain): unique in the project
+    std::string kind = "input";    // "input", "merge", "transform", "mask", "key", "track", "effect" or "grade"
+    std::string label;
+    bool enabled = true;           // off: it passes its first input on (an input: nothing)
+    double x = 0, y = 0;           // where the node editor shows it
+    // An input's picture: "clip" (the clip as its track shows it), "media" (a bin item, placed as a new clip would be),
+    // "track" (what a video track shows at the time) or "generator" (a title, a 3D model or splats, a colour...).
+    std::string source = "clip";
+    Id media = 0;
+    int track = -1;                // a track input's video track (0 = V1)
+    double offset = 0;             // a media input's frame (sequence frames into it) at the clip's first frame
+    Effect generator;              // a generator input's
+    std::string blend = "normal";  // a merge's blend mode for its inputs after the first, or "depth" (by depth)
+    Id follow = 0;                 // a track node's clip, whose transform or Corner Pin it follows
+    std::vector<Effect> effects;   // its settings and effects (core/CompositeGraph.h says which for each kind)
+    GradeGraph grade;              // a grade node's colour nodes over its effects (Effect::node)
+    bool operator==(const CompositeNode&) const = default;
+};
+struct CompositeLink {
+    int from = 0;   // the node it comes from
+    int to = 0;     // the node it goes to (0: the graph's output)
+    int input = 0;  // which of its inputs (a merge's 0 is the background, then each layer over it in order)
+    bool operator==(const CompositeLink&) const = default;
+};
+struct CompositeGraph {
+    std::vector<CompositeNode> nodes;
+    std::vector<CompositeLink> links;
+    bool empty() const { return nodes.empty(); }
+    bool operator==(const CompositeGraph&) const = default;
+};
 // A trim pass's deliverable (render/TrimPasses.h): a display the master is mapped to, its space and peak, each shot
 // trimmed for it (Clip::trims).
 struct TrimTarget {
@@ -430,6 +464,7 @@ struct Clip {
     int gradeVersion = 0;
     Id colorGroup = 0;  // the colour group it is graded with (Sequence::colorGroups), 0 = none
     GradeGraph grade;   // its node graph (core/GradeGraph.h); empty: its effects run as a stack
+    CompositeGraph composite;  // its compositing graph (core/CompositeGraph.h); empty: its picture as it comes
     // A graphic's own settings (core/GraphicsTemplate.h): values for the fields published by the sequence it plays,
     // by field id, as text ("#rrggbb", "1"); a field without one shows the template's own setting.
     std::map<std::string, std::string> fields;
