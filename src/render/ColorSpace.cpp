@@ -805,6 +805,7 @@ void bt2446c(const double in[3], double out[3], bool down) {
 }
 
 // A pixel between SDR and HDR by `t` (one of the BT.2446 methods): code values in `from` to code values in `to`.
+// `hdrPeakNits`: the HDR side's peak (a PQ source's master; HLG's is 1000).
 void convertBt2446(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits, ToneMapping t) {
     double c[3], in[3], out[3], m[9];
     displayLight(from, rgb, c);  // (relative to SDR white, or HDR reference white)
@@ -812,6 +813,15 @@ void convertBt2446(float rgb[3], const ColorSpace& from, const ColorSpace& to, d
     const double scale = from.hdr() ? kSdrWhiteNits : 100;
     for (int r = 0; r < 3; ++r) in[r] = std::max(0.0, (m[r * 3] * c[0] + m[r * 3 + 1] * c[1] + m[r * 3 + 2] * c[2]) * scale);
     if (from.hdr()) {
+        // A master brighter than the method takes (A: 1000 cd/m²; C: what it brings to SDR white) is rolled off to
+        // it first, as BT.2390's EETF does on the brightest channel (all three scaled alike), rather than clipped.
+        const double peak = from.transfer == Transfer::Hlg ? kHlgPeak : std::clamp(hdrPeakNits, 100.0, 10000.0);
+        const double top = toneMappingWhiteNits(t), mx = std::max({in[0], in[1], in[2]});
+        if (peak > top && mx > 0) {
+            const double pqPeak = nitsToPq(peak), e = std::min(nitsToPq(mx) / pqPeak, 1.0);
+            const double rolled = std::min(pqToNits(bt2390Eetf(e, nitsToPq(top) / pqPeak) * pqPeak), top);
+            for (double& v : in) v *= rolled / mx;
+        }
         if (t == ToneMapping::Bt2446A) bt2446aDown(in, out);
         else bt2446c(in, out, true);
     } else {
@@ -991,6 +1001,13 @@ void primariesToXyz(Primaries p, double m[9]) {
     double adapt[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     if (std::fabs(c.wx - 0.3127) > 1e-6 || std::fabs(c.wy - 0.3290) > 1e-6) bradford(c.wx, c.wy, 0.3127, 0.3290, adapt);
     mul3(adapt, toXyz, m);
+}
+
+double bt2390Eetf(double e, double maxLum) {
+    const double ks = std::max(0.0, 1.5 * maxLum - 0.5);
+    if (e < ks) return e;
+    const double t = (e - ks) / (1 - ks), t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * ks + (t3 - 2 * t2 + t) * (1 - ks) + (-2 * t3 + 3 * t2) * maxLum;
 }
 
 double codeToNits(const ColorSpace& space, double code) {

@@ -13412,7 +13412,7 @@ const auto seq = [this] { return state()->sequence(); };
         auto lastSpace = [&spy] { return spy.isEmpty() ? QString() : spy.last().at(2).toString(); };
         read->setCurrentIndex(1);
         QVERIFY(scopes->readsWorking());
-        QTRY_COMPARE(lastSpace(), QString("acescct"));
+        QTRY_COMPARE_WITH_TIMEOUT(lastSpace(), QString("acescct"), 20000);  // (a render, slow under load)
         // 0.5 graphics grey comes in through the inverse output transform: the ACEScct code value that shows as it.
         float grey[3] = {0.5f, 0.5f, 0.5f};
         inverseOutputPixel(grey, rec709Space(), *findColorSpace("acescct"), 1000, OutputTransformKind::Filmic);
@@ -13421,7 +13421,7 @@ const auto seq = [this] { return state()->sequence(); };
         const QColor px = working.pixelColor(working.width() / 2, working.height() / 2);
         QVERIFY2(std::fabs(px.redF() - grey[0]) < 0.02, qPrintable(QString("%1 vs %2").arg(px.redF()).arg(grey[0])));
         read->setCurrentIndex(0);
-        QTRY_COMPARE(lastSpace(), QString("rec709"));
+        QTRY_COMPARE_WITH_TIMEOUT(lastSpace(), QString("rec709"), 20000);
         state()->newProject();
     }
 

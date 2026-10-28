@@ -293,13 +293,25 @@ bool coalesceTrim(Param& lane, double& still, Param& trim) {
     const bool exact = straight(lane) && straight(trim);
     for (const Param* p : {&lane, &trim})
         for (const Keyframe& k : p->keys) times.insert(k.t);
-    if (!exact) {
-        const FrameTime a = *times.begin(), b = *times.rbegin();
-        for (FrameTime t = a; t <= b; ++t) times.insert(t);
-    }
+    const std::vector<FrameTime> at(times.begin(), times.end());
+    auto key = [&](FrameTime t) { return Keyframe{t, base(t) + trim.at(t)}; };
     std::vector<Keyframe> keys;
-    for (FrameTime t : times) keys.push_back({t, base(t) + trim.at(t)});
-    if (!exact) thinKeys(keys, 1e-4);
+    for (size_t i = 0; i < at.size(); ++i) {
+        keys.push_back(key(at[i]));
+        if (exact || i + 1 == at.size() || at[i + 1] - at[i] < 2) continue;
+        // Between two points both curves are smooth (or held): up to 64 points along it, the frame before the next
+        // point among them (so a held value still steps there), thinned on their own (a long pass with eased points
+        // costs no more than its points).
+        const FrameTime span = at[i + 1] - at[i];
+        const int n = int(std::min<FrameTime>(span - 1, 63));
+        std::vector<Keyframe> seg{keys.back()};
+        if (span > 2) seg.push_back(key(at[i] + 1));  // (a point part way into its frame takes effect by the next)
+        for (int j = 2; j < n; ++j) seg.push_back(key(at[i] + FrameTime(double(span) * j / n)));
+        seg.push_back(key(at[i + 1] - 1));
+        seg.push_back(key(at[i + 1]));
+        thinKeys(seg, 1e-4);
+        keys.insert(keys.end(), seg.begin() + 1, seg.end() - 1);
+    }
     lane.keys = std::move(keys);
     trim = Param();
     return true;

@@ -137,7 +137,14 @@ std::vector<FrameTime> exampleFrames(const Sequence& s, const Clip& c, FrameTime
                     for (const Keyframe& k : param.keys)
                         if (c.contains(c.start + k.t)) frames.insert(c.start + k.t);
     if (frames.empty() && c.contains(playhead)) frames.insert(playhead);
-    return {frames.begin(), frames.end()};
+    // At most 128, spread evenly over those marked (as many as a gigabyte holds at the smallest each is cut to:
+    // learningPixelsEach).
+    constexpr size_t kMost = 128;
+    const std::vector<FrameTime> all(frames.begin(), frames.end());
+    if (all.size() <= kMost) return all;
+    std::vector<FrameTime> some;
+    for (size_t k = 0; k < kMost; ++k) some.push_back(all[k * (all.size() - 1) / (kMost - 1)]);
+    return some;
 }
 
 std::string learnedNetworkOf(const Clip& c) {

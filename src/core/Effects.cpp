@@ -1233,8 +1233,18 @@ std::vector<EffectInfo> buildCatalog() {
                          pct("ground_strength", "Ground Shadow Strength", 0, 100, 80),
                          boolean("depth_merge", "Hide Behind Nearer Things (Merge by Depth)", false),
                          pct("opacity", "Opacity", 0, 100, 100),
+                         boolean("frames", "Play Numbered Splat Files One a Frame", true),
+                         num("frames_fps", "Splat Files a Second (0: the sequence's rate)", 0, 1000, 0, 0.01),
+                         boolean("crop", "Crop the Splats to a Box", false),
+                         num("crop_x0", "Crop Box Left (X, the file's units)", -100000, 100000, -10, 0.01),
+                         num("crop_x1", "Crop Box Right (X)", -100000, 100000, 10, 0.01),
+                         num("crop_y0", "Crop Box Bottom (Y)", -100000, 100000, -10, 0.01),
+                         num("crop_y1", "Crop Box Top (Y)", -100000, 100000, 10, 0.01),
+                         num("crop_z0", "Crop Box Back (Z)", -100000, 100000, -10, 0.01),
+                         num("crop_z1", "Crop Box Front (Z)", -100000, 100000, 10, 0.01),
                      },
-                     {str("file", "Model (glTF, GLB, OBJ, USD)", StringKind::File)}});
+                     {str("file", "Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ)", StringKind::File),
+                      str("camera_file", "Take The File's Camera From (USD, glTF; else the model)", StringKind::File)}});
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
         for (const TitleTemplate& tpl : titleTemplates()) {
             EffectInfo t = title;

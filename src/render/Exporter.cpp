@@ -53,6 +53,7 @@
 #include "render/DialogueLoudness.h"
 #include "render/LoudnessReport.h"
 #include "media/SuperScale.h"
+#include "media/ThreadScheduling.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1072,7 +1073,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->global_quality = FF_QP2LAMBDA * 3;
         }
         if (spatial) o.vctx->pix_fmt = AV_PIX_FMT_YUV420P;  // (x265's multiview encoder is 8-bit 4:2:0)
-        rc = avcodec_open2(o.vctx, codec, &opts);
+        {
+            const KeepThreadScheduling keep;  // (SVT-AV1 would leave this thread real-time, and the workers it starts later)
+            rc = avcodec_open2(o.vctx, codec, &opts);
+        }
         av_dict_free(&opts);
         if (rc < 0) return fail("Cannot open video encoder: " + averr(rc));
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);

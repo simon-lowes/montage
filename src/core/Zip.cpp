@@ -230,10 +230,11 @@ bool ZipReader::open(std::string bytes) {
         // Zip64: the locator just before points at the Zip64 end record.
         if (eocd < 20 || le32(b, eocd - 20) != 0x07064b50) return false;
         const uint64_t at = le64(b, eocd - 20 + 8);
-        if (at + 56 > b.size() || le32(b, size_t(at)) != 0x06064b50) return false;
+        if (at > b.size() || b.size() - at < 56 || le32(b, size_t(at)) != 0x06064b50) return false;  // (64-bit: no wrap)
         count = le64(b, size_t(at) + 32);
         cdOffset = le64(b, size_t(at) + 48);
     }
+    if (cdOffset > b.size()) return false;
     size_t p = size_t(cdOffset);
     for (uint64_t n = 0; n < count; ++n) {
         if (p + 46 > b.size() || le32(b, p) != 0x02014b50) return false;
@@ -281,13 +282,16 @@ bool ZipReader::read(const std::string& name, std::string& out, std::string* err
 bool ZipReader::read(const Entry& e, std::string& out, std::string* error) const {
     out.clear();
     const std::string& b = bytes_;
-    const size_t h = size_t(e.headerOffset);
-    if (h + 30 > b.size() || le32(b, h) != 0x04034b50) {
+    // (Zip64 offsets and sizes are 64-bit numbers from the file: compared by what is left, so none can wrap.)
+    if (b.size() < 30 || e.headerOffset > b.size() - 30 || le32(b, size_t(e.headerOffset)) != 0x04034b50) {
         if (error) *error = e.name + ": bad local header";
         return false;
     }
+    const size_t h = size_t(e.headerOffset);
     const size_t data = h + 30 + le16(b, h + 26) + le16(b, h + 28);
-    if (data + e.compressedSize > b.size()) {
+    // Deflate makes at most 1032 bytes of each byte it keeps (a stored entry is its own size).
+    const bool sizeFits = e.method == 0 ? e.size == e.compressedSize : e.size / 1032 <= e.compressedSize + 1;
+    if (data > b.size() || e.compressedSize > b.size() - data || !sizeFits) {
         if (error) *error = e.name + ": truncated";
         return false;
     }
@@ -311,7 +315,7 @@ bool ZipReader::read(const Entry& e, std::string& out, std::string* error) const
     return true;
 }
 
-bool gunzip(const std::string& gz, std::string& out, std::string* error) {
+bool gunzip(const std::string& gz, std::string& out, std::string* error, size_t limit) {
     out.clear();
     auto fail = [&](const char* why) {
         if (error) *error = why;
@@ -331,7 +335,7 @@ bool gunzip(const std::string& gz, std::string& out, std::string* error) {
     if (p + 8 > gz.size()) return fail("The gzip file is truncated");
     const size_t trailer = gz.size() - 8;
     const uint32_t size = le32(gz, trailer + 4);
-    if (!inflateRaw(reinterpret_cast<const uint8_t*>(gz.data() + p), trailer - p, out, size)) return fail("The gzip file is corrupt");
+    if (!inflateRaw(reinterpret_cast<const uint8_t*>(gz.data() + p), trailer - p, out, size, limit)) return fail("The gzip file is corrupt or too large");
     if (uint32_t(out.size()) != size || crc32(out.data(), out.size()) != le32(gz, trailer)) return fail("The gzip file fails its checksum");
     return true;
 }

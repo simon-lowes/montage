@@ -25,14 +25,6 @@ double targetPeak(const ColorSpace& space, double peakNits) {
     return space.transfer == Transfer::Pq ? std::clamp(peakNits, 100.0, 10000.0) : space.transfer == Transfer::Hlg ? 1000 : 100;
 }
 
-// BT.2390's EETF on PQ code values normalised to the source's peak.
-double eetf(double e, double maxLum) {
-    const double ks = std::max(0.0, 1.5 * maxLum - 0.5);
-    if (e < ks) return e;
-    const double t = (e - ks) / (1 - ks), t2 = t * t, t3 = t2 * t;
-    return (2 * t3 - 3 * t2 + 1) * ks + (t3 - 2 * t2 + t) * (1 - ks) + (-2 * t3 + 3 * t2) * maxLum;
-}
-
 // Mid-tone detail: luma less a wide blur of it, at about 1/64 of the width.
 std::vector<float> lumaDetail(const Image& img, const double w[3]) {
     const int W = img.width, H = img.height;
@@ -177,7 +169,7 @@ void rollOffPq(Image& img, double fromNits, double toNits) {
     std::vector<float> gain(kN + 1);
     for (int i = 0; i <= kN; ++i) {
         const double code = double(i) / kN, e = std::min(code / top, 1.0);
-        const double in = codeToNits(pq, code), out = codeToNits(pq, eetf(e, maxLum) * top);
+        const double in = codeToNits(pq, code), out = codeToNits(pq, bt2390Eetf(e, maxLum) * top);
         gain[size_t(i)] = float(in > 1e-6 ? out / in : 1);
     }
     parallelRows(img.height, [&](int y0, int y1) {
@@ -236,7 +228,7 @@ void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Ef
             const ColorSpace rolled{"trim-pq-" + to->id, "", to->primaries, Transfer::Pq, false};
             convertColor(img, from, rolled, master);
             if (const double headroom = sdrHeadroomNits(*to); fromPeak > headroom) rollOffPq(img, fromPeak, headroom);
-            convertColor(img, rolled, *to, master);
+            convertColor(img, rolled, *to, sdrHeadroomNits(*to));  // (rolled off already: no more)
         } else if (to->transfer == Transfer::Pq && from.hdr() && (fromPeak > peak || master > peak)) {
             // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
             convertColor(img, from, *to, master);
