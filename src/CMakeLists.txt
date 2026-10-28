@@ -85,7 +85,7 @@ add_library(montage_engine STATIC
   media/Decoder.h media/Decoder.cpp
   media/DeepImage.h media/DeepImage.cpp
   media/Model3D.h media/Model3D.cpp
-  media/Usd.h media/Usd.cpp media/UsdModel.cpp
+  media/Usd.h media/Usd.cpp media/UsdModel.cpp media/Splats.h media/Splats.cpp
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
@@ -183,6 +183,7 @@ add_library(montage_engine STATIC
   render/Titles.h render/Titles.cpp
   render/ModelRender.h render/ModelRender.cpp
   render/ModelClip.h render/ModelClip.cpp
+  render/SplatRender.h render/SplatRender.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
   render/AvidMedia.h render/AvidMedia.cpp
@@ -556,8 +557,10 @@ endif()
 if(MONTAGE_WITH_OPENEXR)
   target_link_libraries(montage_engine PRIVATE OpenEXR::OpenEXR)
   # OpenJPH's own API (HTJ2K codestreams for IMF), compiled into OpenEXRCore.
+  # And zstd's (SPZ splat files), compiled into OpenEXRCore too.
   target_include_directories(montage_engine PRIVATE ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/common
-                                                    ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph)
+                                                    ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph
+                                                    ${openexr_SOURCE_DIR}/external/zstd/lib)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
 endif()
 if(MONTAGE_WITH_OMT)

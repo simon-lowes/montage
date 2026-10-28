@@ -311,7 +311,7 @@ bool ZipReader::read(const Entry& e, std::string& out, std::string* error) const
     return true;
 }
 
-bool gunzip(const std::string& gz, std::string& out, std::string* error) {
+bool gunzip(const std::string& gz, std::string& out, std::string* error, size_t limit) {
     out.clear();
     auto fail = [&](const char* why) {
         if (error) *error = why;
@@ -331,7 +331,7 @@ bool gunzip(const std::string& gz, std::string& out, std::string* error) {
     if (p + 8 > gz.size()) return fail("The gzip file is truncated");
     const size_t trailer = gz.size() - 8;
     const uint32_t size = le32(gz, trailer + 4);
-    if (!inflateRaw(reinterpret_cast<const uint8_t*>(gz.data() + p), trailer - p, out, size)) return fail("The gzip file is corrupt");
+    if (!inflateRaw(reinterpret_cast<const uint8_t*>(gz.data() + p), trailer - p, out, size, limit)) return fail("The gzip file is corrupt or too large");
     if (uint32_t(out.size()) != size || crc32(out.data(), out.size()) != le32(gz, trailer)) return fail("The gzip file fails its checksum");
     return true;
 }

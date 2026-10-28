@@ -17,8 +17,9 @@ bool inflateRaw(const uint8_t* data, size_t size, std::string& out, size_t expec
 
 uint32_t crc32(const void* data, size_t size, uint32_t crc = 0);
 
-// A gzip file's contents (RFC 1952, one member), checked against its CRC-32 and length.
-bool gunzip(const std::string& gz, std::string& out, std::string* error = nullptr);
+// A gzip file's contents (RFC 1952, one member), checked against its CRC-32 and length; `limit` (0: none) is the most
+// it may make.
+bool gunzip(const std::string& gz, std::string& out, std::string* error = nullptr, size_t limit = 0);
 
 // The regular files in a tar archive (POSIX ustar, with GNU long names): each name without a leading "./", and
 // where its bytes are in `tar`. Empty if it is not a tar archive.

@@ -163,6 +163,7 @@
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
 #include "media/Model3D.h"
+#include "media/Splats.h"
 #include "media/Usd.h"
 #include "render/OGraf.h"
 #include "render/Gallery.h"
@@ -2385,21 +2386,25 @@ void McpServer::Impl::addTools() {
     add("montage_add_model", "Add a 3D model",
         "Add a 3D model (glTF 2.0 .gltf or .glb, OBJ with its MTL, or a USD scene .usd/.usda/.usdc/.usdz) to the picture, "
         "lit, shaded (metallic-roughness, its textures), casting shadows onto the ground and playing one of its "
-        "animations. With camera (a number, 1 for the file's first) it is seen through a camera in the file, everything "
-        "where the file puts it and lit by the file's own lights (and its dome light) when it has some; a USD file with "
-        "a camera is seen through it unless camera is 0. Otherwise, without over it is seen through its own camera in "
+        "animations; or Gaussian splats, a captured 3D scene (.ply as the training tools write it, or .spz; a numbered "
+        "run of files, scene_0001.ply on, plays a file a frame), lit by its own colours and cropped by the crop_* "
+        "settings (a box in the file's units, with crop 1). With camera (a number, 1 for the file's first) it is seen "
+        "through a camera in the file, or in camera_file (a USD or glTF file) when given, everything where the file puts "
+        "it and a model lit by the file's own lights (and its dome light) when it has some; a USD file with a camera, or "
+        "a camera_file, is seen through it unless camera is 0. Otherwise, without over it is seen through its own camera in "
         "front of the frame (size in pixels, positions in pixels from the centre, y up). With over (a "
         "video clip whose camera montage_camera_track solved), it stands in that shot: placed at place {x, y} (fractions "
         "of the picture, on the solved ground) or at position [x, y, z] in the scene's units (the ground at y = 0), at "
         "its own size times scale (%), on the track above the footage for the footage's length. settings sets any of "
         "its settings by name (montage_list_effects with kind generator lists model3d's; colours as name.r / .g / .b), "
         "e.g. {\"light_angle\": 30, \"env_track\": 3, \"depth_merge\": 1}. Returns the clip with the model's "
-        "animations, cameras, lights, triangle count and what in the file is not read (notes).",
+        "animations, cameras, lights, triangle count and what in the file is not read (notes); for splats their count, "
+        "the number of files in their run (frames) and the degree of their colours' harmonics.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
             "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
-            "camera":{"type":"integer","minimum":0},
+            "camera":{"type":"integer","minimum":0},"camera_file":{"type":"string"},
             "settings":{"type":"object","additionalProperties":{"type":"number"}}},
             "required":["project","file"]})json",
         false, [](const QJsonObject& a) {
@@ -2408,25 +2413,39 @@ void McpServer::Impl::addTools() {
             const QFileInfo fi(absolute(need(a, "file")));
             if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(need(a, "file"))};
             std::string err;
-            const std::shared_ptr<const Model> model = cachedModel(fi.absoluteFilePath().toStdString(), &err);
-            if (!model) return fail(QString::fromStdString(err));
+            const std::string path = fi.absoluteFilePath().toStdString();
+            const bool splats = isSplatFile(path);
+            const std::shared_ptr<const SplatCloud> cloud = splats ? cachedSplats(path, &err) : nullptr;
+            const std::shared_ptr<const Model> model = splats ? nullptr : cachedModel(path, &err);
+            if (!cloud && !model) return fail(QString::fromStdString(err));
             Clip c = makeGeneratorClip(l.project, "model3d", 1);
-            c.generator.strings["file"] = fi.absoluteFilePath().toStdString();
+            c.generator.strings["file"] = path;
+            // The file the camera is in: camera_file, else the model's own.
+            std::shared_ptr<const Model> cameras = model;
+            if (a.contains("camera_file")) {
+                const QFileInfo cf(absolute(str(a, "camera_file")));
+                if (!cf.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(str(a, "camera_file"))};
+                cameras = cachedModel(cf.absoluteFilePath().toStdString(), &err);
+                if (!cameras) return fail(QString::fromStdString(err));
+                c.generator.strings["camera_file"] = cf.absoluteFilePath().toStdString();
+            }
             c.name = fi.completeBaseName().toStdString();
             TrackRef t{TrackKind::Video, 0};
             FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
             FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
             const Clip* footage = nullptr;
             if (a.contains("camera") && !a.value("camera").isDouble()) throw ArgError{"\"camera\" is a number (1: the file's first)"};
+            const bool cameraFile = a.contains("camera_file");
             const int fileCamera = a.contains("camera") ? a.value("camera").toInt()
-                                   : !a.contains("over") && usd::isUsdPath(fi.absoluteFilePath().toStdString()) && !model->cameras.empty() ? 1 : 0;
+                                   : !a.contains("over") && cameras && !cameras->cameras.empty() && (cameraFile || usd::isUsdPath(path)) ? 1 : 0;
             if (fileCamera > 0 && a.contains("over")) throw ArgError{"Give \"camera\" or \"over\", not both"};
-            if (fileCamera > int(model->cameras.size()))
-                return fail(model->cameras.empty() ? QStringLiteral("The file has no camera") : QStringLiteral("The file has %1 cameras").arg(model->cameras.size()));
+            if (fileCamera > 0 && !cameras) return fail("Splats have no camera of their own: give camera_file, a USD or glTF file with one");
+            if (fileCamera > 0 && fileCamera > int(cameras->cameras.size()))
+                return fail(cameras->cameras.empty() ? QStringLiteral("The file has no camera") : QStringLiteral("The file has %1 cameras").arg(cameras->cameras.size()));
             if (fileCamera > 0) {
                 c.generator.params["camera"] = Param(2.0);
                 c.generator.params["camera_index"] = Param(double(fileCamera));
-                if (!model->lights.empty()) c.generator.params["light_kind"] = Param(3.0), c.generator.params["ambient"] = Param(0.0);
+                if (model && !cameraFile && !model->lights.empty()) c.generator.params["light_kind"] = Param(3.0), c.generator.params["ambient"] = Param(0.0);
             }
             if (a.contains("over")) {
                 QJsonObject o;
@@ -2485,6 +2504,17 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
             QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            if (cloud) {
+                int frames = 1;
+                splatFrameFile(path, 0, 1, false, &frames);
+                out["splats"] = double(cloud->count);
+                out["frames"] = frames;
+                out["sh_degree"] = cloud->shDegree;
+                QJsonArray notes;
+                for (const std::string& n : cloud->notes) notes.append(QString::fromStdString(n));
+                if (!notes.isEmpty()) out["notes"] = notes;
+                return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
+            }
             QJsonArray anims;
             for (const ModelAnimation& an : model->animations) anims.append(QString::fromStdString(an.name));
             out["animations"] = anims;

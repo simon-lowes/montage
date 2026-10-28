@@ -193,92 +193,56 @@ void addFileLights(const std::shared_ptr<const Model>& model, const ModelPose& p
     }
 }
 
-}  // namespace
-
-int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
-    const int v = int(std::lround(c.generator.p("camera_track", t - c.start, 0)));
-    if (v > 0) return v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
-    for (int k = int(track) - 1; k >= 0; --k)
-        if (const Clip* f = clipOn(seq.videoTracks[size_t(k)], t); f && parsedSolve(*f)) return k;
-    return -1;
+// How much a model or splat clip scales its file: 1 seen through a file's camera, its scale (%) in a solved scene,
+// else its size (pixels) across its largest extent.
+double clipScale(const Effect& g, FrameTime lt, long mode, const std::array<double, 3>& lo, const std::array<double, 3>& hi) {
+    if (mode == 2) return 1;
+    if (mode == 1) return g.p("scale", lt, 100) / 100;
+    return g.p("size", lt, 400) / std::max({1e-9, hi[1] - lo[1], hi[0] - lo[0], hi[2] - lo[2]});
 }
 
-int modelLightTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
-    const int v = int(std::lround(c.generator.p("env_track", t - c.start, 0)));
-    return v > 0 && v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
+// Where it puts its file in the world: centred on the bounds (standing on their bottom in a solved scene when asked),
+// scaled by k, turned and moved; where the file has it when seen through a file's camera.
+Mat4 clipPlace(const Effect& g, FrameTime lt, long mode, double k, const std::array<double, 3>& lo, const std::array<double, 3>& hi) {
+    if (mode == 2) return identity4();
+    auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
+    const bool stand = mode == 1 && P("stand", 1) > 0.5;
+    const Mat4 centre = trsMatrix({-k * (lo[0] + hi[0]) / 2, -k * (stand ? lo[1] : (lo[1] + hi[1]) / 2), -k * (lo[2] + hi[2]) / 2}, {0, 0, 0, 1}, {k, k, k});
+    return trsMatrix({P("pos_x", 0), P("pos_y", 0), P("pos_z", 0)}, {0, 0, 0, 1}, {1, 1, 1}) * turned(P("rot_x", 0), P("rot_y", 0), P("rot_z", 0)) * centre;
 }
 
-bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
-                    const std::function<Image(int track)>& trackLayer, ModelScene& scene, ModelCamera& cam,
-                    std::shared_ptr<const Model>& model, std::string* error) {
+// Camera `camera_index` (1-based) of `model` posed by `pose` at `sec`, on the sequence's picture scaled by `scale`.
+bool fileCameraOf(const Model& model, const ModelPose& pose, double sec, const std::string& file, const Effect& g, FrameTime lt,
+                  const Sequence& seq, double scale, ModelCamera& cam, std::string* error) {
+    const int index = int(std::lround(g.p("camera_index", lt, 1))) - 1;
+    std::array<double, 3> at;
+    std::array<std::array<double, 3>, 3> axes;
+    if (index < 0 || size_t(index) >= model.cameras.size() || !modelCameraPlace(pose, model.cameras[size_t(index)], at, axes)) {
+        if (error) *error = model.cameras.empty() ? file + " has no camera" : file + " has no camera " + std::to_string(index + 1);
+        return false;
+    }
+    const ModelCameraInfo& fc = model.cameras[size_t(index)];
+    // Rows: right, down and ahead.
+    cam.R = {axes[0][0], axes[0][1], axes[0][2], -axes[1][0], -axes[1][1], -axes[1][2], -axes[2][0], -axes[2][1], -axes[2][2]};
+    cam.C = at;
+    double f, cx, cy;
+    modelCameraLens(fc, sec, seq.width, seq.height, f, cx, cy);
+    cam.screen = {f * scale, 0, cx * scale, 0, f * scale, cy * scale};
+    cam.nearZ = std::max(1e-6, fc.nearClip);
+    return true;
+}
+
+// The camera a model or splat clip is seen through at t: its own in front of the frame (mode 0), the one the 3D Camera
+// Tracker solved (1; `onGround`: whether that scene has a ground, at y = 0), or one in the file named for the camera
+// (2), moving as that file's first animation moves it.
+bool clipCamera(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double scale, int ti, long mode,
+                ModelCamera& cam, double& groundY, bool& onGround, std::string* error) {
     const Effect& g = c.generator;
     const FrameTime lt = t - c.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
-    const std::string file = g.s("file");
-    if (file.empty()) {
-        if (error) *error = "Choose a model file (glTF, GLB, OBJ or USD)";
-        return false;
-    }
-    model = cachedModel(file, error);
-    if (!model) return false;
-    const int ti = trackOf(seq, c);
-    const double fps = seq.fpsValue();
-
-    // Its pose: the animation chosen (1-based; 0 none) at the clip's time, its speed and offset, looped.
-    const int animation = int(std::lround(P("animation", 1))) - 1;
-    double sec = lt / fps * P("anim_speed", 100) / 100 + P("anim_offset", 0);
-    if (animation >= 0 && size_t(animation) < model->animations.size()) {
-        const double d = model->animations[size_t(animation)].duration;
-        if (P("loop", 1) > 0.5 && d > 0) sec = sec - d * std::floor(sec / d);
-    }
-    const PosedTriangles rest = posedTriangles(*model, poseModel(*model, -1, 0));
-    std::array<double, 3> lo, hi;
-    if (!modelBounds(rest, lo, hi)) {
-        if (error) *error = file + " has nothing to draw";
-        return false;
-    }
-    const ModelPose pose = poseModel(*model, animation, sec);
-    PosedTriangles posed = posedTriangles(*model, pose);
-
-    // Into the world: centred on its rest bounds (standing on their bottom when asked), sized, turned and moved; seen
-    // through its own file's camera, left where the file has it.
-    const long mode = std::lround(P("camera", 0));
     const bool solved = mode == 1, fileCamera = mode == 2;
-    const bool stand = solved && P("stand", 1) > 0.5;
-    const double modelHeight = std::max(1e-9, hi[1] - lo[1]);
-    const double k = fileCamera ? 1 : solved ? P("scale", 100) / 100 : P("size", 400) / std::max({modelHeight, hi[0] - lo[0], hi[2] - lo[2]});
-    const Mat4 centre = trsMatrix({-k * (lo[0] + hi[0]) / 2, -k * (stand ? lo[1] : (lo[1] + hi[1]) / 2), -k * (lo[2] + hi[2]) / 2}, {0, 0, 0, 1}, {k, k, k});
-    const Mat4 place = fileCamera ? identity4()
-                                  : trsMatrix({P("pos_x", 0), P("pos_y", 0), P("pos_z", 0)}, {0, 0, 0, 1}, {1, 1, 1}) *
-                                        turned(P("rot_x", 0), P("rot_y", 0), P("rot_z", 0)) * centre;
-    const Mat4 normalM = inverse4(place);
-    for (size_t i = 0; i < posed.positions.size() / 3; ++i) {
-        const std::array<double, 3> q = transformPoint(place, {posed.positions[i * 3], posed.positions[i * 3 + 1], posed.positions[i * 3 + 2]});
-        const double n0 = posed.normals[i * 3], n1 = posed.normals[i * 3 + 1], n2 = posed.normals[i * 3 + 2];
-        double n[3] = {normalM[0] * n0 + normalM[1] * n1 + normalM[2] * n2, normalM[4] * n0 + normalM[5] * n1 + normalM[6] * n2,
-                       normalM[8] * n0 + normalM[9] * n1 + normalM[10] * n2};
-        const double l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        const std::array<double, 3> tg = transformDirection(place, {posed.tangents[i * 4], posed.tangents[i * 4 + 1], posed.tangents[i * 4 + 2]});
-        for (int a = 0; a < 3; ++a) {
-            posed.positions[i * 3 + size_t(a)] = float(q[size_t(a)]);
-            posed.normals[i * 3 + size_t(a)] = float(l > 0 ? n[a] / l : 0);
-            posed.tangents[i * 4 + size_t(a)] = float(tg[size_t(a)]);
-        }
-    }
-    // The ground under the model's rest pose as placed.
-    double groundY = 1e300, size = 0;
-    std::array<double, 3> wlo{1e300, 1e300, 1e300}, whi{-1e300, -1e300, -1e300};
-    for (int corner = 0; corner < 8; ++corner) {
-        const std::array<double, 3> q = transformPoint(place, {corner & 1 ? hi[0] : lo[0], corner & 2 ? hi[1] : lo[1], corner & 4 ? hi[2] : lo[2]});
-        groundY = std::min(groundY, q[1]);
-        for (int a = 0; a < 3; ++a) wlo[size_t(a)] = std::min(wlo[size_t(a)], q[size_t(a)]), whi[size_t(a)] = std::max(whi[size_t(a)], q[size_t(a)]);
-    }
-    size = std::max({whi[0] - wlo[0], whi[1] - wlo[1], whi[2] - wlo[2]});
-    const std::array<double, 3> mid{(wlo[0] + whi[0]) / 2, (wlo[1] + whi[1]) / 2, (wlo[2] + whi[2]) / 2};
-
-    // The camera.
     const double SW = seq.width, SH = seq.height;
-    bool onGround = true;
+    onGround = true;
     if (solved) {
         const int ct = ti >= 0 ? modelCameraTrack(seq, size_t(ti), c, t) : -1;
         const Clip* footage = ct >= 0 ? clipOn(seq.videoTracks[size_t(ct)], t) : nullptr;
@@ -307,21 +271,14 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         groundY = 0;
         onGround = solve->oriented;  // (a scene not stood on its ground has no ground to catch shadows)
     } else if (fileCamera) {
-        const int index = int(std::lround(P("camera_index", 1))) - 1;
-        std::array<double, 3> at;
-        std::array<std::array<double, 3>, 3> axes;
-        if (index < 0 || size_t(index) >= model->cameras.size() || !modelCameraPlace(pose, model->cameras[size_t(index)], at, axes)) {
-            if (error) *error = model->cameras.empty() ? file + " has no camera" : file + " has no camera " + std::to_string(index + 1);
+        const std::string file = g.s("camera_file");
+        const std::shared_ptr<const Model> model = file.empty() ? nullptr : cachedModel(file, error);
+        if (!model) {
+            if (error && file.empty()) *error = "Choose the file to take the camera from";
             return false;
         }
-        const ModelCameraInfo& fc = model->cameras[size_t(index)];
-        // Rows: right, down and ahead.
-        cam.R = {axes[0][0], axes[0][1], axes[0][2], -axes[1][0], -axes[1][1], -axes[1][2], -axes[2][0], -axes[2][1], -axes[2][2]};
-        cam.C = at;
-        double f, cx, cy;
-        modelCameraLens(fc, sec, SW, SH, f, cx, cy);
-        cam.screen = {f * scale, 0, cx * scale, 0, f * scale, cy * scale};
-        cam.nearZ = std::max(1e-6, fc.nearClip);
+        const double sec = lt / seq.fpsValue();
+        if (!fileCameraOf(*model, poseModel(*model, model->animations.empty() ? -1 : 0, sec), sec, file, g, lt, seq, scale, cam, error)) return false;
     } else {
         // In front of the frame: the plane z = 0 at one sequence pixel a unit, y up, the camera on +z looking back.
         const double f = (SW / 2) / std::tan(std::clamp(P("fov", 35), 1.0, 170.0) * kDeg / 2);
@@ -329,6 +286,98 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         cam.C = {0, 0, f};
         cam.screen = {f * scale, 0, SW / 2 * scale, 0, f * scale, SH / 2 * scale};
         cam.nearZ = 1;
+    }
+    return true;
+}
+
+}  // namespace
+
+int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
+    const int v = int(std::lround(c.generator.p("camera_track", t - c.start, 0)));
+    if (v > 0) return v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
+    for (int k = int(track) - 1; k >= 0; --k)
+        if (const Clip* f = clipOn(seq.videoTracks[size_t(k)], t); f && parsedSolve(*f)) return k;
+    return -1;
+}
+
+int modelLightTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
+    const int v = int(std::lround(c.generator.p("env_track", t - c.start, 0)));
+    return v > 0 && v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
+}
+
+bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
+                    const std::function<Image(int track)>& trackLayer, ModelScene& scene, ModelCamera& cam,
+                    std::shared_ptr<const Model>& model, std::string* error) {
+    const Effect& g = c.generator;
+    const FrameTime lt = t - c.start;
+    auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
+    const std::string file = g.s("file");
+    if (file.empty()) {
+        if (error) *error = "Choose a model file (glTF, GLB, OBJ or USD)";
+        return false;
+    }
+    if (isSplatFile(file)) {
+        if (error) *error = file + " is Gaussian splats, not a model";
+        return false;
+    }
+    model = cachedModel(file, error);
+    if (!model) return false;
+    const int ti = trackOf(seq, c);
+    const double fps = seq.fpsValue();
+
+    // Its pose: the animation chosen (1-based; 0 none) at the clip's time, its speed and offset, looped.
+    const int animation = int(std::lround(P("animation", 1))) - 1;
+    double sec = lt / fps * P("anim_speed", 100) / 100 + P("anim_offset", 0);
+    if (animation >= 0 && size_t(animation) < model->animations.size()) {
+        const double d = model->animations[size_t(animation)].duration;
+        if (P("loop", 1) > 0.5 && d > 0) sec = sec - d * std::floor(sec / d);
+    }
+    const PosedTriangles rest = posedTriangles(*model, poseModel(*model, -1, 0));
+    std::array<double, 3> lo, hi;
+    if (!modelBounds(rest, lo, hi)) {
+        if (error) *error = file + " has nothing to draw";
+        return false;
+    }
+    const ModelPose pose = poseModel(*model, animation, sec);
+    PosedTriangles posed = posedTriangles(*model, pose);
+
+    // Into the world: centred on its rest bounds (standing on their bottom when asked), sized, turned and moved; seen
+    // through a file's camera, left where the file has it.
+    const long mode = std::lround(P("camera", 0));
+    const bool fileCamera = mode == 2;
+    const double k = clipScale(g, lt, mode, lo, hi);
+    const Mat4 place = clipPlace(g, lt, mode, k, lo, hi);
+    const Mat4 normalM = inverse4(place);
+    for (size_t i = 0; i < posed.positions.size() / 3; ++i) {
+        const std::array<double, 3> q = transformPoint(place, {posed.positions[i * 3], posed.positions[i * 3 + 1], posed.positions[i * 3 + 2]});
+        const double n0 = posed.normals[i * 3], n1 = posed.normals[i * 3 + 1], n2 = posed.normals[i * 3 + 2];
+        double n[3] = {normalM[0] * n0 + normalM[1] * n1 + normalM[2] * n2, normalM[4] * n0 + normalM[5] * n1 + normalM[6] * n2,
+                       normalM[8] * n0 + normalM[9] * n1 + normalM[10] * n2};
+        const double l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        const std::array<double, 3> tg = transformDirection(place, {posed.tangents[i * 4], posed.tangents[i * 4 + 1], posed.tangents[i * 4 + 2]});
+        for (int a = 0; a < 3; ++a) {
+            posed.positions[i * 3 + size_t(a)] = float(q[size_t(a)]);
+            posed.normals[i * 3 + size_t(a)] = float(l > 0 ? n[a] / l : 0);
+            posed.tangents[i * 4 + size_t(a)] = float(tg[size_t(a)]);
+        }
+    }
+    // The ground under the model's rest pose as placed.
+    double groundY = 1e300, size = 0;
+    std::array<double, 3> wlo{1e300, 1e300, 1e300}, whi{-1e300, -1e300, -1e300};
+    for (int corner = 0; corner < 8; ++corner) {
+        const std::array<double, 3> q = transformPoint(place, {corner & 1 ? hi[0] : lo[0], corner & 2 ? hi[1] : lo[1], corner & 4 ? hi[2] : lo[2]});
+        groundY = std::min(groundY, q[1]);
+        for (int a = 0; a < 3; ++a) wlo[size_t(a)] = std::min(wlo[size_t(a)], q[size_t(a)]), whi[size_t(a)] = std::max(whi[size_t(a)], q[size_t(a)]);
+    }
+    size = std::max({whi[0] - wlo[0], whi[1] - wlo[1], whi[2] - wlo[2]});
+    const std::array<double, 3> mid{(wlo[0] + whi[0]) / 2, (wlo[1] + whi[1]) / 2, (wlo[2] + whi[2]) / 2};
+
+    // The camera: the file's own, unless another file is named for it.
+    bool onGround = true;
+    if (fileCamera && g.s("camera_file").empty()) {
+        if (!fileCameraOf(*model, pose, sec, file, g, lt, seq, scale, cam, error)) return false;
+    } else if (!clipCamera(p, seq, c, t, scale, ti, mode, cam, groundY, onGround, error)) {
+        return false;
     }
     (void)w, (void)h;
 
@@ -365,6 +414,51 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     scene.groundHeight = groundY;
     scene.groundStrength = float(P("ground_strength", 80) / 100);
     scene.opacity = float(P("opacity", 100) / 100);
+    return true;
+}
+
+bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double scale,
+                    std::shared_ptr<const SplatCloud>& cloud, Mat4& place, ModelCamera& cam, SplatRenderOptions& options,
+                    std::string* error) {
+    const Effect& g = c.generator;
+    const FrameTime lt = t - c.start;
+    auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
+    const std::string file = g.s("file");
+    if (file.empty()) {
+        if (error) *error = "Choose a splat file (PLY or SPZ)";
+        return false;
+    }
+    // The file of a numbered run showing now (at the run's own rate, sped up and offset as an animation is), sized by
+    // the run's first file so that it stays put as it plays.
+    const double fps = seq.fpsValue();
+    const double sec = lt / fps * P("anim_speed", 100) / 100 + P("anim_offset", 0);
+    const double rate = P("frames_fps", 0) > 0 ? P("frames_fps", 0) : fps;
+    std::string first = file;
+    const std::string now = P("frames", 1) > 0.5 ? splatFrameFile(file, sec, rate, P("loop", 1) > 0.5, nullptr, &first) : file;
+    cloud = cachedSplats(now, error);
+    if (!cloud) return false;
+    std::shared_ptr<const SplatCloud> base = first == now ? cloud : cachedSplats(first);
+    if (!base) base = cloud;
+    const std::array<double, 3> lo{base->lo[0], base->lo[1], base->lo[2]}, hi{base->hi[0], base->hi[1], base->hi[2]};
+    const long mode = std::lround(P("camera", 0));
+    const double k = clipScale(g, lt, mode, lo, hi);
+    place = clipPlace(g, lt, mode, k, lo, hi);
+    double groundY = 0;
+    bool onGround = false;
+    if (mode == 2 && g.s("camera_file").empty()) {
+        if (error) *error = "Splats have no camera of their own: choose a file to take the camera from (USD or glTF)";
+        return false;
+    }
+    const int ti = trackOf(seq, c);
+    if (!clipCamera(p, seq, c, t, scale, ti, mode, cam, groundY, onGround, error)) return false;
+    options = SplatRenderOptions{};
+    options.crop = P("crop", 0) > 0.5;
+    const char* names[3][2] = {{"crop_x0", "crop_x1"}, {"crop_y0", "crop_y1"}, {"crop_z0", "crop_z1"}};
+    for (int a = 0; a < 3; ++a) {
+        const double u = P(names[a][0], -10), v = P(names[a][1], 10);
+        options.cropLo[size_t(a)] = std::min(u, v), options.cropHi[size_t(a)] = std::max(u, v);
+    }
+    options.opacity = float(std::clamp(P("opacity", 100) / 100, 0.0, 1.0));
     return true;
 }
 
@@ -411,6 +505,18 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
 
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                       const std::function<Image(int track)>& trackLayer, std::vector<float>* depth, std::string* error) {
+    if (isSplatFile(c.generator.s("file"))) {
+        // (already in the values the splats were trained on, as the other generators draw)
+        std::shared_ptr<const SplatCloud> cloud;
+        Mat4 place;
+        ModelCamera cam;
+        SplatRenderOptions options;
+        if (!splatClipScene(p, seq, c, t, scale, cloud, place, cam, options, error)) {
+            if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
+            return Image(std::max(1, w), std::max(1, h));
+        }
+        return renderSplats(*cloud, place, cam, w, h, depth, options);
+    }
     ModelScene scene;
     ModelCamera cam;
     std::shared_ptr<const Model> model;

@@ -191,6 +191,8 @@
 #include "core/Zip.h"
 #include "render/ModelClip.h"
 #include "render/ModelRender.h"
+#include "render/SplatRender.h"
+#include "media/Splats.h"
 #include "media/Exr.h"
 #include "render/VideoFx.h"
 #ifdef MONTAGE_WITH_OPENEXR
@@ -30408,6 +30410,555 @@ if ui["pressed"] == "add":
                     QVERIFY(solve.project(i, solve.points[n].X, seen) && mc.project({pts[n * 3], pts[n * 3 + 1], pts[n * 3 + 2]}, px, py));
                     QVERIFY2(std::hypot(px - seen.x, py - seen.y) < 0.01, qPrintable(QString("frame %1 point %2: %3, %4 against %5, %6").arg(i).arg(n).arg(px).arg(py).arg(seen.x).arg(seen.y)));
                 }
+            }
+        }
+    }
+
+    void gaussianSplats() {
+        // ---- Clouds made up here, with pictures worked out by hand.
+        auto cloudOf = [](size_t n, int degree) {
+            SplatCloud c;
+            c.count = n, c.shDegree = degree;
+            c.positions.assign(n * 3, 0.0f);
+            c.scales.assign(n * 3, 0.1f);
+            c.rotations.assign(n * 4, 0.0f);
+            for (size_t i = 0; i < n; ++i) c.rotations[i * 4 + 3] = 1;
+            c.opacities.assign(n, 0.5f);
+            c.colors.assign(n * 3, 0.0f);
+            c.sh.assign(n * size_t(c.shCoefficients()) * 3, 0.0f);
+            return c;
+        };
+        auto dcFor = [](double colour) { return float((colour - 0.5) / kSplatSh0); };
+        auto near = [](double a, double b, double tol) { return std::fabs(a - b) <= tol * std::max(1.0, std::fabs(b)); };
+
+        // A splat's covariance on the screen is J Σ Jᵀ, with J the projection's Jacobian at its centre (found here by
+        // differences), Σ its covariance placed in the world; through a lens with some skew, placed turned and scaled.
+        {
+            SplatCloud c = cloudOf(1, 0);
+            c.positions = {0.4f, -0.3f, -0.5f};
+            c.scales = {0.3f, 0.1f, 0.05f};
+            const double axis[3] = {1 / std::sqrt(14.0), 2 / std::sqrt(14.0), 3 / std::sqrt(14.0)}, half = 0.45;
+            c.rotations = {float(axis[0] * std::sin(half)), float(axis[1] * std::sin(half)), float(axis[2] * std::sin(half)), float(std::cos(half))};
+            ModelCamera cam = lookAt({1, 0.5, 4}, {0, 0, 0}, 900, 640, 360);
+            cam.screen[1] = 15;
+            const Mat4 place = trsMatrix({0.2, 0.1, -0.3}, {0, std::sin(M_PI / 12), 0, std::cos(M_PI / 12)}, {1.5, 1.5, 1.5});
+            ProjectedSplat got;
+            QVERIFY(projectSplat(c, 0, place, cam, got));
+            // Σ in the world: M R S² Rᵀ Mᵀ.
+            const Mat4 rs = place * trsMatrix({0, 0, 0}, {c.rotations[0], c.rotations[1], c.rotations[2], c.rotations[3]}, {c.scales[0], c.scales[1], c.scales[2]});
+            double S[3][3];
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) S[i][j] = rs[0 * 4 + i] * rs[0 * 4 + j] + rs[1 * 4 + i] * rs[1 * 4 + j] + rs[2 * 4 + i] * rs[2 * 4 + j];
+            const std::array<double, 3> mu = transformPoint(place, {c.positions[0], c.positions[1], c.positions[2]});
+            double J[2][3], px, py;
+            QVERIFY(cam.project(mu, px, py));
+            QVERIFY(near(got.x, px, 1e-9) && near(got.y, py, 1e-9));
+            for (int k = 0; k < 3; ++k) {
+                std::array<double, 3> a = mu, b = mu;
+                a[size_t(k)] += 1e-5, b[size_t(k)] -= 1e-5;
+                double ax, ay, bx, by;
+                QVERIFY(cam.project(a, ax, ay) && cam.project(b, bx, by));
+                J[0][k] = (ax - bx) / 2e-5, J[1][k] = (ay - by) / 2e-5;
+            }
+            double want[2][2] = {{0, 0}, {0, 0}};
+            for (int r = 0; r < 2; ++r)
+                for (int s = 0; s < 2; ++s)
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j) want[r][s] += J[r][i] * S[i][j] * J[s][j];
+            QVERIFY2(near(got.xx, want[0][0], 1e-4) && near(got.xy, want[0][1], 1e-4) && near(got.yy, want[1][1], 1e-4),
+                     qPrintable(QString("got %1 %2 %3, wanted %4 %5 %6").arg(got.xx).arg(got.xy).arg(got.yy).arg(want[0][0]).arg(want[0][1]).arg(want[1][1])));
+            // Straight ahead and square on, the ellipse is the splat's own scaled by f / z.
+            SplatCloud ahead = cloudOf(1, 0);
+            ahead.positions = {0, 0, -6};
+            ahead.scales = {0.3f, 0.1f, 0.7f};
+            QVERIFY(projectSplat(ahead, 0, identity4(), lookAt({0, 0, 0}, {0, 0, -1}, 800, 640, 360), got));
+            const double k = 800.0 / 6;
+            QVERIFY(near(got.xx, k * k * 0.09, 1e-6) && near(got.yy, k * k * 0.01, 1e-6) && std::fabs(got.xy) < 1e-6 && near(got.depth, 6, 1e-12));
+            QVERIFY(near(got.x, 320, 1e-12) && near(got.y, 180, 1e-12));
+        }
+
+        // The constant colour comes out exactly, at the splat's opacity, where it is centred.
+        {
+            SplatCloud c = cloudOf(1, 0);
+            c.opacities = {0.6f};
+            c.colors = {dcFor(0.2), dcFor(0.5), dcFor(0.8)};
+            std::vector<float> depth;
+            const Image img = renderSplats(c, identity4(), lookAt({0, 0, 5}, {0, 0, 0}, 500, 101, 101), 101, 101, &depth);
+            const float* q = img.at(50, 50);
+            QVERIFY2(std::fabs(q[0] - 0.6f * 0.2f) < 1e-6f && std::fabs(q[1] - 0.6f * 0.5f) < 1e-6f && std::fabs(q[2] - 0.6f * 0.8f) < 1e-6f &&
+                         std::fabs(q[3] - 0.6f) < 1e-6f,
+                     qPrintable(QString("%1 %2 %3 %4").arg(q[0]).arg(q[1]).arg(q[2]).arg(q[3])));
+            QVERIFY(std::fabs(depth[50 * 101 + 50] - 5) < 1e-5f && depth[0] == 0);
+        }
+
+        // Two overlapping splats, red behind blue: from the front blue over red, from behind red over blue.
+        {
+            SplatCloud c = cloudOf(2, 0);
+            c.positions = {0, 0, -1, 0, 0, 1};
+            c.scales.assign(6, 0.3f);
+            c.colors = {dcFor(1), dcFor(0), dcFor(0), dcFor(0), dcFor(0), dcFor(1)};
+            const float* q;
+            const Image front = renderSplats(c, identity4(), lookAt({0, 0, 6}, {0, 0, 0}, 500, 101, 101), 101, 101);
+            q = front.at(50, 50);
+            QVERIFY2(std::fabs(q[0] - 0.25f) < 1e-5f && q[1] < 1e-6f && std::fabs(q[2] - 0.5f) < 1e-5f && std::fabs(q[3] - 0.75f) < 1e-5f,
+                     qPrintable(QString("front %1 %2 %3 %4").arg(q[0]).arg(q[1]).arg(q[2]).arg(q[3])));
+            const Image back = renderSplats(c, identity4(), lookAt({0, 0, -6}, {0, 0, 0}, 500, 101, 101), 101, 101);
+            q = back.at(50, 50);
+            QVERIFY2(std::fabs(q[0] - 0.5f) < 1e-5f && q[1] < 1e-6f && std::fabs(q[2] - 0.25f) < 1e-5f && std::fabs(q[3] - 0.75f) < 1e-5f,
+                     qPrintable(QString("back %1 %2 %3 %4").arg(q[0]).arg(q[1]).arg(q[2]).arg(q[3])));
+        }
+
+        // 50,000 random splats with view-dependent colour draw the same on 1 thread, 8 threads and the shared workers;
+        // turning the cloud and the camera together changes nothing.
+        SplatCloud random = cloudOf(50000, 3);
+        {
+            std::mt19937 rng(7);
+            std::uniform_real_distribution<double> u(-1, 1);
+            std::normal_distribution<double> g;
+            for (size_t i = 0; i < random.count; ++i) {
+                for (size_t a = 0; a < 3; ++a) {
+                    random.positions[i * 3 + a] = float(u(rng));
+                    random.scales[i * 3 + a] = float(std::exp(-3.5 + u(rng)));
+                    random.colors[i * 3 + a] = float(1.5 * u(rng));
+                }
+                double q[4], l = 0;
+                for (double& v : q) v = g(rng), l += v * v;
+                for (size_t a = 0; a < 4; ++a) random.rotations[i * 4 + a] = float(q[a] / std::sqrt(l));
+                random.opacities[i] = float(0.5 + 0.45 * u(rng));
+            }
+            for (float& v : random.sh) v = float(0.3 * u(rng));
+        }
+        const ModelCamera view = lookAt({0.3, 0.4, 3.5}, {0, 0, 0}, 400, 320, 180);
+        std::vector<float> d1, d8, d0;
+        SplatRenderOptions one, eight;
+        one.threads = 1, eight.threads = 8;
+        const Image r1 = renderSplats(random, identity4(), view, 320, 180, &d1, one);
+        const Image r8 = renderSplats(random, identity4(), view, 320, 180, &d8, eight);
+        const Image r0 = renderSplats(random, identity4(), view, 320, 180, &d0);
+        QVERIFY(r1.px.size() == r8.px.size() && std::memcmp(r1.px.data(), r8.px.data(), r1.px.size() * sizeof(float)) == 0);
+        QVERIFY(std::memcmp(r1.px.data(), r0.px.data(), r1.px.size() * sizeof(float)) == 0 && d1 == d8 && d1 == d0);
+        int covered = 0;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) covered += r1.at(x, y)[3] > 0.9f;
+        QVERIFY2(covered > 320 * 180 / 4, qPrintable(QString("%1 pixels covered").arg(covered)));
+        {
+            // The cloud turned 180° about x by its placing, the camera turned with it: the same picture.
+            const Mat4 turn = trsMatrix({0, 0, 0}, {1, 0, 0, 0}, {1, 1, 1});
+            ModelCamera turnedView = lookAt({0.3, -0.4, -3.5}, {0, 0, 0}, 400, 320, 180);
+            // (lookAt keeps +y up; turned, the camera's down is world +y)
+            for (int k = 0; k < 3; ++k) turnedView.R[size_t(k)] = view.R[size_t(k)] * (k == 0 ? 1 : -1);
+            for (int k = 0; k < 3; ++k) turnedView.R[size_t(3 + k)] = view.R[size_t(3 + k)] * (k == 0 ? 1 : -1);
+            for (int k = 0; k < 3; ++k) turnedView.R[size_t(6 + k)] = view.R[size_t(6 + k)] * (k == 0 ? 1 : -1);
+            const Image t = renderSplats(random, turn, turnedView, 320, 180);
+            double most = 0;
+            for (size_t i = 0; i < t.px.size(); ++i) most = std::max(most, double(std::fabs(t.px[i] - r1.px[i])));
+            QVERIFY2(most < 1e-3, qPrintable(QString("turned with its camera, off by %1").arg(most)));
+        }
+
+        // ---- Files. As PLY, the cloud comes back as it was (y down in the file); as SPZ (versions 2, 3 and 4), within
+        // the format's quantisation, and drawn nearly the same.
+        std::string err;
+        QVERIFY2(saveSplats(random, path("cloud.ply"), &err), err.c_str());
+        SplatCloud ply;
+        QVERIFY2(loadSplats(path("cloud.ply"), ply, &err), err.c_str());
+        QCOMPARE(ply.count, random.count);
+        QCOMPARE(ply.shDegree, 3);
+        for (size_t i = 0; i < random.positions.size(); ++i)
+            QVERIFY(near(ply.positions[i], random.positions[i], 1e-6) && near(ply.scales[i], random.scales[i], 1e-5) && near(ply.colors[i], random.colors[i], 1e-6));
+        for (size_t i = 0; i < random.sh.size(); ++i) QVERIFY(near(ply.sh[i], random.sh[i], 1e-6));
+        for (size_t i = 0; i < random.count; ++i) QVERIFY(near(ply.opacities[i], random.opacities[i], 1e-5));
+        {
+            QFile f(QString::fromStdString(path("cloud.ply")));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray b = f.readAll();
+            const qsizetype at = b.indexOf("end_header\n") + 11;
+            float xyz[3];
+            std::memcpy(xyz, b.constData() + at, sizeof xyz);
+            QVERIFY(xyz[0] == random.positions[0] && xyz[1] == -random.positions[1] && xyz[2] == -random.positions[2]);
+        }
+        for (const int version : {2, 3, 4}) {
+            const std::string file = path(("cloud_v" + std::to_string(version) + ".spz").c_str());
+            QVERIFY2(saveSplats(random, file, &err, version), err.c_str());
+            SplatCloud spz;
+            QVERIFY2(loadSplats(file, spz, &err), err.c_str());
+            QCOMPARE(spz.count, random.count);
+            QCOMPARE(spz.shDegree, 3);
+            double worst[6] = {0, 0, 0, 0, 0, 0};
+            for (size_t i = 0; i < random.count; ++i) {
+                for (size_t a = 0; a < 3; ++a) {
+                    worst[0] = std::max(worst[0], double(std::fabs(spz.positions[i * 3 + a] - random.positions[i * 3 + a])));
+                    worst[1] = std::max(worst[1], std::fabs(std::log(double(spz.scales[i * 3 + a]) / random.scales[i * 3 + a])));
+                    worst[2] = std::max(worst[2], double(std::fabs(spz.colors[i * 3 + a] - random.colors[i * 3 + a])));
+                }
+                worst[3] = std::max(worst[3], double(std::fabs(spz.opacities[i] - random.opacities[i])));
+                double dot = 0;
+                for (size_t a = 0; a < 4; ++a) dot += double(spz.rotations[i * 4 + a]) * random.rotations[i * 4 + a];
+                worst[4] = std::max(worst[4], 2 * std::acos(std::min(1.0, std::fabs(dot))));
+            }
+            for (size_t i = 0; i < random.sh.size(); ++i) worst[5] = std::max(worst[5], double(std::fabs(spz.sh[i] - random.sh[i])));
+            // Steps: 1/4096 a position, 1/16 a log scale, 1/(0.15 x 255) a colour term, 1/255 an opacity, 8/128 and
+            // 16/128 a harmonic (degree 1, higher); rotations to 9 bits (versions 3 and 4) or 8 (version 2, w made up, so off
+            // by up to 0.25 rad when it is small).
+            const bool ok = worst[0] < 0.5 / 4096 + 1e-6 && worst[1] < 0.5 / 16 + 1e-5 && worst[2] < 0.5 / (0.15 * 255) + 1e-5 &&
+                            worst[3] < 0.5 / 255 + 1e-6 && worst[4] < (version == 2 ? 0.25 : 0.01) && worst[5] < 8.5 / 128 + 1e-6;
+            QVERIFY2(ok, qPrintable(QString("version %1: position %2, log scale %3, colour %4, opacity %5, rotation %6, harmonics %7")
+                                        .arg(version).arg(worst[0]).arg(worst[1]).arg(worst[2]).arg(worst[3]).arg(worst[4]).arg(worst[5])));
+            const Image r = renderSplats(spz, identity4(), view, 320, 180);
+            double diff = 0;
+            for (size_t i = 0; i < r.px.size(); ++i) diff += std::fabs(r.px[i] - r1.px[i]);
+            diff /= double(r.px.size());
+            QVERIFY2(diff < 0.01, qPrintable(QString("version %1 drawn %2 off on average").arg(version).arg(diff)));
+        }
+
+        // A PLY written by hand in the training tools' frame (y down, z ahead) with every harmonic set: its colour
+        // seen along a direction is the harmonics' sum along it in the file's frame.
+        {
+            auto basis = [](double x, double y, double z, double* b) {
+                const double xx = x * x, yy = y * y, zz = z * z;
+                const double c1 = 0.4886025119029199;
+                b[0] = -c1 * y, b[1] = c1 * z, b[2] = -c1 * x;
+                b[3] = 1.0925484305920792 * x * y, b[4] = -1.0925484305920792 * y * z, b[5] = 0.31539156525252005 * (2 * zz - xx - yy);
+                b[6] = -1.0925484305920792 * x * z, b[7] = 0.5462742152960396 * (xx - yy);
+                b[8] = -0.5900435899266435 * y * (3 * xx - yy), b[9] = 2.890611442640554 * x * y * z;
+                b[10] = -0.4570457994644658 * y * (4 * zz - xx - yy), b[11] = 0.3731763325901154 * z * (2 * zz - 3 * xx - 3 * yy);
+                b[12] = -0.4570457994644658 * x * (4 * zz - xx - yy), b[13] = 1.445305721320277 * z * (xx - yy);
+                b[14] = -0.5900435899266435 * x * (xx - 3 * yy);
+            };
+            std::vector<float> rest(45);
+            for (size_t i = 0; i < 45; ++i) rest[i] = float(0.05 * (int(i % 7) - 3));
+            const float dc[3] = {0.3f, -0.2f, 0.1f};
+            std::string header = "ply\nformat binary_little_endian 1.0\ncomment by hand\nelement vertex 1\n";
+            for (const char* n : {"x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2"}) header += std::string("property float ") + n + "\n";
+            for (int i = 0; i < 45; ++i) header += "property float f_rest_" + std::to_string(i) + "\n";
+            for (const char* n : {"opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"}) header += std::string("property float ") + n + "\n";
+            header += "end_header\n";
+            std::vector<float> v{1, 2, 3, dc[0], dc[1], dc[2]};
+            v.insert(v.end(), rest.begin(), rest.end());
+            v.insert(v.end(), {0.0f, -2.0f, -2.5f, -3.0f, 1.0f, 0.0f, 0.0f, 0.0f});
+            QFile f(QString::fromStdString(path("byhand.ply")));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(header.data(), qint64(header.size()));
+            f.write(reinterpret_cast<const char*>(v.data()), qint64(v.size() * sizeof(float)));
+            f.close();
+            SplatCloud h;
+            QVERIFY2(loadSplats(path("byhand.ply"), h, &err), err.c_str());
+            QVERIFY(h.positions[0] == 1 && h.positions[1] == -2 && h.positions[2] == -3 && std::fabs(h.opacities[0] - 0.5f) < 1e-7f &&
+                    near(h.scales[0], std::exp(-2.0), 1e-6));
+            const std::array<std::array<double, 3>, 4> dirs{{{0.36, 0.48, 0.8}, {-0.6, 0, 0.8}, {0, -1, 0}, {0.2, 0.3, -0.932738}}};
+            for (const std::array<double, 3>& d : dirs) {
+                double b[15];
+                basis(d[0], d[1], d[2], b);
+                const std::array<float, 3> got = splatColor(h, 0, {d[0], -d[1], -d[2]});
+                for (int ch = 0; ch < 3; ++ch) {
+                    double want = 0.5 + kSplatSh0 * dc[ch];
+                    for (int k = 0; k < 15; ++k) want += b[k] * rest[size_t(ch * 15 + k)];
+                    QVERIFY2(std::fabs(got[size_t(ch)] - std::max(0.0, want)) < 1e-5,
+                             qPrintable(QString("channel %1 along %2 %3 %4: %5, wanted %6").arg(ch).arg(d[0]).arg(d[1]).arg(d[2]).arg(got[size_t(ch)]).arg(want)));
+                }
+            }
+        }
+
+        // Files that are not splats, or are damaged, are refused with a reason.
+        {
+            auto refused = [&](const char* name, const QByteArray& bytes) {
+                QFile f(QString::fromStdString(path(name)));
+                if (!f.open(QIODevice::WriteOnly)) return false;
+                f.write(bytes);
+                f.close();
+                SplatCloud c;
+                std::string why;
+                return !loadSplats(path(name), c, &why) && !why.empty() && c.count == 0;
+            };
+            QVERIFY(refused("text.ply", "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nend_header\n0\n"));
+            QVERIFY(refused("mesh.ply", QByteArray("ply\nformat binary_little_endian 1.0\nelement vertex 3\nproperty float x\nproperty float y\n"
+                                                   "property float z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n") +
+                                            QByteArray(36 + 13, '\0')));
+            QByteArray huge("ply\nformat binary_little_endian 1.0\nelement vertex 4000000000\n");
+            for (const char* n : {"x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"})
+                huge += QByteArray("property float ") + n + "\n";
+            QVERIFY(refused("huge.ply", huge + "end_header\n" + QByteArray(56, '\0')));
+            QByteArray shortPly = huge;
+            shortPly.replace("4000000000", "3");
+            QVERIFY(refused("short.ply", shortPly + "end_header\n" + QByteArray(100, '\0')));
+            QVERIFY(refused("empty.ply", QByteArray()));
+            QVERIFY(refused("noise.spz", QByteArray(300, '\x5a')));
+            QVERIFY(refused("bad4.spz", QByteArray("NGSP\x04\0\0\0\x10\0\0\0\0\x0c\0\x05\xff\xff\0\0", 20) + QByteArray(40, '\0')));
+            QByteArray bad = QByteArray("NGSP\x04\0\0\0\x01\0\0\0\0\x0c\0\x05\x20\0\0\0", 20) + QByteArray(12, '\0');
+            for (int i = 0; i < 5; ++i) bad += QByteArray("\x10\0\0\0\0\0\0\0\x09\0\0\0\0\0\0\0", 16);  // (sizes that do not fit)
+            QVERIFY(refused("bad4b.spz", bad + QByteArray(20, '\0')));
+            // A gzip (of stored blocks) whose header claims far more splats than it holds.
+            {
+                const QByteArray claim = QByteArray("NGSP\x02\0\0\0\xff\xff\xff\0\0\x0c\0\0", 16) + QByteArray(64, '\0');
+                QByteArray gz("\x1f\x8b\x08\0\0\0\0\0\0\xff\x01", 11);
+                const uint16_t n = uint16_t(claim.size());
+                gz += char(n & 0xff), gz += char(n >> 8), gz += char(~n & 0xff), gz += char((~n >> 8) & 0xff);
+                gz += claim;
+                const uint32_t crc = crc32(claim.constData(), size_t(claim.size()));
+                for (int i = 0; i < 4; ++i) gz += char((crc >> (8 * i)) & 0xff);
+                for (int i = 0; i < 4; ++i) gz += char((uint32_t(claim.size()) >> (8 * i)) & 0xff);
+                QVERIFY(refused("claims.spz", gz));
+            }
+            {
+                SplatCloud tiny = cloudOf(3, 0);
+                QVERIFY(saveSplats(tiny, path("tiny.spz"), &err, 3));
+                QFile t(QString::fromStdString(path("tiny.spz")));
+                QVERIFY(t.open(QIODevice::ReadOnly));
+                QByteArray b = t.readAll();
+                b.truncate(b.size() - 30);
+                QVERIFY(refused("cut.spz", b));
+            }
+        }
+
+        // ---- In the cut. A numbered run of files plays a file a frame (looping), each a splat of its own colour.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        const float colours[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        for (int i = 0; i < 3; ++i) {
+            SplatCloud one = cloudOf(1, 0);
+            one.scales = {0.5f, 0.5f, 0.5f};
+            one.opacities = {0.9f};
+            one.colors = {dcFor(colours[i][0]), dcFor(colours[i][1]), dcFor(colours[i][2])};
+            QVERIFY(saveSplats(one, path(("run_000" + std::to_string(i + 1) + ".ply").c_str()), &err));
+        }
+        Clip clip;
+        clip.id = p.newId();
+        clip.duration = 100;
+        clip.generator = makeEffect(p, "model3d");
+        clip.generator.strings["file"] = path("run_0001.ply");
+        clip.generator.params["rot_y"] = 0.0;
+        s.videoTracks[0].clips.push_back(clip);
+        for (const int t : {0, 1, 2, 3, 7}) {
+            std::vector<float> depth;
+            const Image img = renderModelClip(p, s, s.videoTracks[0].clips[0], t, 320, 180, 1, {}, &depth, &err);
+            const float* q = img.at(160, 90);
+            const int want = t % 3;
+            QVERIFY2(q[3] > 0.85f && q[want] > 0.8f && q[(want + 1) % 3] < 0.05f && q[(want + 2) % 3] < 0.05f,
+                     qPrintable(QString("frame %1: %2 %3 %4 %5 %6").arg(t).arg(q[0]).arg(q[1]).arg(q[2]).arg(q[3]).arg(err.c_str())));
+            // Its depth: the camera's distance from the frame's plane, where the splat sits.
+            const double f = 160 / std::tan(17.5 * M_PI / 180);
+            QVERIFY2(std::fabs(depth[90 * 320 + 160] - f) < 1e-3 * f, qPrintable(QString("depth %1, wanted %2").arg(depth[90 * 320 + 160]).arg(f)));
+        }
+        s.videoTracks[0].clips[0].generator.params["frames"] = Param(0.0);
+        QVERIFY(renderModelClip(p, s, s.videoTracks[0].clips[0], 1, 320, 180, 1, {}, nullptr, &err).at(160, 90)[0] > 0.8f);
+        // Cropped away, nothing; the box round it, all of it.
+        s.videoTracks[0].clips[0].generator.params["crop"] = Param(1.0);
+        s.videoTracks[0].clips[0].generator.params["crop_x0"] = Param(0.5);
+        QVERIFY(renderModelClip(p, s, s.videoTracks[0].clips[0], 1, 320, 180, 1, {}, nullptr, &err).at(160, 90)[3] == 0);
+        s.videoTracks[0].clips[0].generator.params["crop_x0"] = Param(-0.5);
+        QVERIFY(renderModelClip(p, s, s.videoTracks[0].clips[0], 1, 320, 180, 1, {}, nullptr, &err).at(160, 90)[3] > 0.85f);
+
+        // Through a camera in a USD file (8 units down +z, looking back at the origin): the splat there in the
+        // picture's middle, 8 units off; without a file for the camera, refused with a reason.
+        {
+            Clip& sc = s.videoTracks[0].clips[0];
+            sc.generator.params["camera"] = Param(2.0);
+            std::shared_ptr<const SplatCloud> cloud;
+            Mat4 place;
+            ModelCamera cam;
+            SplatRenderOptions so;
+            err.clear();
+            QVERIFY(!splatClipScene(p, s, sc, 0, 1, cloud, place, cam, so, &err) && !err.empty());
+            sc.generator.strings["camera_file"] = MONTAGE_TEST_DATA_DIR "/models/camera.usda";
+            QVERIFY2(splatClipScene(p, s, sc, 0, 1, cloud, place, cam, so, &err), err.c_str());
+            ProjectedSplat at;
+            QVERIFY(projectSplat(*cloud, 0, place, cam, at));
+            QVERIFY2(std::fabs(at.x - 160) < 1e-6 && std::fabs(at.y - 90) < 1e-6 && std::fabs(at.depth - 8) < 1e-6,
+                     qPrintable(QString("%1 %2 %3").arg(at.x).arg(at.y).arg(at.depth)));
+        }
+
+        // Placed in a shot through a solved camera dollying past (made up rather than tracked): a splat at a point of
+        // the solved scene lands where the solve projects that point on every frame, and is drawn there in the cut.
+        {
+            const int W = 320, H = 180, frames = 24;
+            CameraSolve solve;
+            solve.width = W, solve.height = H, solve.focal = 260, solve.fps = 25, solve.start = 0, solve.oriented = true;
+            for (int i = 0; i < frames; ++i) {
+                const std::array<double, 3> C{-1 + 0.08 * i, 1.4, 5};
+                const ModelCamera c = lookAt(C, {0, 0.5, 0}, 1, 1, 1);
+                SolvedCamera sc;
+                sc.valid = true;
+                std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+                sc.C = {C[0], C[1], C[2]};
+                solve.cameras.push_back(sc);
+            }
+            const QString dir = QString::fromStdString(path("splatdolly"));
+            QDir().mkpath(dir);
+            QImage grey(W, H, QImage::Format_RGB32);
+            grey.fill(qRgb(40, 40, 40));
+            for (int i = 1; i <= frames; ++i) QVERIFY(grey.save(dir + QStringLiteral("/plate_%1.png").arg(i, 4, 10, QLatin1Char('0'))));
+            ImageSequence plates;
+            QVERIFY(detectImageSequence((dir + "/plate_0001.png").toStdString(), plates));
+            plates.fps = Rational{25, 1};
+            Project q = makeDefaultProject();
+            Sequence& qs = *q.active();
+            qs.width = W, qs.height = H, qs.fps = {25, 1};
+            MediaItem m = probeOrFail(q, imageSequencePath(plates));
+            q.media.push_back(m);
+            QVERIFY(edit::placeMedia(q, qs, m.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            Effect track = makeEffect(q, "camera_track");
+            track.strings["solve"] = cameraSolveToString(solve);
+            qs.videoTracks[0].clips.at(0).effects.push_back(track);
+            SplatCloud dot = cloudOf(1, 0);
+            dot.scales = {0.05f, 0.05f, 0.05f};
+            dot.opacities = {0.95f};
+            dot.colors = {dcFor(1), dcFor(1), dcFor(1)};
+            QVERIFY(saveSplats(dot, path("dot.spz"), &err));
+            Clip sc;
+            sc.id = q.newId();
+            sc.duration = frames;
+            sc.generator = makeEffect(q, "model3d");
+            sc.generator.strings["file"] = path("dot.spz");
+            sc.generator.params["camera"] = Param(1.0);
+            sc.generator.params["stand"] = Param(0.0);
+            sc.generator.params["rot_y"] = Param(0.0);
+            sc.generator.params["pos_x"] = Param(0.3), sc.generator.params["pos_y"] = Param(0.5), sc.generator.params["pos_z"] = Param(-0.2);
+            if (qs.videoTracks.size() < 2) edit::addTrack(q, qs, TrackKind::Video);
+            qs.videoTracks[1].clips.push_back(sc);
+            RenderOptions o;
+            for (int t = 0; t < frames; ++t) {
+                std::shared_ptr<const SplatCloud> cloud;
+                Mat4 place;
+                ModelCamera cam;
+                SplatRenderOptions so;
+                QVERIFY2(splatClipScene(q, qs, qs.videoTracks[1].clips[0], t, 1, cloud, place, cam, so, &err), err.c_str());
+                ProjectedSplat at;
+                Point2 want;
+                QVERIFY(projectSplat(*cloud, 0, place, cam, at) && solve.project(t, {0.3, 0.5, -0.2}, want));
+                QVERIFY2(std::hypot(at.x - want.x, at.y - want.y) < 0.5,
+                         qPrintable(QString("frame %1: %2, %3 against %4, %5").arg(t).arg(at.x).arg(at.y).arg(want.x).arg(want.y)));
+                if (t % 8 == 0) {
+                    const Image img = renderSequenceFrame(q, qs, t, o);
+                    int bx = -1, by = -1;
+                    float best = 0;
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x)
+                            if (img.at(x, y)[1] > best) best = img.at(x, y)[1], bx = x, by = y;
+                    QVERIFY2(best > 0.5f && std::hypot(bx + 0.5 - want.x, by + 0.5 - want.y) < 1.5,
+                             qPrintable(QString("frame %1: brightest %2 at %3, %4; projected %5, %6").arg(t).arg(best).arg(bx).arg(by).arg(want.x).arg(want.y)));
+                }
+            }
+        }
+
+        // Added over MCP: the clip, the splats' count and the length of their run.
+        {
+            QVERIFY(saveSplats(random, path("random.spz"), &err));
+            Project mp = makeDefaultProject();
+            const QString project = QString::fromStdString(path("splats.montage"));
+            QVERIFY(saveProject(mp, project.toStdString()));
+            McpServer server;
+            auto call = [&](const char* tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QJsonObject r = call("montage_add_model", {{"project", project}, {"file", QString::fromStdString(path("random.spz"))}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(r.value("structuredContent").toObject().value("splats").toDouble(), 50000.0);
+            QCOMPARE(r.value("structuredContent").toObject().value("sh_degree").toInt(), 3);
+            r = call("montage_add_model", {{"project", project}, {"file", QString::fromStdString(path("run_0002.ply"))},
+                                           {"camera_file", MONTAGE_TEST_DATA_DIR "/models/camera.usda"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(r.value("structuredContent").toObject().value("frames").toInt(), 3);
+            r = call("montage_add_model", {{"project", project}, {"file", QString::fromStdString(path("random.spz"))}, {"camera", 1}});
+            QVERIFY(r.value("isError").toBool());
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back, &err));
+            int splatClips = 0, throughFile = 0;
+            for (const Track& tr : back.active()->videoTracks)
+                for (const Clip& c : tr.clips) {
+                    splatClips += c.generator.type == "model3d";
+                    throughFile += c.generator.p("camera", 0, 0) == 2 && !c.generator.s("camera_file").empty();
+                }
+            QCOMPARE(splatClips, 2);
+            QCOMPARE(throughFile, 1);
+        }
+
+        // Sample scenes from Niantic's spz project, and its own tools, when CI fetched and built them: the sample read
+        // and drawn; and what the tools read from files written here, and write from the sample, read here alike.
+        const QByteArray samples = qgetenv("MONTAGE_TEST_SPZ_SAMPLES"), tools = qgetenv("MONTAGE_TEST_SPZ_TOOLS");
+        if (!samples.isEmpty()) {
+            SplatCloud lizard;
+            const std::string file = samples.toStdString() + "/hornedlizard.spz";
+            QVERIFY2(loadSplats(file, lizard, &err), err.c_str());
+            QCOMPARE(lizard.count, size_t(786233));
+            QCOMPARE(lizard.shDegree, 3);
+            // Its last splat, unpacked by hand from the file's bytes (version 2: positions in 1/4096ths, the rotation's
+            // w made up).
+            {
+                const size_t i = 786232;
+                const float want[] = {-0.5107421875f, -0.4052734375f, 0.08837890625f, 0.494118f, 0.274510f, 0.169935f, -0.091503f,
+                                      0.00205496f, 0.00218749f, 0.00492959f, -0.184314f, -0.309804f, -0.929412f, 0.0790174f, -0.0625f};
+                const float got[] = {lizard.positions[i * 3], lizard.positions[i * 3 + 1], lizard.positions[i * 3 + 2], lizard.opacities[i],
+                                     lizard.colors[i * 3], lizard.colors[i * 3 + 1], lizard.colors[i * 3 + 2], lizard.scales[i * 3],
+                                     lizard.scales[i * 3 + 1], lizard.scales[i * 3 + 2], lizard.rotations[i * 4], lizard.rotations[i * 4 + 1],
+                                     lizard.rotations[i * 4 + 2], lizard.rotations[i * 4 + 3], lizard.sh[i * 45]};
+                for (size_t k = 0; k < std::size(want); ++k)
+                    QVERIFY2(std::fabs(got[k] - want[k]) < 1e-4f * (k >= 7 && k <= 9 ? std::fabs(want[k]) : std::max(1.0f, std::fabs(want[k]))),
+                             qPrintable(QString("value %1: %2, wanted %3").arg(k).arg(got[k]).arg(want[k])));
+            }
+            const std::array<double, 3> mid{(lizard.lo[0] + lizard.hi[0]) / 2.0, (lizard.lo[1] + lizard.hi[1]) / 2.0, (lizard.lo[2] + lizard.hi[2]) / 2.0};
+            // (its bounds are the scene's middle, not the dome of background splats 200 units off round it)
+            const double size = std::max({lizard.hi[0] - lizard.lo[0], lizard.hi[1] - lizard.lo[1], lizard.hi[2] - lizard.lo[2]});
+            QVERIFY2(size > 1 && size < 20, qPrintable(QString("%1 across").arg(size)));
+            QElapsedTimer timer;
+            timer.start();
+            const Image img = renderSplats(lizard, identity4(), lookAt({mid[0], mid[1], mid[2] + 1.2 * size}, mid, 480, 480, 270), 480, 270);
+            int covered = 0;
+            for (int y = 0; y < 270; ++y)
+                for (int x = 0; x < 480; ++x) covered += img.at(x, y)[3] > 0.5f;
+            qInfo("hornedlizard.spz drawn at 480 x 270 in %lld ms, %d pixels covered", qint64(timer.elapsed()), covered);
+            QVERIFY(covered > 480 * 270 / 10);
+        }
+        if (!tools.isEmpty()) {
+            auto run = [&](const char* tool, const std::string& in, const std::string& out) {
+                QProcess pr;
+                pr.start(QString::fromLocal8Bit(tools) + "/" + tool, {QString::fromStdString(in), QString::fromStdString(out)});
+                return pr.waitForFinished(300000) && pr.exitStatus() == QProcess::NormalExit && pr.exitCode() == 0 && QFileInfo::exists(QString::fromStdString(out));
+            };
+            // The tools keep a file's own frame (PLY y down, SPZ y up, unconverted), so what they write turned 180° about
+            // x is what is read here.
+            auto same = [&](const SplatCloud& a, const SplatCloud& b, double tol) {
+                if (a.count != b.count || a.shDegree != b.shDegree) return false;
+                for (size_t i = 0; i < a.count; ++i) {
+                    const double sign[3] = {1, -1, -1};
+                    for (size_t k = 0; k < 3; ++k)
+                        if (!near(a.positions[i * 3 + k], sign[k] * b.positions[i * 3 + k], tol) || !near(a.scales[i * 3 + k], b.scales[i * 3 + k], tol) ||
+                            !near(a.colors[i * 3 + k], b.colors[i * 3 + k], tol))
+                            return false;
+                    double dot = double(a.rotations[i * 4 + 3]) * b.rotations[i * 4 + 3];
+                    for (size_t k = 0; k < 3; ++k) dot += sign[k] * a.rotations[i * 4 + k] * b.rotations[i * 4 + k];
+                    if (std::fabs(dot) < 1 - tol || !near(a.opacities[i], b.opacities[i], tol)) return false;
+                    if (i % 97 == 0) {  // (the colour along a direction, against the colour along that direction turned)
+                        const std::array<float, 3> ca = splatColor(a, i, {0.36, 0.48, 0.8}), cb = splatColor(b, i, {0.36, -0.48, -0.8});
+                        for (size_t k = 0; k < 3; ++k)
+                            if (!near(ca[k], cb[k], tol * 10)) return false;
+                    }
+                }
+                return true;
+            };
+            QVERIFY(run("ply_to_spz", path("cloud.ply"), path("tool.spz")));
+            QVERIFY(run("spz_to_ply", path("tool.spz"), path("tool.ply")));
+            SplatCloud fromTool, plyBack;
+            QVERIFY2(loadSplats(path("tool.spz"), fromTool, &err), err.c_str());
+            QVERIFY2(loadSplats(path("tool.ply"), plyBack, &err), err.c_str());
+            QVERIFY2(same(fromTool, plyBack, 1e-5), "their version 4 file read here as they read it");
+            for (const int version : {2, 3, 4}) {
+                const std::string ours = path(("cloud_v" + std::to_string(version) + ".spz").c_str()), back = path(("cloud_v" + std::to_string(version) + "_tool.ply").c_str());
+                QVERIFY(run("spz_to_ply", ours, back));
+                SplatCloud a, b;
+                QVERIFY2(loadSplats(ours, a, &err) && loadSplats(back, b, &err), err.c_str());
+                QVERIFY2(same(a, b, 1e-5), qPrintable(QString("our version %1 file read by the tools as here").arg(version)));
+            }
+            if (!samples.isEmpty()) {
+                const std::string file = samples.toStdString() + "/hornedlizard.spz";
+                QVERIFY(run("spz_to_ply", file, path("lizard.ply")));
+                SplatCloud a, b;
+                QVERIFY2(loadSplats(file, a, &err) && loadSplats(path("lizard.ply"), b, &err), err.c_str());
+                QVERIFY2(same(a, b, 1e-5), "their version 2 sample read here as they read it");
             }
         }
     }
