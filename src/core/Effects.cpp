@@ -121,6 +121,18 @@ std::vector<EffectInfo> buildCatalog() {
                   choice("key_mode", "Key Input", {"Multiply with the node's matte", "Add to it", "Subtract from it", "Replace it"}, 0)},
                  {}});
     c.back().hidden = true;
+    // A compositing graph's nodes' own settings (core/CompositeGraph.h): a merge's opacity; a mask node's shape (as
+    // every video filter's mask) and how its mask input's picture is read; a track node's following.
+    c.push_back({"composite_merge", "Merge", EffectCategory::VideoFilter, "Composite", {pct("opacity", "Opacity", 0, 100, 100)}, {}});
+    c.back().hidden = true;
+    c.push_back({"composite_mask", "Mask", EffectCategory::VideoFilter, "Composite",
+                 {choice("matte", "Mask Input", {"Alpha", "Luma", "Inverted Alpha", "Inverted Luma"}, 0)}, {}});
+    c.back().hidden = true;
+    c.push_back({"composite_track", "Track", EffectCategory::VideoFilter, "Composite",
+                 {choice("follow", "Follow", {"Position", "Position and Scale", "Position, Scale and Rotation", "Corner Pin"}, 2),
+                  num("reference", "Reference Frame", 0, 1000000, 0, 1)},
+                 {}});
+    c.back().hidden = true;
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
                  {
                      num("exposure", "Exposure (stops)", -5, 5, 0),

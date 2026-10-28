@@ -39,6 +39,7 @@
 #include "AudioFx.h"
 #include "audio/Upmix.h"
 #include "ColorSpace.h"
+#include "CompositeRender.h"
 #include "Exporter.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
@@ -194,6 +195,14 @@ struct Geometry {
     double cl = 0, cr = 0, ct = 0, cb = 0;  // crop fractions
     double opacity = 1;
 };
+
+// Clips whose compositing graph (core/CompositeGraph.h) is being drawn on this thread: inside it, such a clip (taken as
+// an input, or seen on a track another input shows) is drawn as it comes, so no graph draws itself again.
+thread_local std::vector<Id> tCompositing;
+bool compositeShown(const Clip& c) {
+    return !c.composite.empty() && std::find(tCompositing.begin(), tCompositing.end(), c.id) == tCompositing.end();
+}
+Image compositeLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, bool* displayReferred);  // (below)
 
 // Sequence pixels to this image's pixels, for pixel-sized effect parameters.
 double effectPixelScale(const Clip& c, FrameTime lt, double sx, double mw, int srcWidth) {
@@ -1424,6 +1433,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
 // the layer came in display-referred (graded scene-referred: graphics, a display-referred clip).
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                 const Image* below, bool* displayReferred) {
+    if (compositeShown(c)) return compositeLayer(p, seq, c, t, o, displayReferred);  // (its graph's output)
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
@@ -1625,12 +1635,16 @@ const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& f
 }
 
 // What track `m` shows at t (a transition's mix while one runs), on the CPU.
-Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H) {
+// (`displayReferred`, when given, is told whether it is mixed as the display shows it.)
+Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H,
+                   bool* displayReferred = nullptr) {
     ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
+    if (displayReferred) *displayReferred = false;
     const Track& track = seq.videoTracks[m];
     FrameTime from = 0, to = 0;
-    if (const Transition* tr = activeTransition(track, t, from, to)) return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H);
-    if (const Clip* c = clipAt(track, t)) return clipLayer(p, seq, *c, t, o, nullptr);
+    if (const Transition* tr = activeTransition(track, t, from, to))
+        return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H, {}, displayReferred);
+    if (const Clip* c = clipAt(track, t)) return clipLayer(p, seq, *c, t, o, nullptr, displayReferred);
     return {};
 }
 
@@ -1768,6 +1782,8 @@ std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, F
 
 // Whether a clip's picture takes part in the depth merge (or is flattened on its own, `flattened`).
 bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
+    if (flattened) *flattened = false;
+    if (compositeShown(c)) return false;  // (a graph's output is flat; its inputs may be deep)
     const bool deep = enabledEffect(seq, c, "make_deep") ||
                       (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
                       !clipDeepFile(p, seq, c, t).empty();
@@ -1958,6 +1974,62 @@ DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const 
         }
     if (!merge.empty()) out.merged = deepLayer(mergeDeep(merge));
     return out;
+}
+
+// A clip's compositing graph drawn (render/CompositeRender.h), the compositor drawing its inputs.
+Image compositeLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, bool* displayReferred) {
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
+    struct Inside {
+        explicit Inside(Id id) { tCompositing.push_back(id); }
+        ~Inside() { tCompositing.pop_back(); }
+    } inside(c.id);
+    const int SW = seq.width, SH = seq.height;
+    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
+    size_t own = 0;  // (its track, for what a deep input reads from the tracks)
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
+        for (const Clip& x : seq.videoTracks[ti].clips)
+            if (x.id == c.id) own = ti;
+    CompositeHost host;
+    host.layer = [&](const Clip& x, bool* shown) { return clipLayer(p, seq, x, t, o, nullptr, shown); };
+    host.track = [&](int track, bool* shown) {
+        return track >= 0 && size_t(track) < seq.videoTracks.size() ? trackPicture(p, seq, size_t(track), t, o, W, H, shown) : Image();
+    };
+    host.isDeep = [&](const Clip& x) { return isDeepClip(p, seq, x, t); };
+    host.deep = [&](const Clip& x) { return clipDeepFrame(p, seq, own, x, t, o, W, H); };
+    host.transform = [&](const Image& img, const Effect& e, FrameTime lt) {
+        return transformLayer(img, geometryFor(e, lt, SW, SH, SW, SH), SW, SH, o.scale);
+    };
+    host.move = [&](const Image& img, const CanvasMove& m) {
+        Geometry g;
+        g.mw = SW, g.mh = SH;
+        g.sx = m.sx, g.sy = m.sy, g.rot = m.rot;
+        g.px = m.px, g.py = m.py, g.ax = m.ax, g.ay = m.ay;
+        g.opacity = m.opacity;
+        return transformLayer(img, g, SW, SH, o.scale);
+    };
+    host.placement = [&](const Clip& x, FrameTime at, CanvasMove& out) {
+        Geometry g;
+        if (!clipGeometry(p, seq, x, at, g)) return false;
+        out.sx = g.sx, out.sy = g.sy, out.rot = g.rot, out.px = g.px, out.py = g.py, out.opacity = g.opacity;
+        return true;
+    };
+    host.blend = [&](Image& canvas, const Image& layer, const std::string& mode, float opacity, bool shown) {
+        const SceneGrading* sg = currentSceneGrading();
+        if (!sg) {
+            blendOnto(canvas, layer, mode, opacity);
+            return;
+        }
+        if (opacity >= 1) {
+            blendGraded(canvas, layer, mode, shown, *sg);
+            return;
+        }
+        Image faded = layer;
+        for (float& v : faded.px) v *= opacity;
+        blendGraded(canvas, faded, mode, shown, *sg);
+    };
+    host.shown = [](const Image& img) { return asShown(img); };
+    host.drawing = [](Id id) { return std::find(tCompositing.begin(), tCompositing.end(), id) != tCompositing.end(); };
+    return renderCompositeGraph(p, seq, c, t, o, host, displayReferred);
 }
 
 }  // namespace
@@ -2303,6 +2375,7 @@ bool runOnSource(const Effect& e) {
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
+    if (compositeShown(c)) return GpuLayerResult::Unsupported;  // (a compositing graph is drawn on the CPU)
     if (c.isGenerator() && c.generator.type == "adjustment") return GpuLayerResult::Unsupported;
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.

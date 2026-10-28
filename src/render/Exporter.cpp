@@ -20,6 +20,8 @@
 #include "audio/TimeStretch.h"
 #include "media/Rife.h"
 
+#include <QDir>
+#include <QFileInfo>
 #include <QImage>
 #include <QString>
 #include <algorithm>
@@ -54,6 +56,7 @@
 #include "render/LoudnessReport.h"
 #include "media/SuperScale.h"
 #include "media/ThreadScheduling.h"
+#include "media/Decoder.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -2778,6 +2781,101 @@ bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::
     st.in = 0;
     st.out = copy.duration;
     return exportSequence(p, alone, st, progress, cancel, error);
+}
+
+bool bakeCompositeClips(Project& p, Id seqId, const std::string& output, std::string* error, int* baked,
+                        const std::atomic<bool>* cancel) {
+    if (baked) *baked = 0;
+    const Sequence* found = p.findSequence(seqId);
+    if (!found) return true;
+    std::vector<Id> clips;
+    for (const Track& t : found->videoTracks)
+        for (const Clip& c : t.clips)
+            if (!c.composite.empty()) clips.push_back(c.id);
+    if (clips.empty()) return true;
+    const QFileInfo out(QString::fromStdString(output));
+    const QString folder = out.absolutePath() + "/" + out.completeBaseName() + " Composites";
+    if (!QDir().mkpath(folder)) {
+        if (error) *error = "Cannot make " + folder.toStdString();
+        return false;
+    }
+    for (Id id : clips) {
+        const Sequence& seq = *p.findSequence(seqId);
+        const auto loc = edit::locate(seq, id);
+        const Clip* c = edit::clipById(seq, id);
+        if (!loc || !c) continue;
+        // The clip alone on its track, the other tracks there for its graph's track inputs but not shown.
+        Sequence alone = seq;
+        for (Track& t : alone.videoTracks) t.muted = true;
+        Track& own = alone.videoTracks[size_t(loc->track.index)];
+        own.muted = false;
+        // With handles where a transition reaches past its ends, as the interchange file's dissolves need them.
+        FrameTime head = 0, tail = 0;
+        const Track& real = seq.videoTracks[size_t(loc->track.index)];
+        for (const Transition& tr : real.transitions) {
+            FrameTime a = 0, b = 0;
+            if (!edit::transitionRange(real, tr, a, b)) continue;
+            if (tr.clipB == id) head = std::max(head, c->start - a);
+            if (tr.clipA == id) tail = std::max(tail, b - c->end());
+        }
+        head = std::clamp<FrameTime>(head, 0, c->start);
+        own.transitions.clear();
+        Clip copy = *c;
+        copy.blendMode = "normal";
+        copy.linkGroup = 0;
+        if (!copy.reverse) copy.sourceIn -= double(head) * copy.speed;
+        copy.start -= head;
+        copy.duration += head + tail;
+        edit::shiftKeyframes(copy, head);
+        own.clips.assign(1, copy);
+        alone.audioTracks.clear();
+        alone.buses.clear();
+        alone.captionTracks.clear();
+        alone.markers.clear();
+        std::string name;
+        for (char ch : c->name) name += std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == ' ' ? ch : '_';
+        ExportSettings st;
+        st.path = (folder + "/" + QString::fromStdString(name.empty() ? std::string("Clip") : name) + " " + QString::number(id) + ".mov").toStdString();
+        st.videoCodec = "prores_ks";
+        st.profile = "4444";  // with its transparency
+        st.alpha = true;
+        st.crf = 12;
+        st.audioCodec = "none";
+        st.smartRender = false;
+        st.in = copy.start;
+        st.out = copy.end();
+        std::string err;
+        if (!exportSequence(p, alone, st, {}, cancel, &err)) {
+            if (error) *error = "Cannot render the composite of \"" + c->name + "\": " + err;
+            return false;
+        }
+        MediaItem m;
+        m.id = p.newId();
+        if (!probeMedia(st.path, m, &err)) {
+            if (error) *error = err;
+            return false;
+        }
+        p.media.push_back(m);
+        // (looked up again: the media list grew, the sequence did not move)
+        // A plain clip of the file in its place: everything else it did (effects, grade, colour group, animations, its
+        // place in the frame) is in the picture.
+        Clip* k = edit::clipById(*p.findSequence(seqId), id);
+        Clip plain;
+        plain.id = k->id;
+        plain.name = k->name;
+        plain.start = k->start;
+        plain.duration = k->duration;
+        plain.enabled = k->enabled;
+        plain.blendMode = k->blendMode;
+        plain.linkGroup = k->linkGroup;
+        plain.colorLabel = k->colorLabel;
+        plain.mediaId = m.id;
+        plain.sourceIn = double(head);
+        plain.motion = makeEffect("transform", k->motion.id);
+        *k = std::move(plain);
+        if (baked) ++*baked;
+    }
+    return true;
 }
 
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,

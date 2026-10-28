@@ -5,6 +5,7 @@
 #include "Surround.h"
 #include "FilmCount.h"
 #include "Interpretation.h"
+#include "CompositeGraph.h"
 #include "GradeGraph.h"
 
 #include <QDir>
@@ -275,6 +276,63 @@ Effect effectFromJson(const QJsonValue& v) {
     return e;
 }
 
+QJsonObject compositeGraphToJson(const CompositeGraph& g) {
+    QJsonArray nodes, links;
+    for (const CompositeNode& n : g.nodes) {
+        QJsonObject o{{"key", n.key}, {"id", double(n.id)}, {"kind", qs(n.kind)}, {"x", n.x}, {"y", n.y}};
+        if (!n.label.empty()) o["label"] = qs(n.label);
+        if (!n.enabled) o["enabled"] = false;
+        if (n.kind == "input") {
+            o["source"] = qs(n.source);
+            if (n.media) o["media"] = double(n.media);
+            if (n.track >= 0) o["track"] = n.track;
+            if (n.offset != 0) o["offset"] = n.offset;
+            if (!n.generator.empty()) o["generator"] = effectToJson(n.generator);
+        }
+        if (n.kind == "merge") o["blend"] = qs(n.blend);
+        if (n.follow) o["follow"] = double(n.follow);
+        QJsonArray fx;
+        for (const Effect& e : n.effects) fx.append(effectToJson(e));
+        if (!fx.isEmpty()) o["effects"] = fx;
+        if (!n.grade.empty()) o["grade"] = gradeGraphToJson(n.grade);
+        nodes.append(o);
+    }
+    for (const CompositeLink& l : g.links) links.append(QJsonObject{{"from", l.from}, {"to", l.to}, {"input", l.input}});
+    return QJsonObject{{"nodes", nodes}, {"links", links}};
+}
+
+double finiteOr(double v, double otherwise) { return std::isfinite(v) ? v : otherwise; }
+
+CompositeGraph compositeGraphFromJson(const QJsonObject& o) {
+    CompositeGraph g;
+    for (const auto& v : o.value("nodes").toArray()) {
+        const QJsonObject n = v.toObject();
+        CompositeNode node;
+        node.key = n.value("key").toInt();
+        node.id = Id(i64(n.value("id")));
+        node.kind = n.value("kind").toString("input").toStdString();
+        node.label = ss(n.value("label"));
+        node.enabled = n.value("enabled").toBool(true);
+        node.x = finiteOr(n.value("x").toDouble(), 0);
+        node.y = finiteOr(n.value("y").toDouble(), 0);
+        node.source = n.value("source").toString("clip").toStdString();
+        node.media = Id(i64(n.value("media")));
+        node.track = n.value("track").toInt(-1);
+        node.offset = std::max(0.0, finiteOr(n.value("offset").toDouble(), 0));
+        node.generator = effectFromJson(n.value("generator"));
+        node.blend = n.value("blend").toString("normal").toStdString();
+        node.follow = Id(i64(n.value("follow")));
+        for (const auto& e : n.value("effects").toArray()) node.effects.push_back(effectFromJson(e));
+        node.grade = gradeGraphFromJson(n.value("grade").toObject());
+        if (node.key > 0) g.nodes.push_back(std::move(node));
+    }
+    for (const auto& v : o.value("links").toArray()) {
+        const QJsonObject l = v.toObject();
+        g.links.push_back({l.value("from").toInt(), l.value("to").toInt(), l.value("input").toInt()});
+    }
+    return g;
+}
+
 QJsonArray markersToJson(const std::vector<Marker>& markers) {
     QJsonArray m;
     for (const auto& mk : markers) {
@@ -376,6 +434,7 @@ QJsonObject clipToJson(const Clip& c) {
     }
     if (c.colorGroup) o["colorGroup"] = double(c.colorGroup);
     if (!c.grade.empty()) o["grade"] = gradeGraphToJson(c.grade);
+    if (!c.composite.empty()) o["composite"] = compositeGraphToJson(c.composite);
     if (!c.trims.empty()) {
         QJsonObject trims;
         for (const auto& [target, e] : c.trims) trims[qs(target)] = effectToJson(e);
@@ -447,6 +506,7 @@ Clip clipFromJson(const QJsonObject& o) {
     c.gradeVersion = c.gradeVersions.empty() ? 0 : std::clamp(o.value("gradeVersion").toInt(), 0, int(c.gradeVersions.size()) - 1);
     c.colorGroup = Id(i64(o.value("colorGroup")));
     c.grade = gradeGraphFromJson(o.value("grade").toObject());
+    c.composite = compositeGraphFromJson(o.value("composite").toObject());
     const QJsonObject trims = o.value("trims").toObject();
     for (auto it = trims.begin(); it != trims.end(); ++it) {
         Effect e = effectFromJson(it.value());
@@ -1001,6 +1061,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
                 c.grade = {};
             }
             takeOut(c);
+            if (!c.composite.empty() && !validComposite(c.composite)) c.composite = {};  // (its picture as it comes)
             settle(c.effects, c.grade);
             for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
         }
@@ -1043,6 +1104,18 @@ bool clipFromJsonString(const std::string& json, Clip& out) {
 }
 
 std::string effectToJsonString(const Effect& e) { return QJsonDocument(effectToJson(e)).toJson(QJsonDocument::Compact).toStdString(); }
+
+std::string compositeGraphToJsonString(const CompositeGraph& g) {
+    return QJsonDocument(compositeGraphToJson(g)).toJson(QJsonDocument::Compact).toStdString();
+}
+
+bool compositeGraphFromJsonString(const std::string& json, CompositeGraph& out) {
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(json), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject() || !doc.object().value("nodes").isArray()) return false;
+    out = compositeGraphFromJson(doc.object());
+    return true;
+}
 
 bool effectFromJsonString(const std::string& json, Effect& out) {
     QJsonParseError err;
@@ -1364,6 +1437,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         bump(c.generator.id);
         bump(c.timing.id);
         for (const auto& e : c.effects) bump(e.id);
+        for (const CompositeNode& n : c.composite.nodes) {
+            bump(n.id);
+            bump(n.generator.id);
+            for (const auto& e : n.effects) bump(e.id);
+        }
     };
     for (const auto& m : p.media) bump(m.id);
     for (const auto& b : p.smartBins) bump(b.id);
@@ -1439,6 +1517,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     for (Sequence& s : p.sequences)
         for (Track& t : s.videoTracks)
             for (Clip& c : t.clips) separateEffectIds(p, s, c);
+    // A compositing node shared between clips (saved so) given a fresh owner id.
+    for (Sequence& s : p.sequences) separateCompositeIds(p, s);
     out = std::move(p);
     return true;
 }

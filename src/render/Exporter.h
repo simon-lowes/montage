@@ -272,6 +272,13 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
 // (or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error = nullptr,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, bool apv = false);
+// Interchange formats (EDL, OpenTimelineIO, FCP XML, AAF) get a compositing graph's clip as its rendered picture: each
+// clip of sequence `seq` in `p` with a graph (core/CompositeGraph.h) rendered, as the timeline shows its layer, to ProRes
+// 4444 with its transparency (the frame's size, its place in it baked in) in a folder beside `output` ("name
+// Composites"), and replaced in `p` by that file, its blend mode kept. `p` is the export's own copy. `baked` gets how
+// many; false with `error` when one cannot be rendered.
+bool bakeCompositeClips(Project& p, Id seq, const std::string& output, std::string* error = nullptr, int* baked = nullptr,
+                        const std::atomic<bool>* cancel = nullptr);
 // Whether FFmpeg here has APV's encoder (OpenAPV's liboapv, FFmpeg 8 and later) and decoder.
 bool apvEncoderAvailable();
 bool apvDecoderAvailable();

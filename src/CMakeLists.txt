@@ -60,6 +60,7 @@ add_library(montage_engine STATIC
   core/ClipAnimation.h core/ClipAnimation.cpp
   core/GradeVersions.h core/GradeVersions.cpp
   core/GradeGraph.h core/GradeGraph.cpp
+  core/CompositeGraph.h core/CompositeGraph.cpp
   core/AudioChannels.h core/AudioChannels.cpp
   core/TranscriptCorrect.h core/TranscriptCorrect.cpp
   core/SpellCheck.h core/SpellCheck.cpp
@@ -261,6 +262,7 @@ add_library(montage_engine STATIC
   render/Exporter.h render/Exporter.cpp
   render/RenderFarm.h render/RenderFarm.cpp
   render/GradeGraph.h render/GradeGraph.cpp
+  render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   render/RemoteReview.h render/RemoteReview.cpp

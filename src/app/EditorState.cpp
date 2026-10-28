@@ -1,6 +1,7 @@
 #include "EditorState.h"
 
 #include "core/Expression.h"
+#include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
 #include "render/ClipAnalysis.h"
 #include "render/LearnFromClip.h"
@@ -359,6 +360,20 @@ void EditorState::setPaintEffect(Id effect) {
 int EditorState::selectedGradeNode() const {
     const Clip* c = primaryClip();
     return c && c->id == gradeNodeClip_ && findGradeNode(c->grade, gradeNodeKey_) ? gradeNodeKey_ : 0;
+}
+
+int EditorState::selectedCompositeNode() const {
+    const Clip* c = primaryClip();
+    return c && c->id == compositeNodeClip_ && findCompositeNode(c->composite, compositeNodeKey_) ? compositeNodeKey_ : 0;
+}
+
+void EditorState::selectCompositeNode(int key) {
+    const Clip* c = primaryClip();
+    const Id clip = c && key ? c->id : 0;
+    if (clip == compositeNodeClip_ && (clip ? key : 0) == compositeNodeKey_) return;
+    compositeNodeClip_ = clip;
+    compositeNodeKey_ = clip ? key : 0;
+    emit compositeNodeSelected();
 }
 
 void EditorState::selectGradeNode(int key) {

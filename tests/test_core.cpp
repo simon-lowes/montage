@@ -20,6 +20,7 @@
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
+#include "core/CompositeGraph.h"
 #include "core/Interpretation.h"
 #include "core/Ambisonics.h"
 #include "core/SpokenSearch.h"
@@ -3039,6 +3040,176 @@ private slots:
         QCOMPARE(best.size(), size_t(3));
         QVERIFY(best[0].text == "b" && best[1].text == "c" && best[2].text == "d");
         QCOMPARE(bestSpokenHits(hits, 1).size(), size_t(1));
+    }
+
+    void compositeGraphEdits() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 60)).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, makeGeneratorClip(p, "color", 60)).ok);
+        const Id id = s.videoTracks[0].clips.front().id, other = s.videoTracks[1].clips.front().id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        auto node = [&](int k) -> CompositeNode& { return *findCompositeNode(clip().composite, k); };
+        auto linked = [&](int from, int to, int input) {
+            const CompositeLink* l = compositeLinkInto(clip().composite, to, input);
+            return l && l->from == from;
+        };
+        // Started: an input of the clip itself into the output.
+        int in = 0;
+        QVERIFY(edit::startComposite(p, s, id, &in).ok);
+        QVERIFY(!edit::startComposite(p, s, id).ok);
+        QVERIFY(!edit::startComposite(p, s, p.newId()).ok);
+        QCOMPARE(clip().composite.nodes.size(), size_t(1));
+        QCOMPARE(node(in).source, std::string("clip"));
+        QVERIFY(linked(in, 0, 0) && validComposite(clip().composite));
+        // A merge after it takes it as its background; inputs after the merge are its layers, in order.
+        int merge = 0, a = 0, b = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "merge", in, &merge).ok);
+        QVERIFY(linked(in, merge, 0) && linked(merge, 0, 0));
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", merge, &a).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", merge, &b).ok);
+        QVERIFY(linked(a, merge, 1) && linked(b, merge, 2));
+        QCOMPARE(compositeOrder(clip().composite), (std::vector<int>{in, a, b, merge}));
+        QCOMPARE(compositeNodeName(node(merge)), "Merge " + std::to_string(merge));
+        // An effect after the merge, between it and the output; removed, the merge feeds the output again.
+        int fx = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "effect", 0, &fx).ok);
+        QVERIFY(linked(merge, fx, 0) && linked(fx, 0, 0));
+        // Refused: a loop, an input into an input, a merge's input past the next, an unknown kind.
+        QVERIFY(!edit::connectCompositeNodes(s, id, {fx, merge, 3}).ok);
+        QVERIFY(!edit::connectCompositeNodes(s, id, {merge, b, 0}).ok);
+        QVERIFY(!edit::connectCompositeNodes(s, id, {fx, merge, 5}).ok);
+        QVERIFY(!edit::addCompositeNode(p, s, id, "blur").ok);
+        QVERIFY(validComposite(clip().composite));
+        // The first layer gone: the second becomes the first.
+        QVERIFY(edit::removeCompositeNode(s, id, a).ok);
+        QVERIFY(linked(b, merge, 1) && !compositeLinkInto(clip().composite, merge, 2));
+
+        // What an input brings in must be there: media with a picture, another track, a generator but not an
+        // adjustment layer.
+        CompositeNode n = node(b);
+        n.source = "media";
+        n.media = p.newId();
+        QVERIFY(!edit::setCompositeNode(p, s, id, n).ok);
+        n.source = "track";
+        n.track = 0;
+        QVERIFY(!edit::setCompositeNode(p, s, id, n).ok);
+        n.track = 1;
+        QVERIFY(edit::setCompositeNode(p, s, id, n).ok);
+        n.source = "generator";
+        n.generator = makeEffect(p, "invert");
+        QVERIFY(!edit::setCompositeNode(p, s, id, n).ok);
+        n.generator = makeEffect(p, "adjustment");
+        QVERIFY(!edit::setCompositeNode(p, s, id, n).ok);
+        n.generator = makeEffect(p, "title");
+        n.label = "Name";
+        QVERIFY(edit::setCompositeNode(p, s, id, n).ok);
+        QCOMPARE(compositeNodeName(node(b)), std::string("Name"));
+        // Settings: a merge's opacity (not an unknown one); a mask's shape; a generator input's own.
+        QVERIFY(edit::setCompositeNodeParams(s, id, merge, {{"opacity", 40.0}}).ok);
+        QCOMPARE(compositeSettings(node(merge))->p("opacity", 0), 40.0);
+        QVERIFY(!edit::setCompositeNodeParams(s, id, merge, {{"wobble", 1.0}}).ok);
+        QVERIFY(edit::setCompositeNodeParams(s, id, b, {{"size", 40.0}}).ok);
+        QCOMPARE(node(b).generator.p("size", 0), 40.0);
+
+        // A node's effects are its own: found by its id (keyed from the clip's start), its generator too.
+        node(fx).effects.push_back(makeEffect(p, "invert"));
+        FrameTime origin = -1;
+        QVERIFY(edit::effectChain(s, node(fx).id, &origin) == &node(fx).effects);
+        QCOMPARE(origin, clip().start);
+        QVERIFY(edit::ownedEffect(s, node(b).id, node(b).generator.id) == &node(b).generator);
+        QVERIFY(edit::ownedEffect(s, node(fx).id, node(fx).effects[0].id) == &node(fx).effects[0]);
+
+        // Saved and read, and as JSON text: the same graph.
+        const CompositeGraph g = clip().composite;
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QVERIFY(edit::clipById(*back.active(), id)->composite == g);
+        CompositeGraph again;
+        QVERIFY(compositeGraphFromJsonString(compositeGraphToJsonString(g), again) && again == g);
+        QVERIFY(!compositeGraphFromJsonString("{\"nodes\": 3}", again));
+
+        // Split: the right half's nodes, generator and effects get their own ids, the left keeps them; its nodes' keys
+        // and a media input's frame move with its start.
+        MediaItem film;
+        film.id = p.newId();
+        film.kind = MediaKind::Video;
+        film.hasVideo = true;
+        film.width = 64, film.height = 36;
+        film.duration = 100;
+        p.media.push_back(film);
+        int mi = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", merge, &mi).ok);
+        CompositeNode fromFilm = node(mi);
+        fromFilm.source = "media";
+        fromFilm.media = film.id;
+        fromFilm.offset = 5;
+        QVERIFY(edit::setCompositeNode(p, s, id, fromFilm).ok);
+        Keyframe late;
+        late.t = 40, late.v = 10;
+        compositeSettings(node(merge))->params["opacity"].keys = {late};
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 30).ok);
+        {
+            const CompositeGraph& r = s.videoTracks[0].clips[1].composite;
+            QCOMPARE(compositeSettings(*findCompositeNode(r, merge))->params.at("opacity").keys.at(0).t, FrameTime(10));
+            QCOMPARE(findCompositeNode(r, mi)->offset, 35.0);
+        }
+        QVERIFY(edit::removeCompositeNode(s, id, mi).ok);
+        compositeSettings(node(merge))->params["opacity"].keys.clear();
+        QVERIFY(edit::removeCompositeNode(s, s.videoTracks[0].clips[1].id, mi).ok);
+        compositeSettings(*findCompositeNode(s.videoTracks[0].clips[1].composite, merge))->params["opacity"].keys.clear();
+        const Clip& left = s.videoTracks[0].clips[0];
+        const Clip& right = s.videoTracks[0].clips[1];
+        QVERIFY(left.composite == g);
+        QCOMPARE(right.composite.nodes.size(), g.nodes.size());
+        for (size_t i = 0; i < g.nodes.size(); ++i) {
+            QVERIFY(right.composite.nodes[i].id != g.nodes[i].id);
+            QCOMPARE(right.composite.nodes[i].kind, g.nodes[i].kind);
+            for (size_t k = 0; k < g.nodes[i].effects.size(); ++k) QVERIFY(right.composite.nodes[i].effects[k].id != g.nodes[i].effects[k].id);
+        }
+        QVERIFY(right.composite.nodes[size_t(std::find_if(g.nodes.begin(), g.nodes.end(), [&](const CompositeNode& x) { return x.key == b; }) - g.nodes.begin())]
+                    .generator.id != node(b).generator.id);
+        // Put down again as a copy (a close-up, a multicam piece): fresh ids.
+        Clip twin = left;
+        twin.id = 0;
+        twin.start = 150;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, twin).ok);
+        QVERIFY(edit::clipAt(s, {TrackKind::Video, 0}, 160)->composite.nodes[0].id != g.nodes[0].id);
+        // Bounds: a graph of more nodes than a graph holds, or a key past the highest, is refused.
+        CompositeGraph huge = g;
+        while (huge.nodes.size() <= size_t(kMaxCompositeNodes)) {
+            CompositeNode extra = makeCompositeNode(p, "effect");
+            extra.key = nextCompositeNodeKey(huge);
+            huge.nodes.push_back(extra);
+        }
+        QVERIFY(!validComposite(huge));
+        CompositeGraph far = g;
+        far.nodes[0].key = kMaxCompositeKey + 1;
+        QVERIFY(!validComposite(far));
+        // Copied and pasted: fresh ids again.
+        const auto copied = edit::copyClips(s, {id});
+        QVERIFY(edit::pasteClips(p, s, copied, 200, false).ok);
+        const Clip& pasted = s.videoTracks[0].clips.back();
+        QVERIFY(pasted.composite.nodes.size() == g.nodes.size() && pasted.composite.nodes[0].id != g.nodes[0].id);
+        // Read from a file whose clips share node ids: each gets its own.
+        Clip& o = *edit::clipById(s, other);
+        o.composite = g;
+        Project shared;
+        QVERIFY(projectFromJson(projectToJson(p), shared));
+        QVERIFY(edit::clipById(*shared.active(), other)->composite.nodes[0].id != edit::clipById(*shared.active(), id)->composite.nodes[0].id);
+        o.composite = {};
+        // As a preset on another clip: fresh ids; one naming its own track (V2) refused there.
+        CompositeGraph preset = g;
+        for (CompositeNode& x : preset.nodes)
+            if (x.key == b) x.source = "track", x.track = 1;
+        QVERIFY(!edit::applyComposite(p, s, other, preset).ok);
+        QVERIFY(edit::applyComposite(p, s, other, g).ok);
+        QVERIFY(edit::clipById(s, other)->composite.nodes[0].id != g.nodes[0].id);
+        QVERIFY(edit::effectChain(s, edit::clipById(s, other)->composite.nodes[0].id));
+        // Cleared: no graph.
+        QVERIFY(edit::removeComposite(s, other).ok);
+        QVERIFY(edit::clipById(s, other)->composite.empty());
+        QVERIFY(!edit::removeComposite(s, other).ok);
     }
 
     void gradeGraphEdits() {

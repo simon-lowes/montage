@@ -144,6 +144,7 @@
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
+#include "CompositeNodePanel.h"
 #include "GradeNodePanel.h"
 #include "GalleryPanel.h"
 #include "TrimPanel.h"
@@ -634,6 +635,9 @@ void MainWindow::buildPanels() {
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
+    // The picked clip's compositing node graph.
+    compositeNodes_ = new CompositeNodePanel(state_, this);
+    compositeDock_ = makeDock(tr("Composite"), "composite", compositeNodes_);
     // The lined script (the screenplay with each take's line down what it reads).
     linedScript_ = new LinedScriptPanel(state_, this);
     linedScriptDock_ = makeDock(tr("Script"), "linedScript", linedScript_);
@@ -914,11 +918,13 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
         resizeDocks({binDock_}, {320}, Qt::Horizontal);
     } else if (name == "Effects") {
-        arrangeDocks({{inspectorDock_, keyframesDock_, sourceDock_}, {programDock_}}, {{effectsDock_, binDock_, indexDock_}}, {{meterDock_}});
+        arrangeDocks({{inspectorDock_, keyframesDock_, sourceDock_}, {programDock_}}, {{effectsDock_, binDock_, indexDock_}}, {{meterDock_}},
+                     {{compositeDock_}});
         resizeDocks({effectsDock_}, {360}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
         resizeDocks({inspectorDock_, programDock_}, {640, 900}, Qt::Horizontal);
         resizeDocks({inspectorDock_}, {h / 2 + 40}, Qt::Vertical);
+        resizeDocks({compositeDock_}, {h / 3}, Qt::Vertical);
     } else if (name == "Captions") {
         arrangeDocks({{captionsDock_, sourceDock_}, {programDock_}}, {{transcriptDock_, binDock_, indexDock_}}, {{meterDock_}});
         resizeDocks({transcriptDock_}, {400}, Qt::Horizontal);
@@ -933,7 +939,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, soundLibraryDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, soundLibraryDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, compositeDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -9285,11 +9291,21 @@ void MainWindow::exportInterchange(Interchange format) {
                                                 st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + "." + k.ext,
                                                 k.filter);
     if (path.isEmpty()) return;
-    const Project& pr = state_->project();
-    const std::string text = format == Interchange::Edl ? exportEdl(pr, *s)
-                             : format == Interchange::Otio ? exportOtio(pr, *s)
-                             : format == Interchange::Fcp7Xml ? exportFcp7Xml(pr, *s)
-                                                              : exportFcpXml(pr, *s);
+    // A copy with each compositing graph's clip rendered to a file beside the export.
+    Project pr = state_->project();
+    std::string err;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool baked = bakeCompositeClips(pr, s->id, path.toStdString(), &err);
+    QApplication::restoreOverrideCursor();
+    if (!baked) {
+        QMessageBox::warning(this, tr("Export"), QString::fromStdString(err));
+        return;
+    }
+    const Sequence& sq = *pr.findSequence(s->id);
+    const std::string text = format == Interchange::Edl ? exportEdl(pr, sq)
+                             : format == Interchange::Otio ? exportOtio(pr, sq)
+                             : format == Interchange::Fcp7Xml ? exportFcp7Xml(pr, sq)
+                                                              : exportFcpXml(pr, sq);
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
         QMessageBox::warning(this, tr("Export"), tr("Cannot write %1").arg(path));
@@ -9345,6 +9361,7 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture
     poll.start(100);
     watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress, picture, avid]() {
         Outcome o;
+        if (picture && !bakeCompositeClips(*snap, seqId, path.toStdString(), &o.error, nullptr, cancel.get())) return o;
         const Sequence* sq = snap->findSequence(seqId);
         if (!sq) return o;
         AafExportOptions options;

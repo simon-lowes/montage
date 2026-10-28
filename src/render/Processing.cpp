@@ -1926,7 +1926,10 @@ void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixel
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     // (a grade node's settings act through the node graph, render/GradeGraph.h; a 3D Camera Tracker only holds its solve)
     // (Sky Replacement runs when tracks are composited, render/SkyReplace.h)
-    if (!e.enabled || img.empty() || e.type == "grade_node" || e.type == "camera_track" || e.type == "sky_replace") return;
+    // (a compositing node's settings act through its graph, render/CompositeRender.h)
+    if (!e.enabled || img.empty() || e.type == "grade_node" || e.type == "camera_track" || e.type == "sky_replace" ||
+        e.type.rfind("composite_", 0) == 0)
+        return;
     // A sequence graded scene-referred: the effect in the values it is made for, and back.
     const SceneGrading* sg = currentSceneGrading();
     const ColorSpace& here = currentWorkingSpace();

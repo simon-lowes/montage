@@ -133,20 +133,33 @@ public:
                 return fail("The browser stopped at once: " + QString::fromUtf8(log().right(400)).trimmed().toStdString(), error);
         }
         if (port <= 0) return fail("The browser did not open its DevTools port", error);
+        // A busy machine can be slow to answer the upgrade (or drop the first one), so a silent attempt is retried
+        // on a fresh connection until the minute is up.
         sock_.setProxy(QNetworkProxy::NoProxy);
-        sock_.connectToHost(QStringLiteral("127.0.0.1"), quint16(port));
-        if (!sock_.waitForConnected(10000)) return fail("Cannot reach the browser's DevTools port", error);
-        QByteArray key(16, 0);
-        for (char& c : key) c = char(QRandomGenerator::global()->bounded(256));
-        sock_.write("GET " + path.toUtf8() + " HTTP/1.1\r\nHost: 127.0.0.1:" + QByteArray::number(port) +
-                    "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key.toBase64() +
-                    "\r\nSec-WebSocket-Version: 13\r\n\r\n");
-        QDeadlineTimer hs(10000);
+        QDeadlineTimer hs(60000);
         int end = -1;
-        while ((end = int(in_.indexOf("\r\n\r\n"))) < 0) {
-            if (hs.hasExpired() || !sock_.waitForReadyRead(int(std::max<qint64>(1, hs.remainingTime()))))
-                return fail("The browser's DevTools did not answer", error);
-            in_ += sock_.readAll();
+        while (end < 0) {
+            if (cancel && cancel->load()) return fail("Cancelled", error);
+            if (hs.hasExpired()) return fail("The browser's DevTools did not answer", error);
+            sock_.abort();
+            in_.clear();
+            sock_.connectToHost(QStringLiteral("127.0.0.1"), quint16(port));
+            if (!sock_.waitForConnected(10000)) return fail("Cannot reach the browser's DevTools port", error);
+            QByteArray key(16, 0);
+            for (char& c : key) c = char(QRandomGenerator::global()->bounded(256));
+            sock_.write("GET " + path.toUtf8() + " HTTP/1.1\r\nHost: 127.0.0.1:" + QByteArray::number(port) +
+                        "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key.toBase64() +
+                        "\r\nSec-WebSocket-Version: 13\r\n\r\n");
+            QDeadlineTimer attempt(std::min<qint64>(15000, std::max<qint64>(1, hs.remainingTime())));
+            while ((end = int(in_.indexOf("\r\n\r\n"))) < 0 && !attempt.hasExpired() &&
+                   sock_.state() == QAbstractSocket::ConnectedState) {
+                if (sock_.waitForReadyRead(int(std::min<qint64>(250, std::max<qint64>(1, attempt.remainingTime())))))
+                    in_ += sock_.readAll();
+                else if (cancel && cancel->load()) return fail("Cancelled", error);
+            }
+            if (end < 0) end = int((in_ += sock_.readAll()).indexOf("\r\n\r\n"));
+            if (end < 0 && proc_.state() == QProcess::NotRunning)
+                return fail("The browser stopped: " + QString::fromUtf8(log().right(400)).trimmed().toStdString(), error);
         }
         if (!in_.startsWith("HTTP/1.1 101")) return fail("The browser's DevTools refused the connection", error);
         in_.remove(0, end + 4);

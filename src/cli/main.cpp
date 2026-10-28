@@ -874,6 +874,12 @@ int cmdInterchange(const std::vector<std::string>& args, const std::string& form
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
     Project p;
     if (!load(args[0], p)) return 1;
+    // Each compositing graph's clip rendered to a file beside the export (standard output: beside the project).
+    std::string err;
+    if (!bakeCompositeClips(p, p.active()->id, out.empty() ? args[0] : out, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
     const Sequence& s = *p.active();
     const std::string text = format == "otio"     ? exportOtio(p, s)
                              : format == "xml"    ? exportFcp7Xml(p, s)
@@ -911,6 +917,10 @@ int cmdAaf(const std::vector<std::string>& args) {
     std::signal(SIGINT, [](int) { gCancel = true; });
     AafExportResult r;
     std::string err;
+    if (options.picture && !bakeCompositeClips(p, p.active()->id, out, &err, nullptr, &gCancel)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
     const bool ok = exportAaf(
         p, *p.active(), out, &r,
         [](double f, FrameTime) {

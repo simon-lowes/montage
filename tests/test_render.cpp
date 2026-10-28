@@ -32,6 +32,8 @@
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
 #include "core/GradeGraph.h"
+#include "core/CompositeGraph.h"
+#include "render/CompositeRender.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/ProjectIO.h"
@@ -84,6 +86,7 @@
 #include <QNetworkProxy>
 #include <thread>
 #include <atomic>
+#include <array>
 #include <functional>
 #include <mutex>
 #include <QPainter>
@@ -14329,6 +14332,305 @@ colorspaces:
         qInfo("%s", story.c_str());
         static const QRegularExpression storyForm("^Logline: [A-Z][^\\n]+\\n\\nBeats:\\n(- [^\\n]+\\n){3,12}\\nOpen questions:\\n(- [^\\n]+\\n?){1,5}$");
         QVERIFY2(storyForm.match(QString::fromStdString(story)).hasMatch(), story.c_str());
+    }
+
+    void compositeGraphRebuildsStack() {
+        // A keyed foreground over a graded plate with a title: as three tracks, and as the plate clip's compositing graph
+        // (the clip into a Grade, the foreground into a Key, merged over it, the title merged over that). The same picture.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 96, s.height = 54;
+        auto picture = [&](const char* name, const std::function<QColor(int, int)>& colour) {
+            QImage q(96, 54, QImage::Format_RGBA64);
+            for (int y = 0; y < 54; ++y)
+                for (int x = 0; x < 96; ++x) q.setPixelColor(x, y, colour(x, y));
+            const QString path = dir.filePath(name);
+            MediaItem m;
+            if (!q.save(path) || !probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id plate = picture("plate.png", [](int x, int y) { return QColor::fromRgbF(x / 96.0f, y / 54.0f, 0.4f, 1); });
+        const Id fg = picture("fg.png", [](int x, int y) {
+            return x > 30 && x < 66 && y > 12 && y < 42 ? QColor::fromRgbF(0.8f, 0.3f, 0.25f, 1) : QColor::fromRgbF(0.1f, 0.75f, 0.2f, 1);
+        });
+        QVERIFY(plate && fg);
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["exposure"] = 0.3;
+        cc.params["saturation"] = 1.2;
+        Clip title = makeGeneratorClip(p, "title", 30);
+        title.generator.strings["text"] = "Over";
+        title.generator.params["size"] = 20.0;
+        auto placed = edit::placeMedia(p, s, plate, 0, 0, 30, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        const Id id = placed.created[0];
+        edit::clipById(s, id)->effects = {cc};
+        auto top = edit::placeMedia(p, s, fg, 0, 0, 30, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(top.ok);
+        edit::clipById(s, top.created[0])->effects = {makeEffect(p, "screen_key")};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, title).ok);
+
+        Sequence g = s;
+        g.videoTracks[1].clips.clear();
+        g.videoTracks[2].clips.clear();
+        edit::clipById(g, id)->effects.clear();
+        int grade = 0, merge = 0, fgIn = 0, key = 0, titleIn = 0;
+        QVERIFY(edit::addCompositeNode(p, g, id, "grade", 0, &grade).ok);  // (the clip into the output first)
+        QVERIFY(edit::addCompositeNode(p, g, id, "merge", grade, &merge).ok);
+        QVERIFY(edit::addCompositeNode(p, g, id, "input", merge, &fgIn).ok);
+        QVERIFY(edit::addCompositeNode(p, g, id, "key", fgIn, &key).ok);
+        QVERIFY(edit::addCompositeNode(p, g, id, "input", merge, &titleIn).ok);
+        auto node = [&](int k) -> CompositeNode& { return *findCompositeNode(edit::clipById(g, id)->composite, k); };
+        Effect graded = cc;
+        graded.id = p.newId();
+        node(grade).effects = {graded};
+        CompositeNode n = node(fgIn);
+        n.source = "media";
+        n.media = fg;
+        QVERIFY(edit::setCompositeNode(p, g, id, n).ok);
+        n = node(titleIn);
+        n.source = "generator";
+        n.generator = title.generator;
+        n.generator.id = p.newId();
+        QVERIFY(edit::setCompositeNode(p, g, id, n).ok);
+        QCOMPARE(node(key).effects.at(0).type, std::string("screen_key"));
+        std::string why;
+        QVERIFY2(validComposite(edit::clipById(g, id)->composite, &why), why.c_str());
+        QCOMPARE(compositeOrder(edit::clipById(g, id)->composite).back(), merge);
+
+        RenderOptions o;
+        auto same = [](const Image& a, const Image& b, const QString& what) {
+            if (a.width != b.width || a.height != b.height) return what + ": sizes differ";
+            int differ = 0;
+            float worst = 0;
+            for (size_t i = 0; i < a.px.size(); ++i)
+                if (a.px[i] != b.px[i]) ++differ, worst = std::max(worst, std::fabs(a.px[i] - b.px[i]));
+            return differ ? what + QString(": %1 values differ, by up to %2").arg(differ).arg(worst) : QString();
+        };
+        for (FrameTime t : {FrameTime(3), FrameTime(17)}) {
+            const QString differs = same(renderProgramFrame(p, s, t, o), renderProgramFrame(p, g, t, o), QString("frame %1").arg(t));
+            QVERIFY2(differs.isEmpty(), qPrintable(differs));
+        }
+        // (Each piece shows: the screen keyed away, the title drawn.)
+        const Image all = renderProgramFrame(p, g, 3, o);
+        QVERIFY(all.at(4, 4)[1] < 0.5f);
+        CompositeNode hidden = node(titleIn);
+        hidden.enabled = false;
+        QVERIFY(edit::setCompositeNode(p, g, id, hidden).ok);
+        QVERIFY(!same(renderProgramFrame(p, g, 3, o), all, "title").isEmpty());
+        hidden.enabled = true;
+        QVERIFY(edit::setCompositeNode(p, g, id, hidden).ok);
+
+        // Each node drawn once for a frame, then kept; a changed grade draws only it and the merge after it again.
+        clearCompositeCache();
+        auto renders = [&] {
+            std::map<int, uint64_t> m;
+            for (const CompositeNode& x : edit::clipById(g, id)->composite.nodes) m[x.key] = compositeNodeRenders(x.id);
+            return m;
+        };
+        renderProgramFrame(p, g, 9, o);
+        const auto first = renders();
+        QCOMPARE(first.size(), size_t(6));
+        for (const auto& [k, count] : first) QVERIFY2(count == 1, qPrintable(QString("node %1 drawn %2 times").arg(k).arg(count)));
+        renderProgramFrame(p, g, 9, o);
+        QVERIFY(renders() == first);
+        QVERIFY(compositeCacheStats().reused >= 1);
+        node(grade).effects[0].params["exposure"] = 0.5;
+        renderProgramFrame(p, g, 9, o);
+        for (const auto& [k, count] : renders())
+            QVERIFY2(count == first.at(k) + (k == grade || k == merge ? 1 : 0), qPrintable(QString("node %1 drawn %2 times").arg(k).arg(count)));
+        node(grade).effects[0].params["exposure"] = 0.3;
+
+        // Saved and opened again: the same graph, the same picture.
+        Project saved = p;
+        *saved.findSequence(g.id) = g;
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(saved), back));
+        QVERIFY(edit::clipById(*back.findSequence(g.id), id)->composite == edit::clipById(g, id)->composite);
+        clearCompositeCache();
+        const QString reopened = same(renderProgramFrame(back, *back.findSequence(g.id), 17, o), renderProgramFrame(p, s, 17, o), "reopened");
+        QVERIFY2(reopened.isEmpty(), qPrintable(reopened));
+
+        // On the GPU where there is one: the graph's layer made on the CPU, the frame finished there; the same picture.
+        if (!gpu::initialize(&why)) {
+            qInfo("CPU and GPU not compared: %s", why.c_str());
+            return;
+        }
+        o.gpu = false;
+        const Image cpu = renderProgramFrame(p, g, 12, o);
+        o.gpu = true;
+        const Image onGpu = renderProgramFrame(p, g, 12, o);
+        QCOMPARE(onGpu.width, cpu.width);
+        double worst = 0;
+        for (size_t i = 0; i < cpu.px.size() && i < onGpu.px.size(); ++i) worst = std::max(worst, double(std::fabs(cpu.px[i] - onGpu.px[i])));
+        QVERIFY2(worst <= 2e-3, qPrintable(QString("CPU and GPU differ by %1").arg(worst)));
+    }
+
+    void compositeNodeKnownAnswers() {
+        // Each kind of compositing node on a grey clip (0.25), with a red clip on a hidden V2 to bring in.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.25f, 0.25f, 0.25f, 0, 20)).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, colorClip(p, 1, 0, 0, 0, 20)).ok);
+        s.videoTracks[1].muted = true;
+        const Id id = s.videoTracks[0].clips[0].id, red = s.videoTracks[1].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        auto node = [&](int k) -> CompositeNode& { return *findCompositeNode(clip().composite, k); };
+        RenderOptions o;
+        auto px = [&](int x, int y, FrameTime t = 2) {
+            const Image img = renderProgramFrame(p, s, t, o);
+            const float* v = img.at(x, y);
+            return std::array<float, 3>{v[0], v[1], v[2]};
+        };
+        auto near = [](float a, float b) { return std::fabs(a - b) < 2e-3f; };
+        auto show = [](const std::array<float, 3>& v) { return qPrintable(QString("%1 %2 %3").arg(v[0]).arg(v[1]).arg(v[2])); };
+        const auto plain = px(32, 18);
+        QVERIFY2(near(plain[0], 0.25f), show(plain));
+
+        // Input of the clip: the clip as it was.
+        int in = 0;
+        QVERIFY(edit::startComposite(p, s, id, &in).ok);
+        QCOMPARE(px(32, 18), plain);
+        // Effect: inverted; switched off, it passes its input on.
+        int fx = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "effect", in, &fx).ok);
+        node(fx).effects.push_back(makeEffect(p, "invert"));
+        QVERIFY2(near(px(32, 18)[0], 1 - plain[0]), show(px(32, 18)));
+        CompositeNode off = node(fx);
+        off.enabled = false;
+        QVERIFY(edit::setCompositeNode(p, s, id, off).ok);
+        QCOMPARE(px(32, 18), plain);
+        QVERIFY(edit::removeCompositeNode(s, id, fx).ok);
+
+        // Grade: Color Correct's gain of 2 as on the clip; and a clip's whole grade in colour nodes taken.
+        Effect gain = makeEffect(p, "color_correct");
+        gain.params["gain"] = 2.0;
+        QVERIFY(edit::removeComposite(s, id).ok);
+        clip().effects = {gain};
+        const float gained = px(32, 18)[0];
+        clip().effects.clear();
+        QVERIFY(gained > plain[0] + 0.1f);
+        QVERIFY(edit::startComposite(p, s, id, &in).ok);
+        int gr = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "grade", in, &gr).ok);
+        Effect g2 = gain;
+        g2.id = p.newId();
+        node(gr).effects = {g2};
+        QVERIFY2(near(px(32, 18)[0], gained), show(px(32, 18)));
+        Effect g3 = gain;
+        g3.id = p.newId();
+        edit::clipById(s, red)->effects = {g3};
+        QVERIFY(edit::convertToNodes(s, red).ok);
+        node(gr).effects.clear();
+        QVERIFY(edit::gradeNodeFromClip(p, s, id, gr, red).ok);
+        QVERIFY(!node(gr).grade.empty());
+        QVERIFY2(near(px(32, 18)[0], gained), show(px(32, 18)));
+        edit::clipById(s, red)->effects.clear();
+        edit::clipById(s, red)->grade = {};
+        QVERIFY(edit::removeCompositeNode(s, id, gr).ok);
+
+        // Input of a track: what V2 shows (red); merged at half opacity, half of each; multiplied, grey times red.
+        int merge = 0, top = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "merge", in, &merge).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", merge, &top).ok);
+        CompositeNode t = node(top);
+        t.source = "track";
+        t.track = 0;
+        QVERIFY(!edit::setCompositeNode(p, s, id, t).ok);  // (its own track: it would be drawn inside itself)
+        t.track = 1;
+        QVERIFY(edit::setCompositeNode(p, s, id, t).ok);
+        auto v = px(32, 18);
+        QVERIFY2(near(v[0], 1) && near(v[1], 0), show(v));
+        QVERIFY(edit::setCompositeNodeParams(s, id, merge, {{"opacity", 50.0}}).ok);
+        v = px(32, 18);
+        QVERIFY2(near(v[0], (plain[0] + 1) / 2) && near(v[1], plain[1] / 2), show(v));
+        QVERIFY(edit::setCompositeNodeParams(s, id, merge, {{"opacity", 100.0}}).ok);
+        CompositeNode m = node(merge);
+        m.blend = "multiply";
+        QVERIFY(edit::setCompositeNode(p, s, id, m).ok);
+        v = px(32, 18);
+        QVERIFY2(near(v[0], plain[0]) && near(v[1], 0), show(v));
+        // Merged by depth: the clip made deep (at 5) stays in front of the flat red layered over it.
+        Effect deep = makeEffect(p, "make_deep");
+        deep.params["source"] = 2.0;  // (a constant depth)
+        deep.params["depth"] = 5.0;
+        clip().effects = {deep};
+        m.blend = "normal";
+        QVERIFY(edit::setCompositeNode(p, s, id, m).ok);
+        v = px(32, 18);
+        QVERIFY2(near(v[0], 1) && near(v[1], 0), show(v));
+        m.blend = "depth";
+        QVERIFY(edit::setCompositeNode(p, s, id, m).ok);
+        v = px(32, 18);
+        QVERIFY2(near(v[0], plain[0]) && near(v[1], plain[1]), show(v));
+        clip().effects.clear();
+        QVERIFY(edit::removeCompositeNode(s, id, merge).ok);
+        QVERIFY(edit::removeCompositeNode(s, id, top).ok);
+        QCOMPARE(px(32, 18), plain);
+
+        // Transform: half size, 16 px right (the grey from x 32 to 64, y 9 to 27).
+        int tf = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "transform", in, &tf).ok);
+        QVERIFY(edit::setCompositeNodeParams(s, id, tf, {{"scale", 50.0}, {"pos_x", 16.0}}).ok);
+        QVERIFY2(near(px(48, 18)[0], plain[0]) && near(px(20, 18)[0], 0) && near(px(48, 4)[0], 0), show(px(48, 18)));
+        // Track: moved as V2's clip moves, 20 px right over its first ten frames (from frame 0, the reference).
+        Clip& followed = *edit::clipById(s, red);
+        Keyframe k0, k1;
+        k0.t = 0, k0.v = 0;
+        k1.t = 10, k1.v = 20;
+        followed.motion.params["pos_x"].keys = {k0, k1};
+        int trk = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "track", tf, &trk).ok);
+        CompositeNode tn = node(trk);
+        tn.follow = red;
+        QVERIFY(edit::setCompositeNode(p, s, id, tn).ok);
+        QVERIFY(edit::setCompositeNodeParams(s, id, trk, {{"follow", 0.0}, {"reference", 0.0}}).ok);
+        QVERIFY2(near(px(36, 18, 0)[0], plain[0]), show(px(36, 18, 0)));
+        QVERIFY2(near(px(36, 18, 10)[0], 0) && near(px(56, 18, 10)[0], plain[0]), show(px(56, 18, 10)));
+        tn.follow = p.newId();
+        QVERIFY(!edit::setCompositeNode(p, s, id, tn).ok);  // (no such clip)
+        QVERIFY(edit::removeCompositeNode(s, id, trk).ok);
+        QVERIFY(edit::removeCompositeNode(s, id, tf).ok);
+
+        // Mask: by its own rectangle over the left half; then by a mask picture's alpha (a white square in the middle),
+        // and that picture's luma inverted.
+        int mk = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "mask", in, &mk).ok);
+        QVERIFY(edit::setCompositeNodeParams(s, id, mk, {{"mask.shape", 2.0}, {"mask.x", 0.25}, {"mask.w", 0.5}, {"mask.h", 2.0}, {"mask.feather", 0.0}}).ok);
+        QVERIFY2(near(px(8, 18)[0], plain[0]) && near(px(56, 18)[0], 0), show(px(56, 18)));
+        QVERIFY(edit::setCompositeNodeParams(s, id, mk, {{"mask.shape", 0.0}}).ok);
+        int white = 0, small = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", mk, &white).ok);
+        CompositeNode w = node(white);
+        w.source = "generator";
+        w.generator = colorClip(p, 1, 1, 1, 0, 1).generator;
+        QVERIFY(edit::setCompositeNode(p, s, id, w).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "transform", white, &small).ok);
+        QVERIFY(edit::setCompositeNodeParams(s, id, small, {{"scale", 50.0}}).ok);
+        QVERIFY(edit::connectCompositeNodes(s, id, {small, mk, 1}).ok);
+        QVERIFY2(near(px(32, 18)[0], plain[0]) && near(px(4, 4)[0], 0), show(px(4, 4)));
+        QVERIFY(edit::setCompositeNodeParams(s, id, mk, {{"matte", 3.0}}).ok);
+        QVERIFY2(near(px(32, 18)[0], 0) && near(px(4, 4)[0], plain[0]), show(px(32, 18)));
+        QVERIFY(!edit::connectCompositeNodes(s, id, {mk, small, 0}).ok);  // (a loop)
+
+        // Key: a green screen keyed away; the key switched off, the green again.
+        QVERIFY(edit::removeComposite(s, id).ok);
+        QVERIFY(edit::startComposite(p, s, id, &in).ok);
+        CompositeNode screen = node(in);
+        screen.source = "generator";
+        screen.generator = colorClip(p, 0.1f, 0.75f, 0.2f, 0, 1).generator;
+        QVERIFY(edit::setCompositeNode(p, s, id, screen).ok);
+        QVERIFY2(near(px(32, 18)[1], 0.75f), show(px(32, 18)));
+        int key = 0;
+        QVERIFY(edit::addCompositeNode(p, s, id, "key", in, &key).ok);
+        QVERIFY2(px(32, 18)[1] < 0.02f, show(px(32, 18)));
+        CompositeNode keyOff = node(key);
+        keyOff.enabled = false;
+        QVERIFY(edit::setCompositeNode(p, s, id, keyOff).ok);
+        QVERIFY2(near(px(32, 18)[1], 0.75f), show(px(32, 18)));
     }
 
     void draftingAudioDescription() {
