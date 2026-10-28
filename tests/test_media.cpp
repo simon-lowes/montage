@@ -5487,6 +5487,17 @@ private slots:
         s.markers.push_back({30, 0, "worked on"});
         s.markers.push_back({80, 0, "after the clip"});
         QVERIFY(exampleFrames(s, bars, 0) == std::vector<FrameTime>({10, 30}));
+        {
+            // A key on every frame of a long clip: 128 examples at most, from first to last.
+            Sequence many = s;
+            many.markers.clear();
+            Clip longer = bars;
+            longer.duration = 3600;
+            for (FrameTime f = 0; f < 3600; ++f) longer.effects[0].params["saturation"].addKey(f, 0.4);
+            const std::vector<FrameTime> some = exampleFrames(many, longer, 0);
+            QCOMPARE(some.size(), size_t(128));
+            QVERIFY(some.front() == longer.start && some.back() == longer.start + 3599 && std::is_sorted(some.begin(), some.end()));
+        }
         const Image truth = renderSequenceFrame(p, s, 40, ro);
         const QString project = QString::fromStdString(path("learn.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
@@ -10624,6 +10635,11 @@ private slots:
             QVERIFY(std::fabs(leqm(two, 2) - (at2k + 3.0103)) < 0.05);
             const double gains[2] = {1.0, std::pow(10.0, -3.0 / 20)};
             QVERIFY(std::fabs(leqm(two, 2, gains) - (at2k + 10 * std::log10(1.5))) < 0.05);
+            // An ambisonic field is measured by its W alone (its other components are directions, not more sound).
+            const std::vector<double> field = leqmChannelGains("ambix", 4);
+            QCOMPARE(field, (std::vector<double>{1, 0, 0, 0}));
+            QCOMPARE(leqmChannelGains("ambix3", 16).size(), size_t(16));
+            QCOMPARE(leqmChannelGains("5.1", 6)[4], std::pow(10.0, -3.0 / 20));
         }
         QCOMPARE(leqm(std::vector<float>(size_t(rate), 0.0f)), 0.0);
 

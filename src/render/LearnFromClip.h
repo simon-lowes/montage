@@ -26,7 +26,8 @@ int64_t learningPixelsEach(size_t frames);
 void fitLearningPair(learn::Pair& p, int64_t maxPixels);
 
 // The frames the clip was worked on, to learn from: the sequence's markers on it, else where its effects (those a
-// Learned Effect stands in for too) have keys, else the playhead (when on it). Timeline frames, in order.
+// Learned Effect stands in for too) have keys, else the playhead (when on it). Timeline frames, in order; at most
+// 128, spread over them.
 std::vector<FrameTime> exampleFrames(const Sequence& s, const Clip& c, FrameTime playhead);
 
 // The network a clip's Learned Effect runs ("" when it has none).

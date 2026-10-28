@@ -3749,6 +3749,23 @@ colorspaces:
         // Six straight blades (a corner at 0 degrees): a spike straight down, little between the spikes, nothing beyond the
         // kernel's 40 px.
         QVERIFY(glared.at(128, 148)[1] > 20 * glared.at(148, 128)[1] && glared.at(188, 128)[1] < 1e-6f);
+        // On a layer with six times the sequence's pixels (scaled down six times), the glare reaches as far in the
+        // sequence: 40 px of it, 240 of the layer's, the light it spreads the same.
+        {
+            Image big(768, 768);
+            for (int y = 0; y < 768; ++y)
+                for (int x = 0; x < 768; ++x) big.at(x, y)[3] = 1;
+            for (int y = 384; y < 390; ++y)
+                for (int x = 384; x < 390; ++x) std::fill_n(big.at(x, y), 3, 5.0f);
+            Image bigGlared = big;
+            applyVideoEffect(fx("aperture_glare", {{"threshold", 1.0}, {"size", 40}, {"intensity", 1.0}}), 0, bigGlared, 6);
+            double added = 0;
+            for (int y = 0; y < 768; ++y)
+                for (int x = 0; x < 768; ++x) added += bigGlared.at(x, y)[1] - big.at(x, y)[1];
+            QVERIFY2(std::fabs(added - 36 * 4) < 36 * 0.1, qPrintable(QString::number(added)));
+            QVERIFY2(bigGlared.at(387, 387 + 120)[1] > 1e-5f, qPrintable(QString::number(bigGlared.at(387, 507)[1])));  // (past where a kernel of 80 px reaches)
+            QVERIFY(bigGlared.at(387, 387 + 260)[1] < 1e-5f);
+        }
 
         // Light Rays: a bright point gives a ray straight out from the centre, beyond the point, and nothing towards
         // the centre or to the side.
@@ -4897,6 +4914,21 @@ colorspaces:
             }
         }
 
+        // A master brighter than a method takes is rolled off into it, not clipped: up to 4000 cd/m², every level
+        // brighter than the last, and the brightest still short of SDR's peak, as the trim pass's own roll-off has it.
+        for (const ColorSpace* m : {&a, &c}) {
+            double last = -1, at1000 = 0;
+            for (int i = 1; i <= 400; ++i) {
+                float px[3];
+                px[0] = px[1] = px[2] = float(nitsToCode(pq, 10.0 * i));
+                convertPixel(px, pq, *m, 4000);
+                QVERIFY2(px[1] >= last && px[1] <= 1.0f, qPrintable(QString("%1 at %2 nits: %3").arg(QString::fromStdString(m->id)).arg(10 * i).arg(px[1])));
+                last = px[1];
+                if (i == 100) at1000 = last;
+            }
+            QVERIFY2(last > at1000 + 0.02, qPrintable(QString("%1: %2 at 1000 nits, %3 at 4000").arg(QString::fromStdString(m->id)).arg(at1000).arg(last)));
+        }
+
         // Method C's curve is continuous at its knee (58.5 cd/m² of SDR, code 0.8): it rises through it both ways.
         double lastUp = -1, lastDown = -1;
         for (int i = 0; i <= 2000; ++i) {
@@ -4913,7 +4945,7 @@ colorspaces:
                 for (double b : {0.0, 0.25, 0.6, 1.0}) {
                     float px[3] = {float(r), float(g), float(b)};
                     convertPixel(px, c, pq, 1000);
-                    convertPixel(px, pq, c, 1000);
+                    convertPixel(px, pq, c, cTop);  // (a master made from SDR this way peaks at Method C's white)
                     // (compared in light: a channel at zero comes back within the float precision of the PQ code,
                     // which BT.1886's curve magnifies near black)
                     const double want[3] = {r, g, b};
@@ -7733,6 +7765,15 @@ colorspaces:
         QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
         QVERIFY(r.application == 5 && r.frames == 24 && r.colour == "aces2065-1" && r.targetFrames == 2 && r.codedFrames == 24);
         QCOMPARE(QString::fromStdString(r.outputTransform), QStringLiteral("urn:montage:transformId:Output.Montage.Filmic.rec709_100nit"));
+        // Delivered in another display's colour, the frames are taken back through it and the transform names it.
+        for (const char* other : {"srgb", "p3d65", "rec2020"}) {
+            Sequence in = now;
+            in.colorSpace = other;
+            std::string display;
+            const std::string named = imfOutputTransform(in, &display);
+            QCOMPARE(QString::fromStdString(display), QString(other));
+            QVERIFY2(QString::fromStdString(named).startsWith(QStringLiteral("urn:montage:transformId:Output.Montage.Filmic.%1_").arg(other)), named.c_str());
+        }
         QVERIFY(QFileInfo::exists(QString::fromStdString(r.amf)));
         std::vector<std::string> issues = verifyImf(r.folder);
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
@@ -9310,6 +9351,28 @@ colorspaces:
                         QVERIFY2(std::fabs(dB(delivered.amplitude[c][b], measured.amplitude[c][b])) < (b < 2 ? 2 : 1),
                                  qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(delivered.amplitude[c][b], measured.amplitude[c][b]))));
         }
+        // A colour outside the delivery space's gamut keeps its colour under the grain (only the grain is taken back).
+        {
+            const ColorSpace& cct = *findColorSpace("acescct");
+            SceneGrading grading;
+            grading.working = &cct;
+            grading.linear = &linearColorSpace(cct.primaries);
+            grading.display = grading.delivery = &space;
+            Image img(64, 64);
+            const float green[3] = {float(fromLinear(Transfer::AcesCct, 0.05)), float(fromLinear(Transfer::AcesCct, 0.5)),
+                                    float(fromLinear(Transfer::AcesCct, 0.02))};
+            for (size_t i = 0; i < img.px.size(); i += 4) img.px[i] = green[0], img.px[i + 1] = green[1], img.px[i + 2] = green[2], img.px[i + 3] = 1;
+            {
+                const SceneGradingScope scene(&grading);
+                const WorkingSpaceScope inCct(&cct);
+                applyVideoEffect(match, 0, img, 1);
+            }
+            double mean[3] = {0, 0, 0};
+            for (size_t i = 0; i < img.px.size(); i += 4)
+                for (int k = 0; k < 3; ++k) mean[k] += img.px[i + size_t(k)] / (64.0 * 64.0);
+            for (int k = 0; k < 3; ++k)
+                QVERIFY2(std::fabs(mean[k] - green[k]) < 0.01, qPrintable(QString("channel %1: %2 for %3").arg(k).arg(mean[k]).arg(green[k])));
+        }
         // Twice the size: grain twice as large.
         {
             Effect big = match;
@@ -10697,6 +10760,25 @@ colorspaces:
         Project back;
         QVERIFY(loadProject(file.toStdString(), back));
         QVERIFY(back.active()->colorGroups == s.colorGroups);
+        // Grouped again with the wide group's shots split evenly in two: both halves keep its grade.
+        {
+            Project halves = p;
+            Sequence& h = *halves.active();
+            const std::vector<Id> shots = colorGroupMembers(h, wide);
+            QVERIFY(shots.size() >= 2);
+            ShotGrouping twoWays;
+            twoWays.scenes = {""};
+            twoWays.angles = {{std::vector<Id>(shots.begin(), shots.begin() + std::ptrdiff_t(shots.size() / 2)), 0},
+                              {std::vector<Id>(shots.begin() + std::ptrdiff_t(shots.size() / 2), shots.end()), 0}};
+            if (shots.size() % 2) twoWays.angles[1].clips.pop_back();  // (an even split)
+            QVERIFY(edit::applyShotGrouping(halves, h, twoWays).ok);
+            for (const ShotGrouping::Angle& a : twoWays.angles) {
+                const ColorGroup* g = colorGroupOf(h, *edit::clipById(h, a.clips.front()));
+                QVERIFY(g && g->pre.size() == 1 && g->pre[0].p("gain", 0) == 1.5);
+            }
+            QVERIFY(colorGroupOf(h, *edit::clipById(h, twoWays.angles[0].clips.front()))->pre[0].id !=
+                    colorGroupOf(h, *edit::clipById(h, twoWays.angles[1].clips.front()))->pre[0].id);
+        }
 
         // Locked, the wide group stays as it is when grouped again at another sensitivity; the unlocked groups that
         // keep most of their shots keep their grades.

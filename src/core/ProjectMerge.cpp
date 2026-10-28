@@ -56,6 +56,14 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
     auto fx = [&](Effect& e) {
         fn(e.id);
         if (const auto it = e.strings.find("media"); it != e.strings.end()) text(it->second);
+        // Settings naming a track by its id (a compressor's or gate's sidechain, Lip Sync's sound, a plug-in's key).
+        std::set<std::string> names;
+        if (const EffectInfo* info = e.type.empty() ? nullptr : findEffectInfo(e.type))
+            for (const StringParamInfo& sp : info->strings)
+                if (sp.kind == StringKind::Track) names.insert(sp.name);
+        if (e.type == "plugin") names.insert("sidechain");
+        for (const std::string& name : names)
+            if (const auto it = e.strings.find(name); it != e.strings.end()) text(it->second);
     };
     auto fxs = [&](std::vector<Effect>& v) {
         for (Effect& e : v) fx(e);
@@ -118,8 +126,17 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
 }
 
 // Fields that are where the editor was looking rather than the work: mine's are kept, and they are not listed.
-bool viewField(const QString& key) {
-    return key == "activeSequence" || key == "nextId" || key == "playhead" || key == "height" || key == "lanesShown" || key == "collapsedFolders";
+// (A track's height is how tall it is drawn; a sequence's or media item's is its picture's.) `path`: the field's own.
+bool viewField(const QString& key, const std::string& path) {
+    if (key == "height") {
+        // .../video/<track>/height (and audio and caption tracks)
+        const size_t field = path.rfind('/'), item = field == std::string::npos || field == 0 ? std::string::npos : path.rfind('/', field - 1);
+        if (item == std::string::npos || item == 0) return false;
+        const size_t list = path.rfind('/', item - 1);
+        const std::string name = path.substr(list == std::string::npos ? 0 : list + 1, item - (list == std::string::npos ? 0 : list + 1));
+        return name == "video" || name == "audio" || name == "captions";
+    }
+    return key == "activeSequence" || key == "nextId" || key == "playhead" || key == "lanesShown" || key == "collapsedFolders";
 }
 // Fields merged whole (analyses, masks and drawings are not merged part by part).
 bool wholeField(const QString& key) {
@@ -215,7 +232,7 @@ public:
     Merger(const std::map<std::string, MergeSide>& choices, MergeResult& r) : choices_(choices), r_(r) {}
 
     QJsonValue merge(const QJsonValue& b, const QJsonValue& m, const QJsonValue& t, const Where& w, const QString& field) {
-        const bool view = viewField(field);
+        const bool view = viewField(field, w.path);
         if (m == t) {
             if (m != b && !view) describe(MergeSide::Both, b, m, w, field);
             return m;
@@ -267,7 +284,7 @@ private:
     // Lists what one side changed from `before` to `after`, thing by thing and field by field (keys, analyses and
     // other whole fields as one change).
     void describe(MergeSide side, const QJsonValue& before, const QJsonValue& after, const Where& w, const QString& field) {
-        if (viewField(field)) return;
+        if (viewField(field, w.path)) return;
         if (before.isUndefined() != after.isUndefined() && !wholeField(field)) {  // a list or group made or emptied: its contents
             const QJsonValue& v = before.isUndefined() ? after : before;
             if (v.isArray()) return describe(side, before.isUndefined() ? QJsonArray() : before, after.isUndefined() ? QJsonArray() : after, w, field);
@@ -495,8 +512,14 @@ void settleMovedClips(Project& p, const Project& mine, const std::map<std::strin
             k.mine = places[ours].first->name;
             k.theirs = places[theirsAt].first->name;
             k.sequence = s.id, k.clip = id;
+            // Left on two tracks by theirs being taken where mine had removed it (moved it away): theirs, unless
+            // chosen otherwise, so that the choice already made is not undone.
+            const bool theirsKept = std::any_of(r.conflicts.begin(), r.conflicts.end(), [&](const MergeConflict& x) {
+                return x.kind == MergeConflict::Removed && x.clip == id && x.sequence == s.id && x.choice == MergeSide::Theirs;
+            });
             const auto it = choices.find(k.key);
-            k.choice = it != choices.end() && it->second == MergeSide::Theirs ? MergeSide::Theirs : MergeSide::Mine;
+            k.choice = it != choices.end() ? (it->second == MergeSide::Theirs ? MergeSide::Theirs : MergeSide::Mine)
+                                           : theirsKept ? MergeSide::Theirs : MergeSide::Mine;
             r.conflicts.push_back(k);
             for (size_t i = 0; i < places.size(); ++i)
                 if (k.choice == MergeSide::Mine ? i != ours : i != theirsAt) drop.push_back({places[i].first, id});

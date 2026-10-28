@@ -6,13 +6,16 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
 #include <locale>
 #include <memory>
+#include <new>
 #include <sstream>
+#include <unordered_map>
 
 #include "core/Zip.h"
 
@@ -723,6 +726,7 @@ private:
     }
 
     bool body(Prim& p, int depth) {
+        if (depth > kMaxDepth) return bad("prims nest too deeply");  // (variants within variants come here directly)
         while (ok_) {
             skip();
             if (i_ >= s_.size()) return bad("a prim does not end");
@@ -1138,6 +1142,7 @@ private:
     template <class Int>
     bool compressedInts(Reader& r, size_t count, std::vector<Int>& out) {
         if (count > kMaxElements) return bad("too many values");
+        if (!spend(count * sizeof(Int) * 2 + 16)) return false;  // (what it unpacks to, and the values)
         const uint64_t size = r.get<uint64_t>();
         if (!r.ok || size > b_.size() - r.pos) return bad("compressed integers lie outside the file");
         const uint8_t* p = r.take(size_t(size));
@@ -1158,6 +1163,7 @@ private:
             Reader r{b_, size_t(toc_["TOKENS"].start)};
             const uint64_t n = r.get<uint64_t>(), raw = r.get<uint64_t>(), packed = r.get<uint64_t>();
             if (!r.ok || n > kMaxElements || raw > kMaxUnpacked || packed > b_.size() - r.pos) return bad("its tokens are damaged");
+            if (!spend(size_t(raw) * 2 + size_t(n) * sizeof(std::string))) return false;
             std::vector<uint8_t> text;
             if (!fastDecompress(r.take(size_t(packed)), size_t(packed), text, size_t(raw))) return bad("its tokens are damaged");
             tokens_.reserve(size_t(n));
@@ -1173,6 +1179,7 @@ private:
             Reader r{b_, size_t(toc_["STRINGS"].start)};
             const uint64_t n = r.get<uint64_t>();
             if (!r.ok || n > kMaxElements || n * 4 > b_.size() - r.pos) return bad("its strings are damaged");
+            if (!spend(size_t(n) * 4)) return false;
             strings_.resize(size_t(n));
             for (uint32_t& s : strings_) s = r.get<uint32_t>();
         }
@@ -1182,6 +1189,7 @@ private:
             if (!r.ok || n > kMaxElements || !compressedInts(r, size_t(n), fieldTokens_)) return bad("its fields are damaged");
             const uint64_t packed = r.get<uint64_t>();
             if (!r.ok || packed > b_.size() - r.pos) return bad("its fields are damaged");
+            if (!spend(size_t(n) * 16)) return false;
             std::vector<uint8_t> raw;
             if (!fastDecompress(r.take(size_t(packed)), size_t(packed), raw, size_t(n) * 8) || raw.size() != size_t(n) * 8) return bad("its fields are damaged");
             fieldReps_.resize(size_t(n));
@@ -1200,6 +1208,7 @@ private:
             if (!r.ok || numPaths > kMaxElements || encoded > kMaxElements || !compressedInts(r, size_t(encoded), index) ||
                 !compressedInts(r, size_t(encoded), element) || !compressedInts(r, size_t(encoded), jump))
                 return bad("its paths are damaged");
+            if (!spend(size_t(numPaths) * sizeof(PathNode))) return false;
             paths_.assign(size_t(numPaths), PathNode{});
             // The tree in depth-first order: each entry's jump says whether a child follows (> 0 or -1) and where its
             // next sibling is (>= 0: that many entries on; 0: the next).
@@ -1243,6 +1252,7 @@ private:
             std::vector<uint32_t> path, set, type;
             if (!r.ok || !compressedInts(r, size_t(n), path) || !compressedInts(r, size_t(n), set) || !compressedInts(r, size_t(n), type))
                 return bad("its specs are damaged");
+            if (!spend(size_t(n) * sizeof(Spec))) return false;
             specs_.resize(size_t(n));
             for (size_t i = 0; i < specs_.size(); ++i) specs_[i] = {path[i], set[i], type[i]};
         }
@@ -1671,16 +1681,17 @@ private:
         std::function<Prim(int, int)> assemble = [&](int id, int depth) -> Prim {
             Node& n = nodes[size_t(id)];
             Prim p = std::move(n.prim);
-            std::vector<int> kids = n.kids;
-            std::stable_sort(kids.begin(), kids.end(), [&](int a, int b) {
-                auto rank = [&](int k) {
-                    const auto it = std::find(n.order.begin(), n.order.end(), nodes[size_t(k)].prim.name);
-                    return it == n.order.end() ? n.order.size() : size_t(it - n.order.begin());
-                };
-                return rank(a) < rank(b);
-            });
+            // (Ranked once each, by a lookup: a parent may have very many children.)
+            std::unordered_map<std::string, size_t> place;
+            for (size_t k = 0; k < n.order.size(); ++k) place.emplace(n.order[k], k);
+            std::vector<std::pair<size_t, int>> kids;
+            for (const int k : n.kids) {
+                const auto it = place.find(nodes[size_t(k)].prim.name);
+                kids.push_back({it == place.end() ? n.order.size() : it->second, k});
+            }
+            std::stable_sort(kids.begin(), kids.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
             if (depth > kMaxDepth) return p;
-            for (const int k : kids) {
+            for (const auto& [rank, k] : kids) {
                 Node& kid = nodes[size_t(k)];
                 if (!kid.set.empty()) {
                     const std::string set = kid.set, variant = kid.variant;
@@ -1960,6 +1971,36 @@ private:
     // A prim's variants, references and payloads composed into it (each weaker than what it says itself, variants
     // stronger than references), until none is left; then its children.
     size_t flattened_ = 0;  // prims composed (references within references can multiply them)
+    // Bytes of values copied in by references and payloads (one large array referenced many times would otherwise
+    // be copied each time).
+    size_t copied_ = 0;
+    static size_t primBytes(const Prim& p, int depth) {
+        auto valueBytes = [](const Value& v) {
+            size_t n = 64 + v.numbers.size() * sizeof(double);
+            for (const std::string& t : v.texts) n += sizeof(std::string) + t.size();
+            return n;
+        };
+        size_t n = 256;
+        if (depth > kMaxDepth) return n;
+        for (const auto& [name, a] : p.attributes) {
+            n += 128 + name.size() + valueBytes(a.value);
+            for (const auto& s : a.samples) n += valueBytes(s.second);
+        }
+        for (const Prim& c : p.children) n += primBytes(c, depth + 1);
+        for (const auto& [set, variants] : p.variantSets)
+            for (const auto& [name, v] : variants) n += primBytes(v, depth + 1);
+        return n;
+    }
+    bool mayCopy(const Prim& target) {
+        const size_t n = primBytes(target, 0);
+        if (n > (size_t(1) << 31) - copied_) {
+            if (copied_ != SIZE_MAX) note("The scene's references copy in more than 2 GB: the rest are not composed");
+            copied_ = SIZE_MAX;
+            return false;
+        }
+        copied_ += n;
+        return true;
+    }
     void flatten(Prim& p, const std::string& path, const Layer& owner, const std::string& ownerId, int layerDepth, int depth, bool variants) {
         if (depth > kMaxDepth) return;
         if (++flattened_ > kMaxPrims) {
@@ -1993,6 +2034,7 @@ private:
                         note("A reference to " + (a.prim.empty() ? std::string("nothing") : a.prim) + " is not found or holds itself");
                         continue;
                     }
+                    if (!mayCopy(*t)) continue;
                     target = *t;
                     from = a.prim;
                 } else {
@@ -2005,6 +2047,7 @@ private:
                         note(a.asset + " has no prim " + (name.empty() ? std::string("to reference") : name));
                         continue;
                     }
+                    if (!mayCopy(*t)) continue;
                     target = *t;
                     from = name;
                 }
@@ -2051,7 +2094,13 @@ bool openStage(const std::string& path, Stage& out, std::string* error, FileRead
     out.path = path;
     out.reader_ = readFile;
     Composer c(out, readFile);
-    const auto l = c.layer(path, 0, true);
+    std::shared_ptr<const Layer> l;
+    try {
+        l = c.layer(path, 0, true);
+    } catch (const std::bad_alloc&) {  // (whatever the limits above let through, a load does not end the program)
+        c.notes.insert(c.notes.begin(), path + " needs more memory than there is");
+        l = nullptr;
+    }
     out.notes = c.notes;
     out.packages_ = c.packages;
     if (!l) {

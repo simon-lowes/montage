@@ -409,7 +409,7 @@ WarpMesh meshFor(const Effect& e, int w, int h) {
 
 WarpMesh buildWarpMesh(int w, int h, int vertices, const Image* alpha, double grow) {
     if (w <= 0 || h <= 0) return {};
-    vertices = std::clamp(vertices, 4, 1000000);
+    vertices = std::clamp(vertices, 4, 10000);  // (the setting's own range: a project file may say more)
     const int cols = std::max(1, int(std::lround(std::sqrt(double(vertices) * w / h))) - 1);
     const int rows = std::max(1, int(std::lround(double(vertices) / (cols + 1))) - 1);
     WarpMesh full = lattice(cols, rows, w, h);
@@ -743,6 +743,23 @@ void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale) {
 
 std::vector<MeshPoint> meshWarpMoved(const Effect& e, double t, int w, int h, double pixelScale, const std::vector<MeshPoint>& rest) {
     if (w <= 0 || h <= 0) return rest;
+    // Over the picture's alpha, worked out at the size the picture was last drawn, so that the solve drawing it made is
+    // used again (a mesh scaled to this size would be a new one to solve, each time the picture's alpha moves).
+    if (std::lround(e.p("mesh_from", 0, 0)) == 0) {
+        LastMesh last;
+        {
+            std::lock_guard<std::mutex> g(lastMeshLock);
+            if (const auto it = lastMeshes.find(e.id); it != lastMeshes.end()) last = it->second;
+        }
+        if (last.mesh && last.w > 0 && last.h > 0 && (last.w != w || last.h != h)) {
+            const double sx = double(last.w) / w, sy = double(last.h) / h;
+            std::vector<MeshPoint> there;
+            for (const MeshPoint& p : rest) there.push_back({p[0] * sx, p[1] * sy});
+            std::vector<MeshPoint> out = meshWarpMoved(e, t, last.w, last.h, pixelScale * sx, there);
+            for (MeshPoint& p : out) p = {p[0] / sx, p[1] / sy};
+            return out;
+        }
+    }
     const WarpMesh mesh = meshFor(e, w, h);
     if (mesh.tris.empty()) return rest;
     const std::vector<MeshPoint> v = solveWarp(mesh, meshWarpPins(e, t, w, h, pixelScale));
@@ -900,11 +917,12 @@ bool trackMeshPins(const Project& p, const Sequence& seq, const Clip& c, const E
         std::vector<TrackRegion> ahead, behind;
         const size_t wantAhead = last > from ? size_t(std::floor((last - from) / frameSeconds + 1e-6)) + 1 : 1;
         const size_t wantBehind = first < from ? size_t(std::floor((from - first) / frameSeconds + 1e-6)) + 1 : 1;
+        std::string lost;  // (why a region was lost: said only if no size holds the pin)
         for (double size : {0.1, 0.2, 0.3}) {
             start.w = size, start.h = size * aspect;
-            std::vector<TrackRegion> a = last > from ? trackRegion(path, from, last, start, MotionModel::TranslationScale, stage(0, 0.5), &cancelled, error)
+            std::vector<TrackRegion> a = last > from ? trackRegion(path, from, last, start, MotionModel::TranslationScale, stage(0, 0.5), &cancelled, &lost)
                                                      : std::vector<TrackRegion>{start};
-            std::vector<TrackRegion> b = first < from ? trackRegion(path, from, first, start, MotionModel::TranslationScale, stage(0.5, 1), &cancelled, error)
+            std::vector<TrackRegion> b = first < from ? trackRegion(path, from, first, start, MotionModel::TranslationScale, stage(0.5, 1), &cancelled, &lost)
                                                       : std::vector<TrackRegion>{start};
             if (cancelled) return fail("Cancelled");
             if (a.size() + b.size() > ahead.size() + behind.size()) ahead = std::move(a), behind = std::move(b);
@@ -919,7 +937,7 @@ bool trackMeshPins(const Project& p, const Sequence& seq, const Clip& c, const E
             px.addKey(f, run[size_t(n)].x);
             py.addKey(f, run[size_t(n)].y);
         }
-        if (px.keys.size() < 2) return fail("A pin could not be tracked");
+        if (px.keys.size() < 2) return fail(lost.empty() ? "A pin could not be tracked" : lost.c_str());
         keys[pins[i]] = {px, py};
     }
     if (progress) progress(1.0);

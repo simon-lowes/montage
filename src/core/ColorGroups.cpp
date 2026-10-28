@@ -224,8 +224,8 @@ Result applyShotGrouping(Project& p, Sequence& s, const ShotGrouping& found) {
     for (const ColorGroup& g : s.colorGroups)
         if (g.locked && g.parent && remade.count(g.parent)) kept.insert(g.parent);
     for (Id g : kept) remade.erase(g);
-    // An old group is reused by the new one that has most of its shots (and more than half of them; a kept scene's
-    // locked groups' shots not counted).
+    // An old group is reused by the new one that has most of its shots (and at least half of them, the first such
+    // when it splits evenly; a kept scene's locked groups' shots not counted).
     std::map<Id, std::set<Id>> oldMembers;
     for (Id g : remade)
         for (Id c : colorGroupMembers(s, g, true)) oldMembers[g].insert(c);
@@ -247,7 +247,7 @@ Result applyShotGrouping(Project& p, Sequence& s, const ShotGrouping& found) {
             const ColorGroup* old = findColorGroup(s, g);
             if (!old || old->kind != kind || reused.count(g)) continue;
             const size_t n = size_t(std::count_if(clips.begin(), clips.end(), [&](Id c) { return members.count(c) > 0; }));
-            if (n > bestCount && 2 * n > members.size()) best = g, bestCount = n;
+            if (n > bestCount && 2 * n >= members.size()) best = g, bestCount = n;
         }
         if (best) reused.insert(best);
         return best;
@@ -277,15 +277,34 @@ Result applyShotGrouping(Project& p, Sequence& s, const ShotGrouping& found) {
     for (Track& t : s.videoTracks)
         for (Clip& c : t.clips)
             if (remade.count(c.colorGroup) && (placed.count(c.id) || !reused.count(c.colorGroup))) c.colorGroup = 0;
+    // (the grades of the groups that go, for the new groups made of their shots)
+    std::map<Id, ColorGroup> gone;
+    for (const ColorGroup& g : s.colorGroups)
+        if (remade.count(g.id) && !reused.count(g.id) && (!g.pre.empty() || !g.post.empty())) gone[g.id] = g;
     std::erase_if(s.colorGroups, [&](const ColorGroup& g) { return remade.count(g.id) && !reused.count(g.id); });
     for (ColorGroup& g : s.colorGroups)
         if (g.parent && !findColorGroup(s, g.parent)) g.parent = 0;
-    auto make = [&](const std::string& kind, const std::string& name) {
+    // A new group takes the grade of the graded group that went that held most of its shots (so a group split in
+    // two keeps its grade in both halves).
+    auto make = [&](const std::string& kind, const std::string& name, const std::vector<Id>& clips) {
         ColorGroup g;
         g.id = p.newId();
         g.postId = p.newId();
         g.kind = kind;
         g.name = name.empty() ? freeGroupName(s, kind == "scene" ? "Scene" : "Angle") : name;
+        const ColorGroup* from = nullptr;
+        size_t most = 0;
+        for (const auto& [id, old] : gone) {
+            if (old.kind != kind) continue;
+            const std::set<Id>& members = oldMembers[id];
+            const size_t n = size_t(std::count_if(clips.begin(), clips.end(), [&](Id c) { return members.count(c) > 0; }));
+            if (n > most) from = &old, most = n;
+        }
+        if (from) {
+            g.pre = from->pre, g.post = from->post;
+            for (auto* list : {&g.pre, &g.post})
+                for (Effect& e : *list) e.id = p.newId();
+        }
         s.colorGroups.push_back(std::move(g));
         return s.colorGroups.back().id;
     };
@@ -293,13 +312,18 @@ Result applyShotGrouping(Project& p, Sequence& s, const ShotGrouping& found) {
         bool used = false;
         for (const ShotGrouping::Angle& a : found.angles) used = used || (a.scene == int(k) && !a.clips.empty());
         if (!used) continue;
-        if (!sceneIds[k]) sceneIds[k] = make("scene", found.scenes[k]);
+        if (!sceneIds[k]) {
+            std::vector<Id> clips;
+            for (const ShotGrouping::Angle& a : found.angles)
+                if (a.scene == int(k)) clips.insert(clips.end(), a.clips.begin(), a.clips.end());
+            sceneIds[k] = make("scene", found.scenes[k], clips);
+        }
         else findColorGroup(s, sceneIds[k])->parent = 0;
     }
     for (size_t k = 0; k < found.angles.size(); ++k) {
         const ShotGrouping::Angle& a = found.angles[k];
         if (a.clips.empty()) continue;
-        if (!angleIds[k]) angleIds[k] = make("angle", "");
+        if (!angleIds[k]) angleIds[k] = make("angle", "", a.clips);
         ColorGroup* g = findColorGroup(s, angleIds[k]);
         g->parent = a.scene >= 0 && size_t(a.scene) < sceneIds.size() ? sceneIds[size_t(a.scene)] : 0;
         for (Clip* c : videoClips(s, a.clips))  // (a clip in a kept group stays there, unless it is straight in a kept scene)

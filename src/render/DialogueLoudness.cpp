@@ -267,7 +267,10 @@ std::vector<double> leqmChannelGains(const std::string& audioLayout, int channel
     std::vector<double> gains;
     if (channels > 2)
         for (const Speaker& sp : layoutSpeakers(audioLayout))
-            gains.push_back(sp.lfe || (sp.elevation == 0 && std::fabs(sp.angle) <= 30.0 + 1e-9) ? 1.0 : std::pow(10.0, -3.0 / 20));
+            // (an ambisonic field's components are not speakers: its loudness is its W's, as BS.1770 is measured)
+            gains.push_back(ambisonicLayout(audioLayout) ? sp.loudnessWeight
+                            : sp.lfe || (sp.elevation == 0 && std::fabs(sp.angle) <= 30.0 + 1e-9) ? 1.0
+                                                                                                : std::pow(10.0, -3.0 / 20));
     gains.resize(size_t(std::max(1, channels)), 1.0);
     return gains;
 }

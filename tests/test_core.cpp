@@ -1,5 +1,6 @@
 // Engine tests: keyframes, timecode, edit operations, undo, project I/O.
 #include <QtTest>
+#include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QImage>
 #include <set>
@@ -6870,6 +6871,28 @@ private slots:
             QCOMPARE(back.active()->buses.at(0), bus);
             QCOMPARE(busVolumeAt(back.active()->buses.at(0), 0), 1.5);
         }
+        // Eased and held points hours apart fold in quickly, as a few points, held steps kept, eases within 0.01 dB.
+        {
+            Track m;
+            m.kind = TrackKind::Audio;
+            m.volumeAuto.addKey(0, -20);
+            m.volumeAuto.keys.back().interp = Interp::Smooth;
+            m.volumeAuto.addKey(10'000'000, 0);
+            m.volumeTrim.addKey(5'000'000, 0);
+            m.volumeTrim.keys.back().interp = Interp::Hold;
+            m.volumeTrim.addKey(5'000'500, -6);
+            m.volumeTrim.addKey(9'000'000, 0);
+            const Track before = m;
+            QElapsedTimer clock;
+            clock.start();
+            QVERIFY(coalesceTrim(m));
+            QVERIFY2(clock.elapsed() < 1000, qPrintable(QString::number(clock.elapsed())));
+            QVERIFY(m.volumeAuto.keys.size() < 400);
+            for (double f : {5'000'499.0, 5'000'500.0})
+                QVERIFY2(std::fabs(trackVolumeAt(m, f) - trackVolumeAt(before, f)) < 1e-9, qPrintable(QString::number(f)));
+            for (double f = 0; f <= 10'000'000; f += 12'345.5)
+                QVERIFY2(std::fabs(trackVolumeAt(m, f) - trackVolumeAt(before, f)) < 0.01, qPrintable(QString::number(f)));
+        }
         // Trim modes write the trim and show it; what cannot be trimmed is written as in Write, Latch or Touch.
         QCOMPARE(untrimmed(AutomationMode::TrimTouch), AutomationMode::Touch);
         QCOMPARE(trimmed(AutomationMode::Write), AutomationMode::TrimWrite);
@@ -8634,6 +8657,46 @@ private slots:
         const MergeResult withTake = mergeProjects(base, mediaMine, mediaTheirs);
         QVERIFY(withTake.renumbered.count(take));
         QCOMPARE(clip(withTake.project, a)->effects.back().s("media"), std::to_string(withTake.renumbered.at(take)));
+
+        // A compressor keyed from a track both sides made: its sidechain follows the track's new id.
+        Project trackMine = base, trackTheirs = base;
+        auto addAudio = [](Project& p) {
+            Track t;
+            t.id = p.newId();
+            t.name = "A9";
+            p.active()->audioTracks.push_back(t);
+            return t.id;
+        };
+        addAudio(trackMine);
+        const Id voice = addAudio(trackTheirs);
+        Effect duck = makeEffect(trackTheirs, "compressor");
+        duck.strings["sidechain"] = std::to_string(voice);
+        trackTheirs.active()->audioTracks[0].effects.push_back(duck);
+        const MergeResult keyed = mergeProjects(base, trackMine, trackTheirs);
+        QVERIFY(keyed.ok && keyed.renumbered.count(voice));
+        QCOMPARE(keyed.project.active()->audioTracks[0].effects.back().s("sidechain"), std::to_string(keyed.renumbered.at(voice)));
+
+        // The sequence's frame height is the work (both changing it is a conflict); a track's drawn height is not.
+        Project tallMine = base, tallTheirs = base;
+        tallMine.active()->height = 720, tallTheirs.active()->height = 540;
+        tallMine.active()->videoTracks[0].height = 80, tallTheirs.active()->videoTracks[0].height = 120;
+        const MergeResult tall = mergeProjects(base, tallMine, tallTheirs);
+        QCOMPARE(tall.conflicts.size(), size_t(1));
+        QCOMPARE(tall.conflicts[0].field, std::string("height"));
+        QCOMPARE(mergeProjects(base, tallMine, tallTheirs, {{tall.conflicts[0].key, MergeSide::Theirs}}).project.active()->height, 540);
+        QCOMPARE(tall.project.active()->videoTracks[0].height, 80);
+
+        // Mine moves B to V2, theirs trims it where it was: taking theirs leaves it once, on V1, trimmed.
+        Project bMoved = base, bTrimmed = base;
+        QVERIFY(moveClips(bMoved, *bMoved.active(), {b}, 0, 1, 0).ok);
+        clipById(*bTrimmed.active(), b)->duration = 30;
+        const MergeResult split = mergeProjects(base, bMoved, bTrimmed);
+        QCOMPARE(tracksWith(split.project, b), std::make_pair(1, 1));
+        std::map<std::string, MergeSide> takeTheirs;
+        for (const MergeConflict& x : split.conflicts) takeTheirs[x.key] = MergeSide::Theirs;
+        const MergeResult theirsTaken = mergeProjects(base, bMoved, bTrimmed, takeTheirs);
+        QCOMPARE(tracksWith(theirsTaken.project, b), std::make_pair(1, 0));
+        QCOMPARE(clip(theirsTaken.project, b)->duration, FrameTime(30));
     }
 
     void timelineCompare() {

@@ -821,11 +821,16 @@ void grainMatch(const Effect& e, FrameTime t, Image& img) {
     const ColorSpace& working = currentWorkingSpace();
     // (Graded scene-referred, the picture is in the working space and the profile in the sequence's, where the plate's
     // grain was measured: the grain is added there, its strength in each light and colour as measured, and the picture
-    // taken back.)
+    // taken back. Only the grain is taken back: what the delivery space cannot hold, such as colours outside its
+    // gamut, is left as it was rather than clipped to it.)
     if (const SceneGrading* sg = currentSceneGrading(); sg && sg->delivery && sg->delivery->id != working.id) {
-        convertExactly(img, working, *sg->delivery);
-        addGrain(img, *sg->delivery, effectGrainProfile(e), s, t);
-        convertExactly(img, *sg->delivery, working);
+        Image clean = img;
+        convertExactly(clean, working, *sg->delivery);
+        Image grained = clean;
+        addGrain(grained, *sg->delivery, effectGrainProfile(e), s, t);
+        convertExactly(grained, *sg->delivery, working);
+        convertExactly(clean, *sg->delivery, working);
+        for (size_t i = 0; i < img.px.size(); ++i) img.px[i] += grained.px[i] - clean.px[i];
         return;
     }
     addGrain(img, working, effectGrainProfile(e), s, t);

@@ -865,7 +865,10 @@ void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) 
     // (the pattern repeats every 360 / blades degrees, so a turn by a whole step makes the same kernel)
     const double step = shape.rounding >= 1 ? 360.0 : 360.0 / shape.blades;
     shape.rotation = std::round(std::fmod(std::fmod(e.p("rotation", t, 0), step) + step, step) * 10) / 10;
-    const int radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * std::min(pixelScale, 2.0))));
+    // On a picture with more pixels than the sequence (a large layer scaled down) the glare is worked out on a picture
+    // f times smaller each way, so that its kernel stays as small as at twice the sequence's size, and drawn back up.
+    const int f = pixelScale > 2 ? int(std::ceil(pixelScale / 2 - 1e-9)) : 1;
+    const int radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * pixelScale / f)));
     if (intensity <= 0) return;
     // The highlights: the light above the threshold.
     std::vector<float> bright(size_t(W) * H * 3, 0.0f);
@@ -882,20 +885,36 @@ void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) 
         }
     }
     if (!any) return;
+    if (f > 1) {
+        const int w = (W + f - 1) / f, h = (H + f - 1) / f;
+        std::vector<float> small(size_t(w) * size_t(h) * 3, 0.0f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                for (int c = 0; c < 3; ++c)
+                    small[(size_t(y / f) * size_t(w) + size_t(x / f)) * 3 + size_t(c)] += bright[(size_t(y) * W + size_t(x)) * 3 + size_t(c)];
+        // (each the mean of what it covers: the edges' blocks cover fewer pixels)
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const float n = float((std::min(W, (x + 1) * f) - x * f) * (std::min(H, (y + 1) * f) - y * f));
+                for (int c = 0; c < 3; ++c) small[(size_t(y) * size_t(w) + size_t(x)) * 3 + size_t(c)] /= n;
+            }
+        bright = std::move(small);
+    }
+    const int GW = (W + f - 1) / f, GH = (H + f - 1) / f;  // (the glare's own picture)
     // Convolved by FFT in tiles (overlap-add): red and green as one complex picture, blue as another.
     const int K = 2 * radius + 1, M = nextPow2(K + std::max(K / 2, 128)), T = M - K + 1;
     const auto kernel = glareKernel(shape, radius, M);
-    std::vector<float> glare(size_t(W) * H * 3, 0.0f);
+    std::vector<float> glare(size_t(GW) * GH * 3, 0.0f);
     std::vector<Cf> rg(size_t(M) * M), b(size_t(M) * M), out(size_t(M) * M);
-    for (int ty = 0; ty < H; ty += T)
-        for (int tx = 0; tx < W; tx += T) {
-            const int tw = std::min(T, W - tx), th = std::min(T, H - ty);
+    for (int ty = 0; ty < GH; ty += T)
+        for (int tx = 0; tx < GW; tx += T) {
+            const int tw = std::min(T, GW - tx), th = std::min(T, GH - ty);
             bool lit = false;
             std::fill(rg.begin(), rg.end(), Cf(0, 0));
             std::fill(b.begin(), b.end(), Cf(0, 0));
             for (int y = 0; y < th; ++y)
                 for (int x = 0; x < tw; ++x) {
-                    const float* s = &bright[(size_t(ty + y) * W + size_t(tx + x)) * 3];
+                    const float* s = &bright[(size_t(ty + y) * GW + size_t(tx + x)) * 3];
                     rg[size_t(y) * M + size_t(x)] = Cf(s[0], s[1]);
                     b[size_t(y) * M + size_t(x)] = Cf(s[2], 0);
                     lit = lit || s[0] > 0 || s[1] > 0 || s[2] > 0;
@@ -916,21 +935,32 @@ void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) 
             const float norm = 1.0f / (float(M) * float(M));
             for (int y = -radius; y < th + radius; ++y) {
                 const int oy = ty + y;
-                if (oy < 0 || oy >= H) continue;
+                if (oy < 0 || oy >= GH) continue;
                 for (int x = -radius; x < tw + radius; ++x) {
                     const int ox = tx + x;
-                    if (ox < 0 || ox >= W) continue;
+                    if (ox < 0 || ox >= GW) continue;
                     const size_t i = size_t((y + M) % M) * M + size_t((x + M) % M);
-                    float* g = &glare[(size_t(oy) * W + size_t(ox)) * 3];
+                    float* g = &glare[(size_t(oy) * GW + size_t(ox)) * 3];
                     g[0] += out[i].real() * norm, g[1] += out[i].imag() * norm, g[2] += b[i].real() * norm;
                 }
             }
         }
-    parallelRows(H, [&](int y0, int y1) {
+    parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             float* p = img.row(y);
-            for (int x = 0; x < W; ++x, p += 4) {
-                const float* g = &glare[(size_t(y) * W + size_t(x)) * 3];
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                float g[3];
+                if (f == 1) {
+                    std::copy_n(&glare[(size_t(y) * GW + size_t(x)) * 3], 3, g);
+                } else {  // (drawn back up between the small picture's pixels)
+                    const double sx = std::clamp((x + 0.5) / f - 0.5, 0.0, double(GW - 1)), sy = std::clamp((y + 0.5) / f - 0.5, 0.0, double(GH - 1));
+                    const int x0 = int(sx), y0g = int(sy), x1 = std::min(GW - 1, x0 + 1), y1g = std::min(GH - 1, y0g + 1);
+                    const float fx = float(sx - x0), fy = float(sy - y0g);
+                    for (int c = 0; c < 3; ++c) {
+                        auto at = [&](int gx, int gy) { return glare[(size_t(gy) * GW + size_t(gx)) * 3 + size_t(c)]; };
+                        g[c] = (at(x0, y0g) * (1 - fx) + at(x1, y0g) * fx) * (1 - fy) + (at(x0, y1g) * (1 - fx) + at(x1, y1g) * fx) * fy;
+                    }
+                }
                 float most = 0;
                 for (int c = 0; c < 3; ++c) {
                     const float add = std::max(0.0f, g[c]) * float(intensity);  // (FFT rounding can dip below 0)

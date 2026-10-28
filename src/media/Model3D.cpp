@@ -12,6 +12,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <set>
 #include <tuple>
 
 #define CGLTF_IMPLEMENTATION
@@ -468,6 +469,13 @@ bool loadGltf(const std::string& path, const QByteArray& bytes, Model& out, std:
                 for (cgltf_size k = 0; k < gp.targets[t].attributes_count; ++k) fits = fits && unpack(gp.targets[t].attributes[k].data, 1);
             if (!fits) return fail(path + " is larger than Montage can load");
         }
+    // (and the skins' matrices and the animations' times and values, unpacked once each)
+    for (cgltf_size i = 0; i < data->skins_count; ++i)
+        if (!unpack(data->skins[i].inverse_bind_matrices, 16)) return fail(path + " is larger than Montage can load");
+    for (cgltf_size i = 0; i < data->animations_count; ++i)
+        for (cgltf_size k = 0; k < data->animations[i].samplers_count; ++k)
+            if (!unpack(data->animations[i].samplers[k].input, 1) || !unpack(data->animations[i].samplers[k].output, 1))
+                return fail(path + " is larger than Montage can load");
     for (cgltf_size i = 0; i < data->meshes_count; ++i) {
         const cgltf_mesh& gm = data->meshes[i];
         ModelMesh mesh;
@@ -663,12 +671,21 @@ bool loadGltf(const std::string& path, const QByteArray& bytes, Model& out, std:
 bool loadObj(const std::string& path, const QByteArray& bytes, Model& out, std::string* error) {
     const QDir dir = QFileInfo(QString::fromStdString(path)).absoluteDir();
     // Its material libraries read here (so paths in any script work) and handed over as one.
+    // (each library once, and no more than a model file in all: a model naming one large library many times cannot
+    // read it each time)
     std::string mtl;
+    std::set<QByteArray> libraries;
     for (const QByteArray& line : bytes.split('\n')) {
         const QByteArray l = line.trimmed();
         if (l.startsWith("mtllib")) {
             const QByteArray name = l.mid(6).trimmed();
-            mtl += readWhole(dir.filePath(QString::fromUtf8(name))).toStdString() + "\n";
+            if (!libraries.insert(name).second) continue;
+            const QByteArray lib = readWhole(dir.filePath(QString::fromUtf8(name)));
+            if (qint64(mtl.size()) + lib.size() > kMaxModelFile) {
+                if (error) *error = path + "'s material libraries are larger than Montage reads";
+                return false;
+            }
+            mtl += lib.toStdString() + "\n";
         }
     }
     tinyobj::ObjReader reader;

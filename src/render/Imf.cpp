@@ -11,6 +11,7 @@
 #include <QXmlStreamWriter>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <condition_variable>
 #include <deque>
 #include <future>
@@ -463,13 +464,14 @@ bool decodeTiff16(const std::vector<uint8_t>& tiff, std::vector<uint16_t>& rgb, 
 
 constexpr const char* kApp5 = "http://www.smpte-ra.org/ns/2067-50/2017";
 
-// The display an Application #5 master's target frames are shown on: the sequence's delivery colour when IMF has one
-// for it, else Rec.709.
-const ImfColourSpec& acesDisplay(const Sequence& s) {
+// The display an Application #5 master is made for: the sequence's delivery colour (its frames are taken back to
+// ACES through it), the space alone when it is tone mapped; Rec.709 for one that is not a display's.
+const ColorSpace& acesDisplay(const Sequence& s) {
     const ColorSpace& delivery = sequenceColorSpace(s);
-    for (const ImfColourSpec& c : kColours)
-        if (delivery.id == c.space) return c;
-    return kColours[0];
+    if (delivery.sceneReferred) return *findColorSpace("rec709");
+    if (const size_t plus = delivery.id.find('+'); plus != std::string::npos)
+        if (const ColorSpace* base = findColorSpace(delivery.id.substr(0, plus))) return *base;
+    return delivery;
 }
 
 // What an output transform name says: the display Montage has for it and its peak (from ACES's ids, or Montage's own).
@@ -539,7 +541,7 @@ void soundDescriptor(QXmlStreamWriter& x, const dcp::ImfSoundWriter& w) {
 }  // namespace
 
 std::string imfOutputTransform(const Sequence& s, std::string* display, double* peakNits) {
-    const ColorSpace* shown = findColorSpace(acesDisplay(s).space);
+    const ColorSpace* shown = &acesDisplay(s);
     const double peak = displayPeakNits(*shown, std::clamp(s.hdrPeakNits, 100.0, 10000.0));
     if (display) *display = shown->id;
     if (peakNits) *peakNits = peak;
@@ -1102,8 +1104,12 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                         std::vector<float> theirs;
                         AcesContainerInfo info;
                         if (cs.empty() || !readAcesContainer(cs.data(), cs.size(), info, &theirs) || info.width != W || info.height != H) return false;
-                        for (size_t i = 0; i < mine.size(); ++i)
-                            if (!(std::fabs(mine[i] - theirs[i]) <= 1e-3f * std::max(1.0f, std::fabs(mine[i])))) return false;
+                        for (size_t i = 0; i < mine.size(); ++i) {
+                            // (as half floats keep it: past their largest, infinite)
+                            const float m = std::fabs(mine[i]) >= 65520.0f ? std::copysign(std::numeric_limits<float>::infinity(), mine[i]) : mine[i];
+                            if (m == theirs[i] || (std::isnan(m) && std::isnan(theirs[i]))) continue;
+                            if (!(std::fabs(m - theirs[i]) <= 1e-3f * std::max(1.0f, std::fabs(m)))) return false;
+                        }
                         return true;
                     } catch (...) {
                         return false;
