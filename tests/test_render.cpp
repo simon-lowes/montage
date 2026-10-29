@@ -79,6 +79,7 @@
 #include "media/GainMap.h"
 #include "render/Gallery.h"
 #include "render/LinedScript.h"
+#include "render/RemoteGrade.h"
 #include "render/RemoteReview.h"
 #include "core/History.h"
 #include <QTcpServer>
@@ -12777,6 +12778,249 @@ colorspaces:
         QVERIFY(sendOne());
         QCOMPARE(lumaOf(dev->sent().back()), 940);
         sched.stop();
+    }
+
+    void remoteGradeFollows() {
+        using namespace montage::remote;
+        // Settings: SRT with a passphrase, and a port with one after it for the notes.
+        GradeSettings bad;
+        QVERIFY(!checkGradeSettings(bad).empty());
+        bad.passphrase = "a passphrase long enough";
+        QVERIFY(checkGradeSettings(bad).empty());
+        bad.address = "udp://0.0.0.0:9100";
+        QVERIFY(!checkGradeSettings(bad).empty());
+        bad.address = "srt://0.0.0.0:65535";
+        QVERIFY(!checkGradeSettings(bad).empty());
+
+        // Patches: values changed, keys added and removed, arrays resized; a patch that does not fit refused.
+        const std::string a = R"({"a":1,"b":{"c":[1,2,3],"d":"x","gone":true},"e":[{"f":1},{"f":2}]})";
+        const std::string b = R"({"a":1,"b":{"c":[1,2],"d":"y","new":null},"e":[{"f":1},{"f":5,"g":[]}],"h":2.5})";
+        const std::string patch = jsonPatch(a, b);
+        std::string out;
+        QVERIFY(applyJsonPatch(a, patch, out));
+        QCOMPARE(jsonHash(out), jsonHash(b));
+        QVERIFY(jsonHash(out) != jsonHash(a) && jsonPatch(b, b) == "[]");
+        QVERIFY(!applyJsonPatch(a, R"([{"p":["e",7,"f"],"v":1}])", out));
+        QVERIFY(!applyJsonPatch(a, R"([{"p":["b","zz","q"],"v":1}])", out));
+        QVERIFY(!applyJsonPatch(a, R"([{"p":[],"v":1}])", out));
+        QVERIFY(!applyJsonPatch(a, R"([{"p":["a","k"],"v":1}])", out));
+        QVERIFY(applyJsonPatch(a, R"([{"p":["b","gone"],"x":1}])", out) && !QString::fromStdString(out).contains("gone"));
+
+        // The playhead while parked stays; while playing moves on at the picture rate and speed.
+        ViewState v;
+        v.playhead = 100;
+        QCOMPARE(followPlayhead(v, {24, 1}, 500), FrameTime(100));
+        v.playing = true;
+        QCOMPARE(followPlayhead(v, {24, 1}, 500), FrameTime(112));
+        v.speed = -2;
+        QCOMPARE(followPlayhead(v, {24, 1}, 500), FrameTime(76));
+
+        // A project: two clips of media and a colour matte, the first with a grade.
+        Project p;
+        Sequence seq = makeSequence(p, "Grade", 64, 36, {24, 1});
+        p.sequences.push_back(seq);
+        p.activeSequence = seq.id;
+        Id media[2];
+        for (int i = 0; i < 2; ++i) {
+            MediaItem m;
+            m.id = media[i] = p.newId();
+            m.name = "shot" + std::to_string(i);
+            m.path = "/colourist/media/shot" + std::to_string(i) + ".mov";
+            m.kind = MediaKind::Video;
+            m.duration = 48;
+            p.media.push_back(m);
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = m.id;
+            c.start = 48 * i;
+            c.duration = 48;
+            Effect e;
+            e.id = p.newId();
+            e.type = "colorCorrect";
+            e.params["exposure"] = 0.0;
+            e.params["saturation"] = 1.0;
+            c.effects.push_back(e);
+            p.sequences[0].videoTracks[0].clips.push_back(c);
+        }
+        for (int i = 0; i < 40; ++i) {  // (and a reel's worth of other shots, graded, left alone)
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.start = 10 * i;
+            Effect e;
+            e.id = p.newId();
+            e.type = "colorCorrect";
+            e.params["exposure"] = 0.01 * i;
+            c.effects.push_back(e);
+            p.sequences[0].videoTracks[1].clips.push_back(c);
+        }
+        // The client's copy: its own media, elsewhere.
+        Project local = p;
+        local.media[0].path = "/client/footage/shot0.mov";
+        Project received = p;
+        keepLocalMedia(local, received);
+        QVERIFY(received.media[0].path == "/client/footage/shot0.mov" && received.media[1].path == p.media[1].path);
+        // A frame showing media the client lacks comes from the stream.
+        auto lacks = [&](Id m) { return m == media[1]; };
+        QVERIFY(!needsStream(p, p.sequences[0], 10, lacks));
+        QVERIFY(needsStream(p, p.sequences[0], 60, lacks));
+        p.sequences[0].videoTracks[0].clips[1].enabled = false;
+        QVERIFY(!needsStream(p, p.sequences[0], 60, lacks));
+        p.sequences[0].videoTracks[0].clips[1].enabled = true;
+
+        // Live over loopback (a port of this test run's own).
+        std::string why;
+        if (!gradingAvailable(&why)) QSKIP(why.c_str());
+        int port = 0;  // (one with the next free as well, for the notes)
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QUdpSocket a, b;
+            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1)) port = a.localPort();
+        }
+        QVERIFY(port > 0);
+        GradeSettings hs;
+        hs.address = "srt://127.0.0.1:" + std::to_string(port);
+        hs.passphrase = output::generatePassphrase();
+        GradeHost host;
+        std::string err;
+        QVERIFY2(host.start(hs, &err), err.c_str());
+        host.publish(p);
+        auto waitFor = [](const std::function<bool()>& done, int ms) {
+            QElapsedTimer t;
+            t.start();
+            while (!done() && t.elapsed() < ms) QThread::msleep(10);
+            return done();
+        };
+        // A wrong passphrase is refused.
+        {
+            GradeSettings wrong = hs;
+            wrong.passphrase = "not the right passphrase";
+            GradeClient intruder;
+            QVERIFY(intruder.start(wrong, &err));
+            QVERIFY(waitFor([&] { return !intruder.status().error.empty(); }, 10000));
+            QVERIFY(!intruder.status().connected && QString::fromStdString(intruder.status().error).contains("passphrase"));
+            Project none;
+            QVERIFY(!intruder.takeProject(none));
+            intruder.stop();
+            QCOMPARE(host.status().snapshots, int64_t(0));
+        }
+        GradeSettings cs = hs;
+        cs.name = "Client";
+        GradeClient client;
+        QVERIFY2(client.start(cs, &err), err.c_str());
+        Project followed;
+        uint64_t rev = 0;
+        auto caughtUp = [&] {
+            Project got;
+            if (client.takeProject(got, &rev)) followed = std::move(got);
+            return rev == host.status().revision && projectToJson(followed) == projectToJson(p);
+        };
+        QVERIFY(waitFor(caughtUp, 15000));
+        QVERIFY(host.status().connected && host.status().snapshots == 1 && waitFor([&] { return host.status().client == "Client"; }, 5000));
+
+        // 500 random grade changes (values, keys, effects added and removed, clips switched off), some in bursts: the
+        // client's project ends byte-identical, sent as patches.
+        std::mt19937 rng(7);
+        for (int i = 0; i < 500; ++i) {
+            Clip& c = p.sequences[0].videoTracks[0].clips[rng() % 2];
+            switch (rng() % 6) {
+            case 0:
+            case 1:
+                c.effects[0].params["exposure"].value = double(int(rng() % 2001) - 1000) / 1000.0;
+                break;
+            case 2:
+                c.effects[0].params["saturation"].keys.push_back({FrameTime(rng() % 48), double(rng() % 200) / 100.0});
+                std::sort(c.effects[0].params["saturation"].keys.begin(), c.effects[0].params["saturation"].keys.end(),
+                          [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
+                break;
+            case 3:
+                if (c.effects.size() < 4) {
+                    Effect e;
+                    e.id = p.newId();
+                    e.type = "curves";
+                    e.params["master"] = double(rng() % 100) / 100.0;
+                    c.effects.push_back(e);
+                } else {
+                    c.effects.pop_back();
+                }
+                break;
+            case 4:
+                c.effects[0].enabled = !c.effects[0].enabled;
+                break;
+            default:
+                c.effects[0].strings["look"] = "look " + std::to_string(rng() % 10);
+                break;
+            }
+            host.publish(p);
+            if (rng() % 8 == 0) QThread::msleep(15);
+        }
+        QVERIFY(waitFor(caughtUp, 20000));
+        QVERIFY2(host.status().patches > 0 && host.status().snapshots == 1, QByteArray::number(qlonglong(host.status().patches)).constData());
+        QCOMPARE(client.status().mismatches, int64_t(0));
+
+        // The view: parked, the playhead is the colourist's; playing at 24 fps, followed within a frame.
+        ViewState view;
+        view.sequence = seq.id;
+        view.playhead = 30;
+        view.viewer = R"({"exposure":2})";
+        view.compare = std::string("\x89PNG fake picture", 17);
+        host.setView(view);
+        ViewState seen;
+        int64_t age = 0;
+        QVERIFY(waitFor([&] { return client.view(seen) && seen.playhead == 30; }, 5000));
+        QVERIFY(seen.sequence == seq.id && seen.viewer == view.viewer && seen.compare == view.compare && !seen.playing);
+        view.playhead = 31;  // (the picture sent once, kept)
+        host.setView(view);
+        QVERIFY(waitFor([&] { return client.view(seen) && seen.playhead == 31; }, 5000));
+        QVERIFY(seen.compare == view.compare);
+        QElapsedTimer playing;
+        playing.start();
+        view.playing = true;
+        view.compare.clear();
+        // (each end shows whole frames: the client's frame against the colourist's exact place, at most a frame behind or
+        // ahead of it beyond the frame it rounds down to)
+        double worst = 0;
+        while (playing.elapsed() < 1500) {
+            view.playhead = 31 + FrameTime(double(playing.elapsed()) * 24 / 1000);
+            host.setView(view);
+            QThread::msleep(5);
+            if (playing.elapsed() > 300 && client.view(seen, &age)) {
+                const double hostNow = 31 + double(playing.elapsed()) * 24 / 1000;
+                worst = std::max(worst, std::abs(double(followPlayhead(seen, {24, 1}, age)) - hostNow));
+            }
+        }
+        QVERIFY2(worst < 2, QByteArray::number(worst).constData());
+        QVERIFY(seen.compare.empty() && seen.playing);
+
+        // Notes and pointers come back.
+        output::RemoteMarker note;
+        note.frame = 12;
+        note.sequence = seq.id;
+        note.text = "Warmer skin here";
+        client.sendNote(note);
+        client.sendPointer({seq.id, 12, 0.25, 0.75, ""});
+        std::vector<output::RemoteMarker> notes;
+        std::vector<Pointer> pointers;
+        QVERIFY(waitFor([&] {
+            for (auto& n : host.takeNotes()) notes.push_back(n);
+            for (auto& q : host.takePointers()) pointers.push_back(q);
+            return notes.size() == 1 && pointers.size() == 1;
+        }, 10000));
+        QVERIFY(notes[0].text == "Warmer skin here" && notes[0].author == "Client" && notes[0].frame == 12 && notes[0].sequence == seq.id);
+        QVERIFY(pointers[0].x == 0.25 && pointers[0].y == 0.75 && pointers[0].author == "Client");
+
+        // Drift: a copy that differs is found by the next check and sent whole again.
+        client.damageForTest();
+        QVERIFY(waitFor([&] { return client.status().mismatches >= 1 && host.status().resyncs >= 1; }, 15000));
+        QVERIFY(waitFor(caughtUp, 10000));
+
+        // A dropped connection: the client joins again and is brought up to date.
+        client.stop();
+        QVERIFY(waitFor([&] { return !host.status().connected; }, 20000));
+        p.sequences[0].videoTracks[0].clips[0].effects[0].params["exposure"].value = 0.123;
+        host.publish(p);
+        QVERIFY(client.start(cs, &err));
+        QVERIFY(waitFor(caughtUp, 20000));
+        QVERIFY(host.status().snapshots == 3);
+        client.stop();
+        host.stop();
     }
 
     void remoteReviewStream() {

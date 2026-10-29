@@ -1616,5 +1616,22 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - S-ADM in IMF (ST 2067-203): the track file's frames follow ST 2127-1's MGA layout, which is only in the paid standard (bmx has the descriptors and labels, not the frames). The ADM BWF master stays the ADM deliverable.
     - Not checked with an IAB renderer or validator: building the open IAB renderer and validator in CI was refused; checked against the standards and asdcplib's reader.
     - No IAB in: an IAB track in a package Montage imports is not read as sound.
-- [ ] 14. Remote grading (M)
+- [x] 14. Remote grading (M)
+  - Done: `render/RemoteGrade` (GradeHost, GradeClient) and Playback › Video Output › Remote Grading… (app/RemoteGradePanel): another Montage with its own media follows the colourist's live.
+    - Two SRT connections in file (reliable) mode through FFmpeg, AES-256 with the passphrase: the work on the colourist's port, notes back on the next. Messages are length-prefixed JSON (not compressed, so a message never grows past the length it gives).
+    - The project goes as its project file JSON: whole on joining, then patches (changed values by path; arrays that change length whole; the whole document again when a patch would be over half its size), the latest state ten times a second at most. Every change is sent, not only grades (the edit, keyframes, groups, markers).
+    - The view: sequence, playhead, playing and speed, the exposure check, the wipe with its reference picture (a JPEG, sent when it changes), the scope's mode. The client plays on its own clock at the colourist's speed and is put back when it drifts past a frame (more at shuttle speeds) for a while; parked, it seeks to the frame. A view from a colourist who has gone, or a playing one not heard from for 1.5 s, is not followed (playback pauses).
+    - A SHA-256 hash of the project every two seconds; a mismatch (or a patch that does not apply) asks for the whole project again. A client that drops joins again and gets the whole project.
+    - The client keeps its own media files (by media id); `EditorState::followProject` puts the project in place without an undo step and clears the history; the first one lets go of the client's project file and its lock, so saving asks where. Joining is refused while the client's project has unsaved changes. Where the frame shows media it lacks (offline), the Program monitor shows the colourist's Remote Review stream (`stream`, same passphrase) instead.
+    - Notes (at the client's playhead, with its name) land as review markers (one undo step, "Notes from Remote Grading"); pointers (Alt+click on the client's Program monitor) are drawn on the colourist's for four seconds.
+    - MCP `montage_remote_grade` (status, host, join, note, stop).
+  - **Tests:**
+    - render `remoteGradeFollows`: settings checks; patches with keys added and removed and arrays resized, bad patches refused; the playhead followed parked and playing (speeds either way); media kept by id; frames needing the stream. Over loopback: a wrong passphrase refused; 500 random grade changes (values, keys, effects added and removed, switched off) leave the client's project byte-identical, sent as patches after one snapshot; the playhead within two frames of the colourist's exact place while playing at 24 fps for 1.5 s (each end shows whole frames); the wipe's picture sent once and kept; notes and pointers back; a damaged copy found by the hash and sent whole again; a dropped client brought up to date.
+    - app `remoteGradingBothWays`: hosting from the dialog (an edit, the playhead, the exposure check, the wipe's picture reach the client; its note lands as a marker, its pointer is shown; MCP status); following over MCP (refused with unsaved changes; the colourist's project with this Montage's media, the playhead and exposure check and scope, a note and an Alt+click pointer back, the stream shown over a shot with missing media, playing and parking with the colourist).
+  - Not yet:
+    - Not measured over real long-distance networks; checked on loopback only.
+    - One client at a time; a relay for several clients is not built.
+    - Gallery stills travel only as the wipe's picture; the client's own Gallery is not filled.
+    - When the whole project must go again (joining, drift) it goes whole, not only the clips that differ.
+    - The client's own edits are overwritten by the colourist's next change (it is not locked while following).
 - [ ] 15. Montage in other languages (M)

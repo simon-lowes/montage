@@ -56,6 +56,7 @@ class MonitorCalibrationDialog;
 class PatchGenerator;
 class ReferenceOutputController;
 class RemoteReviewController;
+class RemoteGradeController;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -569,8 +570,9 @@ private:
     void showReferenceOutput();
     MonitorCalibrationDialog* showMonitorCalibration();
     void showRemoteReview();
+    void showRemoteGrade();
     // Markers reviewers sent from a remote review (one undo step), on the sequence streamed.
-    int applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers);
+    int applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers, const QString& undoLabel = QString());
     void about();
 
     EditorState* state_;
@@ -604,6 +606,8 @@ private:
     ReferenceOutputController* referenceOutput_ = nullptr;
     RemoteReviewController* remoteReview_ = nullptr;
     QAction* remoteReviewAction_ = nullptr;
+    RemoteGradeController* remoteGrade_ = nullptr;
+    QAction* remoteGradeAction_ = nullptr;
     QAction* referenceOutputAction_ = nullptr;
     PatchGenerator* patchGenerator_ = nullptr;
     QAction* monitorCalibrationAction_ = nullptr;

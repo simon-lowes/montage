@@ -206,6 +206,10 @@ public:
 
     // ---- Sequences ----------------------------------------------------------
     void setActiveSequence(Id id);
+    // A project as remote grading brings it from the colourist (render/RemoteGrade.h): in place of this one, not an
+    // edit here (no undo step, and the undo history cleared: undoing would take the project from under the colourist).
+    // The first one also lets go of this project's file (and its lock): saving asks where.
+    void followProject(Project p);
     Id newSequence(const QString& name, int w, int h, Rational fps);
 
     // ---- File -----------------------------------------------------------------

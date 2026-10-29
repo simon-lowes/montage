@@ -54,6 +54,8 @@ public:
     void setCompare(const QImage& reference, const QString& label = QString());
     void clearCompare();
     bool comparing() const { return !compare_.isNull(); }
+    const QImage& compareImage() const { return compare_; }
+    QString compareLabel() const { return compareLabel_; }
     double split() const { return split_; }
     void setSplit(double s);
     // The divider's x position in the widget.

@@ -56,6 +56,7 @@
 #include "core/ProjectLock.h"
 #include "ProductionPanel.h"
 #include "ReferenceOutputPanel.h"
+#include "RemoteGradePanel.h"
 #include "RemoteReviewPanel.h"
 #include <algorithm>
 #include <array>
@@ -18031,6 +18032,198 @@ print("added " + ui["name"])
         QCOMPARE(program->speed(), 2.0);
         program->shuttle(0);
         QCOMPARE(program->speed(), 0.0);
+    }
+
+    void remoteGradingBothWays() {
+        loadDemo();
+        std::string why;
+        if (!remote::gradingAvailable(&why)) QSKIP(why.c_str());
+        auto* controller = win_->findChild<RemoteGradeController*>("remoteGradeController");
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(controller && program);
+        MonitorPanel* monitor = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) monitor = m;
+        QVERIFY(monitor);
+        auto* exposure = monitor->findChild<QComboBox*>("exposureView");
+        QVERIFY(exposure);
+        int port = 0;  // (one with the next two free as well: the notes, and a stream that is not there)
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QUdpSocket a, b, c;
+            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1) &&
+                c.bind(QHostAddress::LocalHost, a.localPort() + 2))
+                port = a.localPort();
+        }
+        QVERIFY(port > 0);
+        const QString address = QStringLiteral("srt://127.0.0.1:%1").arg(port);
+        // Hosting from Playback › Video Output › Remote Grading…, a passphrase made for it.
+        auto* action = win_->findChild<QAction*>("remoteGrade");
+        QVERIFY(action);
+        action->trigger();
+        auto* dlg = win_->findChild<QDialog*>("remoteGradeDialog");
+        QVERIFY(dlg);
+        dlg->findChild<QTabWidget*>("remoteGradeTabs")->setCurrentIndex(0);
+        dlg->findChild<QLineEdit*>("remoteGradeHostAddress")->setText(address);
+        const QString pass = dlg->findChild<QLineEdit*>("remoteGradeHostPassphrase")->text();
+        QCOMPARE(pass.size(), 20);
+        dlg->findChild<QPushButton*>("remoteGradeStart")->click();
+        QCOMPARE(controller->mode(), RemoteGradeController::Mode::Hosting);
+        QVERIFY(action->isChecked());
+        // A client's Montage (here the engine's) follows: the project, then an edit to the grade.
+        remote::GradeSettings cs;
+        cs.address = address.toStdString();
+        cs.passphrase = pass.toStdString();
+        cs.name = "Client";
+        remote::GradeClient client;
+        QVERIFY(client.start(cs));
+        Project got;
+        auto same = [&] {
+            Project p;
+            if (client.takeProject(p)) got = std::move(p);
+            return projectToJson(got) == projectToJson(state()->project());
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(same(), 15000);
+        QVERIFY(state()->edit("Grade", [](Project& p, Sequence& s) {
+            Effect e;
+            e.id = p.newId();
+            e.type = "colorCorrect";
+            e.params["exposure"] = 0.4;
+            s.videoTracks[0].clips[0].effects.push_back(e);
+            return true;
+        }));
+        QTRY_VERIFY_WITH_TIMEOUT(same(), 10000);
+        // The playhead, the exposure check, the wipe and the scope.
+        program->seek(17);
+        exposure->setCurrentIndex(3);
+        QImage still(64, 36, QImage::Format_RGB32);
+        still.fill(Qt::red);
+        monitor->viewer()->setCompare(still, "Still 1");
+        remote::ViewState v;
+        QTRY_VERIFY_WITH_TIMEOUT(client.view(v) && v.playhead == 17 && RemoteGradeController::viewerJson(QString::fromStdString(v.viewer)).value("exposure").toInt() == 3 &&
+                                     !v.compare.empty(),
+                                 10000);
+        QVERIFY(RemoteGradeController::viewerJson(QString::fromStdString(v.viewer)).value("wipe").toBool());
+        QImage sent;
+        QVERIFY(sent.loadFromData(QByteArray::fromStdString(v.compare)) && sent.size() == still.size());
+        monitor->viewer()->clearCompare();
+        exposure->setCurrentIndex(0);
+        // The client's notes land as markers; its pointers show on the Program monitor.
+        output::RemoteMarker note;
+        note.frame = 5;
+        note.sequence = state()->project().activeSequence;
+        note.text = "Lift the shadows";
+        client.sendNote(note);
+        client.sendPointer({note.sequence, 5, 0.5, 0.5, ""});
+        auto hasMarker = [&](const QString& text) {
+            for (const Marker& m : state()->sequence()->markers)
+                if (QString::fromStdString(m.comment) == text || QString::fromStdString(m.name).contains(text)) return true;
+            return false;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(hasMarker("Lift the shadows") && !controller->pointers().empty(), 10000);
+        QCOMPARE(controller->pointers().front().pointer.author, std::string("Client"));
+        QCOMPARE(state()->undoText(), QStringLiteral("Notes from Remote Grading"));
+        QJsonObject st;
+        bool isError = false;
+        controller->runTool({{"action", "status"}}, st, isError);
+        QVERIFY(!isError && st.value("mode").toString() == "hosting" && st.value("client_connected").toBool() && st.value("client").toString() == "Client");
+        client.stop();
+        dlg->findChild<QPushButton*>("remoteGradeStart")->click();
+        QCOMPARE(controller->mode(), RemoteGradeController::Mode::Off);
+        dlg->close();
+
+        // Following a colourist (here the engine's host) over MCP: their project in place of this one, this Montage's
+        // own media files kept, their playhead, exposure check and scope.
+        Project theirs = state()->project();
+        theirs.name = "Colourist's";
+        Sequence* ts = theirs.findSequence(theirs.activeSequence);
+        QVERIFY(ts);
+        ts->videoTracks[0].clips[0].effects.back().params["exposure"] = -0.25;
+        ts->playhead = 9;  // (where their view puts it)
+        MediaItem gone;  // (a shot whose media this Montage lacks)
+        gone.id = theirs.newId();
+        gone.name = "Missing";
+        gone.path = (dir_.path() + "/not-here.mov").toStdString();
+        gone.kind = MediaKind::Video;
+        gone.duration = 400;
+        theirs.media.push_back(gone);
+        Clip over;
+        over.id = theirs.newId();
+        over.mediaId = gone.id;
+        over.start = 40;
+        over.duration = 20;
+        while (ts->videoTracks.size() < 3) ts->videoTracks.emplace_back();
+        ts->videoTracks[2].clips.push_back(over);
+        Project local = state()->project();
+        std::string localPath;
+        for (MediaItem& m : theirs.media)
+            if (const MediaItem* l = local.findMedia(m.id); l && !l->path.empty()) {
+                localPath = l->path;
+                m.path = "/colourist/media/" + m.name + ".mov";
+                break;
+            }
+        remote::GradeSettings hs;
+        hs.address = address.toStdString();
+        hs.passphrase = output::generatePassphrase();
+        remote::GradeHost host;
+        QVERIFY(host.start(hs));
+        host.publish(theirs);
+        remote::ViewState view;
+        view.sequence = theirs.activeSequence;
+        view.playhead = 9;
+        view.viewer = R"({"exposure":2,"scope":2})";
+        host.setView(view);
+        st = {};
+        const QJsonObject joining{{"action", "join"}, {"address", address}, {"passphrase", QString::fromStdString(hs.passphrase)}};
+        // (refused while this project has unsaved changes: following replaces it)
+        QVERIFY(state()->isModified());
+        controller->runTool(joining, st, isError);
+        QVERIFY(isError && controller->mode() == RemoteGradeController::Mode::Off);
+        isError = false;
+        QVERIFY(state()->save(dir_.filePath("graded.montage")));
+        controller->runTool({{"action", "join"}, {"address", address}, {"passphrase", QString::fromStdString(hs.passphrase)}, {"name", "Me"},
+                             {"stream", QStringLiteral("srt://127.0.0.1:%1").arg(port + 2)}},
+                            st, isError);
+        QVERIFY2(!isError && st.value("mode").toString() == "following", qPrintable(QJsonDocument(st).toJson()));
+        QTRY_VERIFY_WITH_TIMEOUT(state()->project().name == "Colourist's" && program->position() == 9 && exposure->currentIndex() == 2, 15000);
+        Project expected = theirs;
+        remote::keepLocalMedia(local, expected);
+        QCOMPARE(projectToJson(state()->project()), projectToJson(expected));
+        if (!localPath.empty()) QVERIFY(std::any_of(state()->project().media.begin(), state()->project().media.end(), [&](const MediaItem& m) { return m.path == localPath; }));
+        QVERIFY(!state()->canUndo() && state()->filePath().isEmpty());  // (saving asks where: not over the file this was)
+        // A note over MCP, and a pointer by Alt+click on the Program monitor.
+        controller->runTool({{"action", "note"}, {"text", "Looks good"}}, st, isError);
+        QVERIFY(!isError);
+        const QRectF r = monitor->viewer()->imageRect();
+        if (r.width() > 0) QTest::mouseClick(monitor->viewer(), Qt::LeftButton, Qt::AltModifier, r.center().toPoint());
+        std::vector<output::RemoteMarker> notes;
+        std::vector<remote::Pointer> pointers;
+        QTRY_VERIFY_WITH_TIMEOUT(
+            [&] {
+                for (auto& n : host.takeNotes()) notes.push_back(n);
+                for (auto& q : host.takePointers()) pointers.push_back(q);
+                return notes.size() == 1 && (r.width() <= 0 || pointers.size() == 1);
+            }(),
+            10000);
+        QVERIFY(notes[0].text == "Looks good" && notes[0].author == "Me" && notes[0].frame == 9);
+        if (r.width() > 0) QVERIFY(std::abs(pointers[0].x - 0.5) < 0.05 && std::abs(pointers[0].y - 0.5) < 0.05);
+        // The shot whose media is missing here shows the colourist's stream instead.
+        QVERIFY(!controller->showingStream());
+        view.playhead = 45;
+        host.setView(view);
+        QTRY_VERIFY_WITH_TIMEOUT(program->position() == 45 && controller->showingStream(), 10000);
+        QVERIFY(controller->status().contains("stream"));
+        // Playing as the colourist plays, and parked again.
+        view.playing = true;
+        host.setView(view);
+        QTRY_VERIFY_WITH_TIMEOUT(program->isPlaying(), 10000);
+        view.playing = false;
+        view.playhead = 3;
+        host.setView(view);
+        QTRY_VERIFY_WITH_TIMEOUT(!program->isPlaying() && program->position() == 3, 10000);
+        controller->runTool({{"action", "stop"}}, st, isError);
+        QCOMPARE(controller->mode(), RemoteGradeController::Mode::Off);
+        host.stop();
+        state()->newProject();
     }
 
     void remoteReviewRoundTrip() {

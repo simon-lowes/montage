@@ -1221,6 +1221,41 @@ bool EditorState::sourceEdit(SourceEdit mode) {
 // ---------------------------------------------------------------------------
 // Sequences
 
+void EditorState::followProject(Project p) {
+    if (gesture_) gesture_.reset();
+    const bool first = !path_.isEmpty() || readOnly_;
+    if (first) {
+        // (no longer this file's project: saving it asks where, so the colourist's never lands on the file this was)
+        releaseLock();
+        path_.clear();
+        readOnly_ = false;
+        lockHolder_.clear();
+        lockFree_ = false;
+        ++projectGeneration_;
+        maskObjects_.clear();
+        paintEffect_ = 0;
+        emit lockStateChanged();
+    }
+    const Id was = project_.activeSequence;
+    std::set<std::string> known;
+    for (const MediaItem& m : project_.media) known.insert(m.path);
+    project_ = std::move(p);
+    if (!project_.findSequence(project_.activeSequence) && !project_.sequences.empty()) project_.activeSequence = project_.sequences.front().id;
+    history_.clear();
+    bool added = false;
+    for (const MediaItem& m : project_.media)
+        if (!known.count(m.path)) {
+            startAudioDecode(m);
+            added = true;
+        }
+    if (added) offlineChecked_.clear();
+    pruneSelection();
+    if (was != project_.activeSequence) emit sequenceSwitched();
+    emit projectChanged();
+    emit historyChanged();
+    if (first) emit fileStateChanged();
+}
+
 void EditorState::setActiveSequence(Id id) {
     if (!project_.findSequence(id) || id == project_.activeSequence) return;
     if (gesture_) endGesture(true);

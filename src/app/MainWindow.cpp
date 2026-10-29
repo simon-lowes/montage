@@ -179,6 +179,7 @@
 #include "LensCorrectionDialog.h"
 #include "LicencesDialog.h"
 #include "ReferenceOutputPanel.h"
+#include "RemoteGradePanel.h"
 #include "RemoteReviewPanel.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
@@ -2361,6 +2362,7 @@ void MainWindow::buildMenus() {
         output->addSeparator();
         output->addAction(referenceOutputAction_);
         output->addAction(remoteReviewAction_);
+        output->addAction(remoteGradeAction_);
         output->addSeparator();
         output->addAction(monitorCalibrationAction_);
     });
@@ -2394,6 +2396,63 @@ void MainWindow::buildMenus() {
     connect(remoteReview_, &RemoteReviewController::markersReceived, this,
             [this](Id seq, const std::vector<output::RemoteMarker>& markers) { applyRemoteMarkers(seq, markers); });
     addAction(remoteReviewAction_);
+    // A client's Montage (or a second colourist's) following this one live, or this one following (render/RemoteGrade.h).
+    {
+        RemoteGradeHooks hooks;
+        hooks.viewer = [this] {
+            QJsonObject o;
+            if (programPanel_) {
+                ViewerWidget* v = programPanel_->viewer();
+                o["exposure"] = v->exposureView();
+                o["wipe"] = v->comparing();
+                o["split"] = v->split();
+            }
+            if (scopes_) o["scope"] = int(scopes_->mode());
+            return o;
+        };
+        hooks.compare = [this] { return programPanel_ && programPanel_->viewer()->comparing() ? programPanel_->viewer()->compareImage() : QImage(); };
+        hooks.applyViewer = [this](const QJsonObject& o, const QImage& compare) {
+            if (programPanel_) {
+                if (auto* exposure = programPanel_->findChild<QComboBox*>(QStringLiteral("exposureView")))
+                    exposure->setCurrentIndex(std::clamp(o.value("exposure").toInt(), 0, exposure->count() - 1));
+                ViewerWidget* v = programPanel_->viewer();
+                if (o.value("wipe").toBool() && !compare.isNull()) {
+                    v->setCompare(compare, tr("Colourist's wipe"));
+                    v->setSplit(o.value("split").toDouble(0.5));
+                } else if (v->comparing() && v->compareLabel() == tr("Colourist's wipe")) {
+                    v->clearCompare();
+                }
+            }
+            const int scope = o.value("scope").toInt(-1);
+            if (scopes_ && scope >= 0 && scope <= int(ScopesWidget::Mode::Chromaticity)) scopes_->setMode(ScopesWidget::Mode(scope));
+        };
+        hooks.notes = [this](Id seq, const std::vector<output::RemoteMarker>& markers) { applyRemoteMarkers(seq, markers, tr("Notes from Remote Grading")); };
+        remoteGrade_ = new RemoteGradeController(state_, program_, std::move(hooks), this);
+        remoteGrade_->setObjectName(QStringLiteral("remoteGradeController"));
+        if (programPanel_) {
+            ViewerWidget* v = programPanel_->viewer();
+            remoteGrade_->watchViewer(v, [v] { return v->imageRect(); });
+            v->addOverlay([this](QPainter& p, const QRectF& r) {
+                if (remoteGrade_) remoteGrade_->paintOverlay(p, r);
+            });
+            connect(remoteGrade_, &RemoteGradeController::pointersChanged, v, qOverload<>(&QWidget::update));
+        }
+        remoteGradeAction_ = new QAction(tr("Remote Grading…"), this);
+        remoteGradeAction_->setObjectName(QStringLiteral("remoteGrade"));
+        remoteGradeAction_->setToolTip(tr("Another Montage with its own media follows this one's grade, playhead and viewer live (or this one follows another)"));
+        remoteGradeAction_->setCheckable(true);
+        connect(remoteGradeAction_, &QAction::triggered, this, [this] {
+            remoteGradeAction_->setChecked(remoteGrade_->mode() != RemoteGradeController::Mode::Off);
+            showRemoteGrade();
+        });
+        connect(remoteGrade_, &RemoteGradeController::modeChanged, this,
+                [this] { remoteGradeAction_->setChecked(remoteGrade_->mode() != RemoteGradeController::Mode::Off); });
+        addAction(remoteGradeAction_);
+        if (liveLink_)
+            liveLink_->addAppTool(RemoteGradeController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+                return remoteGrade_->runTool(args, structured, isError);
+            });
+    }
     // Each display's calibration LUT, and the patch generator calibration software measures them through.
     patchGenerator_ = new PatchGenerator(referenceOutput_, this, this);
     monitorCalibrationAction_ = new QAction(tr("Monitor Calibration…"), this);
@@ -2816,6 +2875,15 @@ void MainWindow::syncProgram() {
     program_->requestFrame();
 }
 
+void MainWindow::showRemoteGrade() {
+    if (auto* open = findChild<RemoteGradePanel*>(QStringLiteral("remoteGradeDialog"))) {
+        open->raise();
+        open->activateWindow();
+        return;
+    }
+    (new RemoteGradePanel(remoteGrade_, this))->show();
+}
+
 void MainWindow::showRemoteReview() {
     if (auto* open = findChild<RemoteReviewPanel*>(QStringLiteral("remoteReviewDialog"))) {
         open->raise();
@@ -2825,7 +2893,7 @@ void MainWindow::showRemoteReview() {
     (new RemoteReviewPanel(remoteReview_, this))->show();
 }
 
-int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers) {
+int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers, const QString& undoLabel) {
     // As review notes (core/ReviewPage.h): named after the reviewer, in their colour, their note as the comment, on
     // the sequence the picture they marked was from (when it is still in the project), kept within it.
     const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
@@ -2848,7 +2916,7 @@ int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::Remote
     }
     if (bySequence.empty()) return 0;
     MarkerImport result;
-    state_->edit(tr("Markers from Remote Review"), [&](Project& p, Sequence&) {
+    state_->edit(undoLabel.isEmpty() ? tr("Markers from Remote Review") : undoLabel, [&](Project& p, Sequence&) {
         for (const auto& [id, notes] : bySequence)
             if (Sequence* s = p.findSequence(id)) {
                 const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
@@ -3290,6 +3358,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
         e->ignore();
         return;
     }
+    if (remoteGrade_) remoteGrade_->stop();  // (a client's last notes land before the project is offered for saving)
     if (!maybeSave()) {
         e->ignore();
         return;
