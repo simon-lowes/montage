@@ -123,6 +123,10 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         for (ColorGroup& g : s.colorGroups) fn(g.id), fn(g.postId), fn(g.parent), fxs(g.pre), fxs(g.post);
         for (SharedNode& n : s.sharedNodes) fn(n.id), fxs(n.effects);
         for (AdrCue& c : s.adrCues) fn(c.id), fn(c.clip);
+        for (VfxShotRecord& v : s.vfxShots) {
+            fn(v.clip), fn(v.plateMedia);
+            for (VfxVersion& r : v.versions) fn(r.media);
+        }
         for (TemplateField& f : s.fields) fn(f.clip), fn(f.effect);
     }
     for (auto& line : p.script.readings)

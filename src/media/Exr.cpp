@@ -272,6 +272,25 @@ bool exrNeedsLibrary(const std::string& compression) {
     return compression.rfind("htj2k", 0) == 0 || compression == "lj2k" || compression == "zstd";
 }
 
+bool readExrChromaticities(const std::string& file, double xy[8]) {
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        Imf::InputFile in(file.c_str(), 1);
+        const auto* c = in.header().findTypedAttribute<Imf::ChromaticitiesAttribute>("chromaticities");
+        if (!c) return false;
+        const Imf::Chromaticities& v = c->value();
+        const double out[8] = {v.red.x, v.red.y, v.green.x, v.green.y, v.blue.x, v.blue.y, v.white.x, v.white.y};
+        std::copy(out, out + 8, xy);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+#else
+    (void)file, (void)xy;
+    return false;
+#endif
+}
+
 bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error) {
     out = {};
 #ifdef MONTAGE_WITH_OPENEXR

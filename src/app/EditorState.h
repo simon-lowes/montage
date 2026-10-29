@@ -165,6 +165,11 @@ public:
     bool addWatchFolder(const QString& folder);
     bool removeWatchFolder(const QString& folder);
     std::vector<Id> scanWatchFolders();  // imports what has arrived and settled; the ids
+    // VFX returns (render/VfxShots.h): the open sequence's returns folder (and the folders in it) watched, and looked
+    // through a moment after anything changes there; each scan that finds something new, or more frames of a
+    // version, is one undo step. The versions it brought in ("<shot> v<n>"); `problems`: what is wrong with them.
+    std::vector<std::string> scanVfxReturnsNow(std::vector<std::string>* problems = nullptr);
+    QStringList vfxWatchedFolders() const;
     bool removeMedia(Id id, QString* error = nullptr);
 
     // The media item loaded in the source monitor and its marks
@@ -318,6 +323,10 @@ private:
     QTimer* folderTimer_ = nullptr;                 // a scan once things settle
     std::set<std::string> watchSkipped_;            // arrived but could not be imported: not tried again
     void watchFoldersChanged();
+    QFileSystemWatcher* vfxWatcher_ = nullptr;  // the VFX returns
+    QTimer* vfxTimer_ = nullptr;
+    QString vfxRoot_;
+    void watchVfxReturns(bool again = false);  // (again: its folders looked for anew, new ones having come)
     QTimer* reloadTimer_ = nullptr;
     QStringList changedFiles_;
     // Files being written (growing media): when writing began and was last seen, and whether it counts as growing.

@@ -137,6 +137,7 @@
 #include "media/Interpret.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/VfxShots.h"
 #include "render/Amf.h"
 #include "render/AafExport.h"
 #include "core/Interpretation.h"
@@ -9756,6 +9757,309 @@ private slots:
         QVERIFY(call("montage_ambisonics", {{"project", project}, {"hrtf", QString::fromStdString(fieldWav)}}).value("isError").toBool());
         call("montage_ambisonics", {{"project", project}, {"hrtf", "head"}});
         QVERIFY(binauralHrtf().empty());
+    }
+
+    void vfxShotVersions() {
+        // The footage: 2 s at 25 fps, a little redder every frame, so a version a frame off shows another red.
+        const std::string footage = path("vfx-footage.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64;
+            gs.height = 36;
+            gs.fps = Rational{25, 1};
+            for (int k = 0; k < 50; ++k) {
+                Clip c = makeGeneratorClip(gen, "color", 1);
+                c.generator.params["color.r"] = Param(0.1 + 0.016 * k);
+                c.generator.params["color.g"] = Param(0.2);
+                c.generator.params["color.b"] = Param(0.3);
+                c.start = k;
+                edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+            }
+            ExportSettings st;
+            st.path = footage;
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.name = "Reel1";
+        s.width = 64;
+        s.height = 36;
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, footage);
+        p.media.push_back(m);
+        // Three shots: source frames 10-17 at 0, 25-30 at 8, and 40-44 at 16 (only five frames of tail handle).
+        std::vector<Id> ids;
+        for (const auto& [in, start, length] : std::vector<std::tuple<double, FrameTime, FrameTime>>{{10, 0, 8}, {25, 8, 6}, {40, 16, 5}}) {
+            Clip c = makeClip(p, m, TrackKind::Video, s);
+            c.sourceIn = in;
+            c.start = start;
+            c.duration = length;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+            ids.push_back(c.id);
+        }
+        // Pulled with names from a pattern and a compositing script each, which writes the first version to the returns.
+        VfxPullOptions o;
+        o.folder = path("vfx-pulls");
+        o.namePattern = "{sequence}_{shot}";
+        o.scripts = true;
+        o.returns = path("vfx-returns");
+        std::vector<VfxShot> shots;
+        std::string err;
+        QVERIFY2(exportVfxPulls(p, s, ids, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(3));
+        QCOMPARE(shots[0].name, std::string("Reel1_010"));
+        QCOMPARE(shots[2].name, std::string("Reel1_030"));
+        QCOMPARE(shots[2].lastFrame, 1010);
+        recordVfxShots(s, shots);
+        s.vfxReturns = o.returns;
+        QCOMPARE(s.vfxShots.size(), size_t(3));
+        QCOMPARE(s.vfxShots[0].plateMedia, m.id);
+        // The script reads the plate untouched and writes v001 where the returns are looked for.
+        const VfxShotRecord& a = s.vfxShots[0];
+        const std::string write = o.returns + "/Reel1_010_comp_v001/Reel1_010_comp_v001.####.exr";
+        // (Rec.709 video pulled from a sequence graded for its display: OpenEXR of the display's light, read back as that.)
+        QCOMPARE(a.colorSpace, std::string("linear-rec709+display"));
+        const std::string space = findColorSpace(a.colorSpace)->label;
+        QCOMPARE(space, std::string("Linear Rec.709, display light"));
+        const std::string expected = "#! nuke\n"
+                                     "# Written by Montage for VFX shot Reel1_010: its plate read untouched and written to its next version.\n"
+                                     "Root {\n inputs 0\n first_frame 993\n last_frame 1016\n lock_range true\n fps 25\n format \"64 36 0 0 64 36 1 Reel1_010\"\n}\n"
+                                     "Read {\n inputs 0\n file_type exr\n file \"" + a.plate + "\"\n format \"64 36 0 0 64 36 1 Reel1_010\"\n first 993\n"
+                                     " last 1016\n origfirst 993\n origlast 1016\n origset true\n raw true\n name Plate\n label \"" + space + "\"\n xpos 0\n ypos 0\n}\n"
+                                     "Write {\n file \"" + write + "\"\n file_type exr\n raw true\n create_directories true\n first 993\n last 1016\n"
+                                     " use_limit true\n name Return\n xpos 0\n ypos 120\n}\n"
+                                     "StickyNote {\n inputs 0\n name Pull\n label \"Shot Reel1_010\\nFrames 993-1016, the cut 1001-1008\\nColour: " + space +
+                                     " (read and written raw)\\nACES Metadata File: " + a.amf + "\"\n xpos 160\n ypos 0\n}\n";
+        QFile nk(QString::fromStdString(a.script));
+        QVERIFY(nk.open(QIODevice::ReadOnly));
+        QCOMPARE(QString::fromUtf8(nk.readAll()).toStdString(), expected);
+        // The vendor's renders: shot 010's v001 every frame (the plate's, copied), its v002 with frame 1005 missing and
+        // stopping at 1014; shot 020's v001 a movie at half the size; shot 030's v001 one OpenEXR frame in ACES primaries.
+        auto plateFile = [&](const VfxShotRecord& r, int n) {
+            return QString::fromStdString(r.plate).replace(QStringLiteral("####"), QStringLiteral("%1").arg(n, 4, 10, QChar('0')));
+        };
+        auto version = [&](const std::string& name, int n) {
+            const QString folder = QString::fromStdString(o.returns + "/" + name);
+            QDir().mkpath(folder);
+            return folder + "/" + QString::fromStdString(name) + QStringLiteral(".%1.exr").arg(n, 4, 10, QChar('0'));
+        };
+        for (int n = a.firstFrame; n <= a.lastFrame; ++n) {
+            QVERIFY(QFile::copy(plateFile(a, n), version("Reel1_010_comp_v001", n)));
+            if (n != 1005 && n <= 1014) QVERIFY(QFile::copy(plateFile(a, n), version("Reel1_010_comp_v002", n)));
+        }
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 32;
+            gs.height = 18;
+            gs.fps = Rational{25, 1};
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "color", 22));
+            ExportSettings st;
+            st.path = o.returns + "/Reel1_020_comp_v001.mov";
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        if (exrAvailable()) {
+            std::vector<float> rgba(64 * 36 * 4, 0.18f);
+            std::vector<uint8_t> bytes;
+            QVERIFY2(writeAcesContainer(64, 36, rgba.data(), false, bytes, &err), err.c_str());
+            QFile f(version("Reel1_030_comp_v001", 1001));
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write(reinterpret_cast<const char*>(bytes.data()), qint64(bytes.size())) == qint64(bytes.size()));
+        }
+        // Found and brought in as takes on the shots' clips.
+        VfxScan scan;
+        QVERIFY2(scanVfxReturns(p, s, o.returns, "", &scan, &err), err.c_str());
+        std::vector<std::string> added = scan.added;
+        std::sort(added.begin(), added.end());
+        std::vector<std::string> want{"Reel1_010 v1", "Reel1_010 v2", "Reel1_020 v1"};
+        if (exrAvailable()) want.push_back("Reel1_030 v1");
+        QCOMPARE(added, want);
+        QCOMPARE(s.vfxShots[0].versions.size(), size_t(2));
+        QVERIFY(s.vfxShots[0].versions[0].problems.empty());
+        QCOMPARE(s.vfxShots[0].versions[1].problems,
+                 (std::vector<std::string>{"1 frame missing: 1005", "Frames 993-1014, short of the pull's 993-1016"}));
+        QCOMPARE(s.vfxShots[1].versions.at(0).problems, std::vector<std::string>{"32 x 18, not the plate's 64 x 36"});
+        if (exrAvailable()) {
+            const std::vector<std::string>& c = s.vfxShots[2].versions.at(0).problems;
+            QCOMPARE(c.size(), size_t(2));
+            QCOMPARE(c[0], std::string("Frames 1001-1001, short of the pull's 993-1010"));
+            QCOMPARE(c[1], "Its chromaticities are not those of the plate's " + space);
+        }
+        // Up to the latest, then down: v001 lands frame for frame on the cut (frame 1001 on the clip's first frame).
+        auto red = [&](FrameTime t) { return renderSequenceFrame(p, s, t, {}).at(32, 18)[0]; };
+        const double plateRed[3] = {red(0), red(4), red(7)};
+        QVERIFY(edit::setVfxVersion(p, s, ids[0], -1).ok);
+        QCOMPARE(edit::clipById(s, ids[0])->mediaId, s.vfxShots[0].versions[1].media);
+        QCOMPARE(s.vfxShots[0].version, 2);
+        QVERIFY(edit::stepVfxVersion(p, s, ids[0], -1).ok);
+        const Clip* shown = edit::clipById(s, ids[0]);
+        QCOMPARE(shown->mediaId, s.vfxShots[0].versions[0].media);
+        QCOMPARE(shown->sourceIn, 8.0);  // (from file 993: eight frames of head handle)
+        const FrameTime at[3] = {0, 4, 7};
+        for (int k = 0; k < 3; ++k) {
+            const double v = red(at[k]);
+            QVERIFY2(std::fabs(v - plateRed[k]) < 0.004, qPrintable(QString("frame %1: %2 against the plate's %3").arg(at[k]).arg(v).arg(plateRed[k])));
+        }
+        QVERIFY(std::fabs(plateRed[1] - red(5)) > 0.008);  // (a frame off would show)
+        QVERIFY(edit::stepVfxVersion(p, s, ids[0], -1).ok);
+        QCOMPARE(edit::clipById(s, ids[0])->mediaId, m.id);
+        QVERIFY(!edit::stepVfxVersion(p, s, ids[0], -1).ok);
+        QVERIFY(edit::stepVfxVersion(p, s, ids[0], 1).ok);
+        QCOMPARE(s.vfxShots[0].version, 1);
+        // The movie version is placed by the pull's numbers too: its first frame is 993.
+        QVERIFY(edit::setVfxVersion(p, s, ids[1], 1).ok);
+        QCOMPARE(edit::clipById(s, ids[1])->sourceIn, 8.0);
+        // Scanning again adds nothing; the missing frame written since is noticed.
+        QVERIFY(QFile::copy(plateFile(a, 1005), version("Reel1_010_comp_v002", 1005)));
+        QVERIFY2(scanVfxReturns(p, s, o.returns, "", &scan, &err), err.c_str());
+        QVERIFY2(scan.added.empty(), scan.added.empty() ? "" : scan.added.front().c_str());
+        QCOMPARE(s.vfxShots[0].versions[1].problems, std::vector<std::string>{"Frames 993-1014, short of the pull's 993-1016"});
+        // A version whose later frames come first (a render farm's chunks) stays in place once its first ones arrive.
+        for (int n = 1001; n <= a.lastFrame; ++n) QVERIFY(QFile::copy(plateFile(a, n), version("Reel1_010_comp_v003", n)));
+        QVERIFY2(scanVfxReturns(p, s, o.returns, "", &scan, &err), err.c_str());
+        QCOMPARE(scan.added, std::vector<std::string>{"Reel1_010 v3"});
+        QVERIFY(edit::setVfxVersion(p, s, ids[0], 3).ok);
+        auto matchesPlate = [&] {
+            for (int k = 0; k < 3; ++k)
+                if (std::fabs(red(at[k]) - plateRed[k]) >= 0.004) return false;
+            return true;
+        };
+        QVERIFY(matchesPlate());
+        for (int n = a.firstFrame; n < 1001; ++n) QVERIFY(QFile::copy(plateFile(a, n), version("Reel1_010_comp_v003", n)));
+        QVERIFY2(scanVfxReturns(p, s, o.returns, "", &scan, &err), err.c_str());
+        QVERIFY(scan.added.empty());
+        QVERIFY(matchesPlate());
+        QVERIFY(edit::setVfxVersion(p, s, ids[0], 1).ok);
+        QVERIFY(matchesPlate());
+        // A take picked by hand counts as the version shown; picking one leaves linked clips alone.
+        {
+            Clip* shownClip = edit::clipById(s, ids[0]);
+            int third = -1;
+            for (size_t k = 0; k < shownClip->takes.size(); ++k)
+                if (shownClip->takes[k].mediaId == s.vfxShots[0].versions[2].media) third = int(k);
+            QVERIFY(edit::pickTake(p, s, ids[0], third).ok);
+            QCOMPARE(vfxShownVersion(s, s.vfxShots[0]), 3);
+            QVERIFY(edit::stepVfxVersion(p, s, ids[0], -1).ok);
+            QCOMPARE(vfxShownVersion(s, s.vfxShots[0]), 2);
+            QVERIFY(edit::setVfxVersion(p, s, ids[0], 1).ok);
+        }
+        // A frame number far off is counted, not listed one by one.
+        QCOMPARE(vfxVersionProblems(s.vfxShots[0], {993, 994, 20241029}, 64, 36, "").at(0),
+                 std::string("20240034 frames missing: 995, 996, 997, 998, 999, 1000, 1001, 1002, 1003, 1004 and 20240024 more"));
+        // Status and note, kept with the project.
+        const std::string note = "Needs a softer edge on the matte, \"see\" frame 1004";
+        QVERIFY(edit::setVfxStatus(s, "Reel1_010", kVfxForReview, &note).ok);
+        QVERIFY(!edit::setVfxStatus(s, "Reel9_999", kVfxApproved).ok);
+        const std::string project = path("vfx-shots.montage");
+        QVERIFY(saveProject(p, project));
+        Project back;
+        QVERIFY(loadProject(project, back));
+        QVERIFY(back.active()->vfxShots == s.vfxShots);
+        QCOMPARE(back.active()->vfxReturns, o.returns);
+        // A pull again (the clip showing v001) pulls the plate, not the version, and keeps the shot's versions, status and note.
+        QCOMPARE(edit::clipById(s, ids[0])->mediaId, s.vfxShots[0].versions[0].media);
+        const double cutSource = s.vfxShots[0].cutSource;
+        QVERIFY2(exportVfxPulls(p, s, {ids[0]}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.at(0).name, std::string("Reel1_010"));
+        QCOMPARE(shots[0].cutSource, cutSource);
+        QCOMPARE(shots[0].firstFrame, 993);
+        recordVfxShots(s, shots);
+        QCOMPARE(s.vfxShots.size(), size_t(3));
+        QCOMPARE(s.vfxShots[0].note, note);
+        QCOMPARE(s.vfxShots[0].versions.size(), size_t(3));
+        QCOMPARE(s.vfxShots[0].plateMedia, m.id);
+        QVERIFY(matchesPlate());
+        // A shot of another clip keeps its name: a new pull that would name a clip the same is numbered apart.
+        {
+            Sequence other = s;
+            VfxPullOptions renamed = o;
+            renamed.folder = path("vfx-pulls-renamed");
+            renamed.namePattern = "Reel1_020";
+            renamed.scripts = false;
+            QVERIFY2(exportVfxPulls(p, other, {ids[2]}, renamed, &shots, nullptr, nullptr, &err), err.c_str());
+            QCOMPARE(shots.at(0).name, std::string("Reel1_020_1"));
+        }
+        // The shot list as CSV and OpenTimelineIO.
+        const QStringList rows = QString::fromStdString(vfxShotListCsv(s)).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(rows.size(), 4);
+        QVERIFY2(rows[1].startsWith("Reel1_010,0,For Review,v1,v1 v2 v3,\"Needs a softer edge on the matte, \"\"see\"\" frame 1004\",993,1001,1008,1016,"),
+                 qPrintable(rows[1]));
+        QVERIFY2(rows[2].startsWith("Reel1_020,8,In Progress,v1,v1,,") && rows[2].endsWith(",\"32 x 18, not the plate's 64 x 36\""), qPrintable(rows[2]));
+        QJsonParseError pe;
+        const QJsonDocument otio = QJsonDocument::fromJson(QByteArray::fromStdString(vfxShotListOtio(s)), &pe);
+        QVERIFY2(pe.error == QJsonParseError::NoError, qPrintable(pe.errorString()));
+        QCOMPARE(otio["OTIO_SCHEMA"].toString(), QString("Timeline.1"));
+        const QJsonArray children = otio["tracks"]["children"][0]["children"].toArray();
+        QCOMPARE(children.size(), 4);
+        QCOMPARE(children[2]["OTIO_SCHEMA"].toString(), QString("Gap.1"));
+        QCOMPARE(children[2]["source_range"]["duration"]["value"].toDouble(), 2.0);
+        const QJsonValue first = children[0];
+        QCOMPARE(first["source_range"]["start_time"]["value"].toDouble(), 1001.0);
+        QCOMPARE(first["source_range"]["duration"]["value"].toDouble(), 8.0);
+        const QJsonValue ref = first["media_references"]["DEFAULT_MEDIA"];
+        QCOMPARE(ref["OTIO_SCHEMA"].toString(), QString("ImageSequenceReference.1"));
+        QCOMPARE(ref["name_prefix"].toString(), QString("Reel1_010."));
+        QCOMPARE(ref["name_suffix"].toString(), QString(".exr"));
+        QCOMPARE(ref["frame_zero_padding"].toInt(), 4);
+        QCOMPARE(ref["start_frame"].toInt(), 993);
+        QCOMPARE(first["metadata"]["montage"]["vfx"]["status"].toString(), QString("For Review"));
+        QCOMPARE(children[3]["name"].toString(), QString("Reel1_030"));
+        // Over MCP: the shots listed, the latest version shown, a status set, the list and scripts written, a pull recorded.
+        QVERIFY(saveProject(p, project));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject q{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                       {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                             {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto out = server.handle(QJsonDocument(q).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(out.back())).object().value("result").toObject();
+        };
+        const QString pj = QString::fromStdString(project);
+        QJsonObject res = call("montage_vfx_shots", {{"project", pj}, {"action", "list"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(QJsonValue(res)["structuredContent"]["shots"].toArray().size(), 3);
+        QCOMPARE(QJsonValue(res)["structuredContent"]["shots"][0]["versions"][1]["problems"][0].toString(), QString("Frames 993-1014, short of the pull's 993-1016"));
+        res = call("montage_vfx_shots", {{"project", pj}, {"action", "set_version"}, {"version", "latest"}, {"shots", QJsonArray{"Reel1_010"}}});
+        QCOMPARE(QJsonValue(res)["content"][0]["text"].toString(), QString("Reel1_010: v3"));
+        res = call("montage_vfx_shots", {{"project", pj}, {"action", "set_status"}, {"status", "approved"}, {"clips", QJsonArray{double(ids[1])}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QVERIFY(call("montage_vfx_shots", {{"project", pj}, {"action", "set_status"}, {"status", "done"}, {"shots", QJsonArray{"Reel1_010"}}})["isError"].toBool());
+        const QString otioFile = QString::fromStdString(path("vfx-shots.otio"));
+        QVERIFY(!call("montage_vfx_shots", {{"project", pj}, {"action", "export"}, {"output", otioFile}})["isError"].toBool());
+        QVERIFY(QFileInfo(otioFile).size() > 0);
+        res = call("montage_vfx_shots", {{"project", pj}, {"action", "script"}, {"shots", QJsonArray{"Reel1_020"}}, {"output", QString::fromStdString(path("vfx-scripts"))}});
+        const QString script = QJsonValue(res)["structuredContent"]["files"][0].toString();
+        QFile written(script);
+        QVERIFY(written.open(QIODevice::ReadOnly));
+        QVERIFY(written.readAll().contains("Reel1_020_comp_v002/Reel1_020_comp_v002.####.exr"));  // (the version after its latest)
+        res = call("montage_vfx_shots", {{"project", pj}, {"action", "scan"}});
+        QCOMPARE(QJsonValue(res)["content"][0]["text"].toString().section('\n', 0, 0), QString("No new versions"));
+        {
+            Project reopened;
+            QVERIFY(loadProject(project, reopened));
+            const Sequence& rs = *reopened.active();
+            QCOMPARE(rs.vfxShots[0].version, 3);
+            QCOMPARE(edit::clipById(rs, ids[0])->mediaId, rs.vfxShots[0].versions[2].media);
+            QCOMPARE(rs.vfxShots[1].status, int(kVfxApproved));
+            QCOMPARE(rs.vfxShots[1].script, script.toStdString());
+        }
+        res = call("montage_vfx_pull", {{"project", pj}, {"folder", QString::fromStdString(path("vfx-pulls-mcp"))}, {"clips", QJsonArray{double(ids[2])}},
+                                        {"name_pattern", "{clip}_{shot}"}, {"scripts", true}, {"handles", 2}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(QJsonValue(res)["structuredContent"]["shots"][0]["name"].toString(), QString("vfx-footage_030"));
+        QVERIFY(QFileInfo::exists(QJsonValue(res)["structuredContent"]["shots"][0]["script"].toString()));
+        Project pulled;
+        QVERIFY(loadProject(project, pulled));
+        // (the same clip pulled again: its shot renamed, not a second one; the returns folder kept)
+        QCOMPARE(pulled.active()->vfxShots.size(), size_t(3));
+        QCOMPARE(pulled.active()->vfxShots[2].name, std::string("vfx-footage_030"));
+        QCOMPARE(pulled.active()->vfxReturns, o.returns);
     }
 
     void vfxPullsWithHandles() {

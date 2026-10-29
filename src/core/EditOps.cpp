@@ -2054,6 +2054,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
         q.id = p.newId();
         q.clip = clips.count(q.clip) ? clips[q.clip] : 0;
     }
+    for (VfxShotRecord& v : s.vfxShots) v.clip = clips.count(v.clip) ? clips[v.clip] : 0;
     // A graphic's published fields follow their clips and effects to the copies.
     for (TemplateField& f : s.fields) {
         const auto effect = effects.find({f.clip, f.effect});
@@ -2857,7 +2858,7 @@ Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<
     return {};
 }
 
-Result pickTake(Project& p, Sequence& s, Id clipId, int index) {
+Result pickTake(Project& p, Sequence& s, Id clipId, int index, bool linked) {
     Clip* c = clipById(s, clipId);
     if (!c || c->takes.empty()) return Result::fail("That clip is not an audition");
     if (index < 0 || index >= int(c->takes.size())) return Result::fail("No such take");
@@ -2875,7 +2876,7 @@ Result pickTake(Project& p, Sequence& s, Id clipId, int index) {
     // track plays (a sound-only take leaves the picture as it is) and the channels they pick. One left behind on an
     // earlier take (the picture under a sound-only take) catches up when a take it can play is picked.
     const int count = sourceChannelCount(*to);
-    for (Id id : linkedClips(s, clipId)) {
+    for (Id id : linked ? linkedClips(s, clipId) : std::vector<Id>{}) {
         Clip* l = clipById(s, id);
         if (!l || id == clipId || !l->takes.empty()) continue;
         int on = l->mediaId == before[size_t(current)].mediaId ? current : -1;

@@ -90,6 +90,7 @@ class AudioMeterWidget;
 class LoudnessReadout;
 class VoiceoverDialog;
 class LinkMediaDialog;
+class VfxShotsDialog;
 class LiveLink;
 class AssistantPanel;
 class ScriptConsole;
@@ -391,6 +392,10 @@ public:
     int addTakesFromBin();  // how many takes were added
     bool cycleTake(int step);
     bool finalizeAudition();
+    // VFX shots (render/VfxShots.h): the version shown on the selected shots' clips (else the clip under the playhead)
+    // stepped up or down, one undo step; and the VFX Shots window.
+    bool stepVfxVersion(int step);
+    VfxShotsDialog* showVfxShots();
     // Effect presets (core/EffectPresets.h, app/EffectPresetStore.h): the clip's effects saved under a name (the file,
     // or empty with a message), and a preset's effects added to the selected clips of its kind (how many clips).
     QString saveEffectsAsPreset(const QString& name);
@@ -655,6 +660,7 @@ private:
     LoudnessReadout* loudness_ = nullptr;
     VoiceoverDialog* voiceover_ = nullptr;
     QPointer<LinkMediaDialog> linkMedia_;
+    QPointer<VfxShotsDialog> vfxShots_;
     QTimer renderBarTimer_;
     QTimer backgroundTimer_;
     bool backgroundRender_ = false, backgroundBusy_ = false;

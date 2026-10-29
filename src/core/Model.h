@@ -274,6 +274,38 @@ struct Marker {
     bool operator==(const Marker&) const = default;
 };
 
+// A version of a VFX shot sent back by the vendor (render/VfxShots.h): its number (v003: 3), its frames or movie (an
+// image sequence's media path), the media item it was brought in as, and what is wrong with it against the pull.
+struct VfxVersion {
+    int number = 0;
+    std::string path;
+    Id media = 0;
+    std::vector<std::string> problems;
+    bool operator==(const VfxVersion&) const = default;
+};
+
+// A shot pulled for visual effects (render/VfxPull.h, render/VfxShots.h): which clip of the cut it is, what was pulled
+// (the source and its frame numbers, handles included; the cut's first frame numbered cutIn), its returned versions
+// (each a take on the clip), the version shown (0: the plate, the clip's own footage), and its status and note.
+struct VfxShotRecord {
+    std::string name;
+    Id clip = 0;
+    Id plateMedia = 0;         // the footage the clip showed when it was pulled
+    double cutSource = 0;      // the clip's in-point in that footage then (sequence frames, as Clip::sourceIn)
+    std::string folder;        // where its plate was written
+    std::string plate;         // its frames ("shot.####.exr")
+    int firstFrame = 0, lastFrame = 0, cutIn = 0, cutOut = 0;
+    int width = 0, height = 0;  // the plate's
+    Rational fps{24, 1};        // the footage's
+    std::string colorSpace;     // the plate's (ColorSpace.h id)
+    std::string amf, script;    // its ACES Metadata File and compositing script, when written
+    int status = 0;             // VfxStatus
+    std::string note;
+    std::vector<VfxVersion> versions;  // by number
+    int version = 0;                   // the one the clip shows (0: the plate)
+    bool operator==(const VfxShotRecord&) const = default;
+};
+
 // An ADR cue (core/Adr.h): a line to re-record to picture, from `start` to `end` (timeline frames, end exclusive).
 struct AdrCue {
     Id id = 0;
@@ -658,6 +690,9 @@ struct Sequence {
     std::vector<SharedNode> sharedNodes;   // grade nodes shared by its clips (core/GradeGraph.h)
     std::vector<TrimTarget> trimTargets;   // HDR and SDR deliverables the grade is trimmed for (render/TrimPasses.h)
     std::vector<AdrCue> adrCues;           // lines to re-record, in time order (core/Adr.h)
+    std::vector<VfxShotRecord> vfxShots;   // shots pulled for visual effects (render/VfxShots.h)
+    std::string vfxReturns;                // the folder their versions come back to, and how they are named
+    std::string vfxPattern;                // ("" = "{shot}_comp_v###")
     std::string colorSpace = "rec709";  // delivery space (ColorSpace.h id), and the working space when workingSpace is ""
     // Scene-referred grading: the space clips are graded and composited in (a scene-referred ColorSpace.h id: ACEScct,
     // ACEScg, a camera log), each viewer and deliverable reached through an output transform; "" = the delivery space.

@@ -8,6 +8,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -123,6 +124,7 @@
 #include "render/AudioReactive.h"
 #include "render/Expressions.h"
 #include "render/VfxPull.h"
+#include "render/VfxShots.h"
 #include "render/Amf.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
@@ -12510,8 +12512,14 @@ void McpServer::Impl::addTools() {
         "piz, pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256, htj2k32; default zip). `st_maps` writes, for a shot whose "
         "clip has a Lens Correction, ST maps (32-bit OpenEXR, red the source's x over its width, green 1 minus its y over "
         "its height) that undistort the plate as Lens Correction does with no fit (all of the picture, at the overscan size "
-        "returned), and redistort renders back.",
+        "returned), and redistort renders back. The shots are kept with the sequence (see montage_vfx_shots): "
+        "`name_pattern` names them from {sequence}, {shot} (010, 020... in the cut's order), {clip} and {layer} (the "
+        "clip's track), as \"{sequence}_{shot}\" (default: the clip's name); `scripts` writes a Nuke script (.nk) beside "
+        "each shot that reads its plate untouched and writes v001 to `returns` (default <folder>/returns, where versions "
+        "are then looked for), named by `returns_pattern` ({shot} and #'s for the version; default {shot}_comp_v###).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
+            "name_pattern":{"type":"string"},"scripts":{"type":"boolean","default":false},"returns":{"type":"string"},
+            "returns_pattern":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
             "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
@@ -12529,6 +12537,13 @@ void McpServer::Impl::addTools() {
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
             o.stMaps = a.value("st_maps").toBool();
+            o.namePattern = str(a, "name_pattern").toStdString();
+            o.scripts = a.value("scripts").toBool();
+            // (the sequence's returns folder and naming kept unless others are given)
+            o.returns = a.contains("returns")            ? absolute(str(a, "returns")).toStdString()
+                        : !l.seq().vfxReturns.empty() ? l.seq().vfxReturns
+                                                        : QDir(QString::fromStdString(o.folder)).filePath(QStringLiteral("returns")).toStdString();
+            o.returnsPattern = a.contains("returns_pattern") ? str(a, "returns_pattern").toStdString() : l.seq().vfxPattern;
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
             if (clips.empty())
@@ -12544,6 +12559,7 @@ void McpServer::Impl::addTools() {
                 QJsonObject sh{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
                                {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
+                if (!s.script.empty()) sh["script"] = QString::fromStdString(s.script);
                 if (!s.undistortMap.empty()) {
                     sh["undistort_map"] = QString::fromStdString(s.undistortMap);
                     sh["redistort_map"] = QString::fromStdString(s.redistortMap);
@@ -12557,9 +12573,159 @@ void McpServer::Impl::addTools() {
                 list.append(sh);
                 lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
             }
+            recordVfxShots(l.seq(), shots);
+            l.seq().vfxReturns = o.returns;
+            l.seq().vfxPattern = o.returnsPattern;
+            save(l);
             const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");
             return ok(QStringLiteral("Pulled %1 shots:\n%2\nPull list: %3").arg(shots.size()).arg(lines.join('\n'), csv),
                       QJsonObject{{"shots", list}, {"pull_list", csv}});
+        });
+
+    add("montage_vfx_shots", "VFX shots and versions",
+        "The shots pulled for visual effects (montage_vfx_pull) and the versions the vendor sends back. action list: each "
+        "shot with its clip, status, note, the version its clip shows (0: the plate) and its versions with what is wrong "
+        "with each. scan: looks through `folder` (default: the returns folder the pull named) and the folders in it for "
+        "versions named by `pattern` ({shot} and #'s for the version number; default the pull's, else {shot}_comp_v###), "
+        "as numbered frames (OpenEXR, DPX, TIFF, PNG) or movies, and brings each new one in as a take on its shot's clip, "
+        "placed by its frame numbers (the number the pull gave the cut's first frame lands on it), checking each against "
+        "the pull: missing frames, a short range, another size, OpenEXR chromaticities other than the plate's. "
+        "set_version: shows `version` (a number, \"latest\", \"up\", \"down\" or 0 for the plate) on the shots of `clips` "
+        "(clip ids) or `shots` (names; default all). set_status: `status` (in_progress, for_review, approved, final) and "
+        "optionally `note` on `shots`. export: the shot list to `output` as CSV (.csv) or OpenTimelineIO (.otio). script: "
+        "a Nuke script for each of `shots` beside its plate (or in `output`, a folder), writing the version after its latest.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","scan","set_version","set_status","export","script"]},
+            "folder":{"type":"string"},"pattern":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"}},"shots":{"type":"array","items":{"type":"string"}},
+            "version":{"type":["integer","string"]},"status":{"type":"string","enum":["in_progress","for_review","approved","final"]},
+            "note":{"type":"string"},"output":{"type":"string"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            auto shotJson = [&](const VfxShotRecord& r) {
+                QJsonArray versions;
+                for (const VfxVersion& v : r.versions) {
+                    QJsonArray problems;
+                    for (const std::string& pr : v.problems) problems.append(QString::fromStdString(pr));
+                    versions.append(QJsonObject{{"number", v.number}, {"path", QString::fromStdString(v.path)}, {"media", double(v.media)},
+                                                {"problems", problems}});
+                }
+                return QJsonObject{{"name", QString::fromStdString(r.name)}, {"clip", double(r.clip)},
+                                   {"status", vfxStatusName(r.status)}, {"note", QString::fromStdString(r.note)},
+                                   {"version", vfxShownVersion(s, r)}, {"versions", versions}, {"plate", QString::fromStdString(r.plate)},
+                                   {"first_frame", r.firstFrame}, {"cut_in", r.cutIn}, {"cut_out", r.cutOut}, {"last_frame", r.lastFrame},
+                                   {"color_space", QString::fromStdString(r.colorSpace)}, {"script", QString::fromStdString(r.script)}};
+            };
+            // The shots named (by clip or name), all of them when none are.
+            std::vector<VfxShotRecord*> chosen;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                VfxShotRecord* r = vfxShotOfClip(s, Id(v.toDouble()));
+                if (!r) return fail(QStringLiteral("Clip %1 is not a VFX shot").arg(qint64(v.toDouble())));
+                chosen.push_back(r);
+            }
+            for (const QJsonValue& v : a.value("shots").toArray()) {
+                VfxShotRecord* r = findVfxShot(s, v.toString().toStdString());
+                if (!r) return fail(QStringLiteral("No VFX shot named %1").arg(v.toString()));
+                chosen.push_back(r);
+            }
+            if (chosen.empty() && !a.contains("clips") && !a.contains("shots"))
+                for (VfxShotRecord& r : s.vfxShots) chosen.push_back(&r);
+            if (s.vfxShots.empty() && action != "list") return fail("This sequence has no VFX shots: pull some first (montage_vfx_pull)");
+            if (action == "list") {
+                QJsonArray list;
+                QStringList lines;
+                for (const VfxShotRecord& r : s.vfxShots) {
+                    list.append(shotJson(r));
+                    lines << QStringLiteral("%1: %2, %3 (%4 versions)").arg(QString::fromStdString(r.name), vfxStatusName(r.status),
+                                                                         vfxShownVersion(s, r) ? QStringLiteral("v%1").arg(vfxShownVersion(s, r)) : QStringLiteral("the plate"))
+                                 .arg(r.versions.size());
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No VFX shots") : lines.join('\n'),
+                          QJsonObject{{"shots", list}, {"returns", QString::fromStdString(s.vfxReturns)}, {"pattern", QString::fromStdString(s.vfxPattern)}});
+            }
+            if (action == "scan") {
+                const std::string folder = a.contains("folder") ? absolute(str(a, "folder")).toStdString() : s.vfxReturns;
+                VfxScan scan;
+                std::string err;
+                if (!scanVfxReturns(l.project, s, folder, str(a, "pattern").toStdString(), &scan, &err)) return fail(QString::fromStdString(err));
+                save(l);
+                QJsonArray added, problems;
+                for (const std::string& n : scan.added) added.append(QString::fromStdString(n));
+                for (const std::string& n : scan.problems) problems.append(QString::fromStdString(n));
+                QString msg = scan.added.empty() ? QStringLiteral("No new versions") : QStringLiteral("New: %1").arg(QString::fromStdString(
+                                                                                            [&] { std::string t; for (const std::string& n : scan.added) t += (t.empty() ? "" : ", ") + n; return t; }()));
+                for (const std::string& n : scan.problems) msg += "\n" + QString::fromStdString(n);
+                return ok(msg, QJsonObject{{"added", added}, {"problems", problems}});
+            }
+            if (action == "set_version") {
+                const QJsonValue v = a.value("version");
+                const QString word = v.isString() ? v.toString() : QString();
+                bool number = v.isDouble();
+                int n = v.toInt(-1);
+                if (word == "latest") n = -1, number = true;
+                else if (!word.isEmpty() && word != "up" && word != "down") {
+                    n = word.toInt(&number);
+                    if (!number) return fail("version is a number, latest, up or down");
+                }
+                if (!number && word.isEmpty()) return fail("Say which version");
+                QStringList lines;
+                for (VfxShotRecord* r : chosen) {
+                    const Id clip = r->clip;
+                    const std::string name = r->name;
+                    const edit::Result res = number ? edit::setVfxVersion(l.project, s, clip, n) : edit::stepVfxVersion(l.project, s, clip, word == "up" ? 1 : -1);
+                    const VfxShotRecord* now = findVfxShot(s, name);
+                    lines << (res.ok ? QStringLiteral("%1: %2").arg(QString::fromStdString(name),
+                                                                    vfxShownVersion(s, *now) ? QStringLiteral("v%1").arg(vfxShownVersion(s, *now)) : QStringLiteral("the plate"))
+                                     : QString::fromStdString(name + ": " + res.error));
+                }
+                save(l);
+                return ok(lines.join('\n'));
+            }
+            if (action == "set_status") {
+                static const QStringList names{"in_progress", "for_review", "approved", "final"};
+                const int status = names.indexOf(need(a, "status"));
+                if (status < 0) return fail("status is in_progress, for_review, approved or final");
+                const std::string note = str(a, "note").toStdString();
+                if (chosen.empty()) return fail("Name the shots");
+                for (VfxShotRecord* r : chosen)
+                    if (const edit::Result res = edit::setVfxStatus(s, r->name, status, a.contains("note") ? &note : nullptr); !res.ok)
+                        return fail(QString::fromStdString(res.error));
+                save(l);
+                return ok(QStringLiteral("%1 shots set to %2").arg(chosen.size()).arg(vfxStatusName(status)));
+            }
+            if (action == "export") {
+                const QString out = absolute(need(a, "output"));
+                const std::string text = out.endsWith(".otio", Qt::CaseInsensitive) ? vfxShotListOtio(s) : vfxShotListCsv(s);
+                QSaveFile f(out);
+                if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size()) || !f.commit())
+                    return fail(QStringLiteral("Cannot write %1").arg(out));
+                return ok(QStringLiteral("Wrote %1 (%2 shots)").arg(out).arg(s.vfxShots.size()), QJsonObject{{"file", out}});
+            }
+            if (action == "script") {
+                QJsonArray files;
+                const QString folder = a.contains("output") ? absolute(str(a, "output")) : QString();
+                for (VfxShotRecord* r : chosen) {
+                    const QString dir = folder.isEmpty() ? QFileInfo(QString::fromStdString(r->plate)).absolutePath() : folder;
+                    if (!QDir().mkpath(dir)) return fail(QStringLiteral("Cannot make the folder %1").arg(dir));
+                    const QString file = QString::fromStdString(vfxScriptFile(*r, dir.toStdString()));
+                    const int next = r->versions.empty() ? 1 : r->versions.back().number + 1;
+                    const QString ext = QFileInfo(QString::fromStdString(r->plate)).suffix().toLower();
+                    const std::string format = ext == "tif" ? "tiff" : ext.toStdString();
+                    const std::string returns = s.vfxReturns.empty() ? QDir(dir).filePath("returns").toStdString() : s.vfxReturns;
+                    const std::string nk = nukeScript(*r, vfxVersionPath(returns, s.vfxPattern, *r, next, format));
+                    QSaveFile f(file);
+                    if (!f.open(QIODevice::WriteOnly) || f.write(nk.data(), qint64(nk.size())) != qint64(nk.size()) || !f.commit())
+                        return fail(QStringLiteral("Cannot write %1").arg(file));
+                    r->script = file.toStdString();
+                    files.append(file);
+                }
+                save(l);
+                return ok(QStringLiteral("Wrote %1 scripts").arg(files.size()), QJsonObject{{"files", files}});
+            }
+            return fail("action is list, scan, set_version, set_status, export or script");
         });
 
     add("montage_export_timeline", "Export the timeline",

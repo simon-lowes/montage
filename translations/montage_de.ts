@@ -9891,6 +9891,14 @@ Download it now?</source>
         <source>%1 is free to edit: File › Edit Project</source>
         <translation type="unfinished">%1 ist kostenlos zu bearbeiten: Datei › Projekt bearbeiten</translation>
     </message>
+    <message>
+        <source>New VFX versions: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>New VFX Versions</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::EffectsBrowser</name>
@@ -20402,6 +20410,38 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Clear Pitch Edits</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>VFX Shots…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Next VFX Version</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Previous VFX Version</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The clips&apos; names</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>{sequence}, {shot} (010, 020... in the cut&apos;s order), {clip} and {layer} (the clip&apos;s track), as {sequence}_{shot}</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shot names:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Write a compositing script (Nuke) for each shot, writing its first version to the returns folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select VFX shots (clips pulled for visual effects) to step their versions</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -27701,6 +27741,192 @@ so the jump in the picture morphs across instead of cutting</source>
     <message>
         <source>Copy Trim</source>
         <translation type="unfinished">Trim kopieren</translation>
+    </message>
+</context>
+<context>
+    <name>montage::VfxShotsDialog</name>
+    <message>
+        <source>For Review</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Approved</source>
+        <translation type="unfinished">Genehmigt</translation>
+    </message>
+    <message>
+        <source>Final</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In Progress</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VFX Shots</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Returns Folder…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How versions are named</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How the vendor names a version: {shot} for the shot&apos;s name, #&apos;s for the version&apos;s number</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Named:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VFX shots</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shot</source>
+        <translation type="unfinished">Schuss</translation>
+    </message>
+    <message>
+        <source>Status</source>
+        <translation type="unfinished">Status</translation>
+    </message>
+    <message>
+        <source>Shows</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Versions</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Note</source>
+        <translation type="unfinished">Anmerkung</translation>
+    </message>
+    <message>
+        <source>Problems</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Look for New Versions</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Previous Version</source>
+        <translation type="unfinished">Vorherige Version</translation>
+    </message>
+    <message>
+        <source>Next Version</source>
+        <translation type="unfinished">Nächste Version</translation>
+    </message>
+    <message>
+        <source>Latest</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Set</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Status:</source>
+        <translation type="unfinished">Status:</translation>
+    </message>
+    <message>
+        <source>Export Shot List…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Write Compositing Scripts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Returns Folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VFX Version Names</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose the folder the versions come back to first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No new versions</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>New: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export Shot List</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>CSV (*.csv);;OpenTimelineIO (*.otio)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wrote %1</source>
+        <translation type="unfinished">%1 geschrieben</translation>
+    </message>
+    <message>
+        <source>Returns: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No returns folder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Its clip is no longer in the cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Next VFX Version</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Previous VFX Version</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show VFX Version</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pick the shots in the list</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VFX Status</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not write %1</source>
+        <translation type="unfinished">%1 kann nicht geschrieben werden</translation>
+    </message>
+    <message>
+        <source>VFX Scripts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Wrote %n script(s), each writing the version after the shot&apos;s latest</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>VFX Returns Folder</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

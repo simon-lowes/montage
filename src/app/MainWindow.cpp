@@ -109,6 +109,7 @@
 #include "core/ReviewPage.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/VfxShots.h"
 #include "render/Jpeg2000.h"
 #include "media/Exr.h"
 #include "render/Amf.h"
@@ -170,6 +171,7 @@
 #include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "FootageNotesDialog.h"
+#include "VfxShotsDialog.h"
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
 #include "CaptionsPanel.h"
@@ -1346,6 +1348,7 @@ void MainWindow::buildMenus() {
     add(file, QT_TR_NOOP("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, QT_TR_NOOP("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, QT_TR_NOOP("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
+    add(file, QT_TR_NOOP("VFX Shots…"), QKeySequence(), [this] { showVfxShots(); })->setObjectName(QStringLiteral("vfxShots"));
     add(file, QT_TR_NOOP("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF, bin)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, QT_TR_NOOP("Import IMF &Package…"), QKeySequence(), [this] { importImfPackage(); })->setObjectName(QStringLiteral("importImf"));
     add(file, QT_TR_NOOP("Import Media Composer &Bin…"), QKeySequence(), [this] {
@@ -1967,6 +1970,9 @@ void MainWindow::buildMenus() {
     add(auditionM, QT_TR_NOOP("Next Take"), QKeySequence("Ctrl+Alt+Right"), [this] { cycleTake(1); })->setObjectName(QStringLiteral("nextTake"));
     add(auditionM, QT_TR_NOOP("Previous Take"), QKeySequence("Ctrl+Alt+Left"), [this] { cycleTake(-1); })->setObjectName(QStringLiteral("previousTake"));
     add(auditionM, QT_TR_NOOP("Finalize Audition"), QKeySequence(), [this] { finalizeAudition(); })->setObjectName(QStringLiteral("finalizeAudition"));
+    add(clipM, QT_TR_NOOP("Next VFX Version"), QKeySequence(), [this] { stepVfxVersion(1); })->setObjectName(QStringLiteral("nextVfxVersion"));
+    add(clipM, QT_TR_NOOP("Previous VFX Version"), QKeySequence(), [this] { stepVfxVersion(-1); })
+        ->setObjectName(QStringLiteral("previousVfxVersion"));
     add(clipM, QT_TR_NOOP("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
     add(clipM, QT_TR_NOOP("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
@@ -4068,6 +4074,17 @@ void MainWindow::vfxPullDialog() {
         sourceLayers->hide();
         mattes->hide();
     }
+    // The shots' names, and a compositing script each writing its first version where the returns are looked for.
+    auto* names = new QLineEdit(&dlg);
+    names->setObjectName(QStringLiteral("vfxNamePattern"));
+    names->setPlaceholderText(tr("The clips' names"));
+    names->setToolTip(tr("{sequence}, {shot} (010, 020... in the cut's order), {clip} and {layer} (the clip's track), as {sequence}_{shot}"));
+    names->setText(appSettings().value("vfx/namePattern").toString());
+    form->addRow(tr("Shot names:"), names);
+    auto* scripts = new QCheckBox(tr("Write a compositing script (Nuke) for each shot, writing its first version to the returns folder"), &dlg);
+    scripts->setObjectName(QStringLiteral("vfxScripts"));
+    scripts->setChecked(appSettings().value("vfx/scripts", false).toBool());
+    form->addRow(scripts);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -4093,6 +4110,13 @@ void MainWindow::vfxPullDialog() {
     o.format = format->currentData().toString().toStdString();
     o.handles = handles->value();
     o.cutIn = cutIn->value();
+    o.namePattern = names->text().trimmed().toStdString();
+    o.scripts = scripts->isChecked();
+    appSettings().setValue("vfx/namePattern", names->text().trimmed());
+    appSettings().setValue("vfx/scripts", o.scripts);
+    // (the returns folder kept, if the sequence has one; else one in the pulls' folder)
+    o.returns = !s->vfxReturns.empty() ? s->vfxReturns : QDir(folder).filePath(QStringLiteral("returns")).toStdString();
+    o.returnsPattern = s->vfxPattern;
     QProgressDialog progress(tr("Pulling shots..."), tr("Cancel"), 0, 1000, this);
     progress.setWindowModality(Qt::WindowModal);
     std::atomic<bool> cancel{false};
@@ -4104,8 +4128,18 @@ void MainWindow::vfxPullDialog() {
         QApplication::processEvents();
     }, &cancel, &err);
     progress.close();
-    if (!ok) QMessageBox::warning(this, tr("Export VFX Pulls"), QString::fromStdString(err));
-    else statusBar()->showMessage(tr("Pulled %n shot(s) with a pull list into %1", "", int(shots.size())).arg(QDir::toNativeSeparators(folder)), 8000);
+    if (!ok) {
+        QMessageBox::warning(this, tr("Export VFX Pulls"), QString::fromStdString(err));
+        return;
+    }
+    // The shots kept with the sequence, their versions looked for in the returns folder from now on.
+    QDir().mkpath(QString::fromStdString(o.returns));
+    state_->edit(tr("Export VFX Pulls"), [&](Project&, Sequence& seq) {
+        recordVfxShots(seq, shots);
+        seq.vfxReturns = o.returns;
+        return true;
+    });
+    statusBar()->showMessage(tr("Pulled %n shot(s) with a pull list into %1", "", int(shots.size())).arg(QDir::toNativeSeparators(folder)), 8000);
 }
 
 CleanFeedWindow* MainWindow::showCleanFeed(int screenIndex) {
@@ -5984,6 +6018,42 @@ bool MainWindow::cycleTake(int step) {
     const Id clip = c->id;
     return state_->apply(step > 0 ? tr("Next Take") : tr("Previous Take"),
                          [clip, step](Project& p, Sequence& s) { return edit::cycleTake(p, s, clip, step); });
+}
+
+bool MainWindow::stepVfxVersion(int step) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (vfxShotOfClip(*s, id)) clips.push_back(id);
+    if (clips.empty())
+        if (const Clip* c = clipForCommand(); c && vfxShotOfClip(*s, c->id)) clips.push_back(c->id);
+    if (clips.empty()) {
+        state_->message(tr("Select VFX shots (clips pulled for visual effects) to step their versions"));
+        return false;
+    }
+    QString why;
+    const bool done = state_->edit(step > 0 ? tr("Next VFX Version") : tr("Previous VFX Version"), [&](Project& p, Sequence& seq) {
+        bool any = false;
+        for (Id clip : clips) {
+            const edit::Result r = edit::stepVfxVersion(p, seq, clip, step);
+            if (r.ok) any = true;
+            else why = QString::fromStdString(r.error);
+        }
+        return any;
+    });
+    if (!done && !why.isEmpty()) state_->message(why);
+    return done;
+}
+
+VfxShotsDialog* MainWindow::showVfxShots() {
+    if (!vfxShots_) {
+        vfxShots_ = new VfxShotsDialog(state_, this);
+        vfxShots_->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    vfxShots_->show();
+    vfxShots_->raise();
+    return vfxShots_;
 }
 
 bool MainWindow::finalizeAudition() {

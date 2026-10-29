@@ -106,6 +106,8 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/VfxPull.h"
+#include "render/VfxShots.h"
 #include "render/Titles.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
@@ -135,6 +137,7 @@
 #include "ScopesWidget.h"
 #include "render/Gamut.h"
 #include "LinkMediaDialog.h"
+#include "VfxShotsDialog.h"
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
@@ -7547,6 +7550,90 @@ private slots:
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(3));
         state()->newProject();
+    }
+
+    void vfxReturnsWatched() {
+        // A second of footage on the timeline, pulled as one shot whose versions come back to a watched folder.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 32, gs.height = 18, gs.fps = {25, 1};
+        Clip matte = makeGeneratorClip(gen, "color", 25);
+        matte.generator.params["color.r"] = Param(0.7);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, matte);
+        ExportSettings st;
+        st.path = (dir_.path() + "/vfx-plate.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("vfxShots") && win_->findChild<QAction*>("nextVfxVersion"));
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.fps = Rational{25, 1};
+            return edit::placeMedia(p, s, ids.at(0), 0, 5, 15, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        QCOMPARE(win_->stepVfxVersion(1), false);  // not a VFX shot yet
+        VfxPullOptions o;
+        o.folder = (dir_.path() + "/vfx-pulls").toStdString();
+        o.format = "tiff";
+        o.handles = 2;
+        o.namePattern = "{shot}";
+        o.returns = (dir_.path() + "/vfx-returns").toStdString();
+        std::vector<VfxShot> shots;
+        QVERIFY2(exportVfxPulls(state()->project(), *state()->sequence(), {clip}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(QDir().mkpath(QString::fromStdString(o.returns)));
+        QVERIFY(state()->edit("Pull", [&](Project&, Sequence& s) {
+            recordVfxShots(s, shots);
+            s.vfxReturns = o.returns;
+            return true;
+        }));
+        QVERIFY(state()->vfxWatchedFolders().contains(QString::fromStdString(o.returns)));
+        // The vendor's v001 lands while the project is open: noticed, brought in as a take, one undo step.
+        const VfxShot& shot = shots.at(0);
+        const QString out = QString::fromStdString(o.returns) + "/010_comp_v001";
+        QVERIFY(QDir().mkpath(out));
+        for (int n = shot.firstFrame; n <= shot.lastFrame; ++n) {
+            const QString name = QStringLiteral(".%1.tif").arg(n, 4, 10, QChar('0'));
+            QVERIFY(QFile::copy(QString::fromStdString(shot.folder + "/" + shot.name) + name, out + "/010_comp_v001" + name));
+        }
+        auto versions = [&] { return state()->sequence()->vfxShots.at(0).versions.size(); };
+        QTRY_COMPARE_WITH_TIMEOUT(versions(), size_t(1), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(state()->sequence()->vfxShots.at(0).versions[0].problems.empty(), 8000);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->takes.size(), size_t(2));
+        while (versions() == 1 && state()->undoText() == QStringLiteral("New VFX Versions")) state()->undo();
+        QCOMPARE(versions(), size_t(0));
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->takes.empty());
+        QVERIFY(state()->scanVfxReturnsNow() == std::vector<std::string>{"010 v1"});
+        // The VFX Shots window and the Clip menu step the version shown.
+        VfxShotsDialog* dlg = win_->showVfxShots();
+        QVERIFY(dlg);
+        auto* list = dlg->findChild<QTreeWidget*>("vfxShotsList");
+        QCOMPARE(list->topLevelItemCount(), 1);
+        QCOMPARE(list->topLevelItem(0)->text(2), QString("Plate"));
+        state()->setSelection({clip}, false);
+        QVERIFY(win_->stepVfxVersion(1));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->mediaId, state()->sequence()->vfxShots[0].versions[0].media);
+        QCOMPARE(list->topLevelItem(0)->text(2), QString("v1"));
+        QVERIFY(!win_->stepVfxVersion(1));  // already the latest
+        list->topLevelItem(0)->setSelected(true);
+        const QString note = "Grain too heavy";
+        QVERIFY(dlg->setStatus(kVfxApproved, &note));
+        QCOMPARE(list->topLevelItem(0)->text(1), QString("Approved"));
+        QCOMPARE(list->topLevelItem(0)->text(4), note);
+        QVERIFY(dlg->showVersion(0));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->mediaId, ids.at(0));
+        state()->undo();
+        QCOMPARE(list->topLevelItem(0)->text(2), QString("v1"));
+        const QString csv = dir_.path() + "/vfx-shots.csv";
+        QVERIFY(dlg->exportList(csv));
+        QFile f(csv);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QVERIFY(QString::fromUtf8(f.readAll()).contains("\n010,0,Approved,v1,v1,Grain too heavy,"));
+        dlg->close();
+        state()->newProject();
+        QVERIFY(state()->vfxWatchedFolders().isEmpty());
     }
 
     void watchFolderImports() {

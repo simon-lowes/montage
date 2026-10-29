@@ -220,6 +220,7 @@ add_library(montage_engine STATIC
   render/ExtendClip.h render/ExtendClip.cpp
   render/PaperEdit.h render/PaperEdit.cpp
   render/VfxPull.h render/VfxPull.cpp
+  render/VfxShots.h render/VfxShots.cpp
   render/Spherical.h render/Spherical.cpp
   render/Stereo.h render/Stereo.cpp
   render/SpatialVideo.h render/SpatialVideo.cpp

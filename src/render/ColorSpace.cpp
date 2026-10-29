@@ -241,6 +241,10 @@ const std::vector<ColorSpace>& colorSpaces() {
 const ColorSpace* findColorSpace(const std::string& id) {
     for (const auto& c : colorSpaces())
         if (c.id == id) return &c;
+    if (id.size() > 8 && id.compare(id.size() - 8, 8, "+display") == 0) {
+        const ColorSpace* base = findColorSpace(id.substr(0, id.size() - 8));
+        return base && base->sceneReferred ? &displayLightOf(*base) : nullptr;
+    }
     // (an SDR space with a tone mapping)
     const size_t plus = id.find('+');
     ToneMapping t;
@@ -268,8 +272,26 @@ bool parseToneMapping(const std::string& id, ToneMapping& out) {
     return false;
 }
 
+const ColorSpace& displayLightOf(const ColorSpace& s) {
+    if (!s.sceneReferred) return s;
+    // (made once each, kept for the life of the program: callers hold them by reference)
+    static std::mutex m;
+    static std::map<std::string, std::unique_ptr<ColorSpace>> made;
+    std::lock_guard lock(m);
+    auto& slot = made[s.id];
+    if (!slot) {
+        slot = std::make_unique<ColorSpace>(s);
+        slot->id = s.id + "+display";
+        std::string label = s.label;
+        if (const size_t at = label.find(" (scene)"); at != std::string::npos) label.erase(at, 8);
+        slot->label = label + ", display light";
+        slot->sceneReferred = false;
+    }
+    return *slot;
+}
+
 const ColorSpace& withToneMapping(const ColorSpace& s, ToneMapping t) {
-    if (s.hdr() || s.sceneReferred || s.toneMapping == t) return s;
+    if (s.hdr() || s.sceneReferred || s.toneMapping == t || s.id.ends_with("+display")) return s;
     const ColorSpace* base = findColorSpace(s.id.substr(0, s.id.find('+')));
     if (!base) return s;
     if (t == ToneMapping::Montage) return *base;
@@ -289,7 +311,10 @@ const ColorSpace& withToneMapping(const ColorSpace& s, ToneMapping t) {
 }
 
 bool sameColorSpace(const ColorSpace& a, const ColorSpace& b) {
-    return a.id == b.id || a.id.substr(0, a.id.find('+')) == b.id.substr(0, b.id.find('+'));
+    // (a tone mapping is the same space; a scene-referred space's display light is not: it is read another way)
+    if (a.id == b.id) return true;
+    if (a.id.ends_with("+display") || b.id.ends_with("+display")) return false;
+    return a.id.substr(0, a.id.find('+')) == b.id.substr(0, b.id.find('+'));
 }
 
 std::string colorSpaceFromTags(const std::string& primaries, const std::string& transfer) {
@@ -318,7 +343,7 @@ const ColorSpace& mediaColorSpace(const MediaItem& m) {
 
 const ColorSpace& sequenceColorSpace(const Sequence& s) {
     const ColorSpace* c = findColorSpace(s.colorSpace);
-    return c && !c->sceneReferred ? *c : rec709Space();
+    return c && !c->sceneReferred && !c->id.ends_with("+display") ? *c : rec709Space();
 }
 
 std::vector<const ColorSpace*> workingColorSpaces() {

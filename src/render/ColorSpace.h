@@ -68,11 +68,16 @@ struct ColorSpace {
 
 // Every colour space Montage knows, Rec.709 first.
 const std::vector<ColorSpace>& colorSpaces();
-// One of them by id, or an SDR display space with a tone mapping ("rec709+bt2446a", as withToneMapping names it).
+// One of them by id, or an SDR display space with a tone mapping ("rec709+bt2446a", as withToneMapping names it), or a
+// scene-referred one holding display light ("linear-rec709+display", displayLightOf).
 const ColorSpace* findColorSpace(const std::string& id);
 // An SDR display space with that tone mapping (its id the space's with "+bt2446a" or "+bt2446c"); any other space, or
 // with Montage's, as it is (an SDR space with another tone mapping, without it).
 const ColorSpace& withToneMapping(const ColorSpace& s, ToneMapping t);
+// A scene-referred space's encoding holding display light ("linear-rec709+display"): what a display-referred sequence
+// writes when asked for a scene-referred space (its display's light, no display rendering undone), so read back
+// exactly, without a display rendering. A display space is its own.
+const ColorSpace& displayLightOf(const ColorSpace& s);
 // Whether two spaces hold the same code values (the same space, whatever tone mapping each has).
 bool sameColorSpace(const ColorSpace& a, const ColorSpace& b);
 // The space FFmpeg's tags describe (primaries and transfer names as av_color_*_name gives them).

@@ -1,7 +1,9 @@
 #include "VfxPull.h"
+#include "VfxShots.h"
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QRegularExpression>
 #include <QString>
 #include <algorithm>
@@ -169,6 +171,33 @@ struct PullLayers {
 
 }  // namespace
 
+std::string vfxShotName(const std::string& pattern, const Project& p, const Sequence& seq, const Clip& c) {
+    const MediaItem* m = p.findMedia(c.mediaId);
+    const std::string clip = c.name.empty() && m ? m->name : c.name;
+    if (pattern.empty()) return safeName(clip);
+    // ({clip}: a file's name without its extension)
+    const std::string clipWord = m && clip == m->name ? QFileInfo(QString::fromStdString(clip)).completeBaseName().toStdString() : clip;
+    // Its layer, and its place among the cut's footage clips (by start, then the lower track first).
+    std::string layer;
+    std::vector<std::pair<FrameTime, size_t>> order;
+    std::pair<FrameTime, size_t> mine{c.start, 0};
+    for (size_t t = 0; t < seq.videoTracks.size(); ++t)
+        for (const Clip& k : seq.videoTracks[t].clips) {
+            const MediaItem* km = p.findMedia(k.mediaId);
+            if (k.id == c.id) layer = seq.videoTracks[t].name, mine = {k.start, t};
+            else if ((km && km->kind == MediaKind::Video && km->hasVideo) || vfxShotOfClip(seq, k.id)) order.emplace_back(k.start, t);
+        }
+    const long n = std::count_if(order.begin(), order.end(), [&](const auto& o) { return o < mine; });
+    char shot[16];
+    std::snprintf(shot, sizeof shot, "%03d", int(n + 1) * 10);
+    QString out = QString::fromStdString(pattern);
+    out.replace(QStringLiteral("{sequence}"), QString::fromStdString(seq.name));
+    out.replace(QStringLiteral("{shot}"), QString::fromLatin1(shot));
+    out.replace(QStringLiteral("{clip}"), QString::fromStdString(clipWord));
+    out.replace(QStringLiteral("{layer}"), QString::fromStdString(layer));
+    return safeName(out.toStdString());
+}
+
 bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>& clips, const VfxPullOptions& o, std::vector<VfxShot>* out,
                     const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
     auto fail = [&](const std::string& msg) {
@@ -178,18 +207,33 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
     if (o.format != "exr" && o.format != "dpx" && o.format != "tiff") return fail("Pulls are OpenEXR, DPX or TIFF");
     if (o.stMaps && !exrAvailable()) return fail("ST maps need Montage built with the OpenEXR library");
     if (!QDir().mkpath(QString::fromStdString(o.folder))) return fail("Cannot make the folder " + o.folder);
-    // The shots: footage clips on video tracks, in timeline order.
-    std::vector<const Clip*> chosen;
+    // The shots: footage clips on video tracks, in timeline order. A shot showing a version the vendor sent back is
+    // pulled from its plate again (its plate take, where the version is placed against it), not from the version.
+    std::vector<Clip> plates;
     for (const Track& t : seq.videoTracks)
         for (const Clip& c : t.clips)
             if (std::find(clips.begin(), clips.end(), c.id) != clips.end() && c.mediaId) {
-                const MediaItem* m = p.findMedia(c.mediaId);
-                if (m && m->kind == MediaKind::Video && m->hasVideo) chosen.push_back(&c);
+                Clip plate = c;
+                if (const VfxShotRecord* r = vfxShotOfClip(seq, c.id); r && r->plateMedia && c.mediaId != r->plateMedia)
+                    for (const Take& take : c.takes)
+                        if (take.mediaId == r->plateMedia) {
+                            plate.mediaId = take.mediaId;
+                            plate.sourceIn += take.offset;
+                            plate.takes.clear();
+                            break;
+                        }
+                const MediaItem* m = p.findMedia(plate.mediaId);
+                if (m && m->kind == MediaKind::Video && m->hasVideo) plates.push_back(plate);
             }
-    std::sort(chosen.begin(), chosen.end(), [](const Clip* a, const Clip* b) { return a->start < b->start; });
+    std::sort(plates.begin(), plates.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
+    std::vector<const Clip*> chosen;
+    for (const Clip& c : plates) chosen.push_back(&c);
     if (chosen.empty()) return fail("Choose clips of footage to pull (titles and other generated clips have no source frames)");
     std::vector<VfxShot> shots;
+    // (names other clips' shots have are not given again: their versions would be taken for this one's)
     std::vector<std::string> used;
+    for (const VfxShotRecord& r : seq.vfxShots)
+        if (std::none_of(plates.begin(), plates.end(), [&](const Clip& c) { return c.id == r.clip; })) used.push_back(r.name);
     const double seqFps = seq.fpsValue();
     for (size_t n = 0; n < chosen.size(); ++n) {
         const Clip& c = *chosen[n];
@@ -226,9 +270,12 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         plate.motion = makeEffect("transform", 2);
         plate.layer = c.layer;  // (a multi-layer render's layer the cut shows)
         alone.videoTracks[0].clips.push_back(plate);
-        // Names: the clip's, numbered when two shots share one.
-        std::string name = safeName(c.name.empty() ? m.name : c.name);
-        if (std::count(used.begin(), used.end(), name)) name += "_" + std::to_string(n + 1);
+        // Names: the clip's or the pattern's, numbered when two shots share one.
+        std::string name = vfxShotName(o.namePattern, p, seq, c);
+        if (std::count(used.begin(), used.end(), name)) {
+            const std::string base = name;
+            for (int k = int(n); std::count(used.begin(), used.end(), name); ++k) name = base + "_" + std::to_string(k + 1);
+        }
         used.push_back(name);
         VfxShot shot;
         shot.name = name;
@@ -242,6 +289,10 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         shot.lastFrame = shot.cutOut + tail;
         shot.sourceIn = double(first) / mf;
         shot.sourceOut = double(first + frames) / mf;
+        shot.clip = c.id;
+        shot.width = alone.width, shot.height = alone.height;
+        shot.fps = alone.fps;
+        shot.cutSource = double(cutFirst) * seqFps / mf;
         if (!QDir().mkpath(QString::fromStdString(shot.folder))) return fail("Cannot make the folder " + shot.folder);
         ExportSettings st;
         st.videoCodec = o.format;
@@ -316,14 +367,21 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         } else if (!exportSequence(p, alone, st, prog, cancel, &why)) {
             return fail(name + ": " + why);
         }
+        // The frames' space (as the exporter chooses it: EXR any space asked for, else linear Rec.709; DPX the space
+        // asked for or the footage's; TIFF a display space asked for, else the sequence's).
+        const ColorSpace* chosenSpace = findColorSpace(st.colorSpace);
+        const std::string space = o.format == "exr"                                               ? (chosenSpace ? chosenSpace->id : std::string("linear-rec709"))
+                                  : chosenSpace && (o.format == "dpx" || !chosenSpace->sceneReferred) ? chosenSpace->id
+                                                                                                     : sequenceColorSpace(alone).id;
+        // (Video made for a display, pulled from a sequence not graded scene-referred, comes in its display's light: read
+        // back as that, its versions show as the plate did.)
+        const ColorSpace* written = findColorSpace(space);
+        shot.colorSpace = written && written->sceneReferred && !sceneReferredWorking(alone) && !mediaColorSpace(m).sceneReferred
+                              ? displayLightOf(*written).id
+                              : space;
+        shot.plate = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + QStringLiteral(".####.") + ext).toStdString();
         if (o.amf) {
             // The frames' space as the input transform and the cut's grade as looks, for the frames by their numbers.
-            // (as the exporter chooses it: EXR any space asked for, else linear Rec.709; DPX the space asked for or the
-            // footage's; TIFF a display space asked for, else the sequence's)
-            const ColorSpace* chosen = findColorSpace(st.colorSpace);
-            const std::string space = o.format == "exr"                                     ? (chosen ? chosen->id : std::string("linear-rec709"))
-                                      : chosen && (o.format == "dpx" || !chosen->sceneReferred) ? chosen->id
-                                                                                               : sequenceColorSpace(alone).id;
             AmfDocument amf;
             if (!clipAmf(p, seq, c, shot.folder, amf, nullptr, space, &why)) return fail(name + ": " + why);
             amf.clipName = name;
@@ -353,6 +411,15 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
                 shot.overscanWidth = maps.overscanWidth;
                 shot.overscanHeight = maps.overscanHeight;
             }
+        }
+        if (o.scripts) {
+            const std::string returns = o.returns.empty() ? QDir(QString::fromStdString(o.folder)).filePath(QStringLiteral("returns")).toStdString() : o.returns;
+            VfxShotRecord r = vfxShotRecord(shot);
+            shot.script = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + QStringLiteral(".nk")).toStdString();
+            const std::string nk = nukeScript(r, vfxVersionPath(returns, o.returnsPattern, r, 1, o.format));
+            QFile f(QString::fromStdString(shot.script));
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(nk.data(), qint64(nk.size())) != qint64(nk.size()))
+                return fail("Cannot write " + shot.script);
         }
         shots.push_back(shot);
     }
