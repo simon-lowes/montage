@@ -1,5 +1,6 @@
 #include "SoundLibraryPanel.h"
 
+#include <QCoreApplication>
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
@@ -74,6 +75,8 @@ bool soundRangeFromMime(const QMimeData* mime, SoundRange& out) {
 
 // A sound's waveform: drag across it to choose a stretch, then drag the stretch away (onto the timeline).
 class SoundWaveView : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(montage::SoundWaveView)  // (its texts under its own name, as lupdate files them)
+
 public:
     explicit SoundWaveView(QWidget* parent) : QWidget(parent) {
         setMinimumHeight(90);

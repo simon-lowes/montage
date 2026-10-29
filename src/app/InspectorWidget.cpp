@@ -1,4 +1,5 @@
 #include "InspectorWidget.h"
+#include "Language.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/CompositeGraph.h"
@@ -525,7 +526,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     // ---- Generator ---------------------------------------------------------
     if (clip.isGenerator()) {
         if (const EffectInfo* info = findEffectInfo(clip.generator.type)) {
-            QFormLayout* g = addSection(QString::fromStdString(info->displayName));
+            QFormLayout* g = addSection(language::engine(info->displayName));
             addParamRows(g, *info, target(clip.generator.id));
             if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
             if (clip.generator.type == "title") addTitleTextTools(g, clip, target(clip.generator.id));
@@ -836,7 +837,7 @@ void InspectorWidget::buildCompositeNode(const Clip& clip, const std::function<F
             t.key = QString("p%1:%2").arg(owner).arg(effectId);
             t.owner = owner;
             t.effect = effectId;
-            QFormLayout* g = addSection(QString::fromStdString(info->displayName));
+            QFormLayout* g = addSection(language::engine(info->displayName));
             addParamRows(g, *info, t);
         }
     }
@@ -898,6 +899,10 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         EffectInfo shown = *catalog;
         shown.displayName = plugins::effectName(e);
         if (e.type == "grade_node") shown.displayName = tr("Window, Key and Mix").toStdString();  // a colour node's own
+        // (as shown: a plug-in's own name and a colour node's as they are, a built-in effect's in the interface's language)
+        const QString title = e.type == "plugin" || e.type == "ara" || e.type == "ofx" || e.type == "grade_node"
+                                  ? QString::fromStdString(shown.displayName)
+                                  : language::engine(shown.displayName);
         shown.params = effectParams(e);
         // A plugin with a key input: which track it hears there (as the Compressor's sidechain).
         if (e.type == "plugin" && (e.s("key_input") == "1" || plugins::knownSidechain(e.s("plugin_id")))) {
@@ -933,7 +938,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         for (QWidget* w : {static_cast<QWidget*>(on), static_cast<QWidget*>(up), static_cast<QWidget*>(down),
                            static_cast<QWidget*>(reset), static_cast<QWidget*>(del)})
             th->addWidget(w);
-        QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
+        QFormLayout* f = addSection(title, tools);
         if (state_->sequence() && sceneReferredWorking(*state_->sequence()) && effectDomain(e.type) == EffectDomain::Display) {
             // (it cannot work on scene light: it gets the picture as the display shows it, and gives it back)
             auto* note = new QLabel(tr("On the displayed picture: graded scene-referred, this effect works through the output "
@@ -1388,7 +1393,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             }
         if (kind == TrackKind::Video && supportsMask(e.type)) {
             // Shape masks and the HSL qualifier; folded away until one is used.
-            QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
+            QFormLayout* mf = addSection(tr("%1 Mask").arg(title), nullptr,
                                          !hasMask(e, localTime()));
             addParamRows(mf, maskInfo(), target(eid));
             if (e.p("mask.depth", localTime()) > 0.5 && depthAvailable() && !depthModel().installed()) {
@@ -1839,9 +1844,9 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
     for (const EffectInfo* info : effectsInCategory(kind == TrackKind::Video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter)) {
         if (sharedNode && runsBeforeGrade(info->type)) continue;
         QMenu*& g = groups[info->group];
-        if (!g) g = menu->addMenu(QString::fromStdString(info->group));
+        if (!g) g = menu->addMenu(language::engine(info->group));
         std::string type = info->type;
-        QString label = QString::fromStdString(info->displayName);
+        QString label = language::engine(info->displayName);
         g->addAction(label, this, [this, owner, type, label, node] {
             if (!ensureEffectModel(window(), type)) return;
             // Bandwidth Extension: the models the clip's cut-off needs.
@@ -1923,7 +1928,7 @@ void InspectorWidget::buildTransition(const Transition& tr0, TrackKind kind) {
     QFormLayout* form = addSection(tr("Transition"));
     auto* type = new QComboBox(content_);
     for (const EffectInfo* info : effectsInCategory(kind == TrackKind::Video ? EffectCategory::VideoTransition : EffectCategory::AudioTransition))
-        type->addItem(QString::fromStdString(info->displayName), QString::fromStdString(info->type));
+        type->addItem(language::engine(info->displayName), QString::fromStdString(info->type));
     form->addRow(tr("Type"), type);
     auto* dur = new QSpinBox(content_);
     dur->setRange(1, 100000);
@@ -2056,7 +2061,7 @@ void InspectorWidget::addHdrPalette(QFormLayout* form, const EffectInfo& info, c
     auto* zone = new QComboBox(content_);
     zone->setObjectName(QStringLiteral("hdrZone"));
     zone->addItem(tr("Global"));
-    for (const HdrZone& z : hdrZones()) zone->addItem(tr(z.label));
+    for (const HdrZone& z : hdrZones()) zone->addItem(language::engine(z.label));
     hdrZone_ = std::clamp(hdrZone_, 0, zone->count() - 1);
     zone->setCurrentIndex(hdrZone_);
     connect(zone, &QComboBox::currentIndexChanged, this, [this](int i) {
@@ -2088,7 +2093,7 @@ void InspectorWidget::addColorSlice(QFormLayout* form, const EffectInfo& info, c
     auto* vector = new QComboBox(content_);
     vector->setObjectName(QStringLiteral("sliceVector"));
     vector->addItem(tr("Global"));
-    for (const HueVector& v : colorSliceVectors()) vector->addItem(tr(v.label));
+    for (const HueVector& v : colorSliceVectors()) vector->addItem(language::engine(v.label));
     vector->addItem(tr("Skin"));
     sliceVector_ = std::clamp(sliceVector_, 0, vector->count() - 1);
     vector->setCurrentIndex(sliceVector_);
@@ -2391,7 +2396,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     h->setContentsMargins(0, 0, 0, 0);
     h->setSpacing(3);
     const std::string name = pi.name;
-    const QString label = tr(pi.label.c_str());
+    const QString label = language::engine(pi.label);
     const QString mergeKey = target.key + ":" + QString::fromStdString(name);
     std::vector<std::string> names = {name};
     if (pi.kind == ParamKind::Color) names = {name + ".r", name + ".g", name + ".b"};
@@ -2456,7 +2461,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         case ParamKind::Choice: {
             auto* combo = new QComboBox(row);
             combo->setObjectName(QStringLiteral("choice_") + QString::fromStdString(name));
-            for (const auto& c : pi.choices) combo->addItem(tr(c.c_str()));
+            for (const auto& c : pi.choices) combo->addItem(language::engine(c));
             h->addWidget(combo, 1);
             connect(combo, &QComboBox::activated, this, [write, name](int idx) { write({{name, double(idx)}}); });
             refreshWidget = [combo, read, name] {
@@ -2810,7 +2815,7 @@ void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, con
 
 void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target) {
     const std::string name = si.name;
-    const QString label = tr(si.label.c_str());
+    const QString label = language::engine(si.label);
     const QString mergeKey = target.key + ":s:" + QString::fromStdString(name);
     auto read = [this, target, name]() -> QString {
         const Sequence* s = state_->sequence();
@@ -3032,7 +3037,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             combo->setObjectName(QString::fromStdString("track_" + name));
             form->addRow(label, combo);
             connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
-            const QString none = si.choices.empty() ? tr("None") : tr(si.choices.front().c_str());
+            const QString none = si.choices.empty() ? tr("None") : language::engine(si.choices.front());
             refreshers_.push_back([this, combo, read, target, none] {
                 QSignalBlocker b(combo);
                 combo->clear();
@@ -3058,12 +3063,13 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
         }
         case StringKind::Choice: {
             auto* combo = new QComboBox(content_);
-            for (const auto& c : si.choices) combo->addItem(QString::fromStdString(c));
+            // (each shown in the interface's language, kept as written)
+            for (const auto& c : si.choices) combo->addItem(language::engine(c), QString::fromStdString(c));
             form->addRow(label, combo);
-            connect(combo, &QComboBox::textActivated, this, write);
+            connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
             refreshers_.push_back([combo, read] {
                 QSignalBlocker b(combo);
-                combo->setCurrentText(read());
+                combo->setCurrentIndex(combo->findData(read()));
             });
             break;
         }

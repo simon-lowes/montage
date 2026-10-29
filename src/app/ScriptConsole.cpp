@@ -1,4 +1,5 @@
 #include "ScriptConsole.h"
+#include "Language.h"
 
 #include <QComboBox>
 #include <QCoreApplication>
@@ -81,6 +82,7 @@ ScriptConsole::ScriptConsole(EditorState* state, LiveLink* link, QWidget* parent
     language_ = new QComboBox(this);
     language_->setObjectName(QStringLiteral("scriptLanguage"));
     language_->addItems({QStringLiteral("Lua"), QStringLiteral("Python")});
+    language::keepUntranslated(language_);
     language_->setToolTip(tr("The script's language (a script opened or saved follows its file's)"));
     auto* openBtn = new QPushButton(tr("Open…"), this);
     auto* saveBtn = new QPushButton(tr("Save…"), this);

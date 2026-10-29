@@ -1,4 +1,5 @@
 #include "GalleryPanel.h"
+#include "Language.h"
 
 #include <QComboBox>
 #include <QFileInfo>
@@ -27,6 +28,7 @@ GalleryPanel::GalleryPanel(EditorState* state, QWidget* parent) : QWidget(parent
     albums_ = new QComboBox(this);
     albums_->setObjectName(QStringLiteral("galleryAlbum"));
     albums_->setToolTip(tr("Album"));
+    language::keepUntranslated(albums_);  // (the albums' names)
     auto* newAlbum = new QToolButton(this);
     newAlbum->setText(QStringLiteral("+"));
     newAlbum->setToolTip(tr("New Album…"));

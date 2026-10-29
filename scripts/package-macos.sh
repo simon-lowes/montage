@@ -35,6 +35,16 @@ cp "$OFFSCREEN" "$APP/Contents/PlugIns/platforms/"
   -executable="$APP/Contents/MacOS/montage-plugin-probe" \
   -executable="$APP/Contents/PlugIns/platforms/libqoffscreen.dylib" -libpath="$(brew --prefix)/lib"
 
+# Qt's own translations, for its dialogs and buttons in the language chosen in Window › Language (Homebrew's
+# qttranslations).
+QTTR=$(find -L "$(brew --prefix)/share/qt/translations" "$(brew --prefix)/opt/qttranslations" -name 'qtbase_de.qm' 2>/dev/null | head -1 || true)
+if [ -n "$QTTR" ]; then
+  mkdir -p "$APP/Contents/Resources/translations"
+  cp "$(dirname "$QTTR")"/qtbase_*.qm "$APP/Contents/Resources/translations/"
+else
+  echo "Qt's translations not found; its dialogs stay in English" >&2
+fi
+
 # Qt's SVG image and icon plugins need QtSvg, which macdeployqt cannot find in
 # Homebrew's layout. Montage uses no SVG, so leave them out.
 rm -f "$APP/Contents/PlugIns/imageformats/libqsvg.dylib" "$APP/Contents/PlugIns/iconengines/libqsvgicon.dylib"

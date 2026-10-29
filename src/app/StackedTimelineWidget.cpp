@@ -1,5 +1,6 @@
 #include "StackedTimelineWidget.h"
 
+#include <QCoreApplication>
 #include <QApplication>
 #include <QComboBox>
 #include <QDrag>
@@ -63,6 +64,8 @@ bool sequencePartFromMime(const Project& p, const QMimeData* mime, Id* sequence,
 // The tracks, drawn to fit the width (Ctrl+wheel zooms, the wheel scrolls).
 
 class StackedTimelineCanvas : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(montage::StackedTimelineCanvas)  // (its texts under its own name, as lupdate files them)
+
 public:
     explicit StackedTimelineCanvas(StackedTimelineWidget* owner) : QWidget(owner), w_(owner) {
         setFocusPolicy(Qt::StrongFocus);

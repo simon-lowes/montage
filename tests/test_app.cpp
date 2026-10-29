@@ -43,6 +43,11 @@
 #include <QMenu>
 #include <QPainter>
 #include <QTabBar>
+#include <QProcess>
+#include <QDirIterator>
+#include <QXmlStreamReader>
+#include <QGroupBox>
+#include <QMenuBar>
 #include <QTableWidget>
 #include <QSpinBox>
 #include <QTimer>
@@ -57,6 +62,8 @@
 #include "ProductionPanel.h"
 #include "ReferenceOutputPanel.h"
 #include "RemoteGradePanel.h"
+#include "Language.h"
+#include "media/InterfaceDrafts.h"
 #include "RemoteReviewPanel.h"
 #include <algorithm>
 #include <array>
@@ -18032,6 +18039,252 @@ print("added " + ui["name"])
         QCOMPARE(program->speed(), 2.0);
         program->shuttle(0);
         QCOMPARE(program->speed(), 0.0);
+    }
+
+    void languageChoiceAndTestLanguage() {
+        using language::PseudoTranslator;
+        // The test language: accented, about 40 % longer and between marks, keeping what arg(), plural forms, rich text,
+        // mnemonics and menu shortcuts need.
+        const QString open = QStringLiteral("&Open %1 of %n files…\tCtrl+O");
+        const QString p = PseudoTranslator::pseudo(open);
+        QVERIFY(PseudoTranslator::marked(p) && !PseudoTranslator::marked(open));
+        QVERIFY2(p.contains("&Ó") && p.contains("%1") && p.contains("%n") && p.endsWith("\tCtrl+O"), qPrintable(p));
+        QVERIFY(p.indexOf('\t') >= int(open.indexOf('\t') * 1.3));
+        QCOMPARE(PseudoTranslator::pseudo("<p>Done</p>"), QString::fromUtf8("<p>⟦Dóñé~⟧</p>"));
+        QCOMPARE(PseudoTranslator::pseudo("Tom &amp; Jerry && 50%%"), QString::fromUtf8("⟦Tóm &amp; Jérrý && 50%%~~~~⟧"));
+        QCOMPARE(PseudoTranslator::pseudo("%L1 of %2"), QString::fromUtf8("⟦%L1 óf %2~⟧"));
+        PseudoTranslator t;
+        QVERIFY(t.translate("Ctx", "").isEmpty());
+        QCOMPARE(t.translate("QShortcut", "Ctrl"), QString("Ctrl"));
+        QCOMPARE(t.translate("QGuiApplication", "QT_LAYOUT_DIRECTION"), QString("QT_LAYOUT_DIRECTION"));
+
+        // Window › Language: English, each translation built in, and the test language, saved for the next start.
+        QVERIFY(win_->findChild<QMenu*>("languageMenu"));
+        QAction* system = win_->findChild<QAction*>("language_system");
+        QAction* pseudo = win_->findChild<QAction*>("language_pseudo");
+        QVERIFY(system && pseudo && win_->findChild<QAction*>("language_en"));
+        const auto langs = language::available();
+        QVERIFY(langs.size() >= 2 && langs.front().code == "en" && langs.back().code == "pseudo");
+        for (const auto& l : langs) QVERIFY2(win_->findChild<QAction*>("language_" + l.code), qPrintable(l.code));
+        pseudo->trigger();
+        QCOMPARE(language::chosen(), QString("pseudo"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("next time it starts"));
+        system->trigger();
+        QVERIFY(language::chosen().isEmpty() && system->isChecked());
+        QCOMPARE(language::installed(), QString("en"));
+    }
+
+    void testLanguageFindsUntranslatedText() {
+        // Under the test language, every text in a newly built window and its main dialogs goes through tr(): none
+        // lacks the marks, and in the dialogs none is cut short.
+        QCOMPARE(language::install("pseudo"), QString("pseudo"));
+        auto w = std::make_unique<MainWindow>();
+        w->resize(1600, 1000);
+        w->show();
+        QVERIFY(QTest::qWaitForWindowExposed(w.get()));
+        QStringList unmarked, clipped;
+        auto needs = [](QString text) {
+            // Words, not numbers, timecodes, units or other symbols that read the same in every language.
+            static const QRegularExpression same(QStringLiteral("\\b(dB|dBFS|dBTP|LUFS|LU|Hz|kHz|ms|fps|px|HDR|SDR|EDR)\\b"));
+            text.remove(same);
+            int run = 0;
+            for (QChar c : text) {
+                run = c.isLetter() ? run + 1 : 0;
+                if (run >= 2) return true;
+            }
+            return false;
+        };
+        QString where;
+        auto check = [&](const QString& text, QObject* o, const char* what) {
+            if (text.isEmpty() || !needs(text) || language::PseudoTranslator::marked(text) || language::keptUntranslated(o)) return;
+            unmarked << QStringLiteral("%1: %2 %3 (%4): %5").arg(where, o->metaObject()->className(), o->objectName(), what, text.left(80));
+        };
+        std::function<void(QMenu*)> menuWalk = [&](QMenu* m) {
+            check(m->title(), m, "menu");
+            for (QAction* a : m->actions()) {
+                if (a->menu()) menuWalk(a->menu());
+                else if (!a->isSeparator()) check(a->text(), a, "action");
+            }
+        };
+        auto walk = [&](QWidget* top, bool sizes) {
+            for (QWidget* c : top->findChildren<QWidget*>()) {
+                if (auto* l = qobject_cast<QLabel*>(c)) check(l->text(), l, "label");
+                else if (auto* b = qobject_cast<QAbstractButton*>(c)) check(b->text(), b, "button");
+                else if (auto* g = qobject_cast<QGroupBox*>(c)) check(g->title(), g, "group");
+                else if (auto* e = qobject_cast<QLineEdit*>(c)) check(e->placeholderText(), e, "placeholder");
+                else if (auto* t = qobject_cast<QTabBar*>(c))
+                    for (int i = 0; i < t->count(); ++i) check(t->tabText(i), t, "tab");
+                else if (auto* d = qobject_cast<QDockWidget*>(c)) check(d->windowTitle(), d, "dock");
+                else if (auto* cb = qobject_cast<QComboBox*>(c))
+                    for (int i = 0; i < cb->count(); ++i) check(cb->itemText(i), cb, "choice");
+                else if (auto* tw = qobject_cast<QTreeWidget*>(c)) {
+                    for (int k = 0; k < tw->columnCount(); ++k) check(tw->headerItem()->text(k), tw, "heading");
+                    for (QTreeWidgetItemIterator it(tw); *it; ++it)
+                        if (!(*it)->data(0, language::kUntranslatedRole).toBool())
+                            for (int k = 0; k < tw->columnCount(); ++k) check((*it)->text(k), tw, "row");
+                } else if (auto* lw = qobject_cast<QListWidget*>(c))
+                    for (int i = 0; i < lw->count(); ++i) check(lw->item(i)->text(), lw, "row");
+                if (!c->toolTip().isEmpty()) check(c->toolTip(), c, "tooltip");
+                if (!sizes || !c->isVisible() || language::keptUntranslated(c)) continue;
+                // Cut short: narrower than the text needs (a label that wraps: shorter than its lines need).
+                const bool label = qobject_cast<QLabel*>(c), button = qobject_cast<QAbstractButton*>(c);
+                if (!label && !button) continue;
+                auto* l = qobject_cast<QLabel*>(c);
+                const QString text = l ? l->text() : static_cast<QAbstractButton*>(c)->text();
+                if (text.isEmpty() || (l && (!l->pixmap().isNull() || l->textFormat() == Qt::RichText))) continue;
+                const bool cut = l && l->wordWrap() ? c->height() < c->heightForWidth(c->width()) : c->width() < c->sizeHint().width();
+                if (cut)
+                    clipped << QStringLiteral("%1: %2 %3 %4x%5 needs %6x%7: %8").arg(where, c->metaObject()->className(), c->objectName())
+                                   .arg(c->width()).arg(c->height()).arg(c->sizeHint().width()).arg(l && l->wordWrap() ? c->heightForWidth(c->width()) : c->sizeHint().height())
+                                   .arg(text.left(60));
+            }
+        };
+        where = "window";
+        for (QAction* a : w->menuBar()->actions())
+            if (a->menu()) menuWalk(a->menu());
+        walk(w.get(), false);
+        EditorState* st = w->state();
+        const std::vector<std::pair<const char*, std::function<QDialog*()>>> dialogs{
+            {"Export", [&] { return new ExportDialog(st, w.get()); }},
+            {"Conform Check", [&] { return new ConformCheckDialog(st, w.get()); }},
+            {"Quality Check", [&] { return new QualityCheckDialog(st, w.get()); }},
+            {"Link Media", [&] { return new LinkMediaDialog(st, w.get()); }},
+            {"Merge", [&] { return new MergeDialog(st, w.get()); }},
+            {"Offload", [&] { return new OffloadDialog(st, w.get()); }},
+            {"Project Manager", [&] { return new ProjectManagerDialog(st, w.get()); }},
+            {"Sequence Settings", [&] { return new SequenceSettingsDialog(w.get()); }},
+            {"Stems", [&] { return new StemsDialog(w.get()); }},
+            {"Transcribe", [&] { return new TranscribeDialog(1, w.get()); }},
+            {"Footage Notes", [&] { return new FootageNotesDialog(st, w.get()); }},
+            {"Audio Description", [&] { return new AudioDescriptionDialog(st, w.get()); }},
+            {"Repair Media", [&] { return new RepairMediaDialog(st, w.get()); }},
+            {"Graphics Templates", [&] { return new GraphicsTemplatesDialog(st, w.get()); }},
+        };
+        for (const auto& [name, make] : dialogs) {
+            where = QString::fromLatin1(name);
+            std::unique_ptr<QDialog> d(make());
+            d->show();
+            QCoreApplication::processEvents();
+            check(d->windowTitle(), d.get(), "title");
+            walk(d.get(), true);
+        }
+        unmarked.removeDuplicates();
+        clipped.removeDuplicates();
+        w.reset();
+        language::uninstall();
+        QVERIFY2(unmarked.isEmpty(), qPrintable(QStringLiteral("%1 not translated:\n").arg(unmarked.size()) + unmarked.join('\n')));
+        QVERIFY2(clipped.isEmpty(), qPrintable(QStringLiteral("%1 cut short:\n").arg(clipped.size()) + clipped.join('\n')));
+    }
+
+    void engineTextsAreListedForTranslators() {
+        // Every text the engine gives the interface (effects, settings, presets, colour spaces) is in
+        // app/EngineTexts.cpp, where lupdate finds it.
+        const std::vector<std::string> listed = language::listedEngineTexts();
+        const std::set<std::string> have(listed.begin(), listed.end());
+        QStringList missing;
+        for (const std::string& t : engineInterfaceTexts())
+            if (!have.count(t)) missing << QString::fromStdString(t);
+        QVERIFY2(missing.isEmpty(), qPrintable(QStringLiteral("Not listed (montage-cli interface-texts -o src/app/EngineTexts.cpp):\n") +
+                                               missing.join('\n')));
+    }
+
+    void rightToLeftMirrorsPanelsNotTheTimeline() {
+        // Arabic: the window's panels and docks mirror; the timeline, its rulers, the keyframes and the monitors still
+        // run left to right.
+        loadDemo();
+        QDockWidget* media = win_->findChild<QDockWidget*>("media");
+        QVERIFY(media && media->isVisible());
+        const QRect before = media->geometry();
+        QCOMPARE(language::install("ar"), QString("ar"));
+        QVERIFY(language::rightToLeft("ar") && language::rightToLeft("he") && !language::rightToLeft("de"));
+        QCOMPARE(QGuiApplication::layoutDirection(), Qt::RightToLeft);
+        QTRY_VERIFY(win_->isRightToLeft() && media->widget()->isRightToLeft());
+        QTRY_VERIFY2(std::abs(media->x() - (win_->width() - before.x() - before.width())) <= 4,
+                     qPrintable(QStringLiteral("%1 then %2 of %3").arg(before.x()).arg(media->x()).arg(win_->width())));
+        QVERIFY(timeline()->isLeftToRight() && win_->findChild<QTabBar*>("sequenceTabs")->isLeftToRight());
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>()) QVERIFY(m->isLeftToRight());
+        QVERIFY(win_->findChild<QDockWidget*>("keyframes")->widget()->isLeftToRight());
+        QVERIFY(win_->findChild<QDockWidget*>("multicam")->widget()->isLeftToRight());
+        language::uninstall();
+        QCOMPARE(QGuiApplication::layoutDirection(), Qt::LeftToRight);
+        QTRY_COMPARE(media->x(), before.x());  // (back on the left, laid out afresh)
+    }
+
+    void projectsDoNotFollowTheLocale() {
+        // A project saved, an edit list exported, and the agent link's answers read the same under German and French
+        // number formats (decimal commas) as under C.
+        loadDemo();
+        auto results = [&](const char* tag) {
+            const QString path = dir_.filePath(QStringLiteral("locale-%1.montage").arg(tag));
+            if (!saveProject(state()->project(), path.toStdString())) return QByteArray();
+            QFile f(path);
+            if (!f.open(QIODevice::ReadOnly)) return QByteArray();
+            QByteArray all = f.readAll();
+            all += QByteArray::fromStdString(exportEdl(state()->project(), *state()->sequence()));
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_project_info"}, {"arguments", QJsonObject{}}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object(); });
+            QTest::qWaitFor([&] { return !answer.isEmpty(); }, 60000);  // (the tool runs on a worker)
+            return all + QJsonDocument(answer).toJson(QJsonDocument::Compact);
+        };
+        const QByteArray c = results("c");
+        QVERIFY2(c.size() > 1000 && c.contains("\"result\""), c.right(400).constData());
+        for (const char* name : {"de_DE", "fr_FR"}) {
+            QLocale::setDefault(QLocale(QString::fromLatin1(name)));
+            QCOMPARE(QLocale().decimalPoint(), QString(","));
+            const QByteArray other = results(name);
+            QLocale::setDefault(QLocale::c());
+            QCOMPARE(other, c);
+        }
+    }
+
+    void everyTranslatableTextIsFound() {
+        // lupdate finds every tr() text in the interface, each under the name Montage asks for it by.
+        const QByteArray lupdate = qgetenv("MONTAGE_TEST_LUPDATE");
+        if (lupdate.isEmpty()) QSKIP("MONTAGE_TEST_LUPDATE (Qt's lupdate) is not set");
+        const QString src = QStringLiteral(MONTAGE_SOURCE_DIR "/src");
+        const QString ts = dir_.filePath("found.ts");
+        QProcess p;
+        p.setProcessChannelMode(QProcess::MergedChannels);
+        p.start(QString::fromLocal8Bit(lupdate), {QStringLiteral("-locations"), QStringLiteral("none"), src, QStringLiteral("-ts"), ts});
+        QVERIFY(p.waitForFinished(300000));
+        const QString log = QString::fromLocal8Bit(p.readAll());
+        QVERIFY2(p.exitCode() == 0, qPrintable(log));
+        // A tr() lupdate cannot place, or one it files under another name than Montage's class asks with.
+        for (const QString& bad : {QStringLiteral("lacks Q_OBJECT"), QStringLiteral("Cannot invoke tr()"),
+                                   QStringLiteral("cannot be called without context"), QStringLiteral("Circular")})
+            QVERIFY2(!log.contains(bad), qPrintable(log));
+        QFile f(ts);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QSet<QString> found;
+        QXmlStreamReader x(&f);
+        while (x.readNextStartElement() || !x.atEnd())
+            if (x.isStartElement() && x.name() == QLatin1String("source")) found.insert(x.readElementText());
+        QVERIFY(found.size() > 4000);
+        // Every tr("…") with a single string in the source is among them.
+        static const QRegularExpression call(QStringLiteral("\\btr\\(\"((?:[^\"\\\\]|\\\\.)*)\"\\s*[,)]"));
+        int checked = 0;
+        QStringList missing;
+        QDirIterator it(src, {QStringLiteral("*.cpp"), QStringLiteral("*.h")}, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            QFile s(it.next());
+            if (!s.open(QIODevice::ReadOnly)) continue;
+            const QString code = QString::fromUtf8(s.readAll());
+            for (auto m = call.globalMatch(code); m.hasNext();) {
+                QString text = m.next().captured(1);
+                text.replace(QLatin1String("\\n"), QLatin1String("\n")).replace(QLatin1String("\\t"), QLatin1String("\t"));
+                text.replace(QLatin1String("\\\""), QLatin1String("\"")).replace(QLatin1String("\\\\"), QLatin1String("\\"));
+                static const QRegularExpression u(QStringLiteral("\\\\u([0-9a-fA-F]{4})"));
+                for (auto e = u.match(text); e.hasMatch(); e = u.match(text))
+                    text.replace(e.capturedStart(), e.capturedLength(), QChar(char16_t(e.captured(1).toUShort(nullptr, 16))));
+                ++checked;
+                if (!found.contains(text)) missing << QFileInfo(s.fileName()).fileName() + ": " + text;
+            }
+        }
+        QVERIFY(checked > 4000);
+        QVERIFY2(missing.isEmpty(), qPrintable(missing.mid(0, 20).join('\n')));
     }
 
     void remoteGradingBothWays() {

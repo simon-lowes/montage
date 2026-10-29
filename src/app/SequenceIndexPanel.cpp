@@ -1,4 +1,5 @@
 #include "SequenceIndexPanel.h"
+#include "Language.h"
 #include "media/ImageSequence.h"
 
 #include <QCheckBox>
@@ -99,7 +100,7 @@ void SequenceIndexPanel::rebuild() {
                 if (!c.enabled) kind += tr(" (off)");
                 QStringList fx;
                 for (const Effect& e : c.effects)
-                    if (const EffectInfo* info = findEffectInfo(e.type)) fx << QString::fromStdString(info->displayName);
+                    if (const EffectInfo* info = findEffectInfo(e.type)) fx << language::engine(info->displayName);
                 Row row;
                 row.clip = c.id;
                 row.start = c.start;
@@ -159,6 +160,7 @@ void SequenceIndexPanel::rebuildRoles() {
         const QString name = QString::fromStdString(r);
         auto* box = new QCheckBox(name, rolesBar_);
         box->setObjectName(QStringLiteral("role_") + name);
+        language::keepUntranslated(box);  // (the project's own names for its roles)
         box->setChecked(!edit::roleMuted(*s, r));
         connect(box, &QCheckBox::toggled, this, [this, name](bool on) { setRoleHeard(name, on); });
         lay->addWidget(box);

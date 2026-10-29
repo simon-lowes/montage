@@ -159,6 +159,7 @@ add_library(montage_engine STATIC
   media/BandwidthExtension.h media/BandwidthExtension.cpp
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp
+  media/InterfaceDrafts.h media/InterfaceDrafts.cpp
   render/Processing.h render/Processing.cpp render/TransferTables.h
   render/Ofx.h render/Ofx.cpp
   render/FaceRefine.h render/FaceRefine.cpp

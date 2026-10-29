@@ -38,7 +38,14 @@ if(MONTAGE_BUILD_APP)
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
     MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
     MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
-    MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+    MONTAGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  # Qt's lupdate, to check it finds every tr() text (everyTranslatableTextIsFound).
+  find_program(MONTAGE_TEST_LUPDATE_BIN NAMES lupdate-qt6 lupdate
+    HINTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}" "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_LIBEXECS}" /usr/lib/qt6/bin)
+  if(MONTAGE_TEST_LUPDATE_BIN)
+    set_property(TEST test_app APPEND PROPERTY ENVIRONMENT "MONTAGE_TEST_LUPDATE=${MONTAGE_TEST_LUPDATE_BIN}")
+  endif()
 endif()
 
 # ---- Audio plugins: test CLAP plugins built as loadable *.clap modules ----

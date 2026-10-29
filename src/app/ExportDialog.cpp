@@ -1,5 +1,6 @@
 // Montage — export dialog.
 #include "ExportDialog.h"
+#include "Language.h"
 #include "Settings.h"
 
 #include <QCheckBox>
@@ -141,7 +142,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
 
     preset_ = new QComboBox(form_);
     preset_->setObjectName(QStringLiteral("exportPreset"));
-    for (const ExportPreset& p : exportPresets()) preset_->addItem(QString::fromStdString(p.name));
+    for (const ExportPreset& p : exportPresets()) preset_->addItem(language::engine(p.name), QString::fromStdString(p.name));
     presetDescription_ = new QLabel(form_);
     presetDescription_->setPalette(dim);
 
@@ -344,10 +345,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     form->addRow(QString(), smart_);
     color_ = new QComboBox(form_);
     color_->setObjectName(QStringLiteral("exportColor"));
-    color_->addItem(tr("Same as sequence (%1)").arg(QString::fromStdString(seq ? sequenceColorSpace(*seq).label : "Rec.709")),
+    color_->addItem(tr("Same as sequence (%1)").arg(language::engine(seq ? sequenceColorSpace(*seq).label : "Rec.709")),
                     QString());
     for (const ColorSpace* cs : displayColorSpaces())
-        color_->addItem(QString::fromStdString(cs->label), QString::fromStdString(cs->id));
+        color_->addItem(language::engine(cs->label), QString::fromStdString(cs->id));
     color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
                           "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
     form->addRow(tr("Colour:"), color_);
@@ -376,7 +377,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     // OpenEXR frames: any of OpenEXR's compressions (HTJ2K and zstd through the OpenEXR library).
     exrCompression_ = new QComboBox(form_);
     exrCompression_->setObjectName(QStringLiteral("exportExrCompression"));
-    for (const std::string& c : exrCompressions()) exrCompression_->addItem(QString::fromStdString(exrCompressionLabel(c)), QString::fromStdString(c));
+    for (const std::string& c : exrCompressions()) exrCompression_->addItem(language::engine(exrCompressionLabel(c)), QString::fromStdString(c));
     exrCompression_->setCurrentIndex(std::max(0, exrCompression_->findData(appSettings().value("export/exrCompression", "zip").toString())));
     exrCompression_->setToolTip(tr("How OpenEXR frames are compressed: ZIP, PIZ, Zstandard and HTJ2K keep every value; PXR24, B44 and DWA are smaller and lossy"));
     if (exrAvailable()) form->addRow(tr("OpenEXR compression:"), exrCompression_);
@@ -595,7 +596,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     // Restore the last preset; the path is derived from it in presetChanged().
     // Looked up by name, so a preset saved under its old name ("Apple ProRes 422 HQ") comes back as it is now called.
     const ExportPreset* lastPreset = findExportPreset(appSettings().value(kSettingsPreset).toString().toStdString());
-    if (const int i = lastPreset ? preset_->findText(QString::fromStdString(lastPreset->name)) : -1; i >= 0) preset_->setCurrentIndex(i);
+    if (const int i = lastPreset ? preset_->findData(QString::fromStdString(lastPreset->name)) : -1; i >= 0) preset_->setCurrentIndex(i);
 
     connect(preset_, &QComboBox::currentIndexChanged, this, [this] { presetChanged(); });
     connect(browse_, &QPushButton::clicked, this, [this] { browse(); });
@@ -641,7 +642,7 @@ const ExportPreset* ExportDialog::currentPreset() const {
 void ExportDialog::presetChanged() {
     const ExportPreset* p = currentPreset();
     if (!p) return;
-    presetDescription_->setText(QString::fromStdString(p->description));
+    presetDescription_->setText(language::engine(p->description));
 
     const QString ext = QString::fromStdString(p->extension);
     const QString path = path_->text().trimmed();
@@ -1195,7 +1196,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.out = out;
     }
 
-    settings.setValue(kSettingsPreset, preset_->currentText());
+    settings.setValue(kSettingsPreset, preset_->currentData());
     settings.setValue(kSettingsDir, fi.absolutePath());
     return true;
 }

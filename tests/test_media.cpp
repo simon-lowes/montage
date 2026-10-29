@@ -170,6 +170,7 @@
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/Translator.h"
+#include "media/InterfaceDrafts.h"
 #include "media/SpeechEnhance.h"
 #include "media/BandwidthExtension.h"
 #include "media/LearnedEffect.h"
@@ -28588,6 +28589,87 @@ if ui["pressed"] == "add":
         QVERIFY(r.value("isError").toBool());
         r = call({{"project", project}, {"export", ttml}, {"track", 9}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void interfaceTranslationDrafts() {
+        // Machine drafts for Montage's own interface: untranslated texts get one, still unfinished for review; finished
+        // translations, rich text and plural forms are left alone; placeholders must survive and the mnemonic comes back.
+        const std::string ts = R"(<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
+<TS version="2.1" language="de">
+<context>
+    <name>montage::MainWindow</name>
+    <message>
+        <source>&amp;Open Project…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Exported %1 to %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lost %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, %1 selected </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save</source>
+        <translation>Speichern</translation>
+    </message>
+    <message>
+        <source>&lt;b&gt;Bold&lt;/b&gt;</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n clip(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Gone</source>
+        <translation type="vanished">Weg</translation>
+    </message>
+</context>
+</TS>
+)";
+        InterfaceDraftStats before = interfaceTranslationStatus(ts);
+        QCOMPARE(before.messages, 7);
+        QCOMPARE(before.finished, 1);
+        QCOMPARE(before.existing, 0);
+        std::vector<std::string> asked;
+        auto fake = [&](const std::vector<std::string>& in, std::vector<std::string>& out) {
+            asked = in;
+            out = {"Projekt öffnen.", "%1 nach %2 exportiert", "Verloren", "%1 ausgewählt."};
+            return true;
+        };
+        std::string out, err;
+        InterfaceDraftStats st;
+        QVERIFY2(draftInterfaceTranslation(ts, fake, out, &st, 0, &err), err.c_str());
+        // The mnemonic is taken off before translating; rich text and plurals are not sent.
+        QCOMPARE(asked, (std::vector<std::string>{"Open Project…", "Exported %1 to %2", "Lost %1", ", %1 selected "}));
+        QCOMPARE(st.drafted, 3);
+        QCOMPARE(st.skipped, 3);  // rich text, plural forms, and the draft that lost %1
+        QVERIFY2(out.find("<translation type=\"unfinished\">&amp;Projekt öffnen…</translation>") != std::string::npos, out.c_str());
+        QVERIFY(out.find("<translation type=\"unfinished\">%1 nach %2 exportiert</translation>") != std::string::npos);
+        QVERIFY(out.find("<translation type=\"unfinished\">, %1 ausgewählt </translation>") != std::string::npos);
+        QVERIFY(out.find("<translation>Speichern</translation>") != std::string::npos);
+        QVERIFY(out.find("Verloren") == std::string::npos);
+        const InterfaceDraftStats after = interfaceTranslationStatus(out);
+        QCOMPARE(after.existing, 3);
+        QCOMPARE(after.finished, 1);
+        // Drafting again changes nothing: drafts are not redone.
+        std::string again;
+        QVERIFY(draftInterfaceTranslation(out, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
+            o.assign(in.size(), "x %1");
+            return true;
+        }, again, &st));
+        QCOMPARE(again.find("x %1") != std::string::npos, true);  // (only "Lost %1" is still open)
+        QCOMPARE(st.drafted, 1);
     }
 
     void translation() {

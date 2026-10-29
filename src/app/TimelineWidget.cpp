@@ -1,4 +1,5 @@
 #include "TimelineWidget.h"
+#include "Language.h"
 
 #include "EffectPresetStore.h"
 
@@ -761,7 +762,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
                 f.setPointSize(7);
                 p.setFont(f);
                 p.drawText(tr2.adjusted(3, 0, -3, 0), Qt::AlignCenter,
-                           p.fontMetrics().elidedText(info ? QString::fromStdString(info->displayName) : QString(),
+                           p.fontMetrics().elidedText(info ? language::engine(info->displayName) : QString(),
                                                       Qt::ElideRight, tr2.width() - 6));
             }
         }
@@ -2899,7 +2900,7 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
             FrameTime f = snapFrame(frameRound(pos.x()), {});
             FrameTime len = FrameTime(std::llround(5 * s->fpsValue()));
             std::vector<Id> created;
-            state_->apply(tr("Add %1").arg(QString::fromStdString(info->displayName)), [&](Project& p, Sequence& sq) {
+            state_->apply(tr("Add %1").arg(language::engine(info->displayName)), [&](Project& p, Sequence& sq) {
                 Clip c = makeGeneratorClip(p, type, len);
                 c.start = f;
                 auto r = edit::overwrite(p, sq, {TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)}, c);

@@ -1,4 +1,5 @@
 #include "KeyframePanel.h"
+#include "Language.h"
 
 #include <QApplication>
 #include <QContextMenuEvent>
@@ -106,12 +107,12 @@ void KeyframePanel::rebuild() {
                 QString label = QString::fromStdString(name);
                 if (info)
                     for (const ParamInfo& pi : info->params)
-                        if (pi.name == name) label = QString::fromStdString(pi.label);
+                        if (pi.name == name) label = language::engine(pi.label);
                 if (name == kMaskPathParam) label = tr("Mask Path");
                 if (!param.expr.empty()) label += QStringLiteral(" =");  // (driven by an expression: its curve in the graph)
                 ParamAddress a = addr;
                 a.param = name;
-                rows_.push_back({QString::fromStdString(info ? info->displayName : effect->type) + QStringLiteral(" · ") + label, a});
+                rows_.push_back({(info ? language::engine(info->displayName) : QString::fromStdString(effect->type)) + QStringLiteral(" · ") + label, a});
             }
         }
         // Keep only selected keys that still exist.

@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "Accessibility.h"
+#include "Language.h"
 #include "MonitorCalibrationDialog.h"
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
@@ -404,6 +405,8 @@ void MainWindow::buildPanels() {
         v->addWidget(sequenceTabs_);
         v->addWidget(timeline_, 1);
         setCentralWidget(centre);
+        // Time runs left to right in every language: in Arabic or Hebrew the panels mirror, but not the timeline.
+        centre->setLayoutDirection(Qt::LeftToRight);
         connect(sequenceTabs_, &QTabBar::currentChanged, this, [this](int i) {
             if (i >= 0 && i < int(openSequences_.size())) state_->setActiveSequence(openSequences_[size_t(i)]);
         });
@@ -620,6 +623,8 @@ void MainWindow::buildPanels() {
         }});
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
     stacked_ = new StackedTimelineWidget(state_, this);
+    // (Left to right in every language, as the timeline, its rulers and the monitors are.)
+    for (QWidget* w : std::initializer_list<QWidget*>{sourcePanel_, programPanel_, stacked_}) w->setLayoutDirection(Qt::LeftToRight);
     stackedDock_ = makeDock(tr("Stacked Timeline"), "stacked", stacked_);
     connect(bin_, &MediaBinWidget::openInStackedTimeline, this, [this](Id sequence) {
         stacked_->setSequence(sequence);
@@ -634,6 +639,8 @@ void MainWindow::buildPanels() {
     cueSheetDock_ = makeDock(tr("Cue Sheet"), "cueSheet", cueSheet_);
     connect(cueSheet_, &CueSheetPanel::exportRequested, this, [this] { exportPaperworkDialog(QStringLiteral("cue_sheet")); });
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
+    keyframesDock_->widget()->setLayoutDirection(Qt::LeftToRight);  // (its own timeline)
+    multicam_->setLayoutDirection(Qt::LeftToRight);                  // (monitors)
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
     // The picked clip's compositing node graph.
@@ -849,15 +856,39 @@ void MainWindow::buildPanels() {
     resetLayout();
 }
 
+// A side as the layout reads it: left and right swap places in a language written right to left (QMainWindow keeps its
+// dock areas where they are).
+Qt::DockWidgetArea MainWindow::side(Qt::DockWidgetArea area) const {
+    if (!isRightToLeft()) return area;
+    if (area == Qt::LeftDockWidgetArea) return Qt::RightDockWidgetArea;
+    if (area == Qt::RightDockWidgetArea) return Qt::LeftDockWidgetArea;
+    return area;
+}
+
+void MainWindow::setSideCorner(Qt::Corner corner, Qt::DockWidgetArea area) {
+    if (isRightToLeft()) {
+        static const Qt::Corner mirrored[] = {Qt::TopRightCorner, Qt::TopLeftCorner, Qt::BottomRightCorner, Qt::BottomLeftCorner};
+        corner = mirrored[corner];
+    }
+    setCorner(corner, side(area));
+}
+
+void MainWindow::changeEvent(QEvent* e) {
+    QMainWindow::changeEvent(e);
+    // The language's direction changed under a built window (only the tests do so; a language is chosen for the next
+    // start): the workspace is laid out again the other way round.
+    if (e->type() == QEvent::LayoutDirectionChange && !docks_.empty() && isVisible()) resetLayout();
+}
+
 void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom) {
     for (QDockWidget* d : docks_) {
         removeDockWidget(d);
         d->setFloating(false);
     }
-    setCorner(Qt::TopLeftCorner, Qt::TopDockWidgetArea);
-    setCorner(Qt::TopRightCorner, Qt::TopDockWidgetArea);
-    setCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
-    setCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
+    setSideCorner(Qt::TopLeftCorner, Qt::TopDockWidgetArea);
+    setSideCorner(Qt::TopRightCorner, Qt::TopDockWidgetArea);
+    setSideCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
+    setSideCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
     std::vector<QDockWidget*> placed;
     auto place = [&](Qt::DockWidgetArea area, const DockGroups& groups, Qt::Orientation split) {
         // Split before tabbing: a split beside a tabbed panel only adds another tab.
@@ -877,8 +908,8 @@ void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, con
         }
     };
     place(Qt::TopDockWidgetArea, top, Qt::Horizontal);
-    place(Qt::LeftDockWidgetArea, left, Qt::Vertical);
-    place(Qt::RightDockWidgetArea, right, Qt::Vertical);
+    place(side(Qt::LeftDockWidgetArea), left, Qt::Vertical);
+    place(side(Qt::RightDockWidgetArea), right, Qt::Vertical);
     place(Qt::BottomDockWidgetArea, bottom, Qt::Horizontal);
     QDockWidget* home = top.front().front();
     for (QDockWidget* d : docks_)
@@ -897,6 +928,15 @@ const QStringList& MainWindow::builtInWorkspaces() {
     return names;
 }
 
+// A workspace's name as shown: a built-in one's in the interface's language (its name stays the same in settings).
+QString MainWindow::workspaceTitle(const QString& name) {
+    static const char* const titles[] = {QT_TR_NOOP("Editing"), QT_TR_NOOP("Colour"),   QT_TR_NOOP("Audio"),
+                                         QT_TR_NOOP("Effects"), QT_TR_NOOP("Captions"), QT_TR_NOOP("Logging")};
+    for (const char* t : titles)
+        if (name == QLatin1String(t)) return tr(t);
+    return name;
+}
+
 void MainWindow::layOutBuiltIn(const QString& name) {
     const int h = height();
     if (name == "Colour") {
@@ -904,7 +944,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         // The gallery beside them, the clips under the timeline.
         arrangeDocks({{scopesDock_}, {programDock_}}, {{galleryDock_, binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, trimsDock_, keyframesDock_}},
                      {{clipsDock_}});
-        setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
+        setSideCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
         resizeDocks({binDock_}, {260}, Qt::Horizontal);
         resizeDocks({inspectorDock_}, {400}, Qt::Horizontal);
         resizeDocks({scopesDock_, programDock_}, {520, 900}, Qt::Horizontal);
@@ -1033,7 +1073,7 @@ void MainWindow::syncWorkspaceUi() {
     syncingWorkspace_ = true;
     const QStringList names = workspaces();
     while (workspaceBar_->count() > 0) workspaceBar_->removeTab(0);
-    for (const QString& n : names) workspaceBar_->addTab(n);
+    for (const QString& n : names) workspaceBar_->setTabData(workspaceBar_->addTab(workspaceTitle(n)), n);
     workspaceBar_->setCurrentIndex(int(names.indexOf(workspace_)));
     std::erase_if(workspaceActions_, [this](QAction* a) {
         if (builtInWorkspaces().contains(a->data().toString())) return false;
@@ -1061,9 +1101,12 @@ void MainWindow::syncWorkspaceUi() {
 void MainWindow::restoreLayout() {
     QSettings s = appSettings();
     if (s.contains("window/geometry")) restoreGeometry(s.value("window/geometry").toByteArray());
-    if (s.contains("window/state")) restoreState(s.value("window/state").toByteArray(), 1);
+    // Left as it was, unless the language now reads the other way: then the workspace is laid out afresh, mirrored.
+    const bool sameWay = s.value("window/rightToLeft", false).toBool() == isRightToLeft();
+    if (s.contains("window/state") && sameWay) restoreState(s.value("window/state").toByteArray(), 1);
     const QString ws = s.value("window/workspace").toString();
     if (workspaces().contains(ws)) workspace_ = ws;  // laid out as it was left, by the state above
+    if (!sameWay) resetLayout();
     syncWorkspaceUi();
 }
 
@@ -2759,7 +2802,7 @@ void MainWindow::buildMenus() {
     workspaceGroup_ = new QActionGroup(this);
     for (int i = 0; i < builtInWorkspaces().size(); ++i) {
         const QString n = builtInWorkspaces()[i];
-        QAction* a = add(workspaceMenu_, n, QKeySequence(QStringLiteral("Alt+Shift+%1").arg(i + 1)), [this, n] { applyWorkspace(n); });
+        QAction* a = add(workspaceMenu_, workspaceTitle(n), QKeySequence(QStringLiteral("Alt+Shift+%1").arg(i + 1)), [this, n] { applyWorkspace(n); });
         a->setObjectName(QStringLiteral("workspace") + n);
         a->setData(n);
         a->setCheckable(true);
@@ -2791,6 +2834,29 @@ void MainWindow::buildMenus() {
         a->setChecked(std::lround(theme::textScale() * 100) == percent);
         textSizes->addAction(a);
     }
+    // The interface's language, from the next start (every window is built in it).
+    QMenu* languageMenu = windowMenu_->addMenu(tr("&Language"));
+    languageMenu->setObjectName(QStringLiteral("languageMenu"));
+    auto* languages = new QActionGroup(this);
+    const QString chosenLanguage = language::chosen();
+    std::vector<language::Language> choices{{QString(), tr("System Language")}};
+    for (const language::Language& l : language::available()) choices.push_back(l);
+    for (const language::Language& l : choices) {
+        if (l.code == QLatin1String("pseudo")) languageMenu->addSeparator();
+        QAction* a = add(languageMenu, l.code.isEmpty() ? l.name : l.label(), QKeySequence(), [this, l] {
+            language::choose(l.code);
+            const QString name = l.code.isEmpty() ? language::displayName(language::resolve(QString())) : l.name;
+            state_->message(language::resolve(l.code) == language::installed()
+                                ? tr("Montage is in %1").arg(name)
+                                : tr("Montage will be in %1 the next time it starts").arg(name),
+                            6000);
+        });
+        a->setObjectName(QStringLiteral("language_%1").arg(l.code.isEmpty() ? QStringLiteral("system") : l.code));
+        if (!l.code.isEmpty() && l.code != QLatin1String("pseudo")) language::keepUntranslated(a);  // (each in itself)
+        a->setCheckable(true);
+        a->setChecked(l.code == chosenLanguage);
+        languages->addAction(a);
+    }
     workspaceBar_ = new QTabBar(this);
     workspaceBar_->setObjectName(QStringLiteral("workspaceBar"));
     workspaceBar_->setDrawBase(false);
@@ -2798,7 +2864,7 @@ void MainWindow::buildMenus() {
     workspaceBar_->setToolTip(tr("Workspaces: the panels laid out for a task (Alt+Shift+1 to 6)"));
     statusBar()->insertPermanentWidget(0, workspaceBar_);
     connect(workspaceBar_, &QTabBar::currentChanged, this, [this](int i) {
-        if (!syncingWorkspace_ && i >= 0) applyWorkspace(workspaceBar_->tabText(i));
+        if (!syncingWorkspace_ && i >= 0) applyWorkspace(workspaceBar_->tabData(i).toString());
     });
     syncWorkspaceUi();
     QMenu* help = menuBar()->addMenu(tr("&Help"));
@@ -3286,10 +3352,13 @@ void MainWindow::addRecent(const QString& path) {
 void MainWindow::rebuildRecentMenu() {
     recentMenu_->clear();
     QStringList recent = appSettings().value("recentProjects").toStringList();
-    for (const QString& p : recent)
-        recentMenu_->addAction(QFileInfo(p).fileName(), this, [this, p] {
+    for (const QString& p : recent) {
+        QAction* a = recentMenu_->addAction(QFileInfo(p).fileName(), this, [this, p] {
             if (maybeSave()) openProject(p);
-        })->setToolTip(p);
+        });
+        a->setToolTip(p);
+        language::keepUntranslated(a);  // (a file's name)
+    }
     recentMenu_->setEnabled(!recent.isEmpty());
 }
 
@@ -3374,6 +3443,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
     QSettings s = appSettings();
     s.setValue("window/geometry", saveGeometry());
     s.setValue("window/state", saveState(1));
+    s.setValue("window/rightToLeft", isRightToLeft());
     s.setValue("window/workspace", workspace_);
     e->accept();
 }
@@ -3725,13 +3795,16 @@ void MainWindow::animateToAudioDialog() {
         if (const EffectInfo* info = findEffectInfo(e.type))
             for (const ParamInfo& pi : info->params)
                 if (pi.kind == ParamKind::Number || pi.kind == ParamKind::Percent || pi.kind == ParamKind::Angle)
-                    what->addItem(prefix + QString::fromStdString(pi.label), QVariantList{QVariant::fromValue<qulonglong>(id), QString::fromStdString(pi.name)});
+                    what->addItem(prefix + language::engine(pi.label), QVariantList{QVariant::fromValue<qulonglong>(id), QString::fromStdString(pi.name)});
     };
     addParams(c->motion.empty() ? makeEffect("transform", 0) : c->motion, tr("Transform › "), 0);
-    if (c->isGenerator()) addParams(c->generator, QString::fromStdString(findEffectInfo(c->generator.type) ? findEffectInfo(c->generator.type)->displayName : c->generator.type) + " › ", c->generator.id);
-    for (const Effect& e : c->effects)
-        addParams(e, QString::fromStdString(findEffectInfo(e.type) ? findEffectInfo(e.type)->displayName : e.type) + " › ", e.id);
-    what->setCurrentIndex(std::max(0, what->findText(tr("Transform › Scale"), Qt::MatchStartsWith)));
+    auto named = [](const std::string& type) {
+        const EffectInfo* info = findEffectInfo(type);
+        return (info ? language::engine(info->displayName) : QString::fromStdString(type)) + QStringLiteral(" › ");
+    };
+    if (c->isGenerator()) addParams(c->generator, named(c->generator.type), c->generator.id);
+    for (const Effect& e : c->effects) addParams(e, named(e.type), e.id);
+    what->setCurrentIndex(std::max(0, what->findText(tr("Transform › ") + language::engine("Scale"), Qt::MatchStartsWith)));
     form->addRow(tr("Setting:"), what);
     auto* track = new QSpinBox(&dlg);
     track->setRange(0, std::max(1, int(s->audioTracks.size())));
@@ -7773,7 +7846,7 @@ void MainWindow::openScriptPanel(const QString& key, const QString& name, const 
         p.dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
         // Where it was left last time, if the saved layout knows it; else beside the Script Console.
         if (!restoreDockWidget(p.dock)) {
-            addDockWidget(Qt::RightDockWidgetArea, p.dock);
+            addDockWidget(side(Qt::RightDockWidgetArea), p.dock);
             if (scriptsDock_->isVisible() && !scriptsDock_->isFloating()) tabifyDockWidget(scriptsDock_, p.dock);
         }
         // Closed by its own button: gone, and not opened again at the next start.
@@ -9851,7 +9924,7 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
         FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
         int vt = state_->targetVideoTrack();
         std::vector<Id> created;
-        state_->apply(tr("Add %1").arg(QString::fromStdString(info->displayName)), [&](Project& p, Sequence& sq) {
+        state_->apply(tr("Add %1").arg(language::engine(info->displayName)), [&](Project& p, Sequence& sq) {
             Clip c = makeGeneratorClip(p, type, len);
             c.start = at;
             auto r = edit::overwrite(p, sq, {TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)}, c);

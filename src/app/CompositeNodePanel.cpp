@@ -1,4 +1,5 @@
 #include "CompositeNodePanel.h"
+#include "Language.h"
 
 #include <QAction>
 #include <QContextMenuEvent>
@@ -174,7 +175,7 @@ public:
             if (n.source == "track") return CompositeNodePanel::tr("track V%1").arg(n.track + 1);
             if (n.source == "generator") {
                 const EffectInfo* info = findEffectInfo(n.generator.type);
-                return info ? QString::fromStdString(info->displayName) : QString::fromStdString(n.generator.type);
+                return info ? language::engine(info->displayName) : QString::fromStdString(n.generator.type);
             }
             const MediaItem* m = state_->project().findMedia(n.media);
             return m ? QString::fromStdString(m->name) : CompositeNodePanel::tr("missing media");
@@ -477,7 +478,7 @@ CompositeNodePanel::CompositeNodePanel(EditorState* state, QWidget* parent) : QW
         for (const char* type : {"title", "title3d", "model3d", "shape", "color", "gradient", "particles"})
             if (const EffectInfo* info = findEffectInfo(type)) {
                 const QString t = QString::fromLatin1(type);
-                gens->addAction(QString::fromStdString(info->displayName), this, [this, t] { addInput("generator", 0, -1, t); });
+                gens->addAction(language::engine(info->displayName), this, [this, t] { addInput("generator", 0, -1, t); });
             }
     });
     connect(presetMenu_, &QMenu::aboutToShow, this, [this] {

@@ -24,6 +24,9 @@ done
 
 WINDEPLOYQT=$(command -v windeployqt6 || command -v windeployqt || ls /ucrt64/share/qt6/bin/windeployqt*.exe | head -1)
 "$WINDEPLOYQT" --release --no-translations --no-system-d3d-compiler --no-opengl-sw "$OUT/montage.exe"
+# Qt's own translations, for its dialogs and buttons in the language chosen in Window › Language.
+mkdir -p "$OUT/translations"
+cp /ucrt64/share/qt6/translations/qtbase_*.qm "$OUT/translations/" 2>/dev/null || echo "Qt's translations not found; its dialogs stay in English" >&2
 
 # montage-cli runs on the headless "offscreen" platform plugin; windeployqt only adds qwindows.
 OFFSCREEN=$(find /ucrt64 -path '*/plugins/platforms/qoffscreen.dll' 2>/dev/null | head -1 || true)

@@ -2,6 +2,7 @@
 #include "Settings.h"
 #include "DisplayCalibration.h"
 
+#include <QCoreApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
@@ -44,6 +45,8 @@ QSettings settings() { return appSettings(); }
 
 // One angle: its picture, number and name; red while it is on the program.
 class AngleView : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(montage::AngleView)  // (its texts under its own name, as lupdate files them)
+
 public:
     AngleView(int index, MulticamPanel* panel) : QWidget(panel), index_(index), panel_(panel) {
         setMinimumSize(96, 54);

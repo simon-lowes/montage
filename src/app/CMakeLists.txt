@@ -11,6 +11,42 @@ set_target_properties(montage_ui PROPERTIES AUTOMOC ON)
 # Help › Licences…: Montage's licence and the third-party notices, built in (LicencesDialog).
 qt_add_resources(montage_ui "licences" PREFIX "/montage/licences" BASE "${PROJECT_SOURCE_DIR}"
   FILES ${PROJECT_SOURCE_DIR}/LICENSE ${PROJECT_SOURCE_DIR}/LICENSE-EXCEPTION ${PROJECT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md)
+# Window › Language: the translations in translations/montage_<language>.ts (edited in Qt Linguist), built in as .qm
+# files when Qt's lrelease is found, each with how far it is done (cmake/TranslationStatus.cmake).
+# `cmake --build build --target montage_lupdate` brings every .ts file up to date with the tr() strings in the source
+# (a new language: an empty translations/montage_<language>.ts first; see translations/README.md).
+file(GLOB MONTAGE_TS_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/translations/montage_*.ts)
+find_package(Qt6 QUIET COMPONENTS LinguistTools)
+if(TARGET Qt6::lrelease)
+  set(MONTAGE_LRELEASE $<TARGET_FILE:Qt6::lrelease>)
+  set(MONTAGE_LUPDATE $<TARGET_FILE:Qt6::lupdate>)
+else()
+  set(_qt_bins "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}" "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_LIBEXECS}" /usr/lib/qt6/bin)
+  find_program(MONTAGE_LRELEASE NAMES lrelease-qt6 lrelease HINTS ${_qt_bins})
+  find_program(MONTAGE_LUPDATE NAMES lupdate-qt6 lupdate HINTS ${_qt_bins})
+endif()
+if(MONTAGE_LRELEASE AND MONTAGE_TS_FILES)
+  set(_qm_files)
+  foreach(ts ${MONTAGE_TS_FILES})
+    get_filename_component(_name ${ts} NAME_WE)
+    set(qm ${CMAKE_CURRENT_BINARY_DIR}/i18n/${_name}.qm)
+    set(status ${CMAKE_CURRENT_BINARY_DIR}/i18n/${_name}.status)
+    add_custom_command(OUTPUT ${qm} COMMAND ${MONTAGE_LRELEASE} -silent ${ts} -qm ${qm} DEPENDS ${ts} VERBATIM)
+    add_custom_command(OUTPUT ${status} COMMAND ${CMAKE_COMMAND} -DTS=${ts} -DOUT=${status} -P ${PROJECT_SOURCE_DIR}/cmake/TranslationStatus.cmake
+      DEPENDS ${ts} ${PROJECT_SOURCE_DIR}/cmake/TranslationStatus.cmake VERBATIM)
+    list(APPEND _qm_files ${qm} ${status})
+  endforeach()
+  qt_add_resources(montage_ui "translations" PREFIX "/montage/i18n" BASE "${CMAKE_CURRENT_BINARY_DIR}/i18n" FILES ${_qm_files})
+  list(LENGTH MONTAGE_TS_FILES _ts_count)
+  message(STATUS "Translations: ${_ts_count}")
+elseif(MONTAGE_TS_FILES)
+  message(STATUS "Translations: off (Qt's lrelease was not found; Montage is in English)")
+endif()
+if(MONTAGE_LUPDATE)
+  add_custom_target(montage_lupdate
+    COMMAND ${MONTAGE_LUPDATE} -silent -locations none -no-obsolete ${PROJECT_SOURCE_DIR}/src -ts ${MONTAGE_TS_FILES}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} VERBATIM)
+endif()
 target_compile_options(montage_ui PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
 # The HDR viewer (HdrSurface.h): Qt's RHI and its HDR swap chain information, from Qt 6.7 (a private module, which

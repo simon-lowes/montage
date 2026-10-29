@@ -441,6 +441,7 @@ public:
     // Audio, Effects, Captions and Logging (Alt+Shift+1 to 6, Window › Workspaces, or the bar in the status bar). A
     // layout of one's own is saved under a name and comes back as it was saved; the current workspace is remembered.
     static const QStringList& builtInWorkspaces();
+    static QString workspaceTitle(const QString& name);
     QStringList workspaces() const;  // the built-in ones, then saved ones by name
     QString currentWorkspace() const { return workspace_; }
     // gpu::initialize, marked in the settings until the GPU has drawn a frame (or Montage quits), so a launch a driver
@@ -471,6 +472,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* e) override;
+    void changeEvent(QEvent* e) override;
     // Dock tab bars: whole names, with scroll arrows when crowded (Qt shortens them to "Tra…" by default).
     void childEvent(QChildEvent* e) override;
 
@@ -486,6 +488,8 @@ private:
     // with its first in front. Panels in no group are hidden, tabbed behind the first top group for Window to bring back.
     using DockGroups = std::vector<std::vector<QDockWidget*>>;
     void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom = {});
+    Qt::DockWidgetArea side(Qt::DockWidgetArea area) const;
+    void setSideCorner(Qt::Corner corner, Qt::DockWidgetArea area);
     void layOutBuiltIn(const QString& name);
     void syncWorkspaceUi();
     void syncProgram();
