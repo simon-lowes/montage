@@ -6,11 +6,15 @@
 #include <QUrl>
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <map>
 #include <numeric>
 
 #include "AvidMedia.h"
+#include "audio/DialogueAlign.h"
+#include "audio/ElasticAudio.h"
+#include "audio/SpeechCleanup.h"
 #include "core/Aaf.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -264,6 +268,26 @@ Obj gainParameter(const Clip& c, int64_t offset, int64_t length) {
 
 }  // namespace
 
+namespace {
+
+// A clip's whole source through its source effects (warp markers and pitch edits among them), as the mixer plays it.
+AudioBufferPtr warpedSource(const Project& p, const Clip& c, int rate) {
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    if (!m) return nullptr;
+    const std::string key = audioKey(m->path, c.channels);
+    AudioBufferPtr sound = MediaPool::instance().audio(key, rate);
+    if (!sound) return nullptr;
+    std::vector<const Effect*> fx;
+    for (const Effect& e : c.effects)
+        if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c)) fx.push_back(&e);
+    std::deque<Effect> resolved;
+    resolveElasticMembers(p, fx, resolved);
+    AudioBufferPtr played = fx.empty() ? sound : cleanedAudio(key, sound, fx, true);
+    return played ? played : sound;
+}
+
+}  // namespace
+
 bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, AafExportResult* result,
                const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error, const AafExportOptions& options) {
     AafExportResult res;
@@ -320,7 +344,12 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             // (rendered too: a sound placed to the sample, whose partial first and last frames the AAF's frame-rate
             // timeline cannot say are silent)
             const bool render = m->kind == MediaKind::Sequence || std::fabs(c.speed - 1) > 1e-9 || c.reverse || c.ramped() || c.head > 0 || c.tail > 0;
-            const std::string key = render ? "clip:" + std::to_string(c.id) : audioKey(m->path, c.channels);
+            // Warp markers and pitch edits (audio/ElasticAudio.h): the whole source as they make it, so the clip keeps
+            // its handles.
+            const bool warped = !render && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) {
+                return e.enabled && (e.type == "elastic_audio" || e.type == "pitch_contour");
+            });
+            const std::string key = render ? "clip:" + std::to_string(c.id) : warped ? "warped:" + std::to_string(c.id) : audioKey(m->path, c.channels);
             sourceOf[c.id] = key;
             Source& s = sources[key];
             if (s.name.empty() && !render && m->timecode >= 0) {
@@ -329,6 +358,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             }
             if (s.name.empty()) {
                 s.name = render ? (c.name.empty() ? "Clip" : c.name) + " (rendered)" : QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).completeBaseName().toStdString();
+                if (warped) s.name += " (warped " + std::to_string(c.id) + ")";
                 if (!render && !c.channels.empty()) {
                     s.name += " ch";
                     for (size_t i = 0; i < c.channels.size(); ++i) s.name += (i ? "+" : " ") + std::to_string(c.channels[i] + 1);
@@ -520,7 +550,8 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     for (auto& [key, s] : sources) {
         if (cancelled()) return false;
         std::vector<int> picked;  // the channels a clip plays, if it chose some
-        std::string from = key.rfind("clip:", 0) == 0 ? key : audioKeyFile(key, &picked);
+        const bool warped = key.rfind("warped:", 0) == 0;
+        std::string from = key.rfind("clip:", 0) == 0 || warped ? key : audioKeyFile(key, &picked);
         std::string temp;
         if (key.rfind("clip:", 0) == 0) {
             const Id clip = Id(std::stoull(key.substr(5)));
@@ -528,7 +559,19 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             if (!renderClipAudio(p, seq, clip, temp, error)) return false;
             from = temp;
         }
-        AudioBufferPtr buf = decodeAudio(from, kRate, error, nullptr, picked);
+        AudioBufferPtr buf;
+        if (warped) {
+            const Clip* c = edit::clipById(seq, Id(std::stoull(key.substr(7))));
+            buf = c ? warpedSource(p, *c, kRate) : nullptr;
+            if (!buf) {
+                if (error) *error = "Cannot read the sound of " + s.name;
+                return false;
+            }
+            picked = c->channels;
+            if (buf->channels == 1 && picked.size() != 1) picked = {0};
+        } else {
+            buf = decodeAudio(from, kRate, error, nullptr, picked);
+        }
         if (!temp.empty()) QFile::remove(QString::fromStdString(temp));
         if (!buf) return false;
         MediaItem probe;

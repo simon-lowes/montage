@@ -54,6 +54,7 @@
 #include "render/ClipPlacement.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
+#include "audio/ElasticAudio.h"
 #include "audio/PluginEffect.h"
 #include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
@@ -6712,6 +6713,196 @@ void McpServer::Impl::addTools() {
             QJsonObject out{{"regions", made}, {"total", int(all.size())}};
             if (!found.isEmpty()) out["found"] = found;
             return ok(QStringLiteral("%1 region(s) on the clip").arg(all.size()), out);
+        });
+
+    add("montage_warp_audio", "Warp audio (elastic audio)",
+        "Change the timing of the sound inside an audio clip with warp markers: a marker pins a moment of the sound, and "
+        "moving it stretches the sound before it and squeezes the sound after it (up to the next markers), its pitch kept "
+        "(mode speech or general: short or long grains) or moving with the speed like tape (varispeed). Times are timeline "
+        "seconds. group_with warps other clips together with this one (the microphones of one take: they share the markers "
+        "and stay in phase; linked audio clips join on their own). onsets puts a marker at each onset heard in the sound. "
+        "move takes the marker playing at 'from' (or makes one there) to play at 'to'. markers replaces them all: each "
+        "'at' (where it plays) with 'plays' (the timeline time whose sound it plays, as the clip was unwarped). clear "
+        "turns elastic audio off. Reports the markers.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clip":{"type":"number","description":"Audio clip id"},
+            "mode":{"type":"string","enum":["speech","general","varispeed"]},
+            "group_with":{"type":"array","items":{"type":"number"},"description":"Other audio clips warped together with it"},
+            "onsets":{"type":"boolean","description":"Add a marker at each onset"},
+            "sensitivity":{"type":"number","description":"Onsets: 0-100 (default 50)"},
+            "markers":{"type":"array","items":{"type":"object","properties":{"at":{"type":"number"},"plays":{"type":"number"}},"required":["at","plays"]}},
+            "move":{"type":"array","items":{"type":"object","properties":{"from":{"type":"number"},"to":{"type":"number"}},"required":["from","to"]}},
+            "remove":{"type":"array","items":{"type":"number"},"description":"Timeline seconds of markers to take off"},
+            "clear":{"type":"boolean"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = Id(a.value("clip").toDouble());
+            const Clip* c = edit::clipById(s, id);
+            if (!c) throw ArgError{"No such clip"};
+            auto check = [](const edit::Result& r) {
+                if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            };
+            if (a.value("clear").toBool()) {
+                check(edit::removeElasticAudio(l.project, s, id));
+                save(l);
+                return ok(QStringLiteral("Elastic audio off"), QJsonObject{{"markers", QJsonArray{}}});
+            }
+            ElasticMode mode = ElasticMode::Speech;
+            const bool hasMode = a.contains("mode");
+            if (hasMode && !parseElasticMode(a.value("mode").toString().toStdString(), mode)) throw ArgError{"mode is speech, general or varispeed"};
+            std::vector<Id> clips{id};
+            for (const QJsonValue& v : a.value("group_with").toArray()) clips.push_back(Id(v.toDouble()));
+            if (!elasticEffectOf(*c) || clips.size() > 1) {
+                check(edit::enableElasticAudio(l.project, s, clips, hasMode ? mode : (elasticEffectOf(*c) ? elasticModeOf(*elasticEffectOf(*c)) : mode)));
+                c = edit::clipById(s, id);
+            } else if (hasMode && elasticModeOf(*elasticEffectOf(*c)) != mode) {
+                check(edit::setElasticMode(l.project, s, id, mode));
+            }
+            const double fps = s.fpsValue();
+            auto groupAt = [&](double t) {
+                const Clip* cl = edit::clipById(s, id);
+                return (cl->sourceIn + (t * fps - double(cl->start))) / fps - elasticOffsetOf(*cl);
+            };
+            auto timelineAt = [&](double u) {
+                const Clip* cl = edit::clipById(s, id);
+                return (double(cl->start) + (u + elasticOffsetOf(*cl)) * fps - cl->sourceIn) / fps;
+            };
+            if (a.contains("markers")) {
+                DialogueWarp w;
+                for (const QJsonValue& v : a.value("markers").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    w.push_back({groupAt(o.value("at").toDouble()), groupAt(o.value("plays").toDouble())});
+                }
+                std::sort(w.begin(), w.end(), [](const AlignPoint& x, const AlignPoint& y) { return x.u < y.u; });
+                const edit::Result r = edit::setWarpPoints(l.project, s, id, w);
+                if (!r.ok && r.error != "Nothing changed") check(r);
+            }
+            int added = 0;
+            if (a.value("onsets").toBool()) {
+                const edit::Result r = edit::addWarpMarkersAtOnsets(l.project, s, id, a.value("sensitivity").toDouble(50), &added);
+                if (!r.ok && added) check(r);
+            }
+            for (const QJsonValue& v : a.value("remove").toArray()) check(edit::removeWarpMarker(l.project, s, id, groupAt(v.toDouble()), 1.0 / fps));
+            for (const QJsonValue& v : a.value("move").toArray()) {
+                const QJsonObject o = v.toObject();
+                const edit::Result r = edit::moveWarpMarker(l.project, s, id, groupAt(o.value("from").toDouble()), groupAt(o.value("to").toDouble()), 1.0 / fps);
+                if (!r.ok && r.error != "Nothing changed") check(r);
+            }
+            save(l);
+            c = edit::clipById(s, id);
+            const DialogueWarp w = elasticEffectOf(*c) ? dialogueWarpFromString(elasticEffectOf(*c)->s("points")) : DialogueWarp{};
+            QJsonArray markers;
+            for (size_t i = 0; i < w.size(); ++i) {
+                QJsonObject o{{"at", timelineAt(w[i].u)}, {"plays", timelineAt(w[i].w)}};
+                if (i > 0) o["stretch_before"] = (w[i].u - w[i - 1].u) / std::max(1e-9, w[i].w - w[i - 1].w);
+                markers.append(o);
+            }
+            QJsonArray group;
+            for (Id g : edit::elasticGroup(s, id)) group.append(double(g));
+            QJsonObject out{{"markers", markers}, {"mode", QString::fromLatin1(elasticModeName(elasticEffectOf(*c) ? elasticModeOf(*elasticEffectOf(*c)) : mode))},
+                            {"clips", group}};
+            if (a.value("onsets").toBool()) out["onsets_added"] = added;
+            return ok(QStringLiteral("%1 warp marker(s) on %2 clip(s)").arg(w.size()).arg(group.size()), out);
+        });
+
+    add("montage_pitch_contour", "Pitch contour",
+        "Read or edit the pitch of an audio clip (a voice or a solo instrument). Reports the pitch heard (tracked by pYIN) "
+        "every 20 ms over start..end (timeline seconds; default the whole clip), with what the clip's pitch edits make of it "
+        "and the median. edits adds pitch edits, each over start..end: shift (semitones), inflection (how much the pitch "
+        "rises and falls about its median: 0 flat, 1 as it is, 2 doubled), correct (0-1: drawn to the nearest note of the "
+        "scale, vibrato kept) with key (C, C#... or 0-11) and scale (chromatic, major, minor), formant (semitones: the "
+        "voice's size without its pitch). The sound is remade by pitch-synchronous overlap-add; outside the edits it is "
+        "unchanged. clear takes all of the clip's pitch edits off first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clip":{"type":"number","description":"Audio clip id"},
+            "start":{"type":"number"},"end":{"type":"number"},
+            "edits":{"type":"array","items":{"type":"object","properties":{
+                "start":{"type":"number"},"end":{"type":"number"},
+                "shift":{"type":"number"},"inflection":{"type":"number"},
+                "correct":{"type":"number"},"key":{"type":["string","number"]},
+                "scale":{"type":"string","enum":["chromatic","major","minor"]},
+                "formant":{"type":"number"}},"required":["start","end"]}},
+            "clear":{"type":"boolean"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = Id(a.value("clip").toDouble());
+            const Clip* c = edit::clipById(s, id);
+            if (!c) throw ArgError{"No such clip"};
+            const auto where = edit::locate(s, id);
+            if (!where || where->track.kind != TrackKind::Audio) throw ArgError{"Give an audio clip"};
+            const double fps = s.fpsValue(), clipStart = double(c->start) / fps, clipEnd = double(c->end()) / fps;
+            auto sourceAt = [&](double t) { return clipSourceSeconds(s, *edit::clipById(s, id), std::clamp(t, clipStart, clipEnd)); };
+            static const char* kKeys[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+            const bool editing = a.contains("edits") || a.value("clear").toBool();
+            if (editing) {
+                std::vector<PitchEdit> edits;
+                if (const Effect* fx = pitchContourOf(*c); fx && !a.value("clear").toBool()) edits = pitchEditsFromString(fx->s("edits"));
+                for (const QJsonValue& v : a.value("edits").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    const double t0 = o.value("start").toDouble(), t1 = o.value("end").toDouble();
+                    if (!(t1 > t0)) throw ArgError{"Each edit's end must be after its start"};
+                    if (t1 <= clipStart || t0 >= clipEnd) throw ArgError{"An edit is outside the clip"};
+                    PitchEdit e;
+                    e.start = sourceAt(t0), e.end = sourceAt(t1);
+                    e.shift = o.value("shift").toDouble(0);
+                    e.inflection = o.value("inflection").toDouble(1);
+                    e.correct = o.value("correct").toDouble(0);
+                    e.formant = o.value("formant").toDouble(0);
+                    e.scale = o.value("scale").toString("chromatic").toStdString();
+                    const QJsonValue key = o.value("key");
+                    if (key.isString()) {
+                        QString k = key.toString().trimmed().replace(QStringLiteral("♯"), QStringLiteral("#"));
+                        const QString flats[] = {"Db", "Eb", "Gb", "Ab", "Bb"}, sharps[] = {"C#", "D#", "F#", "G#", "A#"};
+                        for (int i = 0; i < 5; ++i)
+                            if (k.compare(flats[i], Qt::CaseInsensitive) == 0) k = sharps[i];
+                        e.key = -1;
+                        for (int i = 0; i < 12; ++i)
+                            if (k.compare(QString::fromLatin1(kKeys[i]), Qt::CaseInsensitive) == 0) e.key = i;
+                        if (e.key < 0) throw ArgError{"key is a note name (C, C#, Db... B) or 0-11"};
+                    } else {
+                        e.key = key.toInt(0);
+                    }
+                    edits.push_back(e);
+                }
+                const edit::Result r = edit::setPitchEdits(l.project, s, id, edits);
+                if (!r.ok && r.error != "Nothing changed" && !(edits.empty() && r.error == "The clip has no pitch edits"))
+                    throw ArgError{QString::fromStdString(r.error)};
+                save(l);
+                c = edit::clipById(s, id);
+            }
+            // The pitch over the range asked for, as heard before the edits and as they make it.
+            const double t0 = std::max(clipStart, a.value("start").toDouble(clipStart)), t1 = std::min(clipEnd, a.value("end").toDouble(clipEnd));
+            if (!(t1 > t0)) throw ArgError{"start must be before end, inside the clip"};
+            AudioBufferPtr sound = soundBeforePitchEdits(l.project, *c, 48000);
+            if (!sound) throw ArgError{"Cannot read the clip's sound"};
+            const double a0 = sourceAt(t0), a1 = sourceAt(t1);
+            const PitchTrack track = trackPitch(*sound, a0, a1, 50, 800);
+            const Effect* fx = pitchContourOf(*c);
+            const std::vector<double> edited = editedPitch(track, fx ? pitchEditsFromString(fx->s("edits")) : std::vector<PitchEdit>{});
+            QJsonArray points;
+            std::vector<double> voiced;
+            const size_t step = std::max<size_t>(4, track.f0.size() / 1500 + 1);
+            for (size_t i = 0; i < track.f0.size(); i += step) {
+                QJsonObject o{{"time", t0 + double(i) * track.hop}, {"hz", track.f0[i]}};
+                if (edited[i] != track.f0[i]) o["edited_hz"] = edited[i];
+                points.append(o);
+            }
+            for (double f : track.f0)
+                if (f > 0) voiced.push_back(f);
+            QJsonObject out{{"points", points}};
+            if (!voiced.empty()) {
+                std::nth_element(voiced.begin(), voiced.begin() + long(voiced.size() / 2), voiced.end());
+                const double median = voiced[voiced.size() / 2];
+                const int note = int(std::lround(69 + 12 * std::log2(median / 440)));
+                out["median_hz"] = median;
+                out["median_note"] = QString::fromLatin1(kKeys[(note % 12 + 12) % 12]) + QString::number(note / 12 - 1);
+            }
+            if (fx) out["edits"] = int(pitchEditsFromString(fx->s("edits")).size());
+            return ok(voiced.empty() ? QStringLiteral("No pitch heard there")
+                                     : QStringLiteral("Median pitch %1 Hz (%2)").arg(out["median_hz"].toDouble(), 0, 'f', 1).arg(out["median_note"].toString()),
+                      out);
         });
 
     add("montage_redact_faces", "Redact faces",

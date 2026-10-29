@@ -55,6 +55,7 @@
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/DialogueAlign.h"
+#include "audio/ElasticAudio.h"
 #include "audio/PluginEffect.h"
 #include "audio/RoomResponse.h"
 #include "audio/SpeechCleanup.h"
@@ -3850,6 +3851,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 for (const Effect& e : c.effects)
                     if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
                         sourceFx.push_back(&e);
+                std::deque<Effect> resolved;
+                resolveElasticMembers(p, sourceFx, resolved);
                 if (!sourceFx.empty())
                     if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
                 // Maintain Audio Pitch: the channels stretched together along the time map.
@@ -3989,6 +3992,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             for (const Effect& e : c.effects)
                 if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
                     sourceFx.push_back(&e);
+            std::deque<Effect> resolved;
+            resolveElasticMembers(p, sourceFx, resolved);  // a group warped together reads its other members (audio/ElasticAudio.h)
             if (!sourceFx.empty())
                 if (AudioBufferPtr clean = cleanedAudio(source, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();

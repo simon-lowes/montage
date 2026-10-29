@@ -159,6 +159,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/ElasticAudio.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
 #include "audio/Plugins.h"
@@ -247,6 +248,7 @@
 #include "RenderQueuePanel.h"
 #include "render/RenderFarm.h"
 #include "TimelineWidget.h"
+#include "PitchCurves.h"
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
 #include "core/AutoTag.h"
@@ -5069,6 +5071,115 @@ private slots:
         QVERIFY(bin->shownMedia().empty());
         QCOMPARE(bin->currentSmartBin(), Id(0));
         QVERIFY(tree->isHidden());
+    }
+
+    void elasticAudioOnTheTimeline() {
+        // A spoken line on A1, warped from the Clip menu.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Id audio = trackAt(*state()->sequence(), A1)->clips.front().id;
+        ppf_ = measurePpf();
+        timeline()->setShowVolumeLines(true);
+        auto clip = [&] { return edit::clipById(*state()->sequence(), audio); };
+        auto points = [&] {
+            const Effect* e = elasticEffectOf(*clip());
+            return e ? dialogueWarpFromString(e->s("points")) : DialogueWarp{};
+        };
+        auto action = [&](const char* name) {
+            QAction* a = win_->findChild<QAction*>(QString::fromLatin1(name));
+            if (!a) qWarning("no action %s", name);
+            return a;
+        };
+        state()->setSelection({audio}, false);
+        for (const char* name : {"enableElasticAudio", "warpMarkersAtOnsets", "elasticSpeech", "elasticGeneral", "elasticVarispeed",
+                                 "removeElasticAudio", "shiftPitch", "flattenPitch", "scaleInflection", "correctPitch", "shiftFormants",
+                                 "clearPitchEdits", "showPitchCurves"})
+            QVERIFY(action(name));
+        action("enableElasticAudio")->trigger();
+        QVERIFY(elasticEffectOf(*clip()));
+        QVERIFY(points().empty());
+        state()->undo();
+        QVERIFY(!elasticEffectOf(*clip()));
+        state()->redo();
+
+        // Alt-drag in the clip: a marker made at 2 s and moved to 2.5 s, one undo step; the waveform follows it.
+        const QRect band = timeline()->lineBand(audio);
+        QVERIFY(!band.isNull());
+        const int y = band.top() + 3;
+        auto xAt = [&](double u) { return int(std::lround(timeline()->xForElasticSeconds(*clip(), u))); };
+        QVERIFY(std::abs(timeline()->elasticSecondsAtX(*clip(), xAt(2.0)) - 2.0) < 0.05);
+        const double grabbed = timeline()->elasticSecondsAtX(*clip(), xAt(2.0)), dropped = timeline()->elasticSecondsAtX(*clip(), xAt(2.5));
+        drag(QPoint(xAt(2.0), y), QPoint(xAt(2.5), y), Qt::AltModifier);
+        DialogueWarp w = points();
+        QCOMPARE(w.size(), size_t(3));  // with the anchors at the clip's ends
+        QVERIFY2(std::fabs(w[1].w - grabbed) < 1e-6 && std::fabs(w[1].u - dropped) < 1e-6, qPrintable(QStringLiteral("%1 %2").arg(w[1].u).arg(w[1].w)));
+        QCOMPARE(clip()->start, FrameTime(0));  // the clip did not move
+        state()->undo();
+        QVERIFY(points().empty());
+        state()->redo();
+        QCOMPARE(points(), w);
+        // Dragged again from where it now is, back to 2.2 s.
+        drag(QPoint(xAt(w[1].u), y), QPoint(xAt(2.2), y), Qt::AltModifier);
+        QCOMPARE(points().size(), size_t(3));
+        QVERIFY(std::fabs(points()[1].u - timeline()->elasticSecondsAtX(*clip(), xAt(2.2))) < 1e-6);
+        QCOMPARE(points()[1].w, w[1].w);
+        // Alt-Shift-click takes it off.
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::AltModifier | Qt::ShiftModifier, QPoint(xAt(points()[1].u), y));
+        QVERIFY(points().empty());
+        state()->undo();
+        QCOMPARE(points().size(), size_t(3));
+
+        // Markers at the onsets of the words; a mode.
+        state()->setSelection({audio}, false);
+        action("warpMarkersAtOnsets")->trigger();
+        QVERIFY2(points().size() > 8, qPrintable(QString::number(points().size())));
+        action("elasticGeneral")->trigger();
+        QCOMPARE(elasticModeOf(*elasticEffectOf(*clip())), ElasticMode::General);
+
+        // Pitch edits over In/Out: after the warp in the chain, and drawn as a curve over the waveform.
+        state()->setSelection({audio}, false);
+        QVERIFY(state()->edit("Marks", [](Project&, Sequence& s) {
+            s.inPoint = 25, s.outPoint = 74;
+            return true;
+        }));
+        QVERIFY(win_->addPitchEdit(QStringLiteral("Shift Pitch"), [](PitchEdit& e) { e.shift = 3; }));
+        const Effect* pitch = pitchContourOf(*clip());
+        QVERIFY(pitch);
+        const std::vector<PitchEdit> made = pitchEditsFromString(pitch->s("edits"));
+        QCOMPARE(made.size(), size_t(1));
+        const double fps = state()->sequence()->fpsValue(), from = 25 / fps, to = 75 / fps;
+        QVERIFY(std::fabs(made[0].start - from) < 1e-6 && std::fabs(made[0].end - to) < 1e-6 && made[0].shift == 3);
+        QVERIFY(&clip()->effects.back() == pitchContourOf(*clip()));
+        action("showPitchCurves")->setChecked(false);
+        action("showPitchCurves")->trigger();
+        QVERIFY(timeline()->showPitchCurves());
+        auto curve = timeline()->pitchCurves()->curveNow(state()->project(), *state()->sequence(), *clip());
+        QVERIFY(curve);
+        std::vector<double> voiced;
+        for (double f : curve->track.f0)
+            if (f > 0) voiced.push_back(f);
+        QVERIFY2(voiced.size() > 100, qPrintable(QString::number(voiced.size())));
+        std::nth_element(voiced.begin(), voiced.begin() + long(voiced.size() / 2), voiced.end());
+        QVERIFY2(voiced[voiced.size() / 2] > 80 && voiced[voiced.size() / 2] < 250, qPrintable(QString::number(voiced[voiced.size() / 2])));
+        // Edited three semitones up inside the range only.
+        for (size_t i = 0; i < curve->track.f0.size(); ++i) {
+            const double t = curve->track.start + double(i) * curve->track.hop;
+            if (curve->track.f0[i] <= 0) continue;
+            const double ratio = curve->edited[i] / curve->track.f0[i];
+            if (t > from + 0.05 && t < to - 0.05) QVERIFY(std::fabs(ratio - std::pow(2.0, 0.25)) < 1e-6);
+            if (t < from - 0.05 || t > to + 0.05) QCOMPARE(ratio, 1.0);
+        }
+        viewport()->repaint();
+        action("clearPitchEdits")->trigger();
+        QVERIFY(!pitchContourOf(*clip()));
+        state()->undo();
+        QVERIFY(pitchContourOf(*clip()));
+        action("removeElasticAudio")->trigger();
+        QVERIFY(!elasticEffectOf(*clip()) && !pitchContourOf(*clip()));
+        action("showPitchCurves")->trigger();
     }
 
     void clipLinesOnTheTimeline() {

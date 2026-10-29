@@ -1660,7 +1660,7 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
 
 The eleventh gap analysis (`docs/research/phase12-roadmap.md`, October 2026) ranks what is still missing against the latest Premiere, After Effects, Resolve, Final Cut Pro, Media Composer, Nuke, Baselight, Pro Tools and Nuendo, and open tools and standards; SMPTE's standards became free to read on 17 June 2026, which opens S-ADM (left out of Phase 11 #13) and ST 2110. Items 1–12 can be tested fully in CI; 13–15 each name the part CI cannot check. Approved 29 October 2026.
 
-- [ ] 1. Elastic audio: warp markers inside a clip to move a word, a hit or a beat without cutting, and a pitch curve to change the intonation of a line, with formants kept (M)
+- [x] 1. Elastic audio: warp markers inside a clip to move a word, a hit or a beat without cutting, and a pitch curve to change the intonation of a line, with formants kept (M)
 - [ ] 2. Surface tracking: a mesh that follows a surface as it bends (cloth, skin, a flag), so paint, a logo, a tattoo fix or a grade's window stays on it (M)
 - [ ] 3. Clips as 3D layers: footage, titles, graphics and nested sequences placed and turned in 3D space under one camera, intersecting and lit, and any clip used as a material on 3D models (M)
 - [ ] 4. Shape layers grown into vector graphics: several drawn Bézier paths and primitives in groups, booleans, and the path operators motion designers use (Repeater, Offset, Round Corners, Pucker & Bloat, Twist, Zig Zag, Wiggle), with SVG imported as editable shapes (M)

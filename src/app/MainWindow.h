@@ -14,6 +14,7 @@
 #include "Recovery.h"
 #include "automation/ScriptPanel.h"
 #include "TimelineWidget.h"
+#include "audio/ElasticAudio.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "media/Image.h"
@@ -212,6 +213,16 @@ public:
     void micBleedDialog();
     // Clip › Spectral Repair…: the editor for the selected audio clip (or the one under the playhead), shown modeless.
     SpectralRepairDialog* spectralRepairDialog();
+    // Clip › Elastic Audio (audio/ElasticAudio.h), each one undo step: on for the selected audio clips (warped together
+    // when there are several), warp markers at their onsets, a mode, off.
+    bool enableElasticAudio(int mode = 0);
+    int addWarpMarkersAtOnsets(double sensitivity = 50);
+    bool setElasticMode(int mode);
+    bool removeElasticAudio();
+    // A pitch edit over the In/Out range where it meets the selected audio clip (or the one under the playhead),
+    // else the whole clip: `set` fills in what it does. Clear Pitch Edits takes them all off.
+    bool addPitchEdit(const QString& label, const std::function<void(PitchEdit&)>& set);
+    bool clearPitchEdits();
     RedactFacesDialog* redactFacesDialog();
     LearnEffectDialog* learnEffectDialog();
     PanFollowDialog* panFollowDialog();

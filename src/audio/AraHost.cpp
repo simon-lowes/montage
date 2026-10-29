@@ -7,12 +7,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
 
 #include "ARA_Library/Dispatch/ARAHostDispatch.h"
 #include "DialogueAlign.h"
+#include "ElasticAudio.h"
 #include "PluginEffect.h"
 #include "SpeechCleanup.h"
 #include "media/MediaPool.h"
@@ -565,6 +567,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, std::strin
         if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c)) before.push_back(&e);
     }
     if (before.empty()) return true;
+    std::deque<Effect> resolved;
+    resolveElasticMembers(p, before, resolved);
     if (AudioBufferPtr through = cleanedAudio(key, buffer, before, true); through && through->frames() > 0) {
         buffer = through;
         key += "|through:" + std::to_string(reinterpret_cast<uintptr_t>(through.get()));

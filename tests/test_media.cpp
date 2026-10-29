@@ -70,6 +70,7 @@
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
 #include "audio/DialogueAlign.h"
+#include "audio/ElasticAudio.h"
 #include "audio/RoomResponse.h"
 #include "audio/Upmix.h"
 #include "audio/SpeechCleanup.h"
@@ -33772,6 +33773,415 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), back));
         QVERIFY(edit::clipById(*back.active(), micClip)->effects.empty());
         QCOMPARE(edit::clipById(*back.active(), takeClip)->effects.size(), size_t(1));
+    }
+
+    void elasticAudio() {
+        constexpr int sr = 48000;
+        auto buffer = [](size_t frames) {
+            AudioBuffer b;
+            b.sampleRate = sr, b.channels = 1;
+            b.samples.assign(frames, 0.0f);
+            return b;
+        };
+        // The strongest sinusoid between a and b seconds (a Hann-windowed DFT searched finely).
+        auto toneAt = [](const AudioBuffer& x, double a, double b, double lo, double hi) {
+            const int64_t s0 = int64_t(a * sr), s1 = int64_t(b * sr);
+            auto power = [&](double f) {
+                double re = 0, im = 0;
+                for (int64_t i = s0; i < s1; ++i) {
+                    const double w = 0.5 - 0.5 * std::cos(2 * M_PI * double(i - s0) / double(s1 - s0));
+                    re += w * x.samples[size_t(i)] * std::cos(2 * M_PI * f * double(i) / sr);
+                    im += w * x.samples[size_t(i)] * std::sin(2 * M_PI * f * double(i) / sr);
+                }
+                return re * re + im * im;
+            };
+            double best = lo, top = -1;
+            for (double f = lo; f <= hi; f += 0.5)
+                if (const double pw = power(f); pw > top) top = pw, best = f;
+            for (double step = 0.25; step > 1e-4;) {
+                if (const double pw = power(best - step); pw > top) top = pw, best -= step;
+                else if (const double pr = power(best + step); pr > top) top = pr, best += step;
+                else step /= 2;
+            }
+            return best;
+        };
+        auto cents = [](double f, double ref) { return 1200 * std::log2(f / ref); };
+
+        // The settings as text, read back.
+        const std::vector<ElasticMember> members = {{12, {0, 1}, 0}, {14, {}, -0.25}};
+        QCOMPARE(elasticMembersFromString(elasticMembersToString(members)), members);
+        QVERIFY(elasticMembersFromString("x|0|1;5|0|nan;7||0.5").size() == 1);
+        PitchEdit corrected{1, 2, 0.5, 0.25, 0.8, 7, "minor", -1};
+        const std::vector<PitchEdit> edits = {corrected, PitchEdit{3, 4, -2}};
+        QCOMPARE(pitchEditsFromString(pitchEditsToString(edits)), edits);
+        QVERIFY(pitchEditsFromString("[{\"start\":2,\"end\":1}]").empty());
+        ElasticMode mode;
+        QVERIFY(parseElasticMode("varispeed", mode) && mode == ElasticMode::Varispeed && !parseElasticMode("fast", mode));
+
+        // A 440 Hz tone with a 20 ms gap ending at 1.0 s; the marker there moved to 1.2 s. The first stretch plays
+        // 1.2 times as long (the tone comes back at 1.2 s), the second is squeezed to fit, and the pitch stays 440 Hz.
+        AudioBuffer tone = buffer(size_t(3 * sr));
+        for (size_t i = 0; i < tone.samples.size(); ++i) tone.samples[i] = float(0.5 * std::sin(2 * M_PI * 440 * double(i) / sr));
+        for (size_t i = size_t(0.98 * sr); i < size_t(sr); ++i) tone.samples[i] = 0;
+        const DialogueWarp moved = {{0, 0}, {1.2, 1.0}, {3, 3}};
+        AudioBuffer warped;
+        applyElasticWarp(tone, moved, ElasticMode::Speech, 0, {}, warped);
+        QCOMPARE(warped.frames(), tone.frames());
+        const std::vector<double> back = detectOnsets(warped);
+        QVERIFY2(back.size() == 1 && std::fabs(back[0] - 1.2) < 0.002, qPrintable(QString::number(back.empty() ? -1 : back[0])));
+        QVERIFY2(std::fabs(cents(toneAt(warped, 0.2, 1.1, 430, 450), 440)) < 1, "stretched: 440 Hz");
+        QVERIFY2(std::fabs(cents(toneAt(warped, 1.3, 2.9, 430, 450), 440)) < 1, "squeezed: 440 Hz");
+        for (size_t i = 0; i < size_t(0.03 * sr); ++i) QCOMPARE(warped.samples[i], tone.samples[i]);  // before the markers: as it was
+        // General mode keeps the pitch too; varispeed lets it fall with the speed, like tape.
+        AudioBuffer general, tape;
+        applyElasticWarp(tone, moved, ElasticMode::General, 0, {}, general);
+        QVERIFY(std::fabs(cents(toneAt(general, 0.2, 1.1, 430, 450), 440)) < 1);
+        applyElasticWarp(tone, moved, ElasticMode::Varispeed, 0, {}, tape);
+        QVERIFY2(std::fabs(cents(toneAt(tape, 0.2, 1.1, 300, 450), 440 / 1.2)) < 1, qPrintable(QString::number(toneAt(tape, 0.2, 1.1, 300, 450))));
+        // No markers: the same sound, sample for sample.
+        AudioBuffer same;
+        applyElasticWarp(tone, {}, ElasticMode::Speech, 0, {}, same);
+        QVERIFY(same.samples == tone.samples);
+
+        // Clicks over quiet hiss, each found to within 1 ms, and nothing else.
+        AudioBuffer clicks = buffer(size_t(4 * sr));
+        uint32_t seed = 11;
+        auto noise = [&] {
+            seed = seed * 1664525u + 1013904223u;
+            return double(seed >> 8) / 16777216.0 - 0.5;
+        };
+        for (float& v : clicks.samples) v = float(0.006 * noise());
+        const double clickAt[] = {0.3137, 0.9, 1.4521, 2.05, 2.7333, 3.4};
+        for (double a : clickAt)
+            for (int k = 0; k < 200; ++k) clicks.samples[size_t(a * sr) + size_t(k)] += float(0.8 * std::exp(-k / 30.0) * (k % 2 ? -1 : 1));
+        const std::vector<double> found = detectOnsets(clicks);
+        QCOMPARE(found.size(), std::size(clickAt));
+        for (size_t i = 0; i < found.size(); ++i) QVERIFY2(std::fabs(found[i] - clickAt[i]) < 0.001, qPrintable(QString::number(found[i])));
+
+        // Two microphones of one take, the second 37 samples behind with hiss of its own, warped as a group: cut at the
+        // same places, they stay 37 samples apart everywhere (within one). Warped apart they drift.
+        AudioBuffer boom = buffer(size_t(4 * sr)), lav = buffer(size_t(4 * sr));
+        double y1 = 0, y2 = 0;
+        for (size_t i = 0; i < boom.samples.size(); ++i) {
+            const double t = double(i) / sr;
+            const double env = std::sin(M_PI * std::fmod(t, 0.31) / 0.31) > 0.3 ? 1 : 0.05;
+            const double x = (0.7 * noise() + 0.3 * std::sin(2 * M_PI * (130 + 20 * std::sin(t * 3)) * t)) * env;
+            const double y = x + 1.6 * y1 - 0.8 * y2;
+            y2 = y1, y1 = y;
+            boom.samples[i] = float(0.1 * y);
+        }
+        constexpr int lag = 37;
+        for (size_t i = 0; i < lav.samples.size(); ++i) lav.samples[i] = (i >= size_t(lag) ? 0.7f * boom.samples[i - lag] : 0.0f) + float(0.02 * noise());
+        const DialogueWarp both = {{0, 0}, {1.0, 1.0}, {1.37, 1.2}, {2.2, 2.3}, {4, 4}};
+        AudioBuffer boomOut, lavOut, boomApart, lavApart;
+        applyElasticWarp(boom, both, ElasticMode::Speech, 0, {{&boom, 0}, {&lav, 0}}, boomOut);
+        applyElasticWarp(lav, both, ElasticMode::Speech, 0, {{&boom, 0}, {&lav, 0}}, lavOut);
+        applyElasticWarp(boom, both, ElasticMode::Speech, 0, {}, boomApart);
+        applyElasticWarp(lav, both, ElasticMode::Speech, 0, {}, lavApart);
+        auto lagOf = [](const AudioBuffer& a, const AudioBuffer& b, double from) {
+            int best = 0;
+            double top = -1e300;
+            for (int l = -100; l <= 100; ++l) {
+                double c = 0;
+                for (int64_t i = int64_t(from * sr); i < int64_t((from + 0.3) * sr); ++i) c += double(a.samples[size_t(i)]) * b.samples[size_t(i + l)];
+                if (c > top) top = c, best = l;
+            }
+            return best;
+        };
+        int apartWorst = 0;
+        for (double from = 0.2; from < 3.6; from += 0.4) {
+            QVERIFY2(std::abs(lagOf(boomOut, lavOut, from) - lag) <= 1, qPrintable(QString::number(lagOf(boomOut, lavOut, from))));
+            apartWorst = std::max(apartWorst, std::abs(lagOf(boomApart, lavApart, from) - lag));
+        }
+        QVERIFY2(apartWorst > 1, "warped apart, the microphones drift");
+
+        // A voice gliding from 120 to 100 Hz (pulses through three formants), tracked within 5 cents.
+        auto vowel = [&](double seconds, double f0a, double f0b) {
+            AudioBuffer b = buffer(size_t(seconds * sr));
+            std::vector<double> y(b.samples.size(), 0.0);
+            double phase = 0;
+            for (size_t i = 0; i < y.size(); ++i) {
+                phase += (f0a + (f0b - f0a) * double(i) / sr / seconds) / sr;
+                if (phase >= 1) phase -= 1, y[i] = 1;
+            }
+            for (const auto [f, bw] : {std::pair{700.0, 90.0}, {1220.0, 110.0}, {2600.0, 160.0}}) {
+                const double r = std::exp(-M_PI * bw / sr), a1 = 2 * r * std::cos(2 * M_PI * f / sr), a2 = -r * r;
+                double z1 = 0, z2 = 0;
+                for (double& v : y) {
+                    const double z = v + a1 * z1 + a2 * z2;
+                    z2 = z1, z1 = z, v = z;
+                }
+            }
+            double peak = 0;
+            for (double v : y) peak = std::max(peak, std::fabs(v));
+            for (size_t i = 0; i < y.size(); ++i) b.samples[i] = float(0.5 * y[i] / peak);
+            return b;
+        };
+        const AudioBuffer glide = vowel(1.5, 120, 100);
+        const PitchTrack track = trackPitch(glide);
+        double glideWorst = 0;
+        for (size_t i = 0; i < track.f0.size(); ++i) {
+            const double t = track.start + double(i) * track.hop;
+            if (t < 0.1 || t > 1.4) continue;
+            glideWorst = std::max(glideWorst, track.f0[i] > 0 ? std::fabs(cents(track.f0[i], 120 - 20 * t / 1.5)) : 1e9);
+        }
+        QVERIFY2(glideWorst < 5, qPrintable(QString::number(glideWorst)));
+
+        // Two semitones up over the middle of a steady 110 Hz vowel: within 5 cents of 123.5 Hz, the formants (peaks
+        // of an LPC envelope) moved less than 3 %; outside the edit, the same sound sample for sample.
+        auto formants = [](const AudioBuffer& x, double a, double b) {
+            std::vector<double> v;  // at 16 kHz, pre-emphasised, Hamming-windowed
+            for (int64_t i = int64_t(a * sr); i + 3 <= int64_t(b * sr); i += 3) v.push_back((x.samples[size_t(i)] + x.samples[size_t(i + 1)] + x.samples[size_t(i + 2)]) / 3.0);
+            for (size_t i = v.size() - 1; i > 0; --i) v[i] -= 0.9 * v[i - 1];
+            for (size_t i = 0; i < v.size(); ++i) v[i] *= 0.54 - 0.46 * std::cos(2 * M_PI * double(i) / double(v.size() - 1));
+            constexpr int order = 14;
+            double R[order + 1] = {}, A[order + 1] = {1}, T[order + 1];
+            for (int k = 0; k <= order; ++k)
+                for (size_t i = size_t(k); i < v.size(); ++i) R[k] += v[i] * v[i - size_t(k)];
+            double E = R[0];
+            for (int i = 1; i <= order; ++i) {
+                double acc = R[i];
+                for (int j = 1; j < i; ++j) acc += A[j] * R[i - j];
+                const double k = -acc / E;
+                std::copy(A, A + order + 1, T);
+                for (int j = 1; j < i; ++j) A[j] = T[j] + k * T[i - j];
+                A[i] = k, E *= 1 - k * k;
+            }
+            std::vector<double> env, peaks;
+            for (int i = 0; i < 4000; ++i) {
+                double re = 0, im = 0;
+                for (int j = 0; j <= order; ++j) re += A[j] * std::cos(M_PI * i * j / 4000.0), im -= A[j] * std::sin(M_PI * i * j / 4000.0);
+                env.push_back(-std::log(re * re + im * im));
+            }
+            for (int i = 1; i + 1 < 4000; ++i)
+                if (env[size_t(i)] > env[size_t(i - 1)] && env[size_t(i)] > env[size_t(i + 1)] && i * 2.0 < 3500) peaks.push_back(i * 2.0);
+            return peaks;  // Hz
+        };
+        const AudioBuffer steady = vowel(1.5, 110, 110);
+        AudioBuffer up;
+        applyPitchEdits(steady, {PitchEdit{0.3, 1.2, 2}}, up);
+        const PitchTrack heard = trackPitch(up);
+        double shiftWorst = 0;
+        for (size_t i = 0; i < heard.f0.size(); ++i) {
+            const double t = heard.start + double(i) * heard.hop;
+            if (t > 0.4 && t < 1.1) shiftWorst = std::max(shiftWorst, heard.f0[i] > 0 ? std::fabs(cents(heard.f0[i], 110 * std::pow(2.0, 2 / 12.0))) : 1e9);
+        }
+        QVERIFY2(shiftWorst < 5, qPrintable(QString::number(shiftWorst)));
+        const std::vector<double> before = formants(steady, 0.5, 1.0), after = formants(up, 0.5, 1.0);
+        QCOMPARE(before.size(), size_t(3));
+        QCOMPARE(after.size(), before.size());
+        for (size_t i = 0; i < before.size(); ++i) QVERIFY2(std::fabs(after[i] / before[i] - 1) < 0.03, qPrintable(QString::number(after[i])));
+        for (size_t i = 0; i < up.samples.size(); ++i)
+            if ((double(i) / sr < 0.2 || double(i) / sr > 1.35) && up.samples[i] != steady.samples[i]) QFAIL(qPrintable(QStringLiteral("changed at %1 s").arg(double(i) / sr)));
+        // The formants moved on their own (two semitones: 12 % up), the pitch left where it was.
+        PitchEdit larger{0.3, 1.2};
+        larger.formant = 2;
+        AudioBuffer smaller;
+        applyPitchEdits(steady, {larger}, smaller);
+        const std::vector<double> shifted = formants(smaller, 0.5, 1.0);
+        QCOMPARE(shifted.size(), before.size());
+        for (size_t i = 0; i < before.size(); ++i) QVERIFY2(std::fabs(shifted[i] / before[i] - std::pow(2.0, 2 / 12.0)) < 0.04, qPrintable(QString::number(shifted[i])));
+        QVERIFY(std::fabs(cents(trackPitch(smaller).at(0.7), 110)) < 5);
+        // Flattened: a vibrato of a semitone either way about 110 Hz comes out steady.
+        AudioBuffer vibrato = buffer(size_t(1.5 * sr));
+        {
+            std::vector<double> y(vibrato.samples.size(), 0.0);
+            double phase = 0;
+            for (size_t i = 0; i < y.size(); ++i) {
+                phase += 110 * std::pow(2.0, std::sin(2 * M_PI * 5 * double(i) / sr) / 12) / sr;
+                if (phase >= 1) phase -= 1, y[i] = 1;
+            }
+            const double r = std::exp(-M_PI * 90.0 / sr), a1 = 2 * r * std::cos(2 * M_PI * 700 / sr), a2 = -r * r;
+            double z1 = 0, z2 = 0;
+            for (size_t i = 0; i < y.size(); ++i) {
+                const double z = y[i] + a1 * z1 + a2 * z2;
+                z2 = z1, z1 = z;
+                vibrato.samples[i] = float(0.05 * z);
+            }
+        }
+        PitchEdit flat{0.2, 1.3};
+        flat.inflection = 0;
+        AudioBuffer flattened;
+        applyPitchEdits(vibrato, {flat}, flattened);
+        const PitchTrack wobble = trackPitch(vibrato), level = trackPitch(flattened);
+        // Half the range of each, in cents (the steady pitch is the stretch's median, a little off 110 Hz).
+        double wobbleLow = 1e9, wobbleHigh = -1e9, levelLow = 1e9, levelHigh = -1e9;
+        for (size_t i = 0; i < level.f0.size(); ++i) {
+            const double t = level.start + double(i) * level.hop;
+            if (t < 0.4 || t > 1.1 || wobble.f0[i] <= 0 || level.f0[i] <= 0) continue;
+            wobbleLow = std::min(wobbleLow, cents(wobble.f0[i], 110)), wobbleHigh = std::max(wobbleHigh, cents(wobble.f0[i], 110));
+            levelLow = std::min(levelLow, cents(level.f0[i], 110)), levelHigh = std::max(levelHigh, cents(level.f0[i], 110));
+        }
+        const double wobbleSpread = (wobbleHigh - wobbleLow) / 2, levelSpread = (levelHigh - levelLow) / 2;
+        QVERIFY2(wobbleSpread > 80 && levelSpread < 15, qPrintable(QStringLiteral("%1 %2").arg(wobbleSpread).arg(levelSpread)));
+        // No edits: the same sound.
+        AudioBuffer untouched;
+        applyPitchEdits(steady, {}, untouched);
+        QVERIFY(untouched.samples == steady.samples);
+
+        // On the timeline: the two microphones as clips on A1 and A2, warped together. A marker moved on one moves on
+        // both; each plays its own sound, still 37 samples behind the other.
+        const std::string boomPath = path("elastic-boom.wav"), lavPath = path("elastic-lav.wav");
+        QVERIFY(writeMonoWav(boomPath, boom.samples, sr));
+        QVERIFY(writeMonoWav(lavPath, lav.samples, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        s.sampleRate = sr;
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        auto place = [&](const std::string& file, int track) {
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            Clip c = makeClip(p, p.media.back(), TrackKind::Audio, s);
+            c.start = 0;
+            const edit::Result r = edit::overwrite(p, s, {TrackKind::Audio, track}, c);
+            return r.created.empty() ? Id(0) : r.created[0];
+        };
+        const Id boomClip = place(boomPath, 0), lavClip = place(lavPath, 1);
+        QVERIFY(boomClip && lavClip);
+        QVERIFY(!edit::moveWarpMarker(p, s, boomClip, 1.37, 1.2).ok);  // not on yet
+        const edit::Result on = edit::enableElasticAudio(p, s, {boomClip, lavClip});
+        QVERIFY2(on.ok, on.error.c_str());
+        QCOMPARE(edit::elasticGroup(s, boomClip).size(), size_t(2));
+        auto pointsOf = [&](Id clip) { return dialogueWarpFromString(elasticEffectOf(*edit::clipById(s, clip))->s("points")); };
+        // A marker made where nothing was marked plays what was there; anchors keep the clip's ends where they were.
+        QVERIFY(edit::moveWarpMarker(p, s, boomClip, 1.2, 1.37).ok);
+        QCOMPARE(pointsOf(lavClip), (DialogueWarp{{0, 0}, {1.37, 1.2}, {4, 4}}));
+        QVERIFY(!edit::setWarpPoints(p, s, lavClip, {{1.5, 1.0}, {1.4, 1.2}}).ok);  // out of order
+        QVERIFY(edit::setWarpPoints(p, s, lavClip, {{1, 1}, {1.37, 1.2}, {2.2, 2.3}}).ok);
+        QCOMPARE(pointsOf(boomClip), both);
+        // Moved, a marker stops short of its neighbours.
+        QVERIFY(edit::moveWarpMarker(p, s, lavClip, 1.37, 5.0).ok);
+        QCOMPARE(pointsOf(boomClip)[2], (AlignPoint{2.195, 1.2}));
+        QVERIFY(edit::moveWarpMarker(p, s, boomClip, 2.195, 1.37).ok);
+        QCOMPARE(pointsOf(boomClip), both);
+        QCOMPARE(pointsOf(lavClip), both);
+        auto mixOf = [&](int track) {
+            for (size_t k = 0; k < s.audioTracks.size(); ++k) s.audioTracks[k].muted = int(k) != track;
+            AudioMixer mixer;
+            std::vector<float> out(size_t(4 * sr) * 2);
+            mixer.mix(p, s, 0, 4 * sr, out.data());
+            AudioBuffer left = buffer(size_t(4 * sr));
+            for (size_t i = 0; i < left.samples.size(); ++i) left.samples[i] = out[i * 2];
+            return left;
+        };
+        const AudioBuffer boomHeard = mixOf(0), lavHeard = mixOf(1);
+        for (double from = 0.2; from < 3.6; from += 0.4) QVERIFY2(std::abs(lagOf(boomHeard, lavHeard, from) - lag) <= 1, qPrintable(QString::number(from)));
+        // As the engine makes it from the files (the mixer's centre pan aside).
+        AudioBufferPtr boomFile = decodeAudio(boomPath, sr), lavFile = decodeAudio(lavPath, sr);
+        QVERIFY(boomFile && lavFile);
+        applyElasticWarp(*boomFile, both, ElasticMode::Speech, 0, {{boomFile.get(), 0}, {lavFile.get(), 0}}, boomOut);
+        {
+            AudioBuffer left = buffer(size_t(boomOut.frames()));
+            for (size_t i = 0; i < left.samples.size(); ++i) left.samples[i] = boomOut.samples[i * size_t(boomOut.channels)];
+            boomOut = left;
+        }
+        double scale = 0, energy = 0;
+        for (size_t i = 0; i < boomOut.samples.size(); ++i) scale += double(boomHeard.samples[i]) * boomOut.samples[i], energy += double(boomOut.samples[i]) * boomOut.samples[i];
+        scale /= energy;
+        double worst = 0;
+        for (size_t i = 0; i < boomOut.samples.size(); ++i) worst = std::max(worst, std::fabs(boomHeard.samples[i] - scale * boomOut.samples[i]));
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        // Exported, the same as played.
+        for (Track& t : s.audioTracks) t.muted = false;
+        ExportSettings st;
+        st.path = path("elastic.wav");
+        st.videoCodec = "none";
+        st.audioCodec = "pcm_s24le";
+        st.in = 0, st.out = 99;
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        AudioBufferPtr exported = decodeAudio(st.path, sr, &err);
+        QVERIFY2(exported, err.c_str());
+        {
+            AudioMixer mixer;
+            std::vector<float> played(size_t(4 * sr) * 2);
+            mixer.mix(p, s, 0, 4 * sr, played.data());
+            double diff = 0;
+            for (size_t i = 0; i < std::min(played.size(), exported->samples.size()); ++i) diff = std::max(diff, double(std::fabs(played[i] - exported->samples[i])));
+            QVERIFY2(diff < 1e-4, qPrintable(QString::number(diff)));
+        }
+        // Onsets found in the group's sound add markers; the mode and the whole thing come off as edits.
+        int added = 0;
+        QVERIFY(edit::addWarpMarkersAtOnsets(p, s, boomClip, 50, &added).ok);
+        QVERIFY2(added > 5, qPrintable(QString::number(added)));
+        QVERIFY(edit::setElasticMode(p, s, lavClip, ElasticMode::General).ok);
+        QCOMPARE(elasticModeOf(*elasticEffectOf(*edit::clipById(s, boomClip))), ElasticMode::General);
+        QVERIFY(edit::removeWarpMarker(p, s, boomClip, 1.37).ok);
+        QVERIFY(!edit::removeWarpMarker(p, s, boomClip, 1.37).ok);
+        // AAF: the warped sound, the whole file, so the clip keeps its handles.
+        {
+            AafExportResult ar;
+            const std::string aaf = path("elastic.aaf");
+            QVERIFY2(exportAaf(p, s, aaf, &ar, {}, nullptr, &err), err.c_str());
+            const auto warpedFile = std::find_if(ar.mediaFiles.begin(), ar.mediaFiles.end(), [](const std::string& f) { return f.find("(warped") != std::string::npos; });
+            QVERIFY2(warpedFile != ar.mediaFiles.end(), ar.mediaFiles.empty() ? "none" : ar.mediaFiles[0].c_str());
+            AudioBufferPtr carried = decodeAudio(*warpedFile, sr, &err);
+            QVERIFY2(carried && carried->frames() == boom.frames(), err.c_str());
+        }
+        QVERIFY(edit::removeElasticAudio(p, s, lavClip).ok);
+        QVERIFY(!elasticEffectOf(*edit::clipById(s, boomClip)) && !elasticEffectOf(*edit::clipById(s, lavClip)));
+
+        // Pitch edits on a clip, after its warp in the chain; a sped-up clip is refused.
+        QVERIFY(edit::enableElasticAudio(p, s, {boomClip}).ok);
+        QVERIFY(edit::setPitchEdits(p, s, boomClip, {PitchEdit{0.5, 1.0, 1}}).ok);
+        const std::vector<Effect>& fx = edit::clipById(s, boomClip)->effects;
+        QVERIFY(fx.size() == 2 && fx[0].type == "elastic_audio" && fx[1].type == "pitch_contour");
+        QVERIFY(isSourceAudioEffect("elastic_audio") && isSourceAudioEffect("pitch_contour"));
+        QVERIFY(!edit::setPitchEdits(p, s, boomClip, {PitchEdit{0.5, 1.0, 30}}).ok);
+        QVERIFY(edit::setPitchEdits(p, s, boomClip, {}).ok);
+        edit::clipById(s, lavClip)->speed = 2;
+        QVERIFY(!edit::enableElasticAudio(p, s, {lavClip}).ok);
+        edit::clipById(s, lavClip)->speed = 1;
+
+        // Over MCP: markers at onsets and one moved, reported back; the pitch read and shifted.
+        const std::string voicePath = path("elastic-voice.wav");
+        QVERIFY(writeMonoWav(voicePath, steady.samples, sr));
+        while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+        const Id voiceClip = place(voicePath, 2);
+        const QString project = QString::fromStdString(path("elastic.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_warp_audio", {{"project", project}, {"clip", double(lavClip)}, {"onsets", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("onsets_added").toInt() > 5);
+        r = call("montage_warp_audio", {{"project", project}, {"clip", double(lavClip)}, {"move", QJsonArray{QJsonObject{{"from", 1.1}, {"to", 1.15}}}}, {"mode", "varispeed"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject warpOut = r.value("structuredContent").toObject();
+        QCOMPARE(warpOut.value("mode").toString(), QStringLiteral("varispeed"));
+        bool sawMoved = false;
+        for (const QJsonValue& v : warpOut.value("markers").toArray())
+            sawMoved |= std::fabs(v.toObject().value("at").toDouble() - 1.15) < 1e-3 && std::fabs(v.toObject().value("plays").toDouble() - 1.1) < 1e-3;
+        QVERIFY2(sawMoved, QJsonDocument(warpOut).toJson().constData());
+        r = call("montage_warp_audio", {{"project", project}, {"clip", double(lavClip)}, {"mode", "slow"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_pitch_contour", {{"project", project}, {"clip", double(voiceClip)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(std::fabs(cents(r.value("structuredContent").toObject().value("median_hz").toDouble(), 110)) < 5);
+        QCOMPARE(r.value("structuredContent").toObject().value("median_note").toString(), QStringLiteral("A2"));
+        r = call("montage_pitch_contour", {{"project", project}, {"clip", double(voiceClip)},
+                                           {"edits", QJsonArray{QJsonObject{{"start", 0.4}, {"end", 1.0}, {"shift", 2}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        bool sawEdited = false;
+        for (const QJsonValue& v : r.value("structuredContent").toObject().value("points").toArray())
+            if (const double t = v.toObject().value("time").toDouble(); t > 0.5 && t < 0.9)
+                sawEdited |= std::fabs(cents(v.toObject().value("edited_hz").toDouble(110), 110 * std::pow(2.0, 2 / 12.0))) < 5;
+        QVERIFY(sawEdited);
+        r = call("montage_pitch_contour", {{"project", project}, {"clip", double(voiceClip)},
+                                           {"edits", QJsonArray{QJsonObject{{"start", 0.4}, {"end", 1.0}, {"correct", 1}, {"key", "H"}}}}});
+        QVERIFY(r.value("isError").toBool());
+        Project saved;
+        QVERIFY(loadProject(project.toStdString(), saved));
+        QVERIFY(pitchContourOf(*edit::clipById(*saved.active(), voiceClip)));
+        QCOMPARE(elasticModeOf(*elasticEffectOf(*edit::clipById(*saved.active(), lavClip))), ElasticMode::Varispeed);
     }
 
     void restorationOnFootage() {

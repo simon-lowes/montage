@@ -94,6 +94,7 @@
 
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
+#include "audio/SpectralRepair.h"
 #include "core/Surround.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
@@ -1648,6 +1649,82 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) separateStems(state_, clips, dlg.options(), this);
         }))->setObjectName(QStringLiteral("separateStems"));
     add(clipM, QT_TR_NOOP("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    {
+        // Elastic audio: warp markers in audio clips (Alt-drag on the timeline) and their pitch edited (audio/ElasticAudio.h).
+        QMenu* elasticM = menuIn(clipM, QT_TR_NOOP("&Elastic Audio"));
+        elasticM->setObjectName(QStringLiteral("elasticAudioMenu"));
+        add(elasticM, QT_TR_NOOP("&Warp Selected Clips"), QKeySequence(), withSeq([this] { enableElasticAudio(0); }))
+            ->setObjectName(QStringLiteral("enableElasticAudio"));
+        add(elasticM, QT_TR_NOOP("Add Warp Markers at &Onsets"), QKeySequence(), withSeq([this] { addWarpMarkersAtOnsets(); }))
+            ->setObjectName(QStringLiteral("warpMarkersAtOnsets"));
+        add(elasticM, QT_TR_NOOP("&Speech Mode"), QKeySequence(), withSeq([this] { setElasticMode(0); }))->setObjectName(QStringLiteral("elasticSpeech"));
+        add(elasticM, QT_TR_NOOP("&General Mode"), QKeySequence(), withSeq([this] { setElasticMode(1); }))->setObjectName(QStringLiteral("elasticGeneral"));
+        add(elasticM, QT_TR_NOOP("&Varispeed Mode"), QKeySequence(), withSeq([this] { setElasticMode(2); }))->setObjectName(QStringLiteral("elasticVarispeed"));
+        add(elasticM, QT_TR_NOOP("&Remove Elastic Audio"), QKeySequence(), withSeq([this] { removeElasticAudio(); }))
+            ->setObjectName(QStringLiteral("removeElasticAudio"));
+        elasticM->addSeparator();
+        add(elasticM, QT_TR_NOOP("S&hift Pitch…"), QKeySequence(), withSeq([this] {
+                bool ok = false;
+                const double semis = QInputDialog::getDouble(this, tr("Shift Pitch"), tr("Semitones (up is positive):"), 1, -24, 24, 2, &ok);
+                if (ok) addPitchEdit(tr("Shift Pitch"), [semis](PitchEdit& e) { e.shift = semis; });
+            }))->setObjectName(QStringLiteral("shiftPitch"));
+        add(elasticM, QT_TR_NOOP("&Flatten Pitch"), QKeySequence(), withSeq([this] {
+                addPitchEdit(tr("Flatten Pitch"), [](PitchEdit& e) { e.inflection = 0; });
+            }))->setObjectName(QStringLiteral("flattenPitch"));
+        add(elasticM, QT_TR_NOOP("Scale &Inflection…"), QKeySequence(), withSeq([this] {
+                bool ok = false;
+                const double pct = QInputDialog::getDouble(this, tr("Scale Inflection"), tr("Rise and fall of the pitch (% of as it was):"), 50, 0, 400, 0, &ok);
+                if (ok) addPitchEdit(tr("Scale Inflection"), [pct](PitchEdit& e) { e.inflection = pct / 100; });
+            }))->setObjectName(QStringLiteral("scaleInflection"));
+        add(elasticM, QT_TR_NOOP("&Correct Pitch to Scale…"), QKeySequence(), withSeq([this] {
+                QDialog dlg(this);
+                dlg.setWindowTitle(tr("Correct Pitch to Scale"));
+                auto* form = new QFormLayout(&dlg);
+                auto* key = new QComboBox(&dlg);
+                for (const char* name : {"C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B"}) key->addItem(QString::fromUtf8(name));
+                language::keepUntranslated(key);
+                auto* scale = new QComboBox(&dlg);
+                scale->addItem(tr("Chromatic"), QStringLiteral("chromatic"));
+                scale->addItem(tr("Major"), QStringLiteral("major"));
+                scale->addItem(tr("Minor"), QStringLiteral("minor"));
+                auto* amount = new QSpinBox(&dlg);
+                amount->setRange(0, 100);
+                amount->setValue(100);
+                amount->setSuffix(QStringLiteral(" %"));
+                form->addRow(tr("Key:"), key);
+                form->addRow(tr("Scale:"), scale);
+                form->addRow(tr("Amount:"), amount);
+                auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+                connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+                connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+                form->addRow(buttons);
+                if (dlg.exec() != QDialog::Accepted) return;
+                const int k = key->currentIndex();
+                const std::string sc = scale->currentData().toString().toStdString();
+                const double a = amount->value() / 100.0;
+                addPitchEdit(tr("Correct Pitch"), [k, sc, a](PitchEdit& e) {
+                    e.correct = a;
+                    e.key = k;
+                    e.scale = sc;
+                });
+            }))->setObjectName(QStringLiteral("correctPitch"));
+        add(elasticM, QT_TR_NOOP("Shift F&ormants…"), QKeySequence(), withSeq([this] {
+                bool ok = false;
+                const double semis = QInputDialog::getDouble(this, tr("Shift Formants"), tr("Semitones (up sounds smaller, down larger):"), 1, -12, 12, 2, &ok);
+                if (ok) addPitchEdit(tr("Shift Formants"), [semis](PitchEdit& e) { e.formant = semis; });
+            }))->setObjectName(QStringLiteral("shiftFormants"));
+        add(elasticM, QT_TR_NOOP("C&lear Pitch Edits"), QKeySequence(), withSeq([this] { clearPitchEdits(); }))->setObjectName(QStringLiteral("clearPitchEdits"));
+        elasticM->addSeparator();
+        const bool curves = appSettings().value("timeline/pitchCurves", false).toBool();
+        timeline_->setShowPitchCurves(curves);
+        QAction* show = add(elasticM, QT_TR_NOOP("Show &Pitch Curves"), QKeySequence(), [this](bool on) {
+            timeline_->setShowPitchCurves(on);
+            appSettings().setValue("timeline/pitchCurves", on);
+        });
+        show->setCheckable(true);
+        show->setChecked(curves);
+        show->setObjectName(QStringLiteral("showPitchCurves"));
+    }
     add(clipM, QT_TR_NOOP("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
     add(clipM, QT_TR_NOOP("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
     add(clipM, QT_TR_NOOP("Learn Effect from E&xamples…"), QKeySequence(), withSeq([this] { learnEffectDialog(); }))->setObjectName(QStringLiteral("learnEffect"));
@@ -6575,6 +6652,93 @@ PanFollowDialog* MainWindow::panFollowDialog() {
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->show();
     return dlg;
+}
+
+bool MainWindow::enableElasticAudio(int mode) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+    if (clips.empty())
+        if (const Clip* c = musicClip()) clips.push_back(c->id);
+    if (clips.empty()) {
+        state_->message(tr("Select the audio clips to warp"));
+        return false;
+    }
+    const ElasticMode m = mode == 1 ? ElasticMode::General : mode == 2 ? ElasticMode::Varispeed : ElasticMode::Speech;
+    const bool done = state_->apply(tr("Warp Clips"), [clips, m](Project& p, Sequence& sq) { return edit::enableElasticAudio(p, sq, clips, m); });
+    if (done) state_->message(tr("Alt-drag in the clip to move its sound; Alt-Shift-click a marker to take it off"));
+    return done;
+}
+
+int MainWindow::addWarpMarkersAtOnsets(double sensitivity) {
+    const Clip* c = musicClip();
+    if (!c) {
+        state_->message(tr("Select the audio clip to mark"));
+        return 0;
+    }
+    const Id id = c->id;
+    int added = 0;
+    state_->apply(tr("Add Warp Markers"), [id, sensitivity, &added](Project& p, Sequence& sq) {
+        return edit::addWarpMarkersAtOnsets(p, sq, id, sensitivity, &added);
+    });
+    state_->message(added ? tr("%n warp marker(s) added", "", added) : tr("No onsets found in the clip"));
+    return added;
+}
+
+bool MainWindow::setElasticMode(int mode) {
+    const Clip* c = musicClip();
+    if (!c || !elasticEffectOf(*c)) {
+        state_->message(tr("Select a clip with elastic audio"));
+        return false;
+    }
+    const Id id = c->id;
+    const ElasticMode m = mode == 1 ? ElasticMode::General : mode == 2 ? ElasticMode::Varispeed : ElasticMode::Speech;
+    return state_->apply(tr("Elastic Audio Mode"), [id, m](Project& p, Sequence& sq) { return edit::setElasticMode(p, sq, id, m); });
+}
+
+bool MainWindow::removeElasticAudio() {
+    const Clip* c = musicClip();
+    if (!c) {
+        state_->message(tr("Select the audio clip"));
+        return false;
+    }
+    const Id id = c->id;
+    return state_->apply(tr("Remove Elastic Audio"), [id](Project& p, Sequence& sq) { return edit::removeElasticAudio(p, sq, id); });
+}
+
+bool MainWindow::addPitchEdit(const QString& label, const std::function<void(PitchEdit&)>& set) {
+    const Clip* c = musicClip();
+    const Sequence* s = state_->sequence();
+    if (!c || !s) {
+        state_->message(tr("Select the audio clip whose pitch to edit"));
+        return false;
+    }
+    // The In/Out range where it meets the clip, else the clip; in the clip's source seconds as it plays.
+    FrameTime a = c->start, b = c->end();
+    if (s->inPoint >= 0 && s->outPoint >= s->inPoint && s->inPoint < c->end() && s->outPoint + 1 > c->start)
+        a = std::max(a, s->inPoint), b = std::min(b, s->outPoint + 1);
+    const double fps = s->fpsValue();
+    PitchEdit e;
+    e.start = clipSourceSeconds(*s, *c, double(a) / fps);
+    e.end = clipSourceSeconds(*s, *c, double(b) / fps);
+    set(e);
+    std::vector<PitchEdit> edits;
+    if (const Effect* fx = pitchContourOf(*c)) edits = pitchEditsFromString(fx->s("edits"));
+    edits.push_back(e);
+    const Id id = c->id;
+    return state_->apply(label, [id, edits](Project& p, Sequence& sq) { return edit::setPitchEdits(p, sq, id, edits); });
+}
+
+bool MainWindow::clearPitchEdits() {
+    const Clip* c = musicClip();
+    if (!c) {
+        state_->message(tr("Select the audio clip"));
+        return false;
+    }
+    const Id id = c->id;
+    return state_->apply(tr("Clear Pitch Edits"), [id](Project& p, Sequence& sq) { return edit::setPitchEdits(p, sq, id, {}); });
 }
 
 SpectralRepairDialog* MainWindow::spectralRepairDialog() {

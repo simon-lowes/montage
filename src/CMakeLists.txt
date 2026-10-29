@@ -279,6 +279,7 @@ add_library(montage_engine STATIC
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
   audio/DialogueAlign.h audio/DialogueAlign.cpp
+  audio/ElasticAudio.h audio/ElasticAudio.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp

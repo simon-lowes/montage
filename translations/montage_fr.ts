@@ -5404,6 +5404,46 @@
         <source>sRGB</source>
         <translation type="unfinished">SRGB</translation>
     </message>
+    <message>
+        <source>APV 10-bit 4:2:2 in MP4, AAC sound</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>APV 12-bit 4:4:4 with transparency, for graphics and finishing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>APV 422 10-bit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>APV 422 10-bit (MP4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>APV 4444 12-bit (alpha)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Elastic Audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>General</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Open intra-frame intermediate, 10-bit 4:2:2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pitch Edits</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Varispeed</source>
+        <translation type="unfinished">Variante</translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -19705,6 +19745,177 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>&lt;h3&gt;Montage %1&lt;/h3&gt;&lt;p&gt;A professional non-linear video editor written in C++ with Qt and FFmpeg.&lt;/p&gt;&lt;p&gt;Multi-track editing with ripple, roll, slip and slide tools; keyframed effects and colour correction; titles, transitions, scopes, an audio mixer and export to H.264, HEVC, ProRes, DNxHR, VP9 and AV1.&lt;/p&gt;&lt;p&gt;Copyright © the Montage authors. Montage is free software under the GNU General Public License, version 3 or later, and comes with no warranty. &lt;a href=&quot;https://github.com/simon-lowes/montage&quot;&gt;Source code&lt;/a&gt;.&lt;/p&gt;&lt;p&gt;It uses Qt %2 (LGPL-3.0) and FFmpeg %3 (%4), and the libraries listed in Help › Licences….&lt;/p&gt;&lt;p&gt;Montage is an independent project, not affiliated with or endorsed by the makers of the products and formats it works with. NDI® is a registered trademark of Vizrt NDI AB (&lt;a href=&quot;https://ndi.video&quot;&gt;ndi.video&lt;/a&gt;). VST® is a registered trademark of Steinberg Media Technologies GmbH.&lt;/p&gt;</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>&amp;Elastic Audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Warp Selected Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Warp Markers at &amp;Onsets</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Speech Mode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;General Mode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Varispeed Mode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Remove Elastic Audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>S&amp;hift Pitch…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shift Pitch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Semitones (up is positive):</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Flatten Pitch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Flatten Pitch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scale &amp;Inflection…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scale Inflection</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rise and fall of the pitch (% of as it was):</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>&amp;Correct Pitch to Scale…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Correct Pitch to Scale</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chromatic</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Major</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Minor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Key:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scale:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Amount:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Correct Pitch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shift F&amp;ormants…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shift Formants</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Semitones (up sounds smaller, down larger):</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>C&amp;lear Pitch Edits</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show &amp;Pitch Curves</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the audio clips to warp</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Warp Clips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Alt-drag in the clip to move its sound; Alt-Shift-click a marker to take it off</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the audio clip to mark</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Warp Markers</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n warp marker(s) added</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>No onsets found in the clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select a clip with elastic audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Elastic Audio Mode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the audio clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Elastic Audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the audio clip whose pitch to edit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clear Pitch Edits</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -26341,6 +26552,18 @@ Right-click: width, LFE, height and audio object.</source>
     <message>
         <source>Add Transition</source>
         <translation type="unfinished">Ajouter une transition</translation>
+    </message>
+    <message>
+        <source>Remove Warp Marker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Move Warp Marker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 % | %2 %</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

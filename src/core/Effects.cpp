@@ -723,6 +723,13 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"dialogue_align", "Dialogue Alignment", EffectCategory::AudioFilter, "Restoration",
                  {num("invert", "Invert Polarity", 0, 1, 0, 1)}, {}});
     c.back().hidden = true;
+    // Warp markers on the clip's sound and its pitch edited (audio/ElasticAudio.h): "points", "members" and "offset"
+    // strings, set on the timeline, from the Clip menu or over MCP; the pitch edits' "edits" string.
+    c.push_back({"elastic_audio", "Elastic Audio", EffectCategory::AudioFilter, "Time",
+                 {choice("mode", "Mode", {"Speech", "General", "Varispeed"}, 0)}, {}});
+    c.back().hidden = true;
+    c.push_back({"pitch_contour", "Pitch Edits", EffectCategory::AudioFilter, "Pitch", {}, {}});
+    c.back().hidden = true;
     c.push_back({"dehum", "De-Hum", EffectCategory::AudioFilter, "Restoration",
                  {choice("mains", "Mains", {"50 Hz", "60 Hz"}, 0), num("harmonics", "Harmonics", 1, 16, 6, 1),
                   num("reduction_db", "Reduction (dB)", 0, 60, 30, 0.5), num("width_hz", "Notch Width (Hz)", 0.5, 10, 2, 0.1)},
