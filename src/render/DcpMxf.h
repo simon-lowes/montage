@@ -103,7 +103,7 @@ protected:
     std::vector<uint64_t> offsets_;  // each frame's KLV, from the start of the essence
     uint64_t essenceBytes_ = 0;
     // Identities fixed when the file is opened, so the header written at the end matches the first one.
-    std::array<Uuid, 48> ids_{};
+    std::array<Uuid, 64> ids_{};
     std::string created_;  // timestamp bytes
     bool encrypted_ = false;
     TrackEncryption crypto_;
@@ -178,6 +178,7 @@ public:
     const Uuid& asset() const { return asset_; }
     const Uuid& keyId() const { return keyId_; }
     bool timedText() const { return timedText_; }
+    bool iab() const { return iab_; }  // immersive sound (ST 429-18): each edit unit an IABitstream frame
     // The largest edit unit in bytes (both eyes when stereoscopic): what the bit rate limit is checked against.
     uint64_t largestEditUnit() const;
     // Edit unit `index`'s essence (`eye` 1: the right one), decrypted with `key` (16 bytes) when encrypted.
@@ -196,10 +197,36 @@ private:
     uint64_t bodyStart_ = 0, fileSize_ = 0;
     int64_t containerDuration_ = 0;
     EditRate rate_;
-    bool stereo_ = false, encrypted_ = false, hmac_ = false, timedText_ = false;
+    bool stereo_ = false, encrypted_ = false, hmac_ = false, timedText_ = false, iab_ = false;
     Uuid asset_{}, keyId_{}, context_{};
     std::vector<std::pair<Uuid, uint32_t>> resourceStreams_;
 };
+
+// The FSK sync signal (SMPTE ST 430-12) a cinema's immersive sound processor follows the main sound by: four samples
+// a bit, a burst of 0x4D56 then the edit rate, which quarter of the track file's id comes next (the UUID sub-index),
+// those four bytes, the edit unit's index and a CRC (CCITT, MSB first), packets filling each edit unit (four at 24, 25
+// and 30 frames a second, two at 48 to 60, one at 96 to 120), at about -23 dBFS.
+class FskSync {
+public:
+    bool start(int fps, const Uuid& asset);  // 24, 25, 30, 48, 50, 60, 96, 100 or 120
+    // Edit unit `index`'s 48000 / fps samples (24-bit), carrying on from the one before.
+    void frame(int64_t index, int32_t* out, size_t stride = 1);
+
+private:
+    int code_ = 0, packets_ = 4, padding_ = 25, samples_ = 2000;
+    Uuid asset_{};
+    int subIndex_ = 0;
+    bool lastBit_ = false, polarity_ = false;
+};
+// What a stretch of the signal says: each whole packet found, its CRC checked.
+struct FskPacket {
+    int rateCode = 0, subIndex = 0;
+    std::array<uint8_t, 4> uuid{};
+    uint32_t editUnit = 0;
+    uint16_t crc = 0;  // as sent
+    bool crcOk = false;
+};
+std::vector<FskPacket> readFskSync(const int32_t* samples, size_t count, size_t stride = 1);
 
 // SMPTE ST 429-3: 24-bit PCM at 48 kHz, one picture frame of samples per KLV, with multichannel audio labels for
 // 5.1 (L R C LFE Ls Rs) or 7.1 DS (L R C LFE Lss Rss Lrs Rrs).
@@ -207,10 +234,21 @@ class SoundMxfWriter : public TrackFileWriter {
 public:
     bool open(const std::string& path, const Uuid& asset, int fps, int channels, const std::string& language,
               std::string* error = nullptr);
-    // Exactly samplesPerFrame() interleaved sample frames of `channels()` channels, -1..1.
+    // The 16 channels ST 429-19 has a reel with an immersive (IAB) track carry (channel configuration 4): the 5.1 or 7.1
+    // DS mix (`soundfield` 6 or 8) in channels 1 to 6 and, for 7.1's rear surrounds, 11 and 12 (syncChannel), and the FSK
+    // sync signal for the immersive sound in channel 14, each edit unit's index and this track file's id.
+    bool openWithSync(const std::string& path, const Uuid& asset, int fps, int soundfield, const std::string& language,
+                      std::string* error = nullptr);
+    // Exactly samplesPerFrame() interleaved sample frames of `channels()` channels, -1..1 (with sync, channel 14 is the
+    // signal whatever is given).
     bool write(const float* samples, std::string* error = nullptr);
     int channels() const { return channels_; }
+    int soundfield() const { return sync_ ? soundfield_ : channels_; }
+    bool sync() const { return sync_; }
     int samplesPerFrame() const { return 48000 / fps_; }
+    // Where a soundfield's channel `c` (in its order: L R C LFE Ls Rs, or L R C LFE Lss Rss Lrs Rrs) is among the 16.
+    static int syncChannel(int soundfield, int c) { return soundfield == 8 && c >= 6 ? c + 4 : c; }
+    static constexpr int kSyncChannel = 13;  // channel 14
 
 protected:
     std::vector<uint8_t> headerMetadata(int64_t duration) const override;
@@ -218,9 +256,33 @@ protected:
     std::array<uint8_t, 16> essenceContainer() const override;
 
 private:
-    int channels_ = 6;
+    int channels_ = 6, soundfield_ = 6;
+    bool sync_ = false;
+    FskSync fsk_;
+    std::vector<int32_t> fskBuf_;
     std::string language_ = "en";
     std::vector<uint8_t> buf_;
+};
+
+// SMPTE ST 429-18: a reel's immersive sound, one IABitstream frame (render/Iab.h, DLC coded under Application Profile 1)
+// an edit unit, frame-wrapped; its descriptor names Immersive Audio Coding, with a sub-descriptor of what the bitstream
+// holds at most and its sample rate.
+class IabMxfWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, int fps, int maxChannels, int maxObjects, std::string* error = nullptr);
+    bool write(const uint8_t* frame, size_t size, std::string* error = nullptr);
+    // The largest frame ST 429-18 allows at `fps` (781,250 bytes at 24).
+    static size_t maxFrameBytes(int fps) { return fps > 0 ? (18750000 + size_t(fps) - 1) / size_t(fps) : 0; }
+    static constexpr const char* kContainer = "060e2b34040101050e09060500000000";  // MXF-GC IAData frame wrapped
+    static constexpr const char* kCoding = "060e2b34040101050e09060400000000";     // Immersive Audio Coding
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    int maxChannels_ = 0, maxObjects_ = 0;
 };
 
 // ---- IMF ----------------------------------------------------------------------------------------------------------
@@ -369,6 +431,35 @@ private:
     std::vector<uint8_t> buf_;
 };
 
+// SMPTE ST 2067-201: immersive sound in IMF, IABitstream frames (render/Iab.h, PCM) clip-wrapped in one KLV with an
+// index entry for each frame; the descriptor (a sound descriptor of no channels at the composition's edit rate) carries
+// one IAB soundfield label with the language and the title, and the preface names the IAB track file's level 0 plug-in.
+class ImfIabWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, EditRate rate, const std::string& language, const std::string& title,
+              const std::string& titleVersion, std::string* error = nullptr);
+    bool write(const uint8_t* frame, size_t size, std::string* error = nullptr);
+    EditRate rate() const { return rate_; }
+    const Uuid& soundfieldId() const;
+    const Uuid& soundfieldLink() const;
+    const std::string& language() const { return language_; }
+    const std::string& title() const { return title_; }
+    const std::string& titleVersion() const { return version_; }
+    static constexpr const char* kContainer = "060e2b340401010d0d010301021d0101";   // IMF IAB clip wrapped
+    static constexpr const char* kCoding = "060e2b34040101050e09060400000000";      // Immersive Audio Coding
+    static constexpr const char* kSoundfield = "060e2b340401010d0302022100000000";  // the IAB soundfield
+    static constexpr const char* kLevel0 = "060e2b340401010d0101020102000000";      // IMF IAB track file, level 0
+    static constexpr int kReferenceLevel = -20;  // ReferenceAudioAlignmentLevel, dBFS
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    std::string language_ = "en", title_, version_;
+};
+
 // SMPTE ST 2067-2 timed text: one IMSC 1.1 document (the whole composition's, times from its start) clip-wrapped as
 // ST 429-5 has it, in the AS-02 layout, its descriptor naming the IMSC 1.1 Text or Image profile and the RFC 5646
 // language; an Image document's PNGs follow in generic stream partitions, each named by its resource id.
@@ -409,13 +500,13 @@ private:
 // frame, the samples of clip-wrapped sound, or the timed text document. Every length is checked against the file.
 class ImfTrackReader {
 public:
-    enum class Kind { Unknown, Picture, Sound, TimedText };
+    enum class Kind { Unknown, Picture, Sound, TimedText, Iab };
     // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000 or imfAces), without walking
     // the rest of a file that is not.
     bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false);
     Kind kind() const { return kind_; }
     const Uuid& asset() const { return asset_; }
-    int64_t frames() const { return int64_t(elements_.size()); }  // picture
+    int64_t frames() const { return int64_t(elements_.size()); }  // picture, or IAB (each frame an IABitstream frame)
     uint64_t largestFrame() const;                                // picture: the largest codestream's bytes
     int channels() const { return channels_; }                    // sound
     EditRate rate() const { return rate_; }                       // the descriptor's sample rate

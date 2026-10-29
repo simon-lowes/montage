@@ -196,22 +196,107 @@ std::vector<std::string> admBedChannels(const std::string& layout) {
     return out;
 }
 
+AdmPoint admSpeakerPoint(const Speaker& sp) {
+    const std::array<double, 2> xy = polarToCartesian(-sp.angle, 1);
+    return {xy[0], xy[1], sp.elevation > 0 ? 1.0 : 0.0};
+}
+
+struct ImmersiveMix::Impl {
+    const Project* p = nullptr;
+    std::string layout = "stereo";
+    int bedN = 2;
+    bool overhead = false;
+    std::vector<int> objects;
+    Sequence mixSeq;
+    AudioMixer bed;
+    std::vector<Sequence> objectSeqs;
+    std::vector<std::unique_ptr<AudioMixer>> objectMixers;
+    std::vector<float> stereo;
+};
+
+ImmersiveMix::ImmersiveMix() : d_(std::make_unique<Impl>()) {}
+ImmersiveMix::~ImmersiveMix() = default;
+const std::string& ImmersiveMix::layout() const { return d_->layout; }
+int ImmersiveMix::bedChannels() const { return d_->bedN; }
+bool ImmersiveMix::overhead() const { return d_->overhead; }
+const std::vector<int>& ImmersiveMix::objectTracks() const { return d_->objects; }
+
+bool ImmersiveMix::open(const Project& p, const Sequence& s, int rate, std::string* error) {
+    if (ambisonicLayout(s.audioLayout)) {
+        if (error) *error = "An immersive master is a bed of speakers and objects: an ambisonic mix is delivered as a file of its field (File > Export)";
+        return false;
+    }
+    d_ = std::make_unique<Impl>();
+    Impl& d = *d_;
+    d.p = &p;
+    if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) != audioLayouts().end()) d.layout = s.audioLayout;
+    d.bedN = layoutChannels(d.layout);
+    d.overhead = std::any_of(layoutSpeakers(d.layout).begin(), layoutSpeakers(d.layout).end(), [](const Speaker& k) { return k.elevation > 0; });
+    d.objects = admObjectTracks(s);
+    // The bed: every track but the objects, in the layout, with the objects' LFE sends and aux sends (a reverb return is
+    // part of the bed). Each object: only its track, after its fader, in stereo (centred, straight out, dry, no master
+    // inserts), as one channel.
+    d.mixSeq = s;
+    d.mixSeq.sampleRate = rate;
+    d.mixSeq.audioLayout = d.layout;
+    std::vector<bool> lfeOnly(s.audioTracks.size(), false);
+    for (int t : d.objects) lfeOnly[size_t(t)] = true;
+    d.bed.setLfeOnly(lfeOnly);
+    for (int t : d.objects) {
+        Sequence o = d.mixSeq;
+        o.audioLayout = "stereo";
+        o.masterEffects.clear();
+        Track& tr = o.audioTracks[size_t(t)];
+        tr.pan = 0;
+        tr.panAuto = Param{};
+        tr.output = 0;
+        tr.sends.clear();  // heard in the bed's returns
+        tr.muted = false;
+        tr.solo = false;
+        for (Track& other : o.audioTracks) other.solo = false;
+        d.objectSeqs.push_back(std::move(o));
+        auto m = std::make_unique<AudioMixer>();
+        std::vector<bool> only(s.audioTracks.size(), false);
+        only[size_t(t)] = true;
+        m->setTrackMask(only);
+        d.objectMixers.push_back(std::move(m));
+    }
+    return true;
+}
+
+void ImmersiveMix::mix(int64_t start, int n, float* bed, float* const* objects) {
+    Impl& d = *d_;
+    if (d.bedN > 2) d.bed.mixLayout(*d.p, d.mixSeq, start, n, bed);
+    else d.bed.mix(*d.p, d.mixSeq, start, n, bed);
+    d.stereo.resize(size_t(n) * 2);
+    for (size_t k = 0; k < d.objects.size(); ++k) {
+        d.objectMixers[k]->mix(*d.p, d.objectSeqs[k], start, n, d.stereo.data());
+        for (int i = 0; i < n; ++i) objects[k][i] = 0.70710678f * (d.stereo[size_t(i) * 2] + d.stereo[size_t(i) * 2 + 1]);
+    }
+}
+
+AdmPoint ImmersiveMix::objectAt(size_t k, double frame) const {
+    const Track& tr = d_->mixSeq.audioTracks[size_t(d_->objects[k])];
+    const bool moving = automationReads(trackAutomation(tr)) && surroundAnimated(tr);
+    const Position at = admPosition(moving ? trackSurroundAt(tr, frame) : tr.surround, d_->overhead);
+    return {at.x, at.y, at.z};
+}
+
 bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settings, const std::string& path, AdmResult* result,
                   const std::function<bool(double)>& progress, std::string* error) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
     };
-    if (ambisonicLayout(s.audioLayout))
-        return fail("An ADM master is a bed of speakers and objects: an ambisonic mix is delivered as a file of its field (File > Export)");
-    const std::string layout = std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) != audioLayouts().end()
-                                   ? s.audioLayout
-                                   : std::string("stereo");
-    const int bedN = layoutChannels(layout);
+    ImmersiveMix mix;
+    std::string why;
+    if (!mix.open(p, s, kRate, &why)) return fail(why);
+    const std::string layout = mix.layout();
+    const int bedN = mix.bedChannels();
     const std::vector<std::string> bedChannels = admBedChannels(layout);
     if (std::any_of(bedChannels.begin(), bedChannels.end(), [](const std::string& c) { return c.empty(); }))
         return fail("The sequence's speakers have no ADM names");
-    const std::vector<int> objects = admObjectTracks(s);
+    const std::vector<int>& objects = mix.objectTracks();
     const int channels = bedN + int(objects.size());
     if (channels > 128) return fail("An ADM master here holds up to 128 channels: the bed and at most " + std::to_string(128 - bedN) + " objects");
     FrameTime first = 0, end = s.duration();
@@ -278,52 +363,18 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
     if (f.write(head) != head.size()) return fail("Cannot write " + path);
     const qint64 dataStart = f.pos();
 
-    // The bed: every track but the objects, in the layout, with the objects' LFE sends and aux sends (a reverb return is
-    // part of the bed). Each object: only its track, after its fader, in stereo (centred, straight out, dry, no master
-    // inserts), as one channel.
-    Sequence mixSeq = s;
-    mixSeq.sampleRate = kRate;
-    mixSeq.audioLayout = layout;
-    // Objects keep their LFE send and aux sends in the bed.
-    std::vector<bool> lfeOnly(s.audioTracks.size(), false);
-    for (int t : objects) lfeOnly[size_t(t)] = true;
-    AudioMixer bed;
-    bed.setLfeOnly(lfeOnly);
-    std::vector<Sequence> objectSeqs;
-    std::vector<std::unique_ptr<AudioMixer>> objectMixers;
-    for (int t : objects) {
-        Sequence o = mixSeq;
-        o.audioLayout = "stereo";
-        o.masterEffects.clear();
-        Track& tr = o.audioTracks[size_t(t)];
-        tr.pan = 0;
-        tr.panAuto = Param{};
-        tr.output = 0;
-        tr.sends.clear();  // heard in the bed's returns
-        tr.muted = false;
-        tr.solo = false;
-        for (Track& other : o.audioTracks) other.solo = false;
-        objectSeqs.push_back(std::move(o));
-        auto m = std::make_unique<AudioMixer>();
-        std::vector<bool> only(s.audioTracks.size(), false);
-        only[size_t(t)] = true;
-        m->setTrackMask(only);
-        objectMixers.push_back(std::move(m));
-    }
     const int chunk = 4800;
-    std::vector<float> bedBuf(size_t(chunk) * size_t(bedN)), objBuf(size_t(chunk) * 2);
+    std::vector<float> bedBuf(size_t(chunk) * size_t(bedN)), objBuf(size_t(chunk) * std::max<size_t>(1, objects.size()));
+    std::vector<float*> objPtrs;
+    for (size_t k = 0; k < objects.size(); ++k) objPtrs.push_back(objBuf.data() + k * size_t(chunk));
     std::vector<float> frame(size_t(chunk) * size_t(channels));
     QByteArray pcm;
     for (int64_t done = 0; done < total; done += chunk) {
         const int n = int(std::min<int64_t>(chunk, total - done));
-        if (bedN > 2) bed.mixLayout(p, mixSeq, firstSample + done, n, bedBuf.data());
-        else bed.mix(p, mixSeq, firstSample + done, n, bedBuf.data());
-        for (int i = 0; i < n; ++i)
+        mix.mix(firstSample + done, n, bedBuf.data(), objPtrs.data());
+        for (int i = 0; i < n; ++i) {
             for (int c = 0; c < bedN; ++c) frame[size_t(i) * size_t(channels) + size_t(c)] = bedBuf[size_t(i) * size_t(bedN) + size_t(c)];
-        for (size_t k = 0; k < objects.size(); ++k) {
-            objectMixers[k]->mix(p, objectSeqs[k], firstSample + done, n, objBuf.data());
-            for (int i = 0; i < n; ++i)
-                frame[size_t(i) * size_t(channels) + size_t(bedN) + k] = 0.70710678f * (objBuf[size_t(i) * 2] + objBuf[size_t(i) * 2 + 1]);
+            for (size_t k = 0; k < objects.size(); ++k) frame[size_t(i) * size_t(channels) + size_t(bedN) + k] = objPtrs[k][i];
         }
         pcm.resize(n * channels * 3);
         char* d = pcm.data();

@@ -7461,6 +7461,13 @@ private slots:
         QVERIFY(made.value("problems").toArray().isEmpty() && made.value("frames").toInt() == 24 && made.value("width").toInt() == 2048);
         r = call("montage_verify_dcp", {{"folder", made.value("folder").toString()}});
         QVERIFY(r.value("structuredContent").toObject().value("ok").toBool());
+        // With the immersive sound as an IAB track as well: the stereo bed (left and right), no objects.
+        r = call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp-iab")}, {"title", "Immersive"}, {"iab", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject immersive = r.value("structuredContent").toObject();
+        QVERIFY2(immersive.value("problems").toArray().isEmpty() && immersive.value("iab").toObject().value("bed_channels").toInt() == 2 &&
+                     immersive.value("iab").toObject().value("objects").toInt() == 0,
+                 QJsonDocument(immersive).toJson().constData());
         QFile::remove(QDir(made.value("folder").toString()).filePath("VOLINDEX.xml"));
         r = call("montage_verify_dcp", {{"folder", made.value("folder").toString()}});
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
@@ -7487,7 +7494,8 @@ private slots:
             auto* subtitles = dlg->findChild<QComboBox*>("dcpSubtitles");
             auto* kind = dlg->findChild<QComboBox*>("dcpSubtitleKind");
             auto* encrypt = dlg->findChild<QCheckBox*>("dcpEncrypt");
-            offered = resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
+            auto* iab = dlg->findChild<QCheckBox*>("dcpImmersive");
+            offered = iab && iab->isEnabled() && !iab->isChecked() && resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
                       subtitles->currentIndex() == 0 && subtitles->itemText(1).startsWith("French") && kind && !kind->isEnabled() &&
                       kind->count() == 3 && encrypt &&
                       encrypt->isEnabled() == dcp::securityAvailable();
@@ -7616,7 +7624,8 @@ private slots:
             auto* supplemental = dlg->findChild<QCheckBox*>("imfSupplemental");
             auto* earlier = dlg->findChild<QLineEdit*>("imfEarlier");
             auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
-            offered = sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
+            auto* iab = dlg->findChild<QCheckBox*>("imfImmersive");
+            offered = iab && iab->isEnabled() && !iab->isChecked() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
             // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");

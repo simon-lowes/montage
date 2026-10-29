@@ -7278,6 +7278,12 @@ void MainWindow::exportImfDialog() {
     soundBox->addWidget(sounds);
     soundBox->addLayout(soundButtons);
     form->addRow(tr("Sound:"), soundBox);
+    auto* immersive = new QCheckBox(tr("Immersive sound (IAB): the programme's beds and objects"), &dlg);
+    immersive->setObjectName(QStringLiteral("imfImmersive"));
+    immersive->setEnabled(!ambisonicLayout(s->audioLayout));
+    immersive->setToolTip(ambisonicLayout(s->audioLayout) ? tr("An ambisonic mix has no beds or objects")
+                                                          : tr("An IAB sequence (SMPTE ST 2067-201) beside the main sound, in the package's language"));
+    form->addRow(QString(), immersive);
     // Each caption track as timed text: subtitles, captions for the deaf and hard of hearing, forced narrative, or left out.
     auto* texts = new QTableWidget(0, 3, &dlg);
     texts->setObjectName(QStringLiteral("imfTexts"));
@@ -7396,6 +7402,7 @@ void MainWindow::exportImfDialog() {
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
+    st.immersive = immersive->isEnabled() && immersive->isChecked();
     for (int row = 0; row < sounds->rowCount(); ++row) {
         ImfSound v;
         v.language = sounds->item(row, 0) ? sounds->item(row, 0)->text().trimmed().toStdString() : std::string();
@@ -7505,6 +7512,12 @@ void MainWindow::exportDcpDialog() {
     encrypt->setEnabled(dcp::securityAvailable());
     if (!dcp::securityAvailable()) encrypt->setToolTip(tr("This build has no OpenSSL"));
     form->addRow(QString(), encrypt);
+    auto* immersive = new QCheckBox(tr("Immersive sound (IAB) beside the 5.1 or 7.1: the mix's beds and objects"), &dlg);
+    immersive->setObjectName(QStringLiteral("dcpImmersive"));
+    immersive->setEnabled(!ambisonicLayout(s->audioLayout));
+    immersive->setToolTip(ambisonicLayout(s->audioLayout) ? tr("An ambisonic mix has no beds or objects")
+                                                          : tr("An IAB track for immersive cinemas (SMPTE ST 429-18); the 5.1 or 7.1 then carries the sync signal it plays to"));
+    form->addRow(QString(), immersive);
     auto* rate = new QComboBox(&dlg);
     rate->setObjectName(QStringLiteral("dcpRate"));
     rate->addItem(tr("As the sequence (%1 fps)").arg(dcpFrameRate(*s, 0)), 0);
@@ -7570,6 +7583,7 @@ void MainWindow::exportDcpDialog() {
     st.closedCaptions = st.subtitles && subtitleKind->currentData().toString() == QLatin1String("closed");
     st.burnIn = st.subtitles && subtitleKind->currentData().toString() == QLatin1String("burn");
     st.encrypt = encrypt->isEnabled() && encrypt->isChecked();
+    st.immersive = immersive->isEnabled() && immersive->isChecked();
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     appSettings().setValue(QStringLiteral("dcp/issuer"), issuer->text().trimmed());
     appSettings().setValue(QStringLiteral("dcp/studio"), studio->text().trimmed());

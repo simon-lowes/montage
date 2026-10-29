@@ -88,6 +88,10 @@ struct ImfSettings {
     bool graded = true;
     // Application #5: sequence frames (within what is exported) also given as target frames.
     std::vector<FrameTime> targetFrames;
+    // Immersive sound (SMPTE ST 2067-201): the programme's mix as beds and objects (render/Adm.h ImmersiveMix), an
+    // IABSequence in `language` beside the main audio. Not at every rate: IAB has 23.976, 24, 25, 29.97, 30, 48, 50,
+    // 59.94, 60, 96, 100 and 120.
+    bool immersive = false;
 };
 
 struct ImfResult {
@@ -106,6 +110,8 @@ struct ImfResult {
     std::string outputTransform;  // Application #5: the output transform named (ACESAuthoringInformation)
     int targetFrames = 0;
     std::string amf;              // ... and the ACES Metadata File, when there are target frames
+    bool immersive = false;       // an IABSequence: its bed channels and objects
+    int iabBedChannels = 0, iabObjects = 0;
 };
 
 // A composition playlist as read back: its virtual tracks (each Resource with the track file it plays), and what the

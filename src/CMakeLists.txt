@@ -167,6 +167,7 @@ add_library(montage_engine STATIC
   render/Imf.h render/Imf.cpp
   render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp
+  render/Iab.h render/Iab.cpp
   render/Iamf.h render/Iamf.cpp
   render/HdrStill.h render/HdrStill.cpp
   render/Relight.h render/Relight.cpp

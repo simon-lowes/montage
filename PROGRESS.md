@@ -1602,6 +1602,19 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - A Track node follows a clip's transform or Corner Pin; the camera solve is used through a 3D model input's camera, not as a track mode.
     - 3D scenes and deep images come in as inputs (generators, the clip, bin items); there is no separate 3D or Deep node.
     - The Grade node's colour nodes come from a clip (grade_from); they are not edited in the Nodes panel there.
-- [ ] 13. IAB immersive audio in IMF and DCP, and S-ADM in IMF (M)
+- [x] 13. IAB immersive audio in IMF and DCP, and S-ADM in IMF (M)
+  - Done: the DCP and IMF exports' Immersive sound (IAB) option adds the immersive mix (render/Iab `Program`, the same beds and objects as the ADM master) beside the main sound.
+    - DCP: an IAB track file (ST 429-18: frame-wrapped, its descriptor and sub-descriptor with the most channels and objects, the IAB sample rate), Application Profile 1 (at most 118 objects, 128 rendered), DLC coded; the CPL's AuxData element with the IAB data type, the IAB Profile ExtensionMetadata property, "51-IAB" or "71-IAB" in the name; encrypted with its own MDEK key (in the DKDM and so in KDMs). The main sound becomes ST 429-19's 16 channels (5.1 in 1-6, 7.1's rear surrounds in 11-12, configuration 4's labels) with the ST 430-12 FSK sync signal in channel 14 (packets naming the sound track file's id and the edit unit, CRC-16).
+    - IMF: an IABSequence (ST 2067-201: clip-wrapped, the IAB essence descriptor and soundfield sub-descriptor with language, title and version, ConformsTo, -20 dB alignment level) of PCM frames at the composition's edit rate, mixed at 48 kHz, in the package's language, with its RegXML descriptor in the CPL.
+    - The checks after export read every IAB frame (rate, sizes, coding, elements Montage skips, Application Profile 1's limits and bed channels), and for a DCP the 16-channel sound and its sync packets (CRC, edit unit, the sound file's id).
+    - The export dialogs' checkbox (not for an ambisonic mix) and MCP `montage_export_dcp`/`montage_export_imf` `iab` (results give `iab.bed_channels` and `iab.objects`).
+  - **Tests:**
+    - render `immersiveTrackFiles`: FSK packets against an independent CRC-16/XMODEM, the first sample, the UUID sub-index cycling at each rate, a damaged bit caught; the IAB writers read back by Montage's readers; asdcplib's as-02-info reads the IMF IAB track (MONTAGE_TEST_ASDCP).
+    - render `exportsImmersiveImfAndDcp`: a DCP with a moving object made and checked (IAB frames, 16 channels with sync, CPL entries), a plain 6-channel sound put in its place caught, an encrypted one's DKDM with the MDEK key; an IMF master made and checked, its IAB frames and CPL, Photon passing it (MONTAGE_TEST_PHOTON).
+    - app `exportDcpFromTheFileMenu`/`exportImfFromTheFileMenu`: the dialogs offer it; over MCP, the bed reported.
+  - Not yet:
+    - S-ADM in IMF (ST 2067-203): the track file's frames follow ST 2127-1's MGA layout, which is only in the paid standard (bmx has the descriptors and labels, not the frames). The ADM BWF master stays the ADM deliverable.
+    - Not checked with an IAB renderer or validator: building the open IAB renderer and validator in CI was refused; checked against the standards and asdcplib's reader.
+    - No IAB in: an IAB track in a package Montage imports is not read as sound.
 - [ ] 14. Remote grading (M)
 - [ ] 15. Montage in other languages (M)

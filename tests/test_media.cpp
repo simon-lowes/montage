@@ -59,6 +59,7 @@
 #include "core/Multicam.h"
 #include "core/Effects.h"
 #include "render/MeshWarp.h"
+#include "render/Iab.h"
 #include "core/Expression.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectMerge.h"
@@ -11992,6 +11993,199 @@ private slots:
         QVERIFY(surroundAnimated(moved));
         QVERIFY(std::fabs(trackSurroundAt(moved, 0).x + 1) < 1e-9 && std::fabs(trackSurroundAt(moved, 60).x - 1) < 1e-9);
         QVERIFY(std::fabs(trackSurroundAt(moved, 60).z - 0.5) < 1e-9);
+    }
+
+    void iabFramesAndLosslessCoding() {
+        // A frame at 24 fps: a bed of four channels and two objects, its waveforms a tone, noise, full scale both ways
+        // and silence; written as PCM and as DLC, read back sample for sample.
+        const int n = iab::frameSamples(iab::rateCode(24, 1));
+        QCOMPARE(n, 2000);
+        std::mt19937 rng(7);
+        std::uniform_int_distribution<int32_t> noise(-8388608, 8388607);
+        std::vector<int32_t> tone(static_cast<size_t>(n)), hiss(static_cast<size_t>(n)), edges(static_cast<size_t>(n)), quiet(size_t(n), 0), low(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            tone[size_t(i)] = int32_t(std::lround(3000000 * std::sin(2 * M_PI * 440 * i / 48000.0) + 200000 * std::sin(2 * M_PI * 3100 * i / 48000.0)));
+            hiss[size_t(i)] = noise(rng);
+            edges[size_t(i)] = i % 3 == 0 ? -8388608 : i % 3 == 1 ? 8388607 : 0;
+            low[size_t(i)] = noise(rng) / 4096;
+        }
+        iab::Frame f;
+        f.rate = 0;
+        f.bed = {{iab::L, 1}, {iab::C, 2}, {iab::R, 3}, {iab::LFE, 0}};  // LFE silent: no waveform
+        f.audio = {{1, tone}, {2, hiss}, {3, edges}, {300, quiet}, {70000, low}};
+        iab::Object a{1, 300, std::vector<iab::Point>(8, {0.25, 0.5, 0})};
+        iab::Object b{2, 70000, {}};  // an AudioDataID past Plex(8)'s first field
+        for (int sb = 0; sb < 8; ++sb) b.pan.push_back({sb / 7.0, 1 - sb / 7.0, sb < 4 ? 0.0 : 1.0});
+        f.objects = {a, b};
+        std::vector<uint8_t> pcmBytes, dlcBytes;
+        std::string err;
+        QVERIFY2(iab::writeFrame(f, false, pcmBytes, &err), err.c_str());
+        QVERIFY2(iab::writeFrame(f, true, dlcBytes, &err), err.c_str());
+        QVERIFY(dlcBytes.size() < pcmBytes.size());
+        for (const std::vector<uint8_t>* bytes : {&pcmBytes, &dlcBytes}) {
+            iab::Frame g;
+            size_t used = 0;
+            QVERIFY2(iab::readFrame(bytes->data(), bytes->size(), g, &err, &used), err.c_str());
+            QCOMPARE(used, bytes->size());
+            QCOMPARE(g.dlc, bytes == &dlcBytes);
+            QCOMPARE(g.rate, 0);
+            QCOMPARE(g.maxRendered, 6);
+            QCOMPARE(g.bed.size(), size_t(4));
+            QCOMPARE(g.bed[3].id, int(iab::LFE));
+            QCOMPARE(g.bed[3].audio, 0u);
+            QVERIFY(g.audio == f.audio);
+            QCOMPARE(g.objects.size(), size_t(2));
+            QCOMPARE(g.objects[1].audio, 70000u);
+            for (int sb = 0; sb < 8; ++sb) {
+                QVERIFY(std::fabs(g.objects[0].pan[size_t(sb)].x - 0.25) < 1e-4 && std::fabs(g.objects[0].pan[size_t(sb)].y - 0.5) < 1e-4);
+                QVERIFY(std::fabs(g.objects[1].pan[size_t(sb)].x - sb / 7.0) < 1e-4 && std::fabs(g.objects[1].pan[size_t(sb)].z - (sb < 4 ? 0 : 1)) < 1e-4);
+            }
+        }
+        // The positions' codes (5.4): the walls and the middle exactly.
+        {
+            iab::Frame g;
+            QVERIFY(iab::readFrame(pcmBytes.data(), pcmBytes.size(), g, &err));
+            QCOMPARE(g.objects[1].pan[0].x, 0.0);
+            QCOMPARE(g.objects[1].pan[7].x, 1.0);
+            QCOMPARE(g.objects[0].pan[0].y, 0.5);
+        }
+        // DLC on its own: a tone codes to well under its 24 bits a sample, noise to no more than them, both exactly.
+        auto dlcRoundTrip = [&](const std::vector<int32_t>& x, size_t& bytes) {
+            const std::vector<uint8_t> coded = iab::encodeDlc(x.data(), n, 0);
+            bytes = coded.size();
+            std::vector<int32_t> back;
+            std::string why;
+            return iab::decodeDlc(coded.data(), coded.size(), 0, n, back, &why) && back == x;
+        };
+        size_t toneBytes = 0, hissBytes = 0, edgeBytes = 0, quietBytes = 0;
+        QVERIFY(dlcRoundTrip(tone, toneBytes));
+        QVERIFY(dlcRoundTrip(hiss, hissBytes));
+        QVERIFY(dlcRoundTrip(edges, edgeBytes));
+        QVERIFY(dlcRoundTrip(quiet, quietBytes));
+        QVERIFY2(toneBytes < size_t(n) * 3 * 4 / 5, qPrintable(QString::number(toneBytes)));  // under 20 bits a sample
+        QVERIFY2(hissBytes <= size_t(n) * 3 + 64, qPrintable(QString::number(hissBytes)));
+        QVERIFY2(quietBytes < 16, qPrintable(QString::number(quietBytes)));
+        // A rising tone at every whole rate DLC has (its sub-blocks of 100 to 200 samples): exact, and smaller.
+        for (int code = 0; code < 9; ++code) {
+            const int m = iab::frameSamples(code);
+            std::vector<int32_t> x(static_cast<size_t>(m));
+            for (int i = 0; i < m; ++i) x[size_t(i)] = int32_t(4000000 * std::sin(2 * M_PI * (100 + i * 0.05) * i / 48000.0));
+            const std::vector<uint8_t> coded = iab::encodeDlc(x.data(), m, code);
+            std::vector<int32_t> back;
+            QVERIFY2(iab::decodeDlc(coded.data(), coded.size(), code, m, back, &err) && back == x, qPrintable(QString::number(code)));
+            QVERIFY2(coded.size() < size_t(m) * 3 * 4 / 5, qPrintable(QString("%1: %2 bytes for %3 samples").arg(code).arg(coded.size()).arg(m)));
+        }
+        // 29.97: no DLC; a FrameSequence numbers the frames, whose lengths follow the five-frame cadence.
+        {
+            iab::Frame s;
+            s.rate = iab::rateCode(30000, 1001);
+            QCOMPARE(s.rate, 0xA);
+            QVERIFY(!iab::writeFrame(s, true, pcmBytes, &err));
+            int64_t total = 0;
+            for (int k = 0; k < 5; ++k) {
+                s.frameIndex = k;
+                const int m = iab::frameSamples(s.rate, k);
+                total += m;
+                s.bed = {{iab::C, 1}};
+                s.audio = {{1, std::vector<int32_t>(size_t(m), k)}};
+                QVERIFY2(iab::writeFrame(s, false, pcmBytes, &err), err.c_str());
+                iab::Frame g;
+                QVERIFY2(iab::readFrame(pcmBytes.data(), pcmBytes.size(), g, &err), err.c_str());
+                QCOMPARE(g.frameIndex, k);
+                QCOMPARE(int(g.audio[1].size()), m);
+            }
+            QCOMPARE(total, int64_t(8008));  // five frames of 29.97 at 48 kHz
+        }
+        // Damaged frames are refused, not misread.
+        for (size_t cut : {size_t(3), size_t(12), dlcBytes.size() / 2, dlcBytes.size() - 1}) {
+            iab::Frame g;
+            QVERIFY(!iab::readFrame(dlcBytes.data(), cut, g, &err));
+        }
+
+        // A 5.1 sequence with an object going from the left to the right as IAB frames: the bed as a cinema's (each
+        // surround split between its side's side and rear surrounds at -3 dB), the object's waveform the track alone,
+        // moving across the frames' pan sub-blocks.
+        const int rate = 48000;
+        auto wav = [&](double hz, const char* name) {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / rate));
+            const std::string file = path(name);
+            writeMonoWav(file, x, rate);
+            return file;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        for (const std::string& file : {wav(1000, "iab1k.wav"), wav(440, "iab440.wav")}) p.media.push_back(probeOrFail(p, file));
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        s.audioLayout = "5.1";
+        s.audioTracks[0].surround.x = -1, s.audioTracks[0].surround.y = 0, s.audioTracks[0].surround.width = 0;  // the left surround side
+        Track& obj = s.audioTracks[1];
+        obj.surround.object = true, obj.surround.width = 0;
+        obj.surroundXAuto.addKey(0, -1);
+        obj.surroundXAuto.addKey(48, 1);
+        obj.surroundYAuto.addKey(0, 0);
+        obj.surroundYAuto.addKey(48, 0);
+        iab::ProgramSettings ps;
+        ps.frames = 48;
+        ps.dlc = true;
+        ps.cinema = true;
+        iab::Program prog;
+        QVERIFY2(prog.open(p, s, ps, &err), err.c_str());
+        QCOMPARE(prog.bedChannels(), 8);  // L C R Lss Lrs Rrs Rss LFE
+        QCOMPARE(prog.objects(), 1);
+        std::vector<uint8_t> frame;
+        std::vector<iab::Frame> frames;
+        err.clear();
+        while (prog.next(frame, &err)) {
+            iab::Frame g;
+            QVERIFY2(iab::readFrame(frame.data(), frame.size(), g, &err), err.c_str());
+            frames.push_back(std::move(g));
+        }
+        QVERIFY2(err.empty(), err.c_str());
+        QCOMPARE(frames.size(), size_t(48));
+        const iab::Frame& mid = frames[24];
+        QVERIFY(mid.dlc);
+        std::vector<int> ids;
+        for (const iab::BedChannel& c : mid.bed) ids.push_back(c.id);
+        QVERIFY(ids == (std::vector<int>{iab::L, iab::C, iab::R, iab::Lss, iab::Lrs, iab::Rrs, iab::Rss, iab::LFE}));
+        auto level = [&](const iab::Frame& g, uint32_t audio) {
+            double acc = 0;
+            for (int32_t v : g.audio.at(audio)) acc += double(v) * v;
+            return std::sqrt(acc / double(g.audio.at(audio).size())) / 8388608.0;
+        };
+        // A1 at the left surround only: Lss and Lrs equal, R silent.
+        const double lss = level(mid, mid.bed[3].audio), lrs = level(mid, mid.bed[4].audio);
+        QVERIFY2(lss > 0.05 && std::fabs(lss - lrs) < 1e-6, qPrintable(QString("%1 %2").arg(lss).arg(lrs)));
+        QVERIFY(level(mid, mid.bed[2].audio) < 1e-4);
+        // The object: 440 Hz at the track's level, from the left wall to the right one.
+        QCOMPARE(mid.objects.size(), size_t(1));
+        QVERIFY2(level(mid, mid.objects[0].audio) > 0.1, qPrintable(QString::number(level(mid, mid.objects[0].audio))));
+        QVERIFY(frames.front().objects[0].pan.front().x < 0.02);
+        QVERIFY(frames.back().objects[0].pan.back().x > 0.97);
+        QVERIFY(mid.objects[0].pan.front().x < mid.objects[0].pan.back().x);
+        QVERIFY(std::fabs(mid.objects[0].pan[0].x - 0.5) < 0.05);
+        // Above: 7.1.4's top front and top rear speakers become objects fixed in the ceiling.
+        s.audioLayout = "7.1.4";
+        QVERIFY2(prog.open(p, s, ps, &err), err.c_str());
+        QCOMPARE(prog.bedChannels(), 8);
+        QCOMPARE(prog.objects(), 5);
+        QVERIFY(prog.next(frame, &err));
+        iab::Frame top;
+        QVERIFY(iab::readFrame(frame.data(), frame.size(), top, &err));
+        QCOMPARE(top.objects.size(), size_t(5));
+        for (size_t k = 0; k < 4; ++k) QCOMPARE(top.objects[k].pan[0].z, 1.0);
+        QVERIFY(top.objects[0].pan[0].x < 0.5 && top.objects[0].pan[0].y < 0.5);  // Ltf: front left
+        QVERIFY(top.objects[3].pan[0].x > 0.5 && top.objects[3].pan[0].y > 0.5);  // Rtr: back right
+        // Fractional rates: 23.976 frames of 2002 samples as PCM; DLC has none.
+        ps.rateNum = 24000, ps.rateDen = 1001;
+        QVERIFY(!prog.open(p, s, ps, &err));
+        ps.dlc = false;
+        QVERIFY2(prog.open(p, s, ps, &err), err.c_str());
+        QVERIFY(prog.next(frame, &err));
+        QVERIFY(iab::readFrame(frame.data(), frame.size(), top, &err));
+        QCOMPARE(top.audio.begin()->second.size(), size_t(2002));
     }
 
     void sidechainKeying() {

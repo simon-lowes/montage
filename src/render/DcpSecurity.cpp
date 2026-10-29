@@ -681,7 +681,9 @@ bool makeKdm(const KdmSettings& s, const CertificateChain& chain, std::string& x
     x += "        <KeyIdList>\n";
     for (const ContentKey& k : s.keys) {
         x += "          <TypedKeyId>\n";
-        x += "            <KeyType scope=\"http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type\">" + xmlEscaped(k.type) + "</KeyType>\n";
+        // (an immersive track's MDEK is in the scope that defined it)
+        const char* scope = k.type == "MDEK" ? "http://www.dolby.com/cp850/2012/KDM#kdm-key-type" : "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type";
+        x += "            <KeyType scope=\"" + std::string(scope) + "\">" + xmlEscaped(k.type) + "</KeyType>\n";
         x += "            <KeyId>urn:uuid:" + uuidString(k.id) + "</KeyId>\n";
         x += "          </TypedKeyId>\n";
     }

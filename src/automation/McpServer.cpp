@@ -10217,7 +10217,8 @@ void McpServer::Impl::addTools() {
             "subtitles":{"type":"string","description":"A caption track, by name or language, to go with it"},
             "subtitles_as":{"type":"string","enum":["subtitles","closed_captions","burn_in"],"default":"subtitles"},
             "subtitle_language":{"type":"string","description":"RFC 5646; default: the caption track's"},
-            "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"}},"required":["project","folder"]})json",
+            "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"},
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the mix's beds and objects as an IAB track (ST 429-18, Application Profile 1); the 5.1 or 7.1 then goes in 16 channels with the sync signal (ST 429-19)"}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -10226,6 +10227,7 @@ void McpServer::Impl::addTools() {
             st.resolution = str(a, "resolution", "2k").toStdString();
             st.stereo = a.value("stereo").toBool();
             st.encrypt = a.value("encrypt").toBool();
+            st.immersive = a.value("iab").toBool();
             const QString as = str(a, "subtitles_as", "subtitles");
             if (as != QLatin1String("subtitles") && as != QLatin1String("closed_captions") && as != QLatin1String("burn_in"))
                 throw ArgError{"subtitles_as is subtitles, closed_captions or burn_in"};
@@ -10268,7 +10270,7 @@ void McpServer::Impl::addTools() {
             for (const std::string& i : advice) advised.append(QString::fromStdString(i));
             if (r.overLoudnessLimit())
                 found.append(QStringLiteral("The sound is %1 Leq(M), over the %2 its kind is held to").arg(r.leqm, 0, 'f', 1).arg(r.leqmLimit, 0, 'f', 0));
-            const QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
+            QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
                                   {"cpl", QString::fromStdString(r.cpl)}, {"cpl_id", QString::fromStdString(r.cplId)},
                                   {"frames", double(r.frames)}, {"fps", r.fps},
                                   {"width", r.width}, {"height", r.height}, {"channels", r.channels},
@@ -10278,6 +10280,7 @@ void McpServer::Impl::addTools() {
                                   {"leqm", std::round(r.leqm * 10) / 10},
                                   {"leqm_limit", r.leqmLimit > 0 ? QJsonValue(r.leqmLimit) : QJsonValue()},
                                   {"problems", found}, {"advice", advised}};
+            if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(QString::fromStdString(r.name))
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(QString::fromStdString(r.name)).arg(found.size()),
                       out);
@@ -10373,7 +10376,8 @@ void McpServer::Impl::addTools() {
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
             "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
-            "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"}},
+            "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -10421,6 +10425,7 @@ void McpServer::Impl::addTools() {
             }
             st.application = a.value("application").toInt(2);
             st.graded = a.value("graded").toBool(true);
+            st.immersive = a.value("iab").toBool();
             for (const QJsonValue& v : a.value("target_frames").toArray()) {
                 if (!v.isDouble() || v.toDouble() != std::floor(v.toDouble()) || v.toDouble() < 0)
                     throw ArgError{QStringLiteral("target_frames are whole frame numbers")};
@@ -10443,6 +10448,7 @@ void McpServer::Impl::addTools() {
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+            if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             if (r.application == 5) {
                 out["output_transform"] = QString::fromStdString(r.outputTransform);
                 out["target_frames"] = r.targetFrames;

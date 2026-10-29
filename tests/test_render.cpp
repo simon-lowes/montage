@@ -61,6 +61,7 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
+#include "render/Iab.h"
 #include "render/ImageSubtitles.h"
 #include "media/TextReader.h"
 #include "render/DcpSecurity.h"
@@ -8598,6 +8599,284 @@ colorspaces:
         QVERIFY(fontOut.open(QIODevice::ReadOnly) && fontOut.readAll() == QByteArray(5000, 7));
         const auto [code3, text3] = run("asdcp-unwrap", {"-m", "-k", hexKey, dir.filePath("sound-encrypted.mxf"), dir.filePath("out/sound")});
         QVERIFY2(code3 == 0, qPrintable(text3));
+    }
+
+    void immersiveTrackFiles() {
+        // The FSK sync signal: each packet's CRC is CRC-16/XMODEM of its eight bytes after the sync word (worked out
+        // here byte by byte), the UUID's quarters in turn, the edit unit's index; the first bit (a 0) starts positive.
+        const dcp::Uuid asset = dcp::newUuid();
+        auto xmodem = [](const std::vector<uint8_t>& bytes) {
+            uint16_t crc = 0;
+            for (uint8_t b : bytes) {
+                crc ^= uint16_t(b << 8);
+                for (int i = 0; i < 8; ++i) crc = (crc & 0x8000) ? uint16_t(crc << 1 ^ 0x1021) : uint16_t(crc << 1);
+            }
+            return crc;
+        };
+        for (int fps : {24, 25, 30, 48, 96}) {
+            dcp::FskSync fsk;
+            QVERIFY(fsk.start(fps, asset));
+            int sub = 0;
+            for (int64_t unit = 0; unit < 3; ++unit) {
+                std::vector<int32_t> samples(size_t(48000 / fps));
+                fsk.frame(unit, samples.data());
+                if (unit == 0) QCOMPARE(samples[0], int32_t(0.03827 * 8388608.0));
+                const auto packets = dcp::readFskSync(samples.data(), samples.size());
+                QCOMPARE(int(packets.size()), fps <= 30 ? 4 : fps <= 60 ? 2 : 1);
+                for (const dcp::FskPacket& pk : packets) {
+                    QVERIFY(pk.crcOk);
+                    QCOMPARE(pk.subIndex, sub);
+                    QCOMPARE(pk.editUnit, uint32_t(unit));
+                    QVERIFY(std::equal(pk.uuid.begin(), pk.uuid.end(), asset.begin() + 4 * sub));
+                    std::vector<uint8_t> bytes = {uint8_t(pk.rateCode << 4 | sub)};
+                    bytes.insert(bytes.end(), pk.uuid.begin(), pk.uuid.end());
+                    for (int shift : {16, 8, 0}) bytes.push_back(uint8_t(unit >> shift));
+                    QCOMPARE(pk.crc, xmodem(bytes));
+                    sub = (sub + 1) % 4;
+                }
+            }
+        }
+        {
+            // A damaged bit fails its packet's CRC.
+            dcp::FskSync fsk;
+            QVERIFY(fsk.start(24, asset));
+            std::vector<int32_t> samples(2000);
+            fsk.frame(7, samples.data());
+            for (int i = 4 * 40 + 2; i < 4 * 41; ++i) samples[size_t(i)] = -samples[size_t(i)];  // bit 40 read the other way
+            const auto packets = dcp::readFskSync(samples.data(), samples.size());
+            QVERIFY(!packets.empty() && !packets[0].crcOk);
+        }
+        QVERIFY(!dcp::FskSync().start(23, asset));
+
+        // IAB frames in the cinema's track file (ST 429-18) and IMF's (ST 2067-201), read back unchanged.
+        QTemporaryDir dir;
+        std::vector<std::vector<uint8_t>> frames;
+        for (int k = 0; k < 5; ++k) {
+            iab::Frame f;
+            f.rate = iab::rateCode(24, 1);
+            std::vector<int32_t> wave(2000);
+            for (size_t i = 0; i < wave.size(); ++i) wave[i] = int32_t(std::lround(3e6 * std::sin(0.01 * double(i + 2000 * size_t(k)))));
+            f.audio[1] = wave;
+            f.bed = {{iab::C, 1}};
+            std::vector<uint8_t> out;
+            std::string err;
+            QVERIFY2(iab::writeFrame(f, true, out, &err), err.c_str());
+            frames.push_back(out);
+        }
+        std::string err;
+        {
+            dcp::IabMxfWriter w;
+            const dcp::Uuid id = dcp::newUuid();
+            QVERIFY2(w.open(dir.filePath("iab.mxf").toStdString(), id, 24, 1, 0, &err), err.c_str());
+            for (const auto& f : frames) QVERIFY2(w.write(f.data(), f.size(), &err), err.c_str());
+            std::vector<uint8_t> huge(dcp::IabMxfWriter::maxFrameBytes(24) + 1);
+            QVERIFY(!w.write(huge.data(), huge.size(), &err) && err.find("781250") != std::string::npos);
+            QVERIFY2(w.close(&err), err.c_str());
+            dcp::TrackFileReader r;
+            QVERIFY2(r.open(dir.filePath("iab.mxf").toStdString(), &err), err.c_str());
+            QVERIFY(r.iab() && r.editUnits() == 5 && r.containerDuration() == 5 && r.asset() == id && r.editRate().num == 24);
+            for (int k = 0; k < 5; ++k) {
+                std::vector<uint8_t> got;
+                QVERIFY(r.read(k, 0, got, nullptr, &err));
+                QVERIFY(got == frames[size_t(k)]);
+            }
+        }
+        {
+            dcp::ImfIabWriter w;
+            const dcp::Uuid id = dcp::newUuid();
+            QVERIFY2(w.open(dir.filePath("imf-iab.mxf").toStdString(), id, {24, 1}, "de", "Title", "1", &err), err.c_str());
+            for (const auto& f : frames) QVERIFY2(w.write(f.data(), f.size(), &err), err.c_str());
+            QVERIFY2(w.close(&err), err.c_str());
+            QCOMPARE(w.duration(), int64_t(5));
+            dcp::ImfTrackReader r;
+            QVERIFY2(r.open(dir.filePath("imf-iab.mxf").toStdString(), &err), err.c_str());
+            QVERIFY(r.kind() == dcp::ImfTrackReader::Kind::Iab && r.frames() == 5 && r.asset() == id && r.rate().num == 24);
+            for (int k = 0; k < 5; ++k) {
+                std::vector<uint8_t> got;
+                QVERIFY(r.frame(k, got, &err));
+                QVERIFY(got == frames[size_t(k)]);
+            }
+        }
+        // asdcplib's AS-02 reader takes the IMF file as IAB (when MONTAGE_TEST_ASDCP names its tools).
+        if (const QString tools = qEnvironmentVariable("MONTAGE_TEST_ASDCP"); !tools.isEmpty()) {
+            QProcess info;
+            info.setProcessChannelMode(QProcess::MergedChannels);
+            info.start(QDir(tools).filePath("as-02-info"), {"-i", "-H", dir.filePath("imf-iab.mxf")});
+            QVERIFY(info.waitForFinished(60000));
+            const QString text = QString::fromUtf8(info.readAll());
+            QVERIFY2(info.exitCode() == 0 && text.contains("IABEssenceDescriptor") && text.contains("IABSoundfieldLabelSubDescriptor"), qPrintable(text));
+        }
+    }
+
+    void exportsImmersiveImfAndDcp() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // A second at 24 fps in 5.1: a 1 kHz tone on A1 in the bed, a 440 Hz one on A2 as an object going from the
+        // left wall to the right.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+        s.audioLayout = "5.1";
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.5f, 0.5f, 0, 24));
+        for (int t = 0; t < 2; ++t) {
+            const QString wav = dir.filePath(QStringLiteral("tone%1.wav").arg(t));
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int n = 48000;
+            const double hz = t == 0 ? 1000 : 440;
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+            d.append("RIFF");
+            u32(36 + n * 2);
+            d.append("WAVEfmt ");
+            u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+            d.append("data");
+            u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(0.3 * 32767 * std::sin(2 * M_PI * hz * i / 48000.0)))));
+            f.write(d);
+            f.close();
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(wav.toStdString(), m));
+            p.media.push_back(m);
+            Clip a = makeClip(p, m, TrackKind::Audio, s);
+            a.duration = 24;
+            while (int(s.audioTracks.size()) <= t) s.audioTracks.emplace_back();
+            s.audioTracks[size_t(t)].clips.push_back(a);
+        }
+        Track& a2 = s.audioTracks[1];
+        a2.surround.object = true, a2.surround.width = 0;
+        a2.surroundXAuto.addKey(0, -1);
+        a2.surroundXAuto.addKey(23, 1);
+        a2.surroundYAuto.addKey(0, 0);
+        std::string err;
+
+        // The DCP: the 5.1 in 16 channels with the sync signal, and the IAB track beside it.
+        DcpSettings st;
+        st.title = "Immersive";
+        st.threads = 2;
+        st.immersive = true;
+        DcpResult r;
+        QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.immersive && r.iabBedChannels == 8 && r.iabObjects == 1 && r.channels == 6);
+        QVERIFY2(QString::fromStdString(r.name).contains("_51-IAB_2K_"), r.name.c_str());
+        std::vector<std::string> issues = verifyDcp(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out(QString::fromStdString(r.folder));
+        const QStringList iabs = out.entryList({"iab_*.mxf"}), sounds = out.entryList({"pcm_*.mxf"});
+        QVERIFY(iabs.size() == 1 && sounds.size() == 1);
+        {
+            dcp::TrackFileReader t;
+            QVERIFY2(t.open(out.filePath(iabs[0]).toStdString(), &err), err.c_str());
+            QVERIFY(t.iab() && t.editUnits() == 24);
+            std::vector<uint8_t> bytes;
+            iab::Frame first, last;
+            QVERIFY(t.read(0, 0, bytes, nullptr, &err) && iab::readFrame(bytes.data(), bytes.size(), first, &err));
+            QVERIFY(t.read(23, 0, bytes, nullptr, &err) && iab::readFrame(bytes.data(), bytes.size(), last, &err));
+            QVERIFY(first.dlc && !first.pcm && first.rate == iab::rateCode(24, 1) && first.bed.size() == 8 && first.objects.size() == 1);
+            QVERIFY(first.objects[0].pan.front().x < 0.1 && last.objects[0].pan.back().x > 0.9);
+        }
+        {
+            dcp::TrackFileReader t;
+            QVERIFY2(t.open(out.filePath(sounds[0]).toStdString(), &err), err.c_str());
+            std::vector<uint8_t> unit;
+            QVERIFY(t.read(5, 0, unit, nullptr, &err));
+            QCOMPARE(unit.size(), size_t(2000 * 3 * 16));
+            auto sample = [&](size_t i, int c) {
+                const uint8_t* b = &unit[(i * 16 + size_t(c)) * 3];
+                return int32_t(uint32_t(b[0]) << 8 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 24) >> 8;
+            };
+            double centre = 0, unused = 0;
+            std::vector<int32_t> sync(2000);
+            for (size_t i = 0; i < 2000; ++i) {
+                centre += std::abs(sample(i, 2));
+                for (int c : {6, 7, 8, 9, 10, 11, 12, 14, 15}) unused += std::abs(sample(i, c));
+                sync[i] = sample(i, 13);
+            }
+            QVERIFY(centre > 0 && unused == 0);
+            const auto packets = dcp::readFskSync(sync.data(), sync.size());
+            QCOMPARE(packets.size(), size_t(4));
+            for (const dcp::FskPacket& pk : packets) QVERIFY(pk.crcOk && pk.editUnit == 5 && std::equal(pk.uuid.begin(), pk.uuid.end(), t.asset().begin() + 4 * pk.subIndex));
+        }
+        {
+            QFile f(QString::fromStdString(r.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString cpl = QString::fromUtf8(f.readAll());
+            for (const char* want : {"<axd:AuxData", "xmlns:axd=\"http://www.dolby.com/schemas/2012/AD\"", "<axd:DataType>urn:smpte:ul:060e2b34.04010105.0e090604.00000000</axd:DataType>",
+                                     "51/L,R,C,LFE,Ls,Rs,-,-,-,-,-,-,-,FSKSync,-,-", "<meta:Name>IAB Profile</meta:Name>",
+                                     "<meta:Value>SMPTE-ST-2098-2:2019-P1</meta:Value>"})
+                QVERIFY2(cpl.contains(want), want);
+        }
+        // A main sound without its sync signal is found out.
+        {
+            DcpSettings plain = st;
+            plain.immersive = false;
+            plain.title = "Plain";
+            DcpResult pr;
+            QVERIFY2(exportDcp(p, s, plain, dir.path().toStdString(), &pr, {}, &err), err.c_str());
+            const QString plainSound = QDir(QString::fromStdString(pr.folder)).entryList({"pcm_*.mxf"}).value(0);
+            QVERIFY(QFile::remove(out.filePath(sounds[0])));
+            QVERIFY(QFile::copy(QDir(QString::fromStdString(pr.folder)).filePath(plainSound), out.filePath(sounds[0])));
+            issues = verifyDcp(r.folder);
+            bool found = false;
+            for (const std::string& i : issues) found = found || i.find("16 channels") != std::string::npos;
+            QVERIFY(found);
+        }
+
+        // Encrypted: the immersive track has a key of its own, of the type immersive tracks have.
+        if (dcp::securityAvailable()) {
+            DcpSettings sealed = st;
+            sealed.title = "Sealed";
+            sealed.encrypt = true;
+            sealed.dkdms = dir.filePath("dkdms").toStdString();
+            DcpResult sr;
+            QVERIFY2(exportDcp(p, s, sealed, dir.path().toStdString(), &sr, {}, &err), err.c_str());
+            issues = verifyDcp(sr.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QFile k(QString::fromStdString(sr.dkdm));
+            QVERIFY(k.open(QIODevice::ReadOnly));
+            const QString kdm = QString::fromUtf8(k.readAll());
+            QVERIFY(kdm.contains("<KeyType scope=\"http://www.dolby.com/cp850/2012/KDM#kdm-key-type\">MDEK</KeyType>") && kdm.count("<TypedKeyId>") == 3);
+        }
+
+        // IMF: an IABSequence of PCM frames beside the 5.1.
+        ImfSettings im;
+        im.title = "Immersive";
+        im.threads = 2;
+        im.immersive = true;
+        ImfResult ir;
+        QVERIFY2(exportImf(p, s, im, dir.path().toStdString(), &ir, {}, &err), err.c_str());
+        QVERIFY(ir.immersive && ir.iabBedChannels == 8 && ir.iabObjects == 1);
+        issues = verifyImf(ir.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir imf(QString::fromStdString(ir.folder));
+        const QStringList imfIab = imf.entryList({"IAB_*.mxf"});
+        QCOMPARE(imfIab.size(), 1);
+        {
+            dcp::ImfTrackReader t;
+            QVERIFY2(t.open(imf.filePath(imfIab[0]).toStdString(), &err), err.c_str());
+            QVERIFY(t.kind() == dcp::ImfTrackReader::Kind::Iab && t.frames() == 24);
+            std::vector<uint8_t> bytes;
+            iab::Frame f;
+            QVERIFY(t.frame(12, bytes, &err) && iab::readFrame(bytes.data(), bytes.size(), f, &err));
+            QVERIFY(f.pcm && !f.dlc && f.objects.size() == 1 && f.bed.size() == 8);
+        }
+        ImfComposition comp;
+        QVERIFY2(readImfComposition(ir.cpl, comp, &err), err.c_str());
+        bool sequence = false;
+        for (const ImfVirtualTrack& t : comp.tracks) sequence = sequence || (t.kind == "IABSequence" && t.length() == 24);
+        QVERIFY(sequence);
+        {
+            QFile f(QString::fromStdString(ir.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString cpl = QString::fromUtf8(f.readAll());
+            for (const char* want : {"xmlns:iab=\"http://www.smpte-ra.org/ns/2067-201/2019\"", "<iab:IABSequence>", "<r0:IABEssenceDescriptor",
+                                     "<r1:SoundCompression>urn:smpte:ul:060e2b34.04010105.0e090604.00000000</r1:SoundCompression>"})
+                QVERIFY2(cpl.contains(want), want);
+        }
+        const QStringList photon = photonErrors(imf.path());
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
     }
 
     void dcpSecurity() {

@@ -309,6 +309,9 @@ constexpr const char* kDataDef = "060e2b34040101010103020203000000";
 constexpr const char* kTimedTextContainer = "060e2b340401010a0d01030102130101";  // ST 429-5, clip wrapped
 constexpr const char* kTimedTextElement = "060e2b34010201010d01030117010b01";
 constexpr const char* kAcesElement = "060e2b34010201010d01030115011201";  // an ACES frame (track number 15011201)
+constexpr const char* kIabElement = "060e2b34010201050e09060100000001";        // ST 429-18 (not a registered UL)
+constexpr const char* kIabDescriptor = "060e2b34025301050e09060300000000";
+constexpr const char* kIabSubDescriptor = "060e2b34025301050e09060600000000";
 constexpr const char* kStreamElement = "060e2b340101010c0d01050901000000";       // a generic stream's data
 constexpr const char* kStreamPartition = "060e2b34020501010d01020101031100";
 constexpr const char* kEncryptedContainer = "060e2b34040101070d010301020b0100";
@@ -355,7 +358,7 @@ Bytes productVersion() {
 enum Id : size_t {
     kPreface, kIdentification, kGeneration, kStorage, kContainerData, kMaterial, kMpTcTrack, kMpTcSeq, kMpTc, kMpTrack,
     kMpSeq, kMpClip, kSource, kFpTcTrack, kFpTcSeq, kFpTc, kFpTrack, kFpSeq, kFpClip, kDescriptor, kSub, kMaterialUmid,
-    kSoundfieldLink, kChannelSet0, kChannelLink0 = kChannelSet0 + 8, kStaticTrack = kChannelLink0 + 8, kDmSeq, kDmSegment,
+    kSoundfieldLink, kChannelSet0, kChannelLink0 = kChannelSet0 + 16, kStaticTrack = kChannelLink0 + 16, kDmSeq, kDmSegment,
     kFramework, kContext, kContextId, kStereoSub
 };
 
@@ -367,7 +370,7 @@ struct Crypto {
 };
 
 // The metadata both kinds share: everything but the essence descriptor and its sub-descriptors.
-Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int64_t duration, const std::string& created,
+Bytes packages(const std::array<Uuid, 64>& ids, const Uuid& asset, int fps, int64_t duration, const std::string& created,
                const char* container, const char* dataDef, const std::string& trackName, uint32_t trackNumber,
                const std::string& packageName, const Crypto& crypto = {}) {
     Bytes out;
@@ -550,15 +553,22 @@ Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int6
 void indexBase(Set& s, EditRate rate, int64_t start, int64_t duration, uint32_t editUnitBytes);
 
 // The same for an IMF (AS-02, OP1a) file: one track in each package, no timecode, a rational edit rate.
-Bytes packagesImf(const std::array<Uuid, 48>& ids, const Uuid& asset, EditRate rate, int64_t duration, const std::string& created,
+Bytes packagesImf(const std::array<Uuid, 64>& ids, const Uuid& asset, EditRate rate, int64_t duration, const std::string& created,
                   const char* container, const char* dataDef, const std::string& trackName, uint32_t trackNumber,
-                  const std::string& packageName) {
+                  const std::string& packageName, const char* conformsTo = nullptr, uint16_t conformsTag = 0) {
     Bytes out;
     {
         Set s;
         s.uuid(0x3c0a, ids[kPreface]);
         s.item(0x3b02, stamp(created));
         s.u16(0x3b05, 0x0103);
+        if (conformsTo) {  // ConformsToSpecifications (a dynamic tag)
+            Bytes specs;
+            put32(specs, 1);
+            put32(specs, 16);
+            putUl(specs, conformsTo);
+            s.item(conformsTag, specs);
+        }
         s.u32(0x3b07, 1);
         s.uuid(0x3b08, ids[kSource]);
         s.refs(0x3b06, {ids[kIdentification]});
@@ -1236,6 +1246,130 @@ std::vector<uint8_t> PictureMxfWriter::indexSegments() const {
 
 // ---- Sound --------------------------------------------------------------------------------------------------------
 
+namespace {
+
+// ST 430-12's edit rate codes and the zero bits that end a packet at each, so the packets fill the edit unit.
+bool fskRate(int fps, int& code, int& packets, int& padding) {
+    static const int rates[] = {24, 25, 30, 48, 50, 60, 96, 100, 120};
+    for (int k = 0; k < 9; ++k)
+        if (rates[k] == fps) {
+            code = k;
+            packets = k < 3 ? 4 : k < 6 ? 2 : 1;
+            padding = k % 3 == 0 ? 25 : k % 3 == 1 ? 20 : 0;
+            return true;
+        }
+    return false;
+}
+
+// The CRC (polynomial 0x1021, starting at 0, most significant bit first) a bit at a time.
+void crcBit(uint16_t& crc, bool bit) {
+    const bool top = ((crc >> 15) & 1) != bit;
+    crc = uint16_t(crc << 1);
+    if (top) crc ^= 0x1021;
+}
+
+}  // namespace
+
+bool FskSync::start(int fps, const Uuid& asset) {
+    if (!fskRate(fps, code_, packets_, padding_)) return false;
+    samples_ = 48000 / fps;
+    asset_ = asset;
+    subIndex_ = 0;
+    lastBit_ = polarity_ = false;
+    return true;
+}
+
+void FskSync::frame(int64_t index, int32_t* out, size_t stride) {
+    std::vector<bool> bits;
+    bits.reserve(size_t(samples_ / 4));
+    uint16_t crc = 0;
+    bool crcOn = false;
+    auto put = [&](uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; --i) {
+            const bool b = (v >> i) & 1;
+            if (crcOn) crcBit(crc, b);
+            bits.push_back(b);
+        }
+    };
+    for (int k = 0; k < packets_; ++k) {
+        put(0x4d56, 16);
+        crc = 0;
+        crcOn = true;
+        put(uint32_t(code_), 4);
+        put(0, 2);
+        put(uint32_t(subIndex_), 2);
+        for (int b = 0; b < 4; ++b) put(asset_[size_t(subIndex_ * 4 + b)], 8);
+        put(uint32_t(index) & 0xffffff, 24);
+        crcOn = false;
+        put(crc, 16);
+        put(0, 4);
+        put(0, padding_);
+        subIndex_ = (subIndex_ + 1) % 4;
+    }
+    // Each bit four samples: a 0 a half-cycle of 6 kHz, a 1 a whole cycle of 12 kHz; the polarity turns over after each 0.
+    constexpr double kScale = 8388608.0;
+    static const int32_t zero[4] = {int32_t(0.03827 * kScale), int32_t(0.09239 * kScale), int32_t(0.09239 * kScale), int32_t(0.03827 * kScale)};
+    static const int32_t one[4] = {int32_t(0.07071 * kScale), int32_t(0.07071 * kScale), int32_t(-0.07071 * kScale), int32_t(-0.07071 * kScale)};
+    size_t at = 0;
+    for (bool b : bits) {
+        if (!lastBit_) polarity_ = !polarity_;
+        for (int i = 0; i < 4; ++i, ++at) {
+            const int32_t v = b ? one[i] : zero[i];
+            out[at * stride] = polarity_ ? v : -v;
+        }
+        lastBit_ = b;
+    }
+    for (; at < size_t(samples_); ++at) out[at * stride] = 0;
+}
+
+std::vector<FskPacket> readFskSync(const int32_t* samples, size_t count, size_t stride) {
+    // A 1 changes sign halfway through its four samples; a 0 does not.
+    std::vector<uint8_t> bits(count / 4);
+    for (size_t k = 0; k < bits.size(); ++k) bits[k] = (samples[(4 * k) * stride] > 0) != (samples[(4 * k + 2) * stride] > 0);
+    std::vector<FskPacket> out;
+    auto value = [&](size_t at, int n) {
+        uint32_t v = 0;
+        for (int i = 0; i < n; ++i) v = v << 1 | bits[at + size_t(i)];
+        return v;
+    };
+    for (size_t at = 0; at + 16 + 80 <= bits.size();) {
+        if (value(at, 16) != 0x4d56) {
+            ++at;
+            continue;
+        }
+        FskPacket p;
+        size_t b = at + 16;
+        uint16_t crc = 0;
+        for (size_t i = 0; i < 64; ++i) crcBit(crc, bits[b + i]);
+        p.rateCode = int(value(b, 4));
+        p.subIndex = int(value(b + 6, 2));
+        for (int i = 0; i < 4; ++i) p.uuid[size_t(i)] = uint8_t(value(b + 8 + size_t(8 * i), 8));
+        p.editUnit = value(b + 40, 24);
+        p.crc = uint16_t(value(b + 64, 16));
+        p.crcOk = p.crc == crc;
+        out.push_back(p);
+        at = b + 80;
+    }
+    return out;
+}
+
+bool SoundMxfWriter::openWithSync(const std::string& path, const Uuid& asset, int fps, int soundfield, const std::string& language,
+                                  std::string* error) {
+    if (soundfield != 6 && soundfield != 8) {
+        if (error) *error = "DCP sound is 5.1 (6 channels) or 7.1 (8 channels)";
+        return false;
+    }
+    if (!fsk_.start(fps, asset)) {
+        if (error) *error = "The sync signal for immersive sound runs at 24, 25, 30, 48, 50, 60, 96, 100 or 120 frames a second";
+        return false;
+    }
+    sync_ = true;
+    soundfield_ = soundfield;
+    channels_ = 16;
+    language_ = language.empty() ? "en" : language;
+    return openFile(path, asset, fps, error);
+}
+
 bool SoundMxfWriter::open(const std::string& path, const Uuid& asset, int fps, int channels, const std::string& language, std::string* error) {
     if (channels != 6 && channels != 8) {
         if (error) *error = "DCP sound is 5.1 (6 channels) or 7.1 (8 channels)";
@@ -1246,6 +1380,8 @@ bool SoundMxfWriter::open(const std::string& path, const Uuid& asset, int fps, i
         return false;
     }
     channels_ = channels;
+    soundfield_ = channels;
+    sync_ = false;
     language_ = language.empty() ? "en" : language;
     return openFile(path, asset, fps, error);
 }
@@ -1259,6 +1395,16 @@ bool SoundMxfWriter::write(const float* samples, std::string* error) {
         buf_[i * 3] = uint8_t(s);
         buf_[i * 3 + 1] = uint8_t(s >> 8);
         buf_[i * 3 + 2] = uint8_t(s >> 16);
+    }
+    if (sync_) {
+        fskBuf_.resize(size_t(samplesPerFrame()));
+        fsk_.frame(frames(), fskBuf_.data());
+        for (size_t i = 0; i < fskBuf_.size(); ++i) {
+            uint8_t* p = &buf_[(i * size_t(channels_) + size_t(kSyncChannel)) * 3];
+            p[0] = uint8_t(fskBuf_[i]);
+            p[1] = uint8_t(fskBuf_[i] >> 8);
+            p[2] = uint8_t(fskBuf_[i] >> 16);
+        }
     }
     return writeElement(ul(kSoundElement).data(), buf_.data(), buf_.size(), error);
 }
@@ -1288,9 +1434,11 @@ std::vector<uint8_t> SoundMxfWriter::headerMetadata(int64_t duration) const {
                                     {"chRss", "Right Side Surround", "060e2b340401010d0302010800000000"},
                                     {"chLrs", "Left Rear Surround", "060e2b340401010d0302010900000000"},
                                     {"chRrs", "Right Rear Surround", "060e2b340401010d0302010a00000000"}};
-    const Channel* labels = channels_ == 8 ? seven : five;
+    // (with sync, only the soundfield's channels are labelled, as other DCP tools do: the sync channel has none)
+    const int field = soundfield();
+    const Channel* labels = field == 8 ? seven : five;
     std::vector<Uuid> subs = {ids_[kSub]};
-    for (int c = 0; c < channels_; ++c) subs.push_back(ids_[kChannelSet0 + size_t(c)]);
+    for (int c = 0; c < field; ++c) subs.push_back(ids_[kChannelSet0 + size_t(c)]);
     {
         Set s;
         s.uuid(0x3c0a, ids_[kDescriptor]);
@@ -1305,28 +1453,29 @@ std::vector<uint8_t> SoundMxfWriter::headerMetadata(int64_t duration) const {
         s.u32(0x3d01, 24);
         s.u16(0x3d0a, uint32_t(3 * channels_));
         s.u32(0x3d09, uint32_t(48000 * 3 * channels_));
-        s.label(0x3d32, "060e2b340401010d0402021003020000");  // ST 429-2 channel configuration: MCA labels
+        // ST 429-2 channel configuration: MCA labels, or configuration 4 (the 16-channel layout) with sync
+        s.label(0x3d32, sync_ ? "060e2b340401010b0402021003010400" : "060e2b340401010d0402021003020000");
         putBytes(out, setKlv(0x48, s));
     }
     const Bytes language(language_.begin(), language_.end());
     {
         Set s;
         s.uuid(0x3c0a, ids_[kSub]);
-        s.label(0xfffe, channels_ == 8 ? "060e2b340401010d0302020200000000" : "060e2b340401010d0302020100000000");
+        s.label(0xfffe, field == 8 ? "060e2b340401010d0302020200000000" : "060e2b340401010d0302020100000000");
         s.uuid(0xfffd, ids_[kSoundfieldLink]);
-        s.text(0xfffc, channels_ == 8 ? "sg71" : "sg51");
-        s.text(0xfffb, channels_ == 8 ? "7.1DS" : "5.1");
+        s.text(0xfffc, field == 8 ? "sg71" : "sg51");
+        s.text(0xfffb, field == 8 ? "7.1DS" : "5.1");
         s.item(0xfffa, language);
         putBytes(out, setKlv(0x6c, s));
     }
-    for (int c = 0; c < channels_; ++c) {
+    for (int c = 0; c < field; ++c) {
         Set s;
         s.uuid(0x3c0a, ids_[kChannelSet0 + size_t(c)]);
         s.label(0xfffe, labels[c].dictionary);
         s.uuid(0xfffd, ids_[kChannelLink0 + size_t(c)]);
         s.text(0xfffc, labels[c].symbol);
         s.text(0xfffb, labels[c].name);
-        s.u32(0xfff9, uint32_t(c + 1));
+        s.u32(0xfff9, uint32_t((sync_ ? syncChannel(field, c) : c) + 1));
         s.item(0xfffa, language);
         s.uuid(0xfff8, ids_[kSoundfieldLink]);
         putBytes(out, setKlv(0x6b, s));
@@ -1346,6 +1495,66 @@ std::vector<uint8_t> SoundMxfWriter::indexSegments() const {
     s.item(0x3f0a, entries);
     return klv(ul("060e2b34025301010d01020101100100"), s.body);
 }
+
+// ---- Immersive sound (IAB) ----------------------------------------------------------------------------------------
+
+namespace {
+
+// ST 429-18's Data Essence Coding item (its version byte 5, as the standard has it) and its sub-descriptor's items.
+const PrimerEntry kIabPrimer[] = {
+    {0x3e01, "060e2b34010101050403030200000000"}, {0xfffe, "060e2b34010101050e09050600000000"},
+    {0xfffd, "060e2b34010101050e09050700000000"}, {0xfffc, "060e2b34010101050e09050800000000"},
+    {0xfffb, "060e2b34010101050e09050a00000000"}, {0xfffa, "060e2b340101010e040203010f000000"},
+};
+
+}  // namespace
+
+bool IabMxfWriter::open(const std::string& path, const Uuid& asset, int fps, int maxChannels, int maxObjects, std::string* error) {
+    maxChannels_ = maxChannels;
+    maxObjects_ = maxObjects;
+    return openFile(path, asset, fps, error);
+}
+
+bool IabMxfWriter::write(const uint8_t* frame, size_t size, std::string* error) {
+    if (size > maxFrameBytes(fps_)) {
+        if (error) *error = "An immersive sound frame is larger than a DCP allows (" + std::to_string(maxFrameBytes(fps_)) + " bytes)";
+        return false;
+    }
+    return writeElement(ul(kIabElement).data(), frame, size, error);
+}
+
+std::array<uint8_t, 16> IabMxfWriter::essenceContainer() const { return ul(kContainer); }
+
+std::vector<uint8_t> IabMxfWriter::headerMetadata(int64_t duration) const {
+    Bytes out = primer(kCommonPrimer, kIabPrimer, encrypted_);
+    putBytes(out, packages(ids_, asset_, fps_, duration, created_, kContainer, kDataDef, "IAB Track", 1,
+                           "File Package: SMPTE ST 429-18 frame wrapping of IA bitstreams",
+                           {encrypted_, ids_[kContextId], crypto_.keyId, kContainer}));
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, {ids_[kSub]});
+        s.u32(0x3006, 2);
+        s.rational(0x3001, uint32_t(fps_), 1);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kContainer);
+        s.label(0x3e01, kCoding);
+        putBytes(out, setKlv(kIabDescriptor, s));
+    }
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kSub]);
+        s.u8(0xfffe, 1);  // the IAFrames' Version
+        s.u16(0xfffd, uint32_t(maxChannels_));
+        s.u16(0xfffc, uint32_t(maxObjects_));
+        s.u32(0xfffb, 0);  // the first frame of action is the first edit unit
+        s.rational(0xfffa, 48000, 1);
+        putBytes(out, setKlv(kIabSubDescriptor, s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> IabMxfWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
 
 // ---- Timed text ---------------------------------------------------------------------------------------------------
 
@@ -1533,6 +1742,7 @@ bool TrackFileReader::open(const std::string& path, std::string* error) {
         return false;
     };
     path_ = path;
+    iab_ = false;
     File file;
     if (!openRead(file, path)) return fail("Cannot open " + path);
     fileSize_ = file.size;
@@ -1585,6 +1795,11 @@ bool TrackFileReader::open(const std::string& path, std::string* error) {
             if (context.size() == 16) std::memcpy(context_.data(), context.data(), 16);
             if (id.size() == 16) std::memcpy(keyId_.data(), id.data(), 16);
             hmac_ = mic.size() == 16 && sameKey(mic.data(), kHmacSha1);
+            continue;
+        }
+        if (sameKey(key, kIabDescriptor)) {  // an immersive sound track file (ST 429-18)
+            iab_ = true;
+            containerDuration_ = int64_t(beOf(get(0x3002)));
             continue;
         }
         const auto prefix = ul("060e2b34025301010d01010101010000");
@@ -2171,6 +2386,99 @@ std::vector<uint8_t> ImfSoundWriter::indexSegments() const {
     return klv(ul("060e2b34025301010d01020101100100"), s.body);
 }
 
+// ---- IMF immersive sound (IAB) ------------------------------------------------------------------------------------
+
+namespace {
+
+// The sound descriptor's items an IAB descriptor uses, the label's (numbered as asdcplib numbers them) and the
+// preface's ConformsToSpecifications.
+const PrimerEntry kImfIabPrimer[] = {
+    {0x3d01, "060e2b34010101040402030304000000"}, {0x3d02, "060e2b34010101040402030104000000"},
+    {0x3d03, "060e2b34010101050402030101010000"}, {0x3d06, "060e2b34010101020402040200000000"},
+    {0x3d07, "060e2b34010101050402010104000000"}, {0xfffe, "060e2b340101010e0103070101000000"},
+    {0xfffd, "060e2b340101010e0103070105000000"}, {0xfffc, "060e2b340101010e0103070102000000"},
+    {0xfffb, "060e2b340101010e0103070103000000"}, {0xfffa, "060e2b340101010d0301010203150000"},
+    {0xfff9, "060e2b340101010e0105100000000000"}, {0xfff8, "060e2b340101010e0105110000000000"},
+    {0xfff7, "060e2b340101010e0302010220000000"}, {0xfff6, "060e2b340101010e0302010221000000"},
+    {0xfff5, "060e2b340101010e0402010106000000"}, {0xfff4, "060e2b340101010e0402010107000000"},
+    {0xfff3, "060e2b340101010e0102021002040000"},
+};
+constexpr const char* kImfIabElement = "060e2b34010201010d01030116010d01";  // an IA bitstream clip (track number 16010d01)
+
+}  // namespace
+
+bool ImfIabWriter::open(const std::string& path, const Uuid& asset, EditRate rate, const std::string& language, const std::string& title,
+                        const std::string& titleVersion, std::string* error) {
+    language_ = language.empty() ? "en" : language;
+    title_ = title.empty() ? "Untitled" : title;
+    version_ = titleVersion.empty() ? "1" : titleVersion;
+    if (!openImfFile(path, asset, rate, error)) return false;
+    // One KLV for the whole bitstream, its length written on closing; the index points at each frame inside it.
+    Bytes kl;
+    putUl(kl, kImfIabElement);
+    clipLengthAt_ = long(kHeaderSize + 140 + 16);
+    kl.insert(kl.end(), 8, 0);
+    kl[16] = 0x87;
+    if (!writeRaw(kl.data(), kl.size(), error)) return false;
+    clipStart_ = essenceBytes_;
+    return true;
+}
+
+bool ImfIabWriter::write(const uint8_t* frame, size_t size, std::string* error) {
+    const uint64_t at = essenceBytes_;
+    if (!writeRaw(frame, size, error)) return false;
+    offsets_.push_back(at);
+    return true;
+}
+
+const Uuid& ImfIabWriter::soundfieldId() const { return ids_[kSub]; }
+const Uuid& ImfIabWriter::soundfieldLink() const { return ids_[kSoundfieldLink]; }
+
+std::array<uint8_t, 16> ImfIabWriter::essenceContainer() const { return ul(kContainer); }
+
+std::vector<uint8_t> ImfIabWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kImfIabPrimer), std::end(kImfIabPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kContainer, kSoundDef, "IA Bitstream", 0x16010d01,
+                              "Clip wrapping of IA bitstreams as specified in SMPTE ST 2067-201", kLevel0, 0xfff3));
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, {ids_[kSub]});
+        s.u32(0x3006, 1);
+        s.rational(0x3001, rate_.num, rate_.den);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kContainer);
+        s.rational(0x3d03, 48000, 1);
+        s.u8(0x3d02, 0);
+        s.u32(0x3d07, 0);
+        s.u32(0x3d01, 24);
+        s.label(0x3d06, kCoding);
+        s.rational(0xfff5, rate_.num, rate_.den);
+        s.u8(0xfff4, uint8_t(int8_t(kReferenceLevel)));
+        putBytes(out, setKlv("060e2b34025301010d01010101017b00", s));
+    }
+    {
+        const Bytes language(language_.begin(), language_.end());
+        Set s;
+        s.uuid(0x3c0a, ids_[kSub]);
+        s.label(0xfffe, kSoundfield);
+        s.uuid(0xfffd, ids_[kSoundfieldLink]);
+        s.text(0xfffc, "IAB");
+        s.text(0xfffb, "IAB");
+        s.item(0xfffa, language);
+        s.text(0xfff9, title_);
+        s.text(0xfff8, version_);
+        s.text(0xfff7, "PRM");
+        s.text(0xfff6, "FCMP");
+        putBytes(out, setKlv("060e2b34025301010d01010101017c00", s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> ImfIabWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
 // ---- IMF timed text -----------------------------------------------------------------------------------------------
 
 bool ImfTimedTextWriter::write(const std::string& xml, int64_t duration, const std::string& language, std::string* error,
@@ -2258,7 +2566,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     uint32_t stream = 0;                                            // the generic stream partition read last
     // Every KLV in turn: the header's sets (the file package's id, the sound's channels) and the essence elements
     // (06.0e.2b.34.01.02.01.01.0d.01.03.01, byte 12 the item: 15 picture, 16 sound, 17 data).
-    bool sound = false, text = false;
+    bool sound = false, text = false, iab = false;
     for (uint64_t at = 0; at + 17 <= file.size;) {
         uint8_t key[16];
         uint64_t length = 0, head = 0;
@@ -2334,7 +2642,8 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                 clipAt_ = value;
                 clipSize_ = length;
             }
-        } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) && (key[14] == 0x2f || key[14] == 0x37 || key[14] == 0x48 || key[14] == 0x29 || key[14] == 0x28 || key[14] == 0x64)) {
+        } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) &&
+                   (key[14] == 0x2f || key[14] == 0x37 || key[14] == 0x48 || key[14] == 0x29 || key[14] == 0x28 || key[14] == 0x64 || key[14] == 0x7b)) {
             Bytes v(static_cast<size_t>(length));
             if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
             const auto it = items(v);
@@ -2350,6 +2659,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             } else {
                 if (auto c = it.find(0x3d07); c != it.end() && key[14] == 0x48) channels_ = int(beOf(c->second));
                 if (key[14] == 0x29) rgba_ = true;
+                if (key[14] == 0x7b) iab = true;  // an IAB essence descriptor (ST 2067-201)
                 if (key[14] == 0x29 || key[14] == 0x28) {
                     auto size = [&](uint16_t tag) {
                         const auto x = it.find(tag);
@@ -2379,7 +2689,22 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     // (an edit rate a frame count can be turned into a time with)
     if (!text && (rate_.num == 0 || rate_.den == 0 || rate_.value() < 1 || rate_.value() > 192000))
         return fail(path + " has no edit rate Montage reads");
-    if (!elements_.empty() && !sound && !text) kind_ = Kind::Picture;
+    if (iab && sound && elements_.empty()) {
+        // The bitstream's frames, one after another in the clip: each an (empty) preamble and an IAFrame, both
+        // tagged and with a 4-byte length.
+        const uint64_t end = clipAt_ + clipSize_;
+        for (uint64_t at = clipAt_; at < end;) {
+            uint8_t h[5];
+            if (!file.seek(at) || !file.read(h, 5) || h[0] != 0x01) return fail(path + " has a damaged IA bitstream");
+            uint64_t next = at + 5 + readBe(h + 1, 4);
+            if (next + 5 > end || !file.seek(next) || !file.read(h, 5) || h[0] != 0x02) return fail(path + " has a damaged IA bitstream");
+            next += 5 + readBe(h + 1, 4);
+            if (next > end || elements_.size() >= (size_t(1) << 24)) return fail(path + " has a damaged IA bitstream");
+            elements_.emplace_back(at, next - at);
+            at = next;
+        }
+        kind_ = Kind::Iab;
+    } else if (!elements_.empty() && !sound && !text) kind_ = Kind::Picture;
     else if (sound && elements_.empty() && channels_ > 0 && channels_ <= 64) kind_ = Kind::Sound;
     else if (text && elements_.empty()) kind_ = Kind::TimedText;
     else return fail(path + " is not an IMF track file Montage reads");
