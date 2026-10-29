@@ -1656,3 +1656,22 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - The agent link's tools and their answers are not translated (on purpose), nor are messages the engine writes (errors, reports).
     - Plural forms need translators (Qt Linguist asks for each form).
 
+# Phase 12
+
+The eleventh gap analysis (`docs/research/phase12-roadmap.md`, October 2026) ranks what is still missing against the latest Premiere, After Effects, Resolve, Final Cut Pro, Media Composer, Nuke, Baselight, Pro Tools and Nuendo, and open tools and standards; SMPTE's standards became free to read on 17 June 2026, which opens S-ADM (left out of Phase 11 #13) and ST 2110. Items 1–12 can be tested fully in CI; 13–15 each name the part CI cannot check. Approved 29 October 2026.
+
+- [ ] 1. Elastic audio: warp markers inside a clip to move a word, a hit or a beat without cutting, and a pitch curve to change the intonation of a line, with formants kept (M)
+- [ ] 2. Surface tracking: a mesh that follows a surface as it bends (cloth, skin, a flag), so paint, a logo, a tattoo fix or a grade's window stays on it (M)
+- [ ] 3. Clips as 3D layers: footage, titles, graphics and nested sequences placed and turned in 3D space under one camera, intersecting and lit, and any clip used as a material on 3D models (M)
+- [ ] 4. Shape layers grown into vector graphics: several drawn Bézier paths and primitives in groups, booleans, and the path operators motion designers use (Repeater, Offset, Round Corners, Pucker & Bloat, Twist, Zig Zag, Wiggle), with SVG imported as editable shapes (M)
+- [ ] 5. VFX shot versions: pulled shots tracked by name, the vendor's renders scanned back in as numbered versions, placed to the frame, checked, stepped up and down with a status, and a Nuke script written for each pull (S–M)
+- [ ] 6. Immersive sound as ADM in IMF: the bed and objects with frame-by-frame S-ADM metadata (ST 2067-203, in ST 2127-1's MGA layout) and ADM audio (ST 2067-204), and IMF packages with IAB, S-ADM or ADM sound read back in (S–M)
+- [ ] 7. Captions timed to shot changes: cuts shown on the caption track, snapping, the half-second rules checked and fixed, and EBU-TT-D in and out (S)
+- [ ] 8. Tape and archive sound repair: wow and flutter taken out, azimuth error between channels corrected, and silence stripped from clips (S–M)
+- [ ] 9. Colour tools from Baselight 8: a visual crosstalk control, saturation by colour correlation bounded by a gamut, and a grain model in linear light with tonal response, colour correlation, spectral shape and kurtosis (S–M)
+- [ ] 10. Keying uneven screens: a clean plate (shot, or made from the footage) for the keyer to correct the screen against, and edges extended so no screen colour shows in hair and motion blur (S)
+- [ ] 11. ASC Framing Decision Lists: framing decided on set brought in as frame lines and applied to clips, and written out with VFX pulls and conforms (S)
+- [ ] 12. One export split across render nodes: a long render cut into segments that several computers encode at once, joined into one file (S–M)
+- [ ] 13. Reference output over IP as SMPTE ST 2110: uncompressed video (-20), audio (-30) and ancillary data (-40) with SDP, timed from PTP, and registered and connected through NMOS (M)
+- [ ] 14. The GPU path completed for playback and export: Y′CbCr frames converted on the GPU, hardware-decoded frames kept in GPU memory, OCIO on the GPU through a baked table, exports rendered on the GPU, and Vulkan (L)
+- [ ] 15. Live review in any browser: the Program streamed over WebRTC to a link a client opens with no software, with frame-accurate timecode, and notes and drawings that come back as markers (M)
