@@ -24,6 +24,7 @@
 #include <QFontDatabase>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QDir>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -76,6 +77,7 @@
 #include "render/Restoration.h"
 #include "render/FilmScan.h"
 #include "render/MeshWarp.h"
+#include "render/SurfaceTrack.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -189,6 +191,10 @@ QString InspectorWidget::signature() const {
         if (e.type == "mesh_warp")
             for (int k : meshPins(e)) sig += QString("p%1k%2").arg(k).arg(meshPinKind(e, k));
         if (e.type == "grid_warp") sig += QString("g%1x%2").arg(std::lround(e.p("rows", 0, 3))).arg(std::lround(e.p("cols", 0, 3)));
+        // A Surface Tracker's status line: rebuild when it is tracked.
+        if (e.type == "surface_track")
+            if (const auto tk = e.strings.find("track"); tk != e.strings.end())
+                sig += QString("t%1").arg(qHash(QByteArrayView(tk->second.data(), qsizetype(tk->second.size()))));
     }
     // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
     if (!c->grade.empty()) {
@@ -1170,6 +1176,69 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     });
                 });
                 f->addRow(QString(), reset);
+            }
+        }
+        if (e.type == "surface_track" && onClip) {
+            // Tracked from the mask drawn round the surface on the playhead's frame; its track exported for compositing.
+            auto* row = new QWidget(content_);
+            auto* h = new QHBoxLayout(row);
+            h->setContentsMargins(0, 0, 0, 0);
+            auto* track = new QPushButton(tr("Track Surface"), row);
+            track->setObjectName(QStringLiteral("trackSurface"));
+            track->setToolTip(tr("Lay a mesh inside the mask on this frame and follow the surface as it moves and bends, to both "
+                                 "ends of the clip"));
+            connect(track, &QPushButton::clicked, this, [this, owner, eid] {
+                QTimer::singleShot(0, this, [this, owner, eid] { trackSurfaceOf(owner, eid, false); });
+            });
+            const std::shared_ptr<const SurfaceTrack> tracked = cachedSurfaceTrack(e);
+            auto* arm = new QPushButton(tr("Vertices on the Monitor"), row);
+            arm->setObjectName(QStringLiteral("surfaceOnMonitor"));
+            arm->setCheckable(true);
+            arm->setEnabled(bool(tracked));
+            arm->setChecked(state_->paintEffect() == eid);
+            arm->setToolTip(tr("Drag a vertex on the Program monitor to where the surface is on that frame where the track has "
+                               "slipped; Ctrl-click one to let it go. Then Solve Again From Here. Esc stops."));
+            connect(arm, &QPushButton::toggled, this, [this, eid](bool on) {
+                if (on) state_->setPaintEffect(eid);
+                else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
+            });
+            connect(state_, &EditorState::paintEffectChanged, arm, [this, arm, eid] {
+                const QSignalBlocker block(arm);
+                arm->setChecked(state_->paintEffect() == eid);
+            });
+            auto* again = new QPushButton(tr("Solve Again From Here"), row);
+            again->setObjectName(QStringLiteral("solveSurfaceAgain"));
+            again->setToolTip(tr("Keep the track up to the playhead and track on from there, holding the vertices put by hand"));
+            again->setEnabled(tracked && !tracked->fixes.empty());
+            connect(again, &QPushButton::clicked, this, [this, owner, eid] {
+                QTimer::singleShot(0, this, [this, owner, eid] { trackSurfaceOf(owner, eid, true); });
+            });
+            auto* exportMaps = new QPushButton(tr("Export ST Maps..."), row);
+            exportMaps->setObjectName(QStringLiteral("exportSurfaceMaps"));
+            exportMaps->setToolTip(tr("An OpenEXR for each frame with the ST map and the surface's motion vectors"));
+            exportMaps->setEnabled(bool(tracked));
+            connect(exportMaps, &QPushButton::clicked, this, [this, tracked] {
+                if (!tracked) return;
+                const QString dir = QFileDialog::getExistingDirectory(window(), tr("Export ST Maps"));
+                if (dir.isEmpty()) return;
+                std::string err;
+                const std::vector<std::string> files =
+                    writeSurfaceExrs(*tracked, QDir(dir).filePath(QStringLiteral("surface")).toStdString(), 0, int(tracked->frames.size()) - 1, &err);
+                if (files.empty()) state_->message(QString::fromStdString(err), 6000);
+                else state_->message(tr("Wrote %n ST map(s)", "", int(files.size())), 4000);
+            });
+            h->addWidget(track);
+            h->addWidget(arm);
+            h->addWidget(again);
+            h->addStretch(1);
+            f->addRow(QString(), row);
+            f->addRow(QString(), exportMaps);
+            if (tracked) {
+                int on = 0;
+                for (const auto& fr : tracked->frames) on += fr.empty() ? 0 : 1;
+                auto* note = new QLabel(tr("Tracked on %1 of %2 frames, %3 vertices").arg(on).arg(tracked->frames.size()).arg(tracked->mesh.rest.size()), content_);
+                note->setObjectName(QStringLiteral("surfaceTrackNote"));
+                f->addRow(QString(), note);
             }
         }
         if ((e.type == "paint" || e.type == "dust_spots") && onClip) {
@@ -3551,6 +3620,33 @@ void InspectorWidget::trackWarpPins(Id clip, Id effect) {
         return true;
     });
     state_->message(tr("Tracked %n pin(s)", "", int(keys.size())), 4000);
+}
+
+void InspectorWidget::trackSurfaceOf(Id clip, Id effect, bool again) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || c->duration <= 0 || !edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) return;
+    const FrameTime at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::string track;
+    const bool ok = runAnalysis(tr("Tracking the surface..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
+        return cl && ef && trackClipSurface(*project, *sq, *cl, *ef, at, track, again, [&](double f) { progress(f); return !*cancel; }, err);
+    });
+    if (!ok) return;
+    state_->edit(again ? tr("Solve Surface Again") : tr("Track Surface"), [clip, effect, track](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        ef->strings["track"] = track;
+        return true;
+    });
+    int on = 0;
+    if (const auto t = cachedSurfaceTrack(track))
+        for (const auto& fr : t->frames) on += fr.empty() ? 0 : 1;
+    state_->message(tr("Tracked the surface on %n frame(s)", "", on), 4000);
 }
 
 void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {

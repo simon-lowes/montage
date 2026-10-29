@@ -275,6 +275,7 @@
 #include "render/Exporter.h"
 #include "render/SpatialVideo.h"
 #include "render/Ocio.h"
+#include "render/SurfaceTrack.h"
 
 using namespace montage;
 
@@ -15331,6 +15332,78 @@ const auto seq = [this] { return state()->sequence(); };
         QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.6, 0.6));
         QVERIFY(!fx().params.at("point_x").keyAt(lt));
         state()->setSelection({}, false);
+    }
+
+    void surfaceTrackerInInspector() {
+        loadDemo();
+        // The Surface Tracker on a clip: Track Surface, and its ST maps exported once it has a track.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id trackerId = 0;
+        QVERIFY(state()->edit("Track", [red, &trackerId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "surface_track");
+            trackerId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        QPushButton* track = nullptr;
+        QTRY_VERIFY((track = win_->findChild<QPushButton*>(QStringLiteral("trackSurface"))) != nullptr);
+        QPushButton* maps = win_->findChild<QPushButton*>(QStringLiteral("exportSurfaceMaps"));
+        QVERIFY(maps && !maps->isEnabled());
+        QVERIFY(!win_->findChild<QLabel*>(QStringLiteral("surfaceTrackNote")));
+        // (The red clip is a generator: nothing to track in it.)
+        track->click();
+        QTRY_VERIFY(win_->statusBar()->currentMessage().contains("video clips"));
+        // With a track, the maps can be exported and the Inspector says what it covers.
+        SurfaceTrack t;
+        t.width = 64, t.height = 48;
+        t.mesh = surfaceMesh({{10, 10}, {50, 10}, {50, 40}, {10, 40}}, 64, 48, 30);
+        t.frames.assign(48, t.mesh.rest);
+        t.frames[1].clear();
+        QVERIFY(state()->edit("Track", [red, trackerId, text = surfaceTrackToString(t)](Project&, Sequence& s) {
+            edit::ownedEffect(s, red, trackerId)->strings["track"] = text;
+            return true;
+        }));
+        QLabel* note = nullptr;
+        QTRY_VERIFY((note = win_->findChild<QLabel*>(QStringLiteral("surfaceTrackNote"))) != nullptr);
+        QVERIFY2(note->text().startsWith("Tracked on 47 of 48 frames"), qPrintable(note->text()));
+        QTRY_VERIFY(win_->findChild<QPushButton*>(QStringLiteral("exportSurfaceMaps"))->isEnabled());
+        QVERIFY(!win_->findChild<QPushButton*>(QStringLiteral("solveSurfaceAgain"))->isEnabled());
+        // A vertex dragged on the Program monitor is put there on that frame; Ctrl-click lets it go.
+        const Clip& clip = *clipNamed(*state()->sequence(), "Red");
+        state()->setPlayhead(clip.start);
+        const int frame = surfaceFrameOf(t, *state()->sequence(), clip, 0);
+        QVERIFY(frame >= 0);
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        win_->findChild<QPushButton*>(QStringLiteral("surfaceOnMonitor"))->click();
+        QCOMPARE(state()->paintEffect(), trackerId);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        const MeshPoint v0 = t.mesh.rest[0];
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(v0[0] / 64, v0[1] / 48));
+        QTest::mouseMove(viewer, at(v0[0] / 64 + 0.02, v0[1] / 48 + 0.01));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(v0[0] / 64 + 0.05, v0[1] / 48 + 0.03));
+        auto current = [&] {
+            SurfaceTrack now;
+            surfaceTrackFromString(edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, trackerId)->s("track"), now);
+            return now;
+        };
+        SurfaceTrack put = current();
+        QVERIFY(put.fixes.count(frame) && put.fixes[frame].count(0));
+        const double px = 64 * 1.5 / r.width();
+        QVERIFY2(std::fabs(put.fixes[frame][0][0] - (v0[0] + 0.05 * 64)) < px && std::fabs(put.fixes[frame][0][1] - (v0[1] + 0.03 * 48)) < px,
+                 qPrintable(QString("%1 %2").arg(put.fixes[frame][0][0]).arg(put.fixes[frame][0][1])));
+        QVERIFY(std::hypot(put.frames[size_t(frame)][0][0] - put.fixes[frame][0][0], put.frames[size_t(frame)][0][1] - put.fixes[frame][0][1]) < 1e-3);
+        QTRY_VERIFY(win_->findChild<QPushButton*>(QStringLiteral("solveSurfaceAgain"))->isEnabled());
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, at(v0[0] / 64 + 0.05, v0[1] / 48 + 0.03));
+        QVERIFY(current().fixes.empty());
+        QTest::keyClick(viewer, Qt::Key_Escape);
+        QCOMPARE(state()->paintEffect(), Id(0));
     }
 
     void meshWarpPinsInProgramMonitor() {

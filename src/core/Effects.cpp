@@ -634,6 +634,17 @@ std::vector<EffectInfo> buildCatalog() {
                   boolean("motion_blur", "Motion Blur"), num("shutter", "Shutter Angle", 0, 720, 180, 1), boolean("show_grid", "Show Grid")},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
+    // Surface Tracker (render/SurfaceTrack.h): the surface its mask outlines tracked as it bends ("track" as text, from
+    // the Inspector or MCP), shown as its mesh, with a picture ("picture", a file) put on it, held still as on the
+    // reference frame, or put back after being worked on held still.
+    c.push_back({"surface_track", "Surface Tracker", EffectCategory::VideoFilter, "Distort",
+                 {choice("mode", "Show", {"The Mesh", "A Picture on the Surface", "The Surface Held Still", "The Surface Put Back", "Nothing (Only the Track)"}, 0),
+                  num("detail", "Mesh Vertices", 20, 3000, 200, 10), num("picture_x", "Picture X", -0.5, 1.5, 0.5, 0.001),
+                  num("picture_y", "Picture Y", -0.5, 1.5, 0.5, 0.001), num("picture_w", "Picture Width", 0.01, 2, 0.3, 0.001),
+                  pct("opacity", "Picture Opacity", 0, 100, 100)},
+                 {str("picture", "Picture", StringKind::File)}});
+    for (auto& pi : c.back().params) pi.keyframeable = pi.name == "opacity";
+    c.back().strings[0].fileFilter = "Pictures (*.png *.jpg *.jpeg *.tif *.tiff *.exr *.webp *.heic *.avif);;All files (*)";
     c.push_back({"letterbox", "Letterbox", EffectCategory::VideoFilter, "Stylize",
                  {choice("aspect", "Aspect", {"2.39:1", "2:1", "1.85:1", "4:3", "1:1", "9:16"}, 0),
                   pct("opacity", "Opacity", 0, 100, 100)},
@@ -962,7 +973,8 @@ std::vector<EffectInfo> buildCatalog() {
         c.push_back({"paint", "Paint (Clone and Heal)", EffectCategory::VideoFilter, "Repair",
                      {choice("tool", "Brush", {"Clone", "Heal"}, 0), num("brush", "Brush Size (px)", 2, 400, 30, 1),
                       pct("softness", "Brush Softness", 0, 100, 50), choice("span", "Strokes Last", {"This Frame", "Whole Clip"}, 0),
-                      boolean("track", "Strokes Follow the Mask Track"), num("source_x", "Source X (of the width)", -1, 1, 0.05, 0.001),
+                      boolean("track", "Strokes Follow the Mask Track"), boolean("surface", "Strokes Follow the Surface Track"),
+                      num("source_x", "Source X (of the width)", -1, 1, 0.05, 0.001),
                       num("source_y", "Source Y (of the height)", -1, 1, 0, 0.001)},
                      {}});
         for (size_t i = c.size() - 5; i < c.size(); ++i)
@@ -1336,6 +1348,7 @@ const EffectInfo& maskInfo() {
                     num("mask.refine_radius", "Refine Radius (px)", 1, 64, 8, 0.5),
                     pct("mask.opacity", "Mask Opacity", 0, 100, 100),
                     boolean("mask.invert", "Invert"),
+                    boolean("mask.surface", "Bend With the Surface Track"),
                     boolean("mask.qualify", "HSL Qualifier"),
                     num("mask.hue", "Hue Center", 0, 360, 0, 0.5),
                     num("mask.hue_width", "Hue Width", 1, 360, 60, 0.5),

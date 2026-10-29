@@ -41,6 +41,7 @@
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/MeshWarp.h"
+#include "render/SurfaceTrack.h"
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
@@ -69,6 +70,7 @@
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
 #include "media/Exr.h"
+#include "media/LensCalibration.h"
 #include "media/Proxy.h"
 #include "media/DescribePicture.h"
 #include "media/LanguageModel.h"
@@ -10755,6 +10757,256 @@ colorspaces:
             // The corners hold.
             QVERIFY(out.at(0, 75)[1] > 0.9f);
         }
+    }
+
+    // Surface tracking (render/SurfaceTrack.h): a textured surface turned and bent by moving bumps over 48 frames.
+    void surfaceTracking() {
+        constexpr int W = 320, H = 240, frames = 49;
+        // The texture: waves of 10 to 40 px in many directions.
+        struct Wave {
+            double fx, fy, phase, amp;
+        };
+        std::vector<Wave> waves;
+        {
+            std::mt19937 rng(11);
+            std::uniform_real_distribution<double> u(0, 1);
+            for (int k = 0; k < 40; ++k) {
+                const double wl = 10 + 30 * u(rng), dir = 2 * M_PI * u(rng);
+                waves.push_back({std::cos(dir) / wl, std::sin(dir) / wl, 2 * M_PI * u(rng), 0.025 + 0.02 * u(rng)});
+            }
+        }
+        auto texture = [&](double x, double y) {
+            double v = 0.5;
+            for (const Wave& w : waves) v += w.amp * std::sin(2 * M_PI * (w.fx * x + w.fy * y) + w.phase);
+            return v;
+        };
+        // Where frame f puts each point of the reference (frame 0): turned up to 7 degrees about the middle, and three
+        // bumps moving across, growing from nothing.
+        struct Bump {
+            double x0, y0, vx, vy, ax, ay;
+        };
+        const Bump bumps[] = {{120, 100, 1.0, 0.3, 5, -4}, {200, 150, -0.8, -0.4, -4, 5}, {170, 90, 0.2, 0.9, 6, 3}};
+        auto moved = [&](int f, double x, double y, double& ox, double& oy) {
+            const double k = double(f) / (frames - 1), th = 0.12 * k;
+            ox = 160 + std::cos(th) * (x - 160) - std::sin(th) * (y - 120);
+            oy = 120 + std::sin(th) * (x - 160) + std::cos(th) * (y - 120);
+            for (const Bump& b : bumps) {
+                const double cx = b.x0 + b.vx * f, cy = b.y0 + b.vy * f;
+                const double g = std::exp(-((x - cx) * (x - cx) + (y - cy) * (y - cy)) / (2 * 35.0 * 35.0)) * k;
+                ox += b.ax * g, oy += b.ay * g;
+            }
+        };
+        auto back = [&](int f, double x, double y, double& ux, double& uy) {
+            ux = x, uy = y;
+            for (int it = 0; it < 60; ++it) {
+                double mx, my;
+                moved(f, ux, uy, mx, my);
+                ux += x - mx, uy += y - my;
+            }
+        };
+        std::vector<GrayImage> grays(frames);
+        for (int f = 0; f < frames; ++f) {
+            GrayImage& g = grays[size_t(f)];
+            g.width = W, g.height = H;
+            g.px.resize(size_t(W) * H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double ux, uy;
+                    back(f, x + 0.5, y + 0.5, ux, uy);
+                    g.px[size_t(y) * W + size_t(x)] = float(texture(ux, uy));
+                }
+        }
+        const std::vector<MeshPoint> outline = {{90, 60}, {230, 70}, {245, 170}, {150, 185}, {80, 150}};
+        SurfaceTrack base;
+        base.width = W, base.height = H, base.frameSeconds = 1.0 / 24, base.reference = 0;
+        base.mesh = surfaceMesh(outline, W, H, 200);
+        QVERIFY2(base.mesh.rest.size() > 120 && base.mesh.rest.size() < 400, qPrintable(QString::number(base.mesh.rest.size())));
+        auto read = [&](int i, GrayImage& out) {
+            out = grays[size_t(i)];
+            return true;
+        };
+        SurfaceTrack t = base;
+        std::string err;
+        QVERIFY2(trackSurface(t, frames, 0, read, {}, {}, &err), err.c_str());
+
+        // Within 0.3 px of where the bending puts each vertex on average, 1 px at worst, 0.5 px on average at the end;
+        // no triangle turned over.
+        double sum = 0, worst = 0, last = 0;
+        size_t count = 0;
+        for (int f = 0; f < frames; ++f) {
+            QCOMPARE(t.frames[size_t(f)].size(), t.mesh.rest.size());
+            for (size_t v = 0; v < t.mesh.rest.size(); ++v) {
+                double gx, gy;
+                moved(f, t.mesh.rest[v][0], t.mesh.rest[v][1], gx, gy);
+                const double e = std::hypot(t.frames[size_t(f)][v][0] - gx, t.frames[size_t(f)][v][1] - gy);
+                sum += e, worst = std::max(worst, e), ++count;
+                if (f == frames - 1) last += e / double(t.mesh.rest.size());
+            }
+            for (const auto& tr : t.mesh.tris) {
+                auto area = [&](const std::vector<MeshPoint>& p) {
+                    const MeshPoint &a = p[size_t(tr[0])], &b = p[size_t(tr[1])], &c = p[size_t(tr[2])];
+                    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                };
+                QVERIFY(area(t.frames[size_t(f)]) * area(t.mesh.rest) > 0);
+            }
+        }
+        const double mean = sum / double(count);
+        qInfo("Surface track: mean %.3f px, worst %.3f px, %.3f px at frame %d", mean, worst, last, frames - 1);
+        QVERIFY2(mean <= 0.3 && worst <= 1 && last < 0.5, qPrintable(QString("%1 %2 %3").arg(mean).arg(worst).arg(last)));
+
+        // The same on one thread and on eight.
+        {
+            SurfaceTrack one = base, eight = base;
+            SurfaceTrackOptions o1, o8;
+            o1.threads = 1, o8.threads = 8;
+            QVERIFY(trackSurface(one, frames, 0, read, o1));
+            QVERIFY(trackSurface(eight, frames, 0, read, o8));
+            QVERIFY(one.frames == eight.frames);
+            QVERIFY(one.frames == t.frames);
+        }
+
+        // A logo on the reference frame carried on to the last: as the bending itself draws it, within 1/255 on average.
+        Image logo(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double d = std::hypot(x + 0.5 - 160, y + 0.5 - 125);
+                const double a = std::clamp(28 - d, 0.0, 1.0) * 0.9 + (std::fabs(x + 0.5 - 160) < 50 && std::fabs(y + 0.5 - 125) < 6 ? 0.1 : 0.0);
+                float* p = logo.at(x, y);
+                p[0] = float(a * 0.9), p[1] = float(a * 0.2), p[2] = float(a * 0.1), p[3] = float(a);
+            }
+        const int f = frames - 1;
+        Image carried(W, H), truth(W, H);
+        drawOnSurface(t, f, logo, carried, false);
+        double diff = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                double ux, uy;
+                back(f, x + 0.5, y + 0.5, ux, uy);
+                const double sx = std::clamp(ux - 0.5, 0.0, W - 1.0), sy = std::clamp(uy - 0.5, 0.0, H - 1.0);
+                const int x0 = std::min(int(sx), W - 2), y0 = std::min(int(sy), H - 2);
+                const double ax = sx - x0, ay = sy - y0;
+                for (int c = 0; c < 4; ++c) {
+                    const double v = (logo.at(x0, y0)[c] * (1 - ax) + logo.at(x0 + 1, y0)[c] * ax) * (1 - ay) +
+                                     (logo.at(x0, y0 + 1)[c] * (1 - ax) + logo.at(x0 + 1, y0 + 1)[c] * ax) * ay;
+                    truth.at(x, y)[c] = float(v);
+                    diff += std::fabs(v - carried.at(x, y)[c]);
+                }
+            }
+        diff /= double(W) * H * 4;
+        QVERIFY2(diff < 1.0 / 255, qPrintable(QString::number(diff * 255)));
+
+        // Held still on the reference and put back: the frame again, within 1/255 on average where the surface is.
+        Image frame(W, H);
+        for (size_t i = 0; i < size_t(W) * H; ++i) std::fill_n(&frame.px[i * 4], 3, grays[size_t(f)].px[i]), frame.px[i * 4 + 3] = 1;
+        Image still = frame;
+        drawOnSurface(t, f, frame, still, true);
+        Image again = still;
+        drawOnSurface(t, f, still, again, false);
+        const std::vector<float> on = meshMap(t.mesh, t.frames[size_t(f)], t.mesh.rest, W, H);
+        double back2 = 0;
+        size_t inside = 0;
+        for (size_t i = 0; i < size_t(W) * H; ++i) {
+            if (std::isnan(on[i * 2])) continue;
+            back2 += std::fabs(again.px[i * 4 + 1] - frame.px[i * 4 + 1]), ++inside;
+        }
+        back2 /= double(std::max<size_t>(1, inside));
+        QVERIFY2(inside > 10000 && back2 < 1.0 / 255, qPrintable(QString("%1 %2").arg(inside).arg(back2 * 255)));
+
+        // The ST map, read as a compositor reads one, puts each pixel where the mesh does (within 0.01 px); written
+        // as OpenEXR with the motion vectors, read back the same.
+        const std::vector<float> st = surfaceStMap(t, f);
+        double stWorst = 0;
+        for (int y = 0; y < H; y += 3)
+            for (int x = 0; x < W; x += 3) {
+                const size_t i = size_t(y) * W + size_t(x);
+                if (std::isnan(on[i * 2])) continue;
+                double sx, sy;
+                QVERIFY(stMapLookup(st, W, H, x + 0.5, y + 0.5, W, H, sx, sy));
+                stWorst = std::max(stWorst, std::hypot(sx - on[i * 2], sy - on[i * 2 + 1]));
+            }
+        QVERIFY2(stWorst < 0.01, qPrintable(QString::number(stWorst)));
+        if (exrAvailable()) {
+            QTemporaryDir exrDir;
+            const std::string base2 = (exrDir.path() + "/surface/shot").toStdString();
+            const std::vector<std::string> files = writeSurfaceExrs(t, base2, 46, 48, &err);
+            QVERIFY2(files.size() == 3, err.c_str());
+            QVERIFY(files.back().size() > 9 && files.back().substr(files.back().size() - 9) == ".0048.exr");
+            int rw = 0, rh = 0;
+            std::vector<float> rgba;
+            QVERIFY2(readExrLayer(files.back(), "", rw, rh, rgba, &err), err.c_str());
+            QCOMPARE(rw, W);
+            QCOMPARE(rh, H);
+            double fileWorst = 0;
+            for (size_t i = 0; i < size_t(W) * H; ++i) fileWorst = std::max({fileWorst, double(std::fabs(rgba[i * 4] - st[i * 3])), double(std::fabs(rgba[i * 4 + 1] - st[i * 3 + 1]))});
+            QVERIFY2(fileWorst < 1e-6, qPrintable(QString::number(fileWorst)));
+            std::vector<float> fwd;
+            QVERIFY2(readExrLayer(files.front(), "forward", rw, rh, fwd, &err), err.c_str());
+            const std::vector<float> motion = surfaceMotion(t, 46, 1);
+            const size_t mid = size_t(125) * W + 160;
+            QVERIFY2(std::fabs(fwd[mid * 4] - motion[mid * 2]) < 1e-5 && std::fabs(fwd[mid * 4 + 1] + motion[mid * 2 + 1]) < 1e-5,
+                     qPrintable(QString("%1 %2 %3 %4").arg(fwd[mid * 4]).arg(fwd[mid * 4 + 1]).arg(motion[mid * 2]).arg(motion[mid * 2 + 1])));
+        }
+
+        // As text and back.
+        SurfaceTrack parsed;
+        QVERIFY(surfaceTrackFromString(surfaceTrackToString(t), parsed));
+        QCOMPARE(parsed.mesh.tris, t.mesh.tris);
+        QCOMPARE(parsed.frames.size(), t.frames.size());
+        for (size_t i = 0; i < t.frames.size(); ++i)
+            for (size_t v = 0; v < t.mesh.rest.size(); ++v)
+                QVERIFY(std::fabs(parsed.frames[i][v][0] - t.frames[i][v][0]) < 1e-3 && std::fabs(parsed.frames[i][v][1] - t.frames[i][v][1]) < 1e-3);
+        QCOMPARE(parsed.frameAt(30 / 24.0), 30);
+        QCOMPARE(parsed.frameAt(60 / 24.0), -1);
+        QVERIFY(!surfaceTrackFromString("surface 1\nsize 10 10\ntime 0 0", parsed));
+
+        // A vertex put by hand on frame 30 stays there; the frames before it are kept and the ones after solved again.
+        {
+            SurfaceTrack fixed = t;
+            const int v = int(fixed.mesh.rest.size() / 2);
+            const MeshPoint at{fixed.frames[30][size_t(v)][0] + 2, fixed.frames[30][size_t(v)][1] - 1};
+            fixed.fixes[30][v] = at;
+            QVERIFY2(trackSurface(fixed, frames, 30, read, {}, {}, &err), err.c_str());
+            QVERIFY(fixed.frames[29] == t.frames[29]);
+            QVERIFY(std::fabs(fixed.frames[30][size_t(v)][0] - at[0]) < 1e-3 && std::fabs(fixed.frames[30][size_t(v)][1] - at[1]) < 1e-3);
+            QVERIFY(fixed.frames[31] != t.frames[31]);
+            // (not from frames never tracked)
+            SurfaceTrack fresh = base;
+            fresh.frames.assign(frames, {});
+            QVERIFY(!trackSurface(fresh, frames, 30, read));
+            // On the last frame, with nothing after it to track: held there all the same.
+            SurfaceTrack last = t;
+            last.fixes[frames - 1][v] = {last.frames[frames - 1][size_t(v)][0] + 1, last.frames[frames - 1][size_t(v)][1]};
+            QVERIFY2(trackSurface(last, frames, frames - 1, read, {}, {}, &err), err.c_str());
+            QVERIFY(std::fabs(last.frames[frames - 1][size_t(v)][0] - last.fixes[frames - 1][v][0]) < 1e-3);
+            // Lost from frame 40 when solved again: nothing after it is left from the track before.
+            SurfaceTrack lost = t;
+            auto blind = [&](int i, GrayImage& out) { return i < 40 && read(i, out); };
+            QVERIFY2(trackSurface(lost, frames, 30, blind, {}, {}, &err), err.c_str());
+            QVERIFY(!lost.frames[39].empty());
+            for (int i = 40; i < frames; ++i) QVERIFY(lost.frames[size_t(i)].empty());
+        }
+
+        // Points far off the mesh carried as they are, and text that would size or place things absurdly refused.
+        const std::vector<MeshPoint> far = surfaceCarry(t, 0, 30, {{1e300, 1e300}, {-1e300, 5}, {std::nan(""), 5}});
+        QCOMPARE(far.size(), size_t(3));
+        const std::string text = surfaceTrackToString(t);
+        auto refused = [&](const std::string& from, const std::string& to) {
+            std::string bad = text;
+            const size_t at = bad.find(from);
+            if (at == std::string::npos) return false;
+            bad.replace(at, from.size(), to);
+            SurfaceTrack out;
+            return !surfaceTrackFromString(bad, out);
+        };
+        QVERIFY(refused("size 320 240", "size 65536 65536"));
+        SurfaceTrack farOff = t;
+        farOff.mesh.rest[0] = {1e30, 5};
+        QVERIFY(!surfaceTrackFromString(surfaceTrackToString(farOff), parsed));
+        farOff = t;
+        farOff.frames[3][0] = {1e9, 5};
+        QVERIFY(!surfaceTrackFromString(surfaceTrackToString(farOff), parsed));
+        QVERIFY(!surfaceTrackFromString(text.substr(0, text.find("frames ")) + "frames 10000000\n", parsed));
+        QVERIFY(refused("\nframes 49\n", "\nframes 48\n"));  // (one frame too many: read as a fix)
     }
 
     void gradeNodeGraphs() {

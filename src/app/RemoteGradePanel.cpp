@@ -415,6 +415,7 @@ QString RemoteGradeController::runTool(const QJsonObject& args, QJsonObject& str
         structured["snapshots"] = double(st.snapshots);
         structured["notes_received"] = st.notes;
         structured["port"] = st.port;
+        if (!st.error.empty()) structured["error"] = qs(st.error);
         QJsonArray addresses;
         std::string scheme, host;
         int port = 0;

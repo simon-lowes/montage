@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 
 #include "EditorState.h"
 #include "MonitorPanel.h"
@@ -16,6 +17,7 @@
 #include "render/MeshWarp.h"
 #include "render/Processing.h"
 #include "render/Restoration.h"
+#include "render/SurfaceTrack.h"
 
 namespace montage {
 
@@ -50,7 +52,8 @@ std::optional<PaintOverlay::Target> PaintOverlay::target() const {
             if (e.enabled && e.type == "stop_motion") lt -= lt % std::max<FrameTime>(1, FrameTime(std::lround(e.p("hold", lt, 3))));
         for (const Effect& e : c.effects)
             if (e.id == armed && e.enabled &&
-                (e.type == "paint" || e.type == "dust_spots" || e.type == "depth_blur" || e.type == "mesh_warp" || e.type == "grid_warp")) {
+                (e.type == "paint" || e.type == "dust_spots" || e.type == "depth_blur" || e.type == "mesh_warp" || e.type == "grid_warp" ||
+                 e.type == "surface_track")) {
                 // Dust spots are taken out where a video or picture file is read (not in nested sequences or generators).
                 const MediaItem* m = state_->project().findMedia(c.mediaId);
                 if (e.type == "dust_spots" && (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image))) return std::nullopt;
@@ -61,6 +64,7 @@ std::optional<PaintOverlay::Target> PaintOverlay::target() const {
                 tg.focus = e.type == "depth_blur";
                 tg.mesh = e.type == "mesh_warp";
                 tg.grid = e.type == "grid_warp";
+                tg.surface = e.type == "surface_track";
                 tg.lt = lt;
                 tg.brush = e.p("brush", tg.lt, tg.dust ? 24 : 30);
                 return tg;
@@ -113,10 +117,30 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
     p.setRenderHint(QPainter::Antialiasing);
     p.setBrush(Qt::NoBrush);
     const double wpx = picture.width() / seq->width;  // widget pixels a sequence pixel
-    if (t->mesh || t->grid) {
+    if (t->mesh || t->grid || t->surface) {
         const std::vector<std::pair<int, QPointF>> hs = handles(*t, *e);
         auto shown = [&](int id, QPointF at) { return id == dragging_ && drawing_.effect == t->effect ? mouse_ + grab_ : at; };
-        if (t->grid) {
+        if (t->surface) {
+            // The mesh on this frame, its vertices put by hand here in orange.
+            const std::shared_ptr<const SurfaceTrack> track = cachedSurfaceTrack(*e);
+            const int frame = track ? surfaceFrameOf(*track, *seq, *c, t->lt) : -1;
+            std::map<int, QPointF> at;
+            for (const auto& [id, w] : hs) at[id] = shown(id, w);
+            if (frame >= 0 && at.size() == track->mesh.rest.size()) {
+                p.setPen(QPen(QColor(255, 255, 255, 120), 1));
+                std::set<std::pair<int, int>> edges;
+                for (const auto& tri : track->mesh.tris)
+                    for (int k = 0; k < 3; ++k) edges.insert(std::minmax(tri[size_t(k)], tri[size_t((k + 1) % 3)]));
+                for (const auto& [a, b] : edges) p.drawLine(at[a], at[b]);
+                const auto fixed = track->fixes.find(frame);
+                for (const auto& [id, w] : at) {
+                    const bool put = fixed != track->fixes.end() && fixed->second.count(id);
+                    p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+                    p.setBrush(put ? QColor(255, 140, 0) : QColor(255, 255, 255, 200));
+                    p.drawEllipse(w, put ? 3.5 : 2.5, put ? 3.5 : 2.5);
+                }
+            }
+        } else if (t->grid) {
             // The grid's lines, then its points.
             const int cols = std::clamp(int(std::lround(e->p("cols", 0, 3))), 1, 12);
             std::map<int, QPointF> at;
@@ -190,7 +214,17 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
             if (pts.size() == 1 && path.elementCount()) p.drawEllipse(path.currentPosition(), 2, 2);
             else p.drawPath(path);
         };
-        // Where each shows on this frame (a tracked one moved with the mask).
+        // Where each shows on this frame (a tracked one moved with the mask; one following the surface, with the clip's
+        // surface track, as the render has it).
+        SurfaceContext surface;
+        for (const Effect& x : c->effects)
+            if (x.enabled && x.type == "surface_track" && (surface.track = cachedSurfaceTrack(x))) {
+                surface.mediaSeconds = [c, seq](FrameTime f) {
+                    return c->sourceFrameAt(c->start + std::clamp<FrameTime>(f, 0, std::max<FrameTime>(0, c->duration - 1))) / seq->fpsValue();
+                };
+                break;
+            }
+        const SurfaceScope scope(std::move(surface));
         double fw = 0, fh = 0;
         if (clipFrameSize(state_->project(), *seq, *c, fw, fh) && fw > 0 && fh > 0)
             for (PaintStrokeAt s : paintStrokesAt(*e, t->lt, int(std::lround(fw)), int(std::lround(fh)))) {
@@ -236,6 +270,17 @@ std::vector<std::pair<int, QPointF>> PaintOverlay::handles(const Target& t, cons
                 QPointF w;
                 if (toWidget(t.clip, q[0], q[1], w)) out.emplace_back(r * 1000 + col, w);
             }
+        return out;
+    }
+    if (t.surface) {
+        const std::shared_ptr<const SurfaceTrack> track = cachedSurfaceTrack(e);
+        const int frame = track ? surfaceFrameOf(*track, *seq, *c, t.lt) : -1;
+        if (frame < 0) return out;
+        const std::vector<MeshPoint>& at = track->frames[size_t(frame)];
+        for (size_t k = 0; k < at.size(); ++k) {
+            QPointF w;
+            if (toWidget(t.clip, at[k][0] / track->width, at[k][1] / track->height, w)) out.emplace_back(int(k), w);
+        }
         return out;
     }
     // Position pins where they are put; the others where the warp takes them.
@@ -306,6 +351,30 @@ void PaintOverlay::dropHandle(const Target& t, const QPointF& at, bool remove) {
     if (!e || id < 0 || !clipFrameSize(state_->project(), *seq, *c, fw, fh) || fw < 1 || fh < 1 || !fromWidget(t.clip, at, u, v)) return;
     const Id clip = t.clip, effect = t.effect;
     const FrameTime lt = t.lt;
+    if (t.surface) {
+        // A vertex put where it should be on this frame (held there when the track is solved again), or let go.
+        const std::shared_ptr<const SurfaceTrack> track = cachedSurfaceTrack(*e);
+        const int frame = track ? surfaceFrameOf(*track, *seq, *c, lt) : -1;
+        if (frame < 0 || id >= int(track->mesh.rest.size())) return;
+        SurfaceTrack changed = *track;
+        if (remove) {
+            auto f = changed.fixes.find(frame);
+            if (f == changed.fixes.end() || !f->second.erase(id)) return;
+            if (f->second.empty()) changed.fixes.erase(f);
+        } else {
+            const MeshPoint put{u * changed.width, v * changed.height};
+            changed.fixes[frame][id] = put;
+            changed.frames[size_t(frame)][size_t(id)] = put;
+        }
+        const std::string text = surfaceTrackToString(changed);
+        state_->edit(remove ? tr("Let Go of Vertex") : tr("Put Vertex"), [=](Project&, Sequence& sq) {
+            Effect* ef = edit::ownedEffect(sq, clip, effect);
+            if (!ef) return false;
+            ef->strings["track"] = text;
+            return true;
+        });
+        return;
+    }
     if (t.grid) {
         const int rows = std::clamp(int(std::lround(e->p("rows", 0, 3))), 1, 12), cols = std::clamp(int(std::lround(e->p("cols", 0, 3))), 1, 12);
         const int r = id / 1000, col = id % 1000;
@@ -467,13 +536,13 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
         inside_ = true;
         double u, v;
         if (!fromWidget(t->clip, mouse_, u, v)) return true;
-        if (t->mesh || t->grid) {
+        if (t->mesh || t->grid || t->surface) {
             const Sequence* seq = state_->sequence();
             const Effect* ef = seq ? edit::ownedEffect(const_cast<Sequence&>(*seq), t->clip, t->effect) : nullptr;
             if (!ef) return true;
             const int id = handleAt(*t, *ef, mouse_);
             drawing_ = *t;
-            if (id >= 0 && t->mesh && (me->modifiers() & Qt::ControlModifier)) {
+            if (id >= 0 && (t->mesh || t->surface) && (me->modifiers() & Qt::ControlModifier)) {
                 dragging_ = id;
                 dropHandle(*t, mouse_, true);
             } else if (id >= 0) {

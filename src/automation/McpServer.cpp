@@ -140,6 +140,7 @@
 #include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
+#include "render/SurfaceTrack.h"
 #include "render/QualityCheck.h"
 #include "render/SdhDraft.h"
 #include "render/FrameRepair.h"
@@ -11267,6 +11268,122 @@ void McpServer::Impl::addTools() {
             QJsonArray keys;
             for (const auto& k : focus.keys) keys.append(QJsonObject{{"frame", double(c.start + k.t)}, {"focus", k.v}});
             return ok(QStringLiteral("Keyed Focus Depth at %1 frame(s)").arg(focus.keys.size()), QJsonObject{{"keys", keys}});
+        });
+
+    add("montage_surface_track", "Track a surface",
+        "Tracks a bending surface (cloth, skin, a flag) through a video clip with its surface_track effect (`effect`, its "
+        "id): a mesh of about `detail` vertices is laid inside the effect's mask (an ellipse, a rectangle or a shape) on "
+        "the frame at `at` and followed to both ends of the clip. The effect then shows the mesh, a picture on the "
+        "surface (`picture`, placed by picture_x, picture_y and picture_w as fractions of the frame at `at`), the "
+        "surface held still as on that frame, a picture made on the held-still surface put back, or nothing (mode). Masks with "
+        "Bend With the Surface Track and paint with Strokes Follow the Surface Track on the same clip follow it too. "
+        "`fixes` puts vertices where they should be on frames where the track slipped and solves it again from the "
+        "first of them (the track before it is kept). `export_dir` also writes an OpenEXR per frame: the ST map (R, G) "
+        "and forward and backward motion vectors (layers forward.u/v, backward.u/v, v up).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The surface_track effect's id on the clip"},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame the mask outlines the surface on (the clip's start by default)"},
+            "detail":{"type":"number","description":"About how many mesh vertices (20 to 3000; the effect's detail by default)"},
+            "mode":{"type":"string","enum":["mesh","picture","still","put_back","none"]},
+            "picture":{"type":"string","description":"An image file to put on the surface (sets mode picture)"},
+            "picture_x":{"type":"number"},"picture_y":{"type":"number"},"picture_w":{"type":"number"},
+            "fixes":{"type":"array","items":{"type":"object","properties":{"at":{"type":["number","string"]},
+                "vertex":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"}},"required":["at","vertex","x","y"]},
+                "description":"Vertices put by hand: on the frame at `at` (timeline), vertex `vertex` at x, y (fractions of the frame)"},
+            "export_dir":{"type":"string","description":"A folder for the ST map and motion vector EXRs"}},
+            "required":["project","clip","effect"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clipId = clipArg(l, a).id;
+            const Id effectId = Id(a.value("effect").toDouble());
+            Effect* e = edit::ownedEffect(s, clipId, effectId);
+            if (!e || e->type != "surface_track")
+                throw ArgError{QStringLiteral("No surface_track effect %1 on that clip (see montage_project_info)").arg(qint64(effectId))};
+            const Clip& c = *edit::clipById(s, clipId);
+            if (a.contains("detail")) {
+                const double d = a.value("detail").toDouble(-1);
+                if (!(d >= 20 && d <= 3000)) throw ArgError{"\"detail\" is 20 to 3000 vertices"};
+                e->params["detail"] = Param(std::round(d));
+            }
+            if (a.contains("mode")) {
+                const QStringList modes{"mesh", "picture", "still", "put_back", "none"};
+                const int m = int(modes.indexOf(str(a, "mode", "")));
+                if (m < 0) throw ArgError{"\"mode\" is mesh, picture, still, put_back or none"};
+                e->params["mode"] = Param(double(m));
+            }
+            if (a.contains("picture")) {
+                const QString pic = str(a, "picture", "");
+                if (!QFileInfo(pic).isFile()) throw ArgError{QStringLiteral("No picture at %1").arg(pic)};
+                e->strings["picture"] = QFileInfo(pic).absoluteFilePath().toStdString();
+                if (!a.contains("mode")) e->params["mode"] = Param(1.0);
+            }
+            for (const char* k : {"picture_x", "picture_y", "picture_w"})
+                if (a.contains(k)) {
+                    const double v = a.value(k).toDouble(-9);
+                    if (!(v >= -0.5 && v <= 2)) throw ArgError{QStringLiteral("\"%1\" is a fraction of the frame").arg(k)};
+                    e->params[k] = Param(v);
+                }
+            std::string err;
+            int tracked = 0;
+            const QJsonArray fixes = a.value("fixes").toArray();
+            if (!fixes.isEmpty()) {
+                SurfaceTrack t;
+                if (!surfaceTrackFromString(e->s("track"), t)) return fail("Track the surface first, then fix it");
+                // Solved again out from the reference on each side, from the fix nearest it (or from the reference,
+                // both ways, when one is on it), so every fix is reached.
+                std::map<int, FrameTime> fixedFrames;  // track frame -> clip frame
+                for (const QJsonValue& v : fixes) {
+                    const QJsonObject f = v.toObject();
+                    const FrameTime at = timeArg(f.value("at"), s, "at");
+                    if (!c.contains(at)) throw ArgError{"Each fix's \"at\" must be inside the clip"};
+                    const int frame = surfaceFrameOf(t, s, c, at - c.start);
+                    const int vertex = f.value("vertex").toInt(-1);
+                    const double x = f.value("x").toDouble(-9), y = f.value("y").toDouble(-9);
+                    if (frame < 0) throw ArgError{"A fix is on a frame the surface was not tracked on"};
+                    if (vertex < 0 || vertex >= int(t.mesh.rest.size()))
+                        throw ArgError{QStringLiteral("\"vertex\" is 0 to %1").arg(int(t.mesh.rest.size()) - 1)};
+                    if (!(x >= -0.5 && x <= 1.5 && y >= -0.5 && y <= 1.5)) throw ArgError{"A fix's x and y are fractions of the frame"};
+                    t.fixes[frame][vertex] = MeshPoint{x * t.width, y * t.height};
+                    fixedFrames[frame] = at - c.start;
+                }
+                e->strings["track"] = surfaceTrackToString(t);
+                std::vector<FrameTime> starts;
+                if (const auto on = fixedFrames.find(t.reference); on != fixedFrames.end()) starts.push_back(on->second);
+                else {
+                    if (auto before = fixedFrames.lower_bound(t.reference); before != fixedFrames.begin()) starts.push_back(std::prev(before)->second);
+                    if (auto after = fixedFrames.upper_bound(t.reference); after != fixedFrames.end()) starts.push_back(after->second);
+                }
+                for (FrameTime from : starts) {
+                    std::string track;
+                    if (!trackClipSurface(l.project, s, c, *e, from, track, true, {}, &err))
+                        return fail(QStringLiteral("Could not solve the track again: %1").arg(QString::fromStdString(err)));
+                    e->strings["track"] = track;
+                }
+            } else if (!a.contains("picture") || e->s("track").empty()) {
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+                if (!c.contains(at)) throw ArgError{"\"at\" must be inside the clip"};
+                std::string track;
+                if (!trackClipSurface(l.project, s, c, *e, at - c.start, track, false, {}, &err))
+                    return fail(QStringLiteral("Could not track the surface: %1").arg(QString::fromStdString(err)));
+                e->strings["track"] = track;
+            }
+            const std::shared_ptr<const SurfaceTrack> t = cachedSurfaceTrack(*e);
+            if (!t) return fail("Could not track the surface");
+            for (const auto& f : t->frames) tracked += f.empty() ? 0 : 1;
+            QJsonArray files;
+            if (a.contains("export_dir")) {
+                const QString dir = str(a, "export_dir", "");
+                if (!QDir().mkpath(dir)) throw ArgError{QStringLiteral("Cannot make %1").arg(dir)};
+                const std::string base = QDir(dir).filePath(QStringLiteral("surface")).toStdString();
+                const std::vector<std::string> written = writeSurfaceExrs(*t, base, 0, int(t->frames.size()) - 1, &err);
+                if (written.empty()) return fail(QStringLiteral("Could not write the EXRs: %1").arg(QString::fromStdString(err)));
+                for (const std::string& f : written) files.append(QString::fromStdString(f));
+            }
+            save(l);
+            return ok(QStringLiteral("Tracked the surface on %1 of %2 frame(s)").arg(tracked).arg(t->frames.size()),
+                      QJsonObject{{"frames", int(t->frames.size())}, {"tracked", tracked}, {"lost", int(t->frames.size()) - tracked},
+                                  {"vertices", int(t->mesh.rest.size())}, {"reference", t->reference}, {"files", files}});
         });
 
     add("montage_ograf", "OGraf graphics",

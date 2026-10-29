@@ -5448,6 +5448,58 @@
         <source>Varispeed</source>
         <translation type="unfinished">Скорость</translation>
     </message>
+    <message>
+        <source>A Picture on the Surface</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nothing (Only the Track)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Picture</source>
+        <translation type="unfinished">Иллюстрация</translation>
+    </message>
+    <message>
+        <source>Picture Opacity</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Picture Width</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Picture X</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Picture Y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show</source>
+        <translation type="unfinished">Показать</translation>
+    </message>
+    <message>
+        <source>Strokes Follow the Surface Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Surface Tracker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Mesh</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Surface Held Still</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Surface Put Back</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -12725,6 +12777,66 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
             <numerusform></numerusform>
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>Track Surface</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lay a mesh inside the mask on this frame and follow the surface as it moves and bends, to both ends of the clip</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export ST Maps...</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An OpenEXR for each frame with the ST map and the surface&apos;s motion vectors</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export ST Maps</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Wrote %n ST map(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Tracked on %1 of %2 frames, %3 vertices</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Tracked the surface on %n frame(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Vertices on the Monitor</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drag a vertex on the Program monitor to where the surface is on that frame where the track has slipped; Ctrl-click one to let it go. Then Solve Again From Here. Esc stops.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Solve Again From Here</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep the track up to the playhead and track on from there, holding the vertices put by hand</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Solve Surface Again</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -22732,6 +22844,14 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Paint Stroke</source>
         <translation type="unfinished">Краска</translation>
+    </message>
+    <message>
+        <source>Let Go of Vertex</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Put Vertex</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

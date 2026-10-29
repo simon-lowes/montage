@@ -1,4 +1,5 @@
 #include "Processing.h"
+#include "SurfaceTrack.h"
 #include "ColorChart.h"
 #include "Ofx.h"
 
@@ -1167,6 +1168,10 @@ thread_local SlowEffects tSlow;
 const SlowEffects& currentSlowEffects() { return tSlow; }
 SlowEffectsScope::SlowEffectsScope(SlowEffects slow) : previous_(tSlow) { tSlow = slow; }
 SlowEffectsScope::~SlowEffectsScope() { tSlow = previous_; }
+thread_local SurfaceContext tSurface;
+const SurfaceContext* currentSurface() { return tSurface.track ? &tSurface : nullptr; }
+SurfaceScope::SurfaceScope(SurfaceContext context) : previous_(std::move(tSurface)) { tSurface = std::move(context); }
+SurfaceScope::~SurfaceScope() { tSurface = std::move(previous_); }
 thread_local std::string tCryptoFile;
 const std::string& currentCryptomatteFile() { return tCryptoFile; }
 CryptomatteScope::CryptomatteScope(std::string file) : previous_(std::move(tCryptoFile)) { tCryptoFile = std::move(file); }
@@ -1416,7 +1421,57 @@ void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radi
     });
 }
 
+std::vector<std::array<double, 2>> maskOutline(const Effect& e, FrameTime t, int W, int H) {
+    std::vector<std::array<double, 2>> out;
+    const int shape = int(std::lround(e.p("mask.shape", t)));
+    if (shape == 5) {
+        const std::vector<PathPoint> pts = maskPath(e, t);
+        if (pts.size() < 3) return out;
+        const MaskBox box = maskBox(e, t);
+        for (auto [x, y] : flattenMaskPath(pts, true, 24)) {
+            double u = 0, v = 0;
+            boxToFrame(box, W, H, x, y, u, v);
+            out.push_back({u * W, v * H});
+        }
+    } else if (shape == 1 || shape == 2) {
+        const double cx = e.p("mask.x", t, 0.5) * W, cy = e.p("mask.y", t, 0.5) * H;
+        const double a = std::max(0.5, e.p("mask.w", t, 0.4) * W / 2), b = std::max(0.5, e.p("mask.h", t, 0.4) * H / 2);
+        const double rot = e.p("mask.rotation", t) * M_PI / 180.0, cr = std::cos(rot), sr = std::sin(rot);
+        auto put = [&](double u, double v) { out.push_back({cx + u * cr - v * sr, cy + u * sr + v * cr}); };
+        if (shape == 1)
+            for (int k = 0; k < 72; ++k) put(a * std::cos(2 * M_PI * k / 72), b * std::sin(2 * M_PI * k / 72));
+        else
+            put(-a, -b), put(a, -b), put(a, b), put(-a, b);
+    }
+    return out;
+}
+
 namespace {
+// A drawn mask bent with the clip's surface track: drawn as on the track's reference frame, carried to this one (and
+// a little past the mesh's edge, for its feather; none further off, where the surface does not say where it goes).
+void bendWithSurface(std::vector<float>& matte, int W, int H, double sourceSeconds) {
+    const SurfaceContext* sc = currentSurface();
+    if (sourceSeconds < 0) sourceSeconds = tSourceSeconds;
+    if (!sc || sourceSeconds < 0) return;
+    const SurfaceTrack& tr = *sc->track;
+    const int frame = tr.frameAt(sourceSeconds);
+    if (frame < 0 || tr.width <= 0 || tr.height <= 0) return;
+    const double sx = double(W) / tr.width, sy = double(H) / tr.height;
+    std::vector<MeshPoint> on = tr.frames[size_t(frame)], rest = tr.mesh.rest;
+    for (MeshPoint& p : on) p[0] *= sx, p[1] *= sy;
+    for (MeshPoint& p : rest) p[0] *= sx, p[1] *= sy;
+    const std::vector<float> map = meshMapReaching(tr.mesh, on, rest, W, H, 32 * std::max(sx, sy));
+    const std::vector<float> drawn = matte;
+    auto at = [&](double x, double y) {
+        x = std::clamp(x - 0.5, 0.0, double(W - 1)), y = std::clamp(y - 0.5, 0.0, double(H - 1));
+        const int x0 = std::min(int(x), W - 1), y0 = std::min(int(y), H - 1), x1 = std::min(x0 + 1, W - 1), y1 = std::min(y0 + 1, H - 1);
+        const double fx = x - x0, fy = y - y0;
+        auto v = [&](int xx, int yy) { return double(drawn[size_t(yy) * size_t(W) + size_t(xx)]); };
+        return (v(x0, y0) * (1 - fx) + v(x1, y0) * fx) * (1 - fy) + (v(x0, y1) * (1 - fx) + v(x1, y1) * fx) * fy;
+    };
+    for (size_t i = 0; i < matte.size(); ++i) matte[i] = std::isnan(map[i * 2]) ? 0.f : float(at(map[i * 2], map[i * 2 + 1]));
+}
+
 // An effect mask's drawn shape (an ellipse, a rectangle, a path or a gradient) into `matte`, a picture's size.
 void drawMaskShape(const Effect& e, FrameTime t, int shape, std::vector<float>& matte, int W, int H, double pixelScale) {
     if (shape == 5) {
@@ -1530,6 +1585,9 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
         // The shape's holes and gaps closed (Consolidate), then its edge settled on the picture's own (Refine Edges,
         // as Photoshop's Refine Edge and Resolve's Smart Refine). A gradient has neither holes nor an object's edge.
         consolidateMatte(matte, W, H, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
+        // (A shape drawn on the surface track's reference frame bent as the surface is on this one, before its edge
+        // is fitted to this frame's picture.)
+        if ((shape == 1 || shape == 2 || shape == 5) && e.p("mask.surface", t) > 0.5) bendWithSurface(matte, W, H, sourceSeconds);
         const double refine = std::clamp(e.p("mask.refine", t) / 100.0, 0.0, 1.0);
         if (refine > 0) refineMatteEdges(matte, img, std::max(1.0, e.p("mask.refine_radius", t, 8) * pixelScale), refine);
     }
@@ -2003,6 +2061,11 @@ void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixel
         paintStrokes(e, t, img);
         return;
     }
+    if (e.type == "surface_track") {
+        // Nor the Surface Tracker's: it outlines the surface tracked.
+        surfaceTrackEffect(e, t, img, sourceSeconds);
+        return;
+    }
     if (e.type == "light_rays" && e.p("follow", t, 0) > 0.5) {
         // Nor for rays from the mask's track: it is where they come from.
         applyEffectUnmasked(e, t, img, pixelScale);
@@ -2179,25 +2242,30 @@ std::vector<PaintStrokeAt> paintStrokesAt(const Effect& e, FrameTime t, int W, i
         a.heal = s.heal;
         a.radius = s.radius * W;
         a.softness = s.softness;
-        // A tracked stroke moves as the mask's box has since the frame it was drawn on (its source offset too).
+        // A tracked stroke moves as the mask's box has since the frame it was drawn on (its source offset too); with
+        // the surface track followed, as the surface has.
         const MaskBox from = maskBox(e, FrameTime(s.frame)), to = maskBox(e, t);
-        auto place = [&](double u, double v, double& x, double& y) {
-            if (s.track) {
+        const SurfaceContext* sc = e.p("surface", t) > 0.5 ? currentSurface() : nullptr;
+        const int surfaceFrom = sc ? sc->track->frameAt(sc->mediaSeconds(FrameTime(s.frame))) : -1;
+        const int surfaceTo = sc ? sc->track->frameAt(sc->mediaSeconds(t)) : -1;
+        std::vector<std::array<double, 2>> uv = s.points;
+        uv.push_back({s.points[0][0] + s.dx, s.points[0][1] + s.dy});  // (where it copies from)
+        if (surfaceFrom >= 0 && surfaceTo >= 0) {
+            const SurfaceTrack& tr = *sc->track;
+            std::vector<MeshPoint> px(uv.size());
+            for (size_t i = 0; i < uv.size(); ++i) px[i] = {uv[i][0] * tr.width, uv[i][1] * tr.height};
+            px = surfaceCarry(tr, surfaceFrom, surfaceTo, px);
+            for (size_t i = 0; i < uv.size(); ++i) uv[i] = {px[i][0] / tr.width, px[i][1] / tr.height};
+        } else if (s.track) {
+            for (auto& [u, v] : uv) {
                 double bx, by;
                 frameToBox(from, W, H, u, v, bx, by);
                 boxToFrame(to, W, H, bx, by, u, v);
             }
-            x = u * W - 0.5, y = v * H - 0.5;
-        };
-        for (const auto& p : s.points) {
-            double x, y;
-            place(p[0], p[1], x, y);
-            a.points.push_back({x, y});
         }
-        double sx, sy;
-        place(s.points[0][0] + s.dx, s.points[0][1] + s.dy, sx, sy);
-        a.dx = sx - a.points[0][0], a.dy = sy - a.points[0][1];
-        if (s.track) a.radius *= std::sqrt(std::max(1e-6, (to.w * to.h) / std::max(1e-12, from.w * from.h)));
+        for (size_t i = 0; i + 1 < uv.size(); ++i) a.points.push_back({uv[i][0] * W - 0.5, uv[i][1] * H - 0.5});
+        a.dx = (uv.back()[0] * W - 0.5) - a.points[0][0], a.dy = (uv.back()[1] * H - 0.5) - a.points[0][1];
+        if (s.track && (surfaceFrom < 0 || surfaceTo < 0)) a.radius *= std::sqrt(std::max(1e-6, (to.w * to.h) / std::max(1e-12, from.w * from.h)));
         out.push_back(std::move(a));
     }
     return out;
@@ -3334,6 +3402,7 @@ void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& spac
 bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing) {
     const int shape = int(std::lround(e.p("mask.shape", t)));
     if (shape == 3 || shape == 4 || shape > 6 || e.p("mask.depth", t) > 0.5 || (!showing && e.p("mask.show", t) > 0.5) ||
+        e.p("mask.surface", t) > 0.5 ||
         (shape > 0 && shape != 6 && e.p("mask.refine", t) > 0))
         return false;  // (what the picture holds, or the mask shown)
     // As effectMatte makes it: the shape (and its holes closed) here, the qualifier, inverting and fading there.

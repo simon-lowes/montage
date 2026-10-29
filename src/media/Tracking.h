@@ -35,6 +35,11 @@ std::vector<Point2> goodFeatures(const GrayImage& img, int maxCorners, double mi
 void trackPoints(const GrayImage& a, const GrayImage& b, const std::vector<Point2>& from, std::vector<Point2>& to,
                  std::vector<bool>& ok);
 
+// The same for one point, on pyramids made once (grayPyramid; one level: a residual of a pixel or two), without the
+// check: where `p` in `a` is in `b`. False when lost or without texture.
+std::vector<GrayImage> grayPyramid(const GrayImage& img);
+bool lucasKanade(const std::vector<GrayImage>& a, const std::vector<GrayImage>& b, Point2 p, Point2& out);
+
 // Dense optical flow from `a` to `b` on a grid every `step` pixels: flow[gy *
 // gw + gx] is the motion of the point (gx * step, gy * step). Points without
 // texture take their neighbours' motion.

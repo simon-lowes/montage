@@ -263,6 +263,7 @@
 #include "render/MonitorSection.h"
 #include "media/TakeChoice.h"
 #include "render/ImageSubtitles.h"
+#include "render/SurfaceTrack.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -36366,6 +36367,250 @@ private slots:
         Clip reframed = clip;
         reframed.effects.push_back(makeEffect(p, "reframe_360"));
         QVERIFY(!clipDepthAnalysed(p, s, reframed));
+    }
+
+    void surfaceTrackerOnAClip() {
+        constexpr int W = 320, H = 240, N = 25;
+        // A texture of waves, turned and bent as frames go on (as in test_render's surfaceTracking), encoded.
+        struct Wave {
+            double fx, fy, phase, amp;
+        };
+        std::vector<Wave> waves;
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<double> u(0, 1);
+        for (int k = 0; k < 40; ++k) {
+            const double wl = 10 + 30 * u(rng), dir = 2 * M_PI * u(rng);
+            waves.push_back({std::cos(dir) / wl, std::sin(dir) / wl, 2 * M_PI * u(rng), 0.025 + 0.02 * u(rng)});
+        }
+        auto texture = [&](double x, double y) {
+            double v = 0.5;
+            for (const Wave& w : waves) v += w.amp * std::sin(2 * M_PI * (w.fx * x + w.fy * y) + w.phase);
+            return std::clamp(v, 0.0, 1.0);
+        };
+        auto moved = [&](int f, double x, double y, double& ox, double& oy) {
+            const double k = double(f) / (N - 1), th = 0.12 * k;
+            ox = 160 + std::cos(th) * (x - 160) - std::sin(th) * (y - 120);
+            oy = 120 + std::sin(th) * (x - 160) + std::cos(th) * (y - 120);
+            const double cx = 150 + 1.5 * f, cy = 110 + 0.5 * f;
+            const double g = std::exp(-((x - cx) * (x - cx) + (y - cy) * (y - cy)) / (2 * 35.0 * 35.0)) * k;
+            ox += 5 * g, oy -= 4 * g;
+        };
+        std::vector<QImage> frames;
+        for (int f = 0; f < N; ++f) {
+            QImage im(W, H, QImage::Format_RGB888);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double ux = x + 0.5, uy = y + 0.5;
+                    for (int it = 0; it < 60; ++it) {
+                        double mx, my;
+                        moved(f, ux, uy, mx, my);
+                        ux += x + 0.5 - mx, uy += y + 0.5 - my;
+                    }
+                    const double v = texture(ux, uy);
+                    im.setPixel(x, y, qRgb(int(v * 255 + 0.5), int((0.2 + 0.6 * v) * 255 + 0.5), int((1 - v) * 255 + 0.5)));
+                }
+            frames.push_back(im);
+        }
+        const std::string video = path("surface.mp4");
+        writeFrames(video, frames, 25);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clipId = s.videoTracks[0].clips.at(0).id;
+        QCOMPARE(s.videoTracks[0].clips.at(0).duration, FrameTime(N));
+        // A tracker with no mask yet, and one with an ellipse round the middle of the picture.
+        Effect bare = makeEffect(p, "surface_track"), tracker = makeEffect(p, "surface_track");
+        bare.enabled = false;
+        tracker.params["mask.shape"] = Param(1.0);
+        tracker.params["mask.w"] = Param(0.45);
+        tracker.params["mask.h"] = Param(0.5);
+        tracker.params["detail"] = Param(150.0);
+        s.videoTracks[0].clips[0].effects = {bare, tracker};
+        const QString project = QString::fromStdString(path("surface.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call("montage_surface_track", {{"project", project}, {"clip", double(clipId)}, {"effect", double(bare.id)}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("Draw a mask"), qPrintable(text(r)));
+        const QString exrs = QString::fromStdString(path("surface-exr"));
+        r = call("montage_surface_track", {{"project", project}, {"clip", double(clipId)}, {"effect", double(tracker.id)}, {"mode", "none"},
+                                           {"export_dir", exrs}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("tracked").toInt(), N);
+        QCOMPARE(out.value("files").toArray().size(), N);
+        QVERIFY(QFileInfo(out.value("files").toArray().at(N - 1).toString()).size() > 1000);
+        const int vertices = out.value("vertices").toInt();
+        QVERIFY2(vertices > 80 && vertices < 300, qPrintable(QString::number(vertices)));
+
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        Sequence& qs = *q.active();
+        Clip& clip = *edit::clipById(qs, clipId);
+        QCOMPARE(clip.effects.size(), size_t(2));
+        SurfaceTrack t;
+        QVERIFY(surfaceTrackFromString(clip.effects[1].s("track"), t));
+        QCOMPARE(t.width, W);
+        QCOMPARE(int(t.frames.size()), N);
+        QCOMPARE(t.reference, 0);
+        // Each vertex where the bending takes it, through the encoding.
+        double sum = 0, worst = 0;
+        int count = 0;
+        for (int f = 0; f < N; ++f)
+            for (size_t v = 0; v < t.mesh.rest.size(); ++v) {
+                double x, y;
+                moved(f, t.mesh.rest[v][0], t.mesh.rest[v][1], x, y);
+                const double e = std::hypot(t.frames[size_t(f)][v][0] - x, t.frames[size_t(f)][v][1] - y);
+                sum += e, worst = std::max(worst, e), ++count;
+            }
+        qInfo("Surface track of an encoded clip: mean %.3f px, worst %.3f px", sum / count, worst);
+        QVERIFY2(sum / count < 0.4 && worst < 1.5, qPrintable(QString("%1 %2").arg(sum / count).arg(worst)));
+        // Nothing shown by the tracker itself.
+        clip.effects[1].enabled = false;
+        const Image plain0 = renderSequenceFrame(q, qs, 0, {}), plain24 = renderSequenceFrame(q, qs, N - 1, {});
+        clip.effects[1].enabled = true;
+        QVERIFY(renderSequenceFrame(q, qs, N - 1, {}).px == plain24.px);
+
+        // A mask bent with the surface: drawn round a point on frame 0, round where it has gone on the last frame.
+        Effect inv = makeEffect(q, "invert");
+        inv.params["mask.shape"] = Param(1.0);
+        inv.params["mask.x"] = Param(200.0 / W);
+        inv.params["mask.y"] = Param(90.0 / H);
+        inv.params["mask.w"] = Param(20.0 / W);
+        inv.params["mask.h"] = Param(20.0 / H);
+        inv.params["mask.feather"] = Param(2.0);
+        inv.params["mask.show"] = Param(1.0);
+        inv.params["mask.surface"] = Param(1.0);
+        clip.effects.push_back(inv);
+        auto centroid = [&](const Image& im, double& cx, double& cy) {
+            double w = 0;
+            cx = cy = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double a = im.at(x, y)[0];
+                    cx += a * (x + 0.5), cy += a * (y + 0.5), w += a;
+                }
+            cx /= std::max(w, 1e-9), cy /= std::max(w, 1e-9);
+        };
+        double tx, ty, cx, cy;
+        moved(N - 1, 200, 90, tx, ty);
+        QVERIFY(std::hypot(tx - 200, ty - 90) > 5);
+        centroid(renderSequenceFrame(q, qs, N - 1, {}), cx, cy);
+        QVERIFY2(std::hypot(cx - tx, cy - ty) < 0.75, qPrintable(QString("%1,%2 for %3,%4").arg(cx).arg(cy).arg(tx).arg(ty)));
+        // (none left where it was drawn, nor any of one drawn off the surface)
+        {
+            Effect off = inv;
+            off.params["mask.x"] = Param(15.0 / W);
+            off.params["mask.y"] = Param(15.0 / H);
+            clip.effects.back() = off;
+            const Image none = renderSequenceFrame(q, qs, N - 1, {});
+            float most = 0;
+            for (size_t i = 0; i < none.px.size(); i += 4) most = std::max(most, none.px[i]);
+            QCOMPARE(most, 0.f);
+            clip.effects.back() = inv;
+        }
+        clip.effects.back().params["mask.surface"] = Param(0.0);
+        centroid(renderSequenceFrame(q, qs, N - 1, {}), cx, cy);
+        QVERIFY2(std::hypot(cx - 200, cy - 90) < 0.75, qPrintable(QString("%1,%2").arg(cx).arg(cy)));
+        clip.effects.pop_back();
+
+        // A paint stroke drawn on frame 0 that follows the surface.
+        {
+            Effect paint = makeEffect(q, "paint");
+            paint.params["surface"] = Param(1.0);
+            PaintStroke dot;
+            dot.frame = 0;
+            dot.hold = true;
+            dot.points = {{200.0 / W, 90.0 / H}};
+            paint.strings["strokes"] = paintStrokesToString({dot});
+            SurfaceScope scope({cachedSurfaceTrack(clip.effects[1].s("track")), [](FrameTime f) { return f / 25.0; }});
+            const std::vector<PaintStrokeAt> at = paintStrokesAt(paint, N - 1, W, H);
+            QCOMPARE(at.size(), size_t(1));
+            QVERIFY2(std::hypot(at[0].points[0][0] + 0.5 - tx, at[0].points[0][1] + 0.5 - ty) < 0.75,
+                     qPrintable(QString("%1,%2").arg(at[0].points[0][0]).arg(at[0].points[0][1])));
+            paint.params["surface"] = Param(0.0);
+            const std::vector<PaintStrokeAt> still = paintStrokesAt(paint, N - 1, W, H);
+            QVERIFY(std::hypot(still[0].points[0][0] + 0.5 - 200, still[0].points[0][1] + 0.5 - 90) < 1e-6);
+        }
+
+        // Held still: the last frame's surface as on the first frame; put back, the last frame again.
+        auto meanDiff = [&](const Image& a, const Image& b, bool inside) {
+            double sum = 0;
+            int n = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double ex = (x + 0.5 - W / 2.0) / (0.45 * W / 2), ey = (y + 0.5 - H / 2.0) / (0.5 * H / 2);
+                    if (inside && ex * ex + ey * ey > 0.7 * 0.7) continue;
+                    for (int k = 0; k < 3; ++k) sum += std::fabs(a.at(x, y)[k] - b.at(x, y)[k]);
+                    ++n;
+                }
+            return sum / std::max(1, 3 * n);
+        };
+        clip.effects[1].params["mode"] = Param(2.0);
+        const Image held = renderSequenceFrame(q, qs, N - 1, {});
+        const double heldOff = meanDiff(held, plain0, true), movedOff = meanDiff(plain24, plain0, true);
+        qInfo("Held still: %.4f from the first frame (%.4f without)", heldOff, movedOff);
+        QVERIFY2(heldOff < 0.02 && movedOff > 3 * heldOff, qPrintable(QString("%1 %2").arg(heldOff).arg(movedOff)));
+        Effect back = clip.effects[1];
+        back.params["mode"] = Param(3.0);
+        clip.effects.push_back(back);
+        const Image putBack = renderSequenceFrame(q, qs, N - 1, {});
+        const double backOff = meanDiff(putBack, plain24, false);
+        QVERIFY2(backOff < 0.004, qPrintable(QString::number(backOff)));
+        clip.effects.pop_back();
+        clip.effects[1].params["mode"] = Param(4.0);
+        QVERIFY(saveProject(q, project.toStdString()));
+
+        // A picture put on the surface where it is on frame 0 rides it to the last frame.
+        QImage logo(32, 32, QImage::Format_ARGB32);
+        logo.fill(QColor(255, 0, 0));
+        const QString logoPath = QString::fromStdString(path("surface-logo.png"));
+        QVERIFY(logo.save(logoPath));
+        r = call("montage_surface_track", {{"project", project}, {"clip", double(clipId)}, {"effect", double(tracker.id)}, {"picture", logoPath},
+                                           {"picture_x", 200.0 / W}, {"picture_y", 90.0 / H}, {"picture_w", 0.1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project withLogo;
+        QVERIFY(loadProject(project.toStdString(), withLogo));
+        QCOMPARE(edit::clipById(*withLogo.active(), clipId)->effects[1].s("track"), clip.effects[1].s("track"));
+        const Image logoShown = renderSequenceFrame(withLogo, *withLogo.active(), N - 1, {});
+        double lx = 0, ly = 0;
+        int ln = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (logoShown.at(x, y)[0] > 0.9f && logoShown.at(x, y)[1] < 0.1f) lx += x + 0.5, ly += y + 0.5, ++ln;
+        QVERIFY2(ln > 700 && ln < 1300, qPrintable(QString::number(ln)));
+        QVERIFY2(std::hypot(lx / ln - tx, ly / ln - ty) < 1, qPrintable(QString("%1,%2").arg(lx / ln).arg(ly / ln)));
+
+        // A vertex put by hand halfway: held there, and the track before it kept.
+        double fx, fy, gx, gy;
+        moved(12, t.mesh.rest[5][0] + 3, t.mesh.rest[5][1], fx, fy);
+        moved(20, t.mesh.rest[9][0], t.mesh.rest[9][1] + 2, gx, gy);
+        r = call("montage_surface_track", {{"project", project}, {"clip", double(clipId)}, {"effect", double(tracker.id)},
+                                           {"fixes", QJsonArray{QJsonObject{{"at", 20 / 25.0}, {"vertex", 9}, {"x", gx / W}, {"y", gy / H}},
+                                                                QJsonObject{{"at", 12 / 25.0}, {"vertex", 5}, {"x", fx / W}, {"y", fy / H}}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project fixed;
+        QVERIFY(loadProject(project.toStdString(), fixed));
+        SurfaceTrack ft;
+        QVERIFY(surfaceTrackFromString(edit::clipById(*fixed.active(), clipId)->effects[1].s("track"), ft));
+        QVERIFY(ft.frames[11] == t.frames[11]);
+        QVERIFY(std::hypot(ft.frames[12][5][0] - fx, ft.frames[12][5][1] - fy) < 1e-3);
+        QVERIFY(std::hypot(ft.frames[20][9][0] - gx, ft.frames[20][9][1] - gy) < 1e-3);
+        QVERIFY(ft.frames[13] != t.frames[13]);
+        r = call("montage_surface_track", {{"project", project}, {"clip", double(clipId)}, {"effect", double(tracker.id)},
+                                           {"fixes", QJsonArray{QJsonObject{{"at", 12 / 25.0}, {"vertex", 100000}, {"x", 0.5}, {"y", 0.5}}}}});
+        QVERIFY(r.value("isError").toBool());
     }
 
     void followFocusOnABall() {

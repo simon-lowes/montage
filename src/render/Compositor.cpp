@@ -43,6 +43,7 @@
 #include "Exporter.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
+#include "SurfaceTrack.h"
 #include "Restoration.h"
 #include "FilmScan.h"
 #include "FrameRepair.h"
@@ -1373,6 +1374,18 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
         faceModel().installed())
         faces = cachedFaces(scene ? asShown(src, scene->working) : src);
     FaceScope faceScope(faces);
+    // And its surface track, for masks that bend with it and paint that follows it.
+    SurfaceContext surface;
+    for (const Effect* e : chain)
+        if (e->enabled && e->type == "surface_track") {
+            surface.track = cachedSurfaceTrack(*e);
+            if (!surface.track) continue;  // (not tracked yet: a later one may be)
+            surface.mediaSeconds = [&c, &seq](FrameTime f) {
+                return c.sourceFrameAt(c.start + std::clamp<FrameTime>(f, 0, std::max<FrameTime>(0, c.duration - 1))) / seq.fpsValue();
+            };
+            break;
+        }
+    SurfaceScope surfaceScope(std::move(surface));
     SlowEffectsScope slowScope({o.highQuality || o.slowEffects, o.cancel, o.issues});
     ofx::FetchScope fetchScope(ofxFetch);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
