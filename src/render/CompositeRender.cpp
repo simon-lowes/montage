@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -150,6 +151,7 @@ struct Renderer {
     bool cacheable = true;
     std::map<int, std::string> keys;
     std::map<int, OutPtr> done;  // (this frame's, so a node feeding two others is drawn once)
+    std::set<int> keying, rendering;  // (a loop a project's checks missed ends here rather than in the stack running out)
 
     std::vector<const CompositeLink*> inputsOf(int key) const {
         std::vector<const CompositeLink*> in;
@@ -162,6 +164,7 @@ struct Renderer {
     // What decides the node's picture; "" when it cannot be known again (it is then drawn each time).
     std::string keyOf(int nodeKey) {
         if (auto it = keys.find(nodeKey); it != keys.end()) return it->second;
+        if (!keying.insert(nodeKey).second) return {};
         const CompositeNode* n = findCompositeNode(c.composite, nodeKey);
         std::string key;
         if (n && cacheable) {
@@ -185,7 +188,9 @@ struct Renderer {
                     if (transition) known = false;
                     else if (tc) {
                         data += "|track" + clipLayerKey(p, seq, *tc, t, o);
-                        if (!tc->composite.empty() && host.drawing && host.drawing(tc->id)) data += "|plain";
+                        // A clip with a graph of its own draws differently with which graphs are already being drawn
+                        // (each is drawn plain inside itself), which its key cannot tell: not kept.
+                        if (!tc->composite.empty()) known = false;
                     }
                 } else {
                     data += "|input" + clipLayerKey(p, seq, inputClip(c, *n), t, o);
@@ -211,6 +216,7 @@ struct Renderer {
             }
             if (known) key = hashed(data);
         }
+        keying.erase(nodeKey);
         keys[nodeKey] = key;
         return key;
     }
@@ -251,10 +257,17 @@ struct Renderer {
         runEffects(img, list);
     }
 
+    bool timed(Id media) const {
+        const MediaItem* m = p.findMedia(media);
+        return m && m->kind != MediaKind::Image;
+    }
+
     OutPtr input(const CompositeNode& n) {
         auto out = std::make_shared<Out>();
         if (n.source == "track") {
             out->img = fitted(host.track(n.track, &out->displayReferred));
+        } else if (n.source == "media" && n.offset < 0 && double(lt) < -n.offset && timed(n.media)) {
+            out->img = blank();  // (before its media's first frame: the clip's head was drawn out past it; a still has none)
         } else {
             const Clip tc = n.source == "clip" ? Clip() : inputClip(c, n);
             const Clip& shown = n.source == "clip" ? c : tc;
@@ -419,11 +432,13 @@ struct Renderer {
     OutPtr render(int key) {
         if (auto it = done.find(key); it != done.end()) return it->second;
         const CompositeNode* n = findCompositeNode(c.composite, key);
-        if (!n) return nullptr;
+        if (!n || rendering.count(key)) return nullptr;
         const std::string k = keyOf(key);
         if (OutPtr found = find(k)) return done[key] = found;
         std::vector<std::pair<int, OutPtr>> in;
+        rendering.insert(key);
         for (const CompositeLink* l : inputsOf(key)) in.emplace_back(l->input, render(l->from));
+        rendering.erase(key);
         auto inputAt = [&](int input) -> const Out* {
             for (const auto& [i, x] : in)
                 if (i == input) return x.get();

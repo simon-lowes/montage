@@ -31014,6 +31014,27 @@ if ui["pressed"] == "add":
             QByteArray bad = QByteArray("NGSP\x04\0\0\0\x01\0\0\0\0\x0c\0\x05\x20\0\0\0", 20) + QByteArray(12, '\0');
             for (int i = 0; i < 5; ++i) bad += QByteArray("\x10\0\0\0\0\0\0\0\x09\0\0\0\0\0\0\0", 16);  // (sizes that do not fit)
             QVERIFY(refused("bad4b.spz", bad + QByteArray(20, '\0')));
+            // A small file claiming four million splats, its sizes consistent: refused before 80 MB is set aside.
+            {
+                const uint32_t n = 4000000;
+                QByteArray many = QByteArray("NGSP\x04\0\0\0", 8);
+                for (int i = 0; i < 4; ++i) many += char((n >> (8 * i)) & 0xff);
+                many += QByteArray("\0\x0c\0\x05\x20\0\0\0", 8) + QByteArray(12, '\0');
+                for (const uint64_t each : {9, 1, 3, 3, 4}) {
+                    const uint64_t packed = 16, unpacked = each * n;
+                    for (int i = 0; i < 8; ++i) many += char((packed >> (8 * i)) & 0xff);
+                    for (int i = 0; i < 8; ++i) many += char((unpacked >> (8 * i)) & 0xff);
+                }
+                many += QByteArray(40000, '\0');
+                QFile f(QString::fromStdString(path("many.spz")));
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                f.write(many);
+                f.close();
+                SplatCloud c;
+                std::string why;
+                QVERIFY(!loadSplats(path("many.spz"), c, &why));
+                QVERIFY2(why.find("claims more splats") != std::string::npos, why.c_str());
+            }
             // A gzip (of stored blocks) whose header claims far more splats than it holds.
             {
                 const QByteArray claim = QByteArray("NGSP\x02\0\0\0\xff\xff\xff\0\0\x0c\0\0", 16) + QByteArray(64, '\0');

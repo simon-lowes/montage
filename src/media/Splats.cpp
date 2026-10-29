@@ -354,7 +354,16 @@ struct Packed {
         std::vector<uint8_t>* s[6] = {&positions, &alphas, &colors, &scales, &rotations, &sh};
         return s[i];
     }
+    size_t streamBytes(int i) const {
+        const size_t each[6] = {positionBytes(), 1, 3, 3, rotationBytes(), shBytes()};
+        return count * each[i];
+    }
+    size_t bytes() const { return count * (positionBytes() + 1 + 3 + 3 + rotationBytes() + shBytes()); }
 };
+
+// The most a packed cloud of `fileSize` bytes is let unpack to: real clouds pack a few times smaller (16 leaves room),
+// so a small file claiming millions of splats (or a compression bomb) is refused before anything is allocated.
+uint64_t unpackLimit(size_t fileSize) { return std::min<uint64_t>(kMaxUnpacked, (uint64_t(64) << 20) + uint64_t(fileSize) * 16); }
 
 bool unpack(const Packed& p, const std::string& path, SplatCloud& out, std::string* error) {
     if (p.fractionalBits > 30) return fail(error, path + " stores its positions in a way not known here");
@@ -426,6 +435,9 @@ bool loadSpz(const std::string& path, const std::string& bytes, SplatCloud& out,
         if (toc < 32 || toc > size || size_t(streams) * 16 > size - toc) return fail(error, path + " is cut short");
         const int expected = p.degree > 0 ? 6 : 5;
         if (streams != expected) return fail(error, path + " has " + std::to_string(streams) + " streams, not " + std::to_string(expected));
+        if (p.bytes() > unpackLimit(size)) return fail(error, path + " claims more splats than it can hold");
+        for (int i = 0; i < streams; ++i)
+            if (le64(d + toc + size_t(i) * 16 + 8) != p.streamBytes(i)) return fail(error, path + " is cut short or damaged");
 #ifdef MONTAGE_WITH_OPENEXR
         p.allocate();
         size_t at = toc + size_t(streams) * 16;
@@ -442,7 +454,7 @@ bool loadSpz(const std::string& path, const std::string& bytes, SplatCloud& out,
 #endif
     } else if (size >= 2 && d[0] == 0x1f && d[1] == 0x8b) {
         std::string raw, why;
-        if (!gunzip(bytes, raw, &why, kMaxUnpacked)) return fail(error, path + ": " + why);
+        if (!gunzip(bytes, raw, &why, size_t(unpackLimit(size)))) return fail(error, path + ": " + why);
         const auto* r = reinterpret_cast<const uint8_t*>(raw.data());
         if (raw.size() < 16 || le32(r) != kSpzMagic) return fail(error, path + " is not an SPZ file");
         p.version = int(le32(r + 4));

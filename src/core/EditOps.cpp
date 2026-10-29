@@ -155,9 +155,11 @@ void shiftKeyframes(Clip& c, FrameTime delta) {
     for (CompositeNode& n : c.composite.nodes) {
         for (auto& e : n.effects) shiftParamKeys(e, delta);
         shiftParamKeys(n.generator, delta);
-        if (n.kind == "input" && n.source == "media") n.offset = std::max(0.0, n.offset - double(delta));
+        // (Below 0 when the head is drawn out before the media's first frame: the media starts that far into the clip;
+        // a tracking reference below 0 when the head is trimmed past it, so drawing the head back out restores both.)
+        if (n.kind == "input" && n.source == "media") n.offset -= double(delta);
         if (Effect* st = n.kind == "track" ? compositeSettings(n) : nullptr; st && st->params.count("reference"))
-            st->params["reference"].value = std::max(0.0, st->params["reference"].value + double(delta));
+            st->params["reference"].value += double(delta);
     }
 }
 
@@ -2301,6 +2303,9 @@ Result replaceWithRender(Sequence& s, Id clipId, Id media) {
     c->effects.clear();
     c->timing.params.clear();  // a speed ramp is in the render too
     c->generator = Effect{};      // a title or matte is now footage
+    // And so is its node graph's picture: the whole frame as it plays, the clip's own movement inside it.
+    if (!c->composite.empty()) c->motion = makeEffect("transform", c->motion.id);
+    c->composite = {};
     return {};
 }
 
@@ -2319,6 +2324,10 @@ Result restoreUnrendered(Sequence& s, Id clipId) {
     c->effects = orig.effects;
     c->timing = orig.timing;
     c->generator = orig.generator;
+    // (a graph checked as one loaded from a project is: the copy kept in the clip is as untrusted)
+    if (!orig.composite.empty() && !validComposite(orig.composite)) orig.composite = {};
+    if (!orig.composite.empty()) c->motion = orig.motion;
+    c->composite = orig.composite;
     c->unrendered.clear();
     return {};
 }

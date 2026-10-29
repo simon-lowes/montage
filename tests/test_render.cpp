@@ -14991,6 +14991,77 @@ colorspaces:
         QVERIFY2(worst <= 2e-3, qPrintable(QString("CPU and GPU differ by %1").arg(worst)));
     }
 
+    void nodeGraphRendersAsItPlays() {
+        // A clip on V2 at half size, laid by its graph over what V1 (red) shows: Render and Replace keeps that
+        // picture, with the clip's movement inside it and the graph not run again on the render; Restore brings back
+        // the graph and the movement.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 1, 0, 0, 0, 40)).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, colorClip(p, 0.25f, 0.25f, 0.25f, 10, 20)).ok);
+        const Id id = s.videoTracks[1].clips[0].id;
+        edit::clipById(s, id)->motion.params["scale"] = 50.0;
+        int in = 0, merge = 0, layer = 0;
+        QVERIFY(edit::startComposite(p, s, id, &in).ok);
+        CompositeNode track = *findCompositeNode(edit::clipById(s, id)->composite, in);
+        track.source = "track";
+        track.track = 0;
+        QVERIFY(edit::setCompositeNode(p, s, id, track).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "merge", in, &merge).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", merge, &layer).ok);
+        QCOMPARE(findCompositeNode(edit::clipById(s, id)->composite, layer)->source, std::string("clip"));
+        RenderOptions o;
+        auto px = [&](int x, int y) {
+            const Image img = renderProgramFrame(p, s, 15, o);
+            const float* v = img.at(x, y);
+            return std::array<float, 3>{v[0], v[1], v[2]};
+        };
+        auto near = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+            return std::fabs(a[0] - b[0]) < 0.03f && std::fabs(a[1] - b[1]) < 0.03f && std::fabs(a[2] - b[2]) < 0.03f;
+        };
+        auto show = [](const std::array<float, 3>& v) { return qPrintable(QString("%1 %2 %3").arg(v[0]).arg(v[1]).arg(v[2])); };
+        const auto middle = px(32, 18), corner = px(2, 2);
+        QVERIFY2(near(middle, {0.25f, 0.25f, 0.25f}), show(middle));
+        QVERIFY2(near(corner, {1, 0, 0}), show(corner));
+        const std::string out = dir.filePath("graph.mov").toStdString();
+        std::string err;
+        QVERIFY2(renderClipVideo(p, s, id, out, &err), err.c_str());
+        MediaItem m;
+        QVERIFY(probeMedia(out, m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QCOMPARE(m.width, 64);
+        QVERIFY(edit::replaceWithRender(s, id, m.id).ok);
+        QVERIFY(edit::clipById(s, id)->composite.empty());
+        QCOMPARE(edit::clipById(s, id)->motion.p("scale", 0, 100), 100.0);
+        QVERIFY2(near(px(32, 18), middle), show(px(32, 18)));
+        QVERIFY2(near(px(2, 2), corner), show(px(2, 2)));
+        QVERIFY(edit::restoreUnrendered(s, id).ok);
+        QCOMPARE(edit::clipById(s, id)->composite.nodes.size(), size_t(3));
+        QCOMPARE(edit::clipById(s, id)->motion.p("scale", 0, 100), 50.0);
+        QCOMPARE(px(32, 18), middle);
+
+        // A still as the layer stays shown when the clip's head is drawn out before where the still was placed (a
+        // still has no first frame).
+        QImage green(64, 36, QImage::Format_RGB32);
+        green.fill(QColor(0, 255, 0));
+        const QString still = dir.filePath("green.png");
+        QVERIFY(green.save(still));
+        MediaItem g;
+        QVERIFY(probeMedia(still.toStdString(), g));
+        g.id = p.newId();
+        p.media.push_back(g);
+        CompositeNode logo = *findCompositeNode(edit::clipById(s, id)->composite, layer);
+        logo.source = "media";
+        logo.media = g.id;
+        QVERIFY(edit::setCompositeNode(p, s, id, logo).ok);
+        edit::shiftKeyframes(*edit::clipById(s, id), 20);
+        QVERIFY(findCompositeNode(edit::clipById(s, id)->composite, layer)->offset < -10);
+        QVERIFY2(near(px(32, 18), {0, 1, 0}), show(px(32, 18)));
+    }
+
     void compositeNodeKnownAnswers() {
         // Each kind of compositing node on a grey clip (0.25), with a red clip on a hidden V2 to bring in.
         Project p = makeDefaultProject();

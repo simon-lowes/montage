@@ -91,6 +91,8 @@ std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
                     if (c.mediaId && p.findMedia(c.mediaId)) used.insert(c.mediaId);
                     for (const Take& t : c.takes)  // an audition's other takes
                         if (p.findMedia(t.mediaId)) used.insert(t.mediaId);
+                    for (const CompositeNode& n : c.composite.nodes)  // its node graph's media inputs
+                        if (n.media && p.findMedia(n.media)) used.insert(n.media);
                 }
             };
             useClips(tr->clips);

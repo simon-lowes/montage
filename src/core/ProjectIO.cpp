@@ -318,7 +318,7 @@ CompositeGraph compositeGraphFromJson(const QJsonObject& o) {
         node.source = n.value("source").toString("clip").toStdString();
         node.media = Id(i64(n.value("media")));
         node.track = n.value("track").toInt(-1);
-        node.offset = std::max(0.0, finiteOr(n.value("offset").toDouble(), 0));
+        node.offset = std::clamp(finiteOr(n.value("offset").toDouble(), 0), -1e9, 1e9);
         node.generator = effectFromJson(n.value("generator"));
         node.blend = n.value("blend").toString("normal").toStdString();
         node.follow = Id(i64(n.value("follow")));
@@ -1054,17 +1054,22 @@ Sequence sequenceFromJson(const QJsonObject& o) {
                 }
             }
     };
-    for (Track& t : s.videoTracks)
-        for (Clip& c : t.clips) {
-            if (!c.grade.empty() && !validGrade(c.grade)) {
-                c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
-                c.grade = {};
-            }
-            takeOut(c);
-            if (!c.composite.empty() && !validComposite(c.composite)) c.composite = {};  // (its picture as it comes)
-            settle(c.effects, c.grade);
-            for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
+    auto check = [&](Clip& c) {
+        if (!c.grade.empty() && !validGrade(c.grade)) {
+            c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
+            c.grade = {};
         }
+        takeOut(c);
+        if (!c.composite.empty() && !validComposite(c.composite)) c.composite = {};  // (its picture as it comes)
+        settle(c.effects, c.grade);
+        for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
+    };
+    // (The clips of a track's other versions too: they come into play when that version is switched in.)
+    for (Track& t : s.videoTracks) {
+        for (Clip& c : t.clips) check(c);
+        for (TrackVersion& v : t.versions)
+            for (Clip& c : v.clips) check(c);
+    }
     s.masterVolumeDb = o.value("masterVolumeDb").toDouble(0);
     return s;
 }
@@ -1515,8 +1520,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     // An effect id repeated in a clip (a graph flattened above, or saved so) given a fresh one.
     for (Sequence& s : p.sequences)
-        for (Track& t : s.videoTracks)
+        for (Track& t : s.videoTracks) {
             for (Clip& c : t.clips) separateEffectIds(p, s, c);
+            for (TrackVersion& v : t.versions)
+                for (Clip& c : v.clips) separateEffectIds(p, s, c);
+        }
     // A compositing node shared between clips (saved so) given a fresh owner id.
     for (Sequence& s : p.sequences) separateCompositeIds(p, s);
     out = std::move(p);

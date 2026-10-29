@@ -130,7 +130,7 @@ std::vector<EffectInfo> buildCatalog() {
     c.back().hidden = true;
     c.push_back({"composite_track", "Track", EffectCategory::VideoFilter, "Composite",
                  {choice("follow", "Follow", {"Position", "Position and Scale", "Position, Scale and Rotation", "Corner Pin"}, 2),
-                  num("reference", "Reference Frame", 0, 1000000, 0, 1)},
+                  num("reference", "Reference Frame", -1000000, 1000000, 0, 1)},
                  {}});
     c.back().hidden = true;
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
