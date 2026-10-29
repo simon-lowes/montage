@@ -7,6 +7,7 @@ add_library(montage_engine STATIC
   core/Ucs.h core/Ucs.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
+  core/ShapeContents.h core/ShapeContents.cpp
   core/ColorWarp.h core/ColorWarp.cpp
   core/LinearSolve.h core/LinearSolve.cpp
   core/ObjectMask.h core/ObjectMask.cpp
@@ -188,6 +189,7 @@ add_library(montage_engine STATIC
   render/ModelRender.h render/ModelRender.cpp
   render/ModelClip.h render/ModelClip.cpp
   render/Layer3D.h render/Layer3D.cpp
+  render/ShapeLayers.h render/ShapeLayers.cpp
   render/SplatRender.h render/SplatRender.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp

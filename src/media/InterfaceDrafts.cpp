@@ -2,6 +2,7 @@
 
 #include "core/Adr.h"
 #include "core/Effects.h"
+#include "core/ShapeContents.h"
 #include "media/Exr.h"
 #include "render/ColorSlice.h"
 #include "render/ColorSpace.h"
@@ -261,6 +262,13 @@ std::vector<std::string> engineInterfaceTexts() {
             // (A choice of words; a Track setting's first is its "none". Fonts and files are names, not words.)
             if (sp.kind == StringKind::Choice) for (const std::string& c : sp.choices) add(c);
             if (sp.kind == StringKind::Track && !sp.choices.empty()) add(sp.choices.front());
+        }
+    }
+    for (const ShapeItemKind& k : shapeItemKinds()) {
+        add(k.label);
+        for (const ParamInfo& p : k.params) {
+            add(p.label);
+            for (const std::string& c : p.choices) add(c);
         }
     }
     for (const std::string& m : blendModes()) add(blendModeLabel(m));

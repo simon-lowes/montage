@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="-100 -100 200 200">
+  <path d="M-80,-60 A40,40 0 0,1 0,-60 A40,40 0 0,1 80,-60 Q80,0 0,70 Q-80,0 -80,-60 z" fill="#c62828"/>
+  <path fill-rule="evenodd" fill="#283593" d="M-90 40 h60 v50 h-60 z m15 12 h30 v26 h-30 z"/>
+  <path d="m30 50 c10-20 40-20 50 0 s-10 30-30 30" fill="none" stroke="#00897b" stroke-width="5" stroke-dasharray="8 4" stroke-linejoin="bevel"/>
+  <text x="0" y="0">Not a shape</text>
+</svg>

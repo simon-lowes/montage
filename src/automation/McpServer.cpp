@@ -35,6 +35,7 @@
 #include "core/Storyboard.h"
 #include "render/LearnFromClip.h"
 #include "render/ModelClip.h"
+#include "render/ShapeLayers.h"
 #include "render/ExtendClip.h"
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
@@ -2817,7 +2818,18 @@ void McpServer::Impl::addTools() {
         "Add a shape layer over the picture: a rectangle, ellipse, polygon, star, line or arrow, filled (a colour, or a "
         "gradient to a second colour) and/or outlined. Sizes and positions are in sequence pixels, from the centre. "
         "draw_on animates the outline drawing itself on over that many seconds (Trim End keyframed 0 to 100 %). Lottie "
-        "animations (.json) and SVG graphics are placed like other media, with montage_place_media.",
+        "animations (.json) and SVG graphics are placed like other media, with montage_place_media; svg (a file) instead "
+        "makes an SVG's paths, groups, fills, strokes and gradients into an editable shape layer its size (what it cannot "
+        "make into shapes is listed in notes). items builds a layer of several things, in order, the first on top: "
+        "{type, settings?, name?} with type a shape (rect, ellipse, polygon, star, or path with points [[x, y] or {x, y, "
+        "in: [dx, dy], out: [dx, dy]}], closed, and keys [{frame, points}] to morph it), a paint (fill, stroke: settings "
+        "color \"#rrggbb\", width, gradient 1 linear or 2 radial from start_x/y to end_x/y with color2, or stops "
+        "[[offset, \"#rrggbb\", opacity]]), an operator changing the paths above it in its group (merge: mode 0 keep "
+        "each, 1 union, 2 subtract, 3 intersect, 4 exclude; offset: amount, join; round: radius; pucker: amount -100..100; "
+        "twist: angle; zigzag: size, ridges, points 1 smooth; wiggle: size, spacing, speed, correlation, seed; trim: "
+        "start, end, offset; repeater: copies, offset, pos_x/y, anchor_x/y, scale, rotation, start_opacity, end_opacity) "
+        "or a group (its own items, and pos_x/y, anchor_x/y, scale_x/y, rotation, opacity). Positions are pixels from the "
+        "layer's middle, y down. With clip (a shape layer), its contents are replaced instead of a layer added.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "shape":{"type":"string","enum":["rectangle","ellipse","polygon","star","line","arrow"],"default":"rectangle"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},"track":{"type":"string"},
@@ -2826,11 +2838,125 @@ void McpServer::Impl::addTools() {
             "fill":{"type":"string","description":"#rrggbb, or \"none\""},"gradient_to":{"type":"string","description":"#rrggbb"},
             "stroke_width":{"type":"number","default":0},"stroke_color":{"type":"string","default":"#ffffff"},
             "roundness":{"type":"number","default":0},"points":{"type":"integer","description":"Sides of a polygon, points of a star"},
-            "opacity":{"type":"number","default":100},"draw_on":{"type":"number","description":"Seconds"}},
-            "required":["project","at"]})json",
+            "opacity":{"type":"number","default":100},"draw_on":{"type":"number","description":"Seconds"},
+            "svg":{"type":"string"},"items":{"type":"array","items":{"type":"object"}},"clip":{"type":"number"}},
+            "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            // Contents: from an SVG file, or the items given.
+            std::vector<ShapeItem> contents;
+            Effect built;
+            std::vector<std::string> notes;
+            double svgW = 0, svgH = 0;
+            if (a.contains("svg") && a.contains("items")) throw ArgError{"Give \"svg\" or \"items\", not both"};
+            if (a.contains("svg")) {
+                const QFileInfo fi(absolute(str(a, "svg")));
+                if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(str(a, "svg"))};
+                std::string err;
+                if (!importSvgShapes(fi.absoluteFilePath().toStdString(), built, svgW, svgH, &notes, &err)) return fail(QString::fromStdString(err));
+                contents = shapeContents(built);
+            } else if (a.contains("items")) {
+                std::set<std::string> usedIds;
+                std::function<std::vector<ShapeItem>(const QJsonArray&, int)> items = [&](const QJsonArray& arr, int depth) {
+                    if (depth > 16) throw ArgError{"Groups nest too deep"};
+                    std::vector<ShapeItem> out;
+                    for (const QJsonValue& v : arr) {
+                        const QJsonObject o = v.toObject();
+                        ShapeItem it;
+                        it.type = o.value("type").toString().toStdString();
+                        const ShapeItemKind* kind = shapeItemKind(it.type);
+                        if (!kind) throw ArgError{QStringLiteral("\"%1\" is not a kind of shape item").arg(o.value("type").toString())};
+                        if (it.type == "group") it.items = items(o.value("items").toArray(), depth + 1);
+                        for (int n = 1; it.id.empty(); ++n)
+                            if (const std::string id = it.type + std::to_string(n); usedIds.insert(id).second) it.id = id;
+                        it.name = o.value("name").toString().toStdString();
+                        it.closed = o.value("closed").toBool(true);
+                        const QJsonObject settings = o.value("settings").toObject();
+                        for (auto st = settings.begin(); st != settings.end(); ++st) {
+                            const std::string name = st.key().toStdString();
+                            const ParamInfo* pi = nullptr;
+                            for (const ParamInfo& p : kind->params)
+                                if (p.kind == ParamKind::Color ? name == p.name || name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name)
+                                    pi = &p;
+                            if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of %2").arg(st.key(), QString::fromStdString(kind->label))};
+                            if (pi->kind == ParamKind::Color && name == pi->name) {
+                                const QColor col(st.value().toString());
+                                if (!col.isValid()) throw ArgError{QStringLiteral("\"%1\" is a colour (#rrggbb)").arg(st.key())};
+                                built.params[it.id + "." + name + ".r"] = Param(col.redF());
+                                built.params[it.id + "." + name + ".g"] = Param(col.greenF());
+                                built.params[it.id + "." + name + ".b"] = Param(col.blueF());
+                                continue;
+                            }
+                            if (!st.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(st.key())};
+                            built.params[it.id + "." + name] = Param(std::clamp(st.value().toDouble(), pi->min, pi->max));
+                        }
+                        for (const QJsonValue& sv : o.value("stops").toArray()) {
+                            const QJsonArray st = sv.toArray();
+                            if (st.size() < 2) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
+                            const QColor col(st.at(1).toString());
+                            if (!col.isValid()) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
+                            it.stops.push_back({std::clamp(st.at(0).toDouble(), 0.0, 1.0), col.redF(), col.greenF(), col.blueF(), st.at(2).toDouble(1)});
+                        }
+                        if (it.type == "path") {
+                            auto pointsOf = [](const QJsonArray& arr) {
+                                std::vector<PathPoint> pts;
+                                for (const QJsonValue& pv : arr) {
+                                    PathPoint pt;
+                                    if (pv.isArray()) {
+                                        pt.x = pv.toArray().at(0).toDouble(), pt.y = pv.toArray().at(1).toDouble();
+                                    } else {
+                                        const QJsonObject po = pv.toObject();
+                                        pt.x = po.value("x").toDouble(), pt.y = po.value("y").toDouble();
+                                        const QJsonArray in = po.value("in").toArray(), outh = po.value("out").toArray();
+                                        if (in.size() == 2) pt.ix = in[0].toDouble(), pt.iy = in[1].toDouble();
+                                        if (outh.size() == 2) pt.ox = outh[0].toDouble(), pt.oy = outh[1].toDouble();
+                                    }
+                                    pts.push_back(pt);
+                                }
+                                return pts;
+                            };
+                            if (o.contains("keys")) {
+                                size_t count = 0;
+                                for (const QJsonValue& kv : o.value("keys").toArray()) {
+                                    const QJsonObject ko = kv.toObject();
+                                    const std::vector<PathPoint> pts = pointsOf(ko.value("points").toArray());
+                                    if (pts.size() < 2 || (count && pts.size() != count)) throw ArgError{"Each key of a path has the same number of points (two or more)"};
+                                    count = pts.size();
+                                    setShapePathPoints(built, it.id, FrameTime(std::llround(ko.value("frame").toDouble())), pts, true);
+                                }
+                            } else {
+                                const std::vector<PathPoint> pts = pointsOf(o.value("points").toArray());
+                                if (pts.size() < 2) throw ArgError{"A path has two or more points"};
+                                setShapePathPoints(built, it.id, 0, pts);
+                            }
+                        }
+                        out.push_back(std::move(it));
+                    }
+                    return out;
+                };
+                contents = items(a.value("items").toArray(), 0);
+                if (contents.empty()) throw ArgError{"\"items\" is empty"};
+            }
+            if (a.contains("clip")) {
+                // A shape layer's contents replaced.
+                if (contents.empty()) throw ArgError{"Give \"svg\" or \"items\" to replace a shape layer's contents"};
+                Clip* sc = nullptr;
+                for (Track& tr : s.videoTracks)
+                    for (Clip& k : tr.clips)
+                        if (double(k.id) == a.value("clip").toDouble()) sc = &k;
+                if (!sc || !sc->isGenerator() || sc->generator.type != "shape") throw ArgError{"\"clip\" is not a shape layer"};
+                for (const ShapeItem& it : shapeContents(sc->generator)) eraseShapeItemParams(sc->generator, it);
+                for (const auto& [k, v] : built.params) sc->generator.params[k] = v;
+                setShapeContents(sc->generator, contents);
+                save(l);
+                QJsonObject out = clipJson(l.project, s, *sc);
+                QJsonArray ns;
+                for (const std::string& n : notes) ns.append(QString::fromStdString(n));
+                if (!ns.isEmpty()) out["notes"] = ns;
+                return ok(QStringLiteral("Replaced the shapes of %1").arg(QString::fromStdString(sc->name)), out);
+            }
+            if (!a.contains("at")) throw ArgError{"\"at\" is needed"};
             TrackRef t{TrackKind::Video, 0};
             if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
             else {
@@ -2877,12 +3003,23 @@ void McpServer::Impl::addTools() {
             }
             c.start = timeArg(a.value("at"), s, "at");
             c.name = findEffectInfo("shape")->params[0].choices[size_t(kind)];
+            if (!contents.empty()) {
+                for (const auto& [k, v] : built.params) g.params[k] = v;
+                setShapeContents(g, contents);
+                c.name = a.contains("svg") ? QFileInfo(str(a, "svg")).completeBaseName().toStdString() : std::string("Shapes");
+            }
             const auto r = edit::overwrite(l.project, s, t, c);
             check(r);
             save(l);
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
-            return ok(QStringLiteral("Added a %1 on %2").arg(shapes[kind], QString::fromStdString(trackAt(s, t)->name)),
-                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+            QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            QJsonArray ns;
+            for (const std::string& n : notes) ns.append(QString::fromStdString(n));
+            if (!ns.isEmpty()) out["notes"] = ns;
+            if (svgW > 0) out["size"] = QJsonArray{svgW, svgH};
+            return ok(QStringLiteral("Added %1 on %2").arg(contents.empty() ? "a " + shapes[kind] : QString::fromStdString(c.name),
+                                                           QString::fromStdString(trackAt(s, t)->name)),
+                      out);
         });
 
     add("montage_list_effects", "List effects",

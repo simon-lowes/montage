@@ -48,6 +48,7 @@
 #include "ModelPacks.h"
 #include "render/Expressions.h"
 #include "render/ModelClip.h"
+#include "render/ShapeLayers.h"
 #include "render/Titles.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
@@ -65,6 +66,7 @@
 #include "core/EditOps.h"
 #include "core/GraphicsTemplate.h"
 #include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "ColorWheel.h"
 #include "ColorWarperEditor.h"
 #include "CurveEditor.h"
@@ -169,6 +171,12 @@ QString InspectorWidget::signature() const {
     if (sceneReferredWorking(*s)) sig += QStringLiteral(":scene");  // (effects that work on display values are marked)
     // An OGraf graphic's fields: rebuild when another graphic is chosen.
     if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
+    // A shape layer's contents: rebuild when an item is added, removed, moved or renamed, or another is picked.
+    if (c->generator.type == "shape") {
+        const std::string& contents = c->generator.s("contents");
+        sig += QString("|S%1").arg(qHash(QByteArrayView(contents.data(), qsizetype(contents.size()))));
+        if (const auto sel = shapeSelection_.find(c->id); sel != shapeSelection_.end()) sig += QString::fromStdString(":" + sel->second);
+    }
     // A title's text animations: rebuild when one is added or removed.
     if (c->generator.type == "title")
         for (int k : textAnimators(c->generator)) sig += QString("|A%1").arg(k);
@@ -528,7 +536,15 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     if (clip.isGenerator()) {
         if (const EffectInfo* info = findEffectInfo(clip.generator.type)) {
             QFormLayout* g = addSection(language::engine(info->displayName));
-            addParamRows(g, *info, target(clip.generator.id));
+            if (clip.generator.type == "shape" && !clip.generator.s("contents").empty()) {
+                // A layer of several shapes: its own position, turn and opacity here, the rest in its contents.
+                for (const ParamInfo& pi : info->params)
+                    if (pi.name == "pos_x" || pi.name == "pos_y" || pi.name == "rotation" || pi.name == "opacity")
+                        addParamRow(g, pi, target(clip.generator.id));
+            } else {
+                addParamRows(g, *info, target(clip.generator.id));
+            }
+            if (clip.generator.type == "shape") addShapeContents(g, clip, target(clip.generator.id));
             if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
             if (clip.generator.type == "title") addTitleTextTools(g, clip, target(clip.generator.id));
         }
@@ -2474,7 +2490,9 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             if (const auto live = state_->liveParameter(target.owner, target.effect, n)) return *live;
         Effect* e = target.resolve(const_cast<Sequence&>(*s));
         // A parameter not stored yet (e.g. an unused mask) shows its default.
-        return e ? e->p(n, target.time(), n == pi.name ? pi.def : 0) : 0;
+        double def = n == pi.name ? pi.def : 0;
+        if (pi.kind == ParamKind::Color) def = n == pi.name + ".g" ? pi.defG : n == pi.name + ".b" ? pi.defB : pi.def;
+        return e ? e->p(n, target.time(), def) : 0;
     };
     auto readParam = [this, target](const std::string& n) -> const Param* {
         const Sequence* s = state_->sequence();
@@ -2876,6 +2894,236 @@ void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, con
         });
     });
     layout_->addWidget(add);
+}
+
+void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, const Target& target) {
+    // A shape layer grown into several shapes: its contents listed (groups indented), one picked and its settings
+    // shown; adding the first item makes the layer's one shape into contents to add to.
+    const std::vector<ShapeItem> items = shapeContents(clip.generator);
+    const Id clipId = clip.id;
+    std::string selected = shapeSelection_[clipId];
+    if (!findShapeItem(items, selected)) selected = items.empty() ? std::string() : items.front().id;
+    shapeSelection_[clipId] = selected;
+    auto itemLabel = [](const ShapeItem& it) {
+        if (!it.name.empty()) return QString::fromStdString(it.name);
+        const ShapeItemKind* k = shapeItemKind(it.type);
+        size_t digits = it.id.size();
+        while (digits > 0 && std::isdigit(static_cast<unsigned char>(it.id[digits - 1]))) --digits;
+        return QStringLiteral("%1 %2").arg(language::engine(k ? k->label : it.type), QString::fromStdString(it.id.substr(digits)));
+    };
+    if (!items.empty()) {
+        auto* list = new QComboBox(content_);
+        list->setObjectName(QStringLiteral("shapeItems"));
+        list->setAccessibleName(tr("Shape Contents"));
+        list->setToolTip(tr("What the layer holds, the first drawn on top; a group's items are indented under it"));
+        eachShapeItem(items, [&](const ShapeItem& it, int depth) {
+            list->addItem(QString(depth * 4, QLatin1Char(' ')) + itemLabel(it), QString::fromStdString(it.id));
+        });
+        list->setCurrentIndex(std::max(0, list->findData(QString::fromStdString(selected))));
+        form->addRow(tr("Contents"), list);
+        connect(list, &QComboBox::activated, this, [this, list, clipId](int) {
+            shapeSelection_[clipId] = list->currentData().toString().toStdString();
+            QTimer::singleShot(0, this, [this] {
+                if (signature() != signature_) rebuild();
+            });
+        });
+    }
+
+    // Changes to the contents, the layer's one shape made into contents first; `select` is the item picked after.
+    // (Made once the control that asked has finished with its signal: the edit rebuilds the Inspector, control and all.)
+    auto change = [this, target, clipId](const QString& what, std::function<bool(Effect&, std::vector<ShapeItem>&, std::string&)> fn) {
+        QTimer::singleShot(0, this, [this, target, clipId, what, fn] {
+            std::string select = shapeSelection_[clipId];
+            state_->edit(what, [&](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                plainShapeAsContents(*e);
+                std::vector<ShapeItem> its = shapeContents(*e);
+                if (!fn(*e, its, select)) return false;
+                setShapeContents(*e, its);
+                shapeSelection_[clipId] = select;  // (before the Inspector is rebuilt for the change)
+                return true;
+            });
+            if (signature() != signature_) rebuild();
+        });
+    };
+    auto* row = new QWidget(content_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->setSpacing(3);
+    auto* add = new QToolButton(row);
+    add->setObjectName(QStringLiteral("addShapeItem"));
+    add->setText(tr("Add"));
+    add->setToolTip(tr("Add a shape, a fill or stroke, an operator that changes the paths above it, a repeater or a group"));
+    add->setPopupMode(QToolButton::InstantPopup);
+    auto* menu = new QMenu(add);
+    for (const ShapeItemKind& k : shapeItemKinds()) {
+        const std::string type = k.type;
+        menu->addAction(language::engine(k.label), this, [type, change, label = language::engine(k.label)] {
+            change(tr("Add %1").arg(label), [type](Effect& e, std::vector<ShapeItem>& its, std::string& select) {
+                ShapeItem it;
+                it.type = type;
+                it.id = newShapeItemId(its, type);
+                if (type == "path") setShapePathPoints(e, it.id, 0, {{0, -100}, {100, 80}, {-100, 80}});
+                // A shape goes above the picked item (or first in the picked group), so the paints and operators
+                // below take it in; anything else below it (or last in the group), to work on what is above.
+                const bool isShape = type == "rect" || type == "ellipse" || type == "polygon" || type == "star" || type == "path" || type == "group";
+                std::vector<ShapeItem>* list = &its;
+                size_t index = 0;
+                ShapeItem* at = findShapeItem(its, select, &list, &index);
+                if (at && at->type == "group") list = &at->items, index = isShape ? 0 : list->size();
+                else if (!at) list = &its, index = isShape ? 0 : its.size();
+                else if (!isShape) ++index;
+                list->insert(list->begin() + std::ptrdiff_t(std::min(index, list->size())), it);
+                select = it.id;
+                return true;
+            });
+        });
+    }
+    add->setMenu(menu);
+    h->addWidget(add);
+    auto* remove = smallButton(row, QStringLiteral("✕"), tr("Remove the Picked Item"));
+    remove->setObjectName(QStringLiteral("removeShapeItem"));
+    remove->setAccessibleName(remove->toolTip());
+    auto* up = smallButton(row, QStringLiteral("▲"), tr("Move the Picked Item Up"));
+    up->setObjectName(QStringLiteral("shapeItemUp"));
+    up->setAccessibleName(up->toolTip());
+    auto* down = smallButton(row, QStringLiteral("▼"), tr("Move the Picked Item Down"));
+    down->setObjectName(QStringLiteral("shapeItemDown"));
+    down->setAccessibleName(down->toolTip());
+    for (QToolButton* b : {remove, up, down}) {
+        b->setEnabled(!items.empty());
+        h->addWidget(b);
+    }
+    connect(remove, &QToolButton::clicked, this, [change] {
+        change(tr("Remove Shape Item"), [](Effect& e, std::vector<ShapeItem>& its, std::string& select) {
+            std::vector<ShapeItem>* list = nullptr;
+            size_t index = 0;
+            ShapeItem* at = findShapeItem(its, select, &list, &index);
+            if (!at) return false;
+            eraseShapeItemParams(e, *at);
+            list->erase(list->begin() + std::ptrdiff_t(index));
+            select = list->empty() ? std::string() : (*list)[std::min(index, list->size() - 1)].id;
+            return true;
+        });
+    });
+    for (const int step : {-1, 1})
+        connect(step < 0 ? up : down, &QToolButton::clicked, this, [change, step] {
+            change(tr("Move Shape Item"), [step](Effect&, std::vector<ShapeItem>& its, std::string& select) {
+                std::vector<ShapeItem>* list = nullptr;
+                size_t index = 0;
+                if (!findShapeItem(its, select, &list, &index)) return false;
+                const long to = long(index) + step;
+                if (to < 0 || to >= long(list->size())) return false;
+                std::swap((*list)[index], (*list)[size_t(to)]);
+                return true;
+            });
+        });
+    auto* svg = new QPushButton(tr("Import SVG…"), row);
+    svg->setObjectName(QStringLiteral("importSvgShapes"));
+    svg->setToolTip(tr("Make an SVG drawing's paths, groups, fills, strokes and gradients this layer's contents, to edit and animate"));
+    h->addWidget(svg);
+    connect(svg, &QPushButton::clicked, this, [this, target] { QTimer::singleShot(0, this, [this, target] {
+        const QString file = QFileDialog::getOpenFileName(this, tr("Import SVG"), QString(), tr("SVG drawings (*.svg)"));
+        if (file.isEmpty()) return;
+        Effect made;
+        double w = 0, h = 0;
+        std::vector<std::string> notes;
+        std::string err;
+        if (!importSvgShapes(file.toStdString(), made, w, h, &notes, &err)) {
+            state_->message(tr("Could not import %1: %2").arg(QFileInfo(file).fileName(), QString::fromStdString(err)), 6000);
+            return;
+        }
+        state_->edit(tr("Import SVG"), [&](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e) return false;
+            for (const ShapeItem& it : shapeContents(*e)) eraseShapeItemParams(*e, it);
+            for (const auto& [k, v] : made.params) e->params[k] = v;
+            setShapeContents(*e, shapeContents(made));
+            return true;
+        });
+        if (!notes.empty()) {
+            QStringList ns;
+            for (const std::string& n : notes) ns << QString::fromStdString(n);
+            state_->message(tr("Not made into shapes: %1").arg(ns.join(QStringLiteral("; "))), 8000);
+        }
+    }); });
+    auto* fromMask = new QPushButton(tr("Path From a Mask"), row);
+    fromMask->setObjectName(QStringLiteral("shapePathFromMask"));
+    fromMask->setToolTip(tr("Copy the path drawn with the pen as a Bézier mask on one of this layer's effects into its contents"));
+    h->addWidget(fromMask);
+    h->addStretch(1);
+    connect(fromMask, &QPushButton::clicked, this, [this, target, clipId] { QTimer::singleShot(0, this, [this, target, clipId] {
+        std::string made;
+        state_->edit(tr("Path From a Mask"), [&](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, clipId);
+            Effect* g = target.resolve(s);
+            if (!c || !g) return false;
+            for (const Effect& e : c->effects) {
+                if (std::lround(e.p("mask.shape", 0)) != 5) continue;
+                plainShapeAsContents(*g);
+                std::vector<ShapeItem> its = shapeContents(*g);
+                const std::optional<ShapeItem> path = shapePathFromMask(*g, its, e, s.width, s.height);
+                if (!path) continue;
+                its.insert(its.begin(), *path);
+                setShapeContents(*g, its);
+                made = path->id;
+                shapeSelection_[clipId] = made;
+                return true;
+            }
+            return false;
+        });
+        if (made.empty()) {
+            state_->message(tr("Draw a path with the pen as a Bézier mask on one of this layer's effects first"), 5000);
+            return;
+        }
+        if (signature() != signature_) rebuild();
+    }); });
+    form->addRow(QString(), row);
+
+    // The picked item's settings.
+    const ShapeItem* picked = findShapeItem(items, selected);
+    const ShapeItemKind* kind = picked ? shapeItemKind(picked->type) : nullptr;
+    if (!picked || !kind) return;
+    QFormLayout* section = addSection(itemLabel(*picked));
+    auto* name = new QLineEdit(content_);
+    name->setObjectName(QStringLiteral("shapeItemName"));
+    name->setAccessibleName(tr("Item Name"));
+    name->setPlaceholderText(itemLabel(*picked));
+    name->setText(QString::fromStdString(picked->name));
+    section->addRow(tr("Name"), name);
+    const std::string id = picked->id;
+    connect(name, &QLineEdit::editingFinished, this, [change, name, id] {
+        const std::string text = name->text().trimmed().toStdString();
+        change(tr("Rename Shape Item"), [text, id](Effect&, std::vector<ShapeItem>& its, std::string&) {
+            ShapeItem* it = findShapeItem(its, id);
+            if (!it || it->name == text) return false;
+            it->name = text;
+            return true;
+        });
+    });
+    if (picked->type == "path") {
+        auto* closed = new QCheckBox(tr("Closed"), content_);
+        closed->setObjectName(QStringLiteral("shapePathClosed"));
+        closed->setChecked(picked->closed);
+        section->addRow(tr("Points"), new QLabel(QString::number(shapePathPoints(clip.generator, id, 0).size()), content_));
+        section->addRow(QString(), closed);
+        connect(closed, &QCheckBox::toggled, this, [change, id](bool on) {
+            change(tr("Close Path"), [on, id](Effect&, std::vector<ShapeItem>& its, std::string&) {
+                ShapeItem* it = findShapeItem(its, id);
+                if (!it || it->closed == on) return false;
+                it->closed = on;
+                return true;
+            });
+        });
+    }
+    EffectInfo info;
+    info.type = "shape";
+    for (ParamInfo pi : kind->params) {
+        pi.name = id + "." + pi.name;
+        info.params.push_back(pi);
+    }
+    addParamRows(section, info, target);
 }
 
 void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target) {

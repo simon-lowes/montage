@@ -19,6 +19,7 @@ QPainterPath shapeOutline(const Effect& g, FrameTime t, int w, int h, double sca
 // round by `offset` (a fraction, wrapping on closed paths).
 QPainterPath trimPath(const QPainterPath& path, double start, double end, double offset);
 
-Image renderShape(const Effect& g, FrameTime t, int w, int h, double scale);
+// The shape, or the layer's contents when it has some (render/ShapeLayers.h; `fps` times their wiggles).
+Image renderShape(const Effect& g, FrameTime t, int w, int h, double scale, double fps = 25);
 
 }  // namespace montage

@@ -5,6 +5,8 @@
 #include <QScrollArea>
 #include <array>
 #include <functional>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "core/Effects.h"
@@ -87,6 +89,9 @@ private:
     void addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target);
     // A title's styled runs (Style Selected Text, Clear Styles) and its text animations, a section each.
     void addTitleTextTools(QFormLayout* form, const Clip& clip, const Target& target);
+    // A shape layer's contents (core/ShapeContents.h): listed, added to, removed, reordered, imported from an SVG or a
+    // drawn mask, and the picked item's settings.
+    void addShapeContents(QFormLayout* form, const Clip& clip, const Target& target);
     void renderOGrafClip(Id clip);
 
 public:
@@ -137,6 +142,7 @@ private:
     std::vector<std::function<void()>> refreshers_;
     int sliceVector_ = 0;  // the Hue Vectors vector shown (0 Global, then Red to Magenta, then Skin)
     int hdrZone_ = 0;  // the HDR Palette zone shown (0 Global, then Black to Specular)
+    std::map<Id, std::string> shapeSelection_;  // each shape layer's picked item
 };
 
 }  // namespace montage

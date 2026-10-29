@@ -145,7 +145,7 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
     } else if (g.type == "title") {
         return renderTitle(g, t, w, h, scale, duration, fps);
     } else if (g.type == "shape") {
-        return renderShape(g, t, w, h, scale);
+        return renderShape(g, t, w, h, scale, fps);
     } else if (g.type == "title3d") {
         return renderTitle3D(g, t, w, h, scale, duration, fps);
     } else if (g.type == "particles") {

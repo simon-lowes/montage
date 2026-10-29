@@ -151,6 +151,7 @@
 #include "core/CaptionTools.h"
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
 #include "core/Bleep.h"
@@ -4203,6 +4204,83 @@ private slots:
         IamfInfo ii;
         QVERIFY(readIamfInfo(iamf.toStdString(), ii) && ii.loudspeakerLayout == 7 && ii.title == "App mix" && ii.frames == ir.frames);
         state()->newProject();
+    }
+
+    void shapeContentsInTheInspector() {
+        // A Shape layer grown in the Inspector: adding to it makes its one shape the first of its contents, items are
+        // picked, removed, moved and named, and a path drawn with the pen as a mask is copied in.
+        state()->newProject();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        emit browser->applyRequested("shape", EffectCategory::Generator);
+        const Id id = state()->primaryClip()->id;
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        auto contents = [&] { return shapeContents(edit::clipById(*state()->sequence(), id)->generator); };
+        auto addItem = [&](const QString& label) {
+            auto* add = inspector->findChild<QToolButton*>("addShapeItem");
+            QVERIFY(add && add->menu());
+            QAction* act = nullptr;
+            for (QAction* a : add->menu()->actions())
+                if (a->text() == label) act = a;
+            QVERIFY(act);
+            act->trigger();
+            QApplication::processEvents();
+        };
+        auto list = [&] { return inspector->findChild<QComboBox*>("shapeItems"); };
+        QVERIFY(!list());
+        addItem("Ellipse");
+        std::vector<ShapeItem> its = contents();
+        QCOMPARE(int(its.size()), 3);
+        QCOMPARE(its[0].type, std::string("ellipse"));
+        QCOMPARE(its[1].type, std::string("rect"));
+        QCOMPARE(its[2].type, std::string("fill"));
+        QVERIFY(list() && list()->count() == 3 && list()->currentText() == "Ellipse 1");
+        // Only the layer's own position, turn and opacity stay in its section; the picked item's settings follow.
+        bool trim = false, width = false;
+        for (auto* l : inspector->findChildren<QLabel*>()) {
+            trim |= l->text().startsWith("Trim End") && l->isVisibleTo(inspector);
+            width |= l->text().startsWith("Width (px)") && l->isVisibleTo(inspector);
+        }
+        QVERIFY(!trim && width);
+        // An operator goes under the picked shape, to change it; removing it picks what took its place.
+        addItem("Wiggle");
+        QCOMPARE(contents()[1].type, std::string("wiggle"));
+        QCOMPARE(list()->currentText(), QString("Wiggle 1"));
+        inspector->findChild<QToolButton*>("removeShapeItem")->click();
+        QApplication::processEvents();
+        QCOMPARE(int(contents().size()), 3);
+        QCOMPARE(list()->currentText(), QString("Rectangle 1"));
+        inspector->findChild<QToolButton*>("shapeItemUp")->click();
+        QApplication::processEvents();
+        QCOMPARE(contents()[0].type, std::string("rect"));
+        auto* name = inspector->findChild<QLineEdit*>("shapeItemName");
+        QVERIFY(name);
+        name->setText("Box");
+        emit name->editingFinished();
+        QApplication::processEvents();
+        QCOMPARE(contents()[0].name, std::string("Box"));
+        QCOMPARE(list()->currentText(), QString("Box"));
+        // A Bézier mask drawn on one of its effects, copied in as a path where it was drawn.
+        const Sequence& s = *state()->sequence();
+        const double w = s.width, h = s.height;
+        state()->edit("mask", [&](Project& p, Sequence& seq) {
+            Effect e = makeEffect(p, "gaussian_blur");
+            setMaskPathFromFrame(e, {{0.1, 0.1}, {0.3, 0.1}, {0.3, 0.3}}, w, h, false);
+            edit::clipById(seq, id)->effects.push_back(e);
+            return true;
+        });
+        QApplication::processEvents();
+        inspector->findChild<QPushButton*>("shapePathFromMask")->click();
+        QApplication::processEvents();
+        its = contents();
+        QCOMPARE(its[0].type, std::string("path"));
+        QCOMPARE(list()->currentText(), QString("Path 1"));
+        const std::vector<PathPoint> pts = shapePathPoints(edit::clipById(*state()->sequence(), id)->generator, its[0].id, 0);
+        QCOMPARE(int(pts.size()), 3);
+        QVERIFY(std::fabs(pts[0].x - (0.1 - 0.5) * w) < 1e-6 && std::fabs(pts[2].y - (0.3 - 0.5) * h) < 1e-6);
+        state()->undo();
+        QApplication::processEvents();
+        QCOMPARE(int(contents().size()), 3);
     }
 
     void shapeLayersAndLottieInTheApp() {

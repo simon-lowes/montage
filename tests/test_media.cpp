@@ -194,6 +194,8 @@
 #include "media/Usd.h"
 #include "core/Zip.h"
 #include "render/Layer3D.h"
+#include "render/ShapeLayers.h"
+#include "render/Shapes.h"
 #include "render/ModelClip.h"
 #include "render/ModelRender.h"
 #include "render/SplatRender.h"
@@ -30991,6 +30993,303 @@ if ui["pressed"] == "add":
             QVERIFY2(img.at(W / 2, H / 2)[0] > 0.05f && img.at(10, 10)[0] < 0.02f, qPrintable(QString("the box, the card's track hidden: %1 at the middle, %2 beside").arg(img.at(W / 2, H / 2)[0]).arg(img.at(10, 10)[0])));
         }
         QVERIFY(call("montage_add_model", {{"project", project}, {"shape", "cone"}}).value("isError").toBool());
+    }
+
+    void shapeLayersAsVectorGraphics() {
+        // A Shape layer's contents: groups of shapes, paints and the operators that change the paths above them.
+        const int W = 400, H = 300;
+        Project p = makeDefaultProject();
+        auto item = [](const char* type, const char* id, std::vector<ShapeItem> items = {}) {
+            ShapeItem it;
+            it.type = type, it.id = id, it.items = std::move(items);
+            return it;
+        };
+        auto layer = [&](const std::vector<ShapeItem>& items, const std::map<std::string, double>& params) {
+            Effect g = makeEffect(p, "shape");
+            setShapeContents(g, items);
+            for (const auto& [k, v] : params) g.params[k] = Param(v);
+            return g;
+        };
+        auto alphaSum = [](const Image& img) {
+            double s = 0;
+            for (size_t i = 3; i < img.px.size(); i += 4) s += img.px[i];
+            return s;
+        };
+        auto diff = [](const Image& a, const Image& b, double& mean) {
+            float worst = 0;
+            double sum = 0;
+            for (size_t i = 0; i < a.px.size(); ++i) {
+                const float d = std::fabs(a.px[i] - b.px[i]);
+                worst = std::max(worst, d), sum += d;
+            }
+            mean = sum / double(a.px.size());
+            return worst;
+        };
+        double mean = 0;
+
+        // One rectangle filled matches the plain Rectangle shape; a plain shape draws as it always has.
+        {
+            Effect plain = makeEffect(p, "shape");
+            plain.params["width"] = 180.0, plain.params["height"] = 90.0, plain.params["pos_x"] = 17.0, plain.params["rotation"] = 12.0;
+            const Effect g = layer({item("rect", "r"), item("fill", "f")},
+                                   {{"r.width", 180}, {"r.height", 90}, {"pos_x", 17}, {"rotation", 12}, {"f.color.r", 0.95}, {"f.color.g", 0.75}, {"f.color.b", 0.1}});
+            const float worst = diff(renderShape(plain, 0, W, H, 1), renderShape(g, 0, W, H, 1), mean);
+            QVERIFY2(worst <= 1.0f / 255 + 1e-6f, qPrintable(QString("rectangle off by %1").arg(worst * 255)));
+        }
+        // A Repeater of six copies a sixth of a turn apart looks the same turned a sixth of a turn.
+        {
+            const std::vector<ShapeItem> items{item("rect", "r"), item("fill", "f"), item("repeater", "rep")};
+            std::map<std::string, double> params{{"r.width", 50}, {"r.height", 24}, {"r.pos_x", 90}, {"rep.copies", 6}, {"rep.pos_x", 0}, {"rep.rotation", 60}};
+            const Image a = renderShape(layer(items, params), 0, W, H, 1);
+            params["rotation"] = 60;
+            const Image b = renderShape(layer(items, params), 0, W, H, 1);
+            const float worst = diff(a, b, mean);
+            QVERIFY2(mean <= 1.0 / 255 && alphaSum(a) > 6 * 50 * 24 * 0.98, qPrintable(QString("turned: mean %1, worst %2 (of 255)").arg(mean * 255).arg(worst * 255)));
+        }
+        // A circle taken from a larger one about the same middle leaves a ring of area pi (R^2 - r^2).
+        {
+            const Image img = renderShape(layer({item("ellipse", "big"), item("ellipse", "small"), item("merge", "m"), item("fill", "f")},
+                                                {{"big.width", 200}, {"big.height", 200}, {"small.width", 120}, {"small.height", 120}, {"m.mode", 2}}),
+                                          0, W, H, 1);
+            const double want = M_PI * (100 * 100 - 60 * 60);
+            QVERIFY2(std::fabs(alphaSum(img) / want - 1) < 0.005, qPrintable(QString("ring %1 against %2").arg(alphaSum(img)).arg(want)));
+            QVERIFY2(img.at(W / 2, H / 2)[3] == 0.0f && img.at(W / 2 + 80, H / 2)[3] > 0.99f, "a hole in the middle");
+        }
+        // A square of side s grown by d with round corners has area s^2 + 4sd + pi d^2.
+        {
+            const Image img = renderShape(layer({item("rect", "sq"), item("offset", "o"), item("fill", "f")},
+                                                {{"sq.width", 100}, {"sq.height", 100}, {"o.amount", 20}, {"o.join", 1}}),
+                                          0, W, H, 1);
+            const double want = 100.0 * 100 + 4 * 100 * 20 + M_PI * 20 * 20;
+            QVERIFY2(std::fabs(alphaSum(img) / want - 1) < 0.005, qPrintable(QString("grown %1 against %2").arg(alphaSum(img)).arg(want)));
+            // Shrunk by d, a square of side s - 2d.
+            const Image in = renderShape(layer({item("rect", "sq"), item("offset", "o"), item("fill", "f")},
+                                               {{"sq.width", 100}, {"sq.height", 100}, {"o.amount", -20}}),
+                                         0, W, H, 1);
+            QVERIFY2(std::fabs(alphaSum(in) / (60.0 * 60) - 1) < 0.005, qPrintable(QString("shrunk %1").arg(alphaSum(in))));
+        }
+        // Round Corners on a rectangle draws the rectangle with its corners rounded.
+        {
+            const Image a = renderShape(layer({item("rect", "r"), item("round", "rc"), item("fill", "f")},
+                                              {{"r.width", 200}, {"r.height", 120}, {"rc.radius", 30}}),
+                                        0, W, H, 1);
+            const Image b = renderShape(layer({item("rect", "r"), item("fill", "f")}, {{"r.width", 200}, {"r.height", 120}, {"r.roundness", 30}}), 0, W, H, 1);
+            const float worst = diff(a, b, mean);
+            QVERIFY2(worst <= 1.0f / 255 + 1e-6f, qPrintable(QString("rounded: worst %1 of 255").arg(worst * 255)));
+            const double want = 200.0 * 120 - (4 - M_PI) * 30 * 30;
+            QVERIFY2(std::fabs(alphaSum(a) / want - 1) < 0.005, qPrintable(QString("rounded area %1 against %2").arg(alphaSum(a)).arg(want)));
+        }
+        // Wiggle: the same with one seed whenever and on whichever thread it is drawn, moving on its own, and
+        // another seed another wiggle.
+        {
+            const std::vector<ShapeItem> items{item("ellipse", "e"), item("wiggle", "w"), item("fill", "f")};
+            const Effect g = layer(items, {{"e.width", 200}, {"e.height", 150}, {"w.size", 12}, {"w.seed", 3}});
+            const Image a = renderShape(g, 7, W, H, 1, 25);
+            std::vector<Image> others(4);
+            std::vector<std::thread> threads;
+            for (size_t i = 0; i < others.size(); ++i) threads.emplace_back([&, i] { others[i] = renderShape(g, 7, W, H, 1, 25); });
+            for (std::thread& th : threads) th.join();
+            for (const Image& o : others) QCOMPARE(diff(a, o, mean), 0.0f);
+            QVERIFY2(diff(a, renderShape(g, 11, W, H, 1, 25), mean) > 0.5f, "it moves without keys");
+            const Effect g2 = layer(items, {{"e.width", 200}, {"e.height", 150}, {"w.size", 12}, {"w.seed", 4}});
+            QVERIFY2(diff(a, renderShape(g2, 7, W, H, 1, 25), mean) > 0.5f, "another seed, another wiggle");
+        }
+        // The other operators change the outline and leave something drawn; a group moves, turns and fades what is in it.
+        {
+            const std::map<std::string, double> base{{"s.points", 5}, {"s.outer", 100}, {"s.inner", 45}};
+            const Image star = renderShape(layer({item("star", "s"), item("fill", "f")}, base), 0, W, H, 1);
+            for (const char* op : {"pucker", "twist", "zigzag", "trim"}) {
+                std::map<std::string, double> params = base;
+                params["op.amount"] = 60, params["op.angle"] = 120, params["op.end"] = 50;
+                const bool stroke = std::string(op) == "trim";  // (a trimmed outline is stroked)
+                const Image img = renderShape(layer({item("star", "s"), item(op, "op"), item(stroke ? "stroke" : "fill", "f")}, params), 0, W, H, 1);
+                QVERIFY2(alphaSum(img) > 200 && diff(star, img, mean) > 0.5f, op);
+            }
+            const Image grouped = renderShape(layer({item("group", "g", {item("star", "s"), item("fill", "f")})},
+                                                    {{"s.points", 5}, {"s.outer", 100}, {"s.inner", 45}, {"g.pos_x", 60}, {"g.opacity", 50}}),
+                                              0, W, H, 1);
+            QVERIFY2(std::fabs(grouped.at(W / 2 + 60, H / 2)[3] - 0.5f) < 0.01f && grouped.at(W / 2 - 80, H / 2)[3] == 0.0f, "the group moved and faded");
+        }
+        // A path keyed between two shapes with the same points morphs from one to the other.
+        {
+            Effect g = layer({item("path", "path"), item("fill", "f")}, {});
+            setShapePathPoints(g, "path", 0, {{-50, -50}, {50, -50}, {50, 50}, {-50, 50}}, true);
+            setShapePathPoints(g, "path", 10, {{-100, -50}, {100, -50}, {100, 50}, {-100, 50}}, true);
+            const Image mid = renderShape(g, 5, W, H, 1);
+            QVERIFY2(std::fabs(alphaSum(mid) / (150.0 * 100) - 1) < 0.005, qPrintable(QString("halfway area %1").arg(alphaSum(mid))));
+        }
+
+        // SVG files made into shapes draw as ThorVG draws the files (within 2/255 on average), with what is not
+        // made into shapes listed.
+        if (vectorSupport()) {
+            for (const char* name : {"shapes.svg", "gradients.svg", "paths.svg"}) {
+                const std::string file = std::string(MONTAGE_TEST_DATA_DIR "/svg/") + name;
+                Effect g = makeEffect(p, "shape");
+                double w = 0, h = 0;
+                std::vector<std::string> notes;
+                std::string err;
+                QVERIFY2(importSvgShapes(file, g, w, h, &notes, &err), err.c_str());
+                const int iw = int(std::lround(w)), ih = int(std::lround(h));
+                const Image ours = renderShape(g, 0, iw, ih, 1);
+                VectorInfo info;
+                const std::shared_ptr<VectorDocument> doc = openVector(file, info, &err);
+                QVERIFY2(doc, err.c_str());
+                const Frame16Ptr ref = renderVector(*doc, 0, iw, ih);
+                QVERIFY(ref && ref->width == iw && ref->height == ih);
+                double sum = 0;
+                for (int y = 0; y < ih; ++y)
+                    for (int x = 0; x < iw; ++x) {
+                        const size_t i = (size_t(y) * size_t(iw) + size_t(x)) * 4;
+                        const float a = ref->unit(i + 3);
+                        for (int k = 0; k < 4; ++k) sum += std::fabs(ours.at(x, y)[k] - (k == 3 ? a : ref->unit(i + size_t(k)) * a));
+                    }
+                const double m = sum / (double(iw) * ih * 4);
+                QVERIFY2(m <= 2.0 / 255, qPrintable(QString("%1: %2 of 255 off on average").arg(name).arg(m * 255)));
+                if (std::string(name) == "paths.svg")
+                    QVERIFY2(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Text") != std::string::npos; }), "text listed");
+            }
+        }
+
+        // A plain shape made into contents (to add to) draws as it did: a star outlined, filled with a gradient and
+        // half drawn on, and an arrow.
+        for (const double shape : {3.0, 5.0, 1.0}) {
+            Effect plain = makeEffect(p, "shape");
+            plain.params["shape"] = Param(shape);
+            plain.params["points"] = 7.0, plain.params["width"] = 220.0, plain.params["height"] = 160.0, plain.params["rotation"] = 20.0;
+            plain.params["pos_x"] = 40.0, plain.params["pos_y"] = -15.0, plain.params["gradient_angle"] = 30.0;
+            plain.params["stroke"] = 6.0, plain.params["gradient"] = shape == 1 ? 2.0 : 1.0, plain.params["trim_end"] = 60.0;
+            Effect made = plain;
+            QVERIFY(!plainShapeAsContents(made).empty() && !shapeContents(made).empty());
+            QVERIFY(plainShapeAsContents(made).empty());
+            const Image ia = renderShape(plain, 0, W, H, 1), ib = renderShape(made, 0, W, H, 1);
+            const float worst = diff(ia, ib, mean);
+            QVERIFY2(mean <= 0.25 / 255, qPrintable(QString("shape %1 as contents: mean %2, worst %3 (of 255)").arg(shape).arg(mean * 255).arg(worst * 255)));
+        }
+
+        // What a hostile file or request could ask for stays bounded: repeaters of repeaters, zig-zags of zig-zags,
+        // a wiggle of a huge path, a repeat offset of 1e300; an SVG whose <use> copies itself, and one nested very deep.
+        {
+            std::vector<ShapeItem> its{item("star", "s"), item("zigzag", "z1"), item("zigzag", "z2"), item("wiggle", "w"), item("repeater", "r1"),
+                                       item("repeater", "r2"), item("repeater", "r3"), item("fill", "f")};
+            std::map<std::string, double> params{{"z1.ridges", 100}, {"z2.ridges", 100}, {"w.spacing", 2}, {"r1.copies", 1000},
+                                                 {"r2.copies", 1000}, {"r3.copies", 1000}, {"r3.offset", 1e300}};
+            QElapsedTimer clock;
+            clock.start();
+            const Image img = renderShape(layer(its, params), 0, W, H, 1);
+            QVERIFY2(clock.elapsed() < 60000, qPrintable(QString("%1 ms").arg(clock.elapsed())));
+            const std::string loop = path("loop.svg"), laughs = path("laughs.svg"), deep = path("deep.svg");
+            const std::string head = R"(<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100">)";
+            {
+                std::ofstream f(loop);
+                f << head << R"(<g id="a"><rect width="10" height="10"/><use xlink:href="#a"/></g></svg>)";
+            }
+            {
+                // (ten levels, each using the one before ten times: ten billion rectangles)
+                std::ofstream f(laughs);
+                f << head << R"(<defs><g id="b0"><rect width="5" height="5"/></g>)";
+                for (int i = 1; i < 10; ++i) {
+                    f << "<g id=\"b" << i << "\">";
+                    for (int k = 0; k < 10; ++k) f << "<use xlink:href=\"#b" << i - 1 << "\"/>";
+                    f << "</g>";
+                }
+                f << R"(</defs><use xlink:href="#b9"/></svg>)";
+            }
+            {
+                std::ofstream f(deep);
+                f << head;
+                for (int i = 0; i < 100000; ++i) f << "<g>";
+                f << R"(<rect width="5" height="5"/>)";
+                for (int i = 0; i < 100000; ++i) f << "</g>";
+                f << "</svg>";
+            }
+            Effect g = makeEffect(p, "shape");
+            double w = 0, h = 0;
+            std::vector<std::string> notes;
+            std::string err;
+            QVERIFY2(importSvgShapes(loop, g, w, h, &notes, &err), err.c_str());
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("copies itself") != std::string::npos; }));
+            const std::string before = g.s("contents");
+            QVERIFY(!importSvgShapes(laughs, g, w, h, &notes, &err) && err.find("too large") != std::string::npos);
+            QVERIFY(!importSvgShapes(deep, g, w, h, &notes, &err) && err.find("deep") != std::string::npos);
+            QCOMPARE(g.s("contents"), before);  // (left as it was)
+            QVERIFY(clock.elapsed() < 120000);
+            (void)img;
+        }
+
+        // A path drawn with the pen as a mask (a 100 x 60 box right of the frame's middle) made a path of the layer's
+        // contents lands where it was drawn, through the layer's own position and turn.
+        {
+            Effect mask;
+            mask.type = "mask";
+            setMaskPathFromFrame(mask, {{0.5, 0.4}, {0.75, 0.4}, {0.75, 0.6}, {0.5, 0.6}}, W, H, false);
+            Effect g = layer({item("fill", "f")}, {{"pos_x", 30}, {"rotation", 90}});
+            const std::optional<ShapeItem> path = shapePathFromMask(g, shapeContents(g), mask, W, H);
+            QVERIFY(path && path->closed);
+            std::vector<ShapeItem> its = shapeContents(g);
+            its.insert(its.begin(), *path);
+            setShapeContents(g, its);
+            const Image img = renderShape(g, 0, W, H, 1);
+            QVERIFY2(std::fabs(alphaSum(img) / (100.0 * 60) - 1) < 0.005, qPrintable(QString("drawn area %1").arg(alphaSum(img))));
+            QVERIFY(img.at(W / 2 + 50, H / 2)[3] > 0.99f && img.at(W / 2 - 50, H / 2)[3] == 0.0f && img.at(W / 2 + 50, H / 2 + 40)[3] == 0.0f);
+            QVERIFY(!shapePathFromMask(g, its, Effect{}, W, H));
+        }
+
+        // Through MCP: a layer built from items, an SVG made into one, and a layer's contents replaced.
+        const QString project = QString::fromStdString(path("shape-layers.montage"));
+        QVERIFY(saveProject(makeDefaultProject(), project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonArray items{
+            QJsonObject{{"type", "group"},
+                        {"settings", QJsonObject{{"pos_x", 40}}},
+                        {"items", QJsonArray{QJsonObject{{"type", "path"},
+                                                         {"keys", QJsonArray{QJsonObject{{"frame", 0}, {"points", QJsonArray{QJsonArray{-50, -50}, QJsonArray{50, -50}, QJsonArray{0, 50}}}},
+                                                                             QJsonObject{{"frame", 20}, {"points", QJsonArray{QJsonArray{-80, -50}, QJsonArray{80, -50}, QJsonArray{0, 70}}}}}}},
+                                             QJsonObject{{"type", "fill"}, {"settings", QJsonObject{{"color", "#ff0000"}}}}}}},
+            QJsonObject{{"type", "ellipse"}, {"settings", QJsonObject{{"width", 300}, {"height", 300}}}},
+            QJsonObject{{"type", "stroke"}, {"settings", QJsonObject{{"width", 8}, {"color", "#00ff00"}}}}};
+        QJsonObject r = call("montage_add_shape", {{"project", project}, {"at", 0}, {"items", items}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_shape", {{"project", project}, {"at", 0}, {"items", QJsonArray{QJsonObject{{"type", "blob"}}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_shape", {{"project", project}, {"at", 0}, {"items", QJsonArray{QJsonObject{{"type", "fill"}, {"settings", QJsonObject{{"size", 3}}}}}}})
+                    .value("isError").toBool());
+        r = call("montage_add_shape", {{"project", project}, {"at", 0}, {"svg", QString::fromStdString(MONTAGE_TEST_DATA_DIR "/svg/paths.svg")}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(QJsonDocument(r).toJson().contains("Text"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        std::vector<const Clip*> shapes;
+        for (const Track& tr : back.active()->videoTracks)
+            for (const Clip& c : tr.clips)
+                if (c.generator.type == "shape") shapes.push_back(&c);
+        QCOMPARE(int(shapes.size()), 2);
+        const Effect& built = shapes[0]->generator;
+        const std::vector<ShapeItem> got = shapeContents(built);
+        QCOMPARE(int(got.size()), 3);
+        QCOMPARE(got[0].type, std::string("group"));
+        QCOMPARE(int(got[0].items.size()), 2);
+        const std::string pathId = got[0].items[0].id;
+        const auto firstId = shapes[0]->id;
+        QCOMPARE(shapePathPoints(built, pathId, 10)[2].y, 60.0);
+        QCOMPARE(shapeItemParam(built, got[0], "pos_x", 0), 40.0);
+        QCOMPARE(shapeItemParam(built, got[2], "color.g", 0), 1.0);
+        QVERIFY(!shapeContents(shapes[1]->generator).empty());
+        // Replaced: the first layer becomes one rectangle.
+        r = call("montage_add_shape", {{"project", project}, {"clip", double(firstId)},
+                                       {"items", QJsonArray{QJsonObject{{"type", "rect"}}, QJsonObject{{"type", "fill"}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* replaced = edit::clipById(*back.active(), firstId);
+        QVERIFY(replaced);
+        QCOMPARE(int(shapeContents(replaced->generator).size()), 2);
+        QVERIFY(!replaced->generator.params.count(pathId + ".p0.x"));
     }
 
     void usdCameraAndSolveExport() {

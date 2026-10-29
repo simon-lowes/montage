@@ -5596,6 +5596,190 @@
         <source>Width (solved or file camera, the scene&apos;s units)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Above</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Combine Paths</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Copies</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Copies Go</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Corner</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Corners</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Dash Offset (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>End</source>
+        <translation type="unfinished">Fine</translation>
+    </message>
+    <message>
+        <source>Ends</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Even-Odd</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Exclude Overlaps</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fill Rule</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>First Copy&apos;s Opacity</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gradient End X (radial: its edge)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gradient End Y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gradient Start X</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gradient Start Y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Inner Radius (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Intersect</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep Each</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Last Copy&apos;s Opacity</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Non-Zero</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Offset Paths</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>One After Another</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Outer Radius (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Paths</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pinch (-) or Bulge (+)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pinch and Bulge</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Points</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Points Every (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Points Moving Together</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Repeater</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Ridges a Segment</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Round Corners</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sharp Corner Limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start</source>
+        <translation type="unfinished">Inizio</translation>
+    </message>
+    <message>
+        <source>Stroke</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Together</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Trim</source>
+        <translation type="unfinished">Taglio</translation>
+    </message>
+    <message>
+        <source>Twist</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Union</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wiggle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wiggles a Second</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Zig Zag</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -12867,6 +13051,98 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Solve Surface Again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shape Contents</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>What the layer holds, the first drawn on top; a group&apos;s items are indented under it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Contents</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add</source>
+        <translation type="unfinished">Aggiungi</translation>
+    </message>
+    <message>
+        <source>Add a shape, a fill or stroke, an operator that changes the paths above it, a repeater or a group</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove the Picked Item</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Move the Picked Item Up</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Move the Picked Item Down</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Shape Item</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Move Shape Item</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Import SVG…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Make an SVG drawing&apos;s paths, groups, fills, strokes and gradients this layer&apos;s contents, to edit and animate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Import SVG</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SVG drawings (*.svg)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Could not import %1: %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not made into shapes: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Path From a Mask</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Item Name</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rename Shape Item</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Closed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Points</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Copy the path drawn with the pen as a Bézier mask on one of this layer&apos;s effects into its contents</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Draw a path with the pen as a Bézier mask on one of this layer&apos;s effects first</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
