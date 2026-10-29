@@ -18409,7 +18409,14 @@ print("added " + ui["name"])
                 if (QString::fromStdString(m.comment) == text || QString::fromStdString(m.name).contains(text)) return true;
             return false;
         };
-        QTRY_VERIFY_WITH_TIMEOUT(hasMarker("Lift the shadows") && !controller->pointers().empty(), 10000);
+        auto hostStatus = [&] {  // (what the host saw, should the notes not arrive)
+            QJsonObject st;
+            bool err = false;
+            controller->runTool({{"action", "status"}}, st, err);
+            return QString::fromUtf8(QJsonDocument(st).toJson(QJsonDocument::Compact)) +
+                   QStringLiteral(" client: %1").arg(QString::fromStdString(client.status().error));
+        };
+        QTRY_VERIFY2_WITH_TIMEOUT(hasMarker("Lift the shadows") && !controller->pointers().empty(), qPrintable(hostStatus()), 10000);
         QCOMPARE(controller->pointers().front().pointer.author, std::string("Client"));
         QCOMPARE(state()->undoText(), QStringLiteral("Notes from Remote Grading"));
         QJsonObject st;
