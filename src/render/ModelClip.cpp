@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "media/CameraSolve.h"
+#include "core/Expression.h"
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
@@ -232,19 +233,37 @@ bool fileCameraOf(const Model& model, const ModelPose& pose, double sec, const s
     return true;
 }
 
-// The camera a model or splat clip is seen through at t: its own in front of the frame (mode 0), the one the 3D Camera
-// Tracker solved (1; `onGround`: whether that scene has a ground, at y = 0), or one in the file named for the camera
-// (2), moving as that file's first animation moves it.
-bool clipCamera(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double scale, int ti, long mode,
+// The video track whose solved camera an effect `g` on a clip on `track` uses at t (its local time `lt`).
+int cameraTrackOf(const Sequence& seq, size_t track, const Effect& g, FrameTime lt, FrameTime t) {
+    const int v = int(std::lround(g.p("camera_track", lt, 0)));
+    if (v > 0) return v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
+    for (int k = int(track) - 1; k >= 0; --k)
+        if (const Clip* f = clipOn(seq.videoTracks[size_t(k)], t); f && parsedSolve(*f)) return k;
+    return -1;
+}
+
+// The camera in front of the frame with a field of view `fov` (degrees across its width): the plane z = 0 at one
+// sequence pixel a unit, y up, the camera on +z looking back.
+void frontCamera(const Sequence& seq, double fov, double scale, ModelCamera& cam) {
+    const double SW = seq.width, SH = seq.height;
+    const double f = (SW / 2) / std::tan(std::clamp(fov, 1.0, 170.0) * kDeg / 2);
+    cam.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
+    cam.C = {0, 0, f};
+    cam.screen = {f * scale, 0, SW / 2 * scale, 0, f * scale, SH / 2 * scale};
+    cam.nearZ = 1;
+}
+
+// The camera a model, splat or 3D layer (`g`, on clip `c`) is seen through at t: its own in front of the frame (mode
+// 0), the one the 3D Camera Tracker solved (1; `onGround`: whether that scene has a ground, at y = 0), one in the file
+// named for the camera (2), moving as that file's first animation moves it, or the scene's Camera clip (3).
+bool clipCamera(const Project& p, const Sequence& seq, const Clip& c, const Effect& g, FrameTime t, double scale, int ti, long mode,
                 ModelCamera& cam, double& groundY, bool& onGround, std::string* error) {
-    const Effect& g = c.generator;
     const FrameTime lt = t - c.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
     const bool solved = mode == 1, fileCamera = mode == 2;
-    const double SW = seq.width, SH = seq.height;
     onGround = true;
     if (solved) {
-        const int ct = ti >= 0 ? modelCameraTrack(seq, size_t(ti), c, t) : -1;
+        const int ct = ti >= 0 ? cameraTrackOf(seq, size_t(ti), g, lt, t) : -1;
         const Clip* footage = ct >= 0 ? clipOn(seq.videoTracks[size_t(ct)], t) : nullptr;
         const std::shared_ptr<const CameraSolve> solve = footage ? parsedSolve(*footage) : nullptr;
         const int frame = solve ? cameraSolveFrame(seq, *footage, *solve, t - footage->start) : -1;
@@ -282,29 +301,219 @@ bool clipCamera(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         const double d = model->animations.empty() ? 0 : model->animations[0].duration;
         if (P("loop", 1) > 0.5 && d > 0) sec = sec - d * std::floor(sec / d);
         if (!fileCameraOf(*model, poseModel(*model, model->animations.empty() ? -1 : 0, sec), sec, file, g, lt, seq, scale, cam, error)) return false;
+    } else if (mode == 3) {
+        // The scene's Camera clip (on the track named, else the highest with one at t); where there is none, one with a
+        // 35° lens in front of the frame, as a Camera clip that is left as it is.
+        const int named = int(std::lround(P("camera_track", 0))) - 1;
+        const Clip* cc = sceneCameraClip(seq, t, named);
+        if (!cc && named >= 0) cc = sceneCameraClip(seq, t, -1);
+        if (cc) sceneCamera(p, seq, *cc, t, scale, cam);
+        else frontCamera(seq, 35, scale, cam);
     } else {
-        // In front of the frame: the plane z = 0 at one sequence pixel a unit, y up, the camera on +z looking back.
-        const double f = (SW / 2) / std::tan(std::clamp(P("fov", 35), 1.0, 170.0) * kDeg / 2);
-        cam.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
-        cam.C = {0, 0, f};
-        cam.screen = {f * scale, 0, SW / 2 * scale, 0, f * scale, SH / 2 * scale};
-        cam.nearZ = 1;
+        frontCamera(seq, P("fov", 35), scale, cam);
     }
     return true;
 }
 
+// A shape made in place of a file's model (1 plane, the frame's shape a unit tall, facing +z; 2 box; 3 sphere; 4
+// cylinder, each a unit across), in one material; a picture's top left at uv (0, 0), the right way round from outside.
+std::shared_ptr<const Model> shapeModel(int shape, double aspect, const std::array<float, 4>& color, float metal, float rough) {
+    auto model = std::make_shared<Model>();
+    Model& m = *model;
+    m.path = "shape";
+    ModelMaterial mat;
+    mat.name = "Shape";
+    mat.baseColor = color;
+    mat.metallic = metal, mat.roughness = rough;
+    mat.doubleSided = shape == 1;
+    m.materials.push_back(mat);
+    ModelPrimitive pr;
+    pr.material = 0;
+    using V = std::array<double, 3>;
+    auto vertex = [&](const V& q, const V& n, double u, double v) {
+        for (int k = 0; k < 3; ++k) pr.positions.push_back(float(q[size_t(k)])), pr.normals.push_back(float(n[size_t(k)]));
+        pr.uvs.push_back(float(u)), pr.uvs.push_back(float(v));
+        return uint32_t(pr.positions.size() / 3 - 1);
+    };
+    // A face of corners a b c d (top left, top right, bottom left, bottom right as seen from outside).
+    auto quad = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) { pr.indices.insert(pr.indices.end(), {a, c, b, b, c, d}); };
+    // A flat rectangle: its middle, outward normal, right and up (half sizes in them).
+    auto face = [&](const V& mid, const V& n, const V& r, const V& up) {
+        uint32_t i[4];
+        for (int k = 0; k < 4; ++k) {
+            const double sx = k & 1 ? 1 : -1, sy = k & 2 ? -1 : 1;
+            i[k] = vertex({mid[0] + r[0] * sx + up[0] * sy, mid[1] + r[1] * sx + up[1] * sy, mid[2] + r[2] * sx + up[2] * sy}, n, k & 1 ? 1 : 0,
+                          k & 2 ? 1 : 0);
+        }
+        quad(i[0], i[1], i[2], i[3]);
+    };
+    constexpr double pi = 3.14159265358979323846;
+    if (shape == 1) {
+        face({0, 0, 0}, {0, 0, 1}, {std::max(1e-6, aspect) / 2, 0, 0}, {0, 0.5, 0});
+    } else if (shape == 2) {
+        face({0, 0, 0.5}, {0, 0, 1}, {0.5, 0, 0}, {0, 0.5, 0});
+        face({0, 0, -0.5}, {0, 0, -1}, {-0.5, 0, 0}, {0, 0.5, 0});
+        face({0.5, 0, 0}, {1, 0, 0}, {0, 0, -0.5}, {0, 0.5, 0});
+        face({-0.5, 0, 0}, {-1, 0, 0}, {0, 0, 0.5}, {0, 0.5, 0});
+        face({0, 0.5, 0}, {0, 1, 0}, {0.5, 0, 0}, {0, 0, -0.5});
+        face({0, -0.5, 0}, {0, -1, 0}, {0.5, 0, 0}, {0, 0, 0.5});
+    } else if (shape == 3 || shape == 4) {
+        // Round the side from the back (u 0) through the front (u 0.5, facing +z) to the back again.
+        const int around = 64, down = shape == 3 ? 32 : 1;
+        const uint32_t first = uint32_t(pr.positions.size() / 3);
+        for (int i = 0; i <= down; ++i)
+            for (int j = 0; j <= around; ++j) {
+                const double u = double(j) / around, v = double(i) / down, phi = 2 * pi * (u - 0.5);
+                if (shape == 3) {
+                    const double th = pi * v;
+                    const V n{std::sin(th) * std::sin(phi), std::cos(th), std::sin(th) * std::cos(phi)};
+                    vertex({n[0] / 2, n[1] / 2, n[2] / 2}, n, u, v);
+                } else {
+                    const V n{std::sin(phi), 0, std::cos(phi)};
+                    vertex({n[0] / 2, 0.5 - v, n[2] / 2}, n, u, v);
+                }
+            }
+        for (int i = 0; i < down; ++i)
+            for (int j = 0; j < around; ++j) {
+                const uint32_t a = first + uint32_t(i * (around + 1) + j);
+                quad(a, a + 1, a + uint32_t(around + 1), a + uint32_t(around + 2));
+            }
+        if (shape == 4)  // its ends, the picture laid across them
+            for (const double y : {0.5, -0.5}) {
+                const uint32_t mid = vertex({0, y, 0}, {0, y * 2, 0}, 0.5, 0.5);
+                const uint32_t ring = uint32_t(pr.positions.size() / 3);
+                for (int j = 0; j <= around; ++j) {
+                    const double phi = 2 * pi * j / around;
+                    vertex({std::sin(phi) / 2, y, std::cos(phi) / 2}, {0, y * 2, 0}, 0.5 + std::sin(phi) / 2, 0.5 + std::cos(phi) / 2 * (y > 0 ? 1 : -1));
+                }
+                for (int j = 0; j < around; ++j) pr.indices.insert(pr.indices.end(), {mid, ring + uint32_t(j), ring + uint32_t(j + 1)});
+            }
+    }
+    // Every triangle wound to face out (anticlockwise seen from the side its normals face), its slivers at the poles left out.
+    std::vector<uint32_t> kept;
+    for (size_t t = 0; t + 2 < pr.indices.size(); t += 3) {
+        uint32_t i[3] = {pr.indices[t], pr.indices[t + 1], pr.indices[t + 2]};
+        auto P = [&](uint32_t v) { return V{pr.positions[v * 3], pr.positions[v * 3 + 1], pr.positions[v * 3 + 2]}; };
+        const V a = P(i[0]), b = P(i[1]), c = P(i[2]);
+        const V e1{b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2{c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const V n{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        double out = 0;
+        for (const uint32_t v : i) out += n[0] * pr.normals[v * 3] + n[1] * pr.normals[v * 3 + 1] + n[2] * pr.normals[v * 3 + 2];
+        if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] < 1e-18) continue;
+        if (out < 0) std::swap(i[1], i[2]);
+        kept.insert(kept.end(), i, i + 3);
+    }
+    pr.indices = std::move(kept);
+    ModelMesh mesh;
+    mesh.name = "Shape";
+    mesh.primitives.push_back(std::move(pr));
+    m.meshes.push_back(std::move(mesh));
+    ModelNode node;
+    node.name = "Shape";
+    node.mesh = 0;
+    m.nodes.push_back(node);
+    m.roots.push_back(0);
+    return model;
+}
+
+// A track's picture (premultiplied, the sequence's colour; graded scene-referred, the linear light layers are mixed in)
+// as a texture: linear light, Rec. 709 primaries, premultiplied, at most 2048 pixels across (averaged down).
+std::shared_ptr<const ModelTexture> pictureTexture(const Image& layer, const Sequence& seq) {
+    if (layer.empty()) return nullptr;
+    const SceneGrading* sg = currentSceneGrading();
+    const ColorSpace& from = sg ? *sg->linear : sequenceColorSpace(seq);
+    double mtx[9];
+    primariesMatrix(from.primaries, Primaries::Bt709, mtx);
+    const int step = std::max(1, (std::max(layer.width, layer.height) + 2047) / 2048);
+    const int w = (layer.width + step - 1) / step, h = (layer.height + step - 1) / step;
+    std::vector<float> rgba(size_t(w) * size_t(h) * 4);
+    parallelRows(h, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < w; ++x) {
+                double sum[4] = {0, 0, 0, 0};
+                int n = 0;
+                for (int sy = y * step; sy < std::min(layer.height, (y + 1) * step); ++sy)
+                    for (int sx = x * step; sx < std::min(layer.width, (x + 1) * step); ++sx, ++n) {
+                        const float* q = layer.at(sx, sy);
+                        const float a = std::clamp(q[3], 0.0f, 1.0f);
+                        if (!(a > 1e-6f)) continue;
+                        double l[3];
+                        for (int k = 0; k < 3; ++k) l[k] = toLinear(from.transfer, q[k] / a);
+                        for (int k = 0; k < 3; ++k) sum[k] += std::max(0.0, mtx[k * 3] * l[0] + mtx[k * 3 + 1] * l[1] + mtx[k * 3 + 2] * l[2]) * a;
+                        sum[3] += a;
+                    }
+                float* o = rgba.data() + (size_t(y) * size_t(w) + size_t(x)) * 4;
+                for (int k = 0; k < 4; ++k) o[k] = float(sum[k] / std::max(1, n));
+            }
+    });
+    auto t = std::make_shared<ModelTexture>(linearModelTexture(w, h, std::move(rgba)));
+    t->wrapS = t->wrapT = ModelTexture::Wrap::Clamp;
+    return t;
+}
+
+
 }  // namespace
 
-int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
-    const int v = int(std::lround(c.generator.p("camera_track", t - c.start, 0)));
-    if (v > 0) return v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
-    for (int k = int(track) - 1; k >= 0; --k)
-        if (const Clip* f = clipOn(seq.videoTracks[size_t(k)], t); f && parsedSolve(*f)) return k;
-    return -1;
+int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) { return cameraTrackOf(seq, track, c.generator, t - c.start, t); }
+
+const Clip* sceneCameraClip(const Sequence& seq, FrameTime t, int track) {
+    auto camera = [&](size_t k) -> const Clip* {
+        if (k >= seq.videoTracks.size() || seq.videoTracks[k].muted) return nullptr;
+        const Clip* c = clipOn(seq.videoTracks[k], t);
+        return c && c->enabled && c->isGenerator() && c->generator.type == "camera3d" ? c : nullptr;
+    };
+    if (track >= 0) return camera(size_t(track));
+    for (size_t k = seq.videoTracks.size(); k-- > 0;)
+        if (const Clip* c = camera(k)) return c;
+    return nullptr;
+}
+
+void sceneCamera(const Project& p, const Sequence& seq, const Clip& camera, FrameTime t, double scale, ModelCamera& cam) {
+    ExpressionScope expressions(&p, &seq, &camera);  // (its own expressions see its own clip)
+    const Effect& g = camera.generator;
+    const FrameTime lt = t - camera.start;
+    auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
+    frontCamera(seq, P("fov", 35), scale, cam);
+    // Moved from where the frame fills its view, and turned (or aimed at a point, then rolled).
+    const std::array<double, 3> at{P("pos_x", 0), P("pos_y", 0), cam.C[2] + P("pos_z", 0)};
+    std::array<double, 3> right, up, back;
+    if (P("aim", 0) > 0.5) {
+        std::array<double, 3> b{at[0] - P("aim_x", 0), at[1] - P("aim_y", 0), at[2] - P("aim_z", 0)};
+        double l = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+        if (l < 1e-9) b = {0, 0, 1}, l = 1;
+        for (double& v : b) v /= l;
+        // Right is level (across y), unless it looks straight up or down.
+        std::array<double, 3> r{b[2], 0, -b[0]};
+        double rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+        if (rl < 1e-9) r = {1, 0, 0}, rl = 1;
+        for (double& v : r) v /= rl;
+        const std::array<double, 3> u{b[1] * r[2] - b[2] * r[1], b[2] * r[0] - b[0] * r[2], b[0] * r[1] - b[1] * r[0]};
+        const double roll = P("rot_z", 0) * kDeg, cr = std::cos(roll), sr = std::sin(roll);
+        for (int k = 0; k < 3; ++k) right[size_t(k)] = r[size_t(k)] * cr + u[size_t(k)] * sr, up[size_t(k)] = u[size_t(k)] * cr - r[size_t(k)] * sr;
+        back = b;
+    } else {
+        const Mat4 m = turned(P("rot_x", 0), P("rot_y", 0), P("rot_z", 0));
+        right = transformDirection(m, {1, 0, 0}), up = transformDirection(m, {0, 1, 0}), back = transformDirection(m, {0, 0, 1});
+    }
+    cam.R = {right[0], right[1], right[2], -up[0], -up[1], -up[2], -back[0], -back[1], -back[2]};
+    cam.C = at;
+}
+
+bool effectCamera(const Project& p, const Sequence& seq, const Clip& c, const Effect& g, FrameTime t, double scale, ModelCamera& cam,
+                  std::string* error) {
+    double groundY = 0;
+    bool onGround = false;
+    const long mode = std::lround(g.p("camera", t - c.start, 3));
+    return clipCamera(p, seq, c, g, t, scale, trackOf(seq, c), mode, cam, groundY, onGround, error);
 }
 
 int modelLightTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
     const int v = int(std::lround(c.generator.p("env_track", t - c.start, 0)));
+    return v > 0 && v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
+}
+
+int modelTextureTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
+    const int v = int(std::lround(c.generator.p("texture_track", t - c.start, 0)));
     return v > 0 && v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
 }
 
@@ -314,17 +523,25 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     const Effect& g = c.generator;
     const FrameTime lt = t - c.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
-    const std::string file = g.s("file");
-    if (file.empty()) {
-        if (error) *error = "Choose a model file (glTF, GLB, OBJ or USD)";
-        return false;
+    const int shape = int(std::lround(P("shape", 0)));
+    const std::string file = shape > 0 ? std::string("shape") : g.s("file");
+    if (shape > 0) {
+        auto lin = [](double v) { return float(v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4)); };
+        model = shapeModel(shape, double(seq.width) / std::max(1, seq.height),
+                           {lin(P("shape_color.r", 0.8)), lin(P("shape_color.g", 0.8)), lin(P("shape_color.b", 0.8)), 1},
+                           float(P("shape_metal", 0) / 100), float(P("shape_rough", 50) / 100));
+    } else {
+        if (file.empty()) {
+            if (error) *error = "Choose a model file (glTF, GLB, OBJ or USD)";
+            return false;
+        }
+        if (isSplatFile(file)) {
+            if (error) *error = file + " is Gaussian splats, not a model";
+            return false;
+        }
+        model = cachedModel(file, error);
+        if (!model) return false;
     }
-    if (isSplatFile(file)) {
-        if (error) *error = file + " is Gaussian splats, not a model";
-        return false;
-    }
-    model = cachedModel(file, error);
-    if (!model) return false;
     const int ti = trackOf(seq, c);
     const double fps = seq.fpsValue();
 
@@ -347,7 +564,7 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     // Into the world: centred on its rest bounds (standing on their bottom when asked), sized, turned and moved; seen
     // through a file's camera, left where the file has it.
     const long mode = std::lround(P("camera", 0));
-    const bool fileCamera = mode == 2;
+    const bool fileCamera = mode == 2 && shape == 0;
     const double k = clipScale(g, lt, mode, lo, hi);
     const Mat4 place = clipPlace(g, lt, mode, k, lo, hi);
     const Mat4 normalM = inverse4(place);
@@ -379,7 +596,7 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     bool onGround = true;
     if (fileCamera && g.s("camera_file").empty()) {
         if (!fileCameraOf(*model, pose, sec, file, g, lt, seq, scale, cam, error)) return false;
-    } else if (!clipCamera(p, seq, c, t, scale, ti, mode, cam, groundY, onGround, error)) {
+    } else if (!clipCamera(p, seq, c, g, t, scale, ti, mode, cam, groundY, onGround, error)) {
         return false;
     }
     (void)w, (void)h;
@@ -412,6 +629,11 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     } else if (scene.environment) {  // (the file's dome light)
         scene.environmentRotation += P("env_rotation", 0) * kDeg;
         scene.environmentIntensity = float(P("env_strength", 100) / 100);
+    }
+    if (const int tt = ti >= 0 ? modelTextureTrack(seq, size_t(ti), c, t) : -1; tt >= 0 && trackLayer) {
+        scene.picture = pictureTexture(trackLayer(tt), seq);
+        scene.pictureMaterial = int(std::lround(P("texture_material", 0))) - 1;
+        scene.pictureAsIs = std::lround(P("texture_light", 0)) == 1;
     }
     scene.ground = onGround && P("ground", 1) > 0.5;
     scene.groundHeight = groundY;
@@ -452,7 +674,7 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         return false;
     }
     const int ti = trackOf(seq, c);
-    if (!clipCamera(p, seq, c, t, scale, ti, mode, cam, groundY, onGround, error)) return false;
+    if (!clipCamera(p, seq, c, c.generator, t, scale, ti, mode, cam, groundY, onGround, error)) return false;
     options = SplatRenderOptions{};
     options.crop = P("crop", 0) > 0.5;
     const char* names[3][2] = {{"crop_x0", "crop_x1"}, {"crop_y0", "crop_y1"}, {"crop_z0", "crop_z1"}};
@@ -507,7 +729,7 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
 
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                       const std::function<Image(int track)>& trackLayer, std::vector<float>* depth, std::string* error) {
-    if (isSplatFile(c.generator.s("file"))) {
+    if (std::lround(c.generator.p("shape", t - c.start, 0)) == 0 && isSplatFile(c.generator.s("file"))) {
         // (already in the values the splats were trained on, as the other generators draw)
         std::shared_ptr<const SplatCloud> cloud;
         Mat4 place;

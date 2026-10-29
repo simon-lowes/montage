@@ -24,9 +24,9 @@ constexpr double kSnap = 8;         // snapping distance, widget pixels
 double cross(const QPointF& a, const QPointF& b) { return a.x() * b.y() - a.y() * b.x(); }
 double dot(const QPointF& a, const QPointF& b) { return a.x() * b.x() + a.y() * b.y(); }
 
-// A clip the overlay can move: a picture on a video track, not a whole-frame adjustment or a 360° view.
+// A clip the overlay can move: a picture on a video track, not a whole-frame adjustment, a 3D camera or a 360° view.
 bool movable(const Sequence& s, const Clip& c) {
-    if (!c.enabled || (c.isGenerator() && c.generator.type == "adjustment")) return false;
+    if (!c.enabled || (c.isGenerator() && (c.generator.type == "adjustment" || c.generator.type == "camera3d"))) return false;
     const std::vector<const Effect*> fx = liveEffects(s, c);  // (one in a grade node switched off does nothing)
     return std::none_of(fx.begin(), fx.end(), [](const Effect* e) { return e->type == "reframe_360"; });
 }

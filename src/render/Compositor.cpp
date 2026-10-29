@@ -52,6 +52,7 @@
 #include "Shapes.h"
 #include "Title3D.h"
 #include "Titles.h"
+#include "Layer3D.h"
 #include "ModelClip.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
@@ -856,6 +857,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     bool& reframed = out.reframed;
     std::string& exrFile = out.exrFile;
     ofx::FrameFetch& ofxFetch = out.ofxFetch;
+    if (c.isGenerator() && c.generator.type == "camera3d") return false;  // (a camera shows nothing itself)
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space; or, graded
         // scene-referred, in the light layers are composited in).
@@ -1581,6 +1583,9 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
             // The picture lighting a 3D model.
             if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("env_hide", t - c->start, 1) > 0.5)
                 if (const int m = modelLightTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
+            // The picture on a 3D model's surface.
+            if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("texture_hide", t - c->start, 1) > 0.5)
+                if (const int m = modelTextureTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
         }
     return hidden;
 }
@@ -1798,7 +1803,8 @@ std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, F
 bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
     if (flattened) *flattened = false;
     if (compositeShown(c)) return false;  // (a graph's output is flat; its inputs may be deep)
-    const bool deep = enabledEffect(seq, c, "make_deep") ||
+    const bool model = c.isGenerator() && c.generator.type == "model3d";  // (already in 3D: a 3D Layer does nothing to it)
+    const bool deep = enabledEffect(seq, c, "make_deep") || (!model && enabledEffect(seq, c, "layer_3d")) ||
                       (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
                       !clipDeepFile(p, seq, c, t).empty();
     if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
@@ -1867,6 +1873,18 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         intoWorking(layer, rec709Space(), seq, true);
         f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
+    } else if (const Effect* l3 = enabledEffect(seq, c, "layer_3d")) {
+        // A card in 3D: the clip's picture on its plane, seen through the camera, at the depths there.
+        Image layer = clipLayer(p, seq, c, t, o, nullptr);
+        if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        Image card;
+        std::vector<float> depth;
+        std::string error;
+        if (!renderClipLayer3D(p, seq, c, *l3, t, layer, double(W) / seq.width, card, &depth, &error)) {
+            if (o.issues && !error.empty()) o.issues->note(error);
+            return DeepFrame::blank(W, H);
+        }
+        f = deepFromFlat(card.px.data(), W, H, depth.data(), 0);
     } else if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
         Image layer = clipLayer(p, seq, c, t, o, nullptr);
         if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);

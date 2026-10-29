@@ -4493,10 +4493,6 @@
         <translation type="unfinished">Couleur solide</translation>
     </message>
     <message>
-        <source>Solved Footage Track (0: nearest below)</source>
-        <translation type="unfinished">Voie de pied de pied résolu (0: la plus proche ci-dessous)</translation>
-    </message>
-    <message>
         <source>Solved by the 3D Camera Tracker</source>
         <translation type="unfinished">Résolvé par le tracker caméra 3D</translation>
     </message>
@@ -5494,6 +5490,110 @@
     </message>
     <message>
         <source>The Surface Put Back</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>3D Layer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Aim X</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Aim Y (up)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Aim Z</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Aim at a Point</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As It Is</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cylinder</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hide the Picture&apos;s Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lens (own camera, field of view °)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lit by the Scene</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>On Material (0: all)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pan (Y°)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Picture From Track (0: none)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pivot X (from the middle)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pivot Y (up, from the middle)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plane</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Position Z (back from where the frame fills the view)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shape Colour</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shape Metalness</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shape Roughness</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Solved Footage or Camera Track (0: nearest below, or the highest)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Take The Camera From (USD, glTF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The File</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Scene&apos;s Camera</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Width (solved or file camera, the scene&apos;s units)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

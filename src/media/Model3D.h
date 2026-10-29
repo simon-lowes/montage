@@ -26,12 +26,14 @@ Mat4 inverse4(const Mat4& m);  // (affine)
 // Translation, rotation (a unit quaternion x, y, z, w) and scale, applied scale first.
 Mat4 trsMatrix(const std::array<double, 3>& t, const std::array<double, 4>& r, const std::array<double, 3>& s);
 
-// A texture's pixels, 8 bits a channel (RGBA, top row first; colour in sRGB when `srgb`, alpha linear), with its mip
-// levels, each half the last (averaged in linear light).
+// A texture's pixels, 8 bits a channel (RGBA, top row first; colour in sRGB when `srgb`, alpha linear), or floats
+// (linear light, premultiplied: a picture from a track), with its mip levels, each half the last (averaged in linear
+// light).
 struct ModelTexture {
     struct Level {
         int width = 0, height = 0;
         std::vector<uint8_t> rgba;
+        std::vector<float> rgbaLinear;  // (float textures: in place of rgba)
     };
     std::vector<Level> levels;
     bool srgb = false;
@@ -214,6 +216,8 @@ bool modelBounds(const PosedTriangles& t, std::array<double, 3>& lo, std::array<
 std::string readModelFile(const std::string& path);
 bool decodeModelTexture(const std::string& bytes, bool srgb, ModelTexture& out);
 void buildModelTextureMips(ModelTexture& t);  // its smaller levels made again from its first
+// A float texture (linear light, premultiplied, w x h RGBA, top row first) with its mip levels.
+ModelTexture linearModelTexture(int w, int h, std::vector<float> rgba);
 bool loadUsdModel(const std::string& path, Model& out, std::string* error);
 
 }  // namespace montage

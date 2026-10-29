@@ -187,6 +187,7 @@ add_library(montage_engine STATIC
   render/Titles.h render/Titles.cpp
   render/ModelRender.h render/ModelRender.cpp
   render/ModelClip.h render/ModelClip.cpp
+  render/Layer3D.h render/Layer3D.cpp
   render/SplatRender.h render/SplatRender.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp

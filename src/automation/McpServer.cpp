@@ -2561,17 +2561,70 @@ void McpServer::Impl::addTools() {
         "its settings by name (montage_list_effects with kind generator lists model3d's; colours as name.r / .g / .b), "
         "e.g. {\"light_angle\": 30, \"env_track\": 3, \"depth_merge\": 1}. Returns the clip with the model's "
         "animations, cameras, lights, triangle count and what in the file is not read (notes); for splats their count, "
-        "the number of files in their run (frames) and the degree of their colours' harmonics.",
+        "the number of files in their run (frames) and the degree of their colours' harmonics. In place of a file, shape "
+        "makes one (plane: the frame's shape, a unit tall, facing the camera; box, sphere or cylinder: a unit across) in "
+        "shape_color, shape_metal and shape_rough (settings). Any model can carry a track's picture: settings "
+        "texture_track (the track's number, 1 for V1; hidden unless texture_hide 0), on one material (texture_material, "
+        "1-based; 0 all), lit by the scene or as it is (texture_light 1). camera 0 with settings camera 3 sees it through "
+        "the scene's Camera clip (montage_add_camera).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
+            "shape":{"type":"string","enum":["plane","box","sphere","cylinder"]},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
             "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
             "camera":{"type":"integer","minimum":0},"camera_file":{"type":"string"},
             "settings":{"type":"object","additionalProperties":{"type":"number"}}},
-            "required":["project","file"]})json",
+            "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            if (a.contains("shape")) {
+                // A shape made in place of a file's model.
+                if (a.contains("file")) throw ArgError{"Give \"file\" or \"shape\", not both"};
+                for (const char* k : {"over", "place", "camera", "camera_file"})
+                    if (a.contains(k)) throw ArgError{QStringLiteral("A shape is seen through its own camera or the scene's: \"%1\" is for a file's model").arg(k)};
+                const QStringList shapes{"plane", "box", "sphere", "cylinder"};
+                const int shape = int(shapes.indexOf(str(a, "shape"))) + 1;
+                if (shape <= 0) throw ArgError{"\"shape\" is plane, box, sphere or cylinder"};
+                Clip c = makeGeneratorClip(l.project, "model3d", 1);
+                c.generator.params["shape"] = Param(double(shape));
+                c.generator.params["ground"] = Param(0.0);
+                c.name = str(a, "shape").toStdString();
+                c.name[0] = char(std::toupper(c.name[0]));
+                const EffectInfo* info = findEffectInfo("model3d");
+                const QJsonObject settings = a.value("settings").toObject();
+                for (auto it = settings.begin(); it != settings.end(); ++it) {
+                    const std::string name = it.key().toStdString();
+                    const ParamInfo* pi = nullptr;
+                    for (const ParamInfo& p : info->params)
+                        if (p.kind == ParamKind::Color ? name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name) pi = &p;
+                    if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of 3D Model").arg(it.key())};
+                    if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                    c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
+                }
+                if (a.contains("position")) {
+                    const QJsonArray pos = a.value("position").toArray();
+                    if (pos.size() != 3) throw ArgError{"\"position\" is [x, y, z]"};
+                    for (int k = 0; k < 3; ++k) c.generator.params[k == 0 ? "pos_x" : k == 1 ? "pos_y" : "pos_z"] = Param(pos[k].toDouble());
+                }
+                TrackRef t{TrackKind::Video, 0};
+                if (a.contains("track")) {
+                    t = trackArg(str(a, "track"), s, true, &l.project, &s);
+                } else {
+                    int top = -1;
+                    for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                        if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                    t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+                }
+                c.start = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+                c.duration = std::max<FrameTime>(1, a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue())));
+                const auto r = edit::overwrite(l.project, s, t, c);
+                check(r);
+                save(l);
+                const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+                return ok(QStringLiteral("Added a %1 on %2").arg(str(a, "shape"), QString::fromStdString(trackAt(s, t)->name)),
+                          made ? clipJson(l.project, s, *made) : QJsonObject{});
+            }
             const QFileInfo fi(absolute(need(a, "file")));
             if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(need(a, "file"))};
             std::string err;
@@ -2689,6 +2742,75 @@ void McpServer::Impl::addTools() {
             if (!notes.isEmpty()) out["notes"] = notes;
             out["triangles"] = double(model->triangles());
             return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
+        });
+
+    add("montage_add_camera", "Add a 3D camera",
+        "Add the scene's Camera: 3D layers (montage_add_effect layer_3d), models and splats whose camera is The Scene's "
+        "Camera (camera 3) are seen through it, the one on the highest track when there are several (or the track their "
+        "camera_track names). Left as it is it sees the frame as a 2D view does (its lens fov across the width, the "
+        "frame's plane a pixel a unit, y up); position [x, y, z] moves it (z back from the frame), turn [pan, tilt, roll] "
+        "in degrees turns it, or aim [x, y, z] points it at a point (roll still applies). keys animates it: [{frame, "
+        "position?, turn?, aim?, fov?}], frames from the clip's start. It draws nothing itself.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "duration":{"type":["number","string"],"default":5},"track":{"type":"string"},"fov":{"type":"number"},
+            "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "turn":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "aim":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "keys":{"type":"array","items":{"type":"object"}}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip c = makeGeneratorClip(l.project, "camera3d", 1);
+            c.name = "Camera";
+            auto three = [](const QJsonValue& v, const char* what) {
+                const QJsonArray arr = v.toArray();
+                if (arr.size() != 3) throw ArgError{QStringLiteral("\"%1\" is three numbers").arg(what)};
+                return std::array<double, 3>{arr[0].toDouble(), arr[1].toDouble(), arr[2].toDouble()};
+            };
+            // Its settings from one object (the call's, or a key's), set or keyed at `frame`.
+            auto apply = [&](const QJsonObject& o, FrameTime frame, bool keyed) {
+                auto set = [&](const char* name, double v) {
+                    if (keyed) c.generator.params[name].addKey(frame, v);
+                    else c.generator.params[name] = Param(v);
+                };
+                if (o.contains("fov")) set("fov", std::clamp(o.value("fov").toDouble(35), 5.0, 120.0));
+                if (o.contains("position")) {
+                    const auto v = three(o.value("position"), "position");
+                    set("pos_x", v[0]), set("pos_y", v[1]), set("pos_z", v[2]);
+                }
+                if (o.contains("turn")) {
+                    const auto v = three(o.value("turn"), "turn");
+                    set("rot_y", v[0]), set("rot_x", v[1]), set("rot_z", v[2]);
+                }
+                if (o.contains("aim")) {
+                    const auto v = three(o.value("aim"), "aim");
+                    c.generator.params["aim"] = Param(1.0);
+                    set("aim_x", v[0]), set("aim_y", v[1]), set("aim_z", v[2]);
+                }
+            };
+            apply(a, 0, false);
+            for (const QJsonValue& k : a.value("keys").toArray()) {
+                const QJsonObject o = k.toObject();
+                if (!o.value("frame").isDouble()) throw ArgError{"Each key has a \"frame\""};
+                apply(o, FrameTime(std::llround(o.value("frame").toDouble())), true);
+            }
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) {
+                t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            } else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            c.start = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+            c.duration = std::max<FrameTime>(1, a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue())));
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added a camera on %1").arg(QString::fromStdString(trackAt(s, t)->name)), made ? clipJson(l.project, s, *made) : QJsonObject{});
         });
 
     add("montage_add_shape", "Add a shape",
@@ -2892,7 +3014,13 @@ void McpServer::Impl::addTools() {
         "(amount %); a bend pin turns (angle, degrees) and scales (scale %) the area round it; an overlap pin sets which "
         "part is in front where it folds (depth -100..100 over radius); motion_blur 1 blurs along the mesh's motion "
         "(shutter in degrees). grid_warp moves the points of a grid of rows x cols: params g<r>_<c>.dx and .dy (r 0..rows, "
-        "c 0..cols; fractions of the frame), smooth (shape 0) or straight (shape 1) between them.",
+        "c 0..cols; fractions of the frame), smooth (shape 0) or straight (shape 1) between them. "
+        "layer_3d makes the clip a card in 3D: its picture as its transform leaves it, moved (pos_x, pos_y up, pos_z "
+        "towards the camera) and turned (rot_y, rot_x, rot_z, degrees, about pivot_x / pivot_y from the middle), seen "
+        "through the scene's Camera clip (camera 3, the default; montage_add_camera; without one, the camera that sees the "
+        "frame as it is), its own (camera 0, lens fov), the solve montage_camera_track made (camera 1, width in the "
+        "scene's units, camera_track the footage's track) or a file's (camera 2, strings.camera_file); 3D layers, models "
+        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},

@@ -194,6 +194,34 @@ bool decodeTexture(const QByteArray& bytes, bool srgb, ModelTexture& out) {
 
 }  // namespace
 
+ModelTexture linearModelTexture(int w, int h, std::vector<float> rgba) {
+    ModelTexture out;
+    if (w <= 0 || h <= 0 || rgba.size() != size_t(w) * size_t(h) * 4) return out;
+    ModelTexture::Level l;
+    l.width = w, l.height = h;
+    l.rgbaLinear = std::move(rgba);
+    out.levels.push_back(std::move(l));
+    while (out.levels.back().width > 1 || out.levels.back().height > 1) {
+        const ModelTexture::Level& a = out.levels.back();
+        ModelTexture::Level b;
+        b.width = std::max(1, a.width / 2), b.height = std::max(1, a.height / 2);
+        b.rgbaLinear.resize(size_t(b.width) * size_t(b.height) * 4);
+        for (int y = 0; y < b.height; ++y)
+            for (int x = 0; x < b.width; ++x)
+                for (int c = 0; c < 4; ++c) {
+                    float sum = 0;
+                    for (int dy = 0; dy < 2; ++dy)
+                        for (int dx = 0; dx < 2; ++dx) {
+                            const int sx = std::min(a.width - 1, x * 2 + dx), sy = std::min(a.height - 1, y * 2 + dy);
+                            sum += a.rgbaLinear[(size_t(sy) * size_t(a.width) + size_t(sx)) * 4 + size_t(c)];
+                        }
+                    b.rgbaLinear[(size_t(y) * size_t(b.width) + size_t(x)) * 4 + size_t(c)] = sum / 4;
+                }
+        out.levels.push_back(std::move(b));
+    }
+    return out;
+}
+
 void buildModelTextureMips(ModelTexture& out) {
     if (out.levels.empty()) return;
     out.levels.resize(1);

@@ -69,6 +69,11 @@ struct ModelScene {
     double groundHeight = 0;
     float groundStrength = 1;
     float opacity = 1;
+    // A picture covering the surfaces of one material (or all, -1) in place of their base colour (with its alpha); lit
+    // as they are, or shown as it is (`pictureAsIs`).
+    std::shared_ptr<const ModelTexture> picture;
+    int pictureMaterial = -1;
+    bool pictureAsIs = false;
 };
 
 struct ModelRenderOptions {

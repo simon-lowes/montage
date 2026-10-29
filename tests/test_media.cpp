@@ -193,6 +193,7 @@
 #include "media/Model3D.h"
 #include "media/Usd.h"
 #include "core/Zip.h"
+#include "render/Layer3D.h"
 #include "render/ModelClip.h"
 #include "render/ModelRender.h"
 #include "render/SplatRender.h"
@@ -30721,6 +30722,275 @@ if ui["pressed"] == "add":
         QVERIFY2(std::fabs((ox0 + ox1 + 1) / 2.0 - W / 2.0) < 1.5 && std::fabs((oy0 + oy1 + 1) / 2.0 - H / 2.0) < 1.5 &&
                      std::fabs(oy1 + 1 - oy0 - want) < 2.5,
                  qPrintable(QString("drawn %1..%2 x %3..%4, %5 tall wanted").arg(ox0).arg(ox1).arg(oy0).arg(oy1).arg(want)));
+    }
+
+    void clipsAsThreeDLayers() {
+        // Clips as cards in 3D (the 3D Layer effect), seen through their own camera, a Camera clip and a solve.
+        const int W = 320, H = 180;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 4) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V"));
+        auto colour = [&](double r, double g, double b, FrameTime start, FrameTime duration) {
+            Clip c;
+            c.id = p.newId();
+            c.start = start, c.duration = duration;
+            c.generator = makeEffect(p, "color");
+            c.generator.params["color.r"] = r, c.generator.params["color.g"] = g, c.generator.params["color.b"] = b;
+            return c;
+        };
+        RenderOptions o;
+        auto maxDiff = [](const Image& a, const Image& b) {
+            float d = a.width == b.width && a.height == b.height ? 0.0f : 1e9f;
+            for (size_t i = 0; d < 1e9f && i < a.px.size(); ++i) d = std::max(d, std::fabs(a.px[i] - b.px[i]));
+            return d;
+        };
+        auto redBox = [&](const Image& img, int& x0, int& x1, int& y0, int& y1) {
+            x0 = W, x1 = -1, y0 = H, y1 = -1;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (img.at(x, y)[0] > 0.5f) x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+        };
+
+        // A gradient clip, half size and off to one side: as a card at z = 0, unturned, through its own camera and
+        // through a Camera clip left as it is, the picture is unchanged.
+        Clip grad;
+        grad.id = p.newId();
+        grad.duration = 10;
+        grad.generator = makeEffect(p, "gradient");
+        grad.motion.params["scale"] = 50.0;
+        grad.motion.params["pos_x"] = 37.0;
+        s.videoTracks[1].clips.push_back(grad);
+        const Image flat = renderSequenceFrame(p, s, 3, o);
+        Effect layer = makeEffect(p, "layer_3d");
+        s.videoTracks[1].clips[0].effects.push_back(layer);
+        QCOMPARE(maxDiff(renderSequenceFrame(p, s, 3, o), flat), 0.0f);
+        s.videoTracks[1].clips[0].effects[0].params["camera"] = 0.0;
+        QCOMPARE(maxDiff(renderSequenceFrame(p, s, 3, o), flat), 0.0f);
+        Clip camera;
+        camera.id = p.newId();
+        camera.duration = 10;
+        camera.generator = makeEffect(p, "camera3d");
+        s.videoTracks[3].clips.push_back(camera);
+        s.videoTracks[1].clips[0].effects[0].params["camera"] = 3.0;
+        QCOMPARE(maxDiff(renderSequenceFrame(p, s, 3, o), flat), 0.0f);
+        // The camera moved 20 to the right: the card's picture 20 pixels to the left (the frame's plane is a pixel a
+        // unit); the picture itself, a Camera clip draws nothing.
+        s.videoTracks[3].clips[0].generator.params["pos_x"] = 20.0;
+        {
+            const Image moved = renderSequenceFrame(p, s, 3, o);
+            float d = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x + 20 < W; ++x)
+                    for (int k = 0; k < 4; ++k) d = std::max(d, std::fabs(moved.at(x, y)[k] - flat.at(x + 20, y)[k]));
+            QVERIFY2(d < 1e-5f, qPrintable(QString("moved camera: %1 off").arg(d)));
+        }
+        s.videoTracks[3].clips.clear();
+        s.videoTracks[1].clips.clear();
+
+        // A red card turned 30 degrees about its upright middle: its corners where a pinhole camera puts them (to
+        // 0.01 px), drawn there (to a pixel).
+        Clip red = colour(1, 0, 0, 0, 10);
+        Effect turned = makeEffect(p, "layer_3d");
+        turned.params["rot_y"] = 30.0;
+        red.effects.push_back(turned);
+        s.videoTracks[1].clips.push_back(red);
+        {
+            const Clip& c = s.videoTracks[1].clips[0];
+            ModelCamera cam;
+            std::string err;
+            QVERIFY2(effectCamera(p, s, c, c.effects[0], 0, 1, cam, &err), err.c_str());
+            const Layer3DPlace place = layer3dPlace(c.effects[0], 0, W, H);
+            const double f = (W / 2.0) / std::tan(17.5 * M_PI / 180);
+            double xs[2] = {1e9, -1e9}, ys[2] = {1e9, -1e9};
+            for (int k = 0; k < 4; ++k) {
+                const double sx = k & 1 ? W : 0, sy = k & 2 ? H : 0;
+                const double u = sx - W / 2.0, v = H / 2.0 - sy, a = 30 * M_PI / 180;
+                const double X = u * std::cos(a), Y = v, Z = -u * std::sin(a);
+                const double wantX = W / 2.0 + f * X / (f - Z), wantY = H / 2.0 - f * Y / (f - Z);
+                const std::array<double, 3> P = place.point(sx, sy);
+                double px, py;
+                QVERIFY(cam.project(P, px, py));
+                QVERIFY2(std::hypot(px - wantX, py - wantY) < 0.01, qPrintable(QString("corner %1: %2, %3 against %4, %5").arg(k).arg(px).arg(py).arg(wantX).arg(wantY)));
+                xs[0] = std::min(xs[0], wantX), xs[1] = std::max(xs[1], wantX), ys[0] = std::min(ys[0], wantY), ys[1] = std::max(ys[1], wantY);
+            }
+            const Image img = renderSequenceFrame(p, s, 0, o);
+            int x0, x1, y0, y1;
+            redBox(img, x0, x1, y0, y1);
+            const double cx0 = std::max(0.0, xs[0]), cx1 = std::min(double(W), xs[1]), cy0 = std::max(0.0, ys[0]), cy1 = std::min(double(H), ys[1]);
+            QVERIFY2(std::fabs(x0 - cx0) < 1 && std::fabs(x1 + 1 - cx1) < 1 && std::fabs(y0 - cy0) < 1 && std::fabs(y1 + 1 - cy1) < 1,
+                     qPrintable(QString("drawn %1..%2 x %3..%4, projected %5..%6 x %7..%8").arg(x0).arg(x1).arg(y0).arg(y1).arg(cx0).arg(cx1).arg(cy0).arg(cy1)));
+        }
+        // Turned edge on, it is gone.
+        s.videoTracks[1].clips[0].effects[0].params["rot_y"] = 90.0;
+        {
+            const Image img = renderSequenceFrame(p, s, 0, o);
+            int x0, x1, y0, y1;
+            redBox(img, x0, x1, y0, y1);
+            QVERIFY2(x1 < 0, qPrintable(QString("edge on, still drawn %1..%2").arg(x0).arg(x1)));
+        }
+        // Two cards turned 30 degrees either way about the same upright line cut through each other there, in the
+        // frame's middle: the nearer of them shows either side.
+        s.videoTracks[1].clips[0].effects[0].params["rot_y"] = 30.0;
+        Clip blue = colour(0, 0, 1, 0, 10);
+        Effect other = makeEffect(p, "layer_3d");
+        other.params["rot_y"] = -30.0;
+        blue.effects.push_back(other);
+        s.videoTracks[2].clips.push_back(blue);
+        {
+            const Image img = renderSequenceFrame(p, s, 0, o);
+            const int y = H / 2;
+            // (rot_y 30 brings the card's left half nearer, so red shows on the left, blue on the right)
+            int flips = 0, at = -1;
+            for (int x = 1; x < W; ++x) {
+                const bool a = img.at(x - 1, y)[0] > img.at(x - 1, y)[2], b = img.at(x, y)[0] > img.at(x, y)[2];
+                if (a != b) ++flips, at = x;
+            }
+            QVERIFY2(img.at(2, y)[0] > 0.9f && img.at(W - 3, y)[2] > 0.9f, "red on the left, blue on the right");
+            QVERIFY2(flips == 1 && std::abs(at - W / 2) <= 1, qPrintable(QString("%1 changes, at %2").arg(flips).arg(at)));
+        }
+        s.videoTracks[2].clips.clear();
+        s.videoTracks[1].clips.clear();
+
+        // A card in a solved scene (a camera dollying past, on the footage below): placed a unit wide at a point of
+        // the scene, its corners where the solve sees them on every frame, and drawn there.
+        CameraSolve solve;
+        solve.width = W, solve.height = H, solve.focal = 250, solve.fps = 25, solve.start = 0, solve.oriented = true;
+        for (int i = 0; i < 10; ++i) {
+            const std::array<double, 3> C{-1 + 0.08 * i, 1.6, 6};
+            const ModelCamera c = lookAt(C, {0, 0.5, 0}, 1, 1, 1);
+            SolvedCamera sc;
+            sc.valid = true;
+            std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+            sc.C = {C[0], C[1], C[2]};
+            solve.cameras.push_back(sc);
+        }
+        Clip plate = colour(0.4, 0.4, 0.4, 0, 10);
+        Effect track = makeEffect(p, "camera_track");
+        track.strings["solve"] = cameraSolveToString(solve);
+        plate.effects.push_back(track);
+        s.videoTracks[0].clips.push_back(plate);
+        Clip card = colour(1, 0, 0, 0, 10);
+        Effect solved = makeEffect(p, "layer_3d");
+        solved.params["camera"] = 1.0;
+        solved.params["width"] = 1.0;
+        solved.params["pos_x"] = 0.3, solved.params["pos_y"] = 0.5, solved.params["pos_z"] = -0.5;
+        solved.params["rot_y"] = 20.0;
+        card.effects.push_back(solved);
+        s.videoTracks[1].clips.push_back(card);
+        for (const int t : {0, 4, 9}) {
+            const Clip& c = s.videoTracks[1].clips[0];
+            const Layer3DPlace place = layer3dPlace(c.effects[0], t, W, H);
+            double xs[2] = {1e9, -1e9}, ys[2] = {1e9, -1e9};
+            for (int k = 0; k < 4; ++k) {
+                const std::array<double, 3> P = place.point(k & 1 ? W : 0, k & 2 ? H : 0);
+                Point2 want;
+                QVERIFY(solve.project(t, {P[0], P[1], P[2]}, want));
+                xs[0] = std::min(xs[0], want.x), xs[1] = std::max(xs[1], want.x), ys[0] = std::min(ys[0], want.y), ys[1] = std::max(ys[1], want.y);
+            }
+            const Image img = renderSequenceFrame(p, s, t, o);
+            int x0, x1, y0, y1;
+            redBox(img, x0, x1, y0, y1);
+            QVERIFY2(std::fabs(x0 - xs[0]) < 1 && std::fabs(x1 + 1 - xs[1]) < 1 && std::fabs(y0 - ys[0]) < 1 && std::fabs(y1 + 1 - ys[1]) < 1,
+                     qPrintable(QString("frame %1: drawn %2..%3 x %4..%5, projected %6..%7 x %8..%9").arg(t).arg(x0).arg(x1).arg(y0).arg(y1)
+                                    .arg(xs[0]).arg(xs[1]).arg(ys[0]).arg(ys[1])));
+            // (the plate round it)
+            QVERIFY2(std::fabs(img.at(1, 1)[0] - 0.4f) < 0.02f, "the plate shows round the card");
+        }
+        s.videoTracks[0].clips.clear();
+        s.videoTracks[1].clips.clear();
+
+        // A model's plane covered by the picture on the track below, as it is: the clip showing there at each frame
+        // (red, then green), the track itself hidden round the plane.
+        s.videoTracks[0].clips.push_back(colour(1, 0, 0, 0, 5));
+        s.videoTracks[0].clips.push_back(colour(0, 1, 0, 5, 5));
+        Clip plane;
+        plane.id = p.newId();
+        plane.duration = 10;
+        plane.generator = makeEffect(p, "model3d");
+        plane.generator.params["shape"] = 1.0;
+        plane.generator.params["size"] = W / 2.0;
+        plane.generator.params["rot_x"] = 0.0, plane.generator.params["rot_y"] = 0.0;
+        plane.generator.params["ground"] = 0.0;
+        plane.generator.params["texture_track"] = 1.0;
+        plane.generator.params["texture_light"] = 1.0;
+        s.videoTracks[1].clips.push_back(plane);
+        for (const int t : {2, 7}) {
+            const Image img = renderSequenceFrame(p, s, t, o);
+            const float* mid = img.at(W / 2, H / 2);
+            const float want[3] = {t < 5 ? 1.0f : 0.0f, t < 5 ? 0.0f : 1.0f, 0.0f};
+            QVERIFY2(std::fabs(mid[0] - want[0]) < 0.02f && std::fabs(mid[1] - want[1]) < 0.02f && mid[2] < 0.02f,
+                     qPrintable(QString("frame %1: %2 %3 %4 in the middle").arg(t).arg(mid[0]).arg(mid[1]).arg(mid[2])));
+            QVERIFY2(img.at(5, 5)[0] < 0.02f && img.at(5, 5)[1] < 0.02f, "the picture's track hidden round the plane");
+            int x0 = W, x1 = -1;
+            for (int x = 0; x < W; ++x)
+                if (img.at(x, H / 2)[0] + img.at(x, H / 2)[1] > 0.5f) x0 = std::min(x0, x), x1 = std::max(x1, x);
+            QVERIFY2(std::abs(x0 - W / 4) <= 1 && std::abs(x1 + 1 - 3 * W / 4) <= 1, qPrintable(QString("plane drawn %1..%2").arg(x0).arg(x1)));
+        }
+        // Lit by the scene, its picture still the clip's colour under the light (red, its highlight white).
+        s.videoTracks[1].clips[0].generator.params["texture_light"] = 0.0;
+        {
+            const float* mid = renderSequenceFrame(p, s, 2, o).at(W / 2, H / 2);
+            QVERIFY2(mid[0] > mid[1] + 0.5f && std::fabs(mid[1] - mid[2]) < 1e-3f, qPrintable(QString("lit: %1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));
+        }
+        // Shapes: a box, a sphere and a cylinder, each drawn round the middle.
+        s.videoTracks[1].clips[0].generator.params["texture_track"] = 0.0;
+        for (const double shape : {2.0, 3.0, 4.0}) {
+            s.videoTracks[1].clips[0].generator.params["shape"] = shape;
+            s.videoTracks[1].clips[0].generator.params["rot_y"] = 30.0;
+            std::string err;
+            const Image img = renderModelClip(p, s, s.videoTracks[1].clips[0], 2, W, H, 1, {}, nullptr, &err);
+            QVERIFY2(img.width == W && img.at(W / 2, H / 2)[3] > 0.99f && img.at(2, 2)[3] == 0.0f, qPrintable(QString("shape %1: %2").arg(shape).arg(err.c_str())));
+        }
+
+        // Over MCP: a card, a camera keyed to move 20 to the right over 10 frames (the picture's right edge 10 in half way),
+        // and a plane carrying the card's track.
+        s.videoTracks[0].clips.clear();
+        s.videoTracks[1].clips.clear();
+        Clip spot = colour(1, 0, 0, 0, 20);
+        s.videoTracks[0].clips.push_back(spot);
+        const QString project = QString::fromStdString(path("layers3d.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            if (r.value("isError").toBool()) qWarning() << QJsonDocument(r).toJson().constData();
+            return r;
+        };
+        QVERIFY(!call("montage_add_effect", {{"project", project}, {"clip", double(spot.id)}, {"effect", "layer_3d"}}).value("isError").toBool());
+        QVERIFY(!call("montage_add_camera", {{"project", project}, {"track", "V4"}, {"duration", 20},
+                                             {"keys", QJsonArray{QJsonObject{{"frame", 0}, {"position", QJsonArray{0, 0, 0}}},
+                                                                 QJsonObject{{"frame", 10}, {"position", QJsonArray{20, 0, 0}}}}}})
+                     .value("isError").toBool());
+        {
+            Project q;
+            std::string err;
+            QVERIFY(loadProject(project.toStdString(), q, &err));
+            const Image img = renderSequenceFrame(q, *q.active(), 5, o);
+            int x0, x1, y0, y1;
+            redBox(img, x0, x1, y0, y1);
+            QVERIFY2(x0 == 0 && std::abs(x1 + 1 - (W - 10)) <= 1,
+                     qPrintable(QString("half way, drawn %1..%2").arg(x0).arg(x1)));
+        }
+        const QJsonObject made = call("montage_add_model", {{"project", project}, {"shape", "box"}, {"track", "V2"},
+                                                            {"settings", QJsonObject{{"texture_track", 1}, {"size", 100}}}});
+        QVERIFY(!made.value("isError").toBool());
+        {
+            Project q;
+            std::string err;
+            QVERIFY(loadProject(project.toStdString(), q, &err));
+            const Sequence& qs = *q.active();
+            QVERIFY(qs.videoTracks[1].clips.size() == 1 && qs.videoTracks[1].clips[0].generator.p("shape", 0, 0) == 2.0);
+            // (the card's track hidden: only the box shows)
+            const Image img = renderSequenceFrame(q, qs, 0, o);
+            QVERIFY2(img.at(W / 2, H / 2)[0] > 0.05f && img.at(10, 10)[0] < 0.02f, qPrintable(QString("the box, the card's track hidden: %1 at the middle, %2 beside").arg(img.at(W / 2, H / 2)[0]).arg(img.at(10, 10)[0])));
+        }
+        QVERIFY(call("montage_add_model", {{"project", project}, {"shape", "cone"}}).value("isError").toBool());
     }
 
     void usdCameraAndSolveExport() {
