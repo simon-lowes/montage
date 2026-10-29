@@ -111,6 +111,5301 @@
     </message>
 </context>
 <context>
+    <name>Engine</name>
+    <message>
+        <source>10-bit 4:2:2 for finishing and HDR</source>
+        <translation type="unfinished">10 bits 4:2:2 para el acabado y HDR</translation>
+    </message>
+    <message>
+        <source>10-bit 4:2:2 intra H.264 at 100 Mb/s, four mono 24-bit tracks (as the DPP&apos;s AS-11 asks)</source>
+        <translation type="unfinished">10-bit 4:2:2 intra H.264 a 100 Mb/s, cuatro mono pistas de 24 bits (como pide el AS-11 del DPP)</translation>
+    </message>
+    <message>
+        <source>10-bit 4:4:4 for finishing and keying</source>
+        <translation type="unfinished">10 bits 4:4:4 para el acabado y el keying</translation>
+    </message>
+    <message>
+        <source>10-bit HEVC for HDR-ready masters</source>
+        <translation type="unfinished">HVC de 10 bits para maestros listos para el HDR</translation>
+    </message>
+    <message>
+        <source>105mm Prime</source>
+        <translation type="unfinished">105mm Prime</translation>
+    </message>
+    <message>
+        <source>16mm</source>
+        <translation type="unfinished">16mm</translation>
+    </message>
+    <message>
+        <source>3-Band EQ</source>
+        <translation type="unfinished">EQ de 3 bandas</translation>
+    </message>
+    <message>
+        <source>35mm</source>
+        <translation type="unfinished">35 mm</translation>
+    </message>
+    <message>
+        <source>35mm Prime</source>
+        <translation type="unfinished">35mm Prime</translation>
+    </message>
+    <message>
+        <source>3D</source>
+        <translation type="unfinished">3D</translation>
+    </message>
+    <message>
+        <source>3D Camera Track</source>
+        <translation type="unfinished">Pista de cámara 3D</translation>
+    </message>
+    <message>
+        <source>3D Camera Tracker</source>
+        <translation type="unfinished">Tracker de cámara 3D</translation>
+    </message>
+    <message>
+        <source>3D Cube</source>
+        <translation type="unfinished">Cubo 3D</translation>
+    </message>
+    <message>
+        <source>3D Flip</source>
+        <translation type="unfinished">Flip 3D</translation>
+    </message>
+    <message>
+        <source>3D Model</source>
+        <translation type="unfinished">Modelo 3D</translation>
+    </message>
+    <message>
+        <source>3D Title</source>
+        <translation type="unfinished">Título 3D</translation>
+    </message>
+    <message>
+        <source>50 Hz</source>
+        <translation type="unfinished">50 Hz</translation>
+    </message>
+    <message>
+        <source>50-300mm Zoom</source>
+        <translation type="unfinished">Zoom de 50-300 mm</translation>
+    </message>
+    <message>
+        <source>60 Hz</source>
+        <translation type="unfinished">60 Hz</translation>
+    </message>
+    <message>
+        <source>65mm</source>
+        <translation type="unfinished">65 mm</translation>
+    </message>
+    <message>
+        <source>8-bit 4:2:2, low bandwidth for offline</source>
+        <translation type="unfinished">8-bit 4:2:2, bajo ancho de banda para fuera de línea</translation>
+    </message>
+    <message>
+        <source>8-bit 4:2:2, standard quality</source>
+        <translation type="unfinished">8-bit 4:2:2, calidad estándar</translation>
+    </message>
+    <message>
+        <source>ACES Gamut Compress</source>
+        <translation type="unfinished">Compresión Gamut ACES</translation>
+    </message>
+    <message>
+        <source>ACES2065-1 (linear AP0)</source>
+        <translation type="unfinished">ACES2065-1 (AP0 lineal)</translation>
+    </message>
+    <message>
+        <source>ACEScct</source>
+        <translation type="unfinished">ACESct</translation>
+    </message>
+    <message>
+        <source>ACEScg (linear AP1)</source>
+        <translation type="unfinished">ACEscg (AP1) lineal</translation>
+    </message>
+    <message>
+        <source>AI Frames (RIFE)</source>
+        <translation type="unfinished">Marcos AI (RIFE)</translation>
+    </message>
+    <message>
+        <source>ARA Plug-in</source>
+        <translation type="unfinished">Complemento ARA</translation>
+    </message>
+    <message>
+        <source>ARRI LogC3 / ALEXA Wide Gamut 3</source>
+        <translation type="unfinished">ARRI LogC3 / ALEXA Wide Gamut 3</translation>
+    </message>
+    <message>
+        <source>ARRI LogC4 / ALEXA Wide Gamut 4</source>
+        <translation type="unfinished">ARRI LogC4 / ALEXA Wide Gamut 4</translation>
+    </message>
+    <message>
+        <source>ASC CDL</source>
+        <translation type="unfinished">ASC CDL</translation>
+    </message>
+    <message>
+        <source>AV1 (SVT-AV1)</source>
+        <translation type="unfinished">AV1 (SVT-AV1)</translation>
+    </message>
+    <message>
+        <source>AVC-Intra 100 (MXF)</source>
+        <translation type="unfinished">CVA-Intra 100 (MXF)</translation>
+    </message>
+    <message>
+        <source>Accent Bar</source>
+        <translation type="unfinished">Barra de Accent</translation>
+    </message>
+    <message>
+        <source>Across (s)</source>
+        <translation type="unfinished">A través de (s)</translation>
+    </message>
+    <message>
+        <source>Add</source>
+        <translation type="unfinished">Añadir</translation>
+    </message>
+    <message>
+        <source>Add (glow where they overlap)</source>
+        <translation type="unfinished">Añadir (brillar donde se solapan)</translation>
+    </message>
+    <message>
+        <source>Add Grain</source>
+        <translation type="unfinished">Añadir grano</translation>
+    </message>
+    <message>
+        <source>Add to it</source>
+        <translation type="unfinished">Añadir a él</translation>
+    </message>
+    <message>
+        <source>Adjustment Layer</source>
+        <translation type="unfinished">Capa de ajuste</translation>
+    </message>
+    <message>
+        <source>Air Resistance (per s)</source>
+        <translation type="unfinished">Resistencia al aire (por s)</translation>
+    </message>
+    <message>
+        <source>Alignment</source>
+        <translation type="unfinished">Alineación</translation>
+    </message>
+    <message>
+        <source>Alpha</source>
+        <translation type="unfinished">Alfa</translation>
+    </message>
+    <message>
+        <source>Alpha Blurriness</source>
+        <translation type="unfinished">Blusicidad alfa</translation>
+    </message>
+    <message>
+        <source>Already Running For (s)</source>
+        <translation type="unfinished">Ya en ejecución para (s)</translation>
+    </message>
+    <message>
+        <source>Ambient Light</source>
+        <translation type="unfinished">Luz ambiente</translation>
+    </message>
+    <message>
+        <source>Ambisonics</source>
+        <translation type="unfinished">Ambética</translation>
+    </message>
+    <message>
+        <source>Amount</source>
+        <translation type="unfinished">Cantidad</translation>
+    </message>
+    <message>
+        <source>Amount (%)</source>
+        <translation type="unfinished">Cantidad (%)</translation>
+    </message>
+    <message>
+        <source>Amount (Bulge + / Pinch -)</source>
+        <translation type="unfinished">Cantidad (Bulge &lt;unk&gt; / Pinch -)</translation>
+    </message>
+    <message>
+        <source>Amount (px)</source>
+        <translation type="unfinished">Importe (px)</translation>
+    </message>
+    <message>
+        <source>Amount of Noise</source>
+        <translation type="unfinished">Cantidad de ruido</translation>
+    </message>
+    <message>
+        <source>Amplitude (px)</source>
+        <translation type="unfinished">Amplitud (px)</translation>
+    </message>
+    <message>
+        <source>Analysed Camera Motion</source>
+        <translation type="unfinished">Movimiento de cámara analizada</translation>
+    </message>
+    <message>
+        <source>Anamorphic</source>
+        <translation type="unfinished">Anamórfico</translation>
+    </message>
+    <message>
+        <source>Anamorphic Squeeze</source>
+        <translation type="unfinished">Apretón anamórfico</translation>
+    </message>
+    <message>
+        <source>Anchor X</source>
+        <translation type="unfinished">Ancla X</translation>
+    </message>
+    <message>
+        <source>Anchor Y</source>
+        <translation type="unfinished">Ancla Y</translation>
+    </message>
+    <message>
+        <source>Angle</source>
+        <translation type="unfinished">Ángulo</translation>
+    </message>
+    <message>
+        <source>Animate By</source>
+        <translation type="unfinished">Animar por</translation>
+    </message>
+    <message>
+        <source>Animate In</source>
+        <translation type="unfinished">Animar en</translation>
+    </message>
+    <message>
+        <source>Animate Out</source>
+        <translation type="unfinished">Animar fuera</translation>
+    </message>
+    <message>
+        <source>Animate Out Too</source>
+        <translation type="unfinished">Animar también</translation>
+    </message>
+    <message>
+        <source>Animated GIF</source>
+        <translation type="unfinished">GIF animado</translation>
+    </message>
+    <message>
+        <source>Animation (0: none)</source>
+        <translation type="unfinished">Animación (0: ninguna)</translation>
+    </message>
+    <message>
+        <source>Animation Offset (s)</source>
+        <translation type="unfinished">Desplazamiento de animación (s)</translation>
+    </message>
+    <message>
+        <source>Animation Speed</source>
+        <translation type="unfinished">Velocidad de animación</translation>
+    </message>
+    <message>
+        <source>Aperture (f/)</source>
+        <translation type="unfinished">Apertura (f)</translation>
+    </message>
+    <message>
+        <source>Aperture Blades</source>
+        <translation type="unfinished">Hojas de apertura</translation>
+    </message>
+    <message>
+        <source>Aperture Blades (0 Round, 3 to 12)</source>
+        <translation type="unfinished">Hojas de apertura (0 ronda, 3 a 12)</translation>
+    </message>
+    <message>
+        <source>Aperture Glare</source>
+        <translation type="unfinished">Apertura de la visión</translation>
+    </message>
+    <message>
+        <source>Apple Log (iPhone) / Rec.2020</source>
+        <translation type="unfinished">Registro de Apple (iPhone) / Rec.2020</translation>
+    </message>
+    <message>
+        <source>Apple Log 2 (iPhone 17 Pro) / Apple Gamut</source>
+        <translation type="unfinished">Registro de Apple 2 (iPhone 17 Pro) / Apple Gamut</translation>
+    </message>
+    <message>
+        <source>Apply In</source>
+        <translation type="unfinished">Aplicar en</translation>
+    </message>
+    <message>
+        <source>Approved</source>
+        <translation type="unfinished">Aprobados</translation>
+    </message>
+    <message>
+        <source>Arrow</source>
+        <translation type="unfinished">Flecha</translation>
+    </message>
+    <message>
+        <source>As Set Below</source>
+        <translation type="unfinished">Como se establece a continuación</translation>
+    </message>
+    <message>
+        <source>As Shot</source>
+        <translation type="unfinished">Como disparo</translation>
+    </message>
+    <message>
+        <source>Aspect</source>
+        <translation type="unfinished">Aspect</translation>
+    </message>
+    <message>
+        <source>Attack (ms)</source>
+        <translation type="unfinished">Ataque (ms)</translation>
+    </message>
+    <message>
+        <source>Attractor Reach (px)</source>
+        <translation type="unfinished">Alcance del atractor (px)</translation>
+    </message>
+    <message>
+        <source>Attractor Strength (px/s², negative repels)</source>
+        <translation type="unfinished">Resistencia del atractor (px/s2, repeles negativos)</translation>
+    </message>
+    <message>
+        <source>Attractor X</source>
+        <translation type="unfinished">Atractor X</translation>
+    </message>
+    <message>
+        <source>Attractor Y</source>
+        <translation type="unfinished">Atractor Y</translation>
+    </message>
+    <message>
+        <source>Attractor Z (3D)</source>
+        <translation type="unfinished">Atractor Z (3D)</translation>
+    </message>
+    <message>
+        <source>Audio - AAC (M4A)</source>
+        <translation type="unfinished">Audio - AAC (M4A)</translation>
+    </message>
+    <message>
+        <source>Audio - WAV 24-bit</source>
+        <translation type="unfinished">Audio - WAV 24 bits</translation>
+    </message>
+    <message>
+        <source>Audio Plugin</source>
+        <translation type="unfinished">Complemento de audio</translation>
+    </message>
+    <message>
+        <source>Audio Track (0 = all)</source>
+        <translation type="unfinished">Pista de audio (0 = todos)</translation>
+    </message>
+    <message>
+        <source>Audio Visualiser</source>
+        <translation type="unfinished">Visualizador de audio</translation>
+    </message>
+    <message>
+        <source>Auto-Pan</source>
+        <translation type="unfinished">Auto-pano</translation>
+    </message>
+    <message>
+        <source>Avid-friendly 8-bit 4:2:2 intermediate</source>
+        <translation type="unfinished">Avid-friendly 8-bit 4:2:2 intermedia</translation>
+    </message>
+    <message>
+        <source>Away From the Emitter&apos;s Centre</source>
+        <translation type="unfinished">Lejos del Centro de Emisores</translation>
+    </message>
+    <message>
+        <source>B44 (lossy)</source>
+        <translation type="unfinished">B44 (pérdida)</translation>
+    </message>
+    <message>
+        <source>B44A (lossy)</source>
+        <translation type="unfinished">B44A (pérdida)</translation>
+    </message>
+    <message>
+        <source>Background</source>
+        <translation type="unfinished">Antecedentes</translation>
+    </message>
+    <message>
+        <source>Background Box</source>
+        <translation type="unfinished">Cuadro de fondo</translation>
+    </message>
+    <message>
+        <source>Band 1 (Hz)</source>
+        <translation type="unfinished">Banda 1 (Hz)</translation>
+    </message>
+    <message>
+        <source>Band 1 (dB)</source>
+        <translation type="unfinished">Banda 1 (dB)</translation>
+    </message>
+    <message>
+        <source>Band 1 Q</source>
+        <translation type="unfinished">Banda 1 Q</translation>
+    </message>
+    <message>
+        <source>Band 2 (Hz)</source>
+        <translation type="unfinished">Banda 2 (Hz)</translation>
+    </message>
+    <message>
+        <source>Band 2 (dB)</source>
+        <translation type="unfinished">Banda 2 (dB)</translation>
+    </message>
+    <message>
+        <source>Band 2 Q</source>
+        <translation type="unfinished">Banda 2 Q</translation>
+    </message>
+    <message>
+        <source>Band 3 (Hz)</source>
+        <translation type="unfinished">Banda 3 (Hz)</translation>
+    </message>
+    <message>
+        <source>Band 3 (dB)</source>
+        <translation type="unfinished">Banda 3 (dB)</translation>
+    </message>
+    <message>
+        <source>Band 3 Q</source>
+        <translation type="unfinished">Banda 3 Q</translation>
+    </message>
+    <message>
+        <source>Bandwidth Extension</source>
+        <translation type="unfinished">Extensión de ancho de banda</translation>
+    </message>
+    <message>
+        <source>Bar Color</source>
+        <translation type="unfinished">Color de la barra</translation>
+    </message>
+    <message>
+        <source>Bar Width (px)</source>
+        <translation type="unfinished">Ancho de barra (px)</translation>
+    </message>
+    <message>
+        <source>Barrel / Pincushion</source>
+        <translation type="unfinished">Barril/alpinillo</translation>
+    </message>
+    <message>
+        <source>Bars</source>
+        <translation type="unfinished">Barras</translation>
+    </message>
+    <message>
+        <source>Beats per Bar</source>
+        <translation type="unfinished">Mejores resultados por barra</translation>
+    </message>
+    <message>
+        <source>Behind People</source>
+        <translation type="unfinished">Detrás de la gente</translation>
+    </message>
+    <message>
+        <source>Below</source>
+        <translation type="unfinished">A continuación</translation>
+    </message>
+    <message>
+        <source>Between Points</source>
+        <translation type="unfinished">Entre puntos</translation>
+    </message>
+    <message>
+        <source>Bevelled</source>
+        <translation type="unfinished">Bifurcación</translation>
+    </message>
+    <message>
+        <source>Binaural (headphones)</source>
+        <translation type="unfinished">Bianual (auriculares)</translation>
+    </message>
+    <message>
+        <source>Birth Rate (per second)</source>
+        <translation type="unfinished">Tasa de natalidad (por segundo)</translation>
+    </message>
+    <message>
+        <source>Black</source>
+        <translation type="unfinished">Negro</translation>
+    </message>
+    <message>
+        <source>Black &amp; White</source>
+        <translation type="unfinished">Blanco y negro</translation>
+    </message>
+    <message>
+        <source>Black B</source>
+        <translation type="unfinished">Negro B</translation>
+    </message>
+    <message>
+        <source>Black Exposure (stops)</source>
+        <translation type="unfinished">Exposición en negro (paradas)</translation>
+    </message>
+    <message>
+        <source>Black Falloff (stops)</source>
+        <translation type="unfinished">Black Falloff (paradas)</translation>
+    </message>
+    <message>
+        <source>Black G</source>
+        <translation type="unfinished">Negro G</translation>
+    </message>
+    <message>
+        <source>Black Offset</source>
+        <translation type="unfinished">Desplazamiento negro</translation>
+    </message>
+    <message>
+        <source>Black R</source>
+        <translation type="unfinished">R negro</translation>
+    </message>
+    <message>
+        <source>Black Saturation</source>
+        <translation type="unfinished">Saturación negra</translation>
+    </message>
+    <message>
+        <source>Black Up To (stops)</source>
+        <translation type="unfinished">Negro hasta (para)</translation>
+    </message>
+    <message>
+        <source>Blackmagic Film Gen 5 / Wide Gamut</source>
+        <translation type="unfinished">Blackmagic Film Gen 5 / Wide Gamut</translation>
+    </message>
+    <message>
+        <source>Blacks</source>
+        <translation type="unfinished">Negros</translation>
+    </message>
+    <message>
+        <source>Blade Rotation</source>
+        <translation type="unfinished">Rotación de la hoja</translation>
+    </message>
+    <message>
+        <source>Blade Rounding</source>
+        <translation type="unfinished">Redondeo de la hoja</translation>
+    </message>
+    <message>
+        <source>Bleep</source>
+        <translation type="unfinished">Bleep</translation>
+    </message>
+    <message>
+        <source>Bleeped (source seconds)</source>
+        <translation type="unfinished">Hebilla (segundos fuente)</translation>
+    </message>
+    <message>
+        <source>Blemish Remover</source>
+        <translation type="unfinished">Removedor de color Blemish</translation>
+    </message>
+    <message>
+        <source>Blend</source>
+        <translation type="unfinished">Mezcla</translation>
+    </message>
+    <message>
+        <source>Blend Original</source>
+        <translation type="unfinished">Original</translation>
+    </message>
+    <message>
+        <source>Blend With Original</source>
+        <translation type="unfinished">Mezclar con original</translation>
+    </message>
+    <message>
+        <source>Block Size (px)</source>
+        <translation type="unfinished">Tamaño del bloque (px)</translation>
+    </message>
+    <message>
+        <source>Bloom</source>
+        <translation type="unfinished">Bloom</translation>
+    </message>
+    <message>
+        <source>Blue</source>
+        <translation type="unfinished">Azul</translation>
+    </message>
+    <message>
+        <source>Blue Blurriness</source>
+        <translation type="unfinished">Bluricidad azul</translation>
+    </message>
+    <message>
+        <source>Blue Density</source>
+        <translation type="unfinished">Densidad azul</translation>
+    </message>
+    <message>
+        <source>Blue Hue (°)</source>
+        <translation type="unfinished">Blue Hue (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Blue Offset</source>
+        <translation type="unfinished">Desplazamiento azul</translation>
+    </message>
+    <message>
+        <source>Blue Output: Blue</source>
+        <translation type="unfinished">Salida azul: Azul</translation>
+    </message>
+    <message>
+        <source>Blue Output: Green</source>
+        <translation type="unfinished">Salida azul: Verde</translation>
+    </message>
+    <message>
+        <source>Blue Output: Red</source>
+        <translation type="unfinished">Salida azul: Rojo</translation>
+    </message>
+    <message>
+        <source>Blue Saturation</source>
+        <translation type="unfinished">Saturación azul</translation>
+    </message>
+    <message>
+        <source>Blue from Blue</source>
+        <translation type="unfinished">Azul de azul</translation>
+    </message>
+    <message>
+        <source>Blue from Green</source>
+        <translation type="unfinished">Azul de verde</translation>
+    </message>
+    <message>
+        <source>Blue from Red</source>
+        <translation type="unfinished">Azul de rojo</translation>
+    </message>
+    <message>
+        <source>Blur</source>
+        <translation type="unfinished">Desenfoque</translation>
+    </message>
+    <message>
+        <source>Blur &amp; Sharpen</source>
+        <translation type="unfinished">Desenfoque y afilar</translation>
+    </message>
+    <message>
+        <source>Blur (px)</source>
+        <translation type="unfinished">Desenfoque (px)</translation>
+    </message>
+    <message>
+        <source>Blur Dimensions</source>
+        <translation type="unfinished">Dimensiones del desenfoque</translation>
+    </message>
+    <message>
+        <source>Blur In</source>
+        <translation type="unfinished">Desenfoque</translation>
+    </message>
+    <message>
+        <source>Blur Nearer Than Focus</source>
+        <translation type="unfinished">Más cerca de la concentración</translation>
+    </message>
+    <message>
+        <source>Blur to Undo (px)</source>
+        <translation type="unfinished">Desenfoque a desenfocar (px)</translation>
+    </message>
+    <message>
+        <source>Bokeh Highlights</source>
+        <translation type="unfinished">Puntos destacados de Bokeh</translation>
+    </message>
+    <message>
+        <source>Bold</source>
+        <translation type="unfinished">Negrita</translation>
+    </message>
+    <message>
+        <source>Border (px)</source>
+        <translation type="unfinished">Borde (px)</translation>
+    </message>
+    <message>
+        <source>Border Color</source>
+        <translation type="unfinished">Color de borde</translation>
+    </message>
+    <message>
+        <source>Both</source>
+        <translation type="unfinished">Ambos</translation>
+    </message>
+    <message>
+        <source>Bottom Left X</source>
+        <translation type="unfinished">Abajo a la izquierda X</translation>
+    </message>
+    <message>
+        <source>Bottom Left Y</source>
+        <translation type="unfinished">Abajo izquierda Y</translation>
+    </message>
+    <message>
+        <source>Bottom Right X</source>
+        <translation type="unfinished">Abajo a la derecha X</translation>
+    </message>
+    <message>
+        <source>Bottom Right Y</source>
+        <translation type="unfinished">Abajo, derecha Y</translation>
+    </message>
+    <message>
+        <source>Bottom onto Top</source>
+        <translation type="unfinished">Arriba</translation>
+    </message>
+    <message>
+        <source>Bounce</source>
+        <translation type="unfinished">Rebote</translation>
+    </message>
+    <message>
+        <source>Bounce Off the Frame&apos;s Sides and Top</source>
+        <translation type="unfinished">Rebote fuera de los lados del marco y arriba</translation>
+    </message>
+    <message>
+        <source>Box</source>
+        <translation type="unfinished">Recuadro</translation>
+    </message>
+    <message>
+        <source>Box Color</source>
+        <translation type="unfinished">Color de caja</translation>
+    </message>
+    <message>
+        <source>Box Padding (px)</source>
+        <translation type="unfinished">Relleno de cajas (px)</translation>
+    </message>
+    <message>
+        <source>Brighten Eyes</source>
+        <translation type="unfinished">Brillante ojos</translation>
+    </message>
+    <message>
+        <source>Brightness</source>
+        <translation type="unfinished">Brillo</translation>
+    </message>
+    <message>
+        <source>Brights First</source>
+        <translation type="unfinished">Brights primero</translation>
+    </message>
+    <message>
+        <source>Broadcast Safe</source>
+        <translation type="unfinished">Transmision Safe</translation>
+    </message>
+    <message>
+        <source>Brush</source>
+        <translation type="unfinished">Pincel</translation>
+    </message>
+    <message>
+        <source>Brush Size (px)</source>
+        <translation type="unfinished">Tamaño del pincel (px)</translation>
+    </message>
+    <message>
+        <source>Brush Softness</source>
+        <translation type="unfinished">Suavemente suave</translation>
+    </message>
+    <message>
+        <source>Burst at the Start</source>
+        <translation type="unfinished">La explosión al principio</translation>
+    </message>
+    <message>
+        <source>CDL ID</source>
+        <translation type="unfinished">ID de CDL</translation>
+    </message>
+    <message>
+        <source>Call-out</source>
+        <translation type="unfinished">Llamamiento</translation>
+    </message>
+    <message>
+        <source>Camera</source>
+        <translation type="unfinished">Cámara</translation>
+    </message>
+    <message>
+        <source>Camera Crop Factor</source>
+        <translation type="unfinished">Factor de recorte de cámara</translation>
+    </message>
+    <message>
+        <source>Camera Gyro</source>
+        <translation type="unfinished">Gyro de cámara</translation>
+    </message>
+    <message>
+        <source>Camera Shake</source>
+        <translation type="unfinished">Agitar la cámara</translation>
+    </message>
+    <message>
+        <source>Camera Tilt (°, 3D)</source>
+        <translation type="unfinished">Cámara Tilt (&lt;unk&gt;, 3D)</translation>
+    </message>
+    <message>
+        <source>Camera Turn (°, 3D)</source>
+        <translation type="unfinished">Gira de la cámara (&lt;unk&gt;, 3D)</translation>
+    </message>
+    <message>
+        <source>Canon Log 3 / Cinema Gamut</source>
+        <translation type="unfinished">Canon Log 3 / Cinema Gamut</translation>
+    </message>
+    <message>
+        <source>Cascade</source>
+        <translation type="unfinished">Cascada</translation>
+    </message>
+    <message>
+        <source>Cast Shadows (sun and spot)</source>
+        <translation type="unfinished">Sombras fundidas (sol y mancha)</translation>
+    </message>
+    <message>
+        <source>Cat&apos;s Eye Toward the Edges</source>
+        <translation type="unfinished">Ojo de gato hacia los bordes</translation>
+    </message>
+    <message>
+        <source>Ceiling (dB)</source>
+        <translation type="unfinished">Límite máximo (dB)</translation>
+    </message>
+    <message>
+        <source>Center</source>
+        <translation type="unfinished">Centro</translation>
+    </message>
+    <message>
+        <source>Center X</source>
+        <translation type="unfinished">Centro X</translation>
+    </message>
+    <message>
+        <source>Center X (px)</source>
+        <translation type="unfinished">Centro X (px)</translation>
+    </message>
+    <message>
+        <source>Center Y</source>
+        <translation type="unfinished">Centro Y</translation>
+    </message>
+    <message>
+        <source>Center Y (px)</source>
+        <translation type="unfinished">Centro Y (px)</translation>
+    </message>
+    <message>
+        <source>Centre From</source>
+        <translation type="unfinished">Centro desde</translation>
+    </message>
+    <message>
+        <source>Centre Height</source>
+        <translation type="unfinished">Altura del centro</translation>
+    </message>
+    <message>
+        <source>Centre Width</source>
+        <translation type="unfinished">Ancho de centro</translation>
+    </message>
+    <message>
+        <source>Centre X</source>
+        <translation type="unfinished">Centro X</translation>
+    </message>
+    <message>
+        <source>Centre X and Y</source>
+        <translation type="unfinished">Centro X e Y</translation>
+    </message>
+    <message>
+        <source>Centre Y</source>
+        <translation type="unfinished">Centro Y</translation>
+    </message>
+    <message>
+        <source>Centred Title</source>
+        <translation type="unfinished">Título centrado</translation>
+    </message>
+    <message>
+        <source>Channel Blur</source>
+        <translation type="unfinished">Desenfoque de canales</translation>
+    </message>
+    <message>
+        <source>Channel Tools</source>
+        <translation type="unfinished">Herramientas de canal</translation>
+    </message>
+    <message>
+        <source>Channels</source>
+        <translation type="unfinished">Canales</translation>
+    </message>
+    <message>
+        <source>Chapter Heading</source>
+        <translation type="unfinished">Capítulo</translation>
+    </message>
+    <message>
+        <source>Chart Match</source>
+        <translation type="unfinished">Coincidencia de gráficos</translation>
+    </message>
+    <message>
+        <source>Chin Length</source>
+        <translation type="unfinished">Longitud de la barbilla</translation>
+    </message>
+    <message>
+        <source>Choke</source>
+        <translation type="unfinished">Ahogo</translation>
+    </message>
+    <message>
+        <source>Chorus</source>
+        <translation type="unfinished">Coro</translation>
+    </message>
+    <message>
+        <source>Chroma Key</source>
+        <translation type="unfinished">Clave de croma</translation>
+    </message>
+    <message>
+        <source>Chromatic Aberration</source>
+        <translation type="unfinished">Aberración cromática</translation>
+    </message>
+    <message>
+        <source>CineForm</source>
+        <translation type="unfinished">CineForm</translation>
+    </message>
+    <message>
+        <source>CineForm (alpha)</source>
+        <translation type="unfinished">CineForm (alfa)</translation>
+    </message>
+    <message>
+        <source>CineForm 12-bit RGBA, keeping transparency</source>
+        <translation type="unfinished">CineForm RGBA de 12 bits, manteniendo la transparencia</translation>
+    </message>
+    <message>
+        <source>Circle</source>
+        <translation type="unfinished">Círculo</translation>
+    </message>
+    <message>
+        <source>Clip Black</source>
+        <translation type="unfinished">Clip negro</translation>
+    </message>
+    <message>
+        <source>Clip Level (dBFS, 0 = auto)</source>
+        <translation type="unfinished">Nivel de clip (dBFS, 0 = auto)</translation>
+    </message>
+    <message>
+        <source>Clip Result Values</source>
+        <translation type="unfinished">Valores de los resultados de la revisión</translation>
+    </message>
+    <message>
+        <source>Clip White</source>
+        <translation type="unfinished">Clip blanco</translation>
+    </message>
+    <message>
+        <source>Clock Wipe</source>
+        <translation type="unfinished">Limpiador de reloj</translation>
+    </message>
+    <message>
+        <source>Clone</source>
+        <translation type="unfinished">Clon</translation>
+    </message>
+    <message>
+        <source>Color</source>
+        <translation type="unfinished">Color</translation>
+    </message>
+    <message>
+        <source>Color Bars</source>
+        <translation type="unfinished">Barras de color</translation>
+    </message>
+    <message>
+        <source>Color Correct (Primaries)</source>
+        <translation type="unfinished">Color correcto (primarias)</translation>
+    </message>
+    <message>
+        <source>Color Matte</source>
+        <translation type="unfinished">Color mate</translation>
+    </message>
+    <message>
+        <source>Color Noise</source>
+        <translation type="unfinished">Ruido de color</translation>
+    </message>
+    <message>
+        <source>Color burn</source>
+        <translation type="unfinished">Quema de color</translation>
+    </message>
+    <message>
+        <source>Color dodge</source>
+        <translation type="unfinished">Color esquivar</translation>
+    </message>
+    <message>
+        <source>Colour</source>
+        <translation type="unfinished">Color</translation>
+    </message>
+    <message>
+        <source>Colour (CMY)</source>
+        <translation type="unfinished">Color (CMY)</translation>
+    </message>
+    <message>
+        <source>Colour Bleed (px)</source>
+        <translation type="unfinished">Color Sangrado (px)</translation>
+    </message>
+    <message>
+        <source>Colour Correct by Depth</source>
+        <translation type="unfinished">Color correcto por profundidad</translation>
+    </message>
+    <message>
+        <source>Colour Grain</source>
+        <translation type="unfinished">Granos de color</translation>
+    </message>
+    <message>
+        <source>Colour Space</source>
+        <translation type="unfinished">Espacio de color</translation>
+    </message>
+    <message>
+        <source>Colour Space Transform</source>
+        <translation type="unfinished">Transformar el espacio de color</translation>
+    </message>
+    <message>
+        <source>Colour Warper</source>
+        <translation type="unfinished">Color Warper</translation>
+    </message>
+    <message>
+        <source>Colour at Birth</source>
+        <translation type="unfinished">Color al nacer</translation>
+    </message>
+    <message>
+        <source>Colour at Death</source>
+        <translation type="unfinished">Color en la muerte</translation>
+    </message>
+    <message>
+        <source>Columns</source>
+        <translation type="unfinished">Columnas</translation>
+    </message>
+    <message>
+        <source>Complexity</source>
+        <translation type="unfinished">Complejidad</translation>
+    </message>
+    <message>
+        <source>Composite</source>
+        <translation type="unfinished">Compuesto</translation>
+    </message>
+    <message>
+        <source>Composite Using</source>
+        <translation type="unfinished">Uso compuesto</translation>
+    </message>
+    <message>
+        <source>Compressed mixdown</source>
+        <translation type="unfinished">Mezcla comprimida</translation>
+    </message>
+    <message>
+        <source>Compressor</source>
+        <translation type="unfinished">Compresor</translation>
+    </message>
+    <message>
+        <source>Confetti</source>
+        <translation type="unfinished">Confeti</translation>
+    </message>
+    <message>
+        <source>Config</source>
+        <translation type="unfinished">Config</translation>
+    </message>
+    <message>
+        <source>Constant</source>
+        <translation type="unfinished">Constante</translation>
+    </message>
+    <message>
+        <source>Constant Depth</source>
+        <translation type="unfinished">Profundidad constante</translation>
+    </message>
+    <message>
+        <source>Contrast</source>
+        <translation type="unfinished">Contraste</translation>
+    </message>
+    <message>
+        <source>Contrast Pivot</source>
+        <translation type="unfinished">Pivot de contraste</translation>
+    </message>
+    <message>
+        <source>Contrast Pivot (stops)</source>
+        <translation type="unfinished">Pivot de contraste (paradas)</translation>
+    </message>
+    <message>
+        <source>Convolution Reverb</source>
+        <translation type="unfinished">Reverberación de la convolución</translation>
+    </message>
+    <message>
+        <source>Copy</source>
+        <translation type="unfinished">Copiar</translation>
+    </message>
+    <message>
+        <source>Copy Lows to LFE</source>
+        <translation type="unfinished">Copiar mínimos a LFE</translation>
+    </message>
+    <message>
+        <source>Corner Pin</source>
+        <translation type="unfinished">Pin de esquina</translation>
+    </message>
+    <message>
+        <source>Corner Roundness (px)</source>
+        <translation type="unfinished">Redondeo de la esquina (px)</translation>
+    </message>
+    <message>
+        <source>Corners and Ends</source>
+        <translation type="unfinished">Esquinas y fines</translation>
+    </message>
+    <message>
+        <source>Cover With</source>
+        <translation type="unfinished">Cubrir con</translation>
+    </message>
+    <message>
+        <source>Crawl Left</source>
+        <translation type="unfinished">A la izquierda</translation>
+    </message>
+    <message>
+        <source>Crawl Right</source>
+        <translation type="unfinished">A la derecha</translation>
+    </message>
+    <message>
+        <source>Crop Bottom</source>
+        <translation type="unfinished">Cultivo inferior</translation>
+    </message>
+    <message>
+        <source>Crop Box Back (Z)</source>
+        <translation type="unfinished">Retroceso de la caja de cultivo (Z)</translation>
+    </message>
+    <message>
+        <source>Crop Box Bottom (Y)</source>
+        <translation type="unfinished">Caja de cultivo inferior (Y)</translation>
+    </message>
+    <message>
+        <source>Crop Box Front (Z)</source>
+        <translation type="unfinished">Frente de caja de cultivo (Z)</translation>
+    </message>
+    <message>
+        <source>Crop Box Left (X, the file&apos;s units)</source>
+        <translation type="unfinished">Caja de recorte izquierda (X, unidades del archivo)</translation>
+    </message>
+    <message>
+        <source>Crop Box Right (X)</source>
+        <translation type="unfinished">Caja de cultivo derecha (X)</translation>
+    </message>
+    <message>
+        <source>Crop Box Top (Y)</source>
+        <translation type="unfinished">Recortar la caja superior (Y)</translation>
+    </message>
+    <message>
+        <source>Crop Left</source>
+        <translation type="unfinished">Recortar la izquierda</translation>
+    </message>
+    <message>
+        <source>Crop Right</source>
+        <translation type="unfinished">Cultivo derecho</translation>
+    </message>
+    <message>
+        <source>Crop Top</source>
+        <translation type="unfinished">Recortar arriba</translation>
+    </message>
+    <message>
+        <source>Crop the Splats to a Box</source>
+        <translation type="unfinished">Recorte las salpicaduras a una caja</translation>
+    </message>
+    <message>
+        <source>Cross</source>
+        <translation type="unfinished">Cruz</translation>
+    </message>
+    <message>
+        <source>Cross Dissolve</source>
+        <translation type="unfinished">Cruz Disolver</translation>
+    </message>
+    <message>
+        <source>Cross Zoom</source>
+        <translation type="unfinished">Ampliar</translation>
+    </message>
+    <message>
+        <source>Crossfade</source>
+        <translation type="unfinished">Desfase cruzado</translation>
+    </message>
+    <message>
+        <source>Crossfade (Constant Gain)</source>
+        <translation type="unfinished">Fade cruzado (ganancia constante)</translation>
+    </message>
+    <message>
+        <source>Crossfade (Equal Power)</source>
+        <translation type="unfinished">Fade cruzado (ecualidad de poder)</translation>
+    </message>
+    <message>
+        <source>Curves</source>
+        <translation type="unfinished">Curvas</translation>
+    </message>
+    <message>
+        <source>Custom (SVG Path Data)</source>
+        <translation type="unfinished">Personalizado (datos de ruta de SVG)</translation>
+    </message>
+    <message>
+        <source>Cut-off (Hz, 0 = auto)</source>
+        <translation type="unfinished">Corte (Hz, 0 = auto)</translation>
+    </message>
+    <message>
+        <source>Cutoff (Hz)</source>
+        <translation type="unfinished">Cutoff (Hz)</translation>
+    </message>
+    <message>
+        <source>Cyan</source>
+        <translation type="unfinished">Cian</translation>
+    </message>
+    <message>
+        <source>Cyan Density</source>
+        <translation type="unfinished">Densidad de Cian</translation>
+    </message>
+    <message>
+        <source>Cyan Hue (°)</source>
+        <translation type="unfinished">Cyan Hue (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Cyan Saturation</source>
+        <translation type="unfinished">Saturación de Cyan</translation>
+    </message>
+    <message>
+        <source>DJI D-Log / D-Gamut</source>
+        <translation type="unfinished">DJI D-Log / D-Gamut</translation>
+    </message>
+    <message>
+        <source>DNxHR 444 (10-bit)</source>
+        <translation type="unfinished">DNxHR 444 (10-bit)</translation>
+    </message>
+    <message>
+        <source>DNxHR HQ</source>
+        <translation type="unfinished">DNxHR HQ</translation>
+    </message>
+    <message>
+        <source>DNxHR HQ (MXF)</source>
+        <translation type="unfinished">DNxHR HQ (MXF)</translation>
+    </message>
+    <message>
+        <source>DNxHR HQ in MXF OP1a, each channel a mono track (Avid&apos;s layout)</source>
+        <translation type="unfinished">HQ DNxHR en MXF OP1a, cada canal una pista mono (diseño de Ávid)</translation>
+    </message>
+    <message>
+        <source>DNxHR HQX (10-bit)</source>
+        <translation type="unfinished">DNxHR HQX (10 bits)</translation>
+    </message>
+    <message>
+        <source>DNxHR LB</source>
+        <translation type="unfinished">DNxHR LB</translation>
+    </message>
+    <message>
+        <source>DNxHR SQ</source>
+        <translation type="unfinished">DNxHR SQ</translation>
+    </message>
+    <message>
+        <source>DPX Sequence (10-bit)</source>
+        <translation type="unfinished">Secuencia DPX (10 bits)</translation>
+    </message>
+    <message>
+        <source>DWAA (lossy)</source>
+        <translation type="unfinished">DWAA (pérdida)</translation>
+    </message>
+    <message>
+        <source>DWAB (lossy)</source>
+        <translation type="unfinished">DWAB (pérdida)</translation>
+    </message>
+    <message>
+        <source>DaVinci Intermediate / Wide Gamut</source>
+        <translation type="unfinished">DaVinci Intermediate / Wide Gamut</translation>
+    </message>
+    <message>
+        <source>Damping</source>
+        <translation type="unfinished">Represas</translation>
+    </message>
+    <message>
+        <source>Dark</source>
+        <translation type="unfinished">Oscuro</translation>
+    </message>
+    <message>
+        <source>Dark B</source>
+        <translation type="unfinished">B oscuro</translation>
+    </message>
+    <message>
+        <source>Dark Exposure (stops)</source>
+        <translation type="unfinished">Exposición oscura (paradas)</translation>
+    </message>
+    <message>
+        <source>Dark Falloff (stops)</source>
+        <translation type="unfinished">Otoño (para)</translation>
+    </message>
+    <message>
+        <source>Dark G</source>
+        <translation type="unfinished">G oscuro</translation>
+    </message>
+    <message>
+        <source>Dark R</source>
+        <translation type="unfinished">R oscuro</translation>
+    </message>
+    <message>
+        <source>Dark Saturation</source>
+        <translation type="unfinished">Saturación oscura</translation>
+    </message>
+    <message>
+        <source>Dark Up To (stops)</source>
+        <translation type="unfinished">Dark Up To (para)</translation>
+    </message>
+    <message>
+        <source>Dark and Light</source>
+        <translation type="unfinished">Oscuro y ligero</translation>
+    </message>
+    <message>
+        <source>Darken</source>
+        <translation type="unfinished">Oscuro</translation>
+    </message>
+    <message>
+        <source>Dash (px, 0 solid)</source>
+        <translation type="unfinished">Dash (px, 0 sólido)</translation>
+    </message>
+    <message>
+        <source>Dash Gap (px)</source>
+        <translation type="unfinished">Gap Dash (px)</translation>
+    </message>
+    <message>
+        <source>De-Click</source>
+        <translation type="unfinished">Des-clic</translation>
+    </message>
+    <message>
+        <source>De-Clip</source>
+        <translation type="unfinished">De-Clip</translation>
+    </message>
+    <message>
+        <source>De-Esser</source>
+        <translation type="unfinished">De-Esser</translation>
+    </message>
+    <message>
+        <source>De-Hum</source>
+        <translation type="unfinished">De-Hum</translation>
+    </message>
+    <message>
+        <source>De-Plosive</source>
+        <translation type="unfinished">Des-Plosivo</translation>
+    </message>
+    <message>
+        <source>De-Reverb</source>
+        <translation type="unfinished">De-Reverb</translation>
+    </message>
+    <message>
+        <source>De-Wind</source>
+        <translation type="unfinished">Des-viento</translation>
+    </message>
+    <message>
+        <source>Decay</source>
+        <translation type="unfinished">Decadencia</translation>
+    </message>
+    <message>
+        <source>Decay at 1 kHz (s)</source>
+        <translation type="unfinished">Decadencia a 1 kHz (s)</translation>
+    </message>
+    <message>
+        <source>Decay at 125 Hz (s)</source>
+        <translation type="unfinished">Decadencia a 125 Hz (s)</translation>
+    </message>
+    <message>
+        <source>Decay at 2 kHz (s)</source>
+        <translation type="unfinished">Decadencia a 2 kHz (s)</translation>
+    </message>
+    <message>
+        <source>Decay at 250 Hz (s)</source>
+        <translation type="unfinished">Decadencia a 250 Hz (s)</translation>
+    </message>
+    <message>
+        <source>Decay at 4 kHz (s)</source>
+        <translation type="unfinished">Decadencia a 4 kHz (s)</translation>
+    </message>
+    <message>
+        <source>Decay at 500 Hz (s)</source>
+        <translation type="unfinished">Decadencia a 500 Hz (s)</translation>
+    </message>
+    <message>
+        <source>Decay at 8 kHz (s)</source>
+        <translation type="unfinished">Decadencia a 8 kHz (s)</translation>
+    </message>
+    <message>
+        <source>Decode</source>
+        <translation type="unfinished">Descifrar</translation>
+    </message>
+    <message>
+        <source>Deep</source>
+        <translation type="unfinished">Profundo</translation>
+    </message>
+    <message>
+        <source>Deflicker</source>
+        <translation type="unfinished">Deflacker</translation>
+    </message>
+    <message>
+        <source>Delay (ms)</source>
+        <translation type="unfinished">Demora (ms)</translation>
+    </message>
+    <message>
+        <source>Delay / Echo</source>
+        <translation type="unfinished">Retraso / Eco</translation>
+    </message>
+    <message>
+        <source>Density</source>
+        <translation type="unfinished">Densidad</translation>
+    </message>
+    <message>
+        <source>Depth</source>
+        <translation type="unfinished">Profundidad</translation>
+    </message>
+    <message>
+        <source>Depth (% of width)</source>
+        <translation type="unfinished">Profundidad (% de anchura)</translation>
+    </message>
+    <message>
+        <source>Depth (ms)</source>
+        <translation type="unfinished">Profundidad (ms)</translation>
+    </message>
+    <message>
+        <source>Depth Fog</source>
+        <translation type="unfinished">Niebla de profundidad</translation>
+    </message>
+    <message>
+        <source>Depth Map</source>
+        <translation type="unfinished">Mapa de profundidad</translation>
+    </message>
+    <message>
+        <source>Depth Map Track</source>
+        <translation type="unfinished">Pista de mapa de profundidad</translation>
+    </message>
+    <message>
+        <source>Depth Map Track (V number, 0: the one above)</source>
+        <translation type="unfinished">Track de mapa de profundidad (número V, 0: el de arriba)</translation>
+    </message>
+    <message>
+        <source>Depth Slice</source>
+        <translation type="unfinished">Corteza de profundidad</translation>
+    </message>
+    <message>
+        <source>Description</source>
+        <translation type="unfinished">Descripción</translation>
+    </message>
+    <message>
+        <source>Despill</source>
+        <translation type="unfinished">Despill</translation>
+    </message>
+    <message>
+        <source>Detail Scale</source>
+        <translation type="unfinished">Escala de detalle</translation>
+    </message>
+    <message>
+        <source>Dialogue Alignment</source>
+        <translation type="unfinished">Alineación del diálogo</translation>
+    </message>
+    <message>
+        <source>Dialogue in Centre</source>
+        <translation type="unfinished">Diálogo en el centro</translation>
+    </message>
+    <message>
+        <source>Diamond</source>
+        <translation type="unfinished">Diamante</translation>
+    </message>
+    <message>
+        <source>Difference</source>
+        <translation type="unfinished">Variación</translation>
+    </message>
+    <message>
+        <source>Dip to Black</source>
+        <translation type="unfinished">Sumergir a negro</translation>
+    </message>
+    <message>
+        <source>Dip to White</source>
+        <translation type="unfinished">Sumergir a blanco</translation>
+    </message>
+    <message>
+        <source>Direct Level (dB)</source>
+        <translation type="unfinished">Nivel directo (dB)</translation>
+    </message>
+    <message>
+        <source>Direction</source>
+        <translation type="unfinished">Dirección</translation>
+    </message>
+    <message>
+        <source>Direction (0 up, 90 right)</source>
+        <translation type="unfinished">Dirección (0 arriba, 90 a la derecha)</translation>
+    </message>
+    <message>
+        <source>Directional Blur</source>
+        <translation type="unfinished">Desenfoque direccional</translation>
+    </message>
+    <message>
+        <source>Dirt Removal</source>
+        <translation type="unfinished">Eliminación de suciedad</translation>
+    </message>
+    <message>
+        <source>Display</source>
+        <translation type="unfinished">Visor</translation>
+    </message>
+    <message>
+        <source>Display / View</source>
+        <translation type="unfinished">Mostrar / Vista</translation>
+    </message>
+    <message>
+        <source>Display P3</source>
+        <translation type="unfinished">Pantalla P3</translation>
+    </message>
+    <message>
+        <source>Display Rendering</source>
+        <translation type="unfinished">Visualización</translation>
+    </message>
+    <message>
+        <source>Dissolve</source>
+        <translation type="unfinished">Disolver</translation>
+    </message>
+    <message>
+        <source>Distance (px)</source>
+        <translation type="unfinished">Distancia (px)</translation>
+    </message>
+    <message>
+        <source>Distort</source>
+        <translation type="unfinished">Distorsión</translation>
+    </message>
+    <message>
+        <source>Distortion</source>
+        <translation type="unfinished">Distorsión</translation>
+    </message>
+    <message>
+        <source>Dot Size (px)</source>
+        <translation type="unfinished">Tamaño del punto (px)</translation>
+    </message>
+    <message>
+        <source>Dots</source>
+        <translation type="unfinished">Puntos</translation>
+    </message>
+    <message>
+        <source>Down</source>
+        <translation type="unfinished">Abajo</translation>
+    </message>
+    <message>
+        <source>Drive (dB)</source>
+        <translation type="unfinished">Unidad (dB)</translation>
+    </message>
+    <message>
+        <source>Drop</source>
+        <translation type="unfinished">Soltar</translation>
+    </message>
+    <message>
+        <source>Drop In</source>
+        <translation type="unfinished">Introducir</translation>
+    </message>
+    <message>
+        <source>Drop Shadow</source>
+        <translation type="unfinished">Sombra de caída</translation>
+    </message>
+    <message>
+        <source>Duotone</source>
+        <translation type="unfinished">Duotona</translation>
+    </message>
+    <message>
+        <source>Dust Spot Removal</source>
+        <translation type="unfinished">Eliminación de manchas de polvo</translation>
+    </message>
+    <message>
+        <source>Dynamics</source>
+        <translation type="unfinished">Dinámica</translation>
+    </message>
+    <message>
+        <source>EBU R103 (-5 to 105 %)</source>
+        <translation type="unfinished">EBU R103 (-5 a 105 %)</translation>
+    </message>
+    <message>
+        <source>EQ</source>
+        <translation type="unfinished">EQ</translation>
+    </message>
+    <message>
+        <source>Each Area (16 x 9)</source>
+        <translation type="unfinished">Cada área (16 x 9)</translation>
+    </message>
+    <message>
+        <source>Ease In and Out (s)</source>
+        <translation type="unfinished">Facilite la entrada y salida (s)</translation>
+    </message>
+    <message>
+        <source>Edge Desaturate</source>
+        <translation type="unfinished">Desnaturalizar el borde</translation>
+    </message>
+    <message>
+        <source>Edge Shift (px)</source>
+        <translation type="unfinished">Cambio de borde (px)</translation>
+    </message>
+    <message>
+        <source>Edge Softness</source>
+        <translation type="unfinished">Suavidad del borde</translation>
+    </message>
+    <message>
+        <source>Elevation (3D, towards the viewer)</source>
+        <translation type="unfinished">Elevación (3D, hacia el espectador)</translation>
+    </message>
+    <message>
+        <source>Ellipse</source>
+        <translation type="unfinished">Elipse</translation>
+    </message>
+    <message>
+        <source>Emboss</source>
+        <translation type="unfinished">Rebajas</translation>
+    </message>
+    <message>
+        <source>Emitter</source>
+        <translation type="unfinished">Emisor</translation>
+    </message>
+    <message>
+        <source>Emitter Angle</source>
+        <translation type="unfinished">Ángulo de emisión</translation>
+    </message>
+    <message>
+        <source>Emitter Depth (px, 3D)</source>
+        <translation type="unfinished">Profundidad del emisor (px, 3D)</translation>
+    </message>
+    <message>
+        <source>Emitter Height (px)</source>
+        <translation type="unfinished">Altura del emisor (px)</translation>
+    </message>
+    <message>
+        <source>Emitter Picture</source>
+        <translation type="unfinished">Imagen del emisor</translation>
+    </message>
+    <message>
+        <source>Emitter Width (px)</source>
+        <translation type="unfinished">Ancho del emisor (px)</translation>
+    </message>
+    <message>
+        <source>Emitter X</source>
+        <translation type="unfinished">Emisor X</translation>
+    </message>
+    <message>
+        <source>Emitter Y</source>
+        <translation type="unfinished">Emisor Y</translation>
+    </message>
+    <message>
+        <source>Emitter Z (3D)</source>
+        <translation type="unfinished">Emisor Z (3D)</translation>
+    </message>
+    <message>
+        <source>End Card</source>
+        <translation type="unfinished">Tarjeta de finalización</translation>
+    </message>
+    <message>
+        <source>End Color</source>
+        <translation type="unfinished">Color final</translation>
+    </message>
+    <message>
+        <source>End Off Screen</source>
+        <translation type="unfinished">Fin de la pantalla</translation>
+    </message>
+    <message>
+        <source>Enhance Speech</source>
+        <translation type="unfinished">Mejorar el habla</translation>
+    </message>
+    <message>
+        <source>Estimated from the Picture</source>
+        <translation type="unfinished">Estimación de la imagen</translation>
+    </message>
+    <message>
+        <source>Even Out</source>
+        <translation type="unfinished">Incluso fuera</translation>
+    </message>
+    <message>
+        <source>Every Track</source>
+        <translation type="unfinished">Cada pista</translation>
+    </message>
+    <message>
+        <source>Everything but Speech</source>
+        <translation type="unfinished">Todo menos el habla</translation>
+    </message>
+    <message>
+        <source>Evolution (°)</source>
+        <translation type="unfinished">Evolución (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Evolution Speed (° per frame)</source>
+        <translation type="unfinished">Velocidad de evolución (&lt;unk&gt; por marco)</translation>
+    </message>
+    <message>
+        <source>Expand</source>
+        <translation type="unfinished">Ampliar</translation>
+    </message>
+    <message>
+        <source>Exposure (stops)</source>
+        <translation type="unfinished">Exposición (paradas)</translation>
+    </message>
+    <message>
+        <source>Extra Zoom</source>
+        <translation type="unfinished">Ampliación adicional</translation>
+    </message>
+    <message>
+        <source>Extrusion (px)</source>
+        <translation type="unfinished">Extrusión (px)</translation>
+    </message>
+    <message>
+        <source>Eye Distance</source>
+        <translation type="unfinished">Distancia entre ojos</translation>
+    </message>
+    <message>
+        <source>Eye Size</source>
+        <translation type="unfinished">Tamaño de los ojos</translation>
+    </message>
+    <message>
+        <source>Eyes</source>
+        <translation type="unfinished">Ojos</translation>
+    </message>
+    <message>
+        <source>F-Stop</source>
+        <translation type="unfinished">F-Stop</translation>
+    </message>
+    <message>
+        <source>FFV1 (lossless archive)</source>
+        <translation type="unfinished">FFV1 (archivo sin pérdidas)</translation>
+    </message>
+    <message>
+        <source>Face</source>
+        <translation type="unfinished">Cara</translation>
+    </message>
+    <message>
+        <source>Face Refinement</source>
+        <translation type="unfinished">Refinamiento facial</translation>
+    </message>
+    <message>
+        <source>Face Shape</source>
+        <translation type="unfinished">Forma facial</translation>
+    </message>
+    <message>
+        <source>Face Width</source>
+        <translation type="unfinished">Ancho de cara</translation>
+    </message>
+    <message>
+        <source>Fade</source>
+        <translation type="unfinished">Fade</translation>
+    </message>
+    <message>
+        <source>Fade (Lifted Blacks)</source>
+        <translation type="unfinished">Fade (negros lifted)</translation>
+    </message>
+    <message>
+        <source>Fade In (of life)</source>
+        <translation type="unfinished">Descolorado (de la vida)</translation>
+    </message>
+    <message>
+        <source>Fade Out (of life)</source>
+        <translation type="unfinished">Desvanecimiento (de la vida)</translation>
+    </message>
+    <message>
+        <source>Faded Colour Restore</source>
+        <translation type="unfinished">Restauración de color descolorida</translation>
+    </message>
+    <message>
+        <source>Falloff</source>
+        <translation type="unfinished">Falloff</translation>
+    </message>
+    <message>
+        <source>Far Is White</source>
+        <translation type="unfinished">Lejos es blanco</translation>
+    </message>
+    <message>
+        <source>Farthest Depth</source>
+        <translation type="unfinished">Profundidad más lejana</translation>
+    </message>
+    <message>
+        <source>Fast export on the GPU / media engine (VideoToolbox, NVENC, Quick Sync, AMF); x264 if there is none</source>
+        <translation type="unfinished">Exportación rápida en el motor GPU / medios (VideoToolbox, NVENC, Quick Sync, AMF); x264 si no hay ninguno</translation>
+    </message>
+    <message>
+        <source>Feather</source>
+        <translation type="unfinished">Pluma</translation>
+    </message>
+    <message>
+        <source>Feather (px)</source>
+        <translation type="unfinished">Pluma (px)</translation>
+    </message>
+    <message>
+        <source>Feedback</source>
+        <translation type="unfinished">Comentarios</translation>
+    </message>
+    <message>
+        <source>Field of View (°)</source>
+        <translation type="unfinished">Campo de visión (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Fill</source>
+        <translation type="unfinished">Rellenar</translation>
+    </message>
+    <message>
+        <source>Fill Color</source>
+        <translation type="unfinished">Color de relleno</translation>
+    </message>
+    <message>
+        <source>Fill Frame</source>
+        <translation type="unfinished">Rellenar marco</translation>
+    </message>
+    <message>
+        <source>Fill Gradient</source>
+        <translation type="unfinished">Rellenar el gradiente</translation>
+    </message>
+    <message>
+        <source>Fill Opacity</source>
+        <translation type="unfinished">Rellenar opacidad</translation>
+    </message>
+    <message>
+        <source>Film</source>
+        <translation type="unfinished">Película</translation>
+    </message>
+    <message>
+        <source>Film Base</source>
+        <translation type="unfinished">Base de película</translation>
+    </message>
+    <message>
+        <source>Film Base B</source>
+        <translation type="unfinished">Base de película B</translation>
+    </message>
+    <message>
+        <source>Film Base G</source>
+        <translation type="unfinished">Base de película G</translation>
+    </message>
+    <message>
+        <source>Film Base R</source>
+        <translation type="unfinished">Base de película R</translation>
+    </message>
+    <message>
+        <source>Film Grain</source>
+        <translation type="unfinished">Grano de película</translation>
+    </message>
+    <message>
+        <source>Film Look</source>
+        <translation type="unfinished">Película Mira</translation>
+    </message>
+    <message>
+        <source>Film Negative</source>
+        <translation type="unfinished">Película negativa</translation>
+    </message>
+    <message>
+        <source>Find Edges</source>
+        <translation type="unfinished">Buscar bordes</translation>
+    </message>
+    <message>
+        <source>Fine (cents)</source>
+        <translation type="unfinished">Multa (alces)</translation>
+    </message>
+    <message>
+        <source>Fine Texture</source>
+        <translation type="unfinished">Textura fina</translation>
+    </message>
+    <message>
+        <source>Firework Burst</source>
+        <translation type="unfinished">Fuegos artificiales</translation>
+    </message>
+    <message>
+        <source>Fisheye to Rectilinear</source>
+        <translation type="unfinished">Ojo de pez a rectilíneo</translation>
+    </message>
+    <message>
+        <source>Fit</source>
+        <translation type="unfinished">Ajuste</translation>
+    </message>
+    <message>
+        <source>Fixed</source>
+        <translation type="unfinished">Fijo</translation>
+    </message>
+    <message>
+        <source>Flanger</source>
+        <translation type="unfinished">Flanger</translation>
+    </message>
+    <message>
+        <source>Flat</source>
+        <translation type="unfinished">Plano</translation>
+    </message>
+    <message>
+        <source>Flat (2D)</source>
+        <translation type="unfinished">Plano (2D)</translation>
+    </message>
+    <message>
+        <source>Flatten Deep</source>
+        <translation type="unfinished">Aplanar profundamente</translation>
+    </message>
+    <message>
+        <source>Flicker</source>
+        <translation type="unfinished">Flicker</translation>
+    </message>
+    <message>
+        <source>Flip Horizontal</source>
+        <translation type="unfinished">Voltear horizontalmente</translation>
+    </message>
+    <message>
+        <source>Flip Path</source>
+        <translation type="unfinished">Ruta de giro</translation>
+    </message>
+    <message>
+        <source>Flip Up</source>
+        <translation type="unfinished">Voltear</translation>
+    </message>
+    <message>
+        <source>Flip Vertical</source>
+        <translation type="unfinished">Voltear verticalmente</translation>
+    </message>
+    <message>
+        <source>Floating Dust</source>
+        <translation type="unfinished">Polvo flotante</translation>
+    </message>
+    <message>
+        <source>Floor</source>
+        <translation type="unfinished">Piso</translation>
+    </message>
+    <message>
+        <source>Floor Height (from the top)</source>
+        <translation type="unfinished">Altura del piso (desde arriba)</translation>
+    </message>
+    <message>
+        <source>Focal Length (mm)</source>
+        <translation type="unfinished">Longitud del foco (mm)</translation>
+    </message>
+    <message>
+        <source>Focus Breathing</source>
+        <translation type="unfinished">Focus Respiración</translation>
+    </message>
+    <message>
+        <source>Focus Depth</source>
+        <translation type="unfinished">Profundidad del foco</translation>
+    </message>
+    <message>
+        <source>Focus Distance (m)</source>
+        <translation type="unfinished">Distancia de enfoque (m)</translation>
+    </message>
+    <message>
+        <source>Focus On</source>
+        <translation type="unfinished">Centrarse en</translation>
+    </message>
+    <message>
+        <source>Focus Point</source>
+        <translation type="unfinished">Punto de enfoque</translation>
+    </message>
+    <message>
+        <source>Focus Point X</source>
+        <translation type="unfinished">Punto de atención X</translation>
+    </message>
+    <message>
+        <source>Focus Point Y</source>
+        <translation type="unfinished">Punto de enfoque Y</translation>
+    </message>
+    <message>
+        <source>Focus Position</source>
+        <translation type="unfinished">Posición de enfoque</translation>
+    </message>
+    <message>
+        <source>Focus Repair</source>
+        <translation type="unfinished">Reparar el foco</translation>
+    </message>
+    <message>
+        <source>Focus Width</source>
+        <translation type="unfinished">Ancho de enfoque</translation>
+    </message>
+    <message>
+        <source>Follow</source>
+        <translation type="unfinished">Seguir</translation>
+    </message>
+    <message>
+        <source>Follow Amount</source>
+        <translation type="unfinished">Seguir a la cantidad</translation>
+    </message>
+    <message>
+        <source>Follow Camera</source>
+        <translation type="unfinished">Siga a la cámara</translation>
+    </message>
+    <message>
+        <source>Follow Slanting Scratches</source>
+        <translation type="unfinished">Siga los rasguños inclinados</translation>
+    </message>
+    <message>
+        <source>Follow the 360° View</source>
+        <translation type="unfinished">Siga la vista 360&lt;unk&gt;</translation>
+    </message>
+    <message>
+        <source>Font</source>
+        <translation type="unfinished">Tipo de letra</translation>
+    </message>
+    <message>
+        <source>Font Size (px)</source>
+        <translation type="unfinished">Tamaño de la fuente (px)</translation>
+    </message>
+    <message>
+        <source>Forehead Height</source>
+        <translation type="unfinished">Altura del frente</translation>
+    </message>
+    <message>
+        <source>Forward</source>
+        <translation type="unfinished">Adelante</translation>
+    </message>
+    <message>
+        <source>Found in the Rebate</source>
+        <translation type="unfinished">Encontrado en el Rebate</translation>
+    </message>
+    <message>
+        <source>Frame Blending</source>
+        <translation type="unfinished">Mezcla de marcos</translation>
+    </message>
+    <message>
+        <source>Frame Repair</source>
+        <translation type="unfinished">Reparación de marcos</translation>
+    </message>
+    <message>
+        <source>Frame Sampling</source>
+        <translation type="unfinished">Muestreo de marcos</translation>
+    </message>
+    <message>
+        <source>Frames Either Side</source>
+        <translation type="unfinished">Marcos de cualquier lado</translation>
+    </message>
+    <message>
+        <source>Framing</source>
+        <translation type="unfinished">Framing</translation>
+    </message>
+    <message>
+        <source>Free</source>
+        <translation type="unfinished">Libre</translation>
+    </message>
+    <message>
+        <source>Frequency (Hz)</source>
+        <translation type="unfinished">Frecuencia (Hz)</translation>
+    </message>
+    <message>
+        <source>Friction</source>
+        <translation type="unfinished">Fricción</translation>
+    </message>
+    <message>
+        <source>From</source>
+        <translation type="unfinished">Desde</translation>
+    </message>
+    <message>
+        <source>From Depth</source>
+        <translation type="unfinished">Desde la profundidad</translation>
+    </message>
+    <message>
+        <source>Fujifilm F-Log2 / F-Gamut</source>
+        <translation type="unfinished">Fujifilm F-Log2 / F-Gamut</translation>
+    </message>
+    <message>
+        <source>Gain</source>
+        <translation type="unfinished">Ganancia</translation>
+    </message>
+    <message>
+        <source>Gain (Master)</source>
+        <translation type="unfinished">Ganancia (maestría)</translation>
+    </message>
+    <message>
+        <source>Gain (dB)</source>
+        <translation type="unfinished">Ganancia (dB)</translation>
+    </message>
+    <message>
+        <source>Gain B</source>
+        <translation type="unfinished">Ganancia B</translation>
+    </message>
+    <message>
+        <source>Gain G</source>
+        <translation type="unfinished">Ganancia G</translation>
+    </message>
+    <message>
+        <source>Gain R</source>
+        <translation type="unfinished">Ganancia R</translation>
+    </message>
+    <message>
+        <source>Gamma</source>
+        <translation type="unfinished">Gamma</translation>
+    </message>
+    <message>
+        <source>Gamma (Master)</source>
+        <translation type="unfinished">Gamma (Maestro)</translation>
+    </message>
+    <message>
+        <source>Gamma B</source>
+        <translation type="unfinished">Gamma B</translation>
+    </message>
+    <message>
+        <source>Gamma G</source>
+        <translation type="unfinished">Gamma G</translation>
+    </message>
+    <message>
+        <source>Gamma R</source>
+        <translation type="unfinished">Gamma R</translation>
+    </message>
+    <message>
+        <source>Gate Weave</source>
+        <translation type="unfinished">Tela de la puerta</translation>
+    </message>
+    <message>
+        <source>Gauge</source>
+        <translation type="unfinished">Medidor</translation>
+    </message>
+    <message>
+        <source>Gaussian Blur</source>
+        <translation type="unfinished">Desenfoque gaussiano</translation>
+    </message>
+    <message>
+        <source>Generators</source>
+        <translation type="unfinished">Grupos electrógenos</translation>
+    </message>
+    <message>
+        <source>Ghosts</source>
+        <translation type="unfinished">Fantasmas</translation>
+    </message>
+    <message>
+        <source>Glitch</source>
+        <translation type="unfinished">Glitch</translation>
+    </message>
+    <message>
+        <source>Global B</source>
+        <translation type="unfinished">B mundial</translation>
+    </message>
+    <message>
+        <source>Global Exposure (stops)</source>
+        <translation type="unfinished">Exposición global (paradas)</translation>
+    </message>
+    <message>
+        <source>Global G</source>
+        <translation type="unfinished">G mundial</translation>
+    </message>
+    <message>
+        <source>Global R</source>
+        <translation type="unfinished">R mundial</translation>
+    </message>
+    <message>
+        <source>Global Saturation</source>
+        <translation type="unfinished">Saturación mundial</translation>
+    </message>
+    <message>
+        <source>Glow</source>
+        <translation type="unfinished">Glow</translation>
+    </message>
+    <message>
+        <source>GoPro GP-Log / Rec.709</source>
+        <translation type="unfinished">GoPro GP-Log / Rec.709</translation>
+    </message>
+    <message>
+        <source>GoPro GP-Log2 / Rec.2020</source>
+        <translation type="unfinished">GoPro GP-Log2 / Rec.2020</translation>
+    </message>
+    <message>
+        <source>Gradient</source>
+        <translation type="unfinished">Gradient</translation>
+    </message>
+    <message>
+        <source>Gradient Angle</source>
+        <translation type="unfinished">Ángulo de gradiente</translation>
+    </message>
+    <message>
+        <source>Gradient End Color</source>
+        <translation type="unfinished">Color final de grado</translation>
+    </message>
+    <message>
+        <source>Gradient Horizon</source>
+        <translation type="unfinished">Horizonte de grados</translation>
+    </message>
+    <message>
+        <source>Gradient Top</source>
+        <translation type="unfinished">Superior graduante</translation>
+    </message>
+    <message>
+        <source>Grain</source>
+        <translation type="unfinished">Granos</translation>
+    </message>
+    <message>
+        <source>Grain Match</source>
+        <translation type="unfinished">Coincidencia de granos</translation>
+    </message>
+    <message>
+        <source>Grain Size (px)</source>
+        <translation type="unfinished">Tamaño del grano (px)</translation>
+    </message>
+    <message>
+        <source>Graphic</source>
+        <translation type="unfinished">Gráfico</translation>
+    </message>
+    <message>
+        <source>Gravity (px/s²)</source>
+        <translation type="unfinished">Gravedad (px/s2)</translation>
+    </message>
+    <message>
+        <source>Green</source>
+        <translation type="unfinished">Verde</translation>
+    </message>
+    <message>
+        <source>Green Blurriness</source>
+        <translation type="unfinished">Bluricidad verde</translation>
+    </message>
+    <message>
+        <source>Green Density</source>
+        <translation type="unfinished">Densidad verde</translation>
+    </message>
+    <message>
+        <source>Green Hue (°)</source>
+        <translation type="unfinished">Green Hue (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Green Offset</source>
+        <translation type="unfinished">Desplazamiento verde</translation>
+    </message>
+    <message>
+        <source>Green Output: Blue</source>
+        <translation type="unfinished">Salida verde: azul</translation>
+    </message>
+    <message>
+        <source>Green Output: Green</source>
+        <translation type="unfinished">Salida verde: verde</translation>
+    </message>
+    <message>
+        <source>Green Output: Red</source>
+        <translation type="unfinished">Salida verde: Rojo</translation>
+    </message>
+    <message>
+        <source>Green Saturation</source>
+        <translation type="unfinished">Saturación verde</translation>
+    </message>
+    <message>
+        <source>Green from Blue</source>
+        <translation type="unfinished">Verde de azul</translation>
+    </message>
+    <message>
+        <source>Green from Green</source>
+        <translation type="unfinished">Verde de verde</translation>
+    </message>
+    <message>
+        <source>Green from Red</source>
+        <translation type="unfinished">Verde de rojo</translation>
+    </message>
+    <message>
+        <source>Grid Warp</source>
+        <translation type="unfinished">Warp de cuadrícula</translation>
+    </message>
+    <message>
+        <source>Ground Shadow Strength</source>
+        <translation type="unfinished">Fuerza de la sombra del suelo</translation>
+    </message>
+    <message>
+        <source>Grow Mask (px)</source>
+        <translation type="unfinished">Máscara de crecimiento (px)</translation>
+    </message>
+    <message>
+        <source>Gyro Offset (ms)</source>
+        <translation type="unfinished">Desplazamiento de giroscopios (ms)</translation>
+    </message>
+    <message>
+        <source>H.264 - Fast Draft</source>
+        <translation type="unfinished">H.264 - Proyecto rápido</translation>
+    </message>
+    <message>
+        <source>H.264 - Hardware</source>
+        <translation type="unfinished">H.264 - Hardware</translation>
+    </message>
+    <message>
+        <source>H.264 - High Quality</source>
+        <translation type="unfinished">H.264 - Alta calidad</translation>
+    </message>
+    <message>
+        <source>H.264 - YouTube / Vimeo</source>
+        <translation type="unfinished">H.264 - YouTube / Vimeo</translation>
+    </message>
+    <message>
+        <source>H.264 at the platforms&apos; loudness (-14 LUFS); for a vertical video, Auto Reframe the sequence first</source>
+        <translation type="unfinished">H.264 en la intensidad de las plataformas (-14 LUFS); para un vídeo vertical, Auto Reframe la secuencia primero</translation>
+    </message>
+    <message>
+        <source>H.264 for YouTube, normalised to its -14 LUFS</source>
+        <translation type="unfinished">H.264 para YouTube, normalizado a su -14 LUFS</translation>
+    </message>
+    <message>
+        <source>H.265 - Hardware</source>
+        <translation type="unfinished">H.265 - Hardware</translation>
+    </message>
+    <message>
+        <source>H.265 / HEVC</source>
+        <translation type="unfinished">H.265 / HVC</translation>
+    </message>
+    <message>
+        <source>H.265 / HEVC 10-bit</source>
+        <translation type="unfinished">H.265 / HVC 10 bits</translation>
+    </message>
+    <message>
+        <source>HDR Palette</source>
+        <translation type="unfinished">Paleta HDR</translation>
+    </message>
+    <message>
+        <source>HTJ2K (256 lines)</source>
+        <translation type="unfinished">HTJ2K (256 líneas)</translation>
+    </message>
+    <message>
+        <source>HTJ2K (32 lines)</source>
+        <translation type="unfinished">HTJ2K (32 líneas)</translation>
+    </message>
+    <message>
+        <source>Halation</source>
+        <translation type="unfinished">Halación</translation>
+    </message>
+    <message>
+        <source>Half the size of H.264 at similar quality</source>
+        <translation type="unfinished">La mitad del tamaño de H.264 con una calidad similar</translation>
+    </message>
+    <message>
+        <source>Halftone</source>
+        <translation type="unfinished">Semitona</translation>
+    </message>
+    <message>
+        <source>Hard Clip</source>
+        <translation type="unfinished">Clip duro</translation>
+    </message>
+    <message>
+        <source>Hard light</source>
+        <translation type="unfinished">Luz dura</translation>
+    </message>
+    <message>
+        <source>Hardware HEVC (VideoToolbox, NVENC, Quick Sync, AMF); x265 if there is none</source>
+        <translation type="unfinished">Hardware HEVC (VideoToolbox, NVENC, Quick Sync, AMF); x265 si no hay ninguno</translation>
+    </message>
+    <message>
+        <source>Harmonics</source>
+        <translation type="unfinished">Armonía</translation>
+    </message>
+    <message>
+        <source>Heal</source>
+        <translation type="unfinished">Sanación</translation>
+    </message>
+    <message>
+        <source>Heard As</source>
+        <translation type="unfinished">Oído como</translation>
+    </message>
+    <message>
+        <source>Heart</source>
+        <translation type="unfinished">Corazón</translation>
+    </message>
+    <message>
+        <source>Height</source>
+        <translation type="unfinished">Altura</translation>
+    </message>
+    <message>
+        <source>Height (px)</source>
+        <translation type="unfinished">Altura (px)</translation>
+    </message>
+    <message>
+        <source>Hide Behind Nearer Things (Merge by Depth)</source>
+        <translation type="unfinished">Esconderse detrás de cosas más cercanas (fusionarse por profundidad)</translation>
+    </message>
+    <message>
+        <source>Hide the Depth Map</source>
+        <translation type="unfinished">Ocultar el mapa de profundidad</translation>
+    </message>
+    <message>
+        <source>Hide the Holdout</source>
+        <translation type="unfinished">Ocultar el retén</translation>
+    </message>
+    <message>
+        <source>Hide the Image Light Track</source>
+        <translation type="unfinished">Ocultar la pista de luz de imagen</translation>
+    </message>
+    <message>
+        <source>Hide the Matte</source>
+        <translation type="unfinished">Ocultar el mate</translation>
+    </message>
+    <message>
+        <source>Hide the Sky Track</source>
+        <translation type="unfinished">Ocultar la pista del cielo</translation>
+    </message>
+    <message>
+        <source>High (Hz)</source>
+        <translation type="unfinished">Alto (Hz)</translation>
+    </message>
+    <message>
+        <source>High (dB)</source>
+        <translation type="unfinished">Alta (dB)</translation>
+    </message>
+    <message>
+        <source>High Freq (Hz)</source>
+        <translation type="unfinished">Freq (Hz)</translation>
+    </message>
+    <message>
+        <source>High Gain (dB)</source>
+        <translation type="unfinished">Ganancia elevada (dB)</translation>
+    </message>
+    <message>
+        <source>High Ratio</source>
+        <translation type="unfinished">Alta proporción</translation>
+    </message>
+    <message>
+        <source>High Shelf (Hz)</source>
+        <translation type="unfinished">Plataforma alta (Hz)</translation>
+    </message>
+    <message>
+        <source>High Shelf (dB)</source>
+        <translation type="unfinished">Plataforma alta (dB)</translation>
+    </message>
+    <message>
+        <source>High Threshold (dB)</source>
+        <translation type="unfinished">Umbral alto (dB)</translation>
+    </message>
+    <message>
+        <source>High-Pass Filter</source>
+        <translation type="unfinished">Filtro de alto coste</translation>
+    </message>
+    <message>
+        <source>Highlight</source>
+        <translation type="unfinished">Resalte</translation>
+    </message>
+    <message>
+        <source>Highlight B</source>
+        <translation type="unfinished">Resalte B</translation>
+    </message>
+    <message>
+        <source>Highlight Exposure (stops)</source>
+        <translation type="unfinished">Exposición de relieve (paradas)</translation>
+    </message>
+    <message>
+        <source>Highlight Falloff (stops)</source>
+        <translation type="unfinished">Resaltar caídas (paradas)</translation>
+    </message>
+    <message>
+        <source>Highlight From (stops)</source>
+        <translation type="unfinished">Aspectos destacados de (paradas)</translation>
+    </message>
+    <message>
+        <source>Highlight G</source>
+        <translation type="unfinished">Resalte G</translation>
+    </message>
+    <message>
+        <source>Highlight R</source>
+        <translation type="unfinished">Resalte R</translation>
+    </message>
+    <message>
+        <source>Highlight Saturation</source>
+        <translation type="unfinished">Resaltar la saturación</translation>
+    </message>
+    <message>
+        <source>Highlight Threshold</source>
+        <translation type="unfinished">Resaltar el umbral</translation>
+    </message>
+    <message>
+        <source>Highlight Unsafe Areas</source>
+        <translation type="unfinished">Destacar áreas inseguras</translation>
+    </message>
+    <message>
+        <source>Highlights</source>
+        <translation type="unfinished">Aspectos destacados</translation>
+    </message>
+    <message>
+        <source>Hold (ms)</source>
+        <translation type="unfinished">• Mantener (ms)</translation>
+    </message>
+    <message>
+        <source>Hold Each Frame For (frames)</source>
+        <translation type="unfinished">Sostenga cada marco para (marcos)</translation>
+    </message>
+    <message>
+        <source>Hold Lost Faces (frames)</source>
+        <translation type="unfinished">Sostenga las caras perdidas (marcos)</translation>
+    </message>
+    <message>
+        <source>Hold Out by Depth</source>
+        <translation type="unfinished">Sostener por profundidad</translation>
+    </message>
+    <message>
+        <source>Holdout Track (V number, 0: the one above)</source>
+        <translation type="unfinished">Pista de retención (número V, 0: la de arriba)</translation>
+    </message>
+    <message>
+        <source>Horizon (From the Top)</source>
+        <translation type="unfinished">Horizonte (desde arriba)</translation>
+    </message>
+    <message>
+        <source>Horizon Lock (Camera Gyro)</source>
+        <translation type="unfinished">Cerradura Horizon (Cámara Gyro)</translation>
+    </message>
+    <message>
+        <source>Horizontal</source>
+        <translation type="unfinished">Horizontal</translation>
+    </message>
+    <message>
+        <source>Horizontal and Vertical</source>
+        <translation type="unfinished">Horizontal y vertical</translation>
+    </message>
+    <message>
+        <source>Hue / Saturation</source>
+        <translation type="unfinished">Tono / Saturación</translation>
+    </message>
+    <message>
+        <source>Hue / Saturation / Lightness</source>
+        <translation type="unfinished">Tono / Saturación / Ligereza</translation>
+    </message>
+    <message>
+        <source>Hue Curves</source>
+        <translation type="unfinished">Curvas de color de hue</translation>
+    </message>
+    <message>
+        <source>Hue Shift</source>
+        <translation type="unfinished">Cambio de tono</translation>
+    </message>
+    <message>
+        <source>Hue Variation (°)</source>
+        <translation type="unfinished">Variación del tono (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Hue Vectors</source>
+        <translation type="unfinished">Vectores de tono</translation>
+    </message>
+    <message>
+        <source>Hue vs Hue</source>
+        <translation type="unfinished">Hue vs Hue</translation>
+    </message>
+    <message>
+        <source>Hue vs Luma</source>
+        <translation type="unfinished">Hue vs Luma</translation>
+    </message>
+    <message>
+        <source>Hue vs Saturation</source>
+        <translation type="unfinished">Hue vs Saturación</translation>
+    </message>
+    <message>
+        <source>Image Light Rotation (°)</source>
+        <translation type="unfinished">Rotación de luz de imagen (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Image Light Strength</source>
+        <translation type="unfinished">Fuerza de luz de imagen</translation>
+    </message>
+    <message>
+        <source>Image Light Track (0: none)</source>
+        <translation type="unfinished">Pista de luz de imagen (0: ninguno)</translation>
+    </message>
+    <message>
+        <source>Impulse Response</source>
+        <translation type="unfinished">Respuesta impulsiva</translation>
+    </message>
+    <message>
+        <source>In Duration (s)</source>
+        <translation type="unfinished">En duración (s)</translation>
+    </message>
+    <message>
+        <source>In Focus Range</source>
+        <translation type="unfinished">En rango de enfoque</translation>
+    </message>
+    <message>
+        <source>Ink</source>
+        <translation type="unfinished">Tinta</translation>
+    </message>
+    <message>
+        <source>Input Black</source>
+        <translation type="unfinished">Input Black</translation>
+    </message>
+    <message>
+        <source>Input Space</source>
+        <translation type="unfinished">Espacio de entrada</translation>
+    </message>
+    <message>
+        <source>Input White</source>
+        <translation type="unfinished">Blanco de entrada</translation>
+    </message>
+    <message>
+        <source>Intensity</source>
+        <translation type="unfinished">Intensidad</translation>
+    </message>
+    <message>
+        <source>Intermediate / mastering, 10-bit 4:2:2</source>
+        <translation type="unfinished">Intermedio / maestría, 10 bits 4:2:2</translation>
+    </message>
+    <message>
+        <source>Inverse</source>
+        <translation type="unfinished">Inverso</translation>
+    </message>
+    <message>
+        <source>Invert</source>
+        <translation type="unfinished">Invertir</translation>
+    </message>
+    <message>
+        <source>Invert Key Input</source>
+        <translation type="unfinished">Invertir entrada de clave</translation>
+    </message>
+    <message>
+        <source>Invert Left Polarity</source>
+        <translation type="unfinished">Invertir polaridad izquierda</translation>
+    </message>
+    <message>
+        <source>Invert Polarity</source>
+        <translation type="unfinished">Invertir polaridad</translation>
+    </message>
+    <message>
+        <source>Invert Right Polarity</source>
+        <translation type="unfinished">Invertir polaridad derecha</translation>
+    </message>
+    <message>
+        <source>Inverted Alpha</source>
+        <translation type="unfinished">Alfa invertido</translation>
+    </message>
+    <message>
+        <source>Inverted Luma</source>
+        <translation type="unfinished">Luma invertido</translation>
+    </message>
+    <message>
+        <source>Iris</source>
+        <translation type="unfinished">Iris</translation>
+    </message>
+    <message>
+        <source>Iris Round</source>
+        <translation type="unfinished">Ronda Iris</translation>
+    </message>
+    <message>
+        <source>Italic</source>
+        <translation type="unfinished">Itálica</translation>
+    </message>
+    <message>
+        <source>Iterations</source>
+        <translation type="unfinished">Iteraciones</translation>
+    </message>
+    <message>
+        <source>Its Own</source>
+        <translation type="unfinished">Su propio</translation>
+    </message>
+    <message>
+        <source>Jaw</source>
+        <translation type="unfinished">Jaw</translation>
+    </message>
+    <message>
+        <source>Keep</source>
+        <translation type="unfinished">Mantener</translation>
+    </message>
+    <message>
+        <source>Keep Letters Upright</source>
+        <translation type="unfinished">Mantenga las cartas en orden</translation>
+    </message>
+    <message>
+        <source>Keeps transparency for graphics</source>
+        <translation type="unfinished">Mantiene la transparencia para gráficos</translation>
+    </message>
+    <message>
+        <source>Key Color</source>
+        <translation type="unfinished">Color de la clave</translation>
+    </message>
+    <message>
+        <source>Key High-Pass (Hz)</source>
+        <translation type="unfinished">Clave de alto paso (Hz)</translation>
+    </message>
+    <message>
+        <source>Key Input</source>
+        <translation type="unfinished">Entrada de claves</translation>
+    </message>
+    <message>
+        <source>Key Input Gain</source>
+        <translation type="unfinished">Ganancia de entrada clave</translation>
+    </message>
+    <message>
+        <source>Key Out Brights</source>
+        <translation type="unfinished">Llave hacia fuera brillos</translation>
+    </message>
+    <message>
+        <source>Key Output Gain (Mix)</source>
+        <translation type="unfinished">Ganancia de salida clave (míx)</translation>
+    </message>
+    <message>
+        <source>Keyer (Green / Blue Screen)</source>
+        <translation type="unfinished">Llavero (pantalla verde / azul)</translation>
+    </message>
+    <message>
+        <source>Keying</source>
+        <translation type="unfinished">Teclado</translation>
+    </message>
+    <message>
+        <source>LUT (.cube, .clf)</source>
+        <translation type="unfinished">LUT (.cube, .clf)</translation>
+    </message>
+    <message>
+        <source>LUT File</source>
+        <translation type="unfinished">Archivo LUT</translation>
+    </message>
+    <message>
+        <source>Largest Gaze Corrected (degrees)</source>
+        <translation type="unfinished">La mayor mirada corregida (grados)</translation>
+    </message>
+    <message>
+        <source>Largest Speck (px)</source>
+        <translation type="unfinished">Pez más grande (px)</translation>
+    </message>
+    <message>
+        <source>Largest Spot (% of face)</source>
+        <translation type="unfinished">Punto más grande (% de la cara)</translation>
+    </message>
+    <message>
+        <source>Learned Effect</source>
+        <translation type="unfinished">Efecto aprendido</translation>
+    </message>
+    <message>
+        <source>Left</source>
+        <translation type="unfinished">Izquierda</translation>
+    </message>
+    <message>
+        <source>Left onto Right</source>
+        <translation type="unfinished">Izquierda a derecha</translation>
+    </message>
+    <message>
+        <source>Left to Both</source>
+        <translation type="unfinished">De izquierda a ambas</translation>
+    </message>
+    <message>
+        <source>Leica L-Log / Rec.2020</source>
+        <translation type="unfinished">Leica L-Log / Rec.2020</translation>
+    </message>
+    <message>
+        <source>Length</source>
+        <translation type="unfinished">Longitud</translation>
+    </message>
+    <message>
+        <source>Length (px)</source>
+        <translation type="unfinished">Longitud (px)</translation>
+    </message>
+    <message>
+        <source>Lens</source>
+        <translation type="unfinished">Lente</translation>
+    </message>
+    <message>
+        <source>Lens (field of view °)</source>
+        <translation type="unfinished">Lente (campo de visión &lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Lens (field of view °, 3D)</source>
+        <translation type="unfinished">Lente (campo de visión &lt;unk&gt;, 3D)</translation>
+    </message>
+    <message>
+        <source>Lens Blur (Depth)</source>
+        <translation type="unfinished">Desenfoque de lente (dente)</translation>
+    </message>
+    <message>
+        <source>Lens Correction</source>
+        <translation type="unfinished">Corrección del objetivo</translation>
+    </message>
+    <message>
+        <source>Lens Distortion</source>
+        <translation type="unfinished">Distorsión del objetivo</translation>
+    </message>
+    <message>
+        <source>Lens Flare</source>
+        <translation type="unfinished">Lente</translation>
+    </message>
+    <message>
+        <source>Letter</source>
+        <translation type="unfinished">Carta</translation>
+    </message>
+    <message>
+        <source>Letterbox</source>
+        <translation type="unfinished">Buzón de cartas</translation>
+    </message>
+    <message>
+        <source>Levels</source>
+        <translation type="unfinished">Niveles</translation>
+    </message>
+    <message>
+        <source>Life (s)</source>
+        <translation type="unfinished">Vida (s)</translation>
+    </message>
+    <message>
+        <source>Life Variation</source>
+        <translation type="unfinished">Variación de la vida</translation>
+    </message>
+    <message>
+        <source>Lift (Master)</source>
+        <translation type="unfinished">Elevación (master)</translation>
+    </message>
+    <message>
+        <source>Lift B</source>
+        <translation type="unfinished">Levantar B</translation>
+    </message>
+    <message>
+        <source>Lift G</source>
+        <translation type="unfinished">Levantar G</translation>
+    </message>
+    <message>
+        <source>Lift R</source>
+        <translation type="unfinished">Levantar R</translation>
+    </message>
+    <message>
+        <source>Light</source>
+        <translation type="unfinished">Luz</translation>
+    </message>
+    <message>
+        <source>Light B</source>
+        <translation type="unfinished">Luz B</translation>
+    </message>
+    <message>
+        <source>Light Color</source>
+        <translation type="unfinished">Color de la luz</translation>
+    </message>
+    <message>
+        <source>Light Colour</source>
+        <translation type="unfinished">Color de la luz</translation>
+    </message>
+    <message>
+        <source>Light Direction</source>
+        <translation type="unfinished">Dirección de luz</translation>
+    </message>
+    <message>
+        <source>Light Direction (°)</source>
+        <translation type="unfinished">Dirección de luz (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Light Distance (model sizes)</source>
+        <translation type="unfinished">Distancia de luz (tamaño de modelo)</translation>
+    </message>
+    <message>
+        <source>Light Exposure (stops)</source>
+        <translation type="unfinished">Exposición a la luz (paradas)</translation>
+    </message>
+    <message>
+        <source>Light Falloff (stops)</source>
+        <translation type="unfinished">Desactivación de luz (paradas)</translation>
+    </message>
+    <message>
+        <source>Light From (stops)</source>
+        <translation type="unfinished">Luz de (paradas)</translation>
+    </message>
+    <message>
+        <source>Light G</source>
+        <translation type="unfinished">Luz G</translation>
+    </message>
+    <message>
+        <source>Light Height</source>
+        <translation type="unfinished">Altura de la luz</translation>
+    </message>
+    <message>
+        <source>Light Height (°)</source>
+        <translation type="unfinished">Altura de la luz (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Light Leak</source>
+        <translation type="unfinished">Hoja ligera</translation>
+    </message>
+    <message>
+        <source>Light R</source>
+        <translation type="unfinished">Luz R</translation>
+    </message>
+    <message>
+        <source>Light Rays</source>
+        <translation type="unfinished">Rayos de luz</translation>
+    </message>
+    <message>
+        <source>Light Saturation</source>
+        <translation type="unfinished">Saturación de luz</translation>
+    </message>
+    <message>
+        <source>Light Strength</source>
+        <translation type="unfinished">Resistencia ligera</translation>
+    </message>
+    <message>
+        <source>Light Wrap</source>
+        <translation type="unfinished">Envoltorio de luz</translation>
+    </message>
+    <message>
+        <source>Light Wrap Width (px)</source>
+        <translation type="unfinished">Ancho de envoltorio ligero (px)</translation>
+    </message>
+    <message>
+        <source>Light X</source>
+        <translation type="unfinished">Luz X</translation>
+    </message>
+    <message>
+        <source>Light Y</source>
+        <translation type="unfinished">Luz Y</translation>
+    </message>
+    <message>
+        <source>Lighten</source>
+        <translation type="unfinished">Aligerar</translation>
+    </message>
+    <message>
+        <source>Lighten Face</source>
+        <translation type="unfinished">Aligerar la cara</translation>
+    </message>
+    <message>
+        <source>Lighter ProRes for offline / proxies</source>
+        <translation type="unfinished">Lighter ProRes para offline / proxies</translation>
+    </message>
+    <message>
+        <source>Lightness</source>
+        <translation type="unfinished">Ligereza</translation>
+    </message>
+    <message>
+        <source>Limiter</source>
+        <translation type="unfinished">Limitador</translation>
+    </message>
+    <message>
+        <source>Limits</source>
+        <translation type="unfinished">Límites</translation>
+    </message>
+    <message>
+        <source>Line</source>
+        <translation type="unfinished">Línea</translation>
+    </message>
+    <message>
+        <source>Line Spacing</source>
+        <translation type="unfinished">Espacio de línea</translation>
+    </message>
+    <message>
+        <source>Linear</source>
+        <translation type="unfinished">Lineal</translation>
+    </message>
+    <message>
+        <source>Linear Rec.709 (scene)</source>
+        <translation type="unfinished">Rec.709 (escena)</translation>
+    </message>
+    <message>
+        <source>Lip Height</source>
+        <translation type="unfinished">Altura de los labios</translation>
+    </message>
+    <message>
+        <source>Lip Sync</source>
+        <translation type="unfinished">Sincronización de labios</translation>
+    </message>
+    <message>
+        <source>Little Planet</source>
+        <translation type="unfinished">Pequeño planeta</translation>
+    </message>
+    <message>
+        <source>Local Contrast</source>
+        <translation type="unfinished">Contraste local</translation>
+    </message>
+    <message>
+        <source>Longest Click (ms)</source>
+        <translation type="unfinished">El clic más largo (ms)</translation>
+    </message>
+    <message>
+        <source>Look</source>
+        <translation type="unfinished">Mira</translation>
+    </message>
+    <message>
+        <source>Look Through a Camera in (USD, glTF)</source>
+        <translation type="unfinished">Mira a través de una cámara en (USD, glTF)</translation>
+    </message>
+    <message>
+        <source>Look at Lens</source>
+        <translation type="unfinished">Mira la lente</translation>
+    </message>
+    <message>
+        <source>Loop the Animation</source>
+        <translation type="unfinished">Atraviese la animación</translation>
+    </message>
+    <message>
+        <source>Loops; 480 px wide, 15 fps, its own 256-colour palette, dithered</source>
+        <translation type="unfinished">Loops; 480 px ancho, 15 fps, paleta propia de 256 colores, en diter</translation>
+    </message>
+    <message>
+        <source>Low (Hz)</source>
+        <translation type="unfinished">Baja (Hz)</translation>
+    </message>
+    <message>
+        <source>Low (dB)</source>
+        <translation type="unfinished">Baja (dB)</translation>
+    </message>
+    <message>
+        <source>Low / Mid Split (Hz)</source>
+        <translation type="unfinished">Dividir bajo/medio (Hz)</translation>
+    </message>
+    <message>
+        <source>Low Freq (Hz)</source>
+        <translation type="unfinished">Freq bajo (Hz)</translation>
+    </message>
+    <message>
+        <source>Low Gain (dB)</source>
+        <translation type="unfinished">Baja ganancia (dB)</translation>
+    </message>
+    <message>
+        <source>Low Ratio</source>
+        <translation type="unfinished">Razón baja</translation>
+    </message>
+    <message>
+        <source>Low Shelf (Hz)</source>
+        <translation type="unfinished">Plataforma baja (Hz)</translation>
+    </message>
+    <message>
+        <source>Low Shelf (dB)</source>
+        <translation type="unfinished">Plataforma baja (dB)</translation>
+    </message>
+    <message>
+        <source>Low Threshold (dB)</source>
+        <translation type="unfinished">Umbral bajo (dB)</translation>
+    </message>
+    <message>
+        <source>Low-Pass Filter</source>
+        <translation type="unfinished">Filtro de bajo coste</translation>
+    </message>
+    <message>
+        <source>Lower Centre</source>
+        <translation type="unfinished">Centro inferior</translation>
+    </message>
+    <message>
+        <source>Lower Left</source>
+        <translation type="unfinished">Izquierda inferior</translation>
+    </message>
+    <message>
+        <source>Lower Right</source>
+        <translation type="unfinished">Bajar a la derecha</translation>
+    </message>
+    <message>
+        <source>Lower Third</source>
+        <translation type="unfinished">Tercero inferior</translation>
+    </message>
+    <message>
+        <source>Lower Third (Box)</source>
+        <translation type="unfinished">Tercer nivel inferior (recuadro)</translation>
+    </message>
+    <message>
+        <source>Lowest Sky (% of height)</source>
+        <translation type="unfinished">Cielo más bajo (% de altura)</translation>
+    </message>
+    <message>
+        <source>Luma</source>
+        <translation type="unfinished">Luma</translation>
+    </message>
+    <message>
+        <source>Luma Key</source>
+        <translation type="unfinished">Tecla Luma</translation>
+    </message>
+    <message>
+        <source>Luma Wipe</source>
+        <translation type="unfinished">Luma Wipe</translation>
+    </message>
+    <message>
+        <source>Luma vs Saturation</source>
+        <translation type="unfinished">Luma vs Saturación</translation>
+    </message>
+    <message>
+        <source>Magenta</source>
+        <translation type="unfinished">Magenta</translation>
+    </message>
+    <message>
+        <source>Magenta Density</source>
+        <translation type="unfinished">Densidad de Magenta</translation>
+    </message>
+    <message>
+        <source>Magenta Hue (°)</source>
+        <translation type="unfinished">Magenta Hue (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Magenta Saturation</source>
+        <translation type="unfinished">Saturación de Magenta</translation>
+    </message>
+    <message>
+        <source>Magnification</source>
+        <translation type="unfinished">Ampliación</translation>
+    </message>
+    <message>
+        <source>Magnify</source>
+        <translation type="unfinished">Amplíe</translation>
+    </message>
+    <message>
+        <source>Mains</source>
+        <translation type="unfinished">Principales</translation>
+    </message>
+    <message>
+        <source>Maintain Audio Pitch</source>
+        <translation type="unfinished">Mantener el tono de audio</translation>
+    </message>
+    <message>
+        <source>Make Deep from Depth Map</source>
+        <translation type="unfinished">Profundizar en el mapa</translation>
+    </message>
+    <message>
+        <source>Makeup (dB)</source>
+        <translation type="unfinished">Maquillaje (dB)</translation>
+    </message>
+    <message>
+        <source>Mask</source>
+        <translation type="unfinished">Máscara</translation>
+    </message>
+    <message>
+        <source>Mask Input</source>
+        <translation type="unfinished">Entrada de máscaras</translation>
+    </message>
+    <message>
+        <source>Master (Y)</source>
+        <translation type="unfinished">Maestro (Y)</translation>
+    </message>
+    <message>
+        <source>Mastering-grade H.264 (CRF 16), AAC 320 kbps</source>
+        <translation type="unfinished">Grado de masterización H.264 (CRF 16), AAC 320 kbps</translation>
+    </message>
+    <message>
+        <source>Match Foreground</source>
+        <translation type="unfinished">Coincidir con el terreno previo</translation>
+    </message>
+    <message>
+        <source>Mathematically lossless 10-bit 4:2:2 with FLAC sound, for archiving</source>
+        <translation type="unfinished">10-bit 4:2:2 con sonido FLAC, para archivar</translation>
+    </message>
+    <message>
+        <source>Matte</source>
+        <translation type="unfinished">Matte</translation>
+    </message>
+    <message>
+        <source>Matte Alpha</source>
+        <translation type="unfinished">Matte Alpha</translation>
+    </message>
+    <message>
+        <source>Matte Luma</source>
+        <translation type="unfinished">Matte Luma</translation>
+    </message>
+    <message>
+        <source>Matte Track (V number, 0: the one above)</source>
+        <translation type="unfinished">Pista mate (número V, 0: el anterior)</translation>
+    </message>
+    <message>
+        <source>Max Reduction (dB)</source>
+        <translation type="unfinished">Reducción máxima (dB)</translation>
+    </message>
+    <message>
+        <source>Measured</source>
+        <translation type="unfinished">Medido</translation>
+    </message>
+    <message>
+        <source>Measured Profile</source>
+        <translation type="unfinished">Perfil medido</translation>
+    </message>
+    <message>
+        <source>Merge</source>
+        <translation type="unfinished">Fusionar</translation>
+    </message>
+    <message>
+        <source>Mesh Covers</source>
+        <translation type="unfinished">Cubiertas de malla</translation>
+    </message>
+    <message>
+        <source>Mesh Expansion (px)</source>
+        <translation type="unfinished">Expansión de malla (px)</translation>
+    </message>
+    <message>
+        <source>Mesh Vertices</source>
+        <translation type="unfinished">Vertices de malla</translation>
+    </message>
+    <message>
+        <source>Mesh Warp</source>
+        <translation type="unfinished">Warp de malla</translation>
+    </message>
+    <message>
+        <source>Method</source>
+        <translation type="unfinished">Método</translation>
+    </message>
+    <message>
+        <source>Mid (dB)</source>
+        <translation type="unfinished">Mediana (dB)</translation>
+    </message>
+    <message>
+        <source>Mid / High Split (Hz)</source>
+        <translation type="unfinished">Dividir medio / alto (Hz)</translation>
+    </message>
+    <message>
+        <source>Mid Freq (Hz)</source>
+        <translation type="unfinished">Mid Freq (Hz)</translation>
+    </message>
+    <message>
+        <source>Mid Gain (dB)</source>
+        <translation type="unfinished">Ganancia media (dB)</translation>
+    </message>
+    <message>
+        <source>Mid Q</source>
+        <translation type="unfinished">Medio Q</translation>
+    </message>
+    <message>
+        <source>Mid Ratio</source>
+        <translation type="unfinished">Relación media</translation>
+    </message>
+    <message>
+        <source>Mid Threshold (dB)</source>
+        <translation type="unfinished">Umbral medio (dB)</translation>
+    </message>
+    <message>
+        <source>Mid-tone Contrast</source>
+        <translation type="unfinished">Contraste de tono medio</translation>
+    </message>
+    <message>
+        <source>Mirror</source>
+        <translation type="unfinished">Espejo</translation>
+    </message>
+    <message>
+        <source>Mirror Edges</source>
+        <translation type="unfinished">Bordes de espejo</translation>
+    </message>
+    <message>
+        <source>Mirrored Bars</source>
+        <translation type="unfinished">Barras de espejo</translation>
+    </message>
+    <message>
+        <source>Mix</source>
+        <translation type="unfinished">Mezclar</translation>
+    </message>
+    <message>
+        <source>Mode</source>
+        <translation type="unfinished">Modo</translation>
+    </message>
+    <message>
+        <source>Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ)</source>
+        <translation type="unfinished">Modelo (glTF, GLB, OBJ, USD) o Splats (PLY, SPZ)</translation>
+    </message>
+    <message>
+        <source>Modulation</source>
+        <translation type="unfinished">Modulación</translation>
+    </message>
+    <message>
+        <source>Mono (Sum)</source>
+        <translation type="unfinished">Mono (Suma)</translation>
+    </message>
+    <message>
+        <source>Mono Bass Below (Hz)</source>
+        <translation type="unfinished">Mono Bass Below (Hz)</translation>
+    </message>
+    <message>
+        <source>Mosaic</source>
+        <translation type="unfinished">Mosaico</translation>
+    </message>
+    <message>
+        <source>Most Particles</source>
+        <translation type="unfinished">La mayoría de las partículas</translation>
+    </message>
+    <message>
+        <source>Motion</source>
+        <translation type="unfinished">Moción</translation>
+    </message>
+    <message>
+        <source>Motion Blur</source>
+        <translation type="unfinished">Desenfoque de movimiento</translation>
+    </message>
+    <message>
+        <source>Motion Compensation</source>
+        <translation type="unfinished">Indemnización por mociones</translation>
+    </message>
+    <message>
+        <source>Motion Deblur</source>
+        <translation type="unfinished">Motion Deblur</translation>
+    </message>
+    <message>
+        <source>Motion Tile</source>
+        <translation type="unfinished">Motion Tile</translation>
+    </message>
+    <message>
+        <source>Mouth Width</source>
+        <translation type="unfinished">Ancho de boca</translation>
+    </message>
+    <message>
+        <source>Multiband Compressor</source>
+        <translation type="unfinished">Compresor multibanda</translation>
+    </message>
+    <message>
+        <source>Multiply</source>
+        <translation type="unfinished">Multiplique</translation>
+    </message>
+    <message>
+        <source>Multiply with the node&apos;s matte</source>
+        <translation type="unfinished">Multiplique con la mate del nodo</translation>
+    </message>
+    <message>
+        <source>Nearest Depth</source>
+        <translation type="unfinished">Profundidad más cercana</translation>
+    </message>
+    <message>
+        <source>Nearest Face</source>
+        <translation type="unfinished">Cara más cercana</translation>
+    </message>
+    <message>
+        <source>Nearest Frame</source>
+        <translation type="unfinished">Marco más cercano</translation>
+    </message>
+    <message>
+        <source>Negative Gamma</source>
+        <translation type="unfinished">Gamma negativo</translation>
+    </message>
+    <message>
+        <source>Network File</source>
+        <translation type="unfinished">Archivo de red</translation>
+    </message>
+    <message>
+        <source>News Crawl</source>
+        <translation type="unfinished">Noticias Crawl</translation>
+    </message>
+    <message>
+        <source>Next Step Every (s, 0 never)</source>
+        <translation type="unfinished">Siguiente paso Cada (s, 0 nunca)</translation>
+    </message>
+    <message>
+        <source>Next-generation efficiency</source>
+        <translation type="unfinished">Eficiencia de la próxima generación</translation>
+    </message>
+    <message>
+        <source>Nikon N-Log / N-Gamut</source>
+        <translation type="unfinished">Nikon N-Log / N-Gamut</translation>
+    </message>
+    <message>
+        <source>Node</source>
+        <translation type="unfinished">Nodo</translation>
+    </message>
+    <message>
+        <source>Noise</source>
+        <translation type="unfinished">Ruido</translation>
+    </message>
+    <message>
+        <source>Noise Floor</source>
+        <translation type="unfinished">Suelo de ruido</translation>
+    </message>
+    <message>
+        <source>Noise Gate</source>
+        <translation type="unfinished">Puerta del ruido</translation>
+    </message>
+    <message>
+        <source>Noise Level % (0 = auto)</source>
+        <translation type="unfinished">Nivel de ruido % (0 = auto)</translation>
+    </message>
+    <message>
+        <source>Noise Reduction</source>
+        <translation type="unfinished">Reducción del ruido</translation>
+    </message>
+    <message>
+        <source>Noise Threshold (%)</source>
+        <translation type="unfinished">Umbral de ruido (%)</translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">Ninguno</translation>
+    </message>
+    <message>
+        <source>None (1:1)</source>
+        <translation type="unfinished">Ninguno (1:1)</translation>
+    </message>
+    <message>
+        <source>Normal</source>
+        <translation type="unfinished">Normal</translation>
+    </message>
+    <message>
+        <source>Nose Length</source>
+        <translation type="unfinished">Longitud de la nariz</translation>
+    </message>
+    <message>
+        <source>Nose Width</source>
+        <translation type="unfinished">Ancho de la nariz</translation>
+    </message>
+    <message>
+        <source>Notch Width (Hz)</source>
+        <translation type="unfinished">Anchura de la muesca (Hz)</translation>
+    </message>
+    <message>
+        <source>OGraf Graphic</source>
+        <translation type="unfinished">Gráfico OGraf</translation>
+    </message>
+    <message>
+        <source>Object Removal</source>
+        <translation type="unfinished">Eliminación de objetos</translation>
+    </message>
+    <message>
+        <source>Off</source>
+        <translation type="unfinished">Desactivado</translation>
+    </message>
+    <message>
+        <source>Offset</source>
+        <translation type="unfinished">Desplazamiento</translation>
+    </message>
+    <message>
+        <source>Offset B</source>
+        <translation type="unfinished">Desplazamiento B</translation>
+    </message>
+    <message>
+        <source>Offset G</source>
+        <translation type="unfinished">Desplazamiento G</translation>
+    </message>
+    <message>
+        <source>Offset R</source>
+        <translation type="unfinished">Desplazamiento R</translation>
+    </message>
+    <message>
+        <source>Offset X (px)</source>
+        <translation type="unfinished">Desplazamiento X (px)</translation>
+    </message>
+    <message>
+        <source>Offset Y (px)</source>
+        <translation type="unfinished">Desplazamiento Y (px)</translation>
+    </message>
+    <message>
+        <source>Omitted</source>
+        <translation type="unfinished">Eximidos</translation>
+    </message>
+    <message>
+        <source>On</source>
+        <translation type="unfinished">Activar</translation>
+    </message>
+    <message>
+        <source>One numbered 10-bit DPX a frame, for film and broadcast finishing</source>
+        <translation type="unfinished">Un DPX numerado de 10 bits un marco, para el acabado de la película y la transmisión</translation>
+    </message>
+    <message>
+        <source>One numbered 16-bit TIFF a frame, for finishing and VFX</source>
+        <translation type="unfinished">Un numerado 16-bit TIFF un marco, para el acabado y VFX</translation>
+    </message>
+    <message>
+        <source>One numbered PNG a frame, with transparency (name_000000.png...)</source>
+        <translation type="unfinished">Un PNG numerado un marco, con transparencia (nombre_000000.png...)</translation>
+    </message>
+    <message>
+        <source>One numbered half-float OpenEXR a frame in scene-linear light, values above white kept: for compositing</source>
+        <translation type="unfinished">Un OpenEXR de media flota numerada un marco en luz lineal de escena, valores por encima del blanco mantenido: para composición</translation>
+    </message>
+    <message>
+        <source>Only From the Edge</source>
+        <translation type="unfinished">Sólo desde el borde</translation>
+    </message>
+    <message>
+        <source>Opacity</source>
+        <translation type="unfinished">Opacidad</translation>
+    </message>
+    <message>
+        <source>Open web format, Opus audio</source>
+        <translation type="unfinished">Formato web abierto, audio Opus</translation>
+    </message>
+    <message>
+        <source>OpenColorIO Transform</source>
+        <translation type="unfinished">Transformación OpenColorIO</translation>
+    </message>
+    <message>
+        <source>OpenEXR Sequence (half float)</source>
+        <translation type="unfinished">Secuencia OpenEXR (mitad flotador)</translation>
+    </message>
+    <message>
+        <source>OpenFX</source>
+        <translation type="unfinished">OpenFX</translation>
+    </message>
+    <message>
+        <source>OpenFX Plugin</source>
+        <translation type="unfinished">Complemento OpenFX</translation>
+    </message>
+    <message>
+        <source>Optical Flow</source>
+        <translation type="unfinished">Flujo óptico</translation>
+    </message>
+    <message>
+        <source>Out Duration (s)</source>
+        <translation type="unfinished">Duración (s)</translation>
+    </message>
+    <message>
+        <source>Outline Color</source>
+        <translation type="unfinished">Color de esquema</translation>
+    </message>
+    <message>
+        <source>Outline Width (px)</source>
+        <translation type="unfinished">Ancho de contorno (px)</translation>
+    </message>
+    <message>
+        <source>Output (dB)</source>
+        <translation type="unfinished">Producto (dB)</translation>
+    </message>
+    <message>
+        <source>Output Black</source>
+        <translation type="unfinished">Salida negra</translation>
+    </message>
+    <message>
+        <source>Output Space</source>
+        <translation type="unfinished">Espacio de salida</translation>
+    </message>
+    <message>
+        <source>Output White</source>
+        <translation type="unfinished">Blanco de salida</translation>
+    </message>
+    <message>
+        <source>Overlay</source>
+        <translation type="unfinished">Overlay</translation>
+    </message>
+    <message>
+        <source>P3-D65 PQ (HDR mastering)</source>
+        <translation type="unfinished">P3-D65 PQ (masterización en HDR)</translation>
+    </message>
+    <message>
+        <source>PIZ</source>
+        <translation type="unfinished">PIZ</translation>
+    </message>
+    <message>
+        <source>PNG Sequence</source>
+        <translation type="unfinished">Secuencia PNG</translation>
+    </message>
+    <message>
+        <source>PXR24 (lossy for 32-bit)</source>
+        <translation type="unfinished">PXR24 (pérdida para 32 bits)</translation>
+    </message>
+    <message>
+        <source>Paint (Clone and Heal)</source>
+        <translation type="unfinished">Pintura (Clón y Sanación)</translation>
+    </message>
+    <message>
+        <source>Pan</source>
+        <translation type="unfinished">Pan</translation>
+    </message>
+    <message>
+        <source>Pan (°)</source>
+        <translation type="unfinished">Pan (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Panasonic V-Log / V-Gamut</source>
+        <translation type="unfinished">Panasonic V-Log / V-Gamut</translation>
+    </message>
+    <message>
+        <source>Parametric EQ</source>
+        <translation type="unfinished">EQ paramétrico</translation>
+    </message>
+    <message>
+        <source>Particles</source>
+        <translation type="unfinished">Partículas</translation>
+    </message>
+    <message>
+        <source>Patch Fill</source>
+        <translation type="unfinished">Relleno de parches</translation>
+    </message>
+    <message>
+        <source>Path (SVG Data)</source>
+        <translation type="unfinished">Ruta (datos de VSG)</translation>
+    </message>
+    <message>
+        <source>Path Offset</source>
+        <translation type="unfinished">Desplazamiento de la ruta</translation>
+    </message>
+    <message>
+        <source>Path Radius (px)</source>
+        <translation type="unfinished">Radio de trayectoria (px)</translation>
+    </message>
+    <message>
+        <source>People</source>
+        <translation type="unfinished">Personas</translation>
+    </message>
+    <message>
+        <source>Perforations</source>
+        <translation type="unfinished">Perforaciones</translation>
+    </message>
+    <message>
+        <source>Phase</source>
+        <translation type="unfinished">Fase</translation>
+    </message>
+    <message>
+        <source>Phaser</source>
+        <translation type="unfinished">Fáser</translation>
+    </message>
+    <message>
+        <source>Picture (Alpha)</source>
+        <translation type="unfinished">Imagen (Alfa)</translation>
+    </message>
+    <message>
+        <source>Picture (Brightness)</source>
+        <translation type="unfinished">Imagen (Brrightness)</translation>
+    </message>
+    <message>
+        <source>Pitch</source>
+        <translation type="unfinished">Pitch</translation>
+    </message>
+    <message>
+        <source>Pitch Shift</source>
+        <translation type="unfinished">Cambio de punto</translation>
+    </message>
+    <message>
+        <source>Pixelate</source>
+        <translation type="unfinished">Pixelato</translation>
+    </message>
+    <message>
+        <source>Place At X</source>
+        <translation type="unfinished">Lugar en X</translation>
+    </message>
+    <message>
+        <source>Place At Y</source>
+        <translation type="unfinished">Lugar en Y</translation>
+    </message>
+    <message>
+        <source>Placement</source>
+        <translation type="unfinished">Colocación</translation>
+    </message>
+    <message>
+        <source>Play Numbered Splat Files One a Frame</source>
+        <translation type="unfinished">Jugar archivos de plataforma numerados uno un marco</translation>
+    </message>
+    <message>
+        <source>Play Out Before the End (s, 0 none)</source>
+        <translation type="unfinished">Jugar antes del final (s, 0 ninguno)</translation>
+    </message>
+    <message>
+        <source>Plugins</source>
+        <translation type="unfinished">Complementos</translation>
+    </message>
+    <message>
+        <source>Point</source>
+        <translation type="unfinished">Punto</translation>
+    </message>
+    <message>
+        <source>Polygon</source>
+        <translation type="unfinished">Polígono</translation>
+    </message>
+    <message>
+        <source>Pop</source>
+        <translation type="unfinished">Pop</translation>
+    </message>
+    <message>
+        <source>Pop Words</source>
+        <translation type="unfinished">Palabras emergentes</translation>
+    </message>
+    <message>
+        <source>Position</source>
+        <translation type="unfinished">Posición</translation>
+    </message>
+    <message>
+        <source>Position &amp; Scale</source>
+        <translation type="unfinished">Posición y escala</translation>
+    </message>
+    <message>
+        <source>Position X</source>
+        <translation type="unfinished">Posición X</translation>
+    </message>
+    <message>
+        <source>Position Y</source>
+        <translation type="unfinished">Posición Y</translation>
+    </message>
+    <message>
+        <source>Position Y (up)</source>
+        <translation type="unfinished">Posición Y (arriba)</translation>
+    </message>
+    <message>
+        <source>Position Z (towards the camera)</source>
+        <translation type="unfinished">Posición Z (hacia la cámara)</translation>
+    </message>
+    <message>
+        <source>Position and Scale</source>
+        <translation type="unfinished">Posición y escala</translation>
+    </message>
+    <message>
+        <source>Position, Scale &amp; Rotation</source>
+        <translation type="unfinished">Posición, escala y rotación</translation>
+    </message>
+    <message>
+        <source>Position, Scale and Rotation</source>
+        <translation type="unfinished">Posición, escala y rotación</translation>
+    </message>
+    <message>
+        <source>Posterize</source>
+        <translation type="unfinished">Posterizar</translation>
+    </message>
+    <message>
+        <source>Power B</source>
+        <translation type="unfinished">Potencia B</translation>
+    </message>
+    <message>
+        <source>Power G</source>
+        <translation type="unfinished">Potencia G</translation>
+    </message>
+    <message>
+        <source>Power R</source>
+        <translation type="unfinished">Potencia R</translation>
+    </message>
+    <message>
+        <source>Pre-Delay (ms)</source>
+        <translation type="unfinished">Pre-demora (ms)</translation>
+    </message>
+    <message>
+        <source>Preserve Luminance</source>
+        <translation type="unfinished">Preservar la luminosidad</translation>
+    </message>
+    <message>
+        <source>Print Exposure (stops)</source>
+        <translation type="unfinished">Exposición de impresión (paradas)</translation>
+    </message>
+    <message>
+        <source>Printer Light B (points)</source>
+        <translation type="unfinished">Luz de impresora B (puntos)</translation>
+    </message>
+    <message>
+        <source>Printer Light G (points)</source>
+        <translation type="unfinished">Luz de impresora G (puntos)</translation>
+    </message>
+    <message>
+        <source>Printer Light R (points)</source>
+        <translation type="unfinished">Luz de impresora R (puntos)</translation>
+    </message>
+    <message>
+        <source>Printer Point (log E)</source>
+        <translation type="unfinished">Punto de impresión (log E)</translation>
+    </message>
+    <message>
+        <source>Printing Density (10-bit Log)</source>
+        <translation type="unfinished">Densidad de impresión (Registro de 10 bits)</translation>
+    </message>
+    <message>
+        <source>Privacy</source>
+        <translation type="unfinished">Privacidad</translation>
+    </message>
+    <message>
+        <source>ProRes 422</source>
+        <translation type="unfinished">ProRes 422</translation>
+    </message>
+    <message>
+        <source>ProRes 422 HQ</source>
+        <translation type="unfinished">ProRes 422 HQ</translation>
+    </message>
+    <message>
+        <source>ProRes 422 LT</source>
+        <translation type="unfinished">ProRes 422 LT</translation>
+    </message>
+    <message>
+        <source>ProRes 422 Proxy</source>
+        <translation type="unfinished">ProRes 422 Proxy</translation>
+    </message>
+    <message>
+        <source>ProRes 4444 (alpha)</source>
+        <translation type="unfinished">ProRes 4444 (alfa)</translation>
+    </message>
+    <message>
+        <source>ProRes 4444 XQ (alpha)</source>
+        <translation type="unfinished">ProRes 4444 XQ (alfa)</translation>
+    </message>
+    <message>
+        <source>Projection</source>
+        <translation type="unfinished">Proyección</translation>
+    </message>
+    <message>
+        <source>Protect Highlights</source>
+        <translation type="unfinished">Proteger los aspectos más destacados</translation>
+    </message>
+    <message>
+        <source>Push</source>
+        <translation type="unfinished">Empujar</translation>
+    </message>
+    <message>
+        <source>Quick review copy</source>
+        <translation type="unfinished">Copia de revisión rápida</translation>
+    </message>
+    <message>
+        <source>RED Log3G10 / REDWideGamutRGB</source>
+        <translation type="unfinished">RED Log3G10 / REDWideGamutRGB</translation>
+    </message>
+    <message>
+        <source>RGB Mixer</source>
+        <translation type="unfinished">Mezclador RGB</translation>
+    </message>
+    <message>
+        <source>RLE</source>
+        <translation type="unfinished">RLE</translation>
+    </message>
+    <message>
+        <source>Radial</source>
+        <translation type="unfinished">Radial</translation>
+    </message>
+    <message>
+        <source>Radius</source>
+        <translation type="unfinished">Radio</translation>
+    </message>
+    <message>
+        <source>Radius (px)</source>
+        <translation type="unfinished">Radio (px)</translation>
+    </message>
+    <message>
+        <source>Rain</source>
+        <translation type="unfinished">Lluvia</translation>
+    </message>
+    <message>
+        <source>Random Seed</source>
+        <translation type="unfinished">Semilla aleatoria</translation>
+    </message>
+    <message>
+        <source>Range (dB)</source>
+        <translation type="unfinished">Intervalo (dB)</translation>
+    </message>
+    <message>
+        <source>Rate (Hz)</source>
+        <translation type="unfinished">Tasa (Hz)</translation>
+    </message>
+    <message>
+        <source>Ratio</source>
+        <translation type="unfinished">Proporción</translation>
+    </message>
+    <message>
+        <source>Reach</source>
+        <translation type="unfinished">Alcanzar</translation>
+    </message>
+    <message>
+        <source>Readout (% of a frame)</source>
+        <translation type="unfinished">Lectura (% de un marco)</translation>
+    </message>
+    <message>
+        <source>Rebate Width</source>
+        <translation type="unfinished">Ancho de rebato</translation>
+    </message>
+    <message>
+        <source>Rec.2020 (SDR)</source>
+        <translation type="unfinished">Rec.2020 (DEG)</translation>
+    </message>
+    <message>
+        <source>Rec.2100 HLG</source>
+        <translation type="unfinished">Rec.2100 HLG</translation>
+    </message>
+    <message>
+        <source>Rec.2100 PQ (HDR10)</source>
+        <translation type="unfinished">Rec.2100 PQ (HDR10)</translation>
+    </message>
+    <message>
+        <source>Rec.709 (SDR video)</source>
+        <translation type="unfinished">Rec.709 (vídeo SDR)</translation>
+    </message>
+    <message>
+        <source>Recorded</source>
+        <translation type="unfinished">Grabado</translation>
+    </message>
+    <message>
+        <source>Recording Crop</source>
+        <translation type="unfinished">Grabación de cultivos</translation>
+    </message>
+    <message>
+        <source>Rectangle</source>
+        <translation type="unfinished">Rectángulo</translation>
+    </message>
+    <message>
+        <source>Red</source>
+        <translation type="unfinished">Rojo</translation>
+    </message>
+    <message>
+        <source>Red Blurriness</source>
+        <translation type="unfinished">Bluricidad roja</translation>
+    </message>
+    <message>
+        <source>Red Density</source>
+        <translation type="unfinished">Densidad roja</translation>
+    </message>
+    <message>
+        <source>Red Hue (°)</source>
+        <translation type="unfinished">Rojo Hue (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Red Offset</source>
+        <translation type="unfinished">Desplazamiento rojo</translation>
+    </message>
+    <message>
+        <source>Red Output: Blue</source>
+        <translation type="unfinished">Salida roja: azul</translation>
+    </message>
+    <message>
+        <source>Red Output: Green</source>
+        <translation type="unfinished">Salida roja: verde</translation>
+    </message>
+    <message>
+        <source>Red Output: Red</source>
+        <translation type="unfinished">Salida roja: roja</translation>
+    </message>
+    <message>
+        <source>Red Saturation</source>
+        <translation type="unfinished">Saturación roja</translation>
+    </message>
+    <message>
+        <source>Red from Blue</source>
+        <translation type="unfinished">Rojo de azul</translation>
+    </message>
+    <message>
+        <source>Red from Green</source>
+        <translation type="unfinished">Rojo de verde</translation>
+    </message>
+    <message>
+        <source>Red from Red</source>
+        <translation type="unfinished">Rojo de rojo</translation>
+    </message>
+    <message>
+        <source>Redact Faces</source>
+        <translation type="unfinished">Redactar rostros</translation>
+    </message>
+    <message>
+        <source>Reduction (dB)</source>
+        <translation type="unfinished">Reducción (dB)</translation>
+    </message>
+    <message>
+        <source>Reference Frame</source>
+        <translation type="unfinished">Marco de referencia</translation>
+    </message>
+    <message>
+        <source>Refine</source>
+        <translation type="unfinished">Refinar</translation>
+    </message>
+    <message>
+        <source>Refine Edges</source>
+        <translation type="unfinished">Refinar bordes</translation>
+    </message>
+    <message>
+        <source>Reframe 360°</source>
+        <translation type="unfinished">Reframe 360&lt;unk&gt;</translation>
+    </message>
+    <message>
+        <source>Release (ms)</source>
+        <translation type="unfinished">Liberación (ms)</translation>
+    </message>
+    <message>
+        <source>Relief</source>
+        <translation type="unfinished">Socorro</translation>
+    </message>
+    <message>
+        <source>Relief (px)</source>
+        <translation type="unfinished">Socorro (px)</translation>
+    </message>
+    <message>
+        <source>Relight</source>
+        <translation type="unfinished">Reluminar</translation>
+    </message>
+    <message>
+        <source>Remove Background</source>
+        <translation type="unfinished">Eliminar fondo</translation>
+    </message>
+    <message>
+        <source>Rendering</source>
+        <translation type="unfinished">Rendering</translation>
+    </message>
+    <message>
+        <source>Repair</source>
+        <translation type="unfinished">Reparación</translation>
+    </message>
+    <message>
+        <source>Replace Grain</source>
+        <translation type="unfinished">Reemplazar el grano</translation>
+    </message>
+    <message>
+        <source>Replace it</source>
+        <translation type="unfinished">Reemplácelo</translation>
+    </message>
+    <message>
+        <source>Response (ms)</source>
+        <translation type="unfinished">Respuesta (ms)</translation>
+    </message>
+    <message>
+        <source>Restoration</source>
+        <translation type="unfinished">Restauración</translation>
+    </message>
+    <message>
+        <source>Restore Brightness</source>
+        <translation type="unfinished">Restaurar brillo</translation>
+    </message>
+    <message>
+        <source>Reverb</source>
+        <translation type="unfinished">Reverberación</translation>
+    </message>
+    <message>
+        <source>Reverse</source>
+        <translation type="unfinished">Reversa</translation>
+    </message>
+    <message>
+        <source>Right</source>
+        <translation type="unfinished">Correcto</translation>
+    </message>
+    <message>
+        <source>Right onto Left</source>
+        <translation type="unfinished">Derecha a izquierda</translation>
+    </message>
+    <message>
+        <source>Right to Both</source>
+        <translation type="unfinished">Derecho a ambos</translation>
+    </message>
+    <message>
+        <source>Ripple</source>
+        <translation type="unfinished">Ripple</translation>
+    </message>
+    <message>
+        <source>Rise</source>
+        <translation type="unfinished">¡Levántate!</translation>
+    </message>
+    <message>
+        <source>Roll (Z°)</source>
+        <translation type="unfinished">Rodamiento (Z&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Roll (degrees clockwise)</source>
+        <translation type="unfinished">Rollo (grados en el sentido de las agujas del reloj)</translation>
+    </message>
+    <message>
+        <source>Roll (°)</source>
+        <translation type="unfinished">Rollo (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Roll / Crawl</source>
+        <translation type="unfinished">Rodar / crawl</translation>
+    </message>
+    <message>
+        <source>Roll Up</source>
+        <translation type="unfinished">Rematar</translation>
+    </message>
+    <message>
+        <source>Rolling Credits</source>
+        <translation type="unfinished">Créditos de refinanciación</translation>
+    </message>
+    <message>
+        <source>Rolling Shutter</source>
+        <translation type="unfinished">Rodando el obturador</translation>
+    </message>
+    <message>
+        <source>Rolling Shutter Repair</source>
+        <translation type="unfinished">Reparación de obturadores</translation>
+    </message>
+    <message>
+        <source>Room Level (dB)</source>
+        <translation type="unfinished">Nivel de la sala (dB)</translation>
+    </message>
+    <message>
+        <source>Room Reverb Time (s, 0 = auto)</source>
+        <translation type="unfinished">Tiempo de reverberación en la habitación (s, 0 = auto)</translation>
+    </message>
+    <message>
+        <source>Room Size</source>
+        <translation type="unfinished">Tamaño de la habitación</translation>
+    </message>
+    <message>
+        <source>Rotation</source>
+        <translation type="unfinished">Rotación</translation>
+    </message>
+    <message>
+        <source>Rotation (°)</source>
+        <translation type="unfinished">Rotación (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Rotation Variation (°)</source>
+        <translation type="unfinished">Variación de rotación (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Round</source>
+        <translation type="unfinished">Ronda</translation>
+    </message>
+    <message>
+        <source>Rows</source>
+        <translation type="unfinished">Filas</translation>
+    </message>
+    <message>
+        <source>Saturation</source>
+        <translation type="unfinished">Saturación</translation>
+    </message>
+    <message>
+        <source>Saturation vs Saturation</source>
+        <translation type="unfinished">Saturación vs. saturación</translation>
+    </message>
+    <message>
+        <source>Scale</source>
+        <translation type="unfinished">Escala</translation>
+    </message>
+    <message>
+        <source>Scale (solved camera, of its own units)</source>
+        <translation type="unfinished">Escala (cámara resuelta, de sus propias unidades)</translation>
+    </message>
+    <message>
+        <source>Scale Height</source>
+        <translation type="unfinished">Altura de escala</translation>
+    </message>
+    <message>
+        <source>Scale Width</source>
+        <translation type="unfinished">Anchura de la escala</translation>
+    </message>
+    <message>
+        <source>Scan Encoding</source>
+        <translation type="unfinished">Codificación de exploración</translation>
+    </message>
+    <message>
+        <source>Scanlines</source>
+        <translation type="unfinished">Escanlines</translation>
+    </message>
+    <message>
+        <source>Scramble</source>
+        <translation type="unfinished">Ráfaga</translation>
+    </message>
+    <message>
+        <source>Scratch Removal</source>
+        <translation type="unfinished">Eliminación de arañazos</translation>
+    </message>
+    <message>
+        <source>Scratches</source>
+        <translation type="unfinished">Rascadores</translation>
+    </message>
+    <message>
+        <source>Screen</source>
+        <translation type="unfinished">Pantalla</translation>
+    </message>
+    <message>
+        <source>Screen Balance</source>
+        <translation type="unfinished">Balance de pantalla</translation>
+    </message>
+    <message>
+        <source>Screen Colour</source>
+        <translation type="unfinished">Color de la pantalla</translation>
+    </message>
+    <message>
+        <source>Screen Gain</source>
+        <translation type="unfinished">Ganancia de pantalla</translation>
+    </message>
+    <message>
+        <source>Seamless</source>
+        <translation type="unfinished">Sin costura</translation>
+    </message>
+    <message>
+        <source>Seed</source>
+        <translation type="unfinished">Semillas</translation>
+    </message>
+    <message>
+        <source>Semitones</source>
+        <translation type="unfinished">Semitoides</translation>
+    </message>
+    <message>
+        <source>Sensitivity</source>
+        <translation type="unfinished">Sensibilidad</translation>
+    </message>
+    <message>
+        <source>Sensitivity (dB)</source>
+        <translation type="unfinished">Sensibilidad (dB)</translation>
+    </message>
+    <message>
+        <source>Shadow</source>
+        <translation type="unfinished">Sombra</translation>
+    </message>
+    <message>
+        <source>Shadow B</source>
+        <translation type="unfinished">Sombra B</translation>
+    </message>
+    <message>
+        <source>Shadow Distance (px)</source>
+        <translation type="unfinished">Distancia de sombra (px)</translation>
+    </message>
+    <message>
+        <source>Shadow Exposure (stops)</source>
+        <translation type="unfinished">Exposición a la sombra (paradas)</translation>
+    </message>
+    <message>
+        <source>Shadow Falloff (stops)</source>
+        <translation type="unfinished">Descenso de la sombra (paradas)</translation>
+    </message>
+    <message>
+        <source>Shadow G</source>
+        <translation type="unfinished">Sombra G</translation>
+    </message>
+    <message>
+        <source>Shadow Opacity</source>
+        <translation type="unfinished">Opacidad de la sombra</translation>
+    </message>
+    <message>
+        <source>Shadow R</source>
+        <translation type="unfinished">Sombra R</translation>
+    </message>
+    <message>
+        <source>Shadow Saturation</source>
+        <translation type="unfinished">Saturación de sombras</translation>
+    </message>
+    <message>
+        <source>Shadow Up To (stops)</source>
+        <translation type="unfinished">Sombra hasta (para)</translation>
+    </message>
+    <message>
+        <source>Shadows</source>
+        <translation type="unfinished">Sombras</translation>
+    </message>
+    <message>
+        <source>Shadows Block Rays</source>
+        <translation type="unfinished">Sombras bloquean los rayos</translation>
+    </message>
+    <message>
+        <source>Shadows on the Ground</source>
+        <translation type="unfinished">Sombras en el suelo</translation>
+    </message>
+    <message>
+        <source>Shape</source>
+        <translation type="unfinished">Forma</translation>
+    </message>
+    <message>
+        <source>Shape Wipe</source>
+        <translation type="unfinished">Limpiado en forma</translation>
+    </message>
+    <message>
+        <source>Shapes Across</source>
+        <translation type="unfinished">Formas transversales</translation>
+    </message>
+    <message>
+        <source>Sharp</source>
+        <translation type="unfinished">Agudo</translation>
+    </message>
+    <message>
+        <source>Sharpen</source>
+        <translation type="unfinished">Afilar</translation>
+    </message>
+    <message>
+        <source>Sharpen Eyes</source>
+        <translation type="unfinished">Afilar los ojos</translation>
+    </message>
+    <message>
+        <source>Shine</source>
+        <translation type="unfinished">Brillo</translation>
+    </message>
+    <message>
+        <source>Show Detected</source>
+        <translation type="unfinished">Mostrar detectado</translation>
+    </message>
+    <message>
+        <source>Show Edges</source>
+        <translation type="unfinished">Mostrar bordes</translation>
+    </message>
+    <message>
+        <source>Show Face Mask</source>
+        <translation type="unfinished">Mostrar máscara facial</translation>
+    </message>
+    <message>
+        <source>Show Face Mesh</source>
+        <translation type="unfinished">Mostrar malla facial</translation>
+    </message>
+    <message>
+        <source>Show Grid</source>
+        <translation type="unfinished">Mostrar cuadrícula</translation>
+    </message>
+    <message>
+        <source>Show Irises Found</source>
+        <translation type="unfinished">Mostrar los lirios encontrados</translation>
+    </message>
+    <message>
+        <source>Show Matte</source>
+        <translation type="unfinished">Mostrar mate</translation>
+    </message>
+    <message>
+        <source>Show Mesh</source>
+        <translation type="unfinished">Mostrar malla</translation>
+    </message>
+    <message>
+        <source>Show Repaired</source>
+        <translation type="unfinished">Mostrar reparado</translation>
+    </message>
+    <message>
+        <source>Show Spots Found</source>
+        <translation type="unfinished">Mostrar los lugares encontrados</translation>
+    </message>
+    <message>
+        <source>Show Surface Directions</source>
+        <translation type="unfinished">Mostrar direcciones de superficie</translation>
+    </message>
+    <message>
+        <source>Show Tracked Faces</source>
+        <translation type="unfinished">Mostrar caras rastreadas</translation>
+    </message>
+    <message>
+        <source>Show Tracked Points</source>
+        <translation type="unfinished">Mostrar puntos de seguimiento</translation>
+    </message>
+    <message>
+        <source>Show Whole Picture</source>
+        <translation type="unfinished">Mostrar imagen completa</translation>
+    </message>
+    <message>
+        <source>Shrink / Grow (px)</source>
+        <translation type="unfinished">Reducir/crecer (px)</translation>
+    </message>
+    <message>
+        <source>Shutter Angle</source>
+        <translation type="unfinished">Ángulo de obturación</translation>
+    </message>
+    <message>
+        <source>Shutter Angle (°)</source>
+        <translation type="unfinished">Ángulo de obturación (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Sidechain</source>
+        <translation type="unfinished">Cadena lateral</translation>
+    </message>
+    <message>
+        <source>Sides</source>
+        <translation type="unfinished">Lados</translation>
+    </message>
+    <message>
+        <source>Sides / Points</source>
+        <translation type="unfinished">Lados/puntos</translation>
+    </message>
+    <message>
+        <source>Silence</source>
+        <translation type="unfinished">Silencio</translation>
+    </message>
+    <message>
+        <source>Sine</source>
+        <translation type="unfinished">Sine</translation>
+    </message>
+    <message>
+        <source>Size</source>
+        <translation type="unfinished">Tamaño</translation>
+    </message>
+    <message>
+        <source>Size (% of height)</source>
+        <translation type="unfinished">Tamaño (% de altura)</translation>
+    </message>
+    <message>
+        <source>Size (px)</source>
+        <translation type="unfinished">Tamaño (px)</translation>
+    </message>
+    <message>
+        <source>Size (px, own camera)</source>
+        <translation type="unfinished">Tamaño (px, cámara propia)</translation>
+    </message>
+    <message>
+        <source>Size Variation</source>
+        <translation type="unfinished">Variación del tamaño</translation>
+    </message>
+    <message>
+        <source>Size at Death</source>
+        <translation type="unfinished">Tamaño en la muerte</translation>
+    </message>
+    <message>
+        <source>Size in the File&apos;s Scene (px a unit)</source>
+        <translation type="unfinished">Tamaño en la escena del archivo (px una unidad)</translation>
+    </message>
+    <message>
+        <source>Skin Centre (°)</source>
+        <translation type="unfinished">Centro de la piel (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Skin Density</source>
+        <translation type="unfinished">Densidad de la piel</translation>
+    </message>
+    <message>
+        <source>Skin Hue (°)</source>
+        <translation type="unfinished">Piel Hue (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Skin Saturation</source>
+        <translation type="unfinished">Saturación de la piel</translation>
+    </message>
+    <message>
+        <source>Skin Width (°)</source>
+        <translation type="unfinished">Ancho de la piel (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Sky</source>
+        <translation type="unfinished">Cielo</translation>
+    </message>
+    <message>
+        <source>Sky Defocus (px)</source>
+        <translation type="unfinished">Desenfoque del cielo (px)</translation>
+    </message>
+    <message>
+        <source>Sky Exposure (stops)</source>
+        <translation type="unfinished">Exposición al cielo (paradas)</translation>
+    </message>
+    <message>
+        <source>Sky Matte</source>
+        <translation type="unfinished">Sky Matte</translation>
+    </message>
+    <message>
+        <source>Sky Replacement</source>
+        <translation type="unfinished">Sustitución de Sky</translation>
+    </message>
+    <message>
+        <source>Sky Track (V number, 0: the one above)</source>
+        <translation type="unfinished">Vía Sky (número V, 0: el anterior)</translation>
+    </message>
+    <message>
+        <source>Slide</source>
+        <translation type="unfinished">Diapositiva</translation>
+    </message>
+    <message>
+        <source>Slide Down</source>
+        <translation type="unfinished">Deslizar hacia abajo</translation>
+    </message>
+    <message>
+        <source>Slide Left</source>
+        <translation type="unfinished">Deslizar a la izquierda</translation>
+    </message>
+    <message>
+        <source>Slide Right</source>
+        <translation type="unfinished">Deslizar a la derecha</translation>
+    </message>
+    <message>
+        <source>Slide Up</source>
+        <translation type="unfinished">Deslizar hacia arriba</translation>
+    </message>
+    <message>
+        <source>Slope B</source>
+        <translation type="unfinished">Pendiente B</translation>
+    </message>
+    <message>
+        <source>Slope G</source>
+        <translation type="unfinished">Pendiente G</translation>
+    </message>
+    <message>
+        <source>Slope R</source>
+        <translation type="unfinished">Pendiente R</translation>
+    </message>
+    <message>
+        <source>Smoke Puffs</source>
+        <translation type="unfinished">Puffs de humo</translation>
+    </message>
+    <message>
+        <source>Smooth</source>
+        <translation type="unfinished">Suave</translation>
+    </message>
+    <message>
+        <source>Smooth Cut</source>
+        <translation type="unfinished">Corte suave</translation>
+    </message>
+    <message>
+        <source>Smooth Skin</source>
+        <translation type="unfinished">Piel lisa</translation>
+    </message>
+    <message>
+        <source>Smoothness (s)</source>
+        <translation type="unfinished">Suavidad (s)</translation>
+    </message>
+    <message>
+        <source>Snow</source>
+        <translation type="unfinished">Nieve</translation>
+    </message>
+    <message>
+        <source>Social - TikTok / Reels / Shorts</source>
+        <translation type="unfinished">Social - TikTok / Carretes / Pantalones cortos</translation>
+    </message>
+    <message>
+        <source>Social - YouTube (-14 LUFS)</source>
+        <translation type="unfinished">Social - YouTube (-14 LUFS)</translation>
+    </message>
+    <message>
+        <source>Soft Discs</source>
+        <translation type="unfinished">Discos blandos</translation>
+    </message>
+    <message>
+        <source>Soft Knee</source>
+        <translation type="unfinished">Rodillera blanda</translation>
+    </message>
+    <message>
+        <source>Soft light</source>
+        <translation type="unfinished">Luz suave</translation>
+    </message>
+    <message>
+        <source>Soften (px)</source>
+        <translation type="unfinished">Suavizar (px)</translation>
+    </message>
+    <message>
+        <source>Softness</source>
+        <translation type="unfinished">Suavidad</translation>
+    </message>
+    <message>
+        <source>Softness (px)</source>
+        <translation type="unfinished">Suavidad (px)</translation>
+    </message>
+    <message>
+        <source>Solid</source>
+        <translation type="unfinished">Sólido</translation>
+    </message>
+    <message>
+        <source>Solid Colour</source>
+        <translation type="unfinished">Color sólido</translation>
+    </message>
+    <message>
+        <source>Solved Footage Track (0: nearest below)</source>
+        <translation type="unfinished">Pista de rodaje resuelta (0: más cercana abajo)</translation>
+    </message>
+    <message>
+        <source>Solved by the 3D Camera Tracker</source>
+        <translation type="unfinished">Resuelto por el rastreador de cámara 3D</translation>
+    </message>
+    <message>
+        <source>Sony S-Log3 / S-Gamut3</source>
+        <translation type="unfinished">Sony S-Log3 / S-Gamut3</translation>
+    </message>
+    <message>
+        <source>Sony S-Log3 / S-Gamut3.Cine</source>
+        <translation type="unfinished">Sony S-Log3 / S-Gamut3.Cine</translation>
+    </message>
+    <message>
+        <source>Sony&apos;s broadcast MPEG-2: 1080 lines, 4:2:2 at 50 Mb/s, eight mono 24-bit tracks</source>
+        <translation type="unfinished">MPEG-2 de emisión de Sony: 1080 líneas, 4:2:2 a 50 Mb/s, ocho mono de 24 bits pistas</translation>
+    </message>
+    <message>
+        <source>Sound From</source>
+        <translation type="unfinished">Sonido desde</translation>
+    </message>
+    <message>
+        <source>Source X (of the width)</source>
+        <translation type="unfinished">Fuente X (del ancho)</translation>
+    </message>
+    <message>
+        <source>Source Y (of the height)</source>
+        <translation type="unfinished">Fuente Y (de la altura)</translation>
+    </message>
+    <message>
+        <source>Space</source>
+        <translation type="unfinished">Espacio</translation>
+    </message>
+    <message>
+        <source>Sparks</source>
+        <translation type="unfinished">Chispas</translation>
+    </message>
+    <message>
+        <source>Spatial Chroma</source>
+        <translation type="unfinished">Croma espacial</translation>
+    </message>
+    <message>
+        <source>Spatial Luma</source>
+        <translation type="unfinished">Luma espacial</translation>
+    </message>
+    <message>
+        <source>Spectral Repair</source>
+        <translation type="unfinished">Reparación espectral</translation>
+    </message>
+    <message>
+        <source>Specular</source>
+        <translation type="unfinished">Especific</translation>
+    </message>
+    <message>
+        <source>Specular B</source>
+        <translation type="unfinished">Especicular B</translation>
+    </message>
+    <message>
+        <source>Specular Exposure (stops)</source>
+        <translation type="unfinished">Exposición especular (paradas)</translation>
+    </message>
+    <message>
+        <source>Specular Falloff (stops)</source>
+        <translation type="unfinished">Fallo especular (paradas)</translation>
+    </message>
+    <message>
+        <source>Specular From (stops)</source>
+        <translation type="unfinished">De (paradas)</translation>
+    </message>
+    <message>
+        <source>Specular G</source>
+        <translation type="unfinished">G especular</translation>
+    </message>
+    <message>
+        <source>Specular R</source>
+        <translation type="unfinished">R especular</translation>
+    </message>
+    <message>
+        <source>Specular Saturation</source>
+        <translation type="unfinished">Saturación especular</translation>
+    </message>
+    <message>
+        <source>Speech</source>
+        <translation type="unfinished">Discurso</translation>
+    </message>
+    <message>
+        <source>Speed</source>
+        <translation type="unfinished">Velocidad</translation>
+    </message>
+    <message>
+        <source>Speed (px/s)</source>
+        <translation type="unfinished">Velocidad (px/s)</translation>
+    </message>
+    <message>
+        <source>Speed (° per frame)</source>
+        <translation type="unfinished">Velocidad (&lt;unk&gt; por marco)</translation>
+    </message>
+    <message>
+        <source>Speed Variation</source>
+        <translation type="unfinished">Variación de la velocidad</translation>
+    </message>
+    <message>
+        <source>Sphere</source>
+        <translation type="unfinished">Esfera</translation>
+    </message>
+    <message>
+        <source>Spherize</source>
+        <translation type="unfinished">Epherize</translation>
+    </message>
+    <message>
+        <source>Spill Suppression</source>
+        <translation type="unfinished">Supresión de derrames</translation>
+    </message>
+    <message>
+        <source>Spin</source>
+        <translation type="unfinished">Girar</translation>
+    </message>
+    <message>
+        <source>Spin (°/s)</source>
+        <translation type="unfinished">Espines (&lt;unk&gt;/s)</translation>
+    </message>
+    <message>
+        <source>Spin Variation</source>
+        <translation type="unfinished">Variación de giros</translation>
+    </message>
+    <message>
+        <source>Splat Files a Second (0: the sequence&apos;s rate)</source>
+        <translation type="unfinished">Splat Files a Second (0: la velocidad de la secuencia)</translation>
+    </message>
+    <message>
+        <source>Spot</source>
+        <translation type="unfinished">Spot</translation>
+    </message>
+    <message>
+        <source>Spot Angle (°)</source>
+        <translation type="unfinished">Ángulo de la mancha (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Spread (°)</source>
+        <translation type="unfinished">Separar (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Sprite (Picture or Clip)</source>
+        <translation type="unfinished">Sprite (Pictura o clip)</translation>
+    </message>
+    <message>
+        <source>Sprites</source>
+        <translation type="unfinished">Sprites</translation>
+    </message>
+    <message>
+        <source>Square</source>
+        <translation type="unfinished">Cuadrado</translation>
+    </message>
+    <message>
+        <source>Squares</source>
+        <translation type="unfinished">Cuadrados</translation>
+    </message>
+    <message>
+        <source>Stabilize</source>
+        <translation type="unfinished">Estabilizar</translation>
+    </message>
+    <message>
+        <source>Stages</source>
+        <translation type="unfinished">Etapas</translation>
+    </message>
+    <message>
+        <source>Stand It on the Ground (solved camera)</source>
+        <translation type="unfinished">Párese en el suelo (cámara resuelta)</translation>
+    </message>
+    <message>
+        <source>Stand Upright</source>
+        <translation type="unfinished">De pie</translation>
+    </message>
+    <message>
+        <source>Standard ProRes, 10-bit 4:2:2</source>
+        <translation type="unfinished">ProRes estándar, 10 bits 4:2:2</translation>
+    </message>
+    <message>
+        <source>Star</source>
+        <translation type="unfinished">Estrella</translation>
+    </message>
+    <message>
+        <source>Star Inner Radius</source>
+        <translation type="unfinished">Radio interior de estrellas</translation>
+    </message>
+    <message>
+        <source>Start Color</source>
+        <translation type="unfinished">Iniciar color</translation>
+    </message>
+    <message>
+        <source>Start Off Screen</source>
+        <translation type="unfinished">Iniciar pantalla</translation>
+    </message>
+    <message>
+        <source>Starts At Depth</source>
+        <translation type="unfinished">Comienza a profundidad</translation>
+    </message>
+    <message>
+        <source>Status</source>
+        <translation type="unfinished">Situación</translation>
+    </message>
+    <message>
+        <source>Steady Through the Shot</source>
+        <translation type="unfinished">Firme a través del disparo</translation>
+    </message>
+    <message>
+        <source>Steady on Perforations</source>
+        <translation type="unfinished">Perforaciones constantes</translation>
+    </message>
+    <message>
+        <source>Steps per Frame</source>
+        <translation type="unfinished">Pasos por marco</translation>
+    </message>
+    <message>
+        <source>Stereo</source>
+        <translation type="unfinished">Estereo</translation>
+    </message>
+    <message>
+        <source>Stereo (speakers)</source>
+        <translation type="unfinished">Estereotipos (hablantes)</translation>
+    </message>
+    <message>
+        <source>Stereo 3D</source>
+        <translation type="unfinished">Estereo 3D</translation>
+    </message>
+    <message>
+        <source>Stereo Spread</source>
+        <translation type="unfinished">Separación estereográfica</translation>
+    </message>
+    <message>
+        <source>Stereo Width</source>
+        <translation type="unfinished">Ancho estereo</translation>
+    </message>
+    <message>
+        <source>Still</source>
+        <translation type="unfinished">Todavía</translation>
+    </message>
+    <message>
+        <source>Stop Motion</source>
+        <translation type="unfinished">Detener moción</translation>
+    </message>
+    <message>
+        <source>Straight</source>
+        <translation type="unfinished">Hetero</translation>
+    </message>
+    <message>
+        <source>Streak Length (frames of motion)</source>
+        <translation type="unfinished">Longitud de la estiramiento (marcos de movimiento)</translation>
+    </message>
+    <message>
+        <source>Streaks</source>
+        <translation type="unfinished">Rastrillos</translation>
+    </message>
+    <message>
+        <source>Strength</source>
+        <translation type="unfinished">Dosis</translation>
+    </message>
+    <message>
+        <source>Stretch</source>
+        <translation type="unfinished">Estirar</translation>
+    </message>
+    <message>
+        <source>Strict (0 to 100 %)</source>
+        <translation type="unfinished">Estricto (0 a 100 %)</translation>
+    </message>
+    <message>
+        <source>Stroke Color</source>
+        <translation type="unfinished">Color de la acarreo</translation>
+    </message>
+    <message>
+        <source>Stroke Opacity</source>
+        <translation type="unfinished">Opacidad por apoplejía</translation>
+    </message>
+    <message>
+        <source>Stroke Width (px)</source>
+        <translation type="unfinished">Ancho de carrera (px)</translation>
+    </message>
+    <message>
+        <source>Strokes Follow the Mask Track</source>
+        <translation type="unfinished">Siga la pista de máscaras</translation>
+    </message>
+    <message>
+        <source>Strokes Last</source>
+        <translation type="unfinished">Los golpes duran</translation>
+    </message>
+    <message>
+        <source>Style</source>
+        <translation type="unfinished">Estilo</translation>
+    </message>
+    <message>
+        <source>Style Lines After the First</source>
+        <translation type="unfinished">Líneas de estilo después de la primera</translation>
+    </message>
+    <message>
+        <source>Stylize</source>
+        <translation type="unfinished">Estilización</translation>
+    </message>
+    <message>
+        <source>Subtract</source>
+        <translation type="unfinished">Resta</translation>
+    </message>
+    <message>
+        <source>Subtract from it</source>
+        <translation type="unfinished">Resta de él</translation>
+    </message>
+    <message>
+        <source>Subtractive Saturation</source>
+        <translation type="unfinished">Saturación sustitutiva</translation>
+    </message>
+    <message>
+        <source>Sun</source>
+        <translation type="unfinished">Sun</translation>
+    </message>
+    <message>
+        <source>Super 8</source>
+        <translation type="unfinished">Super 8</translation>
+    </message>
+    <message>
+        <source>Super Scale</source>
+        <translation type="unfinished">Escala Super</translation>
+    </message>
+    <message>
+        <source>Surface Smoothing (px)</source>
+        <translation type="unfinished">Suavizado de superficie (px)</translation>
+    </message>
+    <message>
+        <source>Surround</source>
+        <translation type="unfinished">Alrededor</translation>
+    </message>
+    <message>
+        <source>Surround Delay (ms)</source>
+        <translation type="unfinished">Retardo en el entorno (ms)</translation>
+    </message>
+    <message>
+        <source>Surround Depth</source>
+        <translation type="unfinished">Profundidad de la envolvente</translation>
+    </message>
+    <message>
+        <source>Swap Left and Right</source>
+        <translation type="unfinished">Intercambia izquierda y derecha</translation>
+    </message>
+    <message>
+        <source>Swapped</source>
+        <translation type="unfinished">Desplazados</translation>
+    </message>
+    <message>
+        <source>Swing In</source>
+        <translation type="unfinished">Swing in</translation>
+    </message>
+    <message>
+        <source>TIFF Sequence (16-bit)</source>
+        <translation type="unfinished">Secuencia TIFF (16 bits)</translation>
+    </message>
+    <message>
+        <source>Take The File&apos;s Camera From (USD, glTF; else the model)</source>
+        <translation type="unfinished">Tome la cámara del archivo desde (USD, glTF; de lo contrario el modelo)</translation>
+    </message>
+    <message>
+        <source>Tape</source>
+        <translation type="unfinished">Cinta</translation>
+    </message>
+    <message>
+        <source>Temperature</source>
+        <translation type="unfinished">Temperatura</translation>
+    </message>
+    <message>
+        <source>Tempo (BPM)</source>
+        <translation type="unfinished">Tempo (BPM)</translation>
+    </message>
+    <message>
+        <source>Temporal Frames Each Side</source>
+        <translation type="unfinished">Marcos temporales en cada lado</translation>
+    </message>
+    <message>
+        <source>Temporal Strength</source>
+        <translation type="unfinished">Fuerza temporal</translation>
+    </message>
+    <message>
+        <source>Text</source>
+        <translation type="unfinished">Texto</translation>
+    </message>
+    <message>
+        <source>Text Animation</source>
+        <translation type="unfinished">Animación de texto</translation>
+    </message>
+    <message>
+        <source>Text on a Circle</source>
+        <translation type="unfinished">Texto en un círculo</translation>
+    </message>
+    <message>
+        <source>Text on a Path</source>
+        <translation type="unfinished">Texto en un camino</translation>
+    </message>
+    <message>
+        <source>The File&apos;s Camera</source>
+        <translation type="unfinished">La cámara del archivo</translation>
+    </message>
+    <message>
+        <source>The File&apos;s Camera Number</source>
+        <translation type="unfinished">Número de cámara del archivo</translation>
+    </message>
+    <message>
+        <source>The File&apos;s Lights</source>
+        <translation type="unfinished">Las luces del archivo</translation>
+    </message>
+    <message>
+        <source>The Mask&apos;s Track</source>
+        <translation type="unfinished">La pista de la máscara</translation>
+    </message>
+    <message>
+        <source>The Picture (Its Alpha)</source>
+        <translation type="unfinished">La imagen (su alfa)</translation>
+    </message>
+    <message>
+        <source>The Picture&apos;s Own Curve</source>
+        <translation type="unfinished">La curva de la imagen</translation>
+    </message>
+    <message>
+        <source>The Whole Frame</source>
+        <translation type="unfinished">El marco completo</translation>
+    </message>
+    <message>
+        <source>The highest-quality ProRes, with transparency</source>
+        <translation type="unfinished">ProRes de la más alta calidad, con transparencia</translation>
+    </message>
+    <message>
+        <source>The smallest ProRes, for offline editing</source>
+        <translation type="unfinished">El más pequeño ProRes, para edición offline</translation>
+    </message>
+    <message>
+        <source>Their Color</source>
+        <translation type="unfinished">Su color</translation>
+    </message>
+    <message>
+        <source>Their Size</source>
+        <translation type="unfinished">Su tamaño</translation>
+    </message>
+    <message>
+        <source>Thickening</source>
+        <translation type="unfinished">Espesos</translation>
+    </message>
+    <message>
+        <source>Thickness</source>
+        <translation type="unfinished">Grosor</translation>
+    </message>
+    <message>
+        <source>Thinning With Height</source>
+        <translation type="unfinished">Adelgazamiento con altura</translation>
+    </message>
+    <message>
+        <source>This Frame</source>
+        <translation type="unfinished">Este marco</translation>
+    </message>
+    <message>
+        <source>Threshold</source>
+        <translation type="unfinished">Umbral</translation>
+    </message>
+    <message>
+        <source>Threshold (dB)</source>
+        <translation type="unfinished">Umbral (dB)</translation>
+    </message>
+    <message>
+        <source>Tile Height</source>
+        <translation type="unfinished">Altura de la baldosa</translation>
+    </message>
+    <message>
+        <source>Tile Width</source>
+        <translation type="unfinished">Ancho de la baldosa</translation>
+    </message>
+    <message>
+        <source>Tilt (X°)</source>
+        <translation type="unfinished">Inclinación (X&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Tilt (degrees up)</source>
+        <translation type="unfinished">Inclinación (grados arriba)</translation>
+    </message>
+    <message>
+        <source>Tilt (°)</source>
+        <translation type="unfinished">Inclinación (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Tilt-Shift Blur</source>
+        <translation type="unfinished">Desenfoque de inclinación y aumento</translation>
+    </message>
+    <message>
+        <source>Time</source>
+        <translation type="unfinished">Hora</translation>
+    </message>
+    <message>
+        <source>Time (ms)</source>
+        <translation type="unfinished">Tiempo (ms)</translation>
+    </message>
+    <message>
+        <source>Time Remapping</source>
+        <translation type="unfinished">Remape de tiempo</translation>
+    </message>
+    <message>
+        <source>Tint</source>
+        <translation type="unfinished">Tez</translation>
+    </message>
+    <message>
+        <source>Title</source>
+        <translation type="unfinished">Título</translation>
+    </message>
+    <message>
+        <source>Title Font</source>
+        <translation type="unfinished">Tipo de letra</translation>
+    </message>
+    <message>
+        <source>Title Sparkle</source>
+        <translation type="unfinished">Título Chispa</translation>
+    </message>
+    <message>
+        <source>Title Text</source>
+        <translation type="unfinished">Texto del título</translation>
+    </message>
+    <message>
+        <source>Title Text Bold</source>
+        <translation type="unfinished">Título Texto Negrita</translation>
+    </message>
+    <message>
+        <source>Title Text Size (px)</source>
+        <translation type="unfinished">Tamaño del texto del título (px)</translation>
+    </message>
+    <message>
+        <source>Title Width (% of its distance)</source>
+        <translation type="unfinished">Ancho de título (% de su distancia)</translation>
+    </message>
+    <message>
+        <source>Titles</source>
+        <translation type="unfinished">Títulos</translation>
+    </message>
+    <message>
+        <source>To</source>
+        <translation type="unfinished">A</translation>
+    </message>
+    <message>
+        <source>To Depth</source>
+        <translation type="unfinished">A profundidad</translation>
+    </message>
+    <message>
+        <source>To Record</source>
+        <translation type="unfinished">Para grabar</translation>
+    </message>
+    <message>
+        <source>Tolerance</source>
+        <translation type="unfinished">Tolerancia</translation>
+    </message>
+    <message>
+        <source>Tone</source>
+        <translation type="unfinished">Tono</translation>
+    </message>
+    <message>
+        <source>Tone (Hz)</source>
+        <translation type="unfinished">Tono (Hz)</translation>
+    </message>
+    <message>
+        <source>Tone Level (dB)</source>
+        <translation type="unfinished">Nivel tonal (dB)</translation>
+    </message>
+    <message>
+        <source>Top Left X</source>
+        <translation type="unfinished">X superior izquierda</translation>
+    </message>
+    <message>
+        <source>Top Left Y</source>
+        <translation type="unfinished">Arriba, izquierda Y</translation>
+    </message>
+    <message>
+        <source>Top Right X</source>
+        <translation type="unfinished">X superior derecha</translation>
+    </message>
+    <message>
+        <source>Top Right Y</source>
+        <translation type="unfinished">Arriba Y derecha</translation>
+    </message>
+    <message>
+        <source>Top onto Bottom</source>
+        <translation type="unfinished">Arriba hacia abajo</translation>
+    </message>
+    <message>
+        <source>Track</source>
+        <translation type="unfinished">Pista</translation>
+    </message>
+    <message>
+        <source>Track Matte Key</source>
+        <translation type="unfinished">Clave de control de la calidad</translation>
+    </message>
+    <message>
+        <source>Tracking</source>
+        <translation type="unfinished">Seguimiento</translation>
+    </message>
+    <message>
+        <source>Tracking Errors</source>
+        <translation type="unfinished">Errores de seguimiento</translation>
+    </message>
+    <message>
+        <source>Tracking Out</source>
+        <translation type="unfinished">Seguimiento</translation>
+    </message>
+    <message>
+        <source>Transform</source>
+        <translation type="unfinished">Transformar</translation>
+    </message>
+    <message>
+        <source>Tremolo</source>
+        <translation type="unfinished">Tremolo</translation>
+    </message>
+    <message>
+        <source>Tremolo / Auto-Pan</source>
+        <translation type="unfinished">Tremolo / Auto-Pan</translation>
+    </message>
+    <message>
+        <source>Triangle</source>
+        <translation type="unfinished">Triángulo</translation>
+    </message>
+    <message>
+        <source>Trim End</source>
+        <translation type="unfinished">Fin del trim</translation>
+    </message>
+    <message>
+        <source>Trim Offset</source>
+        <translation type="unfinished">Desplazamiento del recorte</translation>
+    </message>
+    <message>
+        <source>Trim Start</source>
+        <translation type="unfinished">Inicio del recorte</translation>
+    </message>
+    <message>
+        <source>Tube</source>
+        <translation type="unfinished">Tubo</translation>
+    </message>
+    <message>
+        <source>Tunnel</source>
+        <translation type="unfinished">Túnel</translation>
+    </message>
+    <message>
+        <source>Turbulence (px/s)</source>
+        <translation type="unfinished">Turbulencia (px/s)</translation>
+    </message>
+    <message>
+        <source>Turbulence Change (per s)</source>
+        <translation type="unfinished">Cambio de turbulencia (por s)</translation>
+    </message>
+    <message>
+        <source>Turbulence Size (px)</source>
+        <translation type="unfinished">Tamaño de la turbulencia (px)</translation>
+    </message>
+    <message>
+        <source>Turbulent Displace</source>
+        <translation type="unfinished">Desplazamiento turbulento</translation>
+    </message>
+    <message>
+        <source>Turn (Y°)</source>
+        <translation type="unfinished">Gira (Y&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Turn (degrees right)</source>
+        <translation type="unfinished">Girar (grados a la derecha)</translation>
+    </message>
+    <message>
+        <source>Turn (degrees)</source>
+        <translation type="unfinished">Gira (grados)</translation>
+    </message>
+    <message>
+        <source>Twirl</source>
+        <translation type="unfinished">Remolino</translation>
+    </message>
+    <message>
+        <source>Type</source>
+        <translation type="unfinished">Tipo</translation>
+    </message>
+    <message>
+        <source>Typewriter</source>
+        <translation type="unfinished">Máquinas de escribir</translation>
+    </message>
+    <message>
+        <source>Uncompressed 10-bit (v210)</source>
+        <translation type="unfinished">10 bits sin comprimir (v210)</translation>
+    </message>
+    <message>
+        <source>Uncompressed 10-bit 4:2:2, for broadcast ingest</source>
+        <translation type="unfinished">10 bits 4:2:2 sin comprimir, para la ingerencia de emisiones</translation>
+    </message>
+    <message>
+        <source>Uncompressed mixdown</source>
+        <translation type="unfinished">Mezcla sin comprimir</translation>
+    </message>
+    <message>
+        <source>Up</source>
+        <translation type="unfinished">Arriba</translation>
+    </message>
+    <message>
+        <source>Upmix</source>
+        <translation type="unfinished">Upmix</translation>
+    </message>
+    <message>
+        <source>Upper Left</source>
+        <translation type="unfinished">Arriba a la izquierda</translation>
+    </message>
+    <message>
+        <source>Upper Right</source>
+        <translation type="unfinished">Arriba a la derecha</translation>
+    </message>
+    <message>
+        <source>Use Depth</source>
+        <translation type="unfinished">Usar profundidad</translation>
+    </message>
+    <message>
+        <source>VHS</source>
+        <translation type="unfinished">VHS</translation>
+    </message>
+    <message>
+        <source>VP9 (WebM)</source>
+        <translation type="unfinished">VP9 (WebM)</translation>
+    </message>
+    <message>
+        <source>Values Are Depth</source>
+        <translation type="unfinished">Los valores son profundidad</translation>
+    </message>
+    <message>
+        <source>Vertical</source>
+        <translation type="unfinished">Vertical</translation>
+    </message>
+    <message>
+        <source>Vibrance</source>
+        <translation type="unfinished">Vibrance</translation>
+    </message>
+    <message>
+        <source>Video Noise Reduction</source>
+        <translation type="unfinished">Reducción del ruido de vídeo</translation>
+    </message>
+    <message>
+        <source>View</source>
+        <translation type="unfinished">Ver</translation>
+    </message>
+    <message>
+        <source>Vignette</source>
+        <translation type="unfinished">Viñeta</translation>
+    </message>
+    <message>
+        <source>Vignetting</source>
+        <translation type="unfinished">Vignetting</translation>
+    </message>
+    <message>
+        <source>Voice Isolation</source>
+        <translation type="unfinished">Aislamiento de voz</translation>
+    </message>
+    <message>
+        <source>Volume</source>
+        <translation type="unfinished">Volumen</translation>
+    </message>
+    <message>
+        <source>Wave</source>
+        <translation type="unfinished">Ola</translation>
+    </message>
+    <message>
+        <source>Wave Height (px)</source>
+        <translation type="unfinished">Altura de onda (px)</translation>
+    </message>
+    <message>
+        <source>Wave Type</source>
+        <translation type="unfinished">Tipo de onda</translation>
+    </message>
+    <message>
+        <source>Wave Warp</source>
+        <translation type="unfinished">Warp de onda</translation>
+    </message>
+    <message>
+        <source>Wave Width (px)</source>
+        <translation type="unfinished">Ancho de onda (px)</translation>
+    </message>
+    <message>
+        <source>Waveform</source>
+        <translation type="unfinished">Forma de onda</translation>
+    </message>
+    <message>
+        <source>Wavelength (px)</source>
+        <translation type="unfinished">Longitud de onda (px)</translation>
+    </message>
+    <message>
+        <source>Wavelet intermediate, 10-bit 4:2:2 (12-bit RGB with alpha)</source>
+        <translation type="unfinished">Intermediario de orugas, 10 bits 4:2:2 (12 bits RGB con alfa)</translation>
+    </message>
+    <message>
+        <source>Web delivery, CRF 20</source>
+        <translation type="unfinished">Entrega en la Web, FCI 20</translation>
+    </message>
+    <message>
+        <source>Whip Pan</source>
+        <translation type="unfinished">Pan de batido</translation>
+    </message>
+    <message>
+        <source>White Is Far</source>
+        <translation type="unfinished">Blanco está lejos</translation>
+    </message>
+    <message>
+        <source>White Is Near</source>
+        <translation type="unfinished">El blanco está cerca</translation>
+    </message>
+    <message>
+        <source>Whites</source>
+        <translation type="unfinished">Blancos</translation>
+    </message>
+    <message>
+        <source>Whole Clip</source>
+        <translation type="unfinished">Clip completo</translation>
+    </message>
+    <message>
+        <source>Whole Frame</source>
+        <translation type="unfinished">Marco completo</translation>
+    </message>
+    <message>
+        <source>Widest Scratch (px)</source>
+        <translation type="unfinished">Rascamiento más ancho (px)</translation>
+    </message>
+    <message>
+        <source>Width</source>
+        <translation type="unfinished">Ancho</translation>
+    </message>
+    <message>
+        <source>Width (px)</source>
+        <translation type="unfinished">Ancho (px)</translation>
+    </message>
+    <message>
+        <source>Wind X (px/s²)</source>
+        <translation type="unfinished">Viento X (px/s2)</translation>
+    </message>
+    <message>
+        <source>Wind Y (px/s²)</source>
+        <translation type="unfinished">Viento Y (px/s2)</translation>
+    </message>
+    <message>
+        <source>Wind Z (px/s², 3D)</source>
+        <translation type="unfinished">Viento Z (px/s2, 3D)</translation>
+    </message>
+    <message>
+        <source>Wipe</source>
+        <translation type="unfinished">Limpiar</translation>
+    </message>
+    <message>
+        <source>Word</source>
+        <translation type="unfinished">Palabra</translation>
+    </message>
+    <message>
+        <source>Word by Word</source>
+        <translation type="unfinished">Palabra por palabra</translation>
+    </message>
+    <message>
+        <source>Working space</source>
+        <translation type="unfinished">Espacio de trabajo</translation>
+    </message>
+    <message>
+        <source>XDCAM HD422 (MXF)</source>
+        <translation type="unfinished">XDCAM HD422 (MXF)</translation>
+    </message>
+    <message>
+        <source>Yellow</source>
+        <translation type="unfinished">Amarillo</translation>
+    </message>
+    <message>
+        <source>Yellow Density</source>
+        <translation type="unfinished">Densidad amarilla</translation>
+    </message>
+    <message>
+        <source>Yellow Hue (°)</source>
+        <translation type="unfinished">Hue amarillo (&lt;unk&gt;)</translation>
+    </message>
+    <message>
+        <source>Yellow Saturation</source>
+        <translation type="unfinished">Saturación amarilla</translation>
+    </message>
+    <message>
+        <source>ZIP (1 line)</source>
+        <translation type="unfinished">ZIP (1 línea)</translation>
+    </message>
+    <message>
+        <source>ZIP (16 lines)</source>
+        <translation type="unfinished">ZIP (16 líneas)</translation>
+    </message>
+    <message>
+        <source>Zoom</source>
+        <translation type="unfinished">Ampliar</translation>
+    </message>
+    <message>
+        <source>Zoom Blur</source>
+        <translation type="unfinished">Desenfoque de zoom</translation>
+    </message>
+    <message>
+        <source>Zoom From Far</source>
+        <translation type="unfinished">Ampliar desde lejos</translation>
+    </message>
+    <message>
+        <source>Zoom to Fill</source>
+        <translation type="unfinished">Ampliar a llenar</translation>
+    </message>
+    <message>
+        <source>Zoom to Hide Edges</source>
+        <translation type="unfinished">Ampliar para ocultar bordes</translation>
+    </message>
+    <message>
+        <source>Zstandard</source>
+        <translation type="unfinished">Zstandard</translation>
+    </message>
+    <message>
+        <source>sRGB</source>
+        <translation type="unfinished">sRGB</translation>
+    </message>
+</context>
+<context>
     <name>InterpretFootageDialog</name>
     <message>
         <source>Square Pixels (1.0)</source>
@@ -4273,7 +9568,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Generators &amp; Titles</source>
-        <translation type="unfinished">&amp;Títulos de los generadores</translation>
+        <translation type="unfinished">Generadores y títulos</translation>
     </message>
     <message>
         <source>Other</source>
@@ -5868,11 +11163,11 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Position &amp; Scale</source>
-        <translation type="unfinished">&amp;Escala de posición</translation>
+        <translation type="unfinished">Posición y escala</translation>
     </message>
     <message>
         <source>Position, Scale &amp; Rotation</source>
-        <translation type="unfinished">&amp;Posición, rotación de escala</translation>
+        <translation type="unfinished">Posición, escala y rotación</translation>
     </message>
     <message>
         <source>How much around the point to follow</source>
@@ -11173,10 +16468,6 @@ Take it over and edit it?</source>
     <message>
         <source>Transform › </source>
         <translation type="unfinished">Transformar </translation>
-    </message>
-    <message>
-        <source>Transform › Scale</source>
-        <translation type="unfinished">Transformar escala</translation>
     </message>
     <message>
         <source>Setting:</source>
@@ -21985,16 +27276,16 @@ so the jump in the picture morphs across instead of cutting</source>
 <context>
     <name>montage::language</name>
     <message>
-        <source>%1 (%2 % checked, the rest machine drafts)</source>
-        <translation type="unfinished">%1 (%2 % comprobado, el resto de borradores de la máquina)</translation>
-    </message>
-    <message>
         <source>%1 (%2 % translated)</source>
         <translation type="unfinished">%1 (%2 % traducido)</translation>
     </message>
     <message>
         <source>Test Language (Finds Untranslated Text)</source>
         <translation type="unfinished">Idioma de prueba (encontra texto no traducido)</translation>
+    </message>
+    <message>
+        <source>%1 (%2 % checked, %3 % machine drafts)</source>
+        <translation type="unfinished">%1 (%2 % controlado, %3 % borradores de máquinas)</translation>
     </message>
 </context>
 </TS>

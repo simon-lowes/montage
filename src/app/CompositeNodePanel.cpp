@@ -358,7 +358,7 @@ protected:
             std::vector<std::string> modes = blendModes();
             modes.push_back("depth");
             for (const std::string& m : modes) {
-                QAction* a = blend->addAction(m == "depth" ? CompositeNodePanel::tr("By Depth") : QString::fromStdString(m));
+                QAction* a = blend->addAction(m == "depth" ? CompositeNodePanel::tr("By Depth") : language::engine(blendModeLabel(m)));
                 a->setCheckable(true);
                 a->setChecked(m == n->blend);
                 const QString mode = QString::fromStdString(m);

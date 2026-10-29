@@ -473,6 +473,7 @@ public:
 protected:
     void closeEvent(QCloseEvent* e) override;
     void changeEvent(QEvent* e) override;
+    void showEvent(QShowEvent* e) override;
     // Dock tab bars: whole names, with scroll arrows when crowded (Qt shortens them to "Tra…" by default).
     void childEvent(QChildEvent* e) override;
 
@@ -489,6 +490,7 @@ private:
     using DockGroups = std::vector<std::vector<QDockWidget*>>;
     void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom = {});
     Qt::DockWidgetArea side(Qt::DockWidgetArea area) const;
+    void mirrorDocks();  // the panels as they are, the other way round
     void setSideCorner(Qt::Corner corner, Qt::DockWidgetArea area);
     void layOutBuiltIn(const QString& name);
     void syncWorkspaceUi();
@@ -744,6 +746,7 @@ private:
     std::vector<QAction*> workspaceActions_;
     QActionGroup* workspaceGroup_ = nullptr;
     bool syncingWorkspace_ = false;
+    bool mirrorWhenShown_ = false;
     QLabel* statusInfo_ = nullptr;
     Monitor active_ = Monitor::Program;
     std::vector<edit::ClipboardItem> clipboard_;

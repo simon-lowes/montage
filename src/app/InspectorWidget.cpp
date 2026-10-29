@@ -407,12 +407,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     QComboBox* blend = nullptr;
     if (kind == TrackKind::Video) {
         blend = new QComboBox(content_);
-        for (const auto& m : blendModes()) {
-            QString label = QString::fromStdString(m);
-            label.replace('_', ' ');
-            label[0] = label[0].toUpper();
-            blend->addItem(label, QString::fromStdString(m));
-        }
+        for (const auto& m : blendModes()) blend->addItem(language::engine(blendModeLabel(m)), QString::fromStdString(m));
         form->addRow(tr("Blend Mode"), blend);
         connect(blend, &QComboBox::activated, this, [this, clipId, blend](int idx) {
             std::string mode = blend->itemData(idx).toString().toStdString();
@@ -777,10 +772,11 @@ void InspectorWidget::buildGradeNodes(const Clip& clip, const std::function<Fram
             for (size_t i = 0; n->kind == "layer" && i < n->blend.size(); ++i) {
                 auto* mode = new QComboBox(content_);
                 mode->setObjectName(QStringLiteral("layerBlend%1").arg(i + 1));
-                for (const std::string& b : blendModes()) mode->addItem(QString::fromStdString(b));
-                mode->setCurrentText(QString::fromStdString(n->blend[i]));
+                for (const std::string& b : blendModes()) mode->addItem(language::engine(blendModeLabel(b)), QString::fromStdString(b));
+                mode->setCurrentIndex(std::max(0, mode->findData(QString::fromStdString(n->blend[i]))));
                 f->addRow(tr("Input %1:").arg(i + 2), mode);
-                connect(mode, &QComboBox::currentTextChanged, this, [this, clipId, key, i](const QString& b) {
+                connect(mode, &QComboBox::activated, this, [this, clipId, key, i, mode](int at) {
+                    const QString b = mode->itemData(at).toString();
                     state_->apply(tr("Layer Blend Mode"), [clipId, key, i, b](Project&, Sequence& sq) {
                         const Clip* c = edit::clipById(sq, clipId);
                         const GradeNode* m = c ? findGradeNode(c->grade, key) : nullptr;
@@ -3067,9 +3063,11 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             for (const auto& c : si.choices) combo->addItem(language::engine(c), QString::fromStdString(c));
             form->addRow(label, combo);
             connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
-            refreshers_.push_back([combo, read] {
+            refreshers_.push_back([combo, read, def = QString::fromStdString(si.def)] {
                 QSignalBlocker b(combo);
-                combo->setCurrentIndex(combo->findData(read()));
+                int at = combo->findData(read());
+                if (at < 0) at = combo->findData(def);
+                combo->setCurrentIndex(at < 0 ? 0 : at);
             });
             break;
         }

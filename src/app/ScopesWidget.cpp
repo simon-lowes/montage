@@ -1,5 +1,6 @@
 // Montage — video scopes widget.
 #include "ScopesWidget.h"
+#include "Language.h"
 
 #include "Accessibility.h"
 
@@ -977,7 +978,7 @@ void ScopesWidget::paintChromaticity(QPainter& p, const QRect& area) {
                               {Primaries::Bt2020, tr("Rec.2020"), QColor(90, 200, 255, 200)}};
     const ColorSpace* cs = findColorSpace(space_.toStdString());
     if (cs && cs->primaries != Primaries::Bt709 && cs->primaries != Primaries::P3D65 && cs->primaries != Primaries::Bt2020)
-        gamuts.push_back({cs->primaries, QString::fromStdString(cs->label), QColor(200, 130, 255, 200)});
+        gamuts.push_back({cs->primaries, language::engine(cs->label), QColor(200, 130, 255, 200)});
     for (size_t g = 0; g < gamuts.size(); ++g) {
         const auto c = gamutChromaticities(gamuts[g].primaries);
         QPolygonF tri;

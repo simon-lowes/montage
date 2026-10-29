@@ -18079,9 +18079,19 @@ print("added " + ui["name"])
         // lacks the marks, and in the dialogs none is cut short.
         QCOMPARE(language::install("pseudo"), QString("pseudo"));
         auto w = std::make_unique<MainWindow>();
+        auto back = qScopeGuard([&w] {
+            w.reset();
+            language::uninstall();
+        });
         w->resize(1600, 1000);
         w->show();
         QVERIFY(QTest::qWaitForWindowExposed(w.get()));
+        // Shortcuts keep their English names, so a saved keymap works in every language.
+        QVERIFY(keymap::find(w.get(), "Edit/Redo") && keymap::find(w.get(), "Sequence/End Trim Mode"));
+        QStringList ids;
+        for (QAction* a : keymap::actions(w.get()))
+            if (keymap::idOf(a).contains(QChar(0x27E6))) ids << keymap::idOf(a);
+        QVERIFY2(ids.isEmpty(), qPrintable(ids.join('\n')));
         QStringList unmarked, clipped;
         auto needs = [](QString text) {
             // Words, not numbers, timecodes, units or other symbols that read the same in every language.
@@ -18170,8 +18180,6 @@ print("added " + ui["name"])
         }
         unmarked.removeDuplicates();
         clipped.removeDuplicates();
-        w.reset();
-        language::uninstall();
         QVERIFY2(unmarked.isEmpty(), qPrintable(QStringLiteral("%1 not translated:\n").arg(unmarked.size()) + unmarked.join('\n')));
         QVERIFY2(clipped.isEmpty(), qPrintable(QStringLiteral("%1 cut short:\n").arg(clipped.size()) + clipped.join('\n')));
     }
@@ -18195,7 +18203,19 @@ print("added " + ui["name"])
         QDockWidget* media = win_->findChild<QDockWidget*>("media");
         QVERIFY(media && media->isVisible());
         const QRect before = media->geometry();
+        // (the layout as a window left to right leaves it, for the next start)
+        {
+            QSettings s = appSettings();
+            s.setValue("window/geometry", win_->saveGeometry());
+            s.setValue("window/state", win_->saveState(1));
+            s.setValue("window/rightToLeft", false);
+        }
         QCOMPARE(language::install("ar"), QString("ar"));
+        auto back = qScopeGuard([] {
+            language::uninstall();
+            QSettings s = appSettings();
+            for (const char* k : {"window/geometry", "window/state", "window/rightToLeft"}) s.remove(k);
+        });
         QVERIFY(language::rightToLeft("ar") && language::rightToLeft("he") && !language::rightToLeft("de"));
         QCOMPARE(QGuiApplication::layoutDirection(), Qt::RightToLeft);
         QTRY_VERIFY(win_->isRightToLeft() && media->widget()->isRightToLeft());
@@ -18205,7 +18225,22 @@ print("added " + ui["name"])
         for (MonitorPanel* m : win_->findChildren<MonitorPanel*>()) QVERIFY(m->isLeftToRight());
         QVERIFY(win_->findChild<QDockWidget*>("keyframes")->widget()->isLeftToRight());
         QVERIFY(win_->findChild<QDockWidget*>("multicam")->widget()->isLeftToRight());
+        {
+            // Started again in Arabic, the layout saved left to right comes back mirrored, its panels the same size.
+            auto again = std::make_unique<MainWindow>();
+            again->show();
+            QVERIFY(QTest::qWaitForWindowExposed(again.get()));
+            QDockWidget* m = again->findChild<QDockWidget*>("media");
+            QVERIFY(m && m->isVisible());
+            QTRY_VERIFY2(std::abs(m->x() - (again->width() - before.x() - before.width())) <= 4 && std::abs(m->width() - before.width()) <= 4,
+                         qPrintable(QStringLiteral("%1 %2 of %3").arg(m->x()).arg(m->width()).arg(again->width())));
+        }
+        back.dismiss();
         language::uninstall();
+        {
+            QSettings s = appSettings();
+            for (const char* k : {"window/geometry", "window/state", "window/rightToLeft"}) s.remove(k);
+        }
         QCOMPARE(QGuiApplication::layoutDirection(), Qt::LeftToRight);
         QTRY_COMPARE(media->x(), before.x());  // (back on the left, laid out afresh)
     }

@@ -26,7 +26,8 @@ class QWidget;
 
 namespace montage::keymap {
 
-// Gives an action its id and remembers its own key (call as it is created).
+// Gives an action its id and remembers its own key (call as it is created). The menu and the command by their names as
+// written in the source, not as translated, so shortcuts, presets and control surfaces find a command in any language.
 void registerAction(QAction* action, const QString& menu, const QString& text);
 QString idOf(const QAction* action);
 QKeySequence defaultKey(const QAction* action);

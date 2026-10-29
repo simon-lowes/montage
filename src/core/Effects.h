@@ -155,5 +155,7 @@ Effect makeEffect(const std::string& type, Id id);
 
 // Blend modes supported by the compositor.
 const std::vector<std::string>& blendModes();
+// A blend mode as the interface names it ("soft_light" → "Soft light").
+std::string blendModeLabel(const std::string& mode);
 
 }  // namespace montage

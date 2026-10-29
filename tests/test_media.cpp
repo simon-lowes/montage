@@ -28616,6 +28616,10 @@ if ui["pressed"] == "add":
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <source>Search and Replace</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <source>Save</source>
         <translation>Speichern</translation>
     </message>
@@ -28635,32 +28639,44 @@ if ui["pressed"] == "add":
         <translation type="vanished">Weg</translation>
     </message>
 </context>
+<context>
+    <name>Engine</name>
+    <message>
+        <source>Black &amp; White</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
 </TS>
 )";
         InterfaceDraftStats before = interfaceTranslationStatus(ts);
-        QCOMPARE(before.messages, 7);
+        QCOMPARE(before.messages, 9);
         QCOMPARE(before.finished, 1);
         QCOMPARE(before.existing, 0);
         std::vector<std::string> asked;
         auto fake = [&](const std::vector<std::string>& in, std::vector<std::string>& out) {
             asked = in;
-            out = {"Projekt öffnen.", "%1 nach %2 exportiert", "Verloren", "%1 ausgewählt."};
+            out = {"Projekt öffnen.", "% 1 nach% 2 exportiert", "Verloren", "%1 ausgewählt.", "Suchen &Ersetzen", "Schwarz & Weiß"};
             return true;
         };
         std::string out, err;
         InterfaceDraftStats st;
         QVERIFY2(draftInterfaceTranslation(ts, fake, out, &st, 0, &err), err.c_str());
-        // The mnemonic is taken off before translating; rich text and plurals are not sent.
-        QCOMPARE(asked, (std::vector<std::string>{"Open Project…", "Exported %1 to %2", "Lost %1", ", %1 selected "}));
-        QCOMPARE(st.drafted, 3);
+        // The mnemonic is taken off before translating (an engine name's "&" is a word); rich text and plurals are not
+        // sent.
+        QCOMPARE(asked, (std::vector<std::string>{"Open Project…", "Exported %1 to %2", "Lost %1", ", %1 selected ", "Search and Replace",
+                                                  "Black & White"}));
+        QCOMPARE(st.drafted, 5);
         QCOMPARE(st.skipped, 3);  // rich text, plural forms, and the draft that lost %1
         QVERIFY2(out.find("<translation type=\"unfinished\">&amp;Projekt öffnen…</translation>") != std::string::npos, out.c_str());
-        QVERIFY(out.find("<translation type=\"unfinished\">%1 nach %2 exportiert</translation>") != std::string::npos);
+        QVERIFY(out.find("<translation type=\"unfinished\">%1 nach %2 exportiert</translation>") != std::string::npos);  // (put together)
         QVERIFY(out.find("<translation type=\"unfinished\">, %1 ausgewählt </translation>") != std::string::npos);
         QVERIFY(out.find("<translation>Speichern</translation>") != std::string::npos);
+        QVERIFY2(out.find("<translation type=\"unfinished\">Schwarz &amp; Weiß</translation>") != std::string::npos, out.c_str());
+        // (an "&" the translation brought before a letter is a word, not a second mnemonic)
+        QVERIFY2(out.find("<translation type=\"unfinished\">Suchen &amp;&amp;Ersetzen</translation>") != std::string::npos, out.c_str());
         QVERIFY(out.find("Verloren") == std::string::npos);
         const InterfaceDraftStats after = interfaceTranslationStatus(out);
-        QCOMPARE(after.existing, 3);
+        QCOMPARE(after.existing, 5);
         QCOMPARE(after.finished, 1);
         // Drafting again changes nothing: drafts are not redone.
         std::string again;

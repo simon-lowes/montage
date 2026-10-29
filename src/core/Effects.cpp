@@ -1820,4 +1820,11 @@ const std::vector<std::string>& blendModes() {
     return modes;
 }
 
+std::string blendModeLabel(const std::string& mode) {
+    std::string label = mode;
+    std::replace(label.begin(), label.end(), '_', ' ');
+    if (!label.empty() && label[0] >= 'a' && label[0] <= 'z') label[0] = char(label[0] - 'a' + 'A');
+    return label;
+}
+
 }  // namespace montage

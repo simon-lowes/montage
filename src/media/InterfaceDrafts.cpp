@@ -62,6 +62,7 @@ std::string escape(const std::string& s) {
 
 // One <message> of the file: where its translation's element is, and what it holds.
 struct Message {
+    std::string context;
     std::string source;
     bool numerus = false;
     bool vanished = false;  // (obsolete: no longer in the source)
@@ -82,6 +83,10 @@ bool parse(const std::string& ts, std::vector<Message>& out, std::string* error)
             return false;
         }
         Message msg;
+        if (const size_t name = ts.rfind("<name>", m); name != std::string::npos) {
+            const size_t close = ts.find("</name>", name);
+            if (close != std::string::npos && close < m) msg.context = unescape(ts.substr(name + 6, close - name - 6));
+        }
         msg.numerus = ts.substr(m, tagEnd - m).find("numerus=\"yes\"") != std::string::npos;
         const size_t s0 = ts.find("<source>", tagEnd), s1 = ts.find("</source>", tagEnd);
         const size_t t0 = ts.find("<translation", tagEnd);
@@ -146,10 +151,11 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
     std::vector<Message> msgs;
     if (!parse(ts, msgs, error)) return false;
     InterfaceDraftStats st = interfaceTranslationStatus(ts);
-    // What goes to the translator: the text without its mnemonic, and with a literal ampersand as one.
+    // What goes to the translator: the text without its mnemonic, and with a literal ampersand as one. An ampersand is a
+    // menu's mnemonic only before a letter or digit and never in the engine's names ("Black & White").
     struct Job {
         size_t message;
-        bool mnemonic;
+        bool mnemonic, doubled;
     };
     std::vector<Job> jobs;
     std::vector<std::string> texts;
@@ -163,18 +169,19 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
         }
         if (limit > 0 && int(jobs.size()) >= limit) continue;
         QString plain;
-        bool mnemonic = false;
+        bool mnemonic = false, doubled = false;
         for (qsizetype k = 0; k < src.size(); ++k) {
             if (src[k] == '&' && k + 1 < src.size() && src[k + 1] == '&') {
                 plain += '&';
+                doubled = true;
                 ++k;
-            } else if (src[k] == '&') {
+            } else if (src[k] == '&' && m.context != "Engine" && k + 1 < src.size() && src[k + 1].isLetterOrNumber()) {
                 mnemonic = true;
             } else {
                 plain += src[k];
             }
         }
-        jobs.push_back({i, mnemonic});
+        jobs.push_back({i, mnemonic, doubled});
         texts.push_back(plain.toStdString());
     }
     std::vector<std::string> drafts;
@@ -188,6 +195,15 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
         const Message& m = msgs[jobs[j].message];
         const QString src = QString::fromStdString(m.source);
         QString d = QString::fromStdString(drafts[j]).trimmed();
+        if (placeholders(d) != placeholders(src)) {
+            // Some models space a placeholder out ("Удалить% 1"): put it back together, after a space as in English.
+            static const QRegularExpression spaced(QStringLiteral("%\\s+(L?\\d+|n)\\b"));
+            for (auto hit = spaced.match(d); hit.hasMatch(); hit = spaced.match(d, hit.capturedStart() + 1)) {
+                const qsizetype at = hit.capturedStart();
+                const bool joined = at > 0 && !d[at - 1].isSpace() && !QStringLiteral("([«\"'„“").contains(d[at - 1]);
+                d.replace(at, hit.capturedLength(), (joined ? QStringLiteral(" %") : QStringLiteral("%")) + hit.captured(1));
+            }
+        }
         if (d.isEmpty() || placeholders(d) != placeholders(src)) {
             ++st.skipped;
             continue;
@@ -205,7 +221,12 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
                 d += end;
             }
         if (!core.endsWith('.') && d.endsWith('.') && !d.endsWith(QStringLiteral("..."))) d.chop(1);
-        d.replace('&', QStringLiteral("&&"));
+        // An ampersand the translation brought ("Suchen & Ersetzen") is a word, not a mnemonic, so before a letter it is
+        // doubled; in the engine's names it is always shown as it is.
+        if (jobs[j].doubled) d.replace('&', QStringLiteral("&&"));
+        else if (m.context != "Engine")
+            for (qsizetype k = d.size() - 2; k >= 0; --k)
+                if (d[k] == '&' && d[k + 1].isLetterOrNumber() && (k == 0 || d[k - 1] != '&')) d.insert(k, '&');
         if (jobs[j].mnemonic) {
             const auto letter = std::find_if(d.begin(), d.end(), [](QChar c) { return c.isLetter(); });
             if (letter != d.end()) d.insert(letter - d.begin(), '&');
@@ -242,6 +263,7 @@ std::vector<std::string> engineInterfaceTexts() {
             if (sp.kind == StringKind::Track && !sp.choices.empty()) add(sp.choices.front());
         }
     }
+    for (const std::string& m : blendModes()) add(blendModeLabel(m));
     for (const TitleTemplate& t : titleTemplates()) add(t.name);
     for (const HdrZone& z : hdrZones()) add(z.label);
     for (const HueVector& v : colorSliceVectors()) add(v.label);

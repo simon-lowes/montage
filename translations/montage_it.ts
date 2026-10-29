@@ -586,7 +586,7 @@
     </message>
     <message>
         <source>Black &amp; White</source>
-        <translation type="unfinished">&amp;Bianco nero</translation>
+        <translation type="unfinished">Bianco e nero</translation>
     </message>
     <message>
         <source>Black B</source>
@@ -722,7 +722,7 @@
     </message>
     <message>
         <source>Blur &amp; Sharpen</source>
-        <translation type="unfinished">&amp;Sfocatura affilata</translation>
+        <translation type="unfinished">Sfocatura e nitidezza</translation>
     </message>
     <message>
         <source>Blur (px)</source>
@@ -3622,7 +3622,7 @@
     </message>
     <message>
         <source>Position &amp; Scale</source>
-        <translation type="unfinished">&amp;Scala posizione</translation>
+        <translation type="unfinished">Posizione &amp; scala</translation>
     </message>
     <message>
         <source>Position X</source>
@@ -3646,7 +3646,7 @@
     </message>
     <message>
         <source>Position, Scale &amp; Rotation</source>
-        <translation type="unfinished">&amp;Posizione, rotazione scala</translation>
+        <translation type="unfinished">Posizione, scala e rotazione</translation>
     </message>
     <message>
         <source>Position, Scale and Rotation</source>
@@ -5355,6 +5355,54 @@
     <message>
         <source>sRGB</source>
         <translation type="unfinished">sRGB</translation>
+    </message>
+    <message>
+        <source>Add</source>
+        <translation type="unfinished">Aggiungi</translation>
+    </message>
+    <message>
+        <source>Color burn</source>
+        <translation type="unfinished">Masterizza colore</translation>
+    </message>
+    <message>
+        <source>Color dodge</source>
+        <translation type="unfinished">Dodge colore</translation>
+    </message>
+    <message>
+        <source>Darken</source>
+        <translation type="unfinished">Ascurità</translation>
+    </message>
+    <message>
+        <source>Difference</source>
+        <translation type="unfinished">Variazione</translation>
+    </message>
+    <message>
+        <source>Hard light</source>
+        <translation type="unfinished">Luce dura</translation>
+    </message>
+    <message>
+        <source>Lighten</source>
+        <translation type="unfinished">Luminosità</translation>
+    </message>
+    <message>
+        <source>Multiply</source>
+        <translation type="unfinished">Moltiplica</translation>
+    </message>
+    <message>
+        <source>Overlay</source>
+        <translation type="unfinished">Sovrapporre</translation>
+    </message>
+    <message>
+        <source>Screen</source>
+        <translation type="unfinished">Schermo</translation>
+    </message>
+    <message>
+        <source>Soft light</source>
+        <translation type="unfinished">Luce morbida</translation>
+    </message>
+    <message>
+        <source>Subtract</source>
+        <translation type="unfinished">Sottrai</translation>
     </message>
 </context>
 <context>
@@ -9520,7 +9568,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Generators &amp; Titles</source>
-        <translation type="unfinished">&amp;Titoli dei generatori</translation>
+        <translation type="unfinished">Generatori e titoli</translation>
     </message>
     <message>
         <source>Other</source>
@@ -11115,11 +11163,11 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Position &amp; Scale</source>
-        <translation type="unfinished">&amp;Scala posizione</translation>
+        <translation type="unfinished">Posizione &amp; scala</translation>
     </message>
     <message>
         <source>Position, Scale &amp; Rotation</source>
-        <translation type="unfinished">&amp;Posizione, rotazione scala</translation>
+        <translation type="unfinished">Posizione, scala e rotazione</translation>
     </message>
     <message>
         <source>How much around the point to follow</source>
@@ -27228,16 +27276,16 @@ so the jump in the picture morphs across instead of cutting</source>
 <context>
     <name>montage::language</name>
     <message>
-        <source>%1 (%2 % checked, the rest machine drafts)</source>
-        <translation type="unfinished">%1 (%2 % spuntato, le altre bozze della macchina)</translation>
-    </message>
-    <message>
         <source>%1 (%2 % translated)</source>
         <translation type="unfinished">%1 (%2 % tradotto)</translation>
     </message>
     <message>
         <source>Test Language (Finds Untranslated Text)</source>
         <translation type="unfinished">Linguaggio di prova (Trova testo non tradotto)</translation>
+    </message>
+    <message>
+        <source>%1 (%2 % checked, %3 % machine drafts)</source>
+        <translation type="unfinished">%1 (%2 % spuntato, %3 % bozze di macchina)</translation>
     </message>
 </context>
 </TS>

@@ -46,7 +46,8 @@ std::vector<Language> available() {
 QString Language::label() const {
     if (texts <= 0 || finished >= texts) return name;
     const int checked = int(std::floor(100.0 * finished / texts));
-    return drafts > 0 ? QCoreApplication::translate("montage::language", "%1 (%2 % checked, the rest machine drafts)").arg(name).arg(checked)
+    const int drafted = int(std::floor(100.0 * drafts / texts));
+    return drafts > 0 ? QCoreApplication::translate("montage::language", "%1 (%2 % checked, %3 % machine drafts)").arg(name).arg(checked).arg(drafted)
                       : QCoreApplication::translate("montage::language", "%1 (%2 % translated)").arg(name).arg(checked);
 }
 
@@ -76,7 +77,8 @@ QString resolve(const QString& choice) {
     for (const Language& l : available())
         if (l.texts > 0 && l.finished * 2 >= l.texts) ready << l.code;
     for (QString ui : QLocale::system().uiLanguages()) {
-        ui.replace('-', '_');
+        // ("zh-Hans-CN" as Qt names it: zh_CN)
+        ui = QLocale(ui).name();
         if (ui.startsWith(QLatin1String("en"))) return QStringLiteral("en");
         if (ready.contains(ui)) return ui;
         if (const QString lang = ui.section('_', 0, 0); ready.contains(lang)) return lang;

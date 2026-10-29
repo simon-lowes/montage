@@ -89,6 +89,7 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <utility>
 #include <tuple>
 
 #include "AudioMeterWidget.h"
@@ -876,8 +877,88 @@ void MainWindow::setSideCorner(Qt::Corner corner, Qt::DockWidgetArea area) {
 void MainWindow::changeEvent(QEvent* e) {
     QMainWindow::changeEvent(e);
     // The language's direction changed under a built window (only the tests do so; a language is chosen for the next
-    // start): the workspace is laid out again the other way round.
-    if (e->type() == QEvent::LayoutDirectionChange && !docks_.empty() && isVisible()) resetLayout();
+    // start): the panels as they are, the other way round.
+    if (e->type() == QEvent::LayoutDirectionChange && !docks_.empty() && isVisible()) mirrorDocks();
+}
+
+void MainWindow::mirrorDocks() {
+    // Each side's panels move to the other, in the same order top to bottom and tabbed as they were; those above and
+    // below the timeline run the other way; the corners swap.
+    using Group = std::vector<QDockWidget*>;
+    auto groupsIn = [&](Qt::DockWidgetArea area) {
+        std::vector<Group> groups;
+        std::set<QDockWidget*> seen;
+        for (QDockWidget* d : docks_) {
+            if (seen.count(d) || d->isFloating() || dockWidgetArea(d) != area || !d->toggleViewAction()->isChecked()) continue;
+            Group g{d};
+            seen.insert(d);
+            for (QDockWidget* t : tabifiedDockWidgets(d))
+                if (!seen.count(t) && t->toggleViewAction()->isChecked()) g.push_back(t), seen.insert(t);
+            std::stable_partition(g.begin(), g.end(), [](QDockWidget* x) { return x->isVisible(); });  // the one in front first
+            groups.push_back(std::move(g));
+        }
+        const bool across = area == Qt::TopDockWidgetArea || area == Qt::BottomDockWidgetArea;
+        std::sort(groups.begin(), groups.end(), [&](const Group& a, const Group& b) {
+            return across ? a[0]->x() > b[0]->x() : a[0]->y() < b[0]->y();
+        });
+        return groups;
+    };
+    const Qt::DockWidgetArea areas[] = {Qt::LeftDockWidgetArea, Qt::RightDockWidgetArea, Qt::TopDockWidgetArea, Qt::BottomDockWidgetArea};
+    std::vector<std::vector<Group>> found;
+    for (Qt::DockWidgetArea a : areas) found.push_back(groupsIn(a));
+    // (and their sizes, which taking them out loses; closed panels move too, to open on the side they now belong)
+    QList<QDockWidget*> sized;
+    QList<int> widths, heights;
+    for (const auto& groups : found)
+        for (const Group& g : groups) {
+            sized << g[0];
+            widths << g[0]->width();
+            heights << g[0]->height();
+        }
+    std::vector<std::pair<QDockWidget*, Qt::DockWidgetArea>> closed;
+    for (QDockWidget* d : docks_)
+        if (!d->isFloating() && !d->toggleViewAction()->isChecked() && dockWidgetArea(d) != Qt::NoDockWidgetArea)
+            closed.emplace_back(d, dockWidgetArea(d));
+    for (const auto& groups : found)
+        for (const Group& g : groups)
+            for (QDockWidget* d : g) removeDockWidget(d);
+    for (const auto& [d, area] : closed) removeDockWidget(d);
+    auto swapped = [](Qt::DockWidgetArea a) {
+        return a == Qt::LeftDockWidgetArea ? Qt::RightDockWidgetArea : a == Qt::RightDockWidgetArea ? Qt::LeftDockWidgetArea : a;
+    };
+    const Qt::DockWidgetArea tl = corner(Qt::TopLeftCorner), tr = corner(Qt::TopRightCorner), bl = corner(Qt::BottomLeftCorner),
+                             br = corner(Qt::BottomRightCorner);
+    setCorner(Qt::TopLeftCorner, swapped(tr));
+    setCorner(Qt::TopRightCorner, swapped(tl));
+    setCorner(Qt::BottomLeftCorner, swapped(br));
+    setCorner(Qt::BottomRightCorner, swapped(bl));
+    for (size_t i = 0; i < found.size(); ++i) {
+        const Qt::DockWidgetArea area = swapped(areas[i]);
+        const Qt::Orientation split = i < 2 ? Qt::Vertical : Qt::Horizontal;
+        QDockWidget* prev = nullptr;
+        for (const Group& g : found[i]) {
+            if (prev) splitDockWidget(prev, g[0], split);
+            else addDockWidget(area, g[0]);
+            prev = g[0];
+        }
+        for (const Group& g : found[i]) {
+            for (size_t k = 1; k < g.size(); ++k) tabifyDockWidget(g[0], g[k]);
+            for (QDockWidget* d : g) d->show();
+            g[0]->raise();
+        }
+    }
+    for (const auto& [d, area] : closed) {
+        addDockWidget(swapped(area), d);
+        d->hide();
+    }
+    resizeDocks(sized, widths, Qt::Horizontal);
+    resizeDocks(sized, heights, Qt::Vertical);
+}
+
+void MainWindow::showEvent(QShowEvent* e) {
+    QMainWindow::showEvent(e);
+    // A layout saved the other way round is mirrored once Qt has laid it out (restoreState waits for the window).
+    if (std::exchange(mirrorWhenShown_, false)) mirrorDocks();
 }
 
 void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom) {
@@ -890,7 +971,9 @@ void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, con
     setSideCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
     setSideCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
     std::vector<QDockWidget*> placed;
-    auto place = [&](Qt::DockWidgetArea area, const DockGroups& groups, Qt::Orientation split) {
+    auto place = [&](Qt::DockWidgetArea area, DockGroups groups, Qt::Orientation split) {
+        // (side by side: from the right in a language written right to left)
+        if (split == Qt::Horizontal && isRightToLeft()) std::reverse(groups.begin(), groups.end());
         // Split before tabbing: a split beside a tabbed panel only adds another tab.
         QDockWidget* prev = nullptr;
         for (const auto& g : groups) {
@@ -1036,6 +1119,7 @@ bool MainWindow::applyWorkspace(const QString& name) {
         QSettings s = appSettings();
         const QByteArray layout = s.value(QStringLiteral("workspaces/") + name).toByteArray();
         if (name.isEmpty() || layout.isEmpty() || !restoreState(layout, 1)) return false;
+        if (s.value(QStringLiteral("workspaceDirections/") + name, false).toBool() != isRightToLeft()) mirrorDocks();  // (saved the other way round)
     }
     workspace_ = name;
     appSettings().setValue(QStringLiteral("window/workspace"), name);
@@ -1049,6 +1133,7 @@ bool MainWindow::saveWorkspace(const QString& name) {
     {
         QSettings s = appSettings();
         s.setValue(QStringLiteral("workspaces/") + n, saveState(1));
+        s.setValue(QStringLiteral("workspaceDirections/") + n, isRightToLeft());
     }
     workspace_ = n;
     appSettings().setValue(QStringLiteral("window/workspace"), n);
@@ -1061,6 +1146,7 @@ bool MainWindow::deleteWorkspace(const QString& name) {
     {
         QSettings s = appSettings();
         s.remove(QStringLiteral("workspaces/") + name);
+        s.remove(QStringLiteral("workspaceDirections/") + name);
     }
     if (workspace_ == name) workspace_ = QStringLiteral("Editing");  // the panels stay where they are
     syncWorkspaceUi();
@@ -1101,12 +1187,12 @@ void MainWindow::syncWorkspaceUi() {
 void MainWindow::restoreLayout() {
     QSettings s = appSettings();
     if (s.contains("window/geometry")) restoreGeometry(s.value("window/geometry").toByteArray());
-    // Left as it was, unless the language now reads the other way: then the workspace is laid out afresh, mirrored.
-    const bool sameWay = s.value("window/rightToLeft", false).toBool() == isRightToLeft();
-    if (s.contains("window/state") && sameWay) restoreState(s.value("window/state").toByteArray(), 1);
+    // Left as it was (mirrored when the language now reads the other way).
+    if (s.contains("window/state") && restoreState(s.value("window/state").toByteArray(), 1) &&
+        s.value("window/rightToLeft", false).toBool() != isRightToLeft())
+        mirrorWhenShown_ = true;
     const QString ws = s.value("window/workspace").toString();
     if (workspaces().contains(ws)) workspace_ = ws;  // laid out as it was left, by the state above
-    if (!sameWay) resetLayout();
     syncWorkspaceUi();
 }
 
@@ -1132,13 +1218,25 @@ void MainWindow::applyHdrViewer() {
 }
 
 void MainWindow::buildMenus() {
-    auto add = [this](QMenu* menu, const QString& text, const QKeySequence& key, auto fn) {
-        QAction* a = menu->addAction(text);
+    // Menus and commands are made from their names as written (QT_TR_NOOP), which name them for shortcuts in every
+    // language; they show translated.
+    auto menuIn = [](auto* parent, const char* title) {
+        QMenu* m = parent->addMenu(tr(title));
+        m->setProperty("sourceTitle", QString::fromUtf8(title));
+        return m;
+    };
+    struct Name {
+        Name(const char* text) : shown(tr(text)), source(QString::fromUtf8(text)) {}
+        Name(QString shown, QString source) : shown(std::move(shown)), source(std::move(source)) {}
+        QString shown, source;
+    };
+    auto add = [this](QMenu* menu, const Name& text, const QKeySequence& key, auto fn) {
+        QAction* a = menu->addAction(text.shown);
         if (!key.isEmpty()) a->setShortcut(key);
         a->setShortcutContext(Qt::WindowShortcut);
         connect(a, &QAction::triggered, this, fn);
         addAction(a);  // keep shortcuts alive even when menus are hidden
-        keymap::registerAction(a, menu->title(), text);  // its key can be changed (Keyboard Shortcuts)
+        keymap::registerAction(a, menu->property("sourceTitle").toString(), text.source);  // its key can be changed (Keyboard Shortcuts)
         return a;
     };
     auto withSeq = [this](auto fn) {
@@ -1148,42 +1246,42 @@ void MainWindow::buildMenus() {
     };
 
     // ---- File
-    QMenu* file = menuBar()->addMenu(tr("&File"));
-    add(file, tr("&New Project"), QKeySequence::New, [this] { newProject(); });
-    add(file, tr("&Open Project…"), QKeySequence::Open, [this] { openDialog(); });
-    recentMenu_ = file->addMenu(tr("Open &Recent"));
+    QMenu* file = menuIn(menuBar(), QT_TR_NOOP("&File"));
+    add(file, QT_TR_NOOP("&New Project"), QKeySequence::New, [this] { newProject(); });
+    add(file, QT_TR_NOOP("&Open Project…"), QKeySequence::Open, [this] { openDialog(); });
+    recentMenu_ = menuIn(file, QT_TR_NOOP("Open &Recent"));
     rebuildRecentMenu();
-    add(file, tr("&Save"), QKeySequence::Save, [this] { save(); });
-    add(file, tr("Save &As…"), QKeySequence("Ctrl+Shift+S"), [this] { saveAs(); });
-    add(file, tr("Open Auto-Save S&napshot…"), QKeySequence(), [this] { openSnapshot(); });
+    add(file, QT_TR_NOOP("&Save"), QKeySequence::Save, [this] { save(); });
+    add(file, QT_TR_NOOP("Save &As…"), QKeySequence("Ctrl+Shift+S"), [this] { saveAs(); });
+    add(file, QT_TR_NOOP("Open Auto-Save S&napshot…"), QKeySequence(), [this] { openSnapshot(); });
     file->addSeparator();
-    add(file, tr("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
-    add(file, tr("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
-    add(file, tr("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
-    add(file, tr("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
-    add(file, tr("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
-    add(file, tr("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
-    add(file, tr("Export &DCP (Digital Cinema)…"), QKeySequence(), [this] { exportDcpDialog(); })->setObjectName(QStringLiteral("exportDcp"));
-    add(file, tr("Make &KDMs…"), QKeySequence(), [this] { makeKdmsDialog(); })->setObjectName(QStringLiteral("makeKdms"));
-    add(file, tr("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
-    add(file, tr("Export Immersive Master (&ADM BWF)…"), QKeySequence(), [this] { exportAdmDialog(); })
+    add(file, QT_TR_NOOP("&Import Media…"), QKeySequence("Ctrl+I"), [this] { bin_->importDialog(); });
+    add(file, QT_TR_NOOP("Import Image Sequence…"), QKeySequence(), [this] { bin_->importImageSequenceDialog(); })->setObjectName(QStringLiteral("importImageSequence"));
+    add(file, QT_TR_NOOP("Watch Folders…"), QKeySequence(), [this] { watchFoldersDialog(); })->setObjectName(QStringLiteral("watchFolders"));
+    add(file, QT_TR_NOOP("&Export Media…"), QKeySequence("Ctrl+M"), [this] { exportMedia(); });
+    add(file, QT_TR_NOOP("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
+    add(file, QT_TR_NOOP("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
+    add(file, QT_TR_NOOP("Export &DCP (Digital Cinema)…"), QKeySequence(), [this] { exportDcpDialog(); })->setObjectName(QStringLiteral("exportDcp"));
+    add(file, QT_TR_NOOP("Make &KDMs…"), QKeySequence(), [this] { makeKdmsDialog(); })->setObjectName(QStringLiteral("makeKdms"));
+    add(file, QT_TR_NOOP("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
+    add(file, QT_TR_NOOP("Export Immersive Master (&ADM BWF)…"), QKeySequence(), [this] { exportAdmDialog(); })
         ->setObjectName(QStringLiteral("exportAdm"));
-    add(file, tr("Export Immersive Audio (&IAMF)…"), QKeySequence(), [this] { exportIamfDialog(); })
+    add(file, QT_TR_NOOP("Export Immersive Audio (&IAMF)…"), QKeySequence(), [this] { exportIamfDialog(); })
         ->setObjectName(QStringLiteral("exportIamf"));
-    add(file, tr("Watch Remote Review…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Watch Remote Review…"), QKeySequence(), [this] {
         auto* w = new ReviewViewerWindow(this);
         w->show();
     })->setObjectName(QStringLiteral("watchRemoteReview"));
-    add(file, tr("Import Review Notes…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Import Review Notes…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Review Notes"), appSettings().value(QStringLiteral("export/lastDirectory")).toString(),
                                                           tr("Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)"));
         if (!path.isEmpty()) importMarkers(path);
     })->setObjectName(QStringLiteral("importReviewNotes"));
-    add(file, tr("Project &Manager…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Project &Manager…"), QKeySequence(), [this] {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
-    add(file, tr("Save a Copy for Another Editor…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Save a Copy for Another Editor…"), QKeySequence(), [this] {
         QString path = QFileDialog::getSaveFileName(this, tr("Save a Copy for Another Editor"),
                                                     appSettings().value("lastProjectDir").toString() + "/" +
                                                         QString::fromStdString(state_->project().name) + " copy.montage",
@@ -1192,10 +1290,10 @@ void MainWindow::buildMenus() {
         if (!path.endsWith(".montage")) path += ".montage";
         saveCopyForAnotherEditor(path);
     })->setObjectName(QStringLiteral("saveCopyForEditor"));
-    add(file, tr("Mer&ge Project…"), QKeySequence(), [this] { mergeProjectDialog(); })->setObjectName(QStringLiteral("mergeProject"));
+    add(file, QT_TR_NOOP("Mer&ge Project…"), QKeySequence(), [this] { mergeProjectDialog(); })->setObjectName(QStringLiteral("mergeProject"));
     {
-        QMenu* prod = file->addMenu(tr("Productio&n"));
-        add(prod, tr("&New Production…"), QKeySequence(), [this] {
+        QMenu* prod = menuIn(file, QT_TR_NOOP("Productio&n"));
+        add(prod, QT_TR_NOOP("&New Production…"), QKeySequence(), [this] {
             const QString folder = QFileDialog::getExistingDirectory(this, tr("New Production: Choose or Make Its Folder (on the Shared Drive)"),
                                                                      appSettings().value("lastProjectDir").toString());
             if (folder.isEmpty()) return;
@@ -1203,7 +1301,7 @@ void MainWindow::buildMenus() {
             const QString name = QInputDialog::getText(this, tr("New Production"), tr("Name:"), QLineEdit::Normal, QDir(folder).dirName(), &ok);
             if (ok) openProduction(folder, true, name);
         })->setObjectName(QStringLiteral("newProduction"));
-        add(prod, tr("&Open Production…"), QKeySequence(), [this] {
+        add(prod, QT_TR_NOOP("&Open Production…"), QKeySequence(), [this] {
             const QString folder = QFileDialog::getExistingDirectory(this, tr("Open Production"), appSettings().value("lastProjectDir").toString());
             if (folder.isEmpty()) return;
             if (!isProduction(folder.toStdString()) &&
@@ -1212,8 +1310,8 @@ void MainWindow::buildMenus() {
                 return;
             openProduction(folder, true);
         })->setObjectName(QStringLiteral("openProduction"));
-        add(prod, tr("&Import from Project…"), QKeySequence(), [this] { importFromProjectDialog(); })->setObjectName(QStringLiteral("importFromProject"));
-        takeEdit_ = add(file, tr("&Edit Project (Take the Lock)"), QKeySequence(), [this] { takeEditInteractive(); });
+        add(prod, QT_TR_NOOP("&Import from Project…"), QKeySequence(), [this] { importFromProjectDialog(); })->setObjectName(QStringLiteral("importFromProject"));
+        takeEdit_ = add(file, QT_TR_NOOP("&Edit Project (Take the Lock)"), QKeySequence(), [this] { takeEditInteractive(); });
         takeEdit_->setObjectName(QStringLiteral("takeEdit"));
         takeEdit_->setEnabled(false);
         connect(state_, &EditorState::lockStateChanged, this, [this] {
@@ -1221,17 +1319,17 @@ void MainWindow::buildMenus() {
             takeEdit_->setEnabled(state_->canTakeEdit());
         });
     }
-    add(file, tr("&Capture…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("&Capture…"), QKeySequence(), [this] {
         CaptureDialog* d = captureDialog();
         d->show();
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
-    add(file, tr("&Offload Card…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("offloadCard"));
-    add(file, tr("Verify Media &Hash List…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Verify Media &Hash List…"), QKeySequence(), [this] {
         const QString folder = QFileDialog::getExistingDirectory(this, tr("Verify a Folder Against Its ASC MHL Hash List"));
         if (folder.isEmpty()) return;
         QString report;
@@ -1244,36 +1342,36 @@ void MainWindow::buildMenus() {
             QMessageBox::information(this, tr("Verify Media Hash List"), report);
         }
     })->setObjectName(QStringLiteral("verifyMhl"));
-    add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
-    add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
-    add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
-    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF, bin)…"), QKeySequence(), [this] { importTimeline(); });
-    add(file, tr("Import IMF &Package…"), QKeySequence(), [this] { importImfPackage(); })->setObjectName(QStringLiteral("importImf"));
-    add(file, tr("Import Media Composer &Bin…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
+    add(file, QT_TR_NOOP("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
+    add(file, QT_TR_NOOP("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
+    add(file, QT_TR_NOOP("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF, bin)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, QT_TR_NOOP("Import IMF &Package…"), QKeySequence(), [this] { importImfPackage(); })->setObjectName(QStringLiteral("importImf"));
+    add(file, QT_TR_NOOP("Import Media Composer &Bin…"), QKeySequence(), [this] {
         QSettings st = appSettings();
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Media Composer Bin"), st.value("lastImportTimelineDir").toString(),
                                                           tr("Media Composer bins (*.avb)"));
         if (!path.isEmpty()) importTimelineFrom(path);
     })->setObjectName(QStringLiteral("importAvidBin"));
-    add(file, tr("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import ALE"), QString(), tr("Avid Log Exchange (*.ale *.ALE);;All files (*)"));
         if (!path.isEmpty()) importAle(path);
     })->setObjectName(QStringLiteral("importAle"));
-    add(file, tr("Export ALE…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Export ALE…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export ALE"), QString(), tr("Avid Log Exchange (*.ale)"));
         if (!path.isEmpty()) exportAle(path.endsWith(QLatin1String(".ale"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".ale"));
     })->setObjectName(QStringLiteral("exportAle"));
-    add(file, tr("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
-    add(file, tr("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
-    add(file, tr("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
-    add(file, tr("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
-    add(file, tr("Export &AAF (Pro Tools, Fairlight, Media Composer)…"), QKeySequence(), [this] { exportAafDialog(); })
+    add(file, QT_TR_NOOP("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
+    add(file, QT_TR_NOOP("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
+    add(file, QT_TR_NOOP("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
+    add(file, QT_TR_NOOP("Export &OpenTimelineIO…"), QKeySequence(), [this] { exportInterchange(Interchange::Otio); });
+    add(file, QT_TR_NOOP("Export &AAF (Pro Tools, Fairlight, Media Composer)…"), QKeySequence(), [this] { exportAafDialog(); })
         ->setObjectName(QStringLiteral("exportAaf"));
-    add(file, tr("Export AAF, Sound Only (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(false); })
+    add(file, QT_TR_NOOP("Export AAF, Sound Only (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(false); })
         ->setObjectName(QStringLiteral("exportAafSound"));
-    add(file, tr("Export AAF with Media (Media Composer)…"), QKeySequence(), [this] { exportAafWithMediaDialog(); })
+    add(file, QT_TR_NOOP("Export AAF with Media (Media Composer)…"), QKeySequence(), [this] { exportAafWithMediaDialog(); })
         ->setObjectName(QStringLiteral("exportAafAvid"));
-    add(file, tr("Export Film &Lists…"), QKeySequence(), [this] {
+    add(file, QT_TR_NOOP("Export Film &Lists…"), QKeySequence(), [this] {
         // Cut, optical, dupe and pull lists, and (from an earlier version picked here) the change list.
         const Sequence* now = state_->sequence();
         if (!now) return;
@@ -1302,63 +1400,63 @@ void MainWindow::buildMenus() {
         exportFilmLists(path, ids[size_t(std::max<qsizetype>(0, names.indexOf(pick)))]);
     })->setObjectName(QStringLiteral("exportFilmLists"));
     {
-        QMenu* paperwork = file->addMenu(tr("Export Pape&rwork"));
+        QMenu* paperwork = menuIn(file, QT_TR_NOOP("Export Pape&rwork"));
         paperwork->setObjectName(QStringLiteral("exportPaperworkMenu"));
-        const std::vector<std::pair<QString, QString>> lists{{QStringLiteral("cue_sheet"), tr("&Music Cue Sheet…")},
-                                                             {QStringLiteral("dialogue_list"), tr("&Dialogue List…")},
-                                                             {QStringLiteral("as_broadcast"), tr("&As-Broadcast Script…")},
-                                                             {QStringLiteral("ccsl"), tr("&CCSL (Continuity and Spotting List)…")}};
+        const std::vector<std::pair<QString, const char*>> lists{{QStringLiteral("cue_sheet"), QT_TR_NOOP("&Music Cue Sheet…")},
+                                                                {QStringLiteral("dialogue_list"), QT_TR_NOOP("&Dialogue List…")},
+                                                                {QStringLiteral("as_broadcast"), QT_TR_NOOP("&As-Broadcast Script…")},
+                                                                {QStringLiteral("ccsl"), QT_TR_NOOP("&CCSL (Continuity and Spotting List)…")}};
         for (const auto& [id, label] : lists)
             add(paperwork, label, QKeySequence(), [this, id] { exportPaperworkDialog(id); })
                 ->setObjectName(QStringLiteral("exportPaperwork_") + id);
     }
     file->addSeparator();
-    add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
+    add(file, QT_TR_NOOP("&Quit"), QKeySequence::Quit, [this] { close(); });
 
     // ---- Edit
-    QMenu* editM = menuBar()->addMenu(tr("&Edit"));
-    undo_ = add(editM, tr("&Undo"), QKeySequence::Undo, [this] { state_->undo(); });
-    redo_ = add(editM, tr("&Redo"), QKeySequence("Ctrl+Shift+Z"), [this] { state_->redo(); });
+    QMenu* editM = menuIn(menuBar(), QT_TR_NOOP("&Edit"));
+    undo_ = add(editM, QT_TR_NOOP("&Undo"), QKeySequence::Undo, [this] { state_->undo(); });
+    redo_ = add(editM, QT_TR_NOOP("&Redo"), QKeySequence("Ctrl+Shift+Z"), [this] { state_->redo(); });
     redo_->setShortcuts({QKeySequence("Ctrl+Shift+Z"), QKeySequence("Ctrl+Y")});
     editM->addSeparator();
-    QAction* cut = add(editM, tr("Cu&t"), QKeySequence::Cut, [this] { copySelection(true); });
-    QAction* copy = add(editM, tr("&Copy"), QKeySequence::Copy, [this] { copySelection(false); });
-    QAction* pasteA = add(editM, tr("&Paste"), QKeySequence::Paste, [this] { paste(false); });
-    add(editM, tr("Paste &Insert"), QKeySequence("Ctrl+Shift+V"), [this] { paste(true); });
-    add(editM, tr("Paste A&ttributes…"), QKeySequence("Ctrl+Alt+V"), [this] {
+    QAction* cut = add(editM, QT_TR_NOOP("Cu&t"), QKeySequence::Cut, [this] { copySelection(true); });
+    QAction* copy = add(editM, QT_TR_NOOP("&Copy"), QKeySequence::Copy, [this] { copySelection(false); });
+    QAction* pasteA = add(editM, QT_TR_NOOP("&Paste"), QKeySequence::Paste, [this] { paste(false); });
+    add(editM, QT_TR_NOOP("Paste &Insert"), QKeySequence("Ctrl+Shift+V"), [this] { paste(true); });
+    add(editM, QT_TR_NOOP("Paste A&ttributes…"), QKeySequence("Ctrl+Alt+V"), [this] {
         if (const unsigned what = askAttributes(tr("Paste Attributes"), false)) pasteAttributes(what);
     })->setObjectName(QStringLiteral("pasteAttributes"));
-    add(editM, tr("Remove Attributes…"), QKeySequence(), [this] {
+    add(editM, QT_TR_NOOP("Remove Attributes…"), QKeySequence(), [this] {
         if (const unsigned what = askAttributes(tr("Remove Attributes"), true)) removeAttributes(what);
     })->setObjectName(QStringLiteral("removeAttributes"));
-    QAction* dup = add(editM, tr("D&uplicate"), QKeySequence("Ctrl+Alt+D"), [this] {
+    QAction* dup = add(editM, QT_TR_NOOP("D&uplicate"), QKeySequence("Ctrl+Alt+D"), [this] {
         auto sel = state_->selectedClips();
         FrameTime at = state_->playhead();
         state_->apply(tr("Duplicate"), [sel, at](Project& p, Sequence& s) { return edit::duplicateClips(p, s, sel, at); });
     });
     editM->addSeparator();
-    QAction* del = add(editM, tr("&Delete (Lift)"), QKeySequence::Delete, [this] { deleteSelection(false); });
+    QAction* del = add(editM, QT_TR_NOOP("&Delete (Lift)"), QKeySequence::Delete, [this] { deleteSelection(false); });
     del->setShortcuts({QKeySequence::Delete, QKeySequence(Qt::Key_Backspace)});
-    QAction* rdel = add(editM, tr("&Ripple Delete"), QKeySequence("Shift+Delete"), [this] { deleteSelection(true); });
+    QAction* rdel = add(editM, QT_TR_NOOP("&Ripple Delete"), QKeySequence("Shift+Delete"), [this] { deleteSelection(true); });
     rdel->setShortcuts({QKeySequence("Shift+Delete"), QKeySequence("Shift+Backspace")});
-    add(editM, tr("Delete &Gaps"), QKeySequence(), [this] { deleteGaps(); })->setObjectName(QStringLiteral("deleteGaps"));
+    add(editM, QT_TR_NOOP("Delete &Gaps"), QKeySequence(), [this] { deleteGaps(); })->setObjectName(QStringLiteral("deleteGaps"));
     editM->addSeparator();
-    add(editM, tr("Select &All"), QKeySequence::SelectAll, withSeq([this] {
+    add(editM, QT_TR_NOOP("Select &All"), QKeySequence::SelectAll, withSeq([this] {
             std::vector<Id> all;
             for (TrackRef r : allTracks(*state_->sequence()))
                 for (const auto& c : trackAt(*state_->sequence(), r)->clips) all.push_back(c.id);
             state_->setSelection(all, false);
         }));
-    add(editM, tr("Dese&lect All"), QKeySequence("Ctrl+Shift+A"), [this] { state_->clearSelection(); });
-    QAction* link = add(editM, tr("&Link"), QKeySequence("Ctrl+L"), [this] {
+    add(editM, QT_TR_NOOP("Dese&lect All"), QKeySequence("Ctrl+Shift+A"), [this] { state_->clearSelection(); });
+    QAction* link = add(editM, QT_TR_NOOP("&Link"), QKeySequence("Ctrl+L"), [this] {
         auto sel = state_->selectedClips();
         state_->apply(tr("Link"), [sel](Project& p, Sequence& s) { return edit::linkClips(p, s, sel); });
     });
-    QAction* unlink = add(editM, tr("U&nlink"), QKeySequence("Ctrl+Shift+L"), [this] {
+    QAction* unlink = add(editM, QT_TR_NOOP("U&nlink"), QKeySequence("Ctrl+Shift+L"), [this] {
         auto sel = state_->selectedClips();
         state_->apply(tr("Unlink"), [sel](Project&, Sequence& s) { return edit::unlinkClips(s, sel); });
     });
-    QAction* enable = add(editM, tr("&Enable / Disable"), QKeySequence("Shift+E"), [this] {
+    QAction* enable = add(editM, QT_TR_NOOP("&Enable / Disable"), QKeySequence("Shift+E"), [this] {
         auto sel = state_->selectedClips();
         state_->edit(tr("Enable / Disable"), [sel](Project&, Sequence& s) {
             bool any = false;
@@ -1372,7 +1470,7 @@ void MainWindow::buildMenus() {
     });
     // Spelling: as you type in captions and titles, and the dictionary for titles.
     editM->addSeparator();
-    QMenu* spellM = editM->addMenu(tr("Spe&lling"));
+    QMenu* spellM = menuIn(editM, QT_TR_NOOP("Spe&lling"));
     spellM->setObjectName(QStringLiteral("spellingMenu"));
     QAction* asYouType = spellM->addAction(tr("Check Spelling as You Type"));
     asYouType->setObjectName(QStringLiteral("checkSpelling"));
@@ -1398,18 +1496,18 @@ void MainWindow::buildMenus() {
         });
     }
     editM->addSeparator();
-    add(editM, tr("Control &Surface…"), QKeySequence(), [this] { controlSurfaceDialog(); })->setObjectName(QStringLiteral("controlSurface"));
+    add(editM, QT_TR_NOOP("Control &Surface…"), QKeySequence(), [this] { controlSurfaceDialog(); })->setObjectName(QStringLiteral("controlSurface"));
 
     // ---- Clip
-    QMenu* clipM = menuBar()->addMenu(tr("&Clip"));
-    QAction* speed = add(clipM, tr("&Speed / Duration…"), QKeySequence("Ctrl+R"), [this] { speedDialog(); });
-    add(clipM, tr("Add &Edit"), QKeySequence("Ctrl+K"), [this] { addEdit(false); });
-    add(clipM, tr("Add Edit to &All Tracks"), QKeySequence("Ctrl+Shift+K"), [this] { addEdit(true); });
-    QAction* trans = add(clipM, tr("Apply Default &Transition"), QKeySequence("Ctrl+D"), [this] { addDefaultTransition(false); });
-    add(clipM, tr("Apply Default Audio &Crossfade"), QKeySequence("Ctrl+Shift+D"), [this] { addDefaultTransition(true); });
-    add(clipM, tr("Apply Default Transitions to Selection"), QKeySequence("Shift+D"), [this] { addTransitionsToSelection(); })
+    QMenu* clipM = menuIn(menuBar(), QT_TR_NOOP("&Clip"));
+    QAction* speed = add(clipM, QT_TR_NOOP("&Speed / Duration…"), QKeySequence("Ctrl+R"), [this] { speedDialog(); });
+    add(clipM, QT_TR_NOOP("Add &Edit"), QKeySequence("Ctrl+K"), [this] { addEdit(false); });
+    add(clipM, QT_TR_NOOP("Add Edit to &All Tracks"), QKeySequence("Ctrl+Shift+K"), [this] { addEdit(true); });
+    QAction* trans = add(clipM, QT_TR_NOOP("Apply Default &Transition"), QKeySequence("Ctrl+D"), [this] { addDefaultTransition(false); });
+    add(clipM, QT_TR_NOOP("Apply Default Audio &Crossfade"), QKeySequence("Ctrl+Shift+D"), [this] { addDefaultTransition(true); });
+    add(clipM, QT_TR_NOOP("Apply Default Transitions to Selection"), QKeySequence("Shift+D"), [this] { addTransitionsToSelection(); })
         ->setObjectName(QStringLiteral("transitionsToSelection"));
-    QAction* nest = add(clipM, tr("&Nest (Compound Clip)…"), QKeySequence(), [this] {
+    QAction* nest = add(clipM, QT_TR_NOOP("&Nest (Compound Clip)…"), QKeySequence(), [this] {
         auto sel = state_->selectedClips();
         if (sel.empty()) return;
         bool ok = false;
@@ -1417,8 +1515,8 @@ void MainWindow::buildMenus() {
         if (!ok || name.isEmpty()) return;
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
-    add(clipM, tr("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
-    add(clipM, tr("Export &LUT from Grade…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
+    add(clipM, QT_TR_NOOP("Export &LUT from Grade…"), QKeySequence(), [this] {
         if (!clipForCommand()) {
             statusBar()->showMessage(tr("Select a graded clip under the playhead to export its LUT"), 5000);
             return;
@@ -1426,7 +1524,7 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export LUT"), QString(), tr("LUT files (*.cube)"));
         if (!path.isEmpty()) exportClipLut(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("exportLut"));
-    add(clipM, tr("Rebuild LUT as &Grade…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Rebuild LUT as &Grade…"), QKeySequence(), [this] {
         const Clip* c = clipForCommand();
         if (!c || std::none_of(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "lut"; })) {
             statusBar()->showMessage(tr("Select a clip with a LUT effect under the playhead to rebuild it as a grade"), 5000);
@@ -1436,12 +1534,12 @@ void MainWindow::buildMenus() {
         if (path.isEmpty()) return;
         rebuildLutAsGrade(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("lutToGrade"));
-    add(clipM, tr("Measure &Grain"), QKeySequence(), [this] { measureGrainAsPreset(); })->setObjectName(QStringLiteral("measureGrain"));
-    add(clipM, tr("Import CDL…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Measure &Grain"), QKeySequence(), [this] { measureGrainAsPreset(); })->setObjectName(QStringLiteral("measureGrain"));
+    add(clipM, QT_TR_NOOP("Import CDL…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
         if (!path.isEmpty()) importCdl(path);
     })->setObjectName(QStringLiteral("importCdl"));
-    add(clipM, tr("Export CDL…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Export CDL…"), QKeySequence(), [this] {
         QString filter;
         const QString path = QFileDialog::getSaveFileName(this, tr("Export CDL"), QString(),
                                                           tr("Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)"), &filter);
@@ -1450,11 +1548,11 @@ void MainWindow::buildMenus() {
         const QString want = filter.contains("*.ccc") ? "ccc" : filter.contains("*.cc") ? "cc" : "cdl";
         exportCdl(ext == "cdl" || ext == "cc" || ext == "ccc" ? path : path + "." + want);
     })->setObjectName(QStringLiteral("exportCdl"));
-    add(clipM, tr("Import ACES Metadata (AMF)…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Import ACES Metadata (AMF)…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import ACES Metadata"), QString(), tr("ACES Metadata File (*.amf);;All files (*)"));
         if (!path.isEmpty()) importAmf(path);
     })->setObjectName(QStringLiteral("importAmf"));
-    add(clipM, tr("Export ACES Metadata (AMF)…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Export ACES Metadata (AMF)…"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
         int clips = 0;
         for (Id id : state_->selectedClips())
@@ -1472,8 +1570,8 @@ void MainWindow::buildMenus() {
         }
         if (!target.isEmpty()) exportAmf(target);
     })->setObjectName(QStringLiteral("exportAmf"));
-    add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
-    add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
+    add(clipM, QT_TR_NOOP("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
             // The selected audio clips, each split where the speaker changes, a track per person.
             std::vector<Id> clips;
             for (Id id : state_->selectedClips())
@@ -1501,8 +1599,8 @@ void MainWindow::buildMenus() {
             });
             statusBar()->showMessage(ok ? tr("Split by speaker: %n people, each on their own track", "", people) : why, 6000);
         }))->setObjectName(QStringLiteral("checkerboardBySpeaker"));
-    add(clipM, tr("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
-    add(clipM, tr("Auto &Duck Music…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Normalize &Loudness…"), QKeySequence(), [this] { normalizeLoudness(); });
+    add(clipM, QT_TR_NOOP("Auto &Duck Music…"), QKeySequence(), withSeq([this] {
             // The selected audio clips are the music.
             std::vector<Id> music;
             for (Id id : state_->selectedClips())
@@ -1514,7 +1612,7 @@ void MainWindow::buildMenus() {
             AutoDuckDialog dlg(state_, music, this);
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
-    add(clipM, tr("Breath Control…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Breath Control…"), QKeySequence(), withSeq([this] {
             bool ok = false;
             const double amount = QInputDialog::getDouble(this, tr("Breath Control"), tr("Turn each breath down by (dB):"),
                                                           appSettings().value("breathControl/amount", -12.0).toDouble(), -60, -1, 1, &ok);
@@ -1522,9 +1620,9 @@ void MainWindow::buildMenus() {
             appSettings().setValue("breathControl/amount", amount);
             breathControl(amount);
         }))->setObjectName(QStringLiteral("breathControl"));
-    add(clipM, tr("Repair Damaged Frames…"), QKeySequence(), withSeq([this] { repairDamagedFrames(); }))
+    add(clipM, QT_TR_NOOP("Repair Damaged Frames…"), QKeySequence(), withSeq([this] { repairDamagedFrames(); }))
         ->setObjectName(QStringLiteral("repairDamagedFrames"));
-    add(clipM, tr("Edit Sound by Samples…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Edit Sound by Samples…"), QKeySequence(), withSeq([this] {
         // The selected sound clip.
         const Sequence* s = state_->sequence();
         Id clip = 0;
@@ -1537,8 +1635,8 @@ void MainWindow::buildMenus() {
         SoundSamplesDialog dlg(state_, clip, this);
         dlg.exec();
     }))->setObjectName(QStringLiteral("editSoundBySamples"));
-    add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
-    add(clipM, tr("Separate Stems…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
+    add(clipM, QT_TR_NOOP("Separate Stems…"), QKeySequence(), withSeq([this] {
             std::vector<Id> clips;
             for (Id id : state_->selectedClips())
                 if (auto loc = edit::locate(*state_->sequence(), id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
@@ -1549,13 +1647,13 @@ void MainWindow::buildMenus() {
             StemsDialog dlg(this);
             if (dlg.exec() == QDialog::Accepted) separateStems(state_, clips, dlg.options(), this);
         }))->setObjectName(QStringLiteral("separateStems"));
-    add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
-    add(clipM, tr("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
-    add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
-    add(clipM, tr("Learn Effect from E&xamples…"), QKeySequence(), withSeq([this] { learnEffectDialog(); }))->setObjectName(QStringLiteral("learnEffect"));
-    add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
+    add(clipM, QT_TR_NOOP("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    add(clipM, QT_TR_NOOP("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
+    add(clipM, QT_TR_NOOP("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
+    add(clipM, QT_TR_NOOP("Learn Effect from E&xamples…"), QKeySequence(), withSeq([this] { learnEffectDialog(); }))->setObjectName(QStringLiteral("learnEffect"));
+    add(clipM, QT_TR_NOOP("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
-    QMenu* groupM = clipM->addMenu(tr("Colour &Group"));
+    QMenu* groupM = menuIn(clipM, QT_TR_NOOP("Colour &Group"));
     groupM->setObjectName(QStringLiteral("colorGroupMenu"));
     connect(groupM, &QMenu::aboutToShow, this, [this, groupM] {
         groupM->clear();
@@ -1601,27 +1699,27 @@ void MainWindow::buildMenus() {
             });
         }
     });
-    add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
-    add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
+    add(clipM, QT_TR_NOOP("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
+    add(clipM, QT_TR_NOOP("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
-    add(clipM, tr("Grab Still"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Grab Still"), QKeySequence(), withSeq([this] {
             galleryDock_->show();
             galleryDock_->raise();
             gallery_->grab();
         }))->setObjectName(QStringLiteral("grabStillAction"));
-    add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
-    add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
-    add(clipM, tr("Correct Lens…"), QKeySequence(), [this] { correctLens(); })->setObjectName(QStringLiteral("correctLens"));
-    add(clipM, tr("Calibrate Lens…"), QKeySequence(), [this] { calibrateLens(); })->setObjectName(QStringLiteral("calibrateLens"));
-    add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
+    add(clipM, QT_TR_NOOP("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
+    add(clipM, QT_TR_NOOP("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
+    add(clipM, QT_TR_NOOP("Correct Lens…"), QKeySequence(), [this] { correctLens(); })->setObjectName(QStringLiteral("correctLens"));
+    add(clipM, QT_TR_NOOP("Calibrate Lens…"), QKeySequence(), [this] { calibrateLens(); })->setObjectName(QStringLiteral("calibrateLens"));
+    add(clipM, QT_TR_NOOP("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
-    compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
+    compareRef_ = add(clipM, QT_TR_NOOP("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
     compareRef_->setCheckable(true);
     compareRef_->setObjectName(QStringLiteral("compareReference"));
-    add(clipM, tr("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
-    add(clipM, tr("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
+    add(clipM, QT_TR_NOOP("Auto Reframe"), QKeySequence(), [this] { autoReframeClips(); })->setObjectName(QStringLiteral("autoReframeClips"));
+    add(clipM, QT_TR_NOOP("Add Frame &Hold"), QKeySequence("Shift+F"), [this] { addFrameHold(); })->setObjectName(QStringLiteral("addFrameHold"));
     {
-        QMenu* extendM = clipM->addMenu(tr("E&xtend Clip"));
+        QMenu* extendM = menuIn(clipM, QT_TR_NOOP("E&xtend Clip"));
         extendM->setObjectName(QStringLiteral("extendClipMenu"));
         auto extendBy = [this](double seconds) {
             const Clip* c = state_->primaryClip();
@@ -1629,9 +1727,9 @@ void MainWindow::buildMenus() {
             if (!c || !s) return state_->message(tr("Select a video clip to extend"));
             extendClip(c->id, FrameTime(std::llround(seconds * s->fpsValue())));
         };
-        add(extendM, tr("By 1 Second"), QKeySequence(), [extendBy] { extendBy(1); })->setObjectName(QStringLiteral("extendClip1s"));
-        add(extendM, tr("By 2 Seconds"), QKeySequence(), [extendBy] { extendBy(2); })->setObjectName(QStringLiteral("extendClip2s"));
-        add(extendM, tr("To the Playhead"), QKeySequence(), [this] {
+        add(extendM, QT_TR_NOOP("By 1 Second"), QKeySequence(), [extendBy] { extendBy(1); })->setObjectName(QStringLiteral("extendClip1s"));
+        add(extendM, QT_TR_NOOP("By 2 Seconds"), QKeySequence(), [extendBy] { extendBy(2); })->setObjectName(QStringLiteral("extendClip2s"));
+        add(extendM, QT_TR_NOOP("To the Playhead"), QKeySequence(), [this] {
             const Clip* c = state_->primaryClip();
             if (!c) return state_->message(tr("Select a video clip to extend"));
             if (state_->playhead() <= c->end()) return state_->message(tr("Put the playhead after the clip's end"));
@@ -1640,19 +1738,19 @@ void MainWindow::buildMenus() {
     }
     {
         // Speed ramp presets on the selected clips: the same footage in the same length, paced differently.
-        QMenu* ramps = clipM->addMenu(tr("Speed &Ramp"));
+        QMenu* ramps = menuIn(clipM, QT_TR_NOOP("Speed &Ramp"));
         for (const edit::SpeedRampPreset& r : edit::speedRampPresets()) {
-            QAction* a = add(ramps, tr(r.name.c_str()), QKeySequence(), [this, id = r.id, name = r.name] { speedRamp(id, tr(name.c_str())); });
+            QAction* a = add(ramps, Name(tr(r.name.c_str()), QString::fromStdString(r.name)), QKeySequence(), [this, id = r.id, name = r.name] { speedRamp(id, tr(name.c_str())); });
             a->setObjectName(QString::fromStdString("ramp_" + r.id));
             a->setStatusTip(tr(r.description.c_str()));
         }
         ramps->addSeparator();
-        add(ramps, tr("Remove Ramp"), QKeySequence(), [this] { speedRamp("none", tr("Remove Ramp")); })
+        add(ramps, QT_TR_NOOP("Remove Ramp"), QKeySequence(), [this] { speedRamp("none", tr("Remove Ramp")); })
             ->setObjectName(QStringLiteral("ramp_none"));
     }
     {
         // Grade versions on the selected picture clips: a new one each, or all to the next or previous one.
-        QMenu* grades = clipM->addMenu(tr("&Grade Versions"));
+        QMenu* grades = menuIn(clipM, QT_TR_NOOP("&Grade Versions"));
         auto onSelected = [this](const QString& label, std::function<edit::Result(Project&, Sequence&, Id)> fn) {
             const auto sel = state_->selectedClips();
             state_->apply(label, [sel, fn](Project& p, Sequence& s) {
@@ -1666,11 +1764,11 @@ void MainWindow::buildMenus() {
                 return any ? edit::Result{} : edit::Result::fail({});
             });
         };
-        add(grades, tr("New Version"), QKeySequence(), [onSelected] {
+        add(grades, QT_TR_NOOP("New Version"), QKeySequence(), [onSelected] {
             onSelected(tr("New Grade Version"), [](Project& p, Sequence& s, Id id) { return edit::addGradeVersion(p, s, id); });
         })->setObjectName(QStringLiteral("gradeNewVersion"));
         for (const int step : {1, -1})
-            add(grades, step > 0 ? tr("Next Version") : tr("Previous Version"), QKeySequence(), [onSelected, step] {
+            add(grades, step > 0 ? QT_TR_NOOP("Next Version") : QT_TR_NOOP("Previous Version"), QKeySequence(), [onSelected, step] {
                 onSelected(tr("Switch Grade Version"), [step](Project&, Sequence& s, Id id) {
                     const Clip* c = edit::clipById(s, id);
                     if (!c || c->gradeVersions.size() < 2) return edit::Result::fail({});
@@ -1679,62 +1777,63 @@ void MainWindow::buildMenus() {
                 });
             })->setObjectName(step > 0 ? QStringLiteral("gradeNextVersion") : QStringLiteral("gradePreviousVersion"));
     }
-    add(clipM, tr("Animate to Audio…"), QKeySequence(), [this] { animateToAudioDialog(); })->setObjectName(QStringLiteral("animateToAudio"));
+    add(clipM, QT_TR_NOOP("Animate to Audio…"), QKeySequence(), [this] { animateToAudioDialog(); })->setObjectName(QStringLiteral("animateToAudio"));
     {
         // Align in Frame: the selected pictures lined up with the frame, inside the action-safe margin.
-        QMenu* align = clipM->addMenu(tr("Align in Frame"));
+        QMenu* align = menuIn(clipM, QT_TR_NOOP("Align in Frame"));
         align->setObjectName(QStringLiteral("alignMenu"));
-        const std::pair<QString, const char*> places[] = {{tr("Centre"), "center"},         {tr("Top"), "top"},
-                                                         {tr("Bottom"), "bottom"},         {tr("Left"), "left"},
-                                                         {tr("Right"), "right"},           {tr("Top Left"), "top_left"},
-                                                         {tr("Top Right"), "top_right"},   {tr("Bottom Left"), "bottom_left"},
-                                                         {tr("Bottom Right"), "bottom_right"}};
+        const std::pair<const char*, const char*> places[] = {
+            {QT_TR_NOOP("Centre"), "center"},       {QT_TR_NOOP("Top"), "top"},
+            {QT_TR_NOOP("Bottom"), "bottom"},       {QT_TR_NOOP("Left"), "left"},
+            {QT_TR_NOOP("Right"), "right"},         {QT_TR_NOOP("Top Left"), "top_left"},
+            {QT_TR_NOOP("Top Right"), "top_right"}, {QT_TR_NOOP("Bottom Left"), "bottom_left"},
+            {QT_TR_NOOP("Bottom Right"), "bottom_right"}};
         for (const auto& [label, name] : places)
             add(align, label, QKeySequence(), [this, n = std::string(name)] { alignSelection(n); })
                 ->setObjectName(QStringLiteral("align_") + QString::fromLatin1(name));
     }
     {
-        QMenu* channels = clipM->addMenu(tr("Audio Channels"));
+        QMenu* channels = menuIn(clipM, QT_TR_NOOP("Audio Channels"));
         channels->setObjectName(QStringLiteral("audioChannelsMenu"));
-        add(channels, tr("Choose Channels…"), QKeySequence(), [this] { audioChannelsDialog(); })->setObjectName(QStringLiteral("audioChannels"));
-        add(channels, tr("Split into Mono Clips"), QKeySequence(), [this] { splitSelectionChannels(false); })->setObjectName(QStringLiteral("splitChannels"));
-        add(channels, tr("Split into Stereo Pairs"), QKeySequence(), [this] { splitSelectionChannels(true); })->setObjectName(QStringLiteral("splitChannelPairs"));
-        add(channels, tr("Play Stereo Mix"), QKeySequence(), [this] { setSelectionChannels({}); })->setObjectName(QStringLiteral("channelsMix"));
+        add(channels, QT_TR_NOOP("Choose Channels…"), QKeySequence(), [this] { audioChannelsDialog(); })->setObjectName(QStringLiteral("audioChannels"));
+        add(channels, QT_TR_NOOP("Split into Mono Clips"), QKeySequence(), [this] { splitSelectionChannels(false); })->setObjectName(QStringLiteral("splitChannels"));
+        add(channels, QT_TR_NOOP("Split into Stereo Pairs"), QKeySequence(), [this] { splitSelectionChannels(true); })->setObjectName(QStringLiteral("splitChannelPairs"));
+        add(channels, QT_TR_NOOP("Play Stereo Mix"), QKeySequence(), [this] { setSelectionChannels({}); })->setObjectName(QStringLiteral("channelsMix"));
     }
-    add(clipM, tr("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
-    add(clipM, tr("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
-    add(clipM, tr("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
-    add(clipM, tr("Close Up"), QKeySequence(), [this] { closeUp(); })->setObjectName(QStringLiteral("closeUp"));
+    add(clipM, QT_TR_NOOP("Swap with Previous Clip"), QKeySequence("Ctrl+Shift+,"), [this] { swapClip(false); })->setObjectName(QStringLiteral("swapPrevious"));
+    add(clipM, QT_TR_NOOP("Swap with Next Clip"), QKeySequence("Ctrl+Shift+."), [this] { swapClip(true); })->setObjectName(QStringLiteral("swapNext"));
+    add(clipM, QT_TR_NOOP("Join Through Edits"), QKeySequence(), [this] { joinThroughEdits(); })->setObjectName(QStringLiteral("joinThroughEdits"));
+    add(clipM, QT_TR_NOOP("Close Up"), QKeySequence(), [this] { closeUp(); })->setObjectName(QStringLiteral("closeUp"));
     // Video layouts: the selected video clips (or those under the playhead) sharing the frame.
-    QMenu* layoutM = clipM->addMenu(tr("Layout"));
+    QMenu* layoutM = menuIn(clipM, QT_TR_NOOP("Layout"));
     layoutM->setObjectName(QStringLiteral("layoutMenu"));
-    const std::tuple<edit::Layout, QString, const char*> layouts[] = {
-        {edit::Layout::PictureInPicture, tr("Picture in Picture"), "layoutPip"},
-        {edit::Layout::SideBySide, tr("Side by Side"), "layoutSideBySide"},
-        {edit::Layout::TopAndBottom, tr("Top and Bottom"), "layoutTopBottom"},
-        {edit::Layout::ThreeAcross, tr("Three Across"), "layoutThreeAcross"},
-        {edit::Layout::Grid, tr("2 × 2 Grid"), "layoutGrid"},
-        {edit::Layout::FullFrame, tr("Full Frame (Reset)"), "layoutFullFrame"}};
+    const std::tuple<edit::Layout, const char*, const char*> layouts[] = {
+        {edit::Layout::PictureInPicture, QT_TR_NOOP("Picture in Picture"), "layoutPip"},
+        {edit::Layout::SideBySide, QT_TR_NOOP("Side by Side"), "layoutSideBySide"},
+        {edit::Layout::TopAndBottom, QT_TR_NOOP("Top and Bottom"), "layoutTopBottom"},
+        {edit::Layout::ThreeAcross, QT_TR_NOOP("Three Across"), "layoutThreeAcross"},
+        {edit::Layout::Grid, QT_TR_NOOP("2 × 2 Grid"), "layoutGrid"},
+        {edit::Layout::FullFrame, QT_TR_NOOP("Full Frame (Reset)"), "layoutFullFrame"}};
     for (const auto& [layout, name, object] : layouts)
         add(layoutM, name, QKeySequence(), [this, layout = layout] { arrangeLayout(layout); })->setObjectName(QLatin1String(object));
     // Audio roles (Final Cut's roles): what a clip is, for muting a role and stems by role.
-    roleMenu_ = clipM->addMenu(tr("Audio Role"));
+    roleMenu_ = menuIn(clipM, QT_TR_NOOP("Audio Role"));
     roleMenu_->setObjectName(QStringLiteral("audioRoleMenu"));
-    add(roleMenu_, tr("Dialogue"), QKeySequence("Ctrl+Alt+1"), [this] { setSelectedRole(QStringLiteral("Dialogue")); })
+    add(roleMenu_, QT_TR_NOOP("Dialogue"), QKeySequence("Ctrl+Alt+1"), [this] { setSelectedRole(QStringLiteral("Dialogue")); })
         ->setObjectName(QStringLiteral("roleDialogue"));
-    add(roleMenu_, tr("Music"), QKeySequence("Ctrl+Alt+2"), [this] { setSelectedRole(QStringLiteral("Music")); })
+    add(roleMenu_, QT_TR_NOOP("Music"), QKeySequence("Ctrl+Alt+2"), [this] { setSelectedRole(QStringLiteral("Music")); })
         ->setObjectName(QStringLiteral("roleMusic"));
-    add(roleMenu_, tr("Effects"), QKeySequence("Ctrl+Alt+3"), [this] { setSelectedRole(QStringLiteral("Effects")); })
+    add(roleMenu_, QT_TR_NOOP("Effects"), QKeySequence("Ctrl+Alt+3"), [this] { setSelectedRole(QStringLiteral("Effects")); })
         ->setObjectName(QStringLiteral("roleEffects"));
     roleMenu_->addSeparator()->setObjectName(QStringLiteral("customRolesStart"));
     roleMenu_->addSeparator();
-    add(roleMenu_, tr("New Role…"), QKeySequence(), [this] {
+    add(roleMenu_, QT_TR_NOOP("New Role…"), QKeySequence(), [this] {
         bool ok = false;
         const QString name = QInputDialog::getText(this, tr("New Role"), tr("Role name:"), QLineEdit::Normal, QString(), &ok).trimmed();
         if (ok && !name.isEmpty()) setSelectedRole(name);
     })->setObjectName(QStringLiteral("roleNew"));
-    add(roleMenu_, tr("No Role"), QKeySequence(), [this] { setSelectedRole(QString()); })->setObjectName(QStringLiteral("roleNone"));
-    add(roleMenu_, tr("Detect Roles by Listening"), QKeySequence(), [this] { detectRoles(); })->setObjectName(QStringLiteral("detectRoles"));
+    add(roleMenu_, QT_TR_NOOP("No Role"), QKeySequence(), [this] { setSelectedRole(QString()); })->setObjectName(QStringLiteral("roleNone"));
+    add(roleMenu_, QT_TR_NOOP("Detect Roles by Listening"), QKeySequence(), [this] { detectRoles(); })->setObjectName(QStringLiteral("detectRoles"));
     connect(roleMenu_, &QMenu::aboutToShow, this, [this] {
         // The sequence's own roles between the standard ones and the rest, and a tick on the selection's role.
         const Sequence* s = state_->sequence();
@@ -1778,27 +1877,27 @@ void MainWindow::buildMenus() {
             a->setChecked(!mixed && role.toStdString() == current);
         }
     });
-    add(clipM, tr("Save Effects as Preset…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Save Effects as Preset…"), QKeySequence(), [this] {
         const Clip* c = state_->primaryClip();
         bool ok = false;
         const QString name = QInputDialog::getText(this, tr("Save Effects as Preset"), tr("Preset name:"), QLineEdit::Normal,
                                                    c ? QString::fromStdString(c->name) : QString(), &ok);
         if (ok) saveEffectsAsPreset(name);
     })->setObjectName(QStringLiteral("saveEffectPreset"));
-    QMenu* auditionM = clipM->addMenu(tr("Audition"));
-    add(auditionM, tr("Add Selected Media as Takes"), QKeySequence("Ctrl+Alt+Y"), [this] { addTakesFromBin(); })
+    QMenu* auditionM = menuIn(clipM, QT_TR_NOOP("Audition"));
+    add(auditionM, QT_TR_NOOP("Add Selected Media as Takes"), QKeySequence("Ctrl+Alt+Y"), [this] { addTakesFromBin(); })
         ->setObjectName(QStringLiteral("addTakes"));
-    add(auditionM, tr("Next Take"), QKeySequence("Ctrl+Alt+Right"), [this] { cycleTake(1); })->setObjectName(QStringLiteral("nextTake"));
-    add(auditionM, tr("Previous Take"), QKeySequence("Ctrl+Alt+Left"), [this] { cycleTake(-1); })->setObjectName(QStringLiteral("previousTake"));
-    add(auditionM, tr("Finalize Audition"), QKeySequence(), [this] { finalizeAudition(); })->setObjectName(QStringLiteral("finalizeAudition"));
-    add(clipM, tr("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
+    add(auditionM, QT_TR_NOOP("Next Take"), QKeySequence("Ctrl+Alt+Right"), [this] { cycleTake(1); })->setObjectName(QStringLiteral("nextTake"));
+    add(auditionM, QT_TR_NOOP("Previous Take"), QKeySequence("Ctrl+Alt+Left"), [this] { cycleTake(-1); })->setObjectName(QStringLiteral("previousTake"));
+    add(auditionM, QT_TR_NOOP("Finalize Audition"), QKeySequence(), [this] { finalizeAudition(); })->setObjectName(QStringLiteral("finalizeAudition"));
+    add(clipM, QT_TR_NOOP("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
-    add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
-    add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
-    add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
-    add(clipM, tr("Match Dialogue to Reference…"), QKeySequence(), [this] { matchDialogueDialog(); })
+    add(clipM, QT_TR_NOOP("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
+    add(clipM, QT_TR_NOOP("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
+    add(clipM, QT_TR_NOOP("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
+    add(clipM, QT_TR_NOOP("Match Dialogue to Reference…"), QKeySequence(), [this] { matchDialogueDialog(); })
         ->setObjectName(QStringLiteral("matchDialogue"));
-    add(clipM, tr("Convert Voice…"), QKeySequence(), [this] {
+    add(clipM, QT_TR_NOOP("Convert Voice…"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
         const Id clip = s ? voiceConversionClip(state_->project(), *s, state_->selectedClips()) : 0;
         if (!clip) {
@@ -1808,33 +1907,33 @@ void MainWindow::buildMenus() {
         VoiceConvertDialog dlg(state_, clip, 0, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("convertVoice"));
-    add(clipM, tr("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
-    add(clipM, tr("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
-    add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
-    add(clipM, tr("Cut Selected Media to the Beat"), QKeySequence(), [this] { cutMediaToBeat(1, true); })
+    add(clipM, QT_TR_NOOP("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
+    add(clipM, QT_TR_NOOP("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
+    add(clipM, QT_TR_NOOP("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
+    add(clipM, QT_TR_NOOP("Cut Selected Media to the Beat"), QKeySequence(), [this] { cutMediaToBeat(1, true); })
         ->setObjectName(QStringLiteral("cutToBeat"));
-    add(clipM, tr("Make Highlights…"), QKeySequence(), [this] { highlightsDialog(); })->setObjectName(QStringLiteral("makeHighlights"));
-    add(clipM, tr("Import Embedded Captions"), QKeySequence(), [this] { importEmbeddedCaptions(); })
+    add(clipM, QT_TR_NOOP("Make Highlights…"), QKeySequence(), [this] { highlightsDialog(); })->setObjectName(QStringLiteral("makeHighlights"));
+    add(clipM, QT_TR_NOOP("Import Embedded Captions"), QKeySequence(), [this] { importEmbeddedCaptions(); })
         ->setObjectName(QStringLiteral("importEmbeddedCaptions"));
-    add(clipM, tr("Read Burned-In Subtitles…"), QKeySequence(), [this] { readBurnedInSubtitles(); })
+    add(clipM, QT_TR_NOOP("Read Burned-In Subtitles…"), QKeySequence(), [this] { readBurnedInSubtitles(); })
         ->setObjectName(QStringLiteral("readBurnedInSubtitles"));
-    add(clipM, tr("Add B-Roll by What Is Said"), QKeySequence(), [this] { addBroll(); })->setObjectName(QStringLiteral("autoBroll"));
-    add(clipM, tr("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
+    add(clipM, QT_TR_NOOP("Add B-Roll by What Is Said"), QKeySequence(), [this] { addBroll(); })->setObjectName(QStringLiteral("autoBroll"));
+    add(clipM, QT_TR_NOOP("S&ynchronize by Audio"), QKeySequence(), [this] { syncByAudio(); });
     clipM->addSeparator();
-    add(clipM, tr("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
-    add(clipM, tr("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
-    add(clipM, tr("Place on Top"), QKeySequence(Qt::Key_F12), [this] { state_->sourceEdit(EditorState::SourceEdit::PlaceOnTop); })
+    add(clipM, QT_TR_NOOP("&Insert from Source"), QKeySequence(Qt::Key_Comma), [this] { state_->insertFromSource(false); });
+    add(clipM, QT_TR_NOOP("&Overwrite from Source"), QKeySequence(Qt::Key_Period), [this] { state_->insertFromSource(true); });
+    add(clipM, QT_TR_NOOP("Place on Top"), QKeySequence(Qt::Key_F12), [this] { state_->sourceEdit(EditorState::SourceEdit::PlaceOnTop); })
         ->setObjectName(QStringLiteral("placeOnTop"));
-    add(clipM, tr("Append at End"), QKeySequence("Shift+F12"), [this] { state_->sourceEdit(EditorState::SourceEdit::Append); })
+    add(clipM, QT_TR_NOOP("Append at End"), QKeySequence("Shift+F12"), [this] { state_->sourceEdit(EditorState::SourceEdit::Append); })
         ->setObjectName(QStringLiteral("appendAtEnd"));
-    add(clipM, tr("Ripple Overwrite"), QKeySequence("Shift+F10"), [this] { state_->sourceEdit(EditorState::SourceEdit::RippleOverwrite); })
+    add(clipM, QT_TR_NOOP("Ripple Overwrite"), QKeySequence("Shift+F10"), [this] { state_->sourceEdit(EditorState::SourceEdit::RippleOverwrite); })
         ->setObjectName(QStringLiteral("rippleOverwrite"));
-    add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
+    add(clipM, QT_TR_NOOP("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
         ->setObjectName(QStringLiteral("smartInsert"));
     {
         // Resolve's Video Only and Audio Only (the Speed Editor's keys): source edits bring one or the other.
-        QAction* video = add(clipM, tr("Edit Video Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(true, !on); });
-        QAction* audio = add(clipM, tr("Edit Audio Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(!on, true); });
+        QAction* video = add(clipM, QT_TR_NOOP("Edit Video Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(true, !on); });
+        QAction* audio = add(clipM, QT_TR_NOOP("Edit Audio Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(!on, true); });
         video->setObjectName(QStringLiteral("editVideoOnly"));
         audio->setObjectName(QStringLiteral("editAudioOnly"));
         for (QAction* a : {video, audio}) a->setCheckable(true);
@@ -1852,7 +1951,7 @@ void MainWindow::buildMenus() {
     {
         // Premiere's "insert and overwrite sequences as nests or individual clips".
         state_->setSequencesAsClips(appSettings().value("editing/sequencesAsClips", false).toBool());
-        QAction* a = add(clipM, tr("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
+        QAction* a = add(clipM, QT_TR_NOOP("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
             state_->setSequencesAsClips(on);
             appSettings().setValue("editing/sequencesAsClips", on);
         });
@@ -1861,26 +1960,26 @@ void MainWindow::buildMenus() {
         a->setChecked(state_->sequencesAsClips());
         a->setToolTip(tr("Edit a sequence from the Source monitor or the bin as its own clips instead of one nested clip"));
     }
-    add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); })->setObjectName(QStringLiteral("matchFrame"));
-    add(clipM, tr("Reverse Match Frame"), QKeySequence("Shift+R"), [this] { reverseMatchFrame(); })
+    add(clipM, QT_TR_NOOP("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); })->setObjectName(QStringLiteral("matchFrame"));
+    add(clipM, QT_TR_NOOP("Reverse Match Frame"), QKeySequence("Shift+R"), [this] { reverseMatchFrame(); })
         ->setObjectName(QStringLiteral("reverseMatchFrame"));
     {
-        QAction* sub = add(clipM, tr("Make S&ubclip"), QKeySequence("Ctrl+U"), [this] { makeSubclip(); });
+        QAction* sub = add(clipM, QT_TR_NOOP("Make S&ubclip"), QKeySequence("Ctrl+U"), [this] { makeSubclip(); });
         sub->setToolTip(tr("Save the Source monitor's In to Out as a subclip in the media bin"));
         sub->setObjectName(QStringLiteral("makeSubclip"));
     }
-    add(clipM, tr("Nudge &Left"), QKeySequence("Alt+Left"), [this] { nudge(-1); });
-    add(clipM, tr("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
+    add(clipM, QT_TR_NOOP("Nudge &Left"), QKeySequence("Alt+Left"), [this] { nudge(-1); });
+    add(clipM, QT_TR_NOOP("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
     clipM->addSeparator();
-    add(clipM, tr("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); })->setObjectName(QStringLiteral("newTitle"));
-    add(clipM, tr("Add OGraf Graphic…"), QKeySequence(), withSeq([this] { addOGrafGraphic(); }))
+    add(clipM, QT_TR_NOOP("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); })->setObjectName(QStringLiteral("newTitle"));
+    add(clipM, QT_TR_NOOP("Add OGraf Graphic…"), QKeySequence(), withSeq([this] { addOGrafGraphic(); }))
         ->setObjectName(QStringLiteral("addOGrafGraphic"));
     // Graphics templates (core/GraphicsTemplate.h): from the library, a picture published, filled from a table.
-    add(clipM, tr("Insert Graphics Template…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Insert Graphics Template…"), QKeySequence(), withSeq([this] {
             GraphicsTemplatesDialog dlg(state_, this);
             dlg.exec();
         }))->setObjectName(QStringLiteral("insertGraphicsTemplate"));
-    add(clipM, tr("Publish Picture to Graphic…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Publish Picture to Graphic…"), QKeySequence(), withSeq([this] {
             const auto& sel = state_->selectedClips();
             if (sel.size() != 1) {
                 statusBar()->showMessage(tr("Select one clip of an image or video in the graphic's sequence"), 5000);
@@ -1893,7 +1992,7 @@ void MainWindow::buildMenus() {
             if (!ok || label.isEmpty()) return;
             if (const QString why = publishPictureField(state_, sel.front(), label); !why.isEmpty()) statusBar()->showMessage(why, 5000);
         }))->setObjectName(QStringLiteral("publishPicture"));
-    add(clipM, tr("Fill Graphics from Table…"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("Fill Graphics from Table…"), QKeySequence(), withSeq([this] {
             const auto& sel = state_->selectedClips();
             const Clip* c = sel.size() == 1 ? edit::clipById(*state_->sequence(), sel.front()) : nullptr;
             if (!c || !graphicOf(state_->project(), *c)) {
@@ -1904,7 +2003,7 @@ void MainWindow::buildMenus() {
                                                               tr("Tables (*.csv *.tsv *.txt);;All files (*)"));
             if (!file.isEmpty()) fillGraphicsFromFile(state_, sel.front(), file);
         }))->setObjectName(QStringLiteral("fillGraphics"));
-    add(clipM, tr("New &Colour Matte"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("New &Colour Matte"), QKeySequence(), withSeq([this] {
             const Sequence* s = state_->sequence();
             FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
             int vt = state_->targetVideoTrack();
@@ -1915,7 +2014,7 @@ void MainWindow::buildMenus() {
             });
         }));
 
-    add(clipM, tr("New &Adjustment Layer"), QKeySequence(), withSeq([this] {
+    add(clipM, QT_TR_NOOP("New &Adjustment Layer"), QKeySequence(), withSeq([this] {
             // Above the targeted track (a new track if it is the top one), so it adjusts what is below.
             const Sequence* s = state_->sequence();
             FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
@@ -1930,16 +2029,16 @@ void MainWindow::buildMenus() {
         }))->setObjectName(QStringLiteral("newAdjustmentLayer"));
 
     // ---- Sequence
-    QMenu* seqM = menuBar()->addMenu(tr("&Sequence"));
-    add(seqM, tr("Sequence &Settings…"), QKeySequence(), [this] { SequenceSettingsDialog::editActive(state_, this); });
-    add(seqM, tr("&New Sequence…"), QKeySequence("Ctrl+Alt+N"), [this] { newSequence(); });
-    add(seqM, tr("Save as Graphics Template…"), QKeySequence(), withSeq([this] { saveSequenceAsGraphicsTemplate(state_, this); }))
+    QMenu* seqM = menuIn(menuBar(), QT_TR_NOOP("&Sequence"));
+    add(seqM, QT_TR_NOOP("Sequence &Settings…"), QKeySequence(), [this] { SequenceSettingsDialog::editActive(state_, this); });
+    add(seqM, QT_TR_NOOP("&New Sequence…"), QKeySequence("Ctrl+Alt+N"), [this] { newSequence(); });
+    add(seqM, QT_TR_NOOP("Save as Graphics Template…"), QKeySequence(), withSeq([this] { saveSequenceAsGraphicsTemplate(state_, this); }))
         ->setObjectName(QStringLiteral("saveGraphicsTemplate"));
-    add(seqM, tr("Graphic Fields…"), QKeySequence(), withSeq([this] {
+    add(seqM, QT_TR_NOOP("Graphic Fields…"), QKeySequence(), withSeq([this] {
             GraphicFieldsDialog dlg(state_, this);
             dlg.exec();
         }))->setObjectName(QStringLiteral("graphicFields"));
-    add(seqM, tr("&Duplicate Sequence"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("&Duplicate Sequence"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
         if (!s) return;
         Id made = 0;
@@ -1950,44 +2049,44 @@ void MainWindow::buildMenus() {
         });
         if (made) state_->setActiveSequence(made);
     })->setObjectName(QStringLiteral("duplicateSequence"));
-    add(seqM, tr("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
+    add(seqM, QT_TR_NOOP("Auto &Reframe Sequence…"), QKeySequence(), [this] { autoReframeDialog(); })
         ->setObjectName(QStringLiteral("autoReframeSequence"));
-    add(seqM, tr("Make &Shorts…"), QKeySequence(), [this] { shortsDialog(); })->setObjectName(QStringLiteral("makeShorts"));
-    add(seqM, tr("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
+    add(seqM, QT_TR_NOOP("Make &Shorts…"), QKeySequence(), [this] { shortsDialog(); })->setObjectName(QStringLiteral("makeShorts"));
+    add(seqM, QT_TR_NOOP("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
         ->setObjectName(QStringLiteral("buildScriptCut"));
-    add(seqM, tr("&Lined Script"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("&Lined Script"), QKeySequence(), [this] {
         // The screenplay with each take's line down what it reads, beside the Source monitor.
         linedScriptDock_->show();
         linedScriptDock_->raise();
     })->setObjectName(QStringLiteral("showLinedScript"));
-    add(seqM, tr("Add LTC &Track"), QKeySequence(), [this] { addLtcTrack(); })->setObjectName(QStringLiteral("addLtcTrack"));
-    add(seqM, tr("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
-    add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
+    add(seqM, QT_TR_NOOP("Add LTC &Track"), QKeySequence(), [this] { addLtcTrack(); })->setObjectName(QStringLiteral("addLtcTrack"));
+    add(seqM, QT_TR_NOOP("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
+    add(seqM, QT_TR_NOOP("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
         if (!state_->sequence()) return;
         // One dialog, kept open beside the work while takes are recorded.
         if (!voiceover_) voiceover_ = new VoiceoverDialog(state_, program_, this);
         voiceover_->show();
         voiceover_->raise();
     })->setObjectName(QStringLiteral("recordVoiceover"));
-    add(seqM, tr("A&DR (Dialogue Replacement)…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("A&DR (Dialogue Replacement)…"), QKeySequence(), [this] {
         // The cue list and recording to picture, in its panel beside the Program monitor.
         adrDock_->show();
         adrDock_->raise();
     })->setObjectName(QStringLiteral("showAdr"));
-    add(seqM, tr("Audio &Description…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Audio &Description…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         // Kept open beside the work while descriptions are written.
         if (!audioDescription_) audioDescription_ = new AudioDescriptionDialog(state_, this);
         audioDescription_->show();
         audioDescription_->raise();
     })->setObjectName(QStringLiteral("audioDescription"));
-    add(seqM, tr("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
+    add(seqM, QT_TR_NOOP("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
         if (!state_->sequence()) return;
         SpeechDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("generateVoiceover"));
     {
-        QAction* mute = add(seqM, tr("Global &Mute"), QKeySequence(), [] {});
+        QAction* mute = add(seqM, QT_TR_NOOP("Global &Mute"), QKeySequence(), [] {});
         mute->setObjectName(QStringLiteral("globalMute"));
         mute->setCheckable(true);
         connect(mute, &QAction::toggled, this, [this](bool on) {
@@ -1995,42 +2094,42 @@ void MainWindow::buildMenus() {
             state_->message(on ? tr("Global Mute: playback is silent (clips, tracks and exports are unchanged)") : tr("Global Mute off"), 4000);
         });
     }
-    add(seqM, tr("Clear Solo"), QKeySequence(), [this] { clearOrRestoreSolo(); })->setObjectName(QStringLiteral("clearSolo"));
-    add(seqM, tr("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
+    add(seqM, QT_TR_NOOP("Clear Solo"), QKeySequence(), [this] { clearOrRestoreSolo(); })->setObjectName(QStringLiteral("clearSolo"));
+    add(seqM, QT_TR_NOOP("Render In to Out"), QKeySequence(Qt::Key_Return), [this] { renderInToOut(); })
         ->setObjectName(QStringLiteral("renderInToOut"));
-    add(seqM, tr("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })
+    add(seqM, QT_TR_NOOP("Delete Render Files"), QKeySequence(), [this] { deleteRenderFiles(); })
         ->setObjectName(QStringLiteral("deleteRenderFiles"));
     {
-        QAction* bg = add(seqM, tr("&Background Render"), QKeySequence(), [this](bool on) { setBackgroundRender(on); });
+        QAction* bg = add(seqM, QT_TR_NOOP("&Background Render"), QKeySequence(), [this](bool on) { setBackgroundRender(on); });
         bg->setCheckable(true);
         bg->setObjectName(QStringLiteral("backgroundRender"));
         bg->setToolTip(tr("Render stretches with effects, titles or transitions while you are not editing or playing"));
         backgroundRender_ = appSettings().value("render/background", false).toBool();
         bg->setChecked(backgroundRender_);
     }
-    add(seqM, tr("Add &Video Track"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Add &Video Track"), QKeySequence(), [this] {
         state_->edit(tr("Add Video Track"), [](Project& p, Sequence& s) {
             edit::addTrack(p, s, TrackKind::Video);
             return true;
         });
     });
-    add(seqM, tr("Add &Audio Track"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Add &Audio Track"), QKeySequence(), [this] {
         state_->edit(tr("Add Audio Track"), [](Project& p, Sequence& s) {
             edit::addTrack(p, s, TrackKind::Audio);
             return true;
         });
     });
     seqM->addSeparator();
-    add(seqM, tr("Mark &In"), QKeySequence(Qt::Key_I), [this] {
+    add(seqM, QT_TR_NOOP("Mark &In"), QKeySequence(Qt::Key_I), [this] {
         if (active_ == Monitor::Source) state_->setSourceIn(source_->position());
         else state_->setInPoint(program_->position());
     });
-    add(seqM, tr("Mark &Out"), QKeySequence(Qt::Key_O), [this] {
+    add(seqM, QT_TR_NOOP("Mark &Out"), QKeySequence(Qt::Key_O), [this] {
         if (active_ == Monitor::Source) state_->setSourceOut(source_->position());
         else state_->setOutPoint(program_->position());
     });
-    add(seqM, tr("Mark Clip"), QKeySequence(Qt::Key_X), [this] { markClip(); });
-    add(seqM, tr("&Clear In and Out"), QKeySequence("Ctrl+Shift+X"), [this] {
+    add(seqM, QT_TR_NOOP("Mark Clip"), QKeySequence(Qt::Key_X), [this] { markClip(); });
+    add(seqM, QT_TR_NOOP("&Clear In and Out"), QKeySequence("Ctrl+Shift+X"), [this] {
         if (active_ == Monitor::Source) {
             state_->setSourceIn(-1);
             state_->setSourceOut(-1);
@@ -2039,74 +2138,74 @@ void MainWindow::buildMenus() {
             state_->setOutPoint(-1);
         }
     });
-    add(seqM, tr("Clear In"), QKeySequence("Ctrl+Shift+I"), [this] {
+    add(seqM, QT_TR_NOOP("Clear In"), QKeySequence("Ctrl+Shift+I"), [this] {
         if (active_ == Monitor::Source) state_->setSourceIn(-1);
         else state_->setInPoint(-1);
     })->setObjectName(QStringLiteral("clearIn"));
-    add(seqM, tr("Clear Out"), QKeySequence("Ctrl+Shift+O"), [this] {
+    add(seqM, QT_TR_NOOP("Clear Out"), QKeySequence("Ctrl+Shift+O"), [this] {
         if (active_ == Monitor::Source) state_->setSourceOut(-1);
         else state_->setOutPoint(-1);
     })->setObjectName(QStringLiteral("clearOut"));
-    add(seqM, tr("Go to In"), QKeySequence("Shift+I"), [this] {
+    add(seqM, QT_TR_NOOP("Go to In"), QKeySequence("Shift+I"), [this] {
         FrameTime t = active_ == Monitor::Source ? state_->sourceIn() : (state_->sequence() ? state_->sequence()->inPoint : -1);
         if (t >= 0) activeController()->seek(t);
     });
-    add(seqM, tr("Go to Out"), QKeySequence("Shift+O"), [this] {
+    add(seqM, QT_TR_NOOP("Go to Out"), QKeySequence("Shift+O"), [this] {
         FrameTime t = active_ == Monitor::Source ? state_->sourceOut() : (state_->sequence() ? state_->sequence()->outPoint : -1);
         if (t >= 0) activeController()->seek(t);
     });
-    add(seqM, tr("&Lift"), QKeySequence(Qt::Key_Semicolon), withSeq([this] {
+    add(seqM, QT_TR_NOOP("&Lift"), QKeySequence(Qt::Key_Semicolon), withSeq([this] {
             FrameTime a = state_->sequence()->inPoint, b = state_->sequence()->outPoint + 1;
             state_->apply(tr("Lift"), [a, b](Project& p, Sequence& s) { return edit::liftRange(p, s, a, b, allTracks(s)); });
         }));
-    add(seqM, tr("E&xtract"), QKeySequence(Qt::Key_Apostrophe), withSeq([this] {
+    add(seqM, QT_TR_NOOP("E&xtract"), QKeySequence(Qt::Key_Apostrophe), withSeq([this] {
             FrameTime a = state_->sequence()->inPoint, b = state_->sequence()->outPoint + 1;
             state_->apply(tr("Extract"), [a, b](Project& p, Sequence& s) { return edit::extractRange(p, s, a, b, allTracks(s)); });
         }));
     seqM->addSeparator();
-    add(seqM, tr("Select Nearest Edit (Trim Mode)"), QKeySequence("Shift+T"), [this] { selectNearestEdit(); })->setObjectName(QStringLiteral("selectEdit"));
-    add(seqM, tr("Cycle Trim Side"), QKeySequence("Alt+T"), [this] { cycleTrimSide(); })->setObjectName(QStringLiteral("cycleTrimSide"));
-    add(seqM, tr("Extend Edit"), QKeySequence("E"), [this] { extendEdit(); })->setObjectName(QStringLiteral("extendEdit"));
-    add(seqM, tr("Trim Backward"), QKeySequence("Ctrl+Left"), [this] { trimSelectedEdit(-1); })->setObjectName(QStringLiteral("trimBackward"));
-    add(seqM, tr("Trim Forward"), QKeySequence("Ctrl+Right"), [this] { trimSelectedEdit(1); })->setObjectName(QStringLiteral("trimForward"));
-    add(seqM, tr("Trim Backward Five Frames"), QKeySequence("Ctrl+Shift+Left"), [this] { trimSelectedEdit(-5); })
+    add(seqM, QT_TR_NOOP("Select Nearest Edit (Trim Mode)"), QKeySequence("Shift+T"), [this] { selectNearestEdit(); })->setObjectName(QStringLiteral("selectEdit"));
+    add(seqM, QT_TR_NOOP("Cycle Trim Side"), QKeySequence("Alt+T"), [this] { cycleTrimSide(); })->setObjectName(QStringLiteral("cycleTrimSide"));
+    add(seqM, QT_TR_NOOP("Extend Edit"), QKeySequence("E"), [this] { extendEdit(); })->setObjectName(QStringLiteral("extendEdit"));
+    add(seqM, QT_TR_NOOP("Trim Backward"), QKeySequence("Ctrl+Left"), [this] { trimSelectedEdit(-1); })->setObjectName(QStringLiteral("trimBackward"));
+    add(seqM, QT_TR_NOOP("Trim Forward"), QKeySequence("Ctrl+Right"), [this] { trimSelectedEdit(1); })->setObjectName(QStringLiteral("trimForward"));
+    add(seqM, QT_TR_NOOP("Trim Backward Five Frames"), QKeySequence("Ctrl+Shift+Left"), [this] { trimSelectedEdit(-5); })
         ->setObjectName(QStringLiteral("trimBackward5"));
-    add(seqM, tr("Trim Forward Five Frames"), QKeySequence("Ctrl+Shift+Right"), [this] { trimSelectedEdit(5); })
+    add(seqM, QT_TR_NOOP("Trim Forward Five Frames"), QKeySequence("Ctrl+Shift+Right"), [this] { trimSelectedEdit(5); })
         ->setObjectName(QStringLiteral("trimForward5"));
-    add(seqM, tr("End Trim Mode"), QKeySequence(Qt::Key_Escape), [this] {
+    add(seqM, QT_TR_NOOP("End Trim Mode"), QKeySequence(Qt::Key_Escape), [this] {
         if (!stopTrimShuttle(false)) endTrimMode();  // Esc while trimming dynamically puts the edit back first
     })->setObjectName(QStringLiteral("endTrim"));
-    add(seqM, tr("Ripple Trim Previous Edit to Playhead"), QKeySequence(Qt::Key_Q), [this] { rippleTrimToPlayhead(true); })
+    add(seqM, QT_TR_NOOP("Ripple Trim Previous Edit to Playhead"), QKeySequence(Qt::Key_Q), [this] { rippleTrimToPlayhead(true); })
         ->setObjectName(QStringLiteral("rippleTrimPrevious"));
-    add(seqM, tr("Ripple Trim Next Edit to Playhead"), QKeySequence(Qt::Key_W), [this] { rippleTrimToPlayhead(false); })
+    add(seqM, QT_TR_NOOP("Ripple Trim Next Edit to Playhead"), QKeySequence(Qt::Key_W), [this] { rippleTrimToPlayhead(false); })
         ->setObjectName(QStringLiteral("rippleTrimNext"));
-    add(seqM, tr("Select Clips After Playhead"), QKeySequence(Qt::Key_A), [this] { selectForward(true); })
+    add(seqM, QT_TR_NOOP("Select Clips After Playhead"), QKeySequence(Qt::Key_A), [this] { selectForward(true); })
         ->setObjectName(QStringLiteral("selectForward"));
-    add(seqM, tr("Select Clips After Playhead on Target Track"), QKeySequence("Shift+A"), [this] { selectForward(false); })
+    add(seqM, QT_TR_NOOP("Select Clips After Playhead on Target Track"), QKeySequence("Shift+A"), [this] { selectForward(false); })
         ->setObjectName(QStringLiteral("selectForwardTrack"));
-    add(seqM, tr("Select Next Clip"), QKeySequence("Alt+Down"), [this] { selectNeighbourClip(1); })
+    add(seqM, QT_TR_NOOP("Select Next Clip"), QKeySequence("Alt+Down"), [this] { selectNeighbourClip(1); })
         ->setObjectName(QStringLiteral("selectNextClip"));
-    add(seqM, tr("Select Previous Clip"), QKeySequence("Alt+Up"), [this] { selectNeighbourClip(-1); })
+    add(seqM, QT_TR_NOOP("Select Previous Clip"), QKeySequence("Alt+Up"), [this] { selectNeighbourClip(-1); })
         ->setObjectName(QStringLiteral("selectPreviousClip"));
-    add(seqM, tr("Select Clip on Track Above"), QKeySequence("Alt+Shift+Up"), [this] { selectClipOnTrack(-1); })
+    add(seqM, QT_TR_NOOP("Select Clip on Track Above"), QKeySequence("Alt+Shift+Up"), [this] { selectClipOnTrack(-1); })
         ->setObjectName(QStringLiteral("selectClipAbove"));
-    add(seqM, tr("Select Clip on Track Below"), QKeySequence("Alt+Shift+Down"), [this] { selectClipOnTrack(1); })
+    add(seqM, QT_TR_NOOP("Select Clip on Track Below"), QKeySequence("Alt+Shift+Down"), [this] { selectClipOnTrack(1); })
         ->setObjectName(QStringLiteral("selectClipBelow"));
-    add(seqM, tr("Select Clip at Playhead"), QKeySequence("Shift+C"), [this] { selectClipAtPlayhead(); })
+    add(seqM, QT_TR_NOOP("Select Clip at Playhead"), QKeySequence("Shift+C"), [this] { selectClipAtPlayhead(); })
         ->setObjectName(QStringLiteral("selectClipAtPlayhead"));
-    add(seqM, tr("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
-    add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
-    add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
-    add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
-    add(seqM, tr("Suggest Chapters…"), QKeySequence(), [this] { suggestChapterMarkers(); })->setObjectName(QStringLiteral("suggestChapters"));
-    QAction* notes = add(seqM, tr("Summary and Notes…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
+    add(seqM, QT_TR_NOOP("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
+    add(seqM, QT_TR_NOOP("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
+    add(seqM, QT_TR_NOOP("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
+    add(seqM, QT_TR_NOOP("Suggest Chapters…"), QKeySequence(), [this] { suggestChapterMarkers(); })->setObjectName(QStringLiteral("suggestChapters"));
+    QAction* notes = add(seqM, QT_TR_NOOP("Summary and Notes…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         FootageNotesDialog dlg(state_, this);
         dlg.exec();
     });
     notes->setObjectName(QStringLiteral("footageNotes"));
     notes->setEnabled(languageModelAvailable());  // (written by the language model, which this build may not have)
-    add(seqM, tr("Compare with Sequence…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Compare with Sequence…"), QKeySequence(), [this] {
         // Another version of the cut, compared with this one (the older one picked from the project's sequences).
         const Sequence* now = state_->sequence();
         if (!now) return;
@@ -2126,13 +2225,13 @@ void MainWindow::buildMenus() {
                                                    names, 0, false, &ok);
         if (ok) compareWith(ids[size_t(names.indexOf(pick))]);
     })->setObjectName(QStringLiteral("compareSequences"));
-    add(seqM, tr("Conform Check…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Conform Check…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         auto* dlg = new ConformCheckDialog(state_, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->show();
     })->setObjectName(QStringLiteral("conformCheck"));
-    add(seqM, tr("Export Markers…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Export Markers…"), QKeySequence(), [this] {
         QString filter;
         const QString path = QFileDialog::getSaveFileName(this, tr("Export Markers"), QString(),
                                                           tr("Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl);;PDF with pictures (*.pdf)"), &filter);
@@ -2142,16 +2241,16 @@ void MainWindow::buildMenus() {
             file += filter.contains("*.txt") ? ".txt" : filter.contains("*.edl") ? ".edl" : filter.contains("*.pdf") ? ".pdf" : ".csv";
         exportMarkers(file);
     })->setObjectName(QStringLiteral("exportMarkers"));
-    add(seqM, tr("Import Markers…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Import Markers…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Markers"), QString(), tr("Marker lists and review notes (*.csv *.txt *.tsv *.json)"));
         if (!path.isEmpty()) importMarkers(path);
     })->setObjectName(QStringLiteral("importMarkers"));
-    add(seqM, tr("&Quality Check…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("&Quality Check…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         QualityCheckDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("qualityCheck"));
-    add(seqM, tr("Dialogue &Intelligibility…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Dialogue &Intelligibility…"), QKeySequence(), [this] {
             QStringList presets;
             for (const std::string& n : intelligibilityPresetNames()) presets << QString::fromStdString(n);
             bool ok = false;
@@ -2163,7 +2262,7 @@ void MainWindow::buildMenus() {
             appSettings().setValue("intelligibility/preset", preset);
             analyseIntelligibility(preset);
         })->setObjectName(QStringLiteral("analyseIntelligibility"));
-    add(seqM, tr("Loudness &Report…"), QKeySequence(), [this] {
+    add(seqM, QT_TR_NOOP("Loudness &Report…"), QKeySequence(), [this] {
             if (!state_->sequence()) return;
             // (name, target, tolerance, dialogue, true peak ceiling, Leq(M) limit)
             struct Standard {
@@ -2204,15 +2303,15 @@ void MainWindow::buildMenus() {
             spec.leqmLimit = standards[size_t(i)].leqm;
             loudnessReport(spec, path);
         })->setObjectName(QStringLiteral("loudnessReport"));
-    add(seqM, tr("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
-    add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
-    add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
-    add(seqM, tr("Clear Marker at Playhead"), QKeySequence("Ctrl+Alt+M"), [this] {
+    add(seqM, QT_TR_NOOP("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
+    add(seqM, QT_TR_NOOP("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
+    add(seqM, QT_TR_NOOP("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
+    add(seqM, QT_TR_NOOP("Clear Marker at Playhead"), QKeySequence("Ctrl+Alt+M"), [this] {
         FrameTime t = state_->playhead();
         state_->edit(tr("Clear Marker"), [t](Project&, Sequence& s) { return edit::removeMarkerAt(s, t); });
     });
     seqM->addSeparator();
-    snapping_ = add(seqM, tr("S&napping"), QKeySequence(Qt::Key_S), [this] { state_->setSnapping(snapping_->isChecked()); });
+    snapping_ = add(seqM, QT_TR_NOOP("S&napping"), QKeySequence(Qt::Key_S), [this] { state_->setSnapping(snapping_->isChecked()); });
     snapping_->setCheckable(true);
     snapping_->setChecked(true);
     {
@@ -2221,7 +2320,7 @@ void MainWindow::buildMenus() {
         const bool opacity = appSettings().value("timeline/opacityLines", false).toBool();
         timeline_->setShowVolumeLines(volume);
         timeline_->setShowOpacityLines(opacity);
-        QAction* v = add(seqM, tr("Show Clip &Volume"), QKeySequence(), [this](bool on) {
+        QAction* v = add(seqM, QT_TR_NOOP("Show Clip &Volume"), QKeySequence(), [this](bool on) {
             timeline_->setShowVolumeLines(on);
             appSettings().setValue("timeline/volumeLines", on);
         });
@@ -2229,7 +2328,7 @@ void MainWindow::buildMenus() {
         v->setChecked(volume);
         v->setObjectName(QStringLiteral("showVolumeLines"));
         v->setToolTip(tr("Draw each audio clip's volume as a line: drag it, Ctrl/Cmd-click to add a keyframe, Alt-click a keyframe to delete it"));
-        QAction* o = add(seqM, tr("Show Clip &Opacity"), QKeySequence(), [this](bool on) {
+        QAction* o = add(seqM, QT_TR_NOOP("Show Clip &Opacity"), QKeySequence(), [this](bool on) {
             timeline_->setShowOpacityLines(on);
             appSettings().setValue("timeline/opacityLines", on);
         });
@@ -2238,7 +2337,7 @@ void MainWindow::buildMenus() {
         o->setObjectName(QStringLiteral("showOpacityLines"));
         const bool trackAuto = appSettings().value("timeline/trackAutomation", false).toBool();
         timeline_->setShowTrackAutomation(trackAuto);
-        QAction* a = add(seqM, tr("Show &Track Automation"), QKeySequence(), [this](bool on) {
+        QAction* a = add(seqM, QT_TR_NOOP("Show &Track Automation"), QKeySequence(), [this](bool on) {
             timeline_->setShowTrackAutomation(on);
             appSettings().setValue("timeline/trackAutomation", on);
         });
@@ -2251,7 +2350,7 @@ void MainWindow::buildMenus() {
     {
         const bool durations = appSettings().value("timeline/clipDurations", false).toBool();
         timeline_->setShowClipDurations(durations);
-        QAction* a = add(seqM, tr("Show Clip &Durations"), QKeySequence(), [this](bool on) {
+        QAction* a = add(seqM, QT_TR_NOOP("Show Clip &Durations"), QKeySequence(), [this](bool on) {
             timeline_->setShowClipDurations(on);
             appSettings().setValue("timeline/clipDurations", on);
         });
@@ -2262,7 +2361,7 @@ void MainWindow::buildMenus() {
     {
         const bool normalize = appSettings().value("timeline/normalizeWaveforms", false).toBool();
         timeline_->setNormalizeWaveforms(normalize);
-        QAction* a = add(seqM, tr("Normalise Waveforms"), QKeySequence(), [this](bool on) {
+        QAction* a = add(seqM, QT_TR_NOOP("Normalise Waveforms"), QKeySequence(), [this](bool on) {
             timeline_->setNormalizeWaveforms(on);
             appSettings().setValue("timeline/normalizeWaveforms", on);
         });
@@ -2275,7 +2374,7 @@ void MainWindow::buildMenus() {
     {
         const bool dups = appSettings().value("timeline/duplicateFrames", false).toBool();
         timeline_->setShowDuplicateFrames(dups);
-        QAction* a = add(seqM, tr("Show &Duplicate Frame Markers"), QKeySequence(), [this](bool on) {
+        QAction* a = add(seqM, QT_TR_NOOP("Show &Duplicate Frame Markers"), QKeySequence(), [this](bool on) {
             timeline_->setShowDuplicateFrames(on);
             appSettings().setValue("timeline/duplicateFrames", on);
         });
@@ -2284,18 +2383,18 @@ void MainWindow::buildMenus() {
         a->setObjectName(QStringLiteral("showDuplicateFrames"));
         a->setToolTip(tr("Mark video frames used more than once in the sequence with a stripe, one colour per file"));
     }
-    add(seqM, tr("Zoom &In"), QKeySequence(Qt::Key_Equal), [this] { timeline_->zoomIn(); });
-    add(seqM, tr("Zoom &Out"), QKeySequence(Qt::Key_Minus), [this] { timeline_->zoomOut(); });
-    add(seqM, tr("Zoom to &Fit"), QKeySequence(Qt::Key_Backslash), [this] { timeline_->zoomToFit(); });
+    add(seqM, QT_TR_NOOP("Zoom &In"), QKeySequence(Qt::Key_Equal), [this] { timeline_->zoomIn(); });
+    add(seqM, QT_TR_NOOP("Zoom &Out"), QKeySequence(Qt::Key_Minus), [this] { timeline_->zoomOut(); });
+    add(seqM, QT_TR_NOOP("Zoom to &Fit"), QKeySequence(Qt::Key_Backslash), [this] { timeline_->zoomToFit(); });
 
     // ---- Playback
-    QMenu* play = menuBar()->addMenu(tr("&Playback"));
+    QMenu* play = menuIn(menuBar(), QT_TR_NOOP("&Playback"));
     {
         // Hardware decoding (on by default; MONTAGE_HWACCEL=off overrides the saved choice).
         const bool hw = qEnvironmentVariable("MONTAGE_HWACCEL") != "off" &&
                         appSettings().value("playback/hardwareDecoding", true).toBool();
         setHwDecodeMode(hw ? HwDecodeMode::Auto : HwDecodeMode::Off);
-        QAction* a = add(play, tr("&Hardware Decoding"), QKeySequence(), [this](bool on) {
+        QAction* a = add(play, QT_TR_NOOP("&Hardware Decoding"), QKeySequence(), [this](bool on) {
             setHwDecodeMode(on ? HwDecodeMode::Auto : HwDecodeMode::Off);
             appSettings().setValue("playback/hardwareDecoding", on);
             MediaPool::instance().clear();  // reopen decoders with the new setting
@@ -2326,7 +2425,7 @@ void MainWindow::buildMenus() {
         }
         const bool onGpu = wantGpu && startGpuGuarded(&why);
         program_->setGpuRendering(onGpu);
-        QAction* g = add(play, tr("&GPU Rendering"), QKeySequence(), [](bool) {});
+        QAction* g = add(play, QT_TR_NOOP("&GPU Rendering"), QKeySequence(), [](bool) {});
         g->setObjectName(QStringLiteral("gpuRendering"));
         g->setCheckable(true);
         g->setChecked(onGpu);
@@ -2354,12 +2453,12 @@ void MainWindow::buildMenus() {
         });
         play->addSeparator();
     }
-    trimView_ = add(play, tr("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
+    trimView_ = add(play, QT_TR_NOOP("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
     trimView_->setObjectName(QStringLiteral("twoUpTrim"));
     trimView_->setCheckable(true);
     trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
     trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
-    QAction* drawings = add(play, tr("Show Review Drawings"), QKeySequence(), [this](bool on) {
+    QAction* drawings = add(play, QT_TR_NOOP("Show Review Drawings"), QKeySequence(), [this](bool on) {
         appSettings().setValue("playback/reviewDrawings", on);
         if (reviewOverlay_) reviewOverlay_->setShown(on);
     });
@@ -2368,7 +2467,7 @@ void MainWindow::buildMenus() {
     drawings->setChecked(appSettings().value("playback/reviewDrawings", true).toBool());
     drawings->setToolTip(tr("Show what reviewers drew on a frame (notes imported from a review page) over the Program monitor at its marker"));
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
-    hdrViewer_ = add(play, tr("HDR Viewer"), QKeySequence(), [this](bool on) {
+    hdrViewer_ = add(play, QT_TR_NOOP("HDR Viewer"), QKeySequence(), [this](bool on) {
         appSettings().setValue("playback/hdrViewer", on);
         hdrMessageShown_ = false;
         applyHdrViewer();
@@ -2381,13 +2480,13 @@ void MainWindow::buildMenus() {
                                                  "instead of tone mapped to SDR")
                                             : tr("This build has no HDR viewer (it needs Qt 6.7 or later)"));
     // Video output: the Program picture alone, full screen here or on another display.
-    QAction* fullScreen = add(play, tr("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
+    QAction* fullScreen = add(play, QT_TR_NOOP("Full Screen Program"), QKeySequence("Ctrl+Shift+F"), [this] {
         if (cleanFeed_ && cleanFeed_->isVisible()) hideCleanFeed();
         else showCleanFeed(-1);
     });
     fullScreen->setObjectName(QStringLiteral("fullScreenProgram"));
     fullScreen->setToolTip(tr("The Program picture alone, full screen (Esc to leave)"));
-    QMenu* output = play->addMenu(tr("Video Output"));
+    QMenu* output = menuIn(play, QT_TR_NOOP("Video Output"));
     output->setObjectName(QStringLiteral("videoOutputMenu"));
     connect(output, &QMenu::aboutToShow, this, [this, output] {
         output->clear();
@@ -2513,7 +2612,7 @@ void MainWindow::buildMenus() {
         });
     // How ambisonic sound (core/Ambisonics.h) is heard: binaurally on headphones, or as stereo on speakers.
     {
-        QMenu* ambiM = play->addMenu(tr("Ambisonic Monitoring"));
+        QMenu* ambiM = menuIn(play, QT_TR_NOOP("Ambisonic Monitoring"));
         ambiM->setObjectName(QStringLiteral("ambisonicMonitorMenu"));
         auto* group = new QActionGroup(ambiM);
         const bool binaural = appSettings().value("playback/ambisonicBinaural", true).toBool();
@@ -2570,7 +2669,7 @@ void MainWindow::buildMenus() {
         showChoice();
     }
     // How the Program monitor shows a stereo 3D sequence's two eyes (render/Stereo.h).
-    QMenu* stereoM = play->addMenu(tr("Stereo 3D View"));
+    QMenu* stereoM = menuIn(play, QT_TR_NOOP("Stereo 3D View"));
     stereoM->setObjectName(QStringLiteral("stereoViewMenu"));
     stereoM->setToolTip(tr("For stereoscopic 3D sequences: one eye, red-cyan anaglyph, both eyes, or where they differ"));
     {
@@ -2599,7 +2698,7 @@ void MainWindow::buildMenus() {
         }
     }
     // What the timecode readouts count in (EditorState.h counterDisplay).
-    QMenu* counterM = play->addMenu(tr("Counter"));
+    QMenu* counterM = menuIn(play, QT_TR_NOOP("Counter"));
     counterM->setObjectName(QStringLiteral("counterMenu"));
     counterM->setToolTip(tr("Timecode, or feet and frames in the sequence's film gauge (Sequence Settings)"));
     {
@@ -2622,49 +2721,49 @@ void MainWindow::buildMenus() {
         }
     }
     play->addSeparator();
-    add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
+    add(play, QT_TR_NOOP("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     // In Trim mode J, K and L trim the selected edit as it plays (dynamic trimming).
-    add(play, tr("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] {
+    add(play, QT_TR_NOOP("Shuttle &Reverse"), QKeySequence(Qt::Key_J), [this] {
         if (!shuttleTrim(-1)) activeController()->shuttle(-1);
     })->setObjectName(QStringLiteral("shuttleReverse"));
-    add(play, tr("&Stop"), QKeySequence(Qt::Key_K), [this] {
+    add(play, QT_TR_NOOP("&Stop"), QKeySequence(Qt::Key_K), [this] {
         if (!stopTrimShuttle()) activeController()->shuttle(0);
     })->setObjectName(QStringLiteral("shuttleStop"));
-    add(play, tr("Shuttle &Forward"), QKeySequence(Qt::Key_L), [this] {
+    add(play, QT_TR_NOOP("Shuttle &Forward"), QKeySequence(Qt::Key_L), [this] {
         if (!shuttleTrim(1)) activeController()->shuttle(1);
     })->setObjectName(QStringLiteral("shuttleForward"));
     play->addSeparator();
-    add(play, tr("Step Back"), QKeySequence(Qt::Key_Left), [this] { activeController()->step(-1); });
-    add(play, tr("Step Forward"), QKeySequence(Qt::Key_Right), [this] { activeController()->step(1); });
-    add(play, tr("Back 5 Frames"), QKeySequence("Shift+Left"), [this] { activeController()->step(-5); });
-    add(play, tr("Forward 5 Frames"), QKeySequence("Shift+Right"), [this] { activeController()->step(5); });
-    add(play, tr("Previous Edit"), QKeySequence(Qt::Key_Up), withSeq([this] {
+    add(play, QT_TR_NOOP("Step Back"), QKeySequence(Qt::Key_Left), [this] { activeController()->step(-1); });
+    add(play, QT_TR_NOOP("Step Forward"), QKeySequence(Qt::Key_Right), [this] { activeController()->step(1); });
+    add(play, QT_TR_NOOP("Back 5 Frames"), QKeySequence("Shift+Left"), [this] { activeController()->step(-5); });
+    add(play, QT_TR_NOOP("Forward 5 Frames"), QKeySequence("Shift+Right"), [this] { activeController()->step(5); });
+    add(play, QT_TR_NOOP("Previous Edit"), QKeySequence(Qt::Key_Up), withSeq([this] {
             program_->seek(edit::prevEdit(*state_->sequence(), state_->playhead()));
         }));
-    add(play, tr("Next Edit"), QKeySequence(Qt::Key_Down), withSeq([this] {
+    add(play, QT_TR_NOOP("Next Edit"), QKeySequence(Qt::Key_Down), withSeq([this] {
             program_->seek(edit::nextEdit(*state_->sequence(), state_->playhead()));
         }));
-    add(play, tr("Go to Start"), QKeySequence(Qt::Key_Home), [this] { activeController()->seek(0); });
-    add(play, tr("Go to End"), QKeySequence(Qt::Key_End), [this] {
+    add(play, QT_TR_NOOP("Go to Start"), QKeySequence(Qt::Key_Home), [this] { activeController()->seek(0); });
+    add(play, QT_TR_NOOP("Go to End"), QKeySequence(Qt::Key_End), [this] {
         const Sequence* s = activeController()->sequence();
         if (s) activeController()->seek(s->duration());
     });
 
     // ---- Tools (menu + toolbar)
-    QMenu* toolsM = menuBar()->addMenu(tr("&Tools"));
+    QMenu* toolsM = menuIn(menuBar(), QT_TR_NOOP("&Tools"));
     QToolBar* tb = addToolBar(tr("Tools"));
     tb->setObjectName("tools");
     tb->setMovable(false);
     tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
     auto* group = new QActionGroup(this);
-    const std::tuple<TimelineWidget::Tool, QString, QString, Qt::Key> tools[] = {
-        {TimelineWidget::Tool::Select, tr("Select"), tr("Selection tool: move, trim, select"), Qt::Key_V},
-        {TimelineWidget::Tool::Razor, tr("Razor"), tr("Razor: cut clips (Shift = all tracks)"), Qt::Key_C},
-        {TimelineWidget::Tool::Ripple, tr("Ripple"), tr("Ripple edit: trim and shift following clips"), Qt::Key_B},
-        {TimelineWidget::Tool::Roll, tr("Roll"), tr("Rolling edit: move a cut between two clips"), Qt::Key_N},
-        {TimelineWidget::Tool::Slip, tr("Slip"), tr("Slip: change a clip's content, not its position"), Qt::Key_Y},
-        {TimelineWidget::Tool::Slide, tr("Slide"), tr("Slide: move a clip between its neighbours"), Qt::Key_U},
-        {TimelineWidget::Tool::Hand, tr("Hand"), tr("Hand: pan the timeline"), Qt::Key_H},
+    const std::tuple<TimelineWidget::Tool, const char*, QString, Qt::Key> tools[] = {
+        {TimelineWidget::Tool::Select, QT_TR_NOOP("Select"), tr("Selection tool: move, trim, select"), Qt::Key_V},
+        {TimelineWidget::Tool::Razor, QT_TR_NOOP("Razor"), tr("Razor: cut clips (Shift = all tracks)"), Qt::Key_C},
+        {TimelineWidget::Tool::Ripple, QT_TR_NOOP("Ripple"), tr("Ripple edit: trim and shift following clips"), Qt::Key_B},
+        {TimelineWidget::Tool::Roll, QT_TR_NOOP("Roll"), tr("Rolling edit: move a cut between two clips"), Qt::Key_N},
+        {TimelineWidget::Tool::Slip, QT_TR_NOOP("Slip"), tr("Slip: change a clip's content, not its position"), Qt::Key_Y},
+        {TimelineWidget::Tool::Slide, QT_TR_NOOP("Slide"), tr("Slide: move a clip between its neighbours"), Qt::Key_U},
+        {TimelineWidget::Tool::Hand, QT_TR_NOOP("Hand"), tr("Hand: pan the timeline"), Qt::Key_H},
     };
     for (const auto& [tool, name, tip, key] : tools) {
         TimelineWidget::Tool t = tool;
@@ -2681,13 +2780,13 @@ void MainWindow::buildMenus() {
     });
     toolsM->addSeparator();
     // AI agents on the open project (MCP over the agent link).
-    agentLinkAction_ = add(toolsM, tr("Let AI Agents Edit This Project"), QKeySequence(), [this] { setAgentLink(agentLinkAction_->isChecked()); });
+    agentLinkAction_ = add(toolsM, QT_TR_NOOP("Let AI Agents Edit This Project"), QKeySequence(), [this] { setAgentLink(agentLinkAction_->isChecked()); });
     agentLinkAction_->setObjectName(QStringLiteral("agentLink"));
     agentLinkAction_->setCheckable(true);
     agentLinkAction_->setToolTip(tr("Claude and other MCP clients edit the project open here, each change one undo step"));
-    add(toolsM, tr("Agent Link…"), QKeySequence(), [this] { agentLinkDialog(); })->setObjectName(QStringLiteral("agentLinkDialog"));
+    add(toolsM, QT_TR_NOOP("Agent Link…"), QKeySequence(), [this] { agentLinkDialog(); })->setObjectName(QStringLiteral("agentLinkDialog"));
     // Scripts: those in the scripts folder, any other file, the console (Resolve's Workspace › Scripts).
-    QMenu* scriptsM = toolsM->addMenu(tr("&Scripts"));
+    QMenu* scriptsM = menuIn(toolsM, QT_TR_NOOP("&Scripts"));
     scriptsM->setObjectName(QStringLiteral("scriptsMenu"));
     connect(scriptsM, &QMenu::aboutToShow, this, [this, scriptsM] {
         scriptsM->clear();
@@ -2723,7 +2822,7 @@ void MainWindow::buildMenus() {
             QDesktopServices::openUrl(QUrl::fromLocalFile(scriptsDirectory()));
         });
     });
-    add(toolsM, tr("Audio &Plugins…"), QKeySequence(), [this] {
+    add(toolsM, QT_TR_NOOP("Audio &Plugins…"), QKeySequence(), [this] {
         auto* dlg = new PluginManagerDialog(this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         connect(dlg, &PluginManagerDialog::pluginsChanged, effects_, &EffectsBrowser::reload);
@@ -2735,7 +2834,7 @@ void MainWindow::buildMenus() {
         initInference();  // (the provider libraries, and the choice saved here, as the command line takes them too)
         InferenceMode saved = InferenceMode::Auto;
         parseInferenceMode(appSettings().value(QStringLiteral("ai/inference"), "auto").toString().toStdString(), saved);
-        QMenu* runOn = toolsM->addMenu(tr("AI Models Run On"));
+        QMenu* runOn = menuIn(toolsM, QT_TR_NOOP("AI Models Run On"));
         runOn->setObjectName(QStringLiteral("aiRunOn"));
         auto* modes = new QActionGroup(this);
         const std::pair<InferenceMode, QString> choices[] = {
@@ -2795,14 +2894,14 @@ void MainWindow::buildMenus() {
     tb->addAction(redo_);
 
     // ---- Window & Help
-    windowMenu_ = menuBar()->addMenu(tr("&Window"));
+    windowMenu_ = menuIn(menuBar(), QT_TR_NOOP("&Window"));
     for (QDockWidget* d : docks_) windowMenu_->addAction(d->toggleViewAction());
     windowMenu_->addSeparator();
-    workspaceMenu_ = windowMenu_->addMenu(tr("&Workspaces"));
+    workspaceMenu_ = menuIn(windowMenu_, QT_TR_NOOP("&Workspaces"));
     workspaceGroup_ = new QActionGroup(this);
     for (int i = 0; i < builtInWorkspaces().size(); ++i) {
         const QString n = builtInWorkspaces()[i];
-        QAction* a = add(workspaceMenu_, workspaceTitle(n), QKeySequence(QStringLiteral("Alt+Shift+%1").arg(i + 1)), [this, n] { applyWorkspace(n); });
+        QAction* a = add(workspaceMenu_, Name(workspaceTitle(n), n), QKeySequence(QStringLiteral("Alt+Shift+%1").arg(i + 1)), [this, n] { applyWorkspace(n); });
         a->setObjectName(QStringLiteral("workspace") + n);
         a->setData(n);
         a->setCheckable(true);
@@ -2810,32 +2909,32 @@ void MainWindow::buildMenus() {
         workspaceActions_.push_back(a);
     }
     workspaceCustomEnd_ = workspaceMenu_->addSeparator();
-    add(workspaceMenu_, tr("&Save as New Workspace…"), QKeySequence(), [this] {
+    add(workspaceMenu_, QT_TR_NOOP("&Save as New Workspace…"), QKeySequence(), [this] {
         bool ok = false;
         const QString n = QInputDialog::getText(this, tr("Save Workspace"), tr("Name:"), QLineEdit::Normal, QString(), &ok);
         if (ok && !saveWorkspace(n)) state_->message(tr("Choose a name other than a built-in workspace's"), 4000);
     })->setObjectName(QStringLiteral("saveWorkspace"));
-    deleteWorkspaceMenu_ = workspaceMenu_->addMenu(tr("&Delete Workspace"));
-    add(windowMenu_, tr("&Reset Workspace to Saved Layout"), QKeySequence(), [this] { resetLayout(); })->setObjectName(QStringLiteral("resetWorkspace"));
+    deleteWorkspaceMenu_ = menuIn(workspaceMenu_, QT_TR_NOOP("&Delete Workspace"));
+    add(windowMenu_, QT_TR_NOOP("&Reset Workspace to Saved Layout"), QKeySequence(), [this] { resetLayout(); })->setObjectName(QStringLiteral("resetWorkspace"));
     windowMenu_->addSeparator();
-    add(windowMenu_, tr("Next Panel"), QKeySequence(Qt::Key_F6), [this] { focusPanel(1); })->setObjectName(QStringLiteral("nextPanel"));
-    add(windowMenu_, tr("Previous Panel"), QKeySequence("Shift+F6"), [this] { focusPanel(-1); })->setObjectName(QStringLiteral("previousPanel"));
-    add(windowMenu_, tr("Next Tab in Panel"), QKeySequence("Ctrl+F6"), [this] { nextPanelTab(); })->setObjectName(QStringLiteral("nextPanelTab"));
-    QAction* contrast = add(windowMenu_, tr("&High Contrast"), QKeySequence(), [this](bool on) { setHighContrast(on); });
+    add(windowMenu_, QT_TR_NOOP("Next Panel"), QKeySequence(Qt::Key_F6), [this] { focusPanel(1); })->setObjectName(QStringLiteral("nextPanel"));
+    add(windowMenu_, QT_TR_NOOP("Previous Panel"), QKeySequence("Shift+F6"), [this] { focusPanel(-1); })->setObjectName(QStringLiteral("previousPanel"));
+    add(windowMenu_, QT_TR_NOOP("Next Tab in Panel"), QKeySequence("Ctrl+F6"), [this] { nextPanelTab(); })->setObjectName(QStringLiteral("nextPanelTab"));
+    QAction* contrast = add(windowMenu_, QT_TR_NOOP("&High Contrast"), QKeySequence(), [this](bool on) { setHighContrast(on); });
     contrast->setObjectName(QStringLiteral("highContrast"));
     contrast->setCheckable(true);
     contrast->setChecked(theme::highContrast());
-    QMenu* textSize = windowMenu_->addMenu(tr("Text &Size"));
+    QMenu* textSize = menuIn(windowMenu_, QT_TR_NOOP("Text &Size"));
     auto* textSizes = new QActionGroup(this);
     for (const int percent : {100, 125, 150, 175, 200}) {
-        QAction* a = add(textSize, tr("%1 %").arg(percent), QKeySequence(), [this, percent] { setTextScale(percent / 100.0); });
+        QAction* a = add(textSize, Name(tr("%1 %").arg(percent), QStringLiteral("%1 %").arg(percent)), QKeySequence(), [this, percent] { setTextScale(percent / 100.0); });
         a->setObjectName(QStringLiteral("textSize%1").arg(percent));
         a->setCheckable(true);
         a->setChecked(std::lround(theme::textScale() * 100) == percent);
         textSizes->addAction(a);
     }
     // The interface's language, from the next start (every window is built in it).
-    QMenu* languageMenu = windowMenu_->addMenu(tr("&Language"));
+    QMenu* languageMenu = menuIn(windowMenu_, QT_TR_NOOP("&Language"));
     languageMenu->setObjectName(QStringLiteral("languageMenu"));
     auto* languages = new QActionGroup(this);
     const QString chosenLanguage = language::chosen();
@@ -2843,7 +2942,7 @@ void MainWindow::buildMenus() {
     for (const language::Language& l : language::available()) choices.push_back(l);
     for (const language::Language& l : choices) {
         if (l.code == QLatin1String("pseudo")) languageMenu->addSeparator();
-        QAction* a = add(languageMenu, l.code.isEmpty() ? l.name : l.label(), QKeySequence(), [this, l] {
+        QAction* a = add(languageMenu, Name(l.code.isEmpty() ? l.name : l.label(), l.code.isEmpty() ? QStringLiteral("System Language") : l.code), QKeySequence(), [this, l] {
             language::choose(l.code);
             const QString name = l.code.isEmpty() ? language::displayName(language::resolve(QString())) : l.name;
             state_->message(language::resolve(l.code) == language::installed()
@@ -2867,11 +2966,11 @@ void MainWindow::buildMenus() {
         if (!syncingWorkspace_ && i >= 0) applyWorkspace(workspaceBar_->tabData(i).toString());
     });
     syncWorkspaceUi();
-    QMenu* help = menuBar()->addMenu(tr("&Help"));
-    add(help, tr("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
-    add(help, tr("&Licences…"), QKeySequence(), [this] { LicencesDialog(this).exec(); })->setObjectName("showLicences");
-    add(help, tr("About &Qt"), QKeySequence(), [] { QApplication::aboutQt(); });
-    add(help, tr("&About Montage"), QKeySequence(), [this] { about(); });
+    QMenu* help = menuIn(menuBar(), QT_TR_NOOP("&Help"));
+    add(help, QT_TR_NOOP("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
+    add(help, QT_TR_NOOP("&Licences…"), QKeySequence(), [this] { LicencesDialog(this).exec(); })->setObjectName("showLicences");
+    add(help, QT_TR_NOOP("About &Qt"), QKeySequence(), [] { QApplication::aboutQt(); });
+    add(help, QT_TR_NOOP("&About Montage"), QKeySequence(), [this] { about(); });
 
     // Timeline context menus reuse the actions.
     auto* sep1 = new QAction(this);
@@ -4594,8 +4693,8 @@ int MainWindow::importAmf(const QString& path, int setSpace) {
     if (!amf.outputSpace.empty() && (amf.outputSpace != s->colorSpace || (findColorSpace(amf.outputSpace)->hdr() && amf.outputPeakNits != s->hdrPeakNits))) {
         if (setSpace < 0) {
             const ColorSpace* out = findColorSpace(amf.outputSpace);
-            const QString what = out->hdr() ? tr("%1 at %2 nits").arg(QString::fromStdString(out->label)).arg(amf.outputPeakNits)
-                                            : QString::fromStdString(out->label);
+            const QString what = out->hdr() ? tr("%1 at %2 nits").arg(language::engine(out->label)).arg(amf.outputPeakNits)
+                                            : language::engine(out->label);
             setSpace = QMessageBox::question(this, tr("Import ACES Metadata"),
                                              tr("Its output transform is for %1. Make that the sequence's colour space?").arg(what)) == QMessageBox::Yes;
         }
@@ -6734,7 +6833,7 @@ void MainWindow::exportVersionsDialog() {
     form->addRow(tr("Loudness:"), loud);
     auto* format = new QComboBox(&dlg);
     for (const char* name : {"H.264 - High Quality", "H.265 / HEVC", "ProRes 422 HQ"})
-        if (findExportPreset(name)) format->addItem(QString::fromLatin1(name));
+        if (findExportPreset(name)) format->addItem(language::engine(name), QString::fromLatin1(name));
     form->addRow(tr("Format:"), format);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Queue Versions"));
@@ -6747,7 +6846,7 @@ void MainWindow::exportVersionsDialog() {
         if (box->isChecked()) chosen.push_back(shape);
     if (chosen.empty()) return;
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
-    exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
+    exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentData().toString());
 }
 
 QString MainWindow::newRoomTonePath(const std::string& sequenceName) const {

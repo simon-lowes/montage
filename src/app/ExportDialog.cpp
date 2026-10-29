@@ -959,7 +959,7 @@ void ExportDialog::updateSummary() {
             line += tr(" (choose H.265: spatial video is MV-HEVC)");
         const ColorSpace* out = findColorSpace(color_->currentData().toString().toStdString());
         const ColorSpace& space = out ? *out : sequenceColorSpace(*seq);
-        line += ", " + QString::fromStdString(space.label);
+        line += ", " + language::engine(space.label);
         if (&space != &sequenceColorSpace(*seq) && sequenceColorSpace(*seq).hdr() && !space.hdr()) line += tr(" (tone mapped)");
         lines << line;
         // FFmpeg writes stereo and spherical metadata into MP4 and Matroska only.
