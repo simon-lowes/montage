@@ -6808,7 +6808,7 @@ void McpServer::Impl::addTools() {
 
     add("montage_pitch_contour", "Pitch contour",
         "Read or edit the pitch of an audio clip (a voice or a solo instrument). Reports the pitch heard (tracked by pYIN) "
-        "every 20 ms over start..end (timeline seconds; default the whole clip), with what the clip's pitch edits make of it "
+        "every 20 ms over start..end (timeline seconds; default the whole clip; at most 15 minutes), with what the clip's pitch edits make of it "
         "and the median. edits adds pitch edits, each over start..end: shift (semitones), inflection (how much the pitch "
         "rises and falls about its median: 0 flat, 1 as it is, 2 doubled), correct (0-1: drawn to the nearest note of the "
         "scale, vibrato kept) with key (C, C#... or 0-11) and scale (chromatic, major, minor), formant (semitones: the "
@@ -6875,6 +6875,7 @@ void McpServer::Impl::addTools() {
             // The pitch over the range asked for, as heard before the edits and as they make it.
             const double t0 = std::max(clipStart, a.value("start").toDouble(clipStart)), t1 = std::min(clipEnd, a.value("end").toDouble(clipEnd));
             if (!(t1 > t0)) throw ArgError{"start must be before end, inside the clip"};
+            if (t1 - t0 > 900) throw ArgError{"Ask for at most 15 minutes at once (start and end)"};
             AudioBufferPtr sound = soundBeforePitchEdits(l.project, *c, 48000);
             if (!sound) throw ArgError{"Cannot read the clip's sound"};
             const double a0 = sourceAt(t0), a1 = sourceAt(t1);

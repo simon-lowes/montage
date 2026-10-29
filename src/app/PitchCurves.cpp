@@ -2,8 +2,6 @@
 
 #include <QCoreApplication>
 #include <QPointer>
-#include <deque>
-#include <thread>
 
 #include "audio/DialogueAlign.h"
 #include "audio/SpeechCleanup.h"
@@ -15,12 +13,18 @@ namespace {
 
 constexpr int kRate = 48000;
 
+}  // namespace
+
 // What the pitch is tracked on: the clip's sound, through its source effects up to its pitch edits.
-struct Job {
+struct PitchCurves::Job {
     std::string sound;
     std::deque<Effect> effects;
     double from = 0, to = 0;  // source seconds
 };
+
+namespace {
+
+using Job = PitchCurves::Job;
 
 bool jobFor(const Project& p, const Sequence& s, const Clip& c, Job& job) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
@@ -37,22 +41,27 @@ bool jobFor(const Project& p, const Sequence& s, const Clip& c, Job& job) {
     const double fps = s.fpsValue();
     job.from = c.sourceIn / fps;
     job.to = (c.sourceIn + c.sourceExtent()) / fps;
-    return true;
+    return job.to - job.from <= PitchCurves::kLongest;
 }
 
-std::shared_ptr<const PitchTrack> run(const Job& job) {
+std::shared_ptr<const PitchTrack> run(const Job& job, const std::atomic<bool>* cancel = nullptr) {
     AudioBufferPtr sound = MediaPool::instance().audio(job.sound, kRate);
     if (!sound) return std::make_shared<PitchTrack>();
     std::vector<const Effect*> fx;
     for (const Effect& e : job.effects) fx.push_back(&e);
     if (!fx.empty())
         if (AudioBufferPtr played = cleanedAudio(job.sound, sound, fx, true)) sound = played;
-    return std::make_shared<PitchTrack>(trackPitch(*sound, job.from, job.to, 50, 800));
+    return std::make_shared<PitchTrack>(trackPitch(*sound, job.from, job.to, 50, 800, cancel));
 }
 
 }  // namespace
 
 PitchCurves::PitchCurves(QObject* parent) : QObject(parent) {}
+
+PitchCurves::~PitchCurves() {
+    cancel_->store(true);
+    if (worker_.joinable()) worker_.join();
+}
 
 std::string PitchCurves::keyOf(const Project& p, const Sequence& s, const Clip& c) const {
     Job job;
@@ -80,26 +89,40 @@ std::shared_ptr<const PitchCurves::Curve> PitchCurves::finish(const std::string&
     return curve;
 }
 
-std::shared_ptr<const PitchCurves::Curve> PitchCurves::curve(const Project& p, const Sequence& s, const Clip& c) {
+std::shared_ptr<const PitchCurves::Curve> PitchCurves::curve(const Project& p, const Sequence& s, const Clip& c, bool start) {
     const std::string key = keyOf(p, s, c);
     if (key.empty()) return nullptr;
     if (auto it = tracks_.find(key); it != tracks_.end()) return finish(key, it->second, c);
-    if (running_.count(key)) return nullptr;
-    running_.insert(key);
+    if (!start || key == running_) return nullptr;
     auto job = std::make_shared<Job>();
     jobFor(p, s, c, *job);
+    // Asked again: to the front of the queue (its back); a few kept, the oldest dropped.
+    std::erase_if(pending_, [&](const auto& q) { return q.first == key; });
+    pending_.emplace_back(key, job);
+    while (pending_.size() > 8) pending_.pop_front();
+    startNext();
+    return nullptr;
+}
+
+void PitchCurves::startNext() {
+    if (!running_.empty() || pending_.empty()) return;
+    if (worker_.joinable()) worker_.join();  // finished: it has posted its result
+    auto [key, job] = pending_.back();
+    pending_.pop_back();
+    running_ = key;
     QPointer<PitchCurves> self(this);
-    std::thread([self, key, job] {
-        auto track = run(*job);
+    worker_ = std::thread([self, key, job, cancel = cancel_] {
+        auto track = run(*job, cancel.get());
+        if (cancel->load()) return;
         QMetaObject::invokeMethod(QCoreApplication::instance(), [self, key, track] {
             if (!self) return;
-            self->running_.erase(key);
+            self->running_.clear();
             if (self->tracks_.size() > 32) self->tracks_.clear();
             self->tracks_[key] = track;
             emit self->ready();
+            self->startNext();
         }, Qt::QueuedConnection);
-    }).detach();
-    return nullptr;
+    });
 }
 
 std::shared_ptr<const PitchCurves::Curve> PitchCurves::curveNow(const Project& p, const Sequence& s, const Clip& c) {

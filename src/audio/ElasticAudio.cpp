@@ -53,21 +53,24 @@ struct Tx {
 };
 
 // The sound as one channel: the mean of the channels, or an ambisonic field's W.
-std::vector<float> monoOf(const AudioBuffer& in) {
+// Over [lo, hi) only (clipped to the sound), from index 0.
+std::vector<float> monoOf(const AudioBuffer& in, int64_t lo, int64_t hi) {
     const int64_t n = in.frames();
+    lo = std::clamp<int64_t>(lo, 0, n), hi = std::clamp<int64_t>(hi, lo, n);
     const size_t nch = size_t(std::max(1, in.channels));
-    std::vector<float> mono(static_cast<size_t>(std::max<int64_t>(0, n)));
-    for (int64_t i = 0; i < n; ++i) {
+    std::vector<float> mono(static_cast<size_t>(hi - lo));
+    for (int64_t i = lo; i < hi; ++i) {
         if (nch >= 4) {
-            mono[size_t(i)] = in.samples[size_t(i) * nch];
+            mono[size_t(i - lo)] = in.samples[size_t(i) * nch];
             continue;
         }
         float sum = 0;
         for (size_t c = 0; c < nch; ++c) sum += in.samples[size_t(i) * nch + c];
-        mono[size_t(i)] = sum / float(nch);
+        mono[size_t(i - lo)] = sum / float(nch);
     }
     return mono;
 }
+std::vector<float> monoOf(const AudioBuffer& in) { return monoOf(in, 0, in.frames()); }
 
 bool isIdentity(const DialogueWarp& warp) {
     return std::all_of(warp.begin(), warp.end(), [](const AlignPoint& p) { return std::fabs(p.w - p.u) < 1e-9; });
@@ -247,22 +250,31 @@ void applyElasticWarp(const AudioBuffer& in, const DialogueWarp& warp, ElasticMo
     const int64_t n = in.frames();
     const size_t nch = size_t(std::max(1, in.channels));
     if (warp.size() < 1 || isIdentity(warp) || n == 0) return;
+    if (!std::isfinite(offset) || std::fabs(offset) > 1e7) return;
     const int64_t off = std::llround(offset * rate);
+    // The group's members (every member's own sound, so members rendered apart choose the same grains), or this sound.
+    std::vector<std::pair<const AudioBuffer*, int64_t>> members;
+    for (const auto& [b, o] : groupIn)
+        if (b && b->frames() > 0 && std::isfinite(o) && std::fabs(o) <= 1e7) members.emplace_back(b, std::llround(o * rate));
+    if (members.empty()) members.emplace_back(&in, off);
     // Only the stretch the markers reach is remade: past the first and last, where the sound plays as it was, it is
-    // copied (a little either side made too, so grains there are whole).
+    // copied (a little either side made too, so grains there are whole). Group samples, the same for every member,
+    // so their grains fall on the same grid.
     const bool anchored = std::fabs(warp.front().w - warp.front().u) < 1e-9 && std::fabs(warp.back().w - warp.back().u) < 1e-9;
     constexpr double margin = 0.15;
-    int64_t r0 = std::numeric_limits<int64_t>::min() / 4, r1 = std::numeric_limits<int64_t>::max() / 4;  // group samples
+    int64_t r0, r1;
     if (anchored) {
         r0 = int64_t(std::floor((warp.front().u - margin) * rate));
         r1 = int64_t(std::ceil((warp.back().u + margin) * rate));
+    } else {
+        r0 = std::numeric_limits<int64_t>::max(), r1 = std::numeric_limits<int64_t>::min();
+        for (const auto& [b, o] : members) r0 = std::min(r0, -o), r1 = std::max(r1, b->frames() - o);
     }
-    // Clipped to where this sound is.
-    r0 = std::max(r0, -off), r1 = std::min(r1, n - off);
-    if (r1 <= r0) return;
+    // Nothing of this sound in it: as it was.
+    if (std::min(r1, n - off) <= std::max(r0, -off)) return;
 
     if (mode == ElasticMode::Varispeed) {
-        for (int64_t g = r0; g < r1; ++g) {
+        for (int64_t g = std::max(r0, -off); g < std::min(r1, n - off); ++g) {
             if (cancel && ((g - r0) & 0xffff) == 0 && cancel->load()) return;
             const double u = double(g) / rate;
             const double w = dialogueWarpAt(warp, u);
@@ -273,18 +285,16 @@ void applyElasticWarp(const AudioBuffer& in, const DialogueWarp& warp, ElasticMo
         return;
     }
 
-    // The group's sound over the stretch, in group samples from r0 (every member's own, so members rendered apart
-    // choose the same grains), or this sound's.
-    std::vector<std::pair<const AudioBuffer*, int64_t>> members;
-    for (const auto& [b, o] : groupIn)
-        if (b && b->frames() > 0) members.emplace_back(b, std::llround(o * rate));
-    if (members.empty()) members.emplace_back(&in, off);
+    // The group's sound over the stretch, in group samples from r0.
     std::vector<float> guide(size_t(r1 - r0), 0.0f);
     for (const auto& [b, o] : members) {
-        const std::vector<float> mono = monoOf(*b);
-        for (int64_t g = r0; g < r1; ++g) {
-            const int64_t i = g + o;
-            if (i >= 0 && i < int64_t(mono.size())) guide[size_t(g - r0)] += mono[size_t(i)];
+        const size_t bch = size_t(std::max(1, b->channels));
+        const int64_t bn = b->frames();
+        for (int64_t g = std::max(r0, -o); g < std::min(r1, bn - o); ++g) {
+            const size_t i = size_t(g + o);
+            double sum = 0;
+            for (size_t c = 0; c < bch; ++c) sum += b->samples[i * bch + c];
+            guide[size_t(g - r0)] += float(sum / double(bch));
         }
     }
     const int hop = stretchHop(rate) * (mode == ElasticMode::General ? 2 : 1);
@@ -418,8 +428,7 @@ PitchTrack trackPitch(const AudioBuffer& in, double from, double to, double fmin
     const int rate = in.sampleRate;
     if (rate <= 0 || in.frames() == 0) return track;
     fmin = std::clamp(fmin, 20.0, rate / 8.0), fmax = std::clamp(fmax, fmin * 1.5, rate / 4.0);
-    const std::vector<float> x = monoOf(in);
-    const int64_t n = int64_t(x.size());
+    const int64_t n = in.frames();
     const int hopS = std::max(1, int(std::lround(0.005 * rate)));
     track.hop = double(hopS) / rate;
     from = std::max(0.0, from);
@@ -435,11 +444,15 @@ PitchTrack trackPitch(const AudioBuffer& in, double from, double to, double fmin
     if (!fwd.ctx || !inv.ctx) return track;
     AlignedBuf<float> a(static_cast<size_t>(N)), b(static_cast<size_t>(N)), r(static_cast<size_t>(N));
     AlignedBuf<AVComplexFloat> A(size_t(N / 2 + 1) + 1), B(size_t(N / 2 + 1) + 1);
-    std::vector<double> prefix(size_t(n) + 1, 0.0);
-    for (int64_t i = 0; i < n; ++i) prefix[size_t(i) + 1] = prefix[size_t(i)] + double(x[size_t(i)]) * x[size_t(i)];
-    auto sample = [&](int64_t i) -> double { return i >= 0 && i < n ? x[size_t(i)] : 0.0; };
+    // Only the sound the frames reach, so a short stretch of a long file costs what the stretch does.
+    const int64_t reach = 2 * (int64_t(W) + tauMax) + 2;
+    const int64_t lo = std::max<int64_t>(0, first - reach), hi = std::min<int64_t>(n, first + frames * hopS + reach);
+    const std::vector<float> x = monoOf(in, lo, hi);
+    std::vector<double> prefix(x.size() + 1, 0.0);
+    for (size_t i = 0; i < x.size(); ++i) prefix[i + 1] = prefix[i] + double(x[i]) * x[i];
+    auto sample = [&](int64_t i) -> double { return i >= lo && i < hi ? x[size_t(i - lo)] : 0.0; };
     auto energy = [&](int64_t s, int64_t len) {
-        return prefix[size_t(std::clamp<int64_t>(s + len, 0, n))] - prefix[size_t(std::clamp<int64_t>(s, 0, n))];
+        return prefix[size_t(std::clamp<int64_t>(s + len, lo, hi) - lo)] - prefix[size_t(std::clamp<int64_t>(s, lo, hi) - lo)];
     };
     // The difference function at one lag, in double, over the window from `base` (for the final period).
     auto diffAt = [&](int tau, int64_t base) {
@@ -519,7 +532,7 @@ PitchTrack trackPitch(const AudioBuffer& in, double from, double to, double fmin
     }
     const double stay = std::log(0.99), change = std::log(0.01);
     std::vector<double> score(size_t(states), -std::log(double(states))), next(static_cast<size_t>(states));
-    std::vector<int32_t> back(size_t(frames) * size_t(states));
+    std::vector<uint16_t> back(size_t(frames) * size_t(states));  // (states < 2^16: 20-cent bins over at most 10 octaves)
     std::vector<double> obs(static_cast<size_t>(states));
     std::vector<double> best(static_cast<size_t>(states));
     std::vector<int32_t> bestFrom(static_cast<size_t>(states));
@@ -541,7 +554,7 @@ PitchTrack trackPitch(const AudioBuffer& in, double from, double to, double fmin
         }
         if (f == 0) {
             for (int st = 0; st < states; ++st) score[size_t(st)] += obs[size_t(st)];
-            for (int st = 0; st < states; ++st) back[size_t(st)] = st;
+            for (int st = 0; st < states; ++st) back[size_t(st)] = uint16_t(st);
             continue;
         }
         // Best predecessor within each half (a band of bins), then the switch between halves.
@@ -565,7 +578,7 @@ PitchTrack trackPitch(const AudioBuffer& in, double from, double to, double fmin
             int32_t from = bestFrom[size_t(st)];
             if (score[size_t(other)] + change > v) v = score[size_t(other)] + change, from = other;
             next[size_t(st)] = v + obs[size_t(st)];
-            back[size_t(f) * size_t(states) + size_t(st)] = from;
+            back[size_t(f) * size_t(states) + size_t(st)] = uint16_t(from);
         }
         const double top = *std::max_element(next.begin(), next.end());
         for (int st = 0; st < states; ++st) score[size_t(st)] = next[size_t(st)] - top;
@@ -657,19 +670,31 @@ struct Mark {
     bool voiced;
 };
 
-std::vector<Mark> pitchMarks(const std::vector<float>& x, const PitchTrack& track, int rate, int64_t a, int64_t b) {
+std::vector<Mark> pitchMarks(const AudioBuffer& in, const PitchTrack& track, int rate, int64_t a, int64_t b) {
     std::vector<Mark> marks;
-    const int64_t n = int64_t(x.size());
+    const int64_t n = in.frames();
     const int smoothLen = std::max(1, rate / 1000);
-    std::vector<double> y(size_t(n), 0.0);
-    {
+    // The sound smoothed over 1 ms (centred), over the stretch and a longest period past it.
+    const int64_t ylo = std::max<int64_t>(0, a), yhi = std::min<int64_t>(n, b + rate / 20 + 2);
+    const int64_t xlo = ylo - smoothLen, xhi = yhi + smoothLen;
+    const std::vector<float> x = monoOf(in, xlo, xhi);
+    const int64_t xbase = std::max<int64_t>(0, xlo);
+    std::vector<double> ys(size_t(std::max<int64_t>(0, yhi - ylo)), 0.0);
+    for (int64_t j = ylo; j < yhi; ++j) {
+        const int64_t last = j + smoothLen / 2;
+        if (last >= n) break;
         double run = 0;
-        for (int64_t i = 0; i < n; ++i) {
-            run += x[size_t(i)];
-            if (i >= smoothLen) run -= x[size_t(i - smoothLen)];
-            y[size_t(std::max<int64_t>(0, i - smoothLen / 2))] = run / smoothLen;
-        }
+        for (int64_t k = std::max<int64_t>(0, last - smoothLen + 1); k <= last; ++k) run += x[size_t(k - xbase)];
+        ys[size_t(j - ylo)] = run / smoothLen;
     }
+    struct {
+        const std::vector<double>& v;
+        int64_t lo;
+        double operator[](size_t i) const {
+            const int64_t k = int64_t(i) - lo;
+            return k >= 0 && k < int64_t(v.size()) ? v[size_t(k)] : -1e300;
+        }
+    } y{ys, ylo};
     const int64_t unvoicedStep = std::max<int64_t>(16, std::llround(0.005 * rate));
     int64_t pos = std::max<int64_t>(0, a);
     bool lastVoiced = false;
@@ -685,6 +710,7 @@ std::vector<Mark> pitchMarks(const std::vector<float>& x, const PitchTrack& trac
                 if (!marks.empty() && m - marks.back().at < T / 2) m = marks.back().at + int64_t(T / 2);
             } else {
                 const int64_t guess = marks.back().at + int64_t(std::lround(T));
+                if (guess >= b) break;
                 const int64_t reach = std::max<int64_t>(1, int64_t(T / 5));
                 m = guess;
                 for (int64_t i = std::max<int64_t>(0, guess - reach); i <= std::min<int64_t>(n - 1, guess + reach); ++i)
@@ -718,7 +744,6 @@ void applyPitchEdits(const AudioBuffer& in, const std::vector<PitchEdit>& edits,
     for (const PitchEdit& e : edits)
         if (e.shift != 0 || e.inflection != 1 || e.correct > 0 || e.formant != 0) active.push_back(e);
     if (active.empty() || rate <= 0 || n == 0) return;
-    const std::vector<float> x = monoOf(in);
     // The stretches remade: each edit and a little either side, carried on to where the voice next stops (where
     // the grains can fall back into step with the original unheard), merged where they meet.
     std::vector<std::pair<double, double>> regions;
@@ -752,7 +777,7 @@ void applyPitchEdits(const AudioBuffer& in, const std::vector<PitchEdit>& edits,
             const size_t k = size_t(std::floor(i));
             return target[k] > 0 && target[k + 1] > 0 ? target[k] + (target[k + 1] - target[k]) * (i - double(k)) : target[k];
         };
-        const std::vector<Mark> marks = pitchMarks(x, track, rate, a, b);
+        const std::vector<Mark> marks = pitchMarks(in, track, rate, a, b);
         if (marks.size() < 3) continue;
         // TD-PSOLA: synthesis marks at the new period, each taking the grain of the nearest analysis mark (its two
         // half-periods, half-Hann each side), resampled for a formant shift; with nothing changed the grains add up
@@ -1194,6 +1219,7 @@ Result addWarpMarkersAtOnsets(Project& p, Sequence& s, Id clip, double sensitivi
         }
     }
     DialogueWarp w = pointsOf(*c);
+    anchor(w, span);
     int count = 0;
     for (double t : detectOnsets(mix, sensitivity)) {
         const double fileTime = span.first + t;  // what is heard there in the file (group seconds)
@@ -1202,17 +1228,16 @@ Result addWarpMarkersAtOnsets(Project& p, Sequence& s, Id clip, double sensitivi
         if (std::any_of(w.begin(), w.end(), [&](const AlignPoint& pt) { return std::fabs(pt.u - u) < 0.02 || std::fabs(pt.w - fileTime) < 0.02; }))
             continue;
         const AlignPoint made{u, fileTime};
-        w.insert(std::upper_bound(w.begin(), w.end(), made, [](const AlignPoint& a, const AlignPoint& b) { return a.u < b.u; }), made);
+        const auto at = std::upper_bound(w.begin(), w.end(), made, [](const AlignPoint& a, const AlignPoint& b) { return a.u < b.u; });
+        // Kept in order both ways (an onset between two moved markers can break that): such ones are left out.
+        if ((at != w.begin() && std::prev(at)->w >= fileTime - 1e-4) || (at != w.end() && at->w <= fileTime + 1e-4)) continue;
+        w.insert(at, made);
         ++count;
     }
     if (added) *added = count;
     if (!count) return Result::fail("No onsets found");
     anchor(w, span);
-    // Markers in order both ways (an onset between two moved markers can break that): such ones are left out.
-    DialogueWarp ordered;
-    for (const AlignPoint& pt : w)
-        if (ordered.empty() || (pt.u > ordered.back().u + 1e-4 && pt.w > ordered.back().w + 1e-4)) ordered.push_back(pt);
-    return writePoints(s, *c, ordered);
+    return writePoints(s, *c, w);
 }
 
 Result setPitchEdits(Project& p, Sequence& s, Id clip, const std::vector<PitchEdit>& edits) {

@@ -568,6 +568,10 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 return false;
             }
             picked = c->channels;
+            // The pool plays a mono file as two equal channels: one file, as for the clip unwarped.
+            const MediaItem* m = c->mediaId ? p.findMedia(c->mediaId) : nullptr;
+            MediaItem probe;
+            if (picked.empty() && m && probeMedia(m->path, probe) && probe.channels == 1) picked = {0};
             if (buf->channels == 1 && picked.size() != 1) picked = {0};
         } else {
             buf = decodeAudio(from, kRate, error, nullptr, picked);

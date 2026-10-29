@@ -1654,7 +1654,7 @@ void TimelineWidget::paintElastic(QPainter& p, const Clip& c, const QRect& r) {
         }
     }
     if (pitched) {
-        if (auto curve = pitch_->curve(state_->project(), *s, c); curve && !curve->track.f0.empty()) {
+        if (auto curve = pitch_->curve(state_->project(), *s, c, drag_.kind != DragKind::WarpMarker); curve && !curve->track.f0.empty()) {
             // The pitch on a semitone scale fitted to the clip's own range.
             const PitchTrack& tr = curve->track;
             double lo = 1e9, hi = -1e9;

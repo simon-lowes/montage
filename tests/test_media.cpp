@@ -33894,6 +33894,16 @@ private slots:
             apartWorst = std::max(apartWorst, std::abs(lagOf(boomApart, lavApart, from) - lag));
         }
         QVERIFY2(apartWorst > 1, "warped apart, the microphones drift");
+        // The second microphone's file starting half a second into the take: the same grains, so the same sound.
+        AudioBuffer lavLate = buffer(lav.samples.size() - size_t(sr / 2)), lavLateOut;
+        std::copy(lav.samples.begin() + sr / 2, lav.samples.end(), lavLate.samples.begin());
+        applyElasticWarp(lavLate, both, ElasticMode::Speech, -0.5, {{&boom, 0}, {&lavLate, -0.5}}, lavLateOut);
+        AudioBuffer lavWithLate;
+        applyElasticWarp(lav, both, ElasticMode::Speech, 0, {{&boom, 0}, {&lavLate, -0.5}}, lavWithLate);
+        double lateWorst = 0;
+        for (size_t i = size_t(sr); i < lav.samples.size(); ++i)
+            lateWorst = std::max(lateWorst, double(std::fabs(lavLateOut.samples[i - size_t(sr / 2)] - lavWithLate.samples[i])));
+        QVERIFY2(lateWorst < 1e-6, qPrintable(QString::number(lateWorst)));
 
         // A voice gliding from 120 to 100 Hz (pulses through three formants), tracked within 5 cents.
         auto vowel = [&](double seconds, double f0a, double f0b) {
@@ -34118,6 +34128,8 @@ private slots:
             QVERIFY2(warpedFile != ar.mediaFiles.end(), ar.mediaFiles.empty() ? "none" : ar.mediaFiles[0].c_str());
             AudioBufferPtr carried = decodeAudio(*warpedFile, sr, &err);
             QVERIFY2(carried && carried->frames() == boom.frames(), err.c_str());
+            // A mono file stays one mono file, as unwarped.
+            QVERIFY2(QString::fromStdString(*warpedFile).endsWith(QStringLiteral(").wav")), warpedFile->c_str());
         }
         QVERIFY(edit::removeElasticAudio(p, s, lavClip).ok);
         QVERIFY(!elasticEffectOf(*edit::clipById(s, boomClip)) && !elasticEffectOf(*edit::clipById(s, lavClip)));
