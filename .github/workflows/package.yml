@@ -206,6 +206,11 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure || {
             for t in $(ctest --test-dir build --rerun-failed --show-only=json-v1 | sed -n 's/.*"name" *: *"\(test_[a-z]*\)".*/\1/p' | sort -u); do
+              # (what failed under ctest itself, which a second run can miss)
+              { grep -A3 '^FAIL!' "build/tests/$t-ctest.txt" | tr -d '\r' | awk '/^FAIL!/ { if (m) print m; m = $0; next } /^[ \t]/ { m = m " " $0 } END { if (m) print m }' |
+                  while read -r line; do echo "::error title=$t under ctest::$line"; done; } 2>/dev/null || true
+              grep -q '^Totals' "build/tests/$t-ctest.txt" 2>/dev/null ||
+                echo "::error title=$t under ctest::stopped before the end (crashed?); last lines: $(tail -n 3 "build/tests/$t-ctest.txt" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
               log="build/tests/$t-results.txt"
               code=0
               (cd build/tests && QT_QPA_PLATFORM=offscreen "./$t.exe" -maxwarnings 0 -o "$t-results.txt,txt") || code=$?
@@ -222,7 +227,9 @@ jobs:
         if: failure()
         with:
           name: test-results-windows
-          path: build/tests/*-results.txt
+          path: |
+            build/tests/*-results.txt
+            build/tests/*-ctest.txt
           if-no-files-found: ignore
       - name: Package (portable zip)
         run: scripts/package-windows.sh build

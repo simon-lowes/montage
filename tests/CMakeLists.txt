@@ -1,9 +1,20 @@
+# Qt Test's console output does not reach ctest on Windows, so there each run also writes its results to a file
+# (<test>-ctest.txt), which the packaging workflow prints when a test fails.
+function(montage_test_command name out)
+  if(WIN32)
+    set(${out} ${name} -o ${name}-ctest.txt,txt -o -,txt PARENT_SCOPE)
+  else()
+    set(${out} ${name} PARENT_SCOPE)
+  endif()
+endfunction()
+
 function(montage_test name)
   add_executable(${name} ${name}.cpp)
   target_link_libraries(${name} PRIVATE montage_engine Qt6::Test)
   set_target_properties(${name} PROPERTIES AUTOMOC ON)
   montage_copy_runtime(${name})
-  add_test(NAME ${name} COMMAND ${name})
+  montage_test_command(${name} command)
+  add_test(NAME ${name} COMMAND ${command})
   set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 300)
 endfunction()
 
@@ -31,7 +42,8 @@ if(MONTAGE_BUILD_APP)
   target_link_libraries(test_app PRIVATE montage_ui Qt6::Test)
   set_target_properties(test_app PROPERTIES AUTOMOC ON)
   montage_copy_runtime(test_app)
-  add_test(NAME test_app COMMAND test_app)
+  montage_test_command(test_app command)
+  add_test(NAME test_app COMMAND ${command})
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 600)
   add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe)
   target_compile_definitions(test_app PRIVATE
