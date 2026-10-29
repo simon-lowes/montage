@@ -268,7 +268,7 @@ std::vector<std::string> engineInterfaceTexts() {
     for (const HdrZone& z : hdrZones()) add(z.label);
     for (const HueVector& v : colorSliceVectors()) add(v.label);
     for (const ColorSpace& cs : colorSpaces()) add(cs.label);
-    for (const ExportPreset& p : exportPresets()) add(p.name), add(p.description);
+    for (const ExportPreset& p : exportPresetsOfEveryBuild()) add(p.name), add(p.description);
     for (const std::string& c : exrCompressions()) add(exrCompressionLabel(c));
     for (int k = kAdrToRecord; k <= kAdrOmitted; ++k) add(adrStatusName(k));
     return {texts.begin(), texts.end()};

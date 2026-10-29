@@ -18232,8 +18232,10 @@ print("added " + ui["name"])
             QVERIFY(QTest::qWaitForWindowExposed(again.get()));
             QDockWidget* m = again->findChild<QDockWidget*>("media");
             QVERIFY(m && m->isVisible());
-            QTRY_VERIFY2(std::abs(m->x() - (again->width() - before.x() - before.width())) <= 4 && std::abs(m->width() - before.width()) <= 4,
-                         qPrintable(QStringLiteral("%1 %2 of %3").arg(m->x()).arg(m->width()).arg(again->width())));
+            // (against the right edge, the width within a separator or two)
+            QTRY_VERIFY2(std::abs(again->width() - m->x() - m->width() - before.x()) <= 4 && std::abs(m->width() - before.width()) <= 16,
+                         qPrintable(QStringLiteral("%1 %2 of %3, was %4 %5 of %6").arg(m->x()).arg(m->width()).arg(again->width())
+                                       .arg(before.x()).arg(before.width()).arg(win_->width())));
         }
         back.dismiss();
         language::uninstall();

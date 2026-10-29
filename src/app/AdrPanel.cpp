@@ -183,6 +183,7 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     connect(beeps_, &QSpinBox::valueChanged, this, [](int v) { appSettings().setValue(QStringLiteral("adr/beeps"), v); });
     input_ = new QComboBox(this);
     input_->setObjectName(QStringLiteral("adrInput"));
+    language::keepUntranslated(input_);  // (the computer's own names for its devices)
     input_->addItems(VoiceoverRecorder::inputs());
     guide_ = new QComboBox(this);
     guide_->setObjectName(QStringLiteral("adrGuide"));

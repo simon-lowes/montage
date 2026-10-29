@@ -297,8 +297,10 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
 
 }  // namespace
 
-const std::vector<ExportPreset>& exportPresets() {
-    static const std::vector<ExportPreset> presets = [] {
+namespace {
+
+std::vector<ExportPreset> makePresets(bool everyBuild) {
+    {
         std::vector<ExportPreset> v;
         v.push_back(preset("H.264 - High Quality", "mp4", "Mastering-grade H.264 (CRF 16), AAC 320 kbps", "libx264", "aac", 16, "slow"));
         v.push_back(preset("H.264 - YouTube / Vimeo", "mp4", "Web delivery, CRF 20", "libx264", "aac", 20, "medium"));
@@ -338,7 +340,7 @@ const std::vector<ExportPreset>& exportPresets() {
         }
         v.push_back(preset("FFV1 (lossless archive)", "mkv", "Mathematically lossless 10-bit 4:2:2 with FLAC sound, for archiving", "ffv1", "flac", 0,
                            "", "", "yuv422p10le"));
-        if (avcodec_find_encoder_by_name("liboapv")) {
+        if (everyBuild || avcodec_find_encoder_by_name("liboapv")) {
             // APV (Advanced Professional Video, an open intra-frame codec; OpenAPV's encoder): listed where FFmpeg has
             // the encoder. Quality is a QP from 0 (best) to 63, or a bitrate.
             v.push_back(preset("APV 422 10-bit", "mov", "Open intra-frame intermediate, 10-bit 4:2:2", "liboapv", "pcm_s24le", 20, "", "", "yuv422p10le"));
@@ -405,9 +407,17 @@ const std::vector<ExportPreset>& exportPresets() {
         v.push_back(preset("Audio - WAV 24-bit", "wav", "Uncompressed mixdown", "none", "pcm_s24le", 0, ""));
         v.push_back(preset("Audio - AAC (M4A)", "m4a", "Compressed mixdown", "none", "aac", 0, ""));
         return v;
-    }();
+    }
+}
+
+}  // namespace
+
+const std::vector<ExportPreset>& exportPresets() {
+    static const std::vector<ExportPreset> presets = makePresets(false);
     return presets;
 }
+
+std::vector<ExportPreset> exportPresetsOfEveryBuild() { return makePresets(true); }
 
 const ExportPreset* findExportPreset(const std::string& name) {
     for (const auto& p : exportPresets())

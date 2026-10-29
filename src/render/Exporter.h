@@ -207,6 +207,8 @@ struct ExportPreset {
     ExportSettings settings;
 };
 const std::vector<ExportPreset>& exportPresets();
+// Every preset any build offers, those needing an encoder this one lacks included (for listing them to translators).
+std::vector<ExportPreset> exportPresetsOfEveryBuild();
 const ExportPreset* findExportPreset(const std::string& name);
 
 using ExportProgress = std::function<void(double fraction, FrameTime frame)>;
