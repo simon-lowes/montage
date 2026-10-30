@@ -186,6 +186,7 @@
 #include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -11203,7 +11204,8 @@ void McpServer::Impl::addTools() {
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
-            "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"}},
+            "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265 and AV1 with rate control per segment; image sequences frame by frame). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -11408,9 +11410,19 @@ void McpServer::Impl::addTools() {
                 const int groups = stems == "buses" ? StemsByBus : stems == "roles" ? StemsByRole : stems == "tracks" ? StemsByTrack : 0;
                 std::string id, why;
                 const std::string name = s.name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
-                if (!submitFarmJob(farm, name, l.project, s.id, st, groups, &id, &why)) return fail(QString::fromStdString(why));
-                return ok(QStringLiteral("Sent to the render farm as %1 (montage_render_farm follows it)").arg(QString::fromStdString(id)),
-                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}});
+                const int segments = a.value("segments").toInt(1);
+                if (segments < 1 || segments > 256) throw ArgError{"\"segments\" is 1 to 256"};
+                if (!submitFarmJob(farm, name, l.project, s.id, st, groups, &id, &why, segments)) return fail(QString::fromStdString(why));
+                QString text = QStringLiteral("Sent to the render farm as %1 (montage_render_farm follows it)").arg(QString::fromStdString(id));
+                QJsonObject o{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}};
+                if (segments > 1) {
+                    int made = 0;
+                    for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+                    o["segments"] = made;
+                    text += made > 1 ? QStringLiteral(", in %1 segments").arg(made) : QStringLiteral(" whole (the range is too short to split)");
+                    if (made > 1 && exportSegmentsLongGop(st)) text += QStringLiteral("\nRate control works per segment: a bitrate is kept within each, not across the whole");
+                }
+                return ok(text, o);
             }
             std::string err;
             LightLevels light;
@@ -11489,10 +11501,17 @@ void McpServer::Impl::addTools() {
                 QStringList lines;
                 if (action == "jobs") {
                     for (const FarmJob& j : farmJobs(farm)) {
-                        list.append(QJsonObject{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
-                                                {"state", farmStateName(j.state)}, {"progress", j.progress}, {"node", QString::fromStdString(j.node)},
-                                                {"output", QString::fromStdString(j.output)}, {"error", QString::fromStdString(j.error)},
-                                                {"cancel_requested", j.cancelRequested}, {"submitted_by", QString::fromStdString(j.submittedBy)}});
+                        QJsonObject job{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
+                                        {"state", farmStateName(j.state)}, {"progress", j.progress}, {"node", QString::fromStdString(j.node)},
+                                        {"output", QString::fromStdString(j.output)}, {"error", QString::fromStdString(j.error)},
+                                        {"cancel_requested", j.cancelRequested}, {"submitted_by", QString::fromStdString(j.submittedBy)}};
+                        // (A job sent in segments: the join, and each segment with its join's id.)
+                        if (j.join) job["segments"] = j.segments;
+                        if (j.segment > 0) {
+                            job["join"] = QString::fromStdString(j.group);
+                            job["segment"] = j.segment;
+                        }
+                        list.append(job);
                         lines << QStringLiteral("%1 %2 %3").arg(QString::fromStdString(j.id), farmStateName(j.state), QString::fromStdString(j.name));
                     }
                     return ok(lines.isEmpty() ? QStringLiteral("No jobs") : lines.join('\n'), QJsonObject{{"jobs", list}});

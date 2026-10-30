@@ -17135,6 +17135,24 @@ print("added " + ui["name"])
         QVERIFY(!cancel->isEnabled());
         remove->click();
         QCOMPARE(list->topLevelItemCount(), 0);
+        // Sent in three segments: a job for each and the join, which Remove takes with them.
+        auto* segments = panel->findChild<QSpinBox*>("queueSegments");
+        QVERIFY(segments);
+        QCOMPARE(segments->text(), QString("Whole"));
+        segments->setValue(3);
+        QCOMPARE(appSettings().value("renderFarm/segments").toInt(), 3);
+        QVERIFY(panel->sendToFarm(queue->add("Split job", "H.264", p, p.active()->id, st)));
+        QCOMPARE(list->topLevelItemCount(), 4);
+        QTreeWidgetItem* join = nullptr;
+        for (int i = 0; i < list->topLevelItemCount(); ++i)
+            if (list->topLevelItem(i)->text(0) == "Split job") join = list->topLevelItem(i);
+            else QVERIFY(list->topLevelItem(i)->text(0).startsWith("Split job - segment "));
+        QVERIFY(join);
+        list->setCurrentItem(join);
+        join->setSelected(true);
+        remove->click();
+        QCOMPARE(list->topLevelItemCount(), 0);
+        segments->setValue(1);
         panel->setFarmFolder(was);
     }
 

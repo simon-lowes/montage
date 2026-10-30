@@ -23,6 +23,7 @@
 #include <functional>
 #include <limits>
 #include <array>
+#include <mutex>
 #include <set>
 #include <QImage>
 #include <QMatrix4x4>
@@ -248,6 +249,7 @@
 #include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -21952,6 +21954,358 @@ if ui["pressed"] == "add":
         QVERIFY(!r.value("isError").toBool());
         r = call("montage_render_farm", {{"farm", farm}, {"action", "retry"}, {"job", mcpJob}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("No job"));
+    }
+
+    void renderFarmSegments() {
+        QTemporaryDir dir;
+        const QString farm = dir.path() + "/farm";
+        std::string err;
+        // Particles, bars and a gradient with film grain over them (every frame different, as footage is), and a tone
+        // that rises.
+        Project p = makeDefaultProject();
+        Sequence& seq = *p.active();
+        seq.width = 320;
+        seq.height = 180;
+        Clip sparks = makeGeneratorClip(p, "particles", 49);
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, sparks);
+        Clip bars = makeGeneratorClip(p, "bars", 52);
+        bars.start = 49;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, bars);
+        Clip ramp = makeGeneratorClip(p, "gradient", 49);
+        ramp.start = 101;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, ramp);
+        QCOMPARE(seq.duration(), FrameTime(150));
+        for (Clip& c : seq.videoTracks[0].clips) c.effects.push_back(makeEffect(p, "film_grain"));
+        std::vector<float> tone(size_t(48000 * 6));
+        double phase = 0;
+        for (size_t i = 0; i < tone.size(); ++i) {
+            phase += 2 * M_PI * (220.0 + 440.0 * double(i) / double(tone.size())) / 48000.0;
+            tone[i] = float(0.3 * std::sin(phase));
+        }
+        QVERIFY(writeMonoWav((dir.path() + "/tone.wav").toStdString(), tone, 48000));
+        MediaItem wav = probeOrFail(p, (dir.path() + "/tone.wav").toStdString());
+        p.media.push_back(wav);
+        QVERIFY(edit::placeMedia(p, seq, wav.id, 0, 0, 150, {}, {TrackKind::Audio, 0}, false).ok);
+
+        // ---- Planned at cuts near equal shares: 50 and 100 move to the cuts at 49 and 101 (within an eighth of a
+        // segment), the others stay on their shares.
+        ExportSettings st;
+        st.videoCodec = "prores_ks";
+        st.profile = "hq";
+        st.audioCodec = "pcm_s24le";
+        st.path = (dir.path() + "/out/master.mov").toStdString();
+        std::vector<ExportSegment> parts = planExportSegments(seq, st, 6);
+        QCOMPARE(parts.size(), size_t(6));
+        const std::vector<FrameTime> starts{0, 25, 49, 75, 101, 125};
+        for (size_t k = 0; k < parts.size(); ++k) {
+            QCOMPARE(parts[k].in, starts[k]);
+            QCOMPARE(parts[k].out, k + 1 < parts.size() ? starts[k + 1] : FrameTime(150));
+        }
+        ExportSettings ranged = st;
+        ranged.in = 140;
+        ranged.out = 143;
+        QCOMPARE(planExportSegments(seq, ranged, 6).size(), size_t(3));  // (no fewer than a frame each)
+        // What is made in one go is refused.
+        auto refused = [&](const std::function<void(ExportSettings&)>& change, const char* why) {
+            ExportSettings x = st;
+            change(x);
+            std::string w;
+            return !exportSplits(x, &w) && QString::fromStdString(w).contains(why);
+        };
+        QVERIFY(exportSplits(st, &err));
+        QVERIFY(refused([](ExportSettings& x) { x.videoCodec = "hw_h264"; }, "hardware"));
+        QVERIFY(refused([](ExportSettings& x) { x.videoCodec = "gif"; }, "not joined"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mxf"; }, "MOV, MP4 or MKV"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mkv"; }, "MKV without sound"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mkv", x.audioCodec = "none"; }, "") == false);
+        QVERIFY(refused([](ExportSettings& x) { x.hdr10Plus = true; }, "dynamic HDR"));
+        QVERIFY(refused([](ExportSettings& x) { x.cea608 = true; }, "CEA-608"));
+        QVERIFY(refused([](ExportSettings& x) { x.rateChange = "speed"; }, "frame rate"));
+        QVERIFY(refused([](ExportSettings& x) { x.audioCodec = "none", x.embedCaptions = true; }, "captions"));
+        QVERIFY(!submitFarmJob(farm.toStdString(), "Refused", p, seq.id, [&] { ExportSettings x = st; x.videoCodec = "gif"; return x; }(), 0, nullptr, &err, 4));
+        QVERIFY(QString::fromStdString(err).contains("cannot be split"));
+        QVERIFY(farmJobs(farm.toStdString()).empty());
+
+        // ---- The same export made whole on this computer, for comparing.
+        ExportSettings whole = st;
+        whole.path = (dir.path() + "/whole/master.mov").toStdString();
+        QVERIFY(QDir().mkpath(dir.path() + "/whole"));
+        QVERIFY2(exportSequence(p, seq, whole, {}, nullptr, &err), err.c_str());
+
+        // ---- Sent in six segments; one node takes a segment and stops answering; two nodes render the rest, take that
+        // one back, and one of them joins them.
+        std::string id;
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Master", p, seq.id, st, 0, &id, &err, 6), err.c_str());
+        std::vector<FarmJob> jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs.size(), size_t(7));
+        std::vector<std::string> segmentJobs;
+        for (const FarmJob& j : jobs) {
+            if (j.id == id) {
+                QVERIFY(j.join);
+                QCOMPARE(j.segments, 6);
+                QCOMPARE(j.name, std::string("Master"));
+            } else {
+                QCOMPARE(j.group, id);
+                QCOMPARE(j.name, "Master - segment " + std::to_string(j.segment) + " of 6");
+                QVERIFY(j.output.find(".montage-segments-" + id) != std::string::npos);
+                segmentJobs.push_back(j.id);
+            }
+        }
+        QCOMPARE(segmentJobs.size(), size_t(6));
+        {
+            const QDir gone(farm + "/jobs/" + QString::fromStdString(segmentJobs[2]));
+            QFile claim(gone.filePath("claim"));
+            QVERIFY(claim.open(QIODevice::WriteOnly));
+            claim.write("gone-node-token");
+            QFile status(gone.filePath("status.json"));
+            QVERIFY(status.open(QIODevice::WriteOnly));
+            status.write(R"({"state": "rendering", "progress": 0.4, "node": "Gone", "beat": 3})");
+        }
+        auto joinEnded = [&](const std::string& job) {
+            for (const FarmJob& j : farmJobs(farm.toStdString()))
+                if (j.id == job) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
+            return true;
+        };
+        std::mutex logLock;
+        QStringList log;
+        std::atomic<int> renderedA{0}, renderedB{0};
+        auto runNodes = [&](const std::string& job, int count) {
+            std::vector<std::thread> nodes;
+            std::vector<int> rendered(size_t(count), 0);
+            for (int n = 0; n < count; ++n)
+                nodes.emplace_back([&, n] {
+                    FarmNodeOptions o;
+                    o.farm = farm.toStdString();
+                    o.name = n == 0 ? "Node A" : "Node B";
+                    o.pollMs = 100;
+                    o.staleMs = 1500;
+                    o.stopped = [&] { return joinEnded(job); };
+                    o.log = [&](const std::string& l) {
+                        std::lock_guard<std::mutex> g(logLock);
+                        log << QString::fromStdString(l);
+                    };
+                    std::string e;
+                    runFarmNode(o, &rendered[size_t(n)], &e);
+                });
+            for (std::thread& t : nodes) t.join();
+            renderedA += rendered[0];
+            if (count > 1) renderedB += rendered[1];
+        };
+        runNodes(id, 2);
+        jobs = farmJobs(farm.toStdString());
+        for (const FarmJob& j : jobs) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        QVERIFY2(log.join('\n').contains("Took back") && log.join('\n').contains("Gone"), qPrintable(log.join('\n')));
+        QVERIFY2(renderedA > 0 && renderedB > 0, qPrintable(log.join('\n')));  // (both nodes rendered)
+        QCOMPARE(renderedA + renderedB, 7);
+        // Every frame as the whole render made it, the sound sample for sample, and the segments' folder gone.
+        const std::string master = st.path;
+        const std::vector<QByteArray> wholeFrames = pictureHashes(whole.path), splitFrames = pictureHashes(master);
+        QCOMPARE(wholeFrames.size(), size_t(150));
+        QVERIFY(splitFrames == wholeFrames);
+        auto pixelAspect = [](const std::string& file) {
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return AVRational{0, 0};
+            avformat_find_stream_info(fmt, nullptr);
+            const AVRational sar = fmt->streams[av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0)]->sample_aspect_ratio;
+            avformat_close_input(&fmt);
+            return sar;
+        };
+        QCOMPARE(pixelAspect(master).num, 1);
+        QCOMPARE(pixelAspect(master).den, 1);
+        const std::vector<float> wholeSound = decodeAudioStream(whole.path, 0, nullptr, nullptr, true),
+                                 splitSound = decodeAudioStream(master, 0, nullptr, nullptr, true);
+        QVERIFY(wholeSound.size() > 48000 * 5);
+        QVERIFY(splitSound == wholeSound);
+        QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        QVERIFY(removeFarmJob(farm.toStdString(), id, &err));
+        QVERIFY(farmJobs(farm.toStdString()).empty());  // (its segments with it)
+
+        // ---- H.264 in four segments: exactly the frames, each segment starting on a keyframe, and within half a
+        // decibel of the single render's quality (both measured against a lossless render).
+        ExportSettings h264 = st;
+        h264.videoCodec = "libx264";
+        h264.profile.clear();
+        h264.audioCodec = "aac";
+        h264.path = (dir.path() + "/out/master.mp4").toStdString();
+        QVERIFY(exportSegmentsLongGop(h264));
+        ExportSettings truth = h264, single = h264;
+        truth.videoCodec = "ffv1";
+        truth.pixFmt = "yuv420p";
+        truth.audioCodec = "none";
+        truth.path = (dir.path() + "/whole/truth.mkv").toStdString();
+        single.path = (dir.path() + "/whole/single.mp4").toStdString();
+        QVERIFY2(exportSequence(p, seq, truth, {}, nullptr, &err), err.c_str());
+        QVERIFY2(exportSequence(p, seq, single, {}, nullptr, &err), err.c_str());
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Web", p, seq.id, h264, 0, &id, &err, 4), err.c_str());
+        runNodes(id, 2);
+        for (const FarmJob& j : farmJobs(farm.toStdString())) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        auto lumaFrames = [](const std::string& file) {
+            std::vector<QByteArray> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            avformat_find_stream_info(fmt, nullptr);
+            const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = avcodec_find_decoder(fmt->streams[idx]->codecpar->codec_id);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(ctx, fmt->streams[idx]->codecpar);
+            ctx->err_recognition = AV_EF_EXPLODE;
+            avcodec_open2(ctx, codec, nullptr);
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            bool broken = false;
+            auto drain = [&] {
+                while (avcodec_receive_frame(ctx, fr) == 0) {
+                    broken |= (fr->flags & AV_FRAME_FLAG_CORRUPT) != 0 || fr->decode_error_flags != 0;
+                    QByteArray y(fr->width * fr->height, '\0');
+                    for (int r = 0; r < fr->height; ++r) std::memcpy(y.data() + r * fr->width, fr->data[0] + r * fr->linesize[0], size_t(fr->width));
+                    out.push_back(y);
+                    av_frame_unref(fr);
+                }
+            };
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == idx && avcodec_send_packet(ctx, pkt) < 0) broken = true;
+                drain();
+                av_packet_unref(pkt);
+            }
+            avcodec_send_packet(ctx, nullptr);
+            drain();
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            if (broken) out.clear();
+            return out;
+        };
+        const std::vector<QByteArray> ref = lumaFrames(truth.path), one = lumaFrames(single.path), split = lumaFrames(h264.path);
+        QCOMPARE(ref.size(), size_t(150));
+        QCOMPARE(one.size(), size_t(150));
+        QCOMPARE(split.size(), size_t(150));  // (every frame, none broken)
+        auto psnr = [&](const std::vector<QByteArray>& v) {
+            double se = 0, n = 0;
+            for (size_t f = 0; f < v.size(); ++f)
+                for (qsizetype i = 0; i < v[f].size(); ++i) {
+                    const double d = double(uint8_t(v[f][i])) - double(uint8_t(ref[f][i]));
+                    se += d * d;
+                    n += 1;
+                }
+            return 10 * std::log10(255.0 * 255.0 / std::max(se / n, 1e-9));
+        };
+        const double psnrOne = psnr(one), psnrSplit = psnr(split);
+        QVERIFY2(std::fabs(psnrOne - psnrSplit) < 0.5, qPrintable(QString("%1 dB whole, %2 dB in segments").arg(psnrOne).arg(psnrSplit)));
+        QVERIFY(psnrSplit > 30);
+        {
+            // A keyframe where each segment starts.
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, h264.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVStream* vs = fmt->streams[v];
+            std::set<int64_t> keys;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v && (pkt->flags & AV_PKT_FLAG_KEY))
+                    keys.insert(av_rescale_q(pkt->pts - (vs->start_time == AV_NOPTS_VALUE ? 0 : vs->start_time), vs->time_base, AVRational{int(seq.fps.den), int(seq.fps.num)}));
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            for (const ExportSegment& s : planExportSegments(seq, h264, 4)) QVERIFY2(keys.count(s.in), qPrintable(QString::number(s.in)));
+        }
+        // The sound as the single render's (AAC, encoded once for the whole).
+        QVERIFY(decodeAudioStream(h264.path, 0) == decodeAudioStream(single.path, 0));
+
+        // ---- A segment changed after its node checked it is rendered again before the join; a cancelled join cancels
+        // its segments; an image sequence's segments write its frames where they go, numbered on.
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Again", p, seq.id, st, 0, &id, &err, 3), err.c_str());
+        {
+            FarmNodeOptions o;
+            o.farm = farm.toStdString();
+            o.name = "Node A";
+            o.pollMs = 100;
+            o.stopped = [&] {
+                for (const FarmJob& j : farmJobs(farm.toStdString()))
+                    if (j.group == id && j.state != FarmState::Done) return false;
+                return true;
+            };
+            QVERIFY(runFarmNode(o, nullptr, &err));
+        }
+        std::string second;
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.group == id && j.segment == 2) second = j.output;
+        {
+            QFile f(QString::fromStdString(second));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.seek(f.size() - 100);
+            f.write("x");
+        }
+        log.clear();
+        runNodes(id, 1);
+        QVERIFY2(log.join('\n').contains("did not check out"), qPrintable(log.join('\n')));
+        for (const FarmJob& j : farmJobs(farm.toStdString())) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        QVERIFY(pictureHashes(st.path) == wholeFrames);
+
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Stopped", p, seq.id, st, 0, &id, &err, 3), err.c_str());
+        QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == id || j.group == id) QCOMPARE(j.state, FarmState::Cancelled);
+        QVERIFY(retryFarmJob(farm.toStdString(), id, &err));
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == id || j.group == id) QCOMPARE(j.state, FarmState::Waiting);
+        QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+
+        ExportSettings frames = st;
+        frames.videoCodec = "png";
+        frames.audioCodec = "none";
+        frames.in = 20;
+        frames.out = 50;
+        frames.startNumber = 100;
+        frames.path = (dir.path() + "/frames/shot.png").toStdString();
+        ExportSettings wholeFramesSt = frames;
+        wholeFramesSt.path = (dir.path() + "/whole/shot.png").toStdString();
+        QVERIFY2(exportSequence(p, seq, wholeFramesSt, {}, nullptr, &err), err.c_str());
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Frames", p, seq.id, frames, 0, &id, &err, 3), err.c_str());
+        runNodes(id, 2);
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == id || j.group == id) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        const QStringList made = QDir(dir.path() + "/frames").entryList({"shot_*.png"}, QDir::Files, QDir::Name);
+        QCOMPARE(made.size(), 30);
+        QCOMPARE(made.front(), QString("shot_000100.png"));
+        QCOMPARE(made.back(), QString("shot_000129.png"));
+        for (const QString& f : made) {
+            QFile a(dir.path() + "/frames/" + f), b(dir.path() + "/whole/" + f);
+            QVERIFY(a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly));
+            QVERIFY2(a.readAll() == b.readAll(), qPrintable(f));
+        }
+
+        // ---- Over MCP: montage_render's segments, with a farm; the jobs list each segment's join.
+        const QString project = dir.path() + "/mcp.montage";
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString farm2 = dir.path() + "/farm2";
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", dir.path() + "/out/mcp.mp4"}, {"farm", farm2}, {"segments", 3}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("segments").toInt(), 3);
+        QVERIFY2(text(r).contains("3 segments") && text(r).contains("Rate control works per segment"), qPrintable(text(r)));
+        const QString job = r.value("structuredContent").toObject().value("job").toString();
+        r = call("montage_render_farm", {{"farm", farm2}});
+        int segs = 0;
+        for (const QJsonValue& v : r.value("structuredContent").toObject().value("jobs").toArray()) {
+            const QJsonObject j = v.toObject();
+            if (j.value("id").toString() == job) QCOMPARE(j.value("segments").toInt(), 3);
+            else segs += j.value("join").toString() == job && j.value("segment").toInt() >= 1;
+        }
+        QCOMPARE(segs, 3);
+        r = call("montage_render", {{"project", project}, {"output", dir.path() + "/out/mcp2.mp4"}, {"farm", farm2}, {"segments", 3}, {"rate_change", "speed"}, {"frame_rate", 30}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("cannot be split"));
     }
 
     void mcpBuildsACutFromAScript() {

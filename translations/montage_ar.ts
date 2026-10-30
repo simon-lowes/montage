@@ -26004,6 +26004,20 @@ montage-cli node &lt;folder&gt;</source>
         <source>Done %1</source>
         <translation type="unfinished">تم %1</translation>
     </message>
+    <message>
+        <source>Whole</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> segments</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Split a job sent to the farm into segments (at cuts near equal lengths) that several nodes
+render at once, then one joins: ProRes, DNxHR and FFV1 frame for frame, H.264, H.265 and AV1
+with rate control per segment, and image sequences. The sound is rendered once, by the node that joins.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::RepairMediaDialog</name>

@@ -272,6 +272,7 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/RenderFarm.h render/RenderFarm.cpp
+  render/SegmentedExport.h render/SegmentedExport.cpp
   render/GradeGraph.h render/GradeGraph.cpp
   render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp

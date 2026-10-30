@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "core/ProjectIO.h"
+#include "render/SegmentedExport.h"
 
 namespace montage {
 
@@ -263,6 +264,10 @@ FarmJob readJob(const std::string& farm, const std::string& id) {
     job.output = ss(j.value("settings").toObject().value("path").toString());
     job.submittedBy = ss(j.value("submittedBy").toString());
     job.submitted = ss(j.value("submitted").toString());
+    job.group = ss(j.value("group").toString());
+    job.segment = j.value("segment").toInt();
+    job.segments = j.value("segments").toInt();
+    job.join = j.value("join").toBool();
     QFile claim(d.filePath(QStringLiteral("claim")));
     const bool claimed = claim.open(QIODevice::ReadOnly);
     if (claimed) job.claim = ss(QString::fromUtf8(claim.readAll()));
@@ -284,6 +289,60 @@ FarmJob readJob(const std::string& farm, const std::string& id) {
     job.beat = int64_t(st.value("beat").toDouble());
     if (job.state == FarmState::Cancelled && job.error.empty()) job.error = "Cancelled";
     return job;
+}
+
+bool jobExists(const std::string& farm, const std::string& id) {
+    return validId(id) && QFileInfo::exists(QDir(jobDir(farm, id)).filePath(QStringLiteral("job.json")));
+}
+
+// A join job's segments, in order.
+std::vector<std::string> segmentIds(const std::string& farm, const std::string& id) {
+    std::vector<std::string> out;
+    for (const QJsonValue& v : readJson(QDir(jobDir(farm, id)).filePath(QStringLiteral("job.json"))).value("after").toArray())
+        out.push_back(ss(v.toString()));
+    return out;
+}
+
+// A count kept in a job's folder (a segment's failures, a join's checks that sent segments back).
+int jobCount(const QDir& d, const char* name) {
+    QFile f(d.filePath(QString::fromLatin1(name)));
+    return f.open(QIODevice::ReadOnly) ? f.readAll().trimmed().toInt() : 0;
+}
+void setJobCount(const QDir& d, const char* name, int n) {
+    QFile f(d.filePath(QString::fromLatin1(name)));
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write(QByteArray::number(n));
+}
+
+std::string newJobId() {
+    return ss(QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmsszzz-")) +
+              QString::number(QRandomGenerator::global()->bounded(0x1000000u), 16).rightJustified(6, '0'));
+}
+
+// Written aside, then put in place whole: a node never sees half a job.
+bool putJob(const std::string& farm, const std::string& jobId, const QJsonObject& job, const QByteArray& project, std::string* error) {
+    const QDir jobs(jobsDir(farm));
+    const QString incoming = jobs.filePath(QStringLiteral(".incoming-") + qs(jobId));
+    if (!QDir().mkpath(incoming)) return fail(error, "Cannot write in the render farm folder " + farm);
+    auto drop = [&](const std::string& e) {
+        QDir(incoming).removeRecursively();
+        return fail(error, e);
+    };
+    QSaveFile p(QDir(incoming).filePath(QStringLiteral("project.json")));
+    if (!p.open(QIODevice::WriteOnly)) return drop("Cannot write the job's project");
+    p.write(project);
+    if (!p.commit()) return drop("Cannot write the job's project");
+    if (!writeJson(QDir(incoming).filePath(QStringLiteral("job.json")), job)) return drop("Cannot write the job");
+    if (!QDir().rename(incoming, jobs.filePath(qs(jobId)))) return drop("Cannot put the job in the render farm");
+    return true;
+}
+
+// A job's folder renamed away (no node can claim it from then on) and removed.
+bool takeJobAway(const std::string& farm, const std::string& id) {
+    if (!validId(id) || !QFileInfo::exists(jobDir(farm, id))) return false;
+    const QString gone = QDir(jobsDir(farm)).filePath(QStringLiteral(".removed-") + qs(id));
+    if (!QDir().rename(jobDir(farm, id), gone)) return false;
+    QDir(gone).removeRecursively();
+    return true;
 }
 
 }  // namespace
@@ -415,20 +474,19 @@ bool openFarm(const std::string& farm, std::string* error) {
 }
 
 bool submitFarmJob(const std::string& farm, const std::string& name, const Project& project, Id sequence, const ExportSettings& settings,
-                   int stems, std::string* id, std::string* error) {
+                   int stems, std::string* id, std::string* error, int segments) {
     if (!openFarm(farm, error)) return false;
-    if (!project.findSequence(sequence)) return fail(error, "The sequence no longer exists");
+    const Sequence* seq = project.findSequence(sequence);
+    if (!seq) return fail(error, "The sequence no longer exists");
     if (settings.path.empty()) return fail(error, "The job has no output file");
-    const std::string jobId = ss(QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmsszzz-")) +
-                                 QString::number(QRandomGenerator::global()->bounded(0x1000000u), 16).rightJustified(6, '0'));
-    // Written aside, then put in place whole: a node never sees half a job.
-    const QDir jobs(jobsDir(farm));
-    const QString incoming = jobs.filePath(QStringLiteral(".incoming-") + qs(jobId));
-    if (!QDir().mkpath(incoming)) return fail(error, "Cannot write in the render farm folder " + farm);
-    auto drop = [&](const std::string& e) {
-        QDir(incoming).removeRecursively();
-        return fail(error, e);
-    };
+    std::vector<ExportSegment> parts;
+    if (segments > 1) {
+        std::string why;
+        if (!exportSplits(settings, &why)) return fail(error, "This export cannot be split into segments: " + why);
+        parts = planExportSegments(*seq, settings, segments);
+        if (parts.empty()) return fail(error, "Nothing to export: the range is empty");
+    }
+    const QByteArray proj = QByteArray::fromStdString(projectToJson(project));
     const QJsonObject job{{"name", qs(name)},
                           {"sequence", QString::number(sequence)},
                           {"stems", stems},
@@ -436,12 +494,46 @@ bool submitFarmJob(const std::string& farm, const std::string& name, const Proje
                           {"submittedBy", QSysInfo::machineHostName()},
                           {"submitted", qs(nowIso())},
                           {"version", 1}};
-    QSaveFile p(QDir(incoming).filePath(QStringLiteral("project.json")));
-    if (!p.open(QIODevice::WriteOnly)) return drop("Cannot write the job's project");
-    p.write(QByteArray::fromStdString(projectToJson(project)));
-    if (!p.commit()) return drop("Cannot write the job's project");
-    if (!writeJson(QDir(incoming).filePath(QStringLiteral("job.json")), job)) return drop("Cannot write the job");
-    if (!QDir().rename(incoming, jobs.filePath(qs(jobId)))) return drop("Cannot put the job in the render farm");
+    const std::string jobId = newJobId();
+    if (parts.size() < 2) {
+        if (!putJob(farm, jobId, job, proj, error)) return false;
+        if (id) *id = jobId;
+        return true;
+    }
+    // The segments first (each a job of its own, writing into a hidden folder beside the output, named as the sender
+    // names it: each node maps it), then the join, which waits for them.
+    const size_t slash = settings.path.find_last_of("/\\");
+    const std::string folder = (slash == std::string::npos ? std::string() : settings.path.substr(0, slash + 1)) + ".montage-segments-" + jobId;
+    const char sep = slash == std::string::npos ? '/' : settings.path[slash];
+    std::vector<std::string> made;
+    auto undo = [&](const std::string& e) {
+        for (const std::string& m : made) takeJobAway(farm, m);
+        return fail(error, e);
+    };
+    QJsonArray after, ranges;
+    const int n = int(parts.size());
+    for (int k = 0; k < n; ++k) {
+        const std::string segId = newJobId();
+        QJsonObject sj = job;
+        sj["name"] = qs(name) + QStringLiteral(" - segment %1 of %2").arg(k + 1).arg(n);
+        sj["stems"] = 0;
+        sj["settings"] = exportSettingsToJson(segmentExportSettings(settings, parts[size_t(k)], folder + sep + segmentFileName(settings, k + 1)));
+        sj["group"] = qs(jobId);
+        sj["segment"] = k + 1;
+        sj["segments"] = n;
+        std::string err;
+        if (!putJob(farm, segId, sj, proj, &err)) return undo(err);
+        made.push_back(segId);
+        after.append(qs(segId));
+        ranges.append(QJsonArray{double(parts[size_t(k)].in), double(parts[size_t(k)].out)});
+    }
+    QJsonObject jj = job;
+    jj["join"] = true;
+    jj["segments"] = n;
+    jj["after"] = after;
+    jj["parts"] = ranges;
+    std::string err;
+    if (!putJob(farm, jobId, jj, proj, &err)) return undo(err);
     if (id) *id = jobId;
     return true;
 }
@@ -481,6 +573,13 @@ bool cancelFarmJob(const std::string& farm, const std::string& id, std::string* 
     QFile f(QDir(jobDir(farm, id)).filePath(QStringLiteral("cancel")));
     if (!f.open(QIODevice::WriteOnly)) return fail(error, "Cannot write in the render farm folder");
     f.write(QSysInfo::machineHostName().toUtf8());
+    f.close();
+    if (j.join)
+        for (const std::string& seg : segmentIds(farm, id))
+            if (jobExists(farm, seg) && !ended(readJob(farm, seg).state)) {
+                QFile c(QDir(jobDir(farm, seg)).filePath(QStringLiteral("cancel")));
+                if (c.open(QIODevice::WriteOnly)) c.write(QSysInfo::machineHostName().toUtf8());
+            }
     return true;
 }
 
@@ -490,6 +589,18 @@ bool retryFarmJob(const std::string& farm, const std::string& id, std::string* e
     if (j.state == FarmState::Rendering || j.state == FarmState::Waiting) return fail(error, "The job has not ended");
     const QDir d(jobDir(farm, id));
     // (The status first: without it and its claim the job waits.)
+    // (A join's segments that did not end well wait again first, so it waits for them; one still stopping is waited
+    // for, or it would end cancelled after the join waits again.)
+    if (j.join)
+        for (const std::string& seg : segmentIds(farm, id))
+            if (jobExists(farm, seg) && !ended(readJob(farm, seg).state))
+                return fail(error, "A segment of the job is still stopping: retry it once it has");
+    if (j.join)
+        for (const std::string& seg : segmentIds(farm, id))
+            if (jobExists(farm, seg))
+                if (const FarmState st = readJob(farm, seg).state; st == FarmState::Failed || st == FarmState::Cancelled) retryFarmJob(farm, seg);
+    QFile::remove(d.filePath(QStringLiteral("failures")));
+    QFile::remove(d.filePath(QStringLiteral("rechecks")));
     QFile::remove(d.filePath(QStringLiteral("cancel")));
     QFile::remove(d.filePath(QStringLiteral("status.json")));
     QFile::remove(d.filePath(QStringLiteral("claim")));
@@ -498,11 +609,26 @@ bool retryFarmJob(const std::string& farm, const std::string& id, std::string* e
 
 bool removeFarmJob(const std::string& farm, const std::string& id, std::string* error) {
     if (!validId(id) || !QFileInfo::exists(jobDir(farm, id))) return fail(error, "No job " + id);
-    if (readJob(farm, id).state == FarmState::Rendering) return fail(error, "The job is rendering: cancel it first");
-    // (Renamed away first, so no node claims it while it goes.)
-    const QString gone = QDir(jobsDir(farm)).filePath(QStringLiteral(".removed-") + qs(id));
-    if (!QDir().rename(jobDir(farm, id), gone)) return fail(error, "Cannot remove the job");
-    QDir(gone).removeRecursively();
+    const FarmJob j = readJob(farm, id);
+    if (j.state == FarmState::Rendering) return fail(error, "The job is rendering: cancel it first");
+    std::vector<std::string> segs;
+    QString folder;
+    if (j.join) {
+        segs = segmentIds(farm, id);
+        for (const std::string& seg : segs)
+            if (jobExists(farm, seg) && readJob(farm, seg).state == FarmState::Rendering)
+                return fail(error, "A segment of the job is rendering: cancel the job first");
+        // Its segments' files, when their folder is reachable as the sender named it.
+        if (!segs.empty() && jobExists(farm, segs.front())) {
+            const QJsonObject sj = readJson(QDir(jobDir(farm, segs.front())).filePath(QStringLiteral("job.json")));
+            const QFileInfo first(sj.value("settings").toObject().value("path").toString());
+            if (first.dir().dirName().startsWith(QStringLiteral(".montage-segments-"))) folder = first.absolutePath();
+        }
+    }
+    // (Renamed away first, the join before its segments, so no node claims any of them while they go.)
+    if (!takeJobAway(farm, id)) return fail(error, "Cannot remove the job");
+    for (const std::string& seg : segs) takeJobAway(farm, seg);
+    if (!folder.isEmpty()) QDir(folder).removeRecursively();
     return true;
 }
 
@@ -559,6 +685,7 @@ struct Node {
     std::string name, token;
     int64_t beat = 0;
     FarmHeartbeats watched;
+    std::map<std::string, int64_t> leftFor;  // segments this node failed, left for other nodes until then (its clock)
 
     explicit Node(const FarmNodeOptions& options) : o(options), watched(options.staleMs) {
         name = o.name.empty() ? ss(QSysInfo::machineHostName()) : o.name;
@@ -617,6 +744,13 @@ struct Node {
     std::string claim() {
         for (const FarmJob& j : farmJobs(o.farm)) {
             if (j.state != FarmState::Waiting || j.cancelRequested) continue;
+            if (const auto it = leftFor.find(j.id); it != leftFor.end() && nowMs() < it->second) continue;
+            // (A join waits for its segments to end, well or not: taken then, it says which did not.)
+            if (j.join) {
+                const std::vector<std::string> segs = segmentIds(o.farm, j.id);
+                if (std::any_of(segs.begin(), segs.end(), [&](const std::string& seg) { return jobExists(o.farm, seg) && !ended(readJob(o.farm, seg).state); }))
+                    continue;
+            }
             const QDir d(jobDir(o.farm, j.id));
             QFile c(d.filePath(QStringLiteral("claim")));
             if (!c.open(QIODevice::WriteOnly | QIODevice::NewOnly)) continue;  // (another node's)
@@ -654,7 +788,19 @@ struct Node {
             }
             return false;
         };
+        const int segment = job.value("segment").toInt();
+        const bool join = job.value("join").toBool();
         auto failJob = [&](const std::string& e) {
+            // A segment is tried again on its own (twice), by whichever node is free.
+            if (segment > 0 && !QFileInfo::exists(d.filePath(QStringLiteral("cancel"))) && jobCount(d, "failures") < 2 && holds(d)) {
+                setJobCount(d, "failures", jobCount(d, "failures") + 1);
+                releaseClaim(d, token);
+                // (Left a while for another node, as the failure may be this computer's: a node working alone, or
+                // ending when out of work, tries it again itself.)
+                if (!o.once) leftFor[id] = nowMs() + std::max<int64_t>(4 * o.pollMs, 15000);
+                log("Segment " + id + " failed (" + e + "): it waits to be rendered again");
+                return false;
+            }
             log("Failed " + id + ": " + e);
             finish("failed", 0, e);
             return true;
@@ -694,6 +840,34 @@ struct Node {
         if (!projectFromJson(ss(QString::fromUtf8(doc.toJson(QJsonDocument::Compact))), p, &err)) return failJob("Cannot read the job's project: " + err);
         const Id seq = job.value("sequence").toString().toULongLong();
         const int stems = job.value("stems").toInt();
+        // A join: every segment done, each with its settings (its file as this node reaches it) and what its node found
+        // in it.
+        std::vector<std::string> segs;
+        std::vector<ExportSegment> parts;
+        std::vector<ExportSettings> segSettings;
+        std::vector<SegmentCheck> recorded;
+        if (join) {
+            if (!p.findSequence(seq)) return failJob("The sequence no longer exists");
+            segs = segmentIds(o.farm, id);
+            const QJsonArray ranges = job.value("parts").toArray();
+            if (segs.empty() || ranges.size() != qsizetype(segs.size())) return failJob("The job's segments are not listed");
+            for (size_t k = 0; k < segs.size(); ++k) {
+                const std::string which = "Segment " + std::to_string(k + 1) + " of " + std::to_string(segs.size());
+                if (!jobExists(o.farm, segs[k])) return failJob(which + " was removed");
+                const FarmJob sj = readJob(o.farm, segs[k]);
+                if (sj.state == FarmState::Cancelled) return failJob(which + " was cancelled");
+                if (sj.state != FarmState::Done) return failJob(which + " failed: " + sj.error);
+                const QDir sd(jobDir(o.farm, segs[k]));
+                ExportSettings x;
+                if (!exportSettingsFromJson(readJson(sd.filePath(QStringLiteral("job.json"))).value("settings").toObject(), x, &err)) return failJob(err);
+                x.path = mapFarmPath(x.path, o.maps);
+                segSettings.push_back(x);
+                const QJsonObject c = readJson(sd.filePath(QStringLiteral("segment.json")));
+                recorded.push_back({int64_t(c.value("frames").toDouble()), int64_t(c.value("bytes").toDouble()), ss(c.value("sha256").toString())});
+                const QJsonArray r = ranges.at(qsizetype(k)).toArray();
+                parts.push_back({FrameTime(r.at(0).toDouble()), FrameTime(r.at(1).toDouble())});
+            }
+        }
         // Rendered into a folder of this claim's own beside the output, and moved into place only while the job is
         // still this node's: a node that lost it (silent too long) never touches what another renders there.
         const QFileInfo out(qs(st.path));
@@ -709,8 +883,49 @@ struct Node {
         bool ok = false, kept = false;
         std::string encoder;
         err.clear();
+        std::vector<size_t> bad;  // a join's segments that did not check out
+        SegmentCheck made;        // a segment's
         std::thread worker([&] {
-            ok = renderExport(p, seq, st, stems, [&progress](double f, FrameTime) { progress = f; }, &cancel, &err, &encoder, &kept);
+            const ExportProgress report = [&progress](double f, FrameTime) { progress = f; };
+            if (join) {
+                // Each segment checked (its frames and bytes as its node found them), then joined.
+                const double checking = 0.3;
+                size_t unread = 0;
+                std::string unreadWhy;
+                for (size_t k = 0; k < segSettings.size() && !cancel; ++k) {
+                    SegmentCheck c;
+                    std::string why;
+                    const auto part = [&](double f) { progress = checking * (double(k) + f) / double(segSettings.size()); };
+                    const bool read = checkExportSegment(segSettings[k], c, &why, &cancel, part) && c.frames > 0;
+                    if (!read) {
+                        ++unread;
+                        if (unreadWhy.empty()) unreadWhy = why.empty() ? "no frames at " + segSettings[k].path : why;
+                    }
+                    if (!read || c.frames != parts[k].out - parts[k].in || c.sha256 != recorded[k].sha256) bad.push_back(k);
+                }
+                // None of them readable here: this node's path to them (its maps, the share) rather than the segments.
+                if (!cancel && unread == segSettings.size()) {
+                    bad.clear();
+                    err = "This node cannot read the segments (" + unreadWhy + "): check its --map for the output's folder";
+                }
+                std::vector<std::string> files;
+                if (!exportIsImageSequence(st))
+                    for (const ExportSettings& x : segSettings) files.push_back(x.path);
+                if (cancel) err = "Cancelled";
+                else if (bad.empty() && err.empty())
+                    ok = joinExportSegments(p, *p.findSequence(seq), st, stems, files, parts,
+                                            [&progress, checking](double f, FrameTime) { progress = checking + (1 - checking) * f; }, &cancel, &err);
+            } else {
+                ok = renderExport(p, seq, st, stems, report, &cancel, &err, &encoder, &kept);
+                // A segment: its frames counted and its bytes hashed, for the join to check against.
+                if (ok && segment > 0) {
+                    ok = checkExportSegment(st, made, &err, &cancel);
+                    if (ok && made.frames != st.out - st.in) {
+                        ok = false;
+                        err = "The segment has " + std::to_string(made.frames) + " frames, not " + std::to_string(st.out - st.in);
+                    }
+                }
+            }
             done = true;
         });
         bool cancelled = false, givenBack = false, lost = false;
@@ -743,6 +958,12 @@ struct Node {
                 if (const size_t at = err.rfind(st.path); at != std::string::npos) err.replace(at, st.path.size(), finalPath);
         }
         QDir(scratch).removeRecursively();
+        if (ok && segment > 0 && holds(d) &&
+            !writeJson(d.filePath(QStringLiteral("segment.json")),
+                       QJsonObject{{"frames", double(made.frames)}, {"bytes", double(made.bytes)}, {"sha256", qs(made.sha256)}})) {
+            ok = false;
+            err = "Cannot write the segment's check in the render farm folder";
+        }
         if (lost || (ok && !holds(d))) {
             log("Lost " + id + " (taken back by another node)");
             return false;
@@ -753,8 +974,24 @@ struct Node {
             log("Gave back " + id);
             return false;
         }
+        if (!bad.empty() && !cancelled && !givenBack) {
+            // Segments that do not check out (changed or lost on the way) are rendered again alone, and the join waits
+            // for them; after two rounds of that, it fails.
+            std::string which;
+            for (size_t k : bad) which += (which.empty() ? "" : ", ") + std::to_string(k + 1);
+            if (jobCount(d, "rechecks") >= 2) return failJob("Segment " + which + " does not check out (its frames or bytes are not what its node wrote)");
+            setJobCount(d, "rechecks", jobCount(d, "rechecks") + 1);
+            for (size_t k : bad) retryFarmJob(o.farm, segs[k]);
+            releaseClaim(d, token);
+            log("Segment " + which + " of " + id + " did not check out: rendered again before the join");
+            return false;
+        }
         if (ok) {
-            finish("done", 1, {}, encoder);
+            // The segments' files, joined, go once the join is done (an image sequence's frames are the output).
+            if (finish("done", 1, {}, encoder) && join && !exportIsImageSequence(st) && !segSettings.empty()) {
+                const QFileInfo first(qs(segSettings.front().path));
+                if (first.dir().dirName().startsWith(QStringLiteral(".montage-segments-"))) QDir(first.absolutePath()).removeRecursively();
+            }
             log("Done " + id + " -> " + finalPath);
         } else if (cancelled) {
             finish("cancelled", progress, "Cancelled");

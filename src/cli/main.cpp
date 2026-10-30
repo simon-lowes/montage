@@ -78,6 +78,7 @@
 #include "render/GpuCompositor.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 
 using namespace montage;
 
@@ -106,7 +107,8 @@ int usage() {
                  "                     [--burn-timecode] [--burn-clip-name] [--burn-text TEXT] [--burn-corner 0-5]\n"
                  "                     [--watermark IMAGE [--watermark-corner 0-5] [--watermark-opacity 0..1]]\n"
                  "                     (corners: 0 top left, 1 top centre, 2 top right, 3-5 bottom)\n"
-                 "  montage-cli farm <folder> submit <project.montage> -o <output> [--name NAME] [render's options]\n"
+                 "  montage-cli farm <folder> submit <project.montage> -o <output> [--name NAME] [--segments N] [render's options]\n"
+                 "                     (--segments: split at cuts into N parts that several nodes render, then one joins)\n"
                  "  montage-cli farm <folder> jobs|nodes [--json]\n"
                  "  montage-cli farm <folder> cancel|retry|remove <job>\n"
                  "                     (a render farm: a folder every computer reaches; jobs wait there for render nodes)\n"
@@ -530,12 +532,19 @@ int cmdFarm(const std::vector<std::string>& args) {
         // `render`'s arguments, plus --name.
         std::vector<std::string> rest(args.begin() + 2, args.end());
         std::string name;
-        for (size_t i = 0; i + 1 < rest.size(); ++i)
-            if (rest[i] == "--name") {
-                name = rest[i + 1];
+        int segments = 1;
+        for (size_t i = 0; i + 1 < rest.size();)
+            if (rest[i] == "--name" || rest[i] == "--segments") {
+                if (rest[i] == "--name") name = rest[i + 1];
+                else segments = std::atoi(rest[i + 1].c_str());
                 rest.erase(rest.begin() + long(i), rest.begin() + long(i) + 2);
-                break;
+            } else {
+                ++i;
             }
+        if (segments < 1 || segments > 256) {
+            std::fprintf(stderr, "error: --segments takes 1 to 256\n");
+            return 2;
+        }
         Project p;
         ExportSettings st;
         int stems = 0;
@@ -544,9 +553,17 @@ int cmdFarm(const std::vector<std::string>& args) {
         st.path = QFileInfo(QString::fromStdString(st.path)).absoluteFilePath().toStdString();
         if (name.empty()) name = p.active()->name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
         std::string id;
-        if (!submitFarmJob(farm, name, p, p.active()->id, st, stems, &id, &err)) {
+        if (!submitFarmJob(farm, name, p, p.active()->id, st, stems, &id, &err, segments)) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
             return 1;
+        }
+        if (segments > 1) {
+            int made = 0;
+            for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+            if (made > 1) std::fprintf(stderr, "In %d segments, joined by job %s\n", made, id.c_str());
+            else std::fprintf(stderr, "Sent whole: the range is too short to split\n");
+            if (made > 1 && exportSegmentsLongGop(st))
+                std::fprintf(stderr, "warning: rate control works per segment (a bitrate is kept within each, not across the whole)\n");
         }
         std::printf("%s\n", id.c_str());
         return 0;
@@ -568,6 +585,16 @@ int cmdFarm(const std::vector<std::string>& args) {
                                             {"error", QString::fromStdString(j.error)}, {"submittedBy", QString::fromStdString(j.submittedBy)},
                                             {"submitted", QString::fromStdString(j.submitted)}, {"started", QString::fromStdString(j.started)},
                                             {"finished", QString::fromStdString(j.finished)}, {"cancelRequested", j.cancelRequested}});
+                    if (j.join) {
+                        QJsonObject o = list.last().toObject();
+                        o["segments"] = j.segments;
+                        list[list.size() - 1] = o;
+                    } else if (j.segment > 0) {
+                        QJsonObject o = list.last().toObject();
+                        o["join"] = QString::fromStdString(j.group);
+                        o["segment"] = j.segment;
+                        list[list.size() - 1] = o;
+                    }
                     continue;
                 }
                 std::string state = farmStateName(j.state);

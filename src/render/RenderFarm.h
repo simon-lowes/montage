@@ -10,6 +10,11 @@
 // each node's heartbeat. Nothing relies on the computers' clocks agreeing: a node that stops answering is noticed by
 // its heartbeat count not changing for a minute of the watcher's own time, and its job is taken back for another.
 // (Jobs are taken oldest first by the sending computer's clock, which only orders them.)
+//
+// A job sent in segments (render/SegmentedExport.h) is a job for each segment, rendered by whichever nodes are free,
+// and a join job that waits for them all: the node that takes it checks each segment (its frames and the hash its node
+// wrote), renders the sound once and joins the segments into the output. A segment that fails is tried again (twice)
+// on its own, and one that does not check out at the join is rendered again alone.
 #pragma once
 
 #include <QJsonObject>
@@ -60,6 +65,11 @@ struct FarmJob {
     int64_t beat = 0;   // the node's heartbeat count while rendering
     bool cancelRequested = false;  // asked to stop, not stopped yet
     std::string claim;  // who holds it (a node's token for this run), while claimed
+    // A job sent in segments: a segment's join job (`group`) and its number (1 based) of `segments`; the join itself has
+    // `join` and the number of its segments.
+    std::string group;
+    int segment = 0, segments = 0;
+    bool join = false;
 };
 struct FarmNodeInfo {
     std::string name, host, state;  // state: idle, rendering, stopped
@@ -71,17 +81,20 @@ struct FarmNodeInfo {
 // The farm's folders made when missing; false with `error` when it cannot be used.
 bool openFarm(const std::string& farm, std::string* error = nullptr);
 // Sends a job: `project` as it is now, its sequence `sequence` exported with `settings` (its path where the nodes
-// write, before their mapping). `id` gets the job's.
+// write, before their mapping). `id` gets the job's. With `segments` > 1, split into that many (at cuts near equal
+// lengths; fewer for a short range) and a join job, whose id `id` gets; refused when the export cannot be split
+// (exportSplits). The segments' files go in a hidden folder beside the output, removed once joined.
 bool submitFarmJob(const std::string& farm, const std::string& name, const Project& project, Id sequence, const ExportSettings& settings,
-                   int stems, std::string* id = nullptr, std::string* error = nullptr);
+                   int stems, std::string* id = nullptr, std::string* error = nullptr, int segments = 1);
 std::vector<FarmJob> farmJobs(const std::string& farm);  // oldest first
 std::vector<FarmNodeInfo> farmNodes(const std::string& farm);
 // A waiting job is cancelled at once; a rendering one is asked to stop (its node looks every half second; a share's
-// caching can delay its seeing the request).
+// caching can delay its seeing the request). A join job's segments that have not ended are cancelled with it.
 bool cancelFarmJob(const std::string& farm, const std::string& id, std::string* error = nullptr);
-// A failed or cancelled job (or one a stopped node left) waits again.
+// A failed or cancelled job (or one a stopped node left) waits again; a join job's failed and cancelled segments too.
 bool retryFarmJob(const std::string& farm, const std::string& id, std::string* error = nullptr);
-// A job that is not rendering, with its copy of the project; the output stays.
+// A job that is not rendering, with its copy of the project; the output stays. A join job's segments go with it (none
+// may be rendering), and their files when the folder is reachable from here.
 bool removeFarmJob(const std::string& farm, const std::string& id, std::string* error = nullptr);
 
 // Notices heartbeats that stop: `stale` is true once the same beat has been seen for `ms` of this computer's time.

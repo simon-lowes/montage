@@ -9,6 +9,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QSignalBlocker>
 #include <QSplitter>
 #include <QTimer>
@@ -56,6 +57,17 @@ RenderQueuePanel::RenderQueuePanel(RenderQueue* queue, QWidget* parent) : QWidge
     reveal_ = button(tr("Show File"), "queueReveal");
     send_ = button(tr("Send to Farm"), "queueSendToFarm");
     send_->setToolTip(tr("Send the job to the render farm, for its render nodes, and take it off this queue"));
+    segments_ = new QSpinBox(this);
+    segments_->setObjectName(QStringLiteral("queueSegments"));
+    segments_->setRange(1, 64);
+    segments_->setSpecialValueText(tr("Whole"));
+    segments_->setSuffix(tr(" segments"));
+    segments_->setToolTip(tr("Split a job sent to the farm into segments (at cuts near equal lengths) that several nodes\n"
+                             "render at once, then one joins: ProRes, DNxHR and FFV1 frame for frame, H.264, H.265 and AV1\n"
+                             "with rate control per segment, and image sequences. The sound is rendered once, by the node that joins."));
+    segments_->setValue(std::clamp(appSettings().value(QStringLiteral("renderFarm/segments"), 1).toInt(), 1, 64));
+    connect(segments_, &QSpinBox::valueChanged, this, [](int v) { appSettings().setValue(QStringLiteral("renderFarm/segments"), v); });
+    row->addWidget(segments_);
     row->addStretch(1);
     localLay->addLayout(row);
 
@@ -154,7 +166,7 @@ bool RenderQueuePanel::sendToFarm(int id) {
     const RenderQueue::Job* j = queue_->job(id);
     if (!j || farm_.isEmpty() || j->status == RenderQueue::Status::Rendering) return false;
     std::string err;
-    if (!submitFarmJob(farm_.toStdString(), j->name.toStdString(), *j->project, j->sequence, j->settings, j->stems, nullptr, &err)) {
+    if (!submitFarmJob(farm_.toStdString(), j->name.toStdString(), *j->project, j->sequence, j->settings, j->stems, nullptr, &err, segments_->value())) {
         QMessageBox::warning(this, tr("Render Farm"), tr("Not sent to the render farm: %1").arg(QString::fromStdString(err)));
         return false;
     }

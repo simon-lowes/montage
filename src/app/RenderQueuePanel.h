@@ -11,6 +11,7 @@
 #include "render/RenderFarm.h"
 
 class QLabel;
+class QSpinBox;
 class QPushButton;
 class QTimer;
 class QTreeWidget;
@@ -53,6 +54,7 @@ private:
     QPushButton* clear_;
     QPushButton* reveal_;
     QPushButton* send_;
+    QSpinBox* segments_;  // a job sent to the farm in this many (1: whole)
     QString farm_;
     QLabel* farmLabel_;
     QLabel* nodes_;
