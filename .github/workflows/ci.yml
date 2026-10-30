@@ -242,3 +242,5 @@ jobs:
           sudo apt-get install -y --no-install-recommends at-spi2-core python3-pyatspi > /dev/null
           build/src/montage-cli new -o "$RUNNER_TEMP/atspi.montage" tests/data/jfk.wav
           dbus-run-session -- xvfb-run -a /usr/bin/python3 scripts/atspi-check.py build/src/app/montage "$RUNNER_TEMP/atspi.montage"
+      - name: AMWA's NMOS tests (IS-04 Node and IS-05) against the ST 2110 output's Node
+        run: sudo scripts/nmos-check.sh build/src/montage-cli "$RUNNER_TEMP/nmos"

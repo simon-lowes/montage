@@ -78,6 +78,9 @@ struct VideoFrame {
     Timecode timecode;
     FrameTime timecodeFrame = 0;  // the frames `timecode` counts, at `fps`
     Rational fps{25, 1};
+    // Its captions as A/53 cc_data (3 bytes an entry; core/Cea708.h), on an output that carries them.
+    const uint8_t* cc = nullptr;
+    int ccCount = 0;
 };
 // The audio that goes with it: `frames` samples of `channels` interleaved (none when no channels).
 struct Audio {
@@ -92,6 +95,7 @@ struct Device {
     bool hdr = false;                  // takes HDR metadata
     std::vector<int> audioChannels{2};  // embedded channel counts it takes
     std::vector<int> audioRates{48000};  // empty: any
+    bool captions = false;             // carries CEA-608/708 captions (ST 2110-40)
 };
 
 class Backend {
@@ -113,6 +117,9 @@ public:
     virtual int receivers() { return -1; }
     // Where receivers find it while open, when it is on the network by an address (OMT's omt://HOST:port); "" else.
     virtual std::string address() { return {}; }
+    // Session descriptions of its streams while open ("video", "audio", "data"), when receivers take them from SDP files
+    // (ST 2110); none else.
+    virtual std::map<std::string, std::string> sdp() { return {}; }
 };
 
 // What the user chose.
@@ -126,6 +133,7 @@ struct Config {
     int audioChannels = 2;        // 0: none
     int videoOffset = 0;          // frames the picture runs ahead (+) of the speakers, for a monitor's latency
     int audioOffsetMs = 0;        // embedded audio's delay against its picture
+    bool captions = true;         // the sequence's captions (its track shown) sent as CEA-608/708, where the device carries them
 };
 
 // The signal a sequence of colour space `space` goes out as, in `format`: its own (BT.709, BT.2020, PQ or HLG; P3 PQ in a
@@ -210,6 +218,8 @@ private:
     Rational seqFps_{25, 1};
     int audioRate_ = 48000, audioChannels_ = 0;
     double renderScale_ = 1;
+    // Each output frame's caption data (A/53 cc_data, 3 bytes an entry), from the sequence's captions as the output started.
+    std::vector<std::vector<uint8_t>> cc_;
 
     std::atomic<bool> running_{false};
     std::thread packer_, sender_;
@@ -230,8 +240,9 @@ private:
 std::shared_ptr<Backend> makeNdiBackend();
 std::shared_ptr<Backend> makeDeckLinkBackend();
 std::shared_ptr<Backend> makeOmtBackend();  // (null in a build without Open Media Transport)
+std::shared_ptr<Backend> makeSt2110Backend();  // (render/St2110.h)
 
-// The interfaces Montage knows (DeckLink, NDI and OMT; and Virtual, a test device, with MONTAGE_VIRTUAL_OUTPUT set).
+// The interfaces Montage knows (DeckLink, NDI, OMT and ST 2110; and Virtual, a test device, with MONTAGE_VIRTUAL_OUTPUT set).
 std::vector<std::shared_ptr<Backend>> backends();
 std::shared_ptr<Backend> findBackend(const std::string& name);
 

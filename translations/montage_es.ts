@@ -24519,12 +24519,28 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished">audio_canales es 0, 2, 8 o 16</translation>
     </message>
     <message>
-        <source>No interface &quot;%1&quot; (DeckLink, NDI or OMT)</source>
-        <translation type="unfinished">No hay interfaz « %1 » (DeckLink, NDI o OMT)</translation>
-    </message>
-    <message>
         <source>action is list, status, start or stop</source>
         <translation type="unfinished">acción es lista, estado, iniciar o detener</translation>
+    </message>
+    <message>
+        <source>NMOS: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, registered with %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, offered over NMOS at %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No interface &quot;%1&quot; (DeckLink, NDI, OMT or ST 2110)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>st2110.%1 is an IPv4 address and port, such as 239.100.0.1:5004</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -24532,10 +24548,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Reference Output</source>
         <translation type="unfinished">Producto de referencia</translation>
-    </message>
-    <message>
-        <source>The Program sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink or UltraStudio, or over the network as an NDI® or Open Media Transport source. 10-bit 4:2:2, HDR signalled, timecode and embedded sound.</source>
-        <translation type="unfinished">El programa se envía a un monitor de transmisión: SDI o HDMI a través de un Blackmagic DeckLink o UltraStudio, o a través de la red como una fuente de transporte NDI&lt;unk&gt; o Open Media. 10-bit 4:2:2, HDR señalizado, código de tiempo y sonido integrado.</translation>
     </message>
     <message>
         <source>Interface:</source>
@@ -24660,6 +24672,86 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Stop</source>
         <translation type="unfinished">Detener</translation>
+    </message>
+    <message>
+        <source>The Program sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink or UltraStudio, or over the network as an NDI® or Open Media Transport source or as SMPTE ST 2110 streams. 10-bit 4:2:2, HDR signalled, timecode and embedded sound.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Send the captions (CEA-608 and 708) while playing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The video stream&apos;s address and port (multicast or unicast IPv4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sound stream&apos;s address and port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The ancillary data stream&apos;s address and port: time code, captions and HDR metadata</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Data stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many routers multicast packets may cross</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Multicast TTL:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The PTP clock the SDP files name (ts-refclk): &quot;ptp=IEEE1588-2008:traceable&quot;, or the grandmaster&apos;s &quot;ptp=IEEE1588-2008:&lt;id&gt;:&lt;domain&gt;&quot;. Montage reads PTP time from the system clock, which linuxptp (ptp4l and phc2sys) or the operating system keeps in step.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PTP reference:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Offer to broadcast controllers (NMOS)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Registers the streams with the facility&apos;s NMOS registry (IS-04), so a broadcast controller lists them and can send them elsewhere (IS-05)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Found by DNS-SD</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The registry&apos;s address, such as http://registry.example:8010 (empty: the one the network&apos;s DNS offers)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>NMOS registry:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save SDP Files…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Writes each stream&apos;s session description, which receivers and broadcast controllers read</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save SDP Files</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

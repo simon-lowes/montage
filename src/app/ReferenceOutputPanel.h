@@ -1,7 +1,8 @@
 // Montage — Playback › Video Output › Reference Output…: the program sent to a broadcast monitor through a DeckLink
-// card (SDI or HDMI) or over NDI (render/ReferenceOutput.h). The controller opens the interface for the Program
+// card (SDI or HDMI), or over the network as NDI, OMT or SMPTE ST 2110 (render/ReferenceOutput.h, render/St2110.h). The controller opens the interface for the Program
 // monitor's sequence and follows it (a sequence of another format opens it again); the panel chooses the interface,
-// device, mode, bit depth, colour, framing, embedded audio and the offsets for a monitor's latency.
+// device, mode, bit depth, colour, framing, embedded audio and the offsets for a monitor's latency. ST 2110 streams are
+// also offered to broadcast controllers as an AMWA NMOS Node (render/Nmos.h), which may send them elsewhere.
 #pragma once
 
 #include <QDialog>
@@ -11,11 +12,15 @@
 #include <memory>
 
 #include "PlaybackController.h"
+#include "render/Nmos.h"
 #include "render/ReferenceOutput.h"
+#include "render/St2110.h"
 
 class QCheckBox;
 class QComboBox;
+class QFormLayout;
 class QLabel;
+class QLineEdit;
 class QPushButton;
 class QSpinBox;
 class QTimer;
@@ -50,12 +55,22 @@ public:
 
     static output::Config loadConfig();
     static void saveConfig(const output::Config& c);
+    // ST 2110's streams (where they go, multicast TTL, PTP reference), kept between sessions.
+    static st2110::SenderOptions loadSt2110();
+    static void saveSt2110(const st2110::SenderOptions& o);
+    // The NMOS Node the ST 2110 output is offered through (whether, and how it finds a registry), kept between sessions.
+    static nmos::NodeOptions loadNmos(bool* enabled = nullptr);
+    static void saveNmos(const nmos::NodeOptions& o, bool enabled);
+    // The Node while the ST 2110 output runs with it (else null).
+    nmos::Node* nmosNode() const { return nmos_ && nmos_->running() ? nmos_ : nullptr; }
 
 signals:
     void runningChanged(bool running);
 
 private:
     QString formatKey() const;
+    void stopOutput();
+    void updateNmos();
     Sequence signalSequence(const Sequence& s) const;
     QPointer<PlaybackController> program_;  // (may go first when the window closes)
     output::Config config_;
@@ -65,6 +80,11 @@ private:
     QTimer* watch_ = nullptr;  // notices the output stopping by itself (a card unplugged)
     QString startedFor_;  // the sequence format it was opened for
     QString lastError_;
+    nmos::Node* nmos_ = nullptr;
+    bool activating_ = false;   // (restarting for a controller's activation)
+    bool keepStreams_ = false;  // (restarting for the sequence: the streams a controller switched off stay off)
+    bool routed_ = false;       // a controller changed where (or whether) the streams go since the last start by hand
+    nmos::NodeOptions nmosStarted_;
 };
 
 class ReferenceOutputPanel : public QDialog {
@@ -88,6 +108,17 @@ private:
     QComboBox* audio_;
     QSpinBox* videoOffset_;
     QSpinBox* audioOffset_;
+    QCheckBox* captions_;
+    QLineEdit* st2110Video_;
+    QLineEdit* st2110Audio_;
+    QLineEdit* st2110Data_;
+    QSpinBox* st2110Ttl_;
+    QLineEdit* st2110Clock_;
+    QCheckBox* nmos_;
+    QLineEdit* nmosRegistry_;
+    QPushButton* saveSdp_;
+    QFormLayout* form_;
+    st2110::SenderOptions chosenSt2110() const;
     QLabel* why_;
     QLabel* status_;
     QPushButton* start_;

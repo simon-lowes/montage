@@ -19249,6 +19249,53 @@ print("added " + ui["name"])
         r = call({{"action", "stop"}});
         QVERIFY(!r.value("isError").toBool() && !controller->running());
         qunsetenv("MONTAGE_VIRTUAL_OUTPUT");
+
+        // ST 2110: its streams' addresses shown only for it; started from an agent on the loopback interface, its SDP
+        // files in the status, the addresses kept for next time.
+        const st2110::SenderOptions savedIp = ReferenceOutputController::loadSt2110();
+        bool savedNmosOn = true;
+        const nmos::NodeOptions savedNmos = ReferenceOutputController::loadNmos(&savedNmosOn);
+        action->trigger();
+        dlg = win_->findChild<QDialog*>("referenceOutputDialog");
+        QVERIFY(dlg);
+        backend = dlg->findChild<QComboBox*>("outputBackend");
+        auto* videoAt = dlg->findChild<QLineEdit*>("outputSt2110Video");
+        QVERIFY(videoAt && backend->findData(QStringLiteral("ST 2110")) >= 0);
+        backend->setCurrentIndex(backend->findData(QStringLiteral("ST 2110")));
+        QVERIFY(videoAt->isVisibleTo(dlg) && dlg->findChild<QCheckBox*>("outputCaptions")->isEnabled());
+        QVERIFY(dlg->findChild<QCheckBox*>("outputNmos")->isVisibleTo(dlg));
+        backend->setCurrentIndex(backend->findData(QStringLiteral("DeckLink")));
+        QVERIFY(!videoAt->isVisibleTo(dlg) && !dlg->findChild<QCheckBox*>("outputNmos")->isVisibleTo(dlg));
+        dlg->close();
+        r = call({{"action", "start"}, {"interface", "ST 2110"}, {"device", "127.0.0.1"}, {"mode", "720p50"},
+                  {"st2110", QJsonObject{{"video", "127.0.0.1:15004"}, {"audio", "127.0.0.1:15006"}, {"data", "127.0.0.1:15008"}}},
+                  {"nmos", QJsonObject{{"enabled", true}, {"registry", "http://127.0.0.1:1"}}}});  // (no registry there: the Node API alone)
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->running());
+        r = call({{"action", "status"}});
+        const QJsonObject sdp = r.value("structuredContent").toObject().value("sdp").toObject();
+        QVERIFY2(sdp.value("video").toString().contains("m=video 15004 RTP/AVP 96"), QJsonDocument(r).toJson().constData());
+        QVERIFY(sdp.value("audio").toString().contains("L24/48000/") && sdp.value("data").toString().contains("smpte291/90000"));
+        QCOMPARE(r.value("structuredContent").toObject().value("address").toString(), QStringLiteral("rtp://127.0.0.1:15004"));
+        QCOMPARE(ReferenceOutputController::loadSt2110().audio.port, 15006);
+        // Offered over NMOS: a controller sending the video elsewhere opens the output again to match.
+        QVERIFY(controller->nmosNode());
+        QVERIFY(r.value("structuredContent").toObject().value("nmos").toObject().value("node_api").toString().startsWith("http://127.0.0.1:"));
+        const QString single = QStringLiteral("/x-nmos/connection/v1.1/single/senders/%1/").arg(controller->nmosNode()->senderId(0).toString(QUuid::WithoutBraces));
+        const QJsonObject patch{{"transport_params", QJsonArray{QJsonObject{{"destination_port", 15010}}}}, {"activation", QJsonObject{{"mode", "activate_immediate"}}}};
+        QCOMPARE(controller->nmosNode()->handle("PATCH", single + "staged", QJsonDocument(patch).toJson()).code, 200);
+        QVERIFY(controller->running() && controller->nmosNode());
+        r = call({{"action", "status"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("address").toString(), QStringLiteral("rtp://127.0.0.1:15010"));
+        QVERIFY(r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString().contains("m=video 15010 RTP/AVP 96"));
+        QVERIFY(controller->nmosNode()->handle("GET", single + "transportfile", {}).body.contains("m=video 15010 RTP/AVP 96"));
+        r = call({{"action", "start"}, {"st2110", QJsonObject{{"video", "not an address"}}}});
+        QVERIFY(r.value("isError").toBool());
+        call({{"action", "stop"}});
+        QVERIFY(!controller->running() && !controller->nmosNode());
+        ReferenceOutputController::saveNmos(savedNmos, savedNmosOn);
+        ReferenceOutputController::saveSt2110(savedIp);
+        st2110::setOutputOptions(savedIp);
     }
 
     void saveAndReopen() {

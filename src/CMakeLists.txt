@@ -277,6 +277,7 @@ add_library(montage_engine STATIC
   render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
+  render/St2110.h render/St2110.cpp render/Nmos.h render/Nmos.cpp
   render/RemoteReview.h render/RemoteReview.cpp
   render/RemoteGrade.h render/RemoteGrade.cpp
   render/SkyReplace.h render/SkyReplace.cpp
@@ -580,6 +581,10 @@ if(MONTAGE_WITH_OPENEXR)
                                                     ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph
                                                     ${openexr_SOURCE_DIR}/external/zstd/lib)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
+endif()
+if(WIN32)
+  # (ST 2110's UDP sockets and interface list: render/St2110)
+  target_link_libraries(montage_engine PRIVATE ws2_32 iphlpapi)
 endif()
 if(MONTAGE_WITH_OMT)
   # Open Media Transport: the protocol (media/Omt), a reference output (render/OmtOutput) and a Capture source.

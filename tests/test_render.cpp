@@ -131,7 +131,10 @@
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
+#include "core/Cea708.h"
 #include "render/ReferenceOutput.h"
+#include "render/Nmos.h"
+#include "render/St2110.h"
 #ifdef MONTAGE_WITH_OMT
 #include "media/Omt.h"
 #include "media/OmtNet.h"
@@ -12829,6 +12832,492 @@ colorspaces:
         s.colorSpace = "rec2100pq";  // (HDR is not sent in 8 bits)
         cfg.depth = 8;
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
+    }
+
+    void st2110() {
+        using namespace montage::output;
+        namespace st = montage::st2110;
+        // The SDP: ST 2110-20's required parameters, the clock and (multicast) the source filter.
+        st::VideoFormat vf;
+        vf.width = 1920, vf.height = 1080, vf.fps = {25, 1}, vf.interlaced = true, vf.tcs = "PQ", vf.colorimetry = "BT2100";
+        st::SdpOptions so;
+        so.source = "192.168.1.10";
+        const std::string sdp = st::videoSdp(vf, {"239.100.0.1", 5004}, 96, so);
+        std::string encoding;
+        auto params = st::sdpParameters(sdp, &encoding);
+        QCOMPARE(QString::fromStdString(encoding), QStringLiteral("raw/90000"));
+        for (const char* k : {"sampling", "width", "height", "exactframerate", "depth", "TCS", "colorimetry", "PM", "SSN", "TP", "interlace"})
+            QVERIFY2(params.count(k), k);
+        QCOMPARE(QString::fromStdString(params["sampling"]), QStringLiteral("YCbCr-4:2:2"));
+        QCOMPARE(QString::fromStdString(params["width"] + "x" + params["height"]), QStringLiteral("1920x1080"));
+        QCOMPARE(QString::fromStdString(params["exactframerate"]), QStringLiteral("25"));
+        QCOMPARE(QString::fromStdString(params["depth"]), QStringLiteral("10"));
+        QCOMPARE(QString::fromStdString(params["TCS"] + " " + params["colorimetry"]), QStringLiteral("PQ BT2100"));
+        QCOMPARE(QString::fromStdString(params["PM"] + " " + params["TP"]), QStringLiteral("2110GPM 2110TPW"));
+        const QString text = QString::fromStdString(sdp);
+        QVERIFY(text.contains("m=video 5004 RTP/AVP 96\r\n") && text.contains("c=IN IP4 239.100.0.1/16\r\n"));
+        QVERIFY(text.contains("a=source-filter: incl IN IP4 239.100.0.1 192.168.1.10\r\n"));
+        QVERIFY(text.contains("a=ts-refclk:ptp=IEEE1588-2008:traceable\r\n") && text.contains("a=mediaclk:direct=0\r\n"));
+        QVERIFY(text.contains("; TP=2110TPW; interlace\r\n"));  // ("; " between parameters, none after the last)
+        vf.fps = {30000, 1001};
+        QCOMPARE(QString::fromStdString(st::sdpParameters(st::videoSdp(vf, {"10.0.0.2", 5004}, 96, so))["exactframerate"]), QStringLiteral("30000/1001"));
+        QVERIFY(!QString::fromStdString(st::videoSdp(vf, {"10.0.0.2", 5004}, 96, so)).contains("source-filter"));
+        st::AudioFormat af;
+        params = st::sdpParameters(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so), &encoding);
+        QCOMPARE(QString::fromStdString(encoding), QStringLiteral("L24/48000/2"));
+        QCOMPARE(QString::fromStdString(params["channel-order"]), QStringLiteral("SMPTE2110.(ST)"));
+        QVERIFY(QString::fromStdString(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so)).contains("a=ptime:1\r\n"));
+        af.channels = 8;
+        QCOMPARE(QString::fromStdString(st::sdpParameters(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so))["channel-order"]),
+                 QStringLiteral("SMPTE2110.(ST,ST,ST,ST)"));
+        params = st::sdpParameters(st::ancSdp(vf, {"239.100.0.3", 5004}, 100, so), &encoding);
+        QCOMPARE(QString::fromStdString(encoding), QStringLiteral("smpte291/90000"));
+        QVERIFY(QString::fromStdString(params["DID_SDID"]).contains("{0x60,0x60}") && QString::fromStdString(params["DID_SDID"]).contains("{0x61,0x01}"));
+        QCOMPARE(QString::fromStdString(params["SSN"] + " " + params["exactframerate"]), QStringLiteral("ST2110-40:2018 30000/1001"));
+        st::Endpoint e;
+        QVERIFY(st::parseEndpoint("239.1.2.3:5006", e) && e.address == "239.1.2.3" && e.port == 5006);
+        QVERIFY(st::parseEndpoint("10.0.0.1", e) && e.port == 5004 && !st::isMulticast(e.address) && st::isMulticast("239.1.2.3"));
+        QVERIFY(!st::parseEndpoint("nonsense", e) && !st::parseEndpoint("10.0.0.1:99999", e));
+
+        // Pictures of random codes (in the ranges the formats keep), packed as the reference output packs them.
+        std::mt19937 rng(2110);
+        auto picture = [&](PixelFormat f, int w, int h) {
+            video::Ycbcr422 y(w, h);
+            const bool ten = f == PixelFormat::V210;
+            std::uniform_int_distribution<int> code(ten ? 4 : 1, ten ? 1019 : 254);
+            for (auto* plane : {&y.y, &y.cb, &y.cr})
+                for (auto& v : *plane) v = uint16_t(code(rng) << (ten ? 6 : 8));
+            std::vector<uint8_t> out(frameBytes(f, w, h));
+            if (ten) video::packV210(y, out.data(), rowBytes(f, w));
+            else video::packUyvy(y, out.data(), rowBytes(f, w));
+            return out;
+        };
+        // Packed into ST 2110-20 packets and back: the same bytes, at 10 bits (a width not in whole v210 groups) and 8,
+        // progressive and interlaced (each field its own timestamp, the frame keeping the first's).
+        auto roundTrip = [&](PixelFormat f, int w, int h, bool interlaced, int drop) {
+            const auto pic = picture(f, w, h);
+            st::RtpState rtp{96, 1234, 65530};  // (the sequence wrapping its 16 bits)
+            std::vector<std::vector<uint8_t>> packets;
+            auto keep = [&](const uint8_t* d, size_t n) {
+                packets.emplace_back(d, d + n);
+                return true;
+            };
+            if (interlaced) {
+                if (!st::packVideo(pic.data(), rowBytes(f, w), f, w, h, 1, 9000, rtp, keep)) return false;
+                if (!st::packVideo(pic.data(), rowBytes(f, w), f, w, h, 2, 9000 + 1800, rtp, keep)) return false;
+            } else if (!st::packVideo(pic.data(), rowBytes(f, w), f, w, h, 0, 9000, rtp, keep)) {
+                return false;
+            }
+            if (int(packets.size()) != st::videoPacketCount(w, h, f == PixelFormat::V210 ? 10 : 8, interlaced)) return false;
+            st::VideoAssembler as(w, h, f, interlaced);
+            int done = 0;
+            for (size_t i = 0; i < packets.size(); ++i) {
+                st::RtpPacket rp;
+                if (!st::parseRtp(packets[i].data(), packets[i].size(), rp) || packets[i].size() > 12 + 1220) return false;
+                if (int(i) == drop) continue;
+                done += as.add(rp) ? 1 : 0;
+            }
+            if (drop >= 0) return done == 1 && as.lost() == 1 && as.frame() != pic;
+            return done == 1 && as.lost() == 0 && as.frame() == pic && as.timestamp() == 9000;
+        };
+        QVERIFY(roundTrip(PixelFormat::V210, 1280, 720, false, -1));
+        QVERIFY(roundTrip(PixelFormat::V210, 1920, 1080, true, -1));
+        QVERIFY(roundTrip(PixelFormat::Uyvy8, 720, 486, true, -1));
+        QVERIFY(roundTrip(PixelFormat::Uyvy8, 1280, 720, false, -1));
+        QVERIFY(roundTrip(PixelFormat::V210, 1280, 720, false, 100));  // (a packet lost: counted, the picture not the same)
+
+        // Ancillary data: time code and a caption packet back with their checksums; a wrong bit refused.
+        const Timecode tc{10, 20, 30, 12, true};
+        const std::vector<CcTriplet> cc{{0xFC, 0x94, 0x20}, {0xFD, 0x80, 0x80}, {0xFF, 0x02, 0x21}};
+        std::vector<st::AncPacket> anc{st::atcPacket(tc), st::captionPacket(captionCdp(cc, {30000, 1001}, 7))};
+        std::vector<uint8_t> ancBytes;
+        st::RtpState ancRtp{100, 5, 0};
+        QVERIFY(st::packAnc(anc, 0, 42, ancRtp, [&](const uint8_t* d, size_t n) {
+            ancBytes.assign(d, d + n);
+            return true;
+        }));
+        st::RtpPacket rp;
+        QVERIFY(st::parseRtp(ancBytes.data(), ancBytes.size(), rp) && rp.marker && rp.timestamp == 42);
+        std::vector<st::AncPacket> back;
+        int field = -1;
+        QVERIFY(st::unpackAnc(rp.payload, rp.size, back, &field) && field == 0 && back.size() == 2);
+        Timecode tcBack;
+        st::AtcType type = st::AtcType::Vitc2;
+        QVERIFY(st::parseAtc(back[0], tcBack, &type));
+        QVERIFY(tcBack.hours == 10 && tcBack.minutes == 20 && tcBack.seconds == 30 && tcBack.frames == 12 && tcBack.dropFrame);
+        QVERIFY(type == st::AtcType::Ltc && back[0].line == 0x7FF && back[0].horizontalOffset == 0xFFE);
+        // (RFC 8331's example: a time code packet is 32 bytes with its alignment)
+        std::vector<uint8_t> one;
+        QVERIFY(st::packAnc({st::atcPacket(tc)}, 0, 0, ancRtp, [&](const uint8_t* d, size_t n) {
+            one.assign(d, d + n);
+            return true;
+        }));
+        QCOMPARE(int(one.size()), 12 + 8 + 32);
+        QCOMPARE(int(one[12 + 2] << 8 | one[12 + 3]), 32);
+        // 50p: the second frame of a pair is VITC2 with its field mark in bit 75 (60p: bit 35).
+        bool mark = false;
+        const st::AncPacket second = st::atcPacket({1, 2, 3, 4, false}, st::AtcType::Vitc2, true, 25);
+        QVERIFY((second.data[14] & 0x80) && !(second.data[6] & 0x80) && (second.data[1] & 0x08) && !(second.data[0] & 0x08));
+        QVERIFY(st::parseAtc(second, tcBack, &type, &mark, 25) && type == st::AtcType::Vitc2 && mark && tcBack.frames == 4);
+        QVERIFY((st::atcPacket({1, 2, 3, 4, false}, st::AtcType::Vitc2, true, 30).data[6] & 0x80));
+        auto frame50 = st::timecodePackets(timecodeOf(51, {50, 1}), {50, 1}, 0);  // (00:00:01:01, the pair's second)
+        QVERIFY(frame50.size() == 1 && st::parseAtc(frame50[0], tcBack, &type, &mark, 25) && type == st::AtcType::Vitc2 && mark);
+        QVERIFY(tcBack.seconds == 1 && tcBack.frames == 0);
+        QCOMPARE(int(st::timecodePackets(timecodeOf(50, {50, 1}), {50, 1}, 0).size()), 2);  // (LTC and VITC1 with the first)
+        QCOMPARE(int(st::timecodePackets(timecodeOf(5, {25, 1}), {25, 1}, 2).size()), 1);   // (an interlaced second field: VITC2)
+        // HDR static metadata (ST 2108-1): the mastering display and light levels, as HEVC's SEI messages carry them.
+        Signal hdr;
+        hdr.eotf = Eotf::Pq, hdr.hdrMetadata = true, hdr.masteringP3 = true, hdr.masteringPeak = 1000, hdr.masteringMin = 0.0001;
+        hdr.maxCll = 1000, hdr.maxFall = 400;
+        const st::AncPacket meta = st::hdrMetadataPacket(hdr);
+        QVERIFY(meta.did == 0x41 && meta.sdid == 0x0C && meta.data.size() == 36);
+        QVERIFY(meta.data[0] == 0 && meta.data[1] == 0x1A && meta.data[2] == 0x89 && meta.data[4] == 0x33 && meta.data[5] == 0xC2);  // (G x: 13250)
+        st::HdrMetadata hm;
+        QVERIFY(st::parseHdrMetadata(meta, hm) && hm.display && hm.lightLevel);
+        QVERIFY(std::abs(hm.primaries[0][0] - 0.680) < 1e-9 && std::abs(hm.primaries[2][1] - 0.060) < 1e-9 && std::abs(hm.white[0] - 0.3127) < 1e-9);
+        QVERIFY(std::abs(hm.maxLuminance - 1000) < 1e-9 && std::abs(hm.minLuminance - 0.0001) < 1e-9 && hm.maxCll == 1000 && hm.maxFall == 400);
+        std::vector<CcTriplet> ccBack;
+        QVERIFY(back[1].did == 0x61 && back[1].sdid == 0x01 && parseCdp(back[1].data.data(), back[1].data.size(), ccBack));
+        QVERIFY(ccBack == cc);
+        ancBytes[12 + 8 + 6] ^= 0x04;  // (the parity bit of the first packet's data count)
+        QVERIFY(st::parseRtp(ancBytes.data(), ancBytes.size(), rp) && !st::unpackAnc(rp.payload, rp.size, back));
+        // Audio: L24 carries 24-bit samples exactly.
+        std::vector<float> samples(96);
+        for (size_t i = 0; i < samples.size(); ++i) samples[i] = float(int(i * 87381 % 16777216) - 8388608) / 8388608.0f;
+        std::vector<uint8_t> audioBytes;
+        st::RtpState audioRtp{97, 6, 0};
+        QVERIFY(st::packAudio(samples.data(), 48, 2, 4800, audioRtp, [&](const uint8_t* d, size_t n) {
+            audioBytes.assign(d, d + n);
+            return true;
+        }));
+        QVERIFY(st::parseRtp(audioBytes.data(), audioBytes.size(), rp) && rp.size == 288);
+        QVERIFY(st::unpackAudio(rp.payload, rp.size, 2) == samples);
+
+        // Over the loopback interface: a receiver for each stream gets 50p video back frame for frame, the sound sample
+        // for sample, and time code and captions it can read. (A small picture: a CI runner's socket buffers are small.)
+        st::Receiver rv, ra, rx;
+        std::string why;
+        QVERIFY2(rv.open({"127.0.0.1", 0}, {}, &why) && ra.open({"127.0.0.1", 0}, {}, &why) && rx.open({"127.0.0.1", 0}, {}, &why), why.c_str());
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", rv.port()}, o.audio = {"127.0.0.1", ra.port()}, o.anc = {"127.0.0.1", rx.port()};
+        o.ttl = 1;
+        st::VideoFormat v;
+        v.width = 320, v.height = 180, v.fps = {50, 1};
+        st::Sender snd;
+        QVERIFY2(snd.open(o, v, st::AudioFormat{}, &why), why.c_str());
+        QVERIFY(QString::fromStdString(snd.sdpVideo()).contains(QStringLiteral("m=video %1 RTP/AVP 96").arg(rv.port())));
+        QVERIFY(QString::fromStdString(snd.sdpAudio()).contains("L24/48000/2") && QString::fromStdString(snd.sdpAnc()).contains("smpte291"));
+        QVERIFY(!snd.clockSource().empty());
+        std::atomic<bool> stop{false};
+        std::mutex m;
+        std::vector<std::vector<uint8_t>> framesIn;
+        std::vector<uint32_t> frameTimes, audioTimes, ancTimes;
+        std::vector<float> audioIn;
+        std::vector<std::vector<st::AncPacket>> ancIn;
+        int64_t lost = 0;
+        bool ancOk = true;
+        std::thread tv([&] {
+            st::VideoAssembler as(320, 180, PixelFormat::V210, false);
+            std::vector<uint8_t> d;
+            st::RtpPacket p;
+            while (!stop)
+                if (rv.receive(d, 50) && st::parseRtp(d.data(), d.size(), p) && as.add(p)) {
+                    std::lock_guard lock(m);
+                    framesIn.push_back(as.frame());
+                    frameTimes.push_back(as.timestamp());
+                    lost = as.lost();
+                }
+        });
+        std::thread ta([&] {
+            std::vector<uint8_t> d;
+            st::RtpPacket p;
+            while (!stop)
+                if (ra.receive(d, 50) && st::parseRtp(d.data(), d.size(), p)) {
+                    const auto s = st::unpackAudio(p.payload, p.size, 2);
+                    std::lock_guard lock(m);
+                    audioIn.insert(audioIn.end(), s.begin(), s.end());
+                    audioTimes.push_back(p.timestamp);
+                }
+        });
+        std::thread tx([&] {
+            std::vector<uint8_t> d;
+            st::RtpPacket p;
+            while (!stop)
+                if (rx.receive(d, 50) && st::parseRtp(d.data(), d.size(), p)) {
+                    std::vector<st::AncPacket> a;
+                    const bool ok = st::unpackAnc(p.payload, p.size, a);
+                    std::lock_guard lock(m);
+                    ancOk = ancOk && ok && p.marker;
+                    ancIn.push_back(a);
+                    ancTimes.push_back(p.timestamp);
+                }
+        });
+        const std::vector<uint8_t> picA = picture(PixelFormat::V210, 320, 180), picB = picture(PixelFormat::V210, 320, 180);
+        Caption caption;
+        caption.start = 5, caption.end = 40, caption.text = "Hello from ST 2110";
+        const auto ccData = captionCcData({caption}, {50, 1}, 60, true, true);
+        std::vector<float> audioOut;
+        const int frames = 60;
+        for (int k = 0; k < frames; ++k) {
+            std::vector<float> a(960 * 2);
+            for (size_t i = 0; i < a.size(); ++i) a[i] = float(int((audioOut.size() + i) * 7919 % 16777216) - 8388608) / 8388608.0f;
+            audioOut.insert(audioOut.end(), a.begin(), a.end());
+            const Timecode t = timecodeOf(FrameTime(36000 * 50 + k), {50, 1});
+            QVERIFY(snd.send((k % 2 ? picB : picA).data(), rowBytes(PixelFormat::V210, 320), PixelFormat::V210, a.data(), 960, &t,
+                             {st::captionPacket(captionCdp(ccData[size_t(k)], {50, 1}, uint16_t(k)))}, &stop));
+        }
+        QCOMPARE(snd.framesSent(), int64_t(frames));
+        auto allIn = [&] {
+            std::lock_guard lock(m);
+            return framesIn.size() >= size_t(frames) && audioIn.size() >= size_t(frames - 1) * 1920 && ancIn.size() >= size_t(frames);
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(allIn(), 3000);
+        stop = true;
+        tv.join(), ta.join(), tx.join();
+        QCOMPARE(lost, int64_t(0));
+        QCOMPARE(int(framesIn.size()), frames);
+        for (int k = 0; k < frames; ++k) QVERIFY2(framesIn[size_t(k)] == (k % 2 ? picB : picA), qPrintable(QString::number(k)));
+        // 90 kHz timestamps a frame apart, from PTP time (a whole number of frames since the epoch).
+        // (a frame sent late goes at the next boundary: frames are never sent early or twice)
+        for (int k = 1; k < frames; ++k) {
+            const uint32_t gap = frameTimes[size_t(k)] - frameTimes[size_t(k - 1)];
+            QVERIFY2(gap > 0 && gap % 1800 == 0, qPrintable(QString::number(gap)));
+        }
+        QCOMPARE(ancTimes, frameTimes);
+        // Sound: every sample sent so far, in 1 ms packets 48 samples apart (the last frame's tail still waiting).
+        QVERIFY(audioIn.size() >= size_t(frames - 1) * 1920 && audioIn.size() % 96 == 0);
+        QVERIFY(std::equal(audioIn.begin(), audioIn.end(), audioOut.begin()));
+        // (late by more than a frame, the sender takes up PTP time again: the sound with the picture)
+        for (size_t k = 1; k < audioTimes.size(); ++k) {
+            const uint32_t gap = audioTimes[k] - audioTimes[k - 1];
+            QVERIFY2(gap > 0 && gap % 48 == 0, qPrintable(QString::number(gap)));
+        }
+        // The sound's first sample is the first frame's start: 48 kHz and 90 kHz from the same instant.
+        // (48 kHz x 1875 and 90 kHz x 1000 count the same: 90 million a second)
+        QCOMPARE(uint32_t(audioTimes[0] * 1875u), uint32_t(frameTimes[0] * 1000u));
+        QVERIFY(ancOk);
+        std::vector<std::pair<double, CcTriplet>> triplets;
+        for (int k = 0; k < frames; ++k) {
+            // Time code: LTC and VITC1 with a pair's first frame, VITC2 with its second; the frame from the pair's count.
+            const auto& in = ancIn[size_t(k)];
+            QCOMPARE(int(in.size()), k % 2 ? 2 : 3);
+            Timecode t;
+            st::AtcType type;
+            bool mark = false;
+            QVERIFY(st::parseAtc(in[in.size() - 2], t, &type, &mark, 25));
+            QVERIFY(type == (k % 2 ? st::AtcType::Vitc2 : st::AtcType::Vitc1) && mark == (k % 2 == 1));
+            const Timecode want = timecodeOf(FrameTime(36000 * 50 + k), {50, 1});
+            QVERIFY2(t.hours == want.hours && t.minutes == want.minutes && t.seconds == want.seconds && t.frames * 2 + (mark ? 1 : 0) == want.frames,
+                     qPrintable(QString::number(k)));
+            std::vector<CcTriplet> c;
+            QVERIFY(parseCdp(in.back().data.data(), in.back().data.size(), c));
+            for (const auto& x : c) triplets.emplace_back(k / 50.0, x);
+        }
+        std::vector<Caption> got;
+        QVERIFY(captionsFromCc(triplets, {50, 1}, got, &why));
+        QCOMPARE(int(got.size()), 1);
+        QCOMPARE(QString::fromStdString(got[0].text), QStringLiteral("Hello from ST 2110"));
+        QVERIFY(std::abs(got[0].start - 5) <= 1 && std::abs(got[0].end - 40) <= 1);
+        snd.close();
+
+        // As a reference output: the Program on the loopback interface, its SDP files, captions while playing.
+        const auto backend = findBackend("ST 2110");
+        QVERIFY(backend && backend->available());
+        Device dev;
+        for (const auto& d : backend->devices())
+            if (d.id == "127.0.0.1") dev = d;
+        QVERIFY(dev.id == "127.0.0.1" && dev.captions && findMode(dev.modes, "720p50"));
+        st::setOutputOptions(o);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1280, s.height = 720, s.fps = {50, 1}, s.sampleRate = 48000;
+        CaptionTrack track;
+        track.captions.push_back(caption);
+        s.captionTracks.push_back(track);
+        Scheduler sched(backend);
+        Config cfg;
+        QVERIFY2(sched.start(dev, *findMode(dev.modes, "720p50"), s, cfg, &why), why.c_str());
+        QCOMPARE(QString::fromStdString(backend->address()), QStringLiteral("rtp://127.0.0.1:%1").arg(rv.port()));
+        const auto sdps = backend->sdp();
+        QVERIFY(sdps.size() == 3 && QString::fromStdString(sdps.at("video")).contains("raw/90000"));
+        QVERIFY(QString::fromStdString(sdps.at("audio")).contains("L24/48000/2") && QString::fromStdString(sdps.at("data")).contains("smpte291"));
+        // The next `count` frames' ancillary packets, after those already sent or on their way (one may have been made
+        // before the playhead changed).
+        auto ancNow = [&](int count) {
+            std::vector<std::vector<st::AncPacket>> out;
+            std::vector<uint8_t> d;
+            st::RtpPacket pk;
+            while (rx.receive(d, 0)) {}
+            for (int skip = 0; skip < 2 && rx.receive(d, 200);) ++skip;
+            for (int i = 0; i < 200 && int(out.size()) < count; ++i)
+                if (rx.receive(d, 100) && st::parseRtp(d.data(), d.size(), pk)) {
+                    std::vector<st::AncPacket> a;
+                    if (st::unpackAnc(pk.payload, pk.size, a)) out.push_back(a);
+                }
+            return out;
+        };
+        sched.setPosition(10, 1);
+        auto playing = ancNow(3);
+        QCOMPARE(int(playing.size()), 3);
+        for (const auto& a : playing) QVERIFY(a.size() == 3 && a[0].did == 0x60 && a[1].did == 0x60 && a[2].did == 0x61);
+        std::vector<CcTriplet> c;
+        QVERIFY(parseCdp(playing[0][2].data.data(), playing[0][2].data.size(), c) && int(c.size()) == ccCountForRate(50));
+        sched.setPosition(10, 0);
+        for (const auto& a : ancNow(3)) QVERIFY(a.size() == 2 && a[0].did == 0x60 && a[1].did == 0x60);  // (parked: time code only)
+        sched.stop();
+        QVERIFY(backend->address().empty());
+        st::setOutputOptions({});
+    }
+
+    // The NMOS Node: its IS-04 resources registered with a registry in order and kept there by heartbeats, and IS-05
+    // activations (at once and scheduled) changing where the streams go, what the registry is told and the SDP served.
+    void nmosNode() {
+        namespace st = montage::st2110;
+        // A registry that takes whatever is posted, and notes it.
+        struct Request {
+            QByteArray method, path;
+            QByteArray contentType, contentLength;
+            QJsonObject body;
+        };
+        std::vector<Request> seen;
+        QTcpServer registry;
+        QVERIFY(registry.listen(QHostAddress::LocalHost));
+        connect(&registry, &QTcpServer::newConnection, this, [&] {
+            while (QTcpSocket* sock = registry.nextPendingConnection()) {
+                auto buffer = std::make_shared<QByteArray>();
+                connect(sock, &QTcpSocket::readyRead, sock, [sock, buffer, &seen] {
+                    *buffer += sock->readAll();
+                    for (;;) {
+                        const qsizetype end = buffer->indexOf("\r\n\r\n");
+                        if (end < 0) return;
+                        const QList<QByteArray> lines = buffer->left(end).split('\n');
+                        Request r;
+                        const QList<QByteArray> first = lines.value(0).trimmed().split(' ');
+                        r.method = first.value(0);
+                        r.path = first.value(1);
+                        for (const QByteArray& l : lines.mid(1)) {
+                            const qsizetype colon = l.indexOf(':');
+                            const QByteArray name = l.left(colon).trimmed().toLower(), value = l.mid(colon + 1).trimmed();
+                            if (name == "content-type") r.contentType = value;
+                            if (name == "content-length") r.contentLength = value;
+                        }
+                        const int length = r.contentLength.toInt();
+                        if (buffer->size() < end + 4 + length) return;
+                        r.body = QJsonDocument::fromJson(buffer->mid(end + 4, length)).object();
+                        buffer->remove(0, end + 4 + length);
+                        const QByteArray reply = r.method == "DELETE" ? QByteArray("HTTP/1.1 204 No Content\r\n\r\n")
+                                               : r.path.contains("/health/") ? QByteArray("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+                                                                              : QByteArray("HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+                        seen.push_back(r);
+                        sock->write(reply);
+                    }
+                });
+            }
+        });
+
+        montage::nmos::Node node;
+        st::VideoFormat video;
+        video.width = 1280;
+        video.height = 720;
+        video.fps = {50, 1};
+        st::AudioFormat audio;
+        audio.channels = 2;
+        st::SenderOptions options;
+        node.setStreams(video, audio, options, true);
+        std::vector<st::SenderOptions> activated;
+        node.onActivated = [&](const st::SenderOptions& o) { activated.push_back(o); };
+        montage::nmos::NodeOptions no;
+        no.address = QStringLiteral("127.0.0.1");
+        no.registry = QStringLiteral("http://127.0.0.1:%1").arg(registry.serverPort());
+        no.heartbeatMs = 200;
+        QString why;
+        QVERIFY2(node.start(no, &why), qPrintable(why));
+        QTRY_VERIFY_WITH_TIMEOUT(node.registered(), 10000);
+
+        // Registered parents first: the node, its device, then the sources, flows and senders.
+        QStringList order;
+        for (const Request& r : seen)
+            if (r.method == "POST" && r.path == "/x-nmos/registration/v1.3/resource") order << r.body["type"].toString();
+        QCOMPARE(order, QStringList({"node", "device", "source", "source", "source", "flow", "flow", "flow", "sender", "sender", "sender"}));
+        // Heartbeats: an empty POST, with no content type.
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(seen.begin(), seen.end(), [&](const Request& r) { return r.path.endsWith("/health/nodes/" + node.nodeId().toString(QUuid::WithoutBraces).toLatin1()); }), 5000);
+        for (const Request& r : seen)
+            if (r.path.contains("/health/")) QVERIFY(r.method == "POST" && r.contentLength == "0" && r.contentType.isEmpty());
+
+        auto json = [&](const QByteArray& method, const QString& path, const QJsonObject& body = {}) {
+            const montage::nmos::Node::Response r = node.handle(method, path, body.isEmpty() ? QByteArray() : QJsonDocument(body).toJson());
+            return std::pair{r.code, r.body};
+        };
+        const QString nodeApi = QStringLiteral("/x-nmos/node/v1.3/");
+        QCOMPARE(QJsonDocument::fromJson(json("GET", nodeApi + "self").second).object()["id"].toString(), node.nodeId().toString(QUuid::WithoutBraces));
+        QCOMPARE(QJsonDocument::fromJson(json("GET", nodeApi + "senders").second).array().size(), 3);
+        QCOMPARE(json("GET", nodeApi + "receivers").first, 200);
+        QCOMPARE(json("GET", nodeApi + "nothing").first, 404);
+
+        // At once: the video to another port; the output told, the SDP served says so, and the registry hears of it.
+        const QString videoId = node.senderId(0).toString(QUuid::WithoutBraces);
+        const QString single = QStringLiteral("/x-nmos/connection/v1.1/single/senders/%1/").arg(videoId);
+        const size_t before = seen.size();
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"destination_port", 5010}}}},
+                                                              {"activation", QJsonObject{{"mode", "activate_immediate"}}}}).first, 200);
+        QCOMPARE(int(activated.size()), 1);
+        QCOMPARE(activated[0].video.port, 5010);
+        QVERIFY(activated[0].sendVideo && activated[0].sendAudio);
+        QVERIFY(json("GET", single + "transportfile").second.contains("m=video 5010 RTP/AVP 96"));
+        const QJsonObject active = QJsonDocument::fromJson(json("GET", single + "active").second).object();
+        QCOMPARE(active["transport_params"].toArray()[0].toObject()["destination_port"].toInt(), 5010);
+        QCOMPARE(active["activation"].toObject()["mode"].toString(), QStringLiteral("activate_immediate"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(seen.begin() + qsizetype(before), seen.end(), [&](const Request& r) {
+                                     return r.body["type"] == "sender" && r.body["data"].toObject()["id"] == videoId;
+                                 }), 5000);
+
+        // Scheduled, a moment from now: staged changes are refused until it happens; then the video is parked, its
+        // SDP gone and its subscription inactive.
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"master_enable", false},
+                                                              {"activation", QJsonObject{{"mode", "activate_scheduled_relative"}, {"requested_time", "0:300000000"}}}}).first, 202);
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"master_enable", true}}).first, 423);
+        QCOMPARE(int(activated.size()), 1);
+        QTRY_COMPARE_WITH_TIMEOUT(int(activated.size()), 2, 5000);
+        QVERIFY(!activated[1].sendVideo && activated[1].sendAudio);
+        QCOMPARE(json("GET", single + "transportfile").first, 404);
+        const QJsonObject sender = QJsonDocument::fromJson(json("GET", nodeApi + "senders/" + videoId).second).object();
+        QCOMPARE(sender["subscription"].toObject()["active"].toBool(), false);
+        QVERIFY(sender["manifest_href"].isNull());
+        const QJsonObject parked = QJsonDocument::fromJson(json("GET", single + "active").second).object();
+        QVERIFY(!parked["master_enable"].toBool());
+        QCOMPARE(parked["activation"].toObject()["requested_time"].toString(), QStringLiteral("0:300000000"));
+        // A scheduled one called off.
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"master_enable", true},
+                                                              {"activation", QJsonObject{{"mode", "activate_scheduled_relative"}, {"requested_time", "10:0"}}}}).first, 202);
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"activation", QJsonObject{{"mode", QJsonValue::Null}}}}).first, 200);
+        QTest::qWait(300);
+        QCOMPARE(int(activated.size()), 2);
+        // In bulk: the sound to another address.
+        const QString audioId = node.senderId(1).toString(QUuid::WithoutBraces);
+        const auto bulk = json("POST", "/x-nmos/connection/v1.1/bulk/senders", {});
+        QCOMPARE(bulk.first, 400);
+        const montage::nmos::Node::Response b = node.handle("POST", "/x-nmos/connection/v1.1/bulk/senders",
+            QJsonDocument(QJsonArray{QJsonObject{{"id", audioId}, {"params", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"destination_ip", "239.100.0.9"}}}},
+                                                                                          {"activation", QJsonObject{{"mode", "activate_immediate"}}}}}}}).toJson());
+        QCOMPARE(b.code, 200);
+        QCOMPARE(QJsonDocument::fromJson(b.body).array()[0].toObject()["code"].toInt(), 200);
+        QCOMPARE(int(activated.size()), 3);
+        QCOMPARE(activated[2].audio.address, std::string("239.100.0.9"));
+
+        // Over HTTP: a request is answered, one with a length that cannot be refused and its connection closed.
+        QTcpSocket http;
+        http.connectToHost(QHostAddress::LocalHost, quint16(node.port()));
+        QVERIFY(http.waitForConnected(5000));
+        http.write("GET /x-nmos/ HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nContent-Length: -30\r\n\r\n");
+        QByteArray answer;
+        QTRY_VERIFY_WITH_TIMEOUT((answer += http.readAll(), http.state() == QAbstractSocket::UnconnectedState), 5000);
+        answer += http.readAll();
+        QVERIFY2(answer.startsWith("HTTP/1.1 200 OK") && answer.contains("\"node/\"") && answer.contains("HTTP/1.1 400 Bad Request"), answer.constData());
+
+        // Stopping takes it off the registry.
+        node.stop();
+        QVERIFY(std::any_of(seen.begin(), seen.end(), [&](const Request& r) { return r.method == "DELETE" && r.path.endsWith(node.nodeId().toString(QUuid::WithoutBraces).toLatin1()); }));
+        QVERIFY(!node.running());
     }
 
     void openMediaTransport() {
