@@ -645,6 +645,91 @@ Result razorAll(Project& p, Sequence& s, FrameTime frame) {
     return res;
 }
 
+Result stripSilence(Project& p, Sequence& s, const std::map<Id, std::vector<std::pair<FrameTime, FrameTime>>>& keep, bool withLinked) {
+    // Clips keyed together (linked to each other, cut with their links) are one unit: a moment is silent where one of
+    // them runs and none of them has sound.
+    struct Unit {
+        std::vector<Id> keyed, targets;
+    };
+    std::vector<Unit> units;
+    for (const auto& [id, ranges] : keep) {
+        if (!clipById(s, id)) return Result::fail("No such clip");
+        std::vector<Id> mine{id};
+        if (withLinked)
+            for (Id l : linkedClips(s, id))
+                if (std::find(mine.begin(), mine.end(), l) == mine.end()) mine.push_back(l);
+        Unit* into = nullptr;
+        for (Unit& u : units)
+            if (std::any_of(mine.begin(), mine.end(), [&](Id x) { return std::find(u.targets.begin(), u.targets.end(), x) != u.targets.end(); }))
+                into = &u;
+        if (!into) into = &units.emplace_back();
+        into->keyed.push_back(id);
+        for (Id x : mine)
+            if (std::find(into->targets.begin(), into->targets.end(), x) == into->targets.end()) into->targets.push_back(x);
+    }
+    std::set<Id> drop;
+    for (const Unit& u : units) {
+        std::vector<std::pair<FrameTime, FrameTime>> spans, sound;
+        std::set<FrameTime> cuts;
+        for (Id k : u.keyed) {
+            const Clip* c = clipById(s, k);
+            spans.emplace_back(c->start, c->end());
+            cuts.insert(c->start), cuts.insert(c->end());
+            for (const auto& [a, b] : keep.at(k)) sound.emplace_back(a, b), cuts.insert(a), cuts.insert(b);
+        }
+        auto within = [](const std::vector<std::pair<FrameTime, FrameTime>>& rs, FrameTime a, FrameTime b) {
+            return std::any_of(rs.begin(), rs.end(), [&](const auto& r) { return r.first <= a && b <= r.second; });
+        };
+        // Each target cut at every edge inside it; then its pieces where a keyed clip runs and none has sound go.
+        struct Piece {
+            TrackRef track;
+            Id id;
+        };
+        std::vector<Piece> pieces;
+        for (Id tid : u.targets) {
+            const auto where = locate(s, tid);
+            Track* t = where ? trackAt(s, where->track) : nullptr;
+            if (!t) continue;
+            if (!editable(t)) return Result::fail("The clip's track is locked");
+            const Clip* tc = clipById(s, tid);
+            const FrameTime ta = tc->start, tb = tc->end();
+            for (FrameTime e : cuts) {
+                if (e <= ta || e >= tb) continue;
+                for (size_t i = 0; i < t->clips.size(); ++i)
+                    if (t->clips[i].start < e && t->clips[i].end() > e) {
+                        splitClip(p, *t, i, e);
+                        break;
+                    }
+                normalize(*t);
+            }
+            for (const Clip& k : t->clips) {
+                if (k.start < ta || k.end() > tb) continue;
+                pieces.push_back({where->track, k.id});
+                // (a piece covers a whole number of stretches between cuts, so it is silent through and through or not)
+                if (within(spans, k.start, k.end()) && !within(sound, k.start, k.end())) drop.insert(k.id);
+            }
+        }
+        // Cut with their links, the pieces starting together are linked to each other (the first ones keep their
+        // group); left whole, the links stay as they were.
+        if (withLinked) {
+            FrameTime first = std::numeric_limits<FrameTime>::max();
+            for (const Piece& pc : pieces) first = std::min(first, clipById(s, pc.id)->start);
+            std::map<FrameTime, Id> regroup;
+            for (const Piece& pc : pieces) {
+                Clip* c = clipById(s, pc.id);
+                if (!c->linkGroup || c->start == first) continue;
+                auto it = regroup.find(c->start);
+                if (it == regroup.end()) it = regroup.emplace(c->start, p.newId()).first;
+                c->linkGroup = it->second;
+            }
+        }
+    }
+    if (drop.empty()) return Result::fail("No silence to strip");
+    Result r = removeClips(p, s, std::vector<Id>(drop.begin(), drop.end()), false);
+    if (r.ok) r.applied = FrameTime(drop.size());
+    return r;
+}
+
 Result removeClips(Project& p, Sequence& s, const std::vector<Id>& ids, bool ripple) {
     (void)p;
     struct Removed {

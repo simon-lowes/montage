@@ -113,6 +113,10 @@ FrameTime nearestEdit(const Sequence& s, TrackRef t, FrameTime frame);
 Result razor(Project& p, Sequence& s, TrackRef t, FrameTime frame);
 Result razorAll(Project& p, Sequence& s, FrameTime frame);
 Result removeClips(Project& p, Sequence& s, const std::vector<Id>& ids, bool ripple);
+// Strip Silence (Pro Tools'): each clip keyed in `keep` cut to those ranges of sequence frames (what lies between them
+// in the clip removed, leaving gaps), and with `withLinked` its linked clips cut alike where they run with it (pieces
+// of a pair linked to each other again). `applied` is the number of pieces removed.
+Result stripSilence(Project& p, Sequence& s, const std::map<Id, std::vector<std::pair<FrameTime, FrameTime>>>& keep, bool withLinked);
 Result moveClips(Project& p, Sequence& s, const std::vector<Id>& ids, FrameTime delta, int videoTrackDelta,
                  int audioTrackDelta, bool insertMode = false);
 Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, TrimMode mode, bool includeLinked = true);

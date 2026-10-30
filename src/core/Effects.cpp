@@ -734,6 +734,14 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"deplosive", "De-Plosive", EffectCategory::AudioFilter, "Restoration",
                  {pct("sensitivity", "Sensitivity", 0, 100, 50), num("reduction_db", "Max Reduction (dB)", 0, 60, 24, 0.5)},
                  {}});
+    // Tape and archive transfers (audio/TapeRepair.h), on the clip's whole source audio.
+    c.push_back({"wow_flutter", "Wow and Flutter", EffectCategory::AudioFilter, "Restoration",
+                 {pct("wow", "Wow (under 4 Hz)", 0, 100, 100), pct("flutter", "Flutter (over 4 Hz)", 0, 100, 100),
+                  num("pilot_hz", "Pilot Tone (Hz, 0 = find)", 0, 20000, 0, 1)},
+                 {}});
+    c.push_back({"azimuth", "Azimuth", EffectCategory::AudioFilter, "Restoration",
+                 {boolean("adaptive", "Follow Over Time"), boolean("polarity", "Fix Polarity", true)},
+                 {}});
     c.push_back({"dewind", "De-Wind", EffectCategory::AudioFilter, "Restoration",
                  {pct("amount", "Amount", 0, 100, 100), num("max_reduction_db", "Max Reduction (dB)", 0, 60, 24, 0.5)},
                  {}});

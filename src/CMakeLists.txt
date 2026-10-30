@@ -289,6 +289,7 @@ add_library(montage_engine STATIC
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp
+  audio/TapeRepair.h audio/TapeRepair.cpp
   audio/SpectralRepair.h audio/SpectralRepair.cpp
   audio/TimeStretch.h audio/TimeStretch.cpp
   audio/Upmix.h audio/Upmix.cpp

@@ -218,6 +218,10 @@ public:
     // when there are several), warp markers at their onsets, a mode, off.
     bool enableElasticAudio(int mode = 0);
     int addWarpMarkersAtOnsets(double sensitivity = 50);
+    // Strip Silence on the selected audio clips (audio/TapeRepair.h soundRegions, core/EditOps.h edit::stripSilence):
+    // the pieces removed (0 when nothing was), one undo step. The dialog asks for the settings, kept between uses.
+    int stripSilence(double thresholdDb, double minSilence, double padBefore, double padAfter, bool linked);
+    void stripSilenceDialog();
     bool setElasticMode(int mode);
     bool removeElasticAudio();
     // A pitch edit over the In/Out range where it meets the selected audio clip (or the one under the playhead),

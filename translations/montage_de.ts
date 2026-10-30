@@ -5780,6 +5780,34 @@
         <source>Zig Zag</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Azimuth</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fix Polarity</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Flutter (over 4 Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Follow Over Time</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pilot Tone (Hz, 0 = find)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wow (under 4 Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wow and Flutter</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -20503,6 +20531,64 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Finding onsets…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strip Si&amp;lence…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the audio clips to strip silence from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Finding silence…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strip Silence works on clips of sound files at their own speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strip Silence</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n silent piece(s) removed</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source> (%n clip(s) left: not a sound file at its own speed)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source> dBFS</source>
+        <translation type="unfinished"> dBFS</translation>
+    </message>
+    <message>
+        <source>Linked video too</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Threshold:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shortest silence:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pad before:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pad after:</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

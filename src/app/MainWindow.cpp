@@ -95,6 +95,7 @@
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpectralRepair.h"
+#include "audio/TapeRepair.h"
 #include "core/Surround.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
@@ -1653,6 +1654,7 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) separateStems(state_, clips, dlg.options(), this);
         }))->setObjectName(QStringLiteral("separateStems"));
     add(clipM, QT_TR_NOOP("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    add(clipM, QT_TR_NOOP("Strip Si&lence…"), QKeySequence(), withSeq([this] { stripSilenceDialog(); }))->setObjectName(QStringLiteral("stripSilence"));
     {
         // Elastic audio: warp markers in audio clips (Alt-drag on the timeline) and their pitch edited (audio/ElasticAudio.h).
         QMenu* elasticM = menuIn(clipM, QT_TR_NOOP("&Elastic Audio"));
@@ -6808,6 +6810,98 @@ int MainWindow::addWarpMarkersAtOnsets(double sensitivity) {
         return 0;
     state_->message(added ? tr("%n warp marker(s) added", "", added) : tr("No onsets found in the clip"));
     return added;
+}
+
+int MainWindow::stripSilence(double thresholdDb, double minSilence, double padBefore, double padAfter, bool linked) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> ids;
+    for (Id id : state_->selectedClips())
+        if (const auto where = edit::locate(*s, id); where && where->track.kind == TrackKind::Audio) ids.push_back(id);
+    if (ids.empty()) {
+        state_->message(tr("Select the audio clips to strip silence from"));
+        return 0;
+    }
+    // Each clip's sound read off the UI thread, where it is loud found, then one edit.
+    const Project snapshot = state_->project();
+    const Sequence seq = *s;
+    std::map<Id, std::vector<std::pair<FrameTime, FrameTime>>> keep;
+    int skipped = 0;
+    if (!runWithProgress(this, state_, tr("Finding silence…"), [&](const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string*) {
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (cancel && cancel->load()) return false;
+                const Clip* c = edit::clipById(seq, ids[i]);
+                const MediaItem* m = c ? snapshot.findMedia(c->mediaId) : nullptr;
+                AudioBufferPtr sound = m && m->hasAudio && c->speed == 1 && !c->reverse && !c->ramped()
+                                           ? MediaPool::instance().audio(audioKey(m->path, c->channels), 48000)
+                                           : nullptr;
+                if (!sound) {
+                    ++skipped;
+                    continue;
+                }
+                keep[ids[i]] = clipSoundFrames(seq, *c, soundRegions(*sound, thresholdDb, minSilence, padBefore, padAfter), sound->sampleRate);
+                progress(double(i + 1) / double(ids.size()));
+            }
+            return true;
+        }))
+        return 0;
+    if (keep.empty()) {
+        state_->message(tr("Strip Silence works on clips of sound files at their own speed"));
+        return 0;
+    }
+    int removed = 0;
+    std::string why;
+    state_->apply(tr("Strip Silence"), [&](Project& p, Sequence& sq) {
+        const edit::Result r = edit::stripSilence(p, sq, keep, linked);
+        removed = r.ok ? int(r.applied) : 0;
+        why = r.error;
+        return r;
+    });
+    QString text = removed ? tr("%n silent piece(s) removed", "", removed) : QString::fromStdString(why);
+    if (skipped) text += tr(" (%n clip(s) left: not a sound file at its own speed)", "", skipped);
+    state_->message(text, 6000);
+    return removed;
+}
+
+void MainWindow::stripSilenceDialog() {
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("stripSilenceDialog"));
+    dlg.setWindowTitle(tr("Strip Silence"));
+    auto* form = new QFormLayout(&dlg);
+    QSettings st = appSettings();
+    auto spin = [&](const char* name, double min, double max, double def, double step, int decimals, const QString& suffix) {
+        auto* b = new QDoubleSpinBox(&dlg);
+        b->setObjectName(QString::fromLatin1(name));
+        b->setRange(min, max);
+        b->setSingleStep(step);
+        b->setDecimals(decimals);
+        b->setSuffix(suffix);
+        b->setValue(st.value(QStringLiteral("stripSilence/") + name, def).toDouble());
+        return b;
+    };
+    QDoubleSpinBox* threshold = spin("threshold", -96, 0, -48, 1, 1, tr(" dBFS"));
+    QDoubleSpinBox* shortest = spin("minSilence", 0, 10, 0.25, 0.05, 3, tr(" s"));
+    QDoubleSpinBox* before = spin("padBefore", 0, 2, 0.01, 0.005, 3, tr(" s"));
+    QDoubleSpinBox* after = spin("padAfter", 0, 5, 0.05, 0.01, 3, tr(" s"));
+    auto* linked = new QCheckBox(tr("Linked video too"), &dlg);
+    linked->setObjectName(QStringLiteral("linked"));
+    linked->setChecked(st.value(QStringLiteral("stripSilence/linked"), true).toBool());
+    form->addRow(tr("Threshold:"), threshold);
+    form->addRow(tr("Shortest silence:"), shortest);
+    form->addRow(tr("Pad before:"), before);
+    form->addRow(tr("Pad after:"), after);
+    form->addRow(QString(), linked);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    st.setValue(QStringLiteral("stripSilence/threshold"), threshold->value());
+    st.setValue(QStringLiteral("stripSilence/minSilence"), shortest->value());
+    st.setValue(QStringLiteral("stripSilence/padBefore"), before->value());
+    st.setValue(QStringLiteral("stripSilence/padAfter"), after->value());
+    st.setValue(QStringLiteral("stripSilence/linked"), linked->isChecked());
+    stripSilence(threshold->value(), shortest->value(), before->value(), after->value(), linked->isChecked());
 }
 
 bool MainWindow::setElasticMode(int mode) {

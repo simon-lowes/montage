@@ -57,6 +57,7 @@
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
 #include "audio/ElasticAudio.h"
+#include "audio/TapeRepair.h"
 #include "audio/PluginEffect.h"
 #include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
@@ -1447,6 +1448,50 @@ void McpServer::Impl::addTools() {
             check(edit::removeClips(l.project, l.seq(), ids, a.value("ripple").toBool()));
             save(l);
             return ok(QStringLiteral("Removed %1 clip(s)").arg(ids.size()), projectJson(l.project));
+        });
+
+    add("montage_strip_silence", "Strip silence",
+        "Cut audio clips to their sound (Pro Tools' Strip Silence): where every channel stays under threshold_db for at "
+        "least min_silence seconds is removed, the rest kept with pad_before and pad_after seconds either side, leaving "
+        "gaps (montage_delete_gaps closes them). With linked (the default) the clips' linked video is cut the same way. "
+        "Clips at another speed than 100 % are left. One undo step.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "threshold_db":{"type":"number","default":-48},"min_silence":{"type":"number","default":0.25},
+            "pad_before":{"type":"number","default":0.01},"pad_after":{"type":"number","default":0.05},
+            "linked":{"type":"boolean","default":true}},"required":["project","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const double threshold = std::clamp(a.value("threshold_db").toDouble(-48), -120.0, 0.0);
+            const double shortest = std::clamp(a.value("min_silence").toDouble(0.25), 0.0, 3600.0);
+            const double before = std::clamp(a.value("pad_before").toDouble(0.01), 0.0, 60.0), after = std::clamp(a.value("pad_after").toDouble(0.05), 0.0, 60.0);
+            std::map<Id, std::vector<std::pair<FrameTime, FrameTime>>> keep;
+            QStringList left;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                const Id id = Id(v.toDouble());
+                const Clip* c = edit::clipById(s, id);
+                const auto where = edit::locate(s, id);
+                if (!c || !where || where->track.kind != TrackKind::Audio) throw ArgError{QStringLiteral("No audio clip %1").arg(double(id))};
+                const MediaItem* m = l.project.findMedia(c->mediaId);
+                AudioBufferPtr sound = m && m->hasAudio && c->speed == 1 && !c->reverse && !c->ramped()
+                                           ? MediaPool::instance().audio(audioKey(m->path, c->channels), 48000)
+                                           : nullptr;
+                if (!sound) {
+                    left << QString::number(double(id));
+                    continue;
+                }
+                keep[id] = clipSoundFrames(s, *c, soundRegions(*sound, threshold, shortest, before, after), sound->sampleRate);
+            }
+            if (keep.empty()) throw ArgError{"\"clips\" must list audio clips of sound files at their own speed"};
+            const edit::Result r = edit::stripSilence(l.project, s, keep, a.value("linked").toBool(true));
+            if (!r.ok && r.error == "No silence to strip") return ok(QStringLiteral("No silence to strip"), QJsonObject{{"removed", 0}});
+            check(r);
+            save(l);
+            QString text = QStringLiteral("Removed %1 silent piece(s)").arg(double(r.applied));
+            if (!left.isEmpty()) text += QStringLiteral("; left clips %1 (not a sound file at its own speed)").arg(left.join(", "));
+            QJsonObject out = projectJson(l.project);
+            out["removed"] = double(r.applied);
+            return ok(text, out);
         });
 
     add("montage_delete_gaps", "Delete gaps",

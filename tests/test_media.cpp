@@ -71,6 +71,7 @@
 #include "core/TranscriptEdit.h"
 #include "audio/DialogueAlign.h"
 #include "audio/ElasticAudio.h"
+#include "audio/TapeRepair.h"
 #include "audio/RoomResponse.h"
 #include "audio/Upmix.h"
 #include "audio/SpeechCleanup.h"
@@ -37351,6 +37352,220 @@ private slots:
         Clip reframed = clip;
         reframed.effects.push_back(makeEffect(p, "reframe_360"));
         QVERIFY(!clipDepthAnalysed(p, s, reframed));
+    }
+
+    void tapeAndArchiveRepair() {
+        constexpr int sr = 48000;
+        auto stereo = [](const std::vector<double>& l, const std::vector<double>& r) {
+            AudioBuffer b;
+            b.sampleRate = sr;
+            b.channels = 2;
+            b.samples.resize(l.size() * 2);
+            for (size_t i = 0; i < l.size(); ++i) b.samples[i * 2] = float(l[i]), b.samples[i * 2 + 1] = float(r[i]);
+            return b;
+        };
+        // Music (chords changing every half second, two partials a note) with a 1 kHz tone, as content time tau.
+        const double chords[4][3] = {{200, 300, 450}, {250, 375, 560}, {220, 330, 440}, {275, 350, 420}};
+        auto music = [&](double tau) {
+            double v = 0.3 * std::sin(2 * M_PI * 1000 * tau);
+            const auto& chord = chords[size_t(std::max(0.0, tau) / 0.5) % 4];
+            for (double f : chord) v += 0.06 * std::sin(2 * M_PI * f * tau) + 0.03 * std::sin(2 * M_PI * 2 * f * tau);
+            return v;
+        };
+        const double seconds = 8;
+        const size_t n = size_t(seconds * sr);
+        // Played back with 0.8 Hz wow of 0.3 % and 12 Hz flutter of 0.05 %: speed s(t), content time its integral.
+        auto speedAt = [](double t) { return 1 + 0.003 * std::sin(2 * M_PI * 0.8 * t) + 0.0005 * std::sin(2 * M_PI * 12 * t); };
+        auto tauAt = [](double t) {
+            return t + 0.003 / (2 * M_PI * 0.8) * (1 - std::cos(2 * M_PI * 0.8 * t)) + 0.0005 / (2 * M_PI * 12) * (1 - std::cos(2 * M_PI * 12 * t));
+        };
+        std::vector<double> clean(n), wobbly(n);
+        for (size_t i = 0; i < n; ++i) clean[i] = music(double(i) / sr), wobbly[i] = music(tauAt(double(i) / sr));
+        const AudioBuffer flat = stereo(clean, clean), tape = stereo(wobbly, wobbly);
+        // The speed is read back from the sound (to 0.03 %, flutter included; against its mean, as it can only be).
+        {
+            const TransferSpeed got = measureTransferSpeed(tape);
+            QVERIFY(!got.speed.empty());
+            double mean = 0;
+            int count = 0;
+            for (double t = 0; t < seconds; t += 0.001) mean += speedAt(t), ++count;  // (over the whole, as measured)
+            mean /= count;
+            double worst = 0;
+            for (double t = 0.5; t < seconds - 0.5; t += 0.001) worst = std::max(worst, std::fabs(got.at(t) - speedAt(t) / mean));
+            QVERIFY2(worst < 3e-4, qPrintable(QString::number(worst)));
+        }
+        // Taken out: what is left wobbles by less than 0.02 %.
+        AudioBuffer steadied;
+        double found = 0;
+        QVERIFY(removeWowFlutter(tape, steadied, 1, 1, 0, nullptr, &found));
+        QVERIFY2(found > 0.003 && found < 0.004, qPrintable(QString::number(found)));
+        {
+            const TransferSpeed left = measureTransferSpeed(steadied, 1000);
+            double worst = 0;
+            for (double t = 0.5; t < seconds - 0.5; t += 0.001) worst = std::max(worst, std::fabs(left.at(t) - 1));
+            QVERIFY2(worst < 2e-4, qPrintable(QString::number(worst)));
+        }
+        // Flutter only: the wow stays.
+        AudioBuffer wowLeft;
+        QVERIFY(removeWowFlutter(tape, wowLeft, 0, 1, 1000));
+        {
+            const TransferSpeed left = measureTransferSpeed(wowLeft, 1000);
+            double worst = 0;
+            for (double t = 0.5; t < seconds - 0.5; t += 0.001) worst = std::max(worst, std::fabs(left.at(t) - 1));
+            QVERIFY2(worst > 0.0025, qPrintable(QString::number(worst)));
+        }
+        // A transfer with no wobble is left exactly as it was.
+        AudioBuffer same;
+        double flatFound = 0;
+        QVERIFY(removeWowFlutter(flat, same, 1, 1, 0, nullptr, &flatFound));
+        QVERIFY2(flatFound < 3e-4, qPrintable(QString::number(flatFound)));
+        QVERIFY(same.samples == flat.samples);
+
+        // Azimuth: band-limited noise on the left, the right 0.37 samples behind; found to 0.02 samples and put back so
+        // the difference nulls below -60 dB; the same with the right channel wired the wrong way round.
+        std::vector<double> noise(size_t(10 * sr));
+        {
+            uint32_t state = 12345;
+            std::vector<double> white(noise.size() + 256);
+            for (double& v : white) {
+                state = state * 1664525u + 1013904223u;
+                v = double(state) / 4294967296.0 - 0.5;
+            }
+            for (size_t i = 0; i < noise.size(); ++i) {  // (8 kHz low-pass, 255 taps)
+                double acc = 0;
+                for (int k = -127; k <= 127; ++k) {
+                    const double x = 2 * 8000.0 / sr * k;
+                    const double sinc = k == 0 ? 1 : std::sin(M_PI * x) / (M_PI * x);
+                    acc += white[size_t(int(i) + 128 + k)] * 2 * 8000.0 / sr * sinc * (0.42 + 0.5 * std::cos(M_PI * k / 128.0) + 0.08 * std::cos(2 * M_PI * k / 128.0));
+                }
+                noise[i] = acc;
+            }
+        }
+        auto delayed = [&](double d) {  // (a long windowed sinc)
+            std::vector<double> y(noise.size(), 0.0);
+            for (size_t i = 0; i < y.size(); ++i) {
+                const double at = double(i) - d;
+                const int64_t base = int64_t(std::floor(at));
+                double acc = 0;
+                for (int64_t k = base - 255; k <= base + 256; ++k) {
+                    if (k < 0 || k >= int64_t(noise.size())) continue;
+                    const double u = double(k) - at;
+                    const double sinc = std::fabs(u) < 1e-12 ? 1 : std::sin(M_PI * u) / (M_PI * u);
+                    const double w = std::fabs(u) >= 256 ? 0 : 0.42 + 0.5 * std::cos(M_PI * u / 256) + 0.08 * std::cos(2 * M_PI * u / 256);
+                    acc += noise[size_t(k)] * sinc * w;
+                }
+                y[i] = acc;
+            }
+            return y;
+        };
+        const std::vector<double> late = delayed(0.37);
+        for (const bool flip : {false, true}) {
+            std::vector<double> right = late;
+            if (flip)
+                for (double& v : right) v = -v;
+            const AudioBuffer pair = stereo(noise, right);
+            const Azimuth az = measureAzimuth(pair);
+            QVERIFY2(std::fabs(az.delay - 0.37) < 0.02 && az.inverted == flip, qPrintable(QString("%1 %2").arg(az.delay).arg(az.inverted)));
+            for (const bool adaptive : {false, true}) {
+                AudioBuffer fixed;
+                double d = 0;
+                QVERIFY(correctAzimuth(pair, fixed, adaptive, true, nullptr, &d));
+                double diff = 0, level = 0;
+                for (size_t i = sr / 10; i + sr / 10 < noise.size(); ++i) {
+                    const double l = fixed.samples[i * 2], r = fixed.samples[i * 2 + 1];
+                    diff += (l - r) * (l - r), level += l * l;
+                }
+                const double db = 10 * std::log10(diff / level);
+                QVERIFY2(db < -60, qPrintable(QString("%1 dB (adaptive %2, inverted %3)").arg(db).arg(adaptive).arg(flip)));
+            }
+        }
+        // Two unrelated channels (two microphones, not one track out of line) are left alone.
+        {
+            std::vector<double> other(noise.size());
+            for (size_t i = 0; i < other.size(); ++i) other[i] = noise[(i * 7919 + 13) % noise.size()];
+            const AudioBuffer pair = stereo(noise, other);
+            AudioBuffer out;
+            QVERIFY(correctAzimuth(pair, out, false, true));
+            QVERIFY(out.samples == pair.samples);
+        }
+        // Mono is left alone.
+        {
+            AudioBuffer one;
+            one.sampleRate = sr, one.channels = 1;
+            one.samples.assign(noise.begin(), noise.end());
+            AudioBuffer out;
+            QVERIFY(correctAzimuth(one, out, false, true));
+            QVERIFY(out.samples == one.samples);
+        }
+
+        // Strip Silence: bursts at 0.5-1.0 s, 1.1-1.3 s (a gap shorter than the shortest silence) and 2.0-2.5 s of 3 s:
+        // the sound regions at the exact samples, with 10 ms before and 50 ms after.
+        std::vector<float> bursts(size_t(3 * sr), 0.0f);
+        for (const auto& [a, b] : std::vector<std::pair<double, double>>{{0.5, 1.0}, {1.1, 1.3}, {2.0, 2.5}})
+            for (size_t i = size_t(a * sr); i < size_t(b * sr); ++i) bursts[i] = (i / 24) % 2 ? 0.5f : -0.5f;  // (a 1 kHz square)
+        bursts[size_t(1.7 * sr)] = 0.001f;  // (under the threshold)
+        AudioBuffer burst;
+        burst.sampleRate = sr, burst.channels = 1;
+        burst.samples = bursts;
+        const auto regions = soundRegions(burst, -40, 0.25, 0.01, 0.05);
+        QCOMPARE(regions, (std::vector<std::pair<int64_t, int64_t>>{{23520, 64800}, {95520, 122400}}));
+        // A quiet start shorter than the shortest silence stays.
+        QCOMPARE(soundRegions(burst, -40, 0.6, 0.01, 0.05).front().first, int64_t(0));
+        // On the timeline at 25 fps: the clip and its linked video cut to frames 12-34 and 49-64, in one edit.
+        const std::string wav = path("bursts.wav");
+        QVERIFY(writeMonoWav(wav, bursts, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        Clip a = makeClip(p, p.media.back(), TrackKind::Audio, s);
+        a.start = 0;
+        a.linkGroup = p.newId();
+        Clip v = makeGeneratorClip(p, "color", 75);
+        v.start = 0;
+        v.linkGroup = a.linkGroup;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Audio, 0}, a).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, v).ok);
+        const Clip& placed = s.audioTracks[0].clips.at(0);
+        QCOMPARE(placed.duration, FrameTime(75));
+        const Id audioId = placed.id;
+        const auto frames = clipSoundFrames(s, placed, regions, sr);
+        QCOMPARE(frames, (std::vector<std::pair<FrameTime, FrameTime>>{{12, 34}, {49, 64}}));
+        const std::string project = path("strip-silence.montage");
+        QVERIFY(saveProject(p, project));
+        const Sequence before = s;
+        const edit::Result r = edit::stripSilence(p, s, {{audioId, frames}}, true);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.applied, FrameTime(6));
+        for (const Track* t : {&s.audioTracks[0], &s.videoTracks[0]}) {
+            QCOMPARE(t->clips.size(), size_t(2));
+            QCOMPARE(t->clips[0].start, FrameTime(12));
+            QCOMPARE(t->clips[0].end(), FrameTime(34));
+            QCOMPARE(t->clips[1].start, FrameTime(49));
+            QCOMPARE(t->clips[1].end(), FrameTime(64));
+        }
+        QCOMPARE(s.audioTracks[0].clips[1].sourceIn, before.audioTracks[0].clips[0].sourceIn + 49);
+        QVERIFY(s.audioTracks[0].clips[0].linkGroup == s.videoTracks[0].clips[0].linkGroup &&
+                s.audioTracks[0].clips[1].linkGroup == s.videoTracks[0].clips[1].linkGroup &&
+                s.audioTracks[0].clips[0].linkGroup != s.audioTracks[0].clips[1].linkGroup);
+        // Over MCP, without the video.
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_strip_silence"},
+                                                     {"arguments", QJsonObject{{"project", QString::fromStdString(project)},
+                                                                               {"clips", QJsonArray{double(audioId)}},
+                                                                               {"threshold_db", -40}, {"linked", false}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("removed").toDouble(), 3.0);
+        Project back;
+        QVERIFY(loadProject(project, back));
+        QCOMPARE(back.active()->audioTracks[0].clips.size(), size_t(2));
+        QCOMPARE(back.active()->videoTracks[0].clips.size(), size_t(1));
     }
 
     void surfaceTrackerOnAClip() {

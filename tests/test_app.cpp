@@ -7941,6 +7941,50 @@ private slots:
         state()->newProject();
     }
 
+    void stripSilenceFromTheClipMenu() {
+        // Three seconds of sound with two bursts (0.5-1.0 s and 2.0-2.5 s) and silence between, placed with its picture.
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 3, 0.0f);
+        for (const auto& [a, b] : std::vector<std::pair<double, double>>{{0.5, 1.0}, {2.0, 2.5}})
+            for (size_t i = size_t(a * rate); i < size_t(b * rate); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / rate));
+        WavWriter w;
+        QVERIFY(w.open(dir_.path() + "/bursts.wav", rate, 1));
+        w.write(x.data(), int64_t(x.size()));
+        QVERIFY(w.close());
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/bursts.wav"});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false).ok; }));
+        const Sequence before = *state()->sequence();
+        const Id clip = trackAt(before, A1)->clips.at(0).id;
+        // Nothing chosen: nothing done.
+        state()->setSelection({}, false);
+        QCOMPARE(win_->stripSilence(-40, 0.25, 0, 0, true), 0);
+        // The dialog takes its settings and cuts the clip to its two bursts, in one undo step.
+        state()->setSelection({clip}, false);
+        QTimer::singleShot(0, this, [] {
+            auto* dlg = qApp->activeModalWidget();
+            QVERIFY(dlg && dlg->objectName() == "stripSilenceDialog");
+            dlg->findChild<QDoubleSpinBox*>("threshold")->setValue(-40);
+            dlg->findChild<QDoubleSpinBox*>("minSilence")->setValue(0.25);
+            dlg->findChild<QDoubleSpinBox*>("padBefore")->setValue(0);
+            dlg->findChild<QDoubleSpinBox*>("padAfter")->setValue(0);
+            dlg->findChild<QCheckBox*>("linked")->setChecked(false);
+            QMetaObject::invokeMethod(dlg, "accept");
+        });
+        win_->findChild<QAction*>("stripSilence")->trigger();
+        QCOMPARE(state()->undoText(), QString("Strip Silence"));
+        const Track* a1 = trackAt(*state()->sequence(), A1);
+        const double fps = state()->sequence()->fpsValue();
+        QCOMPARE(a1->clips.size(), size_t(2));
+        QCOMPARE(a1->clips[0].start, FrameTime(std::floor(0.5 * fps)));
+        QCOMPARE(a1->clips[1].end(), FrameTime(std::ceil(2.5 * fps)));
+        QCOMPARE(trackAt(*state()->sequence(), V1)->clips.size(), trackAt(before, V1)->clips.size());  // (the picture left whole)
+        state()->undo();
+        QVERIFY(trackAt(*state()->sequence(), A1)->clips == trackAt(before, A1)->clips);
+    }
+
     void spectralRepairFromTheClipMenu() {
         // Three seconds of a 440 Hz voice with a 3 kHz whistle from 1.0 to 1.5 s.
         const int rate = 48000;
