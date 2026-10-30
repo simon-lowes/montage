@@ -28,6 +28,10 @@
 #include <sstream>
 #include <QElapsedTimer>
 #include <QTcpServer>
+#include <QNetworkAccessManager>
+#include <QNetworkProxy>
+#include <QNetworkReply>
+#include <QSslCertificate>
 #include <QTcpSocket>
 #include <QThreadPool>
 #include <QLineEdit>
@@ -19182,6 +19186,105 @@ print("added " + ui["name"])
         r = call({{"action", "stop"}});
         QVERIFY(!controller->running());
         dlg->close();
+    }
+
+    void browserReviewFromThePanel() {
+        loadDemo();
+        std::string why;
+        if (!output::BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        QTcpServer tcp;
+        tcp.listen(QHostAddress::LocalHost, 0);
+        const int port = tcp.serverPort();
+        tcp.close();
+        // Playback › Video Output › Remote Review…, viewers in a browser: the address and codecs are a browser's, the SRT
+        // settings put away.
+        win_->findChild<QAction*>("remoteReview")->trigger();
+        auto* dlg = win_->findChild<QDialog*>("remoteReviewDialog");
+        QVERIFY(dlg);
+        auto* viewers = dlg->findChild<QComboBox*>("reviewStreamViewers");
+        viewers->setCurrentIndex(viewers->findData(true));
+        auto* address = dlg->findChild<QLineEdit*>("reviewStreamAddress");
+        QVERIFY(address->text().startsWith("https://"));
+        auto* codec = dlg->findChild<QComboBox*>("reviewStreamCodec");
+        QVERIFY(codec->findData(QStringLiteral("av1")) >= 0);
+        QVERIFY(dlg->findChild<QLineEdit*>("reviewStreamIce")->isVisibleTo(dlg));
+        QVERIFY(!dlg->findChild<QWidget*>("reviewStreamMarkersRow")->isVisibleTo(dlg));
+        address->setText(QStringLiteral("https://127.0.0.1:%1").arg(port));
+        codec->setCurrentIndex(codec->findData(QStringLiteral("h264")));
+        dlg->findChild<QCheckBox*>("reviewStreamHardware")->setChecked(false);
+        const QString pass = dlg->findChild<QLineEdit*>("reviewStreamPassphrase")->text();
+        dlg->findChild<QPushButton*>("reviewStreamStart")->click();
+        auto* controller = win_->findChild<RemoteReviewController*>();
+        QVERIFY2(controller->running(), qPrintable(controller->status()));
+        QVERIFY(controller->browser());
+        QVERIFY(controller->status().contains(tr("Waiting for viewers")));
+        const QString howTo = dlg->findChild<QLabel*>("reviewStreamHowTo")->text();
+        QVERIFY2(howTo.contains(QStringLiteral("https://127.0.0.1:%1/").arg(port)) && howTo.contains(pass), qPrintable(howTo));
+        // Montage's own certificate for this computer, kept for next time, its key this user's alone.
+        QString cert, key;
+        QVERIFY(RemoteReviewController::ownCertificate(cert, key));
+        QVERIFY(QFileInfo::exists(cert) && QFileInfo::exists(key));
+        const QSslCertificate own = QSslCertificate::fromPath(cert).value(0);
+        QVERIFY(own.subjectAlternativeNames().values(QSsl::IpAddressEntry).contains("127.0.0.1"));
+#ifndef Q_OS_WIN
+        QCOMPARE(QFileInfo(key).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther), QFileDevice::Permissions());
+#endif
+
+        // The page is served over HTTPS with that certificate; its settings need the passphrase.
+        QNetworkAccessManager net;
+        net.setProxy(QNetworkProxy::NoProxy);
+        auto get = [&](const QString& path, const QByteArray& token, QSslCertificate* served = nullptr) {
+            QNetworkRequest req(QUrl(QStringLiteral("https://127.0.0.1:%1%2").arg(port).arg(path)));
+            if (!token.isEmpty()) req.setRawHeader("Authorization", "Bearer " + token);
+            QNetworkReply* reply = net.get(req);
+            QObject::connect(reply, &QNetworkReply::sslErrors, reply, [reply](const QList<QSslError>&) { reply->ignoreSslErrors(); });
+            QSignalSpy done(reply, &QNetworkReply::finished);
+            done.wait(10000);
+            if (served) *served = reply->sslConfiguration().peerCertificate();
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const QByteArray body = reply->readAll();
+            reply->deleteLater();
+            return std::make_pair(status, body);
+        };
+        QSslCertificate served;
+        const auto pageGot = get("/", {}, &served);
+        QCOMPARE(pageGot.first, 200);
+        QVERIFY(pageGot.second.contains("Montage live review"));
+        QCOMPARE(served, own);
+        QCOMPARE(get("/config", "wrong passphrase").first, 401);
+        const auto config = get("/config", pass.toUtf8());
+        QCOMPARE(config.first, 200);
+        QCOMPARE(QJsonDocument::fromJson(config.second).object().value("sequence").toInteger(), qint64(state()->sequence()->id));
+
+        // An agent sees it, and can start it again for browsers by asking for WebRTC.
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject msg{{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_remote_review"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(msg).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "status"}});
+        QVERIFY(r.value("structuredContent").toObject().value("webrtc").toBool());
+        QCOMPARE(r.value("structuredContent").toObject().value("viewers").toInt(), 0);
+        QVERIFY(r.value("structuredContent").toObject().value("addresses").toArray().first().toString().startsWith("https://"));
+        call({{"action", "stop"}});
+        QVERIFY(!controller->running());
+        r = call({{"action", "start"}, {"webrtc", true}, {"address", QStringLiteral("https://127.0.0.1:%1").arg(port)}, {"passphrase", ""}, {"hardware", false},
+                  {"ice_servers", QJsonArray{"stun:stun.example.com:3478"}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("passphrase").toString().size(), 20);
+        QVERIFY(controller->running() && controller->browser());
+        QCOMPARE(controller->settings().iceServers, std::vector<std::string>{"stun:stun.example.com:3478"});
+        call({{"action", "stop"}});
+        dlg->close();
+        // (the round trip over SRT reads its settings back on the next run)
+        output::StreamSettings back = RemoteReviewController::loadSettings();
+        back.address = "srt://0.0.0.0:9000";
+        back.codec = "hevc";
+        back.iceServers.clear();
+        RemoteReviewController::saveSettings(back, RemoteReviewController::loadOptions());
     }
 
     void referenceOutputFollowsProgram() {

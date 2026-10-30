@@ -26,9 +26,9 @@ done
 
 # Libraries compiled into Montage: every licence file of their sources, by path (ThorVG's include RapidJSON's and
 # JerryScript's; OpenEXR's its bundled OpenJPH, libdeflate and zstd; bmx's its libMXF and libMXF++, and the
-# cmake-git-version-tracking each of the three compiles in). Lua's tarball has none; its licence is
-# LICENSES/MIT-Lua.txt.
-for dep in whisper llama rnnoise thorvg openexr imath libvmx bmx liburiparser bmx_git_version libmxf_git_version libmxfpp_git_version ascfdl jsoncons; do
+# cmake-git-version-tracking each of the three compiles in; libdatachannel's its libjuice, usrsctp, libSRTP, Plog and
+# nlohmann/json). Lua's tarball has none; its licence is LICENSES/MIT-Lua.txt.
+for dep in whisper llama rnnoise thorvg openexr imath libvmx bmx liburiparser bmx_git_version libmxf_git_version libmxfpp_git_version ascfdl jsoncons libdatachannel; do
   src="$BUILD/_deps/$dep-src"
   [ -d "$src" ] || continue
   (cd "$src" && find . -type f \( -iname 'LICENSE' -o -iname 'LICENSE.*' -o -iname 'LICENCE*' -o -iname 'COPYING' -o -iname 'COPYING.*' \) \

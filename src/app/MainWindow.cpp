@@ -2666,11 +2666,11 @@ void MainWindow::buildMenus() {
         liveLink_->addAppTool(ReferenceOutputController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return referenceOutput_->runTool(args, structured, isError);
         });
-    // To reviewers elsewhere, streamed live (render/RemoteReview.h); their notes come back as markers.
+    // To reviewers elsewhere, streamed live (render/RemoteReview.h, render/WebRtcReview.h); their notes come back as markers.
     remoteReview_ = new RemoteReviewController(program_, this);
     remoteReviewAction_ = new QAction(tr("Remote Review…"), this);
     remoteReviewAction_->setObjectName(QStringLiteral("remoteReview"));
-    remoteReviewAction_->setToolTip(tr("Stream the Program live to reviewers elsewhere over SRT, with a passphrase; their notes come back as markers"));
+    remoteReviewAction_->setToolTip(tr("Stream the Program live to reviewers elsewhere, over SRT or to any web browser, with a passphrase; their notes come back as markers"));
     remoteReviewAction_->setCheckable(true);
     connect(remoteReviewAction_, &QAction::triggered, this, [this] {
         remoteReviewAction_->setChecked(remoteReview_->running());
@@ -2720,6 +2720,11 @@ void MainWindow::buildMenus() {
                 if (remoteGrade_) remoteGrade_->paintOverlay(p, r);
             });
             connect(remoteGrade_, &RemoteGradeController::pointersChanged, v, qOverload<>(&QWidget::update));
+            // Reviewers in a browser pointing at the picture.
+            v->addOverlay([this](QPainter& p, const QRectF& r) {
+                if (remoteReview_) remoteReview_->paintOverlay(p, r);
+            });
+            connect(remoteReview_, &RemoteReviewController::pointersChanged, v, qOverload<>(&QWidget::update));
         }
         remoteGradeAction_ = new QAction(tr("Remote Grading…"), this);
         remoteGradeAction_->setObjectName(QStringLiteral("remoteGrade"));

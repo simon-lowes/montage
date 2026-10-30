@@ -88,8 +88,18 @@
 #include "render/LinedScript.h"
 #include "render/RemoteGrade.h"
 #include "render/RemoteReview.h"
+#include "render/WebRtcReview.h"
+#include "render/HeadlessBrowser.h"
+#include "render/OGraf.h"
+#include "core/ReviewPage.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "core/History.h"
 #include <QTcpServer>
+#include <QSslCertificate>
+#include <QSslKey>
+#include <QSslSocket>
 #include <QUdpSocket>
 #include <QTcpSocket>
 #include <QNetworkProxy>
@@ -15096,6 +15106,292 @@ colorspaces:
         Signal pq;
         pq.eotf = Eotf::Pq;
         QVERIFY(!udp->open(dev, mode, pq, 2, 48000, &why) && QString::fromStdString(why).contains("HDR"));
+    }
+
+    void browserReview() {
+        using namespace montage::output;
+        // Settings: browsers need a passphrase, a codec they may take, ICE servers named as STUN or TURN, and a key
+        // with any certificate. No marker channel of its own (notes come back over WebRTC).
+        StreamSettings st;
+        st.address = "https://0.0.0.0:8443";
+        st.codec = "h264";
+        QVERIFY(isBrowserAddress(st.address) && !isBrowserAddress("srt://0.0.0.0:9000"));
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("passphrase"));
+        st.passphrase = generatePassphrase();
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        QCOMPARE(markersPortFor(st), -1);
+        st.codec = "vp8";
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.codec = "av1";
+        st.iceServers = {"stun:stun.example.com:3478", "turn:ana:secret@turn.example.com:3478"};
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        st.iceServers = {"https://turn.example.com"};
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.iceServers = {"turn:ana:se%22cret@turn.example.com:3478"};  // (a quote, which would break the Link header)
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.iceServers.clear();
+        // Plain HTTP only on this computer: elsewhere it would carry the passphrase in the clear.
+        st.address = "http://0.0.0.0:8080";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("https"));
+        st.address = "http://127.0.0.1:8080";
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        st.address = "https://0.0.0.0:8443";
+        st.certificateFile = "review.pem";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("key"));
+
+        // The frame code reads back, and refuses a picture without one.
+        Planes420 coded(320, 180);
+        std::fill(coded.y.begin(), coded.y.end(), uint16_t(500));
+        burnFrameCode(coded, 123457);
+        auto luma = [&](const Planes420& p) {
+            return [&p](int x, int y) { return (double(p.y[size_t(y) * size_t(p.width) + size_t(x)]) - 64) / 876; };
+        };
+        QCOMPARE(frameCodeValue(320, 180, luma(coded)), int64_t(123457));
+        QCOMPARE(frameCodeValue(320, 180, luma(Planes420(320, 180))), int64_t(0));
+        Planes420 grey(320, 180);
+        std::fill(grey.y.begin(), grey.y.end(), uint16_t(500));
+        QCOMPARE(frameCodeValue(320, 180, luma(grey)), int64_t(-1));
+
+        // A certificate for this computer's names and addresses.
+        std::string cert, key, why;
+        BrowserReviewBackend probe;
+        if (!probe.available(&why)) QSKIP(why.c_str());
+        QVERIFY2(makeReviewCertificate({"localhost", "127.0.0.1", "montage.local"}, cert, key, &why), why.c_str());
+        const QSslCertificate made(QByteArray::fromStdString(cert), QSsl::Pem);
+        QVERIFY(!made.isNull());
+        QCOMPARE(made.issuerInfo(QSslCertificate::CommonName), made.subjectInfo(QSslCertificate::CommonName));  // (self-signed)
+        const auto names = made.subjectAlternativeNames();
+        QVERIFY(names.values(QSsl::DnsEntry).contains("montage.local") && names.values(QSsl::IpAddressEntry).contains("127.0.0.1"));
+        QVERIFY(made.expiryDate() > QDateTime::currentDateTimeUtc().addDays(365));
+        QVERIFY(!QSslKey(QByteArray::fromStdString(key), QSslSocket::activeBackend() == "openssl" ? QSsl::Ec : QSsl::Rsa, QSsl::Pem).isNull());
+
+        const std::string exe = ografBrowser();
+        if (exe.empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        auto freeTcp = [] {
+            QTcpServer s;
+            s.listen(QHostAddress::LocalHost, 0);
+            return int(s.serverPort());
+        };
+
+        // A grey ramp, played in real time by a player of its own (as playback does) while the browser is driven.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec709";
+        auto ramp = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        auto review = std::make_shared<BrowserReviewBackend>();
+        StreamSettings web;
+        web.address = "https://127.0.0.1:" + std::to_string(freeTcp());
+        web.passphrase = generatePassphrase();
+        web.codec = "h264";  // (or AV1, where the browser has no H.264)
+        web.hardware = false;
+        web.bitrateKbps = 3000;
+        web.frameCode = true;
+        review->setSettings(web);
+        review->setSequence(s.id);
+        const Mode mode{"browser", 320, 180, {25, 1}, false, 0};
+        Config cfg;
+        cfg.depth = 10;
+        cfg.audioChannels = 2;
+        Scheduler sched(review);
+        QVERIFY2(sched.start(review->devices()[0], mode, s, cfg, &why), why.c_str());
+        sched.setAudioSource([](int64_t start, int frames, int channels, float* out) {
+            for (int i = 0; i < frames; ++i)
+                for (int c = 0; c < channels; ++c) out[size_t(i) * size_t(channels) + size_t(c)] = 0.25f * float(std::sin(2 * M_PI * 1000 * double(start + i) / 48000));
+        });
+        std::atomic<bool> stopPlayer{false}, playing{false};
+        std::atomic<int64_t> playhead{100};
+        std::thread player([&] {
+            QElapsedTimer clock;
+            FrameTime from = 0;
+            bool was = false;
+            while (!stopPlayer) {
+                if (playing && !was) {
+                    clock.restart();
+                    from = playhead;
+                }
+                was = playing;
+                const FrameTime t = playing ? from + clock.elapsed() * 25 / 1000 : FrameTime(playhead);
+                playhead = t;
+                sched.setPosition(t, playing ? 1 : 0);
+                for (FrameTime f = t; f < t + 4; ++f)
+                    if (sched.wants(f)) sched.submit(f, ramp(f));
+                QThread::msleep(5);
+            }
+        });
+        auto stopAll = qScopeGuard([&] {
+            stopPlayer = true;
+            player.join();
+            sched.stop();
+        });
+
+        // A browser on this computer: the certificate taken as it is (as a reviewer accepts it), sound allowed.
+        bool sandbox = true;
+#ifndef _WIN32
+        sandbox = geteuid() != 0;
+#endif
+        HeadlessBrowser::Options options;
+        options.offline = false;
+        options.extraArgs = {"--ignore-certificate-errors", "--autoplay-policy=no-user-gesture-required",
+                             "--disable-features=WebRtcHideLocalIpsWithMdns"};
+        auto browser = std::make_unique<HeadlessBrowser>();
+        if (!browser->start(exe, 800, 600, sandbox, &why, options)) {
+            if (!sandbox) QFAIL(why.c_str());
+            browser = std::make_unique<HeadlessBrowser>();
+            QVERIFY2(browser->start(exe, 800, 600, false, &why, options), why.c_str());
+        }
+        HeadlessBrowser& b = *browser;
+        auto js = [&](const QString& expression, int ms = 30000) {
+            QJsonObject r;
+            std::string err;
+            if (!b.call("Runtime.evaluate", {{"expression", expression}, {"awaitPromise", true}, {"returnByValue", true}}, &r, &err, true, ms)) {
+                qWarning("%s", err.c_str());
+                return QJsonValue();
+            }
+            if (r.contains("exceptionDetails")) qWarning("%s", QJsonDocument(r.value("exceptionDetails").toObject()).toJson().constData());
+            return r.value("result").toObject().value("value");
+        };
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (js(expression).toBool()) return true;
+                QThread::msleep(50);
+            }
+            return false;
+        };
+        QJsonObject r;
+        const QString page = QString::fromStdString("https://127.0.0.1:" + web.address.substr(web.address.rfind(':') + 1) + "/");
+        QVERIFY2(b.call("Page.navigate", {{"url", page}}, &r, &why), why.c_str());
+        QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), b.log().right(2000).constData());
+
+        // A wrong passphrase is refused.
+        QCOMPARE(js("__montage.join('Ana', 'not the passphrase').then(() => 'joined', e => e.message)").toString(), QStringLiteral("Wrong passphrase"));
+        QCOMPARE(review->receivers(), 0);
+
+        // The right one plays: every picture's burnt-in frame number, read from a canvas, is the frame its tag says.
+        QVERIFY(js("(() => { const s = window.__montage; s.checks = []; const c = document.createElement('canvas'); let g = null;"
+                   "s.onFrame.push((now, meta, v, t) => { const w = v.videoWidth, h = v.videoHeight; if (!w || !h) return;"
+                   "if (c.width !== w || c.height !== h || !g) { c.width = w; c.height = h; g = c.getContext('2d', { willReadFrequently: true }); }"
+                   "g.drawImage(v, 0, 0); const b = Math.max(4, Math.floor(h / 30) & ~1), rw = Math.min(w, 26 * b);"
+                   "const px = g.getImageData(0, 0, rw, 2 * b).data; let code = 0;"
+                   "for (let bit = 0; bit < 24; ++bit) { const cx = (bit + 1) * b, cy = b; let sum = 0;"
+                   "for (let dy = -1; dy <= 1; ++dy) for (let dx = -1; dx <= 1; ++dx) { const i = ((cy + dy) * rw + cx + dx) * 4;"
+                   "sum += (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255; }"
+                   "sum /= 9; if (sum > 0.3 && sum < 0.7) { code = -1; break; } if (sum >= 0.7) code += 2 ** bit; }"
+                   "s.checks.push({ code, tag: t ? t.f : -1 }); if (s.checks.length > 400) s.checks.shift(); }); return true; })()")
+                    .toBool());
+        const QString joined = js("__montage.join('Ana', '" + QString::fromStdString(web.passphrase) + "').then(() => 'joined', e => e.message)").toString();
+        QCOMPARE(joined, QStringLiteral("joined"));
+        QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 20),
+                 (js("__montage.stage").toString() + " " + QString::fromStdString(review->stats().error)).toUtf8().constData());
+        QCOMPARE(review->receivers(), 1);
+        const QString codec = js("__montage.codec").toString();
+        qInfo("Codec: %s (%s)", qPrintable(codec), review->stats().encoder.c_str());
+        QVERIFY(codec == "h264" || codec == "av1");
+
+        // Parked: the frame shown is the playhead's.
+        playhead = 500;
+        QVERIFY2(until("__montage.checks.length > 0 && __montage.checks[__montage.checks.length - 1].tag === 500", 10),
+                 QJsonDocument(js("__montage.checks.slice(-5)").toArray()).toJson().constData());
+        QThread::msleep(500);
+        const QJsonArray parked = js("__montage.checks.slice(-5)").toArray();
+        for (const QJsonValue& c : parked) {
+            QVERIFY2(std::abs(c.toObject().value("code").toInt() - 500) <= 1, QJsonDocument(parked).toJson().constData());
+            QCOMPARE(c.toObject().value("tag").toInt(), 500);
+        }
+        QCOMPARE(js("__montage.frame").toInt(), 500);
+        QCOMPARE(js("__montage.tc").toString(), QString::fromStdString(formatTimecode(500, {25, 1}, true)));
+
+        // Playing: within two frames of their tags, and the frame shown under half a second behind the playhead.
+        js("__montage.checks.length = 0");
+        playing = true;
+        std::vector<int64_t> lags;
+        QElapsedTimer played;
+        played.start();
+        while (played.elapsed() < 4000) {
+            const int64_t at = playhead;
+            const int shownNow = js("__montage.frame").toInt();
+            if (played.elapsed() > 1000 && shownNow > 500) lags.push_back(at - shownNow);
+            QThread::msleep(100);
+        }
+        playing = false;
+        const QJsonArray during = js("__montage.checks.slice()").toArray();
+        QVERIFY(during.size() >= 50);
+        int worst = 0, read = 0;
+        for (const QJsonValue& c : during) {
+            const int code = c.toObject().value("code").toInt(), tag = c.toObject().value("tag").toInt();
+            if (code < 0 || tag < 0) continue;
+            ++read;
+            worst = std::max(worst, std::abs(code - tag));
+        }
+        qInfo("Playing: %d pictures read, worst %d frames from their tags", read, worst);
+        QVERIFY(read >= 50);
+        QVERIFY2(worst <= 2, std::to_string(worst).c_str());
+        std::sort(lags.begin(), lags.end());
+        QVERIFY(lags.size() >= 10);
+        qInfo("Latency: %lld frames (median)", (long long)lags[lags.size() / 2]);
+        QVERIFY2(lags[lags.size() / 2] < 12, std::to_string(lags[lags.size() / 2]).c_str());  // (0.5 s at 25 fps)
+
+        // Sound arrives.
+        QVERIFY(until("__montage.pc.getStats().then(r => { let n = 0; r.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'audio') n = s.packetsReceived; }); return n > 50; })", 10));
+
+        // A note typed in the page lands as a marker on the frame shown, with its drawing.
+        playhead = 700;
+        QVERIFY(until("__montage.frame === 700", 10));
+        const QString id = js("__montage.note('Too dark here', [{ tool: 'pen', color: '#ff0000', width: 0.01, points: [[0.1, 0.1], [0.5, 0.5]] }])").toString();
+        QVERIFY(!id.isEmpty());
+        std::vector<RemoteMarker> got;
+        QElapsedTimer waited;
+        waited.start();
+        while (got.empty() && waited.elapsed() < 10000) {
+            got = review->takeMarkers();
+            QThread::msleep(20);
+        }
+        QCOMPARE(got.size(), size_t(1));
+        QCOMPARE(got[0].frame, FrameTime(700));
+        QCOMPARE(QString::fromStdString(got[0].author), QStringLiteral("Ana"));
+        QCOMPARE(QString::fromStdString(got[0].text), QStringLiteral("Too dark here"));
+        QCOMPARE(QString::fromStdString(got[0].timecode), QString::fromStdString(formatTimecode(700, {25, 1}, true)));
+        QCOMPARE(got[0].sequence, s.id);
+        QCOMPARE(parseReviewDrawing(got[0].drawing).size(), size_t(1));
+        QVERIFY(until("__montage.notes.get('" + id + "').status === 'sent'", 5));
+        QCOMPARE(review->stats().markers, 1);
+
+        // Where the reviewer points is known.
+        js("__montage.dc.send(JSON.stringify({ t: 'p', x: 0.25, y: 0.75 }))");
+        waited.restart();
+        while (review->pointers().empty() && waited.elapsed() < 5000) QThread::msleep(20);
+        QCOMPARE(review->pointers().size(), size_t(1));
+        QCOMPARE(QString::fromStdString(review->pointers()[0].author), QStringLiteral("Ana"));
+        QVERIFY(std::abs(review->pointers()[0].x - 0.25) < 1e-6 && std::abs(review->pointers()[0].y - 0.75) < 1e-6);
+
+        // Another player pulls the same stream over WHEP at once (no data channel; passphrase as its token), and is
+        // let go when it ends its session.
+        QVERIFY(js("(async () => { const pc = new RTCPeerConnection(); window.__whep = pc;"
+                   "pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' });"
+                   "await pc.setLocalDescription(await pc.createOffer());"
+                   "await new Promise(r => { if (pc.iceGatheringState === 'complete') r(); pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); setTimeout(r, 2000); });"
+                   "const w = await fetch('/whep', { method: 'POST', headers: { Authorization: 'Bearer " + QString::fromStdString(web.passphrase) +
+                   "', 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });"
+                   "if (w.status !== 201) return false; window.__whepAt = w.headers.get('Location');"
+                   "await pc.setRemoteDescription({ type: 'answer', sdp: await w.text() }); return true; })()")
+                    .toBool());
+        QVERIFY(until("__whep.getStats().then(r => { let n = 0; r.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'video') n = s.framesDecoded; }); return n > 10; })", 15));
+        QCOMPARE(review->receivers(), 2);
+        QCOMPARE(review->stats().viewers, 2);
+        QCOMPARE(js("fetch(__whepAt, { method: 'DELETE', headers: { Authorization: 'Bearer " + QString::fromStdString(web.passphrase) + "' } }).then(r => r.status)").toInt(), 200);
+        QCOMPARE(review->receivers(), 1);
+        // A wrong passphrase to the endpoint is refused too.
+        QCOMPARE(js("fetch('/whep', { method: 'POST', headers: { Authorization: 'Bearer wrong', 'Content-Type': 'application/sdp' }, body: 'v=0' }).then(r => r.status)").toInt(), 401);
     }
 
     void ndiOutput() {

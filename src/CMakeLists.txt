@@ -278,7 +278,8 @@ add_library(montage_engine STATIC
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   render/St2110.h render/St2110.cpp render/Nmos.h render/Nmos.cpp
-  render/RemoteReview.h render/RemoteReview.cpp
+  render/RemoteReview.h render/RemoteReview.cpp render/WebRtcReview.h render/WebRtcReview.cpp render/WebRtcReviewPage.cpp
+  render/HeadlessBrowser.h
   render/RemoteGrade.h render/RemoteGrade.cpp
   render/SkyReplace.h render/SkyReplace.cpp
   render/FaceShape.h render/FaceShape.cpp
@@ -465,6 +466,11 @@ if(MONTAGE_WITH_OPENSSL)
   else()
     message(STATUS "OpenSSL 3 not found: DCPs cannot be encrypted")
   endif()
+endif()
+if(MONTAGE_HAVE_WEBRTC)
+  message(STATUS "libdatachannel: live review in a browser enabled")
+  target_link_libraries(montage_engine PRIVATE datachannel OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_WEBRTC)
 endif()
 if(MONTAGE_WITH_OCIO)
   find_package(OpenColorIO 2.1 CONFIG QUIET)

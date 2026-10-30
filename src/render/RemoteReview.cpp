@@ -53,11 +53,7 @@ std::string averr(int e) {
     return buf;
 }
 
-std::string timecodeText(const Timecode& tc) {
-    char s[24];
-    std::snprintf(s, sizeof s, "%02d:%02d:%02d%c%02d", tc.hours, tc.minutes, tc.seconds, tc.dropFrame ? ';' : ':', tc.frames);
-    return s;
-}
+std::string timecodeText(const Timecode& tc) { return streamTimecode(tc); }
 
 // What the SRT protocol is given (its options), the rest by the address itself.
 void srtOptions(AVDictionary** d, bool listen, const std::string& passphrase, int latencyMs) {
@@ -114,8 +110,20 @@ bool parseStreamAddress(const std::string& address, std::string& scheme, std::st
     return !host.empty() && port > 0 && port < 65536;
 }
 
+std::string streamTimecode(const Timecode& tc) {
+    char s[24];
+    std::snprintf(s, sizeof s, "%02d:%02d:%02d%c%02d", tc.hours, tc.minutes, tc.seconds, tc.dropFrame ? ';' : ':', tc.frames);
+    return s;
+}
+
+bool isBrowserAddress(const std::string& address) {
+    std::string scheme, host;
+    int port = 0;
+    return parseStreamAddress(address, scheme, host, port) && (scheme == "https" || scheme == "http");
+}
+
 int markersPortFor(const StreamSettings& s) {
-    if (s.markersPort < 0) return -1;
+    if (s.markersPort < 0 || isBrowserAddress(s.address)) return -1;
     if (s.markersPort > 0) return s.markersPort;
     std::string scheme, host;
     int port = 0;
@@ -127,7 +135,27 @@ std::string checkStreamSettings(const StreamSettings& s) {
     std::string scheme, host;
     int port = 0;
     if (!parseStreamAddress(s.address, scheme, host, port)) return "The address needs a host and a port, such as srt://0.0.0.0:9000";
-    if (scheme != "srt" && scheme != "udp") return "Streams go out over SRT (srt://) or UDP (udp://)";
+    if (scheme == "https" || scheme == "http") {
+        if (s.passphrase.size() < 10 || s.passphrase.size() > 79) return "Viewers in a browser need a passphrase of 10 to 79 characters";
+        if (s.codec != "h264" && s.codec != "av1" && s.codec != "hevc") return "The codec is \"h264\", \"av1\" or \"hevc\"";
+        if (s.bitrateKbps < 250 || s.bitrateKbps > 200000) return "The bit rate is 250 to 200000 kb/s";
+        if (s.certificateFile.empty() != s.keyFile.empty()) return "A certificate needs its private key (and a key its certificate)";
+        if (scheme == "http" && !s.certificateFile.empty()) return "A certificate needs an https:// address";
+        // (plain HTTP would carry the passphrase in the clear: only for a browser on this computer)
+        if (scheme == "http" && host != "localhost" && host != "::1" && host.rfind("127.", 0) != 0)
+            return "Browsers on other computers need an https:// address (http:// is for this computer only, 127.0.0.1)";
+        for (const std::string& ice : s.iceServers) {
+            if (ice.rfind("stun:", 0) != 0 && ice.rfind("turn:", 0) != 0 && ice.rfind("turns:", 0) != 0)
+                return "ICE servers start stun:, turn: or turns: (" + ice + ")";
+            // (they go to browsers in a header too)
+            const QByteArray decoded = QByteArray::fromPercentEncoding(QByteArray::fromStdString(ice));
+            if (std::any_of(decoded.begin(), decoded.end(), [](char c) { return uint8_t(c) < 0x20 || c == 0x7f || c == '"' || c == '<' || c == '>'; }))
+                return "An ICE server's address has a character it cannot have (" + ice + ")";
+        }
+        if (s.maxViewers < 1 || s.maxViewers > 64) return "1 to 64 viewers at once";
+        return {};
+    }
+    if (scheme != "srt" && scheme != "udp") return "Streams go out over SRT (srt://) or UDP (udp://), or to browsers from https://";
     if (scheme == "srt" && (s.passphrase.size() < 10 || s.passphrase.size() > 79))
         return "SRT needs a passphrase of 10 to 79 characters";
     if (markersPortFor(s) >= 0 && s.passphrase.size() < 10) return "Markers from reviewers need a passphrase of 10 characters or more";
@@ -249,6 +277,39 @@ void burnTimecode(Planes420& p, const std::string& text) {
                     }
             }
     }
+}
+
+int frameCodeBlock(int height) { return std::max(4, (height / 30) & ~1); }
+
+void burnFrameCode(Planes420& p, int64_t frame) {
+    const int b = frameCodeBlock(p.height), cw = (p.width + 1) / 2;
+    // On a black band half a block wider all round, so the edge blocks keep their level through the encoder.
+    const int x0 = b / 2, y0 = b / 2, w = std::min(p.width, (kFrameCodeBits + 1) * b), h = std::min(p.height, 2 * b);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const int bit = (x - x0) / b;
+            const bool inBlock = x >= x0 && y >= y0 && y < y0 + b && bit < kFrameCodeBits;
+            p.y[size_t(y) * size_t(p.width) + size_t(x)] = inBlock && ((frame >> bit) & 1) ? 940 : 64;
+        }
+    for (int y = 0; y < (h + 1) / 2; ++y)
+        for (int x = 0; x < (w + 1) / 2 && x < cw; ++x) p.u[size_t(y) * size_t(cw) + size_t(x)] = p.v[size_t(y) * size_t(cw) + size_t(x)] = 512;
+}
+
+int64_t frameCodeValue(int width, int height, const std::function<double(int x, int y)>& luma) {
+    const int b = frameCodeBlock(height);
+    if (width < (kFrameCodeBits + 1) * b || height < 2 * b) return -1;
+    int64_t v = 0;
+    for (int bit = 0; bit < kFrameCodeBits; ++bit) {
+        // The middle of the block (a pixel either side of it, each way).
+        const int cx = b / 2 + bit * b + b / 2, cy = b;
+        double sum = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) sum += luma(cx + dx, cy + dy);
+        sum /= 9;
+        if (sum > 0.3 && sum < 0.7) return -1;
+        if (sum >= 0.7) v |= int64_t(1) << bit;
+    }
+    return v;
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +894,7 @@ struct StreamBackend::Impl {
     bool encodePicture(const VideoFrame& f, int64_t pts, bool key) {
         Planes420 p = planesFrom(f);
         if (settings.burnTimecode) burnTimecode(p, timecodeText(f.timecode));
+        if (settings.frameCode) burnFrameCode(p, f.frame);
         if (av_frame_make_writable(vframe) < 0) return false;
         const int w = mode.width, h = mode.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
         switch (vfmt) {
@@ -1107,6 +1169,7 @@ StreamBackend::Stats StreamBackend::stats() const {
     std::lock_guard lock(d_->m);
     Stats s;
     s.connected = d_->open && d_->connected;
+    s.viewers = s.connected ? 1 : 0;
     s.encoded = d_->encoded;
     s.skipped = d_->skipped;
     size_t total = 0;
