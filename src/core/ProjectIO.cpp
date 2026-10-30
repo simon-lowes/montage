@@ -1266,6 +1266,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
             o["shots"] = sh;
         }
         if (!m.created.empty()) o["created"] = qs(m.created);
+        if (!m.fdl.empty()) o["fdl"] = qs(m.fdl);
+        if (!m.fdlFraming.empty()) o["fdlFraming"] = qs(m.fdlFraming);
         if (m.subclipOf) {
             o["subclipOf"] = double(m.subclipOf);
             o["subclipIn"] = m.subclipIn;
@@ -1449,6 +1451,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             m.shots.push_back({d.value("start").toDouble(), d.value("end").toDouble(), ss(d.value("text"))});
         }
         m.created = ss(o.value("created"));
+        m.fdl = ss(o.value("fdl"));
+        m.fdlFraming = ss(o.value("fdlFraming"));
         m.subclipOf = Id(i64(o.value("subclipOf")));
         m.subclipIn = o.value("subclipIn").toDouble();
         m.subclipOut = o.value("subclipOut").toDouble();

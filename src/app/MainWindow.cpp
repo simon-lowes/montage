@@ -6,6 +6,7 @@
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Fdl.h"
 #include "render/FilmLists.h"
 #include "render/PaperworkOutput.h"
 #include "render/ImageSubtitles.h"
@@ -42,6 +43,7 @@
 #include <QEventLoop>
 #include <QFontDatabase>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QGroupBox>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -1388,6 +1390,14 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export ALE"), QString(), tr("Avid Log Exchange (*.ale)"));
         if (!path.isEmpty()) exportAle(path.endsWith(QLatin1String(".ale"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".ale"));
     })->setObjectName(QStringLiteral("exportAle"));
+    add(file, QT_TR_NOOP("Import FDL (Framing Decision List)…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import FDL"), QString(), tr("ASC Framing Decision Lists (*.fdl *.json);;All files (*)"));
+        if (!path.isEmpty()) importFdl(path);
+    })->setObjectName(QStringLiteral("importFdl"));
+    add(file, QT_TR_NOOP("Export FDL…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export FDL"), QString(), tr("ASC Framing Decision Lists (*.fdl)"));
+        if (!path.isEmpty()) exportFdl(path.endsWith(QLatin1String(".fdl"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".fdl"));
+    })->setObjectName(QStringLiteral("exportFdl"));
     add(file, QT_TR_NOOP("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, QT_TR_NOOP("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, QT_TR_NOOP("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
@@ -1528,6 +1538,7 @@ void MainWindow::buildMenus() {
     // ---- Clip
     QMenu* clipM = menuIn(menuBar(), QT_TR_NOOP("&Clip"));
     QAction* speed = add(clipM, QT_TR_NOOP("&Speed / Duration…"), QKeySequence("Ctrl+R"), [this] { speedDialog(); });
+    add(clipM, QT_TR_NOOP("Frame with FDL Template…"), QKeySequence(), [this] { fdlFramingDialog(); })->setObjectName(QStringLiteral("fdlFraming"));
     add(clipM, QT_TR_NOOP("Add &Edit"), QKeySequence("Ctrl+K"), [this] { addEdit(false); });
     add(clipM, QT_TR_NOOP("Add Edit to &All Tracks"), QKeySequence("Ctrl+Shift+K"), [this] { addEdit(true); });
     QAction* trans = add(clipM, QT_TR_NOOP("Apply Default &Transition"), QKeySequence("Ctrl+D"), [this] { addDefaultTransition(false); });
@@ -2573,6 +2584,29 @@ void MainWindow::buildMenus() {
     drawings->setCheckable(true);
     drawings->setChecked(appSettings().value("playback/reviewDrawings", true).toBool());
     drawings->setToolTip(tr("Show what reviewers drew on a frame (notes imported from a review page) over the Program monitor at its marker"));
+    // Frame lines from the footage's FDL (render/Fdl.h) over both monitors.
+    QAction* frameLines = add(play, QT_TR_NOOP("Show Frame Lines"), QKeySequence(), [this](bool on) {
+        appSettings().setValue("playback/frameLines", on);
+        frameLines_ = on;
+        for (MonitorPanel* m : {sourcePanel_, programPanel_})
+            if (m) m->viewer()->update();
+    });
+    frameLines->setObjectName(QStringLiteral("showFrameLines"));
+    frameLines->setCheckable(true);
+    frameLines_ = appSettings().value("playback/frameLines", true).toBool();
+    frameLines->setChecked(frameLines_);
+    frameLines->setToolTip(tr("Show the framing chosen for the footage (its Framing Decision List: File > Import FDL) over the monitors"));
+    if (sourcePanel_)
+        sourcePanel_->viewer()->addOverlay([this](QPainter& p, const QRectF& r) {
+            if (!frameLines_) return;
+            if (const MediaItem* m = state_->sourceMedia() ? state_->project().findMedia(state_->sourceMedia()) : nullptr)
+                paintFrameLines(p, r, mediaFrameLines(*m));
+        });
+    if (programPanel_)
+        programPanel_->viewer()->addOverlay([this](QPainter& p, const QRectF& r) {
+            if (!frameLines_) return;
+            if (const Sequence* s = state_->sequence()) paintFrameLines(p, r, sequenceFrameLines(state_->project(), *s, state_->playhead()));
+        });
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
     hdrViewer_ = add(play, QT_TR_NOOP("HDR Viewer"), QKeySequence(), [this](bool on) {
         appSettings().setValue("playback/hdrViewer", on);
@@ -4074,6 +4108,10 @@ void MainWindow::vfxPullDialog() {
     amf->setObjectName(QStringLiteral("vfxAmf"));
     amf->setChecked(appSettings().value("vfx/amf", true).toBool());
     form->addRow(amf);
+    auto* fdl = new QCheckBox(tr("Write Framing Decision Lists (the plate's framing, and what the cut shows of it)"), &dlg);
+    fdl->setObjectName(QStringLiteral("vfxFdl"));
+    fdl->setChecked(appSettings().value("vfx/fdl", true).toBool());
+    form->addRow(fdl);
     // OpenEXR: its compressions, and more layers in each frame.
     auto* compression = new QComboBox(&dlg);
     compression->setObjectName(QStringLiteral("vfxCompression"));
@@ -4123,8 +4161,10 @@ void MainWindow::vfxPullDialog() {
     appSettings().setValue("vfx/folder", folder);
     appSettings().setValue("vfx/handles", handles->value());
     appSettings().setValue("vfx/amf", amf->isChecked());
+    appSettings().setValue("vfx/fdl", fdl->isChecked());
     VfxPullOptions o;
     o.amf = amf->isChecked();
+    o.fdl = fdl->isChecked();
     if (exrAvailable() && format->currentData().toString() == QLatin1String("exr")) {
         appSettings().setValue("vfx/compression", compression->currentData());
         appSettings().setValue("vfx/sourceLayers", sourceLayers->isChecked());
@@ -4706,6 +4746,130 @@ bool MainWindow::exportFilmLists(const QString& path, Id earlier) {
     }
     state_->message(tr("Wrote film lists of %n event(s) to %1", nullptr, int(lists.events.size())).arg(QFileInfo(path).fileName()), 6000);
     return true;
+}
+
+int MainWindow::importFdl(const QString& path) {
+    std::string json, err;
+    FdlDocument doc;
+    if (!readFdlFile(path.toStdString(), json, doc, &err)) {
+        state_->message(QString::fromStdString(err), 8000);
+        return -1;
+    }
+    const std::vector<Id> chosen = bin_ ? bin_->selectedMedia() : std::vector<Id>{};
+    if (!state_->sequence()) {
+        state_->message(tr("Open a sequence first"), 6000);
+        return 0;
+    }
+    int attached = 0;
+    state_->edit(tr("Import FDL"), [&](Project& p, Sequence&) {
+        attached = attachFdl(p, json, chosen, &err);
+        return attached > 0;
+    });
+    if (!attached) {
+        state_->message(QString::fromStdString(err), 8000);
+        return 0;
+    }
+    state_->message(tr("FDL attached to %n media item(s)", nullptr, attached), 6000);
+    for (MonitorPanel* m : {sourcePanel_, programPanel_})
+        if (m) m->viewer()->update();
+    return attached;
+}
+
+bool MainWindow::exportFdl(const QString& path) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    std::string err;
+    const std::string json = sequenceFdl(state_->project(), *s, state_->selectedClips(), &err);
+    QSaveFile f(path);
+    if (json.empty() || !f.open(QIODevice::WriteOnly) || f.write(json.data(), qint64(json.size())) != qint64(json.size()) || !f.commit()) {
+        state_->message(json.empty() ? QString::fromStdString(err) : tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    state_->message(tr("Wrote the FDL %1").arg(QFileInfo(path).fileName()), 6000);
+    return true;
+}
+
+int MainWindow::frameWithFdl(const QString& templatePath, const QString& templateId, bool resizeSequence) {
+    std::string templates;
+    if (!templatePath.isEmpty()) {
+        FdlDocument doc;
+        std::string err;
+        if (!readFdlFile(templatePath.toStdString(), templates, doc, &err)) {
+            state_->message(QString::fromStdString(err), 8000);
+            return -1;
+        }
+    }
+    std::vector<Id> framed;
+    std::vector<std::string> skipped;
+    std::string err;
+    const std::vector<Id> clips = state_->selectedClips();
+    state_->edit(tr("Frame with FDL"), [&](Project& p, Sequence& s) {
+        framed = frameClipsWithFdl(p, s, clips, templates, templateId.toStdString(), resizeSequence, &skipped, &err);
+        return !framed.empty();
+    });
+    QString msg = framed.empty() ? QString::fromStdString(err) : tr("Framed %n clip(s)", nullptr, int(framed.size()));
+    if (!framed.empty() && !skipped.empty())
+        msg += tr("; not %1").arg(QString::fromStdString(skipped.front())) + (skipped.size() > 1 ? tr(" and %n more", nullptr, int(skipped.size() - 1)) : QString());
+    state_->message(msg, 8000);
+    return int(framed.size());
+}
+
+void MainWindow::fdlFramingDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Frame with FDL Template"));
+    auto* form = new QFormLayout(&dlg);
+    auto* file = new QLineEdit(&dlg);
+    file->setObjectName(QStringLiteral("fdlTemplateFile"));
+    file->setPlaceholderText(tr("The footage's own FDL"));
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    auto* fileRow = new QHBoxLayout;
+    fileRow->addWidget(file, 1);
+    fileRow->addWidget(browse);
+    form->addRow(tr("Canvas templates from:"), fileRow);
+    auto* templ = new QComboBox(&dlg);
+    templ->setObjectName(QStringLiteral("fdlTemplate"));
+    form->addRow(tr("Template:"), templ);
+    auto* resize = new QCheckBox(tr("Make the sequence the template's canvas size"), &dlg);
+    resize->setObjectName(QStringLiteral("fdlResize"));
+    form->addRow(QString(), resize);
+    // The templates on offer: the file's, or those of the footage in the sequence.
+    auto fill = [this, file, templ, s] {
+        templ->clear();
+        std::vector<FdlTemplate> list;
+        FdlDocument doc;
+        std::string json;
+        if (!file->text().trimmed().isEmpty()) {
+            if (readFdlFile(file->text().trimmed().toStdString(), json, doc, nullptr)) list = doc.templates;
+        } else {
+            for (const Track& t : s->videoTracks)
+                for (const Clip& c : t.clips)
+                    if (const MediaItem* m = c.mediaId ? state_->project().findMedia(c.mediaId) : nullptr; m && mediaFdl(*m, doc))
+                        for (const FdlTemplate& ft : doc.templates)
+                            if (std::none_of(list.begin(), list.end(), [&](const FdlTemplate& x) { return x.id == ft.id; })) list.push_back(ft);
+        }
+        for (const FdlTemplate& ft : list)
+            templ->addItem(QStringLiteral("%1 (%2 × %3)").arg(QString::fromStdString(ft.label.empty() ? ft.id : ft.label)).arg(ft.width).arg(ft.height),
+                           QString::fromStdString(ft.id));
+    };
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString path = QFileDialog::getOpenFileName(&dlg, tr("Canvas Templates"), QString(), tr("ASC Framing Decision Lists (*.fdl *.json);;All files (*)"));
+        if (!path.isEmpty()) file->setText(path);
+        fill();
+    });
+    connect(file, &QLineEdit::editingFinished, &dlg, fill);
+    fill();
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    if (templ->count() == 0) {
+        state_->message(tr("No canvas templates: choose an FDL with some"), 6000);
+        return;
+    }
+    frameWithFdl(file->text().trimmed(), templ->currentData().toString(), resize->isChecked());
 }
 
 bool MainWindow::exportAle(const QString& path) {

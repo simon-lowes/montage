@@ -1,0 +1,69 @@
+{
+  "uuid": "5D2E8A41-7C3B-4F09-8E1A-2B3C4D5E6F71",
+  "version": {
+    "major": 2,
+    "minor": 0
+  },
+  "fdl_creator": "Montage tests",
+  "default_framing_intent": "1",
+  "framing_intents": [
+    {
+      "label": "16:9",
+      "id": "1",
+      "aspect_ratio": {
+        "width": 16,
+        "height": 9
+      },
+      "protection": 0.05
+    }
+  ],
+  "contexts": [
+    {
+      "label": "Camera B",
+      "context_creator": "Montage tests",
+      "canvases": [
+        {
+          "label": "HD",
+          "id": "1",
+          "source_canvas_id": "1",
+          "dimensions": {
+            "width": 1920,
+            "height": 1080
+          },
+          "effective_dimensions": {
+            "width": 1800,
+            "height": 1000
+          },
+          "effective_anchor_point": {
+            "x": 60,
+            "y": 40
+          },
+          "anamorphic_squeeze": 1.0,
+          "framing_decisions": [
+            {
+              "label": "16:9",
+              "id": "1-1",
+              "framing_intent_id": "1",
+              "dimensions": {
+                "width": 1600,
+                "height": 900
+              },
+              "anchor_point": {
+                "x": 160,
+                "y": 90
+              },
+              "protection_dimensions": {
+                "width": 1680,
+                "height": 946
+              },
+              "protection_anchor_point": {
+                "x": 120,
+                "y": 67
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

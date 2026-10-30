@@ -501,6 +501,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         burnInkNumber_ = new QCheckBox(tr("Ink number"), row);
         burnInkNumber_->setObjectName(QStringLiteral("burnInkNumber"));
         burnInkNumber_->setChecked(st.value("export/burnInkNumber", false).toBool());
+        burnFrameLines_ = new QCheckBox(tr("Frame lines"), row);
+        burnFrameLines_->setObjectName(QStringLiteral("burnFrameLines"));
+        burnFrameLines_->setChecked(st.value("export/burnFrameLines", false).toBool());
+        burnFrameLines_->setToolTip(tr("The framing of the footage on screen, from its Framing Decision List (FDL)"));
         burnCorner_ = new QComboBox(row);
         burnCorner_->setObjectName(QStringLiteral("burnCorner"));
         burnCorner_->addItems(corners);
@@ -510,6 +514,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         rl->addWidget(burnFootage_);
         rl->addWidget(burnKeyNumber_);
         rl->addWidget(burnInkNumber_);
+        rl->addWidget(burnFrameLines_);
         rl->addWidget(burnCorner_, 1);
         form->addRow(tr("Burn in:"), row);
         burnText_ = new QLineEdit(form_);
@@ -1155,6 +1160,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.burnIn.footage = burnFootage_->isChecked();
         s.burnIn.keyNumber = burnKeyNumber_->isChecked();
         s.burnIn.inkNumber = burnInkNumber_->isChecked();
+        s.burnIn.frameLines = burnFrameLines_->isChecked();
         s.burnIn.text = burnText_->text().trimmed().toStdString();
         s.burnIn.corner = burnCorner_->currentIndex();
         s.burnIn.watermark = watermark_->text().trimmed().toStdString();
@@ -1169,6 +1175,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/burnFootage", burnFootage_->isChecked());
     settings.setValue("export/burnKeyNumber", burnKeyNumber_->isChecked());
     settings.setValue("export/burnInkNumber", burnInkNumber_->isChecked());
+    settings.setValue("export/burnFrameLines", burnFrameLines_->isChecked());
     settings.setValue("export/burnText", burnText_->text());
     settings.setValue("export/burnCorner", burnCorner_->currentIndex());
     settings.setValue("export/watermark", watermark_->text());

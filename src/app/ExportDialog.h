@@ -121,6 +121,7 @@ private:
     QCheckBox* burnFootage_ = nullptr;
     QCheckBox* burnKeyNumber_ = nullptr;
     QCheckBox* burnInkNumber_ = nullptr;
+    QCheckBox* burnFrameLines_ = nullptr;
     QLineEdit* burnText_ = nullptr;
     QComboBox* burnCorner_ = nullptr;
     QLineEdit* watermark_ = nullptr;

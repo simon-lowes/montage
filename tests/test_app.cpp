@@ -106,6 +106,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Fdl.h"
 #include "render/VfxPull.h"
 #include "render/VfxShots.h"
 #include "render/Titles.h"
@@ -1019,6 +1020,70 @@ private slots:
         const QString text = QString::fromUtf8(f.readAll());
         QVERIFY2(text.contains(QStringLiteral("KJ 23 1234 5678+16")) && text.contains(QStringLiteral("KJ 23 1234 5680+15")), qPrintable(text));
         QVERIFY2(text.contains(QStringLiteral("16 mm")), qPrintable(text));
+    }
+
+    void framingDecisionListsFromTheMenus() {
+#ifdef MONTAGE_WITH_FDL
+        state()->newProject();
+        Id media = 0;
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            s.width = 1920, s.height = 1080;
+            for (const char* name : {"A001C005.mov", "B002C001.mov"}) {
+                MediaItem m;
+                m.id = p.newId();
+                if (!media) media = m.id;
+                m.kind = MediaKind::Video;
+                m.name = name;
+                m.path = std::string("/cards/") + name;
+                m.duration = 8;
+                m.width = 1920;
+                m.height = 1080;
+                m.fps = s.fps;
+                m.hasVideo = true;
+                p.media.push_back(m);
+            }
+            return edit::placeMedia(p, s, media, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        for (const char* name : {"importFdl", "exportFdl", "fdlFraming", "showFrameLines"}) QVERIFY2(win_->findChild<QAction*>(name), name);
+        // The FDL names its clip: it goes to that media only, as one undo step.
+        QCOMPARE(win_->importFdl(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), 1);
+        QVERIFY(!state()->project().findMedia(media)->fdl.empty() && state()->project().media[1].fdl.empty());
+        state()->undo();
+        QVERIFY(state()->project().findMedia(media)->fdl.empty());
+        state()->redo();
+        QCOMPARE(win_->importFdl(dir_.path() + "/missing.fdl"), -1);
+        // Its frame lines over the Program monitor: the 16:9 framing, through the clip as it is (it fills the frame).
+        const Sequence& seq = *state()->sequence();
+        std::vector<FrameLine> lines = sequenceFrameLines(state()->project(), seq, 0);
+        auto framing = [&] { return *std::find_if(lines.begin(), lines.end(), [](const FrameLine& l) { return l.kind == 0; }); };
+        QVERIFY(lines.size() == 2 && std::fabs(framing().corners[0] - 160.0 / 1920) < 1e-6);
+        // Its own template applied (the framing fitted into HD): the framing fills the frame, as one undo step.
+        QCOMPARE(win_->frameWithFdl(QString(), QString(), false), 1);
+        const Clip& c = state()->sequence()->videoTracks[0].clips.at(0);
+        QVERIFY2(std::fabs(c.motion.p("scale_x", 0) - 120) < 0.1 && c.motion.p("fit", 0) == 3, qPrintable(QString::number(c.motion.p("scale_x", 0))));
+        lines = sequenceFrameLines(state()->project(), *state()->sequence(), 0);
+        QVERIFY(std::fabs(framing().corners[0]) < 0.002 && std::fabs(framing().corners[4] - 1) < 0.002);
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.at(0).motion.p("scale_x", 0, 100), 100.0);
+        state()->redo();
+        // Written for the sequence: its context names the clip, and says what the cut shows (the framing).
+        const QString out = dir_.path() + "/cut.fdl";
+        QVERIFY(win_->exportFdl(out));
+        std::string json, err;
+        FdlDocument doc;
+        QVERIFY2(readFdlFile(out.toStdString(), json, doc, &err), err.c_str());
+        QVERIFY(doc.contexts.size() == 1 && doc.contexts[0].clipName == "A001C005" && doc.contexts[0].canvases[0].framings.size() == 2);
+        const FdlRect cut = doc.contexts[0].canvases[0].framings[1].rect;
+        QVERIFY2(std::fabs(cut.x - 160) < 1 && std::fabs(cut.w - 1600) < 2, qPrintable(QString("%1 %2").arg(cut.x).arg(cut.w)));
+        // The frame lines can be turned off.
+        QAction* show = win_->findChild<QAction*>("showFrameLines");
+        const bool was = show->isChecked();
+        show->trigger();
+        QCOMPARE(show->isChecked(), !was);
+        QCOMPARE(appSettings().value("playback/frameLines").toBool(), !was);
+        show->trigger();
+        QCOMPARE(show->isChecked(), was);
+#endif
     }
 
     void aleAndCdlFromTheMenus() {

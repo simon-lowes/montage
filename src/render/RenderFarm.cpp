@@ -124,6 +124,7 @@ void visitBurnIn(S& b, V& v) {
     v("footage", b.footage);
     v("keyNumber", b.keyNumber);
     v("inkNumber", b.inkNumber);
+    v("frameLines", b.frameLines);
     v("text", b.text);
     v("corner", b.corner);
     v("size", b.size);

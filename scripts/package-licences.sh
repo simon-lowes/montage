@@ -28,7 +28,7 @@ done
 # JerryScript's; OpenEXR's its bundled OpenJPH, libdeflate and zstd; bmx's its libMXF and libMXF++, and the
 # cmake-git-version-tracking each of the three compiles in). Lua's tarball has none; its licence is
 # LICENSES/MIT-Lua.txt.
-for dep in whisper llama rnnoise thorvg openexr imath libvmx bmx liburiparser bmx_git_version libmxf_git_version libmxfpp_git_version; do
+for dep in whisper llama rnnoise thorvg openexr imath libvmx bmx liburiparser bmx_git_version libmxf_git_version libmxfpp_git_version ascfdl jsoncons; do
   src="$BUILD/_deps/$dep-src"
   [ -d "$src" ] || continue
   (cd "$src" && find . -type f \( -iname 'LICENSE' -o -iname 'LICENSE.*' -o -iname 'LICENCE*' -o -iname 'COPYING' -o -iname 'COPYING.*' \) \
@@ -38,6 +38,12 @@ for dep in whisper llama rnnoise thorvg openexr imath libvmx bmx liburiparser bm
       cp "$src/$f" "$OUT/compiled/$dep/$f"
     done
 done
+
+# The ASC's FDL library's NOTICE (Apache-2.0 asks for it to go with the licence).
+if [ -f "$BUILD/_deps/ascfdl-src/NOTICE" ]; then
+  mkdir -p "$OUT/compiled/ascfdl"
+  cp "$BUILD/_deps/ascfdl-src/NOTICE" "$OUT/compiled/ascfdl/"
+fi
 
 # x265, built by CMakeLists.txt with its multiview encoder for spatial video.
 if [ -f "$BUILD/montage_x265_build-prefix/src/montage_x265_build/COPYING" ]; then

@@ -223,6 +223,9 @@ struct MediaItem {
     std::map<std::string, std::string> metadata;  // scene, shot, take, camera, description, comment, ...
     std::vector<ShotDescription> shots;            // each shot described (Describe Shots), in order
     std::string created;                           // when it was recorded (ISO 8601, from the file), "" = unknown
+    // Its ASC Framing Decision List (render/Fdl.h): the FDL cut down to the context describing it (JSON), "" = none;
+    // and the framing decision shown ("" = the default intent's, else the first).
+    std::string fdl, fdlFraming;
     // A subclip: a saved range of another media item. Clips made from it use
     // that item (with this range), so only bins, logging and search see it.
     Id subclipOf = 0;

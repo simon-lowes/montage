@@ -34,6 +34,7 @@
 #include "core/ColorGroups.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
+#include "render/Fdl.h"
 #include "render/LearnFromClip.h"
 #include "render/ModelClip.h"
 #include "render/ShapeLayers.h"
@@ -11160,6 +11161,7 @@ void McpServer::Impl::addTools() {
                 "footage":{"type":"boolean","description":"Feet and frames in the sequence's film gauge"},
                 "key_number":{"type":"boolean","description":"The key number of the frame on screen (its media's key_number)"},
                 "ink_number":{"type":"boolean","description":"Its ink number"},
+                "frame_lines":{"type":"boolean","description":"The FDL frame lines of the clip on screen (montage_fdl), through its transform"},
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
                 "watermark":{"type":"string","description":"Image file, e.g. a logo"},
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
@@ -11314,6 +11316,7 @@ void McpServer::Impl::addTools() {
                 st.burnIn.footage = b.value("footage").toBool();
                 st.burnIn.keyNumber = b.value("key_number").toBool();
                 st.burnIn.inkNumber = b.value("ink_number").toBool();
+                st.burnIn.frameLines = b.value("frame_lines").toBool();
                 st.burnIn.text = b.value("text").toString().toStdString();
                 st.burnIn.corner = corner("corner", 0);
                 if (b.contains("watermark")) st.burnIn.watermark = absolute(b.value("watermark").toString()).toStdString();
@@ -12666,7 +12669,8 @@ void McpServer::Impl::addTools() {
         "`handles` frames either side (default 8, as far as the footage goes), as an image sequence in a folder per shot "
         "(format exr: half float in scene-linear light; dpx: 10-bit in the footage's own colour; tiff: 16-bit), numbered "
         "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv and (unless `amf` is false) an ACES "
-        "Metadata File per shot giving the frames' colour space and the clip's CDL and looks. `clips` are clip ids "
+        "Metadata File per shot giving the frames' colour space and the clip's CDL and looks, and (unless `fdl` is false) "
+        "an ASC Framing Decision List per shot: the plate's canvas with the footage's framing and what the cut shows. `clips` are clip ids "
         "(default: every footage clip on the video tracks). OpenEXR pulls can carry more in each frame: `source_layers` "
         "copies a multi-layer OpenEXR source's other layers (AOVs) and Cryptomattes as they are, `mattes` adds each of the "
         "clip's masks as a one-channel layer matte_<effect>; `compression` is any of OpenEXR's (none, rle, zips, zip, "
@@ -12683,6 +12687,7 @@ void McpServer::Impl::addTools() {
             "returns_pattern":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
+            "fdl":{"type":"boolean","default":true},
             "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
             "st_maps":{"type":"boolean","default":false}},
             "required":["project","folder"]})json",
@@ -12694,6 +12699,7 @@ void McpServer::Impl::addTools() {
             o.handles = std::clamp(a.value("handles").toInt(8), 0, 1000);
             o.cutIn = a.value("cut_in").toInt(1001);
             o.amf = a.value("amf").toBool(true);
+            o.fdl = a.value("fdl").toBool(true);
             o.compression = str(a, "compression").toStdString();
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
@@ -12720,6 +12726,7 @@ void McpServer::Impl::addTools() {
                 QJsonObject sh{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
                                {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
+                if (!s.fdl.empty()) sh["fdl"] = QString::fromStdString(s.fdl);
                 if (!s.script.empty()) sh["script"] = QString::fromStdString(s.script);
                 if (!s.undistortMap.empty()) {
                     sh["undistort_map"] = QString::fromStdString(s.undistortMap);
@@ -12887,6 +12894,151 @@ void McpServer::Impl::addTools() {
                 return ok(QStringLiteral("Wrote %1 scripts").arg(files.size()), QJsonObject{{"files", files}});
             }
             return fail("action is list, scan, set_version, set_status, export or script");
+        });
+
+    add("montage_fdl", "Framing Decision Lists",
+        "ASC Framing Decision Lists (FDL): the framing chosen for a camera's picture, and canvas templates saying how to "
+        "turn it into a delivery. action import: reads the FDL at `path`, checks it against the format's schema and rules, "
+        "and attaches it to the `media` it describes (ids, paths or names; default every footage item a context names by "
+        "its clip_id, or, for an FDL naming no clips, every one with a canvas its size). list: each media item with an FDL, "
+        "its canvases, framing decisions (the one shown marked), intents and canvas templates. set_framing: shows "
+        "framing decision `framing` (its id) of `media`. detach: removes the FDL from `media`. apply: applies canvas "
+        "template `template_id` (default the first) from the FDL at `template` (default each clip's footage's own) to "
+        "`clips` (ids; default every footage clip of the sequence with an FDL): each clip's transform set (fit None, "
+        "scale, position, crop) so its picture lands in the template's new canvas, fitted into the sequence's frame; "
+        "`resize_sequence` makes the sequence that canvas's size first. export: writes an FDL to `output` with a context "
+        "for each of `clips` (default all footage clips): its recording's canvas and a framing decision for what the cut "
+        "shows of it. frame_lines: the frame lines the Program monitor draws at `frame` (corners as fractions of the frame).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["import","list","set_framing","detach","apply","export","frame_lines"]},
+            "path":{"type":"string"},"media":{"type":"array","items":{"type":["number","string"]}},"framing":{"type":"string"},
+            "template":{"type":"string"},"template_id":{"type":"string"},"resize_sequence":{"type":"boolean","default":false},
+            "clips":{"type":"array","items":{"type":"number"}},"output":{"type":"string"},"frame":{"type":"integer"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            std::vector<MediaItem*> media;
+            for (const QJsonValue& v : a.value("media").toArray()) {
+                MediaItem* m = v.isDouble() ? l.project.findMedia(Id(v.toDouble())) : &projectMedia(l.project, v.toString());
+                if (!m) return fail(QStringLiteral("No media %1").arg(qint64(v.toDouble())));
+                media.push_back(m);
+            }
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            auto rectJson = [](const FdlRect& r) { return QJsonArray{r.x, r.y, r.w, r.h}; };
+            if (action == "import") {
+                std::string json, err;
+                FdlDocument doc;
+                if (!readFdlFile(absolute(need(a, "path")).toStdString(), json, doc, &err)) return fail(QString::fromStdString(err));
+                std::vector<Id> ids;
+                for (const MediaItem* m : media) ids.push_back(m->id);
+                const int n = attachFdl(l.project, json, ids, &err);
+                if (!n) return fail(QString::fromStdString(err));
+                QJsonArray names;
+                for (const MediaItem& m : l.project.media)
+                    if (m.fdl.size() && (ids.empty() || std::find(ids.begin(), ids.end(), m.id) != ids.end())) names.append(QString::fromStdString(m.name));
+                save(l);
+                return ok(QStringLiteral("FDL attached to %1 media item(s)").arg(n), QJsonObject{{"attached", n}, {"media", names}});
+            }
+            if (action == "list") {
+                QJsonArray list;
+                QStringList lines;
+                for (const MediaItem& m : l.project.media) {
+                    if (m.fdl.empty() || (!media.empty() && std::find(media.begin(), media.end(), &m) == media.end())) continue;
+                    FdlDocument doc;
+                    FdlCanvas shownCanvas;
+                    FdlFraming shown;
+                    if (!mediaFdl(m, doc) || doc.contexts.empty()) continue;
+                    mediaFdlFraming(m, shownCanvas, shown);
+                    QJsonArray canvases, intents, templates;
+                    for (const FdlCanvas& c : doc.contexts.front().canvases) {
+                        QJsonArray fds;
+                        for (const FdlFraming& f : c.framings) {
+                            QJsonObject fo{{"id", QString::fromStdString(f.id)}, {"label", QString::fromStdString(f.label)},
+                                           {"intent", QString::fromStdString(f.intent)}, {"rect", rectJson(f.rect)},
+                                           {"shown", c.id == shownCanvas.id && f.id == shown.id}};
+                            if (f.protection) fo["protection"] = rectJson(f.protectionRect);
+                            fds.append(fo);
+                        }
+                        canvases.append(QJsonObject{{"id", QString::fromStdString(c.id)}, {"label", QString::fromStdString(c.label)},
+                                                    {"size", QJsonArray{c.width, c.height}}, {"squeeze", c.squeeze}, {"framing_decisions", fds}});
+                    }
+                    for (const FdlIntent& i : doc.intents)
+                        intents.append(QJsonObject{{"id", QString::fromStdString(i.id)}, {"label", QString::fromStdString(i.label)},
+                                                   {"aspect", QJsonArray{i.aspectW, i.aspectH}}, {"protection", i.protection}});
+                    for (const FdlTemplate& t : doc.templates)
+                        templates.append(QJsonObject{{"id", QString::fromStdString(t.id)}, {"label", QString::fromStdString(t.label)},
+                                                     {"target", QJsonArray{t.width, t.height}}, {"squeeze", t.squeeze}});
+                    list.append(QJsonObject{{"media", double(m.id)}, {"name", QString::fromStdString(m.name)},
+                                            {"context", QString::fromStdString(doc.contexts.front().label)}, {"canvases", canvases},
+                                            {"framing_intents", intents}, {"canvas_templates", templates}});
+                    lines << QStringLiteral("%1: %2 (%3 × %4 at %5, %6)").arg(QString::fromStdString(m.name), QString::fromStdString(shown.id))
+                                 .arg(shown.rect.w).arg(shown.rect.h).arg(shown.rect.x).arg(shown.rect.y);
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No media has an FDL") : lines.join('\n'), QJsonObject{{"media", list}});
+            }
+            if (action == "set_framing" || action == "detach") {
+                if (media.empty()) return fail("Name the media");
+                const std::string id = action == "set_framing" ? need(a, "framing").toStdString() : std::string();
+                for (MediaItem* m : media) {
+                    if (action == "detach") {
+                        m->fdl.clear();
+                        m->fdlFraming.clear();
+                        continue;
+                    }
+                    FdlCanvas canvas;
+                    FdlFraming shown;
+                    if (!mediaFdlFraming(*m, canvas, shown)) return fail(QString::fromStdString(m->name + " has no FDL"));
+                    // (on the canvas its picture is)
+                    if (std::none_of(canvas.framings.begin(), canvas.framings.end(), [&](const FdlFraming& f) { return f.id == id; }))
+                        return fail(QString::fromStdString(m->name + "'s canvas " + canvas.id + " has no framing decision " + id));
+                    m->fdlFraming = id;
+                }
+                save(l);
+                return ok(action == "detach" ? QStringLiteral("FDL removed from %1 media item(s)").arg(media.size())
+                                             : QStringLiteral("Framing %1 shown").arg(QString::fromStdString(id)));
+            }
+            if (action == "apply") {
+                std::string templates, err;
+                if (a.contains("template")) {
+                    FdlDocument doc;
+                    if (!readFdlFile(absolute(str(a, "template")).toStdString(), templates, doc, &err)) return fail(QString::fromStdString(err));
+                }
+                std::vector<std::string> skipped;
+                const std::vector<Id> framed = frameClipsWithFdl(l.project, l.seq(), clips, templates, str(a, "template_id").toStdString(),
+                                                                 a.value("resize_sequence").toBool(), &skipped, &err);
+                if (framed.empty()) return fail(QString::fromStdString(err));
+                save(l);
+                QJsonArray ids, notDone;
+                for (const Id id : framed) ids.append(double(id));
+                for (const std::string& sk : skipped) notDone.append(QString::fromStdString(sk));
+                QString msg = QStringLiteral("Framed %1 clip(s)").arg(framed.size());
+                for (const std::string& sk : skipped) msg += "\nNot " + QString::fromStdString(sk);
+                return ok(msg, QJsonObject{{"clips", ids}, {"skipped", notDone}, {"sequence_size", QJsonArray{l.seq().width, l.seq().height}}});
+            }
+            if (action == "export") {
+                const QString out = absolute(need(a, "output"));
+                std::string err;
+                const std::string json = sequenceFdl(l.project, l.seq(), clips, &err);
+                if (json.empty()) return fail(QString::fromStdString(err));
+                QSaveFile f(out);
+                if (!f.open(QIODevice::WriteOnly) || f.write(json.data(), qint64(json.size())) != qint64(json.size()) || !f.commit())
+                    return fail(QStringLiteral("Cannot write %1").arg(out));
+                return ok(QStringLiteral("Wrote %1").arg(out), QJsonObject{{"output", out}});
+            }
+            if (action == "frame_lines") {
+                const std::vector<FrameLine> lines = sequenceFrameLines(l.project, l.seq(), FrameTime(a.value("frame").toInt(0)));
+                QJsonArray list;
+                for (const FrameLine& fl : lines) {
+                    QJsonArray corners;
+                    for (const double c : fl.corners) corners.append(c);
+                    list.append(QJsonObject{{"kind", fl.kind == 0 ? "framing" : fl.kind == 1 ? "protection" : "effective"},
+                                            {"label", QString::fromStdString(fl.label)}, {"corners", corners}});
+                }
+                return ok(QStringLiteral("%1 frame line(s)").arg(list.size()), QJsonObject{{"lines", list}});
+            }
+            return fail("action is import, list, set_framing, detach, apply, export or frame_lines");
         });
 
     add("montage_export_timeline", "Export the timeline",

@@ -42,6 +42,7 @@
 #include "ColorSpace.h"
 #include "CompositeRender.h"
 #include "Exporter.h"
+#include "Fdl.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
 #include "SurfaceTrack.h"
@@ -3083,6 +3084,16 @@ QPoint cornerPos(int c, int w, int h, int W, int H) {
 void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
                  const ColorSpace* space, FrameTime timecode, bool dropFrame) {
     if (img.width < 8 || img.height < 8) return;
+    // Frame lines under everything else.
+    if (b.frameLines)
+        if (const std::vector<FrameLine> fl = sequenceFrameLines(p, seq, t); !fl.empty()) {
+            QImage lines(img.width, img.height, QImage::Format_RGBA8888_Premultiplied);
+            lines.fill(Qt::transparent);
+            QPainter pa(&lines);
+            paintFrameLines(pa, QRectF(0, 0, img.width, img.height), fl, std::max(1.0, img.height / 720.0));
+            pa.end();
+            blendPatch(img, lines, 0, 0, space);
+        }
     // The logo first, so the text stays readable over it.
     if (watermark && !watermark->isNull() && b.watermarkOpacity > 0) {
         const int ww = std::max(1, int(std::lround(std::clamp(b.watermarkWidth, 0.01, 1.0) * img.width)));

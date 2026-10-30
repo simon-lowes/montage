@@ -44,6 +44,7 @@
 #include "render/SurfaceTrack.h"
 #include "render/ColorChart.h"
 #include "render/CleanPlate.h"
+#include "render/Fdl.h"
 #include "render/Crosstalk.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
@@ -9899,6 +9900,225 @@ colorspaces:
             QVERIFY(a.px == b.px);
             QVERIFY(a.px != img.px);
         }
+    }
+
+    void fdlFraming() {
+#ifndef MONTAGE_WITH_FDL
+        QSKIP("Built without FDL support");
+#else
+        const QString fdlDir = QStringLiteral(MONTAGE_TEST_FDL_DIR);
+        if (!QDir(fdlDir).exists()) QSKIP("The ASC's FDL test files are not here");
+        auto readText = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll().toStdString() : std::string();
+        };
+        // Files that are not FDLs, or break the format's rules, are refused, saying why.
+        FdlDocument doc;
+        std::string json, err;
+        for (const char* bad : {"not_fdl.fdl", "corrupt_fdl.fdl"}) {
+            err.clear();
+            QVERIFY2(!readFdlFile((fdlDir + "/" + bad).toStdString(), json, doc, &err) && !err.empty(), bad);
+        }
+        // The ASC's scenarios for implementers: each template applied to each source makes the canvas and framing their
+        // results have, and the source's picture lands where that framing is (the pipeline's scale and shift).
+        int checked = 0;
+        const QDir scenarios(fdlDir + "/Scenarios_For_Implementers");
+        for (const QString& name : scenarios.entryList({"Scen_*"}, QDir::Dirs)) {
+            const QDir sd(scenarios.filePath(name));
+            const QStringList tmpl = sd.entryList({"*TEMPLATE*.fdl"}, QDir::Files);
+            if (tmpl.size() != 1) continue;
+            const std::string templates = readText(sd.filePath(tmpl.front()));
+            for (const QString& r : QDir(sd.filePath("Results")).entryList({"*.fdl"}, QDir::Files)) {
+                // (results are named after their source, some with "Scen<n>-RESULT-" before it)
+                const QString base = r.contains(QStringLiteral("RESULT-")) ? r.section(QStringLiteral("RESULT-"), 1) : r;
+                QString src;
+                for (const QString& d : {sd.path(), fdlDir + "/Original_Source_Files", fdlDir + "/New_Source_Files"})
+                    if (src.isEmpty() && QFileInfo(d + "/" + base).isFile()) src = d + "/" + base;
+                if (src.isEmpty()) continue;
+                const std::string source = readText(src);
+                FdlFit fit;
+                QVERIFY2(fitFdlTemplate(source, "", "", "", templates, "", fit, &err), qPrintable(name + " " + r + ": " + QString::fromStdString(err)));
+                // (the result's new canvas: the one not the source's own)
+                const QJsonObject result = QJsonDocument::fromJson(QByteArray::fromStdString(readText(sd.filePath("Results/" + r)))).object();
+                const QJsonObject srcCanvas = QJsonDocument::fromJson(QByteArray::fromStdString(source)).object()["contexts"][0]["canvases"][0].toObject();
+                QJsonObject expected;
+                for (const QJsonValue& cv : result["contexts"][0]["canvases"].toArray())
+                    if (cv["id"] != srcCanvas["id"]) expected = cv.toObject();
+                QVERIFY2(!expected.isEmpty(), qPrintable(r));
+                const QString what = name + " " + base;
+                QCOMPARE(fit.width, std::as_const(expected)["dimensions"]["width"].toInt());
+                QCOMPARE(fit.height, std::as_const(expected)["dimensions"]["height"].toInt());
+                const QJsonObject efd = std::as_const(expected)["framing_decisions"][0].toObject();
+                QVERIFY2(std::fabs(fit.framing.x - efd["anchor_point"]["x"].toDouble()) < 1e-6 && std::fabs(fit.framing.y - efd["anchor_point"]["y"].toDouble()) < 1e-6 &&
+                             std::fabs(fit.framing.w - efd["dimensions"]["width"].toDouble()) < 1e-6 &&
+                             std::fabs(fit.framing.h - efd["dimensions"]["height"].toDouble()) < 1e-6,
+                         qPrintable(what));
+                // The source's framing through the scale and shift, cut to the new canvas, is that framing (to the pixel the
+                // pipeline rounds to).
+                const QJsonObject sfd = srcCanvas["framing_decisions"][0].toObject();
+                const double sx = sfd["anchor_point"]["x"].toDouble(), sy = sfd["anchor_point"]["y"].toDouble();
+                const double x0 = std::max(0.0, (sx - fit.anchorX) * fit.scaleX + fit.offsetX);
+                const double y0 = std::max(0.0, (sy - fit.anchorY) * fit.scaleY + fit.offsetY);
+                const double x1 = std::min(double(fit.width), (sx + sfd["dimensions"]["width"].toDouble() - fit.anchorX) * fit.scaleX + fit.offsetX);
+                const double y1 = std::min(double(fit.height), (sy + sfd["dimensions"]["height"].toDouble() - fit.anchorY) * fit.scaleY + fit.offsetY);
+                QVERIFY2(std::fabs(x0 - fit.framing.x) <= 1.5 && std::fabs(y0 - fit.framing.y) <= 1.5 &&
+                             std::fabs(x1 - (fit.framing.x + fit.framing.w)) <= 1.5 && std::fabs(y1 - (fit.framing.y + fit.framing.h)) <= 1.5,
+                         qPrintable(QString("%1: %2 %3 %4 %5 vs %6 %7 %8 %9").arg(what).arg(x0).arg(y0).arg(x1).arg(y1)
+                                        .arg(fit.framing.x).arg(fit.framing.y).arg(fit.framing.x + fit.framing.w).arg(fit.framing.y + fit.framing.h)));
+                // The FDL it writes reads back, and keeps to the format's rules.
+                QVERIFY2(parseFdl(fit.json, doc, &err), qPrintable(what + ": " + QString::fromStdString(err)));
+                ++checked;
+            }
+        }
+        QVERIFY2(checked >= 30, qPrintable(QString::number(checked)));
+
+        // Footage: chart B (4448 x 3096, framing 4004 x 2252 at 222, 422, protection 4448 x 2502 at 0, 297) at an eighth of
+        // its size, white inside the framing, grey in the protection and dark outside; and a 16:9 picture.
+        QTemporaryDir dir;
+        Project p;
+        p.sequences.emplace_back();
+        Sequence& seq = p.sequences.back();
+        seq.id = p.newId();
+        seq.name = "Cut";
+        seq.width = 384, seq.height = 216;  // (a tenth of UHD)
+        seq.videoTracks.emplace_back();
+        const FdlRect fd{222, 422, 4004, 2252}, prot{0, 297, 4448, 2502};
+        auto inside = [](const FdlRect& r, double x, double y) { return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h; };
+        QImage chart(556, 387, QImage::Format_RGB32);
+        for (int y = 0; y < chart.height(); ++y)
+            for (int x = 0; x < chart.width(); ++x) {
+                const double cx = (x + 0.5) * 4448.0 / 556, cy = (y + 0.5) * 3096.0 / 387;
+                chart.setPixel(x, y, inside(fd, cx, cy) ? 0xffffffff : inside(prot, cx, cy) ? 0xff808080 : 0xff1a1a1a);
+            }
+        QImage wide(64, 36, QImage::Format_RGB32);
+        wide.fill(Qt::blue);
+        Id chartId = 0, wideId = 0;
+        for (const auto& [img, file, id] : {std::tuple{&chart, "B_chart.png", &chartId}, {&wide, "wide.png", &wideId}}) {
+            MediaItem m;
+            const QString path = dir.filePath(file);
+            QVERIFY(img->save(path) && probeMedia(path.toStdString(), m));
+            m.id = *id = p.newId();
+            p.media.push_back(m);
+        }
+        QVERIFY(edit::placeMedia(p, seq, chartId, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+        const Id clipId = seq.videoTracks[0].clips[0].id;
+        // B's FDL names no clip: a camera format's. On its own it goes to recordings of its canvas's size (none here: the
+        // chart is a scaled copy); to footage chosen, to that of its shape (the chart, not the 16:9 picture).
+        const std::string chartFdl = readText(fdlDir + "/Original_Source_Files/B_4448x3096_1x_FramingChart.fdl");
+        err.clear();
+        QCOMPARE(attachFdl(p, chartFdl, {}, &err), 0);
+        QVERIFY(!err.empty());
+        QCOMPARE(attachFdl(p, chartFdl, {chartId, wideId}, &err), 1);
+        QVERIFY(!p.findMedia(chartId)->fdl.empty() && p.findMedia(wideId)->fdl.empty());
+        // Its frame lines over its own picture: the framing decision, and its protection.
+        const std::vector<FrameLine> own = mediaFrameLines(*p.findMedia(chartId));
+        const auto framingLine = [](const std::vector<FrameLine>& lines) {
+            const auto it = std::find_if(lines.begin(), lines.end(), [](const FrameLine& l) { return l.kind == 0; });
+            return it == lines.end() ? FrameLine{-1, {}, {}} : *it;
+        };
+        FrameLine fl = framingLine(own);
+        QVERIFY(std::fabs(fl.corners[0] - 222.0 / 4448) < 1e-9 && std::fabs(fl.corners[1] - 422.0 / 3096) < 1e-9 &&
+                std::fabs(fl.corners[4] - 4226.0 / 4448) < 1e-9 && std::fabs(fl.corners[5] - 2674.0 / 3096) < 1e-9);
+        QVERIFY(std::any_of(own.begin(), own.end(), [](const FrameLine& l) { return l.kind == 1; }));
+        // Scenario 1's template (the framing fitted into UHD and cut to it) applied: the framing fills the sequence's frame.
+        const std::string uhd = readText(fdlDir + "/Scenarios_For_Implementers/Scen_1_FitDecision-into-UHD/Scen_1_FitDecision-into-UHD-CANVAS-TEMPLATE.fdl");
+        QVERIFY(!uhd.empty());
+        std::vector<std::string> skipped;
+        QCOMPARE(frameClipsWithFdl(p, seq, {}, uhd, "", false, &skipped, &err), std::vector<Id>{clipId});
+        RenderOptions o;
+        const Image framed = renderProgramFrame(p, seq, 0, o);
+        double white = 0;
+        for (int y = 0; y < framed.height; ++y)
+            for (int x = 0; x < framed.width; ++x) white += framed.at(x, y)[1] > 0.95 ? 1 : 0;
+        QVERIFY2(white / (framed.width * framed.height) > 0.985, qPrintable(QString::number(white / (framed.width * framed.height))));
+        for (const auto& [x, y] : {std::pair{2, 2}, {381, 2}, {2, 213}, {381, 213}, {192, 108}})
+            QVERIFY2(framed.at(x, y)[1] > 0.95, qPrintable(QString("%1 %2: %3").arg(x).arg(y).arg(framed.at(x, y)[1])));
+        // With its own template (none: B has no canvas templates), nothing is framed, saying why.
+        err.clear();
+        Project untouched = p;
+        QVERIFY(frameClipsWithFdl(untouched, untouched.sequences.back(), {}, "", "", false, nullptr, &err).empty() && !err.empty());
+        // Its frame lines through the clip's transform: the framing is the whole frame; burnt into a copy, they show at its edges.
+        fl = framingLine(sequenceFrameLines(p, seq, 0));
+        QVERIFY2(fl.kind == 0 && std::fabs(fl.corners[0]) < 0.006 && std::fabs(fl.corners[1]) < 0.006 && std::fabs(fl.corners[4] - 1) < 0.006 &&
+                     std::fabs(fl.corners[5] - 1) < 0.006,
+                 qPrintable(QString("%1 %2 %3 %4").arg(fl.corners[0]).arg(fl.corners[1]).arg(fl.corners[4]).arg(fl.corners[5])));
+        Image burnt = framed;
+        BurnIn lines;
+        lines.frameLines = true;
+        QVERIFY(lines.any());
+        drawBurnIns(burnt, p, seq, 0, lines, nullptr);
+        QVERIFY(burnt.at(0, 108)[1] < 0.9 && burnt.at(192, 108)[1] > 0.95);
+        // Written back out: the chart's canvas, its framing decision, and what the cut shows of it (the same rectangle).
+        const std::string back = clipFdl(p, seq, seq.videoTracks[0].clips[0], 0, 0, nullptr, &err);
+        QVERIFY2(parseFdl(back, doc, &err), qPrintable(QString::fromStdString(err)));
+        QCOMPARE(doc.contexts.size(), size_t(1));
+        const FdlCanvas& bc = doc.contexts[0].canvases.at(0);
+        QVERIFY(bc.width == 4448 && bc.height == 3096 && bc.framings.size() == 2);
+        const FdlRect cut = bc.framings[1].rect;
+        QVERIFY2(bc.framings[1].intent == "CUT" && std::fabs(cut.x - 222) < 3 && std::fabs(cut.y - 422) < 3 && std::fabs(cut.w - 4004) < 6 &&
+                     std::fabs(cut.h - 2252) < 6,
+                 qPrintable(QString("%1 %2 %3 %4").arg(cut.x).arg(cut.y).arg(cut.w).arg(cut.h)));
+        // For a plate at the footage's decoded size, naming its frames: the framing scaled to it.
+        const FdlClipId plate{"sh010", {}, "sh010.####.exr", 1001, 1010};
+        QVERIFY(parseFdl(clipFdl(p, seq, seq.videoTracks[0].clips[0], 556, 387, &plate, &err), doc, &err));
+        QVERIFY(doc.contexts[0].clipName == "sh010" && doc.contexts[0].canvases[0].width == 556);
+        QVERIFY(std::fabs(doc.contexts[0].canvases[0].framings[0].rect.x - 222.0 / 8) < 0.01);
+        // The sequence's FDL, the chart cut in twice: a context for each, told apart.
+        QVERIFY(edit::placeMedia(p, seq, chartId, 10, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+        const std::string whole = sequenceFdl(p, seq, {}, &err);
+        QVERIFY2(!whole.empty(), qPrintable(QString::fromStdString(err)));
+        QVERIFY2(parseFdl(whole, doc, &err), qPrintable(QString::fromStdString(err)));
+        QVERIFY(doc.contexts.size() == 2 && doc.contexts[0].label != doc.contexts[1].label);
+        // Footage matching a derived canvas (a VFX pull's 4800 x 2700 from a 5184 x 4320 camera canvas), and footage with an
+        // effective area shown whole, both write FDLs that keep to the rules (the canvas its own source; the cut's
+        // framing inside the effective area).
+        for (const auto& [file, w, h] : {std::tuple{fdlDir + "/EXR_VFX-Pulls/VFXPull-Resulting-FDLs/A_5184x4320_2_20percentSafe.fdl", 4800, 2700},
+                                         {QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/effective-area.fdl"), 1920, 1080}}) {
+            Project q;
+            q.sequences.emplace_back();
+            Sequence& qs = q.sequences.back();
+            qs.id = q.newId();
+            qs.width = 1920, qs.height = 1080;
+            qs.videoTracks.emplace_back();
+            MediaItem m;
+            m.id = q.newId();
+            m.kind = MediaKind::Video;
+            m.name = "shot.mov";
+            m.width = w, m.height = h;
+            m.duration = 10;
+            m.fps = qs.fps;
+            m.hasVideo = true;
+            q.media.push_back(m);
+            QVERIFY(edit::placeMedia(q, qs, m.id, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+            QVERIFY2(attachFdl(q, readText(file), {m.id}, &err) == 1, qPrintable(file + ": " + QString::fromStdString(err)));
+            const std::string out = clipFdl(q, qs, qs.videoTracks[0].clips[0], 0, 0, nullptr, &err);
+            QVERIFY2(parseFdl(out, doc, &err), qPrintable(file + ": " + QString::fromStdString(err)));
+            QVERIFY(doc.contexts[0].canvases.size() == 1 && doc.contexts[0].canvases[0].width == w);
+        }
+        // An FDL naming another clip does not go to footage chosen for its size.
+        {
+            MediaItem other;
+            other.id = p.newId();
+            other.kind = MediaKind::Video;
+            other.name = "B002C001.mov";
+            other.width = 1920, other.height = 1080;
+            p.media.push_back(other);
+            QCOMPARE(attachFdl(p, readText(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), {other.id}, &err), 0);
+        }
+        // A template larger than Montage makes pictures is refused.
+        std::string huge = uhd;
+        huge.replace(huge.find("3840"), 4, "99999");
+        QVERIFY(!parseFdl(huge, doc, &err) && err.find("larger") != std::string::npos);
+        // Making the sequence the template's canvas: UHD.
+        untouched = p;
+        QCOMPARE(frameClipsWithFdl(untouched, untouched.sequences.back(), {clipId}, uhd, "", true, nullptr, &err).size(), size_t(1));
+        QVERIFY(untouched.sequences.back().width == 3840 && untouched.sequences.back().height == 2160);
+        // Kept with the project, with the framing chosen.
+        p.findMedia(chartId)->fdlFraming = "1-1";
+        Project loaded;
+        QVERIFY(projectFromJson(projectToJson(p), loaded, &err));
+        QVERIFY(loaded.findMedia(chartId)->fdl == p.findMedia(chartId)->fdl && loaded.findMedia(chartId)->fdlFraming == "1-1");
+#endif
     }
 
     void cleanPlateKeying() {

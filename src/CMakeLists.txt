@@ -242,6 +242,7 @@ add_library(montage_engine STATIC
   render/Gamut.h render/Gamut.cpp
   render/ColorSlice.h render/ColorSlice.cpp
   render/CleanPlate.h render/CleanPlate.cpp
+  render/Fdl.h render/Fdl.cpp
   render/Crosstalk.h render/Crosstalk.cpp
   render/Clf.h render/Clf.cpp
   render/Amf.h render/Amf.cpp
@@ -597,6 +598,10 @@ endif()
 if(MONTAGE_WITH_SPATIAL_VIDEO)
   target_link_libraries(montage_engine PRIVATE montage_x265)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_SPATIAL_VIDEO)
+endif()
+if(MONTAGE_WITH_FDL)
+  target_link_libraries(montage_engine PRIVATE montage_fdl)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_FDL)
 endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)

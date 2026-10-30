@@ -37,6 +37,9 @@ target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CUR
                            MONTAGE_TEST_TOOLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
 target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_definitions(test_render PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+if(MONTAGE_WITH_FDL)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_FDL_DIR="${ascfdl_SOURCE_DIR}/resources/FDL")
+endif()
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)

@@ -11095,6 +11095,14 @@ Do you want to replace it?</source>
         <source>Cancel</source>
         <translation type="unfinished">Annulla</translation>
     </message>
+    <message>
+        <source>Frame lines</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The framing of the footage on screen, from its Framing Decision List (FDL)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::FootageNotesDialog</name>
@@ -20809,6 +20817,104 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Pad after:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Import FDL (Framing Decision List)…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Import FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ASC Framing Decision Lists (*.fdl *.json);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export FDL…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ASC Framing Decision Lists (*.fdl)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame with FDL Template…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show Frame Lines</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show the framing chosen for the footage (its Framing Decision List: File &gt; Import FDL) over the monitors</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Write Framing Decision Lists (the plate&apos;s framing, and what the cut shows of it)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Open a sequence first</source>
+        <translation type="unfinished">Aprire una sequenza prima</translation>
+    </message>
+    <message numerus="yes">
+        <source>FDL attached to %n media item(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Wrote the FDL %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame with FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Framed %n clip(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>; not %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame with FDL Template</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The footage&apos;s own FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Canvas templates from:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Template:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Make the sequence the template&apos;s canvas size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Canvas Templates</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No canvas templates: choose an FDL with some</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

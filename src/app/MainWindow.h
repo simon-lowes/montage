@@ -338,6 +338,13 @@ public:
     // the selected media (else all) as an ALE.
     int importAle(const QString& path, bool cdlToClips = true);
     bool exportAle(const QString& path);
+    // ASC Framing Decision Lists (render/Fdl.h): attached to the bin's chosen media (all of them when none is chosen),
+    // written for the sequence's chosen clips (all when none), and their canvas templates applied to the chosen clips
+    // (from a template FDL, or the footage's own when `templatePath` is empty).
+    int importFdl(const QString& path);
+    bool exportFdl(const QString& path);
+    int frameWithFdl(const QString& templatePath, const QString& templateId, bool resizeSequence);
+    void fdlFramingDialog();
     // Film lists of the active sequence (render/FilmLists.h): .txt, .csv or .pdf; with `earlier` (another sequence),
     // the change list from it too.
     bool exportFilmLists(const QString& path, Id earlier = 0);
@@ -624,6 +631,7 @@ private:
     void showTrimEdit();
     std::vector<Id> openSequences_;
     MonitorPanel* sourcePanel_ = nullptr;
+    bool frameLines_ = true;  // frame lines from the footage's FDL over the monitors
     MonitorPanel* programPanel_ = nullptr;
     MediaBinWidget* bin_ = nullptr;
     EffectsBrowser* effects_ = nullptr;
