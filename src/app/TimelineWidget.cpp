@@ -1,4 +1,5 @@
 #include "TimelineWidget.h"
+#include "Language.h"
 
 #include "EffectPresetStore.h"
 
@@ -27,11 +28,13 @@
 #include "EditorState.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
+#include "PitchCurves.h"
 #include "SoundLibraryPanel.h"
 #include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
+#include "audio/ElasticAudio.h"
 #include "audio/PluginEffect.h"
 #include "core/Effects.h"
 #include "core/AudioChannels.h"
@@ -130,6 +133,8 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     setFrameShape(QFrame::NoFrame);
     setFocusPolicy(Qt::StrongFocus);
     setAccessibleName(tr("Timeline"));
+    pitch_ = new PitchCurves(this);
+    connect(pitch_, &PitchCurves::ready, this, [this] { viewport()->update(); });
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
@@ -477,6 +482,37 @@ double TimelineWidget::frameAtX(int x) const { return (double(x - kHeaderW + hor
 
 FrameTime TimelineWidget::frameRound(int x) const { return std::max<FrameTime>(0, FrameTime(std::llround(frameAtX(x)))); }
 
+double TimelineWidget::elasticSecondsAtX(const Clip& c, double x) const {
+    const Sequence* s = state_->sequence();
+    const double fps = s ? s->fpsValue() : 25;
+    const double f = (x - kHeaderW + horizontalScrollBar()->value()) / ppf_;
+    return (c.sourceIn + (f - double(c.start))) / fps - elasticOffsetOf(c);
+}
+
+double TimelineWidget::xForElasticSeconds(const Clip& c, double u) const {
+    const Sequence* s = state_->sequence();
+    const double fps = s ? s->fpsValue() : 25;
+    const double f = double(c.start) + (u + elasticOffsetOf(c)) * fps - c.sourceIn;
+    return kHeaderW + f * ppf_ - horizontalScrollBar()->value();
+}
+
+std::optional<double> TimelineWidget::warpMarkerNear(const Clip& c, int x) const {
+    const Effect* e = elasticEffectOf(c);
+    if (!e) return std::nullopt;
+    std::optional<double> best;
+    double bestD = 6;
+    for (const AlignPoint& pt : dialogueWarpFromString(e->s("points"))) {
+        const double d = std::fabs(xForElasticSeconds(c, pt.u) - x);
+        if (d <= bestD) bestD = d, best = pt.u;
+    }
+    return best;
+}
+
+void TimelineWidget::setShowPitchCurves(bool on) {
+    showPitch_ = on;
+    viewport()->update();
+}
+
 void TimelineWidget::updateScrollBars() {
     const Sequence* s = state_->sequence();
     FrameTime dur = s ? s->duration() : 0;
@@ -761,7 +797,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
                 f.setPointSize(7);
                 p.setFont(f);
                 p.drawText(tr2.adjusted(3, 0, -3, 0), Qt::AlignCenter,
-                           p.fontMetrics().elidedText(info ? QString::fromStdString(info->displayName) : QString(),
+                           p.fontMetrics().elidedText(info ? language::engine(info->displayName) : QString(),
                                                       Qt::ElideRight, tr2.width() - 6));
             }
         }
@@ -905,6 +941,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         }
     } else {
         paintWaveform(p, c, body.adjusted(0, 1, 0, -2), base.lighter(170));
+        paintElastic(p, c, body.adjusted(0, 1, 0, -2));
     }
     if (!c.enabled) {
         p.setPen(QPen(QColor(0, 0, 0, 60), 1));
@@ -1556,12 +1593,20 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     int x0 = std::max(r.left(), kHeaderW), x1 = std::min(r.right(), viewport()->width());
     const double gain = waveformScale(c);
     double mid = r.center().y(), half = r.height() / 2.0;
+    // Warp markers move the sound within the clip: drawn where it plays.
+    const Effect* elastic = elasticEffectOf(c);
+    const DialogueWarp warp = elastic && elastic->enabled ? dialogueWarpFromString(elastic->s("points")) : DialogueWarp{};
+    const double offset = elasticOffsetOf(c);
     p.setPen(col);
     for (int x = x0; x <= x1; ++x) {
         double fA = frameAtX(x), fB = frameAtX(x + 1);
         if (fB <= c.start || fA >= c.end()) continue;
         double sA = c.sourceFrameAt(FrameTime(std::floor(fA))) / fps * rate;
         double sB = c.sourceFrameAt(FrameTime(std::floor(fB))) / fps * rate;
+        if (!warp.empty()) {
+            sA = (dialogueWarpAt(warp, elasticSecondsAtX(c, x)) + offset) * rate;
+            sB = (dialogueWarpAt(warp, elasticSecondsAtX(c, x + 1)) + offset) * rate;
+        }
         if (sB < sA) std::swap(sA, sB);
         size_t bA = size_t(std::max(0.0, sA / pk->samplesPerBucket));
         size_t bB = size_t(std::max(0.0, sB / pk->samplesPerBucket)) + 1;
@@ -1575,6 +1620,81 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
         int y1 = int(mid - std::min(1.0, hi * gain) * half), y2 = int(mid - std::max(-1.0, lo * gain) * half);
         p.drawLine(x, y1, x, std::max(y1, y2));
     }
+}
+
+void TimelineWidget::paintElastic(QPainter& p, const Clip& c, const QRect& r) {
+    const Effect* elastic = elasticEffectOf(c);
+    const Effect* pitchFx = pitchContourOf(c);
+    const bool pitched = showPitch_ && (elastic || pitchFx || state_->isSelected(c.id));
+    if ((!elastic && !pitched) || r.height() < 6) return;
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    p.save();
+    if (elastic) {
+        const DialogueWarp warp = dialogueWarpFromString(elastic->s("points"));
+        // Each stretch between markers: warm where it is slowed, cool where it is sped up, deeper the further.
+        for (size_t i = 0; i + 1 < warp.size(); ++i) {
+            const double rate = (warp[i + 1].w - warp[i].w) / (warp[i + 1].u - warp[i].u);
+            if (std::fabs(rate - 1) < 0.005) continue;
+            const int xa = int(std::lround(xForElasticSeconds(c, warp[i].u))), xb = int(std::lround(xForElasticSeconds(c, warp[i + 1].u)));
+            const int alpha = int(std::clamp(std::fabs(std::log2(rate)) * 300, 25.0, 110.0));
+            p.fillRect(QRect(xa, r.bottom() - 3, std::max(1, xb - xa), 4), rate < 1 ? QColor(255, 150, 60, alpha + 100) : QColor(80, 170, 255, alpha + 100));
+            p.fillRect(QRect(xa, r.top(), std::max(1, xb - xa), r.height() - 4), rate < 1 ? QColor(255, 150, 60, alpha / 3) : QColor(80, 170, 255, alpha / 3));
+        }
+        for (const AlignPoint& pt : warp) {
+            const int x = int(std::lround(xForElasticSeconds(c, pt.u)));
+            if (x < r.left() || x > r.right()) continue;  // the anchors at the clip's ends
+            const bool moved = std::fabs(pt.u - pt.w) > 1e-4;
+            const QColor col = moved ? QColor(255, 196, 70) : QColor(235, 235, 235, 200);
+            p.setPen(QPen(col, 1));
+            p.drawLine(x, r.top(), x, r.bottom());
+            p.setPen(Qt::NoPen);
+            p.setBrush(col);
+            p.drawPolygon(QPolygon({QPoint(x - 4, r.top()), QPoint(x + 4, r.top()), QPoint(x, r.top() + 5)}));
+        }
+    }
+    if (pitched) {
+        if (auto curve = pitch_->curve(state_->project(), *s, c, drag_.kind != DragKind::WarpMarker); curve && !curve->track.f0.empty()) {
+            // The pitch on a semitone scale fitted to the clip's own range.
+            const PitchTrack& tr = curve->track;
+            double lo = 1e9, hi = -1e9;
+            for (size_t i = 0; i < tr.f0.size(); ++i)
+                for (double f : {tr.f0[i], curve->edited.size() > i ? curve->edited[i] : 0.0})
+                    if (f > 0) lo = std::min(lo, std::log2(f)), hi = std::max(hi, std::log2(f));
+            if (hi >= lo) {
+                lo -= 1.0 / 12, hi += 1.0 / 12;
+                const double offset = elasticOffsetOf(c);
+                auto yOf = [&](double f) { return r.bottom() - 2 - (std::log2(f) - lo) / (hi - lo) * (r.height() - 6); };
+                auto draw = [&](const std::vector<double>& f0, const QColor& col, double width) {
+                    p.setPen(QPen(col, width));
+                    QPolygonF line;
+                    auto flush = [&] {
+                        if (line.size() > 1) p.drawPolyline(line);
+                        line.clear();
+                    };
+                    for (size_t i = 0; i < f0.size(); ++i) {
+                        if (f0[i] <= 0) {
+                            flush();
+                            continue;
+                        }
+                        const double source = tr.start + double(i) * tr.hop;
+                        const double x = xForElasticSeconds(c, source - offset);
+                        if (x < r.left() - 2 || x > r.right() + 2) {
+                            flush();
+                            continue;
+                        }
+                        line << QPointF(x, yOf(f0[i]));
+                    }
+                    flush();
+                };
+                p.setRenderHint(QPainter::Antialiasing, true);
+                const bool edited = curve->edited != tr.f0;
+                draw(tr.f0, edited ? QColor(255, 255, 255, 90) : QColor(120, 255, 200, 220), 1.0);
+                if (edited) draw(curve->edited, QColor(120, 255, 200, 230), 1.6);
+            }
+        }
+    }
+    p.restore();
 }
 
 void TimelineWidget::setIntelligibilityLane(std::vector<IntelligibilitySpan> spans, bool stale) {
@@ -2008,6 +2128,22 @@ void TimelineWidget::beginDrag(QMouseEvent* e, const Hit& hit) {
         drag_.edge = hit.rightEdge ? edit::Edge::Out : edit::Edge::In;
         return;
     }
+    if (alt && tool_ == Tool::Select && hit.kind == HitKind::ClipBody && hit.track && hit.track->kind == TrackKind::Audio)
+        if (const Clip* c = edit::clipById(*s, hit.clip); c && elasticEffectOf(*c)) {
+            // Elastic audio: Alt-drag moves the warp marker under the pointer, or makes one there and moves it;
+            // Alt-Shift-click takes a marker off.
+            const Id id = c->id;
+            const std::optional<double> near = warpMarkerNear(*c, e->pos().x());
+            if (shift) {
+                if (near) state_->apply(tr("Remove Warp Marker"), [id, at = *near](Project& p, Sequence& sq) { return edit::removeWarpMarker(p, sq, id, at); });
+                return;
+            }
+            if (!state_->isSelected(id)) state_->setSelection({id}, false);
+            drag_.kind = DragKind::WarpMarker;
+            drag_.clip = id;
+            drag_.warpFrom = near ? *near : elasticSecondsAtX(*c, e->pos().x());
+            return;
+        }
     if (hit.kind == HitKind::ClipBody || hit.kind == HitKind::ClipIn || hit.kind == HitKind::ClipOut) {
         Id id = hit.clip;
         // Selection.
@@ -2087,6 +2223,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             case DragKind::TrackLine: state_->beginGesture(tr("Track Volume")); break;
             case DragKind::TrackKey: state_->beginGesture(tr("Move Automation Point")); break;
             case DragKind::TransitionEdge: state_->beginGesture(tr("Transition Duration")); break;
+            case DragKind::WarpMarker: state_->beginGesture(tr("Move Warp Marker")); break;
             default: break;
         }
     }
@@ -2279,6 +2416,29 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             drag_.label = laneText(lane, v) + QStringLiteral("  ") + signedTc(placed - from);
             break;
         }
+        case DragKind::WarpMarker: {
+            const Clip* base = edit::clipById(*s, drag_.clip);
+            if (!base) break;
+            const Id id = drag_.clip;
+            const double from = drag_.warpFrom, to = elasticSecondsAtX(*base, pos.x());
+            DialogueWarp placed;
+            state_->updateGesture([&](Project& p, Sequence& sq) {
+                if (edit::moveWarpMarker(p, sq, id, from, to).ok)
+                    if (const Clip* c = edit::clipById(sq, id); c && elasticEffectOf(*c)) placed = dialogueWarpFromString(elasticEffectOf(*c)->s("points"));
+            });
+            // The stretches either side of the marker, as a percentage of their length before.
+            size_t k = 0;
+            for (size_t i = 1; i + 1 < placed.size(); ++i)
+                if (!k || std::fabs(placed[i].u - to) < std::fabs(placed[k].u - to)) k = i;
+            QString text;
+            if (k) {
+                const double before = (placed[k].u - placed[k - 1].u) / std::max(1e-9, placed[k].w - placed[k - 1].w);
+                const double after = (placed[k + 1].u - placed[k].u) / std::max(1e-9, placed[k + 1].w - placed[k].w);
+                text = tr("%1 % | %2 %").arg(before * 100, 0, 'f', 1).arg(after * 100, 0, 'f', 1);
+            }
+            drag_.label = text;
+            break;
+        }
         case DragKind::TrackLine:
         case DragKind::TrackKey: {
             const int ti = drag_.track;
@@ -2387,7 +2547,8 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
                                      drag_.kind == DragKind::CaptionMove || drag_.kind == DragKind::CaptionIn ||
                                      drag_.kind == DragKind::CaptionOut || drag_.kind == DragKind::Line ||
                                      drag_.kind == DragKind::LineKey || drag_.kind == DragKind::TrackLine ||
-                                     drag_.kind == DragKind::TrackKey || drag_.kind == DragKind::TransitionEdge);
+                                     drag_.kind == DragKind::TrackKey || drag_.kind == DragKind::TransitionEdge ||
+                                     drag_.kind == DragKind::WarpMarker);
     if (gesture) state_->endGesture(true);
     if (drag_.kind == DragKind::TakeComp && drag_.started && drag_.pressTrack && drag_.compTo != drag_.pressFrame) {
         const TrackRef ref = *drag_.pressTrack;
@@ -2899,7 +3060,7 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
             FrameTime f = snapFrame(frameRound(pos.x()), {});
             FrameTime len = FrameTime(std::llround(5 * s->fpsValue()));
             std::vector<Id> created;
-            state_->apply(tr("Add %1").arg(QString::fromStdString(info->displayName)), [&](Project& p, Sequence& sq) {
+            state_->apply(tr("Add %1").arg(language::engine(info->displayName)), [&](Project& p, Sequence& sq) {
                 Clip c = makeGeneratorClip(p, type, len);
                 c.start = f;
                 auto r = edit::overwrite(p, sq, {TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)}, c);

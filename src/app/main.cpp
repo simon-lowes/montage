@@ -7,6 +7,7 @@
 #include <QTimer>
 
 #include "EditorState.h"
+#include "Language.h"
 #include "MainWindow.h"
 #include "Theme.h"
 
@@ -21,6 +22,7 @@ int main(int argc, char** argv) {
     QApplication::setWindowIcon(QIcon(":/montage.png"));
     montage::theme::loadSettings();  // (high contrast, text size)
     montage::theme::apply(app);
+    montage::language::install(montage::language::chosen());  // (Window › Language; right to left for Arabic and Hebrew)
 
     QCommandLineParser parser;
     parser.setApplicationDescription("Montage — professional non-linear video editor");

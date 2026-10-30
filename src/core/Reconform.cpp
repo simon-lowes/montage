@@ -703,6 +703,14 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         std::stable_sort(cues.begin(), cues.end(), [](const AdrCue& a, const AdrCue& b) { return a.start < b.start; });
         out.adrCues = std::move(cues);
     }
+    // VFX shots follow their clips (to the first piece of one the new cut splits); one cut out keeps its record, clipless.
+    for (size_t vi = 0; vi < out.vfxShots.size(); ++vi) {
+        const Id sourceClip = vi < source.vfxShots.size() ? source.vfxShots[vi].clip : 0;
+        Id& clip = out.vfxShots[vi].clip;
+        clip = 0;
+        for (size_t j = 0; j < pieces.size() && sourceClip && !clip; ++j)
+            if (auto c = copies.find({j, sourceClip}); c != copies.end()) clip = c->second;
+    }
 
     // New material from the new cut, on the same tracks (more where it has more), labelled to stand out.
     const int newLabel = std::max(0, labelFromName("Forest"));

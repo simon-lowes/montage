@@ -41,6 +41,7 @@
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/MeshWarp.h"
+#include "render/SurfaceTrack.h"
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
@@ -61,6 +62,7 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
+#include "render/Iab.h"
 #include "render/ImageSubtitles.h"
 #include "media/TextReader.h"
 #include "render/DcpSecurity.h"
@@ -68,6 +70,7 @@
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
 #include "media/Exr.h"
+#include "media/LensCalibration.h"
 #include "media/Proxy.h"
 #include "media/DescribePicture.h"
 #include "media/LanguageModel.h"
@@ -78,6 +81,7 @@
 #include "media/GainMap.h"
 #include "render/Gallery.h"
 #include "render/LinedScript.h"
+#include "render/RemoteGrade.h"
 #include "render/RemoteReview.h"
 #include "core/History.h"
 #include <QTcpServer>
@@ -8600,6 +8604,284 @@ colorspaces:
         QVERIFY2(code3 == 0, qPrintable(text3));
     }
 
+    void immersiveTrackFiles() {
+        // The FSK sync signal: each packet's CRC is CRC-16/XMODEM of its eight bytes after the sync word (worked out
+        // here byte by byte), the UUID's quarters in turn, the edit unit's index; the first bit (a 0) starts positive.
+        const dcp::Uuid asset = dcp::newUuid();
+        auto xmodem = [](const std::vector<uint8_t>& bytes) {
+            uint16_t crc = 0;
+            for (uint8_t b : bytes) {
+                crc ^= uint16_t(b << 8);
+                for (int i = 0; i < 8; ++i) crc = (crc & 0x8000) ? uint16_t(crc << 1 ^ 0x1021) : uint16_t(crc << 1);
+            }
+            return crc;
+        };
+        for (int fps : {24, 25, 30, 48, 96}) {
+            dcp::FskSync fsk;
+            QVERIFY(fsk.start(fps, asset));
+            int sub = 0;
+            for (int64_t unit = 0; unit < 3; ++unit) {
+                std::vector<int32_t> samples(size_t(48000 / fps));
+                fsk.frame(unit, samples.data());
+                if (unit == 0) QCOMPARE(samples[0], int32_t(0.03827 * 8388608.0));
+                const auto packets = dcp::readFskSync(samples.data(), samples.size());
+                QCOMPARE(int(packets.size()), fps <= 30 ? 4 : fps <= 60 ? 2 : 1);
+                for (const dcp::FskPacket& pk : packets) {
+                    QVERIFY(pk.crcOk);
+                    QCOMPARE(pk.subIndex, sub);
+                    QCOMPARE(pk.editUnit, uint32_t(unit));
+                    QVERIFY(std::equal(pk.uuid.begin(), pk.uuid.end(), asset.begin() + 4 * sub));
+                    std::vector<uint8_t> bytes = {uint8_t(pk.rateCode << 4 | sub)};
+                    bytes.insert(bytes.end(), pk.uuid.begin(), pk.uuid.end());
+                    for (int shift : {16, 8, 0}) bytes.push_back(uint8_t(unit >> shift));
+                    QCOMPARE(pk.crc, xmodem(bytes));
+                    sub = (sub + 1) % 4;
+                }
+            }
+        }
+        {
+            // A damaged bit fails its packet's CRC.
+            dcp::FskSync fsk;
+            QVERIFY(fsk.start(24, asset));
+            std::vector<int32_t> samples(2000);
+            fsk.frame(7, samples.data());
+            for (int i = 4 * 40 + 2; i < 4 * 41; ++i) samples[size_t(i)] = -samples[size_t(i)];  // bit 40 read the other way
+            const auto packets = dcp::readFskSync(samples.data(), samples.size());
+            QVERIFY(!packets.empty() && !packets[0].crcOk);
+        }
+        QVERIFY(!dcp::FskSync().start(23, asset));
+
+        // IAB frames in the cinema's track file (ST 429-18) and IMF's (ST 2067-201), read back unchanged.
+        QTemporaryDir dir;
+        std::vector<std::vector<uint8_t>> frames;
+        for (int k = 0; k < 5; ++k) {
+            iab::Frame f;
+            f.rate = iab::rateCode(24, 1);
+            std::vector<int32_t> wave(2000);
+            for (size_t i = 0; i < wave.size(); ++i) wave[i] = int32_t(std::lround(3e6 * std::sin(0.01 * double(i + 2000 * size_t(k)))));
+            f.audio[1] = wave;
+            f.bed = {{iab::C, 1}};
+            std::vector<uint8_t> out;
+            std::string err;
+            QVERIFY2(iab::writeFrame(f, true, out, &err), err.c_str());
+            frames.push_back(out);
+        }
+        std::string err;
+        {
+            dcp::IabMxfWriter w;
+            const dcp::Uuid id = dcp::newUuid();
+            QVERIFY2(w.open(dir.filePath("iab.mxf").toStdString(), id, 24, 1, 0, &err), err.c_str());
+            for (const auto& f : frames) QVERIFY2(w.write(f.data(), f.size(), &err), err.c_str());
+            std::vector<uint8_t> huge(dcp::IabMxfWriter::maxFrameBytes(24) + 1);
+            QVERIFY(!w.write(huge.data(), huge.size(), &err) && err.find("781250") != std::string::npos);
+            QVERIFY2(w.close(&err), err.c_str());
+            dcp::TrackFileReader r;
+            QVERIFY2(r.open(dir.filePath("iab.mxf").toStdString(), &err), err.c_str());
+            QVERIFY(r.iab() && r.editUnits() == 5 && r.containerDuration() == 5 && r.asset() == id && r.editRate().num == 24);
+            for (int k = 0; k < 5; ++k) {
+                std::vector<uint8_t> got;
+                QVERIFY(r.read(k, 0, got, nullptr, &err));
+                QVERIFY(got == frames[size_t(k)]);
+            }
+        }
+        {
+            dcp::ImfIabWriter w;
+            const dcp::Uuid id = dcp::newUuid();
+            QVERIFY2(w.open(dir.filePath("imf-iab.mxf").toStdString(), id, {24, 1}, "de", "Title", "1", &err), err.c_str());
+            for (const auto& f : frames) QVERIFY2(w.write(f.data(), f.size(), &err), err.c_str());
+            QVERIFY2(w.close(&err), err.c_str());
+            QCOMPARE(w.duration(), int64_t(5));
+            dcp::ImfTrackReader r;
+            QVERIFY2(r.open(dir.filePath("imf-iab.mxf").toStdString(), &err), err.c_str());
+            QVERIFY(r.kind() == dcp::ImfTrackReader::Kind::Iab && r.frames() == 5 && r.asset() == id && r.rate().num == 24);
+            for (int k = 0; k < 5; ++k) {
+                std::vector<uint8_t> got;
+                QVERIFY(r.frame(k, got, &err));
+                QVERIFY(got == frames[size_t(k)]);
+            }
+        }
+        // asdcplib's AS-02 reader takes the IMF file as IAB (when MONTAGE_TEST_ASDCP names its tools).
+        if (const QString tools = qEnvironmentVariable("MONTAGE_TEST_ASDCP"); !tools.isEmpty()) {
+            QProcess info;
+            info.setProcessChannelMode(QProcess::MergedChannels);
+            info.start(QDir(tools).filePath("as-02-info"), {"-i", "-H", dir.filePath("imf-iab.mxf")});
+            QVERIFY(info.waitForFinished(60000));
+            const QString text = QString::fromUtf8(info.readAll());
+            QVERIFY2(info.exitCode() == 0 && text.contains("IABEssenceDescriptor") && text.contains("IABSoundfieldLabelSubDescriptor"), qPrintable(text));
+        }
+    }
+
+    void exportsImmersiveImfAndDcp() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // A second at 24 fps in 5.1: a 1 kHz tone on A1 in the bed, a 440 Hz one on A2 as an object going from the
+        // left wall to the right.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+        s.audioLayout = "5.1";
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.5f, 0.5f, 0, 24));
+        for (int t = 0; t < 2; ++t) {
+            const QString wav = dir.filePath(QStringLiteral("tone%1.wav").arg(t));
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int n = 48000;
+            const double hz = t == 0 ? 1000 : 440;
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+            d.append("RIFF");
+            u32(36 + n * 2);
+            d.append("WAVEfmt ");
+            u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+            d.append("data");
+            u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(0.3 * 32767 * std::sin(2 * M_PI * hz * i / 48000.0)))));
+            f.write(d);
+            f.close();
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(wav.toStdString(), m));
+            p.media.push_back(m);
+            Clip a = makeClip(p, m, TrackKind::Audio, s);
+            a.duration = 24;
+            while (int(s.audioTracks.size()) <= t) s.audioTracks.emplace_back();
+            s.audioTracks[size_t(t)].clips.push_back(a);
+        }
+        Track& a2 = s.audioTracks[1];
+        a2.surround.object = true, a2.surround.width = 0;
+        a2.surroundXAuto.addKey(0, -1);
+        a2.surroundXAuto.addKey(23, 1);
+        a2.surroundYAuto.addKey(0, 0);
+        std::string err;
+
+        // The DCP: the 5.1 in 16 channels with the sync signal, and the IAB track beside it.
+        DcpSettings st;
+        st.title = "Immersive";
+        st.threads = 2;
+        st.immersive = true;
+        DcpResult r;
+        QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.immersive && r.iabBedChannels == 8 && r.iabObjects == 1 && r.channels == 6);
+        QVERIFY2(QString::fromStdString(r.name).contains("_51-IAB_2K_"), r.name.c_str());
+        std::vector<std::string> issues = verifyDcp(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out(QString::fromStdString(r.folder));
+        const QStringList iabs = out.entryList({"iab_*.mxf"}), sounds = out.entryList({"pcm_*.mxf"});
+        QVERIFY(iabs.size() == 1 && sounds.size() == 1);
+        {
+            dcp::TrackFileReader t;
+            QVERIFY2(t.open(out.filePath(iabs[0]).toStdString(), &err), err.c_str());
+            QVERIFY(t.iab() && t.editUnits() == 24);
+            std::vector<uint8_t> bytes;
+            iab::Frame first, last;
+            QVERIFY(t.read(0, 0, bytes, nullptr, &err) && iab::readFrame(bytes.data(), bytes.size(), first, &err));
+            QVERIFY(t.read(23, 0, bytes, nullptr, &err) && iab::readFrame(bytes.data(), bytes.size(), last, &err));
+            QVERIFY(first.dlc && !first.pcm && first.rate == iab::rateCode(24, 1) && first.bed.size() == 8 && first.objects.size() == 1);
+            QVERIFY(first.objects[0].pan.front().x < 0.1 && last.objects[0].pan.back().x > 0.9);
+        }
+        {
+            dcp::TrackFileReader t;
+            QVERIFY2(t.open(out.filePath(sounds[0]).toStdString(), &err), err.c_str());
+            std::vector<uint8_t> unit;
+            QVERIFY(t.read(5, 0, unit, nullptr, &err));
+            QCOMPARE(unit.size(), size_t(2000 * 3 * 16));
+            auto sample = [&](size_t i, int c) {
+                const uint8_t* b = &unit[(i * 16 + size_t(c)) * 3];
+                return int32_t(uint32_t(b[0]) << 8 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 24) >> 8;
+            };
+            double centre = 0, unused = 0;
+            std::vector<int32_t> sync(2000);
+            for (size_t i = 0; i < 2000; ++i) {
+                centre += std::abs(sample(i, 2));
+                for (int c : {6, 7, 8, 9, 10, 11, 12, 14, 15}) unused += std::abs(sample(i, c));
+                sync[i] = sample(i, 13);
+            }
+            QVERIFY(centre > 0 && unused == 0);
+            const auto packets = dcp::readFskSync(sync.data(), sync.size());
+            QCOMPARE(packets.size(), size_t(4));
+            for (const dcp::FskPacket& pk : packets) QVERIFY(pk.crcOk && pk.editUnit == 5 && std::equal(pk.uuid.begin(), pk.uuid.end(), t.asset().begin() + 4 * pk.subIndex));
+        }
+        {
+            QFile f(QString::fromStdString(r.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString cpl = QString::fromUtf8(f.readAll());
+            for (const char* want : {"<axd:AuxData", "xmlns:axd=\"http://www.dolby.com/schemas/2012/AD\"", "<axd:DataType>urn:smpte:ul:060e2b34.04010105.0e090604.00000000</axd:DataType>",
+                                     "51/L,R,C,LFE,Ls,Rs,-,-,-,-,-,-,-,FSKSync,-,-", "<meta:Name>IAB Profile</meta:Name>",
+                                     "<meta:Value>SMPTE-ST-2098-2:2019-P1</meta:Value>"})
+                QVERIFY2(cpl.contains(want), want);
+        }
+        // A main sound without its sync signal is found out.
+        {
+            DcpSettings plain = st;
+            plain.immersive = false;
+            plain.title = "Plain";
+            DcpResult pr;
+            QVERIFY2(exportDcp(p, s, plain, dir.path().toStdString(), &pr, {}, &err), err.c_str());
+            const QString plainSound = QDir(QString::fromStdString(pr.folder)).entryList({"pcm_*.mxf"}).value(0);
+            QVERIFY(QFile::remove(out.filePath(sounds[0])));
+            QVERIFY(QFile::copy(QDir(QString::fromStdString(pr.folder)).filePath(plainSound), out.filePath(sounds[0])));
+            issues = verifyDcp(r.folder);
+            bool found = false;
+            for (const std::string& i : issues) found = found || i.find("16 channels") != std::string::npos;
+            QVERIFY(found);
+        }
+
+        // Encrypted: the immersive track has a key of its own, of the type immersive tracks have.
+        if (dcp::securityAvailable()) {
+            DcpSettings sealed = st;
+            sealed.title = "Sealed";
+            sealed.encrypt = true;
+            sealed.dkdms = dir.filePath("dkdms").toStdString();
+            DcpResult sr;
+            QVERIFY2(exportDcp(p, s, sealed, dir.path().toStdString(), &sr, {}, &err), err.c_str());
+            issues = verifyDcp(sr.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QFile k(QString::fromStdString(sr.dkdm));
+            QVERIFY(k.open(QIODevice::ReadOnly));
+            const QString kdm = QString::fromUtf8(k.readAll());
+            QVERIFY(kdm.contains("<KeyType scope=\"http://www.dolby.com/cp850/2012/KDM#kdm-key-type\">MDEK</KeyType>") && kdm.count("<TypedKeyId>") == 3);
+        }
+
+        // IMF: an IABSequence of PCM frames beside the 5.1.
+        ImfSettings im;
+        im.title = "Immersive";
+        im.threads = 2;
+        im.immersive = true;
+        ImfResult ir;
+        QVERIFY2(exportImf(p, s, im, dir.path().toStdString(), &ir, {}, &err), err.c_str());
+        QVERIFY(ir.immersive && ir.iabBedChannels == 8 && ir.iabObjects == 1);
+        issues = verifyImf(ir.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir imf(QString::fromStdString(ir.folder));
+        const QStringList imfIab = imf.entryList({"IAB_*.mxf"});
+        QCOMPARE(imfIab.size(), 1);
+        {
+            dcp::ImfTrackReader t;
+            QVERIFY2(t.open(imf.filePath(imfIab[0]).toStdString(), &err), err.c_str());
+            QVERIFY(t.kind() == dcp::ImfTrackReader::Kind::Iab && t.frames() == 24);
+            std::vector<uint8_t> bytes;
+            iab::Frame f;
+            QVERIFY(t.frame(12, bytes, &err) && iab::readFrame(bytes.data(), bytes.size(), f, &err));
+            QVERIFY(f.pcm && !f.dlc && f.objects.size() == 1 && f.bed.size() == 8);
+        }
+        ImfComposition comp;
+        QVERIFY2(readImfComposition(ir.cpl, comp, &err), err.c_str());
+        bool sequence = false;
+        for (const ImfVirtualTrack& t : comp.tracks) sequence = sequence || (t.kind == "IABSequence" && t.length() == 24);
+        QVERIFY(sequence);
+        {
+            QFile f(QString::fromStdString(ir.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString cpl = QString::fromUtf8(f.readAll());
+            for (const char* want : {"xmlns:iab=\"http://www.smpte-ra.org/ns/2067-201/2019\"", "<iab:IABSequence>", "<r0:IABEssenceDescriptor",
+                                     "<r1:SoundCompression>urn:smpte:ul:060e2b34.04010105.0e090604.00000000</r1:SoundCompression>"})
+                QVERIFY2(cpl.contains(want), want);
+        }
+        const QStringList photon = photonErrors(imf.path());
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+    }
+
     void dcpSecurity() {
         // Canonical XML matches what lxml writes for the same document.
         const std::string doc =
@@ -10475,6 +10757,256 @@ colorspaces:
             // The corners hold.
             QVERIFY(out.at(0, 75)[1] > 0.9f);
         }
+    }
+
+    // Surface tracking (render/SurfaceTrack.h): a textured surface turned and bent by moving bumps over 48 frames.
+    void surfaceTracking() {
+        constexpr int W = 320, H = 240, frames = 49;
+        // The texture: waves of 10 to 40 px in many directions.
+        struct Wave {
+            double fx, fy, phase, amp;
+        };
+        std::vector<Wave> waves;
+        {
+            std::mt19937 rng(11);
+            std::uniform_real_distribution<double> u(0, 1);
+            for (int k = 0; k < 40; ++k) {
+                const double wl = 10 + 30 * u(rng), dir = 2 * M_PI * u(rng);
+                waves.push_back({std::cos(dir) / wl, std::sin(dir) / wl, 2 * M_PI * u(rng), 0.025 + 0.02 * u(rng)});
+            }
+        }
+        auto texture = [&](double x, double y) {
+            double v = 0.5;
+            for (const Wave& w : waves) v += w.amp * std::sin(2 * M_PI * (w.fx * x + w.fy * y) + w.phase);
+            return v;
+        };
+        // Where frame f puts each point of the reference (frame 0): turned up to 7 degrees about the middle, and three
+        // bumps moving across, growing from nothing.
+        struct Bump {
+            double x0, y0, vx, vy, ax, ay;
+        };
+        const Bump bumps[] = {{120, 100, 1.0, 0.3, 5, -4}, {200, 150, -0.8, -0.4, -4, 5}, {170, 90, 0.2, 0.9, 6, 3}};
+        auto moved = [&](int f, double x, double y, double& ox, double& oy) {
+            const double k = double(f) / (frames - 1), th = 0.12 * k;
+            ox = 160 + std::cos(th) * (x - 160) - std::sin(th) * (y - 120);
+            oy = 120 + std::sin(th) * (x - 160) + std::cos(th) * (y - 120);
+            for (const Bump& b : bumps) {
+                const double cx = b.x0 + b.vx * f, cy = b.y0 + b.vy * f;
+                const double g = std::exp(-((x - cx) * (x - cx) + (y - cy) * (y - cy)) / (2 * 35.0 * 35.0)) * k;
+                ox += b.ax * g, oy += b.ay * g;
+            }
+        };
+        auto back = [&](int f, double x, double y, double& ux, double& uy) {
+            ux = x, uy = y;
+            for (int it = 0; it < 60; ++it) {
+                double mx, my;
+                moved(f, ux, uy, mx, my);
+                ux += x - mx, uy += y - my;
+            }
+        };
+        std::vector<GrayImage> grays(frames);
+        for (int f = 0; f < frames; ++f) {
+            GrayImage& g = grays[size_t(f)];
+            g.width = W, g.height = H;
+            g.px.resize(size_t(W) * H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double ux, uy;
+                    back(f, x + 0.5, y + 0.5, ux, uy);
+                    g.px[size_t(y) * W + size_t(x)] = float(texture(ux, uy));
+                }
+        }
+        const std::vector<MeshPoint> outline = {{90, 60}, {230, 70}, {245, 170}, {150, 185}, {80, 150}};
+        SurfaceTrack base;
+        base.width = W, base.height = H, base.frameSeconds = 1.0 / 24, base.reference = 0;
+        base.mesh = surfaceMesh(outline, W, H, 200);
+        QVERIFY2(base.mesh.rest.size() > 120 && base.mesh.rest.size() < 400, qPrintable(QString::number(base.mesh.rest.size())));
+        auto read = [&](int i, GrayImage& out) {
+            out = grays[size_t(i)];
+            return true;
+        };
+        SurfaceTrack t = base;
+        std::string err;
+        QVERIFY2(trackSurface(t, frames, 0, read, {}, {}, &err), err.c_str());
+
+        // Within 0.3 px of where the bending puts each vertex on average, 1 px at worst, 0.5 px on average at the end;
+        // no triangle turned over.
+        double sum = 0, worst = 0, last = 0;
+        size_t count = 0;
+        for (int f = 0; f < frames; ++f) {
+            QCOMPARE(t.frames[size_t(f)].size(), t.mesh.rest.size());
+            for (size_t v = 0; v < t.mesh.rest.size(); ++v) {
+                double gx, gy;
+                moved(f, t.mesh.rest[v][0], t.mesh.rest[v][1], gx, gy);
+                const double e = std::hypot(t.frames[size_t(f)][v][0] - gx, t.frames[size_t(f)][v][1] - gy);
+                sum += e, worst = std::max(worst, e), ++count;
+                if (f == frames - 1) last += e / double(t.mesh.rest.size());
+            }
+            for (const auto& tr : t.mesh.tris) {
+                auto area = [&](const std::vector<MeshPoint>& p) {
+                    const MeshPoint &a = p[size_t(tr[0])], &b = p[size_t(tr[1])], &c = p[size_t(tr[2])];
+                    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                };
+                QVERIFY(area(t.frames[size_t(f)]) * area(t.mesh.rest) > 0);
+            }
+        }
+        const double mean = sum / double(count);
+        qInfo("Surface track: mean %.3f px, worst %.3f px, %.3f px at frame %d", mean, worst, last, frames - 1);
+        QVERIFY2(mean <= 0.3 && worst <= 1 && last < 0.5, qPrintable(QString("%1 %2 %3").arg(mean).arg(worst).arg(last)));
+
+        // The same on one thread and on eight.
+        {
+            SurfaceTrack one = base, eight = base;
+            SurfaceTrackOptions o1, o8;
+            o1.threads = 1, o8.threads = 8;
+            QVERIFY(trackSurface(one, frames, 0, read, o1));
+            QVERIFY(trackSurface(eight, frames, 0, read, o8));
+            QVERIFY(one.frames == eight.frames);
+            QVERIFY(one.frames == t.frames);
+        }
+
+        // A logo on the reference frame carried on to the last: as the bending itself draws it, within 1/255 on average.
+        Image logo(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double d = std::hypot(x + 0.5 - 160, y + 0.5 - 125);
+                const double a = std::clamp(28 - d, 0.0, 1.0) * 0.9 + (std::fabs(x + 0.5 - 160) < 50 && std::fabs(y + 0.5 - 125) < 6 ? 0.1 : 0.0);
+                float* p = logo.at(x, y);
+                p[0] = float(a * 0.9), p[1] = float(a * 0.2), p[2] = float(a * 0.1), p[3] = float(a);
+            }
+        const int f = frames - 1;
+        Image carried(W, H), truth(W, H);
+        drawOnSurface(t, f, logo, carried, false);
+        double diff = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                double ux, uy;
+                back(f, x + 0.5, y + 0.5, ux, uy);
+                const double sx = std::clamp(ux - 0.5, 0.0, W - 1.0), sy = std::clamp(uy - 0.5, 0.0, H - 1.0);
+                const int x0 = std::min(int(sx), W - 2), y0 = std::min(int(sy), H - 2);
+                const double ax = sx - x0, ay = sy - y0;
+                for (int c = 0; c < 4; ++c) {
+                    const double v = (logo.at(x0, y0)[c] * (1 - ax) + logo.at(x0 + 1, y0)[c] * ax) * (1 - ay) +
+                                     (logo.at(x0, y0 + 1)[c] * (1 - ax) + logo.at(x0 + 1, y0 + 1)[c] * ax) * ay;
+                    truth.at(x, y)[c] = float(v);
+                    diff += std::fabs(v - carried.at(x, y)[c]);
+                }
+            }
+        diff /= double(W) * H * 4;
+        QVERIFY2(diff < 1.0 / 255, qPrintable(QString::number(diff * 255)));
+
+        // Held still on the reference and put back: the frame again, within 1/255 on average where the surface is.
+        Image frame(W, H);
+        for (size_t i = 0; i < size_t(W) * H; ++i) std::fill_n(&frame.px[i * 4], 3, grays[size_t(f)].px[i]), frame.px[i * 4 + 3] = 1;
+        Image still = frame;
+        drawOnSurface(t, f, frame, still, true);
+        Image again = still;
+        drawOnSurface(t, f, still, again, false);
+        const std::vector<float> on = meshMap(t.mesh, t.frames[size_t(f)], t.mesh.rest, W, H);
+        double back2 = 0;
+        size_t inside = 0;
+        for (size_t i = 0; i < size_t(W) * H; ++i) {
+            if (std::isnan(on[i * 2])) continue;
+            back2 += std::fabs(again.px[i * 4 + 1] - frame.px[i * 4 + 1]), ++inside;
+        }
+        back2 /= double(std::max<size_t>(1, inside));
+        QVERIFY2(inside > 10000 && back2 < 1.0 / 255, qPrintable(QString("%1 %2").arg(inside).arg(back2 * 255)));
+
+        // The ST map, read as a compositor reads one, puts each pixel where the mesh does (within 0.01 px); written
+        // as OpenEXR with the motion vectors, read back the same.
+        const std::vector<float> st = surfaceStMap(t, f);
+        double stWorst = 0;
+        for (int y = 0; y < H; y += 3)
+            for (int x = 0; x < W; x += 3) {
+                const size_t i = size_t(y) * W + size_t(x);
+                if (std::isnan(on[i * 2])) continue;
+                double sx, sy;
+                QVERIFY(stMapLookup(st, W, H, x + 0.5, y + 0.5, W, H, sx, sy));
+                stWorst = std::max(stWorst, std::hypot(sx - on[i * 2], sy - on[i * 2 + 1]));
+            }
+        QVERIFY2(stWorst < 0.01, qPrintable(QString::number(stWorst)));
+        if (exrAvailable()) {
+            QTemporaryDir exrDir;
+            const std::string base2 = (exrDir.path() + "/surface/shot").toStdString();
+            const std::vector<std::string> files = writeSurfaceExrs(t, base2, 46, 48, &err);
+            QVERIFY2(files.size() == 3, err.c_str());
+            QVERIFY(files.back().size() > 9 && files.back().substr(files.back().size() - 9) == ".0048.exr");
+            int rw = 0, rh = 0;
+            std::vector<float> rgba;
+            QVERIFY2(readExrLayer(files.back(), "", rw, rh, rgba, &err), err.c_str());
+            QCOMPARE(rw, W);
+            QCOMPARE(rh, H);
+            double fileWorst = 0;
+            for (size_t i = 0; i < size_t(W) * H; ++i) fileWorst = std::max({fileWorst, double(std::fabs(rgba[i * 4] - st[i * 3])), double(std::fabs(rgba[i * 4 + 1] - st[i * 3 + 1]))});
+            QVERIFY2(fileWorst < 1e-6, qPrintable(QString::number(fileWorst)));
+            std::vector<float> fwd;
+            QVERIFY2(readExrLayer(files.front(), "forward", rw, rh, fwd, &err), err.c_str());
+            const std::vector<float> motion = surfaceMotion(t, 46, 1);
+            const size_t mid = size_t(125) * W + 160;
+            QVERIFY2(std::fabs(fwd[mid * 4] - motion[mid * 2]) < 1e-5 && std::fabs(fwd[mid * 4 + 1] + motion[mid * 2 + 1]) < 1e-5,
+                     qPrintable(QString("%1 %2 %3 %4").arg(fwd[mid * 4]).arg(fwd[mid * 4 + 1]).arg(motion[mid * 2]).arg(motion[mid * 2 + 1])));
+        }
+
+        // As text and back.
+        SurfaceTrack parsed;
+        QVERIFY(surfaceTrackFromString(surfaceTrackToString(t), parsed));
+        QCOMPARE(parsed.mesh.tris, t.mesh.tris);
+        QCOMPARE(parsed.frames.size(), t.frames.size());
+        for (size_t i = 0; i < t.frames.size(); ++i)
+            for (size_t v = 0; v < t.mesh.rest.size(); ++v)
+                QVERIFY(std::fabs(parsed.frames[i][v][0] - t.frames[i][v][0]) < 1e-3 && std::fabs(parsed.frames[i][v][1] - t.frames[i][v][1]) < 1e-3);
+        QCOMPARE(parsed.frameAt(30 / 24.0), 30);
+        QCOMPARE(parsed.frameAt(60 / 24.0), -1);
+        QVERIFY(!surfaceTrackFromString("surface 1\nsize 10 10\ntime 0 0", parsed));
+
+        // A vertex put by hand on frame 30 stays there; the frames before it are kept and the ones after solved again.
+        {
+            SurfaceTrack fixed = t;
+            const int v = int(fixed.mesh.rest.size() / 2);
+            const MeshPoint at{fixed.frames[30][size_t(v)][0] + 2, fixed.frames[30][size_t(v)][1] - 1};
+            fixed.fixes[30][v] = at;
+            QVERIFY2(trackSurface(fixed, frames, 30, read, {}, {}, &err), err.c_str());
+            QVERIFY(fixed.frames[29] == t.frames[29]);
+            QVERIFY(std::fabs(fixed.frames[30][size_t(v)][0] - at[0]) < 1e-3 && std::fabs(fixed.frames[30][size_t(v)][1] - at[1]) < 1e-3);
+            QVERIFY(fixed.frames[31] != t.frames[31]);
+            // (not from frames never tracked)
+            SurfaceTrack fresh = base;
+            fresh.frames.assign(frames, {});
+            QVERIFY(!trackSurface(fresh, frames, 30, read));
+            // On the last frame, with nothing after it to track: held there all the same.
+            SurfaceTrack last = t;
+            last.fixes[frames - 1][v] = {last.frames[frames - 1][size_t(v)][0] + 1, last.frames[frames - 1][size_t(v)][1]};
+            QVERIFY2(trackSurface(last, frames, frames - 1, read, {}, {}, &err), err.c_str());
+            QVERIFY(std::fabs(last.frames[frames - 1][size_t(v)][0] - last.fixes[frames - 1][v][0]) < 1e-3);
+            // Lost from frame 40 when solved again: nothing after it is left from the track before.
+            SurfaceTrack lost = t;
+            auto blind = [&](int i, GrayImage& out) { return i < 40 && read(i, out); };
+            QVERIFY2(trackSurface(lost, frames, 30, blind, {}, {}, &err), err.c_str());
+            QVERIFY(!lost.frames[39].empty());
+            for (int i = 40; i < frames; ++i) QVERIFY(lost.frames[size_t(i)].empty());
+        }
+
+        // Points far off the mesh carried as they are, and text that would size or place things absurdly refused.
+        const std::vector<MeshPoint> far = surfaceCarry(t, 0, 30, {{1e300, 1e300}, {-1e300, 5}, {std::nan(""), 5}});
+        QCOMPARE(far.size(), size_t(3));
+        const std::string text = surfaceTrackToString(t);
+        auto refused = [&](const std::string& from, const std::string& to) {
+            std::string bad = text;
+            const size_t at = bad.find(from);
+            if (at == std::string::npos) return false;
+            bad.replace(at, from.size(), to);
+            SurfaceTrack out;
+            return !surfaceTrackFromString(bad, out);
+        };
+        QVERIFY(refused("size 320 240", "size 65536 65536"));
+        SurfaceTrack farOff = t;
+        farOff.mesh.rest[0] = {1e30, 5};
+        QVERIFY(!surfaceTrackFromString(surfaceTrackToString(farOff), parsed));
+        farOff = t;
+        farOff.frames[3][0] = {1e9, 5};
+        QVERIFY(!surfaceTrackFromString(surfaceTrackToString(farOff), parsed));
+        QVERIFY(!surfaceTrackFromString(text.substr(0, text.find("frames ")) + "frames 10000000\n", parsed));
+        QVERIFY(refused("\nframes 49\n", "\nframes 48\n"));  // (one frame too many: read as a fix)
     }
 
     void gradeNodeGraphs() {
@@ -12500,6 +13032,249 @@ colorspaces:
         sched.stop();
     }
 
+    void remoteGradeFollows() {
+        using namespace montage::remote;
+        // Settings: SRT with a passphrase, and a port with one after it for the notes.
+        GradeSettings bad;
+        QVERIFY(!checkGradeSettings(bad).empty());
+        bad.passphrase = "a passphrase long enough";
+        QVERIFY(checkGradeSettings(bad).empty());
+        bad.address = "udp://0.0.0.0:9100";
+        QVERIFY(!checkGradeSettings(bad).empty());
+        bad.address = "srt://0.0.0.0:65535";
+        QVERIFY(!checkGradeSettings(bad).empty());
+
+        // Patches: values changed, keys added and removed, arrays resized; a patch that does not fit refused.
+        const std::string a = R"({"a":1,"b":{"c":[1,2,3],"d":"x","gone":true},"e":[{"f":1},{"f":2}]})";
+        const std::string b = R"({"a":1,"b":{"c":[1,2],"d":"y","new":null},"e":[{"f":1},{"f":5,"g":[]}],"h":2.5})";
+        const std::string patch = jsonPatch(a, b);
+        std::string out;
+        QVERIFY(applyJsonPatch(a, patch, out));
+        QCOMPARE(jsonHash(out), jsonHash(b));
+        QVERIFY(jsonHash(out) != jsonHash(a) && jsonPatch(b, b) == "[]");
+        QVERIFY(!applyJsonPatch(a, R"([{"p":["e",7,"f"],"v":1}])", out));
+        QVERIFY(!applyJsonPatch(a, R"([{"p":["b","zz","q"],"v":1}])", out));
+        QVERIFY(!applyJsonPatch(a, R"([{"p":[],"v":1}])", out));
+        QVERIFY(!applyJsonPatch(a, R"([{"p":["a","k"],"v":1}])", out));
+        QVERIFY(applyJsonPatch(a, R"([{"p":["b","gone"],"x":1}])", out) && !QString::fromStdString(out).contains("gone"));
+
+        // The playhead while parked stays; while playing moves on at the picture rate and speed.
+        ViewState v;
+        v.playhead = 100;
+        QCOMPARE(followPlayhead(v, {24, 1}, 500), FrameTime(100));
+        v.playing = true;
+        QCOMPARE(followPlayhead(v, {24, 1}, 500), FrameTime(112));
+        v.speed = -2;
+        QCOMPARE(followPlayhead(v, {24, 1}, 500), FrameTime(76));
+
+        // A project: two clips of media and a colour matte, the first with a grade.
+        Project p;
+        Sequence seq = makeSequence(p, "Grade", 64, 36, {24, 1});
+        p.sequences.push_back(seq);
+        p.activeSequence = seq.id;
+        Id media[2];
+        for (int i = 0; i < 2; ++i) {
+            MediaItem m;
+            m.id = media[i] = p.newId();
+            m.name = "shot" + std::to_string(i);
+            m.path = "/colourist/media/shot" + std::to_string(i) + ".mov";
+            m.kind = MediaKind::Video;
+            m.duration = 48;
+            p.media.push_back(m);
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = m.id;
+            c.start = 48 * i;
+            c.duration = 48;
+            Effect e;
+            e.id = p.newId();
+            e.type = "colorCorrect";
+            e.params["exposure"] = 0.0;
+            e.params["saturation"] = 1.0;
+            c.effects.push_back(e);
+            p.sequences[0].videoTracks[0].clips.push_back(c);
+        }
+        for (int i = 0; i < 40; ++i) {  // (and a reel's worth of other shots, graded, left alone)
+            Clip c = makeGeneratorClip(p, "color", 10);
+            c.start = 10 * i;
+            Effect e;
+            e.id = p.newId();
+            e.type = "colorCorrect";
+            e.params["exposure"] = 0.01 * i;
+            c.effects.push_back(e);
+            p.sequences[0].videoTracks[1].clips.push_back(c);
+        }
+        // The client's copy: its own media, elsewhere.
+        Project local = p;
+        local.media[0].path = "/client/footage/shot0.mov";
+        Project received = p;
+        keepLocalMedia(local, received);
+        QVERIFY(received.media[0].path == "/client/footage/shot0.mov" && received.media[1].path == p.media[1].path);
+        // A frame showing media the client lacks comes from the stream.
+        auto lacks = [&](Id m) { return m == media[1]; };
+        QVERIFY(!needsStream(p, p.sequences[0], 10, lacks));
+        QVERIFY(needsStream(p, p.sequences[0], 60, lacks));
+        p.sequences[0].videoTracks[0].clips[1].enabled = false;
+        QVERIFY(!needsStream(p, p.sequences[0], 60, lacks));
+        p.sequences[0].videoTracks[0].clips[1].enabled = true;
+
+        // Live over loopback (a port of this test run's own).
+        std::string why;
+        if (!gradingAvailable(&why)) QSKIP(why.c_str());
+        int port = 0;  // (one with the next free as well, for the notes)
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QUdpSocket a, b;
+            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1)) port = a.localPort();
+        }
+        QVERIFY(port > 0);
+        GradeSettings hs;
+        hs.address = "srt://127.0.0.1:" + std::to_string(port);
+        hs.passphrase = output::generatePassphrase();
+        GradeHost host;
+        std::string err;
+        QVERIFY2(host.start(hs, &err), err.c_str());
+        host.publish(p);
+        auto waitFor = [](const std::function<bool()>& done, int ms) {
+            QElapsedTimer t;
+            t.start();
+            while (!done() && t.elapsed() < ms) QThread::msleep(10);
+            return done();
+        };
+        // A wrong passphrase is refused.
+        {
+            GradeSettings wrong = hs;
+            wrong.passphrase = "not the right passphrase";
+            GradeClient intruder;
+            QVERIFY(intruder.start(wrong, &err));
+            QVERIFY(waitFor([&] { return !intruder.status().error.empty(); }, 10000));
+            QVERIFY(!intruder.status().connected && QString::fromStdString(intruder.status().error).contains("passphrase"));
+            Project none;
+            QVERIFY(!intruder.takeProject(none));
+            intruder.stop();
+            QCOMPARE(host.status().snapshots, int64_t(0));
+        }
+        GradeSettings cs = hs;
+        cs.name = "Client";
+        GradeClient client;
+        QVERIFY2(client.start(cs, &err), err.c_str());
+        Project followed;
+        uint64_t rev = 0;
+        auto caughtUp = [&] {
+            Project got;
+            if (client.takeProject(got, &rev)) followed = std::move(got);
+            return rev == host.status().revision && projectToJson(followed) == projectToJson(p);
+        };
+        QVERIFY(waitFor(caughtUp, 15000));
+        QVERIFY(host.status().connected && host.status().snapshots == 1 && waitFor([&] { return host.status().client == "Client"; }, 5000));
+
+        // 500 random grade changes (values, keys, effects added and removed, clips switched off), some in bursts: the
+        // client's project ends byte-identical, sent as patches.
+        std::mt19937 rng(7);
+        for (int i = 0; i < 500; ++i) {
+            Clip& c = p.sequences[0].videoTracks[0].clips[rng() % 2];
+            switch (rng() % 6) {
+            case 0:
+            case 1:
+                c.effects[0].params["exposure"].value = double(int(rng() % 2001) - 1000) / 1000.0;
+                break;
+            case 2:
+                c.effects[0].params["saturation"].keys.push_back({FrameTime(rng() % 48), double(rng() % 200) / 100.0});
+                std::sort(c.effects[0].params["saturation"].keys.begin(), c.effects[0].params["saturation"].keys.end(),
+                          [](const Keyframe& x, const Keyframe& y) { return x.t < y.t; });
+                break;
+            case 3:
+                if (c.effects.size() < 4) {
+                    Effect e;
+                    e.id = p.newId();
+                    e.type = "curves";
+                    e.params["master"] = double(rng() % 100) / 100.0;
+                    c.effects.push_back(e);
+                } else {
+                    c.effects.pop_back();
+                }
+                break;
+            case 4:
+                c.effects[0].enabled = !c.effects[0].enabled;
+                break;
+            default:
+                c.effects[0].strings["look"] = "look " + std::to_string(rng() % 10);
+                break;
+            }
+            host.publish(p);
+            if (rng() % 8 == 0) QThread::msleep(15);
+        }
+        QVERIFY(waitFor(caughtUp, 20000));
+        QVERIFY2(host.status().patches > 0 && host.status().snapshots == 1, QByteArray::number(qlonglong(host.status().patches)).constData());
+        QCOMPARE(client.status().mismatches, int64_t(0));
+
+        // The view: parked, the playhead is the colourist's; playing at 24 fps, followed within a frame.
+        ViewState view;
+        view.sequence = seq.id;
+        view.playhead = 30;
+        view.viewer = R"({"exposure":2})";
+        view.compare = std::string("\x89PNG fake picture", 17);
+        host.setView(view);
+        ViewState seen;
+        int64_t age = 0;
+        QVERIFY(waitFor([&] { return client.view(seen) && seen.playhead == 30; }, 5000));
+        QVERIFY(seen.sequence == seq.id && seen.viewer == view.viewer && seen.compare == view.compare && !seen.playing);
+        view.playhead = 31;  // (the picture sent once, kept)
+        host.setView(view);
+        QVERIFY(waitFor([&] { return client.view(seen) && seen.playhead == 31; }, 5000));
+        QVERIFY(seen.compare == view.compare);
+        QElapsedTimer playing;
+        playing.start();
+        view.playing = true;
+        view.compare.clear();
+        // (each end shows whole frames: the client's frame against the colourist's exact place, at most a frame behind or
+        // ahead of it beyond the frame it rounds down to)
+        double worst = 0;
+        while (playing.elapsed() < 1500) {
+            view.playhead = 31 + FrameTime(double(playing.elapsed()) * 24 / 1000);
+            host.setView(view);
+            QThread::msleep(5);
+            if (playing.elapsed() > 300 && client.view(seen, &age)) {
+                const double hostNow = 31 + double(playing.elapsed()) * 24 / 1000;
+                worst = std::max(worst, std::abs(double(followPlayhead(seen, {24, 1}, age)) - hostNow));
+            }
+        }
+        QVERIFY2(worst < 2, QByteArray::number(worst).constData());
+        QVERIFY(seen.compare.empty() && seen.playing);
+
+        // Notes and pointers come back.
+        output::RemoteMarker note;
+        note.frame = 12;
+        note.sequence = seq.id;
+        note.text = "Warmer skin here";
+        client.sendNote(note);
+        client.sendPointer({seq.id, 12, 0.25, 0.75, ""});
+        std::vector<output::RemoteMarker> notes;
+        std::vector<Pointer> pointers;
+        QVERIFY(waitFor([&] {
+            for (auto& n : host.takeNotes()) notes.push_back(n);
+            for (auto& q : host.takePointers()) pointers.push_back(q);
+            return notes.size() == 1 && pointers.size() == 1;
+        }, 10000));
+        QVERIFY(notes[0].text == "Warmer skin here" && notes[0].author == "Client" && notes[0].frame == 12 && notes[0].sequence == seq.id);
+        QVERIFY(pointers[0].x == 0.25 && pointers[0].y == 0.75 && pointers[0].author == "Client");
+
+        // Drift: a copy that differs is found by the next check and sent whole again.
+        client.damageForTest();
+        QVERIFY(waitFor([&] { return client.status().mismatches >= 1 && host.status().resyncs >= 1; }, 15000));
+        QVERIFY(waitFor(caughtUp, 10000));
+
+        // A dropped connection: the client joins again and is brought up to date.
+        client.stop();
+        QVERIFY(waitFor([&] { return !host.status().connected; }, 20000));
+        p.sequences[0].videoTracks[0].clips[0].effects[0].params["exposure"].value = 0.123;
+        host.publish(p);
+        QVERIFY(client.start(cs, &err));
+        QVERIFY(waitFor(caughtUp, 20000));
+        QVERIFY(host.status().snapshots == 3);
+        client.stop();
+        host.stop();
+    }
+
     void remoteReviewStream() {
         using namespace montage::output;
         // Settings: SRT needs a passphrase of 10 to 79 characters, and so do markers; addresses need a port.
@@ -14466,6 +15241,77 @@ colorspaces:
         double worst = 0;
         for (size_t i = 0; i < cpu.px.size() && i < onGpu.px.size(); ++i) worst = std::max(worst, double(std::fabs(cpu.px[i] - onGpu.px[i])));
         QVERIFY2(worst <= 2e-3, qPrintable(QString("CPU and GPU differ by %1").arg(worst)));
+    }
+
+    void nodeGraphRendersAsItPlays() {
+        // A clip on V2 at half size, laid by its graph over what V1 (red) shows: Render and Replace keeps that
+        // picture, with the clip's movement inside it and the graph not run again on the render; Restore brings back
+        // the graph and the movement.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 1, 0, 0, 0, 40)).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, colorClip(p, 0.25f, 0.25f, 0.25f, 10, 20)).ok);
+        const Id id = s.videoTracks[1].clips[0].id;
+        edit::clipById(s, id)->motion.params["scale"] = 50.0;
+        int in = 0, merge = 0, layer = 0;
+        QVERIFY(edit::startComposite(p, s, id, &in).ok);
+        CompositeNode track = *findCompositeNode(edit::clipById(s, id)->composite, in);
+        track.source = "track";
+        track.track = 0;
+        QVERIFY(edit::setCompositeNode(p, s, id, track).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "merge", in, &merge).ok);
+        QVERIFY(edit::addCompositeNode(p, s, id, "input", merge, &layer).ok);
+        QCOMPARE(findCompositeNode(edit::clipById(s, id)->composite, layer)->source, std::string("clip"));
+        RenderOptions o;
+        auto px = [&](int x, int y) {
+            const Image img = renderProgramFrame(p, s, 15, o);
+            const float* v = img.at(x, y);
+            return std::array<float, 3>{v[0], v[1], v[2]};
+        };
+        auto near = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+            return std::fabs(a[0] - b[0]) < 0.03f && std::fabs(a[1] - b[1]) < 0.03f && std::fabs(a[2] - b[2]) < 0.03f;
+        };
+        auto show = [](const std::array<float, 3>& v) { return qPrintable(QString("%1 %2 %3").arg(v[0]).arg(v[1]).arg(v[2])); };
+        const auto middle = px(32, 18), corner = px(2, 2);
+        QVERIFY2(near(middle, {0.25f, 0.25f, 0.25f}), show(middle));
+        QVERIFY2(near(corner, {1, 0, 0}), show(corner));
+        const std::string out = dir.filePath("graph.mov").toStdString();
+        std::string err;
+        QVERIFY2(renderClipVideo(p, s, id, out, &err), err.c_str());
+        MediaItem m;
+        QVERIFY(probeMedia(out, m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QCOMPARE(m.width, 64);
+        QVERIFY(edit::replaceWithRender(s, id, m.id).ok);
+        QVERIFY(edit::clipById(s, id)->composite.empty());
+        QCOMPARE(edit::clipById(s, id)->motion.p("scale", 0, 100), 100.0);
+        QVERIFY2(near(px(32, 18), middle), show(px(32, 18)));
+        QVERIFY2(near(px(2, 2), corner), show(px(2, 2)));
+        QVERIFY(edit::restoreUnrendered(s, id).ok);
+        QCOMPARE(edit::clipById(s, id)->composite.nodes.size(), size_t(3));
+        QCOMPARE(edit::clipById(s, id)->motion.p("scale", 0, 100), 50.0);
+        QCOMPARE(px(32, 18), middle);
+
+        // A still as the layer stays shown when the clip's head is drawn out before where the still was placed (a
+        // still has no first frame).
+        QImage green(64, 36, QImage::Format_RGB32);
+        green.fill(QColor(0, 255, 0));
+        const QString still = dir.filePath("green.png");
+        QVERIFY(green.save(still));
+        MediaItem g;
+        QVERIFY(probeMedia(still.toStdString(), g));
+        g.id = p.newId();
+        p.media.push_back(g);
+        CompositeNode logo = *findCompositeNode(edit::clipById(s, id)->composite, layer);
+        logo.source = "media";
+        logo.media = g.id;
+        QVERIFY(edit::setCompositeNode(p, s, id, logo).ok);
+        edit::shiftKeyframes(*edit::clipById(s, id), 20);
+        QVERIFY(findCompositeNode(edit::clipById(s, id)->composite, layer)->offset < -10);
+        QVERIFY2(near(px(32, 18), {0, 1, 0}), show(px(32, 18)));
     }
 
     void compositeNodeKnownAnswers() {

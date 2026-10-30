@@ -78,6 +78,11 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         for (Take& t : c.takes) fn(t.mediaId);
         for (GradeVersion& v : c.gradeVersions) fxs(v.effects), graph(v.grade);
         graph(c.grade);
+        // Its node graph: each node's own id, media, followed clip and effects (the nodes' keys are the clip's own).
+        for (CompositeNode& n : c.composite.nodes) {
+            fn(n.id), fn(n.media), fn(n.follow);
+            fx(n.generator), fxs(n.effects), graph(n.grade);
+        }
         for (auto& [target, e] : c.trims) fx(e);
         for (auto& [field, v] : c.fields)
             if (mediaFields.count(field)) text(v);
@@ -118,6 +123,10 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         for (ColorGroup& g : s.colorGroups) fn(g.id), fn(g.postId), fn(g.parent), fxs(g.pre), fxs(g.post);
         for (SharedNode& n : s.sharedNodes) fn(n.id), fxs(n.effects);
         for (AdrCue& c : s.adrCues) fn(c.id), fn(c.clip);
+        for (VfxShotRecord& v : s.vfxShots) {
+            fn(v.clip), fn(v.plateMedia);
+            for (VfxVersion& r : v.versions) fn(r.media);
+        }
         for (TemplateField& f : s.fields) fn(f.clip), fn(f.effect);
     }
     for (auto& line : p.script.readings)
@@ -631,10 +640,20 @@ void keepUsedMedia(Project& p, const Project& mine, const Project& theirs) {
     for (const Sequence& s : p.sequences)
         for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
             for (const Track& t : *tracks) {
-                for (const Clip& c : t.clips) {
+                auto clip = [&](const Clip& c) {
                     want(c.mediaId);
                     for (const Take& tk : c.takes) want(tk.mediaId);
-                }
+                    for (const CompositeNode& n : c.composite.nodes) want(n.media);
+                    // (and the original a render stands in for: Restore brings its media back)
+                    Clip was;
+                    if (!c.unrendered.empty() && clipFromJsonString(c.unrendered, was)) {
+                        want(was.mediaId);
+                        for (const CompositeNode& n : was.composite.nodes) want(n.media);
+                    }
+                };
+                for (const Clip& c : t.clips) clip(c);
+                for (const TrackVersion& v : t.versions)
+                    for (const Clip& c : v.clips) clip(c);
                 for (const TakeLane& l : t.lanes) want(l.mediaId);
             }
     for (size_t i = 0; i < wanted.size(); ++i) {

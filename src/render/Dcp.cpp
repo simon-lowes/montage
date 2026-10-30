@@ -29,6 +29,7 @@ extern "C" {
 #include "Compositor.h"
 #include "DcpMxf.h"
 #include "DcpSecurity.h"
+#include "Iab.h"
 #include "Jpeg2000.h"
 #include "PackageFiles.h"
 #include "core/Captions.h"
@@ -376,7 +377,7 @@ std::string dcpName(const DcpSettings& settings, int channels, const std::string
     QString content = kind != kinds.end() ? kind->second : QStringLiteral("FTR");
     if (settings.stereo) content += QStringLiteral("-3D");
     QStringList parts = {titleForName(settings.title), content, aspect, language + "-" + subtitle,
-                         territory, channels == 8 ? QStringLiteral("71") : QStringLiteral("51"),
+                         territory, QString(channels == 8 ? "71" : "51") + (settings.immersive ? "-IAB" : ""),
                          settings.resolution == "4k" ? QStringLiteral("4K") : QStringLiteral("2K")};
     if (!code(settings.studio).isEmpty()) parts << code(settings.studio);
     parts << QString::fromStdString(date);
@@ -455,11 +456,12 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         std::string err;
         if (!dcp::signerCertificateChain(chain, &err, settings.certificates)) return fail("Cannot sign the package: " + err);
     }
-    dcp::ContentKey pictureKey, soundKey, subtitleKey;
+    dcp::ContentKey pictureKey, soundKey, subtitleKey, iabKey;
     if (settings.encrypt) {
-        bool a = false, b = false, c = false;
+        bool a = false, b = false, c = false, d = true;
         pictureKey = dcp::newContentKey("MDIK", &a), soundKey = dcp::newContentKey("MDAK", &b), subtitleKey = dcp::newContentKey("MDSK", &c);
-        if (!a || !b || !c) return fail("Cannot make the content keys (the system's random source failed)");
+        if (settings.immersive) iabKey = dcp::newContentKey("MDEK", &d);  // the key type immersive tracks have
+        if (!a || !b || !c || !d) return fail("Cannot make the content keys (the system's random source failed)");
     }
     auto encryption = [](const dcp::ContentKey& k) {
         dcp::TrackEncryption e;
@@ -468,26 +470,33 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         return e;
     };
 
-    const dcp::Uuid pictureId = dcp::newUuid(), soundId = dcp::newUuid(), subtitleId = dcp::newUuid();
+    const dcp::Uuid pictureId = dcp::newUuid(), soundId = dcp::newUuid(), subtitleId = dcp::newUuid(), iabId = dcp::newUuid();
     const QString pictureFile = QStringLiteral("j2c_%1.mxf").arg(QString::fromStdString(dcp::uuidString(pictureId)));
     const QString soundFile = QStringLiteral("pcm_%1.mxf").arg(QString::fromStdString(dcp::uuidString(soundId)));
+    const QString iabFile = QStringLiteral("iab_%1.mxf").arg(QString::fromStdString(dcp::uuidString(iabId)));
     const QString subtitleFile = QStringLiteral("sub_%1.mxf").arg(QString::fromStdString(dcp::uuidString(subtitleId)));
 
     // Sound first (quick): the mix at 48 kHz, a picture frame's worth at a time. A 23.976 sequence plays at 24, so its
     // sound is mixed at the rate that makes each sequence frame 2000 samples, and plays 0.1 % faster (a 59.94 one, at
     // 30 from every other frame, 1600 samples to two frames).
+    const int perFrame = kSampleRate / fps;
+    const int mixRate = int(std::lround(perFrame * s.fpsValue() / step));
+    const int64_t firstSample = int64_t(std::llround(double(first) * perFrame / step));
+    const double soundShare = settings.immersive ? 0.02 : 0.05;  // of the progress
     {
         dcp::SoundMxfWriter sound;
         if (settings.encrypt) sound.encryptWith(encryption(soundKey));
         std::string err;
-        if (!sound.open(QDir(folder).filePath(soundFile).toStdString(), soundId, fps, channels, settings.language, &err)) return fail(err);
+        const std::string soundPath = QDir(folder).filePath(soundFile).toStdString();
+        if (!(settings.immersive ? sound.openWithSync(soundPath, soundId, fps, channels, settings.language, &err)
+                                 : sound.open(soundPath, soundId, fps, channels, settings.language, &err)))
+            return fail(err);
         Sequence mixSeq = s;
         mixSeq.audioLayout = earLevelLayout(s.audioLayout);
-        const int perFrame = kSampleRate / fps;
-        mixSeq.sampleRate = int(std::lround(perFrame * s.fpsValue() / step));
-        const int64_t firstSample = int64_t(std::llround(double(first) * perFrame / step));
+        mixSeq.sampleRate = mixRate;
         AudioMixer mixer;
         std::vector<float> mix(size_t(perFrame) * size_t(std::max(2, seqChannels))), out(size_t(perFrame) * size_t(channels));
+        std::vector<float> wide(settings.immersive ? size_t(perFrame) * 16 : 0);
         // (its Leq(M), as the cinema hears it: the screen channels and LFE at 0 dB, the surrounds 3 dB down)
         std::vector<double> gains(size_t(channels), 1.0);
         for (int c = 4; c < channels; ++c) gains[size_t(c)] = std::pow(10.0, -3.0 / 20);
@@ -506,15 +515,48 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             const int in = std::max(2, seqChannels);
             for (int i = 0; i < perFrame; ++i)
                 for (size_t c = 0; c < route.size(); ++c) out[size_t(i) * size_t(channels) + size_t(route[c])] = mix[size_t(i) * size_t(in) + c];
-            if (!sound.write(out.data(), &err)) return fail(err);
+            if (settings.immersive) {
+                std::fill(wide.begin(), wide.end(), 0.0f);
+                for (int i = 0; i < perFrame; ++i)
+                    for (int c = 0; c < channels; ++c)
+                        wide[size_t(i) * 16 + size_t(dcp::SoundMxfWriter::syncChannel(channels, c))] = out[size_t(i) * size_t(channels) + size_t(c)];
+            }
+            if (!sound.write(settings.immersive ? wide.data() : out.data(), &err)) return fail(err);
             leqm.add(out.data(), perFrame);
-            if (progress && k % 48 == 0 && !progress(0.05 * double(k) / double(frames))) return fail("Stopped");
+            if (progress && k % 48 == 0 && !progress(soundShare * double(k) / double(frames))) return fail("Stopped");
         }
         if (!sound.close(&err)) return fail(err);
         if (result) {
             result->leqm = leqm.leqm();
             result->leqmLimit = dcpLeqmLimit(settings.kind);
         }
+    }
+
+    // The immersive track: the same mix as beds and objects, an IAB frame (DLC coded) to each picture frame.
+    int iabBed = 0, iabObjects = 0;
+    if (settings.immersive) {
+        iab::ProgramSettings ps;
+        ps.rateNum = uint32_t(fps);
+        ps.rateDen = 1;
+        ps.mixRate = mixRate;
+        ps.firstSample = firstSample;
+        ps.frames = frames;
+        ps.dlc = true;
+        ps.cinema = true;
+        iab::Program program;
+        std::string err;
+        if (!program.open(p, s, ps, &err)) return fail(err);
+        iabBed = program.bedChannels();
+        iabObjects = program.objects();
+        dcp::IabMxfWriter writer;
+        if (settings.encrypt) writer.encryptWith(encryption(iabKey));
+        if (!writer.open(QDir(folder).filePath(iabFile).toStdString(), iabId, fps, iabBed, iabObjects, &err)) return fail(err);
+        std::vector<uint8_t> frame;
+        for (int64_t k = 0; k < frames; ++k) {
+            if (!program.next(frame, &err) || !writer.write(frame.data(), frame.size(), &err)) return fail(err.empty() ? "Cannot write the immersive sound" : err);
+            if (progress && k % 24 == 0 && !progress(0.02 + 0.03 * double(k) / double(frames))) return fail("Stopped");
+        }
+        if (!writer.close(&err)) return fail(err);
     }
 
     // The subtitles: ST 428-7 XML with the font it loads, in a timed text track file.
@@ -632,6 +674,12 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
     };
     std::vector<Track> tracks = {{pictureId, pictureFile}, {soundId, soundFile}};
     if (subtitleTrack) tracks.push_back({subtitleId, subtitleFile});
+    if (settings.immersive) tracks.push_back({iabId, iabFile});
+    auto trackHash = [&](const QString& file) {
+        for (const Track& t : tracks)
+            if (t.file == file) return t.hash;
+        return QString();
+    };
     qint64 toHash = 1;
     for (const Track& t : tracks) toHash += QFileInfo(QDir(folder).filePath(t.file)).size();
     qint64 hashed = 0;
@@ -744,6 +792,22 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             x.writeEndElement();
         }
         if (stereo) writePicture();
+        if (settings.immersive) {
+            // (the auxiliary data element cinemas take immersive tracks from, naming the IAB coding)
+            const QString axd = QStringLiteral("http://www.dolby.com/schemas/2012/AD");
+            x.writeNamespace(axd, QStringLiteral("axd"));
+            x.writeStartElement(axd, QStringLiteral("AuxData"));
+            writeText(x, "Id", urn(iabId));
+            writeText(x, "AnnotationText", iabFile);
+            writeText(x, "EditRate", rate);
+            writeText(x, "IntrinsicDuration", QString::number(frames));
+            writeText(x, "EntryPoint", "0");
+            writeText(x, "Duration", QString::number(frames));
+            keyId(x, iabKey);
+            writeText(x, "Hash", trackHash(iabFile));
+            x.writeTextElement(axd, QStringLiteral("DataType"), QStringLiteral("urn:smpte:ul:060e2b34.04010105.0e090604.00000000"));
+            x.writeEndElement();
+        }
         // ST 429-16 composition metadata (asked for by the SMPTE Bv2.1 profile).
         x.writeNamespace(QString::fromLatin1(kMeta), QStringLiteral("meta"));
         x.writeStartElement(QString::fromLatin1(kMeta), QStringLiteral("CompositionMetadataAsset"));
@@ -761,8 +825,12 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         x.writeAttribute(QStringLiteral("units"), QStringLiteral("foot-lambert"));
         x.writeCharacters(QStringLiteral("14"));
         x.writeEndElement();
-        x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("MainSoundConfiguration"),
-                           channels == 8 ? QStringLiteral("71/L,R,C,LFE,Lss,Rss,Lrs,Rrs") : QStringLiteral("51/L,R,C,LFE,Ls,Rs"));
+        // (the 16 channels with an immersive track: unused ones as "-", the sync signal in 14)
+        const QString soundConfig = settings.immersive
+                                        ? (channels == 8 ? QStringLiteral("71/L,R,C,LFE,Lss,Rss,-,-,-,-,Lrs,Rrs,-,FSKSync,-,-")
+                                                         : QStringLiteral("51/L,R,C,LFE,Ls,Rs,-,-,-,-,-,-,-,FSKSync,-,-"))
+                                        : (channels == 8 ? QStringLiteral("71/L,R,C,LFE,Lss,Rss,Lrs,Rrs") : QStringLiteral("51/L,R,C,LFE,Ls,Rs"));
+        x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("MainSoundConfiguration"), soundConfig);
         x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("MainSoundSampleRate"), QStringLiteral("48000 1"));
         for (const char* area : {"MainPictureStoredArea", "MainPictureActiveArea"}) {
             x.writeStartElement(QString::fromLatin1(kMeta), QString::fromLatin1(area));
@@ -782,6 +850,12 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("Name"), QStringLiteral("DCP Constraints Profile"));
         x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("Value"), QStringLiteral("SMPTE-RDD-52:2020-Bv2.1"));
         x.writeEndElement();  // Property
+        if (settings.immersive) {  // (ISDCF Doc 15: the immersive track keeps to Application Profile 1)
+            x.writeStartElement(QString::fromLatin1(kMeta), QStringLiteral("Property"));
+            x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("Name"), QStringLiteral("IAB Profile"));
+            x.writeTextElement(QString::fromLatin1(kMeta), QStringLiteral("Value"), QStringLiteral("SMPTE-ST-2098-2:2019-P1"));
+            x.writeEndElement();
+        }
         x.writeEndElement();  // PropertyList
         x.writeEndElement();  // ExtensionMetadata
         x.writeEndElement();  // ExtensionMetadataList
@@ -798,6 +872,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
                                  {pictureId, pictureFile, "application/mxf", pictureFile},
                                  {soundId, soundFile, "application/mxf", soundFile}};
     if (subtitleTrack) assets.push_back({subtitleId, subtitleFile, "application/mxf", subtitleFile});
+    if (settings.immersive) assets.push_back({iabId, iabFile, "application/mxf", iabFile});
     const bool pklOk = writeXml(pklFile, [&](QXmlStreamWriter& x) {
         x.writeDefaultNamespace(QStringLiteral("http://www.smpte-ra.org/schemas/429-8/2007/PKL"));
         x.writeStartElement("PackingList");
@@ -880,6 +955,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         k.notValidAfter = dcp::kdmTime(until.toSecsSinceEpoch() - 86400);
         k.keys = {pictureKey, soundKey};
         if (subtitleTrack) k.keys.push_back(subtitleKey);
+        if (settings.immersive) k.keys.push_back(iabKey);
         k.recipient = chain.certificates.back();
         std::string xmlText, err;
         if (!dcp::makeKdm(k, chain, xmlText, &err)) return fail("Cannot keep the keys: " + err);
@@ -900,6 +976,9 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         result->width = cw;
         result->height = ch;
         result->channels = channels;
+        result->immersive = settings.immersive;
+        result->iabBedChannels = iabBed;
+        result->iabObjects = iabObjects;
         result->cinemaProfile = cinema;
         result->stereo = stereo;
         result->encrypted = settings.encrypt;
@@ -1148,7 +1227,7 @@ std::vector<std::string> verifyDcp(const std::string& folderPath, const std::fun
         ++compositions;
         signature(c.path);
         struct Ref {
-            QString kind, id, keyId, language;
+            QString kind, id, keyId, language, dataType;
             int64_t intrinsic = -1, entry = 0, duration = -1;
             int rate = 0;
         };
@@ -1169,9 +1248,16 @@ std::vector<std::string> verifyDcp(const std::string& folderPath, const std::fun
             if (field == "EditRate") refs.back().rate = text.section(' ', 0, 0).toInt();
             if (field == "KeyId") refs.back().keyId = bareId(text), encryptedAssets = true;
             if (field == "Language") refs.back().language = text;
+            if (field == "DataType") refs.back().dataType = text;
         }
         if (encryptedAssets && !signedCpl) issue(c.path + " has encrypted assets but is not signed (servers refuse it)");
         bool picture = false;
+        // An immersive (IAB) track needs ST 429-19's main sound beside it: 16 channels, the FSK sync signal in 14.
+        bool immersive = false;
+        QString soundPath;
+        bool soundSealed = false;
+        int soundRate = 0;
+        dcp::Uuid soundAsset{};
         for (const Ref& r : refs) {
             if (!assets.count(r.id) || assets[r.id].hash.isEmpty()) {
                 issue(QStringLiteral("%1 %2 in %3 is not in the package").arg(r.kind, r.id, c.path));
@@ -1235,7 +1321,60 @@ std::vector<std::string> verifyDcp(const std::string& folderPath, const std::fun
                     issue("Stopped");
                     return issues;
                 }
+            } else if (r.kind == "AuxData") {
+                if (r.dataType.compare(QStringLiteral("urn:smpte:ul:060e2b34.04010105.0e090604.00000000"), Qt::CaseInsensitive) != 0) {
+                    reading(QFileInfo(dir.filePath(path)).size());  // auxiliary data of a kind Montage does not check
+                    continue;
+                }
+                immersive = true;
+                if (!track.iab()) {
+                    issue(path + " is not an immersive sound (IAB) track file");
+                    continue;
+                }
+                if (track.editUnits() != track.containerDuration())
+                    issue(QStringLiteral("%1 indexes %2 frames of %3").arg(path).arg(track.editUnits()).arg(track.containerDuration()));
+                if (track.encrypted()) {
+                    reading(QFileInfo(dir.filePath(path)).size());
+                    continue;
+                }
+                // Every frame: within ST 429-18's size, DLC coded, at the composition's rate, inside Application Profile 1.
+                std::set<std::string> told;
+                auto once = [&](const std::string& key, const QString& what) {
+                    if (told.insert(key).second) issue(path + ": " + what);
+                };
+                const int code = iab::rateCode(uint32_t(r.rate), 1);
+                std::vector<uint8_t> frame;
+                for (int64_t k = 0; k < track.editUnits() && !stopped; ++k) {
+                    if (!track.read(k, 0, frame, nullptr, &err)) {
+                        issue(QStringLiteral("%1: %2").arg(path, QString::fromStdString(err)));
+                        break;
+                    }
+                    reading(qint64(frame.size()));
+                    if (r.rate > 0 && frame.size() > dcp::IabMxfWriter::maxFrameBytes(r.rate))
+                        once("size", QStringLiteral("frame %1 is %2 bytes (ST 429-18 allows %3)").arg(k).arg(frame.size()).arg(dcp::IabMxfWriter::maxFrameBytes(r.rate)));
+                    iab::Frame f;
+                    std::vector<uint32_t> skipped;
+                    if (!iab::readFrame(frame.data(), frame.size(), f, &err, nullptr, &skipped)) {
+                        once("read", QStringLiteral("frame %1 cannot be read: %2").arg(k).arg(QString::fromStdString(err)));
+                        continue;
+                    }
+                    if (f.pcm) once("pcm", QStringLiteral("carries PCM sound (a DCP's is DLC coded)"));
+                    if (f.rate != code) once("rate", QStringLiteral("its frames are not at the composition's %1 frames a second").arg(r.rate));
+                    if (!skipped.empty()) once("elements", QStringLiteral("holds elements Application Profile 1 leaves out (zones, remaps, user data)"));
+                    if (f.objects.size() > 118) once("objects", QStringLiteral("has more than 118 objects"));
+                    static const std::set<int> profileBed = {0x0, 0x2, 0x4, 0x5, 0x7, 0x8, 0x9, 0xB, 0xC, 0xD};
+                    for (const iab::BedChannel& c : f.bed)
+                        if (!profileBed.count(c.id)) once("bed", QStringLiteral("its bed has a channel Application Profile 1 does not (ID %1)").arg(c.id));
+                }
+                if (stopped) {
+                    issue("Stopped");
+                    return issues;
+                }
             } else if (r.kind == "MainSound") {
+                soundPath = path;
+                soundSealed = track.encrypted();
+                soundRate = r.rate;
+                soundAsset = track.asset();
                 if (track.encrypted()) {
                     reading(QFileInfo(dir.filePath(path)).size());
                     continue;
@@ -1305,6 +1444,39 @@ std::vector<std::string> verifyDcp(const std::string& folderPath, const std::fun
             }
         }
         if (!picture) issue(c.path + " has no picture");
+        if (immersive && soundPath.isEmpty()) issue(c.path + " has an immersive track but no main sound (it carries the sync signal)");
+        if (immersive && !soundPath.isEmpty() && !soundSealed && soundRate > 0) {
+            // The sync signal in channel 14 of the first edit units: packets whose CRC holds, naming the sound's own
+            // track file and edit unit.
+            dcp::TrackFileReader sound;
+            std::vector<uint8_t> unit;
+            std::string err;
+            const size_t perFrame = size_t(48000 / soundRate);
+            if (!sound.open(dir.filePath(soundPath).toStdString(), &err) || !sound.read(0, 0, unit, nullptr, &err)) {
+                issue(soundPath + " cannot be read for its sync signal");
+            } else if (unit.size() != perFrame * 3 * 16) {
+                issue(soundPath + " is not the 16 channels an immersive reel's main sound has (ST 429-19)");
+            } else {
+                bool good = true;
+                for (int64_t k = 0; k < std::min<int64_t>(4, sound.editUnits()) && good; ++k) {
+                    if (k > 0 && !sound.read(k, 0, unit, nullptr, &err)) {
+                        good = false;
+                        break;
+                    }
+                    std::vector<int32_t> sync(perFrame);
+                    for (size_t i = 0; i < perFrame; ++i) {
+                        const uint8_t* b = &unit[(i * 16 + size_t(dcp::SoundMxfWriter::kSyncChannel)) * 3];
+                        sync[i] = int32_t(uint32_t(b[0]) << 8 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 24) >> 8;
+                    }
+                    const auto packets = dcp::readFskSync(sync.data(), sync.size());
+                    good = !packets.empty();
+                    for (const dcp::FskPacket& pk : packets)
+                        good = good && pk.crcOk && pk.editUnit == uint32_t(k) &&
+                               std::equal(pk.uuid.begin(), pk.uuid.end(), soundAsset.begin() + 4 * pk.subIndex);
+                }
+                if (!good) issue(soundPath + " has no good sync signal in channel 14 for the immersive track (ST 429-19)");
+            }
+        }
     }
     if (compositions == 0) issue("The package holds no composition playlist");
     return issues;

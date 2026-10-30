@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="160">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a3b8c"/>
+      <stop offset="60%" stop-color="#6fa8dc"/>
+      <stop offset="1" stop-color="#ffe6b3"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff59d"/>
+      <stop offset="1" stop-color="#ff9800" stop-opacity="0.2"/>
+    </radialGradient>
+    <linearGradient id="ground" gradientUnits="userSpaceOnUse" x1="0" y1="110" x2="240" y2="160" xlink:href="#groundStops"/>
+    <linearGradient id="groundStops">
+      <stop offset="0" stop-color="#2e7d32"/>
+      <stop offset="1" stop-color="#a5d6a7"/>
+    </linearGradient>
+  </defs>
+  <rect width="240" height="120" fill="url(#sky)"/>
+  <circle cx="170" cy="50" r="30" fill="url(#sun)"/>
+  <path d="M0 110 Q60 90 120 112 T240 105 V160 H0 Z" fill="url(#ground)"/>
+</svg>

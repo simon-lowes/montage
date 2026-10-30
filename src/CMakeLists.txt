@@ -7,6 +7,7 @@ add_library(montage_engine STATIC
   core/Ucs.h core/Ucs.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
+  core/ShapeContents.h core/ShapeContents.cpp
   core/ColorWarp.h core/ColorWarp.cpp
   core/LinearSolve.h core/LinearSolve.cpp
   core/ObjectMask.h core/ObjectMask.cpp
@@ -159,6 +160,7 @@ add_library(montage_engine STATIC
   media/BandwidthExtension.h media/BandwidthExtension.cpp
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp
+  media/InterfaceDrafts.h media/InterfaceDrafts.cpp
   render/Processing.h render/Processing.cpp render/TransferTables.h
   render/Ofx.h render/Ofx.cpp
   render/FaceRefine.h render/FaceRefine.cpp
@@ -167,6 +169,7 @@ add_library(montage_engine STATIC
   render/Imf.h render/Imf.cpp
   render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp
+  render/Iab.h render/Iab.cpp
   render/Iamf.h render/Iamf.cpp
   render/HdrStill.h render/HdrStill.cpp
   render/Relight.h render/Relight.cpp
@@ -185,6 +188,8 @@ add_library(montage_engine STATIC
   render/Titles.h render/Titles.cpp
   render/ModelRender.h render/ModelRender.cpp
   render/ModelClip.h render/ModelClip.cpp
+  render/Layer3D.h render/Layer3D.cpp
+  render/ShapeLayers.h render/ShapeLayers.cpp
   render/SplatRender.h render/SplatRender.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
@@ -215,6 +220,7 @@ add_library(montage_engine STATIC
   render/ExtendClip.h render/ExtendClip.cpp
   render/PaperEdit.h render/PaperEdit.cpp
   render/VfxPull.h render/VfxPull.cpp
+  render/VfxShots.h render/VfxShots.cpp
   render/Spherical.h render/Spherical.cpp
   render/Stereo.h render/Stereo.cpp
   render/SpatialVideo.h render/SpatialVideo.cpp
@@ -257,6 +263,7 @@ add_library(montage_engine STATIC
   render/VideoFx.h render/VideoFx.cpp
   render/StyleFx.h render/StyleFx.cpp
   render/MeshWarp.h render/MeshWarp.cpp
+  render/SurfaceTrack.h render/SurfaceTrack.cpp
   render/TemporalFx.h render/TemporalFx.cpp
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
@@ -266,6 +273,7 @@ add_library(montage_engine STATIC
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   render/RemoteReview.h render/RemoteReview.cpp
+  render/RemoteGrade.h render/RemoteGrade.cpp
   render/SkyReplace.h render/SkyReplace.cpp
   render/FaceShape.h render/FaceShape.cpp
   render/MonitorCalibration.h render/MonitorCalibration.cpp
@@ -276,6 +284,7 @@ add_library(montage_engine STATIC
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
   audio/DialogueAlign.h audio/DialogueAlign.cpp
+  audio/ElasticAudio.h audio/ElasticAudio.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp

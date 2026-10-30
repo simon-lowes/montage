@@ -25,7 +25,11 @@ struct Guide {
         mono.resize(size_t(n));
         for (int64_t i = 0; i < n; ++i)
             mono[size_t(i)] = nch == 2 ? 0.5f * (in.samples[size_t(i) * 2] + in.samples[size_t(i) * 2 + 1]) : in.samples[size_t(i) * nch];
-        coarse.resize(size_t(n / 4));
+        averaged();
+    }
+    explicit Guide(std::vector<float> m) : mono(std::move(m)) { averaged(); }
+    void averaged() {
+        coarse.resize(mono.size() / 4);
         for (size_t i = 0; i < coarse.size(); ++i) coarse[i] = 0.25f * (mono[i * 4] + mono[i * 4 + 1] + mono[i * 4 + 2] + mono[i * 4 + 3]);
     }
 };
@@ -56,29 +60,23 @@ std::atomic<int> gRunning{0};
 
 int stretchHop(int sampleRate) { return std::max(64, int(std::lround(sampleRate * 0.012))); }
 
-void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out,
-                  const std::atomic<bool>* cancel) {
-    out.sampleRate = in.sampleRate;
-    out.channels = std::max(1, in.channels);
-    const size_t nch = size_t(out.channels);  // every channel cut at the same places, so a field keeps its directions
-    out.samples.assign(size_t(std::max<int64_t>(0, outFrames)) * nch, 0.0f);
-    if (outFrames <= 0 || positions.empty() || in.frames() == 0) return;
-    const int64_t N = int64_t(hop) * 2, half = hop;  // grains twice the hop: Hann windows that add up to one
-    const int64_t tolerance = hop / 2;               // how far a grain may move to line up
-    const int64_t n = in.frames();
-    std::vector<float> window(static_cast<size_t>(N));
-    for (int64_t i = 0; i < N; ++i) window[size_t(i)] = float(0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(N)));
-    std::vector<float> weight(size_t(outFrames), 0.0f);
-    const Guide guide(in);
-    const float* src = in.samples.data();
+namespace {
+
+std::vector<int64_t> grainStarts(const Guide& guide, const std::vector<double>& positions, int hop, int64_t outFrames,
+                                 const std::atomic<bool>* cancel, const std::vector<int64_t>& locked = {}) {
+    std::vector<int64_t> starts;
+    if (outFrames <= 0 || positions.empty() || hop <= 0) return starts;
+    const int64_t N = int64_t(hop) * 2, half = hop;
+    const int64_t tolerance = hop / 2;  // how far a grain may move to line up
     int64_t prev = std::numeric_limits<int64_t>::min();  // where the last grain started in the source
     const int64_t grains = outFrames / hop + 2;
+    starts.reserve(size_t(grains));
     for (int64_t k = 0; k < grains; ++k) {
         if (cancel && (k & 255) == 0 && cancel->load()) break;
         const double at = positions[size_t(std::min<int64_t>(k, int64_t(positions.size()) - 1))];
         const int64_t nominal = int64_t(std::llround(at)) - half;  // the grain centred on its source position
         int64_t start = nominal;
-        if (prev != std::numeric_limits<int64_t>::min()) {
+        if (prev != std::numeric_limits<int64_t>::min() && !std::binary_search(locked.begin(), locked.end(), k)) {
             // Where the last grain would have carried on: the grain here that matches it best.
             const int64_t natural = prev + hop;
             if (std::llabs(natural - nominal) <= tolerance) {
@@ -98,9 +96,36 @@ void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, i
             }
         }
         prev = start;
-        const int64_t o0 = k * hop - half;
+        starts.push_back(start);
+    }
+    return starts;
+}
+
+}  // namespace
+
+std::vector<int64_t> wsolaGrainStarts(const std::vector<float>& guide, const std::vector<double>& positions, int hop,
+                                      int64_t outFrames, const std::atomic<bool>* cancel, const std::vector<int64_t>& locked) {
+    return grainStarts(Guide(guide), positions, hop, outFrames, cancel, locked);
+}
+
+void wsolaOverlapAdd(const AudioBuffer& in, const std::vector<int64_t>& starts, int hop, int64_t shift, int64_t outFrames,
+                     AudioBuffer& out) {
+    out.sampleRate = in.sampleRate;
+    out.channels = std::max(1, in.channels);
+    const size_t nch = size_t(out.channels);  // every channel cut at the same places, so a field keeps its directions
+    out.samples.assign(size_t(std::max<int64_t>(0, outFrames)) * nch, 0.0f);
+    if (outFrames <= 0 || hop <= 0 || in.frames() == 0) return;
+    const int64_t N = int64_t(hop) * 2, half = hop;  // grains twice the hop: Hann windows that add up to one
+    const int64_t n = in.frames();
+    std::vector<float> window(static_cast<size_t>(N));
+    for (int64_t i = 0; i < N; ++i) window[size_t(i)] = float(0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(N)));
+    std::vector<float> weight(size_t(outFrames), 0.0f);
+    const float* src = in.samples.data();
+    for (size_t k = 0; k < starts.size(); ++k) {
+        const int64_t o0 = int64_t(k) * hop - half + shift, s0 = starts[k] + shift;
+        if (o0 + N <= 0 || o0 >= outFrames) continue;
         for (int64_t i = 0; i < N; ++i) {
-            const int64_t o = o0 + i, s = start + i;
+            const int64_t o = o0 + i, s = s0 + i;
             if (o < 0 || o >= outFrames) continue;
             const float w = window[size_t(i)];
             weight[size_t(o)] += w;
@@ -111,6 +136,13 @@ void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, i
     for (int64_t o = 0; o < outFrames; ++o)
         if (weight[size_t(o)] > 1e-6f)
             for (size_t c = 0; c < nch; ++c) out.samples[size_t(o) * nch + c] /= weight[size_t(o)];
+}
+
+void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out,
+                  const std::atomic<bool>* cancel) {
+    std::vector<int64_t> starts;
+    if (outFrames > 0 && !positions.empty() && in.frames() > 0) starts = grainStarts(Guide(in), positions, hop, outFrames, cancel);
+    wsolaOverlapAdd(in, starts, hop, 0, outFrames, out);
 }
 
 int stretchesRunning() { return gRunning.load(); }

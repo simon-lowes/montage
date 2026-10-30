@@ -14,6 +14,7 @@
 #include <QDirIterator>
 #include <QDateTime>
 #include <cmath>
+#include <QSet>
 #include <QTimer>
 #include <QStandardPaths>
 #include <QtConcurrent>
@@ -34,6 +35,7 @@
 #include "media/Proxy.h"
 #include "media/ImageSequence.h"
 #include "media/Relink.h"
+#include "render/VfxShots.h"
 #include "Settings.h"
 #include "ThumbnailCache.h"
 
@@ -97,6 +99,26 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
     connect(folderWatcher_, &QFileSystemWatcher::directoryChanged, this, [this] { folderTimer_->start(); });
     connect(folderTimer_, &QTimer::timeout, this, [this] { scanWatchFolders(); });
     connect(this, &EditorState::projectChanged, this, &EditorState::watchFoldersChanged);
+    // VFX returns: looked through once a new version's frames have been quiet for a moment.
+    vfxWatcher_ = new QFileSystemWatcher(this);
+    vfxTimer_ = new QTimer(this);
+    vfxTimer_->setSingleShot(true);
+    vfxTimer_->setInterval(2000);
+    connect(vfxWatcher_, &QFileSystemWatcher::directoryChanged, this, [this] { vfxTimer_->start(); });
+    connect(vfxTimer_, &QTimer::timeout, this, [this] {
+        if (inGesture()) {  // (not in the middle of a drag: once it is over)
+            vfxTimer_->start();
+            return;
+        }
+        std::vector<std::string> problems;
+        const std::vector<std::string> added = scanVfxReturnsNow(&problems);
+        if (!added.empty()) {
+            QStringList names;
+            for (const std::string& n : added) names << QString::fromStdString(n);
+            message(tr("New VFX versions: %1").arg(names.join(QStringLiteral(", "))), 8000);
+        }
+    });
+    connect(this, &EditorState::projectChanged, this, [this] { watchVfxReturns(); });
 }
 
 EditorState::~EditorState() {
@@ -829,6 +851,45 @@ void EditorState::watchFoldersChanged() {
     if (!added.isEmpty()) folderWatcher_->addPaths(added);
 }
 
+void EditorState::watchVfxReturns(bool again) {
+    const Sequence* s = sequence();
+    const QString root = s && !s->vfxShots.empty() ? QString::fromStdString(s->vfxReturns) : QString();
+    if (root == vfxRoot_ && !again) return;
+    vfxRoot_ = root;
+    QStringList wanted;
+    if (!root.isEmpty() && QFileInfo(root).isDir()) {
+        wanted << root;
+        QDirIterator it(root, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (it.hasNext() && wanted.size() < 4000) wanted << it.next();
+    }
+    const QStringList watchedList = vfxWatcher_->directories();
+    const QSet<QString> watched(watchedList.begin(), watchedList.end()), want(wanted.begin(), wanted.end());
+    QStringList gone, added;
+    for (const QString& d : watchedList)
+        if (!want.contains(d)) gone << d;
+    for (const QString& d : wanted)
+        if (!watched.contains(d)) added << d;
+    if (!gone.isEmpty()) vfxWatcher_->removePaths(gone);
+    if (!added.isEmpty()) vfxWatcher_->addPaths(added);
+}
+
+QStringList EditorState::vfxWatchedFolders() const { return vfxWatcher_->directories(); }
+
+std::vector<std::string> EditorState::scanVfxReturnsNow(std::vector<std::string>* problems) {
+    VfxScan scan;
+    const Sequence* seq = sequence();
+    if (!seq || seq->vfxShots.empty() || seq->vfxReturns.empty() || readOnly() || inGesture()) return {};
+    edit(tr("New VFX Versions"), [&](Project& p, Sequence& s) {
+        const std::vector<VfxShotRecord> before = s.vfxShots;
+        const std::vector<MediaItem> media = p.media;
+        if (!scanVfxReturns(p, s, s.vfxReturns, "", &scan)) return false;
+        return s.vfxShots != before || !(p.media == media);
+    });
+    watchVfxReturns(true);
+    if (problems) *problems = scan.problems;
+    return scan.added;
+}
+
 bool EditorState::addWatchFolder(const QString& folder) {
     const QFileInfo fi(folder);
     if (!fi.isDir()) return false;
@@ -1220,6 +1281,41 @@ bool EditorState::sourceEdit(SourceEdit mode) {
 
 // ---------------------------------------------------------------------------
 // Sequences
+
+void EditorState::followProject(Project p) {
+    if (gesture_) gesture_.reset();
+    const bool first = !path_.isEmpty() || readOnly_;
+    if (first) {
+        // (no longer this file's project: saving it asks where, so the colourist's never lands on the file this was)
+        releaseLock();
+        path_.clear();
+        readOnly_ = false;
+        lockHolder_.clear();
+        lockFree_ = false;
+        ++projectGeneration_;
+        maskObjects_.clear();
+        paintEffect_ = 0;
+        emit lockStateChanged();
+    }
+    const Id was = project_.activeSequence;
+    std::set<std::string> known;
+    for (const MediaItem& m : project_.media) known.insert(m.path);
+    project_ = std::move(p);
+    if (!project_.findSequence(project_.activeSequence) && !project_.sequences.empty()) project_.activeSequence = project_.sequences.front().id;
+    history_.clear();
+    bool added = false;
+    for (const MediaItem& m : project_.media)
+        if (!known.count(m.path)) {
+            startAudioDecode(m);
+            added = true;
+        }
+    if (added) offlineChecked_.clear();
+    pruneSelection();
+    if (was != project_.activeSequence) emit sequenceSwitched();
+    emit projectChanged();
+    emit historyChanged();
+    if (first) emit fileStateChanged();
+}
 
 void EditorState::setActiveSequence(Id id) {
     if (!project_.findSequence(id) || id == project_.activeSequence) return;

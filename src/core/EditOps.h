@@ -324,7 +324,8 @@ int joinThroughEdits(Project& p, Sequence& s, const std::vector<Id>& ids = {});
 Result addTakes(Project& p, Sequence& s, Id clipId, const std::vector<std::pair<Id, double>>& media);
 // Makes take `index` the pick: the clip plays it in the same place, keeping its length, effects and keyframes; clips
 // linked to it that play the same media (its sound) follow.
-Result pickTake(Project& p, Sequence& s, Id clipId, int index);
+// `linked` false: the clip alone (a VFX version: the production sound stays).
+Result pickTake(Project& p, Sequence& s, Id clipId, int index, bool linked = true);
 Result cycleTake(Project& p, Sequence& s, Id clipId, int step);  // the next (+1) or previous (-1) take, round
 Result finalizeAudition(Project& p, Sequence& s, Id clipId);     // keeps the pick, forgets the other takes
 

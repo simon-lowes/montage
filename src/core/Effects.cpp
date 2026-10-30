@@ -130,7 +130,7 @@ std::vector<EffectInfo> buildCatalog() {
     c.back().hidden = true;
     c.push_back({"composite_track", "Track", EffectCategory::VideoFilter, "Composite",
                  {choice("follow", "Follow", {"Position", "Position and Scale", "Position, Scale and Rotation", "Corner Pin"}, 2),
-                  num("reference", "Reference Frame", 0, 1000000, 0, 1)},
+                  num("reference", "Reference Frame", -1000000, 1000000, 0, 1)},
                  {}});
     c.back().hidden = true;
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
@@ -634,6 +634,34 @@ std::vector<EffectInfo> buildCatalog() {
                   boolean("motion_blur", "Motion Blur"), num("shutter", "Shutter Angle", 0, 720, 180, 1), boolean("show_grid", "Show Grid")},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
+    // Surface Tracker (render/SurfaceTrack.h): the surface its mask outlines tracked as it bends ("track" as text, from
+    // the Inspector or MCP), shown as its mesh, with a picture ("picture", a file) put on it, held still as on the
+    // reference frame, or put back after being worked on held still.
+    c.push_back({"surface_track", "Surface Tracker", EffectCategory::VideoFilter, "Distort",
+                 {choice("mode", "Show", {"The Mesh", "A Picture on the Surface", "The Surface Held Still", "The Surface Put Back", "Nothing (Only the Track)"}, 0),
+                  num("detail", "Mesh Vertices", 20, 3000, 200, 10), num("picture_x", "Picture X", -0.5, 1.5, 0.5, 0.001),
+                  num("picture_y", "Picture Y", -0.5, 1.5, 0.5, 0.001), num("picture_w", "Picture Width", 0.01, 2, 0.3, 0.001),
+                  pct("opacity", "Picture Opacity", 0, 100, 100)},
+                 {str("picture", "Picture", StringKind::File)}});
+    for (auto& pi : c.back().params) pi.keyframeable = pi.name == "opacity";
+    c.back().strings[0].fileFilter = "Pictures (*.png *.jpg *.jpeg *.tif *.tiff *.exr *.webp *.heic *.avif);;All files (*)";
+    // A clip as a card in 3D (render/Layer3D.h): its picture, as its transform leaves it on the frame, placed and turned
+    // in the scene and seen through a camera, merged with other 3D layers, models and deep pictures by depth.
+    c.push_back({"layer_3d", "3D Layer", EffectCategory::VideoFilter, "Distort",
+                 {choice("camera", "Camera", {"Its Own", "Solved by the 3D Camera Tracker", "The File's Camera", "The Scene's Camera"}, 3),
+                  num("camera_track", "Solved Footage or Camera Track (0: nearest below, or the highest)", 0, 99, 0, 1),
+                  num("camera_index", "The File's Camera Number", 1, 999, 1, 1),
+                  num("fov", "Lens (own camera, field of view °)", 5, 120, 35, 0.5),
+                  num("width", "Width (solved or file camera, the scene's units)", 0.0001, 100000, 1, 0.001),
+                  num("pos_x", "Position X", -100000, 100000, 0, 0.01),
+                  num("pos_y", "Position Y (up)", -100000, 100000, 0, 0.01),
+                  num("pos_z", "Position Z (towards the camera)", -100000, 100000, 0, 0.01),
+                  num("rot_y", "Turn (Y°)", -360, 360, 0, 0.5),
+                  num("rot_x", "Tilt (X°)", -360, 360, 0, 0.5),
+                  num("rot_z", "Roll (Z°)", -360, 360, 0, 0.5),
+                  num("pivot_x", "Pivot X (from the middle)", -100000, 100000, 0, 0.01),
+                  num("pivot_y", "Pivot Y (up, from the middle)", -100000, 100000, 0, 0.01)},
+                 {str("camera_file", "Take The Camera From (USD, glTF)", StringKind::File)}});
     c.push_back({"letterbox", "Letterbox", EffectCategory::VideoFilter, "Stylize",
                  {choice("aspect", "Aspect", {"2.39:1", "2:1", "1.85:1", "4:3", "1:1", "9:16"}, 0),
                   pct("opacity", "Opacity", 0, 100, 100)},
@@ -722,6 +750,13 @@ std::vector<EffectInfo> buildCatalog() {
     // for the take named by "media"), made by Align to Guide in the ADR panel or over MCP.
     c.push_back({"dialogue_align", "Dialogue Alignment", EffectCategory::AudioFilter, "Restoration",
                  {num("invert", "Invert Polarity", 0, 1, 0, 1)}, {}});
+    c.back().hidden = true;
+    // Warp markers on the clip's sound and its pitch edited (audio/ElasticAudio.h): "points", "members" and "offset"
+    // strings, set on the timeline, from the Clip menu or over MCP; the pitch edits' "edits" string.
+    c.push_back({"elastic_audio", "Elastic Audio", EffectCategory::AudioFilter, "Time",
+                 {choice("mode", "Mode", {"Speech", "General", "Varispeed"}, 0)}, {}});
+    c.back().hidden = true;
+    c.push_back({"pitch_contour", "Pitch Edits", EffectCategory::AudioFilter, "Pitch", {}, {}});
     c.back().hidden = true;
     c.push_back({"dehum", "De-Hum", EffectCategory::AudioFilter, "Restoration",
                  {choice("mains", "Mains", {"50 Hz", "60 Hz"}, 0), num("harmonics", "Harmonics", 1, 16, 6, 1),
@@ -955,7 +990,8 @@ std::vector<EffectInfo> buildCatalog() {
         c.push_back({"paint", "Paint (Clone and Heal)", EffectCategory::VideoFilter, "Repair",
                      {choice("tool", "Brush", {"Clone", "Heal"}, 0), num("brush", "Brush Size (px)", 2, 400, 30, 1),
                       pct("softness", "Brush Softness", 0, 100, 50), choice("span", "Strokes Last", {"This Frame", "Whole Clip"}, 0),
-                      boolean("track", "Strokes Follow the Mask Track"), num("source_x", "Source X (of the width)", -1, 1, 0.05, 0.001),
+                      boolean("track", "Strokes Follow the Mask Track"), boolean("surface", "Strokes Follow the Surface Track"),
+                      num("source_x", "Source X (of the width)", -1, 1, 0.05, 0.001),
                       num("source_y", "Source Y (of the height)", -1, 1, 0, 0.001)},
                      {}});
         for (size_t i = c.size() - 5; i < c.size(); ++i)
@@ -1211,8 +1247,8 @@ std::vector<EffectInfo> buildCatalog() {
         // file (the file's units, everything where the file puts it).
         c.push_back({"model3d", "3D Model", EffectCategory::Generator, "Titles",
                      {
-                         choice("camera", "Camera", {"Its Own", "Solved by the 3D Camera Tracker", "The File's Camera"}, 0),
-                         num("camera_track", "Solved Footage Track (0: nearest below)", 0, 99, 0, 1),
+                         choice("camera", "Camera", {"Its Own", "Solved by the 3D Camera Tracker", "The File's Camera", "The Scene's Camera"}, 0),
+                         num("camera_track", "Solved Footage or Camera Track (0: nearest below, or the highest)", 0, 99, 0, 1),
                          num("camera_index", "The File's Camera Number", 1, 999, 1, 1),
                          num("fov", "Lens (field of view °)", 5, 120, 35, 0.5),
                          num("size", "Size (px, own camera)", 1, 20000, 400, 1),
@@ -1247,6 +1283,14 @@ std::vector<EffectInfo> buildCatalog() {
                          pct("opacity", "Opacity", 0, 100, 100),
                          boolean("frames", "Play Numbered Splat Files One a Frame", true),
                          num("frames_fps", "Splat Files a Second (0: the sequence's rate)", 0, 1000, 0, 0.01),
+                         choice("shape", "Shape", {"The File", "Plane", "Box", "Sphere", "Cylinder"}, 0),
+                         color("shape_color", "Shape Colour", 0.8, 0.8, 0.8),
+                         pct("shape_metal", "Shape Metalness", 0, 100, 0),
+                         pct("shape_rough", "Shape Roughness", 0, 100, 50),
+                         num("texture_track", "Picture From Track (0: none)", 0, 99, 0, 1),
+                         num("texture_material", "On Material (0: all)", 0, 999, 0, 1),
+                         boolean("texture_hide", "Hide the Picture's Track", true),
+                         choice("texture_light", "The Picture", {"Lit by the Scene", "As It Is"}, 0),
                          boolean("crop", "Crop the Splats to a Box", false),
                          num("crop_x0", "Crop Box Left (X, the file's units)", -100000, 100000, -10, 0.01),
                          num("crop_x1", "Crop Box Right (X)", -100000, 100000, 10, 0.01),
@@ -1257,6 +1301,23 @@ std::vector<EffectInfo> buildCatalog() {
                      },
                      {str("file", "Model (glTF, GLB, OBJ, USD) or Splats (PLY, SPZ)", StringKind::File),
                       str("camera_file", "Take The File's Camera From (USD, glTF; else the model)", StringKind::File)}});
+        // The scene's camera (render/ModelClip.h): 3D layers, models and splats that choose The Scene's Camera are seen
+        // through the one on the highest track at the time. Draws nothing itself.
+        c.push_back({"camera3d", "Camera", EffectCategory::Generator, "Titles",
+                     {
+                         num("fov", "Lens (field of view °)", 5, 120, 35, 0.5),
+                         num("pos_x", "Position X", -100000, 100000, 0, 0.01),
+                         num("pos_y", "Position Y (up)", -100000, 100000, 0, 0.01),
+                         num("pos_z", "Position Z (back from where the frame fills the view)", -100000, 100000, 0, 0.01),
+                         num("rot_y", "Pan (Y°)", -360, 360, 0, 0.5),
+                         num("rot_x", "Tilt (X°)", -360, 360, 0, 0.5),
+                         num("rot_z", "Roll (Z°)", -360, 360, 0, 0.5),
+                         boolean("aim", "Aim at a Point", false),
+                         num("aim_x", "Aim X", -100000, 100000, 0, 0.01),
+                         num("aim_y", "Aim Y (up)", -100000, 100000, 0, 0.01),
+                         num("aim_z", "Aim Z", -100000, 100000, 0, 0.01),
+                     },
+                     {}});
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
         for (const TitleTemplate& tpl : titleTemplates()) {
             EffectInfo t = title;
@@ -1329,6 +1390,7 @@ const EffectInfo& maskInfo() {
                     num("mask.refine_radius", "Refine Radius (px)", 1, 64, 8, 0.5),
                     pct("mask.opacity", "Mask Opacity", 0, 100, 100),
                     boolean("mask.invert", "Invert"),
+                    boolean("mask.surface", "Bend With the Surface Track"),
                     boolean("mask.qualify", "HSL Qualifier"),
                     num("mask.hue", "Hue Center", 0, 360, 0, 0.5),
                     num("mask.hue_width", "Hue Width", 1, 360, 60, 0.5),
@@ -1818,6 +1880,13 @@ const std::vector<std::string>& blendModes() {
                                                    "darken",  "lighten", "difference", "soft_light", "hard_light",
                                                    "color_dodge", "color_burn", "subtract"};
     return modes;
+}
+
+std::string blendModeLabel(const std::string& mode) {
+    std::string label = mode;
+    std::replace(label.begin(), label.end(), '_', ' ');
+    if (!label.empty() && label[0] >= 'a' && label[0] <= 'z') label[0] = char(label[0] - 'a' + 'A');
+    return label;
 }
 
 }  // namespace montage

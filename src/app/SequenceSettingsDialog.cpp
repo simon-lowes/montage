@@ -1,5 +1,6 @@
 // Montage — sequence settings dialog.
 #include "SequenceSettingsDialog.h"
+#include "Language.h"
 #include "Settings.h"
 
 #include <QCheckBox>
@@ -139,7 +140,7 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     colorSpace_ = new QComboBox(this);
     colorSpace_->setObjectName(QStringLiteral("colorSpace"));
     for (const ColorSpace* cs : displayColorSpaces())
-        colorSpace_->addItem(QString::fromStdString(cs->label), QString::fromStdString(cs->id));
+        colorSpace_->addItem(language::engine(cs->label), QString::fromStdString(cs->id));
     colorSpace_->setToolTip(tr("The space clips are converted into, effects work in and exports deliver.\n"
                                "HDR sequences are previewed tone mapped to SDR."));
     hdrPeak_ = new QSpinBox(this);
@@ -152,7 +153,7 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     workingSpace_->setObjectName(QStringLiteral("workingSpace"));
     workingSpace_->addItem(tr("As delivered (the colour space)"), QString());
     for (const ColorSpace* cs : workingColorSpaces())
-        workingSpace_->addItem(QString::fromStdString(cs->label), QString::fromStdString(cs->id));
+        workingSpace_->addItem(language::engine(cs->label), QString::fromStdString(cs->id));
     workingSpace_->setToolTip(tr("Grade scene-referred: clips are graded in this space and composited in its light, and the\n"
                                  "viewer, each export and each trim target reach their display through an output transform.\n"
                                  "Titles and graphics come in through it, so they look as designed on every display."));

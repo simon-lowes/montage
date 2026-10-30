@@ -1,5 +1,7 @@
 #include "Shapes.h"
 
+#include "ShapeLayers.h"
+
 #include <QImage>
 #include <QLinearGradient>
 #include <QPainter>
@@ -145,7 +147,8 @@ QPainterPath trimPath(const QPainterPath& path, double start, double end, double
     return out;
 }
 
-Image renderShape(const Effect& g, FrameTime t, int w, int h, double scale) {
+Image renderShape(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
+    if (!g.s("contents").empty()) return renderShapeContents(g, t, w, h, scale, fps);
     QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
     {

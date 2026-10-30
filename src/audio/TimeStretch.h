@@ -28,6 +28,18 @@ int stretchHop(int sampleRate);
 void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out,
                   const std::atomic<bool>* cancel = nullptr);
 
+// WSOLA in two steps, for sounds cut together at the same places (the microphones of one take warped as a group):
+// where each grain is taken from, lined up on `guide` (mono; output sample k * hop plays around guide sample
+// `positions[k]`; the grains numbered in `locked`, in order, are taken from exactly there, so a transient keeps its
+// moment)...
+std::vector<int64_t> wsolaGrainStarts(const std::vector<float>& guide, const std::vector<double>& positions, int hop,
+                                      int64_t outFrames, const std::atomic<bool>* cancel = nullptr,
+                                      const std::vector<int64_t>& locked = {});
+// ...then a sound overlap-added from those grains: grain k, from sample starts[k] + shift of `in`, goes to output
+// sample k * hop + shift less half a grain. `shift` is where the sound's time is against the guide's.
+void wsolaOverlapAdd(const AudioBuffer& in, const std::vector<int64_t>& starts, int hop, int64_t shift, int64_t outFrames,
+                     AudioBuffer& out);
+
 // The same, cached under `key` (which must name the source and the time map;
 // `positions` is only asked for when it is not cached): made now with
 // `blocking`, else in the background, nullptr until it is ready.

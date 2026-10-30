@@ -14,6 +14,7 @@
 #include "Recovery.h"
 #include "automation/ScriptPanel.h"
 #include "TimelineWidget.h"
+#include "audio/ElasticAudio.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "media/Image.h"
@@ -56,6 +57,7 @@ class MonitorCalibrationDialog;
 class PatchGenerator;
 class ReferenceOutputController;
 class RemoteReviewController;
+class RemoteGradeController;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -88,6 +90,7 @@ class AudioMeterWidget;
 class LoudnessReadout;
 class VoiceoverDialog;
 class LinkMediaDialog;
+class VfxShotsDialog;
 class LiveLink;
 class AssistantPanel;
 class ScriptConsole;
@@ -211,6 +214,16 @@ public:
     void micBleedDialog();
     // Clip › Spectral Repair…: the editor for the selected audio clip (or the one under the playhead), shown modeless.
     SpectralRepairDialog* spectralRepairDialog();
+    // Clip › Elastic Audio (audio/ElasticAudio.h), each one undo step: on for the selected audio clips (warped together
+    // when there are several), warp markers at their onsets, a mode, off.
+    bool enableElasticAudio(int mode = 0);
+    int addWarpMarkersAtOnsets(double sensitivity = 50);
+    bool setElasticMode(int mode);
+    bool removeElasticAudio();
+    // A pitch edit over the In/Out range where it meets the selected audio clip (or the one under the playhead),
+    // else the whole clip: `set` fills in what it does. Clear Pitch Edits takes them all off.
+    bool addPitchEdit(const QString& label, const std::function<void(PitchEdit&)>& set);
+    bool clearPitchEdits();
     RedactFacesDialog* redactFacesDialog();
     LearnEffectDialog* learnEffectDialog();
     PanFollowDialog* panFollowDialog();
@@ -379,6 +392,10 @@ public:
     int addTakesFromBin();  // how many takes were added
     bool cycleTake(int step);
     bool finalizeAudition();
+    // VFX shots (render/VfxShots.h): the version shown on the selected shots' clips (else the clip under the playhead)
+    // stepped up or down, one undo step; and the VFX Shots window.
+    bool stepVfxVersion(int step);
+    VfxShotsDialog* showVfxShots();
     // Effect presets (core/EffectPresets.h, app/EffectPresetStore.h): the clip's effects saved under a name (the file,
     // or empty with a message), and a preset's effects added to the selected clips of its kind (how many clips).
     QString saveEffectsAsPreset(const QString& name);
@@ -440,6 +457,7 @@ public:
     // Audio, Effects, Captions and Logging (Alt+Shift+1 to 6, Window › Workspaces, or the bar in the status bar). A
     // layout of one's own is saved under a name and comes back as it was saved; the current workspace is remembered.
     static const QStringList& builtInWorkspaces();
+    static QString workspaceTitle(const QString& name);
     QStringList workspaces() const;  // the built-in ones, then saved ones by name
     QString currentWorkspace() const { return workspace_; }
     // gpu::initialize, marked in the settings until the GPU has drawn a frame (or Montage quits), so a launch a driver
@@ -470,6 +488,8 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* e) override;
+    void changeEvent(QEvent* e) override;
+    void showEvent(QShowEvent* e) override;
     // Dock tab bars: whole names, with scroll arrows when crowded (Qt shortens them to "Tra…" by default).
     void childEvent(QChildEvent* e) override;
 
@@ -485,6 +505,9 @@ private:
     // with its first in front. Panels in no group are hidden, tabbed behind the first top group for Window to bring back.
     using DockGroups = std::vector<std::vector<QDockWidget*>>;
     void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom = {});
+    Qt::DockWidgetArea side(Qt::DockWidgetArea area) const;
+    void mirrorDocks();  // the panels as they are, the other way round
+    void setSideCorner(Qt::Corner corner, Qt::DockWidgetArea area);
     void layOutBuiltIn(const QString& name);
     void syncWorkspaceUi();
     void syncProgram();
@@ -569,8 +592,9 @@ private:
     void showReferenceOutput();
     MonitorCalibrationDialog* showMonitorCalibration();
     void showRemoteReview();
+    void showRemoteGrade();
     // Markers reviewers sent from a remote review (one undo step), on the sequence streamed.
-    int applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers);
+    int applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers, const QString& undoLabel = QString());
     void about();
 
     EditorState* state_;
@@ -604,6 +628,8 @@ private:
     ReferenceOutputController* referenceOutput_ = nullptr;
     RemoteReviewController* remoteReview_ = nullptr;
     QAction* remoteReviewAction_ = nullptr;
+    RemoteGradeController* remoteGrade_ = nullptr;
+    QAction* remoteGradeAction_ = nullptr;
     QAction* referenceOutputAction_ = nullptr;
     PatchGenerator* patchGenerator_ = nullptr;
     QAction* monitorCalibrationAction_ = nullptr;
@@ -634,6 +660,7 @@ private:
     LoudnessReadout* loudness_ = nullptr;
     VoiceoverDialog* voiceover_ = nullptr;
     QPointer<LinkMediaDialog> linkMedia_;
+    QPointer<VfxShotsDialog> vfxShots_;
     QTimer renderBarTimer_;
     QTimer backgroundTimer_;
     bool backgroundRender_ = false, backgroundBusy_ = false;
@@ -736,6 +763,7 @@ private:
     std::vector<QAction*> workspaceActions_;
     QActionGroup* workspaceGroup_ = nullptr;
     bool syncingWorkspace_ = false;
+    bool mirrorWhenShown_ = false;
     QLabel* statusInfo_ = nullptr;
     Monitor active_ = Monitor::Program;
     std::vector<edit::ClipboardItem> clipboard_;

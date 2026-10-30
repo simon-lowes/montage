@@ -46,7 +46,7 @@ jobs:
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
         # FFmpeg itself is built below, from the libraries it uses.
-        run: brew install qtbase qtmultimedia opencolorio lilv libraw openjpeg libmysofa onnxruntime openssl@3 ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
+        run: brew install qtbase qtmultimedia qttools qttranslations opencolorio lilv libraw openjpeg libmysofa onnxruntime openssl@3 ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
         run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
@@ -149,7 +149,7 @@ jobs:
           # this build replaces).
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p nasm:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p openssl:p rust:p expat:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p qt6-translations:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p openssl:p rust:p expat:p
             x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
@@ -206,6 +206,11 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure || {
             for t in $(ctest --test-dir build --rerun-failed --show-only=json-v1 | sed -n 's/.*"name" *: *"\(test_[a-z]*\)".*/\1/p' | sort -u); do
+              # (what failed under ctest itself, which a second run can miss)
+              { grep -A3 '^FAIL!' "build/tests/$t-ctest.txt" | tr -d '\r' | awk '/^FAIL!/ { if (m) print m; m = $0; next } /^[ \t]/ { m = m " " $0 } END { if (m) print m }' |
+                  while read -r line; do echo "::error title=$t under ctest::$line"; done; } 2>/dev/null || true
+              grep -q '^Totals' "build/tests/$t-ctest.txt" 2>/dev/null ||
+                echo "::error title=$t under ctest::stopped before the end (crashed?); last lines: $(tail -n 3 "build/tests/$t-ctest.txt" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
               log="build/tests/$t-results.txt"
               code=0
               (cd build/tests && QT_QPA_PLATFORM=offscreen "./$t.exe" -maxwarnings 0 -o "$t-results.txt,txt") || code=$?
@@ -222,7 +227,9 @@ jobs:
         if: failure()
         with:
           name: test-results-windows
-          path: build/tests/*-results.txt
+          path: |
+            build/tests/*-results.txt
+            build/tests/*-ctest.txt
           if-no-files-found: ignore
       - name: Package (portable zip)
         run: scripts/package-windows.sh build

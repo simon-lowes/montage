@@ -1,5 +1,6 @@
 // Montage — effects browser.
 #include "EffectsBrowser.h"
+#include "Language.h"
 #include "render/Ofx.h"
 
 #include "EffectPresetStore.h"
@@ -77,11 +78,11 @@ QIcon categoryIcon(EffectCategory c) {
 
 QString tooltipFor(const EffectInfo& info) {
     QStringList lines;
-    lines << QString::fromStdString(info.displayName);
-    if (!info.group.empty()) lines << QString::fromStdString(info.group);
+    lines << language::engine(info.displayName);
+    if (!info.group.empty()) lines << language::engine(info.group);
     QStringList params;
-    for (const ParamInfo& p : info.params) params << QString::fromStdString(p.label);
-    for (const StringParamInfo& s : info.strings) params << QString::fromStdString(s.label);
+    for (const ParamInfo& p : info.params) params << language::engine(p.label);
+    for (const StringParamInfo& s : info.strings) params << language::engine(s.label);
     if (params.size() > 6) {
         params = params.mid(0, 6);
         params << QStringLiteral("…");
@@ -267,7 +268,7 @@ void EffectsBrowser::populate() {
 
         for (const EffectInfo* info : effectsInCategory(section.category)) {
             QTreeWidgetItem* parent = top;
-            const QString group = info->group.empty() ? tr("Other") : QString::fromStdString(info->group);
+            const QString group = info->group.empty() ? tr("Other") : language::engine(info->group);
             if (section.grouped) {
                 parent = groups.value(group);
                 if (!parent) {
@@ -277,7 +278,7 @@ void EffectsBrowser::populate() {
                     groups.insert(group, parent);
                 }
             }
-            const QString name = QString::fromStdString(info->displayName);
+            const QString name = language::engine(info->displayName);
             const QString type = QString::fromStdString(info->type);
             auto* leaf = new QTreeWidgetItem(parent, QStringList{name});
             leaf->setFlags(leafFlags);
@@ -285,7 +286,8 @@ void EffectsBrowser::populate() {
             leaf->setToolTip(0, tooltipFor(*info));
             leaf->setData(0, kTypeRole, type);
             leaf->setData(0, kCategoryRole, int(info->category));
-            leaf->setData(0, kSearchRole, QStringList{name, group, type}.join(' '));
+            // (found by its name as written too)
+            leaf->setData(0, kSearchRole, QStringList{name, group, QString::fromStdString(info->displayName), QString::fromStdString(info->group), type}.join(' '));
         }
         top->setExpanded(true);
     }
@@ -305,11 +307,13 @@ void EffectsBrowser::populate() {
         QTreeWidgetItem*& folder = vendors[vendor];
         if (!folder) {
             folder = new QTreeWidgetItem(pluginsTop, QStringList{vendor});
+            folder->setData(0, language::kUntranslatedRole, !d.vendor.empty());
             folder->setIcon(0, folderIcon);
             folder->setFlags(folderFlags);
         }
         const QString name = QString::fromStdString(d.name);
         auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
+        leaf->setData(0, language::kUntranslatedRole, true);
         leaf->setFlags(leafFlags);
         leaf->setIcon(0, pluginIcon);
         QStringList details{QString::fromLatin1(plugins::formatName(d.format)), vendor};
@@ -335,11 +339,13 @@ void EffectsBrowser::populate() {
         QTreeWidgetItem*& folder = ofxGroups[group];
         if (!folder) {
             folder = new QTreeWidgetItem(ofxTop, QStringList{group});
+            folder->setData(0, language::kUntranslatedRole, !d.group.empty());
             folder->setIcon(0, folderIcon);
             folder->setFlags(folderFlags);
         }
         const QString name = QString::fromStdString(d.label);
         auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
+        leaf->setData(0, language::kUntranslatedRole, true);
         leaf->setFlags(leafFlags);
         leaf->setIcon(0, categoryIcon(EffectCategory::VideoFilter));
         QStringList details{QStringLiteral("OpenFX"), group, tr("version %1.%2").arg(d.versionMajor).arg(d.versionMinor)};
@@ -362,11 +368,12 @@ void EffectsBrowser::populate() {
         for (const auto& [file, preset] : saved) {
             const QString name = QString::fromStdString(preset.name);
             auto* leaf = new QTreeWidgetItem(top, QStringList{name});
+            leaf->setData(0, language::kUntranslatedRole, true);
             leaf->setFlags(leafFlags);
             leaf->setIcon(0, categoryIcon(preset.video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter));
             QStringList inside;
             for (const Effect& e : preset.effects)
-                if (const EffectInfo* info = findEffectInfo(e.type)) inside << QString::fromStdString(info->displayName);
+                if (const EffectInfo* info = findEffectInfo(e.type)) inside << language::engine(info->displayName);
             leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2").arg(name.toHtmlEscaped(), inside.join(QStringLiteral(", ")).toHtmlEscaped()));
             leaf->setData(0, kTypeRole, QStringLiteral("preset:") + file);
             leaf->setData(0, kCategoryRole, int(preset.video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter));

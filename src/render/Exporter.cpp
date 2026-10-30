@@ -297,8 +297,10 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
 
 }  // namespace
 
-const std::vector<ExportPreset>& exportPresets() {
-    static const std::vector<ExportPreset> presets = [] {
+namespace {
+
+std::vector<ExportPreset> makePresets(bool everyBuild) {
+    {
         std::vector<ExportPreset> v;
         v.push_back(preset("H.264 - High Quality", "mp4", "Mastering-grade H.264 (CRF 16), AAC 320 kbps", "libx264", "aac", 16, "slow"));
         v.push_back(preset("H.264 - YouTube / Vimeo", "mp4", "Web delivery, CRF 20", "libx264", "aac", 20, "medium"));
@@ -338,7 +340,7 @@ const std::vector<ExportPreset>& exportPresets() {
         }
         v.push_back(preset("FFV1 (lossless archive)", "mkv", "Mathematically lossless 10-bit 4:2:2 with FLAC sound, for archiving", "ffv1", "flac", 0,
                            "", "", "yuv422p10le"));
-        if (avcodec_find_encoder_by_name("liboapv")) {
+        if (everyBuild || avcodec_find_encoder_by_name("liboapv")) {
             // APV (Advanced Professional Video, an open intra-frame codec; OpenAPV's encoder): listed where FFmpeg has
             // the encoder. Quality is a QP from 0 (best) to 63, or a bitrate.
             v.push_back(preset("APV 422 10-bit", "mov", "Open intra-frame intermediate, 10-bit 4:2:2", "liboapv", "pcm_s24le", 20, "", "", "yuv422p10le"));
@@ -405,9 +407,17 @@ const std::vector<ExportPreset>& exportPresets() {
         v.push_back(preset("Audio - WAV 24-bit", "wav", "Uncompressed mixdown", "none", "pcm_s24le", 0, ""));
         v.push_back(preset("Audio - AAC (M4A)", "m4a", "Compressed mixdown", "none", "aac", 0, ""));
         return v;
-    }();
+    }
+}
+
+}  // namespace
+
+const std::vector<ExportPreset>& exportPresets() {
+    static const std::vector<ExportPreset> presets = makePresets(false);
     return presets;
 }
+
+std::vector<ExportPreset> exportPresetsOfEveryBuild() { return makePresets(true); }
 
 const ExportPreset* findExportPreset(const std::string& name) {
     for (const auto& p : exportPresets())
@@ -2747,12 +2757,60 @@ bool apvEncoderAvailable() { return avcodec_find_encoder_by_name("liboapv") != n
 
 bool apvDecoderAvailable() { return avcodec_find_decoder_by_name("apv") != nullptr; }
 
+namespace {
+
+// A node graph's clip alone on its track: the clips there its Track nodes follow are kept, on a muted track of their own
+// at the end (out of sight, where the track inputs' numbers do not reach), for the nodes to read their movement.
+void keepFollowedClips(Sequence& alone, const Track& real, const Clip& c) {
+    Track kept;
+    kept.kind = TrackKind::Video;
+    kept.muted = true;
+    for (const Clip& o : real.clips)
+        if (o.id != c.id && std::any_of(c.composite.nodes.begin(), c.composite.nodes.end(), [&](const CompositeNode& n) { return n.follow == o.id; }))
+            kept.clips.push_back(o);
+    if (!kept.clips.empty()) alone.videoTracks.push_back(std::move(kept));
+}
+
+}  // namespace
+
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress, const std::atomic<bool>* cancel, bool apv) {
     const Clip* c = edit::clipById(seq, clip);
     if (!c) {
         if (error) *error = "No such clip";
         return false;
+    }
+    ExportSettings st;
+    st.path = path;
+    st.videoCodec = apv ? "liboapv" : "prores_ks";
+    st.profile = "4444";  // with its transparency
+    st.alpha = true;
+    st.crf = 12;  // (APV's QP: near lossless, as ProRes 4444 is)
+    st.audioCodec = "none";
+    st.smartRender = false;
+    const auto loc = edit::locate(seq, clip);
+    if (!c->composite.empty() && loc && loc->track.kind == TrackKind::Video) {
+        // A node graph's clip at the sequence's size over its own span, with the other tracks there (muted) for its
+        // track inputs, and the clips it follows, so the render is the graph's picture as it plays.
+        // Its movement stays (it is inside the graph's picture); Render and Replace leaves the rendered clip still. The
+        // clips its Track nodes follow stay on its track, outside the span rendered.
+        Sequence whole = seq;
+        for (Track& t : whole.videoTracks) t.muted = true;
+        Track& own = whole.videoTracks[size_t(loc->track.index)];
+        own.muted = false;
+        own.transitions.clear();
+        std::erase_if(own.clips, [&](const Clip& o) {
+            return o.id != c->id && std::none_of(c->composite.nodes.begin(), c->composite.nodes.end(), [&](const CompositeNode& n) { return n.follow == o.id; });
+        });
+        for (Clip& o : own.clips)
+            if (o.id == c->id) o.linkGroup = 0, o.blendMode = "normal";
+        whole.audioTracks.clear();
+        whole.buses.clear();
+        whole.captionTracks.clear();
+        whole.markers.clear();
+        st.in = c->start;
+        st.out = c->end();
+        return exportSequence(p, whole, st, progress, cancel, error);
     }
     // The clip alone, at its media's own size (a generator at the sequence's), its transform left live on the clip.
     Sequence alone = seq;
@@ -2770,14 +2828,6 @@ bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::
     copy.blendMode = "normal";
     copy.motion = makeEffect("transform", c->motion.id);
     alone.videoTracks[0].clips.push_back(copy);
-    ExportSettings st;
-    st.path = path;
-    st.videoCodec = apv ? "liboapv" : "prores_ks";
-    st.profile = "4444";  // with its transparency
-    st.alpha = true;
-    st.crf = 12;  // (APV's QP: near lossless, as ProRes 4444 is)
-    st.audioCodec = "none";
-    st.smartRender = false;
     st.in = 0;
     st.out = copy.duration;
     return exportSequence(p, alone, st, progress, cancel, error);
@@ -2828,6 +2878,7 @@ bool bakeCompositeClips(Project& p, Id seqId, const std::string& output, std::st
         copy.duration += head + tail;
         edit::shiftKeyframes(copy, head);
         own.clips.assign(1, copy);
+        keepFollowedClips(alone, real, *c);  // (after the last use of `own`: this can add a track)
         alone.audioTracks.clear();
         alone.buses.clear();
         alone.captionTracks.clear();

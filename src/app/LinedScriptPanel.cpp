@@ -1,5 +1,6 @@
 #include "LinedScriptPanel.h"
 
+#include <QCoreApplication>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFile>
@@ -26,6 +27,8 @@ namespace montage {
 
 // The pages, one under another, as wide as the panel.
 class LinedScriptPages : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(montage::LinedScriptPages)  // (its texts under its own name, as lupdate files them)
+
 public:
     explicit LinedScriptPages(LinedScriptPanel* panel) : QWidget(panel), panel_(panel) {
         setObjectName(QStringLiteral("linedScriptPages"));

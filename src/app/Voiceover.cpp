@@ -1,4 +1,5 @@
 #include "Voiceover.h"
+#include "Language.h"
 
 #include <QAudioDevice>
 #include <QAudioFormat>
@@ -378,6 +379,7 @@ VoiceoverDialog::VoiceoverDialog(EditorState* state, PlaybackController* program
     auto* form = new QFormLayout(this);
     input_ = new QComboBox(this);
     input_->setObjectName(QStringLiteral("voiceoverInput"));
+    language::keepUntranslated(input_);  // (the computer's own names for its devices)
     input_->addItems(VoiceoverRecorder::inputs());
     track_ = new QComboBox(this);
     track_->setObjectName(QStringLiteral("voiceoverTrack"));

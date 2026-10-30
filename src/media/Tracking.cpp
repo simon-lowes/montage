@@ -258,6 +258,12 @@ std::vector<Point2> goodFeatures(const GrayImage& img, int maxCorners, double mi
     return out;
 }
 
+std::vector<GrayImage> grayPyramid(const GrayImage& img) { return pyramid(img); }
+
+bool lucasKanade(const std::vector<GrayImage>& a, const std::vector<GrayImage>& b, Point2 p, Point2& out) {
+    return !a.empty() && a.size() == b.size() && lkPoint(a, b, p, out);
+}
+
 void trackPoints(const GrayImage& a, const GrayImage& b, const std::vector<Point2>& from, std::vector<Point2>& to,
                  std::vector<bool>& ok) {
     const auto A = pyramid(a), B = pyramid(b);

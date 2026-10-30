@@ -8,6 +8,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -35,6 +36,7 @@
 #include "core/Storyboard.h"
 #include "render/LearnFromClip.h"
 #include "render/ModelClip.h"
+#include "render/ShapeLayers.h"
 #include "render/ExtendClip.h"
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
@@ -54,6 +56,7 @@
 #include "render/ClipPlacement.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
+#include "audio/ElasticAudio.h"
 #include "audio/PluginEffect.h"
 #include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
@@ -121,6 +124,7 @@
 #include "render/AudioReactive.h"
 #include "render/Expressions.h"
 #include "render/VfxPull.h"
+#include "render/VfxShots.h"
 #include "render/Amf.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
@@ -139,6 +143,7 @@
 #include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
+#include "render/SurfaceTrack.h"
 #include "render/QualityCheck.h"
 #include "render/SdhDraft.h"
 #include "render/FrameRepair.h"
@@ -2559,17 +2564,70 @@ void McpServer::Impl::addTools() {
         "its settings by name (montage_list_effects with kind generator lists model3d's; colours as name.r / .g / .b), "
         "e.g. {\"light_angle\": 30, \"env_track\": 3, \"depth_merge\": 1}. Returns the clip with the model's "
         "animations, cameras, lights, triangle count and what in the file is not read (notes); for splats their count, "
-        "the number of files in their run (frames) and the degree of their colours' harmonics.",
+        "the number of files in their run (frames) and the degree of their colours' harmonics. In place of a file, shape "
+        "makes one (plane: the frame's shape, a unit tall, facing the camera; box, sphere or cylinder: a unit across) in "
+        "shape_color, shape_metal and shape_rough (settings). Any model can carry a track's picture: settings "
+        "texture_track (the track's number, 1 for V1; hidden unless texture_hide 0), on one material (texture_material, "
+        "1-based; 0 all), lit by the scene or as it is (texture_light 1). camera 0 with settings camera 3 sees it through "
+        "the scene's Camera clip (montage_add_camera).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
+            "shape":{"type":"string","enum":["plane","box","sphere","cylinder"]},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
             "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
             "camera":{"type":"integer","minimum":0},"camera_file":{"type":"string"},
             "settings":{"type":"object","additionalProperties":{"type":"number"}}},
-            "required":["project","file"]})json",
+            "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            if (a.contains("shape")) {
+                // A shape made in place of a file's model.
+                if (a.contains("file")) throw ArgError{"Give \"file\" or \"shape\", not both"};
+                for (const char* k : {"over", "place", "camera", "camera_file"})
+                    if (a.contains(k)) throw ArgError{QStringLiteral("A shape is seen through its own camera or the scene's: \"%1\" is for a file's model").arg(k)};
+                const QStringList shapes{"plane", "box", "sphere", "cylinder"};
+                const int shape = int(shapes.indexOf(str(a, "shape"))) + 1;
+                if (shape <= 0) throw ArgError{"\"shape\" is plane, box, sphere or cylinder"};
+                Clip c = makeGeneratorClip(l.project, "model3d", 1);
+                c.generator.params["shape"] = Param(double(shape));
+                c.generator.params["ground"] = Param(0.0);
+                c.name = str(a, "shape").toStdString();
+                c.name[0] = char(std::toupper(c.name[0]));
+                const EffectInfo* info = findEffectInfo("model3d");
+                const QJsonObject settings = a.value("settings").toObject();
+                for (auto it = settings.begin(); it != settings.end(); ++it) {
+                    const std::string name = it.key().toStdString();
+                    const ParamInfo* pi = nullptr;
+                    for (const ParamInfo& p : info->params)
+                        if (p.kind == ParamKind::Color ? name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name) pi = &p;
+                    if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of 3D Model").arg(it.key())};
+                    if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                    c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
+                }
+                if (a.contains("position")) {
+                    const QJsonArray pos = a.value("position").toArray();
+                    if (pos.size() != 3) throw ArgError{"\"position\" is [x, y, z]"};
+                    for (int k = 0; k < 3; ++k) c.generator.params[k == 0 ? "pos_x" : k == 1 ? "pos_y" : "pos_z"] = Param(pos[k].toDouble());
+                }
+                TrackRef t{TrackKind::Video, 0};
+                if (a.contains("track")) {
+                    t = trackArg(str(a, "track"), s, true, &l.project, &s);
+                } else {
+                    int top = -1;
+                    for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                        if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                    t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+                }
+                c.start = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+                c.duration = std::max<FrameTime>(1, a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue())));
+                const auto r = edit::overwrite(l.project, s, t, c);
+                check(r);
+                save(l);
+                const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+                return ok(QStringLiteral("Added a %1 on %2").arg(str(a, "shape"), QString::fromStdString(trackAt(s, t)->name)),
+                          made ? clipJson(l.project, s, *made) : QJsonObject{});
+            }
             const QFileInfo fi(absolute(need(a, "file")));
             if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(need(a, "file"))};
             std::string err;
@@ -2689,11 +2747,91 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
         });
 
+    add("montage_add_camera", "Add a 3D camera",
+        "Add the scene's Camera: 3D layers (montage_add_effect layer_3d), models and splats whose camera is The Scene's "
+        "Camera (camera 3) are seen through it, the one on the highest track when there are several (or the track their "
+        "camera_track names). Left as it is it sees the frame as a 2D view does (its lens fov across the width, the "
+        "frame's plane a pixel a unit, y up); position [x, y, z] moves it (z back from the frame), turn [pan, tilt, roll] "
+        "in degrees turns it, or aim [x, y, z] points it at a point (roll still applies). keys animates it: [{frame, "
+        "position?, turn?, aim?, fov?}], frames from the clip's start. It draws nothing itself.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "duration":{"type":["number","string"],"default":5},"track":{"type":"string"},"fov":{"type":"number"},
+            "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "turn":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "aim":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "keys":{"type":"array","items":{"type":"object"}}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip c = makeGeneratorClip(l.project, "camera3d", 1);
+            c.name = "Camera";
+            auto three = [](const QJsonValue& v, const char* what) {
+                const QJsonArray arr = v.toArray();
+                if (arr.size() != 3) throw ArgError{QStringLiteral("\"%1\" is three numbers").arg(what)};
+                return std::array<double, 3>{arr[0].toDouble(), arr[1].toDouble(), arr[2].toDouble()};
+            };
+            // Its settings from one object (the call's, or a key's), set or keyed at `frame`.
+            auto apply = [&](const QJsonObject& o, FrameTime frame, bool keyed) {
+                auto set = [&](const char* name, double v) {
+                    if (keyed) c.generator.params[name].addKey(frame, v);
+                    else c.generator.params[name] = Param(v);
+                };
+                if (o.contains("fov")) set("fov", std::clamp(o.value("fov").toDouble(35), 5.0, 120.0));
+                if (o.contains("position")) {
+                    const auto v = three(o.value("position"), "position");
+                    set("pos_x", v[0]), set("pos_y", v[1]), set("pos_z", v[2]);
+                }
+                if (o.contains("turn")) {
+                    const auto v = three(o.value("turn"), "turn");
+                    set("rot_y", v[0]), set("rot_x", v[1]), set("rot_z", v[2]);
+                }
+                if (o.contains("aim")) {
+                    const auto v = three(o.value("aim"), "aim");
+                    c.generator.params["aim"] = Param(1.0);
+                    set("aim_x", v[0]), set("aim_y", v[1]), set("aim_z", v[2]);
+                }
+            };
+            apply(a, 0, false);
+            for (const QJsonValue& k : a.value("keys").toArray()) {
+                const QJsonObject o = k.toObject();
+                if (!o.value("frame").isDouble()) throw ArgError{"Each key has a \"frame\""};
+                apply(o, FrameTime(std::llround(o.value("frame").toDouble())), true);
+            }
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) {
+                t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            } else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            c.start = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+            c.duration = std::max<FrameTime>(1, a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue())));
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added a camera on %1").arg(QString::fromStdString(trackAt(s, t)->name)), made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
     add("montage_add_shape", "Add a shape",
         "Add a shape layer over the picture: a rectangle, ellipse, polygon, star, line or arrow, filled (a colour, or a "
         "gradient to a second colour) and/or outlined. Sizes and positions are in sequence pixels, from the centre. "
         "draw_on animates the outline drawing itself on over that many seconds (Trim End keyframed 0 to 100 %). Lottie "
-        "animations (.json) and SVG graphics are placed like other media, with montage_place_media.",
+        "animations (.json) and SVG graphics are placed like other media, with montage_place_media; svg (a file) instead "
+        "makes an SVG's paths, groups, fills, strokes and gradients into an editable shape layer its size (what it cannot "
+        "make into shapes is listed in notes). items builds a layer of several things, in order, the first on top: "
+        "{type, settings?, name?} with type a shape (rect, ellipse, polygon, star, or path with points [[x, y] or {x, y, "
+        "in: [dx, dy], out: [dx, dy]}], closed, and keys [{frame, points}] to morph it), a paint (fill, stroke: settings "
+        "color \"#rrggbb\", width, gradient 1 linear or 2 radial from start_x/y to end_x/y with color2, or stops "
+        "[[offset, \"#rrggbb\", opacity]]), an operator changing the paths above it in its group (merge: mode 0 keep "
+        "each, 1 union, 2 subtract, 3 intersect, 4 exclude; offset: amount, join; round: radius; pucker: amount -100..100; "
+        "twist: angle; zigzag: size, ridges, points 1 smooth; wiggle: size, spacing, speed, correlation, seed; trim: "
+        "start, end, offset; repeater: copies, offset, pos_x/y, anchor_x/y, scale, rotation, start_opacity, end_opacity) "
+        "or a group (its own items, and pos_x/y, anchor_x/y, scale_x/y, rotation, opacity). Positions are pixels from the "
+        "layer's middle, y down. With clip (a shape layer), its contents are replaced instead of a layer added.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "shape":{"type":"string","enum":["rectangle","ellipse","polygon","star","line","arrow"],"default":"rectangle"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},"track":{"type":"string"},
@@ -2702,11 +2840,125 @@ void McpServer::Impl::addTools() {
             "fill":{"type":"string","description":"#rrggbb, or \"none\""},"gradient_to":{"type":"string","description":"#rrggbb"},
             "stroke_width":{"type":"number","default":0},"stroke_color":{"type":"string","default":"#ffffff"},
             "roundness":{"type":"number","default":0},"points":{"type":"integer","description":"Sides of a polygon, points of a star"},
-            "opacity":{"type":"number","default":100},"draw_on":{"type":"number","description":"Seconds"}},
-            "required":["project","at"]})json",
+            "opacity":{"type":"number","default":100},"draw_on":{"type":"number","description":"Seconds"},
+            "svg":{"type":"string"},"items":{"type":"array","items":{"type":"object"}},"clip":{"type":"number"}},
+            "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            // Contents: from an SVG file, or the items given.
+            std::vector<ShapeItem> contents;
+            Effect built;
+            std::vector<std::string> notes;
+            double svgW = 0, svgH = 0;
+            if (a.contains("svg") && a.contains("items")) throw ArgError{"Give \"svg\" or \"items\", not both"};
+            if (a.contains("svg")) {
+                const QFileInfo fi(absolute(str(a, "svg")));
+                if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(str(a, "svg"))};
+                std::string err;
+                if (!importSvgShapes(fi.absoluteFilePath().toStdString(), built, svgW, svgH, &notes, &err)) return fail(QString::fromStdString(err));
+                contents = shapeContents(built);
+            } else if (a.contains("items")) {
+                std::set<std::string> usedIds;
+                std::function<std::vector<ShapeItem>(const QJsonArray&, int)> items = [&](const QJsonArray& arr, int depth) {
+                    if (depth > 16) throw ArgError{"Groups nest too deep"};
+                    std::vector<ShapeItem> out;
+                    for (const QJsonValue& v : arr) {
+                        const QJsonObject o = v.toObject();
+                        ShapeItem it;
+                        it.type = o.value("type").toString().toStdString();
+                        const ShapeItemKind* kind = shapeItemKind(it.type);
+                        if (!kind) throw ArgError{QStringLiteral("\"%1\" is not a kind of shape item").arg(o.value("type").toString())};
+                        if (it.type == "group") it.items = items(o.value("items").toArray(), depth + 1);
+                        for (int n = 1; it.id.empty(); ++n)
+                            if (const std::string id = it.type + std::to_string(n); usedIds.insert(id).second) it.id = id;
+                        it.name = o.value("name").toString().toStdString();
+                        it.closed = o.value("closed").toBool(true);
+                        const QJsonObject settings = o.value("settings").toObject();
+                        for (auto st = settings.begin(); st != settings.end(); ++st) {
+                            const std::string name = st.key().toStdString();
+                            const ParamInfo* pi = nullptr;
+                            for (const ParamInfo& p : kind->params)
+                                if (p.kind == ParamKind::Color ? name == p.name || name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name)
+                                    pi = &p;
+                            if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of %2").arg(st.key(), QString::fromStdString(kind->label))};
+                            if (pi->kind == ParamKind::Color && name == pi->name) {
+                                const QColor col(st.value().toString());
+                                if (!col.isValid()) throw ArgError{QStringLiteral("\"%1\" is a colour (#rrggbb)").arg(st.key())};
+                                built.params[it.id + "." + name + ".r"] = Param(col.redF());
+                                built.params[it.id + "." + name + ".g"] = Param(col.greenF());
+                                built.params[it.id + "." + name + ".b"] = Param(col.blueF());
+                                continue;
+                            }
+                            if (!st.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(st.key())};
+                            built.params[it.id + "." + name] = Param(std::clamp(st.value().toDouble(), pi->min, pi->max));
+                        }
+                        for (const QJsonValue& sv : o.value("stops").toArray()) {
+                            const QJsonArray st = sv.toArray();
+                            if (st.size() < 2) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
+                            const QColor col(st.at(1).toString());
+                            if (!col.isValid()) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
+                            it.stops.push_back({std::clamp(st.at(0).toDouble(), 0.0, 1.0), col.redF(), col.greenF(), col.blueF(), st.at(2).toDouble(1)});
+                        }
+                        if (it.type == "path") {
+                            auto pointsOf = [](const QJsonArray& arr) {
+                                std::vector<PathPoint> pts;
+                                for (const QJsonValue& pv : arr) {
+                                    PathPoint pt;
+                                    if (pv.isArray()) {
+                                        pt.x = pv.toArray().at(0).toDouble(), pt.y = pv.toArray().at(1).toDouble();
+                                    } else {
+                                        const QJsonObject po = pv.toObject();
+                                        pt.x = po.value("x").toDouble(), pt.y = po.value("y").toDouble();
+                                        const QJsonArray in = po.value("in").toArray(), outh = po.value("out").toArray();
+                                        if (in.size() == 2) pt.ix = in[0].toDouble(), pt.iy = in[1].toDouble();
+                                        if (outh.size() == 2) pt.ox = outh[0].toDouble(), pt.oy = outh[1].toDouble();
+                                    }
+                                    pts.push_back(pt);
+                                }
+                                return pts;
+                            };
+                            if (o.contains("keys")) {
+                                size_t count = 0;
+                                for (const QJsonValue& kv : o.value("keys").toArray()) {
+                                    const QJsonObject ko = kv.toObject();
+                                    const std::vector<PathPoint> pts = pointsOf(ko.value("points").toArray());
+                                    if (pts.size() < 2 || (count && pts.size() != count)) throw ArgError{"Each key of a path has the same number of points (two or more)"};
+                                    count = pts.size();
+                                    setShapePathPoints(built, it.id, FrameTime(std::llround(ko.value("frame").toDouble())), pts, true);
+                                }
+                            } else {
+                                const std::vector<PathPoint> pts = pointsOf(o.value("points").toArray());
+                                if (pts.size() < 2) throw ArgError{"A path has two or more points"};
+                                setShapePathPoints(built, it.id, 0, pts);
+                            }
+                        }
+                        out.push_back(std::move(it));
+                    }
+                    return out;
+                };
+                contents = items(a.value("items").toArray(), 0);
+                if (contents.empty()) throw ArgError{"\"items\" is empty"};
+            }
+            if (a.contains("clip")) {
+                // A shape layer's contents replaced.
+                if (contents.empty()) throw ArgError{"Give \"svg\" or \"items\" to replace a shape layer's contents"};
+                Clip* sc = nullptr;
+                for (Track& tr : s.videoTracks)
+                    for (Clip& k : tr.clips)
+                        if (double(k.id) == a.value("clip").toDouble()) sc = &k;
+                if (!sc || !sc->isGenerator() || sc->generator.type != "shape") throw ArgError{"\"clip\" is not a shape layer"};
+                for (const ShapeItem& it : shapeContents(sc->generator)) eraseShapeItemParams(sc->generator, it);
+                for (const auto& [k, v] : built.params) sc->generator.params[k] = v;
+                setShapeContents(sc->generator, contents);
+                save(l);
+                QJsonObject out = clipJson(l.project, s, *sc);
+                QJsonArray ns;
+                for (const std::string& n : notes) ns.append(QString::fromStdString(n));
+                if (!ns.isEmpty()) out["notes"] = ns;
+                return ok(QStringLiteral("Replaced the shapes of %1").arg(QString::fromStdString(sc->name)), out);
+            }
+            if (!a.contains("at")) throw ArgError{"\"at\" is needed"};
             TrackRef t{TrackKind::Video, 0};
             if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
             else {
@@ -2753,12 +3005,23 @@ void McpServer::Impl::addTools() {
             }
             c.start = timeArg(a.value("at"), s, "at");
             c.name = findEffectInfo("shape")->params[0].choices[size_t(kind)];
+            if (!contents.empty()) {
+                for (const auto& [k, v] : built.params) g.params[k] = v;
+                setShapeContents(g, contents);
+                c.name = a.contains("svg") ? QFileInfo(str(a, "svg")).completeBaseName().toStdString() : std::string("Shapes");
+            }
             const auto r = edit::overwrite(l.project, s, t, c);
             check(r);
             save(l);
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
-            return ok(QStringLiteral("Added a %1 on %2").arg(shapes[kind], QString::fromStdString(trackAt(s, t)->name)),
-                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+            QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            QJsonArray ns;
+            for (const std::string& n : notes) ns.append(QString::fromStdString(n));
+            if (!ns.isEmpty()) out["notes"] = ns;
+            if (svgW > 0) out["size"] = QJsonArray{svgW, svgH};
+            return ok(QStringLiteral("Added %1 on %2").arg(contents.empty() ? "a " + shapes[kind] : QString::fromStdString(c.name),
+                                                           QString::fromStdString(trackAt(s, t)->name)),
+                      out);
         });
 
     add("montage_list_effects", "List effects",
@@ -2890,7 +3153,13 @@ void McpServer::Impl::addTools() {
         "(amount %); a bend pin turns (angle, degrees) and scales (scale %) the area round it; an overlap pin sets which "
         "part is in front where it folds (depth -100..100 over radius); motion_blur 1 blurs along the mesh's motion "
         "(shutter in degrees). grid_warp moves the points of a grid of rows x cols: params g<r>_<c>.dx and .dy (r 0..rows, "
-        "c 0..cols; fractions of the frame), smooth (shape 0) or straight (shape 1) between them.",
+        "c 0..cols; fractions of the frame), smooth (shape 0) or straight (shape 1) between them. "
+        "layer_3d makes the clip a card in 3D: its picture as its transform leaves it, moved (pos_x, pos_y up, pos_z "
+        "towards the camera) and turned (rot_y, rot_x, rot_z, degrees, about pivot_x / pivot_y from the middle), seen "
+        "through the scene's Camera clip (camera 3, the default; montage_add_camera; without one, the camera that sees the "
+        "frame as it is), its own (camera 0, lens fov), the solve montage_camera_track made (camera 1, width in the "
+        "scene's units, camera_track the footage's track) or a file's (camera 2, strings.camera_file); 3D layers, models "
+        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
@@ -6714,6 +6983,197 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("%1 region(s) on the clip").arg(all.size()), out);
         });
 
+    add("montage_warp_audio", "Warp audio (elastic audio)",
+        "Change the timing of the sound inside an audio clip with warp markers: a marker pins a moment of the sound, and "
+        "moving it stretches the sound before it and squeezes the sound after it (up to the next markers), its pitch kept "
+        "(mode speech or general: short or long grains) or moving with the speed like tape (varispeed). Times are timeline "
+        "seconds. group_with warps other clips together with this one (the microphones of one take: they share the markers "
+        "and stay in phase; linked audio clips join on their own). onsets puts a marker at each onset heard in the sound. "
+        "move takes the marker playing at 'from' (or makes one there) to play at 'to'. markers replaces them all: each "
+        "'at' (where it plays) with 'plays' (the timeline time whose sound it plays, as the clip was unwarped). clear "
+        "turns elastic audio off. Reports the markers.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clip":{"type":"number","description":"Audio clip id"},
+            "mode":{"type":"string","enum":["speech","general","varispeed"]},
+            "group_with":{"type":"array","items":{"type":"number"},"description":"Other audio clips warped together with it"},
+            "onsets":{"type":"boolean","description":"Add a marker at each onset"},
+            "sensitivity":{"type":"number","description":"Onsets: 0-100 (default 50)"},
+            "markers":{"type":"array","items":{"type":"object","properties":{"at":{"type":"number"},"plays":{"type":"number"}},"required":["at","plays"]}},
+            "move":{"type":"array","items":{"type":"object","properties":{"from":{"type":"number"},"to":{"type":"number"}},"required":["from","to"]}},
+            "remove":{"type":"array","items":{"type":"number"},"description":"Timeline seconds of markers to take off"},
+            "clear":{"type":"boolean"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = Id(a.value("clip").toDouble());
+            const Clip* c = edit::clipById(s, id);
+            if (!c) throw ArgError{"No such clip"};
+            auto check = [](const edit::Result& r) {
+                if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            };
+            if (a.value("clear").toBool()) {
+                check(edit::removeElasticAudio(l.project, s, id));
+                save(l);
+                return ok(QStringLiteral("Elastic audio off"), QJsonObject{{"markers", QJsonArray{}}});
+            }
+            ElasticMode mode = ElasticMode::Speech;
+            const bool hasMode = a.contains("mode");
+            if (hasMode && !parseElasticMode(a.value("mode").toString().toStdString(), mode)) throw ArgError{"mode is speech, general or varispeed"};
+            std::vector<Id> clips{id};
+            for (const QJsonValue& v : a.value("group_with").toArray()) clips.push_back(Id(v.toDouble()));
+            if (!elasticEffectOf(*c) || clips.size() > 1) {
+                check(edit::enableElasticAudio(l.project, s, clips, hasMode ? mode : (elasticEffectOf(*c) ? elasticModeOf(*elasticEffectOf(*c)) : mode)));
+                c = edit::clipById(s, id);
+            } else if (hasMode && elasticModeOf(*elasticEffectOf(*c)) != mode) {
+                check(edit::setElasticMode(l.project, s, id, mode));
+            }
+            const double fps = s.fpsValue();
+            auto groupAt = [&](double t) {
+                const Clip* cl = edit::clipById(s, id);
+                return (cl->sourceIn + (t * fps - double(cl->start))) / fps - elasticOffsetOf(*cl);
+            };
+            auto timelineAt = [&](double u) {
+                const Clip* cl = edit::clipById(s, id);
+                return (double(cl->start) + (u + elasticOffsetOf(*cl)) * fps - cl->sourceIn) / fps;
+            };
+            if (a.contains("markers")) {
+                DialogueWarp w;
+                for (const QJsonValue& v : a.value("markers").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    w.push_back({groupAt(o.value("at").toDouble()), groupAt(o.value("plays").toDouble())});
+                }
+                std::sort(w.begin(), w.end(), [](const AlignPoint& x, const AlignPoint& y) { return x.u < y.u; });
+                const edit::Result r = edit::setWarpPoints(l.project, s, id, w);
+                if (!r.ok && r.error != "Nothing changed") check(r);
+            }
+            int added = 0;
+            if (a.value("onsets").toBool()) {
+                const edit::Result r = edit::addWarpMarkersAtOnsets(l.project, s, id, a.value("sensitivity").toDouble(50), &added);
+                if (!r.ok && added) check(r);
+            }
+            for (const QJsonValue& v : a.value("remove").toArray()) check(edit::removeWarpMarker(l.project, s, id, groupAt(v.toDouble()), 1.0 / fps));
+            for (const QJsonValue& v : a.value("move").toArray()) {
+                const QJsonObject o = v.toObject();
+                const edit::Result r = edit::moveWarpMarker(l.project, s, id, groupAt(o.value("from").toDouble()), groupAt(o.value("to").toDouble()), 1.0 / fps);
+                if (!r.ok && r.error != "Nothing changed") check(r);
+            }
+            save(l);
+            c = edit::clipById(s, id);
+            const DialogueWarp w = elasticEffectOf(*c) ? dialogueWarpFromString(elasticEffectOf(*c)->s("points")) : DialogueWarp{};
+            QJsonArray markers;
+            for (size_t i = 0; i < w.size(); ++i) {
+                QJsonObject o{{"at", timelineAt(w[i].u)}, {"plays", timelineAt(w[i].w)}};
+                if (i > 0) o["stretch_before"] = (w[i].u - w[i - 1].u) / std::max(1e-9, w[i].w - w[i - 1].w);
+                markers.append(o);
+            }
+            QJsonArray group;
+            for (Id g : edit::elasticGroup(s, id)) group.append(double(g));
+            QJsonObject out{{"markers", markers}, {"mode", QString::fromLatin1(elasticModeName(elasticEffectOf(*c) ? elasticModeOf(*elasticEffectOf(*c)) : mode))},
+                            {"clips", group}};
+            if (a.value("onsets").toBool()) out["onsets_added"] = added;
+            return ok(QStringLiteral("%1 warp marker(s) on %2 clip(s)").arg(w.size()).arg(group.size()), out);
+        });
+
+    add("montage_pitch_contour", "Pitch contour",
+        "Read or edit the pitch of an audio clip (a voice or a solo instrument). Reports the pitch heard (tracked by pYIN) "
+        "every 20 ms over start..end (timeline seconds; default the whole clip; at most 15 minutes), with what the clip's pitch edits make of it "
+        "and the median. edits adds pitch edits, each over start..end: shift (semitones), inflection (how much the pitch "
+        "rises and falls about its median: 0 flat, 1 as it is, 2 doubled), correct (0-1: drawn to the nearest note of the "
+        "scale, vibrato kept) with key (C, C#... or 0-11) and scale (chromatic, major, minor), formant (semitones: the "
+        "voice's size without its pitch). The sound is remade by pitch-synchronous overlap-add; outside the edits it is "
+        "unchanged. clear takes all of the clip's pitch edits off first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clip":{"type":"number","description":"Audio clip id"},
+            "start":{"type":"number"},"end":{"type":"number"},
+            "edits":{"type":"array","items":{"type":"object","properties":{
+                "start":{"type":"number"},"end":{"type":"number"},
+                "shift":{"type":"number"},"inflection":{"type":"number"},
+                "correct":{"type":"number"},"key":{"type":["string","number"]},
+                "scale":{"type":"string","enum":["chromatic","major","minor"]},
+                "formant":{"type":"number"}},"required":["start","end"]}},
+            "clear":{"type":"boolean"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = Id(a.value("clip").toDouble());
+            const Clip* c = edit::clipById(s, id);
+            if (!c) throw ArgError{"No such clip"};
+            const auto where = edit::locate(s, id);
+            if (!where || where->track.kind != TrackKind::Audio) throw ArgError{"Give an audio clip"};
+            const double fps = s.fpsValue(), clipStart = double(c->start) / fps, clipEnd = double(c->end()) / fps;
+            auto sourceAt = [&](double t) { return clipSourceSeconds(s, *edit::clipById(s, id), std::clamp(t, clipStart, clipEnd)); };
+            static const char* kKeys[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+            const bool editing = a.contains("edits") || a.value("clear").toBool();
+            if (editing) {
+                std::vector<PitchEdit> edits;
+                if (const Effect* fx = pitchContourOf(*c); fx && !a.value("clear").toBool()) edits = pitchEditsFromString(fx->s("edits"));
+                for (const QJsonValue& v : a.value("edits").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    const double t0 = o.value("start").toDouble(), t1 = o.value("end").toDouble();
+                    if (!(t1 > t0)) throw ArgError{"Each edit's end must be after its start"};
+                    if (t1 <= clipStart || t0 >= clipEnd) throw ArgError{"An edit is outside the clip"};
+                    PitchEdit e;
+                    e.start = sourceAt(t0), e.end = sourceAt(t1);
+                    e.shift = o.value("shift").toDouble(0);
+                    e.inflection = o.value("inflection").toDouble(1);
+                    e.correct = o.value("correct").toDouble(0);
+                    e.formant = o.value("formant").toDouble(0);
+                    e.scale = o.value("scale").toString("chromatic").toStdString();
+                    const QJsonValue key = o.value("key");
+                    if (key.isString()) {
+                        QString k = key.toString().trimmed().replace(QStringLiteral("♯"), QStringLiteral("#"));
+                        const QString flats[] = {"Db", "Eb", "Gb", "Ab", "Bb"}, sharps[] = {"C#", "D#", "F#", "G#", "A#"};
+                        for (int i = 0; i < 5; ++i)
+                            if (k.compare(flats[i], Qt::CaseInsensitive) == 0) k = sharps[i];
+                        e.key = -1;
+                        for (int i = 0; i < 12; ++i)
+                            if (k.compare(QString::fromLatin1(kKeys[i]), Qt::CaseInsensitive) == 0) e.key = i;
+                        if (e.key < 0) throw ArgError{"key is a note name (C, C#, Db... B) or 0-11"};
+                    } else {
+                        e.key = key.toInt(0);
+                    }
+                    edits.push_back(e);
+                }
+                const edit::Result r = edit::setPitchEdits(l.project, s, id, edits);
+                if (!r.ok && r.error != "Nothing changed" && !(edits.empty() && r.error == "The clip has no pitch edits"))
+                    throw ArgError{QString::fromStdString(r.error)};
+                save(l);
+                c = edit::clipById(s, id);
+            }
+            // The pitch over the range asked for, as heard before the edits and as they make it.
+            const double t0 = std::max(clipStart, a.value("start").toDouble(clipStart)), t1 = std::min(clipEnd, a.value("end").toDouble(clipEnd));
+            if (!(t1 > t0)) throw ArgError{"start must be before end, inside the clip"};
+            if (t1 - t0 > 900) throw ArgError{"Ask for at most 15 minutes at once (start and end)"};
+            AudioBufferPtr sound = soundBeforePitchEdits(l.project, *c, 48000);
+            if (!sound) throw ArgError{"Cannot read the clip's sound"};
+            const double a0 = sourceAt(t0), a1 = sourceAt(t1);
+            const PitchTrack track = trackPitch(*sound, a0, a1, 50, 800);
+            const Effect* fx = pitchContourOf(*c);
+            const std::vector<double> edited = editedPitch(track, fx ? pitchEditsFromString(fx->s("edits")) : std::vector<PitchEdit>{});
+            QJsonArray points;
+            std::vector<double> voiced;
+            const size_t step = std::max<size_t>(4, track.f0.size() / 1500 + 1);
+            for (size_t i = 0; i < track.f0.size(); i += step) {
+                QJsonObject o{{"time", t0 + double(i) * track.hop}, {"hz", track.f0[i]}};
+                if (edited[i] != track.f0[i]) o["edited_hz"] = edited[i];
+                points.append(o);
+            }
+            for (double f : track.f0)
+                if (f > 0) voiced.push_back(f);
+            QJsonObject out{{"points", points}};
+            if (!voiced.empty()) {
+                std::nth_element(voiced.begin(), voiced.begin() + long(voiced.size() / 2), voiced.end());
+                const double median = voiced[voiced.size() / 2];
+                const int note = int(std::lround(69 + 12 * std::log2(median / 440)));
+                out["median_hz"] = median;
+                out["median_note"] = QString::fromLatin1(kKeys[(note % 12 + 12) % 12]) + QString::number(note / 12 - 1);
+            }
+            if (fx) out["edits"] = int(pitchEditsFromString(fx->s("edits")).size());
+            return ok(voiced.empty() ? QStringLiteral("No pitch heard there")
+                                     : QStringLiteral("Median pitch %1 Hz (%2)").arg(out["median_hz"].toDouble(), 0, 'f', 1).arg(out["median_note"].toString()),
+                      out);
+        });
+
     add("montage_redact_faces", "Redact faces",
         "Hide faces in a video clip, as news and documentary editors must for people who have not agreed to be shown: "
         "every face is found, followed from frame to frame (a face lost for a few frames stays covered) and grouped by "
@@ -10217,7 +10677,8 @@ void McpServer::Impl::addTools() {
             "subtitles":{"type":"string","description":"A caption track, by name or language, to go with it"},
             "subtitles_as":{"type":"string","enum":["subtitles","closed_captions","burn_in"],"default":"subtitles"},
             "subtitle_language":{"type":"string","description":"RFC 5646; default: the caption track's"},
-            "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"}},"required":["project","folder"]})json",
+            "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"},
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the mix's beds and objects as an IAB track (ST 429-18, Application Profile 1); the 5.1 or 7.1 then goes in 16 channels with the sync signal (ST 429-19)"}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -10226,6 +10687,7 @@ void McpServer::Impl::addTools() {
             st.resolution = str(a, "resolution", "2k").toStdString();
             st.stereo = a.value("stereo").toBool();
             st.encrypt = a.value("encrypt").toBool();
+            st.immersive = a.value("iab").toBool();
             const QString as = str(a, "subtitles_as", "subtitles");
             if (as != QLatin1String("subtitles") && as != QLatin1String("closed_captions") && as != QLatin1String("burn_in"))
                 throw ArgError{"subtitles_as is subtitles, closed_captions or burn_in"};
@@ -10268,7 +10730,7 @@ void McpServer::Impl::addTools() {
             for (const std::string& i : advice) advised.append(QString::fromStdString(i));
             if (r.overLoudnessLimit())
                 found.append(QStringLiteral("The sound is %1 Leq(M), over the %2 its kind is held to").arg(r.leqm, 0, 'f', 1).arg(r.leqmLimit, 0, 'f', 0));
-            const QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
+            QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
                                   {"cpl", QString::fromStdString(r.cpl)}, {"cpl_id", QString::fromStdString(r.cplId)},
                                   {"frames", double(r.frames)}, {"fps", r.fps},
                                   {"width", r.width}, {"height", r.height}, {"channels", r.channels},
@@ -10278,6 +10740,7 @@ void McpServer::Impl::addTools() {
                                   {"leqm", std::round(r.leqm * 10) / 10},
                                   {"leqm_limit", r.leqmLimit > 0 ? QJsonValue(r.leqmLimit) : QJsonValue()},
                                   {"problems", found}, {"advice", advised}};
+            if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(QString::fromStdString(r.name))
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(QString::fromStdString(r.name)).arg(found.size()),
                       out);
@@ -10373,7 +10836,8 @@ void McpServer::Impl::addTools() {
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
             "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
-            "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"}},
+            "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -10421,6 +10885,7 @@ void McpServer::Impl::addTools() {
             }
             st.application = a.value("application").toInt(2);
             st.graded = a.value("graded").toBool(true);
+            st.immersive = a.value("iab").toBool();
             for (const QJsonValue& v : a.value("target_frames").toArray()) {
                 if (!v.isDouble() || v.toDouble() != std::floor(v.toDouble()) || v.toDouble() < 0)
                     throw ArgError{QStringLiteral("target_frames are whole frame numbers")};
@@ -10443,6 +10908,7 @@ void McpServer::Impl::addTools() {
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+            if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             if (r.application == 5) {
                 out["output_transform"] = QString::fromStdString(r.outputTransform);
                 out["target_frames"] = r.targetFrames;
@@ -11069,6 +11535,122 @@ void McpServer::Impl::addTools() {
             QJsonArray keys;
             for (const auto& k : focus.keys) keys.append(QJsonObject{{"frame", double(c.start + k.t)}, {"focus", k.v}});
             return ok(QStringLiteral("Keyed Focus Depth at %1 frame(s)").arg(focus.keys.size()), QJsonObject{{"keys", keys}});
+        });
+
+    add("montage_surface_track", "Track a surface",
+        "Tracks a bending surface (cloth, skin, a flag) through a video clip with its surface_track effect (`effect`, its "
+        "id): a mesh of about `detail` vertices is laid inside the effect's mask (an ellipse, a rectangle or a shape) on "
+        "the frame at `at` and followed to both ends of the clip. The effect then shows the mesh, a picture on the "
+        "surface (`picture`, placed by picture_x, picture_y and picture_w as fractions of the frame at `at`), the "
+        "surface held still as on that frame, a picture made on the held-still surface put back, or nothing (mode). Masks with "
+        "Bend With the Surface Track and paint with Strokes Follow the Surface Track on the same clip follow it too. "
+        "`fixes` puts vertices where they should be on frames where the track slipped and solves it again from the "
+        "first of them (the track before it is kept). `export_dir` also writes an OpenEXR per frame: the ST map (R, G) "
+        "and forward and backward motion vectors (layers forward.u/v, backward.u/v, v up).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The surface_track effect's id on the clip"},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame the mask outlines the surface on (the clip's start by default)"},
+            "detail":{"type":"number","description":"About how many mesh vertices (20 to 3000; the effect's detail by default)"},
+            "mode":{"type":"string","enum":["mesh","picture","still","put_back","none"]},
+            "picture":{"type":"string","description":"An image file to put on the surface (sets mode picture)"},
+            "picture_x":{"type":"number"},"picture_y":{"type":"number"},"picture_w":{"type":"number"},
+            "fixes":{"type":"array","items":{"type":"object","properties":{"at":{"type":["number","string"]},
+                "vertex":{"type":"number"},"x":{"type":"number"},"y":{"type":"number"}},"required":["at","vertex","x","y"]},
+                "description":"Vertices put by hand: on the frame at `at` (timeline), vertex `vertex` at x, y (fractions of the frame)"},
+            "export_dir":{"type":"string","description":"A folder for the ST map and motion vector EXRs"}},
+            "required":["project","clip","effect"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clipId = clipArg(l, a).id;
+            const Id effectId = Id(a.value("effect").toDouble());
+            Effect* e = edit::ownedEffect(s, clipId, effectId);
+            if (!e || e->type != "surface_track")
+                throw ArgError{QStringLiteral("No surface_track effect %1 on that clip (see montage_project_info)").arg(qint64(effectId))};
+            const Clip& c = *edit::clipById(s, clipId);
+            if (a.contains("detail")) {
+                const double d = a.value("detail").toDouble(-1);
+                if (!(d >= 20 && d <= 3000)) throw ArgError{"\"detail\" is 20 to 3000 vertices"};
+                e->params["detail"] = Param(std::round(d));
+            }
+            if (a.contains("mode")) {
+                const QStringList modes{"mesh", "picture", "still", "put_back", "none"};
+                const int m = int(modes.indexOf(str(a, "mode", "")));
+                if (m < 0) throw ArgError{"\"mode\" is mesh, picture, still, put_back or none"};
+                e->params["mode"] = Param(double(m));
+            }
+            if (a.contains("picture")) {
+                const QString pic = str(a, "picture", "");
+                if (!QFileInfo(pic).isFile()) throw ArgError{QStringLiteral("No picture at %1").arg(pic)};
+                e->strings["picture"] = QFileInfo(pic).absoluteFilePath().toStdString();
+                if (!a.contains("mode")) e->params["mode"] = Param(1.0);
+            }
+            for (const char* k : {"picture_x", "picture_y", "picture_w"})
+                if (a.contains(k)) {
+                    const double v = a.value(k).toDouble(-9);
+                    if (!(v >= -0.5 && v <= 2)) throw ArgError{QStringLiteral("\"%1\" is a fraction of the frame").arg(k)};
+                    e->params[k] = Param(v);
+                }
+            std::string err;
+            int tracked = 0;
+            const QJsonArray fixes = a.value("fixes").toArray();
+            if (!fixes.isEmpty()) {
+                SurfaceTrack t;
+                if (!surfaceTrackFromString(e->s("track"), t)) return fail("Track the surface first, then fix it");
+                // Solved again out from the reference on each side, from the fix nearest it (or from the reference,
+                // both ways, when one is on it), so every fix is reached.
+                std::map<int, FrameTime> fixedFrames;  // track frame -> clip frame
+                for (const QJsonValue& v : fixes) {
+                    const QJsonObject f = v.toObject();
+                    const FrameTime at = timeArg(f.value("at"), s, "at");
+                    if (!c.contains(at)) throw ArgError{"Each fix's \"at\" must be inside the clip"};
+                    const int frame = surfaceFrameOf(t, s, c, at - c.start);
+                    const int vertex = f.value("vertex").toInt(-1);
+                    const double x = f.value("x").toDouble(-9), y = f.value("y").toDouble(-9);
+                    if (frame < 0) throw ArgError{"A fix is on a frame the surface was not tracked on"};
+                    if (vertex < 0 || vertex >= int(t.mesh.rest.size()))
+                        throw ArgError{QStringLiteral("\"vertex\" is 0 to %1").arg(int(t.mesh.rest.size()) - 1)};
+                    if (!(x >= -0.5 && x <= 1.5 && y >= -0.5 && y <= 1.5)) throw ArgError{"A fix's x and y are fractions of the frame"};
+                    t.fixes[frame][vertex] = MeshPoint{x * t.width, y * t.height};
+                    fixedFrames[frame] = at - c.start;
+                }
+                e->strings["track"] = surfaceTrackToString(t);
+                std::vector<FrameTime> starts;
+                if (const auto on = fixedFrames.find(t.reference); on != fixedFrames.end()) starts.push_back(on->second);
+                else {
+                    if (auto before = fixedFrames.lower_bound(t.reference); before != fixedFrames.begin()) starts.push_back(std::prev(before)->second);
+                    if (auto after = fixedFrames.upper_bound(t.reference); after != fixedFrames.end()) starts.push_back(after->second);
+                }
+                for (FrameTime from : starts) {
+                    std::string track;
+                    if (!trackClipSurface(l.project, s, c, *e, from, track, true, {}, &err))
+                        return fail(QStringLiteral("Could not solve the track again: %1").arg(QString::fromStdString(err)));
+                    e->strings["track"] = track;
+                }
+            } else if (!a.contains("picture") || e->s("track").empty()) {
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+                if (!c.contains(at)) throw ArgError{"\"at\" must be inside the clip"};
+                std::string track;
+                if (!trackClipSurface(l.project, s, c, *e, at - c.start, track, false, {}, &err))
+                    return fail(QStringLiteral("Could not track the surface: %1").arg(QString::fromStdString(err)));
+                e->strings["track"] = track;
+            }
+            const std::shared_ptr<const SurfaceTrack> t = cachedSurfaceTrack(*e);
+            if (!t) return fail("Could not track the surface");
+            for (const auto& f : t->frames) tracked += f.empty() ? 0 : 1;
+            QJsonArray files;
+            if (a.contains("export_dir")) {
+                const QString dir = str(a, "export_dir", "");
+                if (!QDir().mkpath(dir)) throw ArgError{QStringLiteral("Cannot make %1").arg(dir)};
+                const std::string base = QDir(dir).filePath(QStringLiteral("surface")).toStdString();
+                const std::vector<std::string> written = writeSurfaceExrs(*t, base, 0, int(t->frames.size()) - 1, &err);
+                if (written.empty()) return fail(QStringLiteral("Could not write the EXRs: %1").arg(QString::fromStdString(err)));
+                for (const std::string& f : written) files.append(QString::fromStdString(f));
+            }
+            save(l);
+            return ok(QStringLiteral("Tracked the surface on %1 of %2 frame(s)").arg(tracked).arg(t->frames.size()),
+                      QJsonObject{{"frames", int(t->frames.size())}, {"tracked", tracked}, {"lost", int(t->frames.size()) - tracked},
+                                  {"vertices", int(t->mesh.rest.size())}, {"reference", t->reference}, {"files", files}});
         });
 
     add("montage_ograf", "OGraf graphics",
@@ -11930,8 +12512,14 @@ void McpServer::Impl::addTools() {
         "piz, pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256, htj2k32; default zip). `st_maps` writes, for a shot whose "
         "clip has a Lens Correction, ST maps (32-bit OpenEXR, red the source's x over its width, green 1 minus its y over "
         "its height) that undistort the plate as Lens Correction does with no fit (all of the picture, at the overscan size "
-        "returned), and redistort renders back.",
+        "returned), and redistort renders back. The shots are kept with the sequence (see montage_vfx_shots): "
+        "`name_pattern` names them from {sequence}, {shot} (010, 020... in the cut's order), {clip} and {layer} (the "
+        "clip's track), as \"{sequence}_{shot}\" (default: the clip's name); `scripts` writes a Nuke script (.nk) beside "
+        "each shot that reads its plate untouched and writes v001 to `returns` (default <folder>/returns, where versions "
+        "are then looked for), named by `returns_pattern` ({shot} and #'s for the version; default {shot}_comp_v###).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
+            "name_pattern":{"type":"string"},"scripts":{"type":"boolean","default":false},"returns":{"type":"string"},
+            "returns_pattern":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
             "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
@@ -11949,6 +12537,13 @@ void McpServer::Impl::addTools() {
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
             o.stMaps = a.value("st_maps").toBool();
+            o.namePattern = str(a, "name_pattern").toStdString();
+            o.scripts = a.value("scripts").toBool();
+            // (the sequence's returns folder and naming kept unless others are given)
+            o.returns = a.contains("returns")            ? absolute(str(a, "returns")).toStdString()
+                        : !l.seq().vfxReturns.empty() ? l.seq().vfxReturns
+                                                        : QDir(QString::fromStdString(o.folder)).filePath(QStringLiteral("returns")).toStdString();
+            o.returnsPattern = a.contains("returns_pattern") ? str(a, "returns_pattern").toStdString() : l.seq().vfxPattern;
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
             if (clips.empty())
@@ -11964,6 +12559,7 @@ void McpServer::Impl::addTools() {
                 QJsonObject sh{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
                                {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
+                if (!s.script.empty()) sh["script"] = QString::fromStdString(s.script);
                 if (!s.undistortMap.empty()) {
                     sh["undistort_map"] = QString::fromStdString(s.undistortMap);
                     sh["redistort_map"] = QString::fromStdString(s.redistortMap);
@@ -11977,9 +12573,159 @@ void McpServer::Impl::addTools() {
                 list.append(sh);
                 lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
             }
+            recordVfxShots(l.seq(), shots);
+            l.seq().vfxReturns = o.returns;
+            l.seq().vfxPattern = o.returnsPattern;
+            save(l);
             const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");
             return ok(QStringLiteral("Pulled %1 shots:\n%2\nPull list: %3").arg(shots.size()).arg(lines.join('\n'), csv),
                       QJsonObject{{"shots", list}, {"pull_list", csv}});
+        });
+
+    add("montage_vfx_shots", "VFX shots and versions",
+        "The shots pulled for visual effects (montage_vfx_pull) and the versions the vendor sends back. action list: each "
+        "shot with its clip, status, note, the version its clip shows (0: the plate) and its versions with what is wrong "
+        "with each. scan: looks through `folder` (default: the returns folder the pull named) and the folders in it for "
+        "versions named by `pattern` ({shot} and #'s for the version number; default the pull's, else {shot}_comp_v###), "
+        "as numbered frames (OpenEXR, DPX, TIFF, PNG) or movies, and brings each new one in as a take on its shot's clip, "
+        "placed by its frame numbers (the number the pull gave the cut's first frame lands on it), checking each against "
+        "the pull: missing frames, a short range, another size, OpenEXR chromaticities other than the plate's. "
+        "set_version: shows `version` (a number, \"latest\", \"up\", \"down\" or 0 for the plate) on the shots of `clips` "
+        "(clip ids) or `shots` (names; default all). set_status: `status` (in_progress, for_review, approved, final) and "
+        "optionally `note` on `shots`. export: the shot list to `output` as CSV (.csv) or OpenTimelineIO (.otio). script: "
+        "a Nuke script for each of `shots` beside its plate (or in `output`, a folder), writing the version after its latest.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","scan","set_version","set_status","export","script"]},
+            "folder":{"type":"string"},"pattern":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"}},"shots":{"type":"array","items":{"type":"string"}},
+            "version":{"type":["integer","string"]},"status":{"type":"string","enum":["in_progress","for_review","approved","final"]},
+            "note":{"type":"string"},"output":{"type":"string"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            auto shotJson = [&](const VfxShotRecord& r) {
+                QJsonArray versions;
+                for (const VfxVersion& v : r.versions) {
+                    QJsonArray problems;
+                    for (const std::string& pr : v.problems) problems.append(QString::fromStdString(pr));
+                    versions.append(QJsonObject{{"number", v.number}, {"path", QString::fromStdString(v.path)}, {"media", double(v.media)},
+                                                {"problems", problems}});
+                }
+                return QJsonObject{{"name", QString::fromStdString(r.name)}, {"clip", double(r.clip)},
+                                   {"status", vfxStatusName(r.status)}, {"note", QString::fromStdString(r.note)},
+                                   {"version", vfxShownVersion(s, r)}, {"versions", versions}, {"plate", QString::fromStdString(r.plate)},
+                                   {"first_frame", r.firstFrame}, {"cut_in", r.cutIn}, {"cut_out", r.cutOut}, {"last_frame", r.lastFrame},
+                                   {"color_space", QString::fromStdString(r.colorSpace)}, {"script", QString::fromStdString(r.script)}};
+            };
+            // The shots named (by clip or name), all of them when none are.
+            std::vector<VfxShotRecord*> chosen;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                VfxShotRecord* r = vfxShotOfClip(s, Id(v.toDouble()));
+                if (!r) return fail(QStringLiteral("Clip %1 is not a VFX shot").arg(qint64(v.toDouble())));
+                chosen.push_back(r);
+            }
+            for (const QJsonValue& v : a.value("shots").toArray()) {
+                VfxShotRecord* r = findVfxShot(s, v.toString().toStdString());
+                if (!r) return fail(QStringLiteral("No VFX shot named %1").arg(v.toString()));
+                chosen.push_back(r);
+            }
+            if (chosen.empty() && !a.contains("clips") && !a.contains("shots"))
+                for (VfxShotRecord& r : s.vfxShots) chosen.push_back(&r);
+            if (s.vfxShots.empty() && action != "list") return fail("This sequence has no VFX shots: pull some first (montage_vfx_pull)");
+            if (action == "list") {
+                QJsonArray list;
+                QStringList lines;
+                for (const VfxShotRecord& r : s.vfxShots) {
+                    list.append(shotJson(r));
+                    lines << QStringLiteral("%1: %2, %3 (%4 versions)").arg(QString::fromStdString(r.name), vfxStatusName(r.status),
+                                                                         vfxShownVersion(s, r) ? QStringLiteral("v%1").arg(vfxShownVersion(s, r)) : QStringLiteral("the plate"))
+                                 .arg(r.versions.size());
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No VFX shots") : lines.join('\n'),
+                          QJsonObject{{"shots", list}, {"returns", QString::fromStdString(s.vfxReturns)}, {"pattern", QString::fromStdString(s.vfxPattern)}});
+            }
+            if (action == "scan") {
+                const std::string folder = a.contains("folder") ? absolute(str(a, "folder")).toStdString() : s.vfxReturns;
+                VfxScan scan;
+                std::string err;
+                if (!scanVfxReturns(l.project, s, folder, str(a, "pattern").toStdString(), &scan, &err)) return fail(QString::fromStdString(err));
+                save(l);
+                QJsonArray added, problems;
+                for (const std::string& n : scan.added) added.append(QString::fromStdString(n));
+                for (const std::string& n : scan.problems) problems.append(QString::fromStdString(n));
+                QString msg = scan.added.empty() ? QStringLiteral("No new versions") : QStringLiteral("New: %1").arg(QString::fromStdString(
+                                                                                            [&] { std::string t; for (const std::string& n : scan.added) t += (t.empty() ? "" : ", ") + n; return t; }()));
+                for (const std::string& n : scan.problems) msg += "\n" + QString::fromStdString(n);
+                return ok(msg, QJsonObject{{"added", added}, {"problems", problems}});
+            }
+            if (action == "set_version") {
+                const QJsonValue v = a.value("version");
+                const QString word = v.isString() ? v.toString() : QString();
+                bool number = v.isDouble();
+                int n = v.toInt(-1);
+                if (word == "latest") n = -1, number = true;
+                else if (!word.isEmpty() && word != "up" && word != "down") {
+                    n = word.toInt(&number);
+                    if (!number) return fail("version is a number, latest, up or down");
+                }
+                if (!number && word.isEmpty()) return fail("Say which version");
+                QStringList lines;
+                for (VfxShotRecord* r : chosen) {
+                    const Id clip = r->clip;
+                    const std::string name = r->name;
+                    const edit::Result res = number ? edit::setVfxVersion(l.project, s, clip, n) : edit::stepVfxVersion(l.project, s, clip, word == "up" ? 1 : -1);
+                    const VfxShotRecord* now = findVfxShot(s, name);
+                    lines << (res.ok ? QStringLiteral("%1: %2").arg(QString::fromStdString(name),
+                                                                    vfxShownVersion(s, *now) ? QStringLiteral("v%1").arg(vfxShownVersion(s, *now)) : QStringLiteral("the plate"))
+                                     : QString::fromStdString(name + ": " + res.error));
+                }
+                save(l);
+                return ok(lines.join('\n'));
+            }
+            if (action == "set_status") {
+                static const QStringList names{"in_progress", "for_review", "approved", "final"};
+                const int status = names.indexOf(need(a, "status"));
+                if (status < 0) return fail("status is in_progress, for_review, approved or final");
+                const std::string note = str(a, "note").toStdString();
+                if (chosen.empty()) return fail("Name the shots");
+                for (VfxShotRecord* r : chosen)
+                    if (const edit::Result res = edit::setVfxStatus(s, r->name, status, a.contains("note") ? &note : nullptr); !res.ok)
+                        return fail(QString::fromStdString(res.error));
+                save(l);
+                return ok(QStringLiteral("%1 shots set to %2").arg(chosen.size()).arg(vfxStatusName(status)));
+            }
+            if (action == "export") {
+                const QString out = absolute(need(a, "output"));
+                const std::string text = out.endsWith(".otio", Qt::CaseInsensitive) ? vfxShotListOtio(s) : vfxShotListCsv(s);
+                QSaveFile f(out);
+                if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size()) || !f.commit())
+                    return fail(QStringLiteral("Cannot write %1").arg(out));
+                return ok(QStringLiteral("Wrote %1 (%2 shots)").arg(out).arg(s.vfxShots.size()), QJsonObject{{"file", out}});
+            }
+            if (action == "script") {
+                QJsonArray files;
+                const QString folder = a.contains("output") ? absolute(str(a, "output")) : QString();
+                for (VfxShotRecord* r : chosen) {
+                    const QString dir = folder.isEmpty() ? QFileInfo(QString::fromStdString(r->plate)).absolutePath() : folder;
+                    if (!QDir().mkpath(dir)) return fail(QStringLiteral("Cannot make the folder %1").arg(dir));
+                    const QString file = QString::fromStdString(vfxScriptFile(*r, dir.toStdString()));
+                    const int next = r->versions.empty() ? 1 : r->versions.back().number + 1;
+                    const QString ext = QFileInfo(QString::fromStdString(r->plate)).suffix().toLower();
+                    const std::string format = ext == "tif" ? "tiff" : ext.toStdString();
+                    const std::string returns = s.vfxReturns.empty() ? QDir(dir).filePath("returns").toStdString() : s.vfxReturns;
+                    const std::string nk = nukeScript(*r, vfxVersionPath(returns, s.vfxPattern, *r, next, format));
+                    QSaveFile f(file);
+                    if (!f.open(QIODevice::WriteOnly) || f.write(nk.data(), qint64(nk.size())) != qint64(nk.size()) || !f.commit())
+                        return fail(QStringLiteral("Cannot write %1").arg(file));
+                    r->script = file.toStdString();
+                    files.append(file);
+                }
+                save(l);
+                return ok(QStringLiteral("Wrote %1 scripts").arg(files.size()), QJsonObject{{"files", files}});
+            }
+            return fail("action is list, scan, set_version, set_status, export or script");
         });
 
     add("montage_export_timeline", "Export the timeline",

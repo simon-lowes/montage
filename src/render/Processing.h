@@ -155,6 +155,29 @@ private:
     uint64_t previousMedia_;
     bool previousReframed_;
 };
+// The clip's surface track (its first Surface Tracker's, render/SurfaceTrack.h) for the duration of a scope, with the
+// media time of each of the clip's frames: what masks that bend with the surface and paint that follows it read.
+struct SurfaceTrack;
+struct SurfaceContext {
+    std::shared_ptr<const SurfaceTrack> track;
+    std::function<double(FrameTime clipFrame)> mediaSeconds;
+    // The picture as it was before a Surface Tracker held the surface still, for one further on to put it back on.
+    mutable std::shared_ptr<const Image> heldPlate;
+};
+const SurfaceContext* currentSurface();
+class SurfaceScope {
+public:
+    explicit SurfaceScope(SurfaceContext context);
+    ~SurfaceScope();
+    SurfaceScope(const SurfaceScope&) = delete;
+    SurfaceScope& operator=(const SurfaceScope&) = delete;
+
+private:
+    SurfaceContext previous_;
+};
+// The outline of an effect's ellipse, rectangle or drawn mask at clip frame t, in pixels of a w x h frame (none for
+// any other mask).
+std::vector<std::array<double, 2>> maskOutline(const Effect& e, FrameTime t, int w, int h);
 // The colour space the frame being worked on is in (the sequence's, set by the compositor for each sequence it draws),
 // for effects that work in light rather than in code values (the HDR Palette); Rec.709 when none is set.
 struct ColorSpace;

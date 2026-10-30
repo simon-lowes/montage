@@ -2108,7 +2108,13 @@ bool openStage(const std::string& path, Stage& out, std::string* error, FileRead
         if (error) *error = c.notes.empty() ? "Cannot read " + path : c.notes.front();
         return false;
     }
-    out.layer = *l;
+    try {
+        out.layer = *l;  // (a copy as large as the layer: within the same care)
+    } catch (const std::bad_alloc&) {
+        out.layer = {};
+        if (error) *error = path + " needs more memory than there is";
+        return false;
+    }
     return true;
 }
 

@@ -3210,6 +3210,61 @@ private slots:
         QVERIFY(edit::removeComposite(s, other).ok);
         QVERIFY(edit::clipById(s, other)->composite.empty());
         QVERIFY(!edit::removeComposite(s, other).ok);
+
+        // A media input's frame stays with the picture as the clip's head is drawn out and back: before the media's
+        // first frame its offset goes below 0, and drawing the head back in restores it exactly.
+        Clip head;
+        CompositeNode media;
+        media.key = 1;
+        media.kind = "input";
+        media.source = "media";
+        media.offset = 2;
+        head.composite.nodes.push_back(media);
+        // A tracking reference likewise through the head trimmed past it and drawn back out.
+        CompositeNode tracker;
+        tracker.key = 2;
+        tracker.kind = "track";
+        tracker.effects.push_back(makeEffect("composite_track", 0));
+        tracker.effects.back().params["reference"].value = 2;
+        head.composite.nodes.push_back(tracker);
+        edit::shiftKeyframes(head, 5);
+        QCOMPARE(head.composite.nodes[0].offset, -3.0);
+        QCOMPARE(compositeSettings(head.composite.nodes[1])->params["reference"].value, 7.0);
+        edit::shiftKeyframes(head, -10);
+        QCOMPARE(compositeSettings(head.composite.nodes[1])->params["reference"].value, -3.0);
+        edit::shiftKeyframes(head, 5);
+        QCOMPARE(head.composite.nodes[0].offset, 2.0);
+        QCOMPARE(compositeSettings(head.composite.nodes[1])->params["reference"].value, 2.0);
+        head.composite.nodes[0].offset = -3;
+        Clip readBack;
+        QVERIFY(clipFromJsonString(clipToJsonString(head), readBack));
+        QCOMPARE(readBack.composite.nodes[0].offset, -3.0);
+
+        // A graph that loops (1 into 2 into 1), hidden in a track version not shown, is taken out on loading as one on
+        // the track would be.
+        Clip looped = clip();
+        looped.id = p.newId();
+        looped.composite = {};
+        for (int k : {1, 2}) {
+            CompositeNode n;
+            n.key = k;
+            n.id = p.newId();
+            n.kind = "merge";
+            n.blend = "normal";
+            looped.composite.nodes.push_back(n);
+        }
+        looped.composite.links = {{1, 2, 0}, {2, 1, 0}, {2, 0, 0}};
+        QVERIFY(!validComposite(looped.composite));
+        Project withVersion = p;
+        TrackVersion hidden;
+        hidden.name = "Alt";
+        hidden.clips.push_back(looped);
+        withVersion.active()->videoTracks[0].versions = {TrackVersion{"Main", {}, {}}, hidden};
+        Project loaded;
+        std::string why;
+        QVERIFY2(projectFromJson(projectToJson(withVersion), loaded, &why), why.c_str());
+        QCOMPARE(loaded.active()->videoTracks[0].versions.size(), size_t(2));
+        QVERIFY(loaded.active()->videoTracks[0].versions[1].clips.at(0).composite.empty());
     }
 
     void gradeGraphEdits() {
@@ -8693,6 +8748,31 @@ private slots:
         fade.id = theirsNew.newId();
         fade.clipB = e;
         theirsNew.active()->videoTracks[0].transitions.push_back(fade);
+        // Theirs' clip has a node graph (a bin item following the clip's own motion): its nodes' ids, the media and the
+        // followed clip go along with the renumbering.
+        CompositeNode bin;
+        bin.key = 1;
+        bin.source = "media";
+        bin.media = fx.media;
+        CompositeNode follow;
+        follow.key = 2;
+        follow.id = theirsNew.newId();
+        follow.kind = "track";
+        follow.follow = e;
+        bin.id = theirsNew.newId();
+        CompositeGraph& theirGraph = clipById(*theirsNew.active(), e)->composite;
+        theirGraph.nodes = {bin, follow};
+        theirGraph.links = {{1, 2, 0}, {2, 0, 0}};
+        QVERIFY(validComposite(theirGraph));
+        // Mine made fades too, the second with the same id as theirs' node.
+        for (int k = 0; k < 2; ++k) {
+            Transition mineFade;
+            mineFade.id = mineNew.newId();
+            (k ? mineFade.clipA : mineFade.clipB) = d;  // in, then out
+            mineNew.active()->videoTracks[1].transitions.push_back(mineFade);
+        }
+        const Id clash = mineNew.active()->videoTracks[1].transitions.back().id;
+        QCOMPARE(clash, follow.id);
         const MergeResult ids = mergeProjects(base, mineNew, theirsNew);
         QVERIFY(ids.ok && ids.conflicts.empty());
         QVERIFY(ids.renumbered.count(e));
@@ -8703,6 +8783,11 @@ private slots:
         QCOMPARE(ids.project.active()->videoTracks[0].transitions.size(), size_t(1));
         QCOMPARE(ids.project.active()->videoTracks[0].transitions[0].clipB, e2);
         QVERIFY(ids.project.nextId > e2);
+        QCOMPARE(clip(ids.project, e2)->composite.nodes.size(), size_t(2));
+        QCOMPARE(clip(ids.project, e2)->composite.nodes[0].media, fx.media);
+        const CompositeNode& followed = clip(ids.project, e2)->composite.nodes[1];
+        QCOMPARE(followed.follow, e2);
+        QVERIFY(followed.id != clash && ids.renumbered.count(follow.id) && ids.renumbered.at(follow.id) == followed.id);
         std::set<Id> seen;  // every id once
         bool unique = true;
         for (const Sequence& sq : ids.project.sequences)

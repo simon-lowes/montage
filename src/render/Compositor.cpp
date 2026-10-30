@@ -43,6 +43,7 @@
 #include "Exporter.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
+#include "SurfaceTrack.h"
 #include "Restoration.h"
 #include "FilmScan.h"
 #include "FrameRepair.h"
@@ -51,10 +52,12 @@
 #include "Shapes.h"
 #include "Title3D.h"
 #include "Titles.h"
+#include "Layer3D.h"
 #include "ModelClip.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/DialogueAlign.h"
+#include "audio/ElasticAudio.h"
 #include "audio/PluginEffect.h"
 #include "audio/RoomResponse.h"
 #include "audio/SpeechCleanup.h"
@@ -142,7 +145,7 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
     } else if (g.type == "title") {
         return renderTitle(g, t, w, h, scale, duration, fps);
     } else if (g.type == "shape") {
-        return renderShape(g, t, w, h, scale);
+        return renderShape(g, t, w, h, scale, fps);
     } else if (g.type == "title3d") {
         return renderTitle3D(g, t, w, h, scale, duration, fps);
     } else if (g.type == "particles") {
@@ -854,6 +857,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     bool& reframed = out.reframed;
     std::string& exrFile = out.exrFile;
     ofx::FrameFetch& ofxFetch = out.ofxFetch;
+    if (c.isGenerator() && c.generator.type == "camera3d") return false;  // (a camera shows nothing itself)
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space; or, graded
         // scene-referred, in the light layers are composited in).
@@ -1372,6 +1376,18 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
         faceModel().installed())
         faces = cachedFaces(scene ? asShown(src, scene->working) : src);
     FaceScope faceScope(faces);
+    // And its surface track, for masks that bend with it and paint that follows it.
+    SurfaceContext surface;
+    for (const Effect* e : chain)
+        if (e->enabled && e->type == "surface_track") {
+            surface.track = cachedSurfaceTrack(*e);
+            if (!surface.track) continue;  // (not tracked yet: a later one may be)
+            surface.mediaSeconds = [&c, &seq](FrameTime f) {
+                return c.sourceFrameAt(c.start + std::clamp<FrameTime>(f, 0, std::max<FrameTime>(0, c.duration - 1))) / seq.fpsValue();
+            };
+            break;
+        }
+    SurfaceScope surfaceScope(std::move(surface));
     SlowEffectsScope slowScope({o.highQuality || o.slowEffects, o.cancel, o.issues});
     ofx::FetchScope fetchScope(ofxFetch);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
@@ -1567,6 +1583,9 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
             // The picture lighting a 3D model.
             if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("env_hide", t - c->start, 1) > 0.5)
                 if (const int m = modelLightTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
+            // The picture on a 3D model's surface.
+            if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("texture_hide", t - c->start, 1) > 0.5)
+                if (const int m = modelTextureTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
         }
     return hidden;
 }
@@ -1784,7 +1803,8 @@ std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, F
 bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
     if (flattened) *flattened = false;
     if (compositeShown(c)) return false;  // (a graph's output is flat; its inputs may be deep)
-    const bool deep = enabledEffect(seq, c, "make_deep") ||
+    const bool model = c.isGenerator() && c.generator.type == "model3d";  // (already in 3D: a 3D Layer does nothing to it)
+    const bool deep = enabledEffect(seq, c, "make_deep") || (!model && enabledEffect(seq, c, "layer_3d")) ||
                       (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
                       !clipDeepFile(p, seq, c, t).empty();
     if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
@@ -1853,6 +1873,18 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         intoWorking(layer, rec709Space(), seq, true);
         f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
+    } else if (const Effect* l3 = enabledEffect(seq, c, "layer_3d")) {
+        // A card in 3D: the clip's picture on its plane, seen through the camera, at the depths there.
+        Image layer = clipLayer(p, seq, c, t, o, nullptr);
+        if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        Image card;
+        std::vector<float> depth;
+        std::string error;
+        if (!renderClipLayer3D(p, seq, c, *l3, t, layer, double(W) / seq.width, card, &depth, &error)) {
+            if (o.issues && !error.empty()) o.issues->note(error);
+            return DeepFrame::blank(W, H);
+        }
+        f = deepFromFlat(card.px.data(), W, H, depth.data(), 0);
     } else if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
         Image layer = clipLayer(p, seq, c, t, o, nullptr);
         if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
@@ -3850,6 +3882,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 for (const Effect& e : c.effects)
                     if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
                         sourceFx.push_back(&e);
+                std::deque<Effect> resolved;
+                resolveElasticMembers(p, sourceFx, resolved);
                 if (!sourceFx.empty())
                     if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
                 // Maintain Audio Pitch: the channels stretched together along the time map.
@@ -3989,6 +4023,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             for (const Effect& e : c.effects)
                 if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
                     sourceFx.push_back(&e);
+            std::deque<Effect> resolved;
+            resolveElasticMembers(p, sourceFx, resolved);  // a group warped together reads its other members (audio/ElasticAudio.h)
             if (!sourceFx.empty())
                 if (AudioBufferPtr clean = cleanedAudio(source, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();

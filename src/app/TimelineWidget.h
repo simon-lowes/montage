@@ -18,6 +18,7 @@ class QMimeData;
 namespace montage {
 
 class EditorState;
+class PitchCurves;
 
 class TimelineWidget : public QAbstractScrollArea {
     Q_OBJECT
@@ -70,6 +71,15 @@ public:
     bool normalizeWaveforms() const { return normalizeWaves_; }
     // The factor a clip's samples are drawn at: its gain, or with normalising 1 / its peak (0 until peaks are read).
     double waveformScale(const Clip& c) const;
+    // Pitch curves over audio clips with elastic audio or pitch edits, and selected ones (audio/ElasticAudio.h): the
+    // pitch as heard before the edits, and as the edits make it.
+    void setShowPitchCurves(bool on);
+    bool showPitchCurves() const { return showPitch_; }
+    PitchCurves* pitchCurves() const { return pitch_; }
+    // Elastic audio on the timeline: where a group second of the clip's sound is drawn, and the reverse (x in
+    // viewport pixels).
+    double elasticSecondsAtX(const Clip& c, double x) const;
+    double xForElasticSeconds(const Clip& c, double u) const;
     // Duplicate frame markers (Premiere's): a coloured stripe under video frames that another clip also shows.
     void setShowDuplicateFrames(bool on);
     bool showDuplicateFrames() const { return showDuplicates_; }
@@ -192,7 +202,7 @@ private:
         std::string folder;  // a track folder's header (with folderKind)
         TrackKind folderKind = TrackKind::Audio;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey, TransitionEdge, TakeComp };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey, TransitionEdge, TakeComp, WarpMarker };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -218,6 +228,7 @@ private:
         Id transition = 0;       // TransitionEdge: the transition resized (edge: In its start, Out its end)
         FrameTime compTo = 0;    // TakeComp: where the sweep across a take lane has reached
         FrameTime compFrom = 0, compEnd = 0;  // and the lane's span
+        double warpFrom = 0;     // WarpMarker: where the marker played at the press (group seconds)
     };
     // A take lane under an audio track (core/TakeLanes.h), shown while the track's lanes are.
     struct TakeLaneRow {
@@ -278,6 +289,10 @@ private:
     void paintHeaders(QPainter& p, const std::vector<Row>& rs);
     void paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r);
     void paintWaveform(QPainter& p, const Clip& c, const QRect& r, const QColor& col);
+    // Warp markers (and the stretches between them tinted by how far they are slowed or sped up), the pitch curve.
+    void paintElastic(QPainter& p, const Clip& c, const QRect& body);
+    // The warp marker within a few pixels of x on the clip (group seconds), if any.
+    std::optional<double> warpMarkerNear(const Clip& c, int x) const;
     void paintThumbnails(QPainter& p, const Clip& c, const QRect& r);
     std::optional<Lane> laneFor(const Clip& c, TrackKind kind) const;
     static QRect laneBand(const QRect& clipRect);
@@ -322,6 +337,8 @@ private:
     bool showDuplicates_ = false;
     bool showDurations_ = false;
     bool normalizeWaves_ = false;
+    bool showPitch_ = false;
+    PitchCurves* pitch_ = nullptr;
     mutable std::map<Id, double> clipPeaks_;  // normalising: each audio clip's loudest sample, until the project changes
     mutable bool duplicatesDirty_ = true;
     mutable bool throughDirty_ = true;

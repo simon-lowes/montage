@@ -50,6 +50,10 @@ struct DcpSettings {
     bool sign = true;                 // the composition and packing list signed (when the build has OpenSSL)
     std::string certificates;         // the signer's chain folder; empty: Montage's own (dcp::signerFolder)
     std::string dkdms;                // where an encrypted package's DKDM goes; empty: Montage's (dcp::dkdmFolder)
+    // Immersive sound beside the 5.1 or 7.1: the mix's beds and objects (render/Adm.h ImmersiveMix) as an IAB track
+    // (SMPTE ST 429-18, Application Profile 1), the main sound then in ST 429-19's 16 channels with the FSK sync signal
+    // that keeps the immersive sound in step in channel 14.
+    bool immersive = false;
 };
 
 struct DcpResult {
@@ -59,7 +63,9 @@ struct DcpResult {
     int64_t frames = 0;
     int fps = 24;
     int width = 0, height = 0;  // the picture container
-    int channels = 6;
+    int channels = 6;           // the main sound's soundfield (5.1 or 7.1; in 16 channels with an immersive track)
+    bool immersive = false;     // an IAB track: its bed channels and objects
+    int iabBedChannels = 0, iabObjects = 0;
     bool cinemaProfile = true;  // encoded in the DCI profile (false: FFmpeg without OpenJPEG; most servers will refuse it)
     bool stereo = false, encrypted = false, signedPackage = false;
     int subtitleCount = 0;      // subtitles (or closed captions) in the track, burned in or not
@@ -83,8 +89,8 @@ int dcpFrameRate(const Sequence& s, int requested);
 // How many sequence frames make a DCP frame at `rate`: 2 for 50 and 60 (59.94) at 25 and 30, else 1.
 int dcpFrameStep(const Sequence& s, int rate);
 // "Title_FTR_F_EN-XX_XX_51_2K_DI_20261009_MTG_SMPTE_OV": title in camel case (14 characters at most), content kind,
-// aspect, language and subtitles, territory, audio, resolution, studio, date, facility, standard, package type (the
-// ISDCF Digital Cinema Naming Convention; studio and facility only when given).
+// aspect, language and subtitles, territory, audio ("51-IAB" with an immersive track), resolution, studio, date,
+// facility, standard, package type (the ISDCF Digital Cinema Naming Convention; studio and facility only when given).
 std::string dcpName(const DcpSettings& settings, int channels, const std::string& date);
 
 // Writes the DCP into a new folder named dcpName() under `parent`. `progress` (0..1) may return false to stop (the

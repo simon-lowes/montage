@@ -1,4 +1,5 @@
 #include "OffloadDialog.h"
+#include "Language.h"
 
 #include <QCheckBox>
 #include <QDialogButtonBox>
@@ -70,6 +71,7 @@ OffloadDialog::OffloadDialog(EditorState* state, QWidget* parent) : QDialog(pare
     destinations_ = new QListWidget(this);
     destinations_->setObjectName(QStringLiteral("offloadDestinations"));
     destinations_->setMaximumHeight(90);
+    language::keepUntranslated(destinations_);  // (folders)
     for (const QString& d : settings.value(QStringLiteral("offload/destinations")).toStringList()) addDestination(d);
     auto* destButtons = new QHBoxLayout;
     auto* add = new QPushButton(tr("Add…"), this);

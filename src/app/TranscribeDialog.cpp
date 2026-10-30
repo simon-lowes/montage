@@ -1,4 +1,5 @@
 #include "TranscribeDialog.h"
+#include "Language.h"
 #include "Settings.h"
 
 #include <QCheckBox>
@@ -142,8 +143,13 @@ TranscribeDialog::TranscribeDialog(int mediaCount, QWidget* parent) : QDialog(pa
     language_->addItem(tr("Detect automatically"), "auto");
     static const char* codes[] = {"en", "es", "fr", "de", "it", "pt", "nl", "pl", "sv", "da", "no", "fi", "cs", "el",
                                   "tr", "ru", "uk", "ar", "he", "hi", "id", "vi", "th", "ja", "ko", "zh"};
-    for (const char* c : codes)
-        language_->addItem(QLocale::languageToString(QLocale(QString::fromLatin1(c)).language()), QString::fromLatin1(c));
+    // Each language by its own name ("Deutsch", "日本語"), as language lists are read.
+    for (const char* c : codes) {
+        const QLocale l(QString::fromLatin1(c));
+        const QString own = l.nativeLanguageName();
+        language_->addItem(own.isEmpty() ? QLocale::languageToString(l.language()) : own.left(1).toUpper() + own.mid(1), QString::fromLatin1(c));
+    }
+    language::keepUntranslated(language_);
     const int lang = language_->findData(settings.value("transcribe/language", "auto"));
     language_->setCurrentIndex(std::max(0, lang));
     form->addRow(tr("Language:"), language_);

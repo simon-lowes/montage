@@ -1,4 +1,5 @@
 #include "AdrPanel.h"
+#include "Language.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -118,7 +119,7 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
         menu.addAction(tr("Rehearse"), this, &AdrPanel::rehearse);
         menu.addAction(tr("Record"), this, &AdrPanel::record);
         QMenu* status = menu.addMenu(tr("Status"));
-        for (int k = kAdrToRecord; k <= kAdrOmitted; ++k) status->addAction(qs(adrStatusName(k)), this, [this, k] { setCueStatus(k); });
+        for (int k = kAdrToRecord; k <= kAdrOmitted; ++k) status->addAction(language::engine(adrStatusName(k)), this, [this, k] { setCueStatus(k); });
         menu.addSeparator();
         menu.addAction(tr("Remove Cue"), this, &AdrPanel::removeCue);
         menu.exec(table_->viewport()->mapToGlobal(at));
@@ -128,7 +129,7 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     auto* cueRow = new QHBoxLayout;
     status_ = new QComboBox(this);
     status_->setObjectName(QStringLiteral("adrStatus"));
-    for (int k = kAdrToRecord; k <= kAdrOmitted; ++k) status_->addItem(qs(adrStatusName(k)));
+    for (int k = kAdrToRecord; k <= kAdrOmitted; ++k) status_->addItem(language::engine(adrStatusName(k)));
     takes_ = new QComboBox(this);
     takes_->setObjectName(QStringLiteral("adrTakes"));
     takes_->setToolTip(tr("The cue's takes: the one chosen plays (an audition, like any other)"));
@@ -182,6 +183,7 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     connect(beeps_, &QSpinBox::valueChanged, this, [](int v) { appSettings().setValue(QStringLiteral("adr/beeps"), v); });
     input_ = new QComboBox(this);
     input_->setObjectName(QStringLiteral("adrInput"));
+    language::keepUntranslated(input_);  // (the computer's own names for its devices)
     input_->addItems(VoiceoverRecorder::inputs());
     guide_ = new QComboBox(this);
     guide_->setObjectName(QStringLiteral("adrGuide"));
@@ -341,7 +343,7 @@ void AdrPanel::refresh() {
             put(CueEnd, qs(formatTimecode(q.end, s->fps)), true);
             put(CueLine, qs(q.line), true);
             put(CueNote, qs(q.note), true);
-            put(CueStatus, qs(adrStatusName(q.status)), false);
+            put(CueStatus, language::engine(adrStatusName(q.status)), false);
             put(CueTakes, QString::number(adrTakeCount(*s, q)), false);
         }
         // The tracks a guide can be and takes can go to.

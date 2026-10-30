@@ -1,4 +1,5 @@
 #include "InspectorWidget.h"
+#include "Language.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/CompositeGraph.h"
@@ -23,6 +24,7 @@
 #include <QFontDatabase>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QDir>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -46,6 +48,7 @@
 #include "ModelPacks.h"
 #include "render/Expressions.h"
 #include "render/ModelClip.h"
+#include "render/ShapeLayers.h"
 #include "render/Titles.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
@@ -63,6 +66,7 @@
 #include "core/EditOps.h"
 #include "core/GraphicsTemplate.h"
 #include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "ColorWheel.h"
 #include "ColorWarperEditor.h"
 #include "CurveEditor.h"
@@ -75,6 +79,7 @@
 #include "render/Restoration.h"
 #include "render/FilmScan.h"
 #include "render/MeshWarp.h"
+#include "render/SurfaceTrack.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -166,6 +171,12 @@ QString InspectorWidget::signature() const {
     if (sceneReferredWorking(*s)) sig += QStringLiteral(":scene");  // (effects that work on display values are marked)
     // An OGraf graphic's fields: rebuild when another graphic is chosen.
     if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
+    // A shape layer's contents: rebuild when an item is added, removed, moved or renamed, or another is picked.
+    if (c->generator.type == "shape") {
+        const std::string& contents = c->generator.s("contents");
+        sig += QString("|S%1").arg(qHash(QByteArrayView(contents.data(), qsizetype(contents.size()))));
+        if (const auto sel = shapeSelection_.find(c->id); sel != shapeSelection_.end()) sig += QString::fromStdString(":" + sel->second);
+    }
     // A title's text animations: rebuild when one is added or removed.
     if (c->generator.type == "title")
         for (int k : textAnimators(c->generator)) sig += QString("|A%1").arg(k);
@@ -188,6 +199,10 @@ QString InspectorWidget::signature() const {
         if (e.type == "mesh_warp")
             for (int k : meshPins(e)) sig += QString("p%1k%2").arg(k).arg(meshPinKind(e, k));
         if (e.type == "grid_warp") sig += QString("g%1x%2").arg(std::lround(e.p("rows", 0, 3))).arg(std::lround(e.p("cols", 0, 3)));
+        // A Surface Tracker's status line: rebuild when it is tracked.
+        if (e.type == "surface_track")
+            if (const auto tk = e.strings.find("track"); tk != e.strings.end())
+                sig += QString("t%1").arg(qHash(QByteArrayView(tk->second.data(), qsizetype(tk->second.size()))));
     }
     // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
     if (!c->grade.empty()) {
@@ -406,12 +421,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     QComboBox* blend = nullptr;
     if (kind == TrackKind::Video) {
         blend = new QComboBox(content_);
-        for (const auto& m : blendModes()) {
-            QString label = QString::fromStdString(m);
-            label.replace('_', ' ');
-            label[0] = label[0].toUpper();
-            blend->addItem(label, QString::fromStdString(m));
-        }
+        for (const auto& m : blendModes()) blend->addItem(language::engine(blendModeLabel(m)), QString::fromStdString(m));
         form->addRow(tr("Blend Mode"), blend);
         connect(blend, &QComboBox::activated, this, [this, clipId, blend](int idx) {
             std::string mode = blend->itemData(idx).toString().toStdString();
@@ -525,8 +535,16 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
     // ---- Generator ---------------------------------------------------------
     if (clip.isGenerator()) {
         if (const EffectInfo* info = findEffectInfo(clip.generator.type)) {
-            QFormLayout* g = addSection(QString::fromStdString(info->displayName));
-            addParamRows(g, *info, target(clip.generator.id));
+            QFormLayout* g = addSection(language::engine(info->displayName));
+            if (clip.generator.type == "shape" && !clip.generator.s("contents").empty()) {
+                // A layer of several shapes: its own position, turn and opacity here, the rest in its contents.
+                for (const ParamInfo& pi : info->params)
+                    if (pi.name == "pos_x" || pi.name == "pos_y" || pi.name == "rotation" || pi.name == "opacity")
+                        addParamRow(g, pi, target(clip.generator.id));
+            } else {
+                addParamRows(g, *info, target(clip.generator.id));
+            }
+            if (clip.generator.type == "shape") addShapeContents(g, clip, target(clip.generator.id));
             if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
             if (clip.generator.type == "title") addTitleTextTools(g, clip, target(clip.generator.id));
         }
@@ -776,10 +794,11 @@ void InspectorWidget::buildGradeNodes(const Clip& clip, const std::function<Fram
             for (size_t i = 0; n->kind == "layer" && i < n->blend.size(); ++i) {
                 auto* mode = new QComboBox(content_);
                 mode->setObjectName(QStringLiteral("layerBlend%1").arg(i + 1));
-                for (const std::string& b : blendModes()) mode->addItem(QString::fromStdString(b));
-                mode->setCurrentText(QString::fromStdString(n->blend[i]));
+                for (const std::string& b : blendModes()) mode->addItem(language::engine(blendModeLabel(b)), QString::fromStdString(b));
+                mode->setCurrentIndex(std::max(0, mode->findData(QString::fromStdString(n->blend[i]))));
                 f->addRow(tr("Input %1:").arg(i + 2), mode);
-                connect(mode, &QComboBox::currentTextChanged, this, [this, clipId, key, i](const QString& b) {
+                connect(mode, &QComboBox::activated, this, [this, clipId, key, i, mode](int at) {
+                    const QString b = mode->itemData(at).toString();
                     state_->apply(tr("Layer Blend Mode"), [clipId, key, i, b](Project&, Sequence& sq) {
                         const Clip* c = edit::clipById(sq, clipId);
                         const GradeNode* m = c ? findGradeNode(c->grade, key) : nullptr;
@@ -836,7 +855,7 @@ void InspectorWidget::buildCompositeNode(const Clip& clip, const std::function<F
             t.key = QString("p%1:%2").arg(owner).arg(effectId);
             t.owner = owner;
             t.effect = effectId;
-            QFormLayout* g = addSection(QString::fromStdString(info->displayName));
+            QFormLayout* g = addSection(language::engine(info->displayName));
             addParamRows(g, *info, t);
         }
     }
@@ -898,6 +917,10 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         EffectInfo shown = *catalog;
         shown.displayName = plugins::effectName(e);
         if (e.type == "grade_node") shown.displayName = tr("Window, Key and Mix").toStdString();  // a colour node's own
+        // (as shown: a plug-in's own name and a colour node's as they are, a built-in effect's in the interface's language)
+        const QString title = e.type == "plugin" || e.type == "ara" || e.type == "ofx" || e.type == "grade_node"
+                                  ? QString::fromStdString(shown.displayName)
+                                  : language::engine(shown.displayName);
         shown.params = effectParams(e);
         // A plugin with a key input: which track it hears there (as the Compressor's sidechain).
         if (e.type == "plugin" && (e.s("key_input") == "1" || plugins::knownSidechain(e.s("plugin_id")))) {
@@ -933,7 +956,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         for (QWidget* w : {static_cast<QWidget*>(on), static_cast<QWidget*>(up), static_cast<QWidget*>(down),
                            static_cast<QWidget*>(reset), static_cast<QWidget*>(del)})
             th->addWidget(w);
-        QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
+        QFormLayout* f = addSection(title, tools);
         if (state_->sequence() && sceneReferredWorking(*state_->sequence()) && effectDomain(e.type) == EffectDomain::Display) {
             // (it cannot work on scene light: it gets the picture as the display shows it, and gives it back)
             auto* note = new QLabel(tr("On the displayed picture: graded scene-referred, this effect works through the output "
@@ -1171,6 +1194,69 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 f->addRow(QString(), reset);
             }
         }
+        if (e.type == "surface_track" && onClip) {
+            // Tracked from the mask drawn round the surface on the playhead's frame; its track exported for compositing.
+            auto* row = new QWidget(content_);
+            auto* h = new QHBoxLayout(row);
+            h->setContentsMargins(0, 0, 0, 0);
+            auto* track = new QPushButton(tr("Track Surface"), row);
+            track->setObjectName(QStringLiteral("trackSurface"));
+            track->setToolTip(tr("Lay a mesh inside the mask on this frame and follow the surface as it moves and bends, to both "
+                                 "ends of the clip"));
+            connect(track, &QPushButton::clicked, this, [this, owner, eid] {
+                QTimer::singleShot(0, this, [this, owner, eid] { trackSurfaceOf(owner, eid, false); });
+            });
+            const std::shared_ptr<const SurfaceTrack> tracked = cachedSurfaceTrack(e);
+            auto* arm = new QPushButton(tr("Vertices on the Monitor"), row);
+            arm->setObjectName(QStringLiteral("surfaceOnMonitor"));
+            arm->setCheckable(true);
+            arm->setEnabled(bool(tracked));
+            arm->setChecked(state_->paintEffect() == eid);
+            arm->setToolTip(tr("Drag a vertex on the Program monitor to where the surface is on that frame where the track has "
+                               "slipped; Ctrl-click one to let it go. Then Solve Again From Here. Esc stops."));
+            connect(arm, &QPushButton::toggled, this, [this, eid](bool on) {
+                if (on) state_->setPaintEffect(eid);
+                else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
+            });
+            connect(state_, &EditorState::paintEffectChanged, arm, [this, arm, eid] {
+                const QSignalBlocker block(arm);
+                arm->setChecked(state_->paintEffect() == eid);
+            });
+            auto* again = new QPushButton(tr("Solve Again From Here"), row);
+            again->setObjectName(QStringLiteral("solveSurfaceAgain"));
+            again->setToolTip(tr("Keep the track up to the playhead and track on from there, holding the vertices put by hand"));
+            again->setEnabled(tracked && !tracked->fixes.empty());
+            connect(again, &QPushButton::clicked, this, [this, owner, eid] {
+                QTimer::singleShot(0, this, [this, owner, eid] { trackSurfaceOf(owner, eid, true); });
+            });
+            auto* exportMaps = new QPushButton(tr("Export ST Maps..."), row);
+            exportMaps->setObjectName(QStringLiteral("exportSurfaceMaps"));
+            exportMaps->setToolTip(tr("An OpenEXR for each frame with the ST map and the surface's motion vectors"));
+            exportMaps->setEnabled(bool(tracked));
+            connect(exportMaps, &QPushButton::clicked, this, [this, tracked] {
+                if (!tracked) return;
+                const QString dir = QFileDialog::getExistingDirectory(window(), tr("Export ST Maps"));
+                if (dir.isEmpty()) return;
+                std::string err;
+                const std::vector<std::string> files =
+                    writeSurfaceExrs(*tracked, QDir(dir).filePath(QStringLiteral("surface")).toStdString(), 0, int(tracked->frames.size()) - 1, &err);
+                if (files.empty()) state_->message(QString::fromStdString(err), 6000);
+                else state_->message(tr("Wrote %n ST map(s)", "", int(files.size())), 4000);
+            });
+            h->addWidget(track);
+            h->addWidget(arm);
+            h->addWidget(again);
+            h->addStretch(1);
+            f->addRow(QString(), row);
+            f->addRow(QString(), exportMaps);
+            if (tracked) {
+                int on = 0;
+                for (const auto& fr : tracked->frames) on += fr.empty() ? 0 : 1;
+                auto* note = new QLabel(tr("Tracked on %1 of %2 frames, %3 vertices").arg(on).arg(tracked->frames.size()).arg(tracked->mesh.rest.size()), content_);
+                note->setObjectName(QStringLiteral("surfaceTrackNote"));
+                f->addRow(QString(), note);
+            }
+        }
         if ((e.type == "paint" || e.type == "dust_spots") && onClip) {
             // Strokes and spots are drawn on the Program monitor while the effect is armed (app/PaintOverlay).
             const bool dust = e.type == "dust_spots";
@@ -1388,7 +1474,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             }
         if (kind == TrackKind::Video && supportsMask(e.type)) {
             // Shape masks and the HSL qualifier; folded away until one is used.
-            QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
+            QFormLayout* mf = addSection(tr("%1 Mask").arg(title), nullptr,
                                          !hasMask(e, localTime()));
             addParamRows(mf, maskInfo(), target(eid));
             if (e.p("mask.depth", localTime()) > 0.5 && depthAvailable() && !depthModel().installed()) {
@@ -1839,9 +1925,9 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
     for (const EffectInfo* info : effectsInCategory(kind == TrackKind::Video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter)) {
         if (sharedNode && runsBeforeGrade(info->type)) continue;
         QMenu*& g = groups[info->group];
-        if (!g) g = menu->addMenu(QString::fromStdString(info->group));
+        if (!g) g = menu->addMenu(language::engine(info->group));
         std::string type = info->type;
-        QString label = QString::fromStdString(info->displayName);
+        QString label = language::engine(info->displayName);
         g->addAction(label, this, [this, owner, type, label, node] {
             if (!ensureEffectModel(window(), type)) return;
             // Bandwidth Extension: the models the clip's cut-off needs.
@@ -1923,7 +2009,7 @@ void InspectorWidget::buildTransition(const Transition& tr0, TrackKind kind) {
     QFormLayout* form = addSection(tr("Transition"));
     auto* type = new QComboBox(content_);
     for (const EffectInfo* info : effectsInCategory(kind == TrackKind::Video ? EffectCategory::VideoTransition : EffectCategory::AudioTransition))
-        type->addItem(QString::fromStdString(info->displayName), QString::fromStdString(info->type));
+        type->addItem(language::engine(info->displayName), QString::fromStdString(info->type));
     form->addRow(tr("Type"), type);
     auto* dur = new QSpinBox(content_);
     dur->setRange(1, 100000);
@@ -2056,7 +2142,7 @@ void InspectorWidget::addHdrPalette(QFormLayout* form, const EffectInfo& info, c
     auto* zone = new QComboBox(content_);
     zone->setObjectName(QStringLiteral("hdrZone"));
     zone->addItem(tr("Global"));
-    for (const HdrZone& z : hdrZones()) zone->addItem(tr(z.label));
+    for (const HdrZone& z : hdrZones()) zone->addItem(language::engine(z.label));
     hdrZone_ = std::clamp(hdrZone_, 0, zone->count() - 1);
     zone->setCurrentIndex(hdrZone_);
     connect(zone, &QComboBox::currentIndexChanged, this, [this](int i) {
@@ -2088,7 +2174,7 @@ void InspectorWidget::addColorSlice(QFormLayout* form, const EffectInfo& info, c
     auto* vector = new QComboBox(content_);
     vector->setObjectName(QStringLiteral("sliceVector"));
     vector->addItem(tr("Global"));
-    for (const HueVector& v : colorSliceVectors()) vector->addItem(tr(v.label));
+    for (const HueVector& v : colorSliceVectors()) vector->addItem(language::engine(v.label));
     vector->addItem(tr("Skin"));
     sliceVector_ = std::clamp(sliceVector_, 0, vector->count() - 1);
     vector->setCurrentIndex(sliceVector_);
@@ -2391,7 +2477,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     h->setContentsMargins(0, 0, 0, 0);
     h->setSpacing(3);
     const std::string name = pi.name;
-    const QString label = tr(pi.label.c_str());
+    const QString label = language::engine(pi.label);
     const QString mergeKey = target.key + ":" + QString::fromStdString(name);
     std::vector<std::string> names = {name};
     if (pi.kind == ParamKind::Color) names = {name + ".r", name + ".g", name + ".b"};
@@ -2404,7 +2490,9 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             if (const auto live = state_->liveParameter(target.owner, target.effect, n)) return *live;
         Effect* e = target.resolve(const_cast<Sequence&>(*s));
         // A parameter not stored yet (e.g. an unused mask) shows its default.
-        return e ? e->p(n, target.time(), n == pi.name ? pi.def : 0) : 0;
+        double def = n == pi.name ? pi.def : 0;
+        if (pi.kind == ParamKind::Color) def = n == pi.name + ".g" ? pi.defG : n == pi.name + ".b" ? pi.defB : pi.def;
+        return e ? e->p(n, target.time(), def) : 0;
     };
     auto readParam = [this, target](const std::string& n) -> const Param* {
         const Sequence* s = state_->sequence();
@@ -2456,7 +2544,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         case ParamKind::Choice: {
             auto* combo = new QComboBox(row);
             combo->setObjectName(QStringLiteral("choice_") + QString::fromStdString(name));
-            for (const auto& c : pi.choices) combo->addItem(tr(c.c_str()));
+            for (const auto& c : pi.choices) combo->addItem(language::engine(c));
             h->addWidget(combo, 1);
             connect(combo, &QComboBox::activated, this, [write, name](int idx) { write({{name, double(idx)}}); });
             refreshWidget = [combo, read, name] {
@@ -2808,9 +2896,239 @@ void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, con
     layout_->addWidget(add);
 }
 
+void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, const Target& target) {
+    // A shape layer grown into several shapes: its contents listed (groups indented), one picked and its settings
+    // shown; adding the first item makes the layer's one shape into contents to add to.
+    const std::vector<ShapeItem> items = shapeContents(clip.generator);
+    const Id clipId = clip.id;
+    std::string selected = shapeSelection_[clipId];
+    if (!findShapeItem(items, selected)) selected = items.empty() ? std::string() : items.front().id;
+    shapeSelection_[clipId] = selected;
+    auto itemLabel = [](const ShapeItem& it) {
+        if (!it.name.empty()) return QString::fromStdString(it.name);
+        const ShapeItemKind* k = shapeItemKind(it.type);
+        size_t digits = it.id.size();
+        while (digits > 0 && std::isdigit(static_cast<unsigned char>(it.id[digits - 1]))) --digits;
+        return QStringLiteral("%1 %2").arg(language::engine(k ? k->label : it.type), QString::fromStdString(it.id.substr(digits)));
+    };
+    if (!items.empty()) {
+        auto* list = new QComboBox(content_);
+        list->setObjectName(QStringLiteral("shapeItems"));
+        list->setAccessibleName(tr("Shape Contents"));
+        list->setToolTip(tr("What the layer holds, the first drawn on top; a group's items are indented under it"));
+        eachShapeItem(items, [&](const ShapeItem& it, int depth) {
+            list->addItem(QString(depth * 4, QLatin1Char(' ')) + itemLabel(it), QString::fromStdString(it.id));
+        });
+        list->setCurrentIndex(std::max(0, list->findData(QString::fromStdString(selected))));
+        form->addRow(tr("Contents"), list);
+        connect(list, &QComboBox::activated, this, [this, list, clipId](int) {
+            shapeSelection_[clipId] = list->currentData().toString().toStdString();
+            QTimer::singleShot(0, this, [this] {
+                if (signature() != signature_) rebuild();
+            });
+        });
+    }
+
+    // Changes to the contents, the layer's one shape made into contents first; `select` is the item picked after.
+    // (Made once the control that asked has finished with its signal: the edit rebuilds the Inspector, control and all.)
+    auto change = [this, target, clipId](const QString& what, std::function<bool(Effect&, std::vector<ShapeItem>&, std::string&)> fn) {
+        QTimer::singleShot(0, this, [this, target, clipId, what, fn] {
+            std::string select = shapeSelection_[clipId];
+            state_->edit(what, [&](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                plainShapeAsContents(*e);
+                std::vector<ShapeItem> its = shapeContents(*e);
+                if (!fn(*e, its, select)) return false;
+                setShapeContents(*e, its);
+                shapeSelection_[clipId] = select;  // (before the Inspector is rebuilt for the change)
+                return true;
+            });
+            if (signature() != signature_) rebuild();
+        });
+    };
+    auto* row = new QWidget(content_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    h->setSpacing(3);
+    auto* add = new QToolButton(row);
+    add->setObjectName(QStringLiteral("addShapeItem"));
+    add->setText(tr("Add"));
+    add->setToolTip(tr("Add a shape, a fill or stroke, an operator that changes the paths above it, a repeater or a group"));
+    add->setPopupMode(QToolButton::InstantPopup);
+    auto* menu = new QMenu(add);
+    for (const ShapeItemKind& k : shapeItemKinds()) {
+        const std::string type = k.type;
+        menu->addAction(language::engine(k.label), this, [type, change, label = language::engine(k.label)] {
+            change(tr("Add %1").arg(label), [type](Effect& e, std::vector<ShapeItem>& its, std::string& select) {
+                ShapeItem it;
+                it.type = type;
+                it.id = newShapeItemId(its, type);
+                if (type == "path") setShapePathPoints(e, it.id, 0, {{0, -100}, {100, 80}, {-100, 80}});
+                // A shape goes above the picked item (or first in the picked group), so the paints and operators
+                // below take it in; anything else below it (or last in the group), to work on what is above.
+                const bool isShape = type == "rect" || type == "ellipse" || type == "polygon" || type == "star" || type == "path" || type == "group";
+                std::vector<ShapeItem>* list = &its;
+                size_t index = 0;
+                ShapeItem* at = findShapeItem(its, select, &list, &index);
+                if (at && at->type == "group") list = &at->items, index = isShape ? 0 : list->size();
+                else if (!at) list = &its, index = isShape ? 0 : its.size();
+                else if (!isShape) ++index;
+                list->insert(list->begin() + std::ptrdiff_t(std::min(index, list->size())), it);
+                select = it.id;
+                return true;
+            });
+        });
+    }
+    add->setMenu(menu);
+    h->addWidget(add);
+    auto* remove = smallButton(row, QStringLiteral("✕"), tr("Remove the Picked Item"));
+    remove->setObjectName(QStringLiteral("removeShapeItem"));
+    remove->setAccessibleName(remove->toolTip());
+    auto* up = smallButton(row, QStringLiteral("▲"), tr("Move the Picked Item Up"));
+    up->setObjectName(QStringLiteral("shapeItemUp"));
+    up->setAccessibleName(up->toolTip());
+    auto* down = smallButton(row, QStringLiteral("▼"), tr("Move the Picked Item Down"));
+    down->setObjectName(QStringLiteral("shapeItemDown"));
+    down->setAccessibleName(down->toolTip());
+    for (QToolButton* b : {remove, up, down}) {
+        b->setEnabled(!items.empty());
+        h->addWidget(b);
+    }
+    connect(remove, &QToolButton::clicked, this, [change] {
+        change(tr("Remove Shape Item"), [](Effect& e, std::vector<ShapeItem>& its, std::string& select) {
+            std::vector<ShapeItem>* list = nullptr;
+            size_t index = 0;
+            ShapeItem* at = findShapeItem(its, select, &list, &index);
+            if (!at) return false;
+            eraseShapeItemParams(e, *at);
+            list->erase(list->begin() + std::ptrdiff_t(index));
+            select = list->empty() ? std::string() : (*list)[std::min(index, list->size() - 1)].id;
+            return true;
+        });
+    });
+    for (const int step : {-1, 1})
+        connect(step < 0 ? up : down, &QToolButton::clicked, this, [change, step] {
+            change(tr("Move Shape Item"), [step](Effect&, std::vector<ShapeItem>& its, std::string& select) {
+                std::vector<ShapeItem>* list = nullptr;
+                size_t index = 0;
+                if (!findShapeItem(its, select, &list, &index)) return false;
+                const long to = long(index) + step;
+                if (to < 0 || to >= long(list->size())) return false;
+                std::swap((*list)[index], (*list)[size_t(to)]);
+                return true;
+            });
+        });
+    auto* svg = new QPushButton(tr("Import SVG…"), row);
+    svg->setObjectName(QStringLiteral("importSvgShapes"));
+    svg->setToolTip(tr("Make an SVG drawing's paths, groups, fills, strokes and gradients this layer's contents, to edit and animate"));
+    h->addWidget(svg);
+    connect(svg, &QPushButton::clicked, this, [this, target] { QTimer::singleShot(0, this, [this, target] {
+        const QString file = QFileDialog::getOpenFileName(this, tr("Import SVG"), QString(), tr("SVG drawings (*.svg)"));
+        if (file.isEmpty()) return;
+        Effect made;
+        double w = 0, h = 0;
+        std::vector<std::string> notes;
+        std::string err;
+        if (!importSvgShapes(file.toStdString(), made, w, h, &notes, &err)) {
+            state_->message(tr("Could not import %1: %2").arg(QFileInfo(file).fileName(), QString::fromStdString(err)), 6000);
+            return;
+        }
+        state_->edit(tr("Import SVG"), [&](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e) return false;
+            for (const ShapeItem& it : shapeContents(*e)) eraseShapeItemParams(*e, it);
+            for (const auto& [k, v] : made.params) e->params[k] = v;
+            setShapeContents(*e, shapeContents(made));
+            return true;
+        });
+        if (!notes.empty()) {
+            QStringList ns;
+            for (const std::string& n : notes) ns << QString::fromStdString(n);
+            state_->message(tr("Not made into shapes: %1").arg(ns.join(QStringLiteral("; "))), 8000);
+        }
+    }); });
+    auto* fromMask = new QPushButton(tr("Path From a Mask"), row);
+    fromMask->setObjectName(QStringLiteral("shapePathFromMask"));
+    fromMask->setToolTip(tr("Copy the path drawn with the pen as a Bézier mask on one of this layer's effects into its contents"));
+    h->addWidget(fromMask);
+    h->addStretch(1);
+    connect(fromMask, &QPushButton::clicked, this, [this, target, clipId] { QTimer::singleShot(0, this, [this, target, clipId] {
+        std::string made;
+        state_->edit(tr("Path From a Mask"), [&](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, clipId);
+            Effect* g = target.resolve(s);
+            if (!c || !g) return false;
+            for (const Effect& e : c->effects) {
+                if (std::lround(e.p("mask.shape", 0)) != 5) continue;
+                plainShapeAsContents(*g);
+                std::vector<ShapeItem> its = shapeContents(*g);
+                const std::optional<ShapeItem> path = shapePathFromMask(*g, its, e, s.width, s.height);
+                if (!path) continue;
+                its.insert(its.begin(), *path);
+                setShapeContents(*g, its);
+                made = path->id;
+                shapeSelection_[clipId] = made;
+                return true;
+            }
+            return false;
+        });
+        if (made.empty()) {
+            state_->message(tr("Draw a path with the pen as a Bézier mask on one of this layer's effects first"), 5000);
+            return;
+        }
+        if (signature() != signature_) rebuild();
+    }); });
+    form->addRow(QString(), row);
+
+    // The picked item's settings.
+    const ShapeItem* picked = findShapeItem(items, selected);
+    const ShapeItemKind* kind = picked ? shapeItemKind(picked->type) : nullptr;
+    if (!picked || !kind) return;
+    QFormLayout* section = addSection(itemLabel(*picked));
+    auto* name = new QLineEdit(content_);
+    name->setObjectName(QStringLiteral("shapeItemName"));
+    name->setAccessibleName(tr("Item Name"));
+    name->setPlaceholderText(itemLabel(*picked));
+    name->setText(QString::fromStdString(picked->name));
+    section->addRow(tr("Name"), name);
+    const std::string id = picked->id;
+    connect(name, &QLineEdit::editingFinished, this, [change, name, id] {
+        const std::string text = name->text().trimmed().toStdString();
+        change(tr("Rename Shape Item"), [text, id](Effect&, std::vector<ShapeItem>& its, std::string&) {
+            ShapeItem* it = findShapeItem(its, id);
+            if (!it || it->name == text) return false;
+            it->name = text;
+            return true;
+        });
+    });
+    if (picked->type == "path") {
+        auto* closed = new QCheckBox(tr("Closed"), content_);
+        closed->setObjectName(QStringLiteral("shapePathClosed"));
+        closed->setChecked(picked->closed);
+        section->addRow(tr("Points"), new QLabel(QString::number(shapePathPoints(clip.generator, id, 0).size()), content_));
+        section->addRow(QString(), closed);
+        connect(closed, &QCheckBox::toggled, this, [change, id](bool on) {
+            change(tr("Close Path"), [on, id](Effect&, std::vector<ShapeItem>& its, std::string&) {
+                ShapeItem* it = findShapeItem(its, id);
+                if (!it || it->closed == on) return false;
+                it->closed = on;
+                return true;
+            });
+        });
+    }
+    EffectInfo info;
+    info.type = "shape";
+    for (ParamInfo pi : kind->params) {
+        pi.name = id + "." + pi.name;
+        info.params.push_back(pi);
+    }
+    addParamRows(section, info, target);
+}
+
 void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target) {
     const std::string name = si.name;
-    const QString label = tr(si.label.c_str());
+    const QString label = language::engine(si.label);
     const QString mergeKey = target.key + ":s:" + QString::fromStdString(name);
     auto read = [this, target, name]() -> QString {
         const Sequence* s = state_->sequence();
@@ -3032,7 +3350,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             combo->setObjectName(QString::fromStdString("track_" + name));
             form->addRow(label, combo);
             connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
-            const QString none = si.choices.empty() ? tr("None") : tr(si.choices.front().c_str());
+            const QString none = si.choices.empty() ? tr("None") : language::engine(si.choices.front());
             refreshers_.push_back([this, combo, read, target, none] {
                 QSignalBlocker b(combo);
                 combo->clear();
@@ -3058,12 +3376,15 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
         }
         case StringKind::Choice: {
             auto* combo = new QComboBox(content_);
-            for (const auto& c : si.choices) combo->addItem(QString::fromStdString(c));
+            // (each shown in the interface's language, kept as written)
+            for (const auto& c : si.choices) combo->addItem(language::engine(c), QString::fromStdString(c));
             form->addRow(label, combo);
-            connect(combo, &QComboBox::textActivated, this, write);
-            refreshers_.push_back([combo, read] {
+            connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
+            refreshers_.push_back([combo, read, def = QString::fromStdString(si.def)] {
                 QSignalBlocker b(combo);
-                combo->setCurrentText(read());
+                int at = combo->findData(read());
+                if (at < 0) at = combo->findData(def);
+                combo->setCurrentIndex(at < 0 ? 0 : at);
             });
             break;
         }
@@ -3547,6 +3868,33 @@ void InspectorWidget::trackWarpPins(Id clip, Id effect) {
         return true;
     });
     state_->message(tr("Tracked %n pin(s)", "", int(keys.size())), 4000);
+}
+
+void InspectorWidget::trackSurfaceOf(Id clip, Id effect, bool again) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || c->duration <= 0 || !edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) return;
+    const FrameTime at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::string track;
+    const bool ok = runAnalysis(tr("Tracking the surface..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
+        return cl && ef && trackClipSurface(*project, *sq, *cl, *ef, at, track, again, [&](double f) { progress(f); return !*cancel; }, err);
+    });
+    if (!ok) return;
+    state_->edit(again ? tr("Solve Surface Again") : tr("Track Surface"), [clip, effect, track](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        ef->strings["track"] = track;
+        return true;
+    });
+    int on = 0;
+    if (const auto t = cachedSurfaceTrack(track))
+        for (const auto& fr : t->frames) on += fr.empty() ? 0 : 1;
+    state_->message(tr("Tracked the surface on %n frame(s)", "", on), 4000);
 }
 
 void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {

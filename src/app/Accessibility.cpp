@@ -1,4 +1,5 @@
 #include "Accessibility.h"
+#include "Language.h"
 
 #include <QAbstractButton>
 #include <QAbstractItemView>
@@ -99,7 +100,7 @@ private:
 
 QString transitionName(const Transition& t) {
     const EffectInfo* info = findEffectInfo(t.type);
-    return QString::fromStdString(info ? info->displayName : t.type);
+    return info ? language::engine(info->displayName) : QString::fromStdString(t.type);
 }
 
 QString clipText(const Sequence& s, const Track& track, TrackRef ref, const Clip& c) {
@@ -111,7 +112,7 @@ QString clipText(const Sequence& s, const Track& track, TrackRef ref, const Clip
         if (t.clipB == c.id) parts << QApplication::translate("Accessibility", "%1 in").arg(transitionName(t));
         if (t.clipA == c.id) parts << QApplication::translate("Accessibility", "%1 out").arg(transitionName(t));
     }
-    if (!c.effects.empty()) parts << QApplication::translate("Accessibility", "%n effect(s)", nullptr, int(c.effects.size()));
+    if (!c.effects.empty()) parts << QApplication::translate("Accessibility", "%n effect(s)", "", int(c.effects.size()));
     if (!c.enabled) parts << QApplication::translate("Accessibility", "disabled");
     return parts.join(QStringLiteral(", "));
 }
@@ -432,7 +433,7 @@ public:
     QString text(QAccessible::Text t) const override {
         if (t == QAccessible::Name && panel()->accessibleName().isEmpty()) return QApplication::translate("Accessibility", "Keyframes");
         if (t == QAccessible::Description)
-            return QApplication::translate("Accessibility", "%n keyframe(s) on %1 parameters", nullptr, int(keys().size()))
+            return QApplication::translate("Accessibility", "%n keyframe(s) on %1 parameters", "", int(keys().size()))
                 .arg(panel()->rows().size());
         return QAccessibleWidget::text(t);
     }
@@ -665,10 +666,11 @@ QString timelineValue(const Sequence& s, const std::vector<Id>& selection, Id fo
     if (!focus || std::find(selection.begin(), selection.end(), focus) == selection.end()) focus = selection.front();
     if (const Clip* c = edit::clipById(s, focus)) {
         value += QApplication::translate("Accessibility", ", %1 selected").arg(QString::fromStdString(c->name));
-        if (selection.size() > 1)
-            value += QApplication::translate("Accessibility", " with %n other(s)", nullptr, int(selection.size() - 1));
+        // (A count worked out inside the call hangs Qt 6.4's lupdate.)
+        if (const int others = int(selection.size()) - 1; others > 0)
+            value += QApplication::translate("Accessibility", " with %n other(s)", "", others);
     } else {
-        value += QApplication::translate("Accessibility", ", %n clip(s) selected", nullptr, int(selection.size()));
+        value += QApplication::translate("Accessibility", ", %n clip(s) selected", "", int(selection.size()));
     }
     return value;
 }

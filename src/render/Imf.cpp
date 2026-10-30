@@ -32,6 +32,7 @@ extern "C" {
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
+#include "Iab.h"
 #include "ImageSubtitles.h"
 #include "Jpeg2000.h"
 #include "PackageFiles.h"
@@ -201,6 +202,8 @@ QString safeTitle(const std::string& title) {
 const QString kGroups = QStringLiteral("http://www.smpte-ra.org/reg/395/2014/13/1/aaf");
 const QString kElements = QStringLiteral("http://www.smpte-ra.org/reg/335/2012");
 const QString kTypes = QStringLiteral("http://www.smpte-ra.org/reg/2003/2012");
+// ST 2067-201's namespace, the IABSequence's.
+constexpr const char* kIabNs = "http://www.smpte-ra.org/ns/2067-201/2019";
 
 void rgbaComponents(QXmlStreamWriter& x, const QString& element, int bits) {
     x.writeStartElement("r1:" + element);
@@ -535,6 +538,40 @@ void soundDescriptor(QXmlStreamWriter& x, const dcp::ImfSoundWriter& w) {
     x.writeTextElement("r1:BlockAlign", QString::number(3 * w.channels()));
     x.writeTextElement("r1:AverageBytesPerSecond", QString::number(48000 * 3 * w.channels()));
     x.writeTextElement("r1:ChannelAssignment", ulUrn(std::string("060e2b340401010d0402021004010000")));
+    x.writeEndElement();
+}
+
+void iabDescriptor(QXmlStreamWriter& x, const dcp::ImfIabWriter& w) {
+    x.writeStartElement("r0:IABEssenceDescriptor");
+    x.writeNamespace(kGroups, "r0");
+    x.writeNamespace(kElements, "r1");
+    x.writeTextElement("r1:InstanceID", urn(w.descriptorId()));
+    x.writeStartElement("r1:SubDescriptors");
+    x.writeStartElement("r0:IABSoundfieldLabelSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.soundfieldId()));
+    x.writeTextElement("r1:MCALabelDictionaryID", ulUrn(std::string(dcp::ImfIabWriter::kSoundfield)));
+    x.writeTextElement("r1:MCALinkID", urn(w.soundfieldLink()));
+    x.writeTextElement("r1:MCATagSymbol", "IAB");
+    x.writeTextElement("r1:MCATagName", "IAB");
+    x.writeTextElement("r1:RFC5646SpokenLanguage", QString::fromStdString(w.language()));
+    x.writeTextElement("r1:MCATitle", QString::fromStdString(w.title()));
+    x.writeTextElement("r1:MCATitleVersion", QString::fromStdString(w.titleVersion()));
+    x.writeTextElement("r1:MCAAudioContentKind", "PRM");
+    x.writeTextElement("r1:MCAAudioElementKind", "FCMP");
+    x.writeEndElement();
+    x.writeEndElement();  // SubDescriptors
+    const QString rate = QStringLiteral("%1/%2").arg(w.rate().num).arg(w.rate().den);
+    x.writeTextElement("r1:LinkedTrackID", "1");
+    x.writeTextElement("r1:SampleRate", rate);
+    x.writeTextElement("r1:EssenceLength", QString::number(w.duration()));
+    x.writeTextElement("r1:ContainerFormat", ulUrn(std::string(dcp::ImfIabWriter::kContainer)));
+    x.writeTextElement("r1:AudioSampleRate", "48000/1");
+    x.writeTextElement("r1:Locked", "False");
+    x.writeTextElement("r1:ChannelCount", "0");
+    x.writeTextElement("r1:QuantizationBits", "24");
+    x.writeTextElement("r1:SoundCompression", ulUrn(std::string(dcp::ImfIabWriter::kCoding)));
+    x.writeTextElement("r1:ReferenceImageEditRate", rate);
+    x.writeTextElement("r1:ReferenceAudioAlignmentLevel", QString::number(dcp::ImfIabWriter::kReferenceLevel));
     x.writeEndElement();
 }
 
@@ -1289,6 +1326,47 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         virtuals.push_back(std::move(vt));
     }
 
+    // Immersive sound: the programme's mix as beds and objects, an IAB frame (PCM) to each frame of the composition
+    // and silence after the programme, in a track file of its own (a supplemental's written whole again).
+    int iabBed = 0, iabObjects = 0;
+    if (settings.immersive) {
+        iab::ProgramSettings ps;
+        ps.rateNum = rate.num;
+        ps.rateDen = rate.den;
+        ps.mixRate = 48000;
+        ps.firstSample = firstSample;
+        ps.frames = frames;
+        ps.heard = heard;
+        iab::Program program;
+        ImfSound programme{settings.language.empty() ? "en" : settings.language, "PRM", {}};
+        if (!program.open(p, soundVersion(s, programme), ps, &err)) return fail(err);
+        iabBed = program.bedChannels();
+        iabObjects = program.objects();
+        Virtual vt;
+        vt.kind = QStringLiteral("IABSequence");
+        vt.editRate = editRate;
+        const ImfVirtualTrack* was = nullptr;  // (the earlier composition's, for its TrackId)
+        for (const ImfVirtualTrack& t : old.tracks)
+            if (t.kind == "IABSequence") was = &t;
+        vt.trackId = trackIdFor(was);
+        const size_t fileIndex = ownFile("IAB", vt.kind);
+        dcp::ImfIabWriter writer;
+        if (!writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, programme.language,
+                         title.toStdString(), "1", &err))
+            return fail(err);
+        std::vector<uint8_t> frame;
+        for (int64_t k = 0; k < frames; ++k) {
+            if (!program.next(frame, &err) || !writer.write(frame.data(), frame.size(), &err)) return fail(err.empty() ? "Cannot write the immersive sound" : err);
+            if (progress && k % 24 == 0 && !progress(0.1)) return fail("Stopped");
+        }
+        if (!writer.close(&err)) return fail(err);
+        own[fileIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { iabDescriptor(x, writer); });
+        vt.ownFile = int(fileIndex);
+        vt.ownDuration = writer.duration();
+        addRun(vt.runs, false, 0, frames);
+        virtuals.push_back(std::move(vt));
+    }
+
     // Timed text: each caption track's IMSC 1.1 document (times from the composition's start), unless the earlier
     // package has the same document in the same language and kind.
     std::set<std::string> textTracksUsed;
@@ -1612,6 +1690,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         // (Application #5 was published against ST 2067-2:2016's core constraints, so it keeps their namespace.)
         x.writeNamespace(aces ? "http://www.smpte-ra.org/schemas/2067-2/2016" : "http://www.smpte-ra.org/ns/2067-2/2020", "cc");
         x.writeNamespace("http://www.w3.org/2001/XMLSchema-instance", "xsi");
+        if (settings.immersive) x.writeNamespace(QString::fromLatin1(kIabNs), "iab");
         x.writeTextElement("Id", urn(cplId));
         text(x, "Annotation", title);
         x.writeTextElement("IssueDate", issued);
@@ -1650,7 +1729,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeTextElement("Id", urn(segmentId));
         x.writeStartElement("SequenceList");
         for (size_t i = 0; i < virtuals.size(); ++i) {
-            x.writeStartElement("cc:" + virtuals[i].kind);
+            // (an IABSequence is ST 2067-201's own)
+            if (virtuals[i].kind == "IABSequence") x.writeStartElement(QString::fromLatin1(kIabNs), virtuals[i].kind);
+            else x.writeStartElement("cc:" + virtuals[i].kind);
             x.writeTextElement("Id", urn(dcp::newUuid()));
             x.writeTextElement("TrackId", virtuals[i].trackId);
             x.writeStartElement("ResourceList");
@@ -1767,6 +1848,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         result->outputTransform = outputName;
         result->targetFrames = targetsWritten;
         result->amf = amfFile.empty() ? std::string() : QDir(folder).filePath(QString::fromStdString(amfFile)).toStdString();
+        result->immersive = settings.immersive;
+        result->iabBedChannels = iabBed;
+        result->iabObjects = iabObjects;
     }
     return true;
 }
@@ -1923,9 +2007,9 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         std::set<std::string> seen;
         for (const ImfVirtualTrack& t : comp.tracks) {
             const QString kind = QString::fromStdString(t.kind);
-            const bool image = t.kind == "MainImageSequence", sound = t.kind == "MainAudioSequence";
+            const bool image = t.kind == "MainImageSequence", sound = t.kind == "MainAudioSequence", iab = t.kind == "IABSequence";
             const bool text = isTextSequence(kind);
-            if (!image && !sound && !text) continue;  // (markers, and kinds other tools write that Montage does not read)
+            if (!image && !sound && !text && !iab) continue;  // (markers, and kinds other tools write that Montage does not read)
             // Every virtual track as long as the picture.
             if (picture && !t.resources.empty()) {
                 const ImfResource& r0 = t.resources.front();
@@ -1959,7 +2043,7 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     }
                 }
                 const bool acesPicture = image && comp.application == 5;
-                if (text || !inside || acesPicture) {
+                if (text || !inside || acesPicture || iab) {
                     // Read as Montage reads track files (those of other packages without reading all their essence).
                     dcp::ImfTrackReader reader;
                     if (!reader.open(file, &err)) {
@@ -1967,11 +2051,12 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                         continue;
                     }
                     using K = dcp::ImfTrackReader::Kind;
-                    const K want = image ? K::Picture : sound ? K::Sound : K::TimedText;
-                    const int64_t units = image ? reader.frames() : sound ? reader.samples() : r.intrinsic;
+                    const K want = image ? K::Picture : sound ? K::Sound : iab ? K::Iab : K::TimedText;
+                    const int64_t units = image || iab ? reader.frames() : sound ? reader.samples() : r.intrinsic;
                     std::string xml;
                     std::vector<Caption> captions;
-                    if (reader.kind() != want) issue(QStringLiteral("%1 is not the %2 its %3 plays").arg(name, image ? "picture" : sound ? "sound" : "timed text", kind));
+                    if (reader.kind() != want)
+                        issue(QStringLiteral("%1 is not the %2 its %3 plays").arg(name, image ? "picture" : sound ? "sound" : iab ? "immersive sound (IAB)" : "timed text", kind));
                     else if (r.intrinsic >= 0 && units != r.intrinsic)
                         issue(QStringLiteral("%1 has %2 edit units; the composition says %3").arg(name).arg(units).arg(r.intrinsic));
                     else if (acesPicture && !reader.imfAces())
@@ -2007,6 +2092,25 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                             else if (t.index < 0 || t.index >= reader.frames()) issue(QStringLiteral("%1's target frame %2 is of no frame of it").arg(name).arg(i));
                             else if (!reader.targetFrame(i, bytes, &err) || !decodeTiff16(bytes, rgb, w, h, &err) || (comp.width > 0 && (w != comp.width || h != comp.height)))
                                 issue(QStringLiteral("%1's target frame %2 is not a 16-bit TIFF of the picture's size").arg(name).arg(i));
+                        }
+                    } else if (iab && inside) {
+                        // Every frame an IABitstream frame at the composition's rate.
+                        const int code = iab::rateCode(comp.rateNum, comp.rateDen);
+                        std::vector<uint8_t> bytes;
+                        for (int64_t k = 0; k < reader.frames(); ++k) {
+                            iab::Frame f;
+                            if (!reader.frame(k, bytes, &err) || !iab::readFrame(bytes.data(), bytes.size(), f, &err)) {
+                                issue(QStringLiteral("%1 frame %2 is not an IABitstream frame: %3").arg(name).arg(k).arg(QString::fromStdString(err)));
+                                break;
+                            }
+                            if (f.rate != code) {
+                                issue(QStringLiteral("%1's frames are not at the composition's edit rate").arg(name));
+                                break;
+                            }
+                            if (!reading(qint64(bytes.size()))) {
+                                issue("Stopped");
+                                return issues;
+                            }
                         }
                     } else if (text && !reader.text(xml, &err))
                         issue(QStringLiteral("%1 is not timed text Montage reads: %2").arg(name, QString::fromStdString(err)));

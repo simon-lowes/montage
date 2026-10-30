@@ -37,6 +37,7 @@ public:
         bool focus = false;   // Lens Blur (Depth): a click picks the focus point (else Paint)
         bool mesh = false;    // Mesh Warp: pins
         bool grid = false;    // Grid Warp: its points
+        bool surface = false; // Surface Tracker: its vertices, put by hand
         FrameTime lt = 0;     // the clip frame at the playhead
         double brush = 30;    // the brush's size, sequence pixels
     };
@@ -54,8 +55,9 @@ private:
     void finishStroke();
     bool markSpot(const Target& t, const QPointF& pos, bool remove);
     void pickFocus(const Target& t, double u, double v);
-    // A Mesh Warp's pins where the monitor shows them on this frame (k, widget point), and a Grid Warp's points
-    // (r * 1000 + c, widget point); the one within reach of `at` (0 / -1: none).
+    // A Mesh Warp's pins where the monitor shows them on this frame (k, widget point), a Grid Warp's points
+    // (r * 1000 + c, widget point) and a Surface Tracker's vertices (k, widget point); the one within reach of `at`
+    // (0 / -1: none).
     std::vector<std::pair<int, QPointF>> handles(const Target& t, const Effect& e) const;
     int handleAt(const Target& t, const Effect& e, const QPointF& at) const;
     void placePin(const Target& t, const QPointF& at);

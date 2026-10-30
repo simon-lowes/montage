@@ -1,4 +1,5 @@
 #include "MediaBinModel.h"
+#include "Language.h"
 #include "media/ImageSequence.h"
 #include "core/Interpretation.h"
 
@@ -271,7 +272,7 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
                    .arg(m.fps.toDouble(), 0, 'f', 3)
                    .arg(QString::fromStdString(m.videoCodec));
     if (m.hasVideo && m.kind != MediaKind::Sequence)
-        tip += "<br>" + tr("Colour: %1").arg(QString::fromStdString(mediaColorSpace(m).label)) +
+        tip += "<br>" + tr("Colour: %1").arg(language::engine(mediaColorSpace(m).label)) +
                (m.colorOverride.empty() ? QString() : tr(" (interpreted)"));
     if (const Interpretation in = interpretationOf(m); !in.empty()) {
         QStringList how;

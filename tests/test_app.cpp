@@ -43,6 +43,11 @@
 #include <QMenu>
 #include <QPainter>
 #include <QTabBar>
+#include <QProcess>
+#include <QDirIterator>
+#include <QXmlStreamReader>
+#include <QGroupBox>
+#include <QMenuBar>
 #include <QTableWidget>
 #include <QSpinBox>
 #include <QTimer>
@@ -56,6 +61,9 @@
 #include "core/ProjectLock.h"
 #include "ProductionPanel.h"
 #include "ReferenceOutputPanel.h"
+#include "RemoteGradePanel.h"
+#include "Language.h"
+#include "media/InterfaceDrafts.h"
 #include "RemoteReviewPanel.h"
 #include <algorithm>
 #include <array>
@@ -98,6 +106,8 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/VfxPull.h"
+#include "render/VfxShots.h"
 #include "render/Titles.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
@@ -127,6 +137,7 @@
 #include "ScopesWidget.h"
 #include "render/Gamut.h"
 #include "LinkMediaDialog.h"
+#include "VfxShotsDialog.h"
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
@@ -143,6 +154,7 @@
 #include "core/CaptionTools.h"
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "core/MediaLog.h"
 #include "InspectorWidget.h"
 #include "core/Bleep.h"
@@ -151,6 +163,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/ElasticAudio.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
 #include "audio/Plugins.h"
@@ -239,6 +252,7 @@
 #include "RenderQueuePanel.h"
 #include "render/RenderFarm.h"
 #include "TimelineWidget.h"
+#include "PitchCurves.h"
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
 #include "core/AutoTag.h"
@@ -265,6 +279,7 @@
 #include "render/Exporter.h"
 #include "render/SpatialVideo.h"
 #include "render/Ocio.h"
+#include "render/SurfaceTrack.h"
 
 using namespace montage;
 
@@ -4194,6 +4209,83 @@ private slots:
         state()->newProject();
     }
 
+    void shapeContentsInTheInspector() {
+        // A Shape layer grown in the Inspector: adding to it makes its one shape the first of its contents, items are
+        // picked, removed, moved and named, and a path drawn with the pen as a mask is copied in.
+        state()->newProject();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        emit browser->applyRequested("shape", EffectCategory::Generator);
+        const Id id = state()->primaryClip()->id;
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        auto contents = [&] { return shapeContents(edit::clipById(*state()->sequence(), id)->generator); };
+        auto addItem = [&](const QString& label) {
+            auto* add = inspector->findChild<QToolButton*>("addShapeItem");
+            QVERIFY(add && add->menu());
+            QAction* act = nullptr;
+            for (QAction* a : add->menu()->actions())
+                if (a->text() == label) act = a;
+            QVERIFY(act);
+            act->trigger();
+            QApplication::processEvents();
+        };
+        auto list = [&] { return inspector->findChild<QComboBox*>("shapeItems"); };
+        QVERIFY(!list());
+        addItem("Ellipse");
+        std::vector<ShapeItem> its = contents();
+        QCOMPARE(int(its.size()), 3);
+        QCOMPARE(its[0].type, std::string("ellipse"));
+        QCOMPARE(its[1].type, std::string("rect"));
+        QCOMPARE(its[2].type, std::string("fill"));
+        QVERIFY(list() && list()->count() == 3 && list()->currentText() == "Ellipse 1");
+        // Only the layer's own position, turn and opacity stay in its section; the picked item's settings follow.
+        bool trim = false, width = false;
+        for (auto* l : inspector->findChildren<QLabel*>()) {
+            trim |= l->text().startsWith("Trim End") && l->isVisibleTo(inspector);
+            width |= l->text().startsWith("Width (px)") && l->isVisibleTo(inspector);
+        }
+        QVERIFY(!trim && width);
+        // An operator goes under the picked shape, to change it; removing it picks what took its place.
+        addItem("Wiggle");
+        QCOMPARE(contents()[1].type, std::string("wiggle"));
+        QCOMPARE(list()->currentText(), QString("Wiggle 1"));
+        inspector->findChild<QToolButton*>("removeShapeItem")->click();
+        QApplication::processEvents();
+        QCOMPARE(int(contents().size()), 3);
+        QCOMPARE(list()->currentText(), QString("Rectangle 1"));
+        inspector->findChild<QToolButton*>("shapeItemUp")->click();
+        QApplication::processEvents();
+        QCOMPARE(contents()[0].type, std::string("rect"));
+        auto* name = inspector->findChild<QLineEdit*>("shapeItemName");
+        QVERIFY(name);
+        name->setText("Box");
+        emit name->editingFinished();
+        QApplication::processEvents();
+        QCOMPARE(contents()[0].name, std::string("Box"));
+        QCOMPARE(list()->currentText(), QString("Box"));
+        // A Bézier mask drawn on one of its effects, copied in as a path where it was drawn.
+        const Sequence& s = *state()->sequence();
+        const double w = s.width, h = s.height;
+        state()->edit("mask", [&](Project& p, Sequence& seq) {
+            Effect e = makeEffect(p, "gaussian_blur");
+            setMaskPathFromFrame(e, {{0.1, 0.1}, {0.3, 0.1}, {0.3, 0.3}}, w, h, false);
+            edit::clipById(seq, id)->effects.push_back(e);
+            return true;
+        });
+        QApplication::processEvents();
+        inspector->findChild<QPushButton*>("shapePathFromMask")->click();
+        QApplication::processEvents();
+        its = contents();
+        QCOMPARE(its[0].type, std::string("path"));
+        QCOMPARE(list()->currentText(), QString("Path 1"));
+        const std::vector<PathPoint> pts = shapePathPoints(edit::clipById(*state()->sequence(), id)->generator, its[0].id, 0);
+        QCOMPARE(int(pts.size()), 3);
+        QVERIFY(std::fabs(pts[0].x - (0.1 - 0.5) * w) < 1e-6 && std::fabs(pts[2].y - (0.3 - 0.5) * h) < 1e-6);
+        state()->undo();
+        QApplication::processEvents();
+        QCOMPARE(int(contents().size()), 3);
+    }
+
     void shapeLayersAndLottieInTheApp() {
         state()->newProject();
         // A Shape from the Effects browser lands at the playhead, selected, with its settings in the Inspector.
@@ -5061,6 +5153,115 @@ private slots:
         QVERIFY(bin->shownMedia().empty());
         QCOMPARE(bin->currentSmartBin(), Id(0));
         QVERIFY(tree->isHidden());
+    }
+
+    void elasticAudioOnTheTimeline() {
+        // A spoken line on A1, warped from the Clip menu.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        const Id audio = trackAt(*state()->sequence(), A1)->clips.front().id;
+        ppf_ = measurePpf();
+        timeline()->setShowVolumeLines(true);
+        auto clip = [&] { return edit::clipById(*state()->sequence(), audio); };
+        auto points = [&] {
+            const Effect* e = elasticEffectOf(*clip());
+            return e ? dialogueWarpFromString(e->s("points")) : DialogueWarp{};
+        };
+        auto action = [&](const char* name) {
+            QAction* a = win_->findChild<QAction*>(QString::fromLatin1(name));
+            if (!a) qWarning("no action %s", name);
+            return a;
+        };
+        state()->setSelection({audio}, false);
+        for (const char* name : {"enableElasticAudio", "warpMarkersAtOnsets", "elasticSpeech", "elasticGeneral", "elasticVarispeed",
+                                 "removeElasticAudio", "shiftPitch", "flattenPitch", "scaleInflection", "correctPitch", "shiftFormants",
+                                 "clearPitchEdits", "showPitchCurves"})
+            QVERIFY(action(name));
+        action("enableElasticAudio")->trigger();
+        QVERIFY(elasticEffectOf(*clip()));
+        QVERIFY(points().empty());
+        state()->undo();
+        QVERIFY(!elasticEffectOf(*clip()));
+        state()->redo();
+
+        // Alt-drag in the clip: a marker made at 2 s and moved to 2.5 s, one undo step; the waveform follows it.
+        const QRect band = timeline()->lineBand(audio);
+        QVERIFY(!band.isNull());
+        const int y = band.top() + 3;
+        auto xAt = [&](double u) { return int(std::lround(timeline()->xForElasticSeconds(*clip(), u))); };
+        QVERIFY(std::abs(timeline()->elasticSecondsAtX(*clip(), xAt(2.0)) - 2.0) < 0.05);
+        const double grabbed = timeline()->elasticSecondsAtX(*clip(), xAt(2.0)), dropped = timeline()->elasticSecondsAtX(*clip(), xAt(2.5));
+        drag(QPoint(xAt(2.0), y), QPoint(xAt(2.5), y), Qt::AltModifier);
+        DialogueWarp w = points();
+        QCOMPARE(w.size(), size_t(3));  // with the anchors at the clip's ends
+        QVERIFY2(std::fabs(w[1].w - grabbed) < 1e-6 && std::fabs(w[1].u - dropped) < 1e-6, qPrintable(QStringLiteral("%1 %2").arg(w[1].u).arg(w[1].w)));
+        QCOMPARE(clip()->start, FrameTime(0));  // the clip did not move
+        state()->undo();
+        QVERIFY(points().empty());
+        state()->redo();
+        QCOMPARE(points(), w);
+        // Dragged again from where it now is, back to 2.2 s.
+        drag(QPoint(xAt(w[1].u), y), QPoint(xAt(2.2), y), Qt::AltModifier);
+        QCOMPARE(points().size(), size_t(3));
+        QVERIFY(std::fabs(points()[1].u - timeline()->elasticSecondsAtX(*clip(), xAt(2.2))) < 1e-6);
+        QCOMPARE(points()[1].w, w[1].w);
+        // Alt-Shift-click takes it off.
+        QTest::mouseClick(viewport(), Qt::LeftButton, Qt::AltModifier | Qt::ShiftModifier, QPoint(xAt(points()[1].u), y));
+        QVERIFY(points().empty());
+        state()->undo();
+        QCOMPARE(points().size(), size_t(3));
+
+        // Markers at the onsets of the words; a mode.
+        state()->setSelection({audio}, false);
+        action("warpMarkersAtOnsets")->trigger();
+        QVERIFY2(points().size() > 8, qPrintable(QString::number(points().size())));
+        action("elasticGeneral")->trigger();
+        QCOMPARE(elasticModeOf(*elasticEffectOf(*clip())), ElasticMode::General);
+
+        // Pitch edits over In/Out: after the warp in the chain, and drawn as a curve over the waveform.
+        state()->setSelection({audio}, false);
+        QVERIFY(state()->edit("Marks", [](Project&, Sequence& s) {
+            s.inPoint = 25, s.outPoint = 74;
+            return true;
+        }));
+        QVERIFY(win_->addPitchEdit(QStringLiteral("Shift Pitch"), [](PitchEdit& e) { e.shift = 3; }));
+        const Effect* pitch = pitchContourOf(*clip());
+        QVERIFY(pitch);
+        const std::vector<PitchEdit> made = pitchEditsFromString(pitch->s("edits"));
+        QCOMPARE(made.size(), size_t(1));
+        const double fps = state()->sequence()->fpsValue(), from = 25 / fps, to = 75 / fps;
+        QVERIFY(std::fabs(made[0].start - from) < 1e-6 && std::fabs(made[0].end - to) < 1e-6 && made[0].shift == 3);
+        QVERIFY(&clip()->effects.back() == pitchContourOf(*clip()));
+        action("showPitchCurves")->setChecked(false);
+        action("showPitchCurves")->trigger();
+        QVERIFY(timeline()->showPitchCurves());
+        auto curve = timeline()->pitchCurves()->curveNow(state()->project(), *state()->sequence(), *clip());
+        QVERIFY(curve);
+        std::vector<double> voiced;
+        for (double f : curve->track.f0)
+            if (f > 0) voiced.push_back(f);
+        QVERIFY2(voiced.size() > 100, qPrintable(QString::number(voiced.size())));
+        std::nth_element(voiced.begin(), voiced.begin() + long(voiced.size() / 2), voiced.end());
+        QVERIFY2(voiced[voiced.size() / 2] > 80 && voiced[voiced.size() / 2] < 250, qPrintable(QString::number(voiced[voiced.size() / 2])));
+        // Edited three semitones up inside the range only.
+        for (size_t i = 0; i < curve->track.f0.size(); ++i) {
+            const double t = curve->track.start + double(i) * curve->track.hop;
+            if (curve->track.f0[i] <= 0) continue;
+            const double ratio = curve->edited[i] / curve->track.f0[i];
+            if (t > from + 0.05 && t < to - 0.05) QVERIFY(std::fabs(ratio - std::pow(2.0, 0.25)) < 1e-6);
+            if (t < from - 0.05 || t > to + 0.05) QCOMPARE(ratio, 1.0);
+        }
+        viewport()->repaint();
+        action("clearPitchEdits")->trigger();
+        QVERIFY(!pitchContourOf(*clip()));
+        state()->undo();
+        QVERIFY(pitchContourOf(*clip()));
+        action("removeElasticAudio")->trigger();
+        QVERIFY(!elasticEffectOf(*clip()) && !pitchContourOf(*clip()));
+        action("showPitchCurves")->trigger();
     }
 
     void clipLinesOnTheTimeline() {
@@ -7351,6 +7552,90 @@ private slots:
         state()->newProject();
     }
 
+    void vfxReturnsWatched() {
+        // A second of footage on the timeline, pulled as one shot whose versions come back to a watched folder.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 32, gs.height = 18, gs.fps = {25, 1};
+        Clip matte = makeGeneratorClip(gen, "color", 25);
+        matte.generator.params["color.r"] = Param(0.7);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, matte);
+        ExportSettings st;
+        st.path = (dir_.path() + "/vfx-plate.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("vfxShots") && win_->findChild<QAction*>("nextVfxVersion"));
+        const auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.fps = Rational{25, 1};
+            return edit::placeMedia(p, s, ids.at(0), 0, 5, 15, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        QCOMPARE(win_->stepVfxVersion(1), false);  // not a VFX shot yet
+        VfxPullOptions o;
+        o.folder = (dir_.path() + "/vfx-pulls").toStdString();
+        o.format = "tiff";
+        o.handles = 2;
+        o.namePattern = "{shot}";
+        o.returns = (dir_.path() + "/vfx-returns").toStdString();
+        std::vector<VfxShot> shots;
+        QVERIFY2(exportVfxPulls(state()->project(), *state()->sequence(), {clip}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(QDir().mkpath(QString::fromStdString(o.returns)));
+        QVERIFY(state()->edit("Pull", [&](Project&, Sequence& s) {
+            recordVfxShots(s, shots);
+            s.vfxReturns = o.returns;
+            return true;
+        }));
+        QVERIFY(state()->vfxWatchedFolders().contains(QString::fromStdString(o.returns)));
+        // The vendor's v001 lands while the project is open: noticed, brought in as a take, one undo step.
+        const VfxShot& shot = shots.at(0);
+        const QString out = QString::fromStdString(o.returns) + "/010_comp_v001";
+        QVERIFY(QDir().mkpath(out));
+        for (int n = shot.firstFrame; n <= shot.lastFrame; ++n) {
+            const QString name = QStringLiteral(".%1.tif").arg(n, 4, 10, QChar('0'));
+            QVERIFY(QFile::copy(QString::fromStdString(shot.folder + "/" + shot.name) + name, out + "/010_comp_v001" + name));
+        }
+        auto versions = [&] { return state()->sequence()->vfxShots.at(0).versions.size(); };
+        QTRY_COMPARE_WITH_TIMEOUT(versions(), size_t(1), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(state()->sequence()->vfxShots.at(0).versions[0].problems.empty(), 8000);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->takes.size(), size_t(2));
+        while (versions() == 1 && state()->undoText() == QStringLiteral("New VFX Versions")) state()->undo();
+        QCOMPARE(versions(), size_t(0));
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->takes.empty());
+        QVERIFY(state()->scanVfxReturnsNow() == std::vector<std::string>{"010 v1"});
+        // The VFX Shots window and the Clip menu step the version shown.
+        VfxShotsDialog* dlg = win_->showVfxShots();
+        QVERIFY(dlg);
+        auto* list = dlg->findChild<QTreeWidget*>("vfxShotsList");
+        QCOMPARE(list->topLevelItemCount(), 1);
+        QCOMPARE(list->topLevelItem(0)->text(2), QString("Plate"));
+        state()->setSelection({clip}, false);
+        QVERIFY(win_->stepVfxVersion(1));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->mediaId, state()->sequence()->vfxShots[0].versions[0].media);
+        QCOMPARE(list->topLevelItem(0)->text(2), QString("v1"));
+        QVERIFY(!win_->stepVfxVersion(1));  // already the latest
+        list->topLevelItem(0)->setSelected(true);
+        const QString note = "Grain too heavy";
+        QVERIFY(dlg->setStatus(kVfxApproved, &note));
+        QCOMPARE(list->topLevelItem(0)->text(1), QString("Approved"));
+        QCOMPARE(list->topLevelItem(0)->text(4), note);
+        QVERIFY(dlg->showVersion(0));
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->mediaId, ids.at(0));
+        state()->undo();
+        QCOMPARE(list->topLevelItem(0)->text(2), QString("v1"));
+        const QString csv = dir_.path() + "/vfx-shots.csv";
+        QVERIFY(dlg->exportList(csv));
+        QFile f(csv);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QVERIFY(QString::fromUtf8(f.readAll()).contains("\n010,0,Approved,v1,v1,Grain too heavy,"));
+        dlg->close();
+        state()->newProject();
+        QVERIFY(state()->vfxWatchedFolders().isEmpty());
+    }
+
     void watchFolderImports() {
         const QString folder = dir_.path() + "/incoming";
         QDir().mkpath(folder + "/day2");
@@ -7461,6 +7746,13 @@ private slots:
         QVERIFY(made.value("problems").toArray().isEmpty() && made.value("frames").toInt() == 24 && made.value("width").toInt() == 2048);
         r = call("montage_verify_dcp", {{"folder", made.value("folder").toString()}});
         QVERIFY(r.value("structuredContent").toObject().value("ok").toBool());
+        // With the immersive sound as an IAB track as well: the stereo bed (left and right), no objects.
+        r = call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp-iab")}, {"title", "Immersive"}, {"iab", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject immersive = r.value("structuredContent").toObject();
+        QVERIFY2(immersive.value("problems").toArray().isEmpty() && immersive.value("iab").toObject().value("bed_channels").toInt() == 2 &&
+                     immersive.value("iab").toObject().value("objects").toInt() == 0,
+                 QJsonDocument(immersive).toJson().constData());
         QFile::remove(QDir(made.value("folder").toString()).filePath("VOLINDEX.xml"));
         r = call("montage_verify_dcp", {{"folder", made.value("folder").toString()}});
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
@@ -7487,7 +7779,8 @@ private slots:
             auto* subtitles = dlg->findChild<QComboBox*>("dcpSubtitles");
             auto* kind = dlg->findChild<QComboBox*>("dcpSubtitleKind");
             auto* encrypt = dlg->findChild<QCheckBox*>("dcpEncrypt");
-            offered = resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
+            auto* iab = dlg->findChild<QCheckBox*>("dcpImmersive");
+            offered = iab && iab->isEnabled() && !iab->isChecked() && resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
                       subtitles->currentIndex() == 0 && subtitles->itemText(1).startsWith("French") && kind && !kind->isEnabled() &&
                       kind->count() == 3 && encrypt &&
                       encrypt->isEnabled() == dcp::securityAvailable();
@@ -7616,7 +7909,8 @@ private slots:
             auto* supplemental = dlg->findChild<QCheckBox*>("imfSupplemental");
             auto* earlier = dlg->findChild<QLineEdit*>("imfEarlier");
             auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
-            offered = sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
+            auto* iab = dlg->findChild<QCheckBox*>("imfImmersive");
+            offered = iab && iab->isEnabled() && !iab->isChecked() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
             // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");
@@ -15205,6 +15499,78 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setSelection({}, false);
     }
 
+    void surfaceTrackerInInspector() {
+        loadDemo();
+        // The Surface Tracker on a clip: Track Surface, and its ST maps exported once it has a track.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id trackerId = 0;
+        QVERIFY(state()->edit("Track", [red, &trackerId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "surface_track");
+            trackerId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        QPushButton* track = nullptr;
+        QTRY_VERIFY((track = win_->findChild<QPushButton*>(QStringLiteral("trackSurface"))) != nullptr);
+        QPushButton* maps = win_->findChild<QPushButton*>(QStringLiteral("exportSurfaceMaps"));
+        QVERIFY(maps && !maps->isEnabled());
+        QVERIFY(!win_->findChild<QLabel*>(QStringLiteral("surfaceTrackNote")));
+        // (The red clip is a generator: nothing to track in it.)
+        track->click();
+        QTRY_VERIFY(win_->statusBar()->currentMessage().contains("video clips"));
+        // With a track, the maps can be exported and the Inspector says what it covers.
+        SurfaceTrack t;
+        t.width = 64, t.height = 48;
+        t.mesh = surfaceMesh({{10, 10}, {50, 10}, {50, 40}, {10, 40}}, 64, 48, 30);
+        t.frames.assign(48, t.mesh.rest);
+        t.frames[1].clear();
+        QVERIFY(state()->edit("Track", [red, trackerId, text = surfaceTrackToString(t)](Project&, Sequence& s) {
+            edit::ownedEffect(s, red, trackerId)->strings["track"] = text;
+            return true;
+        }));
+        QLabel* note = nullptr;
+        QTRY_VERIFY((note = win_->findChild<QLabel*>(QStringLiteral("surfaceTrackNote"))) != nullptr);
+        QVERIFY2(note->text().startsWith("Tracked on 47 of 48 frames"), qPrintable(note->text()));
+        QTRY_VERIFY(win_->findChild<QPushButton*>(QStringLiteral("exportSurfaceMaps"))->isEnabled());
+        QVERIFY(!win_->findChild<QPushButton*>(QStringLiteral("solveSurfaceAgain"))->isEnabled());
+        // A vertex dragged on the Program monitor is put there on that frame; Ctrl-click lets it go.
+        const Clip& clip = *clipNamed(*state()->sequence(), "Red");
+        state()->setPlayhead(clip.start);
+        const int frame = surfaceFrameOf(t, *state()->sequence(), clip, 0);
+        QVERIFY(frame >= 0);
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        win_->findChild<QPushButton*>(QStringLiteral("surfaceOnMonitor"))->click();
+        QCOMPARE(state()->paintEffect(), trackerId);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        const MeshPoint v0 = t.mesh.rest[0];
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(v0[0] / 64, v0[1] / 48));
+        QTest::mouseMove(viewer, at(v0[0] / 64 + 0.02, v0[1] / 48 + 0.01));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(v0[0] / 64 + 0.05, v0[1] / 48 + 0.03));
+        auto current = [&] {
+            SurfaceTrack now;
+            surfaceTrackFromString(edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, trackerId)->s("track"), now);
+            return now;
+        };
+        SurfaceTrack put = current();
+        QVERIFY(put.fixes.count(frame) && put.fixes[frame].count(0));
+        const double px = 64 * 1.5 / r.width();
+        QVERIFY2(std::fabs(put.fixes[frame][0][0] - (v0[0] + 0.05 * 64)) < px && std::fabs(put.fixes[frame][0][1] - (v0[1] + 0.03 * 48)) < px,
+                 qPrintable(QString("%1 %2").arg(put.fixes[frame][0][0]).arg(put.fixes[frame][0][1])));
+        QVERIFY(std::hypot(put.frames[size_t(frame)][0][0] - put.fixes[frame][0][0], put.frames[size_t(frame)][0][1] - put.fixes[frame][0][1]) < 1e-3);
+        QTRY_VERIFY(win_->findChild<QPushButton*>(QStringLiteral("solveSurfaceAgain"))->isEnabled());
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, at(v0[0] / 64 + 0.05, v0[1] / 48 + 0.03));
+        QVERIFY(current().fixes.empty());
+        QTest::keyClick(viewer, Qt::Key_Escape);
+        QCOMPARE(state()->paintEffect(), Id(0));
+    }
+
     void meshWarpPinsInProgramMonitor() {
         loadDemo();
         // Mesh Warp on the red clip: Pins on the Monitor, then clicks place pins, a drag moves one, Ctrl-click removes one.
@@ -18022,6 +18388,492 @@ print("added " + ui["name"])
         QCOMPARE(program->speed(), 2.0);
         program->shuttle(0);
         QCOMPARE(program->speed(), 0.0);
+    }
+
+    void languageChoiceAndTestLanguage() {
+        using language::PseudoTranslator;
+        // The test language: accented, about 40 % longer and between marks, keeping what arg(), plural forms, rich text,
+        // mnemonics and menu shortcuts need.
+        const QString open = QStringLiteral("&Open %1 of %n files…\tCtrl+O");
+        const QString p = PseudoTranslator::pseudo(open);
+        QVERIFY(PseudoTranslator::marked(p) && !PseudoTranslator::marked(open));
+        QVERIFY2(p.contains("&Ó") && p.contains("%1") && p.contains("%n") && p.endsWith("\tCtrl+O"), qPrintable(p));
+        QVERIFY(p.indexOf('\t') >= int(open.indexOf('\t') * 1.3));
+        QCOMPARE(PseudoTranslator::pseudo("<p>Done</p>"), QString::fromUtf8("<p>⟦Dóñé~⟧</p>"));
+        QCOMPARE(PseudoTranslator::pseudo("Tom &amp; Jerry && 50%%"), QString::fromUtf8("⟦Tóm &amp; Jérrý && 50%%~~~~⟧"));
+        QCOMPARE(PseudoTranslator::pseudo("%L1 of %2"), QString::fromUtf8("⟦%L1 óf %2~⟧"));
+        PseudoTranslator t;
+        QVERIFY(t.translate("Ctx", "").isEmpty());
+        QCOMPARE(t.translate("QShortcut", "Ctrl"), QString("Ctrl"));
+        QCOMPARE(t.translate("QGuiApplication", "QT_LAYOUT_DIRECTION"), QString("QT_LAYOUT_DIRECTION"));
+
+        // Window › Language: English, each translation built in, and the test language, saved for the next start.
+        QVERIFY(win_->findChild<QMenu*>("languageMenu"));
+        QAction* system = win_->findChild<QAction*>("language_system");
+        QAction* pseudo = win_->findChild<QAction*>("language_pseudo");
+        QVERIFY(system && pseudo && win_->findChild<QAction*>("language_en"));
+        const auto langs = language::available();
+        QVERIFY(langs.size() >= 2 && langs.front().code == "en" && langs.back().code == "pseudo");
+        for (const auto& l : langs) QVERIFY2(win_->findChild<QAction*>("language_" + l.code), qPrintable(l.code));
+        pseudo->trigger();
+        QCOMPARE(language::chosen(), QString("pseudo"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("next time it starts"));
+        system->trigger();
+        QVERIFY(language::chosen().isEmpty() && system->isChecked());
+        QCOMPARE(language::installed(), QString("en"));
+    }
+
+    void testLanguageFindsUntranslatedText() {
+        // Under the test language, every text in a newly built window and its main dialogs goes through tr(): none
+        // lacks the marks, and in the dialogs none is cut short.
+        QCOMPARE(language::install("pseudo"), QString("pseudo"));
+        auto w = std::make_unique<MainWindow>();
+        auto back = qScopeGuard([&w] {
+            w.reset();
+            language::uninstall();
+        });
+        w->resize(1600, 1000);
+        w->show();
+        QVERIFY(QTest::qWaitForWindowExposed(w.get()));
+        // Shortcuts keep their English names, so a saved keymap works in every language.
+        QVERIFY(keymap::find(w.get(), "Edit/Redo") && keymap::find(w.get(), "Sequence/End Trim Mode"));
+        QStringList ids;
+        for (QAction* a : keymap::actions(w.get()))
+            if (keymap::idOf(a).contains(QChar(0x27E6))) ids << keymap::idOf(a);
+        QVERIFY2(ids.isEmpty(), qPrintable(ids.join('\n')));
+        QStringList unmarked, clipped;
+        auto needs = [](QString text) {
+            // Words, not numbers, timecodes, units or other symbols that read the same in every language.
+            static const QRegularExpression same(QStringLiteral("\\b(dB|dBFS|dBTP|LUFS|LU|Hz|kHz|ms|fps|px|HDR|SDR|EDR)\\b"));
+            text.remove(same);
+            int run = 0;
+            for (QChar c : text) {
+                run = c.isLetter() ? run + 1 : 0;
+                if (run >= 2) return true;
+            }
+            return false;
+        };
+        QString where;
+        auto check = [&](const QString& text, QObject* o, const char* what) {
+            if (text.isEmpty() || !needs(text) || language::PseudoTranslator::marked(text) || language::keptUntranslated(o)) return;
+            unmarked << QStringLiteral("%1: %2 %3 (%4): %5").arg(where, o->metaObject()->className(), o->objectName(), what, text.left(80));
+        };
+        std::function<void(QMenu*)> menuWalk = [&](QMenu* m) {
+            check(m->title(), m, "menu");
+            for (QAction* a : m->actions()) {
+                if (a->menu()) menuWalk(a->menu());
+                else if (!a->isSeparator()) check(a->text(), a, "action");
+            }
+        };
+        auto walk = [&](QWidget* top, bool sizes) {
+            for (QWidget* c : top->findChildren<QWidget*>()) {
+                if (auto* l = qobject_cast<QLabel*>(c)) check(l->text(), l, "label");
+                else if (auto* b = qobject_cast<QAbstractButton*>(c)) check(b->text(), b, "button");
+                else if (auto* g = qobject_cast<QGroupBox*>(c)) check(g->title(), g, "group");
+                else if (auto* e = qobject_cast<QLineEdit*>(c)) check(e->placeholderText(), e, "placeholder");
+                else if (auto* t = qobject_cast<QTabBar*>(c))
+                    for (int i = 0; i < t->count(); ++i) check(t->tabText(i), t, "tab");
+                else if (auto* d = qobject_cast<QDockWidget*>(c)) check(d->windowTitle(), d, "dock");
+                else if (auto* cb = qobject_cast<QComboBox*>(c))
+                    for (int i = 0; i < cb->count(); ++i) check(cb->itemText(i), cb, "choice");
+                else if (auto* tw = qobject_cast<QTreeWidget*>(c)) {
+                    for (int k = 0; k < tw->columnCount(); ++k) check(tw->headerItem()->text(k), tw, "heading");
+                    for (QTreeWidgetItemIterator it(tw); *it; ++it)
+                        if (!(*it)->data(0, language::kUntranslatedRole).toBool())
+                            for (int k = 0; k < tw->columnCount(); ++k) check((*it)->text(k), tw, "row");
+                } else if (auto* lw = qobject_cast<QListWidget*>(c))
+                    for (int i = 0; i < lw->count(); ++i) check(lw->item(i)->text(), lw, "row");
+                if (!c->toolTip().isEmpty()) check(c->toolTip(), c, "tooltip");
+                if (!sizes || !c->isVisible() || language::keptUntranslated(c)) continue;
+                // Cut short: narrower than the text needs (a label that wraps: shorter than its lines need).
+                const bool label = qobject_cast<QLabel*>(c), button = qobject_cast<QAbstractButton*>(c);
+                if (!label && !button) continue;
+                auto* l = qobject_cast<QLabel*>(c);
+                const QString text = l ? l->text() : static_cast<QAbstractButton*>(c)->text();
+                if (text.isEmpty() || (l && (!l->pixmap().isNull() || l->textFormat() == Qt::RichText))) continue;
+                const bool cut = l && l->wordWrap() ? c->height() < c->heightForWidth(c->width()) : c->width() < c->sizeHint().width();
+                if (cut)
+                    clipped << QStringLiteral("%1: %2 %3 %4x%5 needs %6x%7: %8").arg(where, c->metaObject()->className(), c->objectName())
+                                   .arg(c->width()).arg(c->height()).arg(c->sizeHint().width()).arg(l && l->wordWrap() ? c->heightForWidth(c->width()) : c->sizeHint().height())
+                                   .arg(text.left(60));
+            }
+        };
+        where = "window";
+        for (QAction* a : w->menuBar()->actions())
+            if (a->menu()) menuWalk(a->menu());
+        walk(w.get(), false);
+        EditorState* st = w->state();
+        const std::vector<std::pair<const char*, std::function<QDialog*()>>> dialogs{
+            {"Export", [&] { return new ExportDialog(st, w.get()); }},
+            {"Conform Check", [&] { return new ConformCheckDialog(st, w.get()); }},
+            {"Quality Check", [&] { return new QualityCheckDialog(st, w.get()); }},
+            {"Link Media", [&] { return new LinkMediaDialog(st, w.get()); }},
+            {"Merge", [&] { return new MergeDialog(st, w.get()); }},
+            {"Offload", [&] { return new OffloadDialog(st, w.get()); }},
+            {"Project Manager", [&] { return new ProjectManagerDialog(st, w.get()); }},
+            {"Sequence Settings", [&] { return new SequenceSettingsDialog(w.get()); }},
+            {"Stems", [&] { return new StemsDialog(w.get()); }},
+            {"Transcribe", [&] { return new TranscribeDialog(1, w.get()); }},
+            {"Footage Notes", [&] { return new FootageNotesDialog(st, w.get()); }},
+            {"Audio Description", [&] { return new AudioDescriptionDialog(st, w.get()); }},
+            {"Repair Media", [&] { return new RepairMediaDialog(st, w.get()); }},
+            {"Graphics Templates", [&] { return new GraphicsTemplatesDialog(st, w.get()); }},
+        };
+        for (const auto& [name, make] : dialogs) {
+            where = QString::fromLatin1(name);
+            std::unique_ptr<QDialog> d(make());
+            d->show();
+            QCoreApplication::processEvents();
+            check(d->windowTitle(), d.get(), "title");
+            walk(d.get(), true);
+        }
+        unmarked.removeDuplicates();
+        clipped.removeDuplicates();
+        QVERIFY2(unmarked.isEmpty(), qPrintable(QStringLiteral("%1 not translated:\n").arg(unmarked.size()) + unmarked.join('\n')));
+        QVERIFY2(clipped.isEmpty(), qPrintable(QStringLiteral("%1 cut short:\n").arg(clipped.size()) + clipped.join('\n')));
+    }
+
+    void engineTextsAreListedForTranslators() {
+        // Every text the engine gives the interface (effects, settings, presets, colour spaces) is in
+        // app/EngineTexts.cpp, where lupdate finds it.
+        const std::vector<std::string> listed = language::listedEngineTexts();
+        const std::set<std::string> have(listed.begin(), listed.end());
+        QStringList missing;
+        for (const std::string& t : engineInterfaceTexts())
+            if (!have.count(t)) missing << QString::fromStdString(t);
+        QVERIFY2(missing.isEmpty(), qPrintable(QStringLiteral("Not listed (montage-cli interface-texts -o src/app/EngineTexts.cpp):\n") +
+                                               missing.join('\n')));
+    }
+
+    void rightToLeftMirrorsPanelsNotTheTimeline() {
+        // Arabic: the window's panels and docks mirror; the timeline, its rulers, the keyframes and the monitors still
+        // run left to right.
+        loadDemo();
+        QDockWidget* media = win_->findChild<QDockWidget*>("media");
+        QVERIFY(media && media->isVisible());
+        const QRect before = media->geometry();
+        // (the layout as a window left to right leaves it, for the next start)
+        {
+            QSettings s = appSettings();
+            s.setValue("window/geometry", win_->saveGeometry());
+            s.setValue("window/state", win_->saveState(1));
+            s.setValue("window/rightToLeft", false);
+        }
+        QCOMPARE(language::install("ar"), QString("ar"));
+        auto back = qScopeGuard([] {
+            language::uninstall();
+            QSettings s = appSettings();
+            for (const char* k : {"window/geometry", "window/state", "window/rightToLeft"}) s.remove(k);
+        });
+        QVERIFY(language::rightToLeft("ar") && language::rightToLeft("he") && !language::rightToLeft("de"));
+        QCOMPARE(QGuiApplication::layoutDirection(), Qt::RightToLeft);
+        QTRY_VERIFY(win_->isRightToLeft() && media->widget()->isRightToLeft());
+        QTRY_VERIFY2(std::abs(media->x() - (win_->width() - before.x() - before.width())) <= 4,
+                     qPrintable(QStringLiteral("%1 then %2 of %3").arg(before.x()).arg(media->x()).arg(win_->width())));
+        QVERIFY(timeline()->isLeftToRight() && win_->findChild<QTabBar*>("sequenceTabs")->isLeftToRight());
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>()) QVERIFY(m->isLeftToRight());
+        QVERIFY(win_->findChild<QDockWidget*>("keyframes")->widget()->isLeftToRight());
+        QVERIFY(win_->findChild<QDockWidget*>("multicam")->widget()->isLeftToRight());
+        {
+            // Started again in Arabic, the layout saved left to right comes back mirrored, its panels the same size.
+            auto again = std::make_unique<MainWindow>();
+            again->show();
+            QVERIFY(QTest::qWaitForWindowExposed(again.get()));
+            QDockWidget* m = again->findChild<QDockWidget*>("media");
+            QVERIFY(m && m->isVisible());
+            // (against the right edge, the width within a separator or two)
+            QTRY_VERIFY2(std::abs(again->width() - m->x() - m->width() - before.x()) <= 4 && std::abs(m->width() - before.width()) <= 16,
+                         qPrintable(QStringLiteral("%1 %2 of %3, was %4 %5 of %6").arg(m->x()).arg(m->width()).arg(again->width())
+                                       .arg(before.x()).arg(before.width()).arg(win_->width())));
+        }
+        back.dismiss();
+        language::uninstall();
+        {
+            QSettings s = appSettings();
+            for (const char* k : {"window/geometry", "window/state", "window/rightToLeft"}) s.remove(k);
+        }
+        QCOMPARE(QGuiApplication::layoutDirection(), Qt::LeftToRight);
+        QTRY_COMPARE(media->x(), before.x());  // (back on the left, laid out afresh)
+    }
+
+    void projectsDoNotFollowTheLocale() {
+        // A project saved, an edit list exported, and the agent link's answers read the same under German and French
+        // number formats (decimal commas) as under C.
+        loadDemo();
+        auto results = [&](const char* tag) {
+            const QString path = dir_.filePath(QStringLiteral("locale-%1.montage").arg(tag));
+            if (!saveProject(state()->project(), path.toStdString())) return QByteArray();
+            QFile f(path);
+            if (!f.open(QIODevice::ReadOnly)) return QByteArray();
+            QByteArray all = f.readAll();
+            all += QByteArray::fromStdString(exportEdl(state()->project(), *state()->sequence()));
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_project_info"}, {"arguments", QJsonObject{}}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object(); });
+            QTest::qWaitFor([&] { return !answer.isEmpty(); }, 60000);  // (the tool runs on a worker)
+            return all + QJsonDocument(answer).toJson(QJsonDocument::Compact);
+        };
+        const QByteArray c = results("c");
+        QVERIFY2(c.size() > 1000 && c.contains("\"result\""), c.right(400).constData());
+        for (const char* name : {"de_DE", "fr_FR"}) {
+            QLocale::setDefault(QLocale(QString::fromLatin1(name)));
+            QCOMPARE(QLocale().decimalPoint(), QString(","));
+            const QByteArray other = results(name);
+            QLocale::setDefault(QLocale::c());
+            QCOMPARE(other, c);
+        }
+    }
+
+    void everyTranslatableTextIsFound() {
+        // lupdate finds every tr() text in the interface, each under the name Montage asks for it by.
+        const QByteArray lupdate = qgetenv("MONTAGE_TEST_LUPDATE");
+        if (lupdate.isEmpty()) QSKIP("MONTAGE_TEST_LUPDATE (Qt's lupdate) is not set");
+        const QString src = QStringLiteral(MONTAGE_SOURCE_DIR "/src");
+        const QString ts = dir_.filePath("found.ts");
+        QProcess p;
+        p.setProcessChannelMode(QProcess::MergedChannels);
+        p.start(QString::fromLocal8Bit(lupdate), {QStringLiteral("-locations"), QStringLiteral("none"), src, QStringLiteral("-ts"), ts});
+        QVERIFY(p.waitForFinished(300000));
+        const QString log = QString::fromLocal8Bit(p.readAll());
+        // (a tool that cannot run here ends at once saying nothing, as the lupdate found on Windows CI does; the sources
+        // are the same on every system, so the other builds check them)
+        if ((p.exitStatus() != QProcess::NormalExit || p.exitCode() != 0) && log.trimmed().isEmpty())
+            QSKIP(qPrintable(QStringLiteral("%1 could not run (exit code %2)").arg(QString::fromLocal8Bit(lupdate)).arg(p.exitCode(), 0, 16)));
+        QVERIFY2(p.exitCode() == 0, qPrintable(log));
+        // A tr() lupdate cannot place, or one it files under another name than Montage's class asks with.
+        for (const QString& bad : {QStringLiteral("lacks Q_OBJECT"), QStringLiteral("Cannot invoke tr()"),
+                                   QStringLiteral("cannot be called without context"), QStringLiteral("Circular")})
+            QVERIFY2(!log.contains(bad), qPrintable(log));
+        QFile f(ts);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QSet<QString> found;
+        QXmlStreamReader x(&f);
+        while (x.readNextStartElement() || !x.atEnd())
+            if (x.isStartElement() && x.name() == QLatin1String("source")) found.insert(x.readElementText());
+        QVERIFY(found.size() > 4000);
+        // Every tr("…") with a single string in the source is among them.
+        static const QRegularExpression call(QStringLiteral("\\btr\\(\"((?:[^\"\\\\]|\\\\.)*)\"\\s*[,)]"));
+        int checked = 0;
+        QStringList missing;
+        QDirIterator it(src, {QStringLiteral("*.cpp"), QStringLiteral("*.h")}, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            QFile s(it.next());
+            if (!s.open(QIODevice::ReadOnly)) continue;
+            const QString code = QString::fromUtf8(s.readAll());
+            for (auto m = call.globalMatch(code); m.hasNext();) {
+                QString text = m.next().captured(1);
+                text.replace(QLatin1String("\\n"), QLatin1String("\n")).replace(QLatin1String("\\t"), QLatin1String("\t"));
+                text.replace(QLatin1String("\\\""), QLatin1String("\"")).replace(QLatin1String("\\\\"), QLatin1String("\\"));
+                static const QRegularExpression u(QStringLiteral("\\\\u([0-9a-fA-F]{4})"));
+                for (auto e = u.match(text); e.hasMatch(); e = u.match(text))
+                    text.replace(e.capturedStart(), e.capturedLength(), QChar(char16_t(e.captured(1).toUShort(nullptr, 16))));
+                ++checked;
+                if (!found.contains(text)) missing << QFileInfo(s.fileName()).fileName() + ": " + text;
+            }
+        }
+        QVERIFY(checked > 4000);
+        QVERIFY2(missing.isEmpty(), qPrintable(missing.mid(0, 20).join('\n')));
+    }
+
+    void remoteGradingBothWays() {
+        loadDemo();
+        std::string why;
+        if (!remote::gradingAvailable(&why)) QSKIP(why.c_str());
+        auto* controller = win_->findChild<RemoteGradeController*>("remoteGradeController");
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(controller && program);
+        MonitorPanel* monitor = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) monitor = m;
+        QVERIFY(monitor);
+        auto* exposure = monitor->findChild<QComboBox*>("exposureView");
+        QVERIFY(exposure);
+        int port = 0;  // (one with the next two free as well: the notes, and a stream that is not there)
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            QUdpSocket a, b, c;
+            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1) &&
+                c.bind(QHostAddress::LocalHost, a.localPort() + 2))
+                port = a.localPort();
+        }
+        QVERIFY(port > 0);
+        const QString address = QStringLiteral("srt://127.0.0.1:%1").arg(port);
+        // Hosting from Playback › Video Output › Remote Grading…, a passphrase made for it.
+        auto* action = win_->findChild<QAction*>("remoteGrade");
+        QVERIFY(action);
+        action->trigger();
+        auto* dlg = win_->findChild<QDialog*>("remoteGradeDialog");
+        QVERIFY(dlg);
+        dlg->findChild<QTabWidget*>("remoteGradeTabs")->setCurrentIndex(0);
+        dlg->findChild<QLineEdit*>("remoteGradeHostAddress")->setText(address);
+        const QString pass = dlg->findChild<QLineEdit*>("remoteGradeHostPassphrase")->text();
+        QCOMPARE(pass.size(), 20);
+        dlg->findChild<QPushButton*>("remoteGradeStart")->click();
+        QCOMPARE(controller->mode(), RemoteGradeController::Mode::Hosting);
+        QVERIFY(action->isChecked());
+        // A client's Montage (here the engine's) follows: the project, then an edit to the grade.
+        remote::GradeSettings cs;
+        cs.address = address.toStdString();
+        cs.passphrase = pass.toStdString();
+        cs.name = "Client";
+        remote::GradeClient client;
+        QVERIFY(client.start(cs));
+        Project got;
+        auto same = [&] {
+            Project p;
+            if (client.takeProject(p)) got = std::move(p);
+            return projectToJson(got) == projectToJson(state()->project());
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(same(), 15000);
+        QVERIFY(state()->edit("Grade", [](Project& p, Sequence& s) {
+            Effect e;
+            e.id = p.newId();
+            e.type = "colorCorrect";
+            e.params["exposure"] = 0.4;
+            s.videoTracks[0].clips[0].effects.push_back(e);
+            return true;
+        }));
+        QTRY_VERIFY_WITH_TIMEOUT(same(), 10000);
+        // The playhead, the exposure check, the wipe and the scope.
+        program->seek(17);
+        exposure->setCurrentIndex(3);
+        QImage still(64, 36, QImage::Format_RGB32);
+        still.fill(Qt::red);
+        monitor->viewer()->setCompare(still, "Still 1");
+        remote::ViewState v;
+        QTRY_VERIFY_WITH_TIMEOUT(client.view(v) && v.playhead == 17 && RemoteGradeController::viewerJson(QString::fromStdString(v.viewer)).value("exposure").toInt() == 3 &&
+                                     !v.compare.empty(),
+                                 10000);
+        QVERIFY(RemoteGradeController::viewerJson(QString::fromStdString(v.viewer)).value("wipe").toBool());
+        QImage sent;
+        QVERIFY(sent.loadFromData(QByteArray::fromStdString(v.compare)) && sent.size() == still.size());
+        monitor->viewer()->clearCompare();
+        exposure->setCurrentIndex(0);
+        // The client's notes land as markers; its pointers show on the Program monitor.
+        output::RemoteMarker note;
+        note.frame = 5;
+        note.sequence = state()->project().activeSequence;
+        note.text = "Lift the shadows";
+        client.sendNote(note);
+        client.sendPointer({note.sequence, 5, 0.5, 0.5, ""});
+        auto hasMarker = [&](const QString& text) {
+            for (const Marker& m : state()->sequence()->markers)
+                if (QString::fromStdString(m.comment) == text || QString::fromStdString(m.name).contains(text)) return true;
+            return false;
+        };
+        auto hostStatus = [&] {  // (what the host saw, should the notes not arrive)
+            QJsonObject st;
+            bool err = false;
+            controller->runTool({{"action", "status"}}, st, err);
+            return QString::fromUtf8(QJsonDocument(st).toJson(QJsonDocument::Compact)) +
+                   QStringLiteral(" client: %1").arg(QString::fromStdString(client.status().error));
+        };
+        QTRY_VERIFY2_WITH_TIMEOUT(hasMarker("Lift the shadows") && !controller->pointers().empty(), qPrintable(hostStatus()), 10000);
+        QCOMPARE(controller->pointers().front().pointer.author, std::string("Client"));
+        QCOMPARE(state()->undoText(), QStringLiteral("Notes from Remote Grading"));
+        QJsonObject st;
+        bool isError = false;
+        controller->runTool({{"action", "status"}}, st, isError);
+        QVERIFY(!isError && st.value("mode").toString() == "hosting" && st.value("client_connected").toBool() && st.value("client").toString() == "Client");
+        client.stop();
+        dlg->findChild<QPushButton*>("remoteGradeStart")->click();
+        QCOMPARE(controller->mode(), RemoteGradeController::Mode::Off);
+        dlg->close();
+
+        // Following a colourist (here the engine's host) over MCP: their project in place of this one, this Montage's
+        // own media files kept, their playhead, exposure check and scope.
+        Project theirs = state()->project();
+        theirs.name = "Colourist's";
+        Sequence* ts = theirs.findSequence(theirs.activeSequence);
+        QVERIFY(ts);
+        ts->videoTracks[0].clips[0].effects.back().params["exposure"] = -0.25;
+        ts->playhead = 9;  // (where their view puts it)
+        MediaItem gone;  // (a shot whose media this Montage lacks)
+        gone.id = theirs.newId();
+        gone.name = "Missing";
+        gone.path = (dir_.path() + "/not-here.mov").toStdString();
+        gone.kind = MediaKind::Video;
+        gone.duration = 400;
+        theirs.media.push_back(gone);
+        Clip over;
+        over.id = theirs.newId();
+        over.mediaId = gone.id;
+        over.start = 40;
+        over.duration = 20;
+        while (ts->videoTracks.size() < 3) ts->videoTracks.emplace_back();
+        ts->videoTracks[2].clips.push_back(over);
+        Project local = state()->project();
+        std::string localPath;
+        for (MediaItem& m : theirs.media)
+            if (const MediaItem* l = local.findMedia(m.id); l && !l->path.empty()) {
+                localPath = l->path;
+                m.path = "/colourist/media/" + m.name + ".mov";
+                break;
+            }
+        remote::GradeSettings hs;
+        hs.address = address.toStdString();
+        hs.passphrase = output::generatePassphrase();
+        remote::GradeHost host;
+        QVERIFY(host.start(hs));
+        host.publish(theirs);
+        remote::ViewState view;
+        view.sequence = theirs.activeSequence;
+        view.playhead = 9;
+        view.viewer = R"({"exposure":2,"scope":2})";
+        host.setView(view);
+        st = {};
+        const QJsonObject joining{{"action", "join"}, {"address", address}, {"passphrase", QString::fromStdString(hs.passphrase)}};
+        // (refused while this project has unsaved changes: following replaces it)
+        QVERIFY(state()->isModified());
+        controller->runTool(joining, st, isError);
+        QVERIFY(isError && controller->mode() == RemoteGradeController::Mode::Off);
+        isError = false;
+        QVERIFY(state()->save(dir_.filePath("graded.montage")));
+        controller->runTool({{"action", "join"}, {"address", address}, {"passphrase", QString::fromStdString(hs.passphrase)}, {"name", "Me"},
+                             {"stream", QStringLiteral("srt://127.0.0.1:%1").arg(port + 2)}},
+                            st, isError);
+        QVERIFY2(!isError && st.value("mode").toString() == "following", qPrintable(QJsonDocument(st).toJson()));
+        QTRY_VERIFY_WITH_TIMEOUT(state()->project().name == "Colourist's" && program->position() == 9 && exposure->currentIndex() == 2, 15000);
+        Project expected = theirs;
+        remote::keepLocalMedia(local, expected);
+        QCOMPARE(projectToJson(state()->project()), projectToJson(expected));
+        if (!localPath.empty()) QVERIFY(std::any_of(state()->project().media.begin(), state()->project().media.end(), [&](const MediaItem& m) { return m.path == localPath; }));
+        QVERIFY(!state()->canUndo() && state()->filePath().isEmpty());  // (saving asks where: not over the file this was)
+        // A note over MCP, and a pointer by Alt+click on the Program monitor.
+        controller->runTool({{"action", "note"}, {"text", "Looks good"}}, st, isError);
+        QVERIFY(!isError);
+        const QRectF r = monitor->viewer()->imageRect();
+        if (r.width() > 0) QTest::mouseClick(monitor->viewer(), Qt::LeftButton, Qt::AltModifier, r.center().toPoint());
+        std::vector<output::RemoteMarker> notes;
+        std::vector<remote::Pointer> pointers;
+        QTRY_VERIFY_WITH_TIMEOUT(
+            [&] {
+                for (auto& n : host.takeNotes()) notes.push_back(n);
+                for (auto& q : host.takePointers()) pointers.push_back(q);
+                return notes.size() == 1 && (r.width() <= 0 || pointers.size() == 1);
+            }(),
+            10000);
+        QVERIFY(notes[0].text == "Looks good" && notes[0].author == "Me" && notes[0].frame == 9);
+        if (r.width() > 0) QVERIFY(std::abs(pointers[0].x - 0.5) < 0.05 && std::abs(pointers[0].y - 0.5) < 0.05);
+        // The shot whose media is missing here shows the colourist's stream instead.
+        QVERIFY(!controller->showingStream());
+        view.playhead = 45;
+        host.setView(view);
+        QTRY_VERIFY_WITH_TIMEOUT(program->position() == 45 && controller->showingStream(), 10000);
+        QVERIFY(controller->status().contains("stream"));
+        // Playing as the colourist plays, and parked again.
+        view.playing = true;
+        host.setView(view);
+        QTRY_VERIFY_WITH_TIMEOUT(program->isPlaying(), 10000);
+        view.playing = false;
+        view.playhead = 3;
+        host.setView(view);
+        QTRY_VERIFY_WITH_TIMEOUT(!program->isPlaying() && program->position() == 3, 10000);
+        controller->runTool({{"action", "stop"}}, st, isError);
+        QCOMPARE(controller->mode(), RemoteGradeController::Mode::Off);
+        host.stop();
+        state()->newProject();
     }
 
     void remoteReviewRoundTrip() {

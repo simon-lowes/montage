@@ -1,4 +1,5 @@
 #include "MonitoringPanel.h"
+#include "Language.h"
 
 #include <QAudioDevice>
 #include <QCheckBox>
@@ -83,6 +84,7 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     auto* room = new QFormLayout;
     output_ = new QComboBox(body);
     output_->setObjectName(QStringLiteral("monitorOutput"));
+    language::keepUntranslated(output_);  // (the computer's own names for its devices)
     output_->addItem(tr("System default"), QString());
     for (const QAudioDevice& d : QMediaDevices::audioOutputs()) output_->addItem(d.description(), d.description());
     room->addRow(tr("Output"), output_);
@@ -222,6 +224,7 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     qf->addRow(progRow);
     talkInput_ = new QComboBox(cueBox);
     talkInput_->setObjectName(QStringLiteral("monitorTalkbackInput"));
+    language::keepUntranslated(talkInput_);
     talkInput_->addItem(tr("System default"), QString());
     for (const QAudioDevice& d : QMediaDevices::audioInputs()) talkInput_->addItem(d.description(), d.description());
     qf->addRow(tr("Talkback mic"), talkInput_);

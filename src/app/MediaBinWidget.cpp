@@ -1,5 +1,6 @@
 #include "MediaBinWidget.h"
 #include "RepairMediaDialog.h"
+#include "Language.h"
 
 #include <filesystem>
 #include <set>
@@ -1528,11 +1529,11 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         if (first && pictures.size() == 1) {
             MediaItem plain = *first;
             plain.colorOverride.clear();
-            detected->setText(tr("As Detected (%1)").arg(QString::fromStdString(mediaColorSpace(plain).label)));
+            detected->setText(tr("As Detected (%1)").arg(language::engine(mediaColorSpace(plain).label)));
         }
         interpret->addSeparator();
         for (const ColorSpace& cs : colorSpaces()) {
-            QAction* a = interpret->addAction(QString::fromStdString(cs.label), this, [setOverride, id = cs.id] { setOverride(id); });
+            QAction* a = interpret->addAction(language::engine(cs.label), this, [setOverride, id = cs.id] { setOverride(id); });
             a->setCheckable(true);
             a->setChecked(current == cs.id);
             a->setData(QString::fromStdString(cs.id));

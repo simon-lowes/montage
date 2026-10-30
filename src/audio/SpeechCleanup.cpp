@@ -24,6 +24,7 @@ extern "C" {
 #include "AraHost.h"
 #include "AudioRepair.h"
 #include "DialogueAlign.h"
+#include "ElasticAudio.h"
 #include "SpectralRepair.h"
 #include "media/SpeechEnhance.h"
 
@@ -32,7 +33,7 @@ namespace montage {
 bool isSourceAudioEffect(const std::string& type) {
     return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "bandwidth_extension" || type == "declick" || type == "pitch_shift" ||
            type == "dereverb" || type == "spectral_repair" || type == "dialogue_align" || type == "declip" || type == "deplosive" ||
-           type == "dewind" || type == "ara";
+           type == "dewind" || type == "ara" || type == "elastic_audio" || type == "pitch_contour";
 }
 
 
@@ -743,8 +744,8 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
     std::vector<Effect> copies;
     for (const Effect* e : effects) copies.push_back(*e);
     auto run = [job, source, copies] {
-        // Dialogue Alignment re-times the sound (every channel cut at the same places, so a field keeps its
-        // directions): the effects either side of it run as a chain of their own.
+        // Dialogue Alignment and elastic audio re-time the sound (every channel cut at the same places, so a field keeps
+        // its directions): the effects either side of them run as a chain of their own.
         AudioBufferPtr r = source;
         std::vector<Effect> chain;
         bool missing = false;
@@ -754,7 +755,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             chain.clear();
         };
         for (const Effect& e : copies) {
-            if (e.type != "dialogue_align" && e.type != "ara") {
+            if (e.type != "dialogue_align" && e.type != "ara" && e.type != "elastic_audio" && e.type != "pitch_contour") {
                 chain.push_back(e);
                 continue;
             }
@@ -766,6 +767,16 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
                 std::string err;
                 if (ara::renderEffect(e, r, *out, &job->cancel, &err)) r = out;
                 else if (!err.empty()) std::fprintf(stderr, "ARA plug-in effect left out: %s\n", err.c_str());
+                continue;
+            }
+            if (e.type == "elastic_audio" || e.type == "pitch_contour") {
+                // Warp markers and pitch edits (audio/ElasticAudio.h), on the whole sound.
+                try {
+                    auto out = std::make_shared<AudioBuffer>();
+                    playElasticEffect(e, *r, *out, &job->cancel);
+                    r = out;
+                } catch (const std::exception&) {
+                }
                 continue;
             }
             try {

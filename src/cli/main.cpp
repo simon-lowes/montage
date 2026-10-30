@@ -55,6 +55,7 @@
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
+#include "media/InterfaceDrafts.h"
 #include "media/VisualSearch.h"
 #include "media/SoundSearch.h"
 #include "media/DescribePicture.h"
@@ -161,7 +162,11 @@ int usage() {
                  "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.mcc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
                  "                     [--generate] [--import file.srt|.vtt|.scc|.mcc|.ttml|.stl|.ass] [--save]\n"
                  "  montage-cli translate <subtitles.srt|.vtt> --to LANG [--from LANG] [-o out.srt|out.vtt]\n"
-                 "                     (on this computer, with Opus-MT; LANG is de, fr, es, ja... see `models`)\n",
+                 "                     (on this computer, with Opus-MT; LANG is de, fr, es, ja... see `models`)\n"
+                 "  montage-cli draft-interface <translations/montage_LANG.ts> [--to LANG] [--limit N] [-o out.ts]\n"
+                 "                     (first drafts of Montage's own interface, for a translator to check in Qt Linguist)\n"
+                 "  montage-cli interface-texts [-o src/app/EngineTexts.cpp]\n"
+                 "                     (the engine's texts the interface shows, listed for lupdate to translate)\n",
                  MONTAGE_VERSION);
     return 2;
 }
@@ -1353,6 +1358,70 @@ int cmdTranslate(const std::vector<std::string>& args) {
     return writeFile(out, result) ? 0 : 1;
 }
 
+// Fills a translation of Montage's interface with Opus-MT drafts, still marked unfinished for review.
+int cmdDraftInterface(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string to, out = args[0];
+    int limit = 0;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--to" && i + 1 < args.size()) to = args[++i];
+        else if (args[i] == "--limit" && i + 1 < args.size()) limit = std::atoi(args[++i].c_str());
+        else if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else return usage();
+    }
+    if (to.empty()) {  // from the file's name: montage_de.ts, montage_pt_BR.ts
+        const std::string stem = std::filesystem::path(args[0]).stem().string();
+        if (stem.rfind("montage_", 0) == 0) to = stem.substr(8, 2);
+    }
+    const auto route = translationRoute("en", to);
+    if (to.empty() || route.empty()) {
+        std::fprintf(stderr, "error: no translation from English to %s (see `montage-cli models`)\n", to.empty() ? "?" : to.c_str());
+        return 1;
+    }
+    for (const ModelPack* pack : route)
+        if (!pack->installed()) {
+            std::fprintf(stderr, "error: the %s is not downloaded (%.0f MB, into %s); translate once in the app to fetch it\n",
+                         pack->title.c_str(), double(pack->bytes()) / 1e6, pack->directory().c_str());
+            return 1;
+        }
+    std::string ts;
+    {
+        std::ifstream f(args[0], std::ios::binary);
+        if (!f) {
+            std::fprintf(stderr, "error: cannot read %s\n", args[0].c_str());
+            return 1;
+        }
+        ts.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    std::string result, err;
+    InterfaceDraftStats st;
+    auto run = [&](const std::vector<std::string>& in, std::vector<std::string>& drafts) {
+        return translateTexts(in, "en", to, drafts, [](double p) { std::fprintf(stderr, "\r%3.0f %%", p * 100); }, &gCancel, &err);
+    };
+    if (!draftInterfaceTranslation(ts, run, result, &st, limit, &err)) {
+        std::fprintf(stderr, "\nerror: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "\r%d texts: %d drafted now, %d drafts already, %d finished, %d left to the translator\n", st.messages, st.drafted,
+                 st.existing, st.finished, st.skipped);
+    return writeFile(out, result) ? 0 : 1;
+}
+
+int cmdInterfaceTexts(const std::vector<std::string>& args) {
+    std::string out;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else return usage();
+    }
+    const std::string source = engineInterfaceTextsSource(engineInterfaceTexts());
+    if (out.empty()) {
+        std::fputs(source.c_str(), stdout);
+        return 0;
+    }
+    return writeFile(out, source) ? 0 : 1;
+}
+
 // Finds shots by description, indexing the project's videos first (and saving the index).
 int cmdShots(const std::vector<std::string>& args) {
     if (args.size() < 2) return usage();
@@ -1897,6 +1966,8 @@ int main(int argc, char** argv) {
     if (cmd == "bench") return cmdBench(args);
     if (cmd == "captions") return cmdCaptions(args);
     if (cmd == "translate") return cmdTranslate(args);
+    if (cmd == "draft-interface") return cmdDraftInterface(args);
+    if (cmd == "interface-texts") return cmdInterfaceTexts(args);
     if (cmd == "import") return cmdImport(args);
     if (cmd == "edl" || cmd == "otio" || cmd == "xml" || cmd == "fcpxml") return cmdInterchange(args, cmd);
     if (cmd == "aaf") return cmdAaf(args);

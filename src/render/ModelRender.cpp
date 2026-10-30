@@ -64,13 +64,20 @@ void bilinear(const ModelTexture& tex, int level, double u, double v, float* out
         else x = std::clamp(x, 0, l.width - 1);
         if (tex.wrapT == ModelTexture::Wrap::Repeat) y = ((y % l.height) + l.height) % l.height;
         else y = std::clamp(y, 0, l.height - 1);
-        return l.rgba.data() + (size_t(y) * size_t(l.width) + size_t(x)) * 4;
+        return (size_t(y) * size_t(l.width) + size_t(x)) * 4;
     };
     const int x0 = int(fu), y0 = int(fv);
-    const uint8_t *a = texel(x0, y0), *b = texel(x0 + 1, y0), *c = texel(x0, y0 + 1), *d = texel(x0 + 1, y0 + 1);
+    const size_t a = texel(x0, y0), b = texel(x0 + 1, y0), c = texel(x0, y0 + 1), d = texel(x0 + 1, y0 + 1);
+    if (!l.rgbaLinear.empty()) {
+        const float* q = l.rgbaLinear.data();
+        for (int k = 0; k < 4; ++k)
+            out[k] = float((q[a + size_t(k)] * (1 - au) + q[b + size_t(k)] * au) * (1 - av) + (q[c + size_t(k)] * (1 - au) + q[d + size_t(k)] * au) * av);
+        return;
+    }
+    const uint8_t* q = l.rgba.data();
     for (int k = 0; k < 4; ++k)
-        out[k] = float((tex.linear(a[k], k) * (1 - au) + tex.linear(b[k], k) * au) * (1 - av) +
-                       (tex.linear(c[k], k) * (1 - au) + tex.linear(d[k], k) * au) * av);
+        out[k] = float((tex.linear(q[a + size_t(k)], k) * (1 - au) + tex.linear(q[b + size_t(k)], k) * au) * (1 - av) +
+                       (tex.linear(q[c + size_t(k)], k) * (1 - au) + tex.linear(q[d + size_t(k)], k) * au) * av);
 }
 
 // The texture over a pixel's footprint (its uv derivatives across one pixel each way): mip level from the footprint's
@@ -463,6 +470,9 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
     auto texture = [&](int id) -> const ModelTexture* {
         return s.model && id >= 0 && size_t(id) < s.model->textures.size() ? &s.model->textures[size_t(id)] : nullptr;
     };
+    auto pictureOn = [&](uint32_t tri) {
+        return s.picture && (s.pictureMaterial < 0 || (tri < T.materials.size() && T.materials[tri] == s.pictureMaterial));
+    };
     auto position = [&](uint32_t v) { return V3{T.positions[v * 3], T.positions[v * 3 + 1], T.positions[v * 3 + 2]}; };
 
     // The camera's view of every corner, then each triangle cut by the near plane and put on screen.
@@ -571,9 +581,21 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             return true;
         };
         float base[4] = {m.baseColor[0], m.baseColor[1], m.baseColor[2], m.baseColor[3]}, c[4];
-        if (tex(m.baseTexture, c))
-            for (int k = 0; k < 4; ++k) base[k] *= c[k];
-        for (int k = 0; k < 4; ++k) base[k] *= float(lerp(T.colors, 4, size_t(k), wt));
+        const bool pictured = pictureOn(tri);
+        if (pictured) {
+            sampleTexture(*s.picture, u, v, dux, dvx, duy, dvy, c);  // (premultiplied)
+            for (int k = 0; k < 3; ++k) base[k] = c[3] > 1e-6f ? c[k] / c[3] : 0.0f;
+            base[3] *= c[3];
+            if (s.pictureAsIs) {
+                for (int k = 0; k < 3; ++k) rgba[k] = base[k];
+                rgba[3] = std::clamp(base[3], 0.0f, 1.0f);
+                return;
+            }
+        } else {
+            if (tex(m.baseTexture, c))
+                for (int k = 0; k < 4; ++k) base[k] *= c[k];
+            for (int k = 0; k < 4; ++k) base[k] *= float(lerp(T.colors, 4, size_t(k), wt));
+        }
         double metallic = m.metallic, rough = m.roughness;
         if (tex(m.metallicRoughnessTexture, c)) rough *= c[1], metallic *= c[2];
         rough = std::clamp(rough, 0.03, 1.0), metallic = std::clamp(metallic, 0.0, 1.0);
@@ -637,7 +659,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             const double ks = f0[k] * A + B;
             rgba[k] = float(col[k] + cd[k] * diff[k] * (1 - ks) + spec[k] * ks + em[k]);
         }
-        rgba[3] = m.alpha == ModelMaterial::Alpha::Blend ? std::clamp(base[3], 0.0f, 1.0f) : 1.0f;
+        rgba[3] = m.alpha == ModelMaterial::Alpha::Blend || pictured ? std::clamp(base[3], 0.0f, 1.0f) : 1.0f;
     };
     // What a masked material lets through at a sample.
     auto maskPasses = [&](uint32_t tri, const double* wt) {
@@ -645,7 +667,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
         if (m.alpha != ModelMaterial::Alpha::Mask) return true;
         const uint32_t ix[3] = {T.indices[size_t(tri) * 3], T.indices[size_t(tri) * 3 + 1], T.indices[size_t(tri) * 3 + 2]};
         double alpha = m.baseColor[3] * (wt[0] * T.colors[ix[0] * 4 + 3] + wt[1] * T.colors[ix[1] * 4 + 3] + wt[2] * T.colors[ix[2] * 4 + 3]);
-        if (const ModelTexture* t = texture(m.baseTexture)) {
+        if (const ModelTexture* t = pictureOn(tri) ? s.picture.get() : texture(m.baseTexture)) {
             float c[4];
             const double u = wt[0] * T.uvs[ix[0] * 2] + wt[1] * T.uvs[ix[1] * 2] + wt[2] * T.uvs[ix[2] * 2];
             const double v = wt[0] * T.uvs[ix[0] * 2 + 1] + wt[1] * T.uvs[ix[1] * 2 + 1] + wt[2] * T.uvs[ix[2] * 2 + 1];

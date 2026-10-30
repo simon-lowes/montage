@@ -14,10 +14,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "core/Model.h"
+#include "core/Surround.h"
 
 namespace montage {
 
@@ -42,6 +44,40 @@ std::vector<int> admObjectTracks(const Sequence& s);
 // format, in the layout's channel order.
 std::string admBedPack(const std::string& layout);
 std::vector<std::string> admBedChannels(const std::string& layout);
+
+// A point in ADM's cartesian coordinates: X from -1 (left) to 1 (right), Y from -1 (behind) to 1 (in front), Z from 0
+// (at the ear) to 1 (overhead).
+struct AdmPoint {
+    double x = 0, y = 1, z = 0;
+};
+
+// Where a layout's speaker is in them: its angle by BS.2127's polar to cartesian mapping, overhead speakers at Z 1.
+AdmPoint admSpeakerPoint(const Speaker& sp);
+
+// The sound of an immersive master, mixed a stretch at a time as exportAdmBwf writes it (and the IAB masters of
+// render/Iab.h): the bed, every track but the objects in the sequence's layout (stereo when it has none of its own;
+// not ambisonics), and each object track alone after its fader as one channel; and where each object is.
+class ImmersiveMix {
+public:
+    ImmersiveMix();
+    ~ImmersiveMix();
+    // `rate`: samples a second along the sequence's timeline (48000; a DCP of a 23.976 sequence, which plays at 24,
+    // mixes at 47952).
+    bool open(const Project& p, const Sequence& s, int rate, std::string* error = nullptr);
+    const std::string& layout() const;
+    int bedChannels() const;
+    bool overhead() const;  // the layout has speakers above
+    const std::vector<int>& objectTracks() const;  // admObjectTracks
+    // `n` samples from `start` (at the rate, from the sequence's start): the bed interleaved into `bed`, bedChannels()
+    // a sample, and object k's channel into objects[k].
+    void mix(int64_t start, int n, float* bed, float* const* objects);
+    // Where object k is at sequence frame `frame` (between frames as the panner glides).
+    AdmPoint objectAt(size_t k, double frame) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> d_;
+};
 
 // Writes the master to `path` (.wav). `progress` (0..1) may return false to stop (the file is removed).
 bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settings, const std::string& path, AdmResult* result = nullptr,

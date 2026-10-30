@@ -43,8 +43,19 @@ Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, Fram
 // The video track whose solved camera the clip uses at t (-1: none): its "camera_track" (1-based), else the nearest
 // track below it whose clip at t carries a solve.
 int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
+// The Camera clip ("camera3d") a scene is seen through at t: the one on video track `track` (0-based), else the one on
+// the highest track with one at t (null: none). Its camera at t on the sequence's picture scaled by `scale`: where its
+// Position and Turn put it from where the frame (at z = 0, a unit a pixel, y up) fills its view, or aimed at a point.
+const Clip* sceneCameraClip(const Sequence& seq, FrameTime t, int track = -1);
+void sceneCamera(const Project& p, const Sequence& seq, const Clip& camera, FrameTime t, double scale, ModelCamera& cam);
+// The camera that an effect choosing one as models do ("camera": its own with "fov", the solved one, a file's or the
+// scene's; "camera_track", "camera_index", "camera_file") on clip c sees through at t.
+bool effectCamera(const Project& p, const Sequence& seq, const Clip& c, const Effect& g, FrameTime t, double scale, ModelCamera& cam,
+                  std::string* error = nullptr);
 // The track lighting it (-1: none).
 int modelLightTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
+// The track whose picture covers its surface ("texture_track"; -1: none).
+int modelTextureTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
 
 // The models placed in the scene solved on `footage` (on video track `track`): each model clip seen through that
 // solve, as it stands at its first frame, one mesh a material (for writeSolveUsda).

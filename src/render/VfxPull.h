@@ -33,6 +33,13 @@ struct VfxPullOptions {
     // plate as Lens Correction does with no fit (all of the picture, at the recording's scale) and redistorts its
     // renders to match it.
     bool stMaps = false;
+    // The shots' names: "" the clip's; or a pattern of {sequence}, {shot} (010, 020... in the cut's order), {clip} and
+    // {layer} (the clip's track), as "{sequence}_{shot}_{layer}".
+    std::string namePattern;
+    // A compositing script (Nuke's .nk, render/VfxShots.h) beside each shot's frames: the plate read, written to
+    // `returns` as the shot's first version, named by `returnsPattern` ("" = "{shot}_comp_v###").
+    bool scripts = false;
+    std::string returns, returnsPattern;
 };
 
 struct VfxShot {
@@ -48,7 +55,18 @@ struct VfxShot {
     std::string undistortMap, redistortMap;  // its ST maps, when written
     int overscanWidth = 0, overscanHeight = 0;  // the undistorted plate's size (its undistort map's)
     bool deep = false;                  // a deep render's samples, copied as they are (deep OpenEXR)
+    Id clip = 0;                        // the clip pulled
+    std::string plate;                  // its frames ("<folder>/<name>.####.exr")
+    std::string colorSpace;             // theirs (ColorSpace.h id)
+    int width = 0, height = 0;
+    Rational fps{24, 1};
+    double cutSource = 0;               // the cut's first frame in the footage (sequence frames, as Clip::sourceIn)
+    std::string script;                 // its compositing script, when written
 };
+
+// The name a pattern gives a clip of the cut as a shot (VfxPullOptions::namePattern), made safe for files; {shot}
+// numbers it by its place among the cut's footage clips.
+std::string vfxShotName(const std::string& pattern, const Project& p, const Sequence& seq, const Clip& c);
 
 // Pulls the clips (video clips of footage; titles and other generated clips
 // are skipped), writes "pull_list.csv" in the folder, and returns the shots.

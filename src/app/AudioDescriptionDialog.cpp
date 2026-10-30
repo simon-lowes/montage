@@ -1,4 +1,5 @@
 #include "AudioDescriptionDialog.h"
+#include "Language.h"
 
 #include <QApplication>
 #include <QFutureWatcher>
@@ -106,6 +107,7 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
     voice_ = new QComboBox(this);
     voice_->setObjectName(QStringLiteral("adVoice"));
     for (const TtsVoice& v : ttsVoices()) voice_->addItem(qs(v.name), qs(v.id));
+    language::keepUntranslated(voice_);  // (the voices' names)
     voice_->setCurrentIndex(std::max(0, voice_->findData(saved.value(QStringLiteral("ad/voice"), QStringLiteral("bf_emma")).toString())));
     auto* voiceButton = new QPushButton(tr("Voice Descriptions"), this);
     voiceButton->setObjectName(QStringLiteral("adVoiceButton"));

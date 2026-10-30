@@ -318,7 +318,7 @@ CompositeGraph compositeGraphFromJson(const QJsonObject& o) {
         node.source = n.value("source").toString("clip").toStdString();
         node.media = Id(i64(n.value("media")));
         node.track = n.value("track").toInt(-1);
-        node.offset = std::max(0.0, finiteOr(n.value("offset").toDouble(), 0));
+        node.offset = std::clamp(finiteOr(n.value("offset").toDouble(), 0), -1e9, 1e9);
         node.generator = effectFromJson(n.value("generator"));
         node.blend = n.value("blend").toString("normal").toStdString();
         node.follow = Id(i64(n.value("follow")));
@@ -785,6 +785,34 @@ QJsonObject sequenceToJson(const Sequence& s) {
         }
         o["adrCues"] = cues;
     }
+    if (!s.vfxShots.empty()) {
+        QJsonArray shots;
+        for (const VfxShotRecord& v : s.vfxShots) {
+            QJsonObject vo{{"name", qs(v.name)}, {"clip", double(v.clip)}, {"plateMedia", double(v.plateMedia)}, {"cutSource", v.cutSource},
+                           {"folder", qs(v.folder)}, {"plate", qs(v.plate)}, {"firstFrame", v.firstFrame}, {"lastFrame", v.lastFrame},
+                           {"cutIn", v.cutIn}, {"cutOut", v.cutOut}, {"width", v.width}, {"height", v.height},
+                           {"fps", QJsonArray{double(v.fps.num), double(v.fps.den)}}};
+            if (!v.colorSpace.empty()) vo["colorSpace"] = qs(v.colorSpace);
+            if (!v.amf.empty()) vo["amf"] = qs(v.amf);
+            if (!v.script.empty()) vo["script"] = qs(v.script);
+            if (v.status) vo["status"] = v.status;
+            if (!v.note.empty()) vo["note"] = qs(v.note);
+            if (v.version) vo["version"] = v.version;
+            QJsonArray versions;
+            for (const VfxVersion& r : v.versions) {
+                QJsonObject ro{{"number", r.number}, {"path", qs(r.path)}, {"media", double(r.media)}};
+                QJsonArray problems;
+                for (const std::string& pr : r.problems) problems.append(qs(pr));
+                if (!problems.isEmpty()) ro["problems"] = problems;
+                versions.append(ro);
+            }
+            if (!versions.isEmpty()) vo["versions"] = versions;
+            shots.append(vo);
+        }
+        o["vfxShots"] = shots;
+    }
+    if (!s.vfxReturns.empty()) o["vfxReturns"] = qs(s.vfxReturns);
+    if (!s.vfxPattern.empty()) o["vfxPattern"] = qs(s.vfxPattern);
     if (!s.buses.empty()) {
         QJsonArray buses;
         for (const auto& b : s.buses) {
@@ -972,6 +1000,44 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         q.clip = Id(i64(qo.value("clip")));
         if (q.id && q.end > q.start) s.adrCues.push_back(std::move(q));
     }
+    for (const auto& v : o.value("vfxShots").toArray()) {
+        const QJsonObject vo = v.toObject();
+        VfxShotRecord r;
+        r.name = ss(vo.value("name"));
+        r.clip = Id(i64(vo.value("clip")));
+        r.plateMedia = Id(i64(vo.value("plateMedia")));
+        r.cutSource = vo.value("cutSource").toDouble();
+        r.folder = ss(vo.value("folder"));
+        r.plate = ss(vo.value("plate"));
+        // (frame numbers kept where their differences cannot overflow; a rate of whole numbers)
+        auto frame = [&](const char* key) { return std::clamp(vo.value(key).toInt(), -100000000, 100000000); };
+        r.firstFrame = frame("firstFrame"), r.lastFrame = frame("lastFrame");
+        r.cutIn = frame("cutIn"), r.cutOut = frame("cutOut");
+        r.width = std::clamp(vo.value("width").toInt(), 0, 1 << 16), r.height = std::clamp(vo.value("height").toInt(), 0, 1 << 16);
+        const QJsonArray fps = vo.value("fps").toArray();
+        if (fps.size() == 2) {
+            const int num = fps[0].toInt(0), den = fps[1].toInt(0);
+            if (num >= 1 && num <= 1000000 && den >= 1 && den <= 1000000) r.fps = {num, den};
+        }
+        r.colorSpace = ss(vo.value("colorSpace"));
+        r.amf = ss(vo.value("amf"));
+        r.script = ss(vo.value("script"));
+        r.status = std::clamp(vo.value("status").toInt(0), 0, 3);
+        r.note = ss(vo.value("note"));
+        for (const auto& rv : vo.value("versions").toArray()) {
+            const QJsonObject ro = rv.toObject();
+            VfxVersion ver;
+            ver.number = ro.value("number").toInt();
+            ver.path = ss(ro.value("path"));
+            ver.media = Id(i64(ro.value("media")));
+            for (const auto& pr : ro.value("problems").toArray()) ver.problems.push_back(ss(pr));
+            if (ver.number > 0) r.versions.push_back(std::move(ver));
+        }
+        r.version = std::max(0, vo.value("version").toInt(0));
+        if (!r.name.empty()) s.vfxShots.push_back(std::move(r));
+    }
+    s.vfxReturns = ss(o.value("vfxReturns"));
+    s.vfxPattern = ss(o.value("vfxPattern"));
     for (const auto& v : o.value("buses").toArray()) {
         const QJsonObject bo = v.toObject();
         Bus b;
@@ -1054,17 +1120,22 @@ Sequence sequenceFromJson(const QJsonObject& o) {
                 }
             }
     };
-    for (Track& t : s.videoTracks)
-        for (Clip& c : t.clips) {
-            if (!c.grade.empty() && !validGrade(c.grade)) {
-                c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
-                c.grade = {};
-            }
-            takeOut(c);
-            if (!c.composite.empty() && !validComposite(c.composite)) c.composite = {};  // (its picture as it comes)
-            settle(c.effects, c.grade);
-            for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
+    auto check = [&](Clip& c) {
+        if (!c.grade.empty() && !validGrade(c.grade)) {
+            c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
+            c.grade = {};
         }
+        takeOut(c);
+        if (!c.composite.empty() && !validComposite(c.composite)) c.composite = {};  // (its picture as it comes)
+        settle(c.effects, c.grade);
+        for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
+    };
+    // (The clips of a track's other versions too: they come into play when that version is switched in.)
+    for (Track& t : s.videoTracks) {
+        for (Clip& c : t.clips) check(c);
+        for (TrackVersion& v : t.versions)
+            for (Clip& c : v.clips) check(c);
+    }
     s.masterVolumeDb = o.value("masterVolumeDb").toDouble(0);
     return s;
 }
@@ -1515,8 +1586,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     // An effect id repeated in a clip (a graph flattened above, or saved so) given a fresh one.
     for (Sequence& s : p.sequences)
-        for (Track& t : s.videoTracks)
+        for (Track& t : s.videoTracks) {
             for (Clip& c : t.clips) separateEffectIds(p, s, c);
+            for (TrackVersion& v : t.versions)
+                for (Clip& c : v.clips) separateEffectIds(p, s, c);
+        }
     // A compositing node shared between clips (saved so) given a fresh owner id.
     for (Sequence& s : p.sequences) separateCompositeIds(p, s);
     out = std::move(p);
