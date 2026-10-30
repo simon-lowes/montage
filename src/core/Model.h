@@ -571,6 +571,7 @@ struct SurroundPan {
     double lfeDb = -100;  // -100 = none
     double z = 0;         // height in immersive layouts: 0 at the ear, 1 overhead
     bool object = false;  // an audio object in immersive masters (render/Adm.h), not part of the bed
+    bool lfeOnly = false;  // the LFE channel alone (an imported bed's): at the LFE send's level, to no speaker else
     bool operator==(const SurroundPan&) const = default;
 };
 

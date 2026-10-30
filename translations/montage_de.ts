@@ -20442,6 +20442,22 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Select VFX shots (clips pulled for visual effects) to step their versions</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Immersive sound as S-ADM (Metadata-Guided Audio)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An MGASADMSignalSequence (SMPTE ST 2067-203): the sound with an S-ADM frame (ITU-R BS.2125) each frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Immersive sound as ADM audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ADMAudioSequence (SMPTE ST 2067-204): the sound with its ADM description (ITU-R BS.2076), as a BW64 master holds it</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -26580,6 +26596,14 @@ Right-click: width, LFE, height and audio object.</source>
     <message>
         <source>Centre speaker (dialogue)</source>
         <translation type="unfinished">Sprecher des Zentrums (Dialog)</translation>
+    </message>
+    <message>
+        <source>LFE Channel Only</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Feeds the LFE alone, at the level above, and no other speaker (a bed&apos;s LFE channel)</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

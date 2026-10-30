@@ -7759,6 +7759,17 @@ void MainWindow::exportImfDialog() {
     immersive->setToolTip(ambisonicLayout(s->audioLayout) ? tr("An ambisonic mix has no beds or objects")
                                                           : tr("An IAB sequence (SMPTE ST 2067-201) beside the main sound, in the package's language"));
     form->addRow(QString(), immersive);
+    // The same beds and objects as ADM: S-ADM in Metadata-Guided Audio (ST 2067-203), an ADM audio track file (ST 2067-204).
+    auto* sadm = new QCheckBox(tr("Immersive sound as S-ADM (Metadata-Guided Audio)"), &dlg);
+    sadm->setObjectName(QStringLiteral("imfSadm"));
+    sadm->setEnabled(immersive->isEnabled());
+    sadm->setToolTip(tr("An MGASADMSignalSequence (SMPTE ST 2067-203): the sound with an S-ADM frame (ITU-R BS.2125) each frame"));
+    form->addRow(QString(), sadm);
+    auto* adm = new QCheckBox(tr("Immersive sound as ADM audio"), &dlg);
+    adm->setObjectName(QStringLiteral("imfAdm"));
+    adm->setEnabled(immersive->isEnabled());
+    adm->setToolTip(tr("An ADMAudioSequence (SMPTE ST 2067-204): the sound with its ADM description (ITU-R BS.2076), as a BW64 master holds it"));
+    form->addRow(QString(), adm);
     // Each caption track as timed text: subtitles, captions for the deaf and hard of hearing, forced narrative, or left out.
     auto* texts = new QTableWidget(0, 3, &dlg);
     texts->setObjectName(QStringLiteral("imfTexts"));
@@ -7878,6 +7889,8 @@ void MainWindow::exportImfDialog() {
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
     st.immersive = immersive->isEnabled() && immersive->isChecked();
+    st.sadm = sadm->isEnabled() && sadm->isChecked();
+    st.adm = adm->isEnabled() && adm->isChecked();
     for (int row = 0; row < sounds->rowCount(); ++row) {
         ImfSound v;
         v.language = sounds->item(row, 0) ? sounds->item(row, 0)->text().trimmed().toStdString() : std::string();

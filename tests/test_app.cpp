@@ -7884,6 +7884,14 @@ private slots:
         QVERIFY2(supp.value("supplemental").toBool() && supp.value("coded_frames").toInt() == 0 && supp.value("new_samples").toInt() == 48000 &&
                      supp.value("sounds").toInt() == 2 && supp.value("problems").toArray().isEmpty(),
                  QJsonDocument(supp).toJson().constData());
+        // The beds and objects as S-ADM and ADM over MCP, checked.
+        r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-adm")}, {"title", "Objects"},
+                                        {"sadm", true}, {"adm", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject adm = r.value("structuredContent").toObject();
+        QVERIFY2(adm.value("problems").toArray().isEmpty() && adm.value("adm").toObject().value("sadm").toBool() &&
+                     adm.value("adm").toObject().value("adm").toBool() && adm.value("adm").toObject().value("bed_channels").toInt() >= 2,
+                 QJsonDocument(adm).toJson().constData());
         // Opened from the File menu's import as a sequence: English heard, German muted.
         QVERIFY(win_->findChild<QAction*>("importImf"));
         const size_t before = state()->project().sequences.size();
@@ -7910,7 +7918,9 @@ private slots:
             auto* earlier = dlg->findChild<QLineEdit*>("imfEarlier");
             auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
             auto* iab = dlg->findChild<QCheckBox*>("imfImmersive");
-            offered = iab && iab->isEnabled() && !iab->isChecked() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
+            auto* sadm = dlg->findChild<QCheckBox*>("imfSadm");
+            auto* admBox = dlg->findChild<QCheckBox*>("imfAdm");
+            offered = iab && iab->isEnabled() && !iab->isChecked() && sadm && sadm->isEnabled() && admBox && admBox->isEnabled() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
             // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");

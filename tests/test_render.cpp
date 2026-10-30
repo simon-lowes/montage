@@ -60,6 +60,7 @@
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
+#include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
 #include "render/Iab.h"
@@ -8879,6 +8880,212 @@ colorspaces:
                 QVERIFY2(cpl.contains(want), want);
         }
         const QStringList photon = photonErrors(imf.path());
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+
+        // Opened again: the IAB track's bed speakers and its object as tracks, which mix to the IAB track's sound.
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, ir.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.ok && in.offline.empty(), in.error.c_str());
+        const Sequence& back = *q.findSequence(in.sequence);
+        AdmScene scene;
+        QVERIFY2(immersiveTrackScene(imf.filePath(imfIab[0]).toStdString(), scene, &err), err.c_str());
+        QCOMPARE(scene.objects.size(), size_t(1));
+        QCOMPARE(back.audioLayout, scene.layout);
+        ImmersiveMix again;
+        QVERIFY2(again.open(q, back, 48000, &err), err.c_str());
+        QCOMPARE(again.objectTracks().size(), size_t(1));
+        QVERIFY(again.objectAt(0, 0).x < -0.9 && again.objectAt(0, 23).x > 0.9);
+        std::vector<int32_t> pcm;
+        QVERIFY2(readImmersiveTrack(imf.filePath(imfIab[0]).toStdString(), 0, [&](const int32_t* x, size_t n) {
+            pcm.insert(pcm.end(), x, x + n * size_t(scene.channels));
+            return true;
+        }, &err), err.c_str());
+        QCOMPARE(pcm.size(), size_t(48000) * size_t(scene.channels));
+        const int bedN = again.bedChannels(), n = 4000;
+        std::vector<float> bed(static_cast<size_t>(n) * size_t(bedN)), object(static_cast<size_t>(n));
+        float* objectPtr = object.data();
+        again.mix(20000, n, bed.data(), &objectPtr);
+        double worst = 0, heard = 0;
+        for (int i = 0; i < n; ++i) {
+            const size_t at = size_t(20000 + i) * size_t(scene.channels);
+            for (size_t c = 0; c < scene.bed.size(); ++c) {
+                if (scene.bed[c] < 0) continue;
+                const double want = pcm[at + size_t(scene.bed[c])] / 8388608.0;
+                worst = std::max(worst, std::fabs(bed[size_t(i) * size_t(bedN) + c] - want));
+                heard = std::max(heard, std::fabs(want));
+            }
+            worst = std::max(worst, std::fabs(object[size_t(i)] - pcm[at + size_t(scene.objects[0].channel)] / 8388608.0));
+        }
+        QVERIFY(heard > 0.05);
+        QVERIFY2(worst < 1e-3, qPrintable(QString::number(worst)));
+    }
+
+    void immersiveImfAsAdm() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // Two seconds at 24 fps in 5.1.4: a 1 kHz tone on A1 in the bed, a 440 Hz one on A2 as an object circling the
+        // room half way up.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+        s.audioLayout = "5.1.4";
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.5f, 0.5f, 0, 48));
+        for (int t = 0; t < 2; ++t) {
+            const QString wav = dir.filePath(QStringLiteral("tone%1.wav").arg(t));
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int n = 96000;
+            const double hz = t == 0 ? 1000 : 440;
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+            d.append("RIFF");
+            u32(36 + n * 2);
+            d.append("WAVEfmt ");
+            u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+            d.append("data");
+            u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(0.3 * 32767 * std::sin(2 * M_PI * hz * i / 48000.0)))));
+            f.write(d);
+            f.close();
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(wav.toStdString(), m));
+            p.media.push_back(m);
+            Clip a = makeClip(p, m, TrackKind::Audio, s);
+            a.duration = 48;
+            while (int(s.audioTracks.size()) <= t) s.audioTracks.emplace_back();
+            s.audioTracks[size_t(t)].clips.push_back(a);
+        }
+        Track& a2 = s.audioTracks[1];
+        a2.surround.object = true, a2.surround.width = 0, a2.surround.z = 0.5;
+        for (int f = 0; f <= 48; f += 4) {
+            a2.surroundXAuto.addKey(f, std::sin(2 * M_PI * f / 48));
+            a2.surroundYAuto.addKey(f, std::cos(2 * M_PI * f / 48));
+        }
+        std::string err;
+        ImfSettings im;
+        im.title = "Immersive ADM";
+        im.threads = 2;
+        im.sadm = true;
+        im.adm = true;
+        ImfResult ir;
+        QVERIFY2(exportImf(p, s, im, dir.path().toStdString(), &ir, {}, &err), err.c_str());
+        QVERIFY(ir.sadm && ir.adm && ir.admBedChannels == 10 && ir.admObjects == 1);
+        std::vector<std::string> issues = verifyImf(ir.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir imf(QString::fromStdString(ir.folder));
+        QString admFile, mgaFile;
+        for (const QString& f : imf.entryList({"*.mxf"})) {
+            ImmersiveTrackInfo info;
+            if (!immersiveTrackInfo(imf.filePath(f).toStdString(), info)) continue;
+            QCOMPARE(info.channels, 11);
+            QCOMPARE(info.samples, int64_t(96000));
+            (info.kind == ImmersiveTrackInfo::Kind::Adm ? admFile : mgaFile) = imf.filePath(f);
+        }
+        QVERIFY(!admFile.isEmpty() && !mgaFile.isEmpty());
+        {
+            QFile f(QString::fromStdString(ir.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString cpl = QString::fromUtf8(f.readAll());
+            for (const char* want : {"MGASADMSignalSequence>", "ADMAudioSequence>", "MGASADMOperationalMode>", "ADMOperationalMode>", "Operational-Mode-A"})
+                QVERIFY2(cpl.contains(want), want);
+        }
+
+        // Both files carry the same sound, and the same scene: the bed of 5.1.4 and the object where the mix put it.
+        auto samplesOf = [&](const QString& file) {
+            std::vector<int32_t> all;
+            std::string why;
+            const bool ok = readImmersiveTrack(file.toStdString(), 0, [&](const int32_t* x, size_t n) {
+                all.insert(all.end(), x, x + n * 11);
+                return true;
+            }, &why);
+            if (!ok) qWarning("%s", why.c_str());
+            return all;
+        };
+        const std::vector<int32_t> admPcm = samplesOf(admFile), mgaPcm = samplesOf(mgaFile);
+        QCOMPARE(admPcm.size(), size_t(96000 * 11));
+        QVERIFY(admPcm == mgaPcm);
+        // The media pool plays a channel of either, resampled where the project's rate is another.
+        for (const int rate : {48000, 96000}) {
+            const AudioBufferPtr object = decodeAudio(admFile.toStdString(), rate, &err, nullptr, {10});
+            QVERIFY2(object, err.c_str());
+            const size_t frames = object->samples.size() / size_t(object->channels);
+            QVERIFY2(std::llabs(int64_t(frames) - int64_t(rate) * 2) < 64, qPrintable(QString::number(frames)));
+            double heard = 0, delivered = 0;
+            for (size_t i = 0; i < frames; ++i) heard += double(object->samples[i * size_t(object->channels)]) * object->samples[i * size_t(object->channels)];
+            for (size_t i = 0; i < 96000; ++i) delivered += double(admPcm[i * 11 + 10]) * admPcm[i * 11 + 10] / (8388608.0 * 8388608.0);
+            QVERIFY2(std::fabs(std::sqrt(heard / double(frames)) / std::sqrt(delivered / 96000) - 1) < 0.02,
+                     qPrintable(QStringLiteral("%1 Hz: %2 for %3").arg(rate).arg(std::sqrt(heard / double(frames))).arg(std::sqrt(delivered / 96000))));
+        }
+        // (ADM blocks keep the path within 0.005: points on a straight line share one)
+        ImmersiveMix source;
+        QVERIFY2(source.open(p, s, 48000, &err), err.c_str());
+        AdmScene delivered;
+        for (const QString& file : {admFile, mgaFile}) {
+            AdmScene scene;
+            QVERIFY2(immersiveTrackScene(file.toStdString(), scene, &err), err.c_str());
+            if (file == admFile) delivered = scene;
+            QCOMPARE(scene.layout, std::string("5.1.4"));
+            QCOMPARE(scene.objects.size(), size_t(1));
+            QCOMPARE(scene.objects[0].channel, 10);
+            for (int f = 0; f < 48; ++f) {
+                const AdmPoint want = source.objectAt(0, f), got = scene.objectAt(0, f * 2000.0);
+                QVERIFY2(std::fabs(want.x - got.x) < 0.006 && std::fabs(want.y - got.y) < 0.006 && std::fabs(want.z - got.z) < 0.006,
+                         qPrintable(QStringLiteral("%1 frame %2: %3,%4,%5 for %6,%7,%8").arg(file).arg(f).arg(got.x).arg(got.y).arg(got.z)
+                                        .arg(want.x).arg(want.y).arg(want.z)));
+            }
+        }
+
+        // Opened again: a track for each of the bed's speakers and one for the object moving as delivered, which mix to
+        // the sound delivered.
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, ir.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.ok && in.offline.empty(), in.error.c_str());
+        QVERIFY(q.findSequence(in.sequence));
+        const Sequence& back = *q.findSequence(in.sequence);
+        QCOMPARE(back.audioLayout, std::string("5.1.4"));
+        int beds = 0, objects = 0;
+        for (const Track& t : back.audioTracks) {
+            if (t.muted) continue;
+            (t.surround.object ? objects : beds)++;
+            if (t.name == "Bed LFE") QVERIFY(t.surround.lfeOnly);
+        }
+        QCOMPARE(beds, 10);
+        QCOMPARE(objects, 1);
+        ImmersiveMix again;
+        QVERIFY2(again.open(q, back, 48000, &err), err.c_str());
+        QCOMPARE(again.bedChannels(), 10);
+        for (int f = 0; f < 48; ++f) {
+            const AdmPoint want = delivered.objectAt(0, f * 2000.0), got = again.objectAt(0, f);
+            QVERIFY2(std::fabs(want.x - got.x) < 1e-4 && std::fabs(want.y - got.y) < 1e-4 && std::fabs(want.z - got.z) < 1e-4,
+                     qPrintable(QStringLiteral("frame %1: %2,%3,%4 for %5,%6,%7").arg(f).arg(got.x).arg(got.y).arg(got.z).arg(want.x).arg(want.y).arg(want.z)));
+        }
+        const int n = 4000;
+        std::vector<float> bed(static_cast<size_t>(n) * 10), object(static_cast<size_t>(n));
+        float* objectPtr = object.data();
+        double worst = 0, heard = 0;
+        for (int64_t at : {int64_t(2000), int64_t(50000)}) {
+            again.mix(at, n, bed.data(), &objectPtr);
+            for (int i = 0; i < n; ++i) {
+                for (int c = 0; c < 10; ++c) {
+                    const double want = admPcm[size_t(at + i) * 11 + size_t(c)] / 8388608.0;
+                    worst = std::max(worst, std::fabs(bed[size_t(i) * 10 + size_t(c)] - want));
+                    heard = std::max(heard, std::fabs(want));
+                }
+                worst = std::max(worst, std::fabs(object[size_t(i)] - admPcm[size_t(at + i) * 11 + 10] / 8388608.0));
+            }
+        }
+        QVERIFY(heard > 0.05);
+        QVERIFY2(worst < 1e-3, qPrintable(QString::number(worst)));
+
+        // Photon takes the S-ADM track file (it has no checks of ST 2067-204's).
+        ImfSettings sadmOnly = im;
+        sadmOnly.adm = false;
+        sadmOnly.title = "Immersive S-ADM";
+        ImfResult sr;
+        QVERIFY2(exportImf(p, s, sadmOnly, dir.path().toStdString(), &sr, {}, &err), err.c_str());
+        const QStringList photon = photonErrors(QString::fromStdString(sr.folder));
         QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
     }
 

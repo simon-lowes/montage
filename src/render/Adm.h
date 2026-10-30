@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -78,6 +79,70 @@ private:
     struct Impl;
     std::unique_ptr<Impl> d_;
 };
+
+// One programme's ADM description (BS.2076) as Montage writes and reads it: a bed of speakers in one of its layouts
+// and objects that move, each on a channel of the sound that carries it (a BW64 file's, an IMF ADM or S-ADM track
+// file's). Times are samples at `rate` from the programme's start.
+struct AdmBlock {
+    int64_t from = 0, to = 0;
+    AdmPoint at;        // where the object is at the block's end, gliding there from where the block before left it
+    bool jump = false;  // ... or there from the block's start
+};
+struct AdmScene {
+    std::string title;
+    int rate = 48000;
+    int64_t samples = 0;
+    int channels = 0;    // channels of the sound
+    std::string layout;  // the bed's (core/Surround.h audioLayouts()), "" without one
+    std::string bedPack;
+    std::vector<int> bed;  // the channel carrying each of the layout's speakers, in its order (-1: none)
+    struct Object {
+        std::string name;
+        int channel = -1;
+        std::vector<AdmBlock> blocks;  // in order, back to back
+    };
+    std::vector<Object> objects;
+    // Object k's position at `sample`, as a renderer glides it.
+    AdmPoint objectAt(size_t k, double sample) const;
+};
+
+// What exportAdmBwf writes for the sequence from `first` to `end` (frames): the bed's speakers on channels 0..N-1,
+// then one channel for each object track (admObjectTracks).
+bool admSceneOf(const Project& p, const Sequence& s, FrameTime first, FrameTime end, const std::string& title, AdmScene& out,
+                std::string* error = nullptr);
+
+// The ADM document of a scene (an axml chunk's ebuCoreMain), and each channel's chna entry (track UID, track format,
+// pack).
+std::string admDocument(const AdmScene& scene);
+struct AdmTrack {
+    int channel = 0;  // from 0
+    std::string uid, trackFormat, pack;
+};
+std::vector<AdmTrack> admTracks(const AdmScene& scene);
+
+// The scene as S-ADM (ITU-R BS.2125-1): a 'full' frame for each stretch of `length` samples from `start` (the frames
+// counted from 1 by `index`), each holding the whole programme, the channels' transport track format, and each object's
+// position over the frame (its blocks cut at the frame's edges, each ending where the object is then), times from the
+// programme's start.
+std::string sadmFrame(const AdmScene& scene, int64_t index, int64_t start, int64_t length, const std::string& flowId);
+
+// Reads an ADM document (ebuCoreMain, audioFormatExtended) or an S-ADM frame (BS.2125) into `out`: its first programme's
+// bed (speakers named by BS.2094's common definitions or their speakerLabel, matched to the smallest layout that has
+// them all) and objects (cartesian or polar positions), on the channels `tracks` gives each track UID (a chna chunk's,
+// an MXF file's ADM channel mapping; an S-ADM frame's transport track format when empty). An S-ADM frame's blocks are
+// appended to those `out` already holds (merging a block that only stays put), so a stream of frames reads into one
+// scene. False, with the reason, when it holds no programme Montage reads.
+bool parseAdm(const std::string& xml, AdmScene& out, const std::vector<AdmTrack>& tracks = {}, std::string* error = nullptr,
+              std::vector<std::string>* warnings = nullptr);
+
+// A scene's bed from the channels carrying BS.2051's speakers (labels such as "M+030"): the smallest layout that has
+// them all, or the most of them (the others are noted in `warnings`).
+void admSetBed(AdmScene& scene, const std::map<std::string, int>& speakers, std::vector<std::string>* warnings = nullptr);
+// Adds a block after an object's others: one that only keeps it where it is lengthens the last.
+void admAppendBlock(std::vector<AdmBlock>& blocks, AdmBlock b);
+
+// The panner position (a point, width 0) that puts a sound at an ADM point: the inverse of how objects are written.
+SurroundPan admPanPosition(const AdmPoint& at);
 
 // Writes the master to `path` (.wav). `progress` (0..1) may return false to stop (the file is removed).
 bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settings, const std::string& path, AdmResult* result = nullptr,

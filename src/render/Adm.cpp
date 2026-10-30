@@ -1,6 +1,7 @@
 #include "Adm.h"
 
 #include <QFile>
+#include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 #include <algorithm>
 #include <array>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <set>
 
 #include "Compositor.h"
 #include "core/Automation.h"
@@ -40,6 +42,14 @@ QString admTime(int64_t samples) {
                              (long long)frac);
 }
 
+// The same to the nanosecond (BS.2125's longer form), for S-ADM frames whose edges fall between ADM's 10 µs steps.
+QString admTimeExact(int64_t samples, int rate) {
+    const int64_t whole = samples / rate;
+    const int64_t frac = (samples % rate) * 1000000000 / rate;
+    return QString::asprintf("%02lld:%02lld:%02lld.%09lld", (long long)(whole / 3600), (long long)(whole / 60 % 60), (long long)(whole % 60),
+                             (long long)frac);
+}
+
 QString number(double v) { return QString::number(v, 'f', 6); }
 
 void put16(QByteArray& b, uint16_t v) { b.append(char(v & 0xff)).append(char(v >> 8)); }
@@ -58,10 +68,6 @@ void putText(QByteArray& b, const std::string& s, size_t n) {
 uint16_t get16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
 uint32_t get32(const uint8_t* p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
 uint64_t get64(const uint8_t* p) { return uint64_t(get32(p)) | (uint64_t(get32(p + 4)) << 32); }
-
-struct Channel {
-    std::string uid, trackFormat, pack;
-};
 
 // ITU-R BS.2127's polar to cartesian mapping (section 10.1) at ear level, the one ADM renderers apply to cartesian
 // objects: the loudspeakers M+000, M-030, M-110, M+110 and M+030 sit on the corners and edges of the square, so a
@@ -201,6 +207,673 @@ AdmPoint admSpeakerPoint(const Speaker& sp) {
     return {xy[0], xy[1], sp.elevation > 0 ? 1.0 : 0.0};
 }
 
+AdmPoint AdmScene::objectAt(size_t k, double sample) const {
+    if (k >= objects.size() || objects[k].blocks.empty()) return {};
+    const std::vector<AdmBlock>& b = objects[k].blocks;
+    // The block holding the sample (a block's end its own), and where the one before left off.
+    size_t i = size_t(std::lower_bound(b.begin(), b.end(), sample, [](const AdmBlock& x, double v) { return double(x.to) < v; }) - b.begin());
+    if (i >= b.size()) return b.back().at;
+    const AdmBlock& x = b[i];
+    if (i == 0 || x.jump || x.to <= x.from) return x.at;
+    const AdmPoint& a = b[i - 1].at;
+    const double u = std::clamp((sample - double(x.from)) / double(x.to - x.from), 0.0, 1.0);
+    return {a.x + (x.at.x - a.x) * u, a.y + (x.at.y - a.y) * u, a.z + (x.at.z - a.z) * u};
+}
+
+bool admSceneOf(const Project& p, const Sequence& s, FrameTime first, FrameTime end, const std::string& title, AdmScene& out,
+                std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (ambisonicLayout(s.audioLayout))
+        return fail("An immersive master is a bed of speakers and objects: an ambisonic mix is delivered as a file of its field (File > Export)");
+    (void)p;
+    AdmScene sc;
+    sc.title = title.empty() ? s.name : title;
+    sc.layout = std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) != audioLayouts().end() ? s.audioLayout : "stereo";
+    const std::vector<std::string> bedChannels = admBedChannels(sc.layout);
+    if (std::any_of(bedChannels.begin(), bedChannels.end(), [](const std::string& c) { return c.empty(); }))
+        return fail("The sequence's speakers have no ADM names");
+    const int bedN = int(bedChannels.size());
+    const std::vector<int> objects = admObjectTracks(s);
+    sc.channels = bedN + int(objects.size());
+    if (sc.channels > 128) return fail("An ADM master here holds up to 128 channels: the bed and at most " + std::to_string(128 - bedN) + " objects");
+    if (end <= first) return fail("The sequence is empty");
+    const double fps = s.fpsValue();
+    sc.samples = int64_t(std::llround(double(end - first) * kRate / fps));
+    sc.bedPack = admBedPack(sc.layout);
+    for (int i = 0; i < bedN; ++i) sc.bed.push_back(i);
+    const bool overhead = std::any_of(layoutSpeakers(sc.layout).begin(), layoutSpeakers(sc.layout).end(), [](const Speaker& k) { return k.elevation > 0; });
+    for (size_t k = 0; k < objects.size(); ++k) {
+        const Track& tr = s.audioTracks[size_t(objects[k])];
+        AdmScene::Object o;
+        o.name = tr.name;
+        o.channel = bedN + int(k);
+        for (const Block& b : objectBlocks(tr, overhead, first, end, fps, sc.samples)) o.blocks.push_back({b.from, b.to, {b.at.x, b.at.y, b.at.z}, false});
+        sc.objects.push_back(std::move(o));
+    }
+    out = std::move(sc);
+    return true;
+}
+
+namespace {
+
+QString objectHex(size_t k) { return QString::asprintf("%04X", unsigned(0x1001 + k)); }
+
+// The programme's elements, as admDocument writes them and sadmFrame repeats them in every frame; each object's blocks
+// from `blocks`.
+void writeProgramme(QXmlStreamWriter& x, const AdmScene& sc, const std::vector<AdmTrack>& tracks,
+                    const std::function<void(size_t k, const QString& hex)>& blocks, const std::function<QString(int64_t)>& time) {
+    const QString duration = time(sc.samples);
+    const size_t bedN = sc.bed.size();
+    x.writeStartElement("audioProgramme");
+    x.writeAttribute("audioProgrammeID", "APR_1001");
+    x.writeAttribute("audioProgrammeName", QString::fromStdString(sc.title));
+    x.writeAttribute("start", time(0));
+    x.writeAttribute("end", duration);
+    x.writeTextElement("audioContentIDRef", "ACO_1001");
+    if (!sc.objects.empty()) x.writeTextElement("audioContentIDRef", "ACO_1002");
+    x.writeEndElement();
+    x.writeStartElement("audioContent");
+    x.writeAttribute("audioContentID", "ACO_1001");
+    x.writeAttribute("audioContentName", "Bed");
+    x.writeTextElement("audioObjectIDRef", "AO_1001");
+    x.writeEndElement();
+    if (!sc.objects.empty()) {
+        x.writeStartElement("audioContent");
+        x.writeAttribute("audioContentID", "ACO_1002");
+        x.writeAttribute("audioContentName", "Objects");
+        for (size_t k = 0; k < sc.objects.size(); ++k) x.writeTextElement("audioObjectIDRef", QString::asprintf("AO_%04X", unsigned(0x1002 + k)));
+        x.writeEndElement();
+    }
+    x.writeStartElement("audioObject");
+    x.writeAttribute("audioObjectID", "AO_1001");
+    x.writeAttribute("audioObjectName", "Bed");
+    x.writeAttribute("start", time(0));
+    x.writeAttribute("duration", duration);
+    x.writeTextElement("audioPackFormatIDRef", QString::fromStdString(sc.bedPack));
+    for (size_t i = 0; i < bedN; ++i) x.writeTextElement("audioTrackUIDRef", QString::fromStdString(tracks[i].uid));
+    x.writeEndElement();
+    for (size_t k = 0; k < sc.objects.size(); ++k) {
+        x.writeStartElement("audioObject");
+        x.writeAttribute("audioObjectID", QString::asprintf("AO_%04X", unsigned(0x1002 + k)));
+        x.writeAttribute("audioObjectName", QString::fromStdString(sc.objects[k].name));
+        x.writeAttribute("start", time(0));
+        x.writeAttribute("duration", duration);
+        x.writeTextElement("audioPackFormatIDRef", "AP_0003" + objectHex(k));
+        x.writeTextElement("audioTrackUIDRef", QString::fromStdString(tracks[bedN + k].uid));
+        x.writeEndElement();
+    }
+    if (sc.bedPack == kOwnBedPack) {
+        x.writeStartElement("audioPackFormat");
+        x.writeAttribute("audioPackFormatID", kOwnBedPack);
+        x.writeAttribute("audioPackFormatName", "7.1.2");
+        x.writeAttribute("typeLabel", "0001");
+        x.writeAttribute("typeDefinition", "DirectSpeakers");
+        for (const std::string& c : admBedChannels(sc.layout)) x.writeTextElement("audioChannelFormatIDRef", QString::fromStdString(c));
+        x.writeEndElement();
+    }
+    for (size_t k = 0; k < sc.objects.size(); ++k) {
+        const QString hex = objectHex(k), name = QString::fromStdString(sc.objects[k].name);
+        x.writeStartElement("audioPackFormat");
+        x.writeAttribute("audioPackFormatID", "AP_0003" + hex);
+        x.writeAttribute("audioPackFormatName", name);
+        x.writeAttribute("typeLabel", "0003");
+        x.writeAttribute("typeDefinition", "Objects");
+        x.writeTextElement("audioChannelFormatIDRef", "AC_0003" + hex);
+        x.writeEndElement();
+        x.writeStartElement("audioChannelFormat");
+        x.writeAttribute("audioChannelFormatID", "AC_0003" + hex);
+        x.writeAttribute("audioChannelFormatName", name);
+        x.writeAttribute("typeLabel", "0003");
+        x.writeAttribute("typeDefinition", "Objects");
+        blocks(k, hex);
+        x.writeEndElement();  // audioChannelFormat
+        x.writeStartElement("audioStreamFormat");
+        x.writeAttribute("audioStreamFormatID", "AS_0003" + hex);
+        x.writeAttribute("audioStreamFormatName", "PCM_" + name);
+        x.writeAttribute("formatLabel", "0001");
+        x.writeAttribute("formatDefinition", "PCM");
+        x.writeTextElement("audioChannelFormatIDRef", "AC_0003" + hex);
+        x.writeTextElement("audioTrackFormatIDRef", "AT_0003" + hex + "_01");
+        x.writeEndElement();
+        x.writeStartElement("audioTrackFormat");
+        x.writeAttribute("audioTrackFormatID", "AT_0003" + hex + "_01");
+        x.writeAttribute("audioTrackFormatName", "PCM_" + name);
+        x.writeAttribute("formatLabel", "0001");
+        x.writeAttribute("formatDefinition", "PCM");
+        x.writeTextElement("audioStreamFormatIDRef", "AS_0003" + hex);
+        x.writeEndElement();
+    }
+    for (const AdmTrack& c : tracks) {
+        x.writeStartElement("audioTrackUID");
+        x.writeAttribute("UID", QString::fromStdString(c.uid));
+        x.writeAttribute("sampleRate", QString::number(sc.rate));
+        x.writeAttribute("bitDepth", "24");
+        x.writeTextElement("audioTrackFormatIDRef", QString::fromStdString(c.trackFormat));
+        x.writeTextElement("audioPackFormatIDRef", QString::fromStdString(c.pack));
+        x.writeEndElement();
+    }
+}
+
+void writeBlock(QXmlStreamWriter& x, const QString& hex, size_t index, const QString& rtime, const QString& duration, const AdmPoint& at, bool jump) {
+    x.writeStartElement("audioBlockFormat");
+    x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + QString::asprintf("_%08X", unsigned(index + 1)));
+    x.writeAttribute("rtime", rtime);
+    x.writeAttribute("duration", duration);
+    x.writeTextElement("cartesian", "1");
+    for (auto [coord, v] : {std::pair<const char*, double>{"X", at.x}, {"Y", at.y}, {"Z", at.z}}) {
+        x.writeStartElement("position");
+        x.writeAttribute("coordinate", coord);
+        x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : std::clamp(v, -1.0, 1.0)));
+        x.writeEndElement();
+    }
+    if (jump) x.writeTextElement("jumpPosition", "1");
+    x.writeEndElement();
+}
+
+}  // namespace
+
+std::vector<AdmTrack> admTracks(const AdmScene& sc) {
+    std::vector<AdmTrack> out;
+    const std::vector<std::string> bedChannels = admBedChannels(sc.layout);
+    for (size_t i = 0; i < sc.bed.size() && i < bedChannels.size(); ++i)
+        out.push_back({sc.bed[i], "", "AT_" + bedChannels[i].substr(3) + "_01", sc.bedPack});  // BS.2094's
+    for (size_t k = 0; k < sc.objects.size(); ++k)
+        out.push_back({sc.objects[k].channel, "", ("AT_0003" + objectHex(k) + "_01").toStdString(), ("AP_0003" + objectHex(k)).toStdString()});
+    for (size_t i = 0; i < out.size(); ++i) out[i].uid = QString::asprintf("ATU_%08X", unsigned(i + 1)).toStdString();
+    return out;
+}
+
+std::string admDocument(const AdmScene& sc) {
+    const std::vector<AdmTrack> tracks = admTracks(sc);
+    QByteArray xml;
+    QXmlStreamWriter x(&xml);
+    x.setAutoFormatting(true);
+    x.writeStartDocument();
+    x.writeStartElement("ebuCoreMain");
+    x.writeDefaultNamespace("urn:ebu:metadata-schema:ebuCore_2017");
+    x.writeNamespace("http://purl.org/dc/elements/1.1/", "dc");
+    x.writeAttribute("schema", "EBU_CORE_20171102.xsd");
+    x.writeAttribute("xml:lang", "en");
+    x.writeStartElement("coreMetadata");
+    x.writeStartElement("format");
+    x.writeStartElement("audioFormatExtended");
+    x.writeAttribute("version", "ITU-R_BS.2076-2");
+    writeProgramme(
+        x, sc, tracks,
+        [&](size_t k, const QString& hex) {
+            const std::vector<AdmBlock>& blocks = sc.objects[k].blocks;
+            for (size_t b = 0; b < blocks.size(); ++b)
+                writeBlock(x, hex, b, admTime(blocks[b].from), blocks.size() == 1 ? admTime(sc.samples) : admTime(blocks[b].to - blocks[b].from),
+                           blocks[b].at, blocks[b].jump);
+        },
+        [](int64_t t) { return admTime(t); });
+    x.writeEndElement();  // audioFormatExtended
+    x.writeEndElement();  // format
+    x.writeEndElement();  // coreMetadata
+    x.writeEndElement();  // ebuCoreMain
+    x.writeEndDocument();
+    return xml.toStdString();
+}
+
+std::string sadmFrame(const AdmScene& sc, int64_t index, int64_t start, int64_t length, const std::string& flowId) {
+    const std::vector<AdmTrack> tracks = admTracks(sc);
+    auto time = [&](int64_t t) { return admTimeExact(t, sc.rate); };
+    const int64_t end = start + length;
+    QByteArray xml;
+    QXmlStreamWriter x(&xml);
+    x.writeStartDocument();
+    x.writeStartElement("frame");
+    x.writeAttribute("version", "ITU-R_BS.2125-1");
+    x.writeStartElement("frameHeader");
+    x.writeStartElement("frameFormat");
+    x.writeAttribute("frameFormatID", QString::asprintf("FF_%08llX", (unsigned long long)index));
+    x.writeAttribute("start", time(start));
+    x.writeAttribute("duration", time(length));
+    x.writeAttribute("type", "full");
+    x.writeAttribute("timeReference", "total");
+    if (!flowId.empty()) x.writeAttribute("flowID", QString::fromStdString(flowId));
+    x.writeAttribute("countToFull", "1");
+    x.writeEndElement();
+    x.writeStartElement("transportTrackFormat");
+    x.writeAttribute("transportID", "TP_0001");
+    x.writeAttribute("transportName", "MXF");
+    x.writeAttribute("numIDs", QString::number(tracks.size()));
+    x.writeAttribute("numTracks", QString::number(sc.channels));
+    for (const AdmTrack& t : tracks) {
+        x.writeStartElement("audioTrack");
+        x.writeAttribute("trackID", QString::number(t.channel + 1));
+        x.writeTextElement("audioTrackUIDRef", QString::fromStdString(t.uid));
+        x.writeEndElement();
+    }
+    x.writeEndElement();  // transportTrackFormat
+    x.writeEndElement();  // frameHeader
+    x.writeStartElement("audioFormatExtended");
+    x.writeAttribute("version", "ITU-R_BS.2076-2");
+    writeProgramme(
+        x, sc, tracks,
+        [&](size_t k, const QString& hex) {
+            // The blocks over the frame, cut at its edges: each ends where the object is then.
+            const std::vector<AdmBlock>& blocks = sc.objects[k].blocks;
+            const auto first = std::upper_bound(blocks.begin(), blocks.end(), start, [](int64_t v, const AdmBlock& o) { return v < o.to; });
+            for (size_t b = size_t(first - blocks.begin()); b < blocks.size() && blocks[b].from < end; ++b) {
+                const int64_t from = std::max(blocks[b].from, start), to = std::min(blocks[b].to, end);
+                if (to > from) writeBlock(x, hex, b, time(from), time(to - from), sc.objectAt(k, double(to)), blocks[b].jump && from == blocks[b].from);
+            }
+        },
+        time);
+    x.writeEndElement();  // audioFormatExtended
+    x.writeEndElement();  // frame
+    x.writeEndDocument();
+    return xml.toStdString();
+}
+
+namespace {
+
+// A time as ADM and S-ADM write them ("hh:mm:ss.fffff", "hh:mm:ss.zzzzzSfffff", "zzzzzSfffff", "ss.fffff", or with a
+// date before a T), in samples at `rate`; -1 when it is none of those.
+int64_t admSamples(QString t, int rate) {
+    t = t.trimmed();
+    if (const int T = t.indexOf('T'); T >= 0) t = t.mid(T + 1);
+    if (t.endsWith('Z')) t.chop(1);
+    const int S = t.indexOf('S');
+    QString clock = t, samples;
+    int of = 0;
+    if (S >= 0) {
+        bool ok = false;
+        of = t.mid(S + 1).toInt(&ok);
+        if (!ok || of <= 0) return -1;
+        clock = t.left(S);
+    }
+    double seconds = 0;
+    const QStringList parts = clock.split(':');
+    if (parts.size() > 3) return -1;
+    if (S >= 0) {
+        // The part after the last point (or all of a short form) counts samples at `of`.
+        const int dot = clock.lastIndexOf('.');
+        samples = dot >= 0 ? clock.mid(dot + 1) : clock;
+        clock = dot >= 0 ? clock.left(dot) : QString();
+    }
+    const QStringList hms = clock.isEmpty() ? QStringList() : clock.split(':');
+    for (const QString& part : hms) {
+        bool ok = false;
+        const double v = part.toDouble(&ok);
+        if (!ok || v < 0) return -1;
+        seconds = seconds * 60 + v;
+    }
+    double total = seconds * rate;
+    if (S >= 0) {
+        bool ok = false;
+        const double n = samples.toDouble(&ok);
+        if (!ok || n < 0) return -1;
+        total += n * rate / of;
+    }
+    // (no further than a week: a time a file makes up stays one the arithmetic on it can take)
+    if (!std::isfinite(total) || total > 7.0 * 86400 * rate) return -1;
+    return int64_t(std::llround(total));
+}
+
+// A BS.2051 speaker label as written ("M+030", "urn:itu:bs:2051:0:speaker:M+030", "LFE").
+std::string speakerLabel(QString l) {
+    l = l.trimmed();
+    if (const int c = l.lastIndexOf(':'); c >= 0) l = l.mid(c + 1);
+    if (l.startsWith("LFE", Qt::CaseInsensitive)) return "LFE1";
+    return l.toStdString();
+}
+
+struct ParsedBlock {
+    int64_t rtime = -1, duration = -1;
+    std::map<std::string, double> position;
+    bool cartesian = false, jump = false;
+    std::string speaker;
+};
+struct ParsedChannel {
+    std::string type;  // typeDefinition, or from the ID's typeLabel
+    std::vector<ParsedBlock> blocks;
+};
+struct ParsedObject {
+    std::string name;
+    int64_t start = 0;
+    std::vector<std::string> packs, uids, objects;
+};
+
+}  // namespace
+
+bool parseAdm(const std::string& text, AdmScene& out, const std::vector<AdmTrack>& tracks, std::string* error, std::vector<std::string>* warnings) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    const int rate = out.rate > 0 ? out.rate : 48000;
+    std::vector<std::pair<std::string, std::vector<std::string>>> programmes;  // name, contents (in order)
+    std::map<std::string, int64_t> programmeStart;
+    std::map<std::string, std::vector<std::string>> contents, packChannels, streamChannel, trackStream;
+    std::map<std::string, std::string> packType;
+    std::map<std::string, ParsedObject> objects;
+    std::map<std::string, ParsedChannel> channels;
+    std::map<std::string, std::pair<std::string, std::string>> uids;  // UID: track (or channel) format, pack
+    std::map<std::string, int> transport;                               // UID: channel (S-ADM's transport track format)
+    std::string firstProgramme;
+    int64_t frameStart = -1, frameLength = -1;
+    bool local = false, frame = false;
+
+    QXmlStreamReader x(QByteArray::fromStdString(text));
+    std::string programme, content, object, pack, channel, stream, track, uid;
+    ParsedBlock* block = nullptr;
+    std::string coordinate;
+    int transportTrack = -1;
+    auto attr = [&](const char* name) { return x.attributes().value(QLatin1String(name)).toString(); };
+    while (!x.atEnd()) {
+        const auto tok = x.readNext();
+        if (tok == QXmlStreamReader::EndElement) {
+            const QStringView n = x.name();
+            if (n == u"audioBlockFormat") block = nullptr;
+            else if (n == u"audioChannelFormat") channel.clear();
+            else if (n == u"audioObject") object.clear();
+            else if (n == u"audioTrack") transportTrack = -1;
+            continue;
+        }
+        if (tok != QXmlStreamReader::StartElement) continue;
+        const QStringView n = x.name();
+        if (n == u"frame") {
+            frame = true;
+        } else if (n == u"frameFormat") {
+            frameStart = admSamples(attr("start"), rate);
+            frameLength = admSamples(attr("duration"), rate);
+            local = attr("timeReference") == "local";
+        } else if (n == u"audioTrack") {
+            bool ok = false;
+            transportTrack = attr("trackID").toInt(&ok) - 1;
+            if (!ok || transportTrack < 0 || transportTrack >= 4096) transportTrack = -1;
+        } else if (n == u"audioProgramme") {
+            programme = attr("audioProgrammeID").toStdString();
+            if (firstProgramme.empty()) firstProgramme = programme;
+            programmes.push_back({attr("audioProgrammeName").toStdString(), {}});
+            programmeStart[programme] = std::max<int64_t>(0, admSamples(attr("start").isEmpty() ? "0S1" : attr("start"), rate));
+        } else if (n == u"audioContent") {
+            content = attr("audioContentID").toStdString();
+        } else if (n == u"audioObject") {
+            object = attr("audioObjectID").toStdString();
+            ParsedObject& o = objects[object];
+            o.name = attr("audioObjectName").toStdString();
+            o.start = attr("start").isEmpty() ? 0 : std::max<int64_t>(0, admSamples(attr("start"), rate));
+        } else if (n == u"audioPackFormat") {
+            pack = attr("audioPackFormatID").toStdString();
+            packType[pack] = attr("typeDefinition").toStdString();
+        } else if (n == u"audioChannelFormat") {
+            channel = attr("audioChannelFormatID").toStdString();
+            channels[channel].type = attr("typeDefinition").toStdString();
+        } else if (n == u"audioStreamFormat") {
+            stream = attr("audioStreamFormatID").toStdString();
+        } else if (n == u"audioTrackFormat") {
+            track = attr("audioTrackFormatID").toStdString();
+        } else if (n == u"audioTrackUID") {
+            uid = attr("UID").toStdString();
+            uids[uid];
+        } else if (n == u"audioBlockFormat" && !channel.empty()) {
+            ParsedBlock b;
+            const QString rt = local ? attr("lstart") : attr("rtime");
+            const QString du = local ? attr("lduration") : attr("duration");
+            b.rtime = rt.isEmpty() ? -1 : admSamples(rt, rate);
+            b.duration = du.isEmpty() ? -1 : admSamples(du, rate);
+            if (local && b.rtime >= 0 && frameStart >= 0) b.rtime += frameStart;
+            channels[channel].blocks.push_back(b);
+            block = &channels[channel].blocks.back();
+        } else if (block && n == u"position") {
+            coordinate = attr("coordinate").toStdString();
+            bool ok = false;
+            const double v = x.readElementText().trimmed().toDouble(&ok);
+            if (ok) block->position[coordinate] = v;
+        } else if (block && n == u"cartesian") {
+            block->cartesian = x.readElementText().trimmed() == "1";
+        } else if (block && n == u"jumpPosition") {
+            block->jump = x.readElementText().trimmed() == "1";
+        } else if (block && n == u"speakerLabel") {
+            if (block->speaker.empty()) block->speaker = speakerLabel(x.readElementText());
+        } else {
+            // References, by the element they sit in.
+            const std::string ref = n.toString().toStdString();
+            auto refText = [&] { return x.readElementText().trimmed().toStdString(); };
+            if (ref == "audioContentIDRef" && !programme.empty() && !programmes.empty()) programmes.back().second.push_back(refText());
+            else if (ref == "audioObjectIDRef" && !object.empty()) objects[object].objects.push_back(refText());
+            else if (ref == "audioObjectIDRef" && !content.empty()) contents[content].push_back(refText());
+            else if (ref == "audioPackFormatIDRef" && !object.empty()) objects[object].packs.push_back(refText());
+            else if (ref == "audioPackFormatIDRef" && !uid.empty()) uids[uid].second = refText();
+            else if (ref == "audioTrackUIDRef" && transportTrack >= 0) transport[refText()] = transportTrack;
+            else if (ref == "audioTrackUIDRef" && !object.empty()) objects[object].uids.push_back(refText());
+            else if (ref == "audioChannelFormatIDRef" && !pack.empty() && channel.empty() && stream.empty()) packChannels[pack].push_back(refText());
+            else if (ref == "audioChannelFormatIDRef" && !stream.empty()) streamChannel[stream] = {refText()};
+            else if (ref == "audioStreamFormatIDRef" && !track.empty()) trackStream[track] = {refText()};
+            else if ((ref == "audioTrackFormatIDRef" || ref == "audioChannelFormatIDRef") && !uid.empty()) uids[uid].first = refText();
+        }
+        // (an element's scope ends where the next sibling of its kind starts; references only count inside their own)
+        if (n == u"audioProgramme" || n == u"audioContent" || n == u"audioObject" || n == u"audioPackFormat" || n == u"audioChannelFormat" ||
+            n == u"audioStreamFormat" || n == u"audioTrackFormat" || n == u"audioTrackUID") {
+            if (n != u"audioProgramme") programme.clear();
+            if (n != u"audioContent") content.clear();
+            if (n != u"audioObject") object.clear();
+            if (n != u"audioPackFormat") pack.clear();
+            if (n != u"audioChannelFormat") channel.clear();
+            if (n != u"audioStreamFormat") stream.clear();
+            if (n != u"audioTrackFormat") track.clear();
+            if (n != u"audioTrackUID") uid.clear();
+        }
+    }
+    if (x.hasError()) return fail("The ADM is not well-formed XML: " + x.errorString().toStdString());
+    if (programmes.empty()) return fail("The ADM has no programme");
+    if (programmes.size() > 1 && warnings && !frame)
+        warnings->push_back("The ADM has " + std::to_string(programmes.size()) + " programmes: the first (" + programmes[0].first + ") is read");
+
+    // Which channel of the sound each track UID is on.
+    std::map<std::string, int> channelOf = transport;
+    for (const AdmTrack& t : tracks) channelOf[t.uid] = t.channel;
+    // A UID's channel format: through its track format and stream format, or named directly (S-ADM may), or by number
+    // (BS.2094's common definitions: AT_xxxxxxxx_01 is AC_xxxxxxxx's).
+    auto channelFormatOf = [&](const std::string& u) -> std::string {
+        auto it = uids.find(u);
+        std::string ref = it != uids.end() ? it->second.first : std::string();
+        if (ref.empty())
+            for (const AdmTrack& t : tracks)
+                if (t.uid == u) ref = t.trackFormat;
+        if (ref.rfind("AC_", 0) == 0) return ref;
+        if (const auto ts = trackStream.find(ref); ts != trackStream.end() && !ts->second.empty())
+            if (const auto sc = streamChannel.find(ts->second[0]); sc != streamChannel.end() && !sc->second.empty()) return sc->second[0];
+        if (ref.rfind("AT_", 0) == 0 && ref.size() >= 11) return "AC_" + ref.substr(3, 8);
+        return {};
+    };
+    auto typeOf = [&](const std::string& ac) {
+        if (const auto c = channels.find(ac); c != channels.end() && !c->second.type.empty()) return c->second.type;
+        // (typeLabel: the ID's first four digits)
+        const std::string label = ac.size() >= 7 ? ac.substr(3, 4) : std::string();
+        return std::string(label == "0001" ? "DirectSpeakers" : label == "0003" ? "Objects" : label == "0002" ? "Matrix" : label == "0004" ? "HOA" : "Binaural");
+    };
+    // The common definitions' speakers by channel format.
+    auto commonLabel = [](const std::string& ac) -> std::string {
+        for (const auto& [label, id] : commonChannels())
+            if (QString::fromStdString(id).compare(QString::fromStdString(ac), Qt::CaseInsensitive) == 0) return label;
+        return {};
+    };
+
+    // The first programme's objects, nested ones included (to 16 deep, as BS.2076 nests a few at most), in order.
+    std::vector<std::string> wanted;
+    std::set<std::string> seen;
+    for (const std::string& c : programmes[0].second)
+        for (const std::string& top : contents[c]) {
+            std::vector<std::pair<std::string, int>> stack{{top, 0}};
+            while (!stack.empty() && seen.size() < 4096) {
+                const auto [id, depth] = stack.back();
+                stack.pop_back();
+                if (!seen.insert(id).second) continue;
+                const auto o = objects.find(id);
+                if (o == objects.end()) continue;
+                wanted.push_back(id);
+                if (depth < 16)
+                    for (auto inner = o->second.objects.rbegin(); inner != o->second.objects.rend(); ++inner) stack.push_back({*inner, depth + 1});
+            }
+        }
+    const int64_t progStart = programmeStart[firstProgramme];
+    const int64_t frameEnd = frameStart >= 0 && frameLength >= 0 ? frameStart - progStart + frameLength : -1;
+
+    if (out.title.empty()) out.title = programmes[0].first;
+    std::map<std::string, int> speakers;  // label: channel
+    std::vector<std::string> skipped;
+    std::map<int, size_t> objectOn;  // out.objects by channel
+    for (size_t k = 0; k < out.objects.size(); ++k) objectOn[out.objects[k].channel] = k;
+    bool tooMany = false;
+    for (const std::string& id : wanted) {
+        const ParsedObject& o = objects[id];
+        for (const std::string& u : o.uids) {
+            const auto ch = channelOf.find(u);
+            if (ch == channelOf.end() || ch->second < 0) continue;  // (a silent track, or one this sound does not carry)
+            const std::string ac = channelFormatOf(u);
+            const std::string type = typeOf(ac);
+            if (type == "DirectSpeakers") {
+                std::string label = commonLabel(ac);
+                if (const auto c = channels.find(ac); c != channels.end())
+                    for (const ParsedBlock& b : c->second.blocks)
+                        if (!b.speaker.empty()) label = b.speaker;
+                if (label.empty()) skipped.push_back(o.name + " (" + ac + ")");
+                else speakers[label] = ch->second;
+            } else if (type == "Objects") {
+                AdmScene::Object* obj = nullptr;
+                if (const auto e = objectOn.find(ch->second); e != objectOn.end()) obj = &out.objects[e->second];
+                if (!obj) {
+                    // (as many as an ADM master Montage writes holds)
+                    if (out.objects.size() >= 128) {
+                        tooMany = true;
+                        continue;
+                    }
+                    objectOn[ch->second] = out.objects.size();
+                    out.objects.push_back({o.name.empty() ? ac : o.name, ch->second, {}});
+                    obj = &out.objects.back();
+                }
+                const auto c = channels.find(ac);
+                if (c == channels.end()) continue;
+                for (const ParsedBlock& b : c->second.blocks) {
+                    AdmBlock nb;
+                    // (rtime from the object's start, lstart from the frame's; a block without one lasts the whole object)
+                    const int64_t from = b.rtime >= 0 ? (local ? b.rtime - progStart : o.start + b.rtime) : o.start;
+                    nb.from = std::max<int64_t>(0, from);
+                    nb.to = b.duration >= 0 ? nb.from + b.duration : std::max<int64_t>(nb.from, frameEnd >= 0 ? frameEnd : out.samples);
+                    nb.jump = b.jump;
+                    auto pos = [&](const char* k, double d) {
+                        const auto it = b.position.find(k);
+                        return it == b.position.end() ? d : it->second;
+                    };
+                    if (b.cartesian || b.position.count("X")) {
+                        nb.at = {std::clamp(pos("X", 0), -1.0, 1.0), std::clamp(pos("Y", 1), -1.0, 1.0), std::clamp(pos("Z", 0), -1.0, 1.0)};
+                    } else {
+                        // Polar: round the room by BS.2127's mapping, its elevation as height (30° and above overhead).
+                        const std::array<double, 2> xy = polarToCartesian(pos("azimuth", 0), std::clamp(pos("distance", 1), 0.0, 1.0));
+                        nb.at = {xy[0], xy[1], std::clamp(pos("elevation", 0) / 30.0, -1.0, 1.0)};
+                    }
+                    admAppendBlock(obj->blocks, nb);
+                }
+            } else {
+                skipped.push_back(o.name + " (" + type + ")");
+            }
+        }
+    }
+    if (warnings && tooMany && !frame) warnings->push_back("The ADM has more than 128 objects: the first 128 are read");
+    if (warnings && !skipped.empty() && !frame) {
+        std::string list;
+        for (const std::string& k : skipped) list += (list.empty() ? "" : ", ") + k;
+        warnings->push_back("Not read (Montage reads speakers and objects): " + list);
+    }
+
+    if (!speakers.empty() && out.bed.empty()) admSetBed(out, speakers, frame ? nullptr : warnings);
+    int most = -1;
+    for (int c : out.bed) most = std::max(most, c);
+    for (const AdmScene::Object& o : out.objects) most = std::max(most, o.channel);
+    out.channels = std::max(out.channels, most + 1);
+    int64_t end = std::max<int64_t>(0, frameEnd);
+    for (const AdmScene::Object& o : out.objects)
+        if (!o.blocks.empty()) end = std::max(end, o.blocks.back().to);
+    out.samples = std::max(out.samples, end);
+    if (out.bed.empty() && out.objects.empty()) return fail("The ADM's programme has no speakers or objects Montage reads");
+    return true;
+}
+
+void admSetBed(AdmScene& out, const std::map<std::string, int>& speakers, std::vector<std::string>* warnings) {
+    std::string best;
+    size_t bestHits = 0, bestSize = 0;
+    for (const std::string& l : audioLayouts()) {
+        if (ambisonicLayout(l)) continue;
+        const auto& sp = layoutSpeakers(l);
+        size_t hits = 0;
+        for (const Speaker& k : sp) hits += speakers.count(k.label);
+        if (hits > bestHits || (hits == bestHits && hits > 0 && sp.size() < bestSize)) best = l, bestHits = hits, bestSize = sp.size();
+    }
+    if (best.empty()) return;
+    out.layout = best;
+    out.bedPack = admBedPack(best);
+    out.bed.clear();
+    for (const Speaker& k : layoutSpeakers(best)) {
+        const auto it = speakers.find(k.label);
+        out.bed.push_back(it == speakers.end() ? -1 : it->second);
+    }
+    if (warnings && bestHits < speakers.size()) {
+        std::string list;
+        for (const auto& [label, c] : speakers)
+            if (std::none_of(layoutSpeakers(best).begin(), layoutSpeakers(best).end(), [&](const Speaker& k) { return label == k.label; }))
+                list += (list.empty() ? "" : ", ") + label;
+        warnings->push_back("Speakers not in " + best + ", not read: " + list);
+    }
+}
+
+void admAppendBlock(std::vector<AdmBlock>& bl, AdmBlock nb) {
+    auto same = [](const AdmPoint& a, const AdmPoint& b) { return std::fabs(a.x - b.x) < 1e-9 && std::fabs(a.y - b.y) < 1e-9 && std::fabs(a.z - b.z) < 1e-9; };
+    if (!bl.empty() && nb.from < bl.back().to) {
+        if (nb.to <= bl.back().to) return;  // (a frame repeating what an earlier one said)
+        nb.from = bl.back().to;
+    }
+    // (staying put: the block before ends where it is and was there all along, or jumped there)
+    if (!bl.empty() && !nb.jump && nb.from == bl.back().to && same(nb.at, bl.back().at) &&
+        (bl.size() < 2 || bl.back().jump || same(bl[bl.size() - 2].at, bl.back().at))) {
+        bl.back().to = nb.to;
+        return;
+    }
+    bl.push_back(nb);
+}
+
+SurroundPan admPanPosition(const AdmPoint& at) {
+    SurroundPan p;
+    p.width = 0;
+    p.z = std::clamp(at.z, 0.0, 1.0);
+    const double d = std::min(1.0, std::max(std::fabs(at.x), std::fabs(at.y)));
+    if (d < 1e-9) {
+        p.x = 0, p.y = 0;
+        return p;
+    }
+    const double u = at.x / d, v = at.y / d;  // on the square's edge
+    // The sector it is on (polarToCartesian's corners), how far along, and the angle that puts it there.
+    struct Corner {
+        double az, x, y;
+    };
+    static const Corner corners[5] = {{0, 0, 1}, {-30, 1, 1}, {-110, 1, -1}, {110, -1, -1}, {30, -1, 1}};
+    double az = 0;
+    for (int i = 0; i < 5; ++i) {
+        const Corner& left = corners[i];
+        const Corner& right = corners[(i + 1) % 5];
+        const double dx = right.x - left.x, dy = right.y - left.y;
+        const double t = std::fabs(dx) > std::fabs(dy) ? (u - left.x) / dx : (v - left.y) / dy;
+        if (t < -1e-9 || t > 1 + 1e-9 || std::fabs(left.x + dx * t - u) > 1e-6 || std::fabs(left.y + dy * t - v) > 1e-6) continue;
+        double rightAz = right.az, leftAz = left.az;
+        while (leftAz - 360 >= rightAz) leftAz -= 360;
+        while (leftAz < rightAz) leftAz += 360;
+        const double mid = (leftAz + rightAz) / 2, half = rightAz - mid;
+        const double w = std::tan(std::clamp(t, 0.0, 1.0) * M_PI / 2);
+        const double gainR = std::isinf(w) || w > 1e12 ? 1.0 : w / (1 + w);
+        az = mid + std::atan((2 * gainR - 1) * std::tan(half * M_PI / 180)) * 180 / M_PI;
+        break;
+    }
+    p.x = -std::sin(az * M_PI / 180) * d;
+    p.y = std::cos(az * M_PI / 180) * d;
+    return p;
+}
+
 struct ImmersiveMix::Impl {
     const Project* p = nullptr;
     std::string layout = "stereo";
@@ -288,33 +961,20 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
         if (error) *error = why;
         return false;
     };
-    ImmersiveMix mix;
-    std::string why;
-    if (!mix.open(p, s, kRate, &why)) return fail(why);
-    const std::string layout = mix.layout();
-    const int bedN = mix.bedChannels();
-    const std::vector<std::string> bedChannels = admBedChannels(layout);
-    if (std::any_of(bedChannels.begin(), bedChannels.end(), [](const std::string& c) { return c.empty(); }))
-        return fail("The sequence's speakers have no ADM names");
-    const std::vector<int>& objects = mix.objectTracks();
-    const int channels = bedN + int(objects.size());
-    if (channels > 128) return fail("An ADM master here holds up to 128 channels: the bed and at most " + std::to_string(128 - bedN) + " objects");
     FrameTime first = 0, end = s.duration();
     if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;
-    if (end <= first) return fail("The sequence is empty");
-    const double fps = s.fpsValue();
-    const int64_t firstSample = int64_t(std::llround(double(first) * kRate / fps));
-    const int64_t total = int64_t(std::llround(double(end - first) * kRate / fps));
-
+    AdmScene scene;
+    std::string why;
+    if (!admSceneOf(p, s, first, end, settings.title, scene, &why)) return fail(why);
+    ImmersiveMix mix;
+    if (!mix.open(p, s, kRate, &why)) return fail(why);
+    const int bedN = mix.bedChannels();
+    const std::vector<int>& objects = mix.objectTracks();
+    const int channels = scene.channels;
+    const int64_t firstSample = int64_t(std::llround(double(first) * kRate / s.fpsValue()));
+    const int64_t total = scene.samples;
     // Channel by channel: the bed's speakers, then one channel for each object.
-    std::vector<Channel> chans;
-    const std::string bedPack = admBedPack(layout);
-    for (int i = 0; i < bedN; ++i) chans.push_back({"", "AT_" + bedChannels[size_t(i)].substr(3) + "_01", bedPack});  // BS.2094's
-    for (size_t k = 0; k < objects.size(); ++k) {
-        const QString hex = QString::asprintf("%04X", unsigned(0x1001 + k));
-        chans.push_back({"", ("AT_0003" + hex + "_01").toStdString(), ("AP_0003" + hex).toStdString()});
-    }
-    for (size_t i = 0; i < chans.size(); ++i) chans[i].uid = QString::asprintf("ATU_%08X", unsigned(i + 1)).toStdString();
+    const std::vector<AdmTrack> chans = admTracks(scene);
 
     QFile f(QString::fromStdString(path));
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return fail("Cannot write " + path);
@@ -391,135 +1051,7 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
     if (dataBytes % 2) f.write(QByteArray(1, '\0'));  // chunks are word-aligned
 
     // The ADM: one programme of the bed (and the objects, if any).
-    QByteArray xml;
-    {
-        QXmlStreamWriter x(&xml);
-        x.setAutoFormatting(true);
-        x.writeStartDocument();
-        x.writeStartElement("ebuCoreMain");
-        x.writeDefaultNamespace("urn:ebu:metadata-schema:ebuCore_2017");
-        x.writeNamespace("http://purl.org/dc/elements/1.1/", "dc");
-        x.writeAttribute("schema", "EBU_CORE_20171102.xsd");
-        x.writeAttribute("xml:lang", "en");
-        x.writeStartElement("coreMetadata");
-        x.writeStartElement("format");
-        x.writeStartElement("audioFormatExtended");
-        x.writeAttribute("version", "ITU-R_BS.2076-2");
-        const QString title = QString::fromStdString(settings.title.empty() ? s.name : settings.title);
-        const QString duration = admTime(total);
-        x.writeStartElement("audioProgramme");
-        x.writeAttribute("audioProgrammeID", "APR_1001");
-        x.writeAttribute("audioProgrammeName", title);
-        x.writeAttribute("start", admTime(0));
-        x.writeAttribute("end", duration);
-        x.writeTextElement("audioContentIDRef", "ACO_1001");
-        if (!objects.empty()) x.writeTextElement("audioContentIDRef", "ACO_1002");
-        x.writeEndElement();
-        x.writeStartElement("audioContent");
-        x.writeAttribute("audioContentID", "ACO_1001");
-        x.writeAttribute("audioContentName", "Bed");
-        x.writeTextElement("audioObjectIDRef", "AO_1001");
-        x.writeEndElement();
-        if (!objects.empty()) {
-            x.writeStartElement("audioContent");
-            x.writeAttribute("audioContentID", "ACO_1002");
-            x.writeAttribute("audioContentName", "Objects");
-            for (size_t k = 0; k < objects.size(); ++k) x.writeTextElement("audioObjectIDRef", QString::asprintf("AO_%04X", unsigned(0x1002 + k)));
-            x.writeEndElement();
-        }
-        x.writeStartElement("audioObject");
-        x.writeAttribute("audioObjectID", "AO_1001");
-        x.writeAttribute("audioObjectName", "Bed");
-        x.writeAttribute("start", admTime(0));
-        x.writeAttribute("duration", duration);
-        x.writeTextElement("audioPackFormatIDRef", QString::fromStdString(bedPack));
-        for (int i = 0; i < bedN; ++i) x.writeTextElement("audioTrackUIDRef", QString::fromStdString(chans[size_t(i)].uid));
-        x.writeEndElement();
-        for (size_t k = 0; k < objects.size(); ++k) {
-            const Track& tr = s.audioTracks[size_t(objects[k])];
-            x.writeStartElement("audioObject");
-            x.writeAttribute("audioObjectID", QString::asprintf("AO_%04X", unsigned(0x1002 + k)));
-            x.writeAttribute("audioObjectName", QString::fromStdString(tr.name));
-            x.writeAttribute("start", admTime(0));
-            x.writeAttribute("duration", duration);
-            x.writeTextElement("audioPackFormatIDRef", QString::fromStdString(chans[size_t(bedN) + k].pack));
-            x.writeTextElement("audioTrackUIDRef", QString::fromStdString(chans[size_t(bedN) + k].uid));
-            x.writeEndElement();
-        }
-        if (bedPack == kOwnBedPack) {
-            x.writeStartElement("audioPackFormat");
-            x.writeAttribute("audioPackFormatID", kOwnBedPack);
-            x.writeAttribute("audioPackFormatName", "7.1.2");
-            x.writeAttribute("typeLabel", "0001");
-            x.writeAttribute("typeDefinition", "DirectSpeakers");
-            for (const std::string& c : bedChannels) x.writeTextElement("audioChannelFormatIDRef", QString::fromStdString(c));
-            x.writeEndElement();
-        }
-        for (size_t k = 0; k < objects.size(); ++k) {
-            const Track& tr = s.audioTracks[size_t(objects[k])];
-            const QString hex = QString::asprintf("%04X", unsigned(0x1001 + k)), name = QString::fromStdString(tr.name);
-            x.writeStartElement("audioPackFormat");
-            x.writeAttribute("audioPackFormatID", "AP_0003" + hex);
-            x.writeAttribute("audioPackFormatName", name);
-            x.writeAttribute("typeLabel", "0003");
-            x.writeAttribute("typeDefinition", "Objects");
-            x.writeTextElement("audioChannelFormatIDRef", "AC_0003" + hex);
-            x.writeEndElement();
-            x.writeStartElement("audioChannelFormat");
-            x.writeAttribute("audioChannelFormatID", "AC_0003" + hex);
-            x.writeAttribute("audioChannelFormatName", name);
-            x.writeAttribute("typeLabel", "0003");
-            x.writeAttribute("typeDefinition", "Objects");
-            const bool overhead = std::any_of(layoutSpeakers(layout).begin(), layoutSpeakers(layout).end(),
-                                              [](const Speaker& k) { return k.elevation > 0; });
-            const std::vector<Block> blocks = objectBlocks(tr, overhead, first, end, fps, total);
-            for (size_t b = 0; b < blocks.size(); ++b) {
-                const Block& bl = blocks[b];
-                x.writeStartElement("audioBlockFormat");
-                x.writeAttribute("audioBlockFormatID", "AB_0003" + hex + QString::asprintf("_%08X", unsigned(b + 1)));
-                x.writeAttribute("rtime", admTime(bl.from));
-                x.writeAttribute("duration", blocks.size() == 1 ? duration : admTime(bl.to - bl.from));
-                x.writeTextElement("cartesian", "1");
-                for (auto [coord, v] : {std::pair<const char*, double>{"X", bl.at.x}, {"Y", bl.at.y}, {"Z", bl.at.z}}) {
-                    x.writeStartElement("position");
-                    x.writeAttribute("coordinate", coord);
-                    x.writeCharacters(number(std::abs(v) < 5e-7 ? 0.0 : std::clamp(v, -1.0, 1.0)));
-                    x.writeEndElement();
-                }
-                x.writeEndElement();  // audioBlockFormat
-            }
-            x.writeEndElement();  // audioChannelFormat
-            x.writeStartElement("audioStreamFormat");
-            x.writeAttribute("audioStreamFormatID", "AS_0003" + hex);
-            x.writeAttribute("audioStreamFormatName", "PCM_" + name);
-            x.writeAttribute("formatLabel", "0001");
-            x.writeAttribute("formatDefinition", "PCM");
-            x.writeTextElement("audioChannelFormatIDRef", "AC_0003" + hex);
-            x.writeTextElement("audioTrackFormatIDRef", "AT_0003" + hex + "_01");
-            x.writeEndElement();
-            x.writeStartElement("audioTrackFormat");
-            x.writeAttribute("audioTrackFormatID", "AT_0003" + hex + "_01");
-            x.writeAttribute("audioTrackFormatName", "PCM_" + name);
-            x.writeAttribute("formatLabel", "0001");
-            x.writeAttribute("formatDefinition", "PCM");
-            x.writeTextElement("audioStreamFormatIDRef", "AS_0003" + hex);
-            x.writeEndElement();
-        }
-        for (const Channel& c : chans) {
-            x.writeStartElement("audioTrackUID");
-            x.writeAttribute("UID", QString::fromStdString(c.uid));
-            x.writeAttribute("sampleRate", QString::number(kRate));
-            x.writeAttribute("bitDepth", "24");
-            x.writeTextElement("audioTrackFormatIDRef", QString::fromStdString(c.trackFormat));
-            x.writeTextElement("audioPackFormatIDRef", QString::fromStdString(c.pack));
-            x.writeEndElement();
-        }
-        x.writeEndElement();  // audioFormatExtended
-        x.writeEndElement();  // format
-        x.writeEndElement();  // coreMetadata
-        x.writeEndElement();  // ebuCoreMain
-        x.writeEndDocument();
-    }
+    const QByteArray xml = QByteArray::fromStdString(admDocument(scene));
     QByteArray axml("axml");
     put32(axml, uint32_t(xml.size()));
     axml.append(xml);
@@ -563,7 +1095,7 @@ bool exportAdmBwf(const Project& p, const Sequence& s, const AdmSettings& settin
         result->bedChannels = bedN;
         result->objects = int(objects.size());
         result->samples = total;
-        result->bedPack = bedPack;
+        result->bedPack = scene.bedPack;
     }
     if (progress) progress(1.0);
     return true;

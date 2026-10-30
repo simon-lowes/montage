@@ -92,6 +92,12 @@ struct ImfSettings {
     // IABSequence in `language` beside the main audio. Not at every rate: IAB has 23.976, 24, 25, 29.97, 30, 48, 50,
     // 59.94, 60, 96, 100 and 120.
     bool immersive = false;
+    // Immersive sound as ADM, the same mix as an ADM master (render/Adm.h): S-ADM (SMPTE ST 2067-203, an
+    // MGASADMSignalSequence: Metadata-Guided Audio frames, each with its S-ADM frame) and an ADM audio track file
+    // (ST 2067-204, an ADMAudioSequence: the sound with its axml and chna chunks), each in `language` beside the main
+    // audio (and IAB, when asked for too).
+    bool sadm = false;
+    bool adm = false;
 };
 
 struct ImfResult {
@@ -112,6 +118,8 @@ struct ImfResult {
     std::string amf;              // ... and the ACES Metadata File, when there are target frames
     bool immersive = false;       // an IABSequence: its bed channels and objects
     int iabBedChannels = 0, iabObjects = 0;
+    bool sadm = false, adm = false;  // an MGASADMSignalSequence, an ADMAudioSequence: the ADM's bed channels and objects
+    int admBedChannels = 0, admObjects = 0;
 };
 
 // A composition playlist as read back: its virtual tracks (each Resource with the track file it plays), and what the

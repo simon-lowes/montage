@@ -10837,7 +10837,9 @@ void McpServer::Impl::addTools() {
             "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
-            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"}},
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
+            "sadm":{"type":"boolean","default":false,"description":"Immersive sound as S-ADM: the same beds and objects as a Metadata-Guided Audio track file with an S-ADM frame each edit unit (ITU-R BS.2125), an MGASADMSignalSequence (ST 2067-203)"},
+            "adm":{"type":"boolean","default":false,"description":"Immersive sound as ADM: the same beds and objects as an ADM audio track file, the sound with its axml and chna (ST 2067-204, ST 2131), an ADMAudioSequence"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -10886,6 +10888,8 @@ void McpServer::Impl::addTools() {
             st.application = a.value("application").toInt(2);
             st.graded = a.value("graded").toBool(true);
             st.immersive = a.value("iab").toBool();
+            st.sadm = a.value("sadm").toBool();
+            st.adm = a.value("adm").toBool();
             for (const QJsonValue& v : a.value("target_frames").toArray()) {
                 if (!v.isDouble() || v.toDouble() != std::floor(v.toDouble()) || v.toDouble() < 0)
                     throw ArgError{QStringLiteral("target_frames are whole frame numbers")};
@@ -10909,6 +10913,8 @@ void McpServer::Impl::addTools() {
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
             if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
+            if (r.sadm || r.adm)
+                out["adm"] = QJsonObject{{"bed_channels", r.admBedChannels}, {"objects", r.admObjects}, {"sadm", r.sadm}, {"adm", r.adm}};
             if (r.application == 5) {
                 out["output_transform"] = QString::fromStdString(r.outputTransform);
                 out["target_frames"] = r.targetFrames;

@@ -97,6 +97,7 @@ QJsonValue surroundToJson(const SurroundPan& p) {
     QJsonObject o{{"x", p.x}, {"y", p.y}, {"width", p.width}, {"lfeDb", p.lfeDb}};
     if (p.z != 0) o["z"] = p.z;
     if (p.object) o["object"] = true;
+    if (p.lfeOnly) o["lfeOnly"] = true;
     return o;
 }
 
@@ -109,6 +110,7 @@ SurroundPan surroundFromJson(const QJsonValue& v) {
     p.lfeDb = std::clamp(o.value("lfeDb").toDouble(-100), -100.0, 12.0);
     p.z = std::clamp(o.value("z").toDouble(0), 0.0, 1.0);
     p.object = o.value("object").toBool();
+    p.lfeOnly = o.value("lfeOnly").toBool();
     return p;
 }
 

@@ -4395,7 +4395,15 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             }
             if (postSends)
                 for (size_t i = 0; i < size_t(frames) * 2; ++i) postBuf[i] = trackBuf[i] * tg;
-            if (lfeOnly) {
+            if (track.surround.lfeOnly && !lfeOnly && !upmix) {
+                // (an LFE channel: its sound to the LFE alone, at its send's level)
+                if (lfeCh >= 0 && track.surround.lfeDb > -99) {
+                    const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
+                    for (int i = 0; i < frames; ++i)
+                        master[size_t(i) * size_t(nch) + size_t(lfeCh)] +=
+                            0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+                }
+            } else if (lfeOnly) {
                 if (lfeSend) {
                     const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
                     for (int i = 0; i < frames; ++i)
@@ -4436,7 +4444,9 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             for (int i = 0; i < frames; ++i) {
                 if (panAuto && i % 64 == 0) panGains(trackPanAt(track, double(heard + i) * fps / sr), tl, tr);
                 float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
-                if (!lfeOnly && !upmix) {  // (an object in a bed without speakers to pan to: only its sends; upmixed, its field)
+                // (an object in a bed without speakers to pan to: only its sends; upmixed, its field; an LFE channel in
+                // stereo: nothing, as a fold-down leaves the LFE out)
+                if (!lfeOnly && !upmix && !(track.surround.lfeOnly && bus == busBufs.end())) {
                     dest[i * 2] += l;
                     dest[i * 2 + 1] += r;
                 }
