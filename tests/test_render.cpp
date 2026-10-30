@@ -13317,6 +13317,13 @@ colorspaces:
         Project received = p;
         keepLocalMedia(local, received);
         QVERIFY(received.media[0].path == "/client/footage/shot0.mov" && received.media[1].path == p.media[1].path);
+        // An unrelated item that shares an id is not taken for it, and a network share of the colourist's is not opened.
+        local.media[1].width = p.media[1].width + 2;
+        local.media[1].path = "/client/footage/other.mov";
+        received = p;
+        received.media[1].path = "\\\\server\\share\\shot1.mov";
+        keepLocalMedia(local, received);
+        QVERIFY(received.media[0].path == "/client/footage/shot0.mov" && received.media[1].path.empty());
         // A frame showing media the client lacks comes from the stream.
         auto lacks = [&](Id m) { return m == media[1]; };
         QVERIFY(!needsStream(p, p.sequences[0], 10, lacks));
@@ -13464,6 +13471,16 @@ colorspaces:
         }, 10000));
         QVERIFY(notes[0].text == "Warmer skin here" && notes[0].author == "Client" && notes[0].frame == 12 && notes[0].sequence == seq.id);
         QVERIFY(pointers[0].x == 0.25 && pointers[0].y == 0.75 && pointers[0].author == "Client");
+        // A flood of notes is cut to a few a second, and a drawing too large to keep is left off its note.
+        note.drawing = "[" + std::string(300 << 10, ' ') + "]";
+        client.sendNote(note);
+        note.drawing.clear();
+        for (int i = 0; i < 199; ++i) client.sendNote(note);
+        notes.clear();
+        QTest::qWait(1500);
+        for (auto& n : host.takeNotes()) notes.push_back(n);
+        QVERIFY2(!notes.empty() && notes.size() <= 40, QByteArray::number(int(notes.size())).constData());
+        QVERIFY(notes[0].drawing.empty() && notes[0].text == "Warmer skin here");
 
         // Drift: a copy that differs is found by the next check and sent whole again.
         client.damageForTest();

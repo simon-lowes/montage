@@ -242,8 +242,11 @@ const ColorSpace* findColorSpace(const std::string& id) {
     for (const auto& c : colorSpaces())
         if (c.id == id) return &c;
     if (id.size() > 8 && id.compare(id.size() - 8, 8, "+display") == 0) {
-        const ColorSpace* base = findColorSpace(id.substr(0, id.size() - 8));
-        return base && base->sceneReferred ? &displayLightOf(*base) : nullptr;
+        // (one "+display" on a listed space only, so a crafted id can't recurse)
+        const std::string baseId = id.substr(0, id.size() - 8);
+        for (const auto& c : colorSpaces())
+            if (c.id == baseId) return c.sceneReferred ? &displayLightOf(c) : nullptr;
+        return nullptr;
     }
     // (an SDR space with a tone mapping)
     const size_t plus = id.find('+');

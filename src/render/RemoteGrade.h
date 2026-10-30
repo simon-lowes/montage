@@ -132,7 +132,8 @@ bool applyJsonPatch(const std::string& doc, const std::string& patch, std::strin
 // SHA-256 of a JSON document as compact text (keys in order), in hex.
 std::string jsonHash(const std::string& json);
 
-// The client's own media in place of the colourist's: each media item it also has (by id) keeps its files.
+// The client's own media in place of the colourist's: each media item it also has (by id, of the same kind, size and
+// length) keeps its files; the colourist's network-share paths are not kept.
 void keepLocalMedia(const Project& local, Project& received);
 // Whether frame `t` of `s` shows a picture from media the client lacks (`missing`), which then comes from the stream.
 bool needsStream(const Project& p, const Sequence& s, FrameTime t, const std::function<bool(Id media)>& missing);

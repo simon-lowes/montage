@@ -280,7 +280,8 @@ void applyElasticWarp(const AudioBuffer& in, const DialogueWarp& warp, ElasticMo
             const double w = dialogueWarpAt(warp, u);
             const double slope = (dialogueWarpAt(warp, u + 0.5 / rate) - dialogueWarpAt(warp, u - 0.5 / rate)) * rate;
             const double at = w * rate + double(off);
-            for (size_t c = 0; c < nch; ++c) out.samples[size_t(g + off) * nch + c] = float(sincRead(in, int(c), at, std::max(1.0, slope)));
+            const double narrow = std::min(std::max(1.0, slope), 64.0);  // (taps bounded however steep a marker makes it)
+            for (size_t c = 0; c < nch; ++c) out.samples[size_t(g + off) * nch + c] = float(sincRead(in, int(c), at, narrow));
         }
         return;
     }
@@ -754,21 +755,12 @@ void applyPitchEdits(const AudioBuffer& in, const std::vector<PitchEdit>& edits,
         if (!merged.empty() && r.first <= merged.back().second) merged.back().second = std::max(merged.back().second, r.second);
         else merged.push_back(r);
     }
-    for (auto [ra, rb] : merged) {
-        if (cancel && cancel->load()) return;
-        ra = std::max(0.0, ra);
-        const double reach = std::min(double(n) / rate, rb + 1.0);
-        PitchTrack own;
-        const PitchTrack& track = given ? *given : (own = trackPitch(in, ra - 0.05, reach + 0.05, 50, 800, cancel));
-        if (track.f0.empty()) continue;
-        for (double t = rb; t < reach; t += track.hop)
-            if (track.at(t) <= 0) {
-                rb = t;
-                break;
-            }
-        rb = std::min(rb, reach);
-        const int64_t a = int64_t(std::floor(ra * rate)), b = std::min<int64_t>(n, int64_t(std::ceil(rb * rate)));
-        if (b - a < 64) continue;
+    // (each remade a minute or so at a time, split where the voice stops, so tracking and grains stay small
+    // however long the edit: the pieces meet with 5 ms fades where nothing is changed)
+    constexpr double kPiece = 60;
+    // (`startTs`, when given, is where the grains go on from the piece before, so the two agree where they meet; the
+    // grain at or after `carryFrom` is passed on in `carry`)
+    auto remake = [&](const PitchTrack& track, int64_t a, int64_t b, double startTs, double carryFrom, double* carry) -> bool {
         const std::vector<double> target = editedPitch(track, active);
         auto targetAt = [&](double t) {
             const double i = (t - track.start) / track.hop;
@@ -778,7 +770,7 @@ void applyPitchEdits(const AudioBuffer& in, const std::vector<PitchEdit>& edits,
             return target[k] > 0 && target[k + 1] > 0 ? target[k] + (target[k + 1] - target[k]) * (i - double(k)) : target[k];
         };
         const std::vector<Mark> marks = pitchMarks(in, track, rate, a, b);
-        if (marks.size() < 3) continue;
+        if (marks.size() < 3) return true;
         // TD-PSOLA: synthesis marks at the new period, each taking the grain of the nearest analysis mark (its two
         // half-periods, half-Hann each side), resampled for a formant shift; with nothing changed the grains add up
         // to the original exactly.
@@ -789,10 +781,11 @@ void applyPitchEdits(const AudioBuffer& in, const std::vector<PitchEdit>& edits,
             auto get = [&](int64_t i) { return i >= 0 && i < n ? double(in.samples[size_t(i) * nch + c]) : 0.0; };
             return get(k) * (1 - fr) + get(k + 1) * fr;
         };
-        double ts = double(marks.front().at);
+        double ts = startTs > 0 ? startTs : double(marks.front().at);
         size_t j = 0;
         while (ts < double(b)) {
-            if (cancel && cancel->load()) return;
+            if (cancel && cancel->load()) return false;
+            if (carry && *carry < 0 && ts >= carryFrom) *carry = ts;
             while (j + 1 < marks.size() && std::fabs(double(marks[j + 1].at) - ts) <= std::fabs(double(marks[j].at) - ts)) ++j;
             const Mark& m = marks[j];
             const double L = double(j > 0 ? m.at - marks[j - 1].at : (j + 1 < marks.size() ? marks[j + 1].at - m.at : 0));
@@ -839,6 +832,35 @@ void applyPitchEdits(const AudioBuffer& in, const std::vector<PitchEdit>& edits,
                 float& dst = out.samples[size_t(o) * nch + c];
                 dst = float(dst * (1 - edge) + acc[oi * nch + c] / norm * edge);
             }
+        }
+        return true;
+    };
+    for (auto [ra, rb] : merged) {
+        ra = std::max(0.0, ra);
+        double startTs = -1;
+        while (ra < rb) {
+            if (cancel && cancel->load()) return;
+            const double pieceEnd = std::min(rb, ra + kPiece);
+            const bool last = pieceEnd >= rb;
+            const double reach = std::min(double(n) / rate, pieceEnd + 1.0);
+            PitchTrack own;
+            const PitchTrack& track = given ? *given : (own = trackPitch(in, ra - 0.05, reach + 0.05, 50, 800, cancel));
+            if (track.f0.empty()) break;
+            double end = pieceEnd;
+            for (double t = pieceEnd; t < reach; t += track.hop)
+                if (track.at(t) <= 0) {
+                    end = t;
+                    break;
+                }
+            // (a piece before another runs 30 ms on, written to 10 ms past `end`; the next starts 50 ms back, written from
+            // `end`, its grains going on from the first's, and fades in over the first's output)
+            const double bEnd = last ? end : end + 0.03;
+            const int64_t a = int64_t(std::floor(ra * rate)), b = std::min<int64_t>(n, int64_t(std::ceil(bEnd * rate)));
+            double carry = -1;
+            if (b - a >= 64 && !remake(track, a, b, startTs, (end - 0.03) * rate, last ? nullptr : &carry)) return;
+            if (last || end >= double(n) / rate) break;
+            ra = end - 0.05;
+            startTs = carry;
         }
     }
 }
@@ -1060,13 +1082,16 @@ Result enableElasticAudio(Project& p, Sequence& s, const std::vector<Id>& ids, E
         if (const std::string why = warpable(p, s, *c); !why.empty()) return Result::fail(why);
         if (trackLocked(s, id)) return Result::fail("The clip's track is locked");
     }
-    // The group's time: an existing group's (its first member found), else the first clip's own source time.
+    // The group's time: an existing group's (the first member found with markers, else the first found), else the
+    // first clip's own source time. Two groups each with markers of their own are not merged: one set would be lost.
     const Clip* leader = nullptr;
     for (Id id : all)
-        if (const Clip* c = clipById(s, id); elasticEffectOf(*c)) {
-            leader = c;
-            break;
-        }
+        if (const Clip* c = clipById(s, id); elasticEffectOf(*c) && (!leader || (pointsOf(*leader).empty() && !pointsOf(*c).empty()))) leader = c;
+    if (leader)
+        for (Id id : all)
+            if (const Clip* c = clipById(s, id); elasticEffectOf(*c) && groupOf(*c) != groupOf(*leader) && !pointsOf(*c).empty() &&
+                                                 pointsOf(*c) != pointsOf(*leader))
+                return Result::fail("The clips are warped in two groups, each with its own markers: take elastic audio off one first");
     const bool fresh = !leader;
     if (!leader) leader = clipById(s, all.front());
     const double leaderOffset = elasticOffsetOf(*leader);

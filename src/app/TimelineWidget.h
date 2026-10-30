@@ -139,6 +139,8 @@ public:
     const std::vector<IntelligibilitySpan>& loudnessLane() const { return loudnessLane_; }
     // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
     QRect lineBand(montage::Id clip) const;
+    // Where a caption is drawn on its lane (widget coordinates), for tests; empty if there is no such caption.
+    QRect captionRect(montage::Id track, int index) const;
     int lineY(montage::Id clip, montage::FrameTime local) const;
 
 signals:

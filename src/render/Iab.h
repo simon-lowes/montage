@@ -26,9 +26,10 @@ namespace montage::iab {
 // IAFrame rate codes (ST 2098-2 Table 18): 24, 25, 30, 48, 50, 60, 96, 100, 120, 23.976, 29.97, 59.94.
 int rateCode(uint32_t num, uint32_t den);  // -1: IAB has no such rate
 void rateOf(int code, uint32_t& num, uint32_t& den);
-// Samples at 48 kHz in a frame: at 29.97 and 59.94 a cadence of five (`frameIndex` 0..4, the FrameSequence's).
+// Samples at 48 kHz in a frame (`frameIndex`, a FrameSequence's, changes none of the rates ST 2098-2:2022 defines;
+// 29.97 and 59.94 are reserved there).
 int frameSamples(int code, int frameIndex = 0);
-bool sequenced(int code);  // 29.97 and 59.94, which carry a FrameSequence
+bool sequenced(int code);  // none of the defined rates carries a FrameSequence
 int panSubBlocks(int code);
 // Where pan sub-block `sb` starts, in samples into its frame.
 int panSubBlockStart(int code, int frameIndex, int sb);

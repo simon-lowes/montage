@@ -918,11 +918,29 @@ QPainterPath pathData(const QString& d) {
     QPainterPath q;
     // Tokens: commands and numbers (flags may run together, as "a10 10 0 01 5 5").
     std::vector<std::pair<QChar, std::vector<double>>> cmds;
-    static const QRegularExpression tok(QStringLiteral(R"([MmZzLlHhVvCcSsQqTtAa]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"));
-    for (auto m = tok.globalMatch(d); m.hasNext();) {
-        const QString t = m.next().captured();
-        if (t[0].isLetter()) cmds.push_back({t[0], {}});
-        else if (!cmds.empty()) cmds.back().second.push_back(t.toDouble());
+    static const QRegularExpression number(QStringLiteral(R"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"));
+    static const QString letters = QStringLiteral("MmZzLlHhVvCcSsQqTtAa");
+    for (qsizetype at = 0; at < d.size();) {
+        const QChar ch = d[at];
+        if (letters.contains(ch)) {
+            cmds.push_back({ch, {}});
+            ++at;
+            continue;
+        }
+        // (an arc's two flags are a digit each, whatever follows)
+        if (!cmds.empty() && cmds.back().first.toUpper() == 'A' && (ch == '0' || ch == '1') &&
+            (cmds.back().second.size() % 7 == 3 || cmds.back().second.size() % 7 == 4)) {
+            cmds.back().second.push_back(ch == '1' ? 1 : 0);
+            ++at;
+            continue;
+        }
+        const QRegularExpressionMatch m = number.match(d, at, QRegularExpression::NormalMatch, QRegularExpression::AnchorAtOffsetMatchOption);
+        if (!m.hasMatch()) {
+            ++at;
+            continue;
+        }
+        if (!cmds.empty()) cmds.back().second.push_back(m.captured().toDouble());
+        at = m.capturedEnd();
     }
     QPointF cur, start, lastCtrl;
     QChar prev;
@@ -1133,7 +1151,7 @@ public:
         // (each element a group, so no deeper than a layer's groups are drawn; and only so much of it, as <use> can
         // copy copies)
         if (depth >= kShapeDepth) return note("Elements nested more than " + std::to_string(kShapeDepth) + " deep (left out)");
-        if (++elements_ > 200000) {
+        if (++elements_ > 50000) {
             tooBig_ = true;
             return;
         }
@@ -1230,7 +1248,7 @@ public:
             if (q.isEmpty()) return;
             // Its subpaths as paths, then its stroke above its fill (as SVG paints them).
             for (const BPath& b : fromPainterPathKeepingOpen(q)) {
-                if ((points_ += double(b.v.size())) > 4e6) {
+                if ((points_ += double(b.v.size())) > 1e5) {  // (each point is six parameters, copied with each undo step)
                     tooBig_ = true;
                     return;
                 }
@@ -1340,7 +1358,7 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
     Style none;
     im.element(root, none, items, 0);
     if (im.tooBig_) {
-        if (error) *error = file + " is too large to make into shapes (over 200,000 elements or 4 million points)";
+        if (error) *error = file + " is too large to make into shapes (over 50,000 elements or 100,000 points)";
         return false;
     }
     if (items.empty()) {

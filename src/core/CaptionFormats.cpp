@@ -157,6 +157,69 @@ std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, c
     return out;
 }
 
+std::string captionsToEbuTtD(const std::vector<Caption>& captions, Rational fps, const std::string& language, const CaptionStyle& style) {
+    const double f = frameRate(fps, 30);
+    char colour[16], box[16];
+    std::snprintf(colour, sizeof colour, "#%02x%02x%02x", byte01(style.textR), byte01(style.textG), byte01(style.textB));
+    std::snprintf(box, sizeof box, "#%02x%02x%02x%02x", byte01(style.boxR), byte01(style.boxG), byte01(style.boxB),
+                  byte01(style.boxOpacity));
+    const int fontSize = std::clamp(int(std::lround(style.size * 15 * 100)), 20, 300);
+    const int bottom = std::clamp(int(std::lround(style.position * 100)), 20, 100);
+    // Each colour a caption has of its own, as a style (EBU-TT-D styles text only by reference).
+    std::map<std::string, std::string> colours;  // #rrggbb: style id
+    for (const Caption& c : captions)
+        if (int r, g, b; captionColour(c, r, g, b)) {
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "%02x%02x%02x", r, g, b);
+            colours.emplace(std::string("#") + hex, std::string("colour") + hex);
+        }
+    std::string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    out += "<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:ttp=\"http://www.w3.org/ns/ttml#parameter\" "
+           "xmlns:tts=\"http://www.w3.org/ns/ttml#styling\" xmlns:ttm=\"http://www.w3.org/ns/ttml#metadata\" "
+           "xmlns:ebuttm=\"urn:ebu:tt:metadata\" xmlns:ebutts=\"urn:ebu:tt:style\" "
+           "ttp:timeBase=\"media\" ttp:cellResolution=\"32 15\" xml:lang=\"" +
+           xmlEscape(language.empty() ? "en" : language) + "\">\n";
+    out += "  <head>\n    <metadata>\n      <ebuttm:documentMetadata>\n"
+           "        <ebuttm:conformsToStandard>urn:ebu:tt:distribution:2018-04</ebuttm:conformsToStandard>\n"
+           "      </ebuttm:documentMetadata>\n    </metadata>\n";
+    out += "    <styling>\n";
+    out += "      <style xml:id=\"paragraph\" tts:fontFamily=\"proportionalSansSerif\" tts:fontSize=\"" + std::to_string(fontSize) +
+           "%\" tts:lineHeight=\"125%\" tts:textAlign=\"center\" ebutts:linePadding=\"0.5c\"/>\n";
+    out += std::string("      <style xml:id=\"text\" tts:color=\"") + colour + "\"" +
+           (style.boxOpacity > 0 ? std::string(" tts:backgroundColor=\"") + box + "\"" : std::string()) +
+           (style.bold ? " tts:fontWeight=\"bold\"" : "") + "/>\n";
+    out += "      <style xml:id=\"left\" tts:textAlign=\"left\"/>\n      <style xml:id=\"right\" tts:textAlign=\"right\"/>\n";
+    out += "      <style xml:id=\"italic\" tts:fontStyle=\"italic\"/>\n";
+    for (const auto& [hex, id] : colours) out += "      <style xml:id=\"" + id + "\" tts:color=\"" + hex + "\"/>\n";
+    out += "    </styling>\n    <layout>\n";
+    out += "      <region xml:id=\"bottom\" tts:origin=\"10% 10%\" tts:extent=\"80% " + std::to_string(bottom - 10) +
+           "%\" tts:displayAlign=\"after\"/>\n";
+    out += "      <region xml:id=\"top\" tts:origin=\"10% " + std::to_string(100 - bottom) + "%\" tts:extent=\"80% " +
+           std::to_string(bottom - 10) + "%\" tts:displayAlign=\"before\"/>\n";
+    out += "      <region xml:id=\"middle\" tts:origin=\"10% 10%\" tts:extent=\"80% 80%\" tts:displayAlign=\"center\"/>\n";
+    out += "    </layout>\n  </head>\n  <body>\n    <div>\n";
+    int n = 0;
+    for (const Caption& c : captions) {
+        const QStringList lines = captionLines(c.text);
+        if (lines.isEmpty() || c.end <= c.start) continue;
+        std::string body;
+        for (int i = 0; i < lines.size(); ++i) body += (i ? "<br/>" : "") + xmlEscape(lines[i].toStdString());
+        const char* region = c.vertical == kCaptionTop ? "top" : c.vertical == kCaptionMiddle ? "middle" : "bottom";
+        const char* align = c.align == kCaptionLeft ? " left" : c.align == kCaptionRight ? " right" : "";
+        std::string spanStyle = c.italic ? "text italic" : "text";
+        if (int r, g, b; captionColour(c, r, g, b)) {
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "#%02x%02x%02x", r, g, b);
+            spanStyle += " " + colours[hex];
+        }
+        out += "      <p xml:id=\"sub" + std::to_string(++n) + "\" begin=\"" + ttmlClock(double(c.start) / f) + "\" end=\"" +
+               ttmlClock(double(c.end) / f) + "\" region=\"" + region + "\" style=\"paragraph" + align + "\"><span style=\"" + spanStyle +
+               "\">" + body + "</span></p>\n";
+    }
+    out += "    </div>\n  </body>\n</tt>\n";
+    return out;
+}
+
 bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error) {
     const double f = frameRate(fps, 30);
     QXmlStreamReader x(QByteArray(text.data(), qsizetype(text.size())));
@@ -168,6 +231,7 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
         QString region;  // the region its content goes to (inherited)
         int align;       // its text alignment (inherited), -1 if none was given
         bool italic;     // in italics (inherited)
+        QString colour;  // its text's colour, "#rrggbb" (inherited), "" if none was given
     };
     std::vector<Span> stack;
     bool inP = false;
@@ -178,6 +242,15 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
     // Where each region puts text (the third of the frame it lands in) and each style's alignment.
     std::map<QString, int> regionPlace, regionAlign, styleAlign;
     std::map<QString, bool> styleItalic;
+    std::map<QString, QString> styleColour;
+    QString pColour;  // the colour of the paragraph's first text
+    // (#rgb, #rrggbb or #rrggbbaa as #rrggbb; "" for anything else)
+    auto hexColour = [](const QString& v) -> QString {
+        QString t = v.trimmed().toLower();
+        if (!t.startsWith('#')) return {};
+        if (t.size() == 4) t = QStringLiteral("#") + t[1] + t[1] + t[2] + t[2] + t[3] + t[3];
+        return t.size() == 7 || t.size() == 9 ? t.left(7) : QString();
+    };
     auto alignOf = [](const QString& v) {
         if (v == QStringLiteral("left") || v == QStringLiteral("start")) return int(kCaptionLeft);
         if (v == QStringLiteral("right") || v == QStringLiteral("end")) return int(kCaptionRight);
@@ -228,14 +301,18 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
             } else if (name == QStringLiteral("style") && !id.isEmpty()) {
                 if (const int al = alignOf(attr(a, "textAlign")); al >= 0) styleAlign[id] = al;
                 if (const QString v = attr(a, "fontStyle"); !v.isEmpty()) styleItalic[id] = v == QStringLiteral("italic") || v == QStringLiteral("oblique");
+                if (const QString v = hexColour(attr(a, "color")); !v.isEmpty()) styleColour[id] = v;
             }
             Span span{begin, end, stack.empty() ? QString() : stack.back().region, stack.empty() ? -1 : stack.back().align,
-                      !stack.empty() && stack.back().italic};
+                      !stack.empty() && stack.back().italic, stack.empty() ? QString() : stack.back().colour};
             if (const QString r = attr(a, "region"); !r.isEmpty()) span.region = r;
             for (const QString& st : attr(a, "style").split(' ', Qt::SkipEmptyParts)) {
                 if (auto it = styleAlign.find(st); it != styleAlign.end()) span.align = it->second;
                 if (auto it = styleItalic.find(st); it != styleItalic.end()) span.italic = it->second;
+                if (auto it = styleColour.find(st); it != styleColour.end()) span.colour = it->second;
             }
+            if (const QString v = hexColour(attr(a, "color")); !v.isEmpty() && name != QStringLiteral("style") && name != QStringLiteral("region"))
+                span.colour = v;
             if (const int al = alignOf(attr(a, "textAlign")); al >= 0) span.align = al;
             if (const QString v = attr(a, "fontStyle"); !v.isEmpty()) span.italic = v == QStringLiteral("italic") || v == QStringLiteral("oblique");
             stack.push_back(span);
@@ -243,6 +320,7 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
                 inP = true;
                 buf.clear();
                 italicText = uprightText = 0;
+                pColour.clear();
                 pBegin = begin;
                 pEnd = end;
                 placed = {};
@@ -259,6 +337,7 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
             t.replace('\n', ' ').replace('\t', ' ').replace('\r', ' ');
             buf += t;
             (!stack.empty() && stack.back().italic ? italicText : uprightText) += int(t.trimmed().size());
+            if (pColour.isEmpty() && !t.trimmed().isEmpty() && !stack.empty()) pColour = stack.back().colour;
         } else if (x.isEndElement()) {
             if (!stack.empty()) stack.pop_back();
             if (local(x.qualifiedName()) == QStringLiteral("p") && inP) {
@@ -272,11 +351,25 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
                     c.end = toFrames(pEnd, f);
                     c.text = lines.join('\n').toStdString();
                     c.italic = italicText > 0 && uprightText == 0;
+                    c.colour = pColour.toStdString();
                     caps.push_back(std::move(c));
                 }
             }
         }
     }
+    // A caption's own colour is one other than the track's: the colour of the text style Montage writes (TTML's
+    // "caption", EBU-TT-D's "text"), else the one most captions have.
+    std::string usual;
+    if (auto it = styleColour.find(QStringLiteral("text")); it != styleColour.end()) usual = it->second.toStdString();
+    else if (auto at = styleColour.find(QStringLiteral("caption")); at != styleColour.end()) usual = at->second.toStdString();
+    else {
+        std::map<std::string, int> uses;
+        for (const Caption& c : caps) ++uses[c.colour];
+        for (const auto& [colourOf, n] : uses)
+            if (n > uses[usual] || (n == uses[usual] && colourOf < usual)) usual = colourOf;
+    }
+    for (Caption& c : caps)
+        if (c.colour == usual) c.colour.clear();
     normalizeCaptions(caps);
     if (caps.empty()) {
         if (error)
@@ -961,6 +1054,7 @@ std::string formatOf(std::string ext) {
     if (ext == "xml" || ext == "dfxp" || ext == "imsc" || ext == "ttml") return "ttml";
     if (ext == "ssa" || ext == "ass") return "ass";
     if (ext == "srt" || ext == "vtt" || ext == "scc" || ext == "stl" || ext == "mcc") return ext;
+    if (ext == "ebu-tt-d" || ext == "ebuttd") return "ebuttd";
     return {};
 }
 }  // namespace
@@ -974,6 +1068,7 @@ std::string exportCaptions(const CaptionTrack& track, const Sequence& seq, const
     if (f == "scc") return captionsToScc(track.captions, seq.fps);
     if (f == "mcc") return captionsToMcc(track.captions, seq.fps, track.style);
     if (f == "ttml") return captionsToTtml(track.captions, seq.fps, track.language, track.style);
+    if (f == "ebuttd") return captionsToEbuTtD(track.captions, seq.fps, track.language, track.style);
     if (f == "stl") return captionsToStl(track.captions, seq.fps, track.language, seq.name);
     if (f == "ass") return captionsToAss(track.captions, seq.fps, track.style, seq.width, seq.height);
     return {};

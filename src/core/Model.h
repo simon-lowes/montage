@@ -265,6 +265,7 @@ struct Marker {
     std::string comment;
     int color = 0;
     bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
+    bool shotChange = false;  // a shot change scene detection found inside a clip (core/CaptionTools.h: captions keep clear of it)
     std::string drawing;   // a reviewer's drawing over the frame (core/ReviewPage.h): strokes as JSON, in 0..1 of the picture
     FrameTime drawnAt = -1;  // the frame it was drawn on, when the marker had to sit elsewhere (-1: t)
     std::string reviewId;  // the review note it came from (the notes imported again bring it up to date)

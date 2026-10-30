@@ -46,6 +46,7 @@ public:
     // Subtitle pictures (.sup, .idx, Matroska, MPEG-TS, IMSC Image) are read by OCR (render/ImageSubtitles.h), and
     // written as pictures by extension, or as `pictures` says ("pgs", "dvb", "vobsub", "imsc_image").
     bool importFile(const QString& path, QString* error = nullptr);
+    // `format` "ebu-tt-d" writes EBU-TT-D (whatever the extension).
     bool exportFile(const QString& path, QString* error = nullptr, const QString& pictures = {}) const;
     // The words the last subtitles read from pictures were unsure of.
     const std::vector<OcrReview>& lastReview() const { return lastReview_; }
@@ -79,6 +80,8 @@ public:
     CaptionLimits limits() const;
     void setLimits(const CaptionLimits& limits);
     std::vector<unsigned> issues() const;
+    // The sequence's shot changes the check and Fix Timing keep captions clear of (none when the limits do not).
+    std::vector<FrameTime> shotChanges() const;
     std::vector<size_t> selectedCaptions() const;
     // Each one undo step on the current track: Fix Timing (how many changed), shifting the selected captions (or
     // all), syncing so the first and last of the selection (or the track) start at `first` and `last`, and find and
@@ -100,6 +103,10 @@ public:
     QStringList savedLooks() const;
     bool applyLook(const QString& idOrName);
     bool saveLook(const QString& name);
+
+signals:
+    // Detect Shot Changes was chosen: scene detection on the programme, its cuts as shot-change markers.
+    void detectShotChangesWanted();
 
 public slots:
     void generateDialog();

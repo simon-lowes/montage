@@ -97,6 +97,7 @@ struct Locator {
         cell = std::max(1.0, std::sqrt((x1 - x0) * (y1 - y0) / double(mesh.tris.size())) * 2);
         gw = std::clamp(int((x1 - x0) / cell) + 1, 1, 4096), gh = std::clamp(int((y1 - y0) / cell) + 1, 1, 4096);
         cells.assign(size_t(gw) * size_t(gh), {});
+        size_t entries = 0;  // (a mesh of triangles each across the whole grid is not looked through)
         for (size_t t = 0; t < mesh.tris.size(); ++t) {
             double a0 = 1e300, b0 = 1e300, a1 = -1e300, b1 = -1e300;
             for (int k : mesh.tris[t]) {
@@ -104,8 +105,13 @@ struct Locator {
                 a0 = std::min(a0, p[0]), b0 = std::min(b0, p[1]), a1 = std::max(a1, p[0]), b1 = std::max(b1, p[1]);
             }
             for (int gy = std::max(0, int((b0 - y0) / cell)); gy <= std::min(gh - 1, int((b1 - y0) / cell)); ++gy)
-                for (int gx = std::max(0, int((a0 - x0) / cell)); gx <= std::min(gw - 1, int((a1 - x0) / cell)); ++gx)
+                for (int gx = std::max(0, int((a0 - x0) / cell)); gx <= std::min(gw - 1, int((a1 - x0) / cell)); ++gx) {
+                    if (++entries > (size_t(4) << 20)) {
+                        cells.clear();
+                        return;
+                    }
                     cells[size_t(gy) * size_t(gw) + size_t(gx)].push_back(int(t));
+                }
         }
     }
     // The triangle and the point's barycentric weights in it; false outside the mesh.
@@ -433,13 +439,14 @@ bool surfaceTrackFromString(const std::string& text, SurfaceTrack& out) {
     if (!(in >> word >> out.start >> out.frameSeconds) || word != "time" || !std::isfinite(out.start) || !(out.frameSeconds > 0))
         return false;
     if (!(in >> word >> out.reference) || word != "reference") return false;
-    if (!(in >> word >> count) || word != "vertices" || count > 200000) return false;
+    // (meshes made here have at most about 10,000 vertices: surfaceMesh)
+    if (!(in >> word >> count) || word != "vertices" || count > 20000) return false;
     out.mesh.rest.resize(count);
     for (MeshPoint& p : out.mesh.rest) {
         char comma = 0;
         if (!(in >> p[0] >> comma >> p[1]) || comma != ',' || !near(p[0], p[1])) return false;
     }
-    if (!(in >> word >> count) || word != "triangles" || count > 400000) return false;
+    if (!(in >> word >> count) || word != "triangles" || count > 40000) return false;
     out.mesh.tris.resize(count);
     for (auto& tr : out.mesh.tris) {
         char c1 = 0, c2 = 0;
@@ -546,6 +553,8 @@ std::vector<float> meshMap(const WarpMesh& m, const std::vector<MeshPoint>& move
     };
     std::vector<Tri> tris;
     tris.reserve(m.tris.size());
+    // (triangles that overlap over and over, as only a crafted mesh's do, are drawn up to 16 frames' worth of pixels)
+    double covered = 0;
     for (const auto& tr : m.tris) {
         Tri d{};
         bool ok = true;
@@ -568,6 +577,7 @@ std::vector<float> meshMap(const WarpMesh& m, const std::vector<MeshPoint>& move
         d.x0 = int(std::floor(std::max(minX - 0.5, 0.0))), d.x1 = int(std::ceil(std::min(maxX - 0.5, double(W - 1))));
         d.y0 = int(std::floor(std::max(minY - 0.5, 0.0))), d.y1 = int(std::ceil(std::min(maxY - 0.5, double(H - 1))));
         if (d.x0 > d.x1 || d.y0 > d.y1) continue;
+        if ((covered += double(d.x1 - d.x0 + 1) * double(d.y1 - d.y0 + 1)) > std::max(16.0 * W * H, 64.0 * double(m.tris.size()))) break;
         tris.push_back(d);
     }
     parallelRows(H, [&](int y0, int y1) {

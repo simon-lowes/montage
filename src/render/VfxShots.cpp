@@ -336,8 +336,24 @@ bool scanVfxReturns(Project& p, Sequence& s, const std::string& folder, const st
                 ImageSequence before;
                 const int oldZero = parseImageSequencePath(ver->path, before) ? before.first : r->firstFrame;
                 const Id keep = old->id;
-                *old = m;
-                old->id = keep;
+                // (what the file says, read again; the editor's own settings for it, its bin, proxy, Interpret Colour
+                // and name, stay)
+                old->path = m.path;
+                old->duration = m.duration;
+                old->width = m.width;
+                old->height = m.height;
+                old->fps = m.fps;
+                old->hasVideo = m.hasVideo;
+                old->hasAudio = m.hasAudio;
+                old->sampleRate = m.sampleRate;
+                old->channels = m.channels;
+                old->audioStreams = m.audioStreams;
+                old->videoCodec = m.videoCodec;
+                old->audioCodec = m.audioCodec;
+                old->colorSpace = m.colorSpace;
+                old->maxCll = m.maxCll;
+                old->maxFall = m.maxFall;
+                old->timecode = m.timecode;
                 ver->path = path;
                 const double seqFps = s.fpsValue(), mf = r->fps.valid() ? r->fps.toDouble() : seqFps;
                 if (const double delta = double(oldZero - zero) * seqFps / mf; c && delta != 0) {

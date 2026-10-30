@@ -9825,6 +9825,11 @@ private slots:
         QCOMPARE(a.colorSpace, std::string("linear-rec709+display"));
         const std::string space = findColorSpace(a.colorSpace)->label;
         QCOMPARE(space, std::string("Linear Rec.709, display light"));
+        // A crafted id with many "+display" is refused, not followed down the stack.
+        QVERIFY(!findColorSpace("linear-rec709+display+display"));
+        std::string crafted = "linear-rec709";
+        for (int i = 0; i < 200000; ++i) crafted += "+display";
+        QVERIFY(!findColorSpace(crafted));
         const std::string expected = "#! nuke\n"
                                      "# Written by Montage for VFX shot Reel1_010: its plate read untouched and written to its next version.\n"
                                      "Root {\n inputs 0\n first_frame 993\n last_frame 1016\n lock_range true\n fps 25\n format \"64 36 0 0 64 36 1 Reel1_010\"\n}\n"
@@ -9930,9 +9935,18 @@ private slots:
             return true;
         };
         QVERIFY(matchesPlate());
+        // (its media item keeps what the editor set for it as it grows)
+        MediaItem* v3 = p.findMedia(s.vfxShots[0].versions[2].media);
+        QVERIFY(v3);
+        v3->bin = "Returns";
+        v3->name = "Comp v3 from the vendor";
+        v3->proxyPath = "/proxies/v3.mov";
         for (int n = a.firstFrame; n < 1001; ++n) QVERIFY(QFile::copy(plateFile(a, n), version("Reel1_010_comp_v003", n)));
         QVERIFY2(scanVfxReturns(p, s, o.returns, "", &scan, &err), err.c_str());
         QVERIFY(scan.added.empty());
+        v3 = p.findMedia(s.vfxShots[0].versions[2].media);
+        QVERIFY(v3 && v3->bin == "Returns" && v3->name == "Comp v3 from the vendor" && v3->proxyPath == "/proxies/v3.mov");
+        QVERIFY(v3->colorOverride == "linear-rec709+display");
         QVERIFY(matchesPlate());
         QVERIFY(edit::setVfxVersion(p, s, ids[0], 1).ok);
         QVERIFY(matchesPlate());
@@ -9983,6 +9997,16 @@ private slots:
             renamed.scripts = false;
             QVERIFY2(exportVfxPulls(p, other, {ids[2]}, renamed, &shots, nullptr, nullptr, &err), err.c_str());
             QCOMPARE(shots.at(0).name, std::string("Reel1_020_1"));
+        }
+        // Named from its clip, a shot showing a version is named after its plate, not the version.
+        {
+            Sequence other = s;
+            VfxPullOptions byClip = o;
+            byClip.folder = path("vfx-pulls-by-clip");
+            byClip.namePattern = "{clip}";
+            byClip.scripts = false;
+            QVERIFY2(exportVfxPulls(p, other, {ids[0]}, byClip, &shots, nullptr, nullptr, &err), err.c_str());
+            QCOMPARE(shots.at(0).name, QFileInfo(QString::fromStdString(m.name)).completeBaseName().toStdString());
         }
         // The shot list as CSV and OpenTimelineIO.
         const QStringList rows = QString::fromStdString(vfxShotListCsv(s)).split('\n', Qt::SkipEmptyParts);
@@ -12385,26 +12409,14 @@ private slots:
             QVERIFY2(iab::decodeDlc(coded.data(), coded.size(), code, m, back, &err) && back == x, qPrintable(QString::number(code)));
             QVERIFY2(coded.size() < size_t(m) * 3 * 4 / 5, qPrintable(QString("%1: %2 bytes for %3 samples").arg(code).arg(coded.size()).arg(m)));
         }
-        // 29.97: no DLC; a FrameSequence numbers the frames, whose lengths follow the five-frame cadence.
+        // 29.97 and 59.94: reserved in ST 2098-2:2022, so neither written nor read.
         {
+            QCOMPARE(iab::rateCode(30000, 1001), -1);
+            QCOMPARE(iab::rateCode(60000, 1001), -1);
             iab::Frame s;
-            s.rate = iab::rateCode(30000, 1001);
-            QCOMPARE(s.rate, 0xA);
-            QVERIFY(!iab::writeFrame(s, true, pcmBytes, &err));
-            int64_t total = 0;
-            for (int k = 0; k < 5; ++k) {
-                s.frameIndex = k;
-                const int m = iab::frameSamples(s.rate, k);
-                total += m;
-                s.bed = {{iab::C, 1}};
-                s.audio = {{1, std::vector<int32_t>(size_t(m), k)}};
-                QVERIFY2(iab::writeFrame(s, false, pcmBytes, &err), err.c_str());
-                iab::Frame g;
-                QVERIFY2(iab::readFrame(pcmBytes.data(), pcmBytes.size(), g, &err), err.c_str());
-                QCOMPARE(g.frameIndex, k);
-                QCOMPARE(int(g.audio[1].size()), m);
-            }
-            QCOMPARE(total, int64_t(8008));  // five frames of 29.97 at 48 kHz
+            s.rate = 0xA;
+            s.bed = {{iab::C, 1}};
+            QVERIFY(!iab::writeFrame(s, false, pcmBytes, &err));
         }
         // Damaged frames are refused, not misread.
         for (size_t cut : {size_t(3), size_t(12), dlcBytes.size() / 2, dlcBytes.size() - 1}) {
@@ -28890,6 +28902,30 @@ if ui["pressed"] == "add":
             const QByteArray text = f.readAll();
             QVERIFY2(text.contains("{\\an7}Second") && !text.contains("{\\an2}"), text.constData());
         }
+        // Shot changes: marked at given times, listed, and checked against (or not, with profile off); EBU-TT-D out.
+        {
+            Project before;
+            QVERIFY(loadProject(project.toStdString(), before));
+            const Sequence& bs = *before.active();
+            const FrameTime at = bs.captionTracks.front().captions[1].start + 3;  // just after the second caption starts
+            r = edit({{"project", project}, {"action", "shot_changes"}, {"shot_changes", QJsonArray{double(at) / bs.fpsValue()}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            bool listed = false;
+            for (const QJsonValue& v : r.value("structuredContent").toObject().value("shot_changes").toArray())
+                listed = listed || std::llabs(int64_t(v.toObject().value("frame").toDouble()) - at) <= 1;
+            QVERIFY2(listed, QJsonDocument(r).toJson().constData());
+            r = edit({{"project", project}, {"action", "check"}});
+            QVERIFY2(QJsonDocument(r).toJson().contains("shot change"), QJsonDocument(r).toJson().constData());
+            r = edit({{"project", project}, {"action", "check"}, {"profile", "off"}});
+            QVERIFY2(!QJsonDocument(r).toJson().contains("shot change"), QJsonDocument(r).toJson().constData());
+            QVERIFY(edit({{"project", project}, {"action", "check"}, {"profile", "bbc"}}).value("isError").toBool());
+            const QString ebu = QString::fromStdString(path("ebu.xml"));
+            r = call({{"project", project}, {"export", ebu}, {"format", "ebu-tt-d"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QFile f(ebu);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY(f.readAll().contains("urn:ebu:tt:distribution:2018-04"));
+        }
         QVERIFY(edit({{"project", project}, {"action", "spin"}}).value("isError").toBool());
         QVERIFY(edit({{"project", project}, {"action", "replace"}, {"find", "zebra"}, {"replace", "x"}}).value("isError").toBool());
 
@@ -31127,6 +31163,23 @@ if ui["pressed"] == "add":
             QVERIFY2(std::fabs(x0 - cx0) < 1 && std::fabs(x1 + 1 - cx1) < 1 && std::fabs(y0 - cy0) < 1 && std::fabs(y1 + 1 - cy1) < 1,
                      qPrintable(QString("drawn %1..%2 x %3..%4, projected %5..%6 x %7..%8").arg(x0).arg(x1).arg(y0).arg(y1).arg(cx0).arg(cx1).arg(cy0).arg(cy1)));
         }
+        // Fading out, it stays turned: a transition draws its card, not the flat picture.
+        {
+            Transition fade;
+            fade.id = p.newId();
+            fade.clipA = s.videoTracks[1].clips[0].id;
+            fade.duration = 6;
+            s.videoTracks[1].transitions.push_back(fade);
+            FrameTime a = 0, b = 0;
+            QVERIFY(edit::transitionRange(s.videoTracks[1], fade, a, b) && b > a);
+            const Image still = renderSequenceFrame(p, s, 0, o), fading = renderSequenceFrame(p, s, (a + b) / 2, o);
+            float outside = 0, inside = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    (still.at(x, y)[0] < 0.01f ? outside : inside) = std::max(still.at(x, y)[0] < 0.01f ? outside : inside, fading.at(x, y)[0]);
+            QVERIFY2(outside < 0.01f && inside > 0.2f, qPrintable(QString("red outside the card %1, inside %2").arg(outside).arg(inside)));
+            s.videoTracks[1].transitions.clear();
+        }
         // Turned edge on, it is gone.
         s.videoTracks[1].clips[0].effects[0].params["rot_y"] = 90.0;
         {
@@ -31470,6 +31523,24 @@ if ui["pressed"] == "add":
             QVERIFY2(mean <= 0.25 / 255, qPrintable(QString("shape %1 as contents: mean %2, worst %3 (of 255)").arg(shape).arg(mean * 255).arg(worst * 255)));
         }
 
+        // An arc's flags run together ("0 01", as minifiers write them) read as written apart.
+        {
+            const std::string head = R"(<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40">)";
+            auto drawn = [&](const char* d) {
+                const std::string file = path("arc.svg");
+                {
+                    std::ofstream f(file);
+                    f << head << "<path d=\"" << d << "\" fill=\"#fff\"/></svg>";
+                }
+                Effect g = makeEffect(p, "shape");
+                double w = 0, h = 0;
+                std::string err;
+                if (!importSvgShapes(file, g, w, h, nullptr, &err)) return -1.0;
+                return alphaSum(renderShape(g, 0, 40, 40, 1));
+            };
+            const double apart = drawn("M10 20a10 10 0 0 1 20 0z"), together = drawn("M10 20a10 10 0 0120 0z");
+            QVERIFY2(apart > 100 && std::fabs(together - apart) < 1e-6, qPrintable(QString("%1 %2").arg(apart).arg(together)));
+        }
         // What a hostile file or request could ask for stays bounded: repeaters of repeaters, zig-zags of zig-zags,
         // a wiggle of a huge path, a repeat offset of 1e300; an SVG whose <use> copies itself, and one nested very deep.
         {
@@ -31515,6 +31586,16 @@ if ui["pressed"] == "add":
             const std::string before = g.s("contents");
             QVERIFY(!importSvgShapes(laughs, g, w, h, &notes, &err) && err.find("too large") != std::string::npos);
             QVERIFY(!importSvgShapes(deep, g, w, h, &notes, &err) && err.find("deep") != std::string::npos);
+            {
+                // (one outline of 150,000 points: each point six parameters, copied with every undo step)
+                const std::string dense = path("dense.svg");
+                std::ofstream f(dense);
+                f << head << "<polygon points=\"";
+                for (int i = 0; i < 150000; ++i) f << i % 100 << ',' << (i * 7) % 100 << ' ';
+                f << "\"/></svg>";
+                f.close();
+                QVERIFY(!importSvgShapes(dense, g, w, h, &notes, &err) && err.find("too large") != std::string::npos);
+            }
             QCOMPARE(g.s("contents"), before);  // (left as it was)
             QVERIFY(clock.elapsed() < 120000);
             (void)img;
@@ -34898,6 +34979,36 @@ private slots:
         }
         const double wobbleSpread = (wobbleHigh - wobbleLow) / 2, levelSpread = (levelHigh - levelLow) / 2;
         QVERIFY2(wobbleSpread > 80 && levelSpread < 15, qPrintable(QStringLiteral("%1 %2").arg(wobbleSpread).arg(levelSpread)));
+        // A long edit is remade a minute or so at a time: two minutes of vowel two semitones up, still on pitch and at
+        // the same level either side of where the pieces meet (here in the voice, with no pause to split at).
+        {
+            const AudioBuffer longVowel = vowel(130, 110, 110);
+            AudioBuffer longUp;
+            applyPitchEdits(longVowel, {PitchEdit{0.3, 129.5, 2}}, longUp);
+            for (const double at : {60.2, 120.15}) {
+                const PitchTrack near = trackPitch(longUp, at - 1, at + 1, 50, 800);
+                double worst = 0;
+                double worstAt = 0;
+                for (size_t i = 0; i < near.f0.size(); ++i) {
+                    const double t = near.start + double(i) * near.hop;
+                    if (std::fabs(t - at) > 0.5) continue;
+                    const double d = near.f0[i] > 0 ? std::fabs(cents(near.f0[i], 110 * std::pow(2.0, 2 / 12.0))) : 1e9;
+                    if (d > worst) worst = d, worstAt = t;
+                }
+                QVERIFY2(worst < 10, qPrintable(QStringLiteral("%1 at %2 (%3)").arg(worst).arg(worstAt).arg(at)));
+                auto rms = [&](const AudioBuffer& x, double a, double b) {
+                    double e = 0;
+                    for (int64_t i = int64_t(a * sr); i < int64_t(b * sr); ++i) e += double(x.samples[size_t(i)]) * x.samples[size_t(i)];
+                    return std::sqrt(e / ((b - a) * sr));
+                };
+                // (each 40 ms against the edited sound's own level half a minute in, away from any seam)
+                const double level = rms(longUp, 30, 31);
+                for (double w = at - 0.2; w < at + 0.2; w += 0.04) {
+                    const double ratio = rms(longUp, w, w + 0.04) / level;
+                    QVERIFY2(ratio > 0.9 && ratio < 1.1, qPrintable(QStringLiteral("%1 at %2").arg(ratio).arg(w)));
+                }
+            }
+        }
         // No edits: the same sound.
         AudioBuffer untouched;
         applyPitchEdits(steady, {}, untouched);

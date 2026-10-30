@@ -7615,7 +7615,8 @@ void McpServer::Impl::addTools() {
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
         "(Scenarist, CEA-608), .mcc (MCC captions: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
-        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or as pictures drawn in "
+        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); `format` ebu-tt-d writes EBU-TT-D "
+        "(EBU Tech 3380, the TTML profile European broadcasters take; an .xml file); or as pictures drawn in "
         "the track's style (`format`): pgs (Blu-ray: .sup, or Matroska .mks/.mkv), dvb (MPEG-TS .ts, or Matroska), "
         "vobsub (DVD: .idx with its .sub, or Matroska) or imsc_image (IMSC 1.1 Image: a .ttml document with a PNG a "
         "caption beside it); .sup, .idx and .ts need no `format`. Or read any of them as a new caption track (`import`: "
@@ -7629,7 +7630,7 @@ void McpServer::Impl::addTools() {
         "capitals ([DOOR SLAMS], SPEAKER:) or colours (DOOR SLAMS, a colour per speaker). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
-            "format":{"type":"string","enum":["pgs","dvb","vobsub","imsc_image"],"description":"Export as subtitle pictures"},
+            "format":{"type":"string","enum":["ebu-tt-d","pgs","dvb","vobsub","imsc_image"],"description":"Export as EBU-TT-D, or as subtitle pictures"},
             "width":{"type":"integer","description":"The pictures' frame (default: the sequence's)"},"height":{"type":"integer"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
             "import_embedded":{"type":"number","description":"A video clip (id): the captions inside its file as a new track, where the clip plays them"},
@@ -7800,11 +7801,12 @@ void McpServer::Impl::addTools() {
                 if (!t && !s.captionTracks.empty()) t = &s.captionTracks.front();
             }
             if (!t) return fail("The sequence has no captions");
-            const std::string ext = "." + QFileInfo(path).suffix().toLower().toStdString();
+            const bool ebu = a.value("format").toString() == QLatin1String("ebu-tt-d");
+            const std::string ext = ebu ? std::string("ebu-tt-d") : "." + QFileInfo(path).suffix().toLower().toStdString();
             ImageSubtitleFormat pictureFormat = ImageSubtitleFormat::Pgs;
-            const bool pictures = a.contains("format") ? true : imageSubtitleFormatFor(ext, pictureFormat) || ext == ".mks";
-            if (a.contains("format") && !imageSubtitleFormatFromId(a.value("format").toString().toStdString(), pictureFormat))
-                throw ArgError{"\"format\" is pgs, dvb, vobsub or imsc_image"};
+            const bool pictures = ebu ? false : a.contains("format") ? true : imageSubtitleFormatFor(ext, pictureFormat) || ext == ".mks";
+            if (a.contains("format") && !ebu && !imageSubtitleFormatFromId(a.value("format").toString().toStdString(), pictureFormat))
+                throw ArgError{"\"format\" is ebu-tt-d, pgs, dvb, vobsub or imsc_image"};
             if (pictures) {
                 std::string err;
                 ImageSubtitleResult r;
@@ -7909,9 +7911,15 @@ void McpServer::Impl::addTools() {
         "`replace`, optionally `case_sensitive` and `whole_words`), place (`place`: bottom, top or middle, and left, centre or "
         "right, e.g. \"top left\": where the captions sit, kept in every caption format) or raise_over_titles (captions "
         "shown over lower thirds and other low titles move to the top). `captions` (indices) limits shift, replace and place. Limits "
-        "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames.",
+        "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames. Shot changes (the "
+        "sequence's cuts and its shot-change markers; `shot_changes` adds markers at those times first, and action "
+        "shot_changes lists them) are kept clear of by check and fix_timing under `profile` netflix (the default: no caption "
+        "starts or ends within half a second of one, except starting on it or ending min_gap_frames before it; "
+        "`shot_zone_seconds` changes the half second) or off.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"integer","default":0},
-            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace","place","raise_over_titles"]},
+            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace","place","raise_over_titles","shot_changes"]},
+            "profile":{"type":"string","enum":["netflix","off"],"default":"netflix"},"shot_zone_seconds":{"type":"number"},
+            "shot_changes":{"type":"array","items":{"type":["number","string"]},"description":"Times (seconds or timecodes) to mark as shot changes"},
             "place":{"type":"string"},
             "captions":{"type":"array","items":{"type":"integer"}},"by":{"type":["number","string"]},
             "first":{"type":["number","string"]},"last":{"type":["number","string"]},
@@ -7932,6 +7940,24 @@ void McpServer::Impl::addTools() {
             if (a.contains("min_seconds")) lim.minSeconds = a.value("min_seconds").toDouble();
             if (a.contains("max_seconds")) lim.maxSeconds = a.value("max_seconds").toDouble();
             if (a.contains("min_gap_frames")) lim.minGapFrames = a.value("min_gap_frames").toInt();
+            const QString profile = str(a, "profile", "netflix");
+            if (profile != QLatin1String("netflix") && profile != QLatin1String("off")) throw ArgError{"profile is netflix or off"};
+            if (profile == QLatin1String("off")) lim.shotZoneSeconds = 0;
+            else if (a.contains("shot_zone_seconds")) lim.shotZoneSeconds = std::max(0.0, a.value("shot_zone_seconds").toDouble());
+            // Shot changes given: marked first (kept with the sequence).
+            bool marked = false;
+            for (const QJsonValue& v : a.value("shot_changes").toArray()) {
+                const FrameTime f = timeArg(v, s, "shot_changes");
+                if (std::any_of(s.markers.begin(), s.markers.end(), [f](const Marker& m) { return m.shotChange && m.t == f; })) continue;
+                Marker m;
+                m.t = f;
+                m.name = "Shot change";
+                m.shotChange = true;
+                s.markers.push_back(m);
+                marked = true;
+            }
+            if (marked) std::sort(s.markers.begin(), s.markers.end(), [](const Marker& x, const Marker& y) { return x.t < y.t; });
+            const std::vector<FrameTime> cuts = lim.shotZoneSeconds > 0 ? captionShotChanges(s) : std::vector<FrameTime>();
             std::vector<size_t> chosen;
             for (const QJsonValue& v : a.value("captions").toArray()) {
                 const int i = v.toInt(-1);
@@ -7939,8 +7965,20 @@ void McpServer::Impl::addTools() {
                 chosen.push_back(size_t(i));
             }
             const QString action = need(a, "action");
+            if (marked) save(l);  // (the shot changes given are kept, whatever the action makes of them)
+            if (action == "shot_changes") {
+                QJsonArray list;
+                QStringList at;
+                for (FrameTime f : captionShotChanges(s)) {
+                    list.append(QJsonObject{{"frame", double(f)}, {"at", tc(f, s)}});
+                    at << tc(f, s);
+                }
+                return ok(at.isEmpty() ? QStringLiteral("The sequence has no shot changes")
+                                       : QStringLiteral("%1 shot changes: %2").arg(at.size()).arg(at.join(", ")),
+                          QJsonObject{{"shot_changes", list}, {"zone_frames", shotChangeZone(s.fps, lim)}});
+            }
             if (action == "check") {
-                const std::vector<unsigned> issues = checkCaptions(t.captions, s.fps, lim);
+                const std::vector<unsigned> issues = checkCaptions(t.captions, s.fps, lim, cuts);
                 QJsonArray list;
                 QStringList lines;
                 for (size_t i = 0; i < issues.size(); ++i) {
@@ -7953,12 +7991,14 @@ void McpServer::Impl::addTools() {
                 const QString head = list.isEmpty() ? QStringLiteral("All %1 captions are within the limits").arg(t.captions.size())
                                                      : QStringLiteral("%1 of %2 captions break the limits:").arg(list.size()).arg(t.captions.size());
                 return ok(lines.isEmpty() ? head : head + "\n" + lines.join('\n'),
-                          QJsonObject{{"captions", int(t.captions.size())}, {"issues", list}});
+                          QJsonObject{{"captions", int(t.captions.size())}, {"issues", list}, {"shot_changes", int(cuts.size())}});
             }
             QString done;
             if (action == "fix_timing") {
-                const int n = fixCaptionTiming(t.captions, s.fps, lim);
-                if (!n) return ok(QStringLiteral("No caption needed retiming"), QJsonObject{{"changed", 0}});
+                const int n = fixCaptionTiming(t.captions, s.fps, lim, cuts);
+                if (!n) {
+                    return ok(QStringLiteral("No caption needed retiming"), QJsonObject{{"changed", 0}});
+                }
                 done = QStringLiteral("Retimed %1 captions").arg(n);
             } else if (action == "shift") {
                 if (!a.contains("by")) throw ArgError{QStringLiteral("shift needs \"by\"")};
@@ -8001,7 +8041,7 @@ void McpServer::Impl::addTools() {
             }
             save(l);
             int flagged = 0;
-            for (unsigned v : checkCaptions(t.captions, s.fps, lim)) flagged += v != 0;
+            for (unsigned v : checkCaptions(t.captions, s.fps, lim, cuts)) flagged += v != 0;
             return ok(done + QStringLiteral("; %1 captions still break the limits").arg(flagged),
                       QJsonObject{{"captions", int(t.captions.size())}, {"still_flagged", flagged}});
         });

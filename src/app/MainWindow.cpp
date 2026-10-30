@@ -557,6 +557,7 @@ void MainWindow::buildPanels() {
         if (!in.empty() || !out.empty()) surface_->connectPorts(in, out);
     }
     captions_ = new CaptionsPanel(state_, this);
+    connect(captions_, &CaptionsPanel::detectShotChangesWanted, this, [this] { detectScenes(true); });
     transcript_ = new TranscriptPanel(state_, this);
     connect(transcript_, &TranscriptPanel::sourceSeekRequested, this, [this](FrameTime f) {
         source_->seek(f);
@@ -3164,15 +3165,19 @@ int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::Remote
     }
     if (bySequence.empty()) return 0;
     MarkerImport result;
-    state_->edit(undoLabel.isEmpty() ? tr("Markers from Remote Review") : undoLabel, [&](Project& p, Sequence&) {
-        for (const auto& [id, notes] : bySequence)
-            if (Sequence* s = p.findSequence(id)) {
-                const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
-                result.added += r.added;
-                result.updated += r.updated;
-            }
-        return true;
-    });
+    // (notes coming in one after another join one undo step, rather than each holding a copy of the project)
+    state_->edit(
+        undoLabel.isEmpty() ? tr("Markers from Remote Review") : undoLabel,
+        [&](Project& p, Sequence&) {
+            for (const auto& [id, notes] : bySequence)
+                if (Sequence* s = p.findSequence(id)) {
+                    const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
+                    result.added += r.added;
+                    result.updated += r.updated;
+                }
+            return true;
+        },
+        QStringLiteral("remoteMarkers"));
     const ReviewNote& last = std::prev(bySequence.end())->second.back();
     const Sequence* s = state_->project().findSequence(std::prev(bySequence.end())->first);
     statusBar()->showMessage(markers.size() == 1 ? tr("Marker from %1 at %2: %3")
@@ -5087,12 +5092,19 @@ void MainWindow::markClip() {
     state_->setOutPoint(c->end() - 1);
 }
 
-void MainWindow::detectScenes() {
+void MainWindow::detectScenes(bool markOnly) {
     const Clip* c = state_->primaryClip();
     const Sequence* s = state_->sequence();
+    if (markOnly && s && (!c || !edit::locate(*s, c->id) || edit::locate(*s, c->id)->track.kind != TrackKind::Video)) {
+        // (the programme: the longest picture clip)
+        c = nullptr;
+        for (const Track& t : s->videoTracks)
+            for (const Clip& k : t.clips)
+                if (!k.isGenerator() && k.enabled && (!c || k.duration > c->duration)) c = &k;
+    }
     const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
     if (!m || m->kind != MediaKind::Video || !s) {
-        state_->message(tr("Select a video clip to detect scene cuts in"));
+        state_->message(markOnly ? tr("There is no video clip to detect shot changes in") : tr("Select a video clip to detect scene cuts in"));
         return;
     }
     const Id clipId = c->id;
@@ -5104,14 +5116,14 @@ void MainWindow::detectScenes() {
     connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
     QPointer<QProgressDialog> guard(dlg);
     auto* watcher = new QFutureWatcher<std::vector<double>>(this);
-    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel] {
+    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel, markOnly] {
         std::vector<double> cuts = watcher->result();
         dlg->close();
         dlg->deleteLater();
         watcher->deleteLater();
         if (*cancel) return;
         int made = 0;
-        state_->apply(tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
+        state_->apply(markOnly ? tr("Detect Shot Changes") : tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
             const Clip* clip = edit::clipById(sq, clipId);
             if (!clip) return edit::Result::fail("The clip is gone");
             // Map source times to timeline frames inside the clip.
@@ -5122,6 +5134,21 @@ void MainWindow::detectScenes() {
                 if (clip->reverse) local = double(clip->duration) - local;
                 FrameTime f = clip->start + FrameTime(std::llround(local));
                 if (f > clip->start && f < clip->end()) frames.push_back(f);
+            }
+            // Each a shot-change marker (the razor's cuts are through edits, which captions do not count as shot changes).
+            for (FrameTime f : frames)
+                if (std::none_of(sq.markers.begin(), sq.markers.end(), [f](const Marker& mk) { return mk.shotChange && mk.t == f; })) {
+                    Marker mk;
+                    mk.t = f;
+                    mk.name = tr("Shot change").toStdString();
+                    mk.shotChange = true;
+                    sq.markers.push_back(mk);
+                    if (markOnly) ++made;
+                }
+            std::sort(sq.markers.begin(), sq.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            if (markOnly) {
+                if (!made) return edit::Result::fail("No new shot changes found in this clip");
+                return edit::Result{};
             }
             std::vector<TrackRef> tracks;
             for (Id l : edit::linkedClips(sq, clipId))
@@ -5143,7 +5170,8 @@ void MainWindow::detectScenes() {
             if (!made) return edit::Result::fail("No scene cuts found in this clip");
             return edit::Result{};
         });
-        if (made) state_->message(tr("Cut the clip at %n scene change(s)", "", made), 5000);
+        if (made)
+            state_->message(markOnly ? tr("Marked %n shot change(s)", "", made) : tr("Cut the clip at %n scene change(s)", "", made), 5000);
     });
     watcher->setFuture(QtConcurrent::run([path, cancel, guard] {
         return detectSceneCuts(path, 0.5, [guard](double f) {
@@ -6750,9 +6778,34 @@ int MainWindow::addWarpMarkersAtOnsets(double sensitivity) {
     }
     const Id id = c->id;
     int added = 0;
-    state_->apply(tr("Add Warp Markers"), [id, sensitivity, &added](Project& p, Sequence& sq) {
-        return edit::addWarpMarkersAtOnsets(p, sq, id, sensitivity, &added);
-    });
+    // Found off the UI thread on a copy (the group's sound decoded whole), then its clips' effects taken from it.
+    Project work = state_->project();
+    const Sequence original = *state_->sequence();
+    const Id seqId = original.id, startId = work.nextId;
+    if (!runWithProgress(this, state_, tr("Finding onsets…"), [&](const std::function<void(double)>&, const std::atomic<bool>*, std::string* error) {
+            Sequence* s = work.findSequence(seqId);
+            const edit::Result r = s ? edit::addWarpMarkersAtOnsets(work, *s, id, sensitivity, &added) : edit::Result::fail("No sequence");
+            if (!r.ok && error) *error = r.error;
+            return r.ok;
+        }))
+        return 0;
+    const Sequence* found = work.findSequence(seqId);
+    const std::vector<Id> group = edit::elasticGroup(*found, id);
+    // (taken only if nothing was edited meanwhile, an MCP request say: else those edits and the ids made here would clash)
+    if (!state_->apply(tr("Add Warp Markers"), [&](Project& p, Sequence& sq) {
+            if (p.nextId != startId) return edit::Result::fail("The project changed while the onsets were found");
+            for (Id g : group) {
+                Clip* to = edit::clipById(sq, g);
+                const Clip* from = edit::clipById(*found, g);
+                const Clip* was = edit::clipById(original, g);
+                if (!to || !from || (was && to->effects != was->effects))
+                    return edit::Result::fail("The project changed while the onsets were found");
+                to->effects = from->effects;
+            }
+            p.nextId = work.nextId;
+            return edit::Result{};
+        }))
+        return 0;
     state_->message(added ? tr("%n warp marker(s) added", "", added) : tr("No onsets found in the clip"));
     return added;
 }

@@ -9665,6 +9665,67 @@ private slots:
         state()->newProject();
     }
 
+    void captionsAtShotChanges() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        state()->newProject();
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.captions = {{104, 180, "Starts just after it", {}}, {300, 360, "Later on", {}}};
+            s.captionTracks.push_back(t);
+            Marker m;
+            m.t = 100;
+            m.shotChange = true;
+            s.markers.push_back(m);
+            Clip c = makeGeneratorClip(p, "color", 400);  // (something to play)
+            s.videoTracks[0].clips.push_back(c);
+            return true;
+        }));
+        panel->setCurrentTrack(track);
+        const CaptionLimits saved = panel->limits();
+        panel->setLimits(CaptionLimits{});
+        auto caps = [&] { return state()->sequence()->captionTracks.front().captions; };
+        QCOMPARE(panel->shotChanges(), std::vector<FrameTime>{100});
+        QVERIFY(panel->issues()[0] & kCaptionNearShotChange);
+        QVERIFY(panel->findChild<QAction*>("detectShotChanges"));
+        // Fix Timing starts it on the shot change.
+        panel->findChild<QAction*>("fixCaptionTiming")->trigger();
+        QCOMPARE(caps()[0].start, FrameTime(100));
+        QVERIFY(!(panel->issues()[0] & kCaptionNearShotChange));
+        state()->undo();
+        // Off in the limits: not looked at.
+        CaptionLimits off;
+        off.shotZoneSeconds = 0;
+        panel->setLimits(off);
+        QVERIFY(panel->shotChanges().empty() && panel->issues()[0] == 0);
+        panel->setLimits(CaptionLimits{});
+        // On the timeline, its in-point dragged near the shot change snaps onto it.
+        timeline()->setFocus();
+        QApplication::processEvents();
+        const QRect r = timeline()->captionRect(track, 0);
+        QVERIFY(!r.isNull());
+        const double ppf = double(timeline()->captionRect(track, 1).left() - r.left()) / (300 - 104);
+        const int y = r.center().y();
+        const bool snapping = state()->snapping();
+        state()->setSnapping(true);
+        // (pressed on the in-point, out past the drag distance, then back to frame 102)
+        const QPoint press(r.left() + 1, y), far(r.left() - 60, y), to(r.left() + 1 - int(std::lround(2 * ppf)), y);
+        QTest::mousePress(viewport(), Qt::LeftButton, {}, press);
+        for (const QPoint at : {far, to}) {
+            QMouseEvent move(QEvent::MouseMove, at, viewport()->mapToGlobal(at), Qt::NoButton, Qt::LeftButton, {});
+            QApplication::sendEvent(viewport(), &move);
+        }
+        QTest::mouseRelease(viewport(), Qt::LeftButton, {}, to);
+        QCOMPARE(caps()[0].start, FrameTime(100));
+        state()->undo();
+        QCOMPARE(caps()[0].start, FrameTime(104));
+        state()->setSnapping(snapping);
+        panel->setLimits(saved);
+        state()->newProject();
+    }
+
     void captionLooksInPanel() {
         auto* panel = win_->findChild<CaptionsPanel*>();
         QVERIFY(panel);

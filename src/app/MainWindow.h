@@ -547,7 +547,9 @@ private:
     void addClipMarker();
     void jumpMarker(bool forward);
     void markClip();
-    void detectScenes();
+    // Scene detection on the selected clip: cut there (with a shot-change marker at each cut), or with `markOnly` (the
+    // selected clip, else the longest picture clip) shot-change markers only, for captions to keep clear of.
+    void detectScenes(bool markOnly = false);
     void normalizeLoudness();
     void autoColor();
     // Printer lights on the graded clip's Color Correct: `channel` (0 R, 1 G, 2 B, -1 all three) moved by `points`.

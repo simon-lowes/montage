@@ -1237,11 +1237,29 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 if (!tracked) return;
                 const QString dir = QFileDialog::getExistingDirectory(window(), tr("Export ST Maps"));
                 if (dir.isEmpty()) return;
-                std::string err;
-                const std::vector<std::string> files =
-                    writeSurfaceExrs(*tracked, QDir(dir).filePath(QStringLiteral("surface")).toStdString(), 0, int(tracked->frames.size()) - 1, &err);
-                if (files.empty()) state_->message(QString::fromStdString(err), 6000);
-                else state_->message(tr("Wrote %n ST map(s)", "", int(files.size())), 4000);
+                // (a few frames at a time, off the UI thread, with progress and Cancel)
+                const std::string base = QDir(dir).filePath(QStringLiteral("surface")).toStdString();
+                const auto track = tracked;
+                int written = 0;
+                const bool ok = runAnalysis(tr("Writing ST maps..."), [track, base, &written](const auto& progress, const auto* cancel, std::string* err) {
+                    const int frames = int(track->frames.size());
+                    for (int at = 0; at < frames; at += 8) {
+                        if (cancel && cancel->load()) return false;
+                        // (a stretch where the surface was lost has nothing to write: passed over)
+                        const int last = std::min(frames, at + 8) - 1;
+                        bool any = false;
+                        for (int f = at; f <= last; ++f) any |= track->frames[size_t(f)].size() == track->mesh.rest.size();
+                        if (!any) continue;
+                        if (err) err->clear();
+                        const std::vector<std::string> files = writeSurfaceExrs(*track, base, at, last, err);
+                        if (files.empty()) return false;
+                        written += int(files.size());
+                        progress(double(std::min(frames, at + 8)) / frames);
+                    }
+                    if (!written && err && err->empty()) *err = "No frame of the surface is tracked";
+                    return written > 0;
+                });
+                if (ok) state_->message(tr("Wrote %n ST map(s)", "", written), 4000);
             });
             h->addWidget(track);
             h->addWidget(arm);
@@ -3382,7 +3400,13 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
             refreshers_.push_back([combo, read, def = QString::fromStdString(si.def)] {
                 QSignalBlocker b(combo);
-                int at = combo->findData(read());
+                // (a stored value not among the choices is shown as it is, not as the default it is not)
+                const QString value = read();
+                int at = combo->findData(value);
+                if (at < 0 && !value.isEmpty()) {
+                    combo->addItem(value, value);
+                    at = combo->count() - 1;
+                }
                 if (at < 0) at = combo->findData(def);
                 combo->setCurrentIndex(at < 0 ? 0 : at);
             });

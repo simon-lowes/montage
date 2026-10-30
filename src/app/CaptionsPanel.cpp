@@ -100,6 +100,7 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
     menu->addAction(tr("Sync to Two Points..."), this, &CaptionsPanel::syncDialog)->setObjectName(QStringLiteral("syncCaptions"));
     menu->addAction(tr("Find and Replace..."), this, &CaptionsPanel::findReplaceDialog)->setObjectName(QStringLiteral("replaceCaptions"));
     menu->addAction(tr("Reading Limits..."), this, &CaptionsPanel::limitsDialog)->setObjectName(QStringLiteral("captionLimits"));
+    menu->addAction(tr("Detect Shot Changes"), this, &CaptionsPanel::detectShotChangesWanted)->setObjectName(QStringLiteral("detectShotChanges"));
     menu->addSeparator();
     menu->addAction(tr("Rename Track..."), this, [this] {
         const CaptionTrack* t = track();
@@ -279,7 +280,7 @@ void CaptionsPanel::rebuild() {
     const int keepRow = table_->currentRow();
     table_->setRowCount(0);
     const CaptionLimits lim = limits();
-    const std::vector<unsigned> problems = t && s ? checkCaptions(t->captions, s->fps, lim) : std::vector<unsigned>();
+    const std::vector<unsigned> problems = t && s ? checkCaptions(t->captions, s->fps, lim, shotChanges()) : std::vector<unsigned>();
     const int flagged = int(std::count_if(problems.begin(), problems.end(), [](unsigned v) { return v != 0; }));
     // Misspelt words, caption by caption (in the track's language).
     std::vector<std::vector<Misspelling>> spelling(t ? t->captions.size() : 0);
@@ -348,12 +349,17 @@ void CaptionsPanel::followPlayhead(FrameTime t) {
         const Caption* c = captionAt(*tr, t);
         return c ? int(c - tr->captions.data()) : -1;
     }();
+    // (not an edit: a font changed on an item reports it as changed, which would retime the caption and end a drag on
+    // the timeline in its first move)
+    const bool was = rebuilding_;
+    rebuilding_ = true;
     for (int r = 0; r < table_->rowCount(); ++r)
-        if (QTableWidgetItem* item = table_->item(r, 0)) {
+        if (QTableWidgetItem* item = table_->item(r, 0); item && item->font().bold() != (r == at)) {
             QFont f = item->font();
             f.setBold(r == at);
             item->setFont(f);
         }
+    rebuilding_ = was;
 }
 
 QMenu* CaptionsPanel::spellingMenu(int row) {
@@ -1029,7 +1035,7 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error, const QStrin
         if (error) *error = tr("There are no captions to export");
         return false;
     }
-    const std::string suffix = QFileInfo(path).suffix().toLower().toStdString();
+    const std::string suffix = pictures == QLatin1String("ebu-tt-d") ? std::string("ebu-tt-d") : QFileInfo(path).suffix().toLower().toStdString();
     ImageSubtitleFormat format = ImageSubtitleFormat::Pgs;
     if ((!pictures.isEmpty() && imageSubtitleFormatFromId(pictures.toStdString(), format)) || imageSubtitleFormatFor(suffix, format) || suffix == "mks") {
         std::string err;
@@ -1069,6 +1075,7 @@ void CaptionsPanel::exportDialog() {
                                                     {tr("Scenarist SCC, CEA-608 (*.scc)"), ".scc"},
                                                     {tr("MCC captions, CEA-608 and CTA-708 (*.mcc)"), ".mcc"},
                                                     {tr("TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)"), ".ttml"},
+                                                    {tr("EBU-TT-D (*.xml)"), ".xml"},
                                                     {tr("EBU STL (*.stl)"), ".stl"},
                                                     {tr("Advanced SubStation Alpha (*.ass *.ssa)"), ".ass"},
                                                     {tr("Blu-ray subtitle pictures, PGS (*.sup)"), ".sup"},
@@ -1089,7 +1096,8 @@ void CaptionsPanel::exportDialog() {
             if (f.first == filter) path += f.second;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
-    if (!exportFile(path, &err, filter == formats.back().first ? QStringLiteral("imsc_image") : QString()))
+    const QString as = filter == formats.back().first ? QStringLiteral("imsc_image") : filter == formats[5].first ? QStringLiteral("ebu-tt-d") : QString();
+    if (!exportFile(path, &err, as))
         QMessageBox::warning(this, tr("Export Captions"), err);
     else state_->message(tr("Exported %1").arg(QFileInfo(path).fileName()));
 }
@@ -1326,6 +1334,7 @@ CaptionLimits CaptionsPanel::limits() const {
     l.minSeconds = st.value("captions/minSeconds", l.minSeconds).toDouble();
     l.maxSeconds = st.value("captions/maxSeconds", l.maxSeconds).toDouble();
     l.minGapFrames = st.value("captions/minGapFrames", l.minGapFrames).toInt();
+    l.shotZoneSeconds = st.value("captions/shotZoneSeconds", l.shotZoneSeconds).toDouble();
     return l;
 }
 
@@ -1337,13 +1346,19 @@ void CaptionsPanel::setLimits(const CaptionLimits& l) {
     st.setValue("captions/minSeconds", l.minSeconds);
     st.setValue("captions/maxSeconds", l.maxSeconds);
     st.setValue("captions/minGapFrames", l.minGapFrames);
+    st.setValue("captions/shotZoneSeconds", l.shotZoneSeconds);
     rebuild();
 }
 
 std::vector<unsigned> CaptionsPanel::issues() const {
     const CaptionTrack* t = track();
     const Sequence* s = state_->sequence();
-    return t && s ? checkCaptions(t->captions, s->fps, limits()) : std::vector<unsigned>();
+    return t && s ? checkCaptions(t->captions, s->fps, limits(), shotChanges()) : std::vector<unsigned>();
+}
+
+std::vector<FrameTime> CaptionsPanel::shotChanges() const {
+    const Sequence* s = state_->sequence();
+    return s && limits().shotZoneSeconds > 0 ? captionShotChanges(*s) : std::vector<FrameTime>();
 }
 
 std::vector<size_t> CaptionsPanel::selectedCaptions() const {
@@ -1358,8 +1373,9 @@ int CaptionsPanel::fixTiming() {
     if (!s) return 0;
     const Rational fps = s->fps;
     const CaptionLimits l = limits();
+    const std::vector<FrameTime> cuts = shotChanges();
     int changed = 0;
-    editTrack(tr("Fix Caption Timing"), [&](CaptionTrack& t) { return (changed = fixCaptionTiming(t.captions, fps, l)) > 0; });
+    editTrack(tr("Fix Caption Timing"), [&](CaptionTrack& t) { return (changed = fixCaptionTiming(t.captions, fps, l, cuts)) > 0; });
     return changed;
 }
 
@@ -1567,6 +1583,15 @@ void CaptionsPanel::limitsDialog() {
     auto* gap = new QSpinBox(&dlg);
     gap->setRange(0, 25);
     gap->setSuffix(tr(" frames"));
+    auto* zone = new QDoubleSpinBox(&dlg);
+    zone->setObjectName(QStringLiteral("captionShotZone"));
+    zone->setRange(0, 2);
+    zone->setDecimals(2);
+    zone->setSingleStep(0.25);
+    zone->setSuffix(tr(" s"));
+    zone->setSpecialValueText(tr("Off"));
+    zone->setToolTip(tr("No caption starts or ends this close to a shot change, except starting on it or ending the gap "
+                        "before it (Netflix: half a second)"));
     auto show = [&](const CaptionLimits& v) {
         cps->setValue(v.maxCps);
         chars->setValue(v.maxLineChars);
@@ -1574,6 +1599,7 @@ void CaptionsPanel::limitsDialog() {
         minDur->setValue(v.minSeconds);
         maxDur->setValue(v.maxSeconds);
         gap->setValue(v.minGapFrames);
+        zone->setValue(v.shotZoneSeconds);
     };
     show(l);
     connect(preset, &QComboBox::activated, &dlg, [&](int i) {
@@ -1589,6 +1615,7 @@ void CaptionsPanel::limitsDialog() {
     form->addRow(tr("Shortest on screen:"), minDur);
     form->addRow(tr("Longest on screen:"), maxDur);
     form->addRow(tr("Gap between captions:"), gap);
+    form->addRow(tr("Clear of shot changes:"), zone);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     form->addRow(buttons);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
@@ -1600,6 +1627,7 @@ void CaptionsPanel::limitsDialog() {
     l.minSeconds = minDur->value();
     l.maxSeconds = maxDur->value();
     l.minGapFrames = gap->value();
+    l.shotZoneSeconds = zone->value();
     setLimits(l);
 }
 

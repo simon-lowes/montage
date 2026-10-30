@@ -218,6 +218,7 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
                     for (const Take& take : c.takes)
                         if (take.mediaId == r->plateMedia) {
                             plate.mediaId = take.mediaId;
+                            plate.name = take.name;  // (named as the plate was, not after the version shown)
                             plate.sourceIn += take.offset;
                             plate.takes.clear();
                             break;

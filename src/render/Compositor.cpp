@@ -1607,6 +1607,14 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
         bool display = false;
         Image l = clipLayer(p, seq, c, at, o, below, &display);
         if (finish) finish(c, at, l);
+        // (a 3D Layer stays turned as it mixes: its card, flattened, in place of the flat picture)
+        const bool model = c.isGenerator() && c.generator.type == "model3d";
+        if (const Effect* l3 = model ? nullptr : enabledEffect(seq, c, "layer_3d"); l3 && !l.empty() && l.width == W && l.height == H) {
+            Image card;
+            std::string error;
+            if (renderClipLayer3D(p, seq, c, *l3, at, l, double(W) / seq.width, card, nullptr, &error)) l = std::move(card);
+            else if (o.issues && !error.empty()) o.issues->note(error);
+        }
         shown |= display;
         return l;
     };

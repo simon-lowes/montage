@@ -8630,6 +8630,26 @@ Download it now?</source>
         <source>Gap between captions:</source>
         <translation type="unfinished">Écart entre les légendes :</translation>
     </message>
+    <message>
+        <source>Detect Shot Changes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>EBU-TT-D (*.xml)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Off</source>
+        <translation type="unfinished">Hors</translation>
+    </message>
+    <message>
+        <source>No caption starts or ends this close to a shot change, except starting on it or ending the gap before it (Netflix: half a second)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clear of shot changes:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::CaptureDialog</name>
@@ -13151,6 +13171,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Draw a path with the pen as a Bézier mask on one of this layer&apos;s effects first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Writing ST maps...</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -20456,6 +20480,29 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>An ADMAudioSequence (SMPTE ST 2067-204): the sound with its ADM description (ITU-R BS.2076), as a BW64 master holds it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>There is no video clip to detect shot changes in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Detect Shot Changes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shot change</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Marked %n shot change(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Finding onsets…</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

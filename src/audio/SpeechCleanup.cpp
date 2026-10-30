@@ -716,7 +716,7 @@ void retryCleanupsMissingModels() {
 }
 
 AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& source, const std::vector<const Effect*>& effects,
-                            bool blocking) {
+                            bool blocking, bool keep) {
     if (!source || effects.empty()) return source;
     const std::string key = keyFor(path, source->sampleRate, effects);
     std::shared_ptr<Job> job;
@@ -732,7 +732,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             gCache.emplace_front(key, job);
             start = true;
         }
-        if (blocking) job->needed = true;
+        if (blocking || keep) job->needed = true;
         trimCache();
         if (!start) {
             if (job->done) return job->result;

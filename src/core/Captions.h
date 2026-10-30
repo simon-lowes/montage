@@ -184,6 +184,11 @@ bool parseScc(const std::string& text, Rational fps, std::vector<Caption>& out, 
 // family): times as media clock time, lines as <br/>, the style's colours.
 std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, const std::string& language = "en",
                            const CaptionStyle& style = {});
+// EBU-TT-D (EBU Tech 3380 v1.0.1), the TTML profile European broadcasters deliver subtitles in: media times in
+// hh:mm:ss.sss, regions in percent of the picture, every style by reference (a caption's own colour too), its
+// conformance in the document's metadata. Read back by parseTtml.
+std::string captionsToEbuTtD(const std::vector<Caption>& captions, Rational fps, const std::string& language = "en",
+                             const CaptionStyle& style = {});
 // Reads TTML: clock times (with frames at ttp:frameRate) and offsets (h, m, s,
 // ms, f, t), times nested in body and div, spans and <br/>.
 bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
@@ -224,7 +229,8 @@ std::string captionsToDcst(const std::vector<Caption>& captions, const CaptionSt
 bool parseDcst(const std::string& xml, Rational fps, std::vector<Caption>& out, std::string* error = nullptr, DcstInfo* info = nullptr);
 
 // A caption track in the format a file extension names: srt, vtt, scc, mcc (core/Cea708.h), ttml
-// (also xml, dfxp), stl, ass (also ssa). Empty for an unknown extension.
+// (also xml, dfxp), stl, ass (also ssa), or ebu-tt-d (a format name: EBU-TT-D files end in .xml). Empty for an
+// unknown extension.
 bool captionFormatKnown(const std::string& extension);
 std::string exportCaptions(const CaptionTrack& track, const Sequence& seq, const std::string& extension);
 
