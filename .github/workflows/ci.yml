@@ -256,9 +256,10 @@ jobs:
         timeout-minutes: 15
         run: |
           ./scripts/setup-deps.sh
-          # (lavapipe; and what Qt 6.8's xcb platform needs, as Vulkan is made only through a window system's plugin)
+          # (lavapipe; what Qt 6.8's xcb platform needs, as Vulkan is made only through a window system's plugin; and the
+          # xkbcommon headers, as aqt's Qt6Gui targets link XKB::XKB)
           sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers libvulkan-dev libegl-mesa0 libxcb-cursor0 \
-            libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 > /dev/null
+            libxkbcommon-dev libxkbcommon-x11-dev libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 > /dev/null
       - name: Cache Qt 6.8
         uses: actions/cache@v4
         with:

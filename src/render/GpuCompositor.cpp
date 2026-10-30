@@ -81,7 +81,10 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 #include <QOffscreenSurface>
 #include <qfloat16.h>
 #include <QThread>
-#if QT_CONFIG(vulkan)
+// (A Qt built with Vulkan declares QVulkanInstance only where the Vulkan headers are found when Montage is built; Homebrew's
+// Qt on macOS has Vulkan but no headers.)
+#if QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
+#define MONTAGE_GPU_VULKAN 1
 #include <QVulkanInstance>
 #endif
 #include <condition_variable>
@@ -181,7 +184,7 @@ private:
     bool quit_ = false;
 
     QOffscreenSurface* fallback_ = nullptr;  // (OpenGL; made on the GUI thread)
-#if QT_CONFIG(vulkan)
+#ifdef MONTAGE_GPU_VULKAN
     QVulkanInstance* vulkan_ = nullptr;      // (Vulkan)
 #endif
     QSurfaceFormat glFormat_;                // (OpenGL 3.3: float and 3D textures; the surface may not say so)
@@ -259,7 +262,7 @@ bool Device::start(std::string* why) {
     else if (choice == "software") software_ = true;
     // Chosen automatically on Linux: OpenGL, else Vulkan (where OpenGL cannot be set up, or off the GUI thread).
     bool vulkanAfter = false;
-#if QT_CONFIG(vulkan) && !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+#if defined(MONTAGE_GPU_VULKAN) && !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
     vulkanAfter = backend_ == QRhi::OpenGLES2 && (choice.isEmpty() || choice == "auto");
 #endif
     if (backend_ == QRhi::OpenGLES2 && (!qGuiApp || QThread::currentThread() != qGuiApp->thread())) {
@@ -291,7 +294,7 @@ bool Device::start(std::string* why) {
 
 bool Device::launch() {
     if (backend_ == QRhi::Vulkan) {
-#if QT_CONFIG(vulkan)
+#ifdef MONTAGE_GPU_VULKAN
         // The instance (the window system's Vulkan) made here, on the thread asking, as Qt makes it.
         if (!qGuiApp) {
             problem_ = "no Vulkan (no GUI application to make its instance)";
@@ -307,7 +310,7 @@ bool Device::launch() {
             return false;
         }
 #else
-        problem_ = "this Qt was built without Vulkan";
+        problem_ = "this build has no Vulkan (Qt without it, or no Vulkan headers)";
         return false;
 #endif
     }
@@ -343,7 +346,7 @@ void Device::stop() {
     }
     delete fallback_;
     fallback_ = nullptr;
-#if QT_CONFIG(vulkan)
+#ifdef MONTAGE_GPU_VULKAN
     delete vulkan_;
     vulkan_ = nullptr;
 #endif
@@ -374,7 +377,7 @@ bool Device::create() {
             rhi_ = QRhi::create(QRhi::OpenGLES2, &params, flags);
             break;
         }
-#if QT_CONFIG(vulkan)
+#ifdef MONTAGE_GPU_VULKAN
         case QRhi::Vulkan: {
             QRhiVulkanInitParams params;
             params.inst = vulkan_;
