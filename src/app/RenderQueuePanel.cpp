@@ -57,17 +57,6 @@ RenderQueuePanel::RenderQueuePanel(RenderQueue* queue, QWidget* parent) : QWidge
     reveal_ = button(tr("Show File"), "queueReveal");
     send_ = button(tr("Send to Farm"), "queueSendToFarm");
     send_->setToolTip(tr("Send the job to the render farm, for its render nodes, and take it off this queue"));
-    segments_ = new QSpinBox(this);
-    segments_->setObjectName(QStringLiteral("queueSegments"));
-    segments_->setRange(1, 64);
-    segments_->setSpecialValueText(tr("Whole"));
-    segments_->setSuffix(tr(" segments"));
-    segments_->setToolTip(tr("Split a job sent to the farm into segments (at cuts near equal lengths) that several nodes\n"
-                             "render at once, then one joins: ProRes, DNxHR and FFV1 frame for frame, H.264, H.265 and AV1\n"
-                             "with rate control per segment, and image sequences. The sound is rendered once, by the node that joins."));
-    segments_->setValue(std::clamp(appSettings().value(QStringLiteral("renderFarm/segments"), 1).toInt(), 1, 64));
-    connect(segments_, &QSpinBox::valueChanged, this, [](int v) { appSettings().setValue(QStringLiteral("renderFarm/segments"), v); });
-    row->addWidget(segments_);
     row->addStretch(1);
     localLay->addLayout(row);
 
@@ -109,6 +98,18 @@ RenderQueuePanel::RenderQueuePanel(RenderQueue* queue, QWidget* parent) : QWidge
     farmCancel_ = farmButton(tr("Cancel"), "farmCancel");
     farmRetry_ = farmButton(tr("Retry"), "farmRetry");
     farmRemove_ = farmButton(tr("Remove"), "farmRemove");
+    // (beside the farm's own buttons: the queue's row is already the panel's widest)
+    segments_ = new QSpinBox(farmBox);
+    segments_->setObjectName(QStringLiteral("queueSegments"));
+    segments_->setRange(1, 64);
+    segments_->setSpecialValueText(tr("Whole"));
+    segments_->setSuffix(tr(" segments"));
+    segments_->setToolTip(tr("Split a job sent to the farm into segments (at cuts near equal lengths) that several nodes\n"
+                             "render at once, then one joins: ProRes, DNxHR and FFV1 frame for frame, H.264, H.265 and AV1\n"
+                             "with rate control per segment, and image sequences. The sound is rendered once, by the node that joins."));
+    segments_->setValue(std::clamp(appSettings().value(QStringLiteral("renderFarm/segments"), 1).toInt(), 1, 64));
+    connect(segments_, &QSpinBox::valueChanged, this, [](int v) { appSettings().setValue(QStringLiteral("renderFarm/segments"), v); });
+    farmButtons->addWidget(segments_);
     farmButtons->addStretch(1);
     farmLay->addLayout(farmButtons);
     split->addWidget(local);
