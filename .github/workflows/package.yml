@@ -144,13 +144,25 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: zip curl jq make diffutils git
+          install: zip curl jq make diffutils git zstd
           # FFmpeg itself is built below, from the libraries it uses (Qt Multimedia still pulls in MSYS2's, which
           # this build replaces).
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p nasm:p
             qt6-base:p qt6-multimedia:p qt6-tools:p qt6-translations:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p openssl:p rust:p expat:p
             x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
+      - name: The abseil DLLs MSYS2's ONNX Runtime was built with
+        # MSYS2 moves to a new abseil (its DLLs named for the release) before rebuilding every package on it; until
+        # it rebuilds ONNX Runtime, the release that one needs is put back beside the new one, or nothing starts.
+        run: |
+          missing=$(grep -aoE 'libabsl_[a-z0-9_]+-[0-9]+\.0\.0\.dll' /ucrt64/bin/onnxruntime.dll | sort -u | while read -r d; do [ -f "/ucrt64/bin/$d" ] || echo "$d"; done)
+          [ -z "$missing" ] && exit 0
+          lts=$(echo "$missing" | head -n 1 | sed -E 's/.*-([0-9]+)\.0\.0\.dll/\1/')
+          pkg=$(curl -sSfL https://repo.msys2.org/mingw/ucrt64/ | grep -oE "mingw-w64-ucrt-x86_64-abseil-cpp-20${lts}[0-9.]*-[0-9]+-any\.pkg\.tar\.zst" | sort -uV | tail -n 1)
+          file="$(cygpath -u "$RUNNER_TEMP")/abseil.pkg.tar.zst"
+          curl -sSfL -o "$file" "https://repo.msys2.org/mingw/ucrt64/$pkg"
+          tar -C / --zstd -xf "$file" --wildcards 'ucrt64/bin/libabsl_*.dll'
+          echo "::warning::ONNX Runtime still needs abseil $lts: its DLLs taken from $pkg"
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
         run: echo "versions=$(pacman -Q $(printf 'mingw-w64-ucrt-x86_64-%s ' x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist amf-headers ffnvcodec-headers libvpl) | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
