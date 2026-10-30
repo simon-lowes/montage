@@ -1,5 +1,7 @@
 #include "Ocio.h"
 
+#include "GpuCompositor.h"
+
 #ifdef MONTAGE_WITH_OCIO
 #include <OpenColorIO/OpenColorIO.h>
 
@@ -9,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <regex>
 namespace OCIO = OCIO_NAMESPACE;
 #endif
 
@@ -56,7 +59,30 @@ OCIO::ConstConfigRcPtr loadConfig(const std::string& name, std::string* error) {
     }
 }
 
+OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error);
+
 OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, std::string* error) {
+    OCIO::ConstProcessorRcPtr proc = processorOf(e, error);
+    if (!proc) return nullptr;
+    static std::map<const OCIO::Processor*, std::pair<OCIO::ConstProcessorRcPtr, OCIO::ConstCPUProcessorRcPtr>> cache;
+    {
+        std::lock_guard lock(ocioMutex());
+        if (auto it = cache.find(proc.get()); it != cache.end()) return it->second.second;
+    }
+    try {
+        OCIO::ConstCPUProcessorRcPtr cpu = proc->getDefaultCPUProcessor();
+        std::lock_guard lock(ocioMutex());
+        if (cache.size() > 64) cache.clear();
+        cache[proc.get()] = {proc, cpu};  // (the processor held, so its address is not taken again)
+        return cpu;
+    } catch (const OCIO::Exception& ex) {
+        if (error) *error = ex.what();
+        return nullptr;
+    }
+}
+
+// The effect's transform, one processor a transform (kept for the last 64).
+OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error) {
     const std::string configName = e.s("config");
     OCIO::ConstConfigRcPtr cfg = loadConfig(configName, error);
     if (!cfg) return nullptr;
@@ -66,7 +92,7 @@ OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, std::string* error) {
     const std::string key = configName + '\x1f' + std::to_string(reinterpret_cast<uintptr_t>(cfg.get())) + '\x1f' +
                             (display ? "d" : "c") + (inverse ? "i" : "f") + '\x1f' + src + '\x1f' + dst + '\x1f' +
                             disp + '\x1f' + view + '\x1f' + look;
-    static std::map<std::string, OCIO::ConstCPUProcessorRcPtr> cache;
+    static std::map<std::string, OCIO::ConstProcessorRcPtr> cache;
     {
         std::lock_guard lock(ocioMutex());
         if (auto it = cache.find(key); it != cache.end()) return it->second;
@@ -96,11 +122,10 @@ OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, std::string* error) {
         }
         OCIO::ConstProcessorRcPtr proc =
             cfg->getProcessor(group, inverse ? OCIO::TRANSFORM_DIR_INVERSE : OCIO::TRANSFORM_DIR_FORWARD);
-        OCIO::ConstCPUProcessorRcPtr cpu = proc->getDefaultCPUProcessor();
         std::lock_guard lock(ocioMutex());
         if (cache.size() > 64) cache.clear();
-        cache[key] = cpu;
-        return cpu;
+        cache[key] = proc;
+        return proc;
     } catch (const OCIO::Exception& ex) {
         if (error) *error = ex.what();
         return nullptr;
@@ -175,6 +200,109 @@ bool applyOcio(const Effect& e, Image& img, std::string* error) {
         }
     });
     return true;
+}
+
+std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::string* error) {
+    OCIO::ConstProcessorRcPtr proc = processorOf(e, error);
+    if (!proc) return nullptr;
+    // (Kept by processor, which each entry holds so its address is not reused; one OCIO cannot draw is kept too, with
+    // why, so it is not tried again each frame.)
+    struct Entry {
+        OCIO::ConstProcessorRcPtr proc;
+        std::shared_ptr<const gpu::ShaderStep> step;
+        std::string why;
+    };
+    static std::map<const OCIO::Processor*, Entry> cache;
+    {
+        std::lock_guard lock(ocioMutex());
+        if (auto it = cache.find(proc.get()); it != cache.end()) {
+            if (!it->second.step && error) *error = it->second.why;
+            return it->second.step;
+        }
+    }
+    auto keep = [&](std::shared_ptr<const gpu::ShaderStep> made, const std::string& why) {
+        if (!made && error) *error = why;
+        std::lock_guard lock(ocioMutex());
+        if (cache.size() > 16) cache.clear();
+        cache[proc.get()] = {proc, made, why};
+        return made;
+    };
+    auto step = std::make_shared<gpu::ShaderStep>();
+    try {
+        OCIO::GpuShaderDescRcPtr desc = OCIO::GpuShaderDesc::CreateShaderDesc();
+        desc->setLanguage(OCIO::GPU_LANGUAGE_GLSL_4_0);
+        desc->setFunctionName("ocioTransform");
+        desc->setResourcePrefix("ocio");
+        OCIO::ConstGPUProcessorRcPtr gpuProc = proc->getDefaultGPUProcessor();
+        gpuProc->extractGpuShaderInfo(desc);
+        if (desc->getNumUniforms() > 0) return keep(nullptr, "the transform has values set while it runs");
+        step->key = std::string("ocio:") + gpuProc->getCacheID();
+        step->function = "ocioTransform";
+        // Each sampler's binding, from 2 in the order its texture comes (1D textures, then 3D).
+        std::map<std::string, int> binding;
+        for (unsigned i = 0; i < desc->getNumTextures(); ++i) {
+            const char *texName = nullptr, *sampler = nullptr;
+            unsigned w = 0, h = 0;
+            OCIO::GpuShaderDesc::TextureType channel = OCIO::GpuShaderDesc::TEXTURE_RGB_CHANNEL;
+            OCIO::Interpolation interp = OCIO::INTERP_LINEAR;
+#if OCIO_VERSION_HEX >= 0x02030000
+            OCIO::GpuShaderDesc::TextureDimensions dims = OCIO::GpuShaderDesc::TEXTURE_2D;
+            desc->getTexture(i, texName, sampler, w, h, channel, dims, interp);
+#else
+            desc->getTexture(i, texName, sampler, w, h, channel, interp);
+#endif
+            const float* values = nullptr;
+            desc->getTextureValues(i, values);
+            gpu::ShaderStep::Texture t;
+            t.width = int(w), t.height = int(std::max(1u, h)), t.channels = channel == OCIO::GpuShaderDesc::TEXTURE_RED_CHANNEL ? 1 : 3;
+            t.linear = interp != OCIO::INTERP_NEAREST;
+            t.values.assign(values, values + size_t(t.width) * size_t(t.height) * size_t(t.channels));
+            binding[sampler] = 2 + int(step->textures.size());
+            step->textures.push_back(std::move(t));
+        }
+        for (unsigned i = 0; i < desc->getNum3DTextures(); ++i) {
+            const char *texName = nullptr, *sampler = nullptr;
+            unsigned edge = 0;
+            OCIO::Interpolation interp = OCIO::INTERP_LINEAR;
+            desc->get3DTexture(i, texName, sampler, edge, interp);
+            const float* values = nullptr;
+            desc->get3DTextureValues(i, values);
+            gpu::ShaderStep::Texture t;
+            t.width = t.height = t.depth = int(edge);
+            t.linear = interp != OCIO::INTERP_NEAREST;
+            t.values.assign(values, values + size_t(edge) * edge * edge * 3);
+            binding[sampler] = 2 + int(step->textures.size());
+            step->textures.push_back(std::move(t));
+        }
+        // The samplers given their bindings, 1D ones as 2D textures one texel high (read through a function of their
+        // own, which `texture(name, x)` becomes).
+        std::string text = desc->getShaderText();
+        static const std::regex declaration(R"(uniform\s+sampler([123])D\s+(\w+)\s*;)");
+        std::vector<std::string> oneD;
+        for (auto d = std::sregex_iterator(text.begin(), text.end(), declaration); d != std::sregex_iterator(); ++d)
+            if ((*d)[1] == "1") oneD.push_back((*d)[2]);
+        for (const std::string& name : oneD) text = std::regex_replace(text, std::regex("texture\\s*\\(\\s*" + name + "\\s*,"), name + "_1d(");
+        std::string out;
+        auto it = std::sregex_iterator(text.begin(), text.end(), declaration);
+        size_t last = 0;
+        for (; it != std::sregex_iterator(); ++it) {
+            const std::smatch& m = *it;
+            const std::string name = m[2];
+            const auto b = binding.find(name);
+            if (b == binding.end()) return keep(nullptr, "the shader names a texture it does not list: " + name);
+            out += text.substr(last, size_t(m.position(0)) - last);
+            const std::string dim = m[1] == "3" ? "3D" : "2D";
+            out += "layout(binding = " + std::to_string(b->second) + ") uniform sampler" + dim + " " + name + ";";
+            if (m[1] == "1") out += "\nvec4 " + name + "_1d(float x) { return texture(" + name + ", vec2(x, 0.5)); }";
+            last = size_t(m.position(0) + m.length(0));
+        }
+        out += text.substr(last);
+        if (binding.size() != step->textures.size()) return keep(nullptr, "the shader's textures could not be told apart");
+        step->source = std::move(out);
+    } catch (const OCIO::Exception& ex) {
+        return keep(nullptr, ex.what());
+    }
+    return keep(step, {});
 }
 
 bool applyOcioBuiltin(const std::string& style, float* rgb, size_t count, bool inverse, std::string* error) {
@@ -276,6 +404,10 @@ std::vector<std::string> ocioChoices(const Effect&, const std::string&) { return
 bool applyOcio(const Effect&, Image&, std::string* error) {
     if (error) *error = "Montage was built without OpenColorIO";
     return false;
+}
+std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect&, std::string* error) {
+    if (error) *error = "Montage was built without OpenColorIO";
+    return nullptr;
 }
 bool applyOcioBuiltin(const std::string&, float*, size_t, bool, std::string* error) {
     if (error) *error = "Montage was built without OpenColorIO";

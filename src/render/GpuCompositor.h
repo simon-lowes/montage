@@ -1,13 +1,14 @@
 #pragma once
 
 // The GPU compositor (Phase 6): a frame's layers drawn on the GPU through Qt's RHI (Metal on macOS, Direct3D 11 on
-// Windows, OpenGL elsewhere), with the same arithmetic as the CPU renderer (render/Compositor, render/Processing), so
-// a frame comes out the same within float rounding either way. render/Compositor builds a Frame (what to draw) and
-// falls back to the CPU for whatever the GPU cannot draw; this runs it.
+// Windows, OpenGL elsewhere, or Vulkan where OpenGL can't start), with the same arithmetic as the CPU renderer
+// (render/Compositor, render/Processing), so a frame comes out the same within float rounding either way.
+// render/Compositor builds a Frame (what to draw) and falls back to the CPU for whatever the GPU cannot draw; this runs
+// it.
 //
 // Built where Qt is 6.6 or later (MONTAGE_WITH_GPU); elsewhere available() says why not. MONTAGE_GPU in the
-// environment picks the backend (auto, off, opengl, metal, d3d11, d3d12; software for WARP), MONTAGE_GPU_LOG=1 prints
-// why frames fall back.
+// environment picks the backend (auto, off, opengl, vulkan, metal, d3d11, d3d12; software for WARP or lavapipe),
+// MONTAGE_GPU_LOG=1 prints why frames fall back and how each layer was drawn.
 
 #include <memory>
 #include <optional>
@@ -29,7 +30,24 @@ bool initialize(std::string* why = nullptr);
 bool available(std::string* why = nullptr);
 std::string deviceName();  // e.g. "OpenGL 4.5, llvmpipe (LLVM 20.1.2, 256 bits)"
 int maxTextureSize();      // the widest picture it takes (0 without a GPU)
+bool takesPlanes();        // it converts decoded Y′CbCr planes itself (Frame16::planes)
+bool takesShaders(const std::string& key = {});  // it compiles shader steps (ShaderStep) while running (that one, too)
 void shutdown();           // (before the application goes; initialize() again is allowed)
+
+// A colour step written in GLSL at run time (render/Ocio's OpenColorIO transforms, from OCIO's own GPU shaders):
+// GLSL 4.40 declaring its textures from binding 2 up, in `textures`' order, and `vec4 function(vec4)` on straight
+// colour. Compiled once a key.
+struct ShaderStep {
+    std::string key;
+    std::string source, function;
+    struct Texture {
+        int width = 0, height = 1, depth = 0;  // (depth: a 3D texture's)
+        int channels = 3;                      // 1 (red) or 3, `values` holding that many a texel
+        bool linear = true;                    // sampled between texels
+        std::vector<float> values;
+    };
+    std::vector<Texture> textures;
+};
 
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).
 struct ColorOp {
@@ -39,7 +57,9 @@ struct ColorOp {
     // (its source, table and mask; -1 for none) into the slot `out`, leaving the picture as it is.)
     // (ChromaKey, LumaKey and ScreenKey change the alpha too: render/Processing's keyers, gpucolor.frag's 18 to 20;
     // a ScreenKey whose params[10] or [11] are set has its matte shrunk or grown and blurred by passes of its own.)
-    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey } kind = Lut;
+    // (Shader runs `shader` on the picture, without a mask.)
+    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey, Shader } kind = Lut;
+    std::shared_ptr<const ShaderStep> shader;  // Shader
     int slot = 0;                // Store, Load
     int passMode = 0;            // Pass
     int in[3] = {-1, -1, -1};    // Pass
@@ -69,7 +89,7 @@ struct Placement {
 };
 
 struct Layer {
-    Frame16Ptr frame;                    // a decoded frame (premultiplied on the GPU) ...
+    Frame16Ptr frame;                    // a decoded frame, RGBA or Y′CbCr planes (premultiplied on the GPU) ...
     std::shared_ptr<const Lut3D> input;  // ... and its input transform, if any
     Image image;                         // or a picture made on the CPU (premultiplied, working space)
     std::vector<ColorOp> ops;
@@ -98,11 +118,12 @@ struct Stats {
     long gpuFrames = 0, cpuFrames = 0;  // frames asked of the GPU path: drawn there, or fallen back
     long gpuLayers = 0, cpuLayers = 0;  // their layers: drawn from the source, or made on the CPU and uploaded
     std::string lastFallback;
+    std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
 };
 Stats stats();
 void resetStats();
 void countFallback(const std::string& why);  // (render/Compositor's bookkeeping)
-void countLayer(bool onGpu);
+void countLayer(bool onGpu, const std::string& how = {});  // (and with MONTAGE_GPU_LOG, says how it was drawn)
 
 }  // namespace gpu
 }  // namespace montage

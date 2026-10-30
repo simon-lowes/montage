@@ -2526,10 +2526,11 @@ void MainWindow::buildMenus() {
         a->setChecked(hw);
         a->setToolTip(tr("Decode H.264, HEVC, VP9, AV1 and ProRes on the GPU or media engine "
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
-        // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames
-        // are composited and graded on the GPU, what it cannot draw on the CPU as before. The GPU is set up only when it
-        // is wanted (a driver that misbehaves is out of the way once it is turned off). A launch that ended while the GPU
-        // was being set up or drawing its first frame (a driver crash takes Montage with it) leaves it off the next time.
+        // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames,
+        // Render In to Out's and exports' are composited and graded on the GPU, what it cannot draw on the CPU as before.
+        // The GPU is set up only when it is wanted (a driver that misbehaves is out of the way once it is turned off). A
+        // launch that ended while the GPU was being set up or drawing its first frame (a driver crash takes Montage with
+        // it) leaves it off the next time.
         std::string why;
         bool wantGpu = appSettings().value("playback/gpuRendering", true).toBool();
         if (wantGpu && appSettings().value("playback/gpuStarting", false).toBool()) {
@@ -2548,8 +2549,8 @@ void MainWindow::buildMenus() {
         g->setCheckable(true);
         g->setChecked(onGpu);
         auto describe = [g](const std::string& problem) {
-            g->setToolTip(problem.empty() ? tr("Composite and grade the program monitor's frames on the GPU; effects it has no GPU "
-                                               "form for render on the CPU")
+            g->setToolTip(problem.empty() ? tr("Composite and grade on the GPU: the Program monitor, Render In to Out and exports; "
+                                               "effects it has no GPU form for render on the CPU")
                                           : tr("No GPU rendering: %1").arg(QString::fromStdString(problem)));
         };
         describe(why);
@@ -9702,7 +9703,8 @@ int MainWindow::renderInToOut() {
     if (to < from) return 0;
     auto project = std::make_shared<const Project>(state_->project());
     const Id seqId = s->id;
-    const RenderOptions o = program_->renderOptions();
+    RenderOptions o = program_->renderOptions();
+    o.gpu = program_->gpuRendering();  // (as the Program monitor draws them)
     int rendered = 0;
     const bool ok = runWithProgress(this, state_, tr("Rendering previews..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string*) {
         const Sequence* sq = project->findSequence(seqId);
@@ -9744,7 +9746,8 @@ void MainWindow::startBackgroundRender() {
     if (ranges.empty()) return;
     auto project = std::make_shared<const Project>(state_->project());
     const Id seqId = s->id;
-    const RenderOptions o = program_->renderOptions();
+    RenderOptions o = program_->renderOptions();
+    o.gpu = program_->gpuRendering();
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     backgroundCancel_ = cancel;
     backgroundBusy_ = true;

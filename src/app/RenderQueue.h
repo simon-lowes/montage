@@ -18,6 +18,9 @@
 
 namespace montage {
 
+// Whether exports draw their frames on the GPU: while GPU Rendering is on (Playback menu) and there is one.
+bool exportsOnGpu();
+
 class RenderQueue : public QObject {
     Q_OBJECT
 public:

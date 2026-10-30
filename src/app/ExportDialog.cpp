@@ -1223,6 +1223,7 @@ void ExportDialog::startExport() {
     ExportSettings s;
     FrameTime in = 0, out = 0;
     if (!prepare(s, in, out)) return;
+    s.gpu = exportsOnGpu();
     const Sequence* seq = state_->sequence();
     const QString path = QString::fromStdString(s.path);
     const QFileInfo fi(path);

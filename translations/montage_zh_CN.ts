@@ -16289,10 +16289,6 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <translation type="unfinished">&amp;GPU 调试</translation>
     </message>
     <message>
-        <source>Composite and grade the program monitor&apos;s frames on the GPU; effects it has no GPU form for render on the CPU</source>
-        <translation type="unfinished">组合和分级 GPU 上的程序监视器框架; 效果在 CPU 没有 GPU 格式</translation>
-    </message>
-    <message>
         <source>No GPU rendering: %1</source>
         <translation type="unfinished">没有 GPU 覆盖: # %1</translation>
     </message>
@@ -20755,6 +20751,10 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>No canvas templates: choose an FDL with some</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Composite and grade on the GPU: the Program monitor, Render In to Out and exports; effects it has no GPU form for render on the CPU</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

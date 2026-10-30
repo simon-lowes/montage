@@ -57,6 +57,7 @@ struct ExportSettings {
     FrameTime in = -1;                   // range; -1 = start / end of sequence
     FrameTime out = -1;
     bool useProxies = false;
+    bool gpu = false;                    // frames drawn on the GPU compositor where it can (render/GpuCompositor.h)
     bool alpha = false;                  // keep transparency (ProRes 4444 etc.)
     // A stereoscopic sequence's eyes as delivered (render/Stereo.h names): "sbs" side by side at full size (the
     // default), "sbs_half", "tb", "tb_half", or one picture ("left", "right", "anaglyph"). Packed exports carry stereo

@@ -44,9 +44,13 @@ void countFallback(const std::string& why) {
     if (logFallbacks()) std::fprintf(stderr, "montage gpu: frame on the CPU: %s\n", why.c_str());
 }
 
-void countLayer(bool onGpu) {
-    std::lock_guard lock(gStatsMutex);
-    ++(onGpu ? gStats.gpuLayers : gStats.cpuLayers);
+void countLayer(bool onGpu, const std::string& how) {
+    {
+        std::lock_guard lock(gStatsMutex);
+        ++(onGpu ? gStats.gpuLayers : gStats.cpuLayers);
+        if (!onGpu) gStats.lastCpuLayer = how;
+    }
+    if (logFallbacks() && !how.empty()) std::fprintf(stderr, "montage gpu: layer on the %s: %s\n", onGpu ? "GPU" : "CPU", how.c_str());
 }
 
 }  // namespace montage::gpu
@@ -64,6 +68,8 @@ bool initialize(std::string* why) {
 bool available(std::string* why) { return initialize(why); }
 std::string deviceName() { return {}; }
 int maxTextureSize() { return 0; }
+bool takesPlanes() { return false; }
+bool takesShaders(const std::string&) { return false; }
 void shutdown() {}
 bool execute(const Frame&, Image*, QImage*) { return false; }
 
@@ -73,7 +79,11 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 
 #include <QGuiApplication>
 #include <QOffscreenSurface>
+#include <qfloat16.h>
 #include <QThread>
+#if QT_CONFIG(vulkan)
+#include <QVulkanInstance>
+#endif
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -81,6 +91,9 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 #include <map>
 #include <rhi/qrhi.h>
 #include <shared_mutex>
+#ifdef MONTAGE_WITH_GPU_SHADERS
+#include <rhi/qshaderbaker.h>
+#endif
 #include <thread>
 
 namespace montage::gpu {
@@ -107,6 +120,12 @@ public:
     const std::string& problem() const { return problem_; }
     const std::string& name() const { return name_; }
     int maxTextureSize() const { return maxTexture_; }
+    bool takesPlanes() const { return planes_; }
+    bool takesShaders(const std::string& key) const {
+        if (!shaders_) return false;
+        std::lock_guard lock(brokenMutex_);
+        return !brokenPrograms_.count(key);
+    }
 
     // fn run on the GPU's thread, waited for.
     template <typename F>
@@ -125,6 +144,7 @@ public:
 
 private:
     void loop();
+    bool launch();  // the instance or surface backend_ needs, the GPU's thread and its device
     bool create();  // on the GPU's thread
     void destroy();
 
@@ -140,6 +160,17 @@ private:
     QRhiBuffer* uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]);
     void pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u,
               const std::vector<std::pair<int, QRhiTexture*>>& textures, QRhiBuffer* ubuf, QRhiResourceUpdateBatch* after = nullptr);
+    void drawPass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u, QRhiShaderResourceBindings* srb,
+                  QRhiResourceUpdateBatch* after = nullptr);
+    // A shader step compiled, with its textures uploaded (null, the frame failed, when it cannot be).
+    struct Program {
+        QRhiGraphicsPipeline* ps = nullptr;
+        QRhiShaderResourceBindings* layout = nullptr;
+        std::vector<std::pair<QRhiTexture*, bool>> textures;  // (and sampled between texels)
+        long lastFrame = 0;
+    };
+    Program* program(const ShaderStep& step, QRhiResourceUpdateBatch* u);
+    void dropProgram(Program& prog, bool later = false);
     QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u);
     void endFrame();
 
@@ -150,16 +181,26 @@ private:
     bool quit_ = false;
 
     QOffscreenSurface* fallback_ = nullptr;  // (OpenGL; made on the GUI thread)
+#if QT_CONFIG(vulkan)
+    QVulkanInstance* vulkan_ = nullptr;      // (Vulkan)
+#endif
     QSurfaceFormat glFormat_;                // (OpenGL 3.3: float and 3D textures; the surface may not say so)
     QRhi::Implementation backend_ = QRhi::OpenGLES2;
     bool software_ = false;
     bool ready_ = false;
     std::string problem_, name_;
     int maxTexture_ = 0;
+    bool planes_ = false;  // 8 and 16-bit one and two-channel textures, for Y′CbCr planes
+    bool shaders_ = false;  // shaders compiled while running, with float textures sampled between texels
 
     QRhi* rhi_ = nullptr;
     QRhiCommandBuffer* cb_ = nullptr;
     QRhiSampler* sampler_ = nullptr;
+    QRhiSampler* linear_ = nullptr;  // (shader steps' textures sampled between texels)
+    std::map<std::string, Program> programs_;
+    std::map<std::string, std::string> brokenPrograms_;  // (why each could not be made; brokenMutex_)
+    mutable std::mutex brokenMutex_;
+    std::vector<std::string> programsNew_;  // made this frame (dropped with their uploads when it fails)
     QRhiTexture *dummy2d_ = nullptr, *dummy3d_ = nullptr, *dummy16_ = nullptr, *dummyR_ = nullptr;
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
@@ -214,12 +255,63 @@ bool Device::start(std::string* why) {
     else if (choice == "metal") backend_ = QRhi::Metal;
     else if (choice == "d3d11") backend_ = QRhi::D3D11;
     else if (choice == "d3d12") backend_ = QRhi::D3D12;
+    else if (choice == "vulkan") backend_ = QRhi::Vulkan;
     else if (choice == "software") software_ = true;
-    if (backend_ == QRhi::OpenGLES2) {
-        if (!qGuiApp || QThread::currentThread() != qGuiApp->thread()) {
+    // Chosen automatically on Linux: OpenGL, else Vulkan (where OpenGL cannot be set up, or off the GUI thread).
+    bool vulkanAfter = false;
+#if QT_CONFIG(vulkan) && !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
+    vulkanAfter = backend_ == QRhi::OpenGLES2 && (choice.isEmpty() || choice == "auto");
+#endif
+    if (backend_ == QRhi::OpenGLES2 && (!qGuiApp || QThread::currentThread() != qGuiApp->thread())) {
+        if (!vulkanAfter || !qGuiApp) {
             if (why) *why = "not set up (OpenGL is set up from the GUI thread)";
             return false;  // (not remembered: initialize() from the GUI thread can still)
         }
+        backend_ = QRhi::Vulkan;  // (OpenGL needs the GUI thread; Vulkan doesn't)
+        if (!launch()) {
+            if (why) *why = problem_;
+            problem_.clear();  // (as above)
+            return false;
+        }
+        ready_ = true;
+        return true;
+    }
+    bool ok = launch();
+    if (!ok && vulkanAfter) {
+        const std::string gl = problem_;
+        problem_.clear();
+        backend_ = QRhi::Vulkan;
+        ok = launch();
+        if (!ok) problem_ = "OpenGL: " + gl + "; Vulkan: " + problem_;
+    }
+    ready_ = ok;
+    if (why && !ok) *why = problem_;
+    return ok;
+}
+
+bool Device::launch() {
+    if (backend_ == QRhi::Vulkan) {
+#if QT_CONFIG(vulkan)
+        // The instance (the window system's Vulkan) made here, on the thread asking, as Qt makes it.
+        if (!qGuiApp) {
+            problem_ = "no Vulkan (no GUI application to make its instance)";
+            return false;
+        }
+        vulkan_ = new QVulkanInstance;
+        vulkan_->setExtensions(QRhiVulkanInitParams::preferredInstanceExtensions());
+        vulkan_->setApiVersion(vulkan_->supportedApiVersion());
+        if (!vulkan_->create()) {
+            delete vulkan_;
+            vulkan_ = nullptr;
+            problem_ = "no Vulkan (the instance could not be made)";
+            return false;
+        }
+#else
+        problem_ = "this Qt was built without Vulkan";
+        return false;
+#endif
+    }
+    if (backend_ == QRhi::OpenGLES2) {
         QSurfaceFormat format = QSurfaceFormat::defaultFormat();
         format.setVersion(3, 3);
         format.setProfile(QSurfaceFormat::CoreProfile);
@@ -232,8 +324,6 @@ bool Device::start(std::string* why) {
         stop();
         if (problem_.empty()) problem_ = "no graphics device";
     }
-    ready_ = ok;
-    if (why && !ok) *why = problem_;
     return ok;
 }
 
@@ -253,6 +343,10 @@ void Device::stop() {
     }
     delete fallback_;
     fallback_ = nullptr;
+#if QT_CONFIG(vulkan)
+    delete vulkan_;
+    vulkan_ = nullptr;
+#endif
     ready_ = false;
 }
 
@@ -280,6 +374,14 @@ bool Device::create() {
             rhi_ = QRhi::create(QRhi::OpenGLES2, &params, flags);
             break;
         }
+#if QT_CONFIG(vulkan)
+        case QRhi::Vulkan: {
+            QRhiVulkanInitParams params;
+            params.inst = vulkan_;
+            rhi_ = QRhi::create(QRhi::Vulkan, &params, flags);
+            break;
+        }
+#endif
 #if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
         case QRhi::Metal: {
             QRhiMetalInitParams params;
@@ -312,10 +414,20 @@ bool Device::create() {
         problem_ = "the graphics device lacks float render targets, 16-bit textures or 3D textures";
         return false;
     }
+    planes_ = rhi_->isTextureFormatSupported(T::R8) && rhi_->isTextureFormatSupported(T::RG8) && rhi_->isTextureFormatSupported(T::R16) &&
+              rhi_->isTextureFormatSupported(T::RG16);
     name_ = std::string(rhi_->backendName()) + ", " + rhi_->driverInfo().deviceName.toStdString();
     sampler_ = rhi_->newSampler(QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None, QRhiSampler::ClampToEdge,
                                 QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge);
     sampler_->create();
+    linear_ = rhi_->newSampler(QRhiSampler::Linear, QRhiSampler::Linear, QRhiSampler::None, QRhiSampler::ClampToEdge,
+                               QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge);
+    linear_->create();
+#ifdef MONTAGE_WITH_GPU_SHADERS
+    // (Metal: half floats, as Apple's GPUs filter 32-bit floats only on some devices and systems.)
+    shaders_ = backend_ == QRhi::Metal ? rhi_->isTextureFormatSupported(T::RGBA16F) && rhi_->isTextureFormatSupported(T::R16F)
+                                       : rhi_->isTextureFormatSupported(T::RGBA32F) && rhi_->isTextureFormatSupported(T::R32F);
+#endif
     dummy2d_ = rhi_->newTexture(T::RGBA32F, QSize(1, 1));
     dummy3d_ = rhi_->newTexture(T::RGBA32F, 2, 2, 2, 1, T::ThreeDimensional);
     dummy16_ = rhi_->newTexture(T::RG16, QSize(2, 1));
@@ -368,6 +480,9 @@ bool Device::create() {
 }
 
 void Device::destroy() {
+    for (auto& [key, prog] : programs_) dropProgram(prog);
+    programs_.clear();
+    delete linear_, linear_ = nullptr;
     for (auto& [lut, t] : luts_) delete t.tex;
     luts_.clear();
     lutsNew_.clear();
@@ -491,6 +606,11 @@ void Device::pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdat
                       B::sampledTexture(2, B::FragmentStage, bound[2], sampler_), B::sampledTexture(3, B::FragmentStage, bound[3], sampler_),
                       B::sampledTexture(4, B::FragmentStage, bound[4], sampler_), B::sampledTexture(5, B::FragmentStage, bound[5], sampler_)});
     srb->create();
+    drawPass(ps, into, u, srb, after);
+}
+
+void Device::drawPass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u, QRhiShaderResourceBindings* srb,
+                      QRhiResourceUpdateBatch* after) {
     frameSrbs_.push_back(srb);
     const Target* t = target(into);
     if (!t) {
@@ -507,12 +627,206 @@ void Device::pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdat
     cb_->endPass(after);
 }
 
+void Device::dropProgram(Program& prog, bool later) {
+    // (Later: mid-frame, where uploads to its textures may be waiting.)
+    auto drop = [later](QRhiResource* r) {
+        if (!r) return;
+        if (later) r->deleteLater();
+        else delete r;
+    };
+    drop(prog.ps);
+    drop(prog.layout);
+    for (auto& [tex, linear] : prog.textures) drop(tex);
+    prog = {};
+}
+
+Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch* u) {
+    if (auto it = programs_.find(step.key); it != programs_.end()) {
+        it->second.lastFrame = frameNo_;
+        return &it->second;
+    }
+    if (!takesShaders(step.key)) {
+        failed_ = true;
+        return nullptr;
+    }
+    auto broken = [&](const std::string& why) {
+        {
+            std::lock_guard lock(brokenMutex_);
+            brokenPrograms_[step.key] = why;
+        }
+        if (logFallbacks()) std::fprintf(stderr, "montage gpu: shader %s: %s\n", step.key.c_str(), why.c_str());
+        failed_ = true;
+        return nullptr;
+    };
+#ifdef MONTAGE_WITH_GPU_SHADERS
+    // The step's function on the picture's straight colour, premultiplied again (pixels without alpha left alone).
+    const std::string source = "#version 440\n"
+                               "layout(location = 0) out vec4 fragColor;\n"
+                               "layout(std140, binding = 0) uniform Params { vec4 p[16]; };\n"
+                               "layout(binding = 1) uniform sampler2D srcTex;\n" +
+                               step.source +
+                               "\nvoid main() {\n"
+                               "    const vec4 px = texelFetch(srcTex, ivec2(gl_FragCoord.xy), 0);\n"
+                               "    if (px.a <= 0.0) { fragColor = px; return; }\n"
+                               "    const vec4 c = " + step.function + "(vec4(px.rgb * (1.0 / px.a), px.a));\n"
+                               "    fragColor = vec4(c.rgb * px.a, px.a);\n"
+                               "}\n";
+    QShaderBaker baker;
+    QList<QShaderBaker::GeneratedShader> targets;
+    switch (backend_) {
+        case QRhi::OpenGLES2: targets = {{QShader::GlslShader, QShaderVersion(330)}, {QShader::GlslShader, QShaderVersion(300, QShaderVersion::GlslEs)}}; break;
+        case QRhi::Metal: targets = {{QShader::MslShader, QShaderVersion(12)}}; break;
+        case QRhi::D3D11:
+        case QRhi::D3D12: targets = {{QShader::HlslShader, QShaderVersion(50)}}; break;
+        default: targets = {{QShader::SpirvShader, QShaderVersion(100)}}; break;
+    }
+    baker.setGeneratedShaders(targets);
+    baker.setGeneratedShaderVariants({QShader::StandardShader});
+    baker.setSourceString(QByteArray::fromStdString(source), QShader::FragmentStage);
+    const QShader frag = baker.bake();
+    if (!frag.isValid()) return broken("it does not compile: " + baker.errorMessage().toStdString());
+    using T = QRhiTexture;
+    using B = QRhiShaderResourceBinding;
+    Program prog;
+    prog.lastFrame = frameNo_;
+    QVarLengthArray<QRhiShaderResourceBinding, 8> bindings = {B::uniformBuffer(0, B::FragmentStage, ubufs_.front()),
+                                                              B::sampledTexture(1, B::FragmentStage, dummy2d_, sampler_)};
+    const bool half = backend_ == QRhi::Metal;
+    for (const ShaderStep::Texture& t : step.textures) {
+        const bool threeD = t.depth > 0;
+        const bool red = t.channels == 1 && !threeD;
+        const T::Format format = red ? (half ? T::R16F : T::R32F) : half ? T::RGBA16F : T::RGBA32F;
+        QRhiTexture* tex = threeD ? rhi_->newTexture(format, t.width, t.height, t.depth, 1, T::ThreeDimensional)
+                                  : rhi_->newTexture(format, QSize(t.width, t.height));
+        const size_t texels = size_t(t.width) * size_t(t.height) * size_t(threeD ? t.depth : 1);
+        if (!tex->create() || t.values.size() < texels * size_t(t.channels)) {
+            delete tex;
+            dropProgram(prog, true);
+            return broken("its textures cannot be made");
+        }
+        prog.textures.push_back({tex, t.linear});
+        std::vector<float> texelsOut(red ? t.values : std::vector<float>(texels * 4, 1.0f));
+        if (!red)
+            for (size_t i = 0; i < texels; ++i)
+                for (int c = 0; c < 3; ++c) texelsOut[i * 4 + size_t(c)] = t.values[i * size_t(t.channels) + size_t(t.channels == 1 ? 0 : c)];
+        std::vector<qfloat16> halves(half ? texelsOut.size() : 0);
+        if (half) qFloatToFloat16(halves.data(), texelsOut.data(), qsizetype(texelsOut.size()));
+        const char* data = half ? reinterpret_cast<const char*>(halves.data()) : reinterpret_cast<const char*>(texelsOut.data());
+        const quint32 bytes = quint32(texelsOut.size() * (half ? sizeof(qfloat16) : sizeof(float)));
+        QVarLengthArray<QRhiTextureUploadEntry, 1> entries;
+        const int slices = threeD ? t.depth : 1;
+        for (int z = 0; z < slices; ++z) {
+            QRhiTextureSubresourceUploadDescription d(data + size_t(z) * (bytes / quint32(slices)), bytes / quint32(slices));
+            entries.append(QRhiTextureUploadEntry(z, 0, d));
+        }
+        QRhiTextureUploadDescription desc;
+        desc.setEntries(entries.cbegin(), entries.cend());
+        u->uploadTexture(tex, desc);
+        bindings.append(B::sampledTexture(int(bindings.size()), B::FragmentStage, tex, t.linear ? linear_ : sampler_));
+    }
+    prog.layout = rhi_->newShaderResourceBindings();
+    prog.layout->setBindings(bindings.cbegin(), bindings.cend());
+    prog.ps = rhi_->newGraphicsPipeline();
+    prog.ps->setTopology(QRhiGraphicsPipeline::Triangles);
+    prog.ps->setShaderStages({{QRhiShaderStage::Vertex, shader(kQuadVertQsb, sizeof kQuadVertQsb)}, {QRhiShaderStage::Fragment, frag}});
+    prog.ps->setVertexInputLayout({});
+    prog.ps->setShaderResourceBindings(prog.layout);
+    prog.ps->setRenderPassDescriptor(rpFloat_);
+    if (!prog.layout->create() || !prog.ps->create()) {
+        dropProgram(prog, true);
+        return broken("its pipeline cannot be made");
+    }
+    programsNew_.push_back(step.key);
+    return &(programs_[step.key] = prog);
+#else
+    (void)u;
+    return broken("this build compiles no shaders");
+#endif
+}
+
 // A layer's picture at its source size, through its colour steps (null when it could not be made).
 QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
     using T = QRhiTexture;
     QRhiTexture* cur = nullptr;
     float p[64] = {};
-    if (l.frame) {
+    // The input transform's LUT, for the steps that take a decoded frame in (gpucolor.frag's 0, 24 and 26).
+    auto inputLut = [&](float* q, std::vector<std::pair<int, QRhiTexture*>>& textures) {
+        QRhiTexture* table = nullptr;
+        QRhiTexture* lut = lutTexture(l.input, u, &table);
+        if (!lut) return false;
+        if (l.input) {
+            q[1] = float(l.input->size), q[2] = l.input->is1D ? 1 : 0, q[3] = 1;  // (clamped first, as convertColor does)
+            for (int i = 0; i < 3; ++i) q[4 + i] = l.input->domainMin[i], q[8 + i] = l.input->domainMax[i];
+            q[12] = 1, q[13] = 1;
+        }
+        textures.push_back({3, lut});
+        if (l.input && l.input->is1D) textures.push_back({4, table});
+        return true;
+    };
+    if (l.frame && l.frame->planes) {
+        // Y′CbCr as decoded: each plane uploaded as it is, converted (24), resampled to the frame's size where that
+        // differs (25 along rows, then columns) and taken in as a decoded frame (24 itself, or 26).
+        const YcbcrPlanes& yc = *l.frame->planes;
+        const int W = l.frame->width, H = l.frame->height, cw = yc.chromaWidth(), ch = yc.chromaHeight();
+        const T::Format one = yc.wide ? T::R16 : T::R8, two = yc.wide ? T::RG16 : T::RG8;
+        const int sample = yc.wide ? 2 : 1;
+        QRhiTexture* planes[3] = {texture(one, yc.width, yc.height, false), texture(yc.interleaved ? two : one, cw, ch, false),
+                                  yc.interleaved ? nullptr : texture(one, cw, ch, false)};
+        if (!planes[0] || !planes[1] || (!yc.interleaved && !planes[2])) return nullptr;
+        for (int i = 0; i < 3; ++i) {
+            if (!planes[i]) continue;
+            const int pw = i ? cw : yc.width, ph = i ? ch : yc.height;
+            const quint32 row = quint32(pw * sample * (i == 1 && yc.interleaved ? 2 : 1));
+            QRhiTextureSubresourceUploadDescription d(yc.data[i], quint32(yc.stride[i]) * quint32(ph - 1) + row);
+            d.setDataStride(quint32(yc.stride[i]));
+            u->uploadTexture(planes[i], QRhiTextureUploadEntry(0, 0, d));
+        }
+        // (A 1D input transform's table would take the chroma's binding: it goes through 26.)
+        const bool sized = W == yc.width && H == yc.height && !(l.input && l.input->is1D);
+        QRhiTexture* made = texture(T::RGBA32F, yc.width, yc.height, true);
+        if (!made) return nullptr;
+        p[0] = 24;
+        p[16] = float(yc.width), p[17] = float(yc.height), p[18] = float(cw), p[19] = float(ch);
+        p[20] = float(1 << yc.log2ChromaW), p[21] = float(1 << yc.log2ChromaH), p[22] = yc.chromaX, p[23] = yc.chromaY;
+        p[24] = yc.wide ? 65535.0f : 255.0f, p[25] = float(1 << yc.shift), p[26] = yc.interleaved ? 1 : 0, p[27] = float(yc.bits);
+        const float top = float((1 << yc.bits) - 1), unit = float(1 << (yc.bits - 8));
+        p[28] = yc.fullRange ? 0.0f : 16 * unit, p[29] = yc.fullRange ? top : 219 * unit;
+        p[30] = yc.fullRange ? float(1 << (yc.bits - 1)) : 128 * unit, p[31] = yc.fullRange ? top : 224 * unit;
+        p[32] = yc.kr, p[33] = yc.kb, p[34] = sized ? 1 : 0;
+        std::vector<std::pair<int, QRhiTexture*>> textures = {{1, planes[0]}, {4, planes[1]}};
+        if (planes[2]) textures.push_back({5, planes[2]});
+        if (sized && !inputLut(p, textures)) return nullptr;
+        pass(colorPs_, made, u, textures, uniforms(u, p));
+        u = rhi_->nextResourceUpdateBatch();
+        for (QRhiTexture* t : planes)
+            if (t) release(t);
+        if (sized) {
+            cur = made;
+        } else {
+            auto resample = [&](QRhiTexture* from, int n, int m, bool row) -> QRhiTexture* {
+                const QSize size = from->pixelSize();
+                QRhiTexture* to = texture(T::RGBA32F, row ? m : size.width(), row ? size.height() : m, true);
+                if (!to) return nullptr;
+                float q[64] = {};
+                q[0] = 25, q[16] = float(n), q[17] = float(m), q[18] = row ? 1 : 0;
+                pass(colorPs_, to, u, {{1, from}}, uniforms(u, q));
+                u = rhi_->nextResourceUpdateBatch();
+                release(from);
+                return to;
+            };
+            if (W != yc.width && !(made = resample(made, yc.width, W, true))) return nullptr;
+            if (H != yc.height && !(made = resample(made, yc.height, H, false))) return nullptr;
+            cur = texture(T::RGBA32F, W, H, true);
+            if (!cur) return nullptr;
+            std::fill(p, p + 64, 0.0f);
+            p[0] = 26;
+            textures = {{1, made}};
+            if (!inputLut(p, textures)) return nullptr;
+            pass(colorPs_, cur, u, textures, uniforms(u, p));
+            u = rhi_->nextResourceUpdateBatch();
+            release(made);
+        }
+    } else if (l.frame) {
         const int w = l.frame->width, h = l.frame->height;
         QRhiTexture* raw = texture(T::RG16, w * 2, h, false);
         cur = texture(T::RGBA32F, w, h, true);
@@ -520,17 +834,11 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         QRhiTextureSubresourceUploadDescription d(l.frame->px.data(), quint32(size_t(w) * h * 8));
         d.setDataStride(quint32(w) * 8);
         u->uploadTexture(raw, QRhiTextureUploadEntry(0, 0, d));
-        QRhiTexture* table = nullptr;
-        QRhiTexture* lut = lutTexture(l.input, u, &table);
-        if (!lut) return nullptr;
         p[0] = 0;  // unpack
-        if (l.input) {
-            p[1] = float(l.input->size), p[2] = l.input->is1D ? 1 : 0, p[3] = 1;  // (clamped first, as convertColor does)
-            for (int i = 0; i < 3; ++i) p[4 + i] = l.input->domainMin[i], p[8 + i] = l.input->domainMax[i];
-            p[12] = 1, p[13] = 1;
-        }
+        std::vector<std::pair<int, QRhiTexture*>> textures = {{2, raw}};
+        if (!inputLut(p, textures)) return nullptr;
         QRhiBuffer* ub = uniforms(u, p);
-        pass(colorPs_, cur, u, {{2, raw}, {3, lut}, {4, table}}, ub);
+        pass(colorPs_, cur, u, textures, ub);
         u = rhi_->nextResourceUpdateBatch();
         release(raw);
     } else {
@@ -625,6 +933,24 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         const QSize size = cur->pixelSize();
         QRhiTexture* next = texture(T::RGBA32F, size.width(), size.height(), true);
         if (!next) return nullptr;
+        if (op.kind == ColorOp::Shader) {
+            Program* prog = op.shader ? program(*op.shader, u) : nullptr;
+            if (!prog) return nullptr;
+            using B = QRhiShaderResourceBinding;
+            std::fill(p, p + 64, 0.0f);
+            QVarLengthArray<QRhiShaderResourceBinding, 8> bindings = {B::uniformBuffer(0, B::FragmentStage, uniforms(u, p)),
+                                                                      B::sampledTexture(1, B::FragmentStage, cur, sampler_)};
+            for (const auto& [tex, linear] : prog->textures)
+                bindings.append(B::sampledTexture(int(bindings.size()), B::FragmentStage, tex, linear ? linear_ : sampler_));
+            QRhiShaderResourceBindings* srb = rhi_->newShaderResourceBindings();
+            srb->setBindings(bindings.cbegin(), bindings.cend());
+            srb->create();
+            drawPass(prog->ps, next, u, srb);
+            u = rhi_->nextResourceUpdateBatch();
+            if (!keep(cur)) release(cur);
+            cur = next;
+            continue;
+        }
         std::fill(p, p + 64, 0.0f);
         std::vector<std::pair<int, QRhiTexture*>> textures = {{1, cur}};
         QRhiTexture* input = nullptr;  // (a Mix's: the picture marked)
@@ -738,6 +1064,12 @@ void Device::endFrame() {
         bytes -= oldest->bytes;
         drop(oldest);
     }
+    while (programs_.size() > 16) {
+        auto oldest = std::min_element(programs_.begin(), programs_.end(),
+                                       [](const auto& a, const auto& b) { return a.second.lastFrame < b.second.lastFrame; });
+        dropProgram(oldest->second);
+        programs_.erase(oldest);
+    }
     ++frameNo_;
     failed_ = false;
 }
@@ -749,7 +1081,9 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     if (W <= 0 || H <= 0 || W > maxSize || H > maxSize) return false;
     for (const Item& it : frame.items)
         for (const Layer* l : {&it.a, it.b ? &*it.b : nullptr})
-            if (l && ((l->frame && l->frame->width * 2 > maxSize) || l->image.width > maxSize || l->image.height > maxSize)) return false;
+            if (l && ((l->frame && (l->frame->planes ? std::max(l->frame->planes->width, l->frame->width) : l->frame->width * 2) > maxSize) ||
+                      (l->frame && l->frame->planes && l->frame->planes->height > maxSize) || l->image.width > maxSize || l->image.height > maxSize))
+                return false;
     if (rhi_->beginOffscreenFrame(&cb_) != QRhi::FrameOpSuccess) return false;
     bool ok = true;
     QRhiResourceUpdateBatch* u = rhi_->nextResourceUpdateBatch();
@@ -817,6 +1151,13 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                 luts_.erase(it);
             }
     lutsNew_.clear();
+    if (!ok)
+        for (const std::string& key : programsNew_)
+            if (auto it = programs_.find(key); it != programs_.end()) {
+                dropProgram(it->second);
+                programs_.erase(it);
+            }
+    programsNew_.clear();
     endFrame();
     if (!ok) return false;
     const size_t bytes = size_t(W) * H * (out8 ? 4 : 16);
@@ -866,6 +1207,16 @@ std::string deviceName() {
 int maxTextureSize() {
     std::shared_lock lock(gDeviceMutex);
     return gDevice && gDevice->ready() ? gDevice->maxTextureSize() : 0;
+}
+
+bool takesPlanes() {
+    std::shared_lock lock(gDeviceMutex);
+    return gDevice && gDevice->ready() && gDevice->takesPlanes();
+}
+
+bool takesShaders(const std::string& key) {
+    std::shared_lock lock(gDeviceMutex);
+    return gDevice && gDevice->ready() && gDevice->takesShaders(key);
 }
 
 void shutdown() {

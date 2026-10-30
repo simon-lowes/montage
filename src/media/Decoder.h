@@ -68,7 +68,9 @@ public:
 
     // Frame displayed at media time `t` (seconds from the start of the file; of the conformed file when the path carries
     // an interpretation, core/Interpretation.h), converted to RGBA16 at exactly targetW x targetH (0 = native display size).
-    Frame16Ptr frameAt(double t, int targetW = 0, int targetH = 0, bool highQuality = false);
+    // With `planes`, a frame of Y′CbCr is handed out as decoded (Frame16::planes) where nothing else is done to it but
+    // the conversion (no turn, no alpha interpretation), for the GPU to convert.
+    Frame16Ptr frameAt(double t, int targetW = 0, int targetH = 0, bool highQuality = false, bool planes = false);
 
     int displayWidth() const { return dispW_; }
     int displayHeight() const { return dispH_; }
@@ -87,7 +89,7 @@ private:
     static int pickFormat(AVCodecContext* ctx, const int* formats);
     bool decodeNext(AVFrame* into);  // false at EOF / error
     bool seek(double t);
-    Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq);
+    Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq, bool planes = false);
     std::shared_ptr<Frame16> convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq);
     // The file's frame shown at `t` (its own time), decoded (cur_ or next_), with its time in `pts`; null at the end.
     const AVFrame* decodedAt(double t, double* pts);
@@ -114,7 +116,7 @@ private:
     Frame16Ptr stillFrame_;
     bool stillHq_ = true;  // stillFrame_ scaled with high quality (an MLV frame's)
     SwsContext* sws_ = nullptr;
-    int swsKey_[6] = {};  // the conversion sws_ was made for: sizes, source format, flags
+    int swsKey_[8] = {};  // the conversion sws_ was made for: sizes, source format, flags, chroma siting
     // Hardware decoding: the device's pixel format (-1 = software), the frame
     // hardware frames are copied into, and whether a copy failed (reopen in software).
     int hwPixFmt_ = -1;
@@ -217,6 +219,10 @@ Frame16 rotateFrame(const Frame16& f, int degrees);
 // so still detail stays sharp and motion loses its teeth. Works on planar and
 // semi-planar YUV (8 to 16 bits) in place; returns whether it changed anything.
 bool deinterlaceFrame(AVFrame* f);
+// `f`'s planes as they are, held by a reference to the frame, when it is software Y′CbCr the GPU converts (8 to 16
+// bits, little-endian, three planes or Cb and Cr alternating in a second, no alpha; 4:2:0, 4:2:2 or 4:4:4), with its
+// matrix, range and chroma siting; null otherwise.
+std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f);
 // 0 progressive, 1 top field first, 2 bottom field first.
 int fieldDominance(const AVFrame* f);
 void setFieldDominance(AVFrame* f, int dominance);

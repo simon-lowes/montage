@@ -83,7 +83,10 @@ one with its exact version, licence and source.
   Electronics Co., Ltd.; linked into libavcodec for APV encoding, its `LICENSE` copied into the packages' `ffmpeg`
   licences folder).
 - [Qt](https://www.qt.io) 6 (LGPL-3.0): Core, Gui, Widgets, Network, Concurrent, Xml and Multimedia. You may replace
-  the bundled Qt libraries with your own build of the same version.
+  the bundled Qt libraries with your own build of the same version. And Qt Shader Tools (GPL-3.0), which compiles
+  OpenColorIO's shaders for the GPU while Montage runs, with the [glslang](https://github.com/KhronosGroup/glslang)
+  (BSD-3-Clause and others, listed in its licence file) and [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)
+  (Apache-2.0) it includes.
 - [OpenColorIO](https://opencolorio.org) (BSD-3-Clause), [ONNX Runtime](https://onnxruntime.ai) (MIT, with its own
   third-party notices), [LibRaw](https://www.libraw.org) (LGPL-2.1 or CDDL-1.0), [lilv](https://drobilla.net/software/lilv)
   (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause), [OpenJPEG](https://www.openjpeg.org)

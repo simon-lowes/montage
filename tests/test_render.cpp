@@ -73,6 +73,7 @@
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
+#include "media/MediaPool.h"
 #include "media/Exr.h"
 #include "media/LensCalibration.h"
 #include "media/Proxy.h"
@@ -153,6 +154,8 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 
@@ -190,6 +193,72 @@ void rgb(const Image& img, int x, int y, float out[4]) {
     float a = p[3];
     for (int c = 0; c < 3; ++c) out[c] = a > 0 ? p[c] / a : 0;
     out[3] = a;
+}
+
+// `f` (its format, size and buffers set) filled with Y′CbCr code values code(component, x, y), each in its component's
+// own plane size.
+void fillYcbcrFrame(AVFrame* f, const std::function<int(int, int, int)>& code) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+    // (Zeroed first: writing a sample of fewer than 16 bits keeps the word's other bits.)
+    for (int i = 0; i < 4 && f->data[i]; ++i)
+        std::memset(f->data[i], 0, size_t(f->linesize[i]) * size_t(i == 1 || i == 2 ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height));
+    std::vector<uint16_t> line(static_cast<size_t>(f->width));
+    for (int c = 0; c < 3; ++c) {
+        const int cw = c ? AV_CEIL_RSHIFT(f->width, d->log2_chroma_w) : f->width, ch = c ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height;
+        for (int y = 0; y < ch; ++y) {
+            for (int x = 0; x < cw; ++x) line[size_t(x)] = uint16_t(code(c, x, y));
+            av_write_image_line2(line.data(), f->data, f->linesize, d, 0, y, c, cw, 2);
+        }
+    }
+}
+
+// A short video of Y′CbCr in `fmt` (three frames, each filled by fillYcbcrFrame), tagged with the matrix, range and
+// chroma siting given: FFV1 in Matroska, or NV12 raw there (FFV1 does not take it).
+bool writeYcbcrVideo(const std::string& path, AVPixelFormat fmt, int w, int h, AVColorSpace space, AVColorRange range,
+                     AVChromaLocation siting, const std::function<int(int, int, int)>& code) {
+    const bool raw = fmt == AV_PIX_FMT_NV12;
+    AVFormatContext* oc = nullptr;
+    if (avformat_alloc_output_context2(&oc, nullptr, "matroska", path.c_str()) < 0) return false;
+    auto closeOut = qScopeGuard([&] {
+        if (oc->pb) avio_closep(&oc->pb);
+        avformat_free_context(oc);
+    });
+    const AVCodec* codec = avcodec_find_encoder(raw ? AV_CODEC_ID_RAWVIDEO : AV_CODEC_ID_FFV1);
+    AVCodecContext* cc = codec ? avcodec_alloc_context3(codec) : nullptr;
+    if (!cc) return false;
+    auto freeCodec = qScopeGuard([&] { avcodec_free_context(&cc); });
+    cc->width = w, cc->height = h, cc->pix_fmt = fmt, cc->time_base = {1, 25}, cc->framerate = {25, 1};
+    cc->colorspace = space, cc->color_range = range, cc->chroma_sample_location = siting;
+    if (!raw) cc->level = 3;
+    if (oc->oformat->flags & AVFMT_GLOBALHEADER) cc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (avcodec_open2(cc, codec, nullptr) < 0) return false;
+    AVStream* st = avformat_new_stream(oc, nullptr);
+    if (!st || avcodec_parameters_from_context(st->codecpar, cc) < 0) return false;
+    st->time_base = cc->time_base;
+    if (avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE) < 0 || avformat_write_header(oc, nullptr) < 0) return false;
+    AVFrame* f = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    auto freeFrame = qScopeGuard([&] {
+        av_frame_free(&f);
+        av_packet_free(&pkt);
+    });
+    f->width = w, f->height = h, f->format = fmt, f->colorspace = space, f->color_range = range, f->chroma_location = siting;
+    if (av_frame_get_buffer(f, 0) < 0) return false;
+    fillYcbcrFrame(f, code);
+    auto drain = [&] {
+        while (avcodec_receive_packet(cc, pkt) == 0) {
+            av_packet_rescale_ts(pkt, cc->time_base, st->time_base);
+            pkt->stream_index = st->index;
+            if (av_interleaved_write_frame(oc, pkt) < 0) return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < 3; ++i) {
+        f->pts = i;
+        if (avcodec_send_frame(cc, f) < 0 || !drain()) return false;
+    }
+    if (avcodec_send_frame(cc, nullptr) < 0 || !drain()) return false;
+    return av_write_trailer(oc) == 0;
 }
 
 Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime len) {
@@ -16380,6 +16449,9 @@ colorspaces:
         QVERIFY(same(5) <= 2e-3);
         QCOMPARE(gpu::stats().gpuFrames, 1L);
         QVERIFY(gpu::stats().cpuLayers >= 1);
+        // Each layer made on the CPU is named with why.
+        const std::string layer = gpu::stats().lastCpuLayer;
+        QVERIFY2(layer.find("\"" + masked.name + "\"") == 0 && layer.find("Color Correct") != std::string::npos, layer.c_str());
         QVERIFY(edit::clipById(s, maskedId));
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
         adj.effects.push_back(makeEffect(p, "invert"));
@@ -16388,6 +16460,375 @@ colorspaces:
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
         QVERIFY(!gpu::stats().lastFallback.empty());
+    }
+    void gpuYcbcrPlanes() {
+        // Decoded Y′CbCr converted on the GPU from its planes, as decoded, rather than the decoder converting it to
+        // RGBA on the CPU: every layout, in BT.601, BT.709 and BT.2020, limited and full range, against the CPU's
+        // frame (smooth pictures, so how either side interpolates chroma between its samples does not count).
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesPlanes()) QSKIP("this GPU does not take 8 and 16-bit textures of one and two channels");
+        QTemporaryDir dir;
+        struct Layout {
+            AVPixelFormat fmt;
+            const char* name;
+        };
+        const Layout layouts[] = {{AV_PIX_FMT_YUV420P, "4:2:0 8-bit"},      {AV_PIX_FMT_YUV422P, "4:2:2 8-bit"},
+                                  {AV_PIX_FMT_YUV444P, "4:4:4 8-bit"},      {AV_PIX_FMT_YUV420P10LE, "4:2:0 10-bit"},
+                                  {AV_PIX_FMT_YUV422P10LE, "4:2:2 10-bit"}, {AV_PIX_FMT_YUV444P12LE, "4:4:4 12-bit"},
+                                  {AV_PIX_FMT_YUV420P16LE, "4:2:0 16-bit"}, {AV_PIX_FMT_NV12, "NV12"},
+                                  {AV_PIX_FMT_P010LE, "P010"},              {AV_PIX_FMT_P016LE, "P016"},
+                                  {AV_PIX_FMT_P210LE, "P210"}};
+        const std::pair<AVColorSpace, const char*> matrices[] = {{AVCOL_SPC_SMPTE170M, "BT.601"}, {AVCOL_SPC_BT709, "BT.709"},
+                                                                  {AVCOL_SPC_BT2020_NCL, "BT.2020"}};
+        const int W = 96, H = 54;
+        // Smooth luma and chroma well inside the range (code values of the format's bits).
+        auto smooth = [](int bits, bool full) {
+            return [bits, full](int c, int x, int y) {
+                const double unit = double(1 << (bits - 8));
+                const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.045 + y * 0.03) : 0.5 + 0.18 * std::sin(x * (c == 1 ? 0.07 : 0.05) - y * 0.04);
+                const double lo = full ? 0 : 16 * unit, hi = full ? (1 << bits) - 1 : (c ? 240 : 235) * unit;
+                return int(std::lround(lo + (hi - lo) * v));
+            };
+        };
+        auto differs = [&](const Image& a, const Image& b, QString& where) {
+            double worst = 0;
+            for (int y = 0; y < a.height; ++y)
+                for (int x = 0; x < a.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double e = std::fabs(double(a.at(x, y)[c]) - b.at(x, y)[c]); e > worst) {
+                            worst = e;
+                            where = QStringLiteral(" at %1,%2 channel %3: %4 on the CPU, %5 on the GPU").arg(x).arg(y).arg(c).arg(a.at(x, y)[c]).arg(b.at(x, y)[c]);
+                        }
+            return worst;
+        };
+        int n = 0;
+        for (const Layout& l : layouts) {
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(l.fmt);
+            const int bits = d->comp[0].depth;
+            for (const auto& [space, matrix] : matrices)
+                for (const bool full : {false, true}) {
+                    const QString what = QStringLiteral("%1 %2 %3").arg(l.name, matrix, full ? "full" : "limited");
+                    const AVColorRange range = full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+                    QString where;
+                    if (l.fmt == AV_PIX_FMT_P010LE || l.fmt == AV_PIX_FMT_P016LE || l.fmt == AV_PIX_FMT_P210LE) {
+                        // No container holds these raw (hardware decoders give them): the frame is made here, and its
+                        // planes drawn on the GPU against the decoder's conversion of them on the CPU.
+                        std::shared_ptr<AVFrame> f(av_frame_alloc(), [](AVFrame* fr) { av_frame_free(&fr); });
+                        f->width = W, f->height = H, f->format = l.fmt, f->colorspace = space, f->color_range = range;
+                        f->chroma_location = AVCHROMA_LOC_LEFT;
+                        QVERIFY(av_frame_get_buffer(f.get(), 0) == 0);
+                        fillYcbcrFrame(f.get(), smooth(bits, full));
+                        auto frame = std::make_shared<Frame16>();
+                        frame->width = W, frame->height = H;
+                        frame->planes = ycbcrPlanesOf(f.get());
+                        QVERIFY2(frame->planes, qPrintable(what + ": no planes"));
+                        const Image cpu = toImage(*frame);
+                        gpu::Frame g;
+                        g.width = W, g.height = H;
+                        g.items.emplace_back();
+                        g.items[0].a.frame = frame;
+                        g.items[0].a.place.full = true;
+                        Image onGpu;
+                        QVERIFY2(gpu::execute(g, &onGpu), qPrintable(what + ": not on the GPU"));
+                        const double worst = differs(cpu, onGpu, where);
+                        QVERIFY2(worst <= 1.0 / 1023, qPrintable(what + QStringLiteral(": differs by %1").arg(worst) + where));
+                        continue;
+                    }
+                    const std::string path = dir.filePath(QStringLiteral("v%1.mkv").arg(n++)).toStdString();
+                    QVERIFY2(writeYcbcrVideo(path, l.fmt, W, H, space, range, AVCHROMA_LOC_LEFT, smooth(bits, full)), qPrintable(what));
+                    Frame16Ptr planes = MediaPool::instance().videoFrame(path, 0, 0, 0, false, true);
+                    QVERIFY2(planes && planes->planes && planes->px.empty(), qPrintable(what + ": no planes"));
+                    QCOMPARE(planes->planes->bits, bits);
+                    QCOMPARE(planes->planes->fullRange, full);
+                    Project p = makeDefaultProject();
+                    Sequence& s = *p.active();
+                    s.width = W, s.height = H;
+                    MediaItem m;
+                    QVERIFY(probeMedia(path, m));
+                    m.id = p.newId();
+                    p.media.push_back(m);
+                    QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2, {TrackKind::Video, 0}, {}, false).ok);
+                    RenderOptions o;
+                    o.highQuality = true;
+                    const Image cpu = renderProgramFrame(p, s, 1, o);
+                    gpu::resetStats();
+                    o.gpu = true;
+                    const Image onGpu = renderProgramFrame(p, s, 1, o);
+                    QVERIFY2(gpu::stats().gpuFrames == 1 && gpu::stats().gpuLayers == 1, qPrintable(what + ": not on the GPU"));
+                    QCOMPARE(onGpu.width, W);
+                    const double worst = differs(cpu, onGpu, where);
+                    QVERIFY2(worst <= 1.0 / 1023, qPrintable(what + QStringLiteral(": differs by %1").arg(worst) + where));
+                }
+        }
+        // Sharp chroma, each sample its own: the GPU interpolates it exactly as media/Image's ycbcrToRgba does (chroma
+        // sited left, centred and at the top left), at the picture's own size and resampled to half of it (below half,
+        // the decoder scales it down instead).
+        for (const AVChromaLocation siting : {AVCHROMA_LOC_LEFT, AVCHROMA_LOC_CENTER, AVCHROMA_LOC_TOPLEFT})
+            for (const AVPixelFormat fmt : {AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV422P}) {
+                const std::string path = dir.filePath(QStringLiteral("sharp%1.mkv").arg(n++)).toStdString();
+                const int bits = av_pix_fmt_desc_get(fmt)->comp[0].depth;
+                QVERIFY(writeYcbcrVideo(path, fmt, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, siting, [bits](int c, int x, int y) {
+                    const unsigned hash = unsigned(x * 73856093 ^ y * 19349663 ^ c * 83492791);
+                    return int((16 + hash % 225) << (bits - 8));
+                }));
+                Project p = makeDefaultProject();
+                Sequence& s = *p.active();
+                s.width = W, s.height = H;
+                MediaItem m;
+                QVERIFY(probeMedia(path, m));
+                m.id = p.newId();
+                p.media.push_back(m);
+                QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2, {TrackKind::Video, 0}, {}, false).ok);
+                for (const double scale : {1.0, 0.5}) {
+                    RenderOptions o;
+                    o.gpu = true;
+                    o.scale = scale;
+                    gpu::resetStats();
+                    const Image onGpu = renderProgramFrame(p, s, 1, o);
+                    QVERIFY(gpu::stats().gpuFrames == 1 && gpu::stats().gpuLayers == 1);
+                    Frame16Ptr f = MediaPool::instance().videoFrame(path, m.fps.valid() ? 1 / m.fps.toDouble() : 0.04, onGpu.width, onGpu.height, false, true);
+                    QVERIFY(f && f->planes);
+                    const Image cpu = toImage(*f);
+                    QCOMPARE(cpu.width, onGpu.width);
+                    double worst = 0;
+                    for (size_t i = 0; i < cpu.px.size(); ++i) worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]));
+                    QVERIFY2(worst <= 2e-5, qPrintable(QStringLiteral("siting %1, %2, scale %3: differs by %4")
+                                                           .arg(int(siting)).arg(av_get_pix_fmt_name(fmt)).arg(scale).arg(worst)));
+                }
+            }
+    }
+    void gpuExportMatchesCpu() {
+        // An export drawn on the GPU (one read-back a frame) against the same export on the CPU: Y′CbCr footage graded,
+        // a picture over it scaled, turned, faded and screened, 16-bit PNGs out.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        const int W = 160, H = 90;
+        const std::string video = dir.filePath("footage.mkv").toStdString();
+        QVERIFY(writeYcbcrVideo(video, AV_PIX_FMT_YUV420P10LE, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT, [](int c, int x, int y) {
+            const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.04 + y * 0.03) : 0.5 + 0.15 * std::sin(x * (c == 1 ? 0.05 : 0.03) - y * 0.04);
+            return int(std::lround((c ? 64 + 896 * v : 64 + 876 * v)));
+        }));
+        QImage pic(64, 48, QImage::Format_RGBA64);
+        for (int y = 0; y < 48; ++y)
+            for (int x = 0; x < 64; ++x) pic.setPixelColor(x, y, QColor::fromRgbF(x / 64.0f, 0.3f + y / 96.0f, 0.6f, 1.0f));
+        QVERIFY(pic.save(dir.filePath("pic.png")));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H;
+        Id ids[2];
+        for (int i = 0; i < 2; ++i) {
+            MediaItem m;
+            QVERIFY(probeMedia(i ? dir.filePath("pic.png").toStdString() : video, m));
+            m.id = ids[i] = p.newId();
+            p.media.push_back(m);
+        }
+        auto r1 = edit::placeMedia(p, s, ids[0], 0, 0, 3, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r1.ok);
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["exposure"] = 0.3;
+        cc.params["saturation"] = 1.2;
+        edit::clipById(s, r1.created[0])->effects.push_back(cc);
+        auto r2 = edit::placeMedia(p, s, ids[1], 0, 0, 3, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        top->motion.params["scale"] = 120.0;
+        top->motion.params["rotation"] = 9.0;
+        top->motion.params["opacity"] = 60.0;
+        top->blendMode = "screen";
+        auto exported = [&](bool onGpu) {
+            ExportSettings st;
+            st.path = dir.filePath(onGpu ? "gpu.png" : "cpu.png").toStdString();
+            st.videoCodec = "png";
+            st.pixFmt = "rgb48be";
+            st.audioCodec = "none";
+            st.gpu = onGpu;
+            std::string err;
+            const bool ok = exportSequence(p, s, st, nullptr, nullptr, &err);
+            if (!ok) qWarning("%s", err.c_str());
+            return ok;
+        };
+        QVERIFY(exported(false));
+        gpu::resetStats();
+        QVERIFY(exported(true));
+        QVERIFY2(gpu::stats().gpuFrames == 3 && gpu::stats().cpuLayers == 0, gpu::stats().lastFallback.c_str());
+        double worst = 0;
+        QString where;
+        for (int f = 0; f < 3; ++f) {
+            const QImage a(dir.filePath(QStringLiteral("cpu_%1.png").arg(f, 6, 10, QLatin1Char('0'))));
+            const QImage b(dir.filePath(QStringLiteral("gpu_%1.png").arg(f, 6, 10, QLatin1Char('0'))));
+            QVERIFY(!a.isNull() && a.size() == b.size() && a.width() == W);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const QRgba64 u = a.pixelColor(x, y).rgba64(), v = b.pixelColor(x, y).rgba64();
+                    const std::pair<int, int> rgb[3] = {{u.red(), v.red()}, {u.green(), v.green()}, {u.blue(), v.blue()}};
+                    for (int c = 0; c < 3; ++c)
+                        if (const double e = std::abs(rgb[c].first - rgb[c].second) / 65535.0; e > worst) {
+                            worst = e;
+                            where = QStringLiteral(" (frame %1 at %2,%3 channel %4: %5 on the CPU, %6 on the GPU)")
+                                        .arg(f).arg(x).arg(y).arg(c).arg(rgb[c].first).arg(rgb[c].second);
+                        }
+                }
+        }
+        QVERIFY2(worst <= 1.0 / 1023, qPrintable(QStringLiteral("the GPU's export differs by %1").arg(worst) + where));
+    }
+    void gpuOcioMatchesCpu() {
+        // OpenColorIO's transforms drawn on the GPU through OCIO's own shaders, against its CPU processor: three configs
+        // (a camera's log, gamut and display curves; 1D and 3D LUT files; ACES's output transform with a look), over
+        // 102,400 colours each.
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesShaders()) QSKIP("this build or GPU compiles no shaders while running");
+        QTemporaryDir dir;
+        auto write = [&](const QString& name, const QByteArray& text) {
+            QFile f(dir.filePath(name));
+            return f.open(QIODevice::WriteOnly) && f.write(text) == text.size();
+        };
+        {
+            QByteArray cube = "LUT_3D_SIZE 17\n";
+            for (int b = 0; b < 17; ++b)
+                for (int g = 0; g < 17; ++g)
+                    for (int r = 0; r < 17; ++r)
+                        cube += QByteArray::number(std::pow(r / 16.0, 1.3) * 0.95 + 0.02 * b / 16.0, 'g', 9) + " " +
+                                QByteArray::number(g / 16.0 * 0.9 + 0.05 * std::sin(r * 0.3), 'g', 9) + " " + QByteArray::number(std::sqrt(b / 16.0), 'g', 9) + "\n";
+            QVERIFY(write("look.cube", cube));
+            QByteArray long1d = "Version 1\nFrom 0 1\nLength 4096\nComponents 1\n{\n", short1d = "Version 1\nFrom 0 1\nLength 200\nComponents 3\n{\n";
+            for (int i = 0; i < 4096; ++i) long1d += QByteArray::number(std::pow(i / 4095.0, 0.45), 'g', 9) + "\n";
+            for (int i = 0; i < 200; ++i)
+                short1d += QByteArray::number(i / 199.0, 'g', 9) + " " + QByteArray::number(std::pow(i / 199.0, 1.1), 'g', 9) + " " +
+                           QByteArray::number(std::pow(i / 199.0, 0.9), 'g', 9) + "\n";
+            QVERIFY(write("long.spi1d", long1d + "}\n"));
+            QVERIFY(write("short.spi1d", short1d + "}\n"));
+        }
+        QVERIFY(write("camera.ocio", R"(ocio_profile_version: 2
+roles:
+  default: linear
+  scene_linear: linear
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Video, colorspace: video}
+colorspaces:
+  - !<ColorSpace>
+    name: linear
+    encoding: scene-linear
+  - !<ColorSpace>
+    name: log
+    encoding: log
+    from_scene_reference: !<LogCameraTransform> {base: 10, log_side_slope: 0.247189638, log_side_offset: 0.385536998, lin_side_slope: 5.555556, lin_side_offset: 0.052272, lin_side_break: 0.010591}
+  - !<ColorSpace>
+    name: video
+    encoding: sdr-video
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<MatrixTransform> {matrix: [0.6, 0.3, 0.1, 0, 0.1, 0.8, 0.1, 0, 0.05, 0.1, 0.85, 0, 0, 0, 0, 1]}
+        - !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}
+)"));
+        QVERIFY(write("luts.ocio", QStringLiteral(R"(ocio_profile_version: 2
+search_path: "%1"
+roles:
+  default: raw
+  scene_linear: raw
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Graded, colorspace: graded}
+colorspaces:
+  - !<ColorSpace>
+    name: raw
+    encoding: sdr-video
+  - !<ColorSpace>
+    name: graded
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<FileTransform> {src: long.spi1d, interpolation: linear}
+        - !<FileTransform> {src: short.spi1d, interpolation: linear}
+        - !<FileTransform> {src: look.cube, interpolation: tetrahedral}
+)").arg(dir.path()).toUtf8()));
+        QVERIFY(write("aces.ocio", R"(ocio_profile_version: 2
+roles:
+  default: ACES2065-1
+  scene_linear: ACES2065-1
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  sRGB:
+    - !<View> {name: ACES, colorspace: srgb_display}
+looks:
+  - !<Look>
+    name: Warm
+    process_space: ACES2065-1
+    transform: !<CDLTransform> {slope: [1.1, 1, 0.9], offset: [0.01, 0, -0.01], power: [1, 1.05, 1], sat: 1.1}
+colorspaces:
+  - !<ColorSpace>
+    name: ACES2065-1
+    encoding: scene-linear
+  - !<ColorSpace>
+    name: srgb_display
+    encoding: sdr-video
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<BuiltinTransform> {style: ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-VIDEO_1.0}
+        - !<BuiltinTransform> {style: DISPLAY - CIE-XYZ-D65_to_sRGB}
+)"));
+        struct Case {
+            const char* name;
+            const char* config;
+            bool display;
+            const char* src;
+            const char* dst;
+            const char* look;
+            bool linear;  // what comes in is linear light (0 to 16), else 0..1
+        };
+        const Case cases[] = {{"linear to video", "camera.ocio", false, "linear", "video", "", true},
+                              {"log to linear", "camera.ocio", false, "log", "linear", "", false},
+                              {"1D and 3D LUTs", "luts.ocio", true, "raw", "", "", false},
+                              {"ACES output with a look", "aces.ocio", true, "ACES2065-1", "", "Warm", true}};
+        Project p = makeDefaultProject();
+        const int W = 320, H = 320;
+        for (const Case& c : cases) {
+            Effect e = makeEffect(p, "ocio");
+            e.strings["config"] = dir.filePath(c.config).toStdString();
+            e.strings["mode"] = c.display ? "Display / View" : "Colour Space";
+            e.strings["src"] = c.src;
+            e.strings["dst"] = c.dst;
+            e.strings["look"] = c.look;
+            Image in(W, H, Image::Uninitialized{});
+            uint32_t seed = 12345;
+            auto rnd = [&] {
+                seed = seed * 1664525u + 1013904223u;
+                return double(seed >> 8) / double(1 << 24);
+            };
+            for (size_t i = 0; i < size_t(W) * H; ++i) {
+                float* px = &in.px[i * 4];
+                for (int k = 0; k < 3; ++k) px[k] = float(c.linear ? (i % 97 == 0 ? 0.0 : std::exp2(-10 + 14 * rnd())) : rnd());
+                px[3] = 1;
+            }
+            Image cpu = in;
+            std::string err;
+            QVERIFY2(applyOcio(e, cpu, &err), err.c_str());
+            gpu::Frame frame;
+            frame.width = W, frame.height = H;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.image = in;
+            item.a.place.full = true;
+            QVERIFY2(gpuColorOps(e, 0, item.a.ops, W, H), c.name);
+            QCOMPARE(item.a.ops.size(), size_t(1));
+            QVERIFY(item.a.ops[0].kind == gpu::ColorOp::Shader);
+            frame.items.push_back(std::move(item));
+            Image onGpu;
+            QVERIFY2(gpu::execute(frame, &onGpu), c.name);
+            double worst = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i)
+                worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]) / std::max(1.0, std::fabs(double(cpu.px[i]))));
+            QVERIFY2(worst <= 1e-4, qPrintable(QStringLiteral("%1: differs by %2").arg(c.name).arg(worst)));
+            qInfo("%s: GPU within %.2g of OpenColorIO's CPU processor", c.name, worst);
+        }
     }
     void footageWordsReadAnswers() {
         // The sentences numbered, shortened when asked, several to a line when asked.

@@ -32,8 +32,9 @@ class MediaPool {
 public:
     static MediaPool& instance();
 
-    // Decoded video frame at media time t, scaled to w x h (0 = native).
-    Frame16Ptr videoFrame(const std::string& path, double t, int w = 0, int h = 0, bool highQuality = false);
+    // Decoded video frame at media time t, scaled to w x h (0 = native). With `planes`, Y′CbCr as decoded where the
+    // decoder can (VideoDecoder::frameAt), for the GPU.
+    Frame16Ptr videoFrame(const std::string& path, double t, int w = 0, int h = 0, bool highQuality = false, bool planes = false);
     // Native display size of the video (0,0 if it cannot be opened).
     bool videoSize(const std::string& path, int& w, int& h);
 
@@ -82,15 +83,16 @@ private:
         int64_t micros;
         int w, h;
         bool hq;
+        bool planes;
         bool operator==(const FrameKey& o) const {
-            return micros == o.micros && w == o.w && h == o.h && hq == o.hq && path == o.path;
+            return micros == o.micros && w == o.w && h == o.h && hq == o.hq && planes == o.planes && path == o.path;
         }
     };
     struct FrameKeyHash {
         size_t operator()(const FrameKey& k) const {
             size_t h = std::hash<std::string>()(k.path);
             h ^= std::hash<int64_t>()(k.micros) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-            h ^= size_t(k.w) * 31 + size_t(k.h) * 131 + (k.hq ? 7 : 0);
+            h ^= size_t(k.w) * 31 + size_t(k.h) * 131 + (k.hq ? 7 : 0) + (k.planes ? 11 : 0);
             return h;
         }
     };

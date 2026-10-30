@@ -3530,6 +3530,17 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                                   [lut](float v[3]) { lut->apply(v[0], v[1], v[2]); });
             op.clampFirst = true;
         }
+    } else if (e.type == "ocio") {
+        // OCIO's own GPU shader (within its last digits of the CPU's transform), without a mask.
+        if (op.masked || !gpu::takesShaders()) return false;
+        std::shared_ptr<const gpu::ShaderStep> shader = ocioShaderStep(e);
+        if (!shader) {
+            Image probe(1, 1);
+            return !applyOcio(e, probe);  // (a broken config: the CPU leaves the picture alone too; else the CPU draws it)
+        }
+        if (!gpu::takesShaders(shader->key)) return false;  // (it would not build: the CPU draws it)
+        op.kind = gpu::ColorOp::Shader;
+        op.shader = std::move(shader);
     } else if (e.type == "cdl") {
         const Cdl cdl = effectCdl(e, t);
         if (cdl.identity()) return true;

@@ -5,9 +5,13 @@
 #include <QtConcurrent>
 #include <algorithm>
 
+#include "Settings.h"
+#include "render/GpuCompositor.h"
 #include "render/RenderFarm.h"
 
 namespace montage {
+
+bool exportsOnGpu() { return appSettings().value("playback/gpuRendering", true).toBool() && gpu::available(); }
 
 RenderQueue::RenderQueue(QObject* parent) : QObject(parent) {
     connect(&watcher_, &QFutureWatcher<Result>::finished, this, &RenderQueue::finished);
@@ -113,7 +117,8 @@ void RenderQueue::next() {
     emit changed();
     const std::shared_ptr<const Project> project = j->project;
     const Id seq = j->sequence;
-    const ExportSettings settings = j->settings;
+    ExportSettings settings = j->settings;
+    settings.gpu = exportsOnGpu();  // (what it cannot draw on the CPU)
     const int stems = j->stems;
     std::atomic<bool>* cancel = &cancel_;
     std::atomic<double>* progress = &progress_;
