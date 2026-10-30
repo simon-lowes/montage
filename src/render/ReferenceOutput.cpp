@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "core/Cea708.h"
 #include "core/History.h"
 #include "render/ColorSpace.h"
 #include "render/MonitorCalibration.h"
@@ -217,6 +218,24 @@ bool Scheduler::start(const Device& device, const Mode& mode, const Sequence& s,
                 audioChannels_ = n;
                 break;
             }
+    }
+    // Captions: the track shown, timed in the output's frames, as 608 and 708 caption data a frame.
+    cc_.clear();
+    const CaptionTrack* track = device.captions && config.captions ? captionTrackFor(s) : nullptr;
+    if (track && !track->captions.empty() && mode.fps.valid()) {
+        const double scale = mode.fps.toDouble() / seqFps_.toDouble();
+        std::vector<Caption> captions = track->captions;
+        for (Caption& c : captions) {
+            c.start = FrameTime(std::llround(double(c.start) * scale));
+            c.end = std::max(c.start + 1, FrameTime(std::llround(double(c.end) * scale)));
+        }
+        const auto data = captionCcData(captions, mode.fps, captions.back().end + 1, true, true, track->style);
+        cc_.reserve(data.size());
+        for (const auto& frame : data) {
+            std::vector<uint8_t> bytes;
+            for (const CcTriplet& t : frame) bytes.insert(bytes.end(), t.begin(), t.end());
+            cc_.push_back(std::move(bytes));
+        }
     }
     const Rect r = fitRect(s.width, s.height, mode.width, mode.height, config.scaling);
     renderScale_ = s.width > 0 ? double(r.width) / s.width : 1;
@@ -497,6 +516,11 @@ void Scheduler::sendLoop() {
         vf.timecode = timecodeOf(tcFrame, mode_.fps);
         vf.timecodeFrame = tcFrame;
         vf.fps = mode_.fps;
+        // Captions only while playing at normal speed (608's pop-on captions load over the frames before).
+        if (speed == 1 && tcFrame >= 0 && size_t(tcFrame) < cc_.size() && !cc_[size_t(tcFrame)].empty()) {
+            vf.cc = cc_[size_t(tcFrame)].data();
+            vf.ccCount = int(cc_[size_t(tcFrame)].size() / 3);
+        }
         Audio a;
         a.samples = audio.empty() ? nullptr : audio.data();
         a.frames = audioChannels_ > 0 ? n : 0;
@@ -617,9 +641,10 @@ Signal VirtualBackend::openSignal() const {
 
 std::vector<std::shared_ptr<Backend>> backends() {
     static const std::shared_ptr<Backend> decklink = makeDeckLinkBackend(), ndi = makeNdiBackend(), omt = makeOmtBackend();
-    static const std::shared_ptr<Backend> virt = std::make_shared<VirtualBackend>();
+    static const std::shared_ptr<Backend> virt = std::make_shared<VirtualBackend>(), st2110 = makeSt2110Backend();
     std::vector<std::shared_ptr<Backend>> v{decklink, ndi};
     if (omt) v.push_back(omt);
+    v.push_back(st2110);
     // (looked at each time, so a test can turn it on after start-up)
     const char* env = std::getenv("MONTAGE_VIRTUAL_OUTPUT");
     if (env && *env) v.push_back(virt);

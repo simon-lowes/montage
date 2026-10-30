@@ -87,6 +87,12 @@ protected:
     virtual std::vector<uint8_t> headerMetadata(int64_t duration) const = 0;  // primer and sets
     virtual std::vector<uint8_t> indexSegments() const = 0;
     virtual std::array<uint8_t, 16> essenceContainer() const = 0;
+    // (IMF) What follows the essence before the index: generic stream partitions after a clip ended with endClip().
+    virtual bool finishEssence(std::string* error) {
+        (void)error;
+        return true;
+    }
+    void endClip() { clipEnd_ = essenceBytes_; }
     // The essence container the partitions and preface name: the encrypted one's label when encrypting.
     std::array<uint8_t, 16> containerLabel() const;
     std::vector<uint8_t> partitionPack(const uint8_t key[16], uint64_t thisPartition, uint64_t previous, uint64_t footer,
@@ -100,6 +106,7 @@ protected:
     bool imf_ = false;  // the AS-02 layout
     long clipLengthAt_ = -1;   // where a clip-wrapped KLV's length is written (-1: frame wrapped)
     uint64_t clipStart_ = 0;   // the essence bytes before its value
+    uint64_t clipEnd_ = 0;     // ... and after it (0: the end of the essence)
     std::vector<uint64_t> offsets_;  // each frame's KLV, from the start of the essence
     uint64_t essenceBytes_ = 0;
     // Identities fixed when the file is opened, so the header written at the end matches the first one.
@@ -460,6 +467,97 @@ private:
     std::string language_ = "en", title_, version_;
 };
 
+// SMPTE ST 2067-203: immersive sound as Metadata-Guided Audio (ST 2127-1) with S-ADM (ST 2127-10). Each edit unit an
+// MGA frame of the composition's: its 24-bit samples (every channel's, interleaved, as ST 382 has them) and one metadata
+// section, the S-ADM frame (ITU-R BS.2125) as an ST 2109 payload (UTF-8), the frames clip-wrapped in one KLV with an
+// index entry for each (all random access points). The descriptor (MGA sound, at the composition's edit rate) carries
+// the container constraints, the metadata section's and S-ADM's sub-descriptors, and one MGA soundfield group label
+// for the programme (Operational Mode A: its ADM audioProgrammeID, the language and the title).
+class ImfMgaSadmWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, EditRate rate, int channels, const std::string& language, const std::string& title,
+              const std::string& titleVersion, const std::string& programmeId, std::string* error = nullptr);
+    // One edit unit: `frames` sample frames, and its S-ADM frame's XML.
+    bool write(const int32_t* samples, size_t frames, const std::string& sadm, std::string* error = nullptr);
+    EditRate rate() const { return rate_; }
+    int channels() const { return channels_; }
+    const Uuid& soundfieldId() const;
+    const Uuid& soundfieldLink() const;
+    const Uuid& constraintsId() const;
+    const Uuid& metadataId() const;
+    const Uuid& metadataLink() const;  // MGALinkID
+    const Uuid& sadmId() const;
+    const std::string& language() const { return language_; }
+    const std::string& title() const { return title_; }
+    const std::string& titleVersion() const { return version_; }
+    const std::string& programmeId() const { return programme_; }
+    static constexpr const char* kContainer = "060e2b340401010d0d01030102250200";   // MXF-GC clip-wrapped MGA
+    static constexpr const char* kCoding = "060e2b340401010d0402020102010000";      // MGA uncompressed sound
+    static constexpr const char* kSoundfield = "060e2b340401010d0302022200000000";  // the MGA soundfield
+    static constexpr const char* kSadmPayload = "060e2b340401010d0404021200000000"; // the S-ADM payload (ST 2109 tag 0x12)
+    static constexpr const char* kProfile = "060e2b340401010d0402021101010000";     // ADM as BS.2076 has it (ST 2131)
+    static constexpr int kReferenceLevel = -20;
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    int channels_ = 2;
+    std::string language_ = "en", title_, version_, programme_ = "APR_1001";
+    std::vector<uint8_t> buf_;
+};
+
+// SMPTE ST 2067-204: an ADM audio track file (ST 2131), clip-wrapped 24-bit PCM as ST 2067-2 has it, its channel
+// assignment the ADM's: the axml chunk in a generic stream partition after the essence, named by a RIFF chunk
+// definition and the ADM metadata sub-descriptors, the chna chunk as the ADM channel mappings, and one ADM soundfield
+// group label for the programme (Operational Mode A).
+struct AdmChannelMapping {
+    uint32_t channel = 1;  // from 1
+    std::string uid, trackFormat, pack;
+};
+class ImfAdmWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, int channels, std::vector<AdmChannelMapping> chna, std::string axml,
+              const std::string& language, const std::string& title, const std::string& titleVersion, const std::string& programmeId,
+              std::string* error = nullptr);
+    bool writePcm(const int32_t* samples, size_t frames, std::string* error = nullptr);
+    int channels() const { return channels_; }
+    int64_t duration() const override { return samples_; }
+    const Uuid& soundfieldId() const;
+    const Uuid& soundfieldLink() const;
+    const Uuid& chnaId() const;
+    const Uuid& referencesId() const;
+    const Uuid& chunkId() const;
+    const Uuid& metadataId() const;
+    const std::vector<Uuid>& mappingIds() const { return mappings_; }
+    const std::vector<AdmChannelMapping>& chna() const { return chna_; }
+    const std::string& language() const { return language_; }
+    const std::string& title() const { return title_; }
+    const std::string& titleVersion() const { return version_; }
+    const std::string& programmeId() const { return programme_; }
+    static constexpr uint32_t kAxmlStream = 10;
+    static constexpr const char* kAssignment = "060e2b340401010d0402021005010000";  // AudioLabelingFrameworkADMContent
+    static constexpr const char* kSoundfield = "060e2b340401010d0302022300000000";  // the ADM soundfield
+    static constexpr const char* kProfile = "060e2b340401010d0402021101010000";     // ADM as BS.2076 has it
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+    bool finishEssence(std::string* error) override;
+
+private:
+    int channels_ = 2;
+    int64_t samples_ = 0;
+    std::vector<AdmChannelMapping> chna_;
+    std::vector<Uuid> mappings_;
+    std::string axml_;
+    std::string language_ = "en", title_, version_, programme_ = "APR_1001";
+    std::vector<uint8_t> buf_;
+};
+
 // SMPTE ST 2067-2 timed text: one IMSC 1.1 document (the whole composition's, times from its start) clip-wrapped as
 // ST 429-5 has it, in the AS-02 layout, its descriptor naming the IMSC 1.1 Text or Image profile and the RFC 5646
 // language; an Image document's PNGs follow in generic stream partitions, each named by its resource id.
@@ -500,13 +598,13 @@ private:
 // frame, the samples of clip-wrapped sound, or the timed text document. Every length is checked against the file.
 class ImfTrackReader {
 public:
-    enum class Kind { Unknown, Picture, Sound, TimedText, Iab };
+    enum class Kind { Unknown, Picture, Sound, TimedText, Iab, Mga };
     // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000 or imfAces), without walking
-    // the rest of a file that is not.
-    bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false);
+    // the rest of a file that is not; `immersiveOnly` the same unless it is immersive sound (IAB, MGA, or sound with ADM).
+    bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false, bool immersiveOnly = false);
     Kind kind() const { return kind_; }
     const Uuid& asset() const { return asset_; }
-    int64_t frames() const { return int64_t(elements_.size()); }  // picture, or IAB (each frame an IABitstream frame)
+    int64_t frames() const { return int64_t(elements_.size()); }  // picture, IAB (each an IABitstream frame) or MGA frames
     uint64_t largestFrame() const;                                // picture: the largest codestream's bytes
     int channels() const { return channels_; }                    // sound
     EditRate rate() const { return rate_; }                       // the descriptor's sample rate
@@ -534,6 +632,14 @@ public:
     // `count` sample frames from `first`, interleaved, as 24-bit integers (past the end: false).
     bool pcm(int64_t first, int64_t count, std::vector<int32_t>& out, std::string* error = nullptr) const;
     bool text(std::string& out, std::string* error = nullptr) const;
+    // Sound with ADM (ST 2067-204, ST 2131): its axml chunk, and the channel mapping its chna chunk had.
+    bool adm() const { return kind_ == Kind::Sound && adm_; }
+    bool admXml(std::string& out, std::string* error = nullptr) const;
+    const std::vector<AdmChannelMapping>& admChannels() const { return chna_; }
+    // MGA (ST 2127-1): frame `index`'s samples (channels() interleaved, 24-bit) and its first S-ADM payload's XML (ST
+    // 2127-10; "" when it has none).
+    bool mgaFrame(int64_t index, std::vector<int32_t>* pcm, std::string* sadm, std::string* error = nullptr) const;
+    int sampleRate() const { return sampleRate_; }  // sound, IAB and MGA: the audio's
     // Timed text: the resources the descriptor lists (an Image document's PNGs), each found in its generic stream or not.
     struct Resource {
         Uuid id{};
@@ -550,7 +656,11 @@ private:
     Uuid asset_{};
     int channels_ = 0, width_ = 0, height_ = 0;
     EditRate rate_;
-    bool op1a_ = false, rgba_ = false, j2k_ = false, aces_ = false;
+    bool op1a_ = false, rgba_ = false, j2k_ = false, aces_ = false, adm_ = false;
+    int sampleRate_ = 48000;
+    std::vector<AdmChannelMapping> chna_;
+    uint32_t axmlStream_ = 0;
+    uint64_t axmlAt_ = 0, axmlSize_ = 0;
     std::string acesAuthoring_;
     std::vector<TargetFrame> targets_;
     std::vector<std::pair<uint64_t, uint64_t>> elements_;  // picture frames: offset and size of each value

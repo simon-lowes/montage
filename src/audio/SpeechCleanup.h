@@ -72,9 +72,9 @@ BweResult bandwidthPlanFor(const AudioBuffer& in, double cutoff = 0);
 // nullptr is returned until it is ready. An ambisonic field (four channels or
 // more) has its W cleaned and the same change, frequency by frequency, made to
 // its other channels, so its directions hold (with Pitch Shift: the channels in
-// pairs).
+// pairs). With `keep`, work started without blocking is never cancelled to make room (someone polls for it).
 AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& source, const std::vector<const Effect*>& effects,
-                            bool blocking);
+                            bool blocking, bool keep = false);
 // Number of cleanups still running in the background.
 int cleanupsRunning();
 // Forgets the cleaned copies that left an effect out for want of its model, so they are made again (after a download).

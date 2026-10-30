@@ -6,11 +6,14 @@
 #include <QJsonDocument>
 #include <QGuiApplication>
 #include <QImage>
+#include <QTimer>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <mutex>
+#include <thread>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +40,9 @@
 #include "render/AafExport.h"
 #include "media/Decoder.h"
 #include "media/Loudness.h"
+#include "render/Nmos.h"
+#include "render/St2110.h"
+#include "render/VideoPacking.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
 #include "automation/PythonHost.h"
@@ -78,6 +84,7 @@
 #include "render/GpuCompositor.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 
 using namespace montage;
 
@@ -106,13 +113,19 @@ int usage() {
                  "                     [--burn-timecode] [--burn-clip-name] [--burn-text TEXT] [--burn-corner 0-5]\n"
                  "                     [--watermark IMAGE [--watermark-corner 0-5] [--watermark-opacity 0..1]]\n"
                  "                     (corners: 0 top left, 1 top centre, 2 top right, 3-5 bottom)\n"
-                 "  montage-cli farm <folder> submit <project.montage> -o <output> [--name NAME] [render's options]\n"
+                 "  montage-cli farm <folder> submit <project.montage> -o <output> [--name NAME] [--segments N] [render's options]\n"
+                 "                     (--segments: split at cuts into N parts that several nodes render, then one joins)\n"
                  "  montage-cli farm <folder> jobs|nodes [--json]\n"
                  "  montage-cli farm <folder> cancel|retry|remove <job>\n"
                  "                     (a render farm: a folder every computer reaches; jobs wait there for render nodes)\n"
                  "  montage-cli node <folder> [--name NAME] [--map FROM=TO]... [--once] [--poll SECONDS]\n"
                  "                     (a render node: renders the farm's waiting jobs one at a time, FROM paths read as TO;\n"
                  "                      Ctrl+C gives its job back for another node)\n"
+                 "  montage-cli st2110 [--mode 1080p25] [--depth 10|8] [--video ADDR:PORT] [--audio ADDR:PORT] [--data ADDR:PORT]\n"
+                 "                     [--interface ADDR] [--ttl N] [--channels 2|8] [--seconds N] [--no-nmos] [--nmos-port N]\n"
+                 "                     [--label NAME] [--registry URL | --domain DOMAIN [--dns-server ADDR]]\n"
+                 "                     (colour bars and a tone sent as SMPTE ST 2110 video, sound and time code, their SDP files\n"
+                 "                      printed; an NMOS node registers them and lets a controller route them)\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif|.heic> [--rendition master|<trim target>] [--gain-map]\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -530,12 +543,19 @@ int cmdFarm(const std::vector<std::string>& args) {
         // `render`'s arguments, plus --name.
         std::vector<std::string> rest(args.begin() + 2, args.end());
         std::string name;
-        for (size_t i = 0; i + 1 < rest.size(); ++i)
-            if (rest[i] == "--name") {
-                name = rest[i + 1];
+        int segments = 1;
+        for (size_t i = 0; i + 1 < rest.size();)
+            if (rest[i] == "--name" || rest[i] == "--segments") {
+                if (rest[i] == "--name") name = rest[i + 1];
+                else segments = std::atoi(rest[i + 1].c_str());
                 rest.erase(rest.begin() + long(i), rest.begin() + long(i) + 2);
-                break;
+            } else {
+                ++i;
             }
+        if (segments < 1 || segments > 256) {
+            std::fprintf(stderr, "error: --segments takes 1 to 256\n");
+            return 2;
+        }
         Project p;
         ExportSettings st;
         int stems = 0;
@@ -544,9 +564,17 @@ int cmdFarm(const std::vector<std::string>& args) {
         st.path = QFileInfo(QString::fromStdString(st.path)).absoluteFilePath().toStdString();
         if (name.empty()) name = p.active()->name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
         std::string id;
-        if (!submitFarmJob(farm, name, p, p.active()->id, st, stems, &id, &err)) {
+        if (!submitFarmJob(farm, name, p, p.active()->id, st, stems, &id, &err, segments)) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
             return 1;
+        }
+        if (segments > 1) {
+            int made = 0;
+            for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+            if (made > 1) std::fprintf(stderr, "In %d segments, joined by job %s\n", made, id.c_str());
+            else std::fprintf(stderr, "Sent whole: the range is too short to split\n");
+            if (made > 1 && exportSegmentsLongGop(st))
+                std::fprintf(stderr, "warning: rate control works per segment (a bitrate is kept within each, not across the whole)\n");
         }
         std::printf("%s\n", id.c_str());
         return 0;
@@ -568,6 +596,16 @@ int cmdFarm(const std::vector<std::string>& args) {
                                             {"error", QString::fromStdString(j.error)}, {"submittedBy", QString::fromStdString(j.submittedBy)},
                                             {"submitted", QString::fromStdString(j.submitted)}, {"started", QString::fromStdString(j.started)},
                                             {"finished", QString::fromStdString(j.finished)}, {"cancelRequested", j.cancelRequested}});
+                    if (j.join) {
+                        QJsonObject o = list.last().toObject();
+                        o["segments"] = j.segments;
+                        list[list.size() - 1] = o;
+                    } else if (j.segment > 0) {
+                        QJsonObject o = list.last().toObject();
+                        o["join"] = QString::fromStdString(j.group);
+                        o["segment"] = j.segment;
+                        list[list.size() - 1] = o;
+                    }
                     continue;
                 }
                 std::string state = farmStateName(j.state);
@@ -635,6 +673,150 @@ int cmdNode(const std::vector<std::string>& args) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
+    return 0;
+}
+
+std::atomic<bool> gStopSending{false};
+
+int cmdSt2110(const std::vector<std::string>& args) {
+    using namespace montage::output;
+    std::string modeName = "1080p25";
+    int depth = 10, channels = 2, seconds = 0;
+    bool nmosOn = true;
+    st2110::SenderOptions so = st2110::SenderOptions{};
+    nmos::NodeOptions no;
+    no.label = QStringLiteral("Montage test signal");
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
+        auto endpoint = [&](st2110::Endpoint& e) {
+            const std::string t = next();
+            if (!st2110::parseEndpoint(t, e)) {
+                std::fprintf(stderr, "error: not an IPv4 address and port: %s\n", t.c_str());
+                return false;
+            }
+            return true;
+        };
+        if (a == "--mode") modeName = next();
+        else if (a == "--depth") depth = std::atoi(next().c_str()) == 8 ? 8 : 10;
+        else if (a == "--channels") channels = std::atoi(next().c_str()) == 8 ? 8 : 2;
+        else if (a == "--seconds") seconds = std::max(0, std::atoi(next().c_str()));
+        else if (a == "--video") { if (!endpoint(so.video)) return 2; }
+        else if (a == "--audio") { if (!endpoint(so.audio)) return 2; }
+        else if (a == "--data") { if (!endpoint(so.anc)) return 2; }
+        else if (a == "--interface") so.interfaceAddress = next();
+        else if (a == "--ttl") so.ttl = std::clamp(std::atoi(next().c_str()), 1, 255);
+        else if (a == "--no-nmos") nmosOn = false;
+        else if (a == "--nmos-port") no.port = std::atoi(next().c_str());
+        else if (a == "--label") no.label = QString::fromStdString(next());
+        else if (a == "--registry") no.registry = QString::fromStdString(next());
+        else if (a == "--domain") no.domain = QString::fromStdString(next());
+        else if (a == "--dns-server") no.dnsServer = QString::fromStdString(next());
+        else return usage();
+    }
+    const auto modes = standardModes();
+    const Mode* mode = findMode(modes, modeName);
+    if (!mode) {
+        std::fprintf(stderr, "error: no mode %s (1080p25, 1080i50, 720p59.94, 2160p25...)\n", modeName.c_str());
+        return 2;
+    }
+    st2110::VideoFormat vf;
+    vf.width = mode->width, vf.height = mode->height, vf.fps = mode->fps, vf.interlaced = mode->interlaced, vf.depth = depth;
+    st2110::AudioFormat af;
+    af.channels = channels;
+    // 75 % colour bars (BT.709): white, yellow, cyan, green, magenta, red, blue.
+    const PixelFormat format = depth == 10 ? PixelFormat::V210 : PixelFormat::Uyvy8;
+    video::Ycbcr422 bars(vf.width, vf.height);
+    static const double rgb[7][3] = {{.75, .75, .75}, {.75, .75, 0}, {0, .75, .75}, {0, .75, 0}, {.75, 0, .75}, {.75, 0, 0}, {0, 0, .75}};
+    for (int x = 0; x < vf.width; ++x) {
+        const double* c = rgb[std::min(6, x * 7 / vf.width)];
+        const double y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        const double cb = (c[2] - y) / 1.8556, cr = (c[0] - y) / 1.5748;
+        for (int row = 0; row < vf.height; ++row) {
+            bars.y[size_t(row) * size_t(vf.width) + size_t(x)] = uint16_t(std::lround((16 + 219 * y) * 256));
+            if (x % 2 == 0) {
+                bars.cb[size_t(row) * size_t(bars.chromaWidth()) + size_t(x / 2)] = uint16_t(std::lround((128 + 224 * cb) * 256));
+                bars.cr[size_t(row) * size_t(bars.chromaWidth()) + size_t(x / 2)] = uint16_t(std::lround((128 + 224 * cr) * 256));
+            }
+        }
+    }
+    std::vector<uint8_t> picture(frameBytes(format, vf.width, vf.height));
+    if (format == PixelFormat::V210) video::packV210(bars, picture.data(), rowBytes(format, vf.width));
+    else video::packUyvy(bars, picture.data(), rowBytes(format, vf.width));
+
+    std::mutex m;
+    st2110::SenderOptions pending = so;
+    bool reopen = false;
+    st2110::Sender sender;
+    std::string err;
+    if (!sender.open(so, vf, af, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Sending %s, PTP time from the %s\n\n%s\n%s\n%s\n", mode->name.c_str(), sender.clockSource().c_str(), sender.sdpVideo().c_str(),
+                sender.sdpAudio().c_str(), sender.sdpAnc().c_str());
+    std::fflush(stdout);
+    std::signal(SIGINT, [](int) { gStopSending = true; });
+    std::thread sending([&] {
+        // A 1 kHz tone at -20 dBFS on every channel, and the time of day as time code.
+        std::vector<float> tone;
+        int64_t sample = 0, frame = 0;
+        const double fps = vf.fps.toDouble();
+        const int64_t day = int64_t(std::llround(fps * 86400));
+        const int64_t start = int64_t(std::fmod(double(st2110::ptpNowNs() - 37 * int64_t(1000000000)) / 1e9, 86400.0) * fps);
+        while (!gStopSending) {
+            {
+                std::lock_guard lock(m);
+                if (reopen) {
+                    reopen = false;
+                    std::string why;
+                    if (!sender.open(pending, vf, af, &why)) std::fprintf(stderr, "error: %s\n", why.c_str());
+                    else std::printf("Now sending to %s\n", st2110::endpointText(pending.video).c_str());
+                    std::fflush(stdout);
+                }
+            }
+            const int n = int(std::llround(double(frame + 1) * 48000 / fps) - std::llround(double(frame) * 48000 / fps));
+            tone.resize(size_t(n) * size_t(channels));
+            for (int i = 0; i < n; ++i, ++sample)
+                for (int c = 0; c < channels; ++c) tone[size_t(i) * size_t(channels) + size_t(c)] = float(0.1 * std::sin(2 * M_PI * 1000 * double(sample) / 48000));
+            const Timecode tc = timecodeOf((start + frame) % day, vf.fps);
+            if (!sender.isOpen() || !sender.send(picture.data(), rowBytes(format, vf.width), format, tone.data(), n, &tc, {}, &gStopSending))
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            ++frame;
+        }
+    });
+    nmos::Node node;
+    if (nmosOn) {
+        node.setStreams(vf, af, so, true);
+        node.onActivated = [&](const st2110::SenderOptions& o) {
+            std::lock_guard lock(m);
+            pending = o;
+            reopen = true;
+        };
+        node.onRegistered = [&](bool on) {
+            std::printf("%s %s\n", on ? "Registered with" : "No longer registered", node.registry().toUtf8().constData());
+            std::fflush(stdout);
+        };
+        QString why;
+        if (!node.start(no, &why)) {
+            std::fprintf(stderr, "error: %s\n", why.toUtf8().constData());
+            gStopSending = true;
+            sending.join();
+            return 1;
+        }
+        std::printf("NMOS node at %s (IS-04 v1.3, IS-05 v1.1)\n", node.apiUrl().toUtf8().constData());
+        std::fflush(stdout);
+    }
+    QTimer poll;
+    QObject::connect(&poll, &QTimer::timeout, [] {
+        if (gStopSending) QCoreApplication::quit();
+    });
+    poll.start(100);
+    if (seconds > 0) QTimer::singleShot(seconds * 1000, [] { gStopSending = true; });
+    QCoreApplication::exec();
+    gStopSending = true;
+    sending.join();
+    node.stop();
     return 0;
 }
 
@@ -1938,6 +2120,7 @@ int main(int argc, char** argv) {
     if (cmd == "render") return cmdRender(args);
     if (cmd == "farm") return cmdFarm(args);
     if (cmd == "node") return cmdNode(args);
+    if (cmd == "st2110") return cmdSt2110(args);
     if (cmd == "frame") return cmdFrame(args);
     if (cmd == "presets") return cmdPresets();
     if (cmd == "devices") {  // where the AI models can run (media/Inference.h)

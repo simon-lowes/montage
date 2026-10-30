@@ -1,4 +1,5 @@
 #include "RenderCache.h"
+#include "CleanPlate.h"
 #include "TrimPasses.h"
 #include "core/GradeGraph.h"
 #include "media/LipSync.h"
@@ -132,6 +133,13 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
                 }
             }
         }
+    // A Keyer's clean plate: the clip on its plate track (render/CleanPlate.h), muted or not.
+    if (depth < 4)
+        if (const int m = cleanPlateTrack(seq, c, t); m >= 0)
+            if (const Clip* pc = edit::clipAt(seq, TrackRef{TrackKind::Video, m}, t); pc && pc->enabled) {
+                h.addData(QByteArray("|plate"));
+                addClipAt(h, p, seq, *pc, t, o, depth + 1);
+            }
     // Its colour groups' grades run on it too.
     for (const ColorGroup* g : colorGroupsOf(seq, c))
         for (const auto* chain : {&g->pre, &g->post}) {

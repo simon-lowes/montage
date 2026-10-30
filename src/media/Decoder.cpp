@@ -5,6 +5,7 @@
 #include "FieldRecorder.h"
 #include "Exr.h"
 #include "render/DcpMxf.h"
+#include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
 #include "ImageSequence.h"
 #include "Pulldown.h"
@@ -70,6 +71,7 @@ bool exrByLibrary(const std::string& file, const Interpretation&, ImageSequence*
 }
 
 std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h);
+bool immersiveSound(const std::string& file, ImmersiveTrackInfo* info = nullptr);
 
 // Keep FFmpeg quiet unless something is actually wrong.
 const bool kQuietLogs = [] {
@@ -553,6 +555,21 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // IMF immersive sound (IAB, MGA with S-ADM, ADM): each channel a speaker of its bed or one of its objects.
+    if (ImmersiveTrackInfo ii; immersiveSound(file, &ii)) {
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+        m.kind = MediaKind::Audio;
+        m.hasVideo = false;
+        m.hasAudio = true;
+        m.audioCodec = "pcm_s24le";
+        m.sampleRate = ii.sampleRate;
+        m.channels = ii.channels;
+        m.duration = double(ii.samples) / ii.sampleRate;
+        out = m;
+        return true;
+    }
     // An IMF archival master's pictures (Application #5: ACES image containers, which FFmpeg does not read), in ACES 2065-1.
     if (file.size() >= 4 && exrAvailable() && QString::fromStdString(file.substr(file.size() - 4)).compare(".mxf", Qt::CaseInsensitive) == 0) {
         int w = 0, h = 0;
@@ -914,6 +931,36 @@ void VideoDecoder::close() {
 }
 
 namespace {
+
+// An IMF immersive sound track file (IAB, MGA with S-ADM, ADM: render/ImmersiveTrackFile.h), whose sound Montage reads
+// itself, looked at once per file; false for any other file.
+bool immersiveSound(const std::string& file, ImmersiveTrackInfo* info) {
+    if (file.size() < 4 || QString::fromStdString(file.substr(file.size() - 4)).compare(".mxf", Qt::CaseInsensitive) != 0) return false;
+    static std::mutex lock;
+    static std::map<std::string, std::pair<bool, ImmersiveTrackInfo>> known;
+    std::error_code ec;
+    const std::filesystem::path at = std::filesystem::u8path(file);
+    const auto size = std::filesystem::file_size(at, ec);
+    if (ec) return false;
+    const auto when = std::filesystem::last_write_time(at, ec);
+    if (ec) return false;
+    const std::string key = file + '|' + std::to_string(static_cast<unsigned long long>(size)) + '|' +
+                            std::to_string(static_cast<long long>(when.time_since_epoch().count()));
+    {
+        std::lock_guard<std::mutex> g(lock);
+        if (auto it = known.find(key); it != known.end()) {
+            if (info) *info = it->second.second;
+            return it->second.first;
+        }
+    }
+    ImmersiveTrackInfo i;
+    const bool is = immersiveTrackInfo(file, i);
+    std::lock_guard<std::mutex> g(lock);
+    if (known.size() > 256) known.clear();
+    known[key] = {is, i};
+    if (info) *info = i;
+    return is;
+}
 
 // An IMF picture track file, read once per file (decoders open it again and again: the media pool, thumbnails), with
 // its picture size; nullptr for any other MXF.
@@ -1997,6 +2044,105 @@ namespace {
 
 // A Magic Lantern recording's sound (its PCM blocks, read here: FFmpeg's reader goes through every picture to reach
 // them), as decodeAudioStream hands it on.
+// An IMF immersive sound track file's channels (ordinal 0), or all of them folded to stereo (-1, each channel in both at
+// 1/sqrt(n): a listen in the media pool, not a mix), at `sampleRate`.
+bool decodeImmersiveSound(const std::string& file, const ImmersiveTrackInfo& ii, int sampleRate, int ordinal, std::vector<float>& samples,
+                          int& channels, std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut,
+                          const std::function<bool(std::vector<float>& samples, bool last)>* drain, double seekTo) {
+    if (ordinal > 0) {
+        if (error) *error = "No audio stream";
+        return false;
+    }
+    const int n = ii.channels;
+    channels = ordinal < 0 ? 2 : n;
+    // (resampled in groups of up to 64 channels, as many as FFmpeg's resampler takes; an ADM file can have 128)
+    const size_t nch = size_t(channels);
+    const size_t groupN = (nch + 63) / 64;
+    struct Cleanup {
+        AVChannelLayout layout{};
+        std::vector<SwrContext*> swr;
+        ~Cleanup() {
+            for (SwrContext*& s : swr) swr_free(&s);
+            av_channel_layout_uninit(&layout);
+        }
+    } c;
+    av_channel_layout_default(&c.layout, channels);
+    if (layoutOut) av_channel_layout_copy(layoutOut, &c.layout);
+    if (sampleRate != ii.sampleRate)
+        for (size_t g = 0; g < groupN; ++g) {
+            AVChannelLayout group{};
+            av_channel_layout_default(&group, int(std::min<size_t>(64, nch - g * 64)));
+            SwrContext* swr = nullptr;
+            const int rc = swr_alloc_set_opts2(&swr, &group, AV_SAMPLE_FMT_FLT, sampleRate, &group, AV_SAMPLE_FMT_FLT, ii.sampleRate, 0, nullptr);
+            av_channel_layout_uninit(&group);
+            c.swr.push_back(swr);
+            if (rc < 0 || swr_init(swr) < 0) {
+                if (error) *error = "Cannot initialise resampler";
+                return false;
+            }
+        }
+    const int64_t from = std::max<int64_t>(0, std::llround(seekTo * ii.sampleRate));
+    samples.clear();
+    if (!drain)
+        samples.reserve(size_t(std::min(double(std::max<int64_t>(0, ii.samples - from)) / ii.sampleRate * sampleRate * double(nch), 1e8)) + 4096);
+    std::vector<float> in, groupIn, tmp, out;
+    const float fold = float(1 / std::sqrt(double(n)));
+    auto append = [&](const float* data, int frames) {
+        if (c.swr.empty()) {
+            if (data) samples.insert(samples.end(), data, data + size_t(frames) * nch);
+            return;
+        }
+        int got = -1;
+        for (size_t g = 0; g < groupN; ++g) {
+            const size_t first = g * 64, gn = std::min<size_t>(64, nch - first);
+            const float* src = data;
+            if (data && groupN > 1) {
+                groupIn.resize(size_t(frames) * gn);
+                for (int i = 0; i < frames; ++i)
+                    std::copy_n(data + size_t(i) * nch + first, gn, groupIn.begin() + int64_t(i) * int64_t(gn));
+                src = groupIn.data();
+            }
+            const int maxOut = swr_get_out_samples(c.swr[g], frames);
+            if (maxOut <= 0) return;
+            tmp.resize(size_t(maxOut) * gn);
+            uint8_t* outPtr[1] = {reinterpret_cast<uint8_t*>(tmp.data())};
+            const uint8_t* inPtr[1] = {reinterpret_cast<const uint8_t*>(src)};
+            const int n2 = swr_convert(c.swr[g], outPtr, maxOut, data ? inPtr : nullptr, frames);
+            if (n2 <= 0) return;
+            if (got < 0) got = n2, out.assign(size_t(got) * nch, 0.0f);
+            for (int i = 0; i < std::min(got, n2); ++i) std::copy_n(tmp.begin() + int64_t(i) * int64_t(gn), gn, out.begin() + int64_t(i) * int64_t(nch) + int64_t(first));
+        }
+        if (got > 0) samples.insert(samples.end(), out.begin(), out.begin() + int64_t(got) * int64_t(nch));
+    };
+    bool cancelled = false, stopped = false;
+    const bool ok = readImmersiveTrack(
+        file, from,
+        [&](const int32_t* pcm, size_t frames) {
+            if (cancel && cancel->load()) return !(cancelled = true);
+            in.assign(frames * nch, 0.0f);
+            for (size_t i = 0; i < frames; ++i) {
+                const int32_t* f = pcm + i * size_t(n);
+                if (ordinal < 0) {
+                    float sum = 0;
+                    for (int k = 0; k < n; ++k) sum += float(f[k]) / 8388608.0f;
+                    in[i * 2] = in[i * 2 + 1] = sum * fold;
+                } else {
+                    for (int k = 0; k < n; ++k) in[i * nch + size_t(k)] = float(f[k]) / 8388608.0f;
+                }
+            }
+            append(in.data(), int(frames));
+            if (drain && !(*drain)(samples, false)) return !(stopped = true);
+            return true;
+        },
+        error);
+    if (!ok || cancelled) return false;
+    if (stopped) return true;
+    append(nullptr, 0);  // flush the resampler
+    if (drain) (*drain)(samples, true);
+    samples.shrink_to_fit();
+    return true;
+}
+
 bool decodeMlvSound(const std::string& file, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
                     std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut,
                     const std::function<bool(std::vector<float>& samples, bool last)>* drain, double seekTo) {
@@ -2066,6 +2212,8 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
                        const std::function<bool(std::vector<float>& samples, bool last)>* drain = nullptr, double seekTo = 0) {
     if (isMlvPath(uninterpretedPath(path)))
         return decodeMlvSound(uninterpretedPath(path), sampleRate, ordinal, samples, channels, error, cancel, layoutOut, drain, seekTo);
+    if (ImmersiveTrackInfo ii; immersiveSound(uninterpretedPath(path), &ii))
+        return decodeImmersiveSound(uninterpretedPath(path), ii, sampleRate, ordinal, samples, channels, error, cancel, layoutOut, drain, seekTo);
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -2200,6 +2348,10 @@ bool audioStreamChannels(const std::string& path, std::vector<int>& streams, std
     if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
         if (!readMlvInfo(uninterpretedPath(path), mi, error)) return false;
         if (mi.hasAudio) streams.push_back(mi.channels);
+        return true;
+    }
+    if (ImmersiveTrackInfo ii; immersiveSound(uninterpretedPath(path), &ii)) {
+        streams.push_back(ii.channels);
         return true;
     }
     AVFormatContext* fmt = nullptr;
@@ -2368,6 +2520,8 @@ AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::str
     if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
         if (!readMlvInfo(uninterpretedPath(path), mi, error)) return nullptr;
         if (mi.hasAudio) ordinal = 0;  // (its one sound stream)
+    } else if (immersiveSound(uninterpretedPath(path))) {
+        ordinal = 0;
     } else {
         AVFormatContext* fmt = nullptr;
         if (int rc = openMediaInput(&fmt, path); rc < 0) {

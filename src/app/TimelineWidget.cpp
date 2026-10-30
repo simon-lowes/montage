@@ -29,6 +29,7 @@
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "PitchCurves.h"
+#include "Settings.h"
 #include "SoundLibraryPanel.h"
 #include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
@@ -39,6 +40,7 @@
 #include "core/Effects.h"
 #include "core/AudioChannels.h"
 #include "core/Automation.h"
+#include "core/CaptionTools.h"
 #include "core/KeyframeEdit.h"
 #include "core/Multicam.h"
 #include "media/MediaPool.h"
@@ -882,10 +884,21 @@ void TimelineWidget::paintCaptionLanes(QPainter& p) {
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
+    // (not with shot changes Off in the captions' reading limits)
+    const bool shotChangesShown = !s->captionTracks.empty() && appSettings().value("captions/shotZoneSeconds", 0.5).toDouble() > 0;
+    const std::vector<FrameTime> cuts = shotChangesShown ? captionShotChanges(*s) : std::vector<FrameTime>();
     for (const CaptionTrack& ct : s->captionTracks) {
         p.fillRect(QRect(kHeaderW, y, W - kHeaderW, kCaptionH), theme::kPanel.darker(118));
         p.setPen(QColor(0, 0, 0, 90));
         p.drawLine(kHeaderW, y + kCaptionH - 1, W, y + kCaptionH - 1);
+        // The shot changes captions keep clear of: a line through the lane, a notch at its top.
+        p.setPen(QPen(QColor(0x7f, 0xd3, 0xe8, 170), 1));
+        for (FrameTime cut : cuts) {
+            const int x = xForFrame(cut);
+            if (x < kHeaderW || x > W) continue;
+            p.drawLine(x, y, x, y + kCaptionH - 2);
+            p.drawLine(x - 2, y, x + 2, y);
+        }
         const QColor fill = ct.visible ? QColor(0xc9, 0xa2, 0x27) : QColor(0x6b, 0x62, 0x48);
         for (size_t i = 0; i < ct.captions.size(); ++i) {
             const Caption& c = ct.captions[i];
@@ -1381,6 +1394,20 @@ bool TimelineWidget::laneOf(Id clip, Lane& lane, QRect& band) const {
     lane = *l;
     band = laneBand(r);
     return !band.isNull();
+}
+
+QRect TimelineWidget::captionRect(Id track, int index) const {
+    const Sequence* s = state_->sequence();
+    if (!s) return {};
+    int y = kRulerH - verticalScrollBar()->value();
+    for (const CaptionTrack& ct : s->captionTracks) {
+        if (ct.id == track && index >= 0 && size_t(index) < ct.captions.size()) {
+            const int xs = xForFrame(ct.captions[size_t(index)].start), xe = xForFrame(ct.captions[size_t(index)].end);
+            return QRect(xs, y + 2, std::max(2, xe - xs), kCaptionH - 5);
+        }
+        y += kCaptionH;
+    }
+    return {};
 }
 
 QRect TimelineWidget::lineBand(Id clip) const {
@@ -2343,6 +2370,36 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             const int i = drag_.caption;
             const DragKind kind = drag_.kind;
             FrameTime applied = 0;
+            // Snapping: an in-time to a shot change, an out-time to the gap before one (or to it).
+            FrameTime by = raw;
+            snapIndicator_ = -1;
+            if (const Sequence* base = state_->gestureBase(); base && state_->snapping() && i >= 0) {
+                const CaptionTrack* bt = nullptr;
+                for (const CaptionTrack& t : base->captionTracks)
+                    if (t.id == track) bt = &t;
+                if (bt && size_t(i) < bt->captions.size()) {
+                    const Caption& c = bt->captions[size_t(i)];
+                    const int gap = std::max(0, appSettings().value("captions/minGapFrames", 2).toInt());
+                    std::vector<FrameTime> ins, outs;
+                    const bool shotChangesOn = appSettings().value("captions/shotZoneSeconds", 0.5).toDouble() > 0;
+                    for (FrameTime cut : shotChangesOn ? captionShotChanges(*base) : std::vector<FrameTime>()) {
+                        ins.push_back(cut);
+                        outs.push_back(cut - gap);
+                        outs.push_back(cut);
+                    }
+                    std::sort(outs.begin(), outs.end());
+                    const FrameTime tol = std::max<FrameTime>(1, FrameTime(kSnapPx / ppf_));
+                    FrameTime best = raw, bestDist = tol + 1;
+                    auto consider = [&](const std::vector<FrameTime>& pts, FrameTime edge) {
+                        bool hit = false;
+                        const FrameTime sn = edit::snap(pts, edge + raw, tol, &hit);
+                        if (hit && std::llabs(sn - (edge + raw)) < bestDist) bestDist = std::llabs(sn - (edge + raw)), best = sn - edge, snapIndicator_ = sn;
+                    };
+                    if (kind != DragKind::CaptionOut) consider(ins, c.start);
+                    if (kind != DragKind::CaptionIn) consider(outs, c.end);
+                    by = best;
+                }
+            }
             state_->updateGesture([&](Project&, Sequence& sq) {
                 for (auto& t : sq.captionTracks) {
                     if (t.id != track || i < 0 || size_t(i) >= t.captions.size()) continue;
@@ -2351,15 +2408,15 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
                     const FrameTime hi = size_t(i) + 1 < t.captions.size() ? t.captions[size_t(i) + 1].start
                                                                            : std::numeric_limits<FrameTime>::max() / 4;
                     if (kind == DragKind::CaptionMove) {
-                        applied = std::clamp(raw, lo - c.start, hi - c.end);
+                        applied = std::clamp(by, lo - c.start, hi - c.end);
                         c.start += applied;
                         c.end += applied;
                     } else if (kind == DragKind::CaptionIn) {
-                        const FrameTime v = std::clamp(c.start + raw, lo, c.end - 1);
+                        const FrameTime v = std::clamp(c.start + by, lo, c.end - 1);
                         applied = v - c.start;
                         c.start = v;
                     } else {
-                        const FrameTime v = std::clamp(c.end + raw, c.start + 1, hi);
+                        const FrameTime v = std::clamp(c.end + by, c.start + 1, hi);
                         applied = v - c.end;
                         c.end = v;
                     }

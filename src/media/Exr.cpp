@@ -942,13 +942,14 @@ bool readAcesContainer(const uint8_t* data, size_t size, AcesContainerInfo& info
         if (rgba) {
             // (a picture the size the header says, within reason: a damaged one cannot ask for gigabytes, compressed
             // or not, from a few bytes. ACES in MXF is stored uncompressed; a compressed frame, outside the standard,
-            // is read up to the size of a 4K cinema frame whatever it packs to, and up to 8K only when it packs no
-            // smaller than real pictures do, 64 times.)
+            // is read up to the size of a 2K cinema frame whatever it packs to, and up to 8K only when it packs no
+            // smaller than 1/256 of its size, so a few bytes cannot ask for a 4K frame's 140 MB: a flat frame above 2K that packs
+            // smaller, a leader say, is refused too, compression being outside the standard.)
             const int64_t pixels = int64_t(info.width) * info.height;
             const int64_t bytes = pixels * int64_t(names.size()) * 2;
             const bool packed = header.compression() != Imf::NO_COMPRESSION;
             const bool fits = !packed ? bytes <= int64_t(size)
-                                      : pixels <= int64_t(4096) * 2160 || (pixels <= int64_t(8192) * 4320 && bytes / 64 <= int64_t(size));
+                                      : pixels <= int64_t(2048) * 1080 || (pixels <= int64_t(8192) * 4320 && bytes / 256 <= int64_t(size));
             if (info.width <= 0 || info.height <= 0 || pixels > (int64_t(1) << 27) || !fits)
                 throw std::runtime_error("a picture of " + std::to_string(info.width) + " x " + std::to_string(info.height) + " in " +
                                          std::to_string(size) + " bytes");

@@ -223,6 +223,9 @@ struct MediaItem {
     std::map<std::string, std::string> metadata;  // scene, shot, take, camera, description, comment, ...
     std::vector<ShotDescription> shots;            // each shot described (Describe Shots), in order
     std::string created;                           // when it was recorded (ISO 8601, from the file), "" = unknown
+    // Its ASC Framing Decision List (render/Fdl.h): the FDL cut down to the context describing it (JSON), "" = none;
+    // and the framing decision shown ("" = the default intent's, else the first).
+    std::string fdl, fdlFraming;
     // A subclip: a saved range of another media item. Clips made from it use
     // that item (with this range), so only bins, logging and search see it.
     Id subclipOf = 0;
@@ -265,6 +268,7 @@ struct Marker {
     std::string comment;
     int color = 0;
     bool chapter = false;  // a chapter marker: a chapter in exported MP4 / MOV / MKV files and YouTube's list
+    bool shotChange = false;  // a shot change scene detection found inside a clip (core/CaptionTools.h: captions keep clear of it)
     std::string drawing;   // a reviewer's drawing over the frame (core/ReviewPage.h): strokes as JSON, in 0..1 of the picture
     FrameTime drawnAt = -1;  // the frame it was drawn on, when the marker had to sit elsewhere (-1: t)
     std::string reviewId;  // the review note it came from (the notes imported again bring it up to date)
@@ -571,6 +575,7 @@ struct SurroundPan {
     double lfeDb = -100;  // -100 = none
     double z = 0;         // height in immersive layouts: 0 at the ear, 1 overhead
     bool object = false;  // an audio object in immersive masters (render/Adm.h), not part of the bed
+    bool lfeOnly = false;  // the LFE channel alone (an imported bed's): at the LFE send's level, to no speaker else
     bool operator==(const SurroundPan&) const = default;
 };
 

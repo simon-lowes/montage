@@ -243,34 +243,28 @@ int rateCode(uint32_t num, uint32_t den) {
     for (int i = 0; i < 9; ++i)
         if (uint64_t(num) == uint64_t(whole[i]) * den) return i;
     if (uint64_t(num) * 1001 == uint64_t(24000) * den) return 0x9;
-    if (uint64_t(num) * 1001 == uint64_t(30000) * den) return 0xA;
-    if (uint64_t(num) * 1001 == uint64_t(60000) * den) return 0xB;
-    return -1;
+    return -1;  // (29.97 and 59.94 among them: ST 2098-2:2022 reserves their codes)
 }
 
 void rateOf(int code, uint32_t& num, uint32_t& den) {
     static const uint32_t whole[] = {24, 25, 30, 48, 50, 60, 96, 100, 120};
     if (code >= 0 && code < 9) num = whole[code], den = 1;
-    else if (code == 0x9) num = 24000, den = 1001;
-    else if (code == 0xA) num = 30000, den = 1001;
-    else num = 60000, den = 1001;
+    else num = 24000, den = 1001;
 }
 
 int frameSamples(int code, int frameIndex) {
     static const int whole[] = {2000, 1920, 1600, 1000, 960, 800, 500, 480, 400};
-    static const int c30[] = {1602, 1601, 1602, 1601, 1602}, c60[] = {801, 801, 800, 801, 801};
+    (void)frameIndex;
     if (code >= 0 && code < 9) return whole[code];
     if (code == 0x9) return 2002;
-    if (code == 0xA) return c30[std::clamp(frameIndex, 0, 4)];
-    if (code == 0xB) return c60[std::clamp(frameIndex, 0, 4)];
     return 0;
 }
 
-bool sequenced(int code) { return code == 0xA || code == 0xB; }
+bool sequenced(int) { return false; }
 
 int panSubBlocks(int code) {
     switch (code) {
-    case 3: case 4: case 5: case 0xB: return 4;
+    case 3: case 4: case 5: return 4;
     case 6: case 7: case 8: return 2;
     default: return 8;
     }
@@ -460,7 +454,7 @@ bool writeFrame(const Frame& f, bool dlc, std::vector<uint8_t>& out, std::string
         if (error) *error = why;
         return false;
     };
-    if (f.rate < 0 || f.rate > 0xB) return fail("IAB has no such frame rate");
+    if (f.rate < 0 || f.rate > 0x9) return fail("IAB has no such frame rate");
     if (dlc && !dlcAllowed(f.rate)) return fail("DLC is only defined for whole-number frame rates");
     const int samples = frameSamples(f.rate, f.frameIndex), subBlocks = panSubBlocks(f.rate);
     std::vector<std::vector<uint8_t>> subs;
@@ -599,7 +593,7 @@ bool readFrame(const uint8_t* data, size_t size, Frame& f, std::string* error, s
     if (b.bad()) return fail("An IAFrame ends early");
     if (rate != 0) return fail("Montage reads 48 kHz IAB only");
     if (depth != 1) return fail("Montage reads 24-bit IAB only");
-    if (f.rate > 0xB) return fail("An IAFrame with a reserved frame rate");
+    if (f.rate > 0x9) return fail("An IAFrame with a reserved frame rate");
     f.hasBed = false;
     const int subBlocks = panSubBlocks(f.rate);
     const uint8_t* base = p + at;

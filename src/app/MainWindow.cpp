@@ -6,6 +6,7 @@
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Fdl.h"
 #include "render/FilmLists.h"
 #include "render/PaperworkOutput.h"
 #include "render/ImageSubtitles.h"
@@ -42,6 +43,7 @@
 #include <QEventLoop>
 #include <QFontDatabase>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QGroupBox>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -95,6 +97,7 @@
 #include "AudioMeterWidget.h"
 #include "audio/PluginEffect.h"
 #include "audio/SpectralRepair.h"
+#include "audio/TapeRepair.h"
 #include "core/Surround.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
@@ -114,6 +117,7 @@
 #include "media/Exr.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
+#include "render/Crosstalk.h"
 #include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
@@ -492,6 +496,26 @@ void MainWindow::buildPanels() {
     connect(effects_, &EffectsBrowser::applyRequested, this, &MainWindow::applyFromBrowser);
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
+    // The selected clip's Crosstalk shown moving the primaries on the chromaticity scope.
+    auto showCrosstalk = [this] {
+        std::vector<std::pair<QPointF, QPointF>> moves;
+        const Sequence* s = state_->sequence();
+        for (Id id : s ? state_->selectedClips() : std::vector<Id>{}) {
+            const Clip* c = edit::clipById(*s, id);
+            if (!c) continue;
+            for (const Effect& e : c->effects) {
+                if (e.type != "crosstalk" || !e.enabled) continue;
+                const FrameTime lt = std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
+                for (const auto& [from, to] : crosstalkPrimaries(e, lt, workingColorSpace(*s))) moves.push_back({{from.x, from.y}, {to.x, to.y}});
+                break;
+            }
+            if (!moves.empty()) break;
+        }
+        scopes_->setPrimaryMoves(moves);
+    };
+    connect(state_, &EditorState::selectionChanged, scopes_, showCrosstalk);
+    connect(state_, &EditorState::projectChanged, scopes_, showCrosstalk);
+    connect(state_, &EditorState::playheadChanged, scopes_, showCrosstalk);  // (keyed handles)
     mixer_ = new MixerPanel(state_, this);
     connect(mixer_, &MixerPanel::liveMix, program_, &PlaybackController::setLiveMix);  // an automation pass heard
     connect(mixer_, &MixerPanel::effectsRequested, this, [this] {
@@ -557,6 +581,7 @@ void MainWindow::buildPanels() {
         if (!in.empty() || !out.empty()) surface_->connectPorts(in, out);
     }
     captions_ = new CaptionsPanel(state_, this);
+    connect(captions_, &CaptionsPanel::detectShotChangesWanted, this, [this] { detectScenes(true); });
     transcript_ = new TranscriptPanel(state_, this);
     connect(transcript_, &TranscriptPanel::sourceSeekRequested, this, [this](FrameTime f) {
         source_->seek(f);
@@ -1365,6 +1390,14 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export ALE"), QString(), tr("Avid Log Exchange (*.ale)"));
         if (!path.isEmpty()) exportAle(path.endsWith(QLatin1String(".ale"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".ale"));
     })->setObjectName(QStringLiteral("exportAle"));
+    add(file, QT_TR_NOOP("Import FDL (Framing Decision List)…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import FDL"), QString(), tr("ASC Framing Decision Lists (*.fdl *.json);;All files (*)"));
+        if (!path.isEmpty()) importFdl(path);
+    })->setObjectName(QStringLiteral("importFdl"));
+    add(file, QT_TR_NOOP("Export FDL…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getSaveFileName(this, tr("Export FDL"), QString(), tr("ASC Framing Decision Lists (*.fdl)"));
+        if (!path.isEmpty()) exportFdl(path.endsWith(QLatin1String(".fdl"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".fdl"));
+    })->setObjectName(QStringLiteral("exportFdl"));
     add(file, QT_TR_NOOP("Export Final Cut Pro &7 XML (Premiere, Resolve)…"), QKeySequence(), [this] { exportInterchange(Interchange::Fcp7Xml); });
     add(file, QT_TR_NOOP("Export &FCPXML (Final Cut Pro)…"), QKeySequence(), [this] { exportInterchange(Interchange::FcpXml); });
     add(file, QT_TR_NOOP("Export E&DL (CMX 3600)…"), QKeySequence(), [this] { exportInterchange(Interchange::Edl); });
@@ -1505,6 +1538,7 @@ void MainWindow::buildMenus() {
     // ---- Clip
     QMenu* clipM = menuIn(menuBar(), QT_TR_NOOP("&Clip"));
     QAction* speed = add(clipM, QT_TR_NOOP("&Speed / Duration…"), QKeySequence("Ctrl+R"), [this] { speedDialog(); });
+    add(clipM, QT_TR_NOOP("Frame with FDL Template…"), QKeySequence(), [this] { fdlFramingDialog(); })->setObjectName(QStringLiteral("fdlFraming"));
     add(clipM, QT_TR_NOOP("Add &Edit"), QKeySequence("Ctrl+K"), [this] { addEdit(false); });
     add(clipM, QT_TR_NOOP("Add Edit to &All Tracks"), QKeySequence("Ctrl+Shift+K"), [this] { addEdit(true); });
     QAction* trans = add(clipM, QT_TR_NOOP("Apply Default &Transition"), QKeySequence("Ctrl+D"), [this] { addDefaultTransition(false); });
@@ -1652,6 +1686,7 @@ void MainWindow::buildMenus() {
             if (dlg.exec() == QDialog::Accepted) separateStems(state_, clips, dlg.options(), this);
         }))->setObjectName(QStringLiteral("separateStems"));
     add(clipM, QT_TR_NOOP("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
+    add(clipM, QT_TR_NOOP("Strip Si&lence…"), QKeySequence(), withSeq([this] { stripSilenceDialog(); }))->setObjectName(QStringLiteral("stripSilence"));
     {
         // Elastic audio: warp markers in audio clips (Alt-drag on the timeline) and their pitch edited (audio/ElasticAudio.h).
         QMenu* elasticM = menuIn(clipM, QT_TR_NOOP("&Elastic Audio"));
@@ -2549,6 +2584,29 @@ void MainWindow::buildMenus() {
     drawings->setCheckable(true);
     drawings->setChecked(appSettings().value("playback/reviewDrawings", true).toBool());
     drawings->setToolTip(tr("Show what reviewers drew on a frame (notes imported from a review page) over the Program monitor at its marker"));
+    // Frame lines from the footage's FDL (render/Fdl.h) over both monitors.
+    QAction* frameLines = add(play, QT_TR_NOOP("Show Frame Lines"), QKeySequence(), [this](bool on) {
+        appSettings().setValue("playback/frameLines", on);
+        frameLines_ = on;
+        for (MonitorPanel* m : {sourcePanel_, programPanel_})
+            if (m) m->viewer()->update();
+    });
+    frameLines->setObjectName(QStringLiteral("showFrameLines"));
+    frameLines->setCheckable(true);
+    frameLines_ = appSettings().value("playback/frameLines", true).toBool();
+    frameLines->setChecked(frameLines_);
+    frameLines->setToolTip(tr("Show the framing chosen for the footage (its Framing Decision List: File > Import FDL) over the monitors"));
+    if (sourcePanel_)
+        sourcePanel_->viewer()->addOverlay([this](QPainter& p, const QRectF& r) {
+            if (!frameLines_) return;
+            if (const MediaItem* m = state_->sourceMedia() ? state_->project().findMedia(state_->sourceMedia()) : nullptr)
+                paintFrameLines(p, r, mediaFrameLines(*m));
+        });
+    if (programPanel_)
+        programPanel_->viewer()->addOverlay([this](QPainter& p, const QRectF& r) {
+            if (!frameLines_) return;
+            if (const Sequence* s = state_->sequence()) paintFrameLines(p, r, sequenceFrameLines(state_->project(), *s, state_->playhead()));
+        });
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
     hdrViewer_ = add(play, QT_TR_NOOP("HDR Viewer"), QKeySequence(), [this](bool on) {
         appSettings().setValue("playback/hdrViewer", on);
@@ -3164,15 +3222,19 @@ int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::Remote
     }
     if (bySequence.empty()) return 0;
     MarkerImport result;
-    state_->edit(undoLabel.isEmpty() ? tr("Markers from Remote Review") : undoLabel, [&](Project& p, Sequence&) {
-        for (const auto& [id, notes] : bySequence)
-            if (Sequence* s = p.findSequence(id)) {
-                const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
-                result.added += r.added;
-                result.updated += r.updated;
-            }
-        return true;
-    });
+    // (notes coming in one after another join one undo step, rather than each holding a copy of the project)
+    state_->edit(
+        undoLabel.isEmpty() ? tr("Markers from Remote Review") : undoLabel,
+        [&](Project& p, Sequence&) {
+            for (const auto& [id, notes] : bySequence)
+                if (Sequence* s = p.findSequence(id)) {
+                    const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
+                    result.added += r.added;
+                    result.updated += r.updated;
+                }
+            return true;
+        },
+        QStringLiteral("remoteMarkers"));
     const ReviewNote& last = std::prev(bySequence.end())->second.back();
     const Sequence* s = state_->project().findSequence(std::prev(bySequence.end())->first);
     statusBar()->showMessage(markers.size() == 1 ? tr("Marker from %1 at %2: %3")
@@ -4046,6 +4108,10 @@ void MainWindow::vfxPullDialog() {
     amf->setObjectName(QStringLiteral("vfxAmf"));
     amf->setChecked(appSettings().value("vfx/amf", true).toBool());
     form->addRow(amf);
+    auto* fdl = new QCheckBox(tr("Write Framing Decision Lists (the plate's framing, and what the cut shows of it)"), &dlg);
+    fdl->setObjectName(QStringLiteral("vfxFdl"));
+    fdl->setChecked(appSettings().value("vfx/fdl", true).toBool());
+    form->addRow(fdl);
     // OpenEXR: its compressions, and more layers in each frame.
     auto* compression = new QComboBox(&dlg);
     compression->setObjectName(QStringLiteral("vfxCompression"));
@@ -4095,8 +4161,10 @@ void MainWindow::vfxPullDialog() {
     appSettings().setValue("vfx/folder", folder);
     appSettings().setValue("vfx/handles", handles->value());
     appSettings().setValue("vfx/amf", amf->isChecked());
+    appSettings().setValue("vfx/fdl", fdl->isChecked());
     VfxPullOptions o;
     o.amf = amf->isChecked();
+    o.fdl = fdl->isChecked();
     if (exrAvailable() && format->currentData().toString() == QLatin1String("exr")) {
         appSettings().setValue("vfx/compression", compression->currentData());
         appSettings().setValue("vfx/sourceLayers", sourceLayers->isChecked());
@@ -4680,6 +4748,130 @@ bool MainWindow::exportFilmLists(const QString& path, Id earlier) {
     return true;
 }
 
+int MainWindow::importFdl(const QString& path) {
+    std::string json, err;
+    FdlDocument doc;
+    if (!readFdlFile(path.toStdString(), json, doc, &err)) {
+        state_->message(QString::fromStdString(err), 8000);
+        return -1;
+    }
+    const std::vector<Id> chosen = bin_ ? bin_->selectedMedia() : std::vector<Id>{};
+    if (!state_->sequence()) {
+        state_->message(tr("Open a sequence first"), 6000);
+        return 0;
+    }
+    int attached = 0;
+    state_->edit(tr("Import FDL"), [&](Project& p, Sequence&) {
+        attached = attachFdl(p, json, chosen, &err);
+        return attached > 0;
+    });
+    if (!attached) {
+        state_->message(QString::fromStdString(err), 8000);
+        return 0;
+    }
+    state_->message(tr("FDL attached to %n media item(s)", nullptr, attached), 6000);
+    for (MonitorPanel* m : {sourcePanel_, programPanel_})
+        if (m) m->viewer()->update();
+    return attached;
+}
+
+bool MainWindow::exportFdl(const QString& path) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    std::string err;
+    const std::string json = sequenceFdl(state_->project(), *s, state_->selectedClips(), &err);
+    QSaveFile f(path);
+    if (json.empty() || !f.open(QIODevice::WriteOnly) || f.write(json.data(), qint64(json.size())) != qint64(json.size()) || !f.commit()) {
+        state_->message(json.empty() ? QString::fromStdString(err) : tr("Cannot write %1").arg(path), 6000);
+        return false;
+    }
+    state_->message(tr("Wrote the FDL %1").arg(QFileInfo(path).fileName()), 6000);
+    return true;
+}
+
+int MainWindow::frameWithFdl(const QString& templatePath, const QString& templateId, bool resizeSequence) {
+    std::string templates;
+    if (!templatePath.isEmpty()) {
+        FdlDocument doc;
+        std::string err;
+        if (!readFdlFile(templatePath.toStdString(), templates, doc, &err)) {
+            state_->message(QString::fromStdString(err), 8000);
+            return -1;
+        }
+    }
+    std::vector<Id> framed;
+    std::vector<std::string> skipped;
+    std::string err;
+    const std::vector<Id> clips = state_->selectedClips();
+    state_->edit(tr("Frame with FDL"), [&](Project& p, Sequence& s) {
+        framed = frameClipsWithFdl(p, s, clips, templates, templateId.toStdString(), resizeSequence, &skipped, &err);
+        return !framed.empty();
+    });
+    QString msg = framed.empty() ? QString::fromStdString(err) : tr("Framed %n clip(s)", nullptr, int(framed.size()));
+    if (!framed.empty() && !skipped.empty())
+        msg += tr("; not %1").arg(QString::fromStdString(skipped.front())) + (skipped.size() > 1 ? tr(" and %n more", nullptr, int(skipped.size() - 1)) : QString());
+    state_->message(msg, 8000);
+    return int(framed.size());
+}
+
+void MainWindow::fdlFramingDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Frame with FDL Template"));
+    auto* form = new QFormLayout(&dlg);
+    auto* file = new QLineEdit(&dlg);
+    file->setObjectName(QStringLiteral("fdlTemplateFile"));
+    file->setPlaceholderText(tr("The footage's own FDL"));
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    auto* fileRow = new QHBoxLayout;
+    fileRow->addWidget(file, 1);
+    fileRow->addWidget(browse);
+    form->addRow(tr("Canvas templates from:"), fileRow);
+    auto* templ = new QComboBox(&dlg);
+    templ->setObjectName(QStringLiteral("fdlTemplate"));
+    form->addRow(tr("Template:"), templ);
+    auto* resize = new QCheckBox(tr("Make the sequence the template's canvas size"), &dlg);
+    resize->setObjectName(QStringLiteral("fdlResize"));
+    form->addRow(QString(), resize);
+    // The templates on offer: the file's, or those of the footage in the sequence.
+    auto fill = [this, file, templ, s] {
+        templ->clear();
+        std::vector<FdlTemplate> list;
+        FdlDocument doc;
+        std::string json;
+        if (!file->text().trimmed().isEmpty()) {
+            if (readFdlFile(file->text().trimmed().toStdString(), json, doc, nullptr)) list = doc.templates;
+        } else {
+            for (const Track& t : s->videoTracks)
+                for (const Clip& c : t.clips)
+                    if (const MediaItem* m = c.mediaId ? state_->project().findMedia(c.mediaId) : nullptr; m && mediaFdl(*m, doc))
+                        for (const FdlTemplate& ft : doc.templates)
+                            if (std::none_of(list.begin(), list.end(), [&](const FdlTemplate& x) { return x.id == ft.id; })) list.push_back(ft);
+        }
+        for (const FdlTemplate& ft : list)
+            templ->addItem(QStringLiteral("%1 (%2 × %3)").arg(QString::fromStdString(ft.label.empty() ? ft.id : ft.label)).arg(ft.width).arg(ft.height),
+                           QString::fromStdString(ft.id));
+    };
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString path = QFileDialog::getOpenFileName(&dlg, tr("Canvas Templates"), QString(), tr("ASC Framing Decision Lists (*.fdl *.json);;All files (*)"));
+        if (!path.isEmpty()) file->setText(path);
+        fill();
+    });
+    connect(file, &QLineEdit::editingFinished, &dlg, fill);
+    fill();
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    if (templ->count() == 0) {
+        state_->message(tr("No canvas templates: choose an FDL with some"), 6000);
+        return;
+    }
+    frameWithFdl(file->text().trimmed(), templ->currentData().toString(), resize->isChecked());
+}
+
 bool MainWindow::exportAle(const QString& path) {
     std::vector<Id> ids = bin_->selectedMedia();
     if (ids.empty())
@@ -5087,12 +5279,19 @@ void MainWindow::markClip() {
     state_->setOutPoint(c->end() - 1);
 }
 
-void MainWindow::detectScenes() {
+void MainWindow::detectScenes(bool markOnly) {
     const Clip* c = state_->primaryClip();
     const Sequence* s = state_->sequence();
+    if (markOnly && s && (!c || !edit::locate(*s, c->id) || edit::locate(*s, c->id)->track.kind != TrackKind::Video)) {
+        // (the programme: the longest picture clip)
+        c = nullptr;
+        for (const Track& t : s->videoTracks)
+            for (const Clip& k : t.clips)
+                if (!k.isGenerator() && k.enabled && (!c || k.duration > c->duration)) c = &k;
+    }
     const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
     if (!m || m->kind != MediaKind::Video || !s) {
-        state_->message(tr("Select a video clip to detect scene cuts in"));
+        state_->message(markOnly ? tr("There is no video clip to detect shot changes in") : tr("Select a video clip to detect scene cuts in"));
         return;
     }
     const Id clipId = c->id;
@@ -5104,14 +5303,14 @@ void MainWindow::detectScenes() {
     connect(dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
     QPointer<QProgressDialog> guard(dlg);
     auto* watcher = new QFutureWatcher<std::vector<double>>(this);
-    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel] {
+    connect(watcher, &QFutureWatcher<std::vector<double>>::finished, this, [this, watcher, dlg, clipId, cancel, markOnly] {
         std::vector<double> cuts = watcher->result();
         dlg->close();
         dlg->deleteLater();
         watcher->deleteLater();
         if (*cancel) return;
         int made = 0;
-        state_->apply(tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
+        state_->apply(markOnly ? tr("Detect Shot Changes") : tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
             const Clip* clip = edit::clipById(sq, clipId);
             if (!clip) return edit::Result::fail("The clip is gone");
             // Map source times to timeline frames inside the clip.
@@ -5122,6 +5321,21 @@ void MainWindow::detectScenes() {
                 if (clip->reverse) local = double(clip->duration) - local;
                 FrameTime f = clip->start + FrameTime(std::llround(local));
                 if (f > clip->start && f < clip->end()) frames.push_back(f);
+            }
+            // Each a shot-change marker (the razor's cuts are through edits, which captions do not count as shot changes).
+            for (FrameTime f : frames)
+                if (std::none_of(sq.markers.begin(), sq.markers.end(), [f](const Marker& mk) { return mk.shotChange && mk.t == f; })) {
+                    Marker mk;
+                    mk.t = f;
+                    mk.name = tr("Shot change").toStdString();
+                    mk.shotChange = true;
+                    sq.markers.push_back(mk);
+                    if (markOnly) ++made;
+                }
+            std::sort(sq.markers.begin(), sq.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            if (markOnly) {
+                if (!made) return edit::Result::fail("No new shot changes found in this clip");
+                return edit::Result{};
             }
             std::vector<TrackRef> tracks;
             for (Id l : edit::linkedClips(sq, clipId))
@@ -5143,7 +5357,8 @@ void MainWindow::detectScenes() {
             if (!made) return edit::Result::fail("No scene cuts found in this clip");
             return edit::Result{};
         });
-        if (made) state_->message(tr("Cut the clip at %n scene change(s)", "", made), 5000);
+        if (made)
+            state_->message(markOnly ? tr("Marked %n shot change(s)", "", made) : tr("Cut the clip at %n scene change(s)", "", made), 5000);
     });
     watcher->setFuture(QtConcurrent::run([path, cancel, guard] {
         return detectSceneCuts(path, 0.5, [guard](double f) {
@@ -5475,7 +5690,13 @@ int MainWindow::matchColourChart() {
     ChartMatchDialog dlg(frame, chartView(frame, *s), sequenceColorSpace(*s), QString::fromStdString(clip->name), this);
     if (chartDialogHook_) chartDialogHook_(&dlg);
     if (dlg.exec() != QDialog::Accepted) return 0;
-    const ChartFit fit = dlg.fit();
+    ChartFit fit = dlg.fit();
+    CrosstalkFit cross;
+    if (dlg.asCrosstalk() && dlg.ready()) {
+        bool complete = false;
+        cross = fitCrosstalk(sampleChart(frame, dlg.quad(), sequenceColorSpace(*s), &complete));
+        fit.ok = cross.ok && complete, fit.deltaEBefore = cross.deltaEBefore, fit.deltaEAfter = cross.deltaEAfter;
+    }
     if (!fit.ok || !dlg.ready()) {
         state_->message(tr("The chart could not be matched: put its outline on the patches"), 5000);
         return 0;
@@ -5483,7 +5704,8 @@ int MainWindow::matchColourChart() {
     int n = 0;
     const bool all = dlg.sameMedia();
     state_->edit(tr("Match Colour Chart"), [&](Project& p, Sequence& sq) {
-        n = applyChartMatchToClips(p, sq, all ? clipsOfSameMedia(sq, clipId) : std::vector<Id>{clipId}, fit);
+        const std::vector<Id> clips = all ? clipsOfSameMedia(sq, clipId) : std::vector<Id>{clipId};
+        n = dlg.asCrosstalk() ? applyCrosstalkToClips(p, sq, clips, cross) : applyChartMatchToClips(p, sq, clips, fit);
         return n > 0;
     });
     if (n)
@@ -5816,6 +6038,7 @@ QString MainWindow::measureGrainAsPreset() {
     preset.video = true;
     Effect e = makeEffect("grain_match", 0);
     e.strings["profile"] = grainProfileText(profile);
+    setEffectGrainModel(e, fitGrainModel(profile));  // (the model fitted too, for Grain: Model)
     preset.effects.push_back(e);
     QString error;
     const QString file = presets::save(preset, &error);
@@ -6750,11 +6973,128 @@ int MainWindow::addWarpMarkersAtOnsets(double sensitivity) {
     }
     const Id id = c->id;
     int added = 0;
-    state_->apply(tr("Add Warp Markers"), [id, sensitivity, &added](Project& p, Sequence& sq) {
-        return edit::addWarpMarkersAtOnsets(p, sq, id, sensitivity, &added);
-    });
+    // Found off the UI thread on a copy (the group's sound decoded whole), then its clips' effects taken from it.
+    Project work = state_->project();
+    const Sequence original = *state_->sequence();
+    const Id seqId = original.id, startId = work.nextId;
+    if (!runWithProgress(this, state_, tr("Finding onsets…"), [&](const std::function<void(double)>&, const std::atomic<bool>*, std::string* error) {
+            Sequence* s = work.findSequence(seqId);
+            const edit::Result r = s ? edit::addWarpMarkersAtOnsets(work, *s, id, sensitivity, &added) : edit::Result::fail("No sequence");
+            if (!r.ok && error) *error = r.error;
+            return r.ok;
+        }))
+        return 0;
+    const Sequence* found = work.findSequence(seqId);
+    const std::vector<Id> group = edit::elasticGroup(*found, id);
+    // (taken only if nothing was edited meanwhile, an MCP request say: else those edits and the ids made here would clash)
+    if (!state_->apply(tr("Add Warp Markers"), [&](Project& p, Sequence& sq) {
+            if (p.nextId != startId) return edit::Result::fail("The project changed while the onsets were found");
+            for (Id g : group) {
+                Clip* to = edit::clipById(sq, g);
+                const Clip* from = edit::clipById(*found, g);
+                const Clip* was = edit::clipById(original, g);
+                if (!to || !from || (was && to->effects != was->effects))
+                    return edit::Result::fail("The project changed while the onsets were found");
+                to->effects = from->effects;
+            }
+            p.nextId = work.nextId;
+            return edit::Result{};
+        }))
+        return 0;
     state_->message(added ? tr("%n warp marker(s) added", "", added) : tr("No onsets found in the clip"));
     return added;
+}
+
+int MainWindow::stripSilence(double thresholdDb, double minSilence, double padBefore, double padAfter, bool linked) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> ids;
+    for (Id id : state_->selectedClips())
+        if (const auto where = edit::locate(*s, id); where && where->track.kind == TrackKind::Audio) ids.push_back(id);
+    if (ids.empty()) {
+        state_->message(tr("Select the audio clips to strip silence from"));
+        return 0;
+    }
+    // Each clip's sound read off the UI thread, where it is loud found, then one edit.
+    const Project snapshot = state_->project();
+    const Sequence seq = *s;
+    std::map<Id, std::vector<std::pair<FrameTime, FrameTime>>> keep;
+    int skipped = 0;
+    if (!runWithProgress(this, state_, tr("Finding silence…"), [&](const std::function<void(double)>& progress, const std::atomic<bool>* cancel, std::string*) {
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (cancel && cancel->load()) return false;
+                const Clip* c = edit::clipById(seq, ids[i]);
+                const MediaItem* m = c ? snapshot.findMedia(c->mediaId) : nullptr;
+                AudioBufferPtr sound = m && m->hasAudio && c->speed == 1 && !c->reverse && !c->ramped()
+                                           ? MediaPool::instance().audio(audioKey(m->path, c->channels), 48000)
+                                           : nullptr;
+                if (!sound) {
+                    ++skipped;
+                    continue;
+                }
+                keep[ids[i]] = clipSoundFrames(seq, *c, soundRegions(*sound, thresholdDb, minSilence, padBefore, padAfter), sound->sampleRate);
+                progress(double(i + 1) / double(ids.size()));
+            }
+            return true;
+        }))
+        return 0;
+    if (keep.empty()) {
+        state_->message(tr("Strip Silence works on clips of sound files at their own speed"));
+        return 0;
+    }
+    int removed = 0;
+    std::string why;
+    state_->apply(tr("Strip Silence"), [&](Project& p, Sequence& sq) {
+        const edit::Result r = edit::stripSilence(p, sq, keep, linked);
+        removed = r.ok ? int(r.applied) : 0;
+        why = r.error;
+        return r;
+    });
+    QString text = removed ? tr("%n silent piece(s) removed", "", removed) : QString::fromStdString(why);
+    if (skipped) text += tr(" (%n clip(s) left: not a sound file at its own speed)", "", skipped);
+    state_->message(text, 6000);
+    return removed;
+}
+
+void MainWindow::stripSilenceDialog() {
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("stripSilenceDialog"));
+    dlg.setWindowTitle(tr("Strip Silence"));
+    auto* form = new QFormLayout(&dlg);
+    QSettings st = appSettings();
+    auto spin = [&](const char* name, double min, double max, double def, double step, int decimals, const QString& suffix) {
+        auto* b = new QDoubleSpinBox(&dlg);
+        b->setObjectName(QString::fromLatin1(name));
+        b->setRange(min, max);
+        b->setSingleStep(step);
+        b->setDecimals(decimals);
+        b->setSuffix(suffix);
+        b->setValue(st.value(QStringLiteral("stripSilence/") + name, def).toDouble());
+        return b;
+    };
+    QDoubleSpinBox* threshold = spin("threshold", -96, 0, -48, 1, 1, tr(" dBFS"));
+    QDoubleSpinBox* shortest = spin("minSilence", 0, 10, 0.25, 0.05, 3, tr(" s"));
+    QDoubleSpinBox* before = spin("padBefore", 0, 2, 0.01, 0.005, 3, tr(" s"));
+    QDoubleSpinBox* after = spin("padAfter", 0, 5, 0.05, 0.01, 3, tr(" s"));
+    auto* linked = new QCheckBox(tr("Linked video too"), &dlg);
+    linked->setObjectName(QStringLiteral("linked"));
+    linked->setChecked(st.value(QStringLiteral("stripSilence/linked"), true).toBool());
+    form->addRow(tr("Threshold:"), threshold);
+    form->addRow(tr("Shortest silence:"), shortest);
+    form->addRow(tr("Pad before:"), before);
+    form->addRow(tr("Pad after:"), after);
+    form->addRow(QString(), linked);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    st.setValue(QStringLiteral("stripSilence/threshold"), threshold->value());
+    st.setValue(QStringLiteral("stripSilence/minSilence"), shortest->value());
+    st.setValue(QStringLiteral("stripSilence/padBefore"), before->value());
+    st.setValue(QStringLiteral("stripSilence/padAfter"), after->value());
+    st.setValue(QStringLiteral("stripSilence/linked"), linked->isChecked());
+    stripSilence(threshold->value(), shortest->value(), before->value(), after->value(), linked->isChecked());
 }
 
 bool MainWindow::setElasticMode(int mode) {
@@ -7759,6 +8099,17 @@ void MainWindow::exportImfDialog() {
     immersive->setToolTip(ambisonicLayout(s->audioLayout) ? tr("An ambisonic mix has no beds or objects")
                                                           : tr("An IAB sequence (SMPTE ST 2067-201) beside the main sound, in the package's language"));
     form->addRow(QString(), immersive);
+    // The same beds and objects as ADM: S-ADM in Metadata-Guided Audio (ST 2067-203), an ADM audio track file (ST 2067-204).
+    auto* sadm = new QCheckBox(tr("Immersive sound as S-ADM (Metadata-Guided Audio)"), &dlg);
+    sadm->setObjectName(QStringLiteral("imfSadm"));
+    sadm->setEnabled(immersive->isEnabled());
+    sadm->setToolTip(tr("An MGASADMSignalSequence (SMPTE ST 2067-203): the sound with an S-ADM frame (ITU-R BS.2125) each frame"));
+    form->addRow(QString(), sadm);
+    auto* adm = new QCheckBox(tr("Immersive sound as ADM audio"), &dlg);
+    adm->setObjectName(QStringLiteral("imfAdm"));
+    adm->setEnabled(immersive->isEnabled());
+    adm->setToolTip(tr("An ADMAudioSequence (SMPTE ST 2067-204): the sound with its ADM description (ITU-R BS.2076), as a BW64 master holds it"));
+    form->addRow(QString(), adm);
     // Each caption track as timed text: subtitles, captions for the deaf and hard of hearing, forced narrative, or left out.
     auto* texts = new QTableWidget(0, 3, &dlg);
     texts->setObjectName(QStringLiteral("imfTexts"));
@@ -7878,6 +8229,8 @@ void MainWindow::exportImfDialog() {
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
     st.immersive = immersive->isEnabled() && immersive->isChecked();
+    st.sadm = sadm->isEnabled() && sadm->isChecked();
+    st.adm = adm->isEnabled() && adm->isChecked();
     for (int row = 0; row < sounds->rowCount(); ++row) {
         ImfSound v;
         v.language = sounds->item(row, 0) ? sounds->item(row, 0)->text().trimmed().toStdString() : std::string();

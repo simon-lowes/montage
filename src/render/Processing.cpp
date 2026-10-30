@@ -5,6 +5,8 @@
 
 #include "ColorSpace.h"
 #include "ColorSlice.h"
+#include "CleanPlate.h"
+#include "Crosstalk.h"
 #include "Clf.h"
 #include "Gamut.h"
 #include "TransferTables.h"
@@ -614,6 +616,34 @@ void screenKey(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     auto others = [&](const float* c) { return balance * std::max(c[o1], c[o2]) + (1 - balance) * std::min(c[o1], c[o2]); };
     const float screen = std::max(1e-3f, sk[dom] - others(sk));
     const int w = img.width, h = img.height;
+    // With a clean plate, the screen's colour where each pixel is (render/CleanPlate.h): an uneven screen keyed as if
+    // it were even.
+    const Image plate = keyerPlate(e, t, img, pixelScale);
+    const float plateScreen = std::max(1e-3f, float(std::clamp(e.p("plate_threshold", t, 50), 1.0, 100.0) / 100) * screen);
+    auto plateColour = [&](int x, int y, float c[3]) {
+        const float* q = plate.at(x, y);
+        const float a = q[3] > 0 ? q[3] : 1;
+        for (int k = 0; k < 3; ++k) c[k] = q[k] / a;
+    };
+    if (!plate.empty() && (view == 3 || view == 4)) {
+        parallelRows(h, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                float* p = img.row(y);
+                for (int x = 0; x < w; ++x, p += 4) {
+                    float c[3];
+                    plateColour(x, y, c);
+                    if (view == 3) {  // the plate
+                        p[0] = c[0], p[1] = c[1], p[2] = c[2], p[3] = 1;
+                        continue;
+                    }
+                    // the screen evened out: each channel scaled by the screen colour over the plate's (alpha kept)
+                    // (at most 4 times, so a plate channel near 0 does not blow up)
+                    for (int k = 0; k < 3; ++k) p[k] *= sk[k] / std::max(c[k], 0.25f * sk[k] + 1e-4f);
+                }
+            }
+        });
+        return;
+    }
     std::vector<float> matte(size_t(w) * size_t(h));
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -623,7 +653,14 @@ void screenKey(const Effect& e, FrameTime t, Image& img, double pixelScale) {
                 float m = 0;
                 if (a > 0) {
                     const float c[3] = {p[0] / a, p[1] / a, p[2] / a};
-                    const float d = (c[dom] - others(c)) / screen;  // 1 on the screen, 0 or less on the subject
+                    float here = screen;
+                    if (!plate.empty()) {  // (where the plate is not screen, a set's floor say, the screen colour)
+                        float q[3];
+                        plateColour(x, y, q);
+                        const float lead = q[dom] - others(q);
+                        if (lead >= plateScreen) here = lead;
+                    }
+                    const float d = (c[dom] - others(c)) / here;  // 1 on the screen, 0 or less on the subject
                     m = std::clamp(1 - d * gain, 0.0f, 1.0f);
                     m = std::clamp((m - black) / (white - black), 0.0f, 1.0f);
                 }
@@ -1969,7 +2006,7 @@ EffectDomain effectDomain(const std::string& type) {
                               "rgb_mixer", "mosaic", "focus_repair"})
             m[t] = EffectDomain::Linear;
         for (const char* t : {"posterize", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
-                              "screen_key", "broadcast_safe", "noise", "depth_map"})
+                              "screen_key", "clean_plate", "broadcast_safe", "noise", "depth_map"})
             m[t] = EffectDomain::Display;
         return m;
     }();
@@ -2387,6 +2424,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "cdl") applyCdlEffect(e, t, img);
     else if (ty == "aces_gamut_compress") applyAcesGamutCompress(e, t, currentWorkingSpace(), img);
     else if (ty == "color_slice") colorSlice(e, t, currentWorkingSpace(), img);
+    else if (ty == "crosstalk") crosstalk(e, t, currentWorkingSpace(), img);
+    else if (ty == "colour_correlation") colourCorrelation(e, t, currentWorkingSpace(), img);
     else if (ty == "texture_pop") textureDetail(e, t, currentWorkingSpace(), img, pixelScale);
     else if (ty == "color_space_transform") {
         const ColorSpace* from = nullptr;
@@ -2413,6 +2452,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
         ofx::applyEffect(e, double(t), img, pixelScale, ofx::currentFetch(), nullptr, &currentWorkingSpace());
     else if (ty == "chroma_key") chromaKey(e, t, img);
     else if (ty == "screen_key") screenKey(e, t, img, pixelScale);
+    else if (ty == "clean_plate") cleanPlate(e, t, img, pixelScale);
+    else if (ty == "edge_extend") edgeExtend(e, t, img);
     else if (ty == "luma_key") lumaKey(e, t, img);
     else if (ty == "black_white") blackWhite(e, t, img);
     else if (ty == "invert") invert(e, t, img);
@@ -3545,6 +3586,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[0] = float(e.p("threshold", t, 0.1)), op.params[1] = float(e.p("softness", t, 0.05));
         op.params[2] = e.p("invert", t) > 0.5 ? 1 : 0;
     } else if (e.type == "screen_key") {
+        if (std::lround(e.p("clean_plate", t, 0)) != 0) return false;  // (a clean plate is made and read on the CPU)
         // (as screenKey, the matte shrunk or grown and softened by passes of its own when asked)
         const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
         op.kind = gpu::ColorOp::ScreenKey;

@@ -3,6 +3,7 @@
 #include <optional>
 
 #include "AdaptiveHdr.h"
+#include "CleanPlate.h"
 #include "GrainMatch.h"
 #include "TrimPasses.h"
 #include "OGraf.h"
@@ -41,6 +42,7 @@
 #include "ColorSpace.h"
 #include "CompositeRender.h"
 #include "Exporter.h"
+#include "Fdl.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
 #include "SurfaceTrack.h"
@@ -561,7 +563,10 @@ void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<I
 // (`space` the picture's; `measured` the one its grain was measured in, the sequence's)
 void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vector<const Image*>& around, const std::vector<MotionFn>& motion,
                       const ColorSpace& space, const ColorSpace& measured, double pixelScale, double sourceSeconds) {
-    const Image clean = removeGrain(src, around, motion, space, grainProfileIn(effectGrainProfile(e), measured, space));
+    Image clean = removeGrain(src, around, motion, space, grainProfileIn(effectGrainProfile(e), measured, space));
+    // (Detail kept: that much of what was taken out goes back; Grain Match puts back less grain for it.)
+    if (const float detail = float(std::clamp(e.p("detail", lt, 0) / 100, 0.0, 1.0)); detail > 0)
+        for (size_t i = 0; i < clean.px.size() && i < src.px.size(); ++i) clean.px[i] += (src.px[i] - clean.px[i]) * detail;
     if (!hasMask(e, lt)) {
         src = clean;
         return;
@@ -984,7 +989,12 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
-            if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
+            if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [lt](const Effect& e) {
+                    // (and clean plates made from several frames, render/CleanPlate.h)
+                    const bool plateFrames = (e.type == "clean_plate" || (e.type == "screen_key" && std::lround(e.p("clean_plate", lt, 0)) == 1)) &&
+                                             std::lround(e.p("plate_frames", lt, 1)) > 1;
+                    return e.enabled && (e.type == "ofx" || plateFrames);
+                })) {
                 const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
                 const bool hq = o.highQuality;
                 const Clip clipCopy = c;
@@ -1445,6 +1455,29 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     return transformLayer(src, g, SW, seq.height, o.scale);
 }
 
+const Clip* clipAt(const Track& track, FrameTime t);  // (below)
+
+// The clips whose clean plate is being made on this thread (a plate track whose picture reads the keyed clip's own
+// track, such as a 3D model's texture, would otherwise make it again without end).
+thread_local std::vector<const Clip*> tMakingPlate;
+
+// What the clip's effects need for a clean plate: the picture on its Keyer's plate track at t, as its source gives it
+// (before its own effects), and the space the clip's effects start in.
+CleanPlateContext cleanPlateFor(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o) {
+    CleanPlateContext out;
+    out.space = &currentWorkingSpace();
+    const int m = cleanPlateTrack(seq, c, t);
+    if (m < 0 || std::find(tMakingPlate.begin(), tMakingPlate.end(), &c) != tMakingPlate.end()) return out;
+    const Clip* pc = clipAt(seq.videoTracks[size_t(m)], t);
+    if (!pc) return out;
+    tMakingPlate.push_back(&c);
+    ClipSource ps;
+    const bool made = clipSource(p, seq, *pc, t, o, nullptr, false, ps) && !ps.src.empty();
+    tMakingPlate.pop_back();
+    if (made) out.plate = std::make_shared<const Image>(std::move(ps.src));
+    return out;
+}
+
 // `below` is what the tracks under the clip have made so far, for adjustment layers; `displayReferred` is told whether
 // the layer came in display-referred (graded scene-referred: graphics, a display-referred clip).
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
@@ -1453,6 +1486,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
+    CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));
     Image layer = finishClipLayer(seq, c, o, cs);
     if (displayReferred) *displayReferred = cs.displayReferred;
     return layer;
@@ -1566,6 +1600,25 @@ const Effect* skyTrackEffect(const Sequence& seq, const Clip& c, FrameTime t) {
 
 }  // namespace
 
+int cleanPlateTrack(const Sequence& seq, const Clip& c, FrameTime t, bool hiddenOnly) {
+    const FrameTime lt = t - c.start;
+    const Effect* key = nullptr;
+    for (const Effect* e : gradeChain(seq, c))
+        if (e->enabled && e->type == "screen_key" && std::lround(e->p("clean_plate", lt, 0)) == 2) {
+            key = e;
+            break;
+        }
+    if (!key || (hiddenOnly && key->p("plate_hide", lt, 1) <= 0.5)) return -1;
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const auto& clips = seq.videoTracks[ti].clips;
+        if (clips.empty() || &c < clips.data() || &c >= clips.data() + clips.size()) continue;
+        const int v = int(std::lround(key->p("plate_track", lt, 0)));
+        const int m = v <= 0 ? int(ti) + 1 : v - 1;
+        return m >= 0 && m < int(seq.videoTracks.size()) && m != int(ti) ? m : -1;
+    }
+    return -1;
+}
+
 std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
     std::vector<bool> hidden(seq.videoTracks.size(), false);
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
@@ -1574,6 +1627,8 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = skyTrackEffect(seq, *c, t); e && e->p("hide", t - c->start, 1) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // A Keyer's clean plate.
+            if (const int m = cleanPlateTrack(seq, *c, t, true); m >= 0) hidden[size_t(m)] = true;
             // A depth map made into depth, and a deep holdout, when they are to be hidden.
             if (const Effect* e = enabledEffect(seq, *c, "make_deep"); e && std::lround(e->p("source", t - c->start, 0)) == 0 &&
                                                                      e->p("hide", t - c->start, 1) > 0.5)
@@ -1607,6 +1662,14 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
         bool display = false;
         Image l = clipLayer(p, seq, c, at, o, below, &display);
         if (finish) finish(c, at, l);
+        // (a 3D Layer stays turned as it mixes: its card, flattened, in place of the flat picture)
+        const bool model = c.isGenerator() && c.generator.type == "model3d";
+        if (const Effect* l3 = model ? nullptr : enabledEffect(seq, c, "layer_3d"); l3 && !l.empty() && l.width == W && l.height == H) {
+            Image card;
+            std::string error;
+            if (renderClipLayer3D(p, seq, c, *l3, at, l, double(W) / seq.width, card, nullptr, &error)) l = std::move(card);
+            else if (o.issues && !error.empty()) o.issues->note(error);
+        }
         shown |= display;
         return l;
     };
@@ -3021,6 +3084,16 @@ QPoint cornerPos(int c, int w, int h, int W, int H) {
 void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
                  const ColorSpace* space, FrameTime timecode, bool dropFrame) {
     if (img.width < 8 || img.height < 8) return;
+    // Frame lines under everything else.
+    if (b.frameLines)
+        if (const std::vector<FrameLine> fl = sequenceFrameLines(p, seq, t); !fl.empty()) {
+            QImage lines(img.width, img.height, QImage::Format_RGBA8888_Premultiplied);
+            lines.fill(Qt::transparent);
+            QPainter pa(&lines);
+            paintFrameLines(pa, QRectF(0, 0, img.width, img.height), fl, std::max(1.0, img.height / 720.0));
+            pa.end();
+            blendPatch(img, lines, 0, 0, space);
+        }
     // The logo first, so the text stays readable over it.
     if (watermark && !watermark->isNull() && b.watermarkOpacity > 0) {
         const int ww = std::max(1, int(std::lround(std::clamp(b.watermarkWidth, 0.01, 1.0) * img.width)));
@@ -4395,7 +4468,15 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             }
             if (postSends)
                 for (size_t i = 0; i < size_t(frames) * 2; ++i) postBuf[i] = trackBuf[i] * tg;
-            if (lfeOnly) {
+            if (track.surround.lfeOnly && !lfeOnly && !upmix) {
+                // (an LFE channel: its sound to the LFE alone, at its send's level)
+                if (lfeCh >= 0 && track.surround.lfeDb > -99) {
+                    const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
+                    for (int i = 0; i < frames; ++i)
+                        master[size_t(i) * size_t(nch) + size_t(lfeCh)] +=
+                            0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+                }
+            } else if (lfeOnly) {
                 if (lfeSend) {
                     const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
                     for (int i = 0; i < frames; ++i)
@@ -4436,7 +4517,9 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             for (int i = 0; i < frames; ++i) {
                 if (panAuto && i % 64 == 0) panGains(trackPanAt(track, double(heard + i) * fps / sr), tl, tr);
                 float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
-                if (!lfeOnly && !upmix) {  // (an object in a bed without speakers to pan to: only its sends; upmixed, its field)
+                // (an object in a bed without speakers to pan to: only its sends; upmixed, its field; an LFE channel in
+                // stereo: nothing, as a fold-down leaves the LFE out)
+                if (!lfeOnly && !upmix && !(track.surround.lfeOnly && bus == busBufs.end())) {
                     dest[i * 2] += l;
                     dest[i * 2 + 1] += r;
                 }

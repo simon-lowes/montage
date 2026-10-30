@@ -34,6 +34,7 @@
 #include "core/ColorGroups.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
+#include "render/Fdl.h"
 #include "render/LearnFromClip.h"
 #include "render/ModelClip.h"
 #include "render/ShapeLayers.h"
@@ -41,6 +42,7 @@
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
 #include "render/ColorChart.h"
+#include "render/Crosstalk.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -57,6 +59,7 @@
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
 #include "audio/ElasticAudio.h"
+#include "audio/TapeRepair.h"
 #include "audio/PluginEffect.h"
 #include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
@@ -183,6 +186,7 @@
 #include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -1449,6 +1453,50 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Removed %1 clip(s)").arg(ids.size()), projectJson(l.project));
         });
 
+    add("montage_strip_silence", "Strip silence",
+        "Cut audio clips to their sound (Pro Tools' Strip Silence): where every channel stays under threshold_db for at "
+        "least min_silence seconds is removed, the rest kept with pad_before and pad_after seconds either side, leaving "
+        "gaps (montage_delete_gaps closes them). With linked (the default) the clips' linked video is cut the same way. "
+        "Clips at another speed than 100 % are left. One undo step.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "threshold_db":{"type":"number","default":-48},"min_silence":{"type":"number","default":0.25},
+            "pad_before":{"type":"number","default":0.01},"pad_after":{"type":"number","default":0.05},
+            "linked":{"type":"boolean","default":true}},"required":["project","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const double threshold = std::clamp(a.value("threshold_db").toDouble(-48), -120.0, 0.0);
+            const double shortest = std::clamp(a.value("min_silence").toDouble(0.25), 0.0, 3600.0);
+            const double before = std::clamp(a.value("pad_before").toDouble(0.01), 0.0, 60.0), after = std::clamp(a.value("pad_after").toDouble(0.05), 0.0, 60.0);
+            std::map<Id, std::vector<std::pair<FrameTime, FrameTime>>> keep;
+            QStringList left;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                const Id id = Id(v.toDouble());
+                const Clip* c = edit::clipById(s, id);
+                const auto where = edit::locate(s, id);
+                if (!c || !where || where->track.kind != TrackKind::Audio) throw ArgError{QStringLiteral("No audio clip %1").arg(double(id))};
+                const MediaItem* m = l.project.findMedia(c->mediaId);
+                AudioBufferPtr sound = m && m->hasAudio && c->speed == 1 && !c->reverse && !c->ramped()
+                                           ? MediaPool::instance().audio(audioKey(m->path, c->channels), 48000)
+                                           : nullptr;
+                if (!sound) {
+                    left << QString::number(double(id));
+                    continue;
+                }
+                keep[id] = clipSoundFrames(s, *c, soundRegions(*sound, threshold, shortest, before, after), sound->sampleRate);
+            }
+            if (keep.empty()) throw ArgError{"\"clips\" must list audio clips of sound files at their own speed"};
+            const edit::Result r = edit::stripSilence(l.project, s, keep, a.value("linked").toBool(true));
+            if (!r.ok && r.error == "No silence to strip") return ok(QStringLiteral("No silence to strip"), QJsonObject{{"removed", 0}});
+            check(r);
+            save(l);
+            QString text = QStringLiteral("Removed %1 silent piece(s)").arg(double(r.applied));
+            if (!left.isEmpty()) text += QStringLiteral("; left clips %1 (not a sound file at its own speed)").arg(left.join(", "));
+            QJsonObject out = projectJson(l.project);
+            out["removed"] = double(r.applied);
+            return ok(text, out);
+        });
+
     add("montage_delete_gaps", "Delete gaps",
         "Close every stretch of the timeline where no track has anything (Resolve's Delete Gaps), so nothing slips out of "
         "sync: what follows moves up with its captions, markers and track automation. With leading, the empty start too. "
@@ -1584,7 +1632,7 @@ void McpServer::Impl::addTools() {
         "Key a green or blue screen out of video clips: each gets the Keyer (Keylight-style: screen dominance with balance and "
         "gain, matte clip black and white, shrink or grow, soften, despill with brightness restored, edge desaturation) set to "
         "the screen colour read from its picture at `at` (default: the middle of each clip). Then montage_add_effect "
-        "or montage_set_effect_param can tune it (type screen_key).",
+        "or montage_set_effect_param can tune it (type screen_key; clean_plate 1 or 2 for an unevenly lit screen).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
             "at":{"type":["number","string"]}},"required":["project","clips"]})json",
         false, [](const QJsonObject& a) {
@@ -3159,7 +3207,22 @@ void McpServer::Impl::addTools() {
         "through the scene's Camera clip (camera 3, the default; montage_add_camera; without one, the camera that sees the "
         "frame as it is), its own (camera 0, lens fov), the solve montage_camera_track made (camera 1, width in the "
         "scene's units, camera_track the footage's track) or a file's (camera 2, strings.camera_file); 3D layers, models "
-        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet.",
+        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet. "
+        "crosstalk is a 3 x 3 matrix on linear light whose rows sum to 1 (neutrals stay neutral): red_hue, green_hue and "
+        "blue_hue pull each primary towards its neighbour (degrees, -60..60, positive towards the next: red to green, green "
+        "to blue, blue to red), red_strength etc. (%) take it towards grey or past itself, invert 1 inverts it, and "
+        "strings.matrix (9 numbers, row major) is a fitted matrix the handles work on (montage_match_chart as crosstalk "
+        "fits one to a chart). colour_correlation changes saturation (%) by the channels' spread about their luminance, "
+        "bounded by a gamut (boundary 0 Rec.709, 1 P3, 2 Rec.2020, 3 custom_rx..custom_by) with colours compressed from "
+        "compress_start (%) of the way to it, and only between exposure_low and exposure_high (stops from mid grey, "
+        "exposure_soft the fall-off). "
+        "screen_key keys an unevenly lit screen against a clean plate with clean_plate 1 (made from the picture: where the "
+        "screen colour leads by plate_threshold % of the screen's own, shrunk by plate_erode px, the rest filled in "
+        "smoothly; plate_frames > 1 takes the median of that many frames plate_spacing apart) or 2 (the picture on "
+        "plate_track, V number, 0 the track above, hidden unless plate_hide 0); plate_blur softens it; view 3 shows the "
+        "plate, 4 the screen evened out. clean_plate (the effect) replaces the picture with such a plate (view 1: the "
+        "screen it found), to export as a plate. edge_extend pushes the solid foreground's colour out under edges "
+        "whose alpha is below solid (%), by amount (%), so no screen colour is left in hair and motion blur.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
@@ -4458,7 +4521,12 @@ void McpServer::Impl::addTools() {
         "light, its size and softness, how its colours go together and from frame to frame) from the flat areas of a few "
         "runs of frames, or of a region, and returns it as a profile; apply puts a Grain Match effect on clips (apply_to), "
         "from that profile, a measured profile given, or a film gauge (65mm, 35mm, 16mm, super8). With measure, apply_to "
-        "puts the measured grain on those clips at once. mode replace takes each clip's own grain out first.",
+        "puts the measured grain on those clips at once. mode replace takes each clip's own grain out first (detail, %, "
+        "keeps that much of what taking it out took, with less grain put back). measure also fits the grain model "
+        "(`model`: strength at mid grey as a fraction of the light, response the power of the light it follows, 0.5 "
+        "sensor-like to 1 negative-like, correlation between the channels, yellow_blue 0..1 of the colour on film's "
+        "yellow-blue axis, fine_size and cluster_size in pixels of a frame `width` wide (1920 unless given), clusters their share of the power, "
+        "kurtosis, temporal); apply with `model` (any of those, the rest the defaults) uses the model in scene-linear light.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["measure","apply"]},
             "clip":{"type":"number","description":"measure: the clip whose grain to measure"},
             "region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},
@@ -4467,7 +4535,11 @@ void McpServer::Impl::addTools() {
             "profile":{"type":"string","description":"apply: a profile measure returned"},
             "gauge":{"type":"string","enum":["65mm","35mm","16mm","super8"]},
             "mode":{"type":"string","enum":["add","replace"],"default":"add"},
-            "amount":{"type":"number","default":100,"description":"Percent of the measured strength"}},"required":["project","action"]})json",
+            "amount":{"type":"number","default":100,"description":"Percent of the measured strength"},
+            "detail":{"type":"number","default":0,"description":"replace: percent of what taking the grain out took that is kept"},
+            "model":{"type":"object","properties":{"strength":{"type":"number"},"response":{"type":"number"},"correlation":{"type":"number"},
+                     "yellow_blue":{"type":"number"},"fine_size":{"type":"number"},"cluster_size":{"type":"number"},"clusters":{"type":"number"},
+                     "kurtosis":{"type":"number"},"temporal":{"type":"number"},"width":{"type":"number","default":1920}}}},"required":["project","action"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -4475,6 +4547,16 @@ void McpServer::Impl::addTools() {
             GrainProfile profile;
             int gauge = -1;
             QString text;
+            GrainModel model;
+            bool useModel = false;
+            QJsonObject result;
+            auto modelJson = [](const GrainModel& m) {
+                auto r = [](double v, double k) { return std::round(v * k) / k; };
+                return QJsonObject{{"strength", r(m.strength, 1e5)}, {"response", r(m.response, 1e3)}, {"correlation", r(m.correlation, 1e3)},
+                                   {"yellow_blue", r(m.yellowBlue, 1e3)}, {"fine_size", r(m.fineSize, 1e3)}, {"cluster_size", r(m.clusterSize, 1e3)},
+                                   {"clusters", r(m.clusters, 1e3)}, {"kurtosis", r(m.kurtosis, 1e3)}, {"temporal", r(m.temporal, 1e3)},
+                                   {"width", m.width}};
+            };
             if (action == "measure") {
                 const Clip& c = clipArg(l, a);
                 GrainRegion region;
@@ -4492,8 +4574,26 @@ void McpServer::Impl::addTools() {
                                 fixed(profile.correlation[0], 'f', 2), fixed(profile.correlation[1], 'f', 2), fixed(profile.correlation[2], 'f', 2),
                                 fixed(profile.temporal, 'f', 2)) +
                        QString::fromStdString(grainProfileText(profile));
+                result["profile"] = QString::fromStdString(grainProfileText(profile));
+                result["model"] = modelJson(fitGrainModel(profile));
             } else if (action == "apply") {
-                if (a.contains("profile")) {
+                if (a.contains("model")) {
+                    const QJsonObject mo = a.value("model").toObject();
+                    auto num = [&](const char* k, double& to) {
+                        if (!mo.contains(QLatin1String(k))) return;
+                        if (!mo.value(QLatin1String(k)).isDouble() || !std::isfinite(mo.value(QLatin1String(k)).toDouble()))
+                            throw ArgError{QStringLiteral("\"model.%1\" is a number").arg(QLatin1String(k))};
+                        to = mo.value(QLatin1String(k)).toDouble();
+                    };
+                    num("strength", model.strength), num("response", model.response), num("correlation", model.correlation);
+                    num("yellow_blue", model.yellowBlue), num("fine_size", model.fineSize), num("cluster_size", model.clusterSize);
+                    num("clusters", model.clusters), num("kurtosis", model.kurtosis), num("temporal", model.temporal);
+                    double width = 1920;
+                    num("width", width);
+                    if (!(width >= 16 && width <= 65536)) throw ArgError{QStringLiteral("\"model.width\" is the frame width the sizes are in, 16 to 65536")};
+                    model.width = int(std::lround(width));
+                    useModel = true;
+                } else if (a.contains("profile")) {
                     if (!parseGrainProfile(a.value("profile").toString().toStdString(), profile)) return fail(QStringLiteral("That is not a grain profile"));
                 } else {
                     const QString g = a.value("gauge").toString(QStringLiteral("35mm"));
@@ -4505,6 +4605,7 @@ void McpServer::Impl::addTools() {
                 return fail(QStringLiteral("action is measure or apply"));
             }
             const QJsonArray targets = a.value("apply_to").toArray();
+            const GrainModel fitted = !useModel && gauge < 0 && !targets.isEmpty() ? fitGrainModel(profile) : GrainModel{};
             if (action == "apply" && targets.isEmpty()) return fail(QStringLiteral("apply needs apply_to: the clips to put the grain on"));
             const QString mode = a.value("mode").toString(QStringLiteral("add"));
             if (mode != "add" && mode != "replace") return fail(QStringLiteral("mode is add or replace"));
@@ -4513,10 +4614,12 @@ void McpServer::Impl::addTools() {
                 Clip* c = edit::clipById(s, Id(v.toDouble()));
                 if (!c) return fail(QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble())));
                 Effect e = makeEffect(l.project, "grain_match");
-                if (gauge >= 0) e.params["source"] = double(gauge + 1);
-                else e.strings["profile"] = grainProfileText(profile);
+                if (useModel) setEffectGrainModel(e, model), e.params["source"] = 5;
+                else if (gauge >= 0) e.params["source"] = double(gauge + 1);
+                else e.strings["profile"] = grainProfileText(profile), setEffectGrainModel(e, fitted);
                 e.params["mode"] = mode == "replace" ? 1.0 : 0.0;
                 e.params["amount"] = a.value("amount").toDouble(100);
+                e.params["detail"] = std::clamp(a.value("detail").toDouble(0), 0.0, 100.0);
                 c->effects.push_back(e);
                 ++put;
             }
@@ -4524,7 +4627,7 @@ void McpServer::Impl::addTools() {
                 save(l);
                 text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
             }
-            return ok(text);
+            return result.isEmpty() ? ok(text) : ok(text, result);
         });
 
     add("montage_takes", "Take lanes, comps and track versions on an audio track",
@@ -7615,7 +7718,8 @@ void McpServer::Impl::addTools() {
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
         "(Scenarist, CEA-608), .mcc (MCC captions: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
-        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or as pictures drawn in "
+        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); `format` ebu-tt-d writes EBU-TT-D "
+        "(EBU Tech 3380, the TTML profile European broadcasters take; an .xml file); or as pictures drawn in "
         "the track's style (`format`): pgs (Blu-ray: .sup, or Matroska .mks/.mkv), dvb (MPEG-TS .ts, or Matroska), "
         "vobsub (DVD: .idx with its .sub, or Matroska) or imsc_image (IMSC 1.1 Image: a .ttml document with a PNG a "
         "caption beside it); .sup, .idx and .ts need no `format`. Or read any of them as a new caption track (`import`: "
@@ -7629,7 +7733,7 @@ void McpServer::Impl::addTools() {
         "capitals ([DOOR SLAMS], SPEAKER:) or colours (DOOR SLAMS, a colour per speaker). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
-            "format":{"type":"string","enum":["pgs","dvb","vobsub","imsc_image"],"description":"Export as subtitle pictures"},
+            "format":{"type":"string","enum":["ebu-tt-d","pgs","dvb","vobsub","imsc_image"],"description":"Export as EBU-TT-D, or as subtitle pictures"},
             "width":{"type":"integer","description":"The pictures' frame (default: the sequence's)"},"height":{"type":"integer"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
             "import_embedded":{"type":"number","description":"A video clip (id): the captions inside its file as a new track, where the clip plays them"},
@@ -7800,11 +7904,12 @@ void McpServer::Impl::addTools() {
                 if (!t && !s.captionTracks.empty()) t = &s.captionTracks.front();
             }
             if (!t) return fail("The sequence has no captions");
-            const std::string ext = "." + QFileInfo(path).suffix().toLower().toStdString();
+            const bool ebu = a.value("format").toString() == QLatin1String("ebu-tt-d");
+            const std::string ext = ebu ? std::string("ebu-tt-d") : "." + QFileInfo(path).suffix().toLower().toStdString();
             ImageSubtitleFormat pictureFormat = ImageSubtitleFormat::Pgs;
-            const bool pictures = a.contains("format") ? true : imageSubtitleFormatFor(ext, pictureFormat) || ext == ".mks";
-            if (a.contains("format") && !imageSubtitleFormatFromId(a.value("format").toString().toStdString(), pictureFormat))
-                throw ArgError{"\"format\" is pgs, dvb, vobsub or imsc_image"};
+            const bool pictures = ebu ? false : a.contains("format") ? true : imageSubtitleFormatFor(ext, pictureFormat) || ext == ".mks";
+            if (a.contains("format") && !ebu && !imageSubtitleFormatFromId(a.value("format").toString().toStdString(), pictureFormat))
+                throw ArgError{"\"format\" is ebu-tt-d, pgs, dvb, vobsub or imsc_image"};
             if (pictures) {
                 std::string err;
                 ImageSubtitleResult r;
@@ -7909,9 +8014,15 @@ void McpServer::Impl::addTools() {
         "`replace`, optionally `case_sensitive` and `whole_words`), place (`place`: bottom, top or middle, and left, centre or "
         "right, e.g. \"top left\": where the captions sit, kept in every caption format) or raise_over_titles (captions "
         "shown over lower thirds and other low titles move to the top). `captions` (indices) limits shift, replace and place. Limits "
-        "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames.",
+        "can be changed: max_cps, max_line_chars, max_lines, min_seconds, max_seconds, min_gap_frames. Shot changes (the "
+        "sequence's cuts and its shot-change markers; `shot_changes` adds markers at those times first, and action "
+        "shot_changes lists them) are kept clear of by check and fix_timing under `profile` netflix (the default: no caption "
+        "starts or ends within half a second of one, except starting on it or ending min_gap_frames before it; "
+        "`shot_zone_seconds` changes the half second) or off.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"integer","default":0},
-            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace","place","raise_over_titles"]},
+            "action":{"type":"string","enum":["check","fix_timing","shift","sync","replace","place","raise_over_titles","shot_changes"]},
+            "profile":{"type":"string","enum":["netflix","off"],"default":"netflix"},"shot_zone_seconds":{"type":"number"},
+            "shot_changes":{"type":"array","items":{"type":["number","string"]},"description":"Times (seconds or timecodes) to mark as shot changes"},
             "place":{"type":"string"},
             "captions":{"type":"array","items":{"type":"integer"}},"by":{"type":["number","string"]},
             "first":{"type":["number","string"]},"last":{"type":["number","string"]},
@@ -7932,6 +8043,24 @@ void McpServer::Impl::addTools() {
             if (a.contains("min_seconds")) lim.minSeconds = a.value("min_seconds").toDouble();
             if (a.contains("max_seconds")) lim.maxSeconds = a.value("max_seconds").toDouble();
             if (a.contains("min_gap_frames")) lim.minGapFrames = a.value("min_gap_frames").toInt();
+            const QString profile = str(a, "profile", "netflix");
+            if (profile != QLatin1String("netflix") && profile != QLatin1String("off")) throw ArgError{"profile is netflix or off"};
+            if (profile == QLatin1String("off")) lim.shotZoneSeconds = 0;
+            else if (a.contains("shot_zone_seconds")) lim.shotZoneSeconds = std::max(0.0, a.value("shot_zone_seconds").toDouble());
+            // Shot changes given: marked first (kept with the sequence).
+            bool marked = false;
+            for (const QJsonValue& v : a.value("shot_changes").toArray()) {
+                const FrameTime f = timeArg(v, s, "shot_changes");
+                if (std::any_of(s.markers.begin(), s.markers.end(), [f](const Marker& m) { return m.shotChange && m.t == f; })) continue;
+                Marker m;
+                m.t = f;
+                m.name = "Shot change";
+                m.shotChange = true;
+                s.markers.push_back(m);
+                marked = true;
+            }
+            if (marked) std::sort(s.markers.begin(), s.markers.end(), [](const Marker& x, const Marker& y) { return x.t < y.t; });
+            const std::vector<FrameTime> cuts = lim.shotZoneSeconds > 0 ? captionShotChanges(s) : std::vector<FrameTime>();
             std::vector<size_t> chosen;
             for (const QJsonValue& v : a.value("captions").toArray()) {
                 const int i = v.toInt(-1);
@@ -7939,8 +8068,20 @@ void McpServer::Impl::addTools() {
                 chosen.push_back(size_t(i));
             }
             const QString action = need(a, "action");
+            if (marked) save(l);  // (the shot changes given are kept, whatever the action makes of them)
+            if (action == "shot_changes") {
+                QJsonArray list;
+                QStringList at;
+                for (FrameTime f : captionShotChanges(s)) {
+                    list.append(QJsonObject{{"frame", double(f)}, {"at", tc(f, s)}});
+                    at << tc(f, s);
+                }
+                return ok(at.isEmpty() ? QStringLiteral("The sequence has no shot changes")
+                                       : QStringLiteral("%1 shot changes: %2").arg(at.size()).arg(at.join(", ")),
+                          QJsonObject{{"shot_changes", list}, {"zone_frames", shotChangeZone(s.fps, lim)}});
+            }
             if (action == "check") {
-                const std::vector<unsigned> issues = checkCaptions(t.captions, s.fps, lim);
+                const std::vector<unsigned> issues = checkCaptions(t.captions, s.fps, lim, cuts);
                 QJsonArray list;
                 QStringList lines;
                 for (size_t i = 0; i < issues.size(); ++i) {
@@ -7953,12 +8094,14 @@ void McpServer::Impl::addTools() {
                 const QString head = list.isEmpty() ? QStringLiteral("All %1 captions are within the limits").arg(t.captions.size())
                                                      : QStringLiteral("%1 of %2 captions break the limits:").arg(list.size()).arg(t.captions.size());
                 return ok(lines.isEmpty() ? head : head + "\n" + lines.join('\n'),
-                          QJsonObject{{"captions", int(t.captions.size())}, {"issues", list}});
+                          QJsonObject{{"captions", int(t.captions.size())}, {"issues", list}, {"shot_changes", int(cuts.size())}});
             }
             QString done;
             if (action == "fix_timing") {
-                const int n = fixCaptionTiming(t.captions, s.fps, lim);
-                if (!n) return ok(QStringLiteral("No caption needed retiming"), QJsonObject{{"changed", 0}});
+                const int n = fixCaptionTiming(t.captions, s.fps, lim, cuts);
+                if (!n) {
+                    return ok(QStringLiteral("No caption needed retiming"), QJsonObject{{"changed", 0}});
+                }
                 done = QStringLiteral("Retimed %1 captions").arg(n);
             } else if (action == "shift") {
                 if (!a.contains("by")) throw ArgError{QStringLiteral("shift needs \"by\"")};
@@ -8001,7 +8144,7 @@ void McpServer::Impl::addTools() {
             }
             save(l);
             int flagged = 0;
-            for (unsigned v : checkCaptions(t.captions, s.fps, lim)) flagged += v != 0;
+            for (unsigned v : checkCaptions(t.captions, s.fps, lim, cuts)) flagged += v != 0;
             return ok(done + QStringLiteral("; %1 captions still break the limits").arg(flagged),
                       QJsonObject{{"captions", int(t.captions.size())}, {"still_flagged", flagged}});
         });
@@ -10041,7 +10184,9 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
             "at":{"type":["number","string"],"description":"Timeline time of the frame showing the chart"},
             "corners":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"minItems":4,"maxItems":4},
-            "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false}},
+            "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false},
+            "as":{"type":"string","enum":["chart_match","crosstalk"],"default":"chart_match",
+                  "description":"crosstalk: fit a Crosstalk (rows summing to 1, no offset: the camera's crosstalk, such as under LED light) instead"}},
             "required":["project","clip"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -10068,7 +10213,14 @@ void McpServer::Impl::addTools() {
             bool complete = false;
             const ChartColors shot = sampleChart(frame, q, sequenceColorSpace(s), &complete);
             if (!complete) throw ArgError{"\"corners\" must outline the chart: four corners apart, in order round it, not crossed"};
-            const ChartFit fit = fitChart(shot);
+            const QString as = a.value("as").toString(QStringLiteral("chart_match"));
+            if (as != "chart_match" && as != "crosstalk") throw ArgError{"\"as\" is chart_match or crosstalk"};
+            ChartFit fit = fitChart(shot);
+            CrosstalkFit cross;
+            if (as == "crosstalk") {
+                cross = fitCrosstalk(shot);
+                fit.ok = cross.ok, fit.deltaEBefore = cross.deltaEBefore, fit.deltaEAfter = cross.deltaEAfter, fit.deltaEMax = cross.deltaEMax;
+            }
             if (!fit.ok) return fail("The patches could not be matched (are the corners on the chart?)");
             QJsonArray corners;
             for (const Point2& p : q.p) corners.append(QJsonArray{std::round(p.x * 1e4) / 1e4, std::round(p.y * 1e4) / 1e4});
@@ -10076,9 +10228,14 @@ void McpServer::Impl::addTools() {
                             {"delta_e_after", std::round(fit.deltaEAfter * 100) / 100}, {"delta_e_worst", std::round(fit.deltaEMax * 100) / 100}};
             if (a.value("measure_only").toBool()) return ok(QStringLiteral("Chart measured: delta E %1 now, %2 once matched").arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
             const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
-            const int n = applyChartMatchToClips(l.project, s, clips, fit);
+            const int n = as == "crosstalk" ? applyCrosstalkToClips(l.project, s, clips, cross) : applyChartMatchToClips(l.project, s, clips, fit);
             save(l);
             out["clips"] = n;
+            if (as == "crosstalk") {
+                QJsonArray m;
+                for (double v : cross.m) m.append(std::round(v * 1e6) / 1e6);
+                out["matrix"] = m;
+            }
             return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
         });
 
@@ -10837,7 +10994,9 @@ void McpServer::Impl::addTools() {
             "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
-            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"}},
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
+            "sadm":{"type":"boolean","default":false,"description":"Immersive sound as S-ADM: the same beds and objects as a Metadata-Guided Audio track file with an S-ADM frame each edit unit (ITU-R BS.2125), an MGASADMSignalSequence (ST 2067-203)"},
+            "adm":{"type":"boolean","default":false,"description":"Immersive sound as ADM: the same beds and objects as an ADM audio track file, the sound with its axml and chna (ST 2067-204, ST 2131), an ADMAudioSequence"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -10886,6 +11045,8 @@ void McpServer::Impl::addTools() {
             st.application = a.value("application").toInt(2);
             st.graded = a.value("graded").toBool(true);
             st.immersive = a.value("iab").toBool();
+            st.sadm = a.value("sadm").toBool();
+            st.adm = a.value("adm").toBool();
             for (const QJsonValue& v : a.value("target_frames").toArray()) {
                 if (!v.isDouble() || v.toDouble() != std::floor(v.toDouble()) || v.toDouble() < 0)
                     throw ArgError{QStringLiteral("target_frames are whole frame numbers")};
@@ -10909,6 +11070,8 @@ void McpServer::Impl::addTools() {
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
             if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
+            if (r.sadm || r.adm)
+                out["adm"] = QJsonObject{{"bed_channels", r.admBedChannels}, {"objects", r.admObjects}, {"sadm", r.sadm}, {"adm", r.adm}};
             if (r.application == 5) {
                 out["output_transform"] = QString::fromStdString(r.outputTransform);
                 out["target_frames"] = r.targetFrames;
@@ -10999,6 +11162,7 @@ void McpServer::Impl::addTools() {
                 "footage":{"type":"boolean","description":"Feet and frames in the sequence's film gauge"},
                 "key_number":{"type":"boolean","description":"The key number of the frame on screen (its media's key_number)"},
                 "ink_number":{"type":"boolean","description":"Its ink number"},
+                "frame_lines":{"type":"boolean","description":"The FDL frame lines of the clip on screen (montage_fdl), through its transform"},
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
                 "watermark":{"type":"string","description":"Image file, e.g. a logo"},
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
@@ -11040,7 +11204,8 @@ void McpServer::Impl::addTools() {
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
-            "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"}},
+            "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265 and AV1 with rate control per segment; image sequences frame by frame). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -11153,6 +11318,7 @@ void McpServer::Impl::addTools() {
                 st.burnIn.footage = b.value("footage").toBool();
                 st.burnIn.keyNumber = b.value("key_number").toBool();
                 st.burnIn.inkNumber = b.value("ink_number").toBool();
+                st.burnIn.frameLines = b.value("frame_lines").toBool();
                 st.burnIn.text = b.value("text").toString().toStdString();
                 st.burnIn.corner = corner("corner", 0);
                 if (b.contains("watermark")) st.burnIn.watermark = absolute(b.value("watermark").toString()).toStdString();
@@ -11244,9 +11410,19 @@ void McpServer::Impl::addTools() {
                 const int groups = stems == "buses" ? StemsByBus : stems == "roles" ? StemsByRole : stems == "tracks" ? StemsByTrack : 0;
                 std::string id, why;
                 const std::string name = s.name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
-                if (!submitFarmJob(farm, name, l.project, s.id, st, groups, &id, &why)) return fail(QString::fromStdString(why));
-                return ok(QStringLiteral("Sent to the render farm as %1 (montage_render_farm follows it)").arg(QString::fromStdString(id)),
-                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}});
+                const int segments = a.value("segments").toInt(1);
+                if (segments < 1 || segments > 256) throw ArgError{"\"segments\" is 1 to 256"};
+                if (!submitFarmJob(farm, name, l.project, s.id, st, groups, &id, &why, segments)) return fail(QString::fromStdString(why));
+                QString text = QStringLiteral("Sent to the render farm as %1 (montage_render_farm follows it)").arg(QString::fromStdString(id));
+                QJsonObject o{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}};
+                if (segments > 1) {
+                    int made = 0;
+                    for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+                    o["segments"] = made;
+                    text += made > 1 ? QStringLiteral(", in %1 segments").arg(made) : QStringLiteral(" whole (the range is too short to split)");
+                    if (made > 1 && exportSegmentsLongGop(st)) text += QStringLiteral("\nRate control works per segment: a bitrate is kept within each, not across the whole");
+                }
+                return ok(text, o);
             }
             std::string err;
             LightLevels light;
@@ -11325,10 +11501,17 @@ void McpServer::Impl::addTools() {
                 QStringList lines;
                 if (action == "jobs") {
                     for (const FarmJob& j : farmJobs(farm)) {
-                        list.append(QJsonObject{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
-                                                {"state", farmStateName(j.state)}, {"progress", j.progress}, {"node", QString::fromStdString(j.node)},
-                                                {"output", QString::fromStdString(j.output)}, {"error", QString::fromStdString(j.error)},
-                                                {"cancel_requested", j.cancelRequested}, {"submitted_by", QString::fromStdString(j.submittedBy)}});
+                        QJsonObject job{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
+                                        {"state", farmStateName(j.state)}, {"progress", j.progress}, {"node", QString::fromStdString(j.node)},
+                                        {"output", QString::fromStdString(j.output)}, {"error", QString::fromStdString(j.error)},
+                                        {"cancel_requested", j.cancelRequested}, {"submitted_by", QString::fromStdString(j.submittedBy)}};
+                        // (A job sent in segments: the join, and each segment with its join's id.)
+                        if (j.join) job["segments"] = j.segments;
+                        if (j.segment > 0) {
+                            job["join"] = QString::fromStdString(j.group);
+                            job["segment"] = j.segment;
+                        }
+                        list.append(job);
                         lines << QStringLiteral("%1 %2 %3").arg(QString::fromStdString(j.id), farmStateName(j.state), QString::fromStdString(j.name));
                     }
                     return ok(lines.isEmpty() ? QStringLiteral("No jobs") : lines.join('\n'), QJsonObject{{"jobs", list}});
@@ -12505,7 +12688,8 @@ void McpServer::Impl::addTools() {
         "`handles` frames either side (default 8, as far as the footage goes), as an image sequence in a folder per shot "
         "(format exr: half float in scene-linear light; dpx: 10-bit in the footage's own colour; tiff: 16-bit), numbered "
         "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv and (unless `amf` is false) an ACES "
-        "Metadata File per shot giving the frames' colour space and the clip's CDL and looks. `clips` are clip ids "
+        "Metadata File per shot giving the frames' colour space and the clip's CDL and looks, and (unless `fdl` is false) "
+        "an ASC Framing Decision List per shot: the plate's canvas with the footage's framing and what the cut shows. `clips` are clip ids "
         "(default: every footage clip on the video tracks). OpenEXR pulls can carry more in each frame: `source_layers` "
         "copies a multi-layer OpenEXR source's other layers (AOVs) and Cryptomattes as they are, `mattes` adds each of the "
         "clip's masks as a one-channel layer matte_<effect>; `compression` is any of OpenEXR's (none, rle, zips, zip, "
@@ -12522,6 +12706,7 @@ void McpServer::Impl::addTools() {
             "returns_pattern":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
+            "fdl":{"type":"boolean","default":true},
             "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
             "st_maps":{"type":"boolean","default":false}},
             "required":["project","folder"]})json",
@@ -12533,6 +12718,7 @@ void McpServer::Impl::addTools() {
             o.handles = std::clamp(a.value("handles").toInt(8), 0, 1000);
             o.cutIn = a.value("cut_in").toInt(1001);
             o.amf = a.value("amf").toBool(true);
+            o.fdl = a.value("fdl").toBool(true);
             o.compression = str(a, "compression").toStdString();
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
@@ -12559,6 +12745,7 @@ void McpServer::Impl::addTools() {
                 QJsonObject sh{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
                                {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
+                if (!s.fdl.empty()) sh["fdl"] = QString::fromStdString(s.fdl);
                 if (!s.script.empty()) sh["script"] = QString::fromStdString(s.script);
                 if (!s.undistortMap.empty()) {
                     sh["undistort_map"] = QString::fromStdString(s.undistortMap);
@@ -12726,6 +12913,151 @@ void McpServer::Impl::addTools() {
                 return ok(QStringLiteral("Wrote %1 scripts").arg(files.size()), QJsonObject{{"files", files}});
             }
             return fail("action is list, scan, set_version, set_status, export or script");
+        });
+
+    add("montage_fdl", "Framing Decision Lists",
+        "ASC Framing Decision Lists (FDL): the framing chosen for a camera's picture, and canvas templates saying how to "
+        "turn it into a delivery. action import: reads the FDL at `path`, checks it against the format's schema and rules, "
+        "and attaches it to the `media` it describes (ids, paths or names; default every footage item a context names by "
+        "its clip_id, or, for an FDL naming no clips, every one with a canvas its size). list: each media item with an FDL, "
+        "its canvases, framing decisions (the one shown marked), intents and canvas templates. set_framing: shows "
+        "framing decision `framing` (its id) of `media`. detach: removes the FDL from `media`. apply: applies canvas "
+        "template `template_id` (default the first) from the FDL at `template` (default each clip's footage's own) to "
+        "`clips` (ids; default every footage clip of the sequence with an FDL): each clip's transform set (fit None, "
+        "scale, position, crop) so its picture lands in the template's new canvas, fitted into the sequence's frame; "
+        "`resize_sequence` makes the sequence that canvas's size first. export: writes an FDL to `output` with a context "
+        "for each of `clips` (default all footage clips): its recording's canvas and a framing decision for what the cut "
+        "shows of it. frame_lines: the frame lines the Program monitor draws at `frame` (corners as fractions of the frame).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["import","list","set_framing","detach","apply","export","frame_lines"]},
+            "path":{"type":"string"},"media":{"type":"array","items":{"type":["number","string"]}},"framing":{"type":"string"},
+            "template":{"type":"string"},"template_id":{"type":"string"},"resize_sequence":{"type":"boolean","default":false},
+            "clips":{"type":"array","items":{"type":"number"}},"output":{"type":"string"},"frame":{"type":"integer"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            std::vector<MediaItem*> media;
+            for (const QJsonValue& v : a.value("media").toArray()) {
+                MediaItem* m = v.isDouble() ? l.project.findMedia(Id(v.toDouble())) : &projectMedia(l.project, v.toString());
+                if (!m) return fail(QStringLiteral("No media %1").arg(qint64(v.toDouble())));
+                media.push_back(m);
+            }
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            auto rectJson = [](const FdlRect& r) { return QJsonArray{r.x, r.y, r.w, r.h}; };
+            if (action == "import") {
+                std::string json, err;
+                FdlDocument doc;
+                if (!readFdlFile(absolute(need(a, "path")).toStdString(), json, doc, &err)) return fail(QString::fromStdString(err));
+                std::vector<Id> ids;
+                for (const MediaItem* m : media) ids.push_back(m->id);
+                const int n = attachFdl(l.project, json, ids, &err);
+                if (!n) return fail(QString::fromStdString(err));
+                QJsonArray names;
+                for (const MediaItem& m : l.project.media)
+                    if (m.fdl.size() && (ids.empty() || std::find(ids.begin(), ids.end(), m.id) != ids.end())) names.append(QString::fromStdString(m.name));
+                save(l);
+                return ok(QStringLiteral("FDL attached to %1 media item(s)").arg(n), QJsonObject{{"attached", n}, {"media", names}});
+            }
+            if (action == "list") {
+                QJsonArray list;
+                QStringList lines;
+                for (const MediaItem& m : l.project.media) {
+                    if (m.fdl.empty() || (!media.empty() && std::find(media.begin(), media.end(), &m) == media.end())) continue;
+                    FdlDocument doc;
+                    FdlCanvas shownCanvas;
+                    FdlFraming shown;
+                    if (!mediaFdl(m, doc) || doc.contexts.empty()) continue;
+                    mediaFdlFraming(m, shownCanvas, shown);
+                    QJsonArray canvases, intents, templates;
+                    for (const FdlCanvas& c : doc.contexts.front().canvases) {
+                        QJsonArray fds;
+                        for (const FdlFraming& f : c.framings) {
+                            QJsonObject fo{{"id", QString::fromStdString(f.id)}, {"label", QString::fromStdString(f.label)},
+                                           {"intent", QString::fromStdString(f.intent)}, {"rect", rectJson(f.rect)},
+                                           {"shown", c.id == shownCanvas.id && f.id == shown.id}};
+                            if (f.protection) fo["protection"] = rectJson(f.protectionRect);
+                            fds.append(fo);
+                        }
+                        canvases.append(QJsonObject{{"id", QString::fromStdString(c.id)}, {"label", QString::fromStdString(c.label)},
+                                                    {"size", QJsonArray{c.width, c.height}}, {"squeeze", c.squeeze}, {"framing_decisions", fds}});
+                    }
+                    for (const FdlIntent& i : doc.intents)
+                        intents.append(QJsonObject{{"id", QString::fromStdString(i.id)}, {"label", QString::fromStdString(i.label)},
+                                                   {"aspect", QJsonArray{i.aspectW, i.aspectH}}, {"protection", i.protection}});
+                    for (const FdlTemplate& t : doc.templates)
+                        templates.append(QJsonObject{{"id", QString::fromStdString(t.id)}, {"label", QString::fromStdString(t.label)},
+                                                     {"target", QJsonArray{t.width, t.height}}, {"squeeze", t.squeeze}});
+                    list.append(QJsonObject{{"media", double(m.id)}, {"name", QString::fromStdString(m.name)},
+                                            {"context", QString::fromStdString(doc.contexts.front().label)}, {"canvases", canvases},
+                                            {"framing_intents", intents}, {"canvas_templates", templates}});
+                    lines << QStringLiteral("%1: %2 (%3 × %4 at %5, %6)").arg(QString::fromStdString(m.name), QString::fromStdString(shown.id))
+                                 .arg(shown.rect.w).arg(shown.rect.h).arg(shown.rect.x).arg(shown.rect.y);
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No media has an FDL") : lines.join('\n'), QJsonObject{{"media", list}});
+            }
+            if (action == "set_framing" || action == "detach") {
+                if (media.empty()) return fail("Name the media");
+                const std::string id = action == "set_framing" ? need(a, "framing").toStdString() : std::string();
+                for (MediaItem* m : media) {
+                    if (action == "detach") {
+                        m->fdl.clear();
+                        m->fdlFraming.clear();
+                        continue;
+                    }
+                    FdlCanvas canvas;
+                    FdlFraming shown;
+                    if (!mediaFdlFraming(*m, canvas, shown)) return fail(QString::fromStdString(m->name + " has no FDL"));
+                    // (on the canvas its picture is)
+                    if (std::none_of(canvas.framings.begin(), canvas.framings.end(), [&](const FdlFraming& f) { return f.id == id; }))
+                        return fail(QString::fromStdString(m->name + "'s canvas " + canvas.id + " has no framing decision " + id));
+                    m->fdlFraming = id;
+                }
+                save(l);
+                return ok(action == "detach" ? QStringLiteral("FDL removed from %1 media item(s)").arg(media.size())
+                                             : QStringLiteral("Framing %1 shown").arg(QString::fromStdString(id)));
+            }
+            if (action == "apply") {
+                std::string templates, err;
+                if (a.contains("template")) {
+                    FdlDocument doc;
+                    if (!readFdlFile(absolute(str(a, "template")).toStdString(), templates, doc, &err)) return fail(QString::fromStdString(err));
+                }
+                std::vector<std::string> skipped;
+                const std::vector<Id> framed = frameClipsWithFdl(l.project, l.seq(), clips, templates, str(a, "template_id").toStdString(),
+                                                                 a.value("resize_sequence").toBool(), &skipped, &err);
+                if (framed.empty()) return fail(QString::fromStdString(err));
+                save(l);
+                QJsonArray ids, notDone;
+                for (const Id id : framed) ids.append(double(id));
+                for (const std::string& sk : skipped) notDone.append(QString::fromStdString(sk));
+                QString msg = QStringLiteral("Framed %1 clip(s)").arg(framed.size());
+                for (const std::string& sk : skipped) msg += "\nNot " + QString::fromStdString(sk);
+                return ok(msg, QJsonObject{{"clips", ids}, {"skipped", notDone}, {"sequence_size", QJsonArray{l.seq().width, l.seq().height}}});
+            }
+            if (action == "export") {
+                const QString out = absolute(need(a, "output"));
+                std::string err;
+                const std::string json = sequenceFdl(l.project, l.seq(), clips, &err);
+                if (json.empty()) return fail(QString::fromStdString(err));
+                QSaveFile f(out);
+                if (!f.open(QIODevice::WriteOnly) || f.write(json.data(), qint64(json.size())) != qint64(json.size()) || !f.commit())
+                    return fail(QStringLiteral("Cannot write %1").arg(out));
+                return ok(QStringLiteral("Wrote %1").arg(out), QJsonObject{{"output", out}});
+            }
+            if (action == "frame_lines") {
+                const std::vector<FrameLine> lines = sequenceFrameLines(l.project, l.seq(), FrameTime(a.value("frame").toInt(0)));
+                QJsonArray list;
+                for (const FrameLine& fl : lines) {
+                    QJsonArray corners;
+                    for (const double c : fl.corners) corners.append(c);
+                    list.append(QJsonObject{{"kind", fl.kind == 0 ? "framing" : fl.kind == 1 ? "protection" : "effective"},
+                                            {"label", QString::fromStdString(fl.label)}, {"corners", corners}});
+                }
+                return ok(QStringLiteral("%1 frame line(s)").arg(list.size()), QJsonObject{{"lines", list}});
+            }
+            return fail("action is import, list, set_framing, detach, apply, export or frame_lines");
         });
 
     add("montage_export_timeline", "Export the timeline",

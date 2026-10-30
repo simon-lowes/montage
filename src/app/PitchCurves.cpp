@@ -1,5 +1,8 @@
 #include "PitchCurves.h"
 
+#include <chrono>
+#include <thread>
+
 #include <QCoreApplication>
 #include <QPointer>
 
@@ -49,8 +52,17 @@ std::shared_ptr<const PitchTrack> run(const Job& job, const std::atomic<bool>* c
     if (!sound) return std::make_shared<PitchTrack>();
     std::vector<const Effect*> fx;
     for (const Effect& e : job.effects) fx.push_back(&e);
-    if (!fx.empty())
-        if (AudioBufferPtr played = cleanedAudio(job.sound, sound, fx, true)) sound = played;
+    if (!fx.empty()) {
+        // (the cleanup runs on its own and is waited for here a little at a time, so closing the timeline need not wait
+        // for it; without `cancel`, it is waited for whole)
+        AudioBufferPtr played;
+        if (!cancel) played = cleanedAudio(job.sound, sound, fx, true);
+        while (cancel && !(played = cleanedAudio(job.sound, sound, fx, false, true))) {
+            if (cancel->load()) return std::make_shared<PitchTrack>();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (played) sound = played;
+    }
     return std::make_shared<PitchTrack>(trackPitch(*sound, job.from, job.to, 50, 800, cancel));
 }
 

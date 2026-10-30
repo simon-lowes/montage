@@ -5784,6 +5784,246 @@
         <source>Zig Zag</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Azimuth</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fix Polarity</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Flutter (over 4 Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Follow Over Time</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pilot Tone (Hz, 0 = find)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wow (under 4 Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wow and Flutter</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blue Hue (° towards Red)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blue Strength</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Boundary</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Correlation</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compression Starts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Crosstalk</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom</source>
+        <translation type="unfinished">Другой</translation>
+    </message>
+    <message>
+        <source>Custom Blue x</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Blue y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Green x</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Green y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Red x</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Red y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Detail Kept (Replace)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Exposure Fall-off (Stops)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fitted Matrix</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Green Hue (° towards Blue)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Green Strength</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Highest Exposure (Stops from Grey)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lowest Exposure (Stops from Grey)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Carried to the Next Frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Cluster Size (px at 1920 Wide)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Clusters</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Colour Correlation</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Fine Grain Size (px at 1920 Wide)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Kurtosis (3 Gaussian)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Strength at Mid Grey (%)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Tonal Response (0.5 Sensor, 1 Negative)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Towards Yellow-Blue</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>P3</source>
+        <translation type="unfinished">С3</translation>
+    </message>
+    <message>
+        <source>Rec.2020</source>
+        <translation type="unfinished">Рек.2020</translation>
+    </message>
+    <message>
+        <source>Rec.709</source>
+        <translation type="unfinished">Рек. 709</translation>
+    </message>
+    <message>
+        <source>Red Hue (° towards Green)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Red Strength</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clean Plate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Corrected Screen</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edge Extend</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame Spacing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frames (median)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hide the Plate Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Made from the Picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Blur (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Frame Spacing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Frames (median)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Screen Threshold</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Shrink (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Track (V number, 0: the one above)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen Found</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen Threshold</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shrink (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Solid From (alpha)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -8663,6 +8903,26 @@ Download it now?</source>
         <source>Gap between captions:</source>
         <translation type="unfinished">Разрыв между заголовками:</translation>
     </message>
+    <message>
+        <source>Detect Shot Changes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>EBU-TT-D (*.xml)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Off</source>
+        <translation type="unfinished">Выключено</translation>
+    </message>
+    <message>
+        <source>No caption starts or ends this close to a shot change, except starting on it or ending the gap before it (Netflix: half a second)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clear of shot changes:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::CaptureDialog</name>
@@ -8896,6 +9156,14 @@ Download it now?</source>
     <message>
         <source>Delta E %1 as shot, %2 matched (worst patch %3)</source>
         <translation type="unfinished">Дельта E %1, как выстрел, %2 совпадают (наихудший патч %3)</translation>
+    </message>
+    <message>
+        <source>As Crosstalk (neutrals kept, no offset)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fit the camera&apos;s crosstalk, as under LED light, as a Crosstalk effect whose primaries can then be moved by hand</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -10870,6 +11138,14 @@ Do you want to replace it?</source>
     <message>
         <source>Cancel</source>
         <translation type="unfinished">Отмена</translation>
+    </message>
+    <message>
+        <source>Frame lines</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The framing of the footage on screen, from its Framing Decision List (FDL)</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -13220,6 +13496,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Draw a path with the pen as a Bézier mask on one of this layer&apos;s effects first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Writing ST maps...</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -20595,6 +20875,206 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Select VFX shots (clips pulled for visual effects) to step their versions</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Immersive sound as S-ADM (Metadata-Guided Audio)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An MGASADMSignalSequence (SMPTE ST 2067-203): the sound with an S-ADM frame (ITU-R BS.2125) each frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Immersive sound as ADM audio</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ADMAudioSequence (SMPTE ST 2067-204): the sound with its ADM description (ITU-R BS.2076), as a BW64 master holds it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>There is no video clip to detect shot changes in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Detect Shot Changes</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shot change</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Marked %n shot change(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Finding onsets…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strip Si&amp;lence…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Select the audio clips to strip silence from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Finding silence…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strip Silence works on clips of sound files at their own speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strip Silence</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n silent piece(s) removed</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source> (%n clip(s) left: not a sound file at its own speed)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source> dBFS</source>
+        <translation type="unfinished"> dБФС</translation>
+    </message>
+    <message>
+        <source>Linked video too</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Threshold:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shortest silence:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pad before:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pad after:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Import FDL (Framing Decision List)…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Import FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ASC Framing Decision Lists (*.fdl *.json);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export FDL…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ASC Framing Decision Lists (*.fdl)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame with FDL Template…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show Frame Lines</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show the framing chosen for the footage (its Framing Decision List: File &gt; Import FDL) over the monitors</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Write Framing Decision Lists (the plate&apos;s framing, and what the cut shows of it)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Open a sequence first</source>
+        <translation type="unfinished">Откройте сначала последовательность</translation>
+    </message>
+    <message numerus="yes">
+        <source>FDL attached to %n media item(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Wrote the FDL %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame with FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Framed %n clip(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>; not %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame with FDL Template</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The footage&apos;s own FDL</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Canvas templates from:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Template:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Make the sequence the template&apos;s canvas size</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Canvas Templates</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No canvas templates: choose an FDL with some</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -24231,12 +24711,28 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished">аудио- и аудиоканалы 0, 2, 8 или 16</translation>
     </message>
     <message>
-        <source>No interface &quot;%1&quot; (DeckLink, NDI or OMT)</source>
-        <translation type="unfinished">Нет интерфейса «%1 » (DeckLink, NDI или OMT)</translation>
-    </message>
-    <message>
         <source>action is list, status, start or stop</source>
         <translation type="unfinished">действие - список, статус, начало или остановка</translation>
+    </message>
+    <message>
+        <source>NMOS: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, registered with %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, offered over NMOS at %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No interface &quot;%1&quot; (DeckLink, NDI, OMT or ST 2110)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>st2110.%1 is an IPv4 address and port, such as 239.100.0.1:5004</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -24244,10 +24740,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Reference Output</source>
         <translation type="unfinished">Исходный результат</translation>
-    </message>
-    <message>
-        <source>The Program sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink or UltraStudio, or over the network as an NDI® or Open Media Transport source. 10-bit 4:2:2, HDR signalled, timecode and embedded sound.</source>
-        <translation type="unfinished">Программа направила на радио- и радиостанцию: SDI или HDMI через Blackmagic DeckLink или UltraStudio, или через сеть как NDI, или Open Media Transport. 10 бит 4:2:2, ДРЧ указал, временные коды и встроенный звук.</translation>
     </message>
     <message>
         <source>Interface:</source>
@@ -24372,6 +24864,86 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Stop</source>
         <translation type="unfinished">Стой</translation>
+    </message>
+    <message>
+        <source>The Program sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink or UltraStudio, or over the network as an NDI® or Open Media Transport source or as SMPTE ST 2110 streams. 10-bit 4:2:2, HDR signalled, timecode and embedded sound.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Send the captions (CEA-608 and 708) while playing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The video stream&apos;s address and port (multicast or unicast IPv4)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sound stream&apos;s address and port</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sound stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The ancillary data stream&apos;s address and port: time code, captions and HDR metadata</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Data stream:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How many routers multicast packets may cross</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Multicast TTL:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The PTP clock the SDP files name (ts-refclk): &quot;ptp=IEEE1588-2008:traceable&quot;, or the grandmaster&apos;s &quot;ptp=IEEE1588-2008:&lt;id&gt;:&lt;domain&gt;&quot;. Montage reads PTP time from the system clock, which linuxptp (ptp4l and phc2sys) or the operating system keeps in step.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PTP reference:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Offer to broadcast controllers (NMOS)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Registers the streams with the facility&apos;s NMOS registry (IS-04), so a broadcast controller lists them and can send them elsewhere (IS-05)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Found by DNS-SD</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The registry&apos;s address, such as http://registry.example:8010 (empty: the one the network&apos;s DNS offers)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>NMOS registry:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save SDP Files…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Writes each stream&apos;s session description, which receivers and broadcast controllers read</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save SDP Files</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -24923,6 +25495,20 @@ montage-cli node &lt;folder&gt;</source>
     <message>
         <source>Done %1</source>
         <translation type="unfinished">Выполнено %1</translation>
+    </message>
+    <message>
+        <source>Whole</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> segments</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Split a job sent to the farm into segments (at cuts near equal lengths) that several nodes
+render at once, then one joins: ProRes, DNxHR and FFV1 frame for frame, H.264, H.265 and AV1
+with rate control per segment, and image sequences. The sound is rendered once, by the node that joins.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -26787,6 +27373,14 @@ Right-click: width, LFE, height and audio object.</source>
     <message>
         <source>Centre speaker (dialogue)</source>
         <translation type="unfinished">Докладчик Центра (диалог)</translation>
+    </message>
+    <message>
+        <source>LFE Channel Only</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Feeds the LFE alone, at the level above, and no other speaker (a bed&apos;s LFE channel)</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

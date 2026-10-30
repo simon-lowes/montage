@@ -5,6 +5,7 @@
 #include <complex>
 #include <cstdio>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <sstream>
 
@@ -116,14 +117,74 @@ double resolutionGain(const GrainProfile& g, double scale, double size) {
     return all > 0 ? std::sqrt(std::clamp(power(0.5 * size / scale) / all, 0.0, 1.0)) : 1;
 }
 
-// The lower-triangular L with L Lᵀ = the channels' correlation (shrunk until it has one).
-void cholesky(const GrainProfile& g, double saturation, double L[3][3]) {
+// Grain of another kurtosis than a Gaussian's: each value z of the Gaussian grain made sign(z) |z|^p, scaled back to a
+// standard deviation of 1. Its kurtosis is m(4p) / m(2p)², m(q) = E|z|^q = 2^(q/2) Γ((q + 1) / 2) / √π.
+double absMoment(double q) { return std::exp(0.5 * q * std::log(2.0) + std::lgamma((q + 1) / 2) - 0.5 * std::log(M_PI)); }
+double powerForKurtosis(double kurtosis) {
+    const double k = std::clamp(kurtosis, 1.2, 15.0);
+    if (std::fabs(k - 3) < 1e-9) return 1;
+    double lo = 0.05, hi = 2.6;  // (kurtosis rises with p: 1 at 0, 3 at 1, about 20 at 2.6)
+    for (int i = 0; i < 60; ++i) {
+        const double mid = (lo + hi) / 2;
+        (absMoment(4 * mid) / (absMoment(2 * mid) * absMoment(2 * mid)) < k ? lo : hi) = mid;
+    }
+    return (lo + hi) / 2;
+}
+double shapeGrain(double z, double p, double scale) { return p == 1 ? z : std::copysign(std::pow(std::fabs(z), p), z) * scale; }
+// The correlation two Gaussian grains need for theirs, once shaped by the power p, to be `target`: the shaped
+// correlation worked out on a grid (each grain given the other, as r x + √(1 - r²) u), found by halving.
+double gaussianCorrelationFor(double p, double target) {
+    if (p == 1) return target;
+    // (kept: each frame of grain asks again)
+    static std::mutex m;
+    static std::map<std::pair<double, double>, double> known;
+    {
+        std::lock_guard lock(m);
+        if (auto it = known.find({p, target}); it != known.end()) return it->second;
+    }
+    constexpr int n = 121;
+    constexpr double lim = 6;
+    static thread_local std::vector<double> z, w;
+    if (z.empty()) {
+        for (int i = 0; i < n; ++i) {
+            const double x = -lim + 2 * lim * i / (n - 1);
+            z.push_back(x), w.push_back(std::exp(-0.5 * x * x));
+        }
+    }
+    auto shaped = [&](double r) {
+        const double q = std::sqrt(std::max(0.0, 1 - r * r));
+        double sum = 0, norm = 0, wsum = 0;
+        for (int i = 0; i < n; ++i) {
+            const double fx = std::copysign(std::pow(std::fabs(z[size_t(i)]), p), z[size_t(i)]);
+            norm += w[size_t(i)] * fx * fx;
+            wsum += w[size_t(i)];
+            for (int j = 0; j < n; ++j) {
+                const double y = r * z[size_t(i)] + q * z[size_t(j)];
+                sum += w[size_t(i)] * w[size_t(j)] * fx * std::copysign(std::pow(std::fabs(y), p), y);
+            }
+        }
+        return sum / wsum / norm;
+    };
+    const double t = std::clamp(target, -0.999, 0.999);
+    double lo = -0.9999, hi = 0.9999;
+    for (int i = 0; i < 30; ++i) {
+        const double mid = (lo + hi) / 2;
+        (shaped(mid) < t ? lo : hi) = mid;
+    }
+    std::lock_guard lock(m);
+    if (known.size() > 256) known.clear();
+    return known[{p, target}] = (lo + hi) / 2;
+}
+
+// The lower-triangular L with L Lᵀ = the channels' correlation (shrunk until it has one), for Gaussian grain that is then
+// shaped by the power p.
+void cholesky(const GrainProfile& g, double saturation, double L[3][3], double p = 1) {
     for (double shrink = 1; shrink > 0.0; shrink -= 0.05) {
         const double r[3] = {std::clamp(g.correlation[0], -0.999, 0.999), std::clamp(g.correlation[1], -0.999, 0.999),
                              std::clamp(g.correlation[2], -0.999, 0.999)};
-        // Less colour: each correlation drawn towards 1.
+        // Less colour: each correlation drawn towards 1 (then the Gaussian's that gives it once shaped).
         const double sat = std::clamp(saturation, 0.0, 2.0);
-        auto toward = [&](double v) { return std::clamp(1 - (1 - v) * sat * sat * shrink, -0.999, 0.9995); };
+        auto toward = [&](double v) { return gaussianCorrelationFor(p, std::clamp(1 - (1 - v) * sat * sat * shrink, -0.999, 0.9995)); };
         const double C[3][3] = {{1, toward(r[0]), toward(r[1])}, {toward(r[0]), 1, toward(r[2])}, {toward(r[1]), toward(r[2]), 1}};
         bool ok = true;
         for (int i = 0; i < 3 && ok; ++i)
@@ -267,6 +328,9 @@ std::string grainProfileText(const GrainProfile& g) {
     }
     o << " spectrum=";
     for (int i = 0; i < GrainProfile::kBins; ++i) o << (i ? "," : "") << g.spectrum[i];
+    if (g.kurtosis != 3) o << " kurtosis=" << g.kurtosis;
+    if (g.response > 0) o << " response=" << g.response;
+    if (g.measuredBands != 0xFF) o << " measured=" << int(g.measuredBands);
     return o.str();
 }
 
@@ -303,6 +367,9 @@ bool parseGrainProfile(const std::string& text, GrainProfile& out) {
         else if (k == "green" && list(v, g.amplitude[1], GrainProfile::kBands)) seen[4] = true;
         else if (k == "blue" && list(v, g.amplitude[2], GrainProfile::kBands)) seen[5] = true;
         else if (k == "spectrum" && list(v, g.spectrum, GrainProfile::kBins)) seen[6] = true;
+        else if (k == "kurtosis" && list(v, &one, 1)) g.kurtosis = std::clamp(one, 1.2, 15.0);
+        else if (k == "response" && list(v, &one, 1)) g.response = std::clamp(one, 0.0, 2.0);
+        else if (k == "measured" && list(v, &one, 1) && one >= 1 && one <= 255) g.measuredBands = uint8_t(one);
         else return false;
     }
     if (!std::all_of(std::begin(seen), std::end(seen), [](bool b) { return b; }) || g.width <= 0 || !g.valid()) return false;
@@ -372,6 +439,15 @@ double grainSize(const GrainProfile& g) {
 
 double grainAmplitude(const GrainProfile& g, int c, double light) {
     const double x = std::log2(std::max(light, 1e-9)) + 7.5;  // in bands, 0 the first's middle
+    if (g.response > 0 && std::all_of(g.amplitude[c], g.amplitude[c] + GrainProfile::kBands, [](double a) { return a > 0; })) {
+        // A model's: geometric between the bands (so a power of the light exactly) and on at its power beyond them,
+        // down to two stops below the first and as bright as the light goes.
+        constexpr int last = GrainProfile::kBands - 1;
+        if (x <= 0) return g.amplitude[c][0] * std::exp2(g.response * std::max(x, -2.0));
+        if (x >= last) return g.amplitude[c][last] * std::exp2(g.response * std::min(x - last, 24.0));
+        const int i = int(x);
+        return g.amplitude[c][i] * std::pow(g.amplitude[c][i + 1] / g.amplitude[c][i], x - i);
+    }
     if (x <= 0) return g.amplitude[c][0];
     if (x >= GrainProfile::kBands - 1) return g.amplitude[c][GrainProfile::kBands - 1];
     const int i = int(x);
@@ -399,7 +475,7 @@ bool measureGrain(const std::vector<Image>& frames, const ColorSpace& space, con
         double texture = 0;
         int band = 0;
         double sq[3] = {}, cross[3] = {}, next[3] = {};  // r², r_a r_b, r_t r_{t+1}
-        double bandSq[GrainProfile::kBands][3] = {};
+        double bandSq[GrainProfile::kBands][3] = {}, quad[3] = {};
         double bandCount[GrainProfile::kBands] = {};
         double count = 0;
         double spectrum[GrainProfile::kBins] = {};
@@ -525,6 +601,7 @@ bool measureGrain(const std::vector<Image>& frames, const ColorSpace& space, con
                             t.sq[c] += r[c] * r[c];
                             t.next[c] += r[c] * nxt[at * 3 + size_t(c)];
                             t.bandSq[b][c] += r[c] * r[c];
+                            t.quad[c] += r[c] * r[c] * r[c] * r[c];
                         }
                         t.bandCount[b] += 1;
                         t.cross[0] += r[0] * r[1], t.cross[1] += r[0] * r[2], t.cross[2] += r[1] * r[2];
@@ -588,8 +665,13 @@ bool measureGrain(const std::vector<Image>& frames, const ColorSpace& space, con
     GrainProfile g;
     g.width = W;
     double sq[3] = {}, cross[3] = {}, next[3] = {}, count = 0, bandSq[GrainProfile::kBands][3] = {}, bandCount[GrainProfile::kBands] = {};
+    // The kurtosis: each tile's own (its variance its own, so tiles of stronger grain, or lights within a band, do not
+    // add the kurtosis of a mix of strengths), weighted by its pixels.
+    double excess = 0, excessWeight = 0;
     for (const TileSums* t : flat) {
         for (int c = 0; c < 3; ++c) sq[c] += t->sq[c], cross[c] += t->cross[c], next[c] += t->next[c];
+        for (int c = 0; c < 3; ++c)
+            if (const double v = t->sq[c] / t->count; v > 0) excess += (t->quad[c] / t->count / (v * v) - 3) * t->count, excessWeight += t->count;
         for (int b = 0; b < GrainProfile::kBands; ++b) {
             for (int c = 0; c < 3; ++c) bandSq[b][c] += t->bandSq[b][c];
             bandCount[b] += t->bandCount[b];
@@ -610,11 +692,20 @@ bool measureGrain(const std::vector<Image>& frames, const ColorSpace& space, con
     // Each band's amplitude; a band without enough flat area to measure takes its nearest measured neighbour's,
     // scaled as the square root of the light (as grain and photon noise go).
     bool measured[GrainProfile::kBands] = {};
+    g.measuredBands = 0;
     for (int b = 0; b < GrainProfile::kBands; ++b)
         if (bandCount[b] >= kTile * kTile / 4) {
             measured[b] = true;
+            g.measuredBands |= uint8_t(1u << b);
             for (int c = 0; c < 3; ++c) g.amplitude[c][b] = std::sqrt(bandSq[b][c] / bandCount[b] * share);
         }
+    // What is left holds the neighbours' quarter too, which spreads the grain's own excess over more variance (its
+    // fourth cumulant 1 + 4/256 of the grain's, its variance 1 / share of it). Within 0.25 of a Gaussian's, it is
+    // taken as one (what a picture's own small changes leave), so ordinary grain is made Gaussian as before.
+    if (excessWeight > 0) {
+        const double k = 3 + excess / excessWeight / (share * share) / (1 + 4.0 / 256);
+        g.kurtosis = std::fabs(k - 3) < 0.25 ? 3.0 : std::clamp(k, 1.2, 15.0);
+    }
     for (int b = 0; b < GrainProfile::kBands; ++b) {
         if (measured[b]) continue;
         int best = -1;
@@ -680,6 +771,8 @@ bool measureClipGrain(const Project& p, const Sequence& s, const Clip& c, const 
         for (int b = 0; b < GrainProfile::kBins; ++b) sum.spectrum[b] += one.spectrum[b];
         for (int k = 0; k < 3; ++k) sum.correlation[k] = weight == 0 ? one.correlation[k] : sum.correlation[k] + one.correlation[k];
         sum.temporal += one.temporal;
+        sum.kurtosis = weight == 0 ? one.kurtosis : sum.kurtosis + one.kurtosis;
+        sum.measuredBands = weight == 0 ? one.measuredBands : uint8_t(sum.measuredBands | one.measuredBands);
         sum.width = one.width;
         weight += 1;
     }
@@ -692,6 +785,7 @@ bool measureClipGrain(const Project& p, const Sequence& s, const Clip& c, const 
     for (double& v : sum.spectrum) v /= weight;
     for (double& v : sum.correlation) v /= weight;
     sum.temporal /= weight;
+    sum.kurtosis /= weight;
     out = sum;
     return true;
 }
@@ -706,8 +800,9 @@ void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const 
     // Carried over as a moving average of this frame's fields and the last's: a ρ correlation from frame to frame.
     const double alpha = std::sqrt((1 + std::sqrt(1 - 4 * rho * rho)) / 2), beta = rho / alpha;
     const auto before = beta > 1e-4 ? shapedFields(g, scale, s.seed, t - 1, img.width, img.height) : nullptr;
+    const double power = powerForKurtosis(g.kurtosis), shapeScale = 1 / std::sqrt(absMoment(2 * power));
     double L[3][3];
-    cholesky(g, s.saturation, L);
+    cholesky(g, s.saturation, L, power);
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             float* p = img.row(y);
@@ -721,7 +816,7 @@ void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const 
                 for (int c = 0; c < 3; ++c) l[c] = linear(space.transfer, p[c] / a);
                 const double light = lumaOf(l);
                 for (int c = 0; c < 3; ++c) {
-                    const double gn = L[c][0] * z[0] + L[c][1] * z[1] + L[c][2] * z[2];
+                    const double gn = shapeGrain(L[c][0] * z[0] + L[c][1] * z[1] + L[c][2] * z[2], power, shapeScale);
                     const double v = l[c] + amount * grainAmplitude(g, c, light) * gn;
                     p[c] = float(encoded(space.transfer, v)) * a;
                 }
@@ -802,11 +897,198 @@ Image removeGrain(const Image& current, const std::vector<const Image*>& neighbo
     return stab.apply(denoiseFrame(here, around, ds, motion), true);
 }
 
+namespace {
+
+// The model's spectrum: its two bands' Gaussian grains (blur σ, half the size), each of unit variance, mixed by power.
+double modelSpectrum(double sigmaFine, double sigmaCluster, double clusters, double f) {
+    auto band = [&](double sigma) { return sigma * sigma * std::exp(-4 * M_PI * M_PI * sigma * sigma * f * f); };
+    return (1 - clusters) * band(sigmaFine) + clusters * band(sigmaCluster);
+}
+
+// The yellow-blue axis's correlations: red with green, and red or green with blue.
+void modelCorrelations(double rho, double yellowBlue, double out[3]) {
+    const double u = (1 - rho) * std::clamp(yellowBlue, 0.0, 1.0);
+    out[0] = std::clamp(rho + u, -0.999, 0.999);
+    out[1] = out[2] = std::clamp(rho - u / 2, -0.999, 0.999);
+}
+
+// What measureGrain's spectrum (a 64-pixel tile's periodogram, its mean taken out, through its Hann window, averaged by
+// distance from the middle as a share of its power) is for Gaussian grain of blur σ. The grain's autocorrelation is
+// separable, R(dx) R(dy), and with the tile's mean taken out its covariance is R(x - y) - r(x) - r(y) + R̄ (r the
+// autocorrelation's mean over the tile from a point, R̄ its mean): each term is separable too, so the periodogram is
+// Q(u) Q(v) - 2 Re(A(u) H*(u) A(v) H*(v)) + R̄² |H(u)|² |H(v)|², with H the window's transform, A that of the window
+// times r, and Q the windowed autocorrelation's. Unnormalised, per bin (a unit variance's).
+std::array<double, GrainProfile::kBins> windowedSpectrum(double sigma) {
+    using Cd = std::complex<double>;
+    double h[kTile], R[kTile], r[kTile], Rbar = 0;
+    for (int i = 0; i < kTile; ++i) h[i] = 0.5 - 0.5 * std::cos(2 * M_PI * (i + 0.5) / kTile);
+    for (int d = 0; d < kTile; ++d) R[d] = std::exp(-double(d) * d / (4 * sigma * sigma));
+    for (int x = 0; x < kTile; ++x) {
+        double m = 0;
+        for (int y = 0; y < kTile; ++y) m += R[std::abs(x - y)];
+        r[x] = m / kTile;
+        Rbar += r[x] / kTile;
+    }
+    double Q[kTile];
+    Cd Hc[kTile], Ac[kTile];
+    double windowAuto[kTile] = {};
+    for (int d = 0; d < kTile; ++d)
+        for (int x = 0; x + d < kTile; ++x) windowAuto[d] += h[x] * h[x + d];
+    for (int u = 0; u < kTile; ++u) {
+        Cd hu = 0, au = 0;
+        double q = 0;
+        for (int x = 0; x < kTile; ++x) {
+            const Cd e = std::polar(1.0, -2 * M_PI * u * x / kTile);
+            hu += h[x] * e;
+            au += h[x] * r[x] * e;
+        }
+        for (int d = -(kTile - 1); d < kTile; ++d) q += R[std::abs(d)] * windowAuto[std::abs(d)] * std::cos(2 * M_PI * u * d / kTile);
+        Q[u] = q, Hc[u] = hu, Ac[u] = au;
+    }
+    std::array<double, GrainProfile::kBins> sum{}, count{};
+    for (int v = 0; v < kTile; ++v)
+        for (int u = 0; u < kTile; ++u) {
+            const int fu = u < kTile / 2 ? u : u - kTile, fv = v < kTile / 2 ? v : v - kTile;
+            const int bin = int(std::hypot(fu, fv) * GrainProfile::kBins * 2 / kTile);
+            if (bin >= GrainProfile::kBins || (fu == 0 && fv == 0)) continue;
+            const double p = Q[u] * Q[v] - 2 * (Ac[u] * std::conj(Hc[u]) * Ac[v] * std::conj(Hc[v])).real() +
+                             Rbar * Rbar * std::norm(Hc[u]) * std::norm(Hc[v]);
+            sum[size_t(bin)] += p, count[size_t(bin)] += 1;
+        }
+    for (int b = 0; b < GrainProfile::kBins; ++b) sum[size_t(b)] = count[size_t(b)] > 0 ? sum[size_t(b)] / count[size_t(b)] : 0;
+    return sum;
+}
+
+}  // namespace
+
+GrainProfile grainModelProfile(const GrainModel& m) {
+    GrainProfile g;
+    g.width = std::max(1, m.width);
+    g.response = std::clamp(m.response, 0.05, 2.0);
+    g.kurtosis = std::clamp(m.kurtosis, 1.2, 15.0);
+    g.temporal = std::clamp(m.temporal, 0.0, 0.45);
+    modelCorrelations(std::clamp(m.correlation, -0.45, 1.0), m.yellowBlue, g.correlation);
+    for (int b = 0; b < GrainProfile::kBands; ++b) {
+        const double light = std::exp2(b - 7.5);
+        for (int c = 0; c < 3; ++c) g.amplitude[c][b] = std::max(1e-6, m.strength) * 0.18 * std::pow(light / 0.18, g.response);
+    }
+    const double sf = std::max(0.1, m.fineSize) / 2, sc = std::max(0.1, m.clusterSize) / 2, w = std::clamp(m.clusters, 0.0, 1.0);
+    double peak = 0;
+    for (int i = 0; i < GrainProfile::kBins; ++i) peak = std::max(peak, g.spectrum[i] = modelSpectrum(sf, sc, w, (i + 0.5) / (2.0 * GrainProfile::kBins)));
+    for (double& v : g.spectrum) v = peak > 0 ? v / peak : 1;
+    return g;
+}
+
+GrainModel fitGrainModel(const GrainProfile& g) {
+    GrainModel m;
+    m.width = g.width;
+    m.kurtosis = g.kurtosis;
+    m.temporal = g.temporal;
+    // Tonal response: a line through the measured bands' log amplitudes (the channels' root mean square) against
+    // their log light.
+    double sx = 0, sy = 0, sxx = 0, sxy = 0, n = 0;
+    for (int b = 0; b < GrainProfile::kBands; ++b) {
+        if (!(g.measuredBands & (1u << b))) continue;
+        const double a = std::sqrt((g.amplitude[0][b] * g.amplitude[0][b] + g.amplitude[1][b] * g.amplitude[1][b] +
+                                    g.amplitude[2][b] * g.amplitude[2][b]) / 3);
+        if (!(a > 0)) continue;
+        const double x = std::log(std::exp2(b - 7.5) / 0.18), y = std::log(a);
+        sx += x, sy += y, sxx += x * x, sxy += x * y, n += 1;
+    }
+    if (n >= 2 && n * sxx - sx * sx > 1e-9) {
+        m.response = std::clamp((n * sxy - sx * sy) / (n * sxx - sx * sx), 0.05, 2.0);
+        m.strength = std::exp((sy - m.response * sx) / n) / 0.18;
+    } else if (n >= 1) {
+        m.strength = std::exp(sy / n - m.response * sx / n) / 0.18;
+    }
+    // Colour correlation: the yellow-blue axis's two numbers nearest the three measured.
+    const double rg = g.correlation[0], rb = (g.correlation[1] + g.correlation[2]) / 2;
+    m.correlation = std::clamp((rg + 2 * rb) / 3, -0.45, 1.0);
+    m.yellowBlue = m.correlation < 0.999 ? std::clamp(2 * (rg - rb) / 3 / (1 - m.correlation), 0.0, 1.0) : 0;
+    // The two bands: the sizes and share whose spectrum, as the measuring windows see it, is nearest the measured one
+    // (in square roots, so the fine tail counts), over a grid of blurs 3 % apart.
+    constexpr int kSigmas = 150;
+    static const std::vector<std::array<double, GrainProfile::kBins>> seen = [] {
+        std::vector<std::array<double, GrainProfile::kBins>> v;
+        for (int i = 0; i < kSigmas; ++i) v.push_back(windowedSpectrum(0.15 * std::pow(1.03, i)));
+        return v;
+    }();
+    const double scale = 1;  // (measured on its own frame)
+    std::array<double, GrainProfile::kBins> target{};
+    for (int b = 0; b < GrainProfile::kBins; ++b) target[size_t(b)] = std::sqrt(std::max(0.0, g.spectrum[b]));
+    double best = 1e300;
+    for (int i = 0; i < kSigmas; ++i)
+        for (int j = i; j < kSigmas; ++j)
+            for (int k = 0; k <= 20; ++k) {
+                const double w = k / 20.0;
+                if (j == i && k > 0) break;
+                std::array<double, GrainProfile::kBins> mix{};
+                double peak = 0;
+                for (int b = 0; b < GrainProfile::kBins; ++b) {
+                    mix[size_t(b)] = (1 - w) * seen[size_t(i)][size_t(b)] + w * seen[size_t(j)][size_t(b)];
+                    if (b > 0) peak = std::max(peak, mix[size_t(b)]);
+                }
+                mix[0] = mix[1];  // (as measureGrain takes bin 0)
+                peak = std::max(peak, mix[0]);
+                if (!(peak > 0)) continue;
+                double err = 0;
+                for (int b = 0; b < GrainProfile::kBins; ++b) {
+                    const double d = std::sqrt(mix[size_t(b)] / peak) - target[size_t(b)];
+                    err += d * d;
+                }
+                if (err < best) {
+                    best = err;
+                    m.fineSize = 2 * 0.15 * std::pow(1.03, i) * scale;
+                    m.clusterSize = 2 * 0.15 * std::pow(1.03, j) * scale;
+                    m.clusters = w;
+                }
+            }
+    if (m.clusters == 0) m.clusterSize = std::max(m.clusterSize, 4 * m.fineSize);
+    return m;
+}
+
+double replaceGrainTopUp(double detail) {
+    // What is kept is (1 - d) of the cleaned picture, whose grain is the n frames' average, and d of the plate: of the
+    // plate's grain that leaves ((1 - d) / n + d)² from its own frame and (n - 1) (1 - d)² / n² from the others.
+    const double d = std::clamp(detail, 0.0, 1.0), n = 2 * kReplaceGrainFrames + 1;
+    const double left = ((1 - d) / n + d) * ((1 - d) / n + d) + (n - 1) * (1 - d) * (1 - d) / (n * n);
+    return std::sqrt(std::max(0.0, 1 - left));
+}
+
+GrainModel effectGrainModel(const Effect& e) {
+    GrainModel m;
+    m.strength = e.p("model_strength", 0, 4) / 100;
+    m.response = e.p("response", 0, 0.5);
+    m.correlation = e.p("correlation", 0, 70) / 100;
+    m.yellowBlue = e.p("yellow_blue", 0, 0) / 100;
+    m.fineSize = e.p("fine_size", 0, 1);
+    m.clusterSize = e.p("cluster_size", 0, 4);
+    m.clusters = e.p("clusters", 0, 25) / 100;
+    m.kurtosis = e.p("kurtosis", 0, 3);
+    m.temporal = e.p("temporal", 0, 0) / 100;
+    return m;
+}
+
+void setEffectGrainModel(Effect& e, const GrainModel& m) {
+    e.params["model_strength"] = std::clamp(m.strength * 100, 0.0, 30.0);
+    e.params["response"] = std::clamp(m.response, 0.05, 1.5);
+    e.params["correlation"] = std::clamp(m.correlation * 100, -45.0, 100.0);
+    e.params["yellow_blue"] = std::clamp(m.yellowBlue * 100, 0.0, 100.0);
+    const double toHd = 1920.0 / std::max(1, m.width);  // (the effect's sizes are on a frame 1920 wide)
+    e.params["fine_size"] = std::clamp(m.fineSize * toHd, 0.2, 12.0);
+    e.params["cluster_size"] = std::clamp(m.clusterSize * toHd, 0.5, 60.0);
+    e.params["clusters"] = std::clamp(m.clusters * 100, 0.0, 100.0);
+    e.params["kurtosis"] = std::clamp(m.kurtosis, 1.2, 15.0);
+    e.params["temporal"] = std::clamp(m.temporal * 100, 0.0, 45.0);
+}
+
 GrainProfile effectGrainProfile(const Effect& e) {
     GrainProfile g;
-    if (int(std::lround(e.p("source", 0, 0))) == 0 && parseGrainProfile(e.s("profile"), g)) return g;
-    const int gauge = int(std::lround(e.p("source", 0, 0))) - 1;
-    return stockGrain(gauge < 0 ? 1 : gauge);
+    const int source = int(std::lround(e.p("source", 0, 0)));
+    if (source == 0 && parseGrainProfile(e.s("profile"), g)) return g;
+    if (source == 5) return grainModelProfile(effectGrainModel(e));
+    const int gauge = source - 1;
+    return stockGrain(gauge < 0 || gauge > 3 ? 1 : gauge);
 }
 
 void grainMatch(const Effect& e, FrameTime t, Image& img) {
@@ -814,7 +1096,7 @@ void grainMatch(const Effect& e, FrameTime t, Image& img) {
     // put back allows for what that leaves.)
     GrainSettings s;
     s.amount = e.p("amount", t, 100) / 100;
-    if (std::lround(e.p("mode", 0, 0)) == 1) s.amount *= std::sqrt(1 - 1.0 / (2 * kReplaceGrainFrames + 1));
+    if (std::lround(e.p("mode", 0, 0)) == 1) s.amount *= replaceGrainTopUp(e.p("detail", t, 0) / 100);
     s.size = e.p("size", t, 100) / 100;
     s.saturation = e.p("saturation", t, 100) / 100;
     s.seed = uint32_t(std::max(0.0, e.p("seed", t, 0)));

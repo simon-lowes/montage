@@ -5,6 +5,7 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QPointF>
 #include <QImage>
 #include <QTimer>
 #include <QWidget>
@@ -56,6 +57,10 @@ public:
     double outsideP3() const { return outsideP3_; }
     // The chromaticity scope's samples near a point (xy, or u'v' when cieUv()), for tests.
     int cieSamplesNear(double a, double b, double radius) const;
+    // Primaries a Crosstalk moves, drawn on the chromaticity scope as arrows from where they were (CIE 1931 xy: each
+    // pair's first point) to where it takes them; none, nothing drawn.
+    void setPrimaryMoves(const std::vector<std::pair<QPointF, QPointF>>& xy);
+    const std::vector<std::pair<QPointF, QPointF>>& primaryMoves() const { return primaryMoves_; }
     // The frame in words, for a screen reader: "Waveform: levels 4 % to 96 %, average 41 %; saturation 18 %, leaning
     // blue" (with the HDR light levels, and in the chromaticity scope what lies outside Rec.709).
     QString summary() const;
@@ -131,6 +136,7 @@ private:
     bool cieUv_ = false;
     std::vector<uint32_t> cieCounts_;  // the chromaticity scope's bins (kCieBins square)
     double outside709_ = -1, outsideP3_ = -1;
+    std::vector<std::pair<QPointF, QPointF>> primaryMoves_;
 };
 
 }  // namespace montage

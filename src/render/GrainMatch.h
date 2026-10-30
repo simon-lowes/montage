@@ -11,6 +11,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -35,8 +36,36 @@ struct GrainProfile {
     double correlation[3] = {0.8, 0.8, 0.8};  // red with green, red with blue, green with blue
     double temporal = 0;                      // from one frame to the next (0..0.45)
     int width = 1920;                         // of the frames it was measured on: the grain scales with the picture
+    double kurtosis = 3;                      // of its values (3 Gaussian; less, flatter; more, sparse strong grains)
+    // Above 0: the amplitude follows the light to this power (a model's, render/GrainMatch GrainModel), smoothly between
+    // the bands and on beyond them.
+    double response = 0;
+    uint8_t measuredBands = 0xFF;  // (bit b: band b was measured, the others filled in from it; not kept in the text)
     bool valid() const;
 };
+
+// The grain as a model in scene-linear light: its strength at mid grey and tonal response (from sensor-like, rising as
+// the square root of the light, to negative-like, as the light), its colour correlation (between all the channels, and
+// how much of what differs lies on film's yellow-blue axis), its spectrum in two bands (fine texture and clusters) and
+// its kurtosis.
+struct GrainModel {
+    double strength = 0.04;   // its standard deviation at mid grey (0.18), as a share of the light there
+    double response = 0.5;    // the power of the light it follows
+    double correlation = 0.7; // between every pair of channels, before the yellow-blue part
+    double yellowBlue = 0;    // 0..1: of what differs between the channels, how much is yellow against blue
+    double fineSize = 1;      // the fine texture's grains, about this many pixels across on a frame `width` wide
+    double clusterSize = 4;   // the clusters'
+    double clusters = 0.25;   // the clusters' share of the grain's power
+    double kurtosis = 3;
+    double temporal = 0;
+    int width = 1920;
+};
+GrainProfile grainModelProfile(const GrainModel& m);
+// The model nearest a measured profile (the bands measured, and its spectrum as measureGrain's 64-pixel windows see it).
+GrainModel fitGrainModel(const GrainProfile& g);
+// The model a Grain Match's parameters hold.
+GrainModel effectGrainModel(const Effect& e);
+void setEffectGrainModel(Effect& e, const GrainModel& m);
 
 std::string grainProfileText(const GrainProfile& g);
 bool parseGrainProfile(const std::string& text, GrainProfile& out);
@@ -84,6 +113,9 @@ Image removeGrain(const Image& current, const std::vector<const Image*>& neighbo
 // Replace Grain takes the plate's grain out with this many frames each side. What they leave (in still areas, a 2n + 1
 // frame average leaves 1 / (2n + 1) of the grain's power) is allowed for in the grain put back.
 constexpr int kReplaceGrainFrames = 3;
+// Replace Grain can keep `detail` (0..1) of what taking the grain out took (the plate's fine detail, and its grain with
+// it); the share of the grain's strength then put back, so the two together are as strong as the grain measured.
+double replaceGrainTopUp(double detail);
 
 // The Grain Match effect's profile: its own measured one, else its Film Look gauge's.
 GrainProfile effectGrainProfile(const Effect& e);

@@ -13,6 +13,7 @@
 #include "Amf.h"
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "Fdl.h"
 #include "Processing.h"
 #include "VideoFx.h"
 #include "core/EditOps.h"
@@ -218,6 +219,7 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
                     for (const Take& take : c.takes)
                         if (take.mediaId == r->plateMedia) {
                             plate.mediaId = take.mediaId;
+                            plate.name = take.name;  // (named as the plate was, not after the version shown)
                             plate.sourceIn += take.offset;
                             plate.takes.clear();
                             break;
@@ -395,6 +397,17 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
             QFile f(QString::fromStdString(shot.amf));
             if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
                 return fail("Cannot write " + shot.amf);
+        }
+        if (o.fdl) {
+            const FdlClipId id{name, {}, name + ".####." + ext, shot.firstFrame, shot.lastFrame};
+            // (a sidecar: a clip it cannot be written for, one showing none of its picture say, is pulled without it)
+            const std::string json = clipFdl(p, seq, c, shot.width, shot.height, &id, nullptr);
+            if (!json.empty()) {
+                shot.fdl = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + QStringLiteral(".fdl")).toStdString();
+                QFile f(QString::fromStdString(shot.fdl));
+                if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(json.data(), qint64(json.size())) != qint64(json.size()))
+                    return fail("Cannot write " + shot.fdl);
+            }
         }
         if (o.stMaps) {
             // (The clip's first Lens Correction that is on, as it is at the cut's first frame.)

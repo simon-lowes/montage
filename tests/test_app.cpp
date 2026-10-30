@@ -106,6 +106,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Fdl.h"
 #include "render/VfxPull.h"
 #include "render/VfxShots.h"
 #include "render/Titles.h"
@@ -1019,6 +1020,70 @@ private slots:
         const QString text = QString::fromUtf8(f.readAll());
         QVERIFY2(text.contains(QStringLiteral("KJ 23 1234 5678+16")) && text.contains(QStringLiteral("KJ 23 1234 5680+15")), qPrintable(text));
         QVERIFY2(text.contains(QStringLiteral("16 mm")), qPrintable(text));
+    }
+
+    void framingDecisionListsFromTheMenus() {
+#ifdef MONTAGE_WITH_FDL
+        state()->newProject();
+        Id media = 0;
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            s.width = 1920, s.height = 1080;
+            for (const char* name : {"A001C005.mov", "B002C001.mov"}) {
+                MediaItem m;
+                m.id = p.newId();
+                if (!media) media = m.id;
+                m.kind = MediaKind::Video;
+                m.name = name;
+                m.path = std::string("/cards/") + name;
+                m.duration = 8;
+                m.width = 1920;
+                m.height = 1080;
+                m.fps = s.fps;
+                m.hasVideo = true;
+                p.media.push_back(m);
+            }
+            return edit::placeMedia(p, s, media, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        for (const char* name : {"importFdl", "exportFdl", "fdlFraming", "showFrameLines"}) QVERIFY2(win_->findChild<QAction*>(name), name);
+        // The FDL names its clip: it goes to that media only, as one undo step.
+        QCOMPARE(win_->importFdl(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), 1);
+        QVERIFY(!state()->project().findMedia(media)->fdl.empty() && state()->project().media[1].fdl.empty());
+        state()->undo();
+        QVERIFY(state()->project().findMedia(media)->fdl.empty());
+        state()->redo();
+        QCOMPARE(win_->importFdl(dir_.path() + "/missing.fdl"), -1);
+        // Its frame lines over the Program monitor: the 16:9 framing, through the clip as it is (it fills the frame).
+        const Sequence& seq = *state()->sequence();
+        std::vector<FrameLine> lines = sequenceFrameLines(state()->project(), seq, 0);
+        auto framing = [&] { return *std::find_if(lines.begin(), lines.end(), [](const FrameLine& l) { return l.kind == 0; }); };
+        QVERIFY(lines.size() == 2 && std::fabs(framing().corners[0] - 160.0 / 1920) < 1e-6);
+        // Its own template applied (the framing fitted into HD): the framing fills the frame, as one undo step.
+        QCOMPARE(win_->frameWithFdl(QString(), QString(), false), 1);
+        const Clip& c = state()->sequence()->videoTracks[0].clips.at(0);
+        QVERIFY2(std::fabs(c.motion.p("scale_x", 0) - 120) < 0.1 && c.motion.p("fit", 0) == 3, qPrintable(QString::number(c.motion.p("scale_x", 0))));
+        lines = sequenceFrameLines(state()->project(), *state()->sequence(), 0);
+        QVERIFY(std::fabs(framing().corners[0]) < 0.002 && std::fabs(framing().corners[4] - 1) < 0.002);
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.at(0).motion.p("scale_x", 0, 100), 100.0);
+        state()->redo();
+        // Written for the sequence: its context names the clip, and says what the cut shows (the framing).
+        const QString out = dir_.path() + "/cut.fdl";
+        QVERIFY(win_->exportFdl(out));
+        std::string json, err;
+        FdlDocument doc;
+        QVERIFY2(readFdlFile(out.toStdString(), json, doc, &err), err.c_str());
+        QVERIFY(doc.contexts.size() == 1 && doc.contexts[0].clipName == "A001C005" && doc.contexts[0].canvases[0].framings.size() == 2);
+        const FdlRect cut = doc.contexts[0].canvases[0].framings[1].rect;
+        QVERIFY2(std::fabs(cut.x - 160) < 1 && std::fabs(cut.w - 1600) < 2, qPrintable(QString("%1 %2").arg(cut.x).arg(cut.w)));
+        // The frame lines can be turned off.
+        QAction* show = win_->findChild<QAction*>("showFrameLines");
+        const bool was = show->isChecked();
+        show->trigger();
+        QCOMPARE(show->isChecked(), !was);
+        QCOMPARE(appSettings().value("playback/frameLines").toBool(), !was);
+        show->trigger();
+        QCOMPARE(show->isChecked(), was);
+#endif
     }
 
     void aleAndCdlFromTheMenus() {
@@ -7884,6 +7949,14 @@ private slots:
         QVERIFY2(supp.value("supplemental").toBool() && supp.value("coded_frames").toInt() == 0 && supp.value("new_samples").toInt() == 48000 &&
                      supp.value("sounds").toInt() == 2 && supp.value("problems").toArray().isEmpty(),
                  QJsonDocument(supp).toJson().constData());
+        // The beds and objects as S-ADM and ADM over MCP, checked.
+        r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-adm")}, {"title", "Objects"},
+                                        {"sadm", true}, {"adm", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject adm = r.value("structuredContent").toObject();
+        QVERIFY2(adm.value("problems").toArray().isEmpty() && adm.value("adm").toObject().value("sadm").toBool() &&
+                     adm.value("adm").toObject().value("adm").toBool() && adm.value("adm").toObject().value("bed_channels").toInt() >= 2,
+                 QJsonDocument(adm).toJson().constData());
         // Opened from the File menu's import as a sequence: English heard, German muted.
         QVERIFY(win_->findChild<QAction*>("importImf"));
         const size_t before = state()->project().sequences.size();
@@ -7910,7 +7983,9 @@ private slots:
             auto* earlier = dlg->findChild<QLineEdit*>("imfEarlier");
             auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
             auto* iab = dlg->findChild<QCheckBox*>("imfImmersive");
-            offered = iab && iab->isEnabled() && !iab->isChecked() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
+            auto* sadm = dlg->findChild<QCheckBox*>("imfSadm");
+            auto* admBox = dlg->findChild<QCheckBox*>("imfAdm");
+            offered = iab && iab->isEnabled() && !iab->isChecked() && sadm && sadm->isEnabled() && admBox && admBox->isEnabled() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
             // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");
@@ -7929,6 +8004,50 @@ private slots:
         win_->exportImfDialog();
         QVERIFY(offered);
         state()->newProject();
+    }
+
+    void stripSilenceFromTheClipMenu() {
+        // Three seconds of sound with two bursts (0.5-1.0 s and 2.0-2.5 s) and silence between, placed with its picture.
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 3, 0.0f);
+        for (const auto& [a, b] : std::vector<std::pair<double, double>>{{0.5, 1.0}, {2.0, 2.5}})
+            for (size_t i = size_t(a * rate); i < size_t(b * rate); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / rate));
+        WavWriter w;
+        QVERIFY(w.open(dir_.path() + "/bursts.wav", rate, 1));
+        w.write(x.data(), int64_t(x.size()));
+        QVERIFY(w.close());
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/bursts.wav"});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false).ok; }));
+        const Sequence before = *state()->sequence();
+        const Id clip = trackAt(before, A1)->clips.at(0).id;
+        // Nothing chosen: nothing done.
+        state()->setSelection({}, false);
+        QCOMPARE(win_->stripSilence(-40, 0.25, 0, 0, true), 0);
+        // The dialog takes its settings and cuts the clip to its two bursts, in one undo step.
+        state()->setSelection({clip}, false);
+        QTimer::singleShot(0, this, [] {
+            auto* dlg = qApp->activeModalWidget();
+            QVERIFY(dlg && dlg->objectName() == "stripSilenceDialog");
+            dlg->findChild<QDoubleSpinBox*>("threshold")->setValue(-40);
+            dlg->findChild<QDoubleSpinBox*>("minSilence")->setValue(0.25);
+            dlg->findChild<QDoubleSpinBox*>("padBefore")->setValue(0);
+            dlg->findChild<QDoubleSpinBox*>("padAfter")->setValue(0);
+            dlg->findChild<QCheckBox*>("linked")->setChecked(false);
+            QMetaObject::invokeMethod(dlg, "accept");
+        });
+        win_->findChild<QAction*>("stripSilence")->trigger();
+        QCOMPARE(state()->undoText(), QString("Strip Silence"));
+        const Track* a1 = trackAt(*state()->sequence(), A1);
+        const double fps = state()->sequence()->fpsValue();
+        QCOMPARE(a1->clips.size(), size_t(2));
+        QCOMPARE(a1->clips[0].start, FrameTime(std::floor(0.5 * fps)));
+        QCOMPARE(a1->clips[1].end(), FrameTime(std::ceil(2.5 * fps)));
+        QCOMPARE(trackAt(*state()->sequence(), V1)->clips.size(), trackAt(before, V1)->clips.size());  // (the picture left whole)
+        state()->undo();
+        QVERIFY(trackAt(*state()->sequence(), A1)->clips == trackAt(before, A1)->clips);
     }
 
     void spectralRepairFromTheClipMenu() {
@@ -9651,6 +9770,67 @@ private slots:
         QCOMPARE(caps()[2].start, 2 * (lastStart - 10));
         state()->undo();
         QCOMPARE(caps()[0].start, FrameTime(10));
+        panel->setLimits(saved);
+        state()->newProject();
+    }
+
+    void captionsAtShotChanges() {
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+        state()->newProject();
+        Id track = 0;
+        QVERIFY(state()->edit("Captions", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = track = p.newId();
+            t.captions = {{104, 180, "Starts just after it", {}}, {300, 360, "Later on", {}}};
+            s.captionTracks.push_back(t);
+            Marker m;
+            m.t = 100;
+            m.shotChange = true;
+            s.markers.push_back(m);
+            Clip c = makeGeneratorClip(p, "color", 400);  // (something to play)
+            s.videoTracks[0].clips.push_back(c);
+            return true;
+        }));
+        panel->setCurrentTrack(track);
+        const CaptionLimits saved = panel->limits();
+        panel->setLimits(CaptionLimits{});
+        auto caps = [&] { return state()->sequence()->captionTracks.front().captions; };
+        QCOMPARE(panel->shotChanges(), std::vector<FrameTime>{100});
+        QVERIFY(panel->issues()[0] & kCaptionNearShotChange);
+        QVERIFY(panel->findChild<QAction*>("detectShotChanges"));
+        // Fix Timing starts it on the shot change.
+        panel->findChild<QAction*>("fixCaptionTiming")->trigger();
+        QCOMPARE(caps()[0].start, FrameTime(100));
+        QVERIFY(!(panel->issues()[0] & kCaptionNearShotChange));
+        state()->undo();
+        // Off in the limits: not looked at.
+        CaptionLimits off;
+        off.shotZoneSeconds = 0;
+        panel->setLimits(off);
+        QVERIFY(panel->shotChanges().empty() && panel->issues()[0] == 0);
+        panel->setLimits(CaptionLimits{});
+        // On the timeline, its in-point dragged near the shot change snaps onto it.
+        timeline()->setFocus();
+        QApplication::processEvents();
+        const QRect r = timeline()->captionRect(track, 0);
+        QVERIFY(!r.isNull());
+        const double ppf = double(timeline()->captionRect(track, 1).left() - r.left()) / (300 - 104);
+        const int y = r.center().y();
+        const bool snapping = state()->snapping();
+        state()->setSnapping(true);
+        // (pressed on the in-point, out past the drag distance, then back to frame 102)
+        const QPoint press(r.left() + 1, y), far(r.left() - 60, y), to(r.left() + 1 - int(std::lround(2 * ppf)), y);
+        QTest::mousePress(viewport(), Qt::LeftButton, {}, press);
+        for (const QPoint at : {far, to}) {
+            QMouseEvent move(QEvent::MouseMove, at, viewport()->mapToGlobal(at), Qt::NoButton, Qt::LeftButton, {});
+            QApplication::sendEvent(viewport(), &move);
+        }
+        QTest::mouseRelease(viewport(), Qt::LeftButton, {}, to);
+        QCOMPARE(caps()[0].start, FrameTime(100));
+        state()->undo();
+        QCOMPARE(caps()[0].start, FrameTime(104));
+        state()->setSnapping(snapping);
         panel->setLimits(saved);
         state()->newProject();
     }
@@ -16955,6 +17135,24 @@ print("added " + ui["name"])
         QVERIFY(!cancel->isEnabled());
         remove->click();
         QCOMPARE(list->topLevelItemCount(), 0);
+        // Sent in three segments: a job for each and the join, which Remove takes with them.
+        auto* segments = panel->findChild<QSpinBox*>("queueSegments");
+        QVERIFY(segments);
+        QCOMPARE(segments->text(), QString("Whole"));
+        segments->setValue(3);
+        QCOMPARE(appSettings().value("renderFarm/segments").toInt(), 3);
+        QVERIFY(panel->sendToFarm(queue->add("Split job", "H.264", p, p.active()->id, st)));
+        QCOMPARE(list->topLevelItemCount(), 4);
+        QTreeWidgetItem* join = nullptr;
+        for (int i = 0; i < list->topLevelItemCount(); ++i)
+            if (list->topLevelItem(i)->text(0) == "Split job") join = list->topLevelItem(i);
+            else QVERIFY(list->topLevelItem(i)->text(0).startsWith("Split job - segment "));
+        QVERIFY(join);
+        list->setCurrentItem(join);
+        join->setSelected(true);
+        remove->click();
+        QCOMPARE(list->topLevelItemCount(), 0);
+        segments->setValue(1);
         panel->setFarmFolder(was);
     }
 
@@ -19051,6 +19249,53 @@ print("added " + ui["name"])
         r = call({{"action", "stop"}});
         QVERIFY(!r.value("isError").toBool() && !controller->running());
         qunsetenv("MONTAGE_VIRTUAL_OUTPUT");
+
+        // ST 2110: its streams' addresses shown only for it; started from an agent on the loopback interface, its SDP
+        // files in the status, the addresses kept for next time.
+        const st2110::SenderOptions savedIp = ReferenceOutputController::loadSt2110();
+        bool savedNmosOn = true;
+        const nmos::NodeOptions savedNmos = ReferenceOutputController::loadNmos(&savedNmosOn);
+        action->trigger();
+        dlg = win_->findChild<QDialog*>("referenceOutputDialog");
+        QVERIFY(dlg);
+        backend = dlg->findChild<QComboBox*>("outputBackend");
+        auto* videoAt = dlg->findChild<QLineEdit*>("outputSt2110Video");
+        QVERIFY(videoAt && backend->findData(QStringLiteral("ST 2110")) >= 0);
+        backend->setCurrentIndex(backend->findData(QStringLiteral("ST 2110")));
+        QVERIFY(videoAt->isVisibleTo(dlg) && dlg->findChild<QCheckBox*>("outputCaptions")->isEnabled());
+        QVERIFY(dlg->findChild<QCheckBox*>("outputNmos")->isVisibleTo(dlg));
+        backend->setCurrentIndex(backend->findData(QStringLiteral("DeckLink")));
+        QVERIFY(!videoAt->isVisibleTo(dlg) && !dlg->findChild<QCheckBox*>("outputNmos")->isVisibleTo(dlg));
+        dlg->close();
+        r = call({{"action", "start"}, {"interface", "ST 2110"}, {"device", "127.0.0.1"}, {"mode", "720p50"},
+                  {"st2110", QJsonObject{{"video", "127.0.0.1:15004"}, {"audio", "127.0.0.1:15006"}, {"data", "127.0.0.1:15008"}}},
+                  {"nmos", QJsonObject{{"enabled", true}, {"registry", "http://127.0.0.1:1"}}}});  // (no registry there: the Node API alone)
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->running());
+        r = call({{"action", "status"}});
+        const QJsonObject sdp = r.value("structuredContent").toObject().value("sdp").toObject();
+        QVERIFY2(sdp.value("video").toString().contains("m=video 15004 RTP/AVP 96"), QJsonDocument(r).toJson().constData());
+        QVERIFY(sdp.value("audio").toString().contains("L24/48000/") && sdp.value("data").toString().contains("smpte291/90000"));
+        QCOMPARE(r.value("structuredContent").toObject().value("address").toString(), QStringLiteral("rtp://127.0.0.1:15004"));
+        QCOMPARE(ReferenceOutputController::loadSt2110().audio.port, 15006);
+        // Offered over NMOS: a controller sending the video elsewhere opens the output again to match.
+        QVERIFY(controller->nmosNode());
+        QVERIFY(r.value("structuredContent").toObject().value("nmos").toObject().value("node_api").toString().startsWith("http://127.0.0.1:"));
+        const QString single = QStringLiteral("/x-nmos/connection/v1.1/single/senders/%1/").arg(controller->nmosNode()->senderId(0).toString(QUuid::WithoutBraces));
+        const QJsonObject patch{{"transport_params", QJsonArray{QJsonObject{{"destination_port", 15010}}}}, {"activation", QJsonObject{{"mode", "activate_immediate"}}}};
+        QCOMPARE(controller->nmosNode()->handle("PATCH", single + "staged", QJsonDocument(patch).toJson()).code, 200);
+        QVERIFY(controller->running() && controller->nmosNode());
+        r = call({{"action", "status"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("address").toString(), QStringLiteral("rtp://127.0.0.1:15010"));
+        QVERIFY(r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString().contains("m=video 15010 RTP/AVP 96"));
+        QVERIFY(controller->nmosNode()->handle("GET", single + "transportfile", {}).body.contains("m=video 15010 RTP/AVP 96"));
+        r = call({{"action", "start"}, {"st2110", QJsonObject{{"video", "not an address"}}}});
+        QVERIFY(r.value("isError").toBool());
+        call({{"action", "stop"}});
+        QVERIFY(!controller->running() && !controller->nmosNode());
+        ReferenceOutputController::saveNmos(savedNmos, savedNmosOn);
+        ReferenceOutputController::saveSt2110(savedIp);
+        st2110::setOutputOptions(savedIp);
     }
 
     void saveAndReopen() {

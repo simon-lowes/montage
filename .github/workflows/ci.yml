@@ -222,6 +222,11 @@ jobs:
           (sudo apt-get install -y --no-install-recommends libxml2-utils > /dev/null && scripts/fetch-ttml-schema.sh ~/ttml2-xsd) \
             && echo "MONTAGE_TEST_TTML_SCHEMA=$HOME/ttml2-xsd/ttml2.xsd" >> "$GITHUB_ENV" \
             || echo "::warning::Could not fetch the TTML2 schema; the IMSC test's schema check will be skipped"
+      - name: The EBU-TT-D schema, for the EBU-TT-D test
+        run: |
+          scripts/fetch-ebuttd-schema.sh ~/ebuttd-xsd \
+            && echo "MONTAGE_TEST_EBUTTD_SCHEMA=$HOME/ebuttd-xsd/ebutt_d.xsd" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not fetch the EBU-TT-D schema; the EBU-TT-D test's schema check will be skipped"
       - name: pyaaf2, an independent AAF and MXF reader for the AAF tests
         run: |
           (python3 -m venv ~/pyaaf2 && ~/pyaaf2/bin/pip install -q pyaaf2==1.7.1) && echo "MONTAGE_TEST_PYAAF2=$HOME/pyaaf2/bin/python" >> "$GITHUB_ENV" \
@@ -237,3 +242,5 @@ jobs:
           sudo apt-get install -y --no-install-recommends at-spi2-core python3-pyatspi > /dev/null
           build/src/montage-cli new -o "$RUNNER_TEMP/atspi.montage" tests/data/jfk.wav
           dbus-run-session -- xvfb-run -a /usr/bin/python3 scripts/atspi-check.py build/src/app/montage "$RUNNER_TEMP/atspi.montage"
+      - name: AMWA's NMOS tests (IS-04 Node and IS-05) against the ST 2110 output's Node
+        run: sudo scripts/nmos-check.sh build/src/montage-cli "$RUNNER_TEMP/nmos"

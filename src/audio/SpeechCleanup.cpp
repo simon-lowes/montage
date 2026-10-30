@@ -26,6 +26,7 @@ extern "C" {
 #include "DialogueAlign.h"
 #include "ElasticAudio.h"
 #include "SpectralRepair.h"
+#include "TapeRepair.h"
 #include "media/SpeechEnhance.h"
 
 namespace montage {
@@ -33,6 +34,7 @@ namespace montage {
 bool isSourceAudioEffect(const std::string& type) {
     return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "bandwidth_extension" || type == "declick" || type == "pitch_shift" ||
            type == "dereverb" || type == "spectral_repair" || type == "dialogue_align" || type == "declip" || type == "deplosive" ||
+           type == "wow_flutter" || type == "azimuth" ||
            type == "dewind" || type == "ara" || type == "elastic_audio" || type == "pitch_contour";
 }
 
@@ -591,6 +593,8 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
         } else if (e.type == "spectral_repair") {
             spectralRepair(*cur, *out, spectralRegionsFromString(e.s("regions")), cancel);
             ok = true;
+        } else if (e.type == "azimuth") {
+            ok = correctAzimuth(*cur, *out, e.p("adaptive", 0, 0) > 0.5, e.p("polarity", 0, 1) > 0.5, cancel);
         } else if (e.type == "pitch_shift") {
             pitchShift(*cur, *out, e.p("semitones", 0, 0) + e.p("cents", 0, 0) / 100, cancel);
             ok = true;
@@ -716,7 +720,7 @@ void retryCleanupsMissingModels() {
 }
 
 AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& source, const std::vector<const Effect*>& effects,
-                            bool blocking) {
+                            bool blocking, bool keep) {
     if (!source || effects.empty()) return source;
     const std::string key = keyFor(path, source->sampleRate, effects);
     std::shared_ptr<Job> job;
@@ -732,7 +736,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             gCache.emplace_front(key, job);
             start = true;
         }
-        if (blocking) job->needed = true;
+        if (blocking || keep) job->needed = true;
         trimCache();
         if (!start) {
             if (job->done) return job->result;
@@ -755,7 +759,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             chain.clear();
         };
         for (const Effect& e : copies) {
-            if (e.type != "dialogue_align" && e.type != "ara" && e.type != "elastic_audio" && e.type != "pitch_contour") {
+            if (e.type != "dialogue_align" && e.type != "ara" && e.type != "elastic_audio" && e.type != "pitch_contour" && e.type != "wow_flutter") {
                 chain.push_back(e);
                 continue;
             }
@@ -767,6 +771,12 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
                 std::string err;
                 if (ara::renderEffect(e, r, *out, &job->cancel, &err)) r = out;
                 else if (!err.empty()) std::fprintf(stderr, "ARA plug-in effect left out: %s\n", err.c_str());
+                continue;
+            }
+            if (e.type == "wow_flutter") {
+                // The transfer's speed put back on every channel alike (audio/TapeRepair.h), so a field keeps its directions.
+                auto out = std::make_shared<AudioBuffer>();
+                if (removeWowFlutter(*r, *out, e.p("wow", 0, 100) / 100, e.p("flutter", 0, 100) / 100, e.p("pilot_hz", 0, 0), &job->cancel)) r = out;
                 continue;
             }
             if (e.type == "elastic_audio" || e.type == "pitch_contour") {

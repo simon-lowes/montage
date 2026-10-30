@@ -23,6 +23,7 @@
 #include <functional>
 #include <limits>
 #include <array>
+#include <mutex>
 #include <set>
 #include <QImage>
 #include <QMatrix4x4>
@@ -71,6 +72,7 @@
 #include "core/TranscriptEdit.h"
 #include "audio/DialogueAlign.h"
 #include "audio/ElasticAudio.h"
+#include "audio/TapeRepair.h"
 #include "audio/RoomResponse.h"
 #include "audio/Upmix.h"
 #include "audio/SpeechCleanup.h"
@@ -124,6 +126,7 @@
 #include "media/Sofa.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
+#include "render/Crosstalk.h"
 #include "media/LensCalibration.h"
 #include "media/LensDatabase.h"
 #include "render/ReviewExport.h"
@@ -246,6 +249,7 @@
 #include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/SegmentedExport.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -3042,6 +3046,25 @@ private slots:
                 for (int x = 0; x < half.width; ++x)
                     (x >= 170 ? right : left) = std::max(x >= 170 ? right : left, std::fabs(half.at(x, y)[1] - raw.at(x, y)[1]));
             QVERIFY2(right < 1e-4f && left > 0.02f, qPrintable(QString("%1 %2").arg(right).arg(left)));
+        }
+        // The fitted model comes back with the measurement; given back, it is the Model source's grain.
+        {
+            r = call({{"project", project}, {"action", "measure"}, {"clip", double(plate)}});
+            const QJsonObject model = r.value("structuredContent").toObject().value("model").toObject();
+            QVERIFY2(model.value("strength").toDouble() > 0 && model.value("kurtosis").toDouble() >= 1.2 && model.value("width").toInt() > 0,
+                     QJsonDocument(r).toJson().constData());
+            r = call({{"project", project}, {"action", "apply"}, {"model", model}, {"apply_to", QJsonArray{double(clean)}}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Effect& e = back.active()->videoTracks[0].clips.at(1).effects.back();
+            QCOMPARE(e.p("source", 0, 0), 5.0);
+            QVERIFY(std::fabs(e.p("model_strength", 0, 0) - model.value("strength").toDouble() * 100) < 1e-6);
+            const double size = model.value("fine_size").toDouble() * 1920 / model.value("width").toDouble();
+            QVERIFY(std::fabs(e.p("fine_size", 0, 0) - std::clamp(size, 0.2, 12.0)) < 1e-6);
+            QVERIFY2(spread(renderSequenceFrame(back, *back.active(), 30, {})) > 0.3 * plateNoise, "the model's grain is there");
+            QVERIFY(call({{"project", project}, {"action", "apply"}, {"model", QJsonObject{{"kurtosis", "high"}}}, {"apply_to", QJsonArray{double(clean)}}})
+                        .value("isError")
+                        .toBool());
         }
         // A gauge; and refusals: no clips to put it on, not a profile, an unknown gauge.
         r = call({{"project", project}, {"action", "apply"}, {"gauge", "super8"}, {"apply_to", QJsonArray{double(clean)}}});
@@ -9825,6 +9848,11 @@ private slots:
         QCOMPARE(a.colorSpace, std::string("linear-rec709+display"));
         const std::string space = findColorSpace(a.colorSpace)->label;
         QCOMPARE(space, std::string("Linear Rec.709, display light"));
+        // A crafted id with many "+display" is refused, not followed down the stack.
+        QVERIFY(!findColorSpace("linear-rec709+display+display"));
+        std::string crafted = "linear-rec709";
+        for (int i = 0; i < 200000; ++i) crafted += "+display";
+        QVERIFY(!findColorSpace(crafted));
         const std::string expected = "#! nuke\n"
                                      "# Written by Montage for VFX shot Reel1_010: its plate read untouched and written to its next version.\n"
                                      "Root {\n inputs 0\n first_frame 993\n last_frame 1016\n lock_range true\n fps 25\n format \"64 36 0 0 64 36 1 Reel1_010\"\n}\n"
@@ -9930,9 +9958,18 @@ private slots:
             return true;
         };
         QVERIFY(matchesPlate());
+        // (its media item keeps what the editor set for it as it grows)
+        MediaItem* v3 = p.findMedia(s.vfxShots[0].versions[2].media);
+        QVERIFY(v3);
+        v3->bin = "Returns";
+        v3->name = "Comp v3 from the vendor";
+        v3->proxyPath = "/proxies/v3.mov";
         for (int n = a.firstFrame; n < 1001; ++n) QVERIFY(QFile::copy(plateFile(a, n), version("Reel1_010_comp_v003", n)));
         QVERIFY2(scanVfxReturns(p, s, o.returns, "", &scan, &err), err.c_str());
         QVERIFY(scan.added.empty());
+        v3 = p.findMedia(s.vfxShots[0].versions[2].media);
+        QVERIFY(v3 && v3->bin == "Returns" && v3->name == "Comp v3 from the vendor" && v3->proxyPath == "/proxies/v3.mov");
+        QVERIFY(v3->colorOverride == "linear-rec709+display");
         QVERIFY(matchesPlate());
         QVERIFY(edit::setVfxVersion(p, s, ids[0], 1).ok);
         QVERIFY(matchesPlate());
@@ -9983,6 +10020,16 @@ private slots:
             renamed.scripts = false;
             QVERIFY2(exportVfxPulls(p, other, {ids[2]}, renamed, &shots, nullptr, nullptr, &err), err.c_str());
             QCOMPARE(shots.at(0).name, std::string("Reel1_020_1"));
+        }
+        // Named from its clip, a shot showing a version is named after its plate, not the version.
+        {
+            Sequence other = s;
+            VfxPullOptions byClip = o;
+            byClip.folder = path("vfx-pulls-by-clip");
+            byClip.namePattern = "{clip}";
+            byClip.scripts = false;
+            QVERIFY2(exportVfxPulls(p, other, {ids[0]}, byClip, &shots, nullptr, nullptr, &err), err.c_str());
+            QCOMPARE(shots.at(0).name, QFileInfo(QString::fromStdString(m.name)).completeBaseName().toStdString());
         }
         // The shot list as CSV and OpenTimelineIO.
         const QStringList rows = QString::fromStdString(vfxShotListCsv(s)).split('\n', Qt::SkipEmptyParts);
@@ -12385,26 +12432,14 @@ private slots:
             QVERIFY2(iab::decodeDlc(coded.data(), coded.size(), code, m, back, &err) && back == x, qPrintable(QString::number(code)));
             QVERIFY2(coded.size() < size_t(m) * 3 * 4 / 5, qPrintable(QString("%1: %2 bytes for %3 samples").arg(code).arg(coded.size()).arg(m)));
         }
-        // 29.97: no DLC; a FrameSequence numbers the frames, whose lengths follow the five-frame cadence.
+        // 29.97 and 59.94: reserved in ST 2098-2:2022, so neither written nor read.
         {
+            QCOMPARE(iab::rateCode(30000, 1001), -1);
+            QCOMPARE(iab::rateCode(60000, 1001), -1);
             iab::Frame s;
-            s.rate = iab::rateCode(30000, 1001);
-            QCOMPARE(s.rate, 0xA);
-            QVERIFY(!iab::writeFrame(s, true, pcmBytes, &err));
-            int64_t total = 0;
-            for (int k = 0; k < 5; ++k) {
-                s.frameIndex = k;
-                const int m = iab::frameSamples(s.rate, k);
-                total += m;
-                s.bed = {{iab::C, 1}};
-                s.audio = {{1, std::vector<int32_t>(size_t(m), k)}};
-                QVERIFY2(iab::writeFrame(s, false, pcmBytes, &err), err.c_str());
-                iab::Frame g;
-                QVERIFY2(iab::readFrame(pcmBytes.data(), pcmBytes.size(), g, &err), err.c_str());
-                QCOMPARE(g.frameIndex, k);
-                QCOMPARE(int(g.audio[1].size()), m);
-            }
-            QCOMPARE(total, int64_t(8008));  // five frames of 29.97 at 48 kHz
+            s.rate = 0xA;
+            s.bed = {{iab::C, 1}};
+            QVERIFY(!iab::writeFrame(s, false, pcmBytes, &err));
         }
         // Damaged frames are refused, not misread.
         for (size_t cut : {size_t(3), size_t(12), dlcBytes.size() / 2, dlcBytes.size() - 1}) {
@@ -21921,6 +21956,358 @@ if ui["pressed"] == "add":
         QVERIFY(r.value("isError").toBool() && text(r).contains("No job"));
     }
 
+    void renderFarmSegments() {
+        QTemporaryDir dir;
+        const QString farm = dir.path() + "/farm";
+        std::string err;
+        // Particles, bars and a gradient with film grain over them (every frame different, as footage is), and a tone
+        // that rises.
+        Project p = makeDefaultProject();
+        Sequence& seq = *p.active();
+        seq.width = 320;
+        seq.height = 180;
+        Clip sparks = makeGeneratorClip(p, "particles", 49);
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, sparks);
+        Clip bars = makeGeneratorClip(p, "bars", 52);
+        bars.start = 49;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, bars);
+        Clip ramp = makeGeneratorClip(p, "gradient", 49);
+        ramp.start = 101;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, ramp);
+        QCOMPARE(seq.duration(), FrameTime(150));
+        for (Clip& c : seq.videoTracks[0].clips) c.effects.push_back(makeEffect(p, "film_grain"));
+        std::vector<float> tone(size_t(48000 * 6));
+        double phase = 0;
+        for (size_t i = 0; i < tone.size(); ++i) {
+            phase += 2 * M_PI * (220.0 + 440.0 * double(i) / double(tone.size())) / 48000.0;
+            tone[i] = float(0.3 * std::sin(phase));
+        }
+        QVERIFY(writeMonoWav((dir.path() + "/tone.wav").toStdString(), tone, 48000));
+        MediaItem wav = probeOrFail(p, (dir.path() + "/tone.wav").toStdString());
+        p.media.push_back(wav);
+        QVERIFY(edit::placeMedia(p, seq, wav.id, 0, 0, 150, {}, {TrackKind::Audio, 0}, false).ok);
+
+        // ---- Planned at cuts near equal shares: 50 and 100 move to the cuts at 49 and 101 (within an eighth of a
+        // segment), the others stay on their shares.
+        ExportSettings st;
+        st.videoCodec = "prores_ks";
+        st.profile = "hq";
+        st.audioCodec = "pcm_s24le";
+        st.path = (dir.path() + "/out/master.mov").toStdString();
+        std::vector<ExportSegment> parts = planExportSegments(seq, st, 6);
+        QCOMPARE(parts.size(), size_t(6));
+        const std::vector<FrameTime> starts{0, 25, 49, 75, 101, 125};
+        for (size_t k = 0; k < parts.size(); ++k) {
+            QCOMPARE(parts[k].in, starts[k]);
+            QCOMPARE(parts[k].out, k + 1 < parts.size() ? starts[k + 1] : FrameTime(150));
+        }
+        ExportSettings ranged = st;
+        ranged.in = 140;
+        ranged.out = 143;
+        QCOMPARE(planExportSegments(seq, ranged, 6).size(), size_t(3));  // (no fewer than a frame each)
+        // What is made in one go is refused.
+        auto refused = [&](const std::function<void(ExportSettings&)>& change, const char* why) {
+            ExportSettings x = st;
+            change(x);
+            std::string w;
+            return !exportSplits(x, &w) && QString::fromStdString(w).contains(why);
+        };
+        QVERIFY(exportSplits(st, &err));
+        QVERIFY(refused([](ExportSettings& x) { x.videoCodec = "hw_h264"; }, "hardware"));
+        QVERIFY(refused([](ExportSettings& x) { x.videoCodec = "gif"; }, "not joined"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mxf"; }, "MOV, MP4 or MKV"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mkv"; }, "MKV without sound"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mkv", x.audioCodec = "none"; }, "") == false);
+        QVERIFY(refused([](ExportSettings& x) { x.hdr10Plus = true; }, "dynamic HDR"));
+        QVERIFY(refused([](ExportSettings& x) { x.cea608 = true; }, "CEA-608"));
+        QVERIFY(refused([](ExportSettings& x) { x.rateChange = "speed"; }, "frame rate"));
+        QVERIFY(refused([](ExportSettings& x) { x.audioCodec = "none", x.embedCaptions = true; }, "captions"));
+        QVERIFY(!submitFarmJob(farm.toStdString(), "Refused", p, seq.id, [&] { ExportSettings x = st; x.videoCodec = "gif"; return x; }(), 0, nullptr, &err, 4));
+        QVERIFY(QString::fromStdString(err).contains("cannot be split"));
+        QVERIFY(farmJobs(farm.toStdString()).empty());
+
+        // ---- The same export made whole on this computer, for comparing.
+        ExportSettings whole = st;
+        whole.path = (dir.path() + "/whole/master.mov").toStdString();
+        QVERIFY(QDir().mkpath(dir.path() + "/whole"));
+        QVERIFY2(exportSequence(p, seq, whole, {}, nullptr, &err), err.c_str());
+
+        // ---- Sent in six segments; one node takes a segment and stops answering; two nodes render the rest, take that
+        // one back, and one of them joins them.
+        std::string id;
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Master", p, seq.id, st, 0, &id, &err, 6), err.c_str());
+        std::vector<FarmJob> jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs.size(), size_t(7));
+        std::vector<std::string> segmentJobs;
+        for (const FarmJob& j : jobs) {
+            if (j.id == id) {
+                QVERIFY(j.join);
+                QCOMPARE(j.segments, 6);
+                QCOMPARE(j.name, std::string("Master"));
+            } else {
+                QCOMPARE(j.group, id);
+                QCOMPARE(j.name, "Master - segment " + std::to_string(j.segment) + " of 6");
+                QVERIFY(j.output.find(".montage-segments-" + id) != std::string::npos);
+                segmentJobs.push_back(j.id);
+            }
+        }
+        QCOMPARE(segmentJobs.size(), size_t(6));
+        {
+            const QDir gone(farm + "/jobs/" + QString::fromStdString(segmentJobs[2]));
+            QFile claim(gone.filePath("claim"));
+            QVERIFY(claim.open(QIODevice::WriteOnly));
+            claim.write("gone-node-token");
+            QFile status(gone.filePath("status.json"));
+            QVERIFY(status.open(QIODevice::WriteOnly));
+            status.write(R"({"state": "rendering", "progress": 0.4, "node": "Gone", "beat": 3})");
+        }
+        auto joinEnded = [&](const std::string& job) {
+            for (const FarmJob& j : farmJobs(farm.toStdString()))
+                if (j.id == job) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
+            return true;
+        };
+        std::mutex logLock;
+        QStringList log;
+        std::atomic<int> renderedA{0}, renderedB{0};
+        auto runNodes = [&](const std::string& job, int count) {
+            std::vector<std::thread> nodes;
+            std::vector<int> rendered(size_t(count), 0);
+            for (int n = 0; n < count; ++n)
+                nodes.emplace_back([&, n] {
+                    FarmNodeOptions o;
+                    o.farm = farm.toStdString();
+                    o.name = n == 0 ? "Node A" : "Node B";
+                    o.pollMs = 100;
+                    o.staleMs = 1500;
+                    o.stopped = [&] { return joinEnded(job); };
+                    o.log = [&](const std::string& l) {
+                        std::lock_guard<std::mutex> g(logLock);
+                        log << QString::fromStdString(l);
+                    };
+                    std::string e;
+                    runFarmNode(o, &rendered[size_t(n)], &e);
+                });
+            for (std::thread& t : nodes) t.join();
+            renderedA += rendered[0];
+            if (count > 1) renderedB += rendered[1];
+        };
+        runNodes(id, 2);
+        jobs = farmJobs(farm.toStdString());
+        for (const FarmJob& j : jobs) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        QVERIFY2(log.join('\n').contains("Took back") && log.join('\n').contains("Gone"), qPrintable(log.join('\n')));
+        QVERIFY2(renderedA > 0 && renderedB > 0, qPrintable(log.join('\n')));  // (both nodes rendered)
+        QCOMPARE(renderedA + renderedB, 7);
+        // Every frame as the whole render made it, the sound sample for sample, and the segments' folder gone.
+        const std::string master = st.path;
+        const std::vector<QByteArray> wholeFrames = pictureHashes(whole.path), splitFrames = pictureHashes(master);
+        QCOMPARE(wholeFrames.size(), size_t(150));
+        QVERIFY(splitFrames == wholeFrames);
+        auto pixelAspect = [](const std::string& file) {
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return AVRational{0, 0};
+            avformat_find_stream_info(fmt, nullptr);
+            const AVRational sar = fmt->streams[av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0)]->sample_aspect_ratio;
+            avformat_close_input(&fmt);
+            return sar;
+        };
+        QCOMPARE(pixelAspect(master).num, 1);
+        QCOMPARE(pixelAspect(master).den, 1);
+        const std::vector<float> wholeSound = decodeAudioStream(whole.path, 0, nullptr, nullptr, true),
+                                 splitSound = decodeAudioStream(master, 0, nullptr, nullptr, true);
+        QVERIFY(wholeSound.size() > 48000 * 5);
+        QVERIFY(splitSound == wholeSound);
+        QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        QVERIFY(removeFarmJob(farm.toStdString(), id, &err));
+        QVERIFY(farmJobs(farm.toStdString()).empty());  // (its segments with it)
+
+        // ---- H.264 in four segments: exactly the frames, each segment starting on a keyframe, and within half a
+        // decibel of the single render's quality (both measured against a lossless render).
+        ExportSettings h264 = st;
+        h264.videoCodec = "libx264";
+        h264.profile.clear();
+        h264.audioCodec = "aac";
+        h264.path = (dir.path() + "/out/master.mp4").toStdString();
+        QVERIFY(exportSegmentsLongGop(h264));
+        ExportSettings truth = h264, single = h264;
+        truth.videoCodec = "ffv1";
+        truth.pixFmt = "yuv420p";
+        truth.audioCodec = "none";
+        truth.path = (dir.path() + "/whole/truth.mkv").toStdString();
+        single.path = (dir.path() + "/whole/single.mp4").toStdString();
+        QVERIFY2(exportSequence(p, seq, truth, {}, nullptr, &err), err.c_str());
+        QVERIFY2(exportSequence(p, seq, single, {}, nullptr, &err), err.c_str());
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Web", p, seq.id, h264, 0, &id, &err, 4), err.c_str());
+        runNodes(id, 2);
+        for (const FarmJob& j : farmJobs(farm.toStdString())) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        auto lumaFrames = [](const std::string& file) {
+            std::vector<QByteArray> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            avformat_find_stream_info(fmt, nullptr);
+            const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = avcodec_find_decoder(fmt->streams[idx]->codecpar->codec_id);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(ctx, fmt->streams[idx]->codecpar);
+            ctx->err_recognition = AV_EF_EXPLODE;
+            avcodec_open2(ctx, codec, nullptr);
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            bool broken = false;
+            auto drain = [&] {
+                while (avcodec_receive_frame(ctx, fr) == 0) {
+                    broken |= (fr->flags & AV_FRAME_FLAG_CORRUPT) != 0 || fr->decode_error_flags != 0;
+                    QByteArray y(fr->width * fr->height, '\0');
+                    for (int r = 0; r < fr->height; ++r) std::memcpy(y.data() + r * fr->width, fr->data[0] + r * fr->linesize[0], size_t(fr->width));
+                    out.push_back(y);
+                    av_frame_unref(fr);
+                }
+            };
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == idx && avcodec_send_packet(ctx, pkt) < 0) broken = true;
+                drain();
+                av_packet_unref(pkt);
+            }
+            avcodec_send_packet(ctx, nullptr);
+            drain();
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            if (broken) out.clear();
+            return out;
+        };
+        const std::vector<QByteArray> ref = lumaFrames(truth.path), one = lumaFrames(single.path), split = lumaFrames(h264.path);
+        QCOMPARE(ref.size(), size_t(150));
+        QCOMPARE(one.size(), size_t(150));
+        QCOMPARE(split.size(), size_t(150));  // (every frame, none broken)
+        auto psnr = [&](const std::vector<QByteArray>& v) {
+            double se = 0, n = 0;
+            for (size_t f = 0; f < v.size(); ++f)
+                for (qsizetype i = 0; i < v[f].size(); ++i) {
+                    const double d = double(uint8_t(v[f][i])) - double(uint8_t(ref[f][i]));
+                    se += d * d;
+                    n += 1;
+                }
+            return 10 * std::log10(255.0 * 255.0 / std::max(se / n, 1e-9));
+        };
+        const double psnrOne = psnr(one), psnrSplit = psnr(split);
+        QVERIFY2(std::fabs(psnrOne - psnrSplit) < 0.5, qPrintable(QString("%1 dB whole, %2 dB in segments").arg(psnrOne).arg(psnrSplit)));
+        QVERIFY(psnrSplit > 30);
+        {
+            // A keyframe where each segment starts.
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, h264.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVStream* vs = fmt->streams[v];
+            std::set<int64_t> keys;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v && (pkt->flags & AV_PKT_FLAG_KEY))
+                    keys.insert(av_rescale_q(pkt->pts - (vs->start_time == AV_NOPTS_VALUE ? 0 : vs->start_time), vs->time_base, AVRational{int(seq.fps.den), int(seq.fps.num)}));
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            for (const ExportSegment& s : planExportSegments(seq, h264, 4)) QVERIFY2(keys.count(s.in), qPrintable(QString::number(s.in)));
+        }
+        // The sound as the single render's (AAC, encoded once for the whole).
+        QVERIFY(decodeAudioStream(h264.path, 0) == decodeAudioStream(single.path, 0));
+
+        // ---- A segment changed after its node checked it is rendered again before the join; a cancelled join cancels
+        // its segments; an image sequence's segments write its frames where they go, numbered on.
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Again", p, seq.id, st, 0, &id, &err, 3), err.c_str());
+        {
+            FarmNodeOptions o;
+            o.farm = farm.toStdString();
+            o.name = "Node A";
+            o.pollMs = 100;
+            o.stopped = [&] {
+                for (const FarmJob& j : farmJobs(farm.toStdString()))
+                    if (j.group == id && j.state != FarmState::Done) return false;
+                return true;
+            };
+            QVERIFY(runFarmNode(o, nullptr, &err));
+        }
+        std::string second;
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.group == id && j.segment == 2) second = j.output;
+        {
+            QFile f(QString::fromStdString(second));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.seek(f.size() - 100);
+            f.write("x");
+        }
+        log.clear();
+        runNodes(id, 1);
+        QVERIFY2(log.join('\n').contains("did not check out"), qPrintable(log.join('\n')));
+        for (const FarmJob& j : farmJobs(farm.toStdString())) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        QVERIFY(pictureHashes(st.path) == wholeFrames);
+
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Stopped", p, seq.id, st, 0, &id, &err, 3), err.c_str());
+        QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == id || j.group == id) QCOMPARE(j.state, FarmState::Cancelled);
+        QVERIFY(retryFarmJob(farm.toStdString(), id, &err));
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == id || j.group == id) QCOMPARE(j.state, FarmState::Waiting);
+        QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+
+        ExportSettings frames = st;
+        frames.videoCodec = "png";
+        frames.audioCodec = "none";
+        frames.in = 20;
+        frames.out = 50;
+        frames.startNumber = 100;
+        frames.path = (dir.path() + "/frames/shot.png").toStdString();
+        ExportSettings wholeFramesSt = frames;
+        wholeFramesSt.path = (dir.path() + "/whole/shot.png").toStdString();
+        QVERIFY2(exportSequence(p, seq, wholeFramesSt, {}, nullptr, &err), err.c_str());
+        QVERIFY2(submitFarmJob(farm.toStdString(), "Frames", p, seq.id, frames, 0, &id, &err, 3), err.c_str());
+        runNodes(id, 2);
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == id || j.group == id) QVERIFY2(j.state == FarmState::Done, (j.name + ": " + j.error).c_str());
+        const QStringList made = QDir(dir.path() + "/frames").entryList({"shot_*.png"}, QDir::Files, QDir::Name);
+        QCOMPARE(made.size(), 30);
+        QCOMPARE(made.front(), QString("shot_000100.png"));
+        QCOMPARE(made.back(), QString("shot_000129.png"));
+        for (const QString& f : made) {
+            QFile a(dir.path() + "/frames/" + f), b(dir.path() + "/whole/" + f);
+            QVERIFY(a.open(QIODevice::ReadOnly) && b.open(QIODevice::ReadOnly));
+            QVERIFY2(a.readAll() == b.readAll(), qPrintable(f));
+        }
+
+        // ---- Over MCP: montage_render's segments, with a farm; the jobs list each segment's join.
+        const QString project = dir.path() + "/mcp.montage";
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString farm2 = dir.path() + "/farm2";
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", dir.path() + "/out/mcp.mp4"}, {"farm", farm2}, {"segments", 3}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("segments").toInt(), 3);
+        QVERIFY2(text(r).contains("3 segments") && text(r).contains("Rate control works per segment"), qPrintable(text(r)));
+        const QString job = r.value("structuredContent").toObject().value("job").toString();
+        r = call("montage_render_farm", {{"farm", farm2}});
+        int segs = 0;
+        for (const QJsonValue& v : r.value("structuredContent").toObject().value("jobs").toArray()) {
+            const QJsonObject j = v.toObject();
+            if (j.value("id").toString() == job) QCOMPARE(j.value("segments").toInt(), 3);
+            else segs += j.value("join").toString() == job && j.value("segment").toInt() >= 1;
+        }
+        QCOMPARE(segs, 3);
+        r = call("montage_render", {{"project", project}, {"output", dir.path() + "/out/mcp2.mp4"}, {"farm", farm2}, {"segments", 3}, {"rate_change", "speed"}, {"frame_rate", 30}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("cannot be split"));
+    }
+
     void mcpBuildsACutFromAScript() {
         // Two takes of a two-line scene; the second take fluffs line one.
         Project p = makeDefaultProject();
@@ -25941,6 +26328,22 @@ if ui["pressed"] == "add":
         QVERIFY(loadProject(project.toStdString(), back));
         const auto& fx = back.active()->videoTracks[0].clips[0].effects;
         QCOMPARE(std::count_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "chart_match"; }), 1);
+        // As a Crosstalk: put first, its matrix's rows summing to 1, the chart closer than it was; again, the same one.
+        for (int pass = 0; pass < 2; ++pass) {
+            r = call({{"clip", double(first)}, {"as", "crosstalk"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            out = r.value("structuredContent").toObject();
+            QCOMPARE(out.value("matrix").toArray().size(), 9);
+            QVERIFY2(out.value("delta_e_after").toDouble() < out.value("delta_e_before").toDouble(), QJsonDocument(out).toJson().constData());
+            QVERIFY(loadProject(project.toStdString(), back));
+            const auto& cfx = back.active()->videoTracks[0].clips[0].effects;
+            QCOMPARE(cfx.front().type, std::string("crosstalk"));
+            QCOMPARE(std::count_if(cfx.begin(), cfx.end(), [](const Effect& e) { return e.type == "crosstalk"; }), 1);
+            double m[9];
+            QVERIFY(parseCrosstalkMatrix(cfx.front().s("matrix"), m));
+            for (int row = 0; row < 3; ++row) QVERIFY(std::fabs(m[row * 3] + m[row * 3 + 1] + m[row * 3 + 2] - 1) < 1e-6);
+        }
+        QVERIFY(call({{"clip", double(first)}, {"as", "lut"}}).value("isError").toBool());
         // Bad corners: too few, in a line, off the frame; a clip by name, and a name two clips share.
         auto refused = [](const QJsonObject& res) { return res.value("isError").toBool() || res.isEmpty(); };
         r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0, 0}}}});
@@ -28890,6 +29293,30 @@ if ui["pressed"] == "add":
             const QByteArray text = f.readAll();
             QVERIFY2(text.contains("{\\an7}Second") && !text.contains("{\\an2}"), text.constData());
         }
+        // Shot changes: marked at given times, listed, and checked against (or not, with profile off); EBU-TT-D out.
+        {
+            Project before;
+            QVERIFY(loadProject(project.toStdString(), before));
+            const Sequence& bs = *before.active();
+            const FrameTime at = bs.captionTracks.front().captions[1].start + 3;  // just after the second caption starts
+            r = edit({{"project", project}, {"action", "shot_changes"}, {"shot_changes", QJsonArray{double(at) / bs.fpsValue()}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            bool listed = false;
+            for (const QJsonValue& v : r.value("structuredContent").toObject().value("shot_changes").toArray())
+                listed = listed || std::llabs(int64_t(v.toObject().value("frame").toDouble()) - at) <= 1;
+            QVERIFY2(listed, QJsonDocument(r).toJson().constData());
+            r = edit({{"project", project}, {"action", "check"}});
+            QVERIFY2(QJsonDocument(r).toJson().contains("shot change"), QJsonDocument(r).toJson().constData());
+            r = edit({{"project", project}, {"action", "check"}, {"profile", "off"}});
+            QVERIFY2(!QJsonDocument(r).toJson().contains("shot change"), QJsonDocument(r).toJson().constData());
+            QVERIFY(edit({{"project", project}, {"action", "check"}, {"profile", "bbc"}}).value("isError").toBool());
+            const QString ebu = QString::fromStdString(path("ebu.xml"));
+            r = call({{"project", project}, {"export", ebu}, {"format", "ebu-tt-d"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QFile f(ebu);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY(f.readAll().contains("urn:ebu:tt:distribution:2018-04"));
+        }
         QVERIFY(edit({{"project", project}, {"action", "spin"}}).value("isError").toBool());
         QVERIFY(edit({{"project", project}, {"action", "replace"}, {"find", "zebra"}, {"replace", "x"}}).value("isError").toBool());
 
@@ -31127,6 +31554,23 @@ if ui["pressed"] == "add":
             QVERIFY2(std::fabs(x0 - cx0) < 1 && std::fabs(x1 + 1 - cx1) < 1 && std::fabs(y0 - cy0) < 1 && std::fabs(y1 + 1 - cy1) < 1,
                      qPrintable(QString("drawn %1..%2 x %3..%4, projected %5..%6 x %7..%8").arg(x0).arg(x1).arg(y0).arg(y1).arg(cx0).arg(cx1).arg(cy0).arg(cy1)));
         }
+        // Fading out, it stays turned: a transition draws its card, not the flat picture.
+        {
+            Transition fade;
+            fade.id = p.newId();
+            fade.clipA = s.videoTracks[1].clips[0].id;
+            fade.duration = 6;
+            s.videoTracks[1].transitions.push_back(fade);
+            FrameTime a = 0, b = 0;
+            QVERIFY(edit::transitionRange(s.videoTracks[1], fade, a, b) && b > a);
+            const Image still = renderSequenceFrame(p, s, 0, o), fading = renderSequenceFrame(p, s, (a + b) / 2, o);
+            float outside = 0, inside = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    (still.at(x, y)[0] < 0.01f ? outside : inside) = std::max(still.at(x, y)[0] < 0.01f ? outside : inside, fading.at(x, y)[0]);
+            QVERIFY2(outside < 0.01f && inside > 0.2f, qPrintable(QString("red outside the card %1, inside %2").arg(outside).arg(inside)));
+            s.videoTracks[1].transitions.clear();
+        }
         // Turned edge on, it is gone.
         s.videoTracks[1].clips[0].effects[0].params["rot_y"] = 90.0;
         {
@@ -31470,6 +31914,24 @@ if ui["pressed"] == "add":
             QVERIFY2(mean <= 0.25 / 255, qPrintable(QString("shape %1 as contents: mean %2, worst %3 (of 255)").arg(shape).arg(mean * 255).arg(worst * 255)));
         }
 
+        // An arc's flags run together ("0 01", as minifiers write them) read as written apart.
+        {
+            const std::string head = R"(<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40">)";
+            auto drawn = [&](const char* d) {
+                const std::string file = path("arc.svg");
+                {
+                    std::ofstream f(file);
+                    f << head << "<path d=\"" << d << "\" fill=\"#fff\"/></svg>";
+                }
+                Effect g = makeEffect(p, "shape");
+                double w = 0, h = 0;
+                std::string err;
+                if (!importSvgShapes(file, g, w, h, nullptr, &err)) return -1.0;
+                return alphaSum(renderShape(g, 0, 40, 40, 1));
+            };
+            const double apart = drawn("M10 20a10 10 0 0 1 20 0z"), together = drawn("M10 20a10 10 0 0120 0z");
+            QVERIFY2(apart > 100 && std::fabs(together - apart) < 1e-6, qPrintable(QString("%1 %2").arg(apart).arg(together)));
+        }
         // What a hostile file or request could ask for stays bounded: repeaters of repeaters, zig-zags of zig-zags,
         // a wiggle of a huge path, a repeat offset of 1e300; an SVG whose <use> copies itself, and one nested very deep.
         {
@@ -31515,6 +31977,16 @@ if ui["pressed"] == "add":
             const std::string before = g.s("contents");
             QVERIFY(!importSvgShapes(laughs, g, w, h, &notes, &err) && err.find("too large") != std::string::npos);
             QVERIFY(!importSvgShapes(deep, g, w, h, &notes, &err) && err.find("deep") != std::string::npos);
+            {
+                // (one outline of 150,000 points: each point six parameters, copied with every undo step)
+                const std::string dense = path("dense.svg");
+                std::ofstream f(dense);
+                f << head << "<polygon points=\"";
+                for (int i = 0; i < 150000; ++i) f << i % 100 << ',' << (i * 7) % 100 << ' ';
+                f << "\"/></svg>";
+                f.close();
+                QVERIFY(!importSvgShapes(dense, g, w, h, &notes, &err) && err.find("too large") != std::string::npos);
+            }
             QCOMPARE(g.s("contents"), before);  // (left as it was)
             QVERIFY(clock.elapsed() < 120000);
             (void)img;
@@ -34898,6 +35370,36 @@ private slots:
         }
         const double wobbleSpread = (wobbleHigh - wobbleLow) / 2, levelSpread = (levelHigh - levelLow) / 2;
         QVERIFY2(wobbleSpread > 80 && levelSpread < 15, qPrintable(QStringLiteral("%1 %2").arg(wobbleSpread).arg(levelSpread)));
+        // A long edit is remade a minute or so at a time: two minutes of vowel two semitones up, still on pitch and at
+        // the same level either side of where the pieces meet (here in the voice, with no pause to split at).
+        {
+            const AudioBuffer longVowel = vowel(130, 110, 110);
+            AudioBuffer longUp;
+            applyPitchEdits(longVowel, {PitchEdit{0.3, 129.5, 2}}, longUp);
+            for (const double at : {60.2, 120.15}) {
+                const PitchTrack near = trackPitch(longUp, at - 1, at + 1, 50, 800);
+                double worst = 0;
+                double worstAt = 0;
+                for (size_t i = 0; i < near.f0.size(); ++i) {
+                    const double t = near.start + double(i) * near.hop;
+                    if (std::fabs(t - at) > 0.5) continue;
+                    const double d = near.f0[i] > 0 ? std::fabs(cents(near.f0[i], 110 * std::pow(2.0, 2 / 12.0))) : 1e9;
+                    if (d > worst) worst = d, worstAt = t;
+                }
+                QVERIFY2(worst < 10, qPrintable(QStringLiteral("%1 at %2 (%3)").arg(worst).arg(worstAt).arg(at)));
+                auto rms = [&](const AudioBuffer& x, double a, double b) {
+                    double e = 0;
+                    for (int64_t i = int64_t(a * sr); i < int64_t(b * sr); ++i) e += double(x.samples[size_t(i)]) * x.samples[size_t(i)];
+                    return std::sqrt(e / ((b - a) * sr));
+                };
+                // (each 40 ms against the edited sound's own level half a minute in, away from any seam)
+                const double level = rms(longUp, 30, 31);
+                for (double w = at - 0.2; w < at + 0.2; w += 0.04) {
+                    const double ratio = rms(longUp, w, w + 0.04) / level;
+                    QVERIFY2(ratio > 0.9 && ratio < 1.1, qPrintable(QStringLiteral("%1 at %2").arg(ratio).arg(w)));
+                }
+            }
+        }
         // No edits: the same sound.
         AudioBuffer untouched;
         applyPitchEdits(steady, {}, untouched);
@@ -37240,6 +37742,220 @@ private slots:
         Clip reframed = clip;
         reframed.effects.push_back(makeEffect(p, "reframe_360"));
         QVERIFY(!clipDepthAnalysed(p, s, reframed));
+    }
+
+    void tapeAndArchiveRepair() {
+        constexpr int sr = 48000;
+        auto stereo = [](const std::vector<double>& l, const std::vector<double>& r) {
+            AudioBuffer b;
+            b.sampleRate = sr;
+            b.channels = 2;
+            b.samples.resize(l.size() * 2);
+            for (size_t i = 0; i < l.size(); ++i) b.samples[i * 2] = float(l[i]), b.samples[i * 2 + 1] = float(r[i]);
+            return b;
+        };
+        // Music (chords changing every half second, two partials a note) with a 1 kHz tone, as content time tau.
+        const double chords[4][3] = {{200, 300, 450}, {250, 375, 560}, {220, 330, 440}, {275, 350, 420}};
+        auto music = [&](double tau) {
+            double v = 0.3 * std::sin(2 * M_PI * 1000 * tau);
+            const auto& chord = chords[size_t(std::max(0.0, tau) / 0.5) % 4];
+            for (double f : chord) v += 0.06 * std::sin(2 * M_PI * f * tau) + 0.03 * std::sin(2 * M_PI * 2 * f * tau);
+            return v;
+        };
+        const double seconds = 8;
+        const size_t n = size_t(seconds * sr);
+        // Played back with 0.8 Hz wow of 0.3 % and 12 Hz flutter of 0.05 %: speed s(t), content time its integral.
+        auto speedAt = [](double t) { return 1 + 0.003 * std::sin(2 * M_PI * 0.8 * t) + 0.0005 * std::sin(2 * M_PI * 12 * t); };
+        auto tauAt = [](double t) {
+            return t + 0.003 / (2 * M_PI * 0.8) * (1 - std::cos(2 * M_PI * 0.8 * t)) + 0.0005 / (2 * M_PI * 12) * (1 - std::cos(2 * M_PI * 12 * t));
+        };
+        std::vector<double> clean(n), wobbly(n);
+        for (size_t i = 0; i < n; ++i) clean[i] = music(double(i) / sr), wobbly[i] = music(tauAt(double(i) / sr));
+        const AudioBuffer flat = stereo(clean, clean), tape = stereo(wobbly, wobbly);
+        // The speed is read back from the sound (to 0.03 %, flutter included; against its mean, as it can only be).
+        {
+            const TransferSpeed got = measureTransferSpeed(tape);
+            QVERIFY(!got.speed.empty());
+            double mean = 0;
+            int count = 0;
+            for (double t = 0; t < seconds; t += 0.001) mean += speedAt(t), ++count;  // (over the whole, as measured)
+            mean /= count;
+            double worst = 0;
+            for (double t = 0.5; t < seconds - 0.5; t += 0.001) worst = std::max(worst, std::fabs(got.at(t) - speedAt(t) / mean));
+            QVERIFY2(worst < 3e-4, qPrintable(QString::number(worst)));
+        }
+        // Taken out: what is left wobbles by less than 0.02 %.
+        AudioBuffer steadied;
+        double found = 0;
+        QVERIFY(removeWowFlutter(tape, steadied, 1, 1, 0, nullptr, &found));
+        QVERIFY2(found > 0.003 && found < 0.004, qPrintable(QString::number(found)));
+        {
+            const TransferSpeed left = measureTransferSpeed(steadied, 1000);
+            double worst = 0;
+            for (double t = 0.5; t < seconds - 0.5; t += 0.001) worst = std::max(worst, std::fabs(left.at(t) - 1));
+            QVERIFY2(worst < 2e-4, qPrintable(QString::number(worst)));
+        }
+        // Flutter only: the wow stays.
+        AudioBuffer wowLeft;
+        QVERIFY(removeWowFlutter(tape, wowLeft, 0, 1, 1000));
+        {
+            const TransferSpeed left = measureTransferSpeed(wowLeft, 1000);
+            double worst = 0;
+            for (double t = 0.5; t < seconds - 0.5; t += 0.001) worst = std::max(worst, std::fabs(left.at(t) - 1));
+            QVERIFY2(worst > 0.0025, qPrintable(QString::number(worst)));
+        }
+        // A transfer with no wobble is left exactly as it was.
+        AudioBuffer same;
+        double flatFound = 0;
+        QVERIFY(removeWowFlutter(flat, same, 1, 1, 0, nullptr, &flatFound));
+        QVERIFY2(flatFound < 3e-4, qPrintable(QString::number(flatFound)));
+        QVERIFY(same.samples == flat.samples);
+
+        // Azimuth: band-limited noise on the left, the right 0.37 samples behind; found to 0.02 samples and put back so
+        // the difference nulls below -60 dB; the same with the right channel wired the wrong way round.
+        std::vector<double> noise(size_t(10 * sr));
+        {
+            uint32_t state = 12345;
+            std::vector<double> white(noise.size() + 256);
+            for (double& v : white) {
+                state = state * 1664525u + 1013904223u;
+                v = double(state) / 4294967296.0 - 0.5;
+            }
+            for (size_t i = 0; i < noise.size(); ++i) {  // (8 kHz low-pass, 255 taps)
+                double acc = 0;
+                for (int k = -127; k <= 127; ++k) {
+                    const double x = 2 * 8000.0 / sr * k;
+                    const double sinc = k == 0 ? 1 : std::sin(M_PI * x) / (M_PI * x);
+                    acc += white[size_t(int(i) + 128 + k)] * 2 * 8000.0 / sr * sinc * (0.42 + 0.5 * std::cos(M_PI * k / 128.0) + 0.08 * std::cos(2 * M_PI * k / 128.0));
+                }
+                noise[i] = acc;
+            }
+        }
+        auto delayed = [&](double d) {  // (a long windowed sinc)
+            std::vector<double> y(noise.size(), 0.0);
+            for (size_t i = 0; i < y.size(); ++i) {
+                const double at = double(i) - d;
+                const int64_t base = int64_t(std::floor(at));
+                double acc = 0;
+                for (int64_t k = base - 255; k <= base + 256; ++k) {
+                    if (k < 0 || k >= int64_t(noise.size())) continue;
+                    const double u = double(k) - at;
+                    const double sinc = std::fabs(u) < 1e-12 ? 1 : std::sin(M_PI * u) / (M_PI * u);
+                    const double w = std::fabs(u) >= 256 ? 0 : 0.42 + 0.5 * std::cos(M_PI * u / 256) + 0.08 * std::cos(2 * M_PI * u / 256);
+                    acc += noise[size_t(k)] * sinc * w;
+                }
+                y[i] = acc;
+            }
+            return y;
+        };
+        const std::vector<double> late = delayed(0.37);
+        for (const bool flip : {false, true}) {
+            std::vector<double> right = late;
+            if (flip)
+                for (double& v : right) v = -v;
+            const AudioBuffer pair = stereo(noise, right);
+            const Azimuth az = measureAzimuth(pair);
+            QVERIFY2(std::fabs(az.delay - 0.37) < 0.02 && az.inverted == flip, qPrintable(QString("%1 %2").arg(az.delay).arg(az.inverted)));
+            for (const bool adaptive : {false, true}) {
+                AudioBuffer fixed;
+                double d = 0;
+                QVERIFY(correctAzimuth(pair, fixed, adaptive, true, nullptr, &d));
+                double diff = 0, level = 0;
+                for (size_t i = sr / 10; i + sr / 10 < noise.size(); ++i) {
+                    const double l = fixed.samples[i * 2], r = fixed.samples[i * 2 + 1];
+                    diff += (l - r) * (l - r), level += l * l;
+                }
+                const double db = 10 * std::log10(diff / level);
+                QVERIFY2(db < -60, qPrintable(QString("%1 dB (adaptive %2, inverted %3)").arg(db).arg(adaptive).arg(flip)));
+            }
+        }
+        // Two unrelated channels (two microphones, not one track out of line) are left alone.
+        {
+            std::vector<double> other(noise.size());
+            for (size_t i = 0; i < other.size(); ++i) other[i] = noise[(i * 7919 + 13) % noise.size()];
+            const AudioBuffer pair = stereo(noise, other);
+            AudioBuffer out;
+            QVERIFY(correctAzimuth(pair, out, false, true));
+            QVERIFY(out.samples == pair.samples);
+        }
+        // Mono is left alone.
+        {
+            AudioBuffer one;
+            one.sampleRate = sr, one.channels = 1;
+            one.samples.assign(noise.begin(), noise.end());
+            AudioBuffer out;
+            QVERIFY(correctAzimuth(one, out, false, true));
+            QVERIFY(out.samples == one.samples);
+        }
+
+        // Strip Silence: bursts at 0.5-1.0 s, 1.1-1.3 s (a gap shorter than the shortest silence) and 2.0-2.5 s of 3 s:
+        // the sound regions at the exact samples, with 10 ms before and 50 ms after.
+        std::vector<float> bursts(size_t(3 * sr), 0.0f);
+        for (const auto& [a, b] : std::vector<std::pair<double, double>>{{0.5, 1.0}, {1.1, 1.3}, {2.0, 2.5}})
+            for (size_t i = size_t(a * sr); i < size_t(b * sr); ++i) bursts[i] = (i / 24) % 2 ? 0.5f : -0.5f;  // (a 1 kHz square)
+        bursts[size_t(1.7 * sr)] = 0.001f;  // (under the threshold)
+        AudioBuffer burst;
+        burst.sampleRate = sr, burst.channels = 1;
+        burst.samples = bursts;
+        const auto regions = soundRegions(burst, -40, 0.25, 0.01, 0.05);
+        QCOMPARE(regions, (std::vector<std::pair<int64_t, int64_t>>{{23520, 64800}, {95520, 122400}}));
+        // A quiet start shorter than the shortest silence stays.
+        QCOMPARE(soundRegions(burst, -40, 0.6, 0.01, 0.05).front().first, int64_t(0));
+        // On the timeline at 25 fps: the clip and its linked video cut to frames 12-34 and 49-64, in one edit.
+        const std::string wav = path("bursts.wav");
+        QVERIFY(writeMonoWav(wav, bursts, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        Clip a = makeClip(p, p.media.back(), TrackKind::Audio, s);
+        a.start = 0;
+        a.linkGroup = p.newId();
+        Clip v = makeGeneratorClip(p, "color", 75);
+        v.start = 0;
+        v.linkGroup = a.linkGroup;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Audio, 0}, a).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, v).ok);
+        const Clip& placed = s.audioTracks[0].clips.at(0);
+        QCOMPARE(placed.duration, FrameTime(75));
+        const Id audioId = placed.id;
+        const auto frames = clipSoundFrames(s, placed, regions, sr);
+        QCOMPARE(frames, (std::vector<std::pair<FrameTime, FrameTime>>{{12, 34}, {49, 64}}));
+        const std::string project = path("strip-silence.montage");
+        QVERIFY(saveProject(p, project));
+        const Sequence before = s;
+        const edit::Result r = edit::stripSilence(p, s, {{audioId, frames}}, true);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.applied, FrameTime(6));
+        for (const Track* t : {&s.audioTracks[0], &s.videoTracks[0]}) {
+            QCOMPARE(t->clips.size(), size_t(2));
+            QCOMPARE(t->clips[0].start, FrameTime(12));
+            QCOMPARE(t->clips[0].end(), FrameTime(34));
+            QCOMPARE(t->clips[1].start, FrameTime(49));
+            QCOMPARE(t->clips[1].end(), FrameTime(64));
+        }
+        QCOMPARE(s.audioTracks[0].clips[1].sourceIn, before.audioTracks[0].clips[0].sourceIn + 49);
+        QVERIFY(s.audioTracks[0].clips[0].linkGroup == s.videoTracks[0].clips[0].linkGroup &&
+                s.audioTracks[0].clips[1].linkGroup == s.videoTracks[0].clips[1].linkGroup &&
+                s.audioTracks[0].clips[0].linkGroup != s.audioTracks[0].clips[1].linkGroup);
+        // Over MCP, without the video.
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_strip_silence"},
+                                                     {"arguments", QJsonObject{{"project", QString::fromStdString(project)},
+                                                                               {"clips", QJsonArray{double(audioId)}},
+                                                                               {"threshold_db", -40}, {"linked", false}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("removed").toDouble(), 3.0);
+        Project back;
+        QVERIFY(loadProject(project, back));
+        QCOMPARE(back.active()->audioTracks[0].clips.size(), size_t(2));
+        QCOMPARE(back.active()->videoTracks[0].clips.size(), size_t(1));
     }
 
     void surfaceTrackerOnAClip() {

@@ -205,6 +205,10 @@ ChartMatchDialog::ChartMatchDialog(const Image& frame, const Image& view, const 
     sameMedia_ = new QCheckBox(tr("Every clip of this media"), this);
     sameMedia_->setObjectName(QStringLiteral("chartSameMedia"));
     side->addWidget(sameMedia_);
+    crosstalk_ = new QCheckBox(tr("As Crosstalk (neutrals kept, no offset)"), this);
+    crosstalk_->setObjectName(QStringLiteral("chartAsCrosstalk"));
+    crosstalk_->setToolTip(tr("Fit the camera's crosstalk, as under LED light, as a Crosstalk effect whose primaries can then be moved by hand"));
+    side->addWidget(crosstalk_);
     side->addStretch(1);
     row->addLayout(side, 2);
     layout->addLayout(row, 1);
@@ -277,6 +281,7 @@ void ChartMatchDialog::setQuad(const TrackQuad& q) {
 TrackQuad ChartMatchDialog::quad() const { return view_->quad(); }
 
 bool ChartMatchDialog::sameMedia() const { return sameMedia_->isChecked(); }
+bool ChartMatchDialog::asCrosstalk() const { return crosstalk_->isChecked(); }
 
 void ChartMatchDialog::measure() {
     bool complete = false;

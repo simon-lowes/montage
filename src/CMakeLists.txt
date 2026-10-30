@@ -170,6 +170,7 @@ add_library(montage_engine STATIC
   render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp
   render/Iab.h render/Iab.cpp
+  render/ImmersiveTrackFile.h render/ImmersiveTrackFile.cpp
   render/Iamf.h render/Iamf.cpp
   render/HdrStill.h render/HdrStill.cpp
   render/Relight.h render/Relight.cpp
@@ -240,6 +241,9 @@ add_library(montage_engine STATIC
   render/ColorSpace.h render/ColorSpace.cpp
   render/Gamut.h render/Gamut.cpp
   render/ColorSlice.h render/ColorSlice.cpp
+  render/CleanPlate.h render/CleanPlate.cpp
+  render/Fdl.h render/Fdl.cpp
+  render/Crosstalk.h render/Crosstalk.cpp
   render/Clf.h render/Clf.cpp
   render/Amf.h render/Amf.cpp
   render/HdrView.h render/HdrView.cpp
@@ -268,10 +272,12 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/RenderFarm.h render/RenderFarm.cpp
+  render/SegmentedExport.h render/SegmentedExport.cpp
   render/GradeGraph.h render/GradeGraph.cpp
   render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
+  render/St2110.h render/St2110.cpp render/Nmos.h render/Nmos.cpp
   render/RemoteReview.h render/RemoteReview.cpp
   render/RemoteGrade.h render/RemoteGrade.cpp
   render/SkyReplace.h render/SkyReplace.cpp
@@ -288,6 +294,7 @@ add_library(montage_engine STATIC
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp
+  audio/TapeRepair.h audio/TapeRepair.cpp
   audio/SpectralRepair.h audio/SpectralRepair.cpp
   audio/TimeStretch.h audio/TimeStretch.cpp
   audio/Upmix.h audio/Upmix.cpp
@@ -575,6 +582,10 @@ if(MONTAGE_WITH_OPENEXR)
                                                     ${openexr_SOURCE_DIR}/external/zstd/lib)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
 endif()
+if(WIN32)
+  # (ST 2110's UDP sockets and interface list: render/St2110)
+  target_link_libraries(montage_engine PRIVATE ws2_32 iphlpapi)
+endif()
 if(MONTAGE_WITH_OMT)
   # Open Media Transport: the protocol (media/Omt), a reference output (render/OmtOutput) and a Capture source.
   target_sources(montage_engine PRIVATE media/Omt.h media/Omt.cpp media/OmtNet.h media/OmtNet.cpp media/OmtDiscovery.cpp
@@ -593,6 +604,10 @@ endif()
 if(MONTAGE_WITH_SPATIAL_VIDEO)
   target_link_libraries(montage_engine PRIVATE montage_x265)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_SPATIAL_VIDEO)
+endif()
+if(MONTAGE_WITH_FDL)
+  target_link_libraries(montage_engine PRIVATE montage_fdl)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_FDL)
 endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)

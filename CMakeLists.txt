@@ -23,6 +23,7 @@ option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at co
 option(MONTAGE_WITH_LLAMA "Words from the footage with a small language model on this computer (llama.cpp, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
 option(MONTAGE_WITH_THORVG "Lottie animations and SVG graphics with ThorVG (MIT, fetched at configure time)" ON)
+option(MONTAGE_WITH_FDL "ASC Framing Decision Lists (the ASC's libfdl_core, Apache-2.0, with jsoncons, BSL-1.0, fetched at configure time)" ON)
 option(MONTAGE_WITH_LUA "Lua scripting (Lua 5.4, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibRaw 0.20+ is installed" ON)
@@ -293,6 +294,38 @@ if(MONTAGE_WITH_THORVG)
   target_compile_options(montage_thorvg PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<CXX_COMPILER_ID:MSVC>:/w /O2>)
   find_package(Threads REQUIRED)
   target_link_libraries(montage_thorvg PRIVATE Threads::Threads)
+endif()
+
+if(MONTAGE_WITH_FDL)
+  include(FetchContent)
+  # The ASC's reference implementation of Framing Decision Lists (render/Fdl.h): its C library compiled here as a
+  # static library (its own build makes a shared one), with jsoncons (header-only) for JSON and schema validation.
+  FetchContent_Declare(ascfdl
+    GIT_REPOSITORY https://github.com/ascmitc/fdl.git
+    GIT_TAG e7c7d2b217f1955d7e996001b4d39aa694e34501  # v1.0.2
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_Declare(jsoncons
+    GIT_REPOSITORY https://github.com/danielaparker/jsoncons.git
+    GIT_TAG v1.5.0
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_MakeAvailable(ascfdl jsoncons)
+  set(FDL_CORE ${ascfdl_SOURCE_DIR}/native/core)
+  file(GLOB MONTAGE_FDL_SOURCES ${FDL_CORE}/src/*.cpp)
+  # Its schemas embedded (as its build does), and its export macro empty for a static library.
+  execute_process(COMMAND ${CMAKE_COMMAND} -DFDL_SCHEMA_DIR=${ascfdl_SOURCE_DIR}/schema
+    -DFDL_SCHEMA_OUT=${CMAKE_BINARY_DIR}/ascfdl/fdl_schema_data.h -P ${FDL_CORE}/cmake/GenerateSchemaHeader.cmake)
+  file(WRITE ${CMAKE_BINARY_DIR}/ascfdl/fdl_export.h "#pragma once\n#define FDL_API\n")
+  include(${FDL_CORE}/cmake/FDLVersion.cmake)
+  add_library(montage_fdl STATIC ${MONTAGE_FDL_SOURCES})
+  target_include_directories(montage_fdl PUBLIC ${FDL_CORE}/include ${CMAKE_BINARY_DIR}/ascfdl
+    PRIVATE ${FDL_CORE}/src ${jsoncons_SOURCE_DIR}/include)
+  target_compile_definitions(montage_fdl PRIVATE FDL_ABI_VERSION_MAJOR=${FDL_ABI_VERSION_MAJOR}
+    FDL_ABI_VERSION_MINOR=${FDL_ABI_VERSION_MINOR} FDL_ABI_VERSION_PATCH=${FDL_ABI_VERSION_PATCH}
+    $<$<BOOL:${WIN32}>:NOMINMAX _CRT_SECURE_NO_WARNINGS>)
+  set_target_properties(montage_fdl PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden
+    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF CXX_STANDARD 17)
+  target_compile_options(montage_fdl PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w> $<$<CXX_COMPILER_ID:MSVC>:/w /bigobj>)
 endif()
 
 # SQLite (public domain) for the sound library's index (media/SoundLibrary.h), from its amalgamation, with full-text

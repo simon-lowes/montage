@@ -9,9 +9,11 @@ namespace montage {
 
 bool isGradeEffect(const Effect& e) {
     const EffectInfo* info = findEffectInfo(e.type);
-    // (A Chart Match is the camera's calibration, under every version, not one of them.)
+    // (A Chart Match is the camera's calibration, under every version, not one of them; so is a Crosstalk fitted to a
+    // chart.)
     // (Any effect in a grade node is part of the grade: a blur in a node, say.)
     if (e.node != 0) return true;
+    if (e.type == "crosstalk" && !e.s("matrix").empty()) return false;
     return info && info->category == EffectCategory::VideoFilter && info->group == "Color" && e.type != "chart_match";
 }
 

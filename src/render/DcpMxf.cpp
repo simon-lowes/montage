@@ -11,6 +11,7 @@
 #include <ctime>
 #include <map>
 #include <random>
+#include <set>
 
 #ifdef _WIN32
 #include <QString>
@@ -1053,10 +1054,15 @@ bool TrackFileWriter::close(std::string* error) {
     if (imf_) {
         // AS-02: the index in a partition of its own after the essence, then an empty footer; the body partition
         // pack learns where the footer is.
+        if (!finishEssence(error)) {
+            std::fclose(f_);
+            f_ = nullptr;
+            return false;
+        }
         if (clipLengthAt_ >= 0) {
             Bytes len;
             put8(len, 0x87);
-            const uint64_t n = essenceBytes_ - clipStart_;
+            const uint64_t n = (clipEnd_ ? clipEnd_ : essenceBytes_) - clipStart_;
             for (int k = 6; k >= 0; --k) put8(len, (n >> (8 * k)) & 0xff);
             if (std::fseek(f_, long(clipLengthAt_), SEEK_SET) != 0 || std::fwrite(len.data(), 1, len.size(), f_) != len.size()) return fail();
         }
@@ -2479,6 +2485,345 @@ std::vector<uint8_t> ImfIabWriter::headerMetadata(int64_t duration) const {
 
 std::vector<uint8_t> ImfIabWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
 
+// ---- IMF immersive sound as MGA with S-ADM, and as ADM ---------------------------------------------------------------
+
+namespace {
+
+// The MCA items both label kinds share (as the IAB label's), then each kind's own (numbered down from 0xffff).
+const PrimerEntry kImfMgaPrimer[] = {
+    {0x3d01, "060e2b34010101040402030304000000"}, {0x3d02, "060e2b34010101040402030104000000"},
+    {0x3d03, "060e2b34010101050402030101010000"}, {0x3d06, "060e2b34010101020402040200000000"},
+    {0x3d07, "060e2b34010101050402010104000000"}, {0xfffe, "060e2b340101010e0103070101000000"},
+    {0xfffd, "060e2b340101010e0103070105000000"}, {0xfffc, "060e2b340101010e0103070102000000"},
+    {0xfffb, "060e2b340101010e0103070103000000"}, {0xfffa, "060e2b340101010d0301010203150000"},
+    {0xfff9, "060e2b340101010e0105100000000000"}, {0xfff8, "060e2b340101010e0105110000000000"},
+    {0xfff7, "060e2b340101010e0302010222000000"}, {0xfff6, "060e2b340101010e0302010223000000"},
+    {0xfff5, "060e2b340101010e0402010106000000"}, {0xfff4, "060e2b340101010e0402010107000000"},
+    {0xfff3, "060e2b340101010e0402030401000000"}, {0xfff2, "060e2b340101010e0402030402000000"},  // MGA block align, bytes/s
+    {0xfff1, "060e2b340101010e0402030501000000"}, {0xfff0, "060e2b340101010e0402030502000000"},  // MGALinkID, index
+    {0xffef, "060e2b340101010e0402030503000000"}, {0xffee, "060e2b340101010e0402030504000000"},  // identifier, payload ULs
+    {0xffed, "060e2b340101010e0402030601000000"}, {0xffec, "060e2b340101010e0402030602000000"},  // section link, programme
+    {0xffeb, "060e2b340101010e0402030701000000"}, {0xffea, "060e2b340101010e0402030702000000"},  // S-ADM section link, profiles
+};
+const PrimerEntry kImfAdmPrimer[] = {
+    {0xfffe, "060e2b340101010e0103070101000000"}, {0xfffd, "060e2b340101010e0103070105000000"},
+    {0xfffc, "060e2b340101010e0103070102000000"}, {0xfffb, "060e2b340101010e0103070103000000"},
+    {0xfffa, "060e2b340101010d0301010203150000"}, {0xfff9, "060e2b340101010e0105100000000000"},
+    {0xfff8, "060e2b340101010e0105110000000000"}, {0xfff7, "060e2b340101010e0302010222000000"},
+    {0xfff6, "060e2b340101010e0302010223000000"},
+    {0xfff4, "060e2b340101010e0402030901000000"}, {0xfff3, "060e2b340101010e0402030902000000"},  // channels, UIDs
+    {0xfff2, "060e2b340101010e0402030903000000"}, {0xfff1, "060e2b340101010e0402030904000000"},  // mappings, local channel
+    {0xfff0, "060e2b340101010e0402030905000000"}, {0xffef, "060e2b340101010e0402030906000000"},  // track UID, format
+    {0xffee, "060e2b340101010e0402030907000000"}, {0xffed, "060e2b340101010e0402030806000000"},  // pack, stream IDs
+    {0xffec, "060e2b340101010e0402030801000000"}, {0xffeb, "060e2b340101010e0402030802000000"},  // stream ID, chunk ID
+    {0xffea, "060e2b340101010e0402030a01000000"}, {0xffe9, "060e2b340101010e0402030a02000000"},  // link, profiles
+    {0xffe8, "060e2b340101010e0402030b01000000"}, {0xffe7, "060e2b340101010e0402030b02000000"},  // link, programme
+};
+constexpr const char* kImfMgaElement = "060e2b34010201010d01030116010f01";  // a clip of MGA frames (track number 16010f01)
+constexpr const char* kContainerConstraints = "060e2b34025301010d01010101016700";
+
+Bytes ulBatch(std::initializer_list<const char*> uls) {
+    Bytes b;
+    put32(b, uls.size());
+    put32(b, 16);
+    for (const char* u : uls) putUl(b, u);
+    return b;
+}
+
+}  // namespace
+
+bool ImfMgaSadmWriter::open(const std::string& path, const Uuid& asset, EditRate rate, int channels, const std::string& language,
+                            const std::string& title, const std::string& titleVersion, const std::string& programmeId, std::string* error) {
+    if (channels < 1 || channels > 128) {
+        if (error) *error = "MGA sound here has 1 to 128 channels";
+        return false;
+    }
+    channels_ = channels;
+    language_ = language.empty() ? "en" : language;
+    title_ = title.empty() ? "Untitled" : title;
+    version_ = titleVersion.empty() ? "1" : titleVersion;
+    programme_ = programmeId.empty() ? "APR_1001" : programmeId;
+    if (!openImfFile(path, asset, rate, error)) return false;
+    // One KLV for every frame, its length written on closing; the index points at each frame inside it.
+    Bytes kl;
+    putUl(kl, kImfMgaElement);
+    clipLengthAt_ = long(kHeaderSize + 140 + 16);
+    kl.insert(kl.end(), 8, 0);
+    kl[16] = 0x87;
+    if (!writeRaw(kl.data(), kl.size(), error)) return false;
+    clipStart_ = essenceBytes_;
+    return true;
+}
+
+bool ImfMgaSadmWriter::write(const int32_t* samples, size_t frames, const std::string& sadm, std::string* error) {
+    // The MGA frame: two sections, the sound (index 0, identifier 0) and the S-ADM payload (index 1, identifier 2: one
+    // ST 2109 payload, tag 0x12, its BER length, then version 0, format 0 (UTF-8) and the XML).
+    const size_t pcm = frames * size_t(channels_) * 3;
+    Bytes payload;
+    put8(payload, 0x12);
+    const size_t value = 2 + sadm.size();
+    if (value < 0x80) {
+        put8(payload, value);
+    } else {
+        put8(payload, 0x84);
+        put32(payload, value);
+    }
+    put8(payload, 0);
+    put8(payload, 0);
+    payload.insert(payload.end(), sadm.begin(), sadm.end());
+    buf_.clear();
+    buf_.reserve(1 + 6 + pcm + 6 + payload.size());
+    put8(buf_, 2);
+    put8(buf_, 0);
+    put8(buf_, 0);
+    put32(buf_, pcm);
+    for (size_t i = 0; i < frames * size_t(channels_); ++i) {
+        const int32_t s = std::clamp(samples[i], -8388607, 8388607);
+        buf_.push_back(uint8_t(s));
+        buf_.push_back(uint8_t(s >> 8));
+        buf_.push_back(uint8_t(s >> 16));
+    }
+    put8(buf_, 1);
+    put8(buf_, 2);
+    put32(buf_, payload.size());
+    putBytes(buf_, payload);
+    const uint64_t at = essenceBytes_;
+    if (!writeRaw(buf_.data(), buf_.size(), error)) return false;
+    offsets_.push_back(at);
+    return true;
+}
+
+const Uuid& ImfMgaSadmWriter::soundfieldId() const { return ids_[kSub]; }
+const Uuid& ImfMgaSadmWriter::soundfieldLink() const { return ids_[kSoundfieldLink]; }
+const Uuid& ImfMgaSadmWriter::constraintsId() const { return ids_[kChannelSet0]; }
+const Uuid& ImfMgaSadmWriter::metadataId() const { return ids_[kChannelSet0 + 1]; }
+const Uuid& ImfMgaSadmWriter::metadataLink() const { return ids_[kChannelSet0 + 2]; }
+const Uuid& ImfMgaSadmWriter::sadmId() const { return ids_[kChannelSet0 + 3]; }
+
+std::array<uint8_t, 16> ImfMgaSadmWriter::essenceContainer() const { return ul(kContainer); }
+
+std::vector<uint8_t> ImfMgaSadmWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kImfMgaPrimer), std::end(kImfMgaPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kContainer, kSoundDef, "MGA Sound Track", 0x16010f01,
+                              "Clip wrapping of MGA frames with S-ADM as specified in SMPTE ST 2067-203"));
+    {
+        Set s;  // MGASoundEssenceDescriptor
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, {constraintsId(), metadataId(), sadmId(), soundfieldId()});
+        s.u32(0x3006, 1);
+        s.rational(0x3001, rate_.num, rate_.den);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kContainer);
+        s.rational(0x3d03, 48000, 1);
+        s.u8(0x3d02, 0);
+        s.u32(0x3d07, uint32_t(channels_));
+        s.u32(0x3d01, 24);
+        s.label(0x3d06, kCoding);
+        s.u16(0xfff3, uint32_t(3 * channels_));
+        s.u32(0xfff2, uint32_t(48000 * 3 * channels_));
+        s.rational(0xfff5, rate_.num, rate_.den);
+        s.u8(0xfff4, uint8_t(int8_t(kReferenceLevel)));
+        putBytes(out, setKlv("060e2b34025301010d01010101018106", s));
+    }
+    {
+        Set s;  // ContainerConstraintsSubDescriptor (ST 379-2)
+        s.uuid(0x3c0a, constraintsId());
+        putBytes(out, setKlv(kContainerConstraints, s));
+    }
+    {
+        Set s;  // MGAAudioMetadataSubDescriptor: section 1, one ST 2109 payload, S-ADM
+        s.uuid(0x3c0a, metadataId());
+        s.uuid(0xfff1, metadataLink());
+        s.u8(0xfff0, 1);
+        s.u8(0xffef, 2);
+        s.item(0xffee, ulBatch({kSadmPayload}));
+        putBytes(out, setKlv("060e2b34025301010d01010101018107", s));
+    }
+    {
+        Set s;  // SADMAudioMetadataSubDescriptor
+        s.uuid(0x3c0a, sadmId());
+        s.uuid(0xffeb, metadataLink());
+        s.item(0xffea, ulBatch({kProfile}));
+        putBytes(out, setKlv("060e2b34025301010d01010101018109", s));
+    }
+    {
+        const Bytes language(language_.begin(), language_.end());
+        Set s;  // MGASoundfieldGroupLabelSubDescriptor
+        s.uuid(0x3c0a, soundfieldId());
+        s.label(0xfffe, kSoundfield);
+        s.uuid(0xfffd, soundfieldLink());
+        s.text(0xfffc, "MGASf");
+        s.text(0xfffb, "MGA Soundfield");
+        s.item(0xfffa, language);
+        s.text(0xfff9, title_);
+        s.text(0xfff8, version_);
+        s.text(0xfff7, "PRM");
+        s.text(0xfff6, "FCMP");
+        s.uuid(0xffed, metadataLink());
+        s.text(0xffec, programme_);
+        putBytes(out, setKlv("060e2b34025301010d01010101018108", s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> ImfMgaSadmWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
+bool ImfAdmWriter::open(const std::string& path, const Uuid& asset, int channels, std::vector<AdmChannelMapping> chna, std::string axml,
+                        const std::string& language, const std::string& title, const std::string& titleVersion,
+                        const std::string& programmeId, std::string* error) {
+    if (channels < 1 || channels > 128 || chna.empty()) {
+        if (error) *error = "ADM sound here has 1 to 128 channels, each in the channel assignment";
+        return false;
+    }
+    channels_ = channels;
+    chna_ = std::move(chna);
+    axml_ = std::move(axml);
+    language_ = language.empty() ? "en" : language;
+    title_ = title.empty() ? "Untitled" : title;
+    version_ = titleVersion.empty() ? "1" : titleVersion;
+    programme_ = programmeId.empty() ? "APR_1001" : programmeId;
+    if (!openImfFile(path, asset, {48000, 1}, error)) return false;
+    mappings_.clear();
+    for (size_t i = 0; i < chna_.size(); ++i) mappings_.push_back(newUuid());
+    Bytes kl;
+    putUl(kl, kImfSoundElement);
+    clipLengthAt_ = long(kHeaderSize + 140 + 16);
+    kl.insert(kl.end(), 8, 0);
+    kl[16] = 0x87;
+    if (!writeRaw(kl.data(), kl.size(), error)) return false;
+    clipStart_ = essenceBytes_;
+    return true;
+}
+
+bool ImfAdmWriter::writePcm(const int32_t* samples, size_t frames, std::string* error) {
+    const size_t n = frames * size_t(channels_);
+    buf_.resize(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t s = std::clamp(samples[i], -8388607, 8388607);
+        buf_[i * 3] = uint8_t(s);
+        buf_[i * 3 + 1] = uint8_t(s >> 8);
+        buf_[i * 3 + 2] = uint8_t(s >> 16);
+    }
+    if (!writeRaw(buf_.data(), buf_.size(), error)) return false;
+    samples_ += int64_t(frames);
+    return true;
+}
+
+bool ImfAdmWriter::finishEssence(std::string* error) {
+    // The clip ends; the axml chunk's data follows in a generic stream partition of its own.
+    endClip();
+    return startStream(kAxmlStream, error) &&
+           writeElement(ul(kStreamElement).data(), reinterpret_cast<const uint8_t*>(axml_.data()), axml_.size(), error, false);
+}
+
+const Uuid& ImfAdmWriter::soundfieldId() const { return ids_[kSub]; }
+const Uuid& ImfAdmWriter::soundfieldLink() const { return ids_[kSoundfieldLink]; }
+const Uuid& ImfAdmWriter::chnaId() const { return ids_[kChannelSet0]; }
+const Uuid& ImfAdmWriter::referencesId() const { return ids_[kChannelSet0 + 1]; }
+const Uuid& ImfAdmWriter::chunkId() const { return ids_[kChannelSet0 + 2]; }
+const Uuid& ImfAdmWriter::metadataId() const { return ids_[kChannelSet0 + 3]; }
+
+std::array<uint8_t, 16> ImfAdmWriter::essenceContainer() const { return ul(kImfWaveContainer); }
+
+std::vector<uint8_t> ImfAdmWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kImfSoundPrimer), std::begin(kImfSoundPrimer) + 7);  // the wave descriptor's
+    entries.insert(entries.end(), std::begin(kImfAdmPrimer), std::end(kImfAdmPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kImfWaveContainer, kSoundDef, "Sound Track", 0x16010201,
+                              "File Package: SMPTE 382M clip wrapping of wave audio with ADM (SMPTE ST 2131)"));
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, {chnaId(), referencesId(), chunkId(), metadataId(), soundfieldId()});
+        s.u32(0x3006, 1);
+        s.rational(0x3001, 48000, 1);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kImfWaveContainer);
+        s.rational(0x3d03, 48000, 1);
+        s.u8(0x3d02, 0);
+        s.u32(0x3d07, uint32_t(channels_));
+        s.u32(0x3d01, 24);
+        s.u16(0x3d0a, uint32_t(3 * channels_));
+        s.u32(0x3d09, uint32_t(48000 * 3 * channels_));
+        s.label(0x3d32, kAssignment);
+        putBytes(out, setKlv(0x48, s));
+    }
+    for (size_t i = 0; i < chna_.size(); ++i) {
+        Set s;  // ADMChannelMapping
+        s.uuid(0x3c0a, mappings_[i]);
+        s.u32(0xfff1, chna_[i].channel);
+        s.text(0xfff0, chna_[i].uid);
+        s.text(0xffef, chna_[i].trackFormat);
+        if (!chna_[i].pack.empty()) s.text(0xffee, chna_[i].pack);
+        putBytes(out, setKlv("060e2b34025301010d0101010101810f", s));
+    }
+    {
+        std::set<uint32_t> local;
+        for (const AdmChannelMapping& m : chna_) local.insert(m.channel);
+        Set s;  // ADM_CHNASubDescriptor
+        s.uuid(0x3c0a, chnaId());
+        s.u16(0xfff4, local.size());
+        s.u16(0xfff3, chna_.size());
+        s.refs(0xfff2, mappings_);
+        putBytes(out, setKlv("060e2b34025301010d0101010101810e", s));
+    }
+    {
+        Set s;  // RIFFChunkReferencesSubDescriptor
+        s.uuid(0x3c0a, referencesId());
+        Bytes ids;
+        put32(ids, 1);
+        put32(ids, 4);
+        put32(ids, kAxmlStream);
+        s.item(0xffed, ids);
+        putBytes(out, setKlv("060e2b34025301010d01010101018110", s));
+    }
+    {
+        Set s;  // RIFFChunkDefinitionSubDescriptor: axml, in its stream
+        s.uuid(0x3c0a, chunkId());
+        s.u32(0xffec, kAxmlStream);
+        s.item(0xffeb, Bytes{'a', 'x', 'm', 'l'});
+        putBytes(out, setKlv("060e2b34025301010d0101010101810d", s));
+    }
+    {
+        Set s;  // ADMAudioMetadataSubDescriptor
+        s.uuid(0x3c0a, metadataId());
+        s.u32(0xffea, kAxmlStream);
+        s.item(0xffe9, ulBatch({kProfile}));
+        putBytes(out, setKlv("060e2b34025301010d01010101018111", s));
+    }
+    {
+        const Bytes language(language_.begin(), language_.end());
+        Set s;  // ADMSoundfieldGroupLabelSubDescriptor
+        s.uuid(0x3c0a, soundfieldId());
+        s.label(0xfffe, kSoundfield);
+        s.uuid(0xfffd, soundfieldLink());
+        s.text(0xfffc, "ADM");
+        s.text(0xfffb, "ADM");
+        s.item(0xfffa, language);
+        s.text(0xfff9, title_);
+        s.text(0xfff8, version_);
+        s.text(0xfff7, "PRM");
+        s.text(0xfff6, "FCMP");
+        s.u32(0xffe8, kAxmlStream);
+        s.text(0xffe7, programme_);
+        putBytes(out, setKlv("060e2b34025301010d01010101018112", s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> ImfAdmWriter::indexSegments() const {
+    Set s;
+    indexBase(s, rate_, 0, samples_, uint32_t(3 * channels_));
+    Bytes entries;
+    put32(entries, 0);
+    put32(entries, 11);
+    s.item(0x3f0a, entries);
+    return klv(ul("060e2b34025301010d01020101100100"), s.body);
+}
+
 // ---- IMF timed text -----------------------------------------------------------------------------------------------
 
 bool ImfTimedTextWriter::write(const std::string& xml, int64_t duration, const std::string& language, std::string* error,
@@ -2534,7 +2879,19 @@ std::vector<uint8_t> ImfTimedTextWriter::indexSegments() const { return vbrIndex
 
 // ---- Reading IMF track files --------------------------------------------------------------------------------------
 
-bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfPictureOnly) {
+namespace {
+
+// A UTF-16 string item as text (IDs and names: the characters ASCII has).
+std::string asciiOfUtf16(const Bytes& b) {
+    std::string out;
+    for (size_t i = 0; i + 1 < b.size(); i += 2)
+        if (const unsigned c = unsigned(b[i]) << 8 | b[i + 1]; c >= 0x20 && c < 0x7f) out += char(c);
+    return out;
+}
+
+}  // namespace
+
+bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfPictureOnly, bool immersiveOnly) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -2550,6 +2907,11 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     elements_.clear();
     clipAt_ = clipSize_ = 0;
     resources_.clear();
+    adm_ = false;
+    sampleRate_ = 48000;
+    chna_.clear();
+    axmlStream_ = 0;
+    axmlAt_ = axmlSize_ = 0;
     std::map<uint16_t, std::string> primer;  // local tags and the labels they stand for (hex, the version byte as 00)
     // An item of a set by its label, through the primer (its dynamic tags differ between writers).
     auto item = [&](const std::map<uint16_t, Bytes>& set, const char* hex) -> const Bytes* {
@@ -2566,7 +2928,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     uint32_t stream = 0;                                            // the generic stream partition read last
     // Every KLV in turn: the header's sets (the file package's id, the sound's channels) and the essence elements
     // (06.0e.2b.34.01.02.01.01.0d.01.03.01, byte 12 the item: 15 picture, 16 sound, 17 data).
-    bool sound = false, text = false, iab = false;
+    bool sound = false, text = false, iab = false, mga = false;
     for (uint64_t at = 0; at + 17 <= file.size;) {
         uint8_t key[16];
         uint64_t length = 0, head = 0;
@@ -2591,6 +2953,37 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             stream = uint32_t(beOf(Bytes(v.begin() + 60, v.begin() + 64)));
         } else if (std::memcmp(key, ul(kStreamElement).data(), 13) == 0) {
             if (stream) streamData[stream] = {value, length};
+        } else if (std::memcmp(key, set, 6) == 0 && key[14] == 0x81 && length < (1u << 20) && (key[15] == 0x06 || key[15] == 0x0d || key[15] == 0x0f)) {
+            // MGA's sound descriptor (ST 2127-1), and ST 2131's RIFF chunk definitions and ADM channel mappings.
+            Bytes v(static_cast<size_t>(length));
+            if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
+            const auto it = items(v);
+            if (key[15] == 0x06) {
+                mga = true;
+                if (auto c = it.find(0x3d07); c != it.end() && c->second.size() == 4) channels_ = int(std::min<uint64_t>(beOf(c->second), 4096));
+                if (auto q = it.find(0x3d01); q != it.end() && q->second.size() == 4 && beOf(q->second) != 24) return fail(path + " is not 24-bit sound");
+                if (auto a = it.find(0x3d03); a != it.end() && a->second.size() == 8)
+                    sampleRate_ = int(std::min<uint64_t>(beOf(Bytes(a->second.begin(), a->second.begin() + 4)), 768000));
+                if (auto r = it.find(0x3001); r != it.end() && r->second.size() == 8)
+                    rate_ = EditRate{uint32_t(beOf(Bytes(r->second.begin(), r->second.begin() + 4))), uint32_t(beOf(Bytes(r->second.begin() + 4, r->second.end())))};
+            } else if (key[15] == 0x0d) {
+                const Bytes* sid = item(it, "060e2b340101010e0402030801000000");
+                const Bytes* id = item(it, "060e2b340101010e0402030802000000");
+                if (sid && sid->size() == 4 && id && id->size() == 4 && std::memcmp(id->data(), "axml", 4) == 0) axmlStream_ = uint32_t(beOf(*sid));
+            } else if (chna_.size() < 4096) {
+                AdmChannelMapping m;
+                const Bytes* local = item(it, "060e2b340101010e0402030904000000");
+                const Bytes* uid = item(it, "060e2b340101010e0402030905000000");
+                const Bytes* format = item(it, "060e2b340101010e0402030906000000");
+                const Bytes* pack = item(it, "060e2b340101010e0402030907000000");
+                if (local && local->size() == 4 && uid) {
+                    m.channel = uint32_t(beOf(*local));
+                    m.uid = asciiOfUtf16(*uid);
+                    if (format) m.trackFormat = asciiOfUtf16(*format);
+                    if (pack) m.pack = asciiOfUtf16(*pack);
+                    chna_.push_back(m);
+                }
+            }
         } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) && (key[14] == 0x79 || key[14] == 0x7a)) {
             // ACES picture and target frame sub-descriptors (ST 2065-5).
             Bytes v(static_cast<size_t>(length));
@@ -2632,6 +3025,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
         } else if (std::memcmp(key, essence, 12) == 0) {
             // (past the header: what it said is all there is)
             if (imfPictureOnly && !(op1a_ && rgba_ && (j2k_ || aces_))) return fail(path + " is not an IMF picture track file");
+            if (immersiveOnly && !(iab || mga || adm_)) return fail(path + " is not immersive sound");
             if (key[12] == 0x15) {
                 // (a frame a few bytes long, by the million: a damaged or hostile file, not pictures)
                 if (elements_.size() >= (size_t(1) << 24)) return fail(path + " has too many frames");
@@ -2658,6 +3052,13 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                 if (auto u = it.find(0x4401); u != it.end() && u->second.size() == 32) std::copy(u->second.begin() + 16, u->second.end(), asset_.begin());
             } else {
                 if (auto c = it.find(0x3d07); c != it.end() && key[14] == 0x48) channels_ = int(beOf(c->second));
+                if (key[14] == 0x48) {
+                    // (sound labelled as ADM content: ST 2131's AudioLabelingFrameworkADMContent)
+                    if (auto a = it.find(0x3d32); a != it.end() && a->second.size() == 16)
+                        adm_ = std::memcmp(a->second.data() + 8, ul("060e2b340401010d0402021005010000").data() + 8, 8) == 0;
+                    if (auto a = it.find(0x3d03); a != it.end() && a->second.size() == 8)
+                        sampleRate_ = int(std::min<uint64_t>(beOf(Bytes(a->second.begin(), a->second.begin() + 4)), 768000));
+                }
                 if (key[14] == 0x29) rgba_ = true;
                 if (key[14] == 0x7b) iab = true;  // an IAB essence descriptor (ST 2067-201)
                 if (key[14] == 0x29 || key[14] == 0x28) {
@@ -2704,10 +3105,31 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             at = next;
         }
         kind_ = Kind::Iab;
+    } else if (mga && sound && elements_.empty()) {
+        // MGA frames, one after another in the clip: a section count, then each section's index, identifier and
+        // 4-byte length before its data.
+        if (channels_ <= 0 || channels_ > 4096) return fail(path + " has no channels");
+        const uint64_t end = clipAt_ + clipSize_;
+        for (uint64_t at = clipAt_; at < end;) {
+            uint8_t count = 0;
+            if (!file.seek(at) || !file.read(&count, 1) || count < 2) return fail(path + " has a damaged MGA frame");
+            uint64_t next = at + 1;
+            for (int k = 0; k < count; ++k) {
+                uint8_t h[6];
+                if (next + 6 > end || !file.seek(next) || !file.read(h, 6)) return fail(path + " has a damaged MGA frame");
+                next += 6 + readBe(h + 2, 4);
+            }
+            if (next > end || elements_.size() >= (size_t(1) << 24)) return fail(path + " has a damaged MGA frame");
+            elements_.emplace_back(at, next - at);
+            at = next;
+        }
+        kind_ = Kind::Mga;
     } else if (!elements_.empty() && !sound && !text) kind_ = Kind::Picture;
-    else if (sound && elements_.empty() && channels_ > 0 && channels_ <= 64) kind_ = Kind::Sound;
+    else if (sound && elements_.empty() && channels_ > 0 && channels_ <= (adm_ ? 128 : 64)) kind_ = Kind::Sound;  // (ADM: up to 128)
     else if (text && elements_.empty()) kind_ = Kind::TimedText;
     else return fail(path + " is not an IMF track file Montage reads");
+    if (adm_ && axmlStream_)
+        if (const auto d = streamData.find(axmlStream_); d != streamData.end()) axmlAt_ = d->second.first, axmlSize_ = d->second.second;
     for (const auto& [id, sid] : streamOf) {
         const auto d = streamData.find(sid);
         resources_.push_back({id, d == streamData.end() ? 0 : d->second.first, d == streamData.end() ? 0 : d->second.second, d != streamData.end()});
@@ -2783,6 +3205,75 @@ bool ImfTrackReader::pcm(int64_t first, int64_t count, std::vector<int32_t>& out
     for (size_t i = 0; i < out.size(); ++i) {
         const uint32_t v = uint32_t(b[3 * i]) | uint32_t(b[3 * i + 1]) << 8 | uint32_t(b[3 * i + 2]) << 16;
         out[i] = int32_t(v << 8) >> 8;
+    }
+    return true;
+}
+
+bool ImfTrackReader::admXml(std::string& out, std::string* error) const {
+    File file;
+    if (!adm() || !axmlSize_ || axmlSize_ > (uint64_t(256) << 20) || !openRead(file, path_) || !file.seek(axmlAt_) || !file.fits(axmlSize_)) {
+        if (error) *error = "No ADM (axml) in " + path_;
+        return false;
+    }
+    out.resize(size_t(axmlSize_));
+    if (!file.read(reinterpret_cast<uint8_t*>(out.data()), out.size())) {
+        if (error) *error = "Cannot read the ADM of " + path_;
+        return false;
+    }
+    return true;
+}
+
+bool ImfTrackReader::mgaFrame(int64_t index, std::vector<int32_t>* pcm, std::string* sadm, std::string* error) const {
+    std::vector<uint8_t> f;
+    if (kind_ != Kind::Mga || !frame(index, f, error)) return false;
+    auto fail = [&] {
+        if (error) *error = "A damaged MGA frame in " + path_;
+        return false;
+    };
+    if (sadm) sadm->clear();
+    bool gotSadm = false;
+    size_t at = 1;
+    for (int k = 0; k < f[0]; ++k) {
+        if (at + 6 > f.size()) return fail();
+        const uint8_t idx = f[at], ident = f[at + 1];
+        const size_t len = readBe(&f[at + 2], 4);
+        at += 6;
+        if (len > f.size() - at) return fail();
+        const uint8_t* d = f.data() + at;
+        if (idx == 0 && ident == 0 && pcm) {
+            const size_t n = len / 3;
+            pcm->resize(n - n % size_t(std::max(1, channels_)));
+            for (size_t i = 0; i < pcm->size(); ++i) {
+                const uint32_t v = uint32_t(d[3 * i]) | uint32_t(d[3 * i + 1]) << 8 | uint32_t(d[3 * i + 2]) << 16;
+                (*pcm)[i] = int32_t(v << 8) >> 8;
+            }
+        } else if (idx >= 1 && idx <= 0xfe && ident == 2 && sadm && !gotSadm && len > 0) {
+            // An ST 2109 payload: its tag (an ASN.1 OID sub-identifier, S-ADM's 0x12), its BER length, then S-ADM's
+            // version and format (0: UTF-8; gzip is not read) and the XML.
+            size_t p = 0;
+            uint32_t tag = 0;
+            while (p < len && (d[p] & 0x80)) tag = tag << 7 | (d[p++] & 0x7f);
+            if (p >= len) return fail();
+            tag = tag << 7 | d[p++];
+            if (p >= len) return fail();
+            size_t vlen = d[p++];
+            if (vlen & 0x80) {
+                const int n = int(vlen & 0x7f);
+                if (n > 4 || p + size_t(n) > len) return fail();
+                vlen = readBe(d + p, n);
+                p += size_t(n);
+            }
+            if (vlen > len - p) return fail();
+            if (tag == 0x12 && vlen >= 2) {
+                if (d[p + 1] != 0) {
+                    if (error) *error = "Compressed S-ADM is not read (" + path_ + ")";
+                    return false;
+                }
+                sadm->assign(reinterpret_cast<const char*>(d + p + 2), vlen - 2);
+                gotSadm = true;
+            }
+        }
+        at += len;
     }
     return true;
 }

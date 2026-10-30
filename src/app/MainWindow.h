@@ -218,6 +218,10 @@ public:
     // when there are several), warp markers at their onsets, a mode, off.
     bool enableElasticAudio(int mode = 0);
     int addWarpMarkersAtOnsets(double sensitivity = 50);
+    // Strip Silence on the selected audio clips (audio/TapeRepair.h soundRegions, core/EditOps.h edit::stripSilence):
+    // the pieces removed (0 when nothing was), one undo step. The dialog asks for the settings, kept between uses.
+    int stripSilence(double thresholdDb, double minSilence, double padBefore, double padAfter, bool linked);
+    void stripSilenceDialog();
     bool setElasticMode(int mode);
     bool removeElasticAudio();
     // A pitch edit over the In/Out range where it meets the selected audio clip (or the one under the playhead),
@@ -334,6 +338,13 @@ public:
     // the selected media (else all) as an ALE.
     int importAle(const QString& path, bool cdlToClips = true);
     bool exportAle(const QString& path);
+    // ASC Framing Decision Lists (render/Fdl.h): attached to the bin's chosen media (all of them when none is chosen),
+    // written for the sequence's chosen clips (all when none), and their canvas templates applied to the chosen clips
+    // (from a template FDL, or the footage's own when `templatePath` is empty).
+    int importFdl(const QString& path);
+    bool exportFdl(const QString& path);
+    int frameWithFdl(const QString& templatePath, const QString& templateId, bool resizeSequence);
+    void fdlFramingDialog();
     // Film lists of the active sequence (render/FilmLists.h): .txt, .csv or .pdf; with `earlier` (another sequence),
     // the change list from it too.
     bool exportFilmLists(const QString& path, Id earlier = 0);
@@ -547,7 +558,9 @@ private:
     void addClipMarker();
     void jumpMarker(bool forward);
     void markClip();
-    void detectScenes();
+    // Scene detection on the selected clip: cut there (with a shot-change marker at each cut), or with `markOnly` (the
+    // selected clip, else the longest picture clip) shot-change markers only, for captions to keep clear of.
+    void detectScenes(bool markOnly = false);
     void normalizeLoudness();
     void autoColor();
     // Printer lights on the graded clip's Color Correct: `channel` (0 R, 1 G, 2 B, -1 all three) moved by `points`.
@@ -618,6 +631,7 @@ private:
     void showTrimEdit();
     std::vector<Id> openSequences_;
     MonitorPanel* sourcePanel_ = nullptr;
+    bool frameLines_ = true;  // frame lines from the footage's FDL over the monitors
     MonitorPanel* programPanel_ = nullptr;
     MediaBinWidget* bin_ = nullptr;
     EffectsBrowser* effects_ = nullptr;

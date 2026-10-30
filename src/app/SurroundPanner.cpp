@@ -163,6 +163,15 @@ void SurroundPanner::contextMenuEvent(QContextMenuEvent* e) {
         a->setCheckable(true);
         a->setChecked(std::lround(pan_.lfeDb) == db || (db <= -99 && pan_.lfeDb <= -99));
     }
+    lfe->addSeparator();
+    QAction* only = lfe->addAction(tr("LFE Channel Only"), this, [this](bool on) {
+        pan_.lfeOnly = on;
+        if (on && pan_.lfeDb <= -99) pan_.lfeDb = 0;
+        emitChange(true);
+    });
+    only->setCheckable(true);
+    only->setChecked(pan_.lfeOnly);
+    only->setToolTip(tr("Feeds the LFE alone, at the level above, and no other speaker (a bed's LFE channel)"));
     if (immersiveLayout(layout_) || ambisonicLayout(layout_)) {
         QMenu* h = menu.addMenu(tr("Height"));
         for (int pct : {0, 25, 50, 75, 100}) {

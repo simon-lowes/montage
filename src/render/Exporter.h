@@ -23,6 +23,7 @@ struct BurnIn {
     bool footage = false;           // feet and frames from the sequence's start, in its film gauge (core/FilmCount.h)
     bool keyNumber = false;         // the key number of the top clip's frame (its media's "key_number")
     bool inkNumber = false;         // and its ink number
+    bool frameLines = false;        // the top clip's FDL frame lines (render/Fdl.h), through its transform
     std::string text;               // any text ("" = none)
     int corner = 0;                 // 0 top left, 1 top centre, 2 top right, 3 bottom left, 4 bottom centre, 5 bottom right
     double size = 0.035;            // text height, fraction of the frame height
@@ -30,7 +31,7 @@ struct BurnIn {
     int watermarkCorner = 5;
     double watermarkWidth = 0.15;   // fraction of the frame width
     double watermarkOpacity = 0.6;
-    bool any() const { return timecode || clipName || footage || keyNumber || inkNumber || !text.empty() || !watermark.empty(); }
+    bool any() const { return timecode || clipName || footage || keyNumber || inkNumber || frameLines || !text.empty() || !watermark.empty(); }
 };
 
 struct ExportSettings {

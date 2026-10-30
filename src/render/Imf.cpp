@@ -28,12 +28,14 @@ extern "C" {
 #include <libavutil/opt.h>
 }
 
+#include "Adm.h"
 #include "Amf.h"
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
 #include "Iab.h"
 #include "ImageSubtitles.h"
+#include "ImmersiveTrackFile.h"
 #include "Jpeg2000.h"
 #include "PackageFiles.h"
 #include "RateConversion.h"
@@ -42,6 +44,7 @@ extern "C" {
 #include "core/EditOps.h"
 #include "core/GradeVersions.h"
 #include "core/ImportBuilder.h"
+#include "core/Automation.h"
 #include "core/Surround.h"
 #include "core/TimelineCompare.h"
 #include "media/Exr.h"
@@ -202,8 +205,11 @@ QString safeTitle(const std::string& title) {
 const QString kGroups = QStringLiteral("http://www.smpte-ra.org/reg/395/2014/13/1/aaf");
 const QString kElements = QStringLiteral("http://www.smpte-ra.org/reg/335/2012");
 const QString kTypes = QStringLiteral("http://www.smpte-ra.org/reg/2003/2012");
-// ST 2067-201's namespace, the IABSequence's.
+// ST 2067-201's namespace, the IABSequence's; ST 2067-203's (MGASADMSignalSequence) and ST 2067-204's (ADMAudioSequence),
+// and their operational modes.
 constexpr const char* kIabNs = "http://www.smpte-ra.org/ns/2067-201/2019";
+constexpr const char* kSadmNs = "http://www.smpte-ra.org/ns/2067-203/2022";
+constexpr const char* kAdmNs = "http://www.smpte-ra.org/ns/2067-204/2022";
 
 void rgbaComponents(QXmlStreamWriter& x, const QString& element, int bits) {
     x.writeStartElement("r1:" + element);
@@ -572,6 +578,144 @@ void iabDescriptor(QXmlStreamWriter& x, const dcp::ImfIabWriter& w) {
     x.writeTextElement("r1:SoundCompression", ulUrn(std::string(dcp::ImfIabWriter::kCoding)));
     x.writeTextElement("r1:ReferenceImageEditRate", rate);
     x.writeTextElement("r1:ReferenceAudioAlignmentLevel", QString::number(dcp::ImfIabWriter::kReferenceLevel));
+    x.writeEndElement();
+}
+
+// An ADM audio track file's channel mapping (its chna chunk) as render/Adm.h has it.
+std::vector<AdmTrack> admTracksOf(const dcp::ImfTrackReader& r) {
+    std::vector<AdmTrack> out;
+    for (const dcp::AdmChannelMapping& m : r.admChannels())
+        if (m.channel >= 1 && m.channel <= 4096) out.push_back({int(m.channel) - 1, m.uid, m.trackFormat, m.pack});
+    return out;
+}
+
+void auidList(QXmlStreamWriter& x, const QString& element, const char* ul) {
+    x.writeStartElement(element);
+    x.writeNamespace(kTypes, "r2");
+    x.writeTextElement("r2:AUID", ulUrn(std::string(ul)));
+    x.writeEndElement();
+}
+
+// The MCA items an MGA or ADM soundfield group label carries (ST 377-4:2021's names).
+void soundfieldItems(QXmlStreamWriter& x, const dcp::Uuid& id, const char* dictionary, const dcp::Uuid& link, const char* symbol,
+                     const char* name, const std::string& language, const std::string& title, const std::string& version) {
+    x.writeTextElement("r1:InstanceID", urn(id));
+    x.writeTextElement("r1:MCALabelDictionaryID", ulUrn(std::string(dictionary)));
+    x.writeTextElement("r1:MCALinkID", urn(link));
+    x.writeTextElement("r1:MCATagSymbol", symbol);
+    x.writeTextElement("r1:MCATagName", name);
+    x.writeTextElement("r1:RFC5646SpokenLanguage", QString::fromStdString(language));
+    x.writeTextElement("r1:MCATitle", QString::fromStdString(title));
+    x.writeTextElement("r1:MCATitleVersion", QString::fromStdString(version));
+    x.writeTextElement("r1:MCAContent", "PRM");
+    x.writeTextElement("r1:MCAUseClass", "FCMP");
+}
+
+void mgaDescriptor(QXmlStreamWriter& x, const dcp::ImfMgaSadmWriter& w) {
+    using W = dcp::ImfMgaSadmWriter;
+    x.writeStartElement("r0:MGASoundEssenceDescriptor");
+    x.writeNamespace(kGroups, "r0");
+    x.writeNamespace(kElements, "r1");
+    x.writeTextElement("r1:InstanceID", urn(w.descriptorId()));
+    x.writeStartElement("r1:SubDescriptors");
+    x.writeStartElement("r0:ContainerConstraintsSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.constraintsId()));
+    x.writeEndElement();
+    x.writeStartElement("r0:MGAAudioMetadataSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.metadataId()));
+    x.writeTextElement("r1:MGALinkID", urn(w.metadataLink()));
+    x.writeTextElement("r1:MGAAudioMetadataIndex", "1");
+    x.writeTextElement("r1:MGAAudioMetadataIdentifier", "2");
+    auidList(x, "r1:MGAAudioMetadataPayloadULArray", W::kSadmPayload);
+    x.writeEndElement();
+    x.writeStartElement("r0:SADMAudioMetadataSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.sadmId()));
+    x.writeTextElement("r1:SADMMetadataSectionLinkID", urn(w.metadataLink()));
+    auidList(x, "r1:SADMProfileLevelULBatch", W::kProfile);
+    x.writeEndElement();
+    x.writeStartElement("r0:MGASoundfieldGroupLabelSubDescriptor");
+    soundfieldItems(x, w.soundfieldId(), W::kSoundfield, w.soundfieldLink(), "MGASf", "MGA Soundfield", w.language(), w.title(), w.titleVersion());
+    x.writeTextElement("r1:MGAMetadataSectionLinkID", urn(w.metadataLink()));
+    x.writeTextElement("r1:ADMAudioProgrammeID", QString::fromStdString(w.programmeId()));
+    x.writeEndElement();
+    x.writeEndElement();  // SubDescriptors
+    const QString rate = QStringLiteral("%1/%2").arg(w.rate().num).arg(w.rate().den);
+    x.writeTextElement("r1:LinkedTrackID", "1");
+    x.writeTextElement("r1:SampleRate", rate);
+    x.writeTextElement("r1:EssenceLength", QString::number(w.duration()));
+    x.writeTextElement("r1:ContainerFormat", ulUrn(std::string(W::kContainer)));
+    x.writeTextElement("r1:AudioSampleRate", "48000/1");
+    x.writeTextElement("r1:Locked", "False");
+    x.writeTextElement("r1:ChannelCount", QString::number(w.channels()));
+    x.writeTextElement("r1:QuantizationBits", "24");
+    x.writeTextElement("r1:SoundCompression", ulUrn(std::string(W::kCoding)));
+    x.writeTextElement("r1:MGASoundEssenceBlockAlign", QString::number(3 * w.channels()));
+    x.writeTextElement("r1:MGASoundEssenceAverageBytesPerSecond", QString::number(48000 * 3 * w.channels()));
+    x.writeTextElement("r1:ReferenceImageEditRate", rate);
+    x.writeTextElement("r1:ReferenceAudioAlignmentLevel", QString::number(W::kReferenceLevel));
+    x.writeEndElement();
+}
+
+void admDescriptor(QXmlStreamWriter& x, const dcp::ImfAdmWriter& w) {
+    using W = dcp::ImfAdmWriter;
+    x.writeStartElement("r0:WAVEPCMDescriptor");
+    x.writeNamespace(kGroups, "r0");
+    x.writeNamespace(kElements, "r1");
+    x.writeTextElement("r1:InstanceID", urn(w.descriptorId()));
+    x.writeStartElement("r1:SubDescriptors");
+    x.writeStartElement("r0:ADM_CHNASubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.chnaId()));
+    std::set<uint32_t> local;
+    for (const dcp::AdmChannelMapping& m : w.chna()) local.insert(m.channel);
+    x.writeTextElement("r1:NumLocalChannels", QString::number(local.size()));
+    x.writeTextElement("r1:NumADMAudioTrackUIDs", QString::number(w.chna().size()));
+    x.writeStartElement("r1:ADMChannelMappingsArray");
+    for (size_t i = 0; i < w.chna().size(); ++i) {
+        const dcp::AdmChannelMapping& m = w.chna()[i];
+        x.writeStartElement("r0:ADMChannelMapping");
+        x.writeTextElement("r1:InstanceID", urn(w.mappingIds()[i]));
+        x.writeTextElement("r1:LocalChannelID", QString::number(m.channel));
+        x.writeTextElement("r1:ADMAudioTrackUID", QString::fromStdString(m.uid));
+        x.writeTextElement("r1:ADMAudioTrackChannelFormatID", QString::fromStdString(m.trackFormat));
+        if (!m.pack.empty()) x.writeTextElement("r1:ADMAudioPackFormatID", QString::fromStdString(m.pack));
+        x.writeEndElement();
+    }
+    x.writeEndElement();  // ADMChannelMappingsArray
+    x.writeEndElement();
+    x.writeStartElement("r0:RIFFChunkReferencesSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.referencesId()));
+    x.writeStartElement("r1:RIFFChunkStreamIDsArray");
+    x.writeNamespace(kTypes, "r2");
+    x.writeTextElement("r2:UInt32", QString::number(W::kAxmlStream));
+    x.writeEndElement();
+    x.writeEndElement();
+    x.writeStartElement("r0:RIFFChunkDefinitionSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.chunkId()));
+    x.writeTextElement("r1:RIFFChunkStreamID", QString::number(W::kAxmlStream));
+    x.writeTextElement("r1:RIFFChunkID", "axml");
+    x.writeEndElement();
+    x.writeStartElement("r0:ADMAudioMetadataSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.metadataId()));
+    x.writeTextElement("r1:RIFFChunkStreamID_link1", QString::number(W::kAxmlStream));
+    auidList(x, "r1:ADMProfileLevelULBatch", W::kProfile);
+    x.writeEndElement();
+    x.writeStartElement("r0:ADMSoundfieldGroupLabelSubDescriptor");
+    soundfieldItems(x, w.soundfieldId(), W::kSoundfield, w.soundfieldLink(), "ADM", "ADM", w.language(), w.title(), w.titleVersion());
+    x.writeTextElement("r1:RIFFChunkStreamID_link2", QString::number(W::kAxmlStream));
+    x.writeTextElement("r1:ADMAudioProgrammeID_ST2131", QString::fromStdString(w.programmeId()));
+    x.writeEndElement();
+    x.writeEndElement();  // SubDescriptors
+    x.writeTextElement("r1:LinkedTrackID", "1");
+    x.writeTextElement("r1:SampleRate", "48000/1");
+    x.writeTextElement("r1:EssenceLength", QString::number(w.duration()));
+    x.writeTextElement("r1:ContainerFormat", ulUrn(std::string("060e2b34040101010d01030102060200")));
+    x.writeTextElement("r1:AudioSampleRate", "48000/1");
+    x.writeTextElement("r1:Locked", "False");
+    x.writeTextElement("r1:ChannelCount", QString::number(w.channels()));
+    x.writeTextElement("r1:QuantizationBits", "24");
+    x.writeTextElement("r1:BlockAlign", QString::number(3 * w.channels()));
+    x.writeTextElement("r1:AverageBytesPerSecond", QString::number(48000 * 3 * w.channels()));
+    x.writeTextElement("r1:ChannelAssignment", ulUrn(std::string(W::kAssignment)));
     x.writeEndElement();
 }
 
@@ -1367,6 +1511,93 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         virtuals.push_back(std::move(vt));
     }
 
+    // Immersive sound as ADM (render/Adm.h's master: the bed's speakers and each object on a channel of its own, the
+    // objects where their panners put them): MGA frames each carrying its S-ADM frame (ST 2067-203) and an ADM audio
+    // track file (ST 2067-204), silence after the programme, each a track file of its own (a supplemental's written
+    // whole again).
+    int admBed = 0, admObjects = 0;
+    if (settings.sadm || settings.adm) {
+        const ImfSound programme{settings.language.empty() ? "en" : settings.language, "PRM", {}};
+        const Sequence mixSeq = soundVersion(s, programme);
+        AdmScene scene;
+        if (!admSceneOf(p, mixSeq, first, end, title.toStdString(), scene, &err)) return fail(err);
+        // (through the padding too: the objects stay where they end)
+        scene.samples = total;
+        for (AdmScene::Object& o : scene.objects)
+            if (!o.blocks.empty()) o.blocks.back().to = total;
+        ImmersiveMix mix;
+        if (!mix.open(p, mixSeq, 48000, &err)) return fail(err);
+        const int bedN = mix.bedChannels(), objectN = int(mix.objectTracks().size()), n = scene.channels;
+        admBed = bedN, admObjects = objectN;
+        const std::vector<AdmTrack> tracks = admTracks(scene);
+        auto previous = [&](const char* kind) {
+            const ImfVirtualTrack* was = nullptr;
+            for (const ImfVirtualTrack& t : old.tracks)
+                if (t.kind == kind) was = &t;
+            return trackIdFor(was);
+        };
+        dcp::ImfMgaSadmWriter mga;
+        dcp::ImfAdmWriter admFile;
+        Virtual mgaVt, admVt;
+        size_t mgaIndex = 0, admIndex = 0;
+        if (settings.sadm) {
+            mgaVt.kind = QStringLiteral("MGASADMSignalSequence");
+            mgaVt.editRate = editRate;
+            mgaVt.trackId = previous("MGASADMSignalSequence");
+            mgaIndex = ownFile("SADM", mgaVt.kind);
+            if (!mga.open(QDir(folder).filePath(own[mgaIndex].file).toStdString(), own[mgaIndex].id, rate, n, programme.language,
+                          title.toStdString(), "1", "APR_1001", &err))
+                return fail(err);
+        }
+        if (settings.adm) {
+            admVt.kind = QStringLiteral("ADMAudioSequence");
+            admVt.editRate = QStringLiteral("48000 1");
+            admVt.trackId = previous("ADMAudioSequence");
+            admIndex = ownFile("ADM", admVt.kind);
+            std::vector<dcp::AdmChannelMapping> chna;
+            for (const AdmTrack& t : tracks) chna.push_back({uint32_t(t.channel + 1), t.uid, t.trackFormat, t.pack});
+            if (!admFile.open(QDir(folder).filePath(own[admIndex].file).toStdString(), own[admIndex].id, n, chna, admDocument(scene),
+                              programme.language, title.toStdString(), "1", "APR_1001", &err))
+                return fail(err);
+        }
+        const std::string flow = dcp::uuidString(dcp::newUuid());
+        std::vector<float> bed, objects;
+        std::vector<float*> objectPtrs(static_cast<size_t>(objectN));
+        std::vector<int32_t> pcm;
+        for (int64_t k = 0; k < frames; ++k) {
+            const int64_t at = sampleAt(k, rate), count = sampleAt(k + 1, rate) - at;
+            bed.assign(size_t(count) * size_t(bedN), 0.0f);
+            objects.assign(size_t(count) * size_t(std::max(1, objectN)), 0.0f);
+            for (int o = 0; o < objectN; ++o) objectPtrs[size_t(o)] = objects.data() + size_t(o) * size_t(count);
+            if (const int64_t live = std::clamp<int64_t>(heard - at, 0, count); live > 0) mix.mix(firstSample + at, int(live), bed.data(), objectPtrs.data());
+            pcm.resize(size_t(count) * size_t(n));
+            auto toPcm = [](float v) { return int32_t(std::lround(std::clamp(double(v), -1.0, 8388607.0 / 8388608.0) * 8388608.0)); };
+            for (int64_t i = 0; i < count; ++i) {
+                for (int c = 0; c < bedN; ++c) pcm[size_t(i) * size_t(n) + size_t(c)] = toPcm(bed[size_t(i) * size_t(bedN) + size_t(c)]);
+                for (int o = 0; o < objectN; ++o) pcm[size_t(i) * size_t(n) + size_t(bedN + o)] = toPcm(objectPtrs[size_t(o)][i]);
+            }
+            if (settings.sadm && !mga.write(pcm.data(), size_t(count), sadmFrame(scene, k + 1, at, count, flow), &err)) return fail(err);
+            if (settings.adm && !admFile.writePcm(pcm.data(), size_t(count), &err)) return fail(err);
+            if (progress && k % 24 == 0 && !progress(0.1)) return fail("Stopped");
+        }
+        if (settings.sadm) {
+            if (!mga.close(&err)) return fail(err.empty() ? "Cannot write the S-ADM sound" : err);
+            own[mgaIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { mgaDescriptor(x, mga); });
+            mgaVt.ownFile = int(mgaIndex);
+            mgaVt.ownDuration = mga.duration();
+            addRun(mgaVt.runs, false, 0, frames);
+            virtuals.push_back(std::move(mgaVt));
+        }
+        if (settings.adm) {
+            if (!admFile.close(&err)) return fail(err.empty() ? "Cannot write the ADM sound" : err);
+            own[admIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { admDescriptor(x, admFile); });
+            admVt.ownFile = int(admIndex);
+            admVt.ownDuration = admFile.duration();
+            addRun(admVt.runs, false, 0, total);
+            virtuals.push_back(std::move(admVt));
+        }
+    }
+
     // Timed text: each caption track's IMSC 1.1 document (times from the composition's start), unless the earlier
     // package has the same document in the same language and kind.
     std::set<std::string> textTracksUsed;
@@ -1691,6 +1922,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeNamespace(aces ? "http://www.smpte-ra.org/schemas/2067-2/2016" : "http://www.smpte-ra.org/ns/2067-2/2020", "cc");
         x.writeNamespace("http://www.w3.org/2001/XMLSchema-instance", "xsi");
         if (settings.immersive) x.writeNamespace(QString::fromLatin1(kIabNs), "iab");
+        if (settings.sadm) x.writeNamespace(QString::fromLatin1(kSadmNs), "imfsadm");
+        if (settings.adm) x.writeNamespace(QString::fromLatin1(kAdmNs), "imfadm");
         x.writeTextElement("Id", urn(cplId));
         text(x, "Annotation", title);
         x.writeTextElement("IssueDate", issued);
@@ -1723,6 +1956,17 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeTextElement("cc:ApplicationIdentification", aces    ? kApp5
                                                            : htj2k ? "http://www.smpte-ra.org/ns/2067-21/2023"
                                                                    : "http://www.smpte-ra.org/ns/2067-21/2021");
+        // Each ADM virtual track's parameters: Operational Mode A (every track file holds the whole programme).
+        for (const Virtual& v : virtuals) {
+            const bool sadm = v.kind == "MGASADMSignalSequence";
+            if (!sadm && v.kind != "ADMAudioSequence") continue;
+            const QString ns = QString::fromLatin1(sadm ? kSadmNs : kAdmNs);
+            x.writeStartElement(ns, sadm ? "MGASADMVirtualTrackParameterSet" : "ADMAudioVirtualTrackParameterSet");
+            x.writeTextElement(ns, "Id", urn(dcp::newUuid()));
+            x.writeTextElement(ns, "TrackId", v.trackId);
+            x.writeTextElement(ns, sadm ? "MGASADMOperationalMode" : "ADMOperationalMode", ns + "#Operational-Mode-A");
+            x.writeEndElement();
+        }
         x.writeEndElement();
         x.writeStartElement("SegmentList");
         x.writeStartElement("Segment");
@@ -1731,6 +1975,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         for (size_t i = 0; i < virtuals.size(); ++i) {
             // (an IABSequence is ST 2067-201's own)
             if (virtuals[i].kind == "IABSequence") x.writeStartElement(QString::fromLatin1(kIabNs), virtuals[i].kind);
+            else if (virtuals[i].kind == "MGASADMSignalSequence") x.writeStartElement(QString::fromLatin1(kSadmNs), virtuals[i].kind);
+            else if (virtuals[i].kind == "ADMAudioSequence") x.writeStartElement(QString::fromLatin1(kAdmNs), virtuals[i].kind);
             else x.writeStartElement("cc:" + virtuals[i].kind);
             x.writeTextElement("Id", urn(dcp::newUuid()));
             x.writeTextElement("TrackId", virtuals[i].trackId);
@@ -1849,6 +2095,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         result->targetFrames = targetsWritten;
         result->amf = amfFile.empty() ? std::string() : QDir(folder).filePath(QString::fromStdString(amfFile)).toStdString();
         result->immersive = settings.immersive;
+        result->sadm = settings.sadm;
+        result->adm = settings.adm;
+        result->admBedChannels = admBed;
+        result->admObjects = admObjects;
         result->iabBedChannels = iabBed;
         result->iabObjects = iabObjects;
     }
@@ -2008,8 +2258,9 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         for (const ImfVirtualTrack& t : comp.tracks) {
             const QString kind = QString::fromStdString(t.kind);
             const bool image = t.kind == "MainImageSequence", sound = t.kind == "MainAudioSequence", iab = t.kind == "IABSequence";
+            const bool mga = t.kind == "MGASADMSignalSequence", admSound = t.kind == "ADMAudioSequence";
             const bool text = isTextSequence(kind);
-            if (!image && !sound && !text && !iab) continue;  // (markers, and kinds other tools write that Montage does not read)
+            if (!image && !sound && !text && !iab && !mga && !admSound) continue;  // (markers, and kinds other tools write that Montage does not read)
             // Every virtual track as long as the picture.
             if (picture && !t.resources.empty()) {
                 const ImfResource& r0 = t.resources.front();
@@ -2043,7 +2294,7 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     }
                 }
                 const bool acesPicture = image && comp.application == 5;
-                if (text || !inside || acesPicture || iab) {
+                if (text || !inside || acesPicture || iab || mga || admSound) {
                     // Read as Montage reads track files (those of other packages without reading all their essence).
                     dcp::ImfTrackReader reader;
                     if (!reader.open(file, &err)) {
@@ -2051,12 +2302,13 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                         continue;
                     }
                     using K = dcp::ImfTrackReader::Kind;
-                    const K want = image ? K::Picture : sound ? K::Sound : iab ? K::Iab : K::TimedText;
-                    const int64_t units = image || iab ? reader.frames() : sound ? reader.samples() : r.intrinsic;
+                    const K want = image ? K::Picture : sound || admSound ? K::Sound : iab ? K::Iab : mga ? K::Mga : K::TimedText;
+                    const int64_t units = image || iab || mga ? reader.frames() : sound || admSound ? reader.samples() : r.intrinsic;
                     std::string xml;
                     std::vector<Caption> captions;
-                    if (reader.kind() != want)
-                        issue(QStringLiteral("%1 is not the %2 its %3 plays").arg(name, image ? "picture" : sound ? "sound" : iab ? "immersive sound (IAB)" : "timed text", kind));
+                    if (reader.kind() != want || (admSound && !reader.adm()))
+                        issue(QStringLiteral("%1 is not the %2 its %3 plays")
+                                  .arg(name, image ? "picture" : sound ? "sound" : iab ? "immersive sound (IAB)" : mga ? "immersive sound (MGA with S-ADM)" : admSound ? "sound with ADM" : "timed text", kind));
                     else if (r.intrinsic >= 0 && units != r.intrinsic)
                         issue(QStringLiteral("%1 has %2 edit units; the composition says %3").arg(name).arg(units).arg(r.intrinsic));
                     else if (acesPicture && !reader.imfAces())
@@ -2112,6 +2364,27 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                                 return issues;
                             }
                         }
+                    } else if (mga && inside) {
+                        // Every frame a frame's worth of sound (24-bit, 48 kHz) and an S-ADM frame Montage reads.
+                        std::vector<int32_t> pcm;
+                        std::string sadm;
+                        for (int64_t k = 0; k < reader.frames(); ++k) {
+                            const int64_t want = sampleAt(k + 1, {comp.rateNum, comp.rateDen}) - sampleAt(k, {comp.rateNum, comp.rateDen});
+                            AdmScene scene;
+                            if (!reader.mgaFrame(k, &pcm, &sadm, &err) || reader.sampleRate() != 48000 ||
+                                int64_t(pcm.size()) != want * reader.channels() || !parseAdm(sadm, scene, {}, &err)) {
+                                issue(QStringLiteral("%1 frame %2 is not a frame of sound with its S-ADM: %3").arg(name).arg(k).arg(QString::fromStdString(err)));
+                                break;
+                            }
+                            if (!reading(qint64(pcm.size() * 3 + sadm.size()))) {
+                                issue("Stopped");
+                                return issues;
+                            }
+                        }
+                    } else if (admSound) {
+                        AdmScene scene;
+                        if (reader.sampleRate() != 48000 || !reader.admXml(xml, &err) || !parseAdm(xml, scene, admTracksOf(reader), &err))
+                            issue(QStringLiteral("%1 has no ADM Montage reads: %2").arg(name, QString::fromStdString(err)));
                     } else if (text && !reader.text(xml, &err))
                         issue(QStringLiteral("%1 is not timed text Montage reads: %2").arg(name, QString::fromStdString(err)));
                     else if (text && isImscImage(xml)) {
@@ -2563,6 +2836,141 @@ ImportResult importImf(Project& p, const std::string& path, const MediaProber& p
             }
     }
     b.sequence().audioLayout = channels == 8 ? "7.1" : channels == 6 ? "5.1" : "stereo";
+    // Immersive sound (ADM, else S-ADM, else IAB): a mono track for each of its bed's speakers and each object, playing
+    // that channel of the track file, panned to the speaker or moving as the object does; the main sound is muted.
+    const ImfVirtualTrack* immersive = nullptr;
+    for (const char* kind : {"ADMAudioSequence", "MGASADMSignalSequence", "IABSequence"})
+        for (const ImfVirtualTrack& t : c.tracks)
+            if (!immersive && t.kind == kind && !t.resources.empty()) immersive = &t;
+    if (immersive) {
+        std::map<std::string, AdmScene> scenes;  // by track file
+        auto sceneOf = [&](const ImfResource& r) -> const AdmScene* {
+            const auto it = files.find(r.trackFile);
+            if (it == files.end()) return nullptr;
+            auto [at, added] = scenes.try_emplace(it->second);
+            if (added) {
+                std::string err;
+                std::vector<std::string> warnings;
+                if (!immersiveTrackScene(it->second, at->second, &err, &warnings)) {
+                    b.warn("The immersive sound in " + it->second + " was not read: " + err);
+                    at->second = AdmScene();
+                }
+                for (const std::string& w : warnings) b.warn(w);
+            }
+            return at->second.channels > 0 ? &at->second : nullptr;
+        };
+        const AdmScene* first = nullptr;
+        for (const ImfResource& r : immersive->resources)
+            if (!first) first = sceneOf(r);
+        if (first) {
+            for (int i = 0; i < audio; ++i) b.track(TrackKind::Audio, i).muted = true;
+            std::string layout = first->layout.empty() ? "7.1" : first->layout;
+            bool high = false;
+            for (size_t k = 0; k < first->objects.size(); ++k)
+                for (const AdmBlock& blk : first->objects[k].blocks) high = high || blk.at.z > 1e-6;
+            if (high && !immersiveLayout(layout)) layout = layoutChannels(earLevelLayout(layout)) == 6 ? "5.1.4" : "7.1.4";
+            b.sequence().audioLayout = layout;
+            // The lanes: the bed's speakers, then the objects.
+            struct Lane {
+                int speaker = -1;  // index in the first scene's layout
+                int object = -1;
+            };
+            std::vector<Lane> lanes;
+            const std::vector<Speaker>& speakers = layoutSpeakers(first->layout);
+            for (size_t i = 0; i < first->bed.size() && i < speakers.size(); ++i)
+                if (first->bed[i] >= 0) lanes.push_back({int(i), -1});
+            for (size_t k = 0; k < first->objects.size(); ++k) lanes.push_back({-1, int(k)});
+            const int base = audio;
+            struct Path {
+                bool started = false, moves = false;
+                SurroundPan first;
+                std::optional<SurroundPan> last;  // where the clip before left it
+                std::vector<Keyframe> x, y, z;
+            };
+            std::vector<Path> paths(lanes.size());
+            for (size_t l = 0; l < lanes.size(); ++l) {
+                Track& track = b.track(TrackKind::Audio, base + int(l));
+                if (lanes[l].speaker >= 0) {
+                    const Speaker& sp = speakers[size_t(lanes[l].speaker)];
+                    track.name = std::string("Bed ") + sp.name;
+                    track.surround = admPanPosition(admSpeakerPoint(sp));
+                    if (sp.lfe) track.surround.lfeOnly = true, track.surround.lfeDb = 0;
+                } else {
+                    const AdmScene::Object& o = first->objects[size_t(lanes[l].object)];
+                    track.name = o.name.empty() ? "Object " + std::to_string(lanes[l].object + 1) : o.name;
+                    track.surround = admPanPosition(first->objectAt(size_t(lanes[l].object), 0));
+                    track.surround.object = true;
+                }
+            }
+            int64_t pos = 0;
+            for (const ImfResource& r : immersive->resources)
+                for (int64_t k = 0; k < std::max<int64_t>(1, r.repeat); ++k) {
+                    const double perUnit = fps.toDouble() * double(r.rateDen) / double(r.rateNum);
+                    const FrameTime start = FrameTime(std::llround(double(pos) * perUnit));
+                    const FrameTime stop = FrameTime(std::llround(double(pos + r.duration) * perUnit));
+                    pos += r.duration;
+                    const AdmScene* scene = sceneOf(r);
+                    if (!scene) continue;
+                    const double seconds = double(r.intrinsic > 0 ? r.intrinsic : r.entry + r.duration) * double(r.rateDen) / double(r.rateNum);
+                    const double sourceIn = double(r.entry) * perUnit;  // sequence frames
+                    const Id id = media(r, false, seconds);
+                    const std::vector<Speaker>& here = layoutSpeakers(scene->layout);
+                    for (size_t l = 0; l < lanes.size(); ++l) {
+                        int channel = -1;
+                        if (lanes[l].speaker >= 0) {
+                            // (the same speaker in this file's bed)
+                            const char* name = speakers[size_t(lanes[l].speaker)].name;
+                            for (size_t i = 0; i < here.size() && i < scene->bed.size(); ++i)
+                                if (std::string(here[i].name) == name) channel = scene->bed[i];
+                        } else if (size_t(lanes[l].object) < scene->objects.size()) {
+                            channel = scene->objects[size_t(lanes[l].object)].channel;
+                        }
+                        if (channel < 0) continue;
+                        Clip* clip = b.addClip(TrackKind::Audio, base + int(l), id, start, stop - start, sourceIn);
+                        if (!clip) continue;
+                        clip->channels = {channel};
+                        // (a mono clip panned to one speaker plays there at +3 dB)
+                        clip->audio.params["gain_db"] = Param(-3.0103);
+                        if (lanes[l].object < 0) continue;
+                        // Where the object is: a key a frame over the clip, thinned to those the path needs.
+                        const size_t o = size_t(lanes[l].object);
+                        Path& path = paths[l];
+                        const SurroundPan at0 = admPanPosition(scene->objectAt(o, sourceIn * double(scene->rate) / fps.toDouble()));
+                        std::vector<Keyframe> xs, ys, zs;
+                        for (FrameTime f = start; f < stop; ++f) {
+                            const double sample = (sourceIn + double(f - start)) * double(scene->rate) / fps.toDouble();
+                            const SurroundPan pan = admPanPosition(scene->objectAt(o, sample));
+                            xs.push_back(Keyframe{f, pan.x});
+                            ys.push_back(Keyframe{f, pan.y});
+                            zs.push_back(Keyframe{f, pan.z});
+                            path.moves = path.moves || std::fabs(pan.x - at0.x) > 1e-9 || std::fabs(pan.y - at0.y) > 1e-9 || std::fabs(pan.z - at0.z) > 1e-9;
+                        }
+                        if (!path.started) path.started = true, path.first = at0;
+                        if (path.last && (std::fabs(path.last->x - at0.x) > 1e-9 || std::fabs(path.last->y - at0.y) > 1e-9 || std::fabs(path.last->z - at0.z) > 1e-9))
+                            path.moves = true;  // (somewhere else from this clip on)
+                        if (!xs.empty()) path.last = SurroundPan{xs.back().v, ys.back().v, 0, -100, zs.back().v};
+                        for (auto* keys : {&xs, &ys, &zs}) thinKeys(*keys, 1e-5);
+                        path.x.insert(path.x.end(), xs.begin(), xs.end());
+                        path.y.insert(path.y.end(), ys.begin(), ys.end());
+                        path.z.insert(path.z.end(), zs.begin(), zs.end());
+                    }
+                }
+            // Objects that stay put: where they are; the others keyed along the whole path.
+            for (size_t l = 0; l < lanes.size(); ++l) {
+                const Path& path = paths[l];
+                if (lanes[l].object < 0 || !path.started) continue;
+                Track& track = b.track(TrackKind::Audio, base + int(l));
+                track.surround.x = path.first.x, track.surround.y = path.first.y, track.surround.z = path.first.z;
+                if (!path.moves) continue;
+                auto lay = [](Param& lane, const std::vector<Keyframe>& keys) {
+                    for (const Keyframe& key : keys) lane.addKey(key.t, key.v);
+                };
+                lay(track.surroundXAuto, path.x);
+                lay(track.surroundYAuto, path.y);
+                lay(track.surroundZAuto, path.z);
+            }
+        }
+    }
     // Timed text: a caption track each, the document's captions placed where its resources play them.
     for (const ImfVirtualTrack& t : c.tracks) {
         const QString kind = QString::fromStdString(t.kind);

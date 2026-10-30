@@ -21,8 +21,9 @@ endfunction()
 montage_test(test_core)
 montage_test(test_render)
 target_link_libraries(test_render PRIVATE Qt6::Network)  # (free ports for the remote review stream)
-# (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.)
-set_tests_properties(test_render PROPERTIES TIMEOUT 900)
+# (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.) Qt 6.4's
+# watchdog stops a run 300 s after it starts, whichever function it is in, so the run is given as long as ctest gives it.
+set_tests_properties(test_render PROPERTIES TIMEOUT 900 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=900000")
 montage_test(test_media)
 target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the capture tests)
 if(TARGET OpenEXR::OpenEXR)
@@ -36,6 +37,9 @@ target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CUR
                            MONTAGE_TEST_TOOLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
 target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_definitions(test_render PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+if(MONTAGE_WITH_FDL)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_FDL_DIR="${ascfdl_SOURCE_DIR}/resources/FDL")
+endif()
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)

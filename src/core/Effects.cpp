@@ -262,6 +262,25 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"aces_gamut_compress", "ACES Gamut Compress", EffectCategory::VideoFilter, "Color",
                  {choice("direction", "Direction", {"Forward", "Inverse"}, 0)},
                  {}});
+    // Crosstalk and Colour Correlation (render/Crosstalk.h), on linear light in the working space: a 3 x 3 matrix whose rows
+    // sum to 1, edited as each primary's hue and strength (on a matrix fitted to a chart, Clip > Match Colour Chart), and
+    // saturation by the channels' spread about their luminance, bounded by a gamut and limited to a range of exposure.
+    c.push_back({"crosstalk", "Crosstalk", EffectCategory::VideoFilter, "Color",
+                 {num("red_hue", "Red Hue (° towards Green)", -60, 60, 0, 0.5), pct("red_strength", "Red Strength", 0, 200, 100),
+                  num("green_hue", "Green Hue (° towards Blue)", -60, 60, 0, 0.5), pct("green_strength", "Green Strength", 0, 200, 100),
+                  num("blue_hue", "Blue Hue (° towards Red)", -60, 60, 0, 0.5), pct("blue_strength", "Blue Strength", 0, 200, 100),
+                  boolean("invert", "Invert")},
+                 {str("matrix", "Fitted Matrix", StringKind::Text)}});
+    c.push_back({"colour_correlation", "Colour Correlation", EffectCategory::VideoFilter, "Color",
+                 {pct("saturation", "Saturation", 0, 300, 100), choice("boundary", "Boundary", {"Rec.709", "P3", "Rec.2020", "Custom"}, 1),
+                  pct("compress_start", "Compression Starts", 50, 99, 80),
+                  num("exposure_low", "Lowest Exposure (Stops from Grey)", -12, 12, -12, 0.1),
+                  num("exposure_high", "Highest Exposure (Stops from Grey)", -12, 12, 12, 0.1),
+                  num("exposure_soft", "Exposure Fall-off (Stops)", 0, 6, 1, 0.1),
+                  num("custom_rx", "Custom Red x", 0, 1, 0.64, 0.001), num("custom_ry", "Custom Red y", 0, 1, 0.33, 0.001),
+                  num("custom_gx", "Custom Green x", 0, 1, 0.30, 0.001), num("custom_gy", "Custom Green y", 0, 1, 0.60, 0.001),
+                  num("custom_bx", "Custom Blue x", 0, 1, 0.15, 0.001), num("custom_by", "Custom Blue y", -0.2, 1, 0.06, 0.001)},
+                 {}});
     {
         // Hue Vectors (render/ColorSlice.h; as Resolve's ColorSlice): hue shift, saturation and density by hue vector in a
         // log encoding, saturation subtractive as film's or additive (brightness kept), highlights protected.
@@ -372,7 +391,26 @@ std::vector<EffectInfo> buildCatalog() {
                   num("gain", "Screen Gain", 0.5, 2, 1.1), num("clip_black", "Clip Black", 0, 1, 0.05), num("clip_white", "Clip White", 0, 1, 1),
                   num("shrink", "Shrink / Grow (px)", -10, 10, 0, 0.5), num("soften", "Soften (px)", 0, 20, 0, 0.5),
                   pct("despill", "Despill", 0, 100, 100), pct("restore", "Restore Brightness", 0, 100, 50),
-                  pct("edge_desat", "Edge Desaturate", 0, 100, 0), choice("view", "View", {"Composite", "Matte", "Status"}, 0)},
+                  pct("edge_desat", "Edge Desaturate", 0, 100, 0),
+                  choice("view", "View", {"Composite", "Matte", "Status", "Clean Plate", "Corrected Screen"}, 0),
+                  // A clean plate (render/CleanPlate.h): the screen as it is at each pixel, for an unevenly lit one.
+                  choice("clean_plate", "Clean Plate", {"None", "Made from the Picture", "Track"}, 0),
+                  num("plate_track", "Plate Track (V number, 0: the one above)", 0, 99, 0, 1), boolean("plate_hide", "Hide the Plate Track", true),
+                  pct("plate_threshold", "Plate Screen Threshold", 1, 100, 50), num("plate_erode", "Plate Shrink (px)", 0, 50, 3, 0.5),
+                  num("plate_frames", "Plate Frames (median)", 1, 9, 1, 1), num("plate_spacing", "Plate Frame Spacing", 1, 250, 10, 1),
+                  num("plate_blur", "Plate Blur (px)", 0, 50, 0, 0.5)},
+                 {}});
+    // The screen with nothing in front of it, made from the footage: the screen found, shrunk, the rest filled in
+    // smoothly (and optionally the median of several frames), for keying against or exporting as a plate.
+    c.push_back({"clean_plate", "Clean Plate", EffectCategory::VideoFilter, "Keying",
+                 {color("key", "Screen Colour", 0.1, 0.75, 0.2), num("balance", "Screen Balance", 0, 1, 0.5),
+                  pct("plate_threshold", "Screen Threshold", 1, 100, 50), num("plate_erode", "Shrink (px)", 0, 50, 3, 0.5),
+                  num("plate_frames", "Frames (median)", 1, 9, 1, 1), num("plate_spacing", "Frame Spacing", 1, 250, 10, 1),
+                  num("plate_blur", "Blur (px)", 0, 50, 0, 0.5), choice("view", "View", {"Plate", "Screen Found"}, 0)},
+                 {}});
+    // Under semi-transparent edges, the solid foreground's colour pushed outward in place of the screen mixed in.
+    c.push_back({"edge_extend", "Edge Extend", EffectCategory::VideoFilter, "Keying",
+                 {pct("amount", "Amount", 0, 100, 100), pct("solid", "Solid From (alpha)", 1, 100, 95)},
                  {}});
     // A title or graphic behind the people in the shot beneath it (handled when tracks are composited).
     c.push_back({"behind_people", "Behind People", EffectCategory::VideoFilter, "Keying",
@@ -579,9 +617,17 @@ std::vector<EffectInfo> buildCatalog() {
     // one of Film Look's gauges, by the picture's own light; Replace Grain takes the plate's own out first (with Video
     // Noise Reduction's defaults on the source frames, unless the clip has that effect itself).
     c.push_back({"grain_match", "Grain Match", EffectCategory::VideoFilter, "Stylize",
-                 {choice("source", "Grain", {"Measured", "65mm", "35mm", "16mm", "Super 8"}, 0),
+                 {choice("source", "Grain", {"Measured", "65mm", "35mm", "16mm", "Super 8", "Model"}, 0),
                   choice("mode", "Mode", {"Add Grain", "Replace Grain"}, 0), pct("amount", "Amount", 0, 200, 100),
-                  pct("size", "Size", 25, 400, 100), pct("saturation", "Colour", 0, 200, 100), num("seed", "Seed", 0, 9999, 0, 1)},
+                  pct("size", "Size", 25, 400, 100), pct("saturation", "Colour", 0, 200, 100), num("seed", "Seed", 0, 9999, 0, 1),
+                  pct("detail", "Detail Kept (Replace)", 0, 100, 0),
+                  // The model (render/GrainMatch.h GrainModel), in scene-linear light: Measure Grain fits it as well.
+                  num("model_strength", "Model: Strength at Mid Grey (%)", 0, 30, 4, 0.05),
+                  num("response", "Model: Tonal Response (0.5 Sensor, 1 Negative)", 0.05, 1.5, 0.5, 0.01),
+                  pct("correlation", "Model: Colour Correlation", -45, 100, 70), pct("yellow_blue", "Model: Towards Yellow-Blue", 0, 100, 0),
+                  num("fine_size", "Model: Fine Grain Size (px at 1920 Wide)", 0.2, 12, 1, 0.05), num("cluster_size", "Model: Cluster Size (px at 1920 Wide)", 0.5, 60, 4, 0.1),
+                  pct("clusters", "Model: Clusters", 0, 100, 25), num("kurtosis", "Model: Kurtosis (3 Gaussian)", 1.2, 15, 3, 0.05),
+                  pct("temporal", "Model: Carried to the Next Frame", 0, 45, 0)},
                  {str("profile", "Measured Profile", StringKind::Text)}});
     c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},
@@ -733,6 +779,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {}});
     c.push_back({"deplosive", "De-Plosive", EffectCategory::AudioFilter, "Restoration",
                  {pct("sensitivity", "Sensitivity", 0, 100, 50), num("reduction_db", "Max Reduction (dB)", 0, 60, 24, 0.5)},
+                 {}});
+    // Tape and archive transfers (audio/TapeRepair.h), on the clip's whole source audio.
+    c.push_back({"wow_flutter", "Wow and Flutter", EffectCategory::AudioFilter, "Restoration",
+                 {pct("wow", "Wow (under 4 Hz)", 0, 100, 100), pct("flutter", "Flutter (over 4 Hz)", 0, 100, 100),
+                  num("pilot_hz", "Pilot Tone (Hz, 0 = find)", 0, 20000, 0, 1)},
+                 {}});
+    c.push_back({"azimuth", "Azimuth", EffectCategory::AudioFilter, "Restoration",
+                 {boolean("adaptive", "Follow Over Time"), boolean("polarity", "Fix Polarity", true)},
                  {}});
     c.push_back({"dewind", "De-Wind", EffectCategory::AudioFilter, "Restoration",
                  {pct("amount", "Amount", 0, 100, 100), num("max_reduction_db", "Max Reduction (dB)", 0, 60, 24, 0.5)},

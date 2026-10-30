@@ -36,6 +36,12 @@ constexpr uint32_t kMaxBack = 2u << 20;    // one from the client
 constexpr auto kHashEvery = std::chrono::seconds(2);
 constexpr auto kProjectEvery = std::chrono::milliseconds(100);
 constexpr size_t kMaxQueued = 1000;
+// Notes from a client, which become markers and undo steps on the colourist's machine: at most this many a second,
+// in a session, and bytes of text and drawing in all; a drawing larger than kMaxDrawing is left off its note.
+constexpr int kNotesPerSecond = 20;
+constexpr int kMaxNotes = 5000;
+constexpr size_t kMaxNoteBytes = 32u << 20;
+constexpr qsizetype kMaxDrawing = 256 << 10;
 
 std::string averr(int e) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -252,11 +258,23 @@ bool applyJsonPatch(const std::string& doc, const std::string& patch, std::strin
 std::string jsonHash(const std::string& json) { return hashOf(QJsonDocument::fromJson(QByteArray::fromStdString(json)).object()); }
 
 void keepLocalMedia(const Project& local, Project& received) {
-    for (MediaItem& m : received.media)
-        if (const MediaItem* l = local.findMedia(m.id)) {
+    // (the same media: its id, and the same kind, size and length, so an unrelated item that happens to share an id is
+    // not shown in its place)
+    auto same = [](const MediaItem& a, const MediaItem& b) {
+        return a.kind == b.kind && a.width == b.width && a.height == b.height &&
+               (a.duration <= 0 || b.duration <= 0 || std::fabs(a.duration - b.duration) < 0.5);
+    };
+    // (a network share's path from the colourist is not opened here: on Windows that would sign in to it)
+    auto onShare = [](const std::string& path) { return path.starts_with("\\\\") || path.starts_with("//"); };
+    for (MediaItem& m : received.media) {
+        if (const MediaItem* l = local.findMedia(m.id); l && same(*l, m)) {
             m.path = l->path;
             m.proxyPath = l->proxyPath;
+            continue;
         }
+        if (onShare(m.path)) m.path.clear();
+        if (onShare(m.proxyPath)) m.proxyPath.clear();
+    }
 }
 
 bool needsStream(const Project& p, const Sequence& s, FrameTime t, const std::function<bool(Id)>& missing) {
@@ -287,6 +305,9 @@ struct GradeHost::Impl {
     std::vector<output::RemoteMarker> notes;
     std::vector<Pointer> pointers;
     Status status;
+    size_t noteBytes = 0;  // taken this session
+    Clock::time_point noteSecond{};
+    int notesThisSecond = 0;
     std::thread work, back;
 
     static int interrupted(void* o) { return static_cast<Impl*>(o)->stopping.load() ? 1 : 0; }
@@ -424,6 +445,13 @@ struct GradeHost::Impl {
                     resync = true;
                     cv.notify_all();
                 } else if (t == "note" && notes.size() < kMaxQueued) {
+                    const auto now = Clock::now();
+                    if (now - noteSecond >= std::chrono::seconds(1)) {
+                        noteSecond = now;
+                        notesThisSecond = 0;
+                    }
+                    if (notesThisSecond >= kNotesPerSecond || status.notes >= kMaxNotes || noteBytes >= kMaxNoteBytes) continue;
+                    ++notesThisSecond;
                     output::RemoteMarker mk;
                     mk.frame = std::max<FrameTime>(0, frameOf(o, "frame"));
                     mk.duration = std::max<FrameTime>(0, frameOf(o, "duration"));
@@ -432,8 +460,9 @@ struct GradeHost::Impl {
                     mk.author = text(o, "author", 200);
                     if (mk.author.empty()) mk.author = status.client;
                     mk.text = text(o, "text", 64 * 1024);
-                    mk.drawing = text(o, "drawing", 1 << 20);
+                    if (const QString drawing = o.value("drawing").toString(); drawing.size() <= kMaxDrawing) mk.drawing = drawing.toStdString();
                     mk.id = text(o, "id", 100);
+                    noteBytes += mk.text.size() + mk.drawing.size();
                     notes.push_back(std::move(mk));
                     ++status.notes;
                 } else if (t == "pointer" && pointers.size() < kMaxQueued) {
@@ -478,6 +507,8 @@ bool GradeHost::start(const GradeSettings& settings, std::string* error) {
         d.viewSerial = 0;
         d.notes.clear();
         d.pointers.clear();
+        d.noteBytes = 0;
+        d.notesThisSecond = 0;
         d.running = true;
     }
     d.work = std::thread([&d] { d.runWork(); });

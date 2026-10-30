@@ -518,6 +518,7 @@ RemoteGradePanel::RemoteGradePanel(RemoteGradeController* controller, QWidget* p
     if (controller_->mode() == RemoteGradeController::Mode::Following) tabs_->setCurrentIndex(1);
     layout->addWidget(tabs_);
     status_ = new QLabel(this);
+    status_->setTextFormat(Qt::PlainText);  // (a client's name is shown as typed, never as markup)
     status_->setObjectName(QStringLiteral("remoteGradeStatus"));
     status_->setWordWrap(true);
     status_->setTextInteractionFlags(Qt::TextSelectableByMouse);

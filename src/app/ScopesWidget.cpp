@@ -241,6 +241,12 @@ void ScopesWidget::setCieUv(bool uv) {
     update();
 }
 
+void ScopesWidget::setPrimaryMoves(const std::vector<std::pair<QPointF, QPointF>>& xy) {
+    if (xy == primaryMoves_) return;
+    primaryMoves_ = xy;
+    if (mode_ == Mode::Chromaticity) update();
+}
+
 int ScopesWidget::cieSamplesNear(double a, double b, double radius) const {
     if (cieCounts_.empty()) return 0;
     const double range = cieRange(cieUv_);
@@ -991,6 +997,28 @@ void ScopesWidget::paintChromaticity(QPainter& p, const QRect& area) {
         const QPointF red = tri[0];
         p.drawText(QRectF(red.x() + 4, red.y() - fm.height() / 2.0 + double(g) * fm.height() - fm.height(), 120, fm.height()),
                    Qt::AlignLeft | Qt::AlignVCenter, gamuts[g].name);
+    }
+    // A Crosstalk's primaries: an arrow from each one's place to where it is taken, and the triangle they make.
+    if (!primaryMoves_.empty()) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing);
+        const QColor tint[3] = {QColor(255, 90, 90), QColor(90, 230, 110), QColor(110, 150, 255)};
+        QPolygonF moved;
+        for (size_t i = 0; i < primaryMoves_.size(); ++i) {
+            const QPointF a = at(Xy{primaryMoves_[i].first.x(), primaryMoves_[i].first.y()});
+            const QPointF b = at(Xy{primaryMoves_[i].second.x(), primaryMoves_[i].second.y()});
+            moved << b;
+            p.setPen(QPen(tint[i % 3], 1.5));
+            p.drawLine(a, b);
+            p.setBrush(tint[i % 3]);
+            p.drawEllipse(b, 3.5, 3.5);
+        }
+        if (moved.size() == 3) {
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(QColor(255, 255, 255, 160), 1, Qt::DotLine));
+            p.drawPolygon(moved);
+        }
+        p.restore();
     }
     // D65.
     const QPointF white = at(Xy{0.3127, 0.3290});

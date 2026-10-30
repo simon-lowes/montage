@@ -64,6 +64,8 @@
 #include "core/AudioDescription.h"
 #include "core/TakeLanes.h"
 #include <QProcess>
+#include <QDir>
+#include <QTemporaryFile>
 #include <QSysInfo>
 #include <QCoreApplication>
 #include "core/ProjectIO.h"
@@ -1258,6 +1260,125 @@ private slots:
             "<Text VAlign=\"bottom\" VPosition=\"4\">two</Text></Subtitle></Font></DCSubtitle>";
         QVERIFY2(parseDcst(interop, fps, back, &err), err.c_str());
         QVERIFY(back.size() == 1 && back[0].start == 36 && back[0].end == 72 && back[0].text == "One\ntwo");
+    }
+
+    void captionsAtShotChanges() {
+        // The sequence's shot changes: cuts between clips, a clip leaving a gap and the next after it, a picture on
+        // V2; not a through edit, a dissolve, a title, or a cut under V2's picture; shot-change markers too.
+        {
+            Fixture fx;
+            fx.put(V1, 0, 100, 0);
+            fx.put(V1, 100, 100, 50);   // a cut at 100
+            fx.put(V1, 200, 50, 150);   // a through edit at 200 (the source runs on)
+            const Id d = fx.put(V1, 250, 50, 20);  // a cut at 250, dissolved into
+            QVERIFY(addTransition(fx.p, fx.s(), d, Edge::In, "cross_dissolve", 10).ok);
+            fx.put(V1, 320, 60, 0);     // a gap before it: cuts at 300 and 320
+            fx.put(V1, 380, 100, 100);  // a cut at 380 under V2's picture
+            fx.put(V2, 360, 40, 200);   // a picture on V2: cuts at 360 and 400
+            Clip title = makeGeneratorClip(fx.p, "title", 20);
+            title.start = 130;
+            QVERIFY(overwrite(fx.p, fx.s(), V2, title).ok);
+            fx.s().markers.push_back(Marker{150, 0, "Shot change", "", 0, false, true});
+            QCOMPARE(captionShotChanges(fx.s()), (std::vector<FrameTime>{100, 150, 300, 320, 360, 400}));
+        }
+
+        // The half-second rules at each rate: a caption starting just after a cut starts on it; one ending just before a
+        // cut, on it, or just after it ends two frames before it; one whose speech is over well before a cut it runs
+        // across ends two frames before it; one starting just before a cut, or running across one with speech that may
+        // go on, is reported.
+        for (const Rational fps : {Rational{24000, 1001}, Rational{24, 1}, Rational{25, 1}, Rational{30000, 1001}, Rational{60, 1}}) {
+            const int zone = shotChangeZone(fps);
+            QCOMPARE(zone, fps.toDouble() > 50 ? 30 : fps.toDouble() > 26 ? 15 : 12);
+            const FrameTime L = FrameTime(std::lround(3 * fps.toDouble())), half = zone / 2;
+            const std::vector<FrameTime> cuts = {600, 1200, 1800, 2400, 3000, 3600};
+            Caption spoken{3000 - L, 3000 + L, "Hello there"};
+            spoken.wordTimes = {0.0, 0.1};
+            std::vector<Caption> caps = {{600 + half, 600 + half + L, "Hello there"},  // starts just after a cut
+                                         {1200 - half - L, 1200 - half, "Hello there"},  // ends just before one
+                                         {1800 - L, 1800 + half, "Hello there"},       // ends just after one
+                                         {2400 - half, 2400 - half + L, "Hello there"},  // starts just before one
+                                         spoken,
+                                         {3600 - L, 3600 + L, "Hello there"},  // across one, speech unknown
+                                         {3600 + L + 50, 3600 + 2 * L + 50, "Hello there"}};
+            // Without shot changes the timing is right as it is.
+            std::vector<Caption> plain = caps;
+            QCOMPARE(fixCaptionTiming(plain, fps), 0);
+            QCOMPARE(plain, caps);
+            QCOMPARE(fixCaptionTiming(caps, fps, {}, cuts), 4);
+            QCOMPARE(caps[0].start, FrameTime(600));
+            QCOMPARE(caps[0].end, 600 + half + L);
+            QCOMPARE(caps[1].end, FrameTime(1198));
+            QCOMPARE(caps[2].end, FrameTime(1798));
+            QCOMPARE(caps[3].start, 2400 - half);
+            QCOMPARE(caps[4].end, FrameTime(2998));
+            QCOMPARE(caps[5].end, 3600 + L);
+            for (size_t i = 1; i < caps.size(); ++i) QVERIFY(caps[i].start - caps[i - 1].end >= 2);
+            const std::vector<unsigned> issues = checkCaptions(caps, fps, {}, cuts);
+            QCOMPARE(issues, (std::vector<unsigned>{0, 0, 0, kCaptionNearShotChange, 0, kCaptionCrossesShotChange, 0}));
+            QVERIFY(describeCaptionIssues(issues[3], caps[3], fps).find("within " + std::to_string(zone) + " frames of a shot change") != std::string::npos);
+            QCOMPARE(fixCaptionTiming(caps, fps, {}, cuts), 0);
+            // Off: shot changes are not looked at.
+            CaptionLimits off;
+            off.shotZoneSeconds = 0;
+            QCOMPARE(checkCaptions(caps, fps, off, cuts), std::vector<unsigned>(caps.size(), 0u));
+        }
+
+        // A caption starting just after a cut, the one before running on to it: that one ends the gap before it.
+        std::vector<Caption> pair = {{300, 404, "One two three"}, {405, 480, "Four five six"}};
+        QCOMPARE(fixCaptionTiming(pair, Rational{24, 1}, {}, {400}), 2);
+        QCOMPARE(pair[0].end, FrameTime(398));
+        QCOMPARE(pair[1].start, FrameTime(400));
+        // Not lengthened over a shot change to be read.
+        std::vector<Caption> brief = {{380, 390, "A few words to read here"}};
+        QCOMPARE(fixCaptionTiming(brief, Rational{24, 1}, {}, {400}), 1);
+        QCOMPARE(brief[0].end, FrameTime(398));
+    }
+
+    void ebuTtD() {
+        // Written as EBU-TT-D, read back to the same captions (timing to the frame at each rate, lines, place, italics,
+        // colours).
+        for (const Rational fps : {Rational{24000, 1001}, Rational{25, 1}, Rational{30000, 1001}, Rational{60, 1}}) {
+            std::vector<Caption> caps = {{10, 50, "First line\nsecond line"}, {60, 100, "On top & <left>"}, {120, 3600 * 30, "Long"},
+                                         {3600 * 30 + 5, 3600 * 30 + 40, "Red"}};
+            caps[1].vertical = kCaptionTop, caps[1].align = kCaptionLeft;
+            caps[2].italic = true;
+            caps[3].colour = "#ff0000";
+            CaptionStyle style;
+            style.bold = true;
+            const std::string doc = captionsToEbuTtD(caps, fps, "de", style);
+            QVERIFY(doc.find("<ebuttm:conformsToStandard>urn:ebu:tt:distribution:2018-04</ebuttm:conformsToStandard>") != std::string::npos);
+            QVERIFY(doc.find("ttp:timeBase=\"media\"") != std::string::npos && doc.find("xml:lang=\"de\"") != std::string::npos);
+            QVERIFY(doc.find("tts:color=\"#ff0000\"") != std::string::npos && doc.find(" tts:color=\"#ff0000\">") == std::string::npos);
+            std::vector<Caption> back;
+            std::string err;
+            QVERIFY2(parseTtml(doc, fps, back, &err), err.c_str());
+            QCOMPARE(back, caps);
+            // Most captions in a colour of their own: still theirs, the rest the track's.
+            std::vector<Caption> mostlyRed = caps;
+            mostlyRed[0].colour = mostlyRed[1].colour = "#ff0000";
+            QVERIFY(parseTtml(captionsToEbuTtD(mostlyRed, fps, "de", style), fps, back, &err));
+            QCOMPARE(back, mostlyRed);
+            // By its name as the format to export in.
+            CaptionTrack t;
+            t.language = "de";
+            t.style = style;
+            t.captions = caps;
+            Sequence seq;
+            seq.fps = fps;
+            QCOMPARE(exportCaptions(t, seq, "ebu-tt-d"), doc);
+            // The EBU's schema passes it, where MONTAGE_TEST_EBUTTD_SCHEMA names it (and xmllint is at hand).
+            const QString schema = qEnvironmentVariable("MONTAGE_TEST_EBUTTD_SCHEMA");
+            if (schema.isEmpty()) continue;
+            QTemporaryFile file(QDir::temp().filePath("ebuttd-XXXXXX.xml"));
+            QVERIFY(file.open());
+            file.write(doc.data(), qint64(doc.size()));
+            file.close();
+            QProcess lint;
+            lint.setProcessChannelMode(QProcess::MergedChannels);
+            lint.start("xmllint", {"--noout", "--nonet", "--schema", schema, file.fileName()});
+            QVERIFY2(lint.waitForFinished(120000), "xmllint did not finish");
+            QVERIFY2(lint.exitCode() == 0, lint.readAll().constData());
+        }
     }
 
     void captionChecksAndTools() {

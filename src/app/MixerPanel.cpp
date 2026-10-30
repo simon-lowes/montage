@@ -1486,7 +1486,7 @@ void MixerPanel::playbackPosition(FrameTime t) {
             lv.x = r.x.writing(), lv.y = r.y.writing(), lv.z = r.z.writing();
             lv.surround = r.changedOther;  // (width, LFE and object as changed during the pass; the project's otherwise)
             lv.position = now;
-            lv.position.width = r.position.width, lv.position.lfeDb = r.position.lfeDb, lv.position.object = r.position.object;
+            lv.position.width = r.position.width, lv.position.lfeDb = r.position.lfeDb, lv.position.object = r.position.object, lv.position.lfeOnly = r.position.lfeOnly;
             if (!held && !(lv.x && lv.y && lv.z)) st.surround->setPan(shown);
             r.shownPosition = held ? now : shown;
             key += QStringLiteral("s%1%2%3,%4,%5,%6;").arg(int(lv.x)).arg(int(lv.y)).arg(int(lv.z)).arg(now.x).arg(now.y).arg(now.z);
@@ -1519,7 +1519,7 @@ void MixerPanel::playbackPosition(FrameTime t) {
             if (l.x) tr.surroundXAuto = Param(), tr.surround.x = l.position.x;
             if (l.y) tr.surroundYAuto = Param(), tr.surround.y = l.position.y;
             if (l.z) tr.surroundZAuto = Param(), tr.surround.z = l.position.z;
-            if (l.surround) tr.surround.width = l.position.width, tr.surround.lfeDb = l.position.lfeDb, tr.surround.object = l.position.object;
+            if (l.surround) tr.surround.width = l.position.width, tr.surround.lfeDb = l.position.lfeDb, tr.surround.object = l.position.object, tr.surround.lfeOnly = l.position.lfeOnly;
         }
     };
     emit liveMix(liveOverlay());
@@ -1660,7 +1660,7 @@ void MixerPanel::finishPass(FrameTime t, bool final) {
                     write(r.z, tr.surroundZAuto, tr.surround.z, 0.005, false, false);
                 }
                 if (r.changedOther) {
-                    tr.surround.width = r.position.width, tr.surround.lfeDb = r.position.lfeDb, tr.surround.object = r.position.object;
+                    tr.surround.width = r.position.width, tr.surround.lfeDb = r.position.lfeDb, tr.surround.object = r.position.object, tr.surround.lfeOnly = r.position.lfeOnly;
                     wrote = true;
                 }
             }
@@ -1701,8 +1701,8 @@ void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
         for (Recording& r : recording_)
             if (r.track == index && r.surround) {
                 recorded = true;
-                if (r.position.width != pan.width || r.position.lfeDb != pan.lfeDb || r.position.object != pan.object) {
-                    r.position.width = pan.width, r.position.lfeDb = pan.lfeDb, r.position.object = pan.object;
+                if (r.position.width != pan.width || r.position.lfeDb != pan.lfeDb || r.position.object != pan.object || r.position.lfeOnly != pan.lfeOnly) {
+                    r.position.width = pan.width, r.position.lfeDb = pan.lfeDb, r.position.object = pan.object, r.position.lfeOnly = pan.lfeOnly;
                     r.changedOther = true;
                     liveState_.clear();
                 }
@@ -1719,7 +1719,7 @@ void MixerPanel::setSurround(int index, const SurroundPan& pan, bool) {
             Track& t = s.audioTracks[size_t(index)];
             if (surroundAnimated(t) && readsLanes(t)) {
                 const SurroundPan was = t.surround;
-                t.surround.width = pan.width, t.surround.lfeDb = pan.lfeDb, t.surround.object = pan.object;
+                t.surround.width = pan.width, t.surround.lfeDb = pan.lfeDb, t.surround.object = pan.object, t.surround.lfeOnly = pan.lfeOnly;
                 bool changed = !(t.surround == was);
                 for (auto [lane, v] : {std::pair<Param*, double>{&t.surroundXAuto, pan.x}, {&t.surroundYAuto, pan.y}, {&t.surroundZAuto, pan.z}})
                     if (lane->keys.empty() || lane->at(at) != v || !lane->keyAt(at)) {

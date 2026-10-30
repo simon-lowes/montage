@@ -97,6 +97,7 @@ QJsonValue surroundToJson(const SurroundPan& p) {
     QJsonObject o{{"x", p.x}, {"y", p.y}, {"width", p.width}, {"lfeDb", p.lfeDb}};
     if (p.z != 0) o["z"] = p.z;
     if (p.object) o["object"] = true;
+    if (p.lfeOnly) o["lfeOnly"] = true;
     return o;
 }
 
@@ -109,6 +110,7 @@ SurroundPan surroundFromJson(const QJsonValue& v) {
     p.lfeDb = std::clamp(o.value("lfeDb").toDouble(-100), -100.0, 12.0);
     p.z = std::clamp(o.value("z").toDouble(0), 0.0, 1.0);
     p.object = o.value("object").toBool();
+    p.lfeOnly = o.value("lfeOnly").toBool();
     return p;
 }
 
@@ -338,6 +340,7 @@ QJsonArray markersToJson(const std::vector<Marker>& markers) {
     for (const auto& mk : markers) {
         QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
         if (mk.chapter) mo["chapter"] = true;
+        if (mk.shotChange) mo["shot_change"] = true;
         if (mk.sub != 0) mo["sub"] = mk.sub;
         if (!mk.drawing.empty()) mo["drawing"] = qs(mk.drawing);
         if (mk.drawnAt >= 0) mo["drawn_at"] = double(mk.drawnAt);
@@ -360,6 +363,7 @@ std::vector<Marker> markersFromJson(const QJsonValue& v) {
         mk.comment = ss(mo.value("comment"));
         mk.color = mo.value("color").toInt(0);
         mk.chapter = mo.value("chapter").toBool(false);
+        mk.shotChange = mo.value("shot_change").toBool(false);
         mk.drawing = ss(mo.value("drawing"));
         mk.drawnAt = mo.contains("drawn_at") ? i64(mo.value("drawn_at")) : -1;
         mk.reviewId = ss(mo.value("review_id"));
@@ -1262,6 +1266,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
             o["shots"] = sh;
         }
         if (!m.created.empty()) o["created"] = qs(m.created);
+        if (!m.fdl.empty()) o["fdl"] = qs(m.fdl);
+        if (!m.fdlFraming.empty()) o["fdlFraming"] = qs(m.fdlFraming);
         if (m.subclipOf) {
             o["subclipOf"] = double(m.subclipOf);
             o["subclipIn"] = m.subclipIn;
@@ -1445,6 +1451,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             m.shots.push_back({d.value("start").toDouble(), d.value("end").toDouble(), ss(d.value("text"))});
         }
         m.created = ss(o.value("created"));
+        m.fdl = ss(o.value("fdl"));
+        m.fdlFraming = ss(o.value("fdlFraming"));
         m.subclipOf = Id(i64(o.value("subclipOf")));
         m.subclipIn = o.value("subclipIn").toDouble();
         m.subclipOut = o.value("subclipOut").toDouble();
