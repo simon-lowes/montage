@@ -13477,9 +13477,18 @@ colorspaces:
         note.drawing.clear();
         for (int i = 0; i < 199; ++i) client.sendNote(note);
         notes.clear();
-        QTest::qWait(1500);
+        QElapsedTimer flood;
+        flood.start();
+        QVERIFY(waitFor([&] {
+            for (auto& n : host.takeNotes()) notes.push_back(n);
+            return !notes.empty();
+        }, 15000));
+        QTest::qWait(1000);
         for (auto& n : host.takeNotes()) notes.push_back(n);
-        QVERIFY2(!notes.empty() && notes.size() <= 40, QByteArray::number(int(notes.size())).constData());
+        // (at most 20 in each second begun since they were sent; however slow the link, fewer than the 200 sent)
+        const int seconds = int(flood.elapsed() / 1000) + 1;
+        QVERIFY2(notes.size() <= size_t(20 * (seconds + 1)) && notes.size() < 200,
+                 qPrintable(QStringLiteral("%1 notes in %2 s").arg(notes.size()).arg(flood.elapsed() / 1000.0)));
         QVERIFY(notes[0].drawing.empty() && notes[0].text == "Warmer skin here");
 
         // Drift: a copy that differs is found by the next check and sent whole again.
