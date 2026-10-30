@@ -262,6 +262,25 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"aces_gamut_compress", "ACES Gamut Compress", EffectCategory::VideoFilter, "Color",
                  {choice("direction", "Direction", {"Forward", "Inverse"}, 0)},
                  {}});
+    // Crosstalk and Colour Correlation (render/Crosstalk.h), on linear light in the working space: a 3 x 3 matrix whose rows
+    // sum to 1, edited as each primary's hue and strength (on a matrix fitted to a chart, Clip > Match Colour Chart), and
+    // saturation by the channels' spread about their luminance, bounded by a gamut and limited to a range of exposure.
+    c.push_back({"crosstalk", "Crosstalk", EffectCategory::VideoFilter, "Color",
+                 {num("red_hue", "Red Hue (° towards Green)", -60, 60, 0, 0.5), pct("red_strength", "Red Strength", 0, 200, 100),
+                  num("green_hue", "Green Hue (° towards Blue)", -60, 60, 0, 0.5), pct("green_strength", "Green Strength", 0, 200, 100),
+                  num("blue_hue", "Blue Hue (° towards Red)", -60, 60, 0, 0.5), pct("blue_strength", "Blue Strength", 0, 200, 100),
+                  boolean("invert", "Invert")},
+                 {str("matrix", "Fitted Matrix", StringKind::Text)}});
+    c.push_back({"colour_correlation", "Colour Correlation", EffectCategory::VideoFilter, "Color",
+                 {pct("saturation", "Saturation", 0, 300, 100), choice("boundary", "Boundary", {"Rec.709", "P3", "Rec.2020", "Custom"}, 1),
+                  pct("compress_start", "Compression Starts", 50, 99, 80),
+                  num("exposure_low", "Lowest Exposure (Stops from Grey)", -12, 12, -12, 0.1),
+                  num("exposure_high", "Highest Exposure (Stops from Grey)", -12, 12, 12, 0.1),
+                  num("exposure_soft", "Exposure Fall-off (Stops)", 0, 6, 1, 0.1),
+                  num("custom_rx", "Custom Red x", 0, 1, 0.64, 0.001), num("custom_ry", "Custom Red y", 0, 1, 0.33, 0.001),
+                  num("custom_gx", "Custom Green x", 0, 1, 0.30, 0.001), num("custom_gy", "Custom Green y", 0, 1, 0.60, 0.001),
+                  num("custom_bx", "Custom Blue x", 0, 1, 0.15, 0.001), num("custom_by", "Custom Blue y", -0.2, 1, 0.06, 0.001)},
+                 {}});
     {
         // Hue Vectors (render/ColorSlice.h; as Resolve's ColorSlice): hue shift, saturation and density by hue vector in a
         // log encoding, saturation subtractive as film's or additive (brightness kept), highlights protected.
@@ -579,9 +598,17 @@ std::vector<EffectInfo> buildCatalog() {
     // one of Film Look's gauges, by the picture's own light; Replace Grain takes the plate's own out first (with Video
     // Noise Reduction's defaults on the source frames, unless the clip has that effect itself).
     c.push_back({"grain_match", "Grain Match", EffectCategory::VideoFilter, "Stylize",
-                 {choice("source", "Grain", {"Measured", "65mm", "35mm", "16mm", "Super 8"}, 0),
+                 {choice("source", "Grain", {"Measured", "65mm", "35mm", "16mm", "Super 8", "Model"}, 0),
                   choice("mode", "Mode", {"Add Grain", "Replace Grain"}, 0), pct("amount", "Amount", 0, 200, 100),
-                  pct("size", "Size", 25, 400, 100), pct("saturation", "Colour", 0, 200, 100), num("seed", "Seed", 0, 9999, 0, 1)},
+                  pct("size", "Size", 25, 400, 100), pct("saturation", "Colour", 0, 200, 100), num("seed", "Seed", 0, 9999, 0, 1),
+                  pct("detail", "Detail Kept (Replace)", 0, 100, 0),
+                  // The model (render/GrainMatch.h GrainModel), in scene-linear light: Measure Grain fits it as well.
+                  num("model_strength", "Model: Strength at Mid Grey (%)", 0, 30, 4, 0.05),
+                  num("response", "Model: Tonal Response (0.5 Sensor, 1 Negative)", 0.05, 1.5, 0.5, 0.01),
+                  pct("correlation", "Model: Colour Correlation", -45, 100, 70), pct("yellow_blue", "Model: Towards Yellow-Blue", 0, 100, 0),
+                  num("fine_size", "Model: Fine Grain Size (px at 1920 Wide)", 0.2, 12, 1, 0.05), num("cluster_size", "Model: Cluster Size (px at 1920 Wide)", 0.5, 60, 4, 0.1),
+                  pct("clusters", "Model: Clusters", 0, 100, 25), num("kurtosis", "Model: Kurtosis (3 Gaussian)", 1.2, 15, 3, 0.05),
+                  pct("temporal", "Model: Carried to the Next Frame", 0, 45, 0)},
                  {str("profile", "Measured Profile", StringKind::Text)}});
     c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},

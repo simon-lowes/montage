@@ -43,6 +43,7 @@
 #include "render/MeshWarp.h"
 #include "render/SurfaceTrack.h"
 #include "render/ColorChart.h"
+#include "render/Crosstalk.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
 #include "render/ColorSlice.h"
@@ -9712,6 +9713,307 @@ colorspaces:
         Sequence sip = monitorSequence(seq, solo);
         QVERIFY(sip.audioTracks[1].solo && sip.audioTracks[1].output == 42 && sip.masterVolumeDb == -3);
         QVERIFY(!seq.audioTracks[1].solo);
+    }
+
+    void crosstalkAndColourCorrelation() {
+        Project p = makeDefaultProject();
+        std::mt19937 rng(23);
+        std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+        const ColorSpace& rec709 = rec709Space();
+        const ColorSpace& acesLinear = linearColorSpace(Primaries::Ap1);
+        Image img(96, 64);
+        for (float& v : img.px) v = unit(rng);
+        for (size_t i = 3; i < img.px.size(); i += 4) img.px[i] = 1;
+        // A crosstalk left neutral changes nothing, to the bit.
+        Effect cross = makeEffect(p, "crosstalk");
+        {
+            const WorkingSpaceScope working(&rec709);
+            Image same = img;
+            applyVideoEffect(cross, 0, same, 1);
+            QVERIFY(same.px == img.px);
+        }
+        // Any crosstalk keeps greys grey, in a display space and in scene-linear light, and its rows sum to 1.
+        cross.params["red_hue"] = 20.0, cross.params["green_strength"] = 150.0, cross.params["blue_hue"] = -35.0, cross.params["blue_strength"] = 60.0;
+        double m[9];
+        QVERIFY(crosstalkMatrix(cross, 0, rec709, m));
+        for (int r = 0; r < 3; ++r) QVERIFY(std::fabs(m[r * 3] + m[r * 3 + 1] + m[r * 3 + 2] - 1) < 1e-12);
+        for (const ColorSpace* space : {&rec709, &acesLinear}) {
+            const WorkingSpaceScope working(space);
+            Image greys(64, 1);
+            for (int x = 0; x < 64; ++x) {
+                float* px = greys.at(x, 0);
+                px[0] = px[1] = px[2] = space == &rec709 ? x / 63.0f : std::exp2(float(x) / 4 - 10);
+                px[3] = 1;
+            }
+            applyVideoEffect(cross, 0, greys, 1);
+            for (int x = 0; x < 64; ++x) {
+                const float* px = greys.at(x, 0);
+                const double tol = 1e-6 * std::max(1.0, double(std::fabs(px[1])));
+                QVERIFY2(std::fabs(px[0] - px[1]) <= tol && std::fabs(px[2] - px[1]) <= tol,
+                         qPrintable(QString("%1: %2 %3 %4").arg(x).arg(px[0], 0, 'g', 9).arg(px[1], 0, 'g', 9).arg(px[2], 0, 'g', 9)));
+            }
+        }
+        // Inverted, it takes the picture back: in linear light to 1e-5 (near black, code values are steeper than the
+        // pictures' floats are fine, so a dark channel made from bright ones is compared as light).
+        {
+            const WorkingSpaceScope working(&rec709);
+            Image there = img;
+            applyVideoEffect(cross, 0, there, 1);
+            Effect back = cross;
+            back.params["invert"] = 1.0;
+            applyVideoEffect(back, 0, there, 1);
+            double worst = 0;
+            for (size_t i = 0; i < img.px.size(); ++i)
+                if (i % 4 != 3) worst = std::max(worst, std::fabs(toLinear(Transfer::Bt1886, there.px[i]) - toLinear(Transfer::Bt1886, img.px[i])));
+            QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        }
+        // The handles put each primary where they say: red's hue at 30° towards green, green at 20° towards red, blue
+        // half as strong (its colour half its own away from grey of the same light), each moving no other.
+        {
+            const double hue[3] = {30, -20, 0}, strength[3] = {1, 1, 0.5};
+            double h[9];
+            crosstalkHandles(hue, strength, h);
+            auto hsvHue = [](double r, double g, double b) {
+                const double mx = std::max({r, g, b}), mn = std::min({r, g, b}), d = mx - mn;
+                double hh = mx == r ? 60 * std::fmod((g - b) / d, 6.0) : mx == g ? 60 * ((b - r) / d + 2) : 60 * ((r - g) / d + 4);
+                return hh < 0 ? hh + 360 : hh;
+            };
+            QVERIFY2(std::fabs(hsvHue(h[0], h[3], h[6]) - 30) < 1e-9, qPrintable(QString::number(hsvHue(h[0], h[3], h[6]))));
+            QVERIFY2(std::fabs(hsvHue(h[1], h[4], h[7]) - 100) < 1e-9, qPrintable(QString::number(hsvHue(h[1], h[4], h[7]))));
+            const double blue[3] = {h[2], h[5], h[8]}, mean = (blue[0] + blue[1] + blue[2]) / 3;
+            QVERIFY(std::fabs(blue[0] / mean - 0.5) < 1e-9 && std::fabs(blue[2] / mean - 2) < 1e-9);
+            for (int r = 0; r < 3; ++r) QVERIFY(std::fabs(h[r * 3] + h[r * 3 + 1] + h[r * 3 + 2] - 1) < 1e-12);
+        }
+        // Red's hue turned towards green moves its primary that way on the chromaticity diagram; a weaker blue moves
+        // towards white.
+        {
+            Effect one = makeEffect(p, "crosstalk");
+            one.params["red_hue"] = 30.0, one.params["blue_strength"] = 50.0;
+            const auto moves = crosstalkPrimaries(one, 0, rec709);
+            QVERIFY(moves[0][1].y > moves[0][0].y + 0.05 && moves[0][1].x < moves[0][0].x);
+            const double before = std::hypot(moves[2][0].x - 0.3127, moves[2][0].y - 0.329), after = std::hypot(moves[2][1].x - 0.3127, moves[2][1].y - 0.329);
+            QVERIFY(after < 0.8 * before);
+            QVERIFY(std::fabs(moves[1][1].x - moves[1][0].x) < 0.03);
+        }
+        // Fitted to a chart seen through a camera's crosstalk (rows summing to 1), the fit undoes it.
+        {
+            const double camera[9] = {0.86, 0.10, 0.04, 0.07, 0.85, 0.08, 0.02, 0.15, 0.83};
+            ChartColors shot;
+            for (size_t i = 0; i < 24; ++i) {
+                double l[3];
+                for (int k = 0; k < 3; ++k) l[k] = std::pow(colorChecker24()[i][size_t(k)], 2.4);
+                for (int k = 0; k < 3; ++k) {
+                    const double v = camera[k * 3] * l[0] + camera[k * 3 + 1] * l[1] + camera[k * 3 + 2] * l[2];
+                    shot[i][size_t(k)] = std::pow(v, 1 / 2.4);
+                }
+            }
+            const CrosstalkFit fit = fitCrosstalk(shot);
+            QVERIFY(fit.ok);
+            double undone[9], inverse[9];
+            invertMatrix3(camera, inverse);
+            for (int r = 0; r < 3; ++r) QVERIFY(std::fabs(fit.m[r * 3] + fit.m[r * 3 + 1] + fit.m[r * 3 + 2] - 1) < 1e-9);
+            for (int k = 0; k < 9; ++k) QVERIFY2(std::fabs(fit.m[k] - inverse[k]) < 0.02, qPrintable(QString("%1: %2 for %3").arg(k).arg(fit.m[k]).arg(inverse[k])));
+            (void)undone;
+            QVERIFY2(fit.deltaEBefore > 3 && fit.deltaEAfter < 0.5, qPrintable(QString("%1 -> %2").arg(fit.deltaEBefore).arg(fit.deltaEAfter)));
+            Effect fitted = crosstalkEffect(fit, 1);
+            double held[9];
+            QVERIFY(crosstalkMatrix(fitted, 0, rec709, held));
+            for (int k = 0; k < 9; ++k) QVERIFY(std::fabs(held[k] - fit.m[k]) < 1e-7);
+            // Kept in Rec.709's light, it is the same correction in a sequence working in ACEScg.
+            double inAces[9], to709[9], from709[9], half[9], back[9];
+            QVERIFY(crosstalkMatrix(fitted, 0, acesLinear, inAces));
+            primariesMatrix(Primaries::Ap1, Primaries::Bt709, to709);
+            primariesMatrix(Primaries::Bt709, Primaries::Ap1, from709);
+            multiplyMatrix3(to709, inAces, half);
+            multiplyMatrix3(half, from709, back);
+            for (int k = 0; k < 9; ++k) QVERIFY2(std::fabs(back[k] - fit.m[k]) < 2e-3, qPrintable(QString("%1: %2 for %3").arg(k).arg(back[k]).arg(fit.m[k])));
+            // Grade versions leave a fitted Crosstalk be, as a Chart Match: it is the camera's, not the grade's.
+            QVERIFY(!isGradeEffect(fitted));
+            QVERIFY(isGradeEffect(cross));
+        }
+
+        // Colour Correlation never takes a colour past its boundary: 100,000 random colours in ACEScg's linear light,
+        // saturated, kept inside Rec.709 (to 1e-4), those outside it brought in; at 0 only the luminance is left; at
+        // 100 % colours short of where compression starts are left as they were.
+        Effect corr = makeEffect(p, "colour_correlation");
+        corr.params["boundary"] = 0.0;
+        std::uniform_real_distribution<double> wide(-0.3, 4.0);
+        for (double sat : {0.0, 1.0, 2.5}) {
+            corr.params["saturation"] = sat * 100;
+            const CorrelationSettings cs = correlationSettings(corr, 0, acesLinear);
+            int checked = 0;
+            for (int i = 0; i < 100000; ++i) {
+                double rgb[3] = {wide(rng), wide(rng), wide(rng)}, in[3] = {rgb[0], rgb[1], rgb[2]}, b[3], bIn[3];
+                correlatePixel(cs, rgb);
+                for (int k = 0; k < 3; ++k) {
+                    b[k] = cs.toBoundary[k * 3] * rgb[0] + cs.toBoundary[k * 3 + 1] * rgb[1] + cs.toBoundary[k * 3 + 2] * rgb[2];
+                    bIn[k] = cs.toBoundary[k * 3] * in[0] + cs.toBoundary[k * 3 + 1] * in[1] + cs.toBoundary[k * 3 + 2] * in[2];
+                }
+                const double Y = cs.luma[0] * bIn[0] + cs.luma[1] * bIn[1] + cs.luma[2] * bIn[2];
+                if (Y <= 1e-6) {  // (no light, or less than none, as camera noise below black has: left as it is)
+                    if (Y <= 1e-12) QVERIFY(rgb[0] == in[0] && rgb[1] == in[1] && rgb[2] == in[2]);
+                    continue;
+                }
+                QVERIFY2(std::min({b[0], b[1], b[2]}) >= -1e-4, qPrintable(QString("%1 %2 %3 at %4").arg(b[0]).arg(b[1]).arg(b[2]).arg(sat)));
+                QVERIFY(std::fabs(cs.luma[0] * b[0] + cs.luma[1] * b[1] + cs.luma[2] * b[2] - Y) < 1e-9 * std::max(1.0, Y));
+                if (sat == 0) QVERIFY(std::fabs(b[0] - Y) < 1e-9 * std::max(1.0, Y) && std::fabs(b[2] - Y) < 1e-9 * std::max(1.0, Y));
+                if (sat == 1 && (Y - std::min({bIn[0], bIn[1], bIn[2]})) / Y < 0.79) {
+                    for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(rgb[k] - in[k]) < 1e-9 * std::max(1.0, std::fabs(in[k])));
+                    ++checked;
+                }
+            }
+            if (sat == 1) QVERIFY(checked > 1000);
+        }
+        // Limited to a range of exposure: two stops above grey changes, five does not.
+        {
+            Effect limited = corr;
+            limited.params["saturation"] = 200.0, limited.params["exposure_low"] = -1.0, limited.params["exposure_high"] = 3.0,
+            limited.params["exposure_soft"] = 0.5;
+            const CorrelationSettings cs = correlationSettings(limited, 0, acesLinear);
+            auto spread = [&](double scale) {
+                double rgb[3] = {0.22 * scale, 0.18 * scale, 0.15 * scale};
+                const double before = rgb[0] - rgb[2];
+                correlatePixel(cs, rgb);
+                return (rgb[0] - rgb[2]) / before;
+            };
+            QVERIFY2(spread(4) > 1.5, qPrintable(QString::number(spread(4))));
+            QVERIFY2(std::fabs(spread(32) - 1) < 1e-9, qPrintable(QString::number(spread(32))));
+            QVERIFY2(std::fabs(spread(1.0 / 16) - 1) < 1e-9, qPrintable(QString::number(spread(1.0 / 16))));
+        }
+        // On a picture, as on its pixels; the same with the work in one thread.
+        {
+            const WorkingSpaceScope working(&rec709);
+            corr.params["saturation"] = 160.0;
+            cross.params["red_hue"] = 12.0;
+            Image a = img, b = img;
+            applyVideoEffect(corr, 0, a, 1);
+            applyVideoEffect(cross, 0, a, 1);
+            parallelRows(32, [&](int y0, int) {
+                if (y0 == 0) {
+                    applyVideoEffect(corr, 0, b, 1);
+                    applyVideoEffect(cross, 0, b, 1);
+                }
+            });
+            QVERIFY(a.px == b.px);
+            QVERIFY(a.px != img.px);
+        }
+    }
+
+    void grainModel() {
+        // A model's grain on flat linear grey: its kurtosis and the channels' correlation (yellow against blue) as set.
+        const ColorSpace& linear = linearColorSpace(Primaries::Bt709);
+        GrainModel m;
+        m.strength = 0.05, m.response = 0.8, m.correlation = 0.5, m.yellowBlue = 0.6, m.fineSize = 1, m.clusters = 0, m.kurtosis = 5;
+        m.width = 768;
+        const int W = 768, H = 768;
+        auto flat = [&](double light) {
+            Image img(W, H);
+            for (size_t i = 0; i < img.px.size(); i += 4) img.px[i] = img.px[i + 1] = img.px[i + 2] = float(light), img.px[i + 3] = 1;
+            return img;
+        };
+        GrainSettings gs;
+        double s2[3] = {}, s4[3] = {}, cross[3] = {}, n = 0;
+        for (int f = 0; f < 2; ++f) {
+            Image img = flat(0.18);
+            gs.seed = 7;
+            addGrain(img, linear, grainModelProfile(m), gs, f);
+            for (size_t i = 0; i < img.px.size(); i += 4) {
+                double r[3];
+                for (int c = 0; c < 3; ++c) r[c] = img.px[i + size_t(c)] - 0.18;
+                for (int c = 0; c < 3; ++c) s2[c] += r[c] * r[c], s4[c] += r[c] * r[c] * r[c] * r[c];
+                cross[0] += r[0] * r[1], cross[1] += r[0] * r[2], cross[2] += r[1] * r[2];
+                n += 1;
+            }
+        }
+        for (int c = 0; c < 3; ++c) {
+            const double k = s4[c] / n / ((s2[c] / n) * (s2[c] / n));
+            QVERIFY2(std::fabs(k / 5 - 1) < 0.05, qPrintable(QString("channel %1: kurtosis %2").arg(c).arg(k)));
+            QVERIFY2(std::fabs(std::sqrt(s2[c] / n) / (0.05 * 0.18) - 1) < 0.03, qPrintable(QString("channel %1: %2").arg(c).arg(std::sqrt(s2[c] / n))));
+        }
+        const double want[3] = {0.5 + 0.5 * 0.6, 0.5 - 0.25 * 0.6, 0.5 - 0.25 * 0.6};
+        for (int k = 0; k < 3; ++k) {
+            const int a = k < 2 ? 0 : 1, b = k == 0 ? 1 : 2;
+            const double r = cross[k] / std::sqrt(s2[a] * s2[b]);
+            QVERIFY2(std::fabs(r - want[k]) < 0.02, qPrintable(QString("pair %1: %2 for %3").arg(k).arg(r).arg(want[k])));
+        }
+        // Its spread against the light follows the response's power, sensor-like and negative-like, within 3 %.
+        for (double response : {0.5, 1.0}) {
+            GrainModel t = m;
+            t.response = response, t.kurtosis = 3;
+            double sx = 0, sy = 0, sxx = 0, sxy = 0, count = 0;
+            for (int stop = -6; stop <= 2; stop += 2) {
+                const double light = 0.18 * std::exp2(stop);
+                Image img(256, 256);
+                for (size_t i = 0; i < img.px.size(); i += 4) img.px[i] = img.px[i + 1] = img.px[i + 2] = float(light), img.px[i + 3] = 1;
+                gs.seed = uint32_t(stop + 10);
+                addGrain(img, linear, grainModelProfile(t), gs, 0);
+                double v = 0;
+                for (size_t i = 0; i < img.px.size(); i += 4) v += (img.px[i + 1] - light) * (img.px[i + 1] - light);
+                const double x = std::log(light), y = std::log(std::sqrt(v / (256.0 * 256.0)));
+                sx += x, sy += y, sxx += x * x, sxy += x * y, count += 1;
+            }
+            const double slope = (count * sxy - sx * sy) / (count * sxx - sx * sx);
+            QVERIFY2(std::fabs(slope / response - 1) < 0.03, qPrintable(QString("%1 for %2").arg(slope).arg(response)));
+        }
+        // The same grain from one thread as from many.
+        {
+            Image a = flat(0.3), b = flat(0.3);
+            m.clusters = 0.3, m.clusterSize = 5;
+            addGrain(a, linear, grainModelProfile(m), gs, 3);
+            parallelRows(32, [&](int y0, int) {
+                if (y0 == 0) addGrain(b, linear, grainModelProfile(m), gs, 3);
+            });
+            QVERIFY(a.px == b.px);
+        }
+        // Kurtosis and response kept in the profile's text.
+        {
+            GrainProfile back;
+            QVERIFY(parseGrainProfile(grainProfileText(grainModelProfile(m)), back));
+            QCOMPARE(back.kurtosis, grainModelProfile(m).kurtosis);
+            QCOMPARE(back.response, grainModelProfile(m).response);
+        }
+        // Replace Grain keeping all the detail puts no grain back, keeping none as before.
+        QVERIFY(replaceGrainTopUp(1) < 1e-9);
+        QVERIFY(std::fabs(replaceGrainTopUp(0) - std::sqrt(1 - 1.0 / 7)) < 1e-12);
+
+        // Measured from frames of it (stripes a stop apart, as Grain Match measures plates), the model comes back within 10 %.
+        {
+            const ColorSpace& space = rec709Space();
+            GrainModel set;
+            set.strength = 0.03, set.response = 0.8, set.correlation = 0.6, set.yellowBlue = 0.5, set.fineSize = 1.4, set.clusterSize = 6,
+            set.clusters = 0.3, set.kurtosis = 4, set.width = 512;
+            const GrainProfile made = grainModelProfile(set);
+            const int SW = 512, SH = 192;
+            std::vector<Image> frames;
+            for (int f = 0; f < 9; ++f) {
+                Image img(SW, SH);
+                for (int y = 0; y < SH; ++y)
+                    for (int x = 0; x < SW; ++x) {
+                        float* px = img.at(x, y);
+                        px[0] = px[1] = px[2] = float(fromLinear(space.transfer, std::exp2(x / 64 - 7.5)));
+                        px[3] = 1;
+                    }
+                GrainSettings one;
+                one.seed = 3;
+                addGrain(img, space, made, one, f);
+                frames.push_back(std::move(img));
+            }
+            GrainProfile measured;
+            std::string err;
+            QVERIFY2(measureGrain(frames, space, {}, measured, &err), err.c_str());
+            const GrainModel fit = fitGrainModel(measured);
+            qInfo("fitted: strength %g response %g correlation %g yellow-blue %g fine %g cluster %g clusters %g kurtosis %g", fit.strength,
+                  fit.response, fit.correlation, fit.yellowBlue, fit.fineSize, fit.clusterSize, fit.clusters, fit.kurtosis);
+            auto near = [](double a, double b, double rel) { return std::fabs(a / b - 1) < rel; };
+            QVERIFY(near(fit.strength, set.strength, 0.1));
+            QVERIFY(near(fit.response, set.response, 0.1));
+            QVERIFY(near(fit.correlation, set.correlation, 0.1));
+            QVERIFY(near(fit.yellowBlue, set.yellowBlue, 0.1));
+            QVERIFY(near(fit.kurtosis, set.kurtosis, 0.1));
+            QVERIFY(near(fit.fineSize, set.fineSize, 0.1));
+            QVERIFY(near(fit.clusterSize, set.clusterSize, 0.1));
+            QVERIFY(near(fit.clusters, set.clusters, 0.1));
+        }
     }
 
     void grainMatching() {

@@ -125,6 +125,7 @@
 #include "media/Sofa.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
+#include "render/Crosstalk.h"
 #include "media/LensCalibration.h"
 #include "media/LensDatabase.h"
 #include "render/ReviewExport.h"
@@ -3043,6 +3044,25 @@ private slots:
                 for (int x = 0; x < half.width; ++x)
                     (x >= 170 ? right : left) = std::max(x >= 170 ? right : left, std::fabs(half.at(x, y)[1] - raw.at(x, y)[1]));
             QVERIFY2(right < 1e-4f && left > 0.02f, qPrintable(QString("%1 %2").arg(right).arg(left)));
+        }
+        // The fitted model comes back with the measurement; given back, it is the Model source's grain.
+        {
+            r = call({{"project", project}, {"action", "measure"}, {"clip", double(plate)}});
+            const QJsonObject model = r.value("structuredContent").toObject().value("model").toObject();
+            QVERIFY2(model.value("strength").toDouble() > 0 && model.value("kurtosis").toDouble() >= 1.2 && model.value("width").toInt() > 0,
+                     QJsonDocument(r).toJson().constData());
+            r = call({{"project", project}, {"action", "apply"}, {"model", model}, {"apply_to", QJsonArray{double(clean)}}});
+            QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Effect& e = back.active()->videoTracks[0].clips.at(1).effects.back();
+            QCOMPARE(e.p("source", 0, 0), 5.0);
+            QVERIFY(std::fabs(e.p("model_strength", 0, 0) - model.value("strength").toDouble() * 100) < 1e-6);
+            const double size = model.value("fine_size").toDouble() * 1920 / model.value("width").toDouble();
+            QVERIFY(std::fabs(e.p("fine_size", 0, 0) - std::clamp(size, 0.2, 12.0)) < 1e-6);
+            QVERIFY2(spread(renderSequenceFrame(back, *back.active(), 30, {})) > 0.3 * plateNoise, "the model's grain is there");
+            QVERIFY(call({{"project", project}, {"action", "apply"}, {"model", QJsonObject{{"kurtosis", "high"}}}, {"apply_to", QJsonArray{double(clean)}}})
+                        .value("isError")
+                        .toBool());
         }
         // A gauge; and refusals: no clips to put it on, not a profile, an unknown gauge.
         r = call({{"project", project}, {"action", "apply"}, {"gauge", "super8"}, {"apply_to", QJsonArray{double(clean)}}});
@@ -25954,6 +25974,22 @@ if ui["pressed"] == "add":
         QVERIFY(loadProject(project.toStdString(), back));
         const auto& fx = back.active()->videoTracks[0].clips[0].effects;
         QCOMPARE(std::count_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "chart_match"; }), 1);
+        // As a Crosstalk: put first, its matrix's rows summing to 1, the chart closer than it was; again, the same one.
+        for (int pass = 0; pass < 2; ++pass) {
+            r = call({{"clip", double(first)}, {"as", "crosstalk"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            out = r.value("structuredContent").toObject();
+            QCOMPARE(out.value("matrix").toArray().size(), 9);
+            QVERIFY2(out.value("delta_e_after").toDouble() < out.value("delta_e_before").toDouble(), QJsonDocument(out).toJson().constData());
+            QVERIFY(loadProject(project.toStdString(), back));
+            const auto& cfx = back.active()->videoTracks[0].clips[0].effects;
+            QCOMPARE(cfx.front().type, std::string("crosstalk"));
+            QCOMPARE(std::count_if(cfx.begin(), cfx.end(), [](const Effect& e) { return e.type == "crosstalk"; }), 1);
+            double m[9];
+            QVERIFY(parseCrosstalkMatrix(cfx.front().s("matrix"), m));
+            for (int row = 0; row < 3; ++row) QVERIFY(std::fabs(m[row * 3] + m[row * 3 + 1] + m[row * 3 + 2] - 1) < 1e-6);
+        }
+        QVERIFY(call({{"clip", double(first)}, {"as", "lut"}}).value("isError").toBool());
         // Bad corners: too few, in a line, off the frame; a clip by name, and a name two clips share.
         auto refused = [](const QJsonObject& res) { return res.value("isError").toBool() || res.isEmpty(); };
         r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0, 0}}}});

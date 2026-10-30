@@ -115,6 +115,7 @@
 #include "media/Exr.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
+#include "render/Crosstalk.h"
 #include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
@@ -493,6 +494,26 @@ void MainWindow::buildPanels() {
     connect(effects_, &EffectsBrowser::applyRequested, this, &MainWindow::applyFromBrowser);
     inspector_ = new InspectorWidget(state_, this);
     scopes_ = new ScopesWidget(this);
+    // The selected clip's Crosstalk shown moving the primaries on the chromaticity scope.
+    auto showCrosstalk = [this] {
+        std::vector<std::pair<QPointF, QPointF>> moves;
+        const Sequence* s = state_->sequence();
+        for (Id id : s ? state_->selectedClips() : std::vector<Id>{}) {
+            const Clip* c = edit::clipById(*s, id);
+            if (!c) continue;
+            for (const Effect& e : c->effects) {
+                if (e.type != "crosstalk" || !e.enabled) continue;
+                const FrameTime lt = std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
+                for (const auto& [from, to] : crosstalkPrimaries(e, lt, workingColorSpace(*s))) moves.push_back({{from.x, from.y}, {to.x, to.y}});
+                break;
+            }
+            if (!moves.empty()) break;
+        }
+        scopes_->setPrimaryMoves(moves);
+    };
+    connect(state_, &EditorState::selectionChanged, scopes_, showCrosstalk);
+    connect(state_, &EditorState::projectChanged, scopes_, showCrosstalk);
+    connect(state_, &EditorState::playheadChanged, scopes_, showCrosstalk);  // (keyed handles)
     mixer_ = new MixerPanel(state_, this);
     connect(mixer_, &MixerPanel::liveMix, program_, &PlaybackController::setLiveMix);  // an automation pass heard
     connect(mixer_, &MixerPanel::effectsRequested, this, [this] {
@@ -5505,7 +5526,13 @@ int MainWindow::matchColourChart() {
     ChartMatchDialog dlg(frame, chartView(frame, *s), sequenceColorSpace(*s), QString::fromStdString(clip->name), this);
     if (chartDialogHook_) chartDialogHook_(&dlg);
     if (dlg.exec() != QDialog::Accepted) return 0;
-    const ChartFit fit = dlg.fit();
+    ChartFit fit = dlg.fit();
+    CrosstalkFit cross;
+    if (dlg.asCrosstalk() && dlg.ready()) {
+        bool complete = false;
+        cross = fitCrosstalk(sampleChart(frame, dlg.quad(), sequenceColorSpace(*s), &complete));
+        fit.ok = cross.ok && complete, fit.deltaEBefore = cross.deltaEBefore, fit.deltaEAfter = cross.deltaEAfter;
+    }
     if (!fit.ok || !dlg.ready()) {
         state_->message(tr("The chart could not be matched: put its outline on the patches"), 5000);
         return 0;
@@ -5513,7 +5540,8 @@ int MainWindow::matchColourChart() {
     int n = 0;
     const bool all = dlg.sameMedia();
     state_->edit(tr("Match Colour Chart"), [&](Project& p, Sequence& sq) {
-        n = applyChartMatchToClips(p, sq, all ? clipsOfSameMedia(sq, clipId) : std::vector<Id>{clipId}, fit);
+        const std::vector<Id> clips = all ? clipsOfSameMedia(sq, clipId) : std::vector<Id>{clipId};
+        n = dlg.asCrosstalk() ? applyCrosstalkToClips(p, sq, clips, cross) : applyChartMatchToClips(p, sq, clips, fit);
         return n > 0;
     });
     if (n)
@@ -5846,6 +5874,7 @@ QString MainWindow::measureGrainAsPreset() {
     preset.video = true;
     Effect e = makeEffect("grain_match", 0);
     e.strings["profile"] = grainProfileText(profile);
+    setEffectGrainModel(e, fitGrainModel(profile));  // (the model fitted too, for Grain: Model)
     preset.effects.push_back(e);
     QString error;
     const QString file = presets::save(preset, &error);

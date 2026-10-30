@@ -5808,6 +5808,146 @@
         <source>Wow and Flutter</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Blue Hue (° towards Red)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blue Strength</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Boundary</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Correlation</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Compression Starts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Crosstalk</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom</source>
+        <translation type="unfinished">Benutzerdefiniert</translation>
+    </message>
+    <message>
+        <source>Custom Blue x</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Blue y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Green x</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Green y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Red x</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Custom Red y</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Detail Kept (Replace)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Exposure Fall-off (Stops)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fitted Matrix</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Green Hue (° towards Blue)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Green Strength</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Highest Exposure (Stops from Grey)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lowest Exposure (Stops from Grey)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Carried to the Next Frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Cluster Size (px at 1920 Wide)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Clusters</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Colour Correlation</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Fine Grain Size (px at 1920 Wide)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Kurtosis (3 Gaussian)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Strength at Mid Grey (%)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Tonal Response (0.5 Sensor, 1 Negative)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Model: Towards Yellow-Blue</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>P3</source>
+        <translation type="unfinished">P3</translation>
+    </message>
+    <message>
+        <source>Rec.2020</source>
+        <translation type="unfinished">L 347 vom 20.12.2013, S. 671</translation>
+    </message>
+    <message>
+        <source>Rec.709</source>
+        <translation type="unfinished">Erwägungsgrund 709</translation>
+    </message>
+    <message>
+        <source>Red Hue (° towards Green)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Red Strength</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -8910,6 +9050,14 @@ Download it now?</source>
     <message>
         <source>Delta E %1 as shot, %2 matched (worst patch %3)</source>
         <translation type="unfinished">Delta E %1 als Aufnahme, %2 abgestimmt (schlimmstes Patch %3)</translation>
+    </message>
+    <message>
+        <source>As Crosstalk (neutrals kept, no offset)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fit the camera&apos;s crosstalk, as under LED light, as a Crosstalk effect whose primaries can then be moved by hand</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

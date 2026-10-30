@@ -41,6 +41,7 @@
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
 #include "render/ColorChart.h"
+#include "render/Crosstalk.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -3204,7 +3205,15 @@ void McpServer::Impl::addTools() {
         "through the scene's Camera clip (camera 3, the default; montage_add_camera; without one, the camera that sees the "
         "frame as it is), its own (camera 0, lens fov), the solve montage_camera_track made (camera 1, width in the "
         "scene's units, camera_track the footage's track) or a file's (camera 2, strings.camera_file); 3D layers, models "
-        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet.",
+        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet. "
+        "crosstalk is a 3 x 3 matrix on linear light whose rows sum to 1 (neutrals stay neutral): red_hue, green_hue and "
+        "blue_hue pull each primary towards its neighbour (degrees, -60..60, positive towards the next: red to green, green "
+        "to blue, blue to red), red_strength etc. (%) take it towards grey or past itself, invert 1 inverts it, and "
+        "strings.matrix (9 numbers, row major) is a fitted matrix the handles work on (montage_match_chart as crosstalk "
+        "fits one to a chart). colour_correlation changes saturation (%) by the channels' spread about their luminance, "
+        "bounded by a gamut (boundary 0 Rec.709, 1 P3, 2 Rec.2020, 3 custom_rx..custom_by) with colours compressed from "
+        "compress_start (%) of the way to it, and only between exposure_low and exposure_high (stops from mid grey, "
+        "exposure_soft the fall-off).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
@@ -4503,7 +4512,12 @@ void McpServer::Impl::addTools() {
         "light, its size and softness, how its colours go together and from frame to frame) from the flat areas of a few "
         "runs of frames, or of a region, and returns it as a profile; apply puts a Grain Match effect on clips (apply_to), "
         "from that profile, a measured profile given, or a film gauge (65mm, 35mm, 16mm, super8). With measure, apply_to "
-        "puts the measured grain on those clips at once. mode replace takes each clip's own grain out first.",
+        "puts the measured grain on those clips at once. mode replace takes each clip's own grain out first (detail, %, "
+        "keeps that much of what taking it out took, with less grain put back). measure also fits the grain model "
+        "(`model`: strength at mid grey as a fraction of the light, response the power of the light it follows, 0.5 "
+        "sensor-like to 1 negative-like, correlation between the channels, yellow_blue 0..1 of the colour on film's "
+        "yellow-blue axis, fine_size and cluster_size in pixels of a frame `width` wide (1920 unless given), clusters their share of the power, "
+        "kurtosis, temporal); apply with `model` (any of those, the rest the defaults) uses the model in scene-linear light.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["measure","apply"]},
             "clip":{"type":"number","description":"measure: the clip whose grain to measure"},
             "region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},
@@ -4512,7 +4526,11 @@ void McpServer::Impl::addTools() {
             "profile":{"type":"string","description":"apply: a profile measure returned"},
             "gauge":{"type":"string","enum":["65mm","35mm","16mm","super8"]},
             "mode":{"type":"string","enum":["add","replace"],"default":"add"},
-            "amount":{"type":"number","default":100,"description":"Percent of the measured strength"}},"required":["project","action"]})json",
+            "amount":{"type":"number","default":100,"description":"Percent of the measured strength"},
+            "detail":{"type":"number","default":0,"description":"replace: percent of what taking the grain out took that is kept"},
+            "model":{"type":"object","properties":{"strength":{"type":"number"},"response":{"type":"number"},"correlation":{"type":"number"},
+                     "yellow_blue":{"type":"number"},"fine_size":{"type":"number"},"cluster_size":{"type":"number"},"clusters":{"type":"number"},
+                     "kurtosis":{"type":"number"},"temporal":{"type":"number"},"width":{"type":"number","default":1920}}}},"required":["project","action"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -4520,6 +4538,16 @@ void McpServer::Impl::addTools() {
             GrainProfile profile;
             int gauge = -1;
             QString text;
+            GrainModel model;
+            bool useModel = false;
+            QJsonObject result;
+            auto modelJson = [](const GrainModel& m) {
+                auto r = [](double v, double k) { return std::round(v * k) / k; };
+                return QJsonObject{{"strength", r(m.strength, 1e5)}, {"response", r(m.response, 1e3)}, {"correlation", r(m.correlation, 1e3)},
+                                   {"yellow_blue", r(m.yellowBlue, 1e3)}, {"fine_size", r(m.fineSize, 1e3)}, {"cluster_size", r(m.clusterSize, 1e3)},
+                                   {"clusters", r(m.clusters, 1e3)}, {"kurtosis", r(m.kurtosis, 1e3)}, {"temporal", r(m.temporal, 1e3)},
+                                   {"width", m.width}};
+            };
             if (action == "measure") {
                 const Clip& c = clipArg(l, a);
                 GrainRegion region;
@@ -4537,8 +4565,26 @@ void McpServer::Impl::addTools() {
                                 fixed(profile.correlation[0], 'f', 2), fixed(profile.correlation[1], 'f', 2), fixed(profile.correlation[2], 'f', 2),
                                 fixed(profile.temporal, 'f', 2)) +
                        QString::fromStdString(grainProfileText(profile));
+                result["profile"] = QString::fromStdString(grainProfileText(profile));
+                result["model"] = modelJson(fitGrainModel(profile));
             } else if (action == "apply") {
-                if (a.contains("profile")) {
+                if (a.contains("model")) {
+                    const QJsonObject mo = a.value("model").toObject();
+                    auto num = [&](const char* k, double& to) {
+                        if (!mo.contains(QLatin1String(k))) return;
+                        if (!mo.value(QLatin1String(k)).isDouble() || !std::isfinite(mo.value(QLatin1String(k)).toDouble()))
+                            throw ArgError{QStringLiteral("\"model.%1\" is a number").arg(QLatin1String(k))};
+                        to = mo.value(QLatin1String(k)).toDouble();
+                    };
+                    num("strength", model.strength), num("response", model.response), num("correlation", model.correlation);
+                    num("yellow_blue", model.yellowBlue), num("fine_size", model.fineSize), num("cluster_size", model.clusterSize);
+                    num("clusters", model.clusters), num("kurtosis", model.kurtosis), num("temporal", model.temporal);
+                    double width = 1920;
+                    num("width", width);
+                    if (!(width >= 16 && width <= 65536)) throw ArgError{QStringLiteral("\"model.width\" is the frame width the sizes are in, 16 to 65536")};
+                    model.width = int(std::lround(width));
+                    useModel = true;
+                } else if (a.contains("profile")) {
                     if (!parseGrainProfile(a.value("profile").toString().toStdString(), profile)) return fail(QStringLiteral("That is not a grain profile"));
                 } else {
                     const QString g = a.value("gauge").toString(QStringLiteral("35mm"));
@@ -4550,6 +4596,7 @@ void McpServer::Impl::addTools() {
                 return fail(QStringLiteral("action is measure or apply"));
             }
             const QJsonArray targets = a.value("apply_to").toArray();
+            const GrainModel fitted = !useModel && gauge < 0 && !targets.isEmpty() ? fitGrainModel(profile) : GrainModel{};
             if (action == "apply" && targets.isEmpty()) return fail(QStringLiteral("apply needs apply_to: the clips to put the grain on"));
             const QString mode = a.value("mode").toString(QStringLiteral("add"));
             if (mode != "add" && mode != "replace") return fail(QStringLiteral("mode is add or replace"));
@@ -4558,10 +4605,12 @@ void McpServer::Impl::addTools() {
                 Clip* c = edit::clipById(s, Id(v.toDouble()));
                 if (!c) return fail(QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble())));
                 Effect e = makeEffect(l.project, "grain_match");
-                if (gauge >= 0) e.params["source"] = double(gauge + 1);
-                else e.strings["profile"] = grainProfileText(profile);
+                if (useModel) setEffectGrainModel(e, model), e.params["source"] = 5;
+                else if (gauge >= 0) e.params["source"] = double(gauge + 1);
+                else e.strings["profile"] = grainProfileText(profile), setEffectGrainModel(e, fitted);
                 e.params["mode"] = mode == "replace" ? 1.0 : 0.0;
                 e.params["amount"] = a.value("amount").toDouble(100);
+                e.params["detail"] = std::clamp(a.value("detail").toDouble(0), 0.0, 100.0);
                 c->effects.push_back(e);
                 ++put;
             }
@@ -4569,7 +4618,7 @@ void McpServer::Impl::addTools() {
                 save(l);
                 text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
             }
-            return ok(text);
+            return result.isEmpty() ? ok(text) : ok(text, result);
         });
 
     add("montage_takes", "Take lanes, comps and track versions on an audio track",
@@ -10126,7 +10175,9 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
             "at":{"type":["number","string"],"description":"Timeline time of the frame showing the chart"},
             "corners":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"minItems":4,"maxItems":4},
-            "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false}},
+            "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false},
+            "as":{"type":"string","enum":["chart_match","crosstalk"],"default":"chart_match",
+                  "description":"crosstalk: fit a Crosstalk (rows summing to 1, no offset: the camera's crosstalk, such as under LED light) instead"}},
             "required":["project","clip"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -10153,7 +10204,14 @@ void McpServer::Impl::addTools() {
             bool complete = false;
             const ChartColors shot = sampleChart(frame, q, sequenceColorSpace(s), &complete);
             if (!complete) throw ArgError{"\"corners\" must outline the chart: four corners apart, in order round it, not crossed"};
-            const ChartFit fit = fitChart(shot);
+            const QString as = a.value("as").toString(QStringLiteral("chart_match"));
+            if (as != "chart_match" && as != "crosstalk") throw ArgError{"\"as\" is chart_match or crosstalk"};
+            ChartFit fit = fitChart(shot);
+            CrosstalkFit cross;
+            if (as == "crosstalk") {
+                cross = fitCrosstalk(shot);
+                fit.ok = cross.ok, fit.deltaEBefore = cross.deltaEBefore, fit.deltaEAfter = cross.deltaEAfter, fit.deltaEMax = cross.deltaEMax;
+            }
             if (!fit.ok) return fail("The patches could not be matched (are the corners on the chart?)");
             QJsonArray corners;
             for (const Point2& p : q.p) corners.append(QJsonArray{std::round(p.x * 1e4) / 1e4, std::round(p.y * 1e4) / 1e4});
@@ -10161,9 +10219,14 @@ void McpServer::Impl::addTools() {
                             {"delta_e_after", std::round(fit.deltaEAfter * 100) / 100}, {"delta_e_worst", std::round(fit.deltaEMax * 100) / 100}};
             if (a.value("measure_only").toBool()) return ok(QStringLiteral("Chart measured: delta E %1 now, %2 once matched").arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
             const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
-            const int n = applyChartMatchToClips(l.project, s, clips, fit);
+            const int n = as == "crosstalk" ? applyCrosstalkToClips(l.project, s, clips, cross) : applyChartMatchToClips(l.project, s, clips, fit);
             save(l);
             out["clips"] = n;
+            if (as == "crosstalk") {
+                QJsonArray m;
+                for (double v : cross.m) m.append(std::round(v * 1e6) / 1e6);
+                out["matrix"] = m;
+            }
             return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
         });
 

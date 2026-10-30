@@ -80,6 +80,8 @@ public:
     // A fit worth applying: the chart found or its outline placed by hand, every patch inside the picture.
     bool ready() const { return ready_; }
     bool sameMedia() const;
+    // Fit a Crosstalk (rows summing to 1, no offset) rather than a Chart Match.
+    bool asCrosstalk() const;
 
 private:
     void measure();  // the patches measured again and the fit made
@@ -92,6 +94,7 @@ private:
     QPushButton* find_;
     QPushButton* apply_;
     QCheckBox* sameMedia_;
+    QCheckBox* crosstalk_;
     ChartFit fit_;
     bool placed_ = false;  // found, or moved by hand
     bool ready_ = false;

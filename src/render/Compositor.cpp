@@ -561,7 +561,10 @@ void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<I
 // (`space` the picture's; `measured` the one its grain was measured in, the sequence's)
 void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vector<const Image*>& around, const std::vector<MotionFn>& motion,
                       const ColorSpace& space, const ColorSpace& measured, double pixelScale, double sourceSeconds) {
-    const Image clean = removeGrain(src, around, motion, space, grainProfileIn(effectGrainProfile(e), measured, space));
+    Image clean = removeGrain(src, around, motion, space, grainProfileIn(effectGrainProfile(e), measured, space));
+    // (Detail kept: that much of what was taken out goes back; Grain Match puts back less grain for it.)
+    if (const float detail = float(std::clamp(e.p("detail", lt, 0) / 100, 0.0, 1.0)); detail > 0)
+        for (size_t i = 0; i < clean.px.size() && i < src.px.size(); ++i) clean.px[i] += (src.px[i] - clean.px[i]) * detail;
     if (!hasMask(e, lt)) {
         src = clean;
         return;

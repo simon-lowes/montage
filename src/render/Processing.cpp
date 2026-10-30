@@ -5,6 +5,7 @@
 
 #include "ColorSpace.h"
 #include "ColorSlice.h"
+#include "Crosstalk.h"
 #include "Clf.h"
 #include "Gamut.h"
 #include "TransferTables.h"
@@ -2387,6 +2388,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "cdl") applyCdlEffect(e, t, img);
     else if (ty == "aces_gamut_compress") applyAcesGamutCompress(e, t, currentWorkingSpace(), img);
     else if (ty == "color_slice") colorSlice(e, t, currentWorkingSpace(), img);
+    else if (ty == "crosstalk") crosstalk(e, t, currentWorkingSpace(), img);
+    else if (ty == "colour_correlation") colourCorrelation(e, t, currentWorkingSpace(), img);
     else if (ty == "texture_pop") textureDetail(e, t, currentWorkingSpace(), img, pixelScale);
     else if (ty == "color_space_transform") {
         const ColorSpace* from = nullptr;
