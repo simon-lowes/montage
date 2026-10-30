@@ -5964,6 +5964,78 @@
         <source>Red Strength</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Clean Plate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Corrected Screen</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edge Extend</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame Spacing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frames (median)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hide the Plate Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Made from the Picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Blur (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Frame Spacing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Frames (median)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Screen Threshold</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Shrink (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plate Track (V number, 0: the one above)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen Found</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Screen Threshold</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shrink (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Solid From (alpha)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>

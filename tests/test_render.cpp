@@ -43,6 +43,7 @@
 #include "render/MeshWarp.h"
 #include "render/SurfaceTrack.h"
 #include "render/ColorChart.h"
+#include "render/CleanPlate.h"
 #include "render/Crosstalk.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
@@ -108,6 +109,7 @@
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
 #include "media/Tracking.h"
+#include "render/Ofx.h"
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
@@ -9897,6 +9899,198 @@ colorspaces:
             QVERIFY(a.px == b.px);
             QVERIFY(a.px != img.px);
         }
+    }
+
+    void cleanPlateKeying() {
+        Project p;
+        // An unevenly lit green screen: 40 % brighter from left to right, and redder towards the bottom, bluer at the top.
+        const int w = 240, h = 160;
+        auto screenAt = [&](int x, int y, float c[3]) {
+            const float b = 0.75f + 0.4f * float(x) / float(w - 1), v = float(y) / float(h - 1);
+            c[0] = (0.12f + 0.1f * v) * b, c[1] = 0.7f * b, c[2] = (0.24f - 0.08f * v) * b;
+        };
+        // A subject (a colour the keyer reads as not screen at all) with a soft edge 6 px wide, at (cx, 80).
+        const float subject[3] = {0.6f, 0.5f, 0.4f};
+        auto trueAlpha = [](int x, int y, int cx) { return std::clamp((40.0f - float(std::hypot(x + 0.5 - cx, y + 0.5 - 80.0))) / 6.0f, 0.0f, 1.0f); };
+        auto shot = [&](int cx) {
+            Image img(w, h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    float c[3];
+                    screenAt(x, y, c);
+                    const float a = trueAlpha(x, y, cx);
+                    float* q = img.at(x, y);
+                    for (int k = 0; k < 3; ++k) q[k] = a * subject[k] + (1 - a) * c[k];
+                    q[3] = 1;
+                }
+            return img;
+        };
+        Image truePlate(w, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                screenAt(x, y, truePlate.at(x, y));
+                truePlate.at(x, y)[3] = 1;
+            }
+        const Image img = shot(120);
+        Effect key = makeEffect(p, "screen_key");
+        float mid[3];
+        screenAt(w / 2, h / 2, mid);
+        key.params["key.r"] = mid[0], key.params["key.g"] = mid[1], key.params["key.b"] = mid[2];
+        key.params["gain"] = 1.0, key.params["clip_black"] = 0.0, key.params["despill"] = 0.0;
+        auto run = [&](const Effect& e, const Image& in) {
+            Image out = in;
+            applyVideoEffect(e, 0, out, 1.0);
+            return out;
+        };
+        auto matteError = [&](const Image& keyed, int cx) {
+            double sum = 0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) sum += std::fabs(keyed.at(x, y)[3] - trueAlpha(x, y, cx));
+            return sum / (w * h);
+        };
+        // Against one screen colour, the darker and brighter parts of the screen are not keyed out.
+        const double without = matteError(run(key, img), 120);
+        // With a clean plate shot of the empty screen (on a plate track), it keys to within 1/255 of the true matte.
+        Effect withTrack = key;
+        withTrack.params["clean_plate"] = 2;
+        double withPlate = 0;
+        {
+            CleanPlateScope scope({std::make_shared<const Image>(truePlate), nullptr});
+            withPlate = matteError(run(withTrack, img), 120);
+        }
+        QVERIFY2(withPlate < 1.0 / 255 && without > 20 * withPlate && without > 0.03,
+                 qPrintable(QString("%1 %2").arg(withPlate).arg(without)));
+        // Without the plate track's picture, nothing changes.
+        QVERIFY(run(withTrack, img).px == run(key, img).px);
+        // The new settings, with the clean plate off, change nothing.
+        Effect off = key;
+        off.params["plate_threshold"] = 20, off.params["plate_erode"] = 9, off.params["plate_frames"] = 5, off.params["plate_blur"] = 4;
+        QVERIFY(run(off, img).px == run(key, img).px);
+        // A plate made from the picture itself: where the subject was, filled in to within 2/255 of the true screen (the
+        // screen found shrunk by the soft edge's width, so none of the subject is mixed into what it is filled from).
+        Effect made = key;
+        made.params["clean_plate"] = 1, made.params["plate_erode"] = 6;
+        PlateSettings ps = plateSettings(made, 0);
+        std::vector<uint8_t> found;
+        const Image plate = makeCleanPlate(ps, 0, img, 1.0, &found);
+        QCOMPARE(plate.width, w);
+        double worst = 0;
+        int filled = 0;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                if (found[size_t(y) * w + x]) continue;
+                ++filled;
+                for (int k = 0; k < 3; ++k) { const double e = std::fabs(plate.at(x, y)[k] - truePlate.at(x, y)[k]); worst = std::max(worst, e); }
+            }
+        QVERIFY2(filled > 3000 && worst < 2.0 / 255, qPrintable(QString("%1 %2").arg(filled).arg(worst)));
+        QVERIFY2(matteError(run(made, img), 120) < 1.0 / 255, qPrintable(QString::number(matteError(run(made, img), 120))));
+        // The Keyer shows its plate, and the screen evened out to its screen colour.
+        Effect showPlate = made, showEven = made;
+        showPlate.params["view"] = 3, showEven.params["view"] = 4;
+        const Image shown = run(showPlate, img), even = run(showEven, img);
+        QVERIFY(std::fabs(shown.at(3, 3)[1] - truePlate.at(3, 3)[1]) < 1e-4f);
+        for (const auto& [x, y] : {std::pair{2, 2}, std::pair{w - 3, h - 3}, std::pair{w - 3, 2}})
+            for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(even.at(x, y)[k] - mid[k]) < 1e-3f, qPrintable(QString("%1,%2 %3").arg(x).arg(y).arg(k)));
+        // The Clean Plate effect gives the same plate, or the screen it found.
+        Effect cp = makeEffect(p, "clean_plate");
+        for (const char* k : {"key.r", "key.g", "key.b", "plate_erode"}) cp.params[k] = made.params[k];
+        QVERIFY(run(cp, img).px == plate.px);
+        cp.params["view"] = 1;
+        const Image foundView = run(cp, img);
+        QCOMPARE(foundView.at(2, 2)[0], 1.0f);
+        QCOMPARE(foundView.at(120, 80)[0], 0.0f);
+        // Over several frames the subject moves off: the median of where each pixel was screen, with nothing to fill.
+        {
+            ofx::FetchScope fetch([&](double t, Image& out) {
+                out = shot(120 + int(std::lround(t)) * 6);  // (frames 10 either side: the subject 60 px over)
+                return true;
+            });
+            ps.frames = 3;
+            std::vector<uint8_t> f3;
+            const Image plate3 = makeCleanPlate(ps, 0, img, 1.0, &f3);
+            QVERIFY(f3 == found);  // (this frame's screen)
+            double worst3 = 0;
+            for (size_t i = 0; i < plate3.px.size(); ++i) worst3 = std::max(worst3, double(std::fabs(plate3.px[i] - truePlate.px[i])));
+            QVERIFY2(worst3 < 1e-5, qPrintable(QString::number(worst3)));
+        }
+        // Edge Extend: in the soft edge the screen mixed in is replaced by the subject's colour; the alpha is kept.
+        Image keyed;
+        {
+            CleanPlateScope scope({std::make_shared<const Image>(truePlate), nullptr});
+            keyed = run(withTrack, img);
+        }
+        auto edgeResidual = [&](const Image& im) {
+            double sum = 0;
+            int n = 0;
+            for (size_t i = 0; i < size_t(w) * h; ++i) {
+                const float a = im.px[i * 4 + 3];
+                if (a <= 0.05f || a >= 0.95f) continue;
+                for (int k = 0; k < 3; ++k) sum += std::fabs(im.px[i * 4 + size_t(k)] / a - subject[k]);
+                ++n;
+            }
+            return n ? sum / (3 * n) : 1.0;
+        };
+        Effect extend = makeEffect(p, "edge_extend");
+        const Image extended = run(extend, keyed);
+        const double before = edgeResidual(keyed), after = edgeResidual(extended);
+        QVERIFY2(before > 0.05 && after < 0.01, qPrintable(QString("%1 %2").arg(before).arg(after)));
+        for (size_t i = 0; i < keyed.px.size(); i += 4) QCOMPARE(extended.px[i + 3], keyed.px[i + 3]);
+        Effect half = extend;
+        half.params["amount"] = 50;
+        const double mid50 = edgeResidual(run(half, keyed));
+        QVERIFY(mid50 > after && mid50 < before);
+        // In a sequence: the plate on the track above, hidden, keys an uneven screen (a gradient) out entirely.
+        Sequence seq = makeSequence(p, "Plate", 64, 36, Rational{25, 1});
+        while (seq.videoTracks.size() < 2) edit::addTrack(p, seq, TrackKind::Video);
+        Clip screenClip = makeGeneratorClip(p, "gradient", 10);
+        screenClip.generator.params["color_a.r"] = 0.08, screenClip.generator.params["color_a.g"] = 0.45, screenClip.generator.params["color_a.b"] = 0.15;
+        screenClip.generator.params["color_b.r"] = 0.15, screenClip.generator.params["color_b.g"] = 0.85, screenClip.generator.params["color_b.b"] = 0.25;
+        Clip plateClip = screenClip;
+        QVERIFY(edit::overwrite(p, seq, {TrackKind::Video, 0}, screenClip).ok);
+        QVERIFY(edit::overwrite(p, seq, {TrackKind::Video, 1}, plateClip).ok);
+        Effect seqKey = key;
+        seqKey.params["key.r"] = 0.12, seqKey.params["key.g"] = 0.65, seqKey.params["key.b"] = 0.2;
+        seqKey.params["clean_plate"] = 2;
+        seq.videoTracks[0].clips[0].effects = {seqKey};
+        RenderOptions o;
+        auto brightest = [](const Image& im) {
+            float m = 0;
+            for (size_t i = 0; i < im.px.size(); i += 4) m = std::max(m, im.px[i + 1]);
+            return m;
+        };
+        QVERIFY2(brightest(renderSequenceFrame(p, seq, 2, o)) < 0.01f, qPrintable(QString::number(brightest(renderSequenceFrame(p, seq, 2, o)))));
+        seq.videoTracks[0].clips[0].effects[0].params["clean_plate"] = 0;
+        QVERIFY(brightest(renderSequenceFrame(p, seq, 2, o)) > 0.05f);  // (one screen colour: parts of the gradient stay)
+        seq.videoTracks[0].clips[0].effects[0].params["clean_plate"] = 2;
+        seq.videoTracks[0].clips[0].effects[0].params["plate_hide"] = 0;
+        QVERIFY(brightest(renderSequenceFrame(p, seq, 2, o)) > 0.8f);  // (the plate track shown over it)
+        // A plate track whose picture is made from the keyed clip's own track (a 3D model textured with it) is not
+        // made again without end.
+        Clip plane = makeGeneratorClip(p, "model3d", 10);
+        plane.generator.params["shape"] = 1, plane.generator.params["size"] = 32, plane.generator.params["ground"] = 0;
+        plane.generator.params["texture_track"] = 1, plane.generator.params["texture_hide"] = 0;
+        QVERIFY(edit::overwrite(p, seq, {TrackKind::Video, 1}, plane).ok);
+        QCOMPARE(renderSequenceFrame(p, seq, 2, o).width, 64);
+        // Where the plate is not screen (a set's grey floor in the clean pass), the Keyer keys against the screen
+        // colour, so the floor stays.
+        Image floorPlate = truePlate, floorShot = img;
+        for (int y = 150; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                float* a = floorPlate.at(x, y);
+                float* b = floorShot.at(x, y);
+                a[0] = b[0] = 0.30f, a[1] = b[1] = 0.31f, a[2] = b[2] = 0.30f;
+            }
+        {
+            CleanPlateScope scope({std::make_shared<const Image>(floorPlate), nullptr});
+            const Image keyedFloor = run(withTrack, floorShot);
+            QVERIFY2(keyedFloor.at(10, 155)[3] > 0.97f && keyedFloor.at(10, 10)[3] < 0.01f, qPrintable(QString::number(keyedFloor.at(10, 155)[3])));
+        }
+        // With no screen in the picture, Clean Plate leaves it as it is, and shows no screen found.
+        Effect none = makeEffect(p, "clean_plate");
+        const Image grey = solid(32, 32, 0.5f, 0.45f, 0.4f);
+        QVERIFY(run(none, grey).px == grey.px);
+        none.params["view"] = 1;
+        QCOMPARE(run(none, grey).at(5, 5)[0], 0.0f);
     }
 
     void grainModel() {

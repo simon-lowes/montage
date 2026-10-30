@@ -391,7 +391,26 @@ std::vector<EffectInfo> buildCatalog() {
                   num("gain", "Screen Gain", 0.5, 2, 1.1), num("clip_black", "Clip Black", 0, 1, 0.05), num("clip_white", "Clip White", 0, 1, 1),
                   num("shrink", "Shrink / Grow (px)", -10, 10, 0, 0.5), num("soften", "Soften (px)", 0, 20, 0, 0.5),
                   pct("despill", "Despill", 0, 100, 100), pct("restore", "Restore Brightness", 0, 100, 50),
-                  pct("edge_desat", "Edge Desaturate", 0, 100, 0), choice("view", "View", {"Composite", "Matte", "Status"}, 0)},
+                  pct("edge_desat", "Edge Desaturate", 0, 100, 0),
+                  choice("view", "View", {"Composite", "Matte", "Status", "Clean Plate", "Corrected Screen"}, 0),
+                  // A clean plate (render/CleanPlate.h): the screen as it is at each pixel, for an unevenly lit one.
+                  choice("clean_plate", "Clean Plate", {"None", "Made from the Picture", "Track"}, 0),
+                  num("plate_track", "Plate Track (V number, 0: the one above)", 0, 99, 0, 1), boolean("plate_hide", "Hide the Plate Track", true),
+                  pct("plate_threshold", "Plate Screen Threshold", 1, 100, 50), num("plate_erode", "Plate Shrink (px)", 0, 50, 3, 0.5),
+                  num("plate_frames", "Plate Frames (median)", 1, 9, 1, 1), num("plate_spacing", "Plate Frame Spacing", 1, 250, 10, 1),
+                  num("plate_blur", "Plate Blur (px)", 0, 50, 0, 0.5)},
+                 {}});
+    // The screen with nothing in front of it, made from the footage: the screen found, shrunk, the rest filled in
+    // smoothly (and optionally the median of several frames), for keying against or exporting as a plate.
+    c.push_back({"clean_plate", "Clean Plate", EffectCategory::VideoFilter, "Keying",
+                 {color("key", "Screen Colour", 0.1, 0.75, 0.2), num("balance", "Screen Balance", 0, 1, 0.5),
+                  pct("plate_threshold", "Screen Threshold", 1, 100, 50), num("plate_erode", "Shrink (px)", 0, 50, 3, 0.5),
+                  num("plate_frames", "Frames (median)", 1, 9, 1, 1), num("plate_spacing", "Frame Spacing", 1, 250, 10, 1),
+                  num("plate_blur", "Blur (px)", 0, 50, 0, 0.5), choice("view", "View", {"Plate", "Screen Found"}, 0)},
+                 {}});
+    // Under semi-transparent edges, the solid foreground's colour pushed outward in place of the screen mixed in.
+    c.push_back({"edge_extend", "Edge Extend", EffectCategory::VideoFilter, "Keying",
+                 {pct("amount", "Amount", 0, 100, 100), pct("solid", "Solid From (alpha)", 1, 100, 95)},
                  {}});
     // A title or graphic behind the people in the shot beneath it (handled when tracks are composited).
     c.push_back({"behind_people", "Behind People", EffectCategory::VideoFilter, "Keying",

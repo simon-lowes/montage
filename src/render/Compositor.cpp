@@ -3,6 +3,7 @@
 #include <optional>
 
 #include "AdaptiveHdr.h"
+#include "CleanPlate.h"
 #include "GrainMatch.h"
 #include "TrimPasses.h"
 #include "OGraf.h"
@@ -987,7 +988,12 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
-            if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
+            if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [lt](const Effect& e) {
+                    // (and clean plates made from several frames, render/CleanPlate.h)
+                    const bool plateFrames = (e.type == "clean_plate" || (e.type == "screen_key" && std::lround(e.p("clean_plate", lt, 0)) == 1)) &&
+                                             std::lround(e.p("plate_frames", lt, 1)) > 1;
+                    return e.enabled && (e.type == "ofx" || plateFrames);
+                })) {
                 const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
                 const bool hq = o.highQuality;
                 const Clip clipCopy = c;
@@ -1448,6 +1454,29 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     return transformLayer(src, g, SW, seq.height, o.scale);
 }
 
+const Clip* clipAt(const Track& track, FrameTime t);  // (below)
+
+// The clips whose clean plate is being made on this thread (a plate track whose picture reads the keyed clip's own
+// track, such as a 3D model's texture, would otherwise make it again without end).
+thread_local std::vector<const Clip*> tMakingPlate;
+
+// What the clip's effects need for a clean plate: the picture on its Keyer's plate track at t, as its source gives it
+// (before its own effects), and the space the clip's effects start in.
+CleanPlateContext cleanPlateFor(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o) {
+    CleanPlateContext out;
+    out.space = &currentWorkingSpace();
+    const int m = cleanPlateTrack(seq, c, t);
+    if (m < 0 || std::find(tMakingPlate.begin(), tMakingPlate.end(), &c) != tMakingPlate.end()) return out;
+    const Clip* pc = clipAt(seq.videoTracks[size_t(m)], t);
+    if (!pc) return out;
+    tMakingPlate.push_back(&c);
+    ClipSource ps;
+    const bool made = clipSource(p, seq, *pc, t, o, nullptr, false, ps) && !ps.src.empty();
+    tMakingPlate.pop_back();
+    if (made) out.plate = std::make_shared<const Image>(std::move(ps.src));
+    return out;
+}
+
 // `below` is what the tracks under the clip have made so far, for adjustment layers; `displayReferred` is told whether
 // the layer came in display-referred (graded scene-referred: graphics, a display-referred clip).
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
@@ -1456,6 +1485,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
+    CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));
     Image layer = finishClipLayer(seq, c, o, cs);
     if (displayReferred) *displayReferred = cs.displayReferred;
     return layer;
@@ -1569,6 +1599,25 @@ const Effect* skyTrackEffect(const Sequence& seq, const Clip& c, FrameTime t) {
 
 }  // namespace
 
+int cleanPlateTrack(const Sequence& seq, const Clip& c, FrameTime t, bool hiddenOnly) {
+    const FrameTime lt = t - c.start;
+    const Effect* key = nullptr;
+    for (const Effect* e : gradeChain(seq, c))
+        if (e->enabled && e->type == "screen_key" && std::lround(e->p("clean_plate", lt, 0)) == 2) {
+            key = e;
+            break;
+        }
+    if (!key || (hiddenOnly && key->p("plate_hide", lt, 1) <= 0.5)) return -1;
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const auto& clips = seq.videoTracks[ti].clips;
+        if (clips.empty() || &c < clips.data() || &c >= clips.data() + clips.size()) continue;
+        const int v = int(std::lround(key->p("plate_track", lt, 0)));
+        const int m = v <= 0 ? int(ti) + 1 : v - 1;
+        return m >= 0 && m < int(seq.videoTracks.size()) && m != int(ti) ? m : -1;
+    }
+    return -1;
+}
+
 std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
     std::vector<bool> hidden(seq.videoTracks.size(), false);
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
@@ -1577,6 +1626,8 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = skyTrackEffect(seq, *c, t); e && e->p("hide", t - c->start, 1) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // A Keyer's clean plate.
+            if (const int m = cleanPlateTrack(seq, *c, t, true); m >= 0) hidden[size_t(m)] = true;
             // A depth map made into depth, and a deep holdout, when they are to be hidden.
             if (const Effect* e = enabledEffect(seq, *c, "make_deep"); e && std::lround(e->p("source", t - c->start, 0)) == 0 &&
                                                                      e->p("hide", t - c->start, 1) > 0.5)

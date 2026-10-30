@@ -241,6 +241,7 @@ add_library(montage_engine STATIC
   render/ColorSpace.h render/ColorSpace.cpp
   render/Gamut.h render/Gamut.cpp
   render/ColorSlice.h render/ColorSlice.cpp
+  render/CleanPlate.h render/CleanPlate.cpp
   render/Crosstalk.h render/Crosstalk.cpp
   render/Clf.h render/Clf.cpp
   render/Amf.h render/Amf.cpp

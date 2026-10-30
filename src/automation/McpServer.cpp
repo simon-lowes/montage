@@ -1630,7 +1630,7 @@ void McpServer::Impl::addTools() {
         "Key a green or blue screen out of video clips: each gets the Keyer (Keylight-style: screen dominance with balance and "
         "gain, matte clip black and white, shrink or grow, soften, despill with brightness restored, edge desaturation) set to "
         "the screen colour read from its picture at `at` (default: the middle of each clip). Then montage_add_effect "
-        "or montage_set_effect_param can tune it (type screen_key).",
+        "or montage_set_effect_param can tune it (type screen_key; clean_plate 1 or 2 for an unevenly lit screen).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
             "at":{"type":["number","string"]}},"required":["project","clips"]})json",
         false, [](const QJsonObject& a) {
@@ -3213,7 +3213,14 @@ void McpServer::Impl::addTools() {
         "fits one to a chart). colour_correlation changes saturation (%) by the channels' spread about their luminance, "
         "bounded by a gamut (boundary 0 Rec.709, 1 P3, 2 Rec.2020, 3 custom_rx..custom_by) with colours compressed from "
         "compress_start (%) of the way to it, and only between exposure_low and exposure_high (stops from mid grey, "
-        "exposure_soft the fall-off).",
+        "exposure_soft the fall-off). "
+        "screen_key keys an unevenly lit screen against a clean plate with clean_plate 1 (made from the picture: where the "
+        "screen colour leads by plate_threshold % of the screen's own, shrunk by plate_erode px, the rest filled in "
+        "smoothly; plate_frames > 1 takes the median of that many frames plate_spacing apart) or 2 (the picture on "
+        "plate_track, V number, 0 the track above, hidden unless plate_hide 0); plate_blur softens it; view 3 shows the "
+        "plate, 4 the screen evened out. clean_plate (the effect) replaces the picture with such a plate (view 1: the "
+        "screen it found), to export as a plate. edge_extend pushes the solid foreground's colour out under edges "
+        "whose alpha is below solid (%), by amount (%), so no screen colour is left in hair and motion blur.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
