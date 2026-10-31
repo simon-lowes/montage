@@ -1073,6 +1073,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             av_dict_set(&opts, "oapv-params", ("profile=" + profile).c_str(), 0);
             o.vctx->thread_count = std::clamp(int(std::thread::hardware_concurrency()), 1, 32);
             o.vctx->gop_size = 1;
+            // APV's chroma sits with the first luma sample (FFmpeg's decoder says so of every APV picture), so it is
+            // made there (see the conversion below).
+            o.vctx->chroma_sample_location = AVCHROMA_LOC_TOPLEFT;
         } else if (c == "ffv1") {
             // The archival settings (as the Library of Congress recommends): version 3, intra-only, per-slice CRCs.
             av_dict_set(&opts, "level", "3", 0);
@@ -2060,8 +2063,28 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             } else {
             toRgba16(img, rgba16);
             AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
-            o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt,
-                                         SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
+            const int swsFlags = SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INP;
+            if (!o.sws && (o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT || o.vctx->chroma_sample_location == AVCHROMA_LOC_LEFT)) {
+                // Chroma made where the encoder's format sites it (otherwise FFmpeg's scaler centres it, as the
+                // decoder reads untagged pictures). The cached context below keeps this one, as it matches.
+                o.sws = sws_alloc_context();
+                if (o.sws) {
+                    av_opt_set_int(o.sws, "srcw", img.width, 0);
+                    av_opt_set_int(o.sws, "srch", img.height, 0);
+                    av_opt_set_int(o.sws, "src_format", srcFmt, 0);
+                    av_opt_set_int(o.sws, "dstw", W, 0);
+                    av_opt_set_int(o.sws, "dsth", H, 0);
+                    av_opt_set_int(o.sws, "dst_format", o.vctx->pix_fmt, 0);
+                    av_opt_set_int(o.sws, "sws_flags", swsFlags, 0);
+                    av_opt_set_int(o.sws, "dst_h_chr_pos", 0, 0);
+                    av_opt_set_int(o.sws, "dst_v_chr_pos", o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT ? 0 : 128, 0);
+                    if (sws_init_context(o.sws, nullptr, nullptr) < 0) {
+                        sws_freeContext(o.sws);
+                        o.sws = nullptr;
+                    }
+                }
+            }
+            o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt, swsFlags, nullptr, nullptr, nullptr);
             if (!o.sws) return fail("Cannot convert to the encoder pixel format");
             const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(o.vctx->pix_fmt);
             if (desc && !(desc->flags & AV_PIX_FMT_FLAG_RGB))
