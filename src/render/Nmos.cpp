@@ -17,6 +17,7 @@
 #include <QUrl>
 #include <algorithm>
 #include <limits>
+#include <map>
 
 namespace montage::nmos {
 
@@ -167,20 +168,50 @@ bool Node::start(const NodeOptions& o, QString* error) {
         server_ = nullptr;
         return false;
     }
-    connect(server_, &QTcpServer::newConnection, this, [this] {
+    // The APIs listen on every interface, so what anyone on the network can hold open is bounded: so many connections
+    // in all and from one address, a request's headers and body, and how long a connection may sit without finishing
+    // one (a request trickled in a byte at a time is cut off).
+    constexpr int kMaxClients = 64, kMaxClientsFrom = 8, kIdleMs = 15000;
+    constexpr qsizetype kMaxHeader = 64 << 10, kMaxBody = 1 << 20;
+    auto from = std::make_shared<std::map<QString, int>>();
+    auto clients = std::make_shared<int>(0);
+    connect(server_, &QTcpServer::newConnection, this, [this, from, clients] {
         while (QTcpSocket* s = server_->nextPendingConnection()) {
+            const QString peer = s->peerAddress().toString();
+            if (*clients >= kMaxClients || (*from)[peer] >= kMaxClientsFrom) {
+                if ((*from)[peer] == 0) from->erase(peer);
+                s->abort();
+                s->deleteLater();
+                continue;
+            }
+            ++*clients;
+            ++(*from)[peer];
             auto buffer = std::make_shared<QByteArray>();
+            auto idle = new QTimer(s);
+            idle->setSingleShot(true);
+            idle->start(kIdleMs);
+            connect(idle, &QTimer::timeout, s, &QTcpSocket::abort);
             connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
-            connect(s, &QTcpSocket::readyRead, s, [this, s, buffer] {
+            connect(s, &QObject::destroyed, this, [from, clients, peer] {
+                --*clients;
+                if (--(*from)[peer] <= 0) from->erase(peer);
+            });
+            connect(s, &QTcpSocket::readyRead, s, [this, s, buffer, idle] {
                 if (stopping_) return;  // (nothing more taken while it unregisters)
                 *buffer += s->readAll();
-                if (buffer->size() > (4 << 20)) {
+                if (buffer->size() > kMaxHeader + kMaxBody) {
                     s->abort();
                     return;
                 }
                 // Each whole request in turn (HTTP/1.1, kept alive).
                 for (;;) {
                     const int end = buffer->indexOf("\r\n\r\n");
+                    if ((end < 0 && buffer->size() > kMaxHeader) || end > kMaxHeader) {
+                        s->write("HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        s->disconnectFromHost();
+                        buffer->clear();
+                        return;
+                    }
                     if (end < 0) return;
                     const QList<QByteArray> lines = buffer->left(end).split('\n');
                     const QList<QByteArray> request = lines.value(0).trimmed().split(' ');
@@ -192,7 +223,7 @@ bool Node::start(const NodeOptions& o, QString* error) {
                         const QByteArray name = lines[i].left(colon).trimmed().toLower(), value = lines[i].mid(colon + 1).trimmed();
                         if (name == "content-length") {
                             const qlonglong n = value.toLongLong(&lengthOk);
-                            lengthOk = lengthOk && n >= 0 && n <= (4 << 20);
+                            lengthOk = lengthOk && n >= 0 && n <= kMaxBody;
                             length = lengthOk ? qsizetype(n) : 0;
                         }
                         if (name == "connection") close = value.toLower() == "close";
@@ -206,6 +237,7 @@ bool Node::start(const NodeOptions& o, QString* error) {
                     if (buffer->size() < end + 4 + length) return;
                     const QByteArray body = buffer->mid(end + 4, length);
                     buffer->remove(0, end + 4 + length);
+                    idle->start(kIdleMs);
                     const QByteArray method = request.value(0);
                     Response r = request.size() < 3 ? errorResponse(400, QStringLiteral("Not an HTTP request"))
                                                     : handle(method, QUrl::fromPercentEncoding(request.value(1)), body);

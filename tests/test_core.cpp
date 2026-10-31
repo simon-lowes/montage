@@ -1267,7 +1267,7 @@ private slots:
         // V2; not a through edit, a dissolve, a title, or a cut under V2's picture; shot-change markers too.
         {
             Fixture fx;
-            fx.put(V1, 0, 100, 0);
+            const Id first = fx.put(V1, 0, 100, 0);
             fx.put(V1, 100, 100, 50);   // a cut at 100
             fx.put(V1, 200, 50, 150);   // a through edit at 200 (the source runs on)
             const Id d = fx.put(V1, 250, 50, 20);  // a cut at 250, dissolved into
@@ -1280,6 +1280,19 @@ private slots:
             QVERIFY(overwrite(fx.p, fx.s(), V2, title).ok);
             fx.s().markers.push_back(Marker{150, 0, "Shot change", "", 0, false, true});
             QCOMPARE(captionShotChanges(fx.s()), (std::vector<FrameTime>{100, 150, 300, 320, 360, 400}));
+            // One scene detection found inside a clip is on its source: it stays on that moment of the footage when the
+            // clip is slipped, and goes when that moment is trimmed away.
+            Clip& c0 = *edit::clipById(fx.s(), first);
+            Marker found{40, 0, "Shot change"};
+            found.shotChange = true;
+            c0.markers.push_back(found);
+            QCOMPARE(captionShotChanges(fx.s()).front(), FrameTime(40));
+            c0.sourceIn = 10;
+            QCOMPARE(captionShotChanges(fx.s()).front(), FrameTime(30));
+            c0.sourceIn = 50;
+            QCOMPARE(captionShotChanges(fx.s()).front(), FrameTime(100));
+            c0.markers.clear();
+            c0.sourceIn = 0;
         }
 
         // The half-second rules at each rate: a caption starting just after a cut starts on it; one ending just before a
@@ -1332,9 +1345,15 @@ private slots:
         std::vector<Caption> brief = {{380, 390, "A few words to read here"}};
         QCOMPARE(fixCaptionTiming(brief, Rational{24, 1}, {}, {400}), 1);
         QCOMPARE(brief[0].end, FrameTime(398));
+        // Nor over one it ends exactly on (where a caption snapped to the cut ends).
+        std::vector<Caption> onCut = {{380, 400, "A few words to read here"}};
+        fixCaptionTiming(onCut, Rational{24, 1}, {}, {400});
+        QVERIFY2(onCut[0].end <= 400, qPrintable(QString::number(onCut[0].end)));
     }
 
     void ebuTtD() {
+        // A track with no captions: an empty body (a div must hold a paragraph).
+        QVERIFY(captionsToEbuTtD({}, Rational{25, 1}, "en", {}).find("<div") == std::string::npos);
         // Written as EBU-TT-D, read back to the same captions (timing to the frame at each rate, lines, place, italics,
         // colours).
         for (const Rational fps : {Rational{24000, 1001}, Rational{25, 1}, Rational{30000, 1001}, Rational{60, 1}}) {

@@ -775,8 +775,17 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             }
             if (e.type == "wow_flutter") {
                 // The transfer's speed put back on every channel alike (audio/TapeRepair.h), so a field keeps its directions.
+                // (a sound with nothing to correct kept as it is, not copied)
                 auto out = std::make_shared<AudioBuffer>();
-                if (removeWowFlutter(*r, *out, e.p("wow", 0, 100) / 100, e.p("flutter", 0, 100) / 100, e.p("pilot_hz", 0, 0), &job->cancel)) r = out;
+                bool corrected = false;
+                try {
+                    if (removeWowFlutter(*r, *out, e.p("wow", 0, 100) / 100, e.p("flutter", 0, 100) / 100, e.p("pilot_hz", 0, 0), &job->cancel, nullptr,
+                                         &corrected) &&
+                        corrected)
+                        r = out;
+                } catch (const std::bad_alloc&) {
+                    // (too long a sound for the memory there is: it plays as it was)
+                }
                 continue;
             }
             if (e.type == "elastic_audio" || e.type == "pitch_contour") {

@@ -292,11 +292,10 @@ std::string videoSdp(const VideoFormat& f, const Endpoint& to, int pt, const Sdp
 }
 
 std::string audioSdp(const AudioFormat& f, const Endpoint& to, int pt, const SdpOptions& o) {
-    // Channel order: a stereo pair, or as many pairs as there are (ST 2110-30's symbols).
+    // Channel order: a stereo pair, or as many pairs as there are, an odd one last a mono channel (ST 2110-30's symbols).
     std::string order = "SMPTE2110.(";
-    if (f.channels == 1) order += "M";
-    else
-        for (int i = 0; i < f.channels / 2; ++i) order += i ? ",ST" : "ST";
+    for (int i = 0; i < f.channels / 2; ++i) order += i ? ",ST" : "ST";
+    if (f.channels % 2) order += f.channels > 1 ? ",M" : "M";
     order += ")";
     std::ostringstream s;
     s << sdpHead(to, o, "audio", pt) << "a=rtpmap:" << pt << " L24/" << f.rate << "/" << f.channels << "\r\n"

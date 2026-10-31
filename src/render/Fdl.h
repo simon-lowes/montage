@@ -76,7 +76,8 @@ bool readFdlFile(const std::string& path, std::string& json, FdlDocument& out, s
 // media's name or file name with or without the extension); else, with `bySize`, one with a canvas the media's
 // size or shape (a desqueezed or scaled-down copy); -1 for none.
 int fdlContextFor(const FdlDocument& doc, const MediaItem& m, bool bySize);
-// The canvas of a context the media shows: the one its size or shape matches, else the original (its own source).
+// The canvas of a context the media shows: the one its size or shape matches; for media of no known size the original
+// (its own source); -1 when the media is of another shape than every canvas (framing it by one would stretch it).
 int fdlCanvasFor(const FdlContext& ctx, const MediaItem& m);
 
 // Attaches the FDL to the media it describes: each media item of `media` (all the project's footage when empty)

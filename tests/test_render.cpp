@@ -10186,6 +10186,18 @@ colorspaces:
             other.width = 1920, other.height = 1080;
             p.media.push_back(other);
             QCOMPARE(attachFdl(p, readText(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), {other.id}, &err), 0);
+            // One naming footage of another shape than its canvas (a 4:3 copy of the 16:9 recording) goes to it, but
+            // draws no frame lines on it: framed by that canvas, the picture would be stretched.
+            MediaItem narrow = other;
+            narrow.id = p.newId();
+            narrow.name = "A001C005.mov";
+            narrow.width = 1440;
+            p.media.push_back(narrow);
+            QCOMPARE(attachFdl(p, readText(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), {narrow.id}, &err), 1);
+            FdlCanvas nc;
+            FdlFraming nf;
+            QVERIFY(!mediaFdlFraming(*p.findMedia(narrow.id), nc, nf) && mediaFrameLines(*p.findMedia(narrow.id)).empty());
+            p.media.pop_back();
         }
         // A template larger than Montage makes pictures is refused.
         std::string huge = uhd;
@@ -10195,6 +10207,17 @@ colorspaces:
         untouched = p;
         QCOMPARE(frameClipsWithFdl(untouched, untouched.sequences.back(), {clipId}, uhd, "", true, nullptr, &err).size(), size_t(1));
         QVERIFY(untouched.sequences.back().width == 3840 && untouched.sequences.back().height == 2160);
+        // ... but not one larger than a sequence can be: a frame of 16000 x 9000 floats is over 2 GB.
+        {
+            std::string vast = uhd;
+            for (const auto& [from, to] : {std::pair<std::string, std::string>{"3840", "16000"}, {"2160", "9000"}})
+                for (size_t at = vast.find(from); at != std::string::npos; at = vast.find(from, at + to.size())) vast.replace(at, from.size(), to);
+            Project big = p;
+            skipped.clear();
+            QVERIFY(frameClipsWithFdl(big, big.sequences.back(), {clipId}, vast, "", true, &skipped, &err).empty());
+            QVERIFY2(skipped.size() == 1 && skipped[0].find("larger than a sequence") != std::string::npos, skipped.empty() ? "" : skipped[0].c_str());
+            QVERIFY(big.sequences.back().width == p.sequences.back().width);
+        }
         // Kept with the project, with the framing chosen.
         p.findMedia(chartId)->fdlFraming = "1-1";
         Project loaded;
@@ -12949,6 +12972,11 @@ colorspaces:
         af.channels = 8;
         QCOMPARE(QString::fromStdString(st::sdpParameters(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so))["channel-order"]),
                  QStringLiteral("SMPTE2110.(ST,ST,ST,ST)"));
+        // (an odd channel last, mono)
+        af.channels = 3;
+        QCOMPARE(QString::fromStdString(st::sdpParameters(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so))["channel-order"]),
+                 QStringLiteral("SMPTE2110.(ST,M)"));
+        af.channels = 8;
         params = st::sdpParameters(st::ancSdp(vf, {"239.100.0.3", 5004}, 100, so), &encoding);
         QCOMPARE(QString::fromStdString(encoding), QStringLiteral("smpte291/90000"));
         QVERIFY(QString::fromStdString(params["DID_SDID"]).contains("{0x60,0x60}") && QString::fromStdString(params["DID_SDID"]).contains("{0x61,0x01}"));
@@ -13392,6 +13420,31 @@ colorspaces:
         QTRY_VERIFY_WITH_TIMEOUT((answer += http.readAll(), http.state() == QAbstractSocket::UnconnectedState), 5000);
         answer += http.readAll();
         QVERIFY2(answer.startsWith("HTTP/1.1 200 OK") && answer.contains("\"node/\"") && answer.contains("HTTP/1.1 400 Bad Request"), answer.constData());
+
+        // Anyone on the network can reach it, so what one can hold is bounded: headers that never end are refused...
+        QTcpSocket endless;
+        endless.connectToHost(QHostAddress::LocalHost, quint16(node.port()));
+        QVERIFY(endless.waitForConnected(5000));
+        endless.write("GET / HTTP/1.1\r\nX-Padding: " + QByteArray(70000, 'a'));
+        answer.clear();
+        QTRY_VERIFY_WITH_TIMEOUT((answer += endless.readAll(), endless.state() == QAbstractSocket::UnconnectedState), 5000);
+        answer += endless.readAll();
+        // (its answer, unless the rest of what was sent, arriving after it closed, reset the connection first)
+        QVERIFY2(answer.isEmpty() || answer.startsWith("HTTP/1.1 431"), answer.constData());
+        QTest::qWait(200);
+        // ... and one address has no more than eight connections at once.
+        std::vector<std::unique_ptr<QTcpSocket>> held;
+        for (int i = 0; i < 9; ++i) {
+            held.push_back(std::make_unique<QTcpSocket>());
+            held.back()->connectToHost(QHostAddress::LocalHost, quint16(node.port()));
+            QVERIFY(held.back()->waitForConnected(5000));
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(held[8]->state() == QAbstractSocket::UnconnectedState, 5000);
+        for (int i = 0; i < 8; ++i) QVERIFY2(held[size_t(i)]->state() == QAbstractSocket::ConnectedState, qPrintable(QString::number(i)));
+        held[0]->write("GET /x-nmos/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        QTRY_VERIFY_WITH_TIMEOUT(held[0]->bytesAvailable() > 0, 5000);
+        QVERIFY(held[0]->readAll().startsWith("HTTP/1.1 200 OK"));
+        held.clear();
 
         // Stopping takes it off the registry.
         node.stop();
@@ -15317,7 +15370,8 @@ colorspaces:
         std::vector<int64_t> lags;
         QElapsedTimer played;
         played.start();
-        while (played.elapsed() < 4000) {
+        // (four seconds, or on until 50 pictures were checked: a loaded machine's browser draws fewer of them)
+        while (played.elapsed() < 4000 || (played.elapsed() < 15000 && js("__montage.checks.length").toInt() < 50)) {
             const int64_t at = playhead;
             const int shownNow = js("__montage.frame").toInt();
             if (played.elapsed() > 1000 && shownNow > 500) lags.push_back(at - shownNow);
@@ -15325,7 +15379,7 @@ colorspaces:
         }
         playing = false;
         const QJsonArray during = js("__montage.checks.slice()").toArray();
-        QVERIFY(during.size() >= 50);
+        QVERIFY2(during.size() >= 50, qPrintable(QString("%1 pictures checked in %2 ms").arg(during.size()).arg(played.elapsed())));
         int worst = 0, read = 0;
         for (const QJsonValue& c : during) {
             const int code = c.toObject().value("code").toInt(), tag = c.toObject().value("tag").toInt();

@@ -197,7 +197,8 @@ std::string captionsToEbuTtD(const std::vector<Caption>& captions, Rational fps,
     out += "      <region xml:id=\"top\" tts:origin=\"10% " + std::to_string(100 - bottom) + "%\" tts:extent=\"80% " +
            std::to_string(bottom - 10) + "%\" tts:displayAlign=\"before\"/>\n";
     out += "      <region xml:id=\"middle\" tts:origin=\"10% 10%\" tts:extent=\"80% 80%\" tts:displayAlign=\"center\"/>\n";
-    out += "    </layout>\n  </head>\n  <body>\n    <div>\n";
+    out += "    </layout>\n  </head>\n";
+    std::string div;
     int n = 0;
     for (const Caption& c : captions) {
         const QStringList lines = captionLines(c.text);
@@ -212,11 +213,12 @@ std::string captionsToEbuTtD(const std::vector<Caption>& captions, Rational fps,
             std::snprintf(hex, sizeof hex, "#%02x%02x%02x", r, g, b);
             spanStyle += " " + colours[hex];
         }
-        out += "      <p xml:id=\"sub" + std::to_string(++n) + "\" begin=\"" + ttmlClock(double(c.start) / f) + "\" end=\"" +
+        div += "      <p xml:id=\"sub" + std::to_string(++n) + "\" begin=\"" + ttmlClock(double(c.start) / f) + "\" end=\"" +
                ttmlClock(double(c.end) / f) + "\" region=\"" + region + "\" style=\"paragraph" + align + "\"><span style=\"" + spanStyle +
                "\">" + body + "</span></p>\n";
     }
-    out += "    </div>\n  </body>\n</tt>\n";
+    // (a div holds one paragraph at least: with no captions, an empty body)
+    out += n ? "  <body>\n    <div>\n" + div + "    </div>\n  </body>\n</tt>\n" : std::string("  <body/>\n</tt>\n");
     return out;
 }
 

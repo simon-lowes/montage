@@ -81,11 +81,13 @@ std::array<double, 2> polarToCartesian(double azimuth, double distance) {
     };
     static const Corner corners[5] = {{0, 0, 1}, {-30, 1, 1}, {-110, 1, -1}, {110, -1, -1}, {30, -1, 1}};
     // An angle unwrapped to lie at or past `base` (by less than a turn).
+    // (fmod, not a loop: an angle a file gives can be any size)
     auto from = [](double base, double a) {
-        while (a - 360 >= base) a -= 360;
-        while (a < base) a += 360;
+        a = base + std::fmod(a - base, 360.0);
+        if (a < base) a += 360;
         return a;
     };
+    if (!std::isfinite(azimuth)) azimuth = 0;
     for (int i = 0; i < 5; ++i) {
         const Corner& left = corners[i];
         const Corner& right = corners[(i + 1) % 5];
@@ -625,7 +627,7 @@ bool parseAdm(const std::string& text, AdmScene& out, const std::vector<AdmTrack
             coordinate = attr("coordinate").toStdString();
             bool ok = false;
             const double v = x.readElementText().trimmed().toDouble(&ok);
-            if (ok) block->position[coordinate] = v;
+            if (ok && std::isfinite(v)) block->position[coordinate] = v;
         } else if (block && n == u"cartesian") {
             block->cartesian = x.readElementText().trimmed() == "1";
         } else if (block && n == u"jumpPosition") {

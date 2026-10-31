@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
 
 #include "render/ColorSpace.h"
 #include "render/Ofx.h"
@@ -207,9 +211,76 @@ std::vector<uint8_t> screenPixels(const Image& img, const PlateSettings& s) {
     return mask;
 }
 
+namespace {
+
+// The plates last made from several frames, for the same frame asked for again (the viewer redrawing, a keyer and its
+// view of the plate): each costs the other frames' decodes and a median over them. Told apart by the settings, the frame,
+// the size and a sample of the picture's pixels (another clip at the same time is another picture).
+struct PlateKey {
+    PlateSettings s;
+    FrameTime t = 0;
+    int w = 0, h = 0;
+    double pixelScale = 0;
+    const ColorSpace* space = nullptr;
+    uint64_t sample = 0;
+    bool operator==(const PlateKey& o) const {
+        return std::equal(s.key, s.key + 3, o.s.key) && s.balance == o.s.balance && s.threshold == o.s.threshold && s.erode == o.s.erode &&
+               s.frames == o.s.frames && s.spacing == o.s.spacing && s.blur == o.s.blur && t == o.t && w == o.w && h == o.h &&
+               pixelScale == o.pixelScale && space == o.space && sample == o.sample;
+    }
+};
+struct MadePlate {
+    PlateKey key;
+    std::shared_ptr<const Image> plate;
+    std::shared_ptr<const std::vector<uint8_t>> found;
+};
+std::mutex plateMutex;
+std::deque<MadePlate> madePlates;  // (the last two)
+
+Image buildCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, double pixelScale, std::vector<uint8_t>* found, bool* whole);
+
+uint64_t pixelSample(const Image& img) {
+    uint64_t hash = 1469598103934665603ull;
+    const size_t n = img.px.size(), step = std::max<size_t>(1, n / 4096) | 1;
+    for (size_t i = 0; i < n; i += step) {
+        uint32_t bits;
+        std::memcpy(&bits, &img.px[i], 4);
+        hash = (hash ^ bits) * 1099511628211ull;
+    }
+    return hash;
+}
+
+}  // namespace
+
 Image makeCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, double pixelScale, std::vector<uint8_t>* found) {
     const int w = img.width, h = img.height;
     if (img.empty()) return {};
+    const PlateKey key{s, t, w, h, pixelScale, currentCleanPlate().space, s.frames > 1 ? pixelSample(img) : 0};
+    if (s.frames > 1) {
+        std::lock_guard lock(plateMutex);
+        for (const MadePlate& m : madePlates)
+            if (m.key == key) {
+                if (found) *found = *m.found;
+                return *m.plate;
+            }
+    }
+    std::vector<uint8_t> screen;
+    bool whole = false;
+    Image plate = buildCleanPlate(s, t, img, pixelScale, &screen, &whole);
+    // (only one made from every frame it asks for: one missing some, the clip's ends or a fetch that failed, is made again)
+    if (s.frames > 1 && whole && !plate.empty()) {
+        std::lock_guard lock(plateMutex);
+        madePlates.push_front({key, std::make_shared<const Image>(plate), std::make_shared<const std::vector<uint8_t>>(screen)});
+        if (madePlates.size() > 2) madePlates.pop_back();
+    }
+    if (found) *found = std::move(screen);
+    return plate;
+}
+
+namespace {
+
+Image buildCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, double pixelScale, std::vector<uint8_t>* found, bool* whole) {
+    const int w = img.width, h = img.height;
     const double erode = s.erode * pixelScale;
     // This frame, and the others either side of it the clip has (in the colours the effect runs in).
     std::vector<Image> others;
@@ -224,6 +295,7 @@ Image makeCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, doub
                 others.push_back(resized(o, w, h));
             }
         }
+    *whole = int(others.size()) == s.frames - 1;
     std::vector<std::vector<uint8_t>> masks;
     std::vector<const Image*> frames{&img};
     for (const Image& o : others) frames.push_back(&o);
@@ -266,6 +338,8 @@ Image makeCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, doub
     if (s.blur * pixelScale > 0) gaussianBlur(plate, s.blur * pixelScale);
     return plate;
 }
+
+}  // namespace
 
 void cleanPlate(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     std::vector<uint8_t> found;

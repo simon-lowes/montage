@@ -5317,28 +5317,31 @@ void MainWindow::detectScenes(bool markOnly) {
         if (*cancel) return;
         int made = 0;
         state_->apply(markOnly ? tr("Detect Shot Changes") : tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
-            const Clip* clip = edit::clipById(sq, clipId);
+            Clip* clip = edit::clipById(sq, clipId);
             if (!clip) return edit::Result::fail("The clip is gone");
             // Map source times to timeline frames inside the clip.
             std::vector<FrameTime> frames;
+            std::vector<FrameTime> sources;
             for (double sec : cuts) {
                 double src = sec * sq.fpsValue();
                 double local = clip->ramped() ? clip->localForSource(src) : (src - clip->sourceIn) / clip->speed;
                 if (clip->reverse) local = double(clip->duration) - local;
                 FrameTime f = clip->start + FrameTime(std::llround(local));
-                if (f > clip->start && f < clip->end()) frames.push_back(f);
+                if (f > clip->start && f < clip->end()) frames.push_back(f), sources.push_back(FrameTime(std::llround(src)));
             }
-            // Each a shot-change marker (the razor's cuts are through edits, which captions do not count as shot changes).
-            for (FrameTime f : frames)
-                if (std::none_of(sq.markers.begin(), sq.markers.end(), [f](const Marker& mk) { return mk.shotChange && mk.t == f; })) {
+            // Each a shot-change marker on the clip's source, so it stays on that moment of the footage as the clip
+            // is moved, slipped or trimmed (the razor's cuts are through edits, which captions do not count as shot
+            // changes).
+            for (FrameTime src : sources)
+                if (std::none_of(clip->markers.begin(), clip->markers.end(), [src](const Marker& mk) { return mk.shotChange && mk.t == src; })) {
                     Marker mk;
-                    mk.t = f;
+                    mk.t = src;
                     mk.name = tr("Shot change").toStdString();
                     mk.shotChange = true;
-                    sq.markers.push_back(mk);
+                    clip->markers.push_back(mk);
                     if (markOnly) ++made;
                 }
-            std::sort(sq.markers.begin(), sq.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            std::sort(clip->markers.begin(), clip->markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
             if (markOnly) {
                 if (!made) return edit::Result::fail("No new shot changes found in this clip");
                 return edit::Result{};
@@ -7051,6 +7054,13 @@ int MainWindow::stripSilence(double thresholdDb, double minSilence, double padBe
     int removed = 0;
     std::string why;
     state_->apply(tr("Strip Silence"), [&](Project& p, Sequence& sq) {
+        // (the ranges are where the clips were: not applied to clips edited meanwhile, nor in another sequence)
+        if (sq.id != seq.id) return edit::Result::fail("The sequence changed while the silence was found");
+        for (const auto& [id, ranges] : keep) {
+            const Clip* now = edit::clipById(sq, id);
+            const Clip* then = edit::clipById(seq, id);
+            if (!now || !then || !(*now == *then)) return edit::Result::fail("The clips changed while the silence was found");
+        }
         const edit::Result r = edit::stripSilence(p, sq, keep, linked);
         removed = r.ok ? int(r.applied) : 0;
         why = r.error;

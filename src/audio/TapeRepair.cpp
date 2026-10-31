@@ -134,7 +134,10 @@ double TransferSpeed::at(double seconds) const {
 TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const std::atomic<bool>* cancel) {
     TransferSpeed out;
     const double fs = in.sampleRate;
-    const std::vector<float> x = mono(in);
+    // (a mono sound read as it is: a copy of hours of it is gigabytes)
+    std::vector<float> mixed;
+    if (in.channels > 1) mixed = mono(in);
+    const std::vector<float>& x = in.channels > 1 ? mixed : in.samples;
     const size_t N = powerOfTwoAtLeast(fs * 0.042);  // (2048 at 48 kHz: partials 50 Hz apart are told apart)
     const size_t H = size_t(std::max(1L, std::lround(fs * 0.004)));
     if (fs <= 0 || x.size() < N * 4) return out;
@@ -184,8 +187,11 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
     const std::vector<double> w = hann(N);
     const size_t hops = (x.size() - N) / H;
     if (hops < 2) return out;
-    std::vector<std::vector<std::pair<double, double>>> votes(hops);  // (ratio, weight) each hop
-    for (const double f0 : partials) {
+    // (ratio, weight) for each hop, from each partial in turn; a weight of 0 where it did not vote
+    const size_t P = partials.size();
+    std::vector<std::pair<float, float>> votes(hops * P, {1.0f, 0.0f});
+    for (size_t pi = 0; pi < P; ++pi) {
+        const double f0 = partials[pi];
         if (cancelled(cancel)) return {};
         const double omega = 2 * M_PI * f0 / fs;
         std::vector<cd> kernel(N);
@@ -214,13 +220,16 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
         if (present.size() < hops / 5 || loud <= 0) continue;
         const double usual = median(present);
         for (size_t m = 0; m < hops; ++m)
-            if (mag[m] >= 0.1 * loud && std::fabs(freq[m] / usual - 1) < 0.01) votes[m].emplace_back(freq[m] / usual, mag[m] * mag[m]);
+            if (mag[m] >= 0.1 * loud && std::fabs(freq[m] / usual - 1) < 0.01) votes[m * P + pi] = {float(freq[m] / usual), float(mag[m] * mag[m])};
     }
     // Hops no partial reached take the speed either side of them.
     // Each hop's speed: the weighted median of its partials' (so one that strays is outvoted).
     std::vector<double> speed(hops, std::nan(""));
+    std::vector<std::pair<double, double>> v;
     for (size_t m = 0; m < hops; ++m) {
-        auto& v = votes[m];
+        v.clear();
+        for (size_t pi = 0; pi < P; ++pi)
+            if (const auto& [r, w] = votes[m * P + pi]; w > 0) v.emplace_back(r, w);
         if (v.empty()) continue;
         std::sort(v.begin(), v.end());
         double total = 0;
@@ -263,12 +272,17 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
 }
 
 bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, double flutter, double pilotHz, const std::atomic<bool>* cancel,
-                      double* deviation) {
-    out = in;
+                      double* deviation, bool* corrected) {
     if (deviation) *deviation = 0;
+    if (corrected) *corrected = false;
+    // (`in` as it is, unless the caller only wants to hear of a correction: then nothing is copied)
+    auto unchanged = [&] {
+        if (!corrected) out = in;
+        return true;
+    };
     const TransferSpeed sp = measureTransferSpeed(in, pilotHz, cancel);
     if (cancelled(cancel)) return false;
-    if (sp.speed.empty()) return true;
+    if (sp.speed.empty()) return unchanged();
     // The deviation split at 4 Hz: wow below, flutter above, each by its own amount.
     std::vector<double> d(sp.speed.size());
     for (size_t i = 0; i < d.size(); ++i) d[i] = sp.speed[i] - 1;
@@ -284,7 +298,7 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
     if (deviation) *deviation = most;
     // Nothing to put right when nine readings in ten are within 0.003 % (the odd one off is a note's onset, not the tape).
     std::nth_element(size.begin(), size.begin() + std::ptrdiff_t(size.size() * 9 / 10), size.end());
-    if (size[size.size() * 9 / 10] < 3e-5) return true;
+    if (size[size.size() * 9 / 10] < 3e-5) return unchanged();
     // Content time against tape time (the speed integrated), then each output sample read where its content was.
     const double fs = in.sampleRate;
     const int64_t n = in.frames();
@@ -300,6 +314,10 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
         tau[j] = tau[j - 1] + 0.5 * (applyAt.at(t0) + applyAt.at(t1)) * step;
     }
     const SincTable& sinc = sincTable();
+    out.sampleRate = in.sampleRate;
+    out.channels = in.channels;
+    out.samples.assign(in.samples.size(), 0.0f);
+    if (corrected) *corrected = true;
     size_t j = 0;
     for (int64_t o = 0; o < n; ++o) {
         if ((o & 0xffff) == 0 && cancelled(cancel)) return false;

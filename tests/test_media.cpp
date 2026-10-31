@@ -12128,6 +12128,37 @@ private slots:
         QCOMPARE(cues(r).size(), 3);
     }
 
+    void admPositionsFromAFile() {
+        // An object's position as an ADM file gives it, in polar coordinates: any angle reads (a turn and a half round
+        // is half a turn), and one that is no number (or too large to be one) is not read, rather than hanging the
+        // import or putting NaN keyframes in the pan.
+        AdmScene scene;
+        scene.rate = 48000;
+        scene.samples = 48000;
+        scene.channels = 1;
+        scene.objects.push_back({"Object", 0, {{0, 48000, {0, 1, 0}, false}}});
+        const std::string xml = admDocument(scene);
+        auto polar = [&](const QString& azimuth, const QString& elevation) {
+            QString x = QString::fromStdString(xml);
+            x.replace("<cartesian>1</cartesian>", "<cartesian>0</cartesian>");
+            x.replace(QRegularExpression("<position coordinate=\"X\">[^<]*</position>"), "<position coordinate=\"azimuth\">" + azimuth + "</position>");
+            x.replace(QRegularExpression("<position coordinate=\"Y\">[^<]*</position>"), "<position coordinate=\"elevation\">" + elevation + "</position>");
+            x.replace(QRegularExpression("<position coordinate=\"Z\">[^<]*</position>"), "<position coordinate=\"distance\">1</position>");
+            AdmScene out;
+            std::string err;
+            if (!parseAdm(x.toStdString(), out, admTracks(scene), &err) || out.objects.size() != 1 || out.objects[0].blocks.empty()) return AdmPoint{9, 9, 9};
+            return out.objects[0].blocks.back().at;
+        };
+        const AdmPoint front = polar("0", "0"), round = polar("720", "0"), back = polar("-540", "0"), left = polar("30", "0"), again = polar("390", "0");
+        QVERIFY2(std::fabs(front.x) < 1e-6 && std::fabs(front.y - 1) < 1e-6, qPrintable(QString("%1 %2").arg(front.x).arg(front.y)));
+        QVERIFY(std::fabs(round.x - front.x) < 1e-6 && std::fabs(round.y - front.y) < 1e-6);
+        QVERIFY2(std::fabs(back.x) < 1e-6 && std::fabs(back.y + 1) < 1e-6, qPrintable(QString("%1 %2").arg(back.x).arg(back.y)));
+        QVERIFY(std::fabs(left.x + 1) < 1e-6 && std::fabs(left.y - 1) < 1e-6 && std::fabs(again.x - left.x) < 1e-6 && std::fabs(again.y - left.y) < 1e-6);
+        for (const char* odd : {"1e20", "-1e300", "nan", "inf", "1e400"})
+            for (const AdmPoint p : {polar(odd, "0"), polar("30", odd)})
+                QVERIFY2(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z), odd);
+    }
+
     void movingSurroundAndAdmObjects() {
         const int rate = 48000;
         auto tone = [&](double hz, const char* name) {
