@@ -17122,7 +17122,9 @@ colorspaces:
             double worst = 0;
             for (size_t i = 0; i < cpu.px.size(); ++i)
                 worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]) / std::max(1.0, std::fabs(double(cpu.px[i]))));
-            QVERIFY2(worst <= 1e-4, qPrintable(QStringLiteral("%1: differs by %2").arg(c.name).arg(worst)));
+            // (on Metal the LUTs are half floats, 4.9e-4 a step: within two of them there)
+            const double bound = QString::fromStdString(gpu::deviceName()).startsWith("Metal") ? 1e-3 : 1e-4;
+            QVERIFY2(worst <= bound, qPrintable(QStringLiteral("%1: differs by %2").arg(c.name).arg(worst)));
             qInfo("%s: GPU within %.2g of OpenColorIO's CPU processor", c.name, worst);
         }
     }
