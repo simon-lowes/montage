@@ -36,9 +36,10 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz = 0, co
 
 // Wow and flutter taken out by `wow` and `flutter` (0..1 each). `deviation`, if given, is set to the largest speed
 // error found (a fraction: 0.003 is 0.3 %). With nothing to correct (no steady partials, or nine readings in ten within
-// 0.003 %), `out` is `in` exactly. False when cancelled.
+// 0.003 %), `out` is `in` exactly, or, with `corrected` given, left as it was and `corrected` false (no copy of a long
+// sound). False when cancelled.
 bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, double flutter, double pilotHz = 0,
-                      const std::atomic<bool>* cancel = nullptr, double* deviation = nullptr);
+                      const std::atomic<bool>* cancel = nullptr, double* deviation = nullptr, bool* corrected = nullptr);
 
 // How far the right channel (the second) lags the left, in samples (negative: it leads), over [from, to) (to < 0:
 // the end), and whether it is inverted. `coherence` 0..1: how much of the two channels is the same sound.

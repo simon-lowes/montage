@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <memory>
 #include <list>
 #include <set>
 #include <mutex>
@@ -851,7 +853,35 @@ std::vector<MeshPoint> surfaceCarry(const SurfaceTrack& t, int from, int to, con
     auto tracked = [&](int f) { return f >= 0 && size_t(f) < t.frames.size() && t.frames[size_t(f)].size() == t.mesh.rest.size(); };
     if (!tracked(from) || !tracked(to) || t.mesh.rest.empty()) return points;
     const std::vector<MeshPoint>&A = t.frames[size_t(from)], &B = t.frames[size_t(to)];
-    const Locator loc(t.mesh, A);
+    // (kept for the frames last asked from: each paint stroke drawn on a frame asks from it, every frame)
+    // (told apart by where the points are, so a track made again in the same memory is not taken for the last)
+    struct Known {
+        const WarpMesh* mesh;
+        const std::vector<MeshPoint>* frame;  // (the Locator reads through it)
+        const MeshPoint* at;
+        size_t points, tris;
+        uint64_t sum;
+        std::shared_ptr<const Locator> loc;
+    };
+    uint64_t sum = 1469598103934665603ull;
+    for (const MeshPoint& p : A)
+        for (double v : p) {
+            uint64_t bits;
+            std::memcpy(&bits, &v, 8);
+            sum = (sum ^ bits) * 1099511628211ull;
+        }
+    for (const auto& tr : t.mesh.tris)
+        for (int k : tr) sum = (sum ^ uint64_t(uint32_t(k))) * 1099511628211ull;
+    thread_local std::deque<Known> known;
+    std::shared_ptr<const Locator> found;
+    for (const Known& k : known)
+        if (k.mesh == &t.mesh && k.frame == &A && k.at == A.data() && k.points == A.size() && k.tris == t.mesh.tris.size() && k.sum == sum) found = k.loc;
+    if (!found) {
+        found = std::make_shared<const Locator>(t.mesh, A);
+        known.push_front({&t.mesh, &A, A.data(), A.size(), t.mesh.tris.size(), sum, found});
+        if (known.size() > 8) known.pop_back();
+    }
+    const Locator& loc = *found;
     std::vector<MeshPoint> out(points.size());
     for (size_t i = 0; i < points.size(); ++i) {
         const MeshPoint& p = points[i];

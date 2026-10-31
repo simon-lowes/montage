@@ -104,7 +104,7 @@ int usage() {
                  "                     (two copies merged from the version both started from, recorded in a copy when\n"
                  "                     not given; conflicts take mine, or theirs, and their overlapping clips a new track)\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
-                 "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
+                 "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies] [--gpu]\n"
                  "                     [--loudness LUFS [--ceiling dBTP] [--dialogue-gated]]  (e.g. --loudness -14: normalise the mix;\n"
                  "                     --loudness -27 --ceiling -2 --dialogue-gated: by its dialogue, as Netflix asks)\n"
                  "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
@@ -405,7 +405,7 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     st = ExportSettings();
     int width = 0, height = 0, crf = -1;
     std::string vcodec, acodec;
-    bool proxies = false;
+    bool proxies = false, gpuFrames = false;
     double loudness = 0, ceiling = -1;
     bool dialogueGated = false;
     int captionAnimation = -1;  // -1: as the project has it
@@ -425,6 +425,7 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
         else if (a == "--vcodec") vcodec = next();
         else if (a == "--acodec") acodec = next();
         else if (a == "--proxies") proxies = true;
+        else if (a == "--gpu") gpuFrames = true;
         else if (a == "--burn-captions") st.burnInCaptions = true;
         else if (a == "--caption-animation") {
             static const char* const names[] = {"none", "word", "highlight", "pop", "one-word"};
@@ -483,6 +484,11 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     if (!vcodec.empty()) st.videoCodec = vcodec;
     if (!acodec.empty()) st.audioCodec = acodec;
     st.useProxies = proxies;
+    if (gpuFrames) {
+        std::string why;
+        if (gpu::initialize(&why)) st.gpu = true;
+        else std::fprintf(stderr, "Frames render on the CPU (no GPU: %s)\n", why.c_str());
+    }
     st.loudnessTarget = loudness;
     st.peakCeiling = ceiling;
     st.dialogueGated = dialogueGated;

@@ -1,6 +1,6 @@
 // Montage — Playback › Video Output › Remote Review…: the Program monitor streamed to reviewers elsewhere
-// (render/RemoteReview.h), beside any reference output; the controller opens the stream for the Program's sequence,
-// follows it, and hands on the markers reviewers send. File › Watch Remote Review…: a reviewer's window onto such a
+// (render/RemoteReview.h), or to their web browsers (render/WebRtcReview.h), beside any reference output; the controller
+// opens the stream for the Program's sequence, follows it, and hands on the markers reviewers send and where they point. File › Watch Remote Review…: a reviewer's window onto such a
 // stream, with its sound, the timecode of the frame shown, and notes sent back as markers at that frame.
 #pragma once
 
@@ -15,10 +15,14 @@
 
 #include "PlaybackController.h"
 #include "render/RemoteReview.h"
+#include "render/WebRtcReview.h"
 
 class QAudioSink;
+class QPainter;
+class QRectF;
 class QCheckBox;
 class QComboBox;
+class QFormLayout;
 class QIODevice;
 class QLabel;
 class QLineEdit;
@@ -51,10 +55,19 @@ public:
     QString status() const;
     output::StreamSettings settings() const { return settings_; }
     RemoteReviewOptions options() const { return options_; }
-    std::shared_ptr<output::StreamBackend> backend() const { return backend_; }
+    std::shared_ptr<output::ReviewBackend> backend() const { return backend_; }
+    bool browser() const { return output::isBrowserAddress(settings_.address); }
+    // Where reviewers in a browser point now (0..1 of the picture).
+    std::vector<output::ReviewPointer> pointers() const;
+    // Those pointers over the Program monitor's picture (`picture` its rectangle in the monitor).
+    void paintOverlay(QPainter& p, const QRectF& picture) const;
     std::shared_ptr<output::Scheduler> scheduler() const { return scheduler_; }
-    // The addresses viewers use: each of this computer's network addresses when listening on all of them.
+    // The addresses viewers use: each of this computer's network addresses when listening on all of them (a browser
+    // review's links to its page).
     QStringList viewerAddresses() const;
+    // The certificate and key Montage made for a browser review on this computer (kept, so a reviewer's browser accepts
+    // it once), made again when this computer's addresses are no longer all in it; false and why when it cannot be.
+    static bool ownCertificate(QString& certificateFile, QString& keyFile, QString* error = nullptr);
     // The frame size a sequence goes out at.
     static output::Mode modeFor(const Sequence& s, const RemoteReviewOptions& o);
 
@@ -68,6 +81,8 @@ public:
 
 signals:
     void runningChanged(bool running);
+    // Reviewers in a browser started or stopped pointing, or moved (for the Program monitor's overlay).
+    void pointersChanged();
     // Markers a reviewer sent, for the sequence streamed.
     void markersReceived(montage::Id sequence, const std::vector<montage::output::RemoteMarker>& markers);
 
@@ -76,7 +91,8 @@ private:
     QPointer<PlaybackController> program_;
     output::StreamSettings settings_;
     RemoteReviewOptions options_;
-    std::shared_ptr<output::StreamBackend> backend_;
+    std::shared_ptr<output::ReviewBackend> backend_;
+    size_t pointerCount_ = 0;
     std::shared_ptr<output::Scheduler> scheduler_;
     Id sequence_ = 0;
     QTimer* watch_ = nullptr;  // markers taken; the stream stopping by itself noticed
@@ -93,7 +109,9 @@ public:
 
 private:
     void refresh();
+    void viewersChanged();
     RemoteReviewController* controller_;
+    QComboBox* viewers_;
     QLineEdit* address_;
     QComboBox* direction_;
     QLineEdit* passphrase_;
@@ -107,6 +125,12 @@ private:
     QCheckBox* markers_;
     QSpinBox* markersPort_;
     QSpinBox* latency_;
+    QLineEdit* certificate_;
+    QLineEdit* key_;
+    QLineEdit* ice_;
+    QSpinBox* maxViewers_;
+    QFormLayout* form_;
+    QString srtAddress_, browserAddress_;
     QLabel* howTo_;
     QLabel* status_;
     QPushButton* start_;

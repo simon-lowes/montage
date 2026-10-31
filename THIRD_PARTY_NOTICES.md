@@ -61,6 +61,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [bmx](https://github.com/ebu/bmx) 1.7, the EBU's MXF library, with its [libMXF and libMXF++](https://github.com/ebu/bmx/tree/main/deps) and [uriparser](https://github.com/uriparser/uriparser) 1.0, and the version stamp each compiles in from [cmake-git-version-tracking](https://github.com/andrew-hardin/cmake-git-version-tracking) | BSD-3-Clause (uriparser's library: BSD-3-Clause; cmake-git-version-tracking: MIT) | the sources' licence files (copied into the packages) |
 | [c2pa-rs](https://github.com/contentauth/c2pa-rs) (`c2pa-c-ffi`) and the Rust crates it uses | MIT or Apache-2.0; each crate's own | `c2pa` in the packages' `licenses` folder, one folder per crate |
 | The ASC's [FDL library](https://github.com/ascmitc/fdl) 1.0.2 (`libfdl_core`, with the FDL JSON schemas), which reads, checks and transforms Framing Decision Lists, and [jsoncons](https://github.com/danielaparker/jsoncons) 1.5.0, its JSON parser and schema validator. Copyright 2024-present American Society Of Cinematographers; Copyright (c) 2013-2020 Daniel Parker | Apache-2.0, BSL-1.0 | the sources' licence files and the FDL library's `NOTICE` (copied into the packages); [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
+| [libdatachannel](https://github.com/paullouisageneau/libdatachannel) 0.24.6 (WebRTC for live review in a browser), with [libjuice](https://github.com/paullouisageneau/libjuice) (ICE), [usrsctp](https://github.com/sctplab/usrsctp) (data channels), [libSRTP](https://github.com/cisco/libsrtp) (media encryption), [Plog](https://github.com/SergiusTheBest/plog) (logging) and [JSON for Modern C++](https://github.com/nlohmann/json). Copyright (c) Paul-Louis Ageneau and contributors; Copyright (c) 2015 Randall Stewart and Michael Tuexen; Copyright (c) 2001-2017 Cisco Systems, Inc.; Copyright (c) 2022 Sergey Podobry; Copyright (c) 2013-2025 Niels Lohmann | MPL-2.0, MPL-2.0, BSD-3-Clause, BSD-3-Clause, MIT, MIT | the sources' licence files (copied into the packages). The MPL-2.0 files are unchanged; their source is at the links here |
 | [VST 3 SDK](https://github.com/steinbergmedia/vst3sdk) (interfaces and host helpers) | MIT | [third_party/vst3sdk/LICENSE.txt](third_party/vst3sdk/LICENSE.txt) |
 | [cgltf](https://github.com/jkuhlmann/cgltf) 1.14, which reads glTF 2.0 models | MIT | [third_party/cgltf/LICENSE](third_party/cgltf/LICENSE) |
 | [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader) 2.0.0rc13, which reads OBJ models | MIT (its optional earcut triangulator, ISC, is not compiled in) | [third_party/tinyobjloader/LICENSE](third_party/tinyobjloader/LICENSE) |
@@ -83,7 +84,10 @@ one with its exact version, licence and source.
   Electronics Co., Ltd.; linked into libavcodec for APV encoding, its `LICENSE` copied into the packages' `ffmpeg`
   licences folder).
 - [Qt](https://www.qt.io) 6 (LGPL-3.0): Core, Gui, Widgets, Network, Concurrent, Xml and Multimedia. You may replace
-  the bundled Qt libraries with your own build of the same version.
+  the bundled Qt libraries with your own build of the same version. And Qt Shader Tools (GPL-3.0), which compiles
+  OpenColorIO's shaders for the GPU while Montage runs, with the [glslang](https://github.com/KhronosGroup/glslang)
+  (BSD-3-Clause and others, listed in its licence file) and [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)
+  (Apache-2.0) it includes.
 - [OpenColorIO](https://opencolorio.org) (BSD-3-Clause), [ONNX Runtime](https://onnxruntime.ai) (MIT, with its own
   third-party notices), [LibRaw](https://www.libraw.org) (LGPL-2.1 or CDDL-1.0), [lilv](https://drobilla.net/software/lilv)
   (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause), [OpenJPEG](https://www.openjpeg.org)

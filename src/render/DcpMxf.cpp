@@ -3230,7 +3230,10 @@ bool ImfTrackReader::mgaFrame(int64_t index, std::vector<int32_t>* pcm, std::str
         if (error) *error = "A damaged MGA frame in " + path_;
         return false;
     };
+    // (a frame without a section leaves it empty, not holding the frame before's)
     if (sadm) sadm->clear();
+    if (pcm) pcm->clear();
+    if (f.empty()) return fail();
     bool gotSadm = false;
     size_t at = 1;
     for (int k = 0; k < f[0]; ++k) {

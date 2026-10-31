@@ -40,7 +40,137 @@ void Image::fill(float r, float g, float b, float a) {
     }
 }
 
+size_t YcbcrPlanes::bytes() const {
+    const size_t sample = wide ? 2 : 1;
+    return size_t(width) * size_t(height) * sample + size_t(chromaWidth()) * size_t(chromaHeight()) * sample * 2;
+}
+
+std::vector<float> resampleRgba(const float* src, int sw, int sh, int dw, int dh) {
+    // One direction: n in, m out, each output's taps and weights (normalised).
+    auto weights = [](int n, int m, std::vector<int>& first, std::vector<std::vector<float>>& w) {
+        first.assign(size_t(m), 0);
+        w.assign(size_t(m), {});
+        const float scale = float(n) / float(m), radius = std::max(1.0f, scale);
+        for (int i = 0; i < m; ++i) {
+            const float c = (float(i) + 0.5f) * scale - 0.5f;
+            const int j0 = int(std::ceil(c - radius)), j1 = int(std::floor(c + radius));
+            first[size_t(i)] = j0;
+            float sum = 0;
+            for (int j = j0; j <= j1; ++j) {
+                const float t = std::max(0.0f, 1.0f - std::fabs(float(j) - c) / radius);
+                w[size_t(i)].push_back(t);
+                sum += t;
+            }
+            for (float& t : w[size_t(i)]) t /= sum;
+        }
+    };
+    std::vector<int> fx, fy;
+    std::vector<std::vector<float>> wx, wy;
+    weights(sw, dw, fx, wx);
+    weights(sh, dh, fy, wy);
+    std::vector<float> across(size_t(dw) * size_t(sh) * 4), out(size_t(dw) * size_t(dh) * 4);
+    parallelRows(sh, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < dw; ++x) {
+                float acc[4] = {};
+                for (size_t k = 0; k < wx[size_t(x)].size(); ++k) {
+                    const int j = std::clamp(fx[size_t(x)] + int(k), 0, sw - 1);
+                    for (int c = 0; c < 4; ++c) acc[c] += src[(size_t(y) * size_t(sw) + size_t(j)) * 4 + size_t(c)] * wx[size_t(x)][k];
+                }
+                std::copy(acc, acc + 4, &across[(size_t(y) * size_t(dw) + size_t(x)) * 4]);
+            }
+    });
+    parallelRows(dh, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < dw; ++x) {
+                float acc[4] = {};
+                for (size_t k = 0; k < wy[size_t(y)].size(); ++k) {
+                    const int j = std::clamp(fy[size_t(y)] + int(k), 0, sh - 1);
+                    for (int c = 0; c < 4; ++c) acc[c] += across[(size_t(j) * size_t(dw) + size_t(x)) * 4 + size_t(c)] * wy[size_t(y)][k];
+                }
+                std::copy(acc, acc + 4, &out[(size_t(y) * size_t(dw) + size_t(x)) * 4]);
+            }
+    });
+    return out;
+}
+
+namespace {
+
+// Each pixel of `p` as straight RGB clamped to 0..1, given to put(x, y, r, g, b) row band by row band in parallel.
+template <class Put>
+void eachYcbcrPixel(const YcbcrPlanes& p, const Put& put) {
+    const int W = p.width, H = p.height, cw = p.chromaWidth(), ch = p.chromaHeight();
+    const float top = float((1 << p.bits) - 1), unit = float(1 << (p.bits - 8));
+    const float yOff = p.fullRange ? 0.0f : 16.0f * unit, yRange = p.fullRange ? top : 219.0f * unit;
+    const float cOff = p.fullRange ? float(1 << (p.bits - 1)) : 128.0f * unit, cRange = p.fullRange ? top : 224.0f * unit;
+    auto sample = [&](int plane, int x, int y) {
+        const uint8_t* row = p.data[plane] + size_t(y) * size_t(p.stride[plane]);
+        if (!p.wide) return float(row[x]);
+        uint16_t v;
+        std::memcpy(&v, row + size_t(x) * 2, 2);
+        return float(v >> p.shift);
+    };
+    auto chroma = [&](int which, int x, int y) {  // (Cb 0, Cr 1)
+        return p.interleaved ? sample(1, x * 2 + which, y) : sample(1 + which, x, y);
+    };
+    const float sx = float(1 << p.log2ChromaW), sy = float(1 << p.log2ChromaH);
+    const float kr = p.kr, kb = p.kb, kg = 1.0f - kr - kb;
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            // Where the luma sample falls among the chroma samples, interpolated between the two either side.
+            const float cy = (float(y) - p.chromaY) / sy;
+            const int cy0 = int(std::floor(cy));
+            const float fy = cy - float(cy0);
+            const int ya = std::clamp(cy0, 0, ch - 1), yb = std::clamp(cy0 + 1, 0, ch - 1);
+            for (int x = 0; x < W; ++x) {
+                const float cx = (float(x) - p.chromaX) / sx;
+                const int cx0 = int(std::floor(cx));
+                const float fx = cx - float(cx0);
+                const int xa = std::clamp(cx0, 0, cw - 1), xb = std::clamp(cx0 + 1, 0, cw - 1);
+                float c[2];
+                for (int k = 0; k < 2; ++k) {
+                    const float a = chroma(k, xa, ya) + (chroma(k, xb, ya) - chroma(k, xa, ya)) * fx;
+                    const float b = chroma(k, xa, yb) + (chroma(k, xb, yb) - chroma(k, xa, yb)) * fx;
+                    c[k] = (a + (b - a) * fy - cOff) / cRange;
+                }
+                const float Y = (sample(0, x, y) - yOff) / yRange;
+                const float r = Y + 2.0f * (1.0f - kr) * c[1], b = Y + 2.0f * (1.0f - kb) * c[0];
+                const float g = (Y - kr * r - kb * b) / kg;
+                put(x, y, std::clamp(r, 0.0f, 1.0f), std::clamp(g, 0.0f, 1.0f), std::clamp(b, 0.0f, 1.0f));
+            }
+        }
+    });
+}
+
+}  // namespace
+
+std::vector<float> ycbcrToRgba(const YcbcrPlanes& p, int w, int h) {
+    const int W = p.width, H = p.height;
+    std::vector<float> rgba(size_t(W) * size_t(H) * 4);
+    eachYcbcrPixel(p, [&](int x, int y, float r, float g, float b) {
+        float* o = &rgba[(size_t(y) * size_t(W) + size_t(x)) * 4];
+        o[0] = r, o[1] = g, o[2] = b, o[3] = 1.0f;
+    });
+    if (w <= 0) w = W;
+    if (h <= 0) h = H;
+    return w == W && h == H ? rgba : resampleRgba(rgba.data(), W, H, w, h);
+}
+
+void ycbcrToRgba16(const YcbcrPlanes& p, uint16_t* dst) {
+    eachYcbcrPixel(p, [&](int x, int y, float r, float g, float b) {
+        uint16_t* o = dst + (size_t(y) * size_t(p.width) + size_t(x)) * 4;
+        o[0] = uint16_t(r * 65535.0f + 0.5f), o[1] = uint16_t(g * 65535.0f + 0.5f), o[2] = uint16_t(b * 65535.0f + 0.5f);
+        o[3] = 65535;
+    });
+}
+
 Image toImage(const Frame16& f) {
+    if (f.planes && f.px.empty()) {
+        const std::vector<float> rgba = ycbcrToRgba(*f.planes, f.width, f.height);
+        Image img(f.width, f.height, Image::Uninitialized{});
+        std::copy(rgba.begin(), rgba.end(), img.px.begin());  // (alpha 1: premultiplied as it is)
+        return img;
+    }
     Image img(f.width, f.height, Image::Uninitialized{});
     if (f.half) {
         // Half floats as they are (values past 0..1 kept); alpha clamped to 0..1 before premultiplying.

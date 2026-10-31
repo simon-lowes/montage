@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 
@@ -132,48 +133,54 @@ double powerForKurtosis(double kurtosis) {
 }
 double shapeGrain(double z, double p, double scale) { return p == 1 ? z : std::copysign(std::pow(std::fabs(z), p), z) * scale; }
 // The correlation two Gaussian grains need for theirs, once shaped by the power p, to be `target`: the shaped
-// correlation worked out on a grid (each grain given the other, as r x + √(1 - r²) u), found by halving.
+// correlation worked out on a grid (each grain given the other, as r x + √(1 - r²) u) for Gaussian correlations from -1
+// to 1, once for each p, then read back the other way by interpolating (each frame of grain asks again, for correlations
+// a keyframed saturation changes every frame).
 double gaussianCorrelationFor(double p, double target) {
     if (p == 1) return target;
-    // (kept: each frame of grain asks again)
+    constexpr int kSteps = 200;
+    auto gaussian = [](int i) { return std::clamp(-1 + 2.0 * i / kSteps, -0.9999, 0.9999); };
     static std::mutex m;
-    static std::map<std::pair<double, double>, double> known;
+    static std::map<double, std::shared_ptr<const std::vector<double>>> tables;
+    std::shared_ptr<const std::vector<double>> table;
     {
         std::lock_guard lock(m);
-        if (auto it = known.find({p, target}); it != known.end()) return it->second;
+        if (auto it = tables.find(p); it != tables.end()) table = it->second;
     }
-    constexpr int n = 121;
-    constexpr double lim = 6;
-    static thread_local std::vector<double> z, w;
-    if (z.empty()) {
+    if (!table) {
+        constexpr int n = 121;
+        constexpr double lim = 6;
+        std::vector<double> z(n), w(n), fz(n);
+        double norm = 0, wsum = 0;
         for (int i = 0; i < n; ++i) {
-            const double x = -lim + 2 * lim * i / (n - 1);
-            z.push_back(x), w.push_back(std::exp(-0.5 * x * x));
-        }
-    }
-    auto shaped = [&](double r) {
-        const double q = std::sqrt(std::max(0.0, 1 - r * r));
-        double sum = 0, norm = 0, wsum = 0;
-        for (int i = 0; i < n; ++i) {
-            const double fx = std::copysign(std::pow(std::fabs(z[size_t(i)]), p), z[size_t(i)]);
-            norm += w[size_t(i)] * fx * fx;
+            z[size_t(i)] = -lim + 2 * lim * i / (n - 1);
+            w[size_t(i)] = std::exp(-0.5 * z[size_t(i)] * z[size_t(i)]);
+            fz[size_t(i)] = shapeGrain(z[size_t(i)], p, 1);
+            norm += w[size_t(i)] * fz[size_t(i)] * fz[size_t(i)];
             wsum += w[size_t(i)];
-            for (int j = 0; j < n; ++j) {
-                const double y = r * z[size_t(i)] + q * z[size_t(j)];
-                sum += w[size_t(i)] * w[size_t(j)] * fx * std::copysign(std::pow(std::fabs(y), p), y);
-            }
         }
-        return sum / wsum / norm;
-    };
-    const double t = std::clamp(target, -0.999, 0.999);
-    double lo = -0.9999, hi = 0.9999;
-    for (int i = 0; i < 30; ++i) {
-        const double mid = (lo + hi) / 2;
-        (shaped(mid) < t ? lo : hi) = mid;
+        auto shaped = [&](double r) {
+            const double q = std::sqrt(std::max(0.0, 1 - r * r));
+            double sum = 0;
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j) sum += w[size_t(i)] * w[size_t(j)] * fz[size_t(i)] * shapeGrain(r * z[size_t(i)] + q * z[size_t(j)], p, 1);
+            return sum / wsum / norm;
+        };
+        auto made = std::make_shared<std::vector<double>>(kSteps + 1);
+        for (int i = 0; i <= kSteps; ++i) (*made)[size_t(i)] = shaped(gaussian(i));
+        // (rising with r; kept so for the search below)
+        for (int i = 1; i <= kSteps; ++i) (*made)[size_t(i)] = std::max((*made)[size_t(i)], (*made)[size_t(i - 1)]);
+        table = made;
+        std::lock_guard lock(m);
+        if (tables.size() >= 16) tables.clear();
+        tables[p] = table;
     }
-    std::lock_guard lock(m);
-    if (known.size() > 256) known.clear();
-    return known[{p, target}] = (lo + hi) / 2;
+    const std::vector<double>& v = *table;
+    const double t = std::clamp(target, -0.999, 0.999);
+    const size_t hi = size_t(std::clamp<std::ptrdiff_t>(std::upper_bound(v.begin(), v.end(), t) - v.begin(), 1, kSteps));
+    const double a = v[hi - 1], b = v[hi];
+    const double f = b > a ? std::clamp((t - a) / (b - a), 0.0, 1.0) : 0.5;
+    return gaussian(int(hi) - 1) + f * (gaussian(int(hi)) - gaussian(int(hi) - 1));
 }
 
 // The lower-triangular L with L Lᵀ = the channels' correlation (shrunk until it has one), for Gaussian grain that is then
@@ -796,11 +803,12 @@ void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const 
     const double scale = double(g.width) / img.width / std::clamp(s.size, 0.05, 20.0);
     const float amount = float(s.amount * resolutionGain(g, double(g.width) / img.width, std::clamp(s.size, 0.05, 20.0)));
     const auto now = shapedFields(g, scale, s.seed, t, img.width, img.height);
-    const double rho = std::clamp(g.temporal, 0.0, 0.45);
-    // Carried over as a moving average of this frame's fields and the last's: a ρ correlation from frame to frame.
+    const double power = powerForKurtosis(g.kurtosis), shapeScale = 1 / std::sqrt(absMoment(2 * power));
+    // Carried over as a moving average of this frame's fields and the last's: a ρ correlation from frame to frame (the
+    // Gaussian's that gives the one measured once shaped).
+    const double rho = std::clamp(gaussianCorrelationFor(power, std::clamp(g.temporal, 0.0, 0.45)), 0.0, 0.49);
     const double alpha = std::sqrt((1 + std::sqrt(1 - 4 * rho * rho)) / 2), beta = rho / alpha;
     const auto before = beta > 1e-4 ? shapedFields(g, scale, s.seed, t - 1, img.width, img.height) : nullptr;
-    const double power = powerForKurtosis(g.kurtosis), shapeScale = 1 / std::sqrt(absMoment(2 * power));
     double L[3][3];
     cholesky(g, s.saturation, L, power);
     parallelRows(img.height, [&](int y0, int y1) {

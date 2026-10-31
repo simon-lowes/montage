@@ -278,7 +278,8 @@ add_library(montage_engine STATIC
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   render/St2110.h render/St2110.cpp render/Nmos.h render/Nmos.cpp
-  render/RemoteReview.h render/RemoteReview.cpp
+  render/RemoteReview.h render/RemoteReview.cpp render/WebRtcReview.h render/WebRtcReview.cpp render/WebRtcReviewPage.cpp
+  render/HeadlessBrowser.h
   render/RemoteGrade.h render/RemoteGrade.cpp
   render/SkyReplace.h render/SkyReplace.cpp
   render/FaceShape.h render/FaceShape.cpp
@@ -352,6 +353,19 @@ if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)
     target_link_libraries(montage_engine PRIVATE Qt6::GuiPrivate)
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_GPU)
     message(STATUS "GPU compositor: on (Qt ${Qt6_VERSION})")
+    # Shaders compiled while running (OpenColorIO's), with Qt Shader Tools where it is installed (QShaderBaker is in
+    # its private module, as QRhi is in GUI's).
+    find_package(Qt6 QUIET COMPONENTS ShaderTools)
+    if(TARGET Qt6::ShaderTools AND NOT TARGET Qt6::ShaderToolsPrivate)
+      find_package(Qt6 QUIET COMPONENTS ShaderToolsPrivate)
+    endif()
+    if(TARGET Qt6::ShaderToolsPrivate)
+      target_link_libraries(montage_engine PRIVATE Qt6::ShaderToolsPrivate)
+      target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_GPU_SHADERS)
+      message(STATUS "GPU shaders compiled at run time: on (OpenColorIO on the GPU)")
+    else()
+      message(STATUS "GPU shaders compiled at run time: off (Qt Shader Tools not found; OpenColorIO stays on the CPU)")
+    endif()
   else()
     message(STATUS "GPU compositor: off (Qt's private GUI module was not found)")
   endif()
@@ -452,6 +466,11 @@ if(MONTAGE_WITH_OPENSSL)
   else()
     message(STATUS "OpenSSL 3 not found: DCPs cannot be encrypted")
   endif()
+endif()
+if(MONTAGE_HAVE_WEBRTC)
+  message(STATUS "libdatachannel: live review in a browser enabled")
+  target_link_libraries(montage_engine PRIVATE datachannel OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_WEBRTC)
 endif()
 if(MONTAGE_WITH_OCIO)
   find_package(OpenColorIO 2.1 CONFIG QUIET)

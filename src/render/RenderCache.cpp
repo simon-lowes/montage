@@ -410,14 +410,13 @@ int renderToCache(const Project& p, const Sequence& seq, FrameTime from, FrameTi
             ahead.slowEffects = true;
             ahead.issues = &issues;
             ahead.cancel = cancel;
-            const Image img = renderProgramFrame(p, seq, t, ahead);
+            // (on the GPU, read back as the 8-bit picture kept)
+            QImage q = renderProgramFrameRgba8(p, seq, t, ahead);
             if (issues.incomplete) {
                 if (cancel && cancel->load()) return -1;
                 if (progress) progress(double(t - from + 1) / double(n));
                 continue;
             }
-            QImage q(img.width, img.height, QImage::Format_RGBA8888);
-            toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
             if (cache.store(key, q)) ++rendered;
         }
         if (progress) progress(double(t - from + 1) / double(n));

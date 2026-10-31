@@ -4,6 +4,7 @@
 // these report that OCIO is unavailable.
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,10 @@
 #include "media/Image.h"
 
 namespace montage {
+
+namespace gpu {
+struct ShaderStep;
+}
 
 bool ocioAvailable();
 std::string ocioVersion();
@@ -25,6 +30,10 @@ std::vector<std::string> ocioChoices(const Effect& e, const std::string& param);
 // Applies the "ocio" effect to premultiplied RGBA in place. False (and the
 // image untouched) if the config or transform is invalid.
 bool applyOcio(const Effect& e, Image& img, std::string* error = nullptr);
+// The same transform as OCIO's GPU shader, for render/GpuCompositor (its textures declared from binding 2 up). Null
+// (with why) where the config or transform cannot be made, or the shader has values set while it runs (dynamic
+// properties, which the CPU's transform does not have).
+std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::string* error = nullptr);
 
 // One of OCIO's built-in transforms (e.g. "ACEScct_to_ACES2065-1") on RGB
 // triples in place; used to check Montage's own colour maths.

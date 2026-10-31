@@ -30,6 +30,7 @@ namespace {
 constexpr const char* kCreator = "Montage";
 constexpr const char* kCutIntent = "CUT";  // the framing intent of what the cut shows
 constexpr int kMaxSize = 32768;             // the largest canvas read
+constexpr int kMaxSequence = 8192;          // the largest sequence a template resizes to (as the sequence settings)
 
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -277,6 +278,8 @@ int fdlCanvasFor(const FdlContext& ctx, const MediaItem& m) {
     for (size_t i = 0; i < ctx.canvases.size(); ++i)
         if (const int s = sizeMatch(ctx.canvases[i], m); s > bestScore) best = int(i), bestScore = s;
     if (best >= 0) return best;
+    // (footage of another shape than every canvas: none, as framing it by one would stretch it)
+    if (mediaWidth(m) > 0 && mediaHeight(m) > 0) return -1;
     for (size_t i = 0; i < ctx.canvases.size(); ++i)
         if (ctx.canvases[i].id == ctx.canvases[i].sourceId) return int(i);
     return ctx.canvases.empty() ? -1 : 0;
@@ -564,6 +567,12 @@ std::vector<Id> frameClipsWithFdl(Project& p, Sequence& seq, const std::vector<I
         }
         if (fit.width <= 0 || fit.height <= 0) {
             skip("the template makes an empty canvas");
+            continue;
+        }
+        // (no larger than the sequence settings allow: a template can ask for a canvas a frame of which is gigabytes)
+        if (resizeSequence && !resized && (fit.width > kMaxSequence || fit.height > kMaxSequence)) {
+            skip("the template makes a " + std::to_string(fit.width) + " x " + std::to_string(fit.height) + " canvas, larger than a sequence can be (" +
+                 std::to_string(kMaxSequence) + " x " + std::to_string(kMaxSequence) + ")");
             continue;
         }
         if (resizeSequence && !resized) {

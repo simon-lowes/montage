@@ -151,6 +151,22 @@ bool immersiveTrackScene(const std::string& mxf, AdmScene& out, std::string* err
             if (!o.blocks.empty()) admAppendBlock(o.blocks, {o.blocks.back().to, at, o.blocks.back().at, false});
         sc.samples = at;
     }
+    // Speakers and objects on channels the file doesn't have (a track ID past its last) would be silent clips.
+    if (info.kind != ImmersiveTrackInfo::Kind::Iab && sc.channels > info.channels) {
+        bool dropped = false;
+        for (int& c : sc.bed)
+            if (c >= info.channels) c = -1, dropped = true;
+        const size_t before = sc.objects.size();
+        std::erase_if(sc.objects, [&](const AdmScene::Object& o) { return o.channel >= info.channels; });
+        dropped = dropped || sc.objects.size() != before;
+        if (dropped && warnings)
+            warnings->push_back("The ADM puts sound on channels past the file's " + std::to_string(info.channels) + ": those are not read");
+        sc.channels = info.channels;
+        if (std::none_of(sc.bed.begin(), sc.bed.end(), [](int c) { return c >= 0; }) && sc.objects.empty()) {
+            if (error) *error = "The ADM's speakers and objects are all on channels the file doesn't have";
+            return false;
+        }
+    }
     sc.samples = std::max(sc.samples, info.samples);
     out = std::move(sc);
     return true;
@@ -181,6 +197,14 @@ bool readImmersiveTrack(const std::string& mxf, int64_t first, const std::functi
         if (info.kind == ImmersiveTrackInfo::Kind::Mga) {
             if (!r.mgaFrame(k, &pcm, nullptr, error)) return false;
             n = pcm.size() / channels;
+            // (a frame without sound is a frame's worth of silence at the edit rate, keeping the rest in time)
+            if (n == 0) {
+                const dcp::EditRate er = r.rate();
+                const auto sampleAt = [&](int64_t f) {
+                    return er.num ? int64_t(std::llround(double(f) * info.sampleRate * er.den / er.num)) : 0;
+                };
+                pcm.assign((n = size_t(std::max<int64_t>(0, sampleAt(k + 1) - sampleAt(k)))) * channels, 0);
+            }
         } else {
             if (!r.frame(k, bytes, error) || !iab::readFrame(bytes.data(), bytes.size(), f, error)) return false;
             if (k == 0) layout = iabLayout(f);

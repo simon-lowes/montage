@@ -42,7 +42,8 @@ enum CaptionIssue : unsigned {
 int shotChangeZone(Rational fps, const CaptionLimits& limits = {});
 // Where the sequence's shot changes are: its cuts (the picture's clip edges on tracks shown, not under a picture on a
 // track above, not a through edit or a transition, not titles or other generators) and its shot-change markers
-// (Marker::shotChange, scene detection's inside a clip), sorted, after its first frame.
+// (Marker::shotChange: scene detection's on a clip's source, where the clip shows them now; those given on the
+// sequence), sorted, after its first frame.
 std::vector<FrameTime> captionShotChanges(const Sequence& seq);
 
 // Characters a second for one caption.

@@ -16,6 +16,9 @@
 // and the keyers, which change the alpha as well: 18 Chroma Key, 19 Luma Key, 20 Screen Key (its matte shrunk, grown
 // or softened beforehand in red of `table` where p[3].z or p[3].w says so), with the Screen Key's matte steps:
 //   21 its matte, 22 a running minimum or maximum along a row or column, 23 a box blur along a row or column.
+// and a decoded frame's Y′CbCr planes, as media/Image's ycbcrToRgba converts them: 24 the planes (Y in srcTex, Cb and
+// Cr in table and maskTex, or both in table) to straight RGB, 25 that resampled along a row or column, 26 straight RGB
+// (srcTex) as mode 0 takes a decoded frame (24 does that itself when p[8].z says so).
 // Through the effect's mask where it has one (p[13..15]): its shape drawn on the CPU (maskTex), an HSL qualifier on
 // the colour as it comes in, inverted and faded, and the picture mixed with what the effect made by it (all four
 // channels, premultiplied, as the CPU mixes them).
@@ -322,6 +325,56 @@ float screenMatte(vec3 c, float a) {
     return clamp((m - p[2].x) / (p[2].y - p[2].x), 0.0, 1.0);
 }
 
+// Y′CbCr planes (mode 24). p[4] the luma and chroma planes' sizes; p[5] chroma subsampling and where its first sample
+// sits (luma pixels); p[6] the texels' code scale (255 or 65535), the samples' shift (as a power of two), Cb and Cr in
+// one plane; p[7] luma and chroma offsets and ranges; p[8] the matrix's red and blue weights.
+float planeSample(sampler2D t, ivec2 at, int c) {
+    return floor(floor(texelFetch(t, at, 0)[c] * p[6].x + 0.5) / p[6].y);
+}
+vec2 chromaAt(ivec2 at) {
+    if (p[6].z > 0.5) return vec2(planeSample(table, at, 0), planeSample(table, at, 1));
+    return vec2(planeSample(table, at, 0), planeSample(maskTex, at, 0));
+}
+vec4 ycbcr(ivec2 xy) {
+    const ivec2 cs = ivec2(p[4].zw);
+    const float cx = (float(xy.x) - p[5].z) / p[5].x, cy = (float(xy.y) - p[5].w) / p[5].y;
+    const int cx0 = int(floor(cx)), cy0 = int(floor(cy));
+    const float fx = cx - float(cx0), fy = cy - float(cy0);
+    const int xa = clamp(cx0, 0, cs.x - 1), xb = clamp(cx0 + 1, 0, cs.x - 1);
+    const int ya = clamp(cy0, 0, cs.y - 1), yb = clamp(cy0 + 1, 0, cs.y - 1);
+    const vec2 aa = chromaAt(ivec2(xa, ya)), ba = chromaAt(ivec2(xb, ya)), ab = chromaAt(ivec2(xa, yb)), bb = chromaAt(ivec2(xb, yb));
+    const vec2 a = aa + (ba - aa) * fx, b = ab + (bb - ab) * fx;
+    const vec2 c = (a + (b - a) * fy - vec2(p[7].z)) / p[7].w;  // (Cb, Cr)
+    const float y = (planeSample(srcTex, xy, 0) - p[7].x) / p[7].y;
+    const float kr = p[8].x, kb = p[8].y;
+    const float r = y + 2.0 * (1.0 - kr) * c.y, bl = y + 2.0 * (1.0 - kb) * c.x;
+    const float g = (y - kr * r - kb * bl) / (1.0 - kr - kb);
+    return vec4(clamp01(r), clamp01(g), clamp01(bl), 1.0);
+}
+// Mode 25: srcTex resampled from p[4].x pixels to p[4].y along a row (p[4].z) or a column, as media/Image's
+// resampleRgba: a tent of radius one source pixel, or the scale when shrinking, edges repeated.
+vec4 resampled(ivec2 xy) {
+    const int n = int(p[4].x), m = int(p[4].y);
+    const bool row = p[4].z > 0.5;
+    const float scale = float(n) / float(m), radius = max(1.0, scale);
+    const float c = (float(row ? xy.x : xy.y) + 0.5) * scale - 0.5;
+    const int j0 = int(ceil(c - radius)), j1 = int(floor(c + radius));
+    vec4 acc = vec4(0.0);
+    float sum = 0.0;
+    for (int j = j0; j <= j1; ++j) {
+        const float t = max(0.0, 1.0 - abs(float(j) - c) / radius);
+        const int k = clamp(j, 0, n - 1);
+        acc += texelFetch(srcTex, row ? ivec2(k, xy.y) : ivec2(xy.x, k), 0) * t;
+        sum += t;
+    }
+    return acc / sum;
+}
+// A decoded frame's straight colour premultiplied, through the input transform's LUT if any (modes 0, 24 and 26).
+vec4 decoded(vec3 s, float a) {
+    if (p[3].y > 0.5 && a > 0.0) return vec4(applyLut(s) * a, a);
+    return vec4(s * a, a);
+}
+
 // The Screen Key's matte steps (modes 21 to 23), as render/Processing's minMaxFilter and boxBlurPlane: the window
 // held inside the picture. 22 and 23 have p[1]: the radius, a maximum (else a minimum), along a column (else a row).
 vec4 matteStep(ivec2 xy, int mode) {
@@ -398,6 +451,15 @@ vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const int mode = int(p[0].x);
+    if (mode >= 24) {
+        if (mode == 25) {
+            fragColor = resampled(xy);
+            return;
+        }
+        const vec4 c = mode == 24 ? ycbcr(xy) : texelFetch(srcTex, xy, 0);
+        fragColor = mode == 26 || p[8].z > 0.5 ? decoded(c.rgb, c.a) : c;
+        return;
+    }
     if (mode >= 21) {
         fragColor = matteStep(xy, mode);
         return;
@@ -421,9 +483,7 @@ void main() {
     if (mode == 0) {
         const vec4 lo = texelFetch(src16, ivec2(xy.x * 2, xy.y), 0), hi = texelFetch(src16, ivec2(xy.x * 2 + 1, xy.y), 0);
         const vec3 s = vec3(lo.r, lo.g, hi.r);
-        const float a = hi.g;
-        if (p[3].y > 0.5 && a > 0.0) fragColor = vec4(applyLut(s) * a, a);
-        else fragColor = vec4(s * a, a);
+        fragColor = decoded(s, hi.g);
         return;
     }
     const vec4 px = texelFetch(srcTex, xy, 0);

@@ -152,8 +152,8 @@ void MediaPool::setOpenFiles(std::optional<std::set<std::string>> paths) {
     }
 }
 
-Frame16Ptr MediaPool::videoFrame(const std::string& path, double t, int w, int h, bool highQuality) {
-    FrameKey key{path, int64_t(std::llround(t * 1e6)), w, h, highQuality};
+Frame16Ptr MediaPool::videoFrame(const std::string& path, double t, int w, int h, bool highQuality, bool planes) {
+    FrameKey key{path, int64_t(std::llround(t * 1e6)), w, h, highQuality, planes};
     {
         std::lock_guard lock(m_);
         auto it = index_.find(key);
@@ -164,7 +164,7 @@ Frame16Ptr MediaPool::videoFrame(const std::string& path, double t, int w, int h
     }
     VideoDecoder* dec = acquire(path, t);
     if (!dec) return nullptr;
-    Frame16Ptr f = dec->frameAt(t, w, h, highQuality);
+    Frame16Ptr f = dec->frameAt(t, w, h, highQuality, planes);
     release(dec);
     if (!f) return nullptr;
     std::lock_guard lock(m_);

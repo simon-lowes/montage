@@ -1527,7 +1527,75 @@ bool floatRgba(const AVFrame* f, std::vector<float>& rgba) {
     return true;
 }
 
+// The matrix FFmpeg's scaler is given for `f` (VideoDecoder::convertFixed): the frame's, else BT.709 from 720 lines up
+// and BT.601 below.
+void ycbcrMatrix(const AVFrame* f, float& kr, float& kb) {
+    switch (f->colorspace) {
+        case AVCOL_SPC_BT709: kr = 0.2126f, kb = 0.0722f; return;
+        case AVCOL_SPC_BT470BG:
+        case AVCOL_SPC_SMPTE170M: kr = 0.299f, kb = 0.114f; return;
+        case AVCOL_SPC_SMPTE240M: kr = 0.212f, kb = 0.087f; return;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL: kr = 0.2627f, kb = 0.0593f; return;
+        default:
+            if (f->height >= 720) kr = 0.2126f, kb = 0.0722f;
+            else kr = 0.299f, kb = 0.114f;
+            return;
+    }
+}
+
+// Where `f`'s first chroma sample sits, in luma pixels from the first luma sample, for chroma subsampled 2^log2W x
+// 2^log2H: as the frame says; when it does not, co-sited for 4:2:2 (as Rec. 601 and 709 site it, and Montage's own
+// exports make it), else centred (as FFmpeg's scaler takes it then).
+void chromaSiting(const AVFrame* f, int log2W, int log2H, float& x, float& y) {
+    const float sx = float(1 << log2W), sy = float(1 << log2H);
+    AVChromaLocation l = f->chroma_location;
+    if (l == AVCHROMA_LOC_UNSPECIFIED && log2W == 1 && log2H == 0) l = AVCHROMA_LOC_LEFT;
+    x = l == AVCHROMA_LOC_LEFT || l == AVCHROMA_LOC_TOPLEFT || l == AVCHROMA_LOC_BOTTOMLEFT ? 0.0f : (sx - 1) / 2;
+    y = l == AVCHROMA_LOC_TOPLEFT || l == AVCHROMA_LOC_TOP ? 0.0f
+        : l == AVCHROMA_LOC_BOTTOMLEFT || l == AVCHROMA_LOC_BOTTOM ? sy - 1
+                                                                   : (sy - 1) / 2;
+}
+
 }  // namespace
+
+std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f) {
+    bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
+    const AVPixelFormat fmt = dejpeg(AVPixelFormat(f->format), fullRange);
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fmt);
+    if (!d || d->nb_components != 3 || f->width <= 0 || f->height <= 0 || !f->buf[0] ||
+        (d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_BITSTREAM |
+                     AV_PIX_FMT_FLAG_FLOAT | AV_PIX_FMT_FLAG_ALPHA)) ||
+        d->log2_chroma_w > 1 || d->log2_chroma_h > 1 || (d->log2_chroma_h && !d->log2_chroma_w))
+        return nullptr;
+    const AVComponentDescriptor &Y = d->comp[0], &U = d->comp[1], &V = d->comp[2];
+    const int bits = Y.depth;
+    if (bits < 8 || bits > 16 || U.depth != bits || V.depth != bits || Y.plane != 0 || Y.offset != 0) return nullptr;
+    auto p = std::make_shared<YcbcrPlanes>();
+    p->wide = Y.step == 2;
+    if (Y.step != (p->wide ? 2 : 1) || (!p->wide && bits != 8) || Y.shift != U.shift || Y.shift != V.shift) return nullptr;
+    if (U.plane == 1 && V.plane == 2 && U.step == Y.step && V.step == Y.step && U.offset == 0 && V.offset == 0) {
+        p->interleaved = false;
+    } else if (U.plane == 1 && V.plane == 1 && U.step == Y.step * 2 && V.step == Y.step * 2 && U.offset == 0 && V.offset == Y.step) {
+        p->interleaved = true;  // (NV12, P010; NV21's Cr first is left to the scaler)
+    } else {
+        return nullptr;
+    }
+    p->width = f->width, p->height = f->height, p->bits = bits, p->shift = Y.shift;
+    p->log2ChromaW = d->log2_chroma_w, p->log2ChromaH = d->log2_chroma_h;
+    p->fullRange = fullRange;
+    ycbcrMatrix(f, p->kr, p->kb);
+    chromaSiting(f, p->log2ChromaW, p->log2ChromaH, p->chromaX, p->chromaY);
+    std::shared_ptr<AVFrame> held(av_frame_clone(f), [](AVFrame* fr) { av_frame_free(&fr); });
+    if (!held) return nullptr;
+    for (int i = 0; i < (p->interleaved ? 2 : 3); ++i) {
+        if (!held->data[i] || held->linesize[i] <= 0) return nullptr;
+        p->data[i] = held->data[i];
+        p->stride[i] = held->linesize[i];
+    }
+    p->owner = held;
+    return p;
+}
 
 bool deinterlaceFrame(AVFrame* f) {
     const int dominance = fieldDominance(f);
@@ -1549,7 +1617,7 @@ bool deinterlaceFrame(AVFrame* f) {
     return changed;
 }
 
-Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bool hq) {
+Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bool hq, bool planes) {
     // ProRes RAW is developed first (RGB48, ACEScct), at half size when it is shown that small.
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> developed(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
     if (proResRaw_) {
@@ -1593,8 +1661,16 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     if (h <= 0) h = dispH_;
     int sw = (rotation_ % 180) ? h : w;
     int sh = (rotation_ % 180) ? w : h;
+    std::shared_ptr<Frame16> out;
+    // (Not when a high-quality frame is resized: both sides then take the scaler's bicubic picture.)
+    if (planes && !rotation_ && alpha_.empty() && !(hq && (sw != f->width || sh != f->height)))
+        if (std::shared_ptr<const YcbcrPlanes> yc = ycbcrPlanesOf(f)) {
+            out = std::make_shared<Frame16>();
+            out->width = sw, out->height = sh;
+            out->planes = std::move(yc);
+        }
     std::vector<float> rgba;
-    std::shared_ptr<Frame16> out = floatRgba(f, rgba) ? halfFrame(rgba.data(), f->width, f->height, sw, sh, pts) : convertFixed(f, pts, sw, sh, hq);
+    if (!out) out = floatRgba(f, rgba) ? halfFrame(rgba.data(), f->width, f->height, sw, sh, pts) : convertFixed(f, pts, sw, sh, hq);
     if (!out) return nullptr;
     if (!alpha_.empty()) interpretAlpha(*out, alpha_);
     out->pts = pts / timeScale_;
@@ -1613,11 +1689,24 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
 
 // The picture `f` scaled to `sw` x `sh` 16-bit RGBA by FFmpeg's scaler.
 std::shared_ptr<Frame16> VideoDecoder::convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq) {
+    // High quality at the picture's own size: Y′CbCr the GPU takes is converted as the GPU converts it (exactly; the
+    // scaler takes 8-bit samples a little short of their range), so either renders the same frame.
+    if (hq && sw == f->width && sh == f->height)
+        if (std::shared_ptr<const YcbcrPlanes> yc = ycbcrPlanesOf(f)) {
+            auto out = std::make_shared<Frame16>();
+            out->width = sw, out->height = sh, out->pts = pts;
+            out->px.resize(size_t(sw) * size_t(sh) * 4);
+            ycbcrToRgba16(*yc, out->px.data());
+            return out;
+        }
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
     AVPixelFormat srcFmt = dejpeg(AVPixelFormat(f->format), fullRange);
     const int flags = hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : bilinearRgba64Sound() ? SWS_BILINEAR : SWS_BICUBIC;
-    const int key[6] = {f->width, f->height, int(srcFmt), sw, sh, flags};
-    if (!sws_ || !std::equal(key, key + 6, swsKey_)) {
+    // Chroma sited where the frame says (in 1/256 luma pixels), so the GPU's conversion of the planes matches.
+    float chromaX = 0, chromaY = 0;
+    if (const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(srcFmt)) chromaSiting(f, d->log2_chroma_w, d->log2_chroma_h, chromaX, chromaY);
+    const int key[8] = {f->width, f->height, int(srcFmt), sw, sh, flags, int(std::lround(chromaX * 256)), int(std::lround(chromaY * 256))};
+    if (!sws_ || !std::equal(key, key + 8, swsKey_)) {
         // A slice-threaded context: converting a 4K frame to 16-bit RGBA is
         // otherwise a large share of a frame's time on one core.
         if (sws_) sws_freeContext(sws_);
@@ -1630,13 +1719,15 @@ std::shared_ptr<Frame16> VideoDecoder::convertFixed(const AVFrame* f, double pts
         av_opt_set_int(sws_, "dsth", sh, 0);
         av_opt_set_int(sws_, "dst_format", AV_PIX_FMT_RGBA64LE, 0);
         av_opt_set_int(sws_, "sws_flags", flags, 0);
+        av_opt_set_int(sws_, "src_h_chr_pos", key[6], 0);
+        av_opt_set_int(sws_, "src_v_chr_pos", key[7], 0);
         av_opt_set_int(sws_, "threads", std::clamp(int(std::thread::hardware_concurrency()), 1, 8), 0);
         if (sws_init_context(sws_, nullptr, nullptr) < 0) {
             sws_freeContext(sws_);
             sws_ = nullptr;
             return nullptr;
         }
-        std::copy(key, key + 6, swsKey_);
+        std::copy(key, key + 8, swsKey_);
     }
     int cs = SWS_CS_DEFAULT;
     switch (f->colorspace) {
@@ -1712,7 +1803,7 @@ bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
     return true;
 }
 
-Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality) {
+Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality, bool planes) {
     if (mlv_) {
         // The frame shown at `t` (media time), developed once and kept while it is asked for again; at half size when
         // the sensor's samples (not the stretched picture's) are shown at half or less, or Interpret Footage asks for half.
@@ -1923,11 +2014,11 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             if (!woven_) return nullptr;
             wovenIndex_ = n;
         }
-        return convert(woven_, pulldown_->startOf(n) / std::max(1.0, fps_), targetW, targetH, highQuality);
+        return convert(woven_, pulldown_->startOf(n) / std::max(1.0, fps_), targetW, targetH, highQuality, planes);
     }
     double pts = 0;
     const AVFrame* f = decodedAt(t, &pts);
-    return f ? convert(f, pts, targetW, targetH, highQuality) : nullptr;
+    return f ? convert(f, pts, targetW, targetH, highQuality, planes) : nullptr;
 }
 
 const AVFrame* VideoDecoder::decodedAt(double t, double* pts) {

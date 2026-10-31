@@ -6946,6 +6946,10 @@ Download it now?</source>
         <source>Montage cannot repair this file</source>
         <translation type="unfinished">Монтаж не может восстановить этот файл</translation>
     </message>
+    <message>
+        <source> and </source>
+        <translation type="unfinished"> и </translation>
+    </message>
 </context>
 <context>
     <name>TangentControl</name>
@@ -16449,10 +16453,6 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <translation type="unfinished">&amp;Оформление GPU</translation>
     </message>
     <message>
-        <source>Composite and grade the program monitor&apos;s frames on the GPU; effects it has no GPU form for render on the CPU</source>
-        <translation type="unfinished">Составьте и отметьте рамки программ-мониторинга на GPU; эффекты не имеют формы GPU для передачи на процессор</translation>
-    </message>
-    <message>
         <source>No GPU rendering: %1</source>
         <translation type="unfinished">Нет GPU-реформы: %1</translation>
     </message>
@@ -16523,10 +16523,6 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     <message>
         <source>Remote Review…</source>
         <translation type="unfinished">Дистанционный обзор…</translation>
-    </message>
-    <message>
-        <source>Stream the Program live to reviewers elsewhere over SRT, with a passphrase; their notes come back as markers</source>
-        <translation type="unfinished">Программа работает с экспертами по SRT, с парфюмерной фразой; их записи возвращаются как маркеры</translation>
     </message>
     <message>
         <source>Colourist&apos;s wipe</source>
@@ -21075,6 +21071,14 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>No canvas templates: choose an FDL with some</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Composite and grade on the GPU: the Program monitor, Render In to Out and exports; effects it has no GPU form for render on the CPU</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stream the Program live to reviewers elsewhere, over SRT or to any web browser, with a passphrase; their notes come back as markers</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -25182,16 +25186,44 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>action is status, start or stop</source>
         <translation type="unfinished">действие - состояние, начало или остановка</translation>
     </message>
+    <message>
+        <source>Cannot write %1</source>
+        <translation type="unfinished">Невозможно записать %1</translation>
+    </message>
+    <message>
+        <source> or </source>
+        <translation type="unfinished"> или </translation>
+    </message>
+    <message numerus="yes">
+        <source>%n viewer(s) watching in a browser: %1 × %2</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Waiting for viewers at %1 (%2 × %3)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, %1, %2 Mb/s each</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>; %n note(s) received</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
 </context>
 <context>
     <name>montage::RemoteReviewPanel</name>
     <message>
         <source>Remote Review</source>
         <translation type="unfinished">Дистанционный обзор</translation>
-    </message>
-    <message>
-        <source>The Program streamed live to reviewers elsewhere, with its sound and the timecode burnt in. They watch in Montage (File › Watch Remote Review…, which can send notes back as markers) or any player that reads SRT, such as FFmpeg&apos;s ffplay. Over SRT the stream is encrypted with the passphrase; the notes that come back are signed with it but not encrypted. The passphrase is kept in Montage&apos;s settings on this computer.</source>
-        <translation type="unfinished">Программа была прямой трансляцией для рецензий, с её звуком и сгоревшим кодом времени. Они смотрят в Монтаже (File β Watch Dile Review..., который может отправить ноты обратно в качестве маркеров) или любой игрок, который читает SRT, например FFmpeg&apos;s sechplay. По SRT поток зашифрован парфюмерной фразой; но при этом они не зашифрованы. Пароль хранится в настройках Монтаж на этом компьютере.</translation>
     </message>
     <message>
         <source>srt://0.0.0.0:9000 listens on every network address of this computer; srt://server:port?streamid=… calls a relay; udp://host:port sends unencrypted on a local network</source>
@@ -25336,6 +25368,86 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>. Notes come back as markers: viewers set Markers to %1.</source>
         <translation type="unfinished">. Заметки возвращаются как маркеры: зрители устанавливают маркеры на %1.</translation>
+    </message>
+    <message>
+        <source>The Program streamed live to reviewers elsewhere, with its sound and the timecode burnt in. They watch in Montage (File › Watch Remote Review…, which can send notes back as markers) or any player that reads SRT, such as FFmpeg&apos;s ffplay; or in any web browser, from a link to a page this computer serves, where they type notes and draw on the picture. Over SRT the stream is encrypted with the passphrase, and in a browser everything is (HTTPS and WebRTC). The passphrase is kept in Montage&apos;s settings on this computer.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In Montage or an SRT player</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In any web browser</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Viewers watch:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None: one Montage makes for this computer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A certificate (PEM) for this computer&apos;s name, such as one from your own domain, so browsers trust the page without a warning. Without one, reviewers accept Montage&apos;s own once.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Certificate:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The certificate&apos;s private key (PEM)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Private key:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None (viewers on this network, or reaching this computer&apos;s port)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>STUN and TURN servers that help viewers on other networks reach this computer, separated by spaces: stun:host:3478, turn:user:password@host:3478. None is used unless named here.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ICE servers:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Viewers at once:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.264 (every browser)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AV1, where the browser plays it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HEVC, where the browser plays it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>https://0.0.0.0:8443 serves the page on every network address of this computer; the picture goes out over UDP on the same port number</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Reviewers open %1 in a web browser and give the passphrase %2. Notes and drawings they add come back as markers at the frame they saw.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> The browser warns about Montage&apos;s own certificate the first time: they go on to the page.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> From another network they need TCP and UDP port %1 forwarded here, or an ICE server named above.</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

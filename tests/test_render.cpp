@@ -73,6 +73,7 @@
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
+#include "media/MediaPool.h"
 #include "media/Exr.h"
 #include "media/LensCalibration.h"
 #include "media/Proxy.h"
@@ -87,8 +88,18 @@
 #include "render/LinedScript.h"
 #include "render/RemoteGrade.h"
 #include "render/RemoteReview.h"
+#include "render/WebRtcReview.h"
+#include "render/HeadlessBrowser.h"
+#include "render/OGraf.h"
+#include "core/ReviewPage.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "core/History.h"
 #include <QTcpServer>
+#include <QSslCertificate>
+#include <QSslKey>
+#include <QSslSocket>
 #include <QUdpSocket>
 #include <QTcpSocket>
 #include <QNetworkProxy>
@@ -153,6 +164,8 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 
@@ -190,6 +203,72 @@ void rgb(const Image& img, int x, int y, float out[4]) {
     float a = p[3];
     for (int c = 0; c < 3; ++c) out[c] = a > 0 ? p[c] / a : 0;
     out[3] = a;
+}
+
+// `f` (its format, size and buffers set) filled with Y′CbCr code values code(component, x, y), each in its component's
+// own plane size.
+void fillYcbcrFrame(AVFrame* f, const std::function<int(int, int, int)>& code) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+    // (Zeroed first: writing a sample of fewer than 16 bits keeps the word's other bits.)
+    for (int i = 0; i < 4 && f->data[i]; ++i)
+        std::memset(f->data[i], 0, size_t(f->linesize[i]) * size_t(i == 1 || i == 2 ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height));
+    std::vector<uint16_t> line(static_cast<size_t>(f->width));
+    for (int c = 0; c < 3; ++c) {
+        const int cw = c ? AV_CEIL_RSHIFT(f->width, d->log2_chroma_w) : f->width, ch = c ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height;
+        for (int y = 0; y < ch; ++y) {
+            for (int x = 0; x < cw; ++x) line[size_t(x)] = uint16_t(code(c, x, y));
+            av_write_image_line2(line.data(), f->data, f->linesize, d, 0, y, c, cw, 2);
+        }
+    }
+}
+
+// A short video of Y′CbCr in `fmt` (three frames, each filled by fillYcbcrFrame), tagged with the matrix, range and
+// chroma siting given: FFV1 in Matroska, or NV12 raw there (FFV1 does not take it).
+bool writeYcbcrVideo(const std::string& path, AVPixelFormat fmt, int w, int h, AVColorSpace space, AVColorRange range,
+                     AVChromaLocation siting, const std::function<int(int, int, int)>& code) {
+    const bool raw = fmt == AV_PIX_FMT_NV12;
+    AVFormatContext* oc = nullptr;
+    if (avformat_alloc_output_context2(&oc, nullptr, "matroska", path.c_str()) < 0) return false;
+    auto closeOut = qScopeGuard([&] {
+        if (oc->pb) avio_closep(&oc->pb);
+        avformat_free_context(oc);
+    });
+    const AVCodec* codec = avcodec_find_encoder(raw ? AV_CODEC_ID_RAWVIDEO : AV_CODEC_ID_FFV1);
+    AVCodecContext* cc = codec ? avcodec_alloc_context3(codec) : nullptr;
+    if (!cc) return false;
+    auto freeCodec = qScopeGuard([&] { avcodec_free_context(&cc); });
+    cc->width = w, cc->height = h, cc->pix_fmt = fmt, cc->time_base = {1, 25}, cc->framerate = {25, 1};
+    cc->colorspace = space, cc->color_range = range, cc->chroma_sample_location = siting;
+    if (!raw) cc->level = 3;
+    if (oc->oformat->flags & AVFMT_GLOBALHEADER) cc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    if (avcodec_open2(cc, codec, nullptr) < 0) return false;
+    AVStream* st = avformat_new_stream(oc, nullptr);
+    if (!st || avcodec_parameters_from_context(st->codecpar, cc) < 0) return false;
+    st->time_base = cc->time_base;
+    if (avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE) < 0 || avformat_write_header(oc, nullptr) < 0) return false;
+    AVFrame* f = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    auto freeFrame = qScopeGuard([&] {
+        av_frame_free(&f);
+        av_packet_free(&pkt);
+    });
+    f->width = w, f->height = h, f->format = fmt, f->colorspace = space, f->color_range = range, f->chroma_location = siting;
+    if (av_frame_get_buffer(f, 0) < 0) return false;
+    fillYcbcrFrame(f, code);
+    auto drain = [&] {
+        while (avcodec_receive_packet(cc, pkt) == 0) {
+            av_packet_rescale_ts(pkt, cc->time_base, st->time_base);
+            pkt->stream_index = st->index;
+            if (av_interleaved_write_frame(oc, pkt) < 0) return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < 3; ++i) {
+        f->pts = i;
+        if (avcodec_send_frame(cc, f) < 0 || !drain()) return false;
+    }
+    if (avcodec_send_frame(cc, nullptr) < 0 || !drain()) return false;
+    return av_write_trailer(oc) == 0;
 }
 
 Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime len) {
@@ -10107,6 +10186,18 @@ colorspaces:
             other.width = 1920, other.height = 1080;
             p.media.push_back(other);
             QCOMPARE(attachFdl(p, readText(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), {other.id}, &err), 0);
+            // One naming footage of another shape than its canvas (a 4:3 copy of the 16:9 recording) goes to it, but
+            // draws no frame lines on it: framed by that canvas, the picture would be stretched.
+            MediaItem narrow = other;
+            narrow.id = p.newId();
+            narrow.name = "A001C005.mov";
+            narrow.width = 1440;
+            p.media.push_back(narrow);
+            QCOMPARE(attachFdl(p, readText(QStringLiteral(MONTAGE_TEST_DATA_DIR "/fdl/A001C005.fdl")), {narrow.id}, &err), 1);
+            FdlCanvas nc;
+            FdlFraming nf;
+            QVERIFY(!mediaFdlFraming(*p.findMedia(narrow.id), nc, nf) && mediaFrameLines(*p.findMedia(narrow.id)).empty());
+            p.media.pop_back();
         }
         // A template larger than Montage makes pictures is refused.
         std::string huge = uhd;
@@ -10116,6 +10207,17 @@ colorspaces:
         untouched = p;
         QCOMPARE(frameClipsWithFdl(untouched, untouched.sequences.back(), {clipId}, uhd, "", true, nullptr, &err).size(), size_t(1));
         QVERIFY(untouched.sequences.back().width == 3840 && untouched.sequences.back().height == 2160);
+        // ... but not one larger than a sequence can be: a frame of 16000 x 9000 floats is over 2 GB.
+        {
+            std::string vast = uhd;
+            for (const auto& [from, to] : {std::pair<std::string, std::string>{"3840", "16000"}, {"2160", "9000"}})
+                for (size_t at = vast.find(from); at != std::string::npos; at = vast.find(from, at + to.size())) vast.replace(at, from.size(), to);
+            Project big = p;
+            skipped.clear();
+            QVERIFY(frameClipsWithFdl(big, big.sequences.back(), {clipId}, vast, "", true, &skipped, &err).empty());
+            QVERIFY2(skipped.size() == 1 && skipped[0].find("larger than a sequence") != std::string::npos, skipped.empty() ? "" : skipped[0].c_str());
+            QVERIFY(big.sequences.back().width == p.sequences.back().width);
+        }
         // Kept with the project, with the framing chosen.
         p.findMedia(chartId)->fdlFraming = "1-1";
         Project loaded;
@@ -12870,6 +12972,11 @@ colorspaces:
         af.channels = 8;
         QCOMPARE(QString::fromStdString(st::sdpParameters(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so))["channel-order"]),
                  QStringLiteral("SMPTE2110.(ST,ST,ST,ST)"));
+        // (an odd channel last, mono)
+        af.channels = 3;
+        QCOMPARE(QString::fromStdString(st::sdpParameters(st::audioSdp(af, {"239.100.0.2", 5004}, 97, so))["channel-order"]),
+                 QStringLiteral("SMPTE2110.(ST,M)"));
+        af.channels = 8;
         params = st::sdpParameters(st::ancSdp(vf, {"239.100.0.3", 5004}, 100, so), &encoding);
         QCOMPARE(QString::fromStdString(encoding), QStringLiteral("smpte291/90000"));
         QVERIFY(QString::fromStdString(params["DID_SDID"]).contains("{0x60,0x60}") && QString::fromStdString(params["DID_SDID"]).contains("{0x61,0x01}"));
@@ -13313,6 +13420,31 @@ colorspaces:
         QTRY_VERIFY_WITH_TIMEOUT((answer += http.readAll(), http.state() == QAbstractSocket::UnconnectedState), 5000);
         answer += http.readAll();
         QVERIFY2(answer.startsWith("HTTP/1.1 200 OK") && answer.contains("\"node/\"") && answer.contains("HTTP/1.1 400 Bad Request"), answer.constData());
+
+        // Anyone on the network can reach it, so what one can hold is bounded: headers that never end are refused...
+        QTcpSocket endless;
+        endless.connectToHost(QHostAddress::LocalHost, quint16(node.port()));
+        QVERIFY(endless.waitForConnected(5000));
+        endless.write("GET / HTTP/1.1\r\nX-Padding: " + QByteArray(70000, 'a'));
+        answer.clear();
+        QTRY_VERIFY_WITH_TIMEOUT((answer += endless.readAll(), endless.state() == QAbstractSocket::UnconnectedState), 5000);
+        answer += endless.readAll();
+        // (its answer, unless the rest of what was sent, arriving after it closed, reset the connection first)
+        QVERIFY2(answer.isEmpty() || answer.startsWith("HTTP/1.1 431"), answer.constData());
+        QTest::qWait(200);
+        // ... and one address has no more than eight connections at once.
+        std::vector<std::unique_ptr<QTcpSocket>> held;
+        for (int i = 0; i < 9; ++i) {
+            held.push_back(std::make_unique<QTcpSocket>());
+            held.back()->connectToHost(QHostAddress::LocalHost, quint16(node.port()));
+            QVERIFY(held.back()->waitForConnected(5000));
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(held[8]->state() == QAbstractSocket::UnconnectedState, 5000);
+        for (int i = 0; i < 8; ++i) QVERIFY2(held[size_t(i)]->state() == QAbstractSocket::ConnectedState, qPrintable(QString::number(i)));
+        held[0]->write("GET /x-nmos/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        QTRY_VERIFY_WITH_TIMEOUT(held[0]->bytesAvailable() > 0, 5000);
+        QVERIFY(held[0]->readAll().startsWith("HTTP/1.1 200 OK"));
+        held.clear();
 
         // Stopping takes it off the registry.
         node.stop();
@@ -15029,6 +15161,293 @@ colorspaces:
         QVERIFY(!udp->open(dev, mode, pq, 2, 48000, &why) && QString::fromStdString(why).contains("HDR"));
     }
 
+    void browserReview() {
+        using namespace montage::output;
+        // Settings: browsers need a passphrase, a codec they may take, ICE servers named as STUN or TURN, and a key
+        // with any certificate. No marker channel of its own (notes come back over WebRTC).
+        StreamSettings st;
+        st.address = "https://0.0.0.0:8443";
+        st.codec = "h264";
+        QVERIFY(isBrowserAddress(st.address) && !isBrowserAddress("srt://0.0.0.0:9000"));
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("passphrase"));
+        st.passphrase = generatePassphrase();
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        QCOMPARE(markersPortFor(st), -1);
+        st.codec = "vp8";
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.codec = "av1";
+        st.iceServers = {"stun:stun.example.com:3478", "turn:ana:secret@turn.example.com:3478"};
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        st.iceServers = {"https://turn.example.com"};
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.iceServers = {"turn:ana:se%22cret@turn.example.com:3478"};  // (a quote, which would break the Link header)
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.iceServers.clear();
+        // Plain HTTP only on this computer: elsewhere it would carry the passphrase in the clear.
+        st.address = "http://0.0.0.0:8080";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("https"));
+        st.address = "http://127.0.0.1:8080";
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        st.address = "https://0.0.0.0:8443";
+        st.certificateFile = "review.pem";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("key"));
+
+        // The frame code reads back, and refuses a picture without one.
+        Planes420 coded(320, 180);
+        std::fill(coded.y.begin(), coded.y.end(), uint16_t(500));
+        burnFrameCode(coded, 123457);
+        auto luma = [&](const Planes420& p) {
+            return [&p](int x, int y) { return (double(p.y[size_t(y) * size_t(p.width) + size_t(x)]) - 64) / 876; };
+        };
+        QCOMPARE(frameCodeValue(320, 180, luma(coded)), int64_t(123457));
+        QCOMPARE(frameCodeValue(320, 180, luma(Planes420(320, 180))), int64_t(0));
+        Planes420 grey(320, 180);
+        std::fill(grey.y.begin(), grey.y.end(), uint16_t(500));
+        QCOMPARE(frameCodeValue(320, 180, luma(grey)), int64_t(-1));
+
+        // A certificate for this computer's names and addresses.
+        std::string cert, key, why;
+        BrowserReviewBackend probe;
+        if (!probe.available(&why)) QSKIP(why.c_str());
+        QVERIFY2(makeReviewCertificate({"localhost", "127.0.0.1", "montage.local"}, cert, key, &why), why.c_str());
+        const QSslCertificate made(QByteArray::fromStdString(cert), QSsl::Pem);
+        QVERIFY(!made.isNull());
+        QCOMPARE(made.issuerInfo(QSslCertificate::CommonName), made.subjectInfo(QSslCertificate::CommonName));  // (self-signed)
+        const auto names = made.subjectAlternativeNames();
+        QVERIFY(names.values(QSsl::DnsEntry).contains("montage.local") && names.values(QSsl::IpAddressEntry).contains("127.0.0.1"));
+        QVERIFY(made.expiryDate() > QDateTime::currentDateTimeUtc().addDays(365));
+        QVERIFY(!QSslKey(QByteArray::fromStdString(key), QSslSocket::activeBackend() == "openssl" ? QSsl::Ec : QSsl::Rsa, QSsl::Pem).isNull());
+
+        const std::string exe = ografBrowser();
+        if (exe.empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        auto freeTcp = [] {
+            QTcpServer s;
+            s.listen(QHostAddress::LocalHost, 0);
+            return int(s.serverPort());
+        };
+
+        // A grey ramp, played in real time by a player of its own (as playback does) while the browser is driven.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec709";
+        auto ramp = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        auto review = std::make_shared<BrowserReviewBackend>();
+        StreamSettings web;
+        web.address = "https://127.0.0.1:" + std::to_string(freeTcp());
+        web.passphrase = generatePassphrase();
+        web.codec = "h264";  // (or AV1, where the browser has no H.264)
+        web.hardware = false;
+        web.bitrateKbps = 3000;
+        web.frameCode = true;
+        review->setSettings(web);
+        review->setSequence(s.id);
+        const Mode mode{"browser", 320, 180, {25, 1}, false, 0};
+        Config cfg;
+        cfg.depth = 10;
+        cfg.audioChannels = 2;
+        Scheduler sched(review);
+        QVERIFY2(sched.start(review->devices()[0], mode, s, cfg, &why), why.c_str());
+        sched.setAudioSource([](int64_t start, int frames, int channels, float* out) {
+            for (int i = 0; i < frames; ++i)
+                for (int c = 0; c < channels; ++c) out[size_t(i) * size_t(channels) + size_t(c)] = 0.25f * float(std::sin(2 * M_PI * 1000 * double(start + i) / 48000));
+        });
+        std::atomic<bool> stopPlayer{false}, playing{false};
+        std::atomic<int64_t> playhead{100};
+        std::thread player([&] {
+            QElapsedTimer clock;
+            FrameTime from = 0;
+            bool was = false;
+            while (!stopPlayer) {
+                if (playing && !was) {
+                    clock.restart();
+                    from = playhead;
+                }
+                was = playing;
+                const FrameTime t = playing ? from + clock.elapsed() * 25 / 1000 : FrameTime(playhead);
+                playhead = t;
+                sched.setPosition(t, playing ? 1 : 0);
+                for (FrameTime f = t; f < t + 4; ++f)
+                    if (sched.wants(f)) sched.submit(f, ramp(f));
+                QThread::msleep(5);
+            }
+        });
+        auto stopAll = qScopeGuard([&] {
+            stopPlayer = true;
+            player.join();
+            sched.stop();
+        });
+
+        // A browser on this computer: the certificate taken as it is (as a reviewer accepts it), sound allowed.
+        bool sandbox = true;
+#ifndef _WIN32
+        sandbox = geteuid() != 0;
+#endif
+        HeadlessBrowser::Options options;
+        options.offline = false;
+        options.extraArgs = {"--ignore-certificate-errors", "--autoplay-policy=no-user-gesture-required",
+                             "--disable-features=WebRtcHideLocalIpsWithMdns"};
+        auto browser = std::make_unique<HeadlessBrowser>();
+        if (!browser->start(exe, 800, 600, sandbox, &why, options)) {
+            if (!sandbox) QFAIL(why.c_str());
+            browser = std::make_unique<HeadlessBrowser>();
+            QVERIFY2(browser->start(exe, 800, 600, false, &why, options), why.c_str());
+        }
+        HeadlessBrowser& b = *browser;
+        auto js = [&](const QString& expression, int ms = 30000) {
+            QJsonObject r;
+            std::string err;
+            if (!b.call("Runtime.evaluate", {{"expression", expression}, {"awaitPromise", true}, {"returnByValue", true}}, &r, &err, true, ms)) {
+                qWarning("%s", err.c_str());
+                return QJsonValue();
+            }
+            if (r.contains("exceptionDetails")) qWarning("%s", QJsonDocument(r.value("exceptionDetails").toObject()).toJson().constData());
+            return r.value("result").toObject().value("value");
+        };
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (js(expression).toBool()) return true;
+                QThread::msleep(50);
+            }
+            return false;
+        };
+        QJsonObject r;
+        const QString page = QString::fromStdString("https://127.0.0.1:" + web.address.substr(web.address.rfind(':') + 1) + "/");
+        QVERIFY2(b.call("Page.navigate", {{"url", page}}, &r, &why), why.c_str());
+        QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), b.log().right(2000).constData());
+
+        // A wrong passphrase is refused.
+        QCOMPARE(js("__montage.join('Ana', 'not the passphrase').then(() => 'joined', e => e.message)").toString(), QStringLiteral("Wrong passphrase"));
+        QCOMPARE(review->receivers(), 0);
+
+        // The right one plays: every picture's burnt-in frame number, read from a canvas, is the frame its tag says.
+        QVERIFY(js("(() => { const s = window.__montage; s.checks = []; const c = document.createElement('canvas'); let g = null;"
+                   "s.onFrame.push((now, meta, v, t) => { const w = v.videoWidth, h = v.videoHeight; if (!w || !h) return;"
+                   "if (c.width !== w || c.height !== h || !g) { c.width = w; c.height = h; g = c.getContext('2d', { willReadFrequently: true }); }"
+                   "g.drawImage(v, 0, 0); const b = Math.max(4, Math.floor(h / 30) & ~1), rw = Math.min(w, 26 * b);"
+                   "const px = g.getImageData(0, 0, rw, 2 * b).data; let code = 0;"
+                   "for (let bit = 0; bit < 24; ++bit) { const cx = (bit + 1) * b, cy = b; let sum = 0;"
+                   "for (let dy = -1; dy <= 1; ++dy) for (let dx = -1; dx <= 1; ++dx) { const i = ((cy + dy) * rw + cx + dx) * 4;"
+                   "sum += (0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]) / 255; }"
+                   "sum /= 9; if (sum > 0.3 && sum < 0.7) { code = -1; break; } if (sum >= 0.7) code += 2 ** bit; }"
+                   "s.checks.push({ code, tag: t ? t.f : -1 }); if (s.checks.length > 400) s.checks.shift(); }); return true; })()")
+                    .toBool());
+        const QString joined = js("__montage.join('Ana', '" + QString::fromStdString(web.passphrase) + "').then(() => 'joined', e => e.message)").toString();
+        QCOMPARE(joined, QStringLiteral("joined"));
+        QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 20),
+                 (js("__montage.stage").toString() + " " + QString::fromStdString(review->stats().error)).toUtf8().constData());
+        QCOMPARE(review->receivers(), 1);
+        const QString codec = js("__montage.codec").toString();
+        qInfo("Codec: %s (%s)", qPrintable(codec), review->stats().encoder.c_str());
+        QVERIFY(codec == "h264" || codec == "av1");
+
+        // Parked: the frame shown is the playhead's.
+        playhead = 500;
+        QVERIFY2(until("__montage.checks.length > 0 && __montage.checks[__montage.checks.length - 1].tag === 500", 10),
+                 QJsonDocument(js("__montage.checks.slice(-5)").toArray()).toJson().constData());
+        QThread::msleep(500);
+        const QJsonArray parked = js("__montage.checks.slice(-5)").toArray();
+        for (const QJsonValue& c : parked) {
+            QVERIFY2(std::abs(c.toObject().value("code").toInt() - 500) <= 1, QJsonDocument(parked).toJson().constData());
+            QCOMPARE(c.toObject().value("tag").toInt(), 500);
+        }
+        QCOMPARE(js("__montage.frame").toInt(), 500);
+        QCOMPARE(js("__montage.tc").toString(), QString::fromStdString(formatTimecode(500, {25, 1}, true)));
+
+        // Playing: within two frames of their tags, and the frame shown under half a second behind the playhead.
+        js("__montage.checks.length = 0");
+        playing = true;
+        std::vector<int64_t> lags;
+        QElapsedTimer played;
+        played.start();
+        // (four seconds, or on until 50 pictures were checked: a loaded machine's browser draws fewer of them)
+        while (played.elapsed() < 4000 || (played.elapsed() < 15000 && js("__montage.checks.length").toInt() < 50)) {
+            const int64_t at = playhead;
+            const int shownNow = js("__montage.frame").toInt();
+            if (played.elapsed() > 1000 && shownNow > 500) lags.push_back(at - shownNow);
+            QThread::msleep(100);
+        }
+        playing = false;
+        const QJsonArray during = js("__montage.checks.slice()").toArray();
+        QVERIFY2(during.size() >= 50, qPrintable(QString("%1 pictures checked in %2 ms").arg(during.size()).arg(played.elapsed())));
+        int worst = 0, read = 0;
+        for (const QJsonValue& c : during) {
+            const int code = c.toObject().value("code").toInt(), tag = c.toObject().value("tag").toInt();
+            if (code < 0 || tag < 0) continue;
+            ++read;
+            worst = std::max(worst, std::abs(code - tag));
+        }
+        qInfo("Playing: %d pictures read, worst %d frames from their tags", read, worst);
+        QVERIFY(read >= 50);
+        QVERIFY2(worst <= 2, std::to_string(worst).c_str());
+        std::sort(lags.begin(), lags.end());
+        QVERIFY(lags.size() >= 10);
+        qInfo("Latency: %lld frames (median)", (long long)lags[lags.size() / 2]);
+        QVERIFY2(lags[lags.size() / 2] < 12, std::to_string(lags[lags.size() / 2]).c_str());  // (0.5 s at 25 fps)
+
+        // Sound arrives.
+        QVERIFY(until("__montage.pc.getStats().then(r => { let n = 0; r.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'audio') n = s.packetsReceived; }); return n > 50; })", 10));
+
+        // A note typed in the page lands as a marker on the frame shown, with its drawing.
+        playhead = 700;
+        QVERIFY(until("__montage.frame === 700", 10));
+        const QString id = js("__montage.note('Too dark here', [{ tool: 'pen', color: '#ff0000', width: 0.01, points: [[0.1, 0.1], [0.5, 0.5]] }])").toString();
+        QVERIFY(!id.isEmpty());
+        std::vector<RemoteMarker> got;
+        QElapsedTimer waited;
+        waited.start();
+        while (got.empty() && waited.elapsed() < 10000) {
+            got = review->takeMarkers();
+            QThread::msleep(20);
+        }
+        QCOMPARE(got.size(), size_t(1));
+        QCOMPARE(got[0].frame, FrameTime(700));
+        QCOMPARE(QString::fromStdString(got[0].author), QStringLiteral("Ana"));
+        QCOMPARE(QString::fromStdString(got[0].text), QStringLiteral("Too dark here"));
+        QCOMPARE(QString::fromStdString(got[0].timecode), QString::fromStdString(formatTimecode(700, {25, 1}, true)));
+        QCOMPARE(got[0].sequence, s.id);
+        QCOMPARE(parseReviewDrawing(got[0].drawing).size(), size_t(1));
+        QVERIFY(until("__montage.notes.get('" + id + "').status === 'sent'", 5));
+        QCOMPARE(review->stats().markers, 1);
+
+        // Where the reviewer points is known.
+        js("__montage.dc.send(JSON.stringify({ t: 'p', x: 0.25, y: 0.75 }))");
+        waited.restart();
+        while (review->pointers().empty() && waited.elapsed() < 5000) QThread::msleep(20);
+        QCOMPARE(review->pointers().size(), size_t(1));
+        QCOMPARE(QString::fromStdString(review->pointers()[0].author), QStringLiteral("Ana"));
+        QVERIFY(std::abs(review->pointers()[0].x - 0.25) < 1e-6 && std::abs(review->pointers()[0].y - 0.75) < 1e-6);
+
+        // Another player pulls the same stream over WHEP at once (no data channel; passphrase as its token), and is
+        // let go when it ends its session.
+        QVERIFY(js("(async () => { const pc = new RTCPeerConnection(); window.__whep = pc;"
+                   "pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' });"
+                   "await pc.setLocalDescription(await pc.createOffer());"
+                   "await new Promise(r => { if (pc.iceGatheringState === 'complete') r(); pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && r(); setTimeout(r, 2000); });"
+                   "const w = await fetch('/whep', { method: 'POST', headers: { Authorization: 'Bearer " + QString::fromStdString(web.passphrase) +
+                   "', 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });"
+                   "if (w.status !== 201) return false; window.__whepAt = w.headers.get('Location');"
+                   "await pc.setRemoteDescription({ type: 'answer', sdp: await w.text() }); return true; })()")
+                    .toBool());
+        QVERIFY(until("__whep.getStats().then(r => { let n = 0; r.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'video') n = s.framesDecoded; }); return n > 10; })", 15));
+        QCOMPARE(review->receivers(), 2);
+        QCOMPARE(review->stats().viewers, 2);
+        QCOMPARE(js("fetch(__whepAt, { method: 'DELETE', headers: { Authorization: 'Bearer " + QString::fromStdString(web.passphrase) + "' } }).then(r => r.status)").toInt(), 200);
+        QCOMPARE(review->receivers(), 1);
+        // A wrong passphrase to the endpoint is refused too.
+        QCOMPARE(js("fetch('/whep', { method: 'POST', headers: { Authorization: 'Bearer wrong', 'Content-Type': 'application/sdp' }, body: 'v=0' }).then(r => r.status)").toInt(), 401);
+    }
+
     void ndiOutput() {
         using namespace montage::output;
         // A stand-in NDI Runtime where the SDK says to look.
@@ -16380,6 +16799,9 @@ colorspaces:
         QVERIFY(same(5) <= 2e-3);
         QCOMPARE(gpu::stats().gpuFrames, 1L);
         QVERIFY(gpu::stats().cpuLayers >= 1);
+        // Each layer made on the CPU is named with why.
+        const std::string layer = gpu::stats().lastCpuLayer;
+        QVERIFY2(layer.find("\"" + masked.name + "\"") == 0 && layer.find("Color Correct") != std::string::npos, layer.c_str());
         QVERIFY(edit::clipById(s, maskedId));
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
         adj.effects.push_back(makeEffect(p, "invert"));
@@ -16388,6 +16810,378 @@ colorspaces:
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
         QVERIFY(!gpu::stats().lastFallback.empty());
+    }
+    void gpuYcbcrPlanes() {
+        // Decoded Y′CbCr converted on the GPU from its planes, as decoded, rather than the decoder converting it to
+        // RGBA on the CPU: every layout, in BT.601, BT.709 and BT.2020, limited and full range, against the CPU's
+        // frame (smooth pictures, so how either side interpolates chroma between its samples does not count).
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesPlanes()) QSKIP("this GPU does not take 8 and 16-bit textures of one and two channels");
+        QTemporaryDir dir;
+        struct Layout {
+            AVPixelFormat fmt;
+            const char* name;
+        };
+        const Layout layouts[] = {{AV_PIX_FMT_YUV420P, "4:2:0 8-bit"},      {AV_PIX_FMT_YUV422P, "4:2:2 8-bit"},
+                                  {AV_PIX_FMT_YUV444P, "4:4:4 8-bit"},      {AV_PIX_FMT_YUV420P10LE, "4:2:0 10-bit"},
+                                  {AV_PIX_FMT_YUV422P10LE, "4:2:2 10-bit"}, {AV_PIX_FMT_YUV444P12LE, "4:4:4 12-bit"},
+                                  {AV_PIX_FMT_YUV420P16LE, "4:2:0 16-bit"}, {AV_PIX_FMT_NV12, "NV12"},
+                                  {AV_PIX_FMT_P010LE, "P010"},              {AV_PIX_FMT_P016LE, "P016"},
+                                  {AV_PIX_FMT_P210LE, "P210"}};
+        const std::pair<AVColorSpace, const char*> matrices[] = {{AVCOL_SPC_SMPTE170M, "BT.601"}, {AVCOL_SPC_BT709, "BT.709"},
+                                                                  {AVCOL_SPC_BT2020_NCL, "BT.2020"}};
+        const int W = 96, H = 54;
+        // Smooth luma and chroma well inside the range (code values of the format's bits).
+        auto smooth = [](int bits, bool full) {
+            return [bits, full](int c, int x, int y) {
+                const double unit = double(1 << (bits - 8));
+                const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.045 + y * 0.03) : 0.5 + 0.18 * std::sin(x * (c == 1 ? 0.07 : 0.05) - y * 0.04);
+                const double lo = full ? 0 : 16 * unit, hi = full ? (1 << bits) - 1 : (c ? 240 : 235) * unit;
+                return int(std::lround(lo + (hi - lo) * v));
+            };
+        };
+        auto differs = [&](const Image& a, const Image& b, QString& where) {
+            double worst = 0;
+            for (int y = 0; y < a.height; ++y)
+                for (int x = 0; x < a.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double e = std::fabs(double(a.at(x, y)[c]) - b.at(x, y)[c]); e > worst) {
+                            worst = e;
+                            where = QStringLiteral(" at %1,%2 channel %3: %4 on the CPU, %5 on the GPU").arg(x).arg(y).arg(c).arg(a.at(x, y)[c]).arg(b.at(x, y)[c]);
+                        }
+            return worst;
+        };
+        int n = 0;
+        for (const Layout& l : layouts) {
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(l.fmt);
+            const int bits = d->comp[0].depth;
+            for (const auto& [space, matrix] : matrices)
+                for (const bool full : {false, true}) {
+                    const QString what = QStringLiteral("%1 %2 %3").arg(l.name, matrix, full ? "full" : "limited");
+                    const AVColorRange range = full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+                    QString where;
+                    if (l.fmt == AV_PIX_FMT_P010LE || l.fmt == AV_PIX_FMT_P016LE || l.fmt == AV_PIX_FMT_P210LE) {
+                        // No container holds these raw (hardware decoders give them): the frame is made here, and its
+                        // planes drawn on the GPU against the decoder's conversion of them on the CPU.
+                        std::shared_ptr<AVFrame> f(av_frame_alloc(), [](AVFrame* fr) { av_frame_free(&fr); });
+                        f->width = W, f->height = H, f->format = l.fmt, f->colorspace = space, f->color_range = range;
+                        f->chroma_location = AVCHROMA_LOC_LEFT;
+                        QVERIFY(av_frame_get_buffer(f.get(), 0) == 0);
+                        fillYcbcrFrame(f.get(), smooth(bits, full));
+                        auto frame = std::make_shared<Frame16>();
+                        frame->width = W, frame->height = H;
+                        frame->planes = ycbcrPlanesOf(f.get());
+                        QVERIFY2(frame->planes, qPrintable(what + ": no planes"));
+                        const Image cpu = toImage(*frame);
+                        gpu::Frame g;
+                        g.width = W, g.height = H;
+                        g.items.emplace_back();
+                        g.items[0].a.frame = frame;
+                        g.items[0].a.place.full = true;
+                        Image onGpu;
+                        QVERIFY2(gpu::execute(g, &onGpu), qPrintable(what + ": not on the GPU"));
+                        const double worst = differs(cpu, onGpu, where);
+                        QVERIFY2(worst <= 1.0 / 1023, qPrintable(what + QStringLiteral(": differs by %1").arg(worst) + where));
+                        continue;
+                    }
+                    const std::string path = dir.filePath(QStringLiteral("v%1.mkv").arg(n++)).toStdString();
+                    QVERIFY2(writeYcbcrVideo(path, l.fmt, W, H, space, range, AVCHROMA_LOC_LEFT, smooth(bits, full)), qPrintable(what));
+                    Frame16Ptr planes = MediaPool::instance().videoFrame(path, 0, 0, 0, false, true);
+                    QVERIFY2(planes && planes->planes && planes->px.empty(), qPrintable(what + ": no planes"));
+                    QCOMPARE(planes->planes->bits, bits);
+                    QCOMPARE(planes->planes->fullRange, full);
+                    Project p = makeDefaultProject();
+                    Sequence& s = *p.active();
+                    s.width = W, s.height = H;
+                    MediaItem m;
+                    QVERIFY(probeMedia(path, m));
+                    m.id = p.newId();
+                    p.media.push_back(m);
+                    QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2, {TrackKind::Video, 0}, {}, false).ok);
+                    RenderOptions o;
+                    o.highQuality = true;
+                    const Image cpu = renderProgramFrame(p, s, 1, o);
+                    gpu::resetStats();
+                    o.gpu = true;
+                    const Image onGpu = renderProgramFrame(p, s, 1, o);
+                    QVERIFY2(gpu::stats().gpuFrames == 1 && gpu::stats().gpuLayers == 1, qPrintable(what + ": not on the GPU"));
+                    QCOMPARE(onGpu.width, W);
+                    const double worst = differs(cpu, onGpu, where);
+                    QVERIFY2(worst <= 1.0 / 1023, qPrintable(what + QStringLiteral(": differs by %1").arg(worst) + where));
+                }
+        }
+        // Sharp chroma, each sample its own: the GPU interpolates it exactly as media/Image's ycbcrToRgba does (chroma
+        // sited left, centred and at the top left), at the picture's own size and resampled to half of it (below half,
+        // the decoder scales it down instead).
+        for (const AVChromaLocation siting : {AVCHROMA_LOC_LEFT, AVCHROMA_LOC_CENTER, AVCHROMA_LOC_TOPLEFT})
+            for (const AVPixelFormat fmt : {AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV422P}) {
+                const std::string path = dir.filePath(QStringLiteral("sharp%1.mkv").arg(n++)).toStdString();
+                const int bits = av_pix_fmt_desc_get(fmt)->comp[0].depth;
+                QVERIFY(writeYcbcrVideo(path, fmt, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, siting, [bits](int c, int x, int y) {
+                    const unsigned hash = unsigned(x * 73856093 ^ y * 19349663 ^ c * 83492791);
+                    return int((16 + hash % 225) << (bits - 8));
+                }));
+                Project p = makeDefaultProject();
+                Sequence& s = *p.active();
+                s.width = W, s.height = H;
+                MediaItem m;
+                QVERIFY(probeMedia(path, m));
+                m.id = p.newId();
+                p.media.push_back(m);
+                QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2, {TrackKind::Video, 0}, {}, false).ok);
+                for (const double scale : {1.0, 0.5}) {
+                    RenderOptions o;
+                    o.gpu = true;
+                    o.scale = scale;
+                    gpu::resetStats();
+                    const Image onGpu = renderProgramFrame(p, s, 1, o);
+                    QVERIFY(gpu::stats().gpuFrames == 1 && gpu::stats().gpuLayers == 1);
+                    Frame16Ptr f = MediaPool::instance().videoFrame(path, m.fps.valid() ? 1 / m.fps.toDouble() : 0.04, onGpu.width, onGpu.height, false, true);
+                    QVERIFY(f && f->planes);
+                    const Image cpu = toImage(*f);
+                    QCOMPARE(cpu.width, onGpu.width);
+                    double worst = 0;
+                    for (size_t i = 0; i < cpu.px.size(); ++i) worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]));
+                    QVERIFY2(worst <= 2e-5, qPrintable(QStringLiteral("siting %1, %2, scale %3: differs by %4")
+                                                           .arg(int(siting)).arg(av_get_pix_fmt_name(fmt)).arg(scale).arg(worst)));
+                }
+            }
+    }
+    void gpuExportMatchesCpu() {
+        // An export drawn on the GPU (one read-back a frame) against the same export on the CPU: Y′CbCr footage graded,
+        // a picture over it scaled, turned, faded and screened, 16-bit PNGs out.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        const int W = 160, H = 90;
+        const std::string video = dir.filePath("footage.mkv").toStdString();
+        QVERIFY(writeYcbcrVideo(video, AV_PIX_FMT_YUV420P10LE, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT, [](int c, int x, int y) {
+            const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.04 + y * 0.03) : 0.5 + 0.15 * std::sin(x * (c == 1 ? 0.05 : 0.03) - y * 0.04);
+            return int(std::lround((c ? 64 + 896 * v : 64 + 876 * v)));
+        }));
+        QImage pic(64, 48, QImage::Format_RGBA64);
+        for (int y = 0; y < 48; ++y)
+            for (int x = 0; x < 64; ++x) pic.setPixelColor(x, y, QColor::fromRgbF(x / 64.0f, 0.3f + y / 96.0f, 0.6f, 1.0f));
+        QVERIFY(pic.save(dir.filePath("pic.png")));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H;
+        Id ids[2];
+        for (int i = 0; i < 2; ++i) {
+            MediaItem m;
+            QVERIFY(probeMedia(i ? dir.filePath("pic.png").toStdString() : video, m));
+            m.id = ids[i] = p.newId();
+            p.media.push_back(m);
+        }
+        auto r1 = edit::placeMedia(p, s, ids[0], 0, 0, 3, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r1.ok);
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["exposure"] = 0.3;
+        cc.params["saturation"] = 1.2;
+        edit::clipById(s, r1.created[0])->effects.push_back(cc);
+        auto r2 = edit::placeMedia(p, s, ids[1], 0, 0, 3, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        top->motion.params["scale"] = 120.0;
+        top->motion.params["rotation"] = 9.0;
+        top->motion.params["opacity"] = 60.0;
+        top->blendMode = "screen";
+        auto exported = [&](bool onGpu) {
+            ExportSettings st;
+            st.path = dir.filePath(onGpu ? "gpu.png" : "cpu.png").toStdString();
+            st.videoCodec = "png";
+            st.pixFmt = "rgb48be";
+            st.audioCodec = "none";
+            st.gpu = onGpu;
+            std::string err;
+            const bool ok = exportSequence(p, s, st, nullptr, nullptr, &err);
+            if (!ok) qWarning("%s", err.c_str());
+            return ok;
+        };
+        QVERIFY(exported(false));
+        gpu::resetStats();
+        QVERIFY(exported(true));
+        QVERIFY2(gpu::stats().gpuFrames == 3 && gpu::stats().cpuLayers == 0, gpu::stats().lastFallback.c_str());
+        double worst = 0;
+        QString where;
+        for (int f = 0; f < 3; ++f) {
+            const QImage a(dir.filePath(QStringLiteral("cpu_%1.png").arg(f, 6, 10, QLatin1Char('0'))));
+            const QImage b(dir.filePath(QStringLiteral("gpu_%1.png").arg(f, 6, 10, QLatin1Char('0'))));
+            QVERIFY(!a.isNull() && a.size() == b.size() && a.width() == W);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const QRgba64 u = a.pixelColor(x, y).rgba64(), v = b.pixelColor(x, y).rgba64();
+                    const std::pair<int, int> rgb[3] = {{u.red(), v.red()}, {u.green(), v.green()}, {u.blue(), v.blue()}};
+                    for (int c = 0; c < 3; ++c)
+                        if (const double e = std::abs(rgb[c].first - rgb[c].second) / 65535.0; e > worst) {
+                            worst = e;
+                            where = QStringLiteral(" (frame %1 at %2,%3 channel %4: %5 on the CPU, %6 on the GPU)")
+                                        .arg(f).arg(x).arg(y).arg(c).arg(rgb[c].first).arg(rgb[c].second);
+                        }
+                }
+        }
+        QVERIFY2(worst <= 1.0 / 1023, qPrintable(QStringLiteral("the GPU's export differs by %1").arg(worst) + where));
+    }
+    void gpuOcioMatchesCpu() {
+        // OpenColorIO's transforms drawn on the GPU through OCIO's own shaders, against its CPU processor: three configs
+        // (a camera's log, gamut and display curves; 1D and 3D LUT files; ACES's output transform with a look), over
+        // 102,400 colours each.
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesShaders()) QSKIP("this build or GPU compiles no shaders while running");
+        QTemporaryDir dir;
+        auto write = [&](const QString& name, const QByteArray& text) {
+            QFile f(dir.filePath(name));
+            return f.open(QIODevice::WriteOnly) && f.write(text) == text.size();
+        };
+        {
+            QByteArray cube = "LUT_3D_SIZE 17\n";
+            for (int b = 0; b < 17; ++b)
+                for (int g = 0; g < 17; ++g)
+                    for (int r = 0; r < 17; ++r)
+                        cube += QByteArray::number(std::pow(r / 16.0, 1.3) * 0.95 + 0.02 * b / 16.0, 'g', 9) + " " +
+                                QByteArray::number(g / 16.0 * 0.9 + 0.05 * std::sin(r * 0.3), 'g', 9) + " " + QByteArray::number(std::sqrt(b / 16.0), 'g', 9) + "\n";
+            QVERIFY(write("look.cube", cube));
+            QByteArray long1d = "Version 1\nFrom 0 1\nLength 4096\nComponents 1\n{\n", short1d = "Version 1\nFrom 0 1\nLength 200\nComponents 3\n{\n";
+            for (int i = 0; i < 4096; ++i) long1d += QByteArray::number(std::pow(i / 4095.0, 0.45), 'g', 9) + "\n";
+            for (int i = 0; i < 200; ++i)
+                short1d += QByteArray::number(i / 199.0, 'g', 9) + " " + QByteArray::number(std::pow(i / 199.0, 1.1), 'g', 9) + " " +
+                           QByteArray::number(std::pow(i / 199.0, 0.9), 'g', 9) + "\n";
+            QVERIFY(write("long.spi1d", long1d + "}\n"));
+            QVERIFY(write("short.spi1d", short1d + "}\n"));
+        }
+        QVERIFY(write("camera.ocio", R"(ocio_profile_version: 2
+roles:
+  default: linear
+  scene_linear: linear
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Video, colorspace: video}
+colorspaces:
+  - !<ColorSpace>
+    name: linear
+    encoding: scene-linear
+  - !<ColorSpace>
+    name: log
+    encoding: log
+    from_scene_reference: !<LogCameraTransform> {base: 10, log_side_slope: 0.247189638, log_side_offset: 0.385536998, lin_side_slope: 5.555556, lin_side_offset: 0.052272, lin_side_break: 0.010591}
+  - !<ColorSpace>
+    name: video
+    encoding: sdr-video
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<MatrixTransform> {matrix: [0.6, 0.3, 0.1, 0, 0.1, 0.8, 0.1, 0, 0.05, 0.1, 0.85, 0, 0, 0, 0, 1]}
+        - !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}
+)"));
+        QVERIFY(write("luts.ocio", QStringLiteral(R"(ocio_profile_version: 2
+search_path: "%1"
+roles:
+  default: raw
+  scene_linear: raw
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  Monitor:
+    - !<View> {name: Graded, colorspace: graded}
+colorspaces:
+  - !<ColorSpace>
+    name: raw
+    encoding: sdr-video
+  - !<ColorSpace>
+    name: graded
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<FileTransform> {src: long.spi1d, interpolation: linear}
+        - !<FileTransform> {src: short.spi1d, interpolation: linear}
+        - !<FileTransform> {src: look.cube, interpolation: tetrahedral}
+)").arg(dir.path()).toUtf8()));
+        QVERIFY(write("aces.ocio", R"(ocio_profile_version: 2
+roles:
+  default: ACES2065-1
+  scene_linear: ACES2065-1
+file_rules:
+  - !<Rule> {name: Default, colorspace: default}
+displays:
+  sRGB:
+    - !<View> {name: ACES, colorspace: srgb_display}
+looks:
+  - !<Look>
+    name: Warm
+    process_space: ACES2065-1
+    transform: !<CDLTransform> {slope: [1.1, 1, 0.9], offset: [0.01, 0, -0.01], power: [1, 1.05, 1], sat: 1.1}
+colorspaces:
+  - !<ColorSpace>
+    name: ACES2065-1
+    encoding: scene-linear
+  - !<ColorSpace>
+    name: srgb_display
+    encoding: sdr-video
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<BuiltinTransform> {style: ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-VIDEO_1.0}
+        - !<BuiltinTransform> {style: DISPLAY - CIE-XYZ-D65_to_sRGB}
+)"));
+        struct Case {
+            const char* name;
+            const char* config;
+            bool display;
+            const char* src;
+            const char* dst;
+            const char* look;
+            bool linear;  // what comes in is linear light (0 to 16), else 0..1
+        };
+        const Case cases[] = {{"linear to video", "camera.ocio", false, "linear", "video", "", true},
+                              {"log to linear", "camera.ocio", false, "log", "linear", "", false},
+                              {"1D and 3D LUTs", "luts.ocio", true, "raw", "", "", false},
+                              {"ACES output with a look", "aces.ocio", true, "ACES2065-1", "", "Warm", true}};
+        Project p = makeDefaultProject();
+        const int W = 320, H = 320;
+        for (const Case& c : cases) {
+            Effect e = makeEffect(p, "ocio");
+            e.strings["config"] = dir.filePath(c.config).toStdString();
+            e.strings["mode"] = c.display ? "Display / View" : "Colour Space";
+            e.strings["src"] = c.src;
+            e.strings["dst"] = c.dst;
+            e.strings["look"] = c.look;
+            Image in(W, H, Image::Uninitialized{});
+            uint32_t seed = 12345;
+            auto rnd = [&] {
+                seed = seed * 1664525u + 1013904223u;
+                return double(seed >> 8) / double(1 << 24);
+            };
+            for (size_t i = 0; i < size_t(W) * H; ++i) {
+                float* px = &in.px[i * 4];
+                for (int k = 0; k < 3; ++k) px[k] = float(c.linear ? (i % 97 == 0 ? 0.0 : std::exp2(-10 + 14 * rnd())) : rnd());
+                px[3] = 1;
+            }
+            Image cpu = in;
+            std::string err;
+            QVERIFY2(applyOcio(e, cpu, &err), err.c_str());
+            gpu::Frame frame;
+            frame.width = W, frame.height = H;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.image = in;
+            item.a.place.full = true;
+            QVERIFY2(gpuColorOps(e, 0, item.a.ops, W, H), c.name);
+            QCOMPARE(item.a.ops.size(), size_t(1));
+            QVERIFY(item.a.ops[0].kind == gpu::ColorOp::Shader);
+            frame.items.push_back(std::move(item));
+            Image onGpu;
+            QVERIFY2(gpu::execute(frame, &onGpu), c.name);
+            double worst = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i)
+                worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]) / std::max(1.0, std::fabs(double(cpu.px[i]))));
+            // (on Metal the LUTs are half floats, 4.9e-4 a step, and ACES's output goes through several: within four
+            // steps there)
+            const double bound = QString::fromStdString(gpu::deviceName()).startsWith("Metal") ? 2e-3 : 1e-4;
+            QVERIFY2(worst <= bound, qPrintable(QStringLiteral("%1: differs by %2").arg(c.name).arg(worst)));
+            qInfo("%s: GPU within %.2g of OpenColorIO's CPU processor", c.name, worst);
+        }
     }
     void footageWordsReadAnswers() {
         // The sentences numbered, shortened when asked, several to a line when asked.

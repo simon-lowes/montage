@@ -2526,10 +2526,11 @@ void MainWindow::buildMenus() {
         a->setChecked(hw);
         a->setToolTip(tr("Decode H.264, HEVC, VP9, AV1 and ProRes on the GPU or media engine "
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
-        // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames
-        // are composited and graded on the GPU, what it cannot draw on the CPU as before. The GPU is set up only when it
-        // is wanted (a driver that misbehaves is out of the way once it is turned off). A launch that ended while the GPU
-        // was being set up or drawing its first frame (a driver crash takes Montage with it) leaves it off the next time.
+        // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames,
+        // Render In to Out's and exports' are composited and graded on the GPU, what it cannot draw on the CPU as before.
+        // The GPU is set up only when it is wanted (a driver that misbehaves is out of the way once it is turned off). A
+        // launch that ended while the GPU was being set up or drawing its first frame (a driver crash takes Montage with
+        // it) leaves it off the next time.
         std::string why;
         bool wantGpu = appSettings().value("playback/gpuRendering", true).toBool();
         if (wantGpu && appSettings().value("playback/gpuStarting", false).toBool()) {
@@ -2548,8 +2549,8 @@ void MainWindow::buildMenus() {
         g->setCheckable(true);
         g->setChecked(onGpu);
         auto describe = [g](const std::string& problem) {
-            g->setToolTip(problem.empty() ? tr("Composite and grade the program monitor's frames on the GPU; effects it has no GPU "
-                                               "form for render on the CPU")
+            g->setToolTip(problem.empty() ? tr("Composite and grade on the GPU: the Program monitor, Render In to Out and exports; "
+                                               "effects it has no GPU form for render on the CPU")
                                           : tr("No GPU rendering: %1").arg(QString::fromStdString(problem)));
         };
         describe(why);
@@ -2665,11 +2666,11 @@ void MainWindow::buildMenus() {
         liveLink_->addAppTool(ReferenceOutputController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return referenceOutput_->runTool(args, structured, isError);
         });
-    // To reviewers elsewhere, streamed live (render/RemoteReview.h); their notes come back as markers.
+    // To reviewers elsewhere, streamed live (render/RemoteReview.h, render/WebRtcReview.h); their notes come back as markers.
     remoteReview_ = new RemoteReviewController(program_, this);
     remoteReviewAction_ = new QAction(tr("Remote Review…"), this);
     remoteReviewAction_->setObjectName(QStringLiteral("remoteReview"));
-    remoteReviewAction_->setToolTip(tr("Stream the Program live to reviewers elsewhere over SRT, with a passphrase; their notes come back as markers"));
+    remoteReviewAction_->setToolTip(tr("Stream the Program live to reviewers elsewhere, over SRT or to any web browser, with a passphrase; their notes come back as markers"));
     remoteReviewAction_->setCheckable(true);
     connect(remoteReviewAction_, &QAction::triggered, this, [this] {
         remoteReviewAction_->setChecked(remoteReview_->running());
@@ -2719,6 +2720,11 @@ void MainWindow::buildMenus() {
                 if (remoteGrade_) remoteGrade_->paintOverlay(p, r);
             });
             connect(remoteGrade_, &RemoteGradeController::pointersChanged, v, qOverload<>(&QWidget::update));
+            // Reviewers in a browser pointing at the picture.
+            v->addOverlay([this](QPainter& p, const QRectF& r) {
+                if (remoteReview_) remoteReview_->paintOverlay(p, r);
+            });
+            connect(remoteReview_, &RemoteReviewController::pointersChanged, v, qOverload<>(&QWidget::update));
         }
         remoteGradeAction_ = new QAction(tr("Remote Grading…"), this);
         remoteGradeAction_->setObjectName(QStringLiteral("remoteGrade"));
@@ -5311,28 +5317,31 @@ void MainWindow::detectScenes(bool markOnly) {
         if (*cancel) return;
         int made = 0;
         state_->apply(markOnly ? tr("Detect Shot Changes") : tr("Detect Scene Cuts"), [&](Project& p, Sequence& sq) {
-            const Clip* clip = edit::clipById(sq, clipId);
+            Clip* clip = edit::clipById(sq, clipId);
             if (!clip) return edit::Result::fail("The clip is gone");
             // Map source times to timeline frames inside the clip.
             std::vector<FrameTime> frames;
+            std::vector<FrameTime> sources;
             for (double sec : cuts) {
                 double src = sec * sq.fpsValue();
                 double local = clip->ramped() ? clip->localForSource(src) : (src - clip->sourceIn) / clip->speed;
                 if (clip->reverse) local = double(clip->duration) - local;
                 FrameTime f = clip->start + FrameTime(std::llround(local));
-                if (f > clip->start && f < clip->end()) frames.push_back(f);
+                if (f > clip->start && f < clip->end()) frames.push_back(f), sources.push_back(FrameTime(std::llround(src)));
             }
-            // Each a shot-change marker (the razor's cuts are through edits, which captions do not count as shot changes).
-            for (FrameTime f : frames)
-                if (std::none_of(sq.markers.begin(), sq.markers.end(), [f](const Marker& mk) { return mk.shotChange && mk.t == f; })) {
+            // Each a shot-change marker on the clip's source, so it stays on that moment of the footage as the clip
+            // is moved, slipped or trimmed (the razor's cuts are through edits, which captions do not count as shot
+            // changes).
+            for (FrameTime src : sources)
+                if (std::none_of(clip->markers.begin(), clip->markers.end(), [src](const Marker& mk) { return mk.shotChange && mk.t == src; })) {
                     Marker mk;
-                    mk.t = f;
+                    mk.t = src;
                     mk.name = tr("Shot change").toStdString();
                     mk.shotChange = true;
-                    sq.markers.push_back(mk);
+                    clip->markers.push_back(mk);
                     if (markOnly) ++made;
                 }
-            std::sort(sq.markers.begin(), sq.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            std::sort(clip->markers.begin(), clip->markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
             if (markOnly) {
                 if (!made) return edit::Result::fail("No new shot changes found in this clip");
                 return edit::Result{};
@@ -7045,6 +7054,13 @@ int MainWindow::stripSilence(double thresholdDb, double minSilence, double padBe
     int removed = 0;
     std::string why;
     state_->apply(tr("Strip Silence"), [&](Project& p, Sequence& sq) {
+        // (the ranges are where the clips were: not applied to clips edited meanwhile, nor in another sequence)
+        if (sq.id != seq.id) return edit::Result::fail("The sequence changed while the silence was found");
+        for (const auto& [id, ranges] : keep) {
+            const Clip* now = edit::clipById(sq, id);
+            const Clip* then = edit::clipById(seq, id);
+            if (!now || !then || !(*now == *then)) return edit::Result::fail("The clips changed while the silence was found");
+        }
         const edit::Result r = edit::stripSilence(p, sq, keep, linked);
         removed = r.ok ? int(r.applied) : 0;
         why = r.error;
@@ -9702,7 +9718,8 @@ int MainWindow::renderInToOut() {
     if (to < from) return 0;
     auto project = std::make_shared<const Project>(state_->project());
     const Id seqId = s->id;
-    const RenderOptions o = program_->renderOptions();
+    RenderOptions o = program_->renderOptions();
+    o.gpu = program_->gpuRendering();  // (as the Program monitor draws them)
     int rendered = 0;
     const bool ok = runWithProgress(this, state_, tr("Rendering previews..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string*) {
         const Sequence* sq = project->findSequence(seqId);
@@ -9744,7 +9761,8 @@ void MainWindow::startBackgroundRender() {
     if (ranges.empty()) return;
     auto project = std::make_shared<const Project>(state_->project());
     const Id seqId = s->id;
-    const RenderOptions o = program_->renderOptions();
+    RenderOptions o = program_->renderOptions();
+    o.gpu = program_->gpuRendering();
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     backgroundCancel_ = cancel;
     backgroundBusy_ = true;

@@ -93,6 +93,11 @@ std::vector<FrameTime> captionShotChanges(const Sequence& seq) {
             if (!picture(c)) continue;
             for (const FrameTime f : {c.start, c.end()})
                 if (f > 0 && f < last && !smooth.count(f) && !hidden(f)) out.insert(f);
+            // (those found inside it: on its source, where the clip shows them now)
+            for (const Marker& m : c.markers)
+                if (m.shotChange)
+                    // (the frame showing the source frame after the cut; played backwards, the cut follows it)
+                    if (FrameTime f = c.markerFrame(m); f >= 0 && (f += c.reverse ? 1 : 0) > 0 && f < last && !hidden(f)) out.insert(f);
         }
     }
     for (const Marker& m : seq.markers)
@@ -127,9 +132,13 @@ std::vector<unsigned> checkCaptions(const std::vector<Caption>& captions, Ration
             // from one; across one only where the speech goes on.
             const auto [before, after] = shotChangesAround(shotChanges, c.start);
             if ((before >= 0 && c.start != before && c.start - before < zone) || after - c.start < zone) issues |= kCaptionNearShotChange;
+            // (once it ends the gap before one, a second just after that, a flash frame, is behind it)
+            bool cleared = false;
             for (auto it = std::lower_bound(shotChanges.begin(), shotChanges.end(), c.end - zone + 1);
-                 it != shotChanges.end() && *it < c.end + zone; ++it)
-                if (*it > c.start && c.end != *it - gap) issues |= kCaptionNearShotChange;
+                 it != shotChanges.end() && *it < c.end + zone; ++it) {
+                if (c.end == *it - gap) cleared = true;
+                else if (*it > c.start && !cleared) issues |= kCaptionNearShotChange;
+            }
             const double spoken = speechEnd(c, f, limits);
             for (auto it = std::lower_bound(shotChanges.begin(), shotChanges.end(), c.start + zone); it != shotChanges.end() && *it + zone <= c.end; ++it)
                 if (spoken < 0 || spoken <= double(*it)) issues |= kCaptionCrossesShotChange;
@@ -199,9 +208,9 @@ int fixCaptionTiming(std::vector<Caption>& captions, Rational fps, const Caption
         end = std::min(end, limit);
         // A short pause before the next caption closes up to the minimum gap (a chained pair reads better).
         if (hasNext && limit - end > 0 && limit + gap - end < chain) end = limit;
-        // (not lengthened up to or over a shot change: to the gap before it at most)
+        // (not lengthened up to or over a shot change: to the gap before it at most; one it ends on counts)
         if (zone > 0 && end > c.end)
-            if (const FrameTime cut = shotChangesAround(shotChanges, c.end).second; end > cut - gap) end = std::max(c.end, cut - gap);
+            if (const FrameTime cut = shotChangesAround(shotChanges, c.end - 1).second; end > cut - gap) end = std::max(c.end, cut - gap);
         end = std::max(end, c.start + 1);
         c.end = end;
     }

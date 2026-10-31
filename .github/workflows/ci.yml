@@ -244,3 +244,52 @@ jobs:
           dbus-run-session -- xvfb-run -a /usr/bin/python3 scripts/atspi-check.py build/src/app/montage "$RUNNER_TEMP/atspi.montage"
       - name: AMWA's NMOS tests (IS-04 Node and IS-05) against the ST 2110 output's Node
         run: sudo scripts/nmos-check.sh build/src/montage-cli "$RUNNER_TEMP/nmos"
+
+  # The GPU compositor needs Qt 6.6 or later (Ubuntu 24.04 has 6.4), so this job builds the render tests against Qt
+  # 6.8 and runs the GPU ones on Mesa's software drivers: llvmpipe through OpenGL and lavapipe through Vulkan.
+  gpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: |
+          ./scripts/setup-deps.sh
+          # (lavapipe; what Qt 6.8's xcb platform needs, as Vulkan is made only through a window system's plugin; and the
+          # xkbcommon headers, as aqt's Qt6Gui targets link XKB::XKB)
+          sudo apt-get install -y -q --no-install-recommends mesa-vulkan-drivers libvulkan-dev libegl-mesa0 libxcb-cursor0 \
+            libxkbcommon-dev libxkbcommon-x11-dev libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-shape0 libxcb-xkb1 > /dev/null
+      - name: Cache Qt 6.8
+        uses: actions/cache@v4
+        with:
+          path: ~/Qt
+          key: qt-6.8.3-linux_gcc_64-shadertools
+      - name: Qt 6.8 with Qt Shader Tools (aqtinstall)
+        run: |
+          if [ ! -d ~/Qt/6.8.3/gcc_64 ]; then
+            python3 -m venv ~/aqt && ~/aqt/bin/pip install -q aqtinstall==3.3.0
+            ~/aqt/bin/aqt install-qt linux desktop 6.8.3 linux_gcc_64 -m qtshadertools -O ~/Qt
+          fi
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$HOME/Qt/6.8.3/gcc_64" -DMONTAGE_BUILD_APP=OFF
+      - name: Build the render tests
+        run: cmake --build build --target test_render
+      - name: GPU tests on llvmpipe (OpenGL) and lavapipe (Vulkan)
+        env:
+          QT_QPA_PLATFORM: xcb
+          QTEST_FUNCTION_TIMEOUT: "900000"
+          MONTAGE_GPU_LOG: "1"
+        run: |
+          # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
+          tests="gpuCompositorMatchesCpu gpuFallback gpuYcbcrPlanes gpuExportMatchesCpu gpuOcioMatchesCpu"
+          for backend in opengl vulkan; do
+            echo "::group::$backend"
+            MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1
+            echo "::endgroup::"
+            if grep -q '^SKIP' "$RUNNER_TEMP/$backend.txt"; then
+              grep '^SKIP' -A1 "$RUNNER_TEMP/$backend.txt"
+              failed=1
+            fi
+          done
+          exit "${failed:-0}"

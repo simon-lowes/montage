@@ -981,7 +981,29 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 double fd = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
                 sec = std::clamp(sec, 0.0, std::max(0.0, m->duration - fd * 0.5));
             }
-            Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
+            // Plugins and clean plates that read other frames of the clip.
+            const bool fetchesFrames = m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [lt](const Effect& e) {
+                // (and clean plates made from several frames, render/CleanPlate.h)
+                const bool plateFrames = (e.type == "clean_plate" || (e.type == "screen_key" && std::lround(e.p("clean_plate", lt, 0)) == 1)) &&
+                                         std::lround(e.p("plate_frames", lt, 1)) > 1;
+                return e.enabled && (e.type == "ofx" || plateFrames);
+            });
+            // Left as it was decoded, for the GPU (render/GpuCompositor.h), when nothing runs on it before the input
+            // transform: as the decoder made it, Y′CbCr, where the GPU converts that.
+            bool leave = false;
+            if (deferFrame) {
+                const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
+                leave = !fetchesFrames && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
+                        !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
+                        !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
+                        !enabledEffect(seq, c, "frame_repair") && !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") &&
+                        !enabledEffect(seq, c, "lip_sync") && !upscale && !vr && !sourceStageLooks(c, lt, pictureColorSpace(*m, path), *m);
+            }
+            // (Planes only where the GPU takes the picture whole, and it is not shown at much less than its size, as
+            // uploading it whole then costs more than the decoder's scaling it down.)
+            const bool planes = leave && gpu::takesPlanes() && std::max(m->width, m->height) <= gpu::maxTextureSize() &&
+                                (w <= 0 || 2 * w >= m->width) && (h <= 0 || 2 * h >= m->height);
+            Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality, planes);
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
@@ -989,12 +1011,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
-            if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [lt](const Effect& e) {
-                    // (and clean plates made from several frames, render/CleanPlate.h)
-                    const bool plateFrames = (e.type == "clean_plate" || (e.type == "screen_key" && std::lround(e.p("clean_plate", lt, 0)) == 1)) &&
-                                             std::lround(e.p("plate_frames", lt, 1)) > 1;
-                    return e.enabled && (e.type == "ofx" || plateFrames);
-                })) {
+            if (fetchesFrames) {
                 const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
                 const bool hq = o.highQuality;
                 const Clip clipCopy = c;
@@ -1020,21 +1037,10 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     return true;
                 };
             }
-            // Left as it was decoded, for the GPU (render/GpuCompositor.h), when nothing runs on it before the input
-            // transform.
-            if (deferFrame) {
-                const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
-                const ColorSpace& from = pictureColorSpace(*m, path);
-                if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
-                    !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
-                    !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
-                    !enabledEffect(seq, c, "frame_repair") &&
-                    !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
-                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m) && !f->half) {  // (half floats: the CPU keeps them)
-                    out.frame = f;
-                    out.frameSpace = &from;
-                    return true;
-                }
+            if (leave && !f->half) {  // (half floats: the CPU keeps them)
+                out.frame = f;
+                out.frameSpace = &pictureColorSpace(*m, path);
+                return true;
             }
             src = toImage(*f);
             Image decoded;  // the source frame itself, when src is an in-between (and noise reduction needs it)
@@ -2468,17 +2474,35 @@ bool runOnSource(const Effect& e) {
            e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots" || e.type == "lip_sync";
 }
 
-GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
+// Why a clip's effects keep it on the CPU: the first the GPU has no form for, by name.
+std::string cpuEffectReason(const Clip& c, FrameTime lt) {
+    for (const Effect& e : c.effects) {
+        std::vector<gpu::ColorOp> ops;
+        if (e.enabled && !runOnSource(e) && !gpuColorOps(e, lt, ops, 0, 0, 1)) {
+            const EffectInfo* info = findEffectInfo(e.type);
+            return "its effect " + (info ? info->displayName : e.type);
+        }
+    }
+    return !c.grade.empty() ? "its grade" : "its effects";
+}
+
+GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out,
+                            std::string* why) {
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
-    if (compositeShown(c)) return GpuLayerResult::Unsupported;  // (a compositing graph is drawn on the CPU)
-    if (c.isGenerator() && c.generator.type == "adjustment") return GpuLayerResult::Unsupported;
+    auto cpu = [&](const std::string& reason) {
+        if (why) *why = reason;
+        out = {};
+        return GpuLayerResult::Unsupported;
+    };
+    if (compositeShown(c)) return cpu("a compositing graph");
+    if (c.isGenerator() && c.generator.type == "adjustment") return cpu("an adjustment layer");
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
     const FrameTime lt = t - c.start;
     {
         std::vector<gpu::ColorOp> unused;
         if (!gpuChainOps(seq, c, lt, [](const Effect& e) { return runOnSource(e) || e.type == "aces_gamut_compress"; }, unused, 0, 0, 1))
-            return GpuLayerResult::Unsupported;
+            return cpu(cpuEffectReason(c, lt));
     }
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
@@ -2499,15 +2523,18 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         return runOnSource(e) || &e == cs.sourceCdl || &e == cs.sourceRgc ||
                std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), &e) != cs.sourceLooks.end();
     };
-    if (!gpuChainOps(seq, c, cs.lt, ranAlready, out.ops, w, h, pixelScale)) {
-        out = {};
-        return GpuLayerResult::Unsupported;
-    }
+    if (!gpuChainOps(seq, c, cs.lt, ranAlready, out.ops, w, h, pixelScale)) return cpu(cpuEffectReason(c, cs.lt));
     // A picture wider or taller than the GPU takes is made on the CPU at the canvas's size instead.
     const int maxSize = gpu::maxTextureSize();
-    if ((cs.frame ? w * 2 : w) > maxSize || h > maxSize) {
-        out = {};
-        return GpuLayerResult::Unsupported;
+    const YcbcrPlanes* planes = cs.frame ? cs.frame->planes.get() : nullptr;
+    if ((planes ? std::max(planes->width, w) : cs.frame ? w * 2 : w) > maxSize || std::max(planes ? planes->height : 0, h) > maxSize)
+        return cpu("a picture larger than the GPU takes");
+    if (why) {
+        if (planes)
+            *why = "Y′CbCr " + std::string(planes->log2ChromaH ? "4:2:0" : planes->log2ChromaW ? "4:2:2" : "4:4:4") + " " +
+                   std::to_string(planes->bits) + "-bit, converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
+        else if (cs.frame) *why = "16-bit RGBA from the decoder";
+        else *why = "a picture made on the CPU before its effects";
     }
     // Placed as transformLayer places it (worked out here in double).
     const Geometry& g = cs.g;
@@ -2589,14 +2616,15 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             }
     }
     auto layerOf = [&](const Clip& c, gpu::Layer& l) {
-        const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l);
+        std::string how;
+        const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l, &how);
         if (r == GpuLayerResult::Unsupported) {
             l = {};
             Image img = clipLayer(p, seq, c, t, o, nullptr);
             if (img.empty()) return false;
             l = cpuLayer(std::move(img));
         }
-        gpu::countLayer(r != GpuLayerResult::Unsupported);
+        if (r != GpuLayerResult::Nothing) gpu::countLayer(r != GpuLayerResult::Unsupported, "\"" + c.name + "\": " + how);
         return r != GpuLayerResult::Nothing;
     };
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
@@ -2616,7 +2644,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 item.dissolve = float(std::clamp((double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from)), 0.0, 1.0));
             } else {
                 item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
-                gpu::countLayer(false);
+                gpu::countLayer(false, "a " + active->type + " transition");
             }
             frame.items.push_back(std::move(item));
             continue;
