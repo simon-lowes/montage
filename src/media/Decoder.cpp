@@ -1545,10 +1545,12 @@ void ycbcrMatrix(const AVFrame* f, float& kr, float& kb) {
 }
 
 // Where `f`'s first chroma sample sits, in luma pixels from the first luma sample, for chroma subsampled 2^log2W x
-// 2^log2H: as the frame says, or centred when it does not (as FFmpeg's scaler takes it then).
+// 2^log2H: as the frame says; when it does not, co-sited for 4:2:2 (as Rec. 601 and 709 site it, and Montage's own
+// exports make it), else centred (as FFmpeg's scaler takes it then).
 void chromaSiting(const AVFrame* f, int log2W, int log2H, float& x, float& y) {
     const float sx = float(1 << log2W), sy = float(1 << log2H);
-    const AVChromaLocation l = f->chroma_location;
+    AVChromaLocation l = f->chroma_location;
+    if (l == AVCHROMA_LOC_UNSPECIFIED && log2W == 1 && log2H == 0) l = AVCHROMA_LOC_LEFT;
     x = l == AVCHROMA_LOC_LEFT || l == AVCHROMA_LOC_TOPLEFT || l == AVCHROMA_LOC_BOTTOMLEFT ? 0.0f : (sx - 1) / 2;
     y = l == AVCHROMA_LOC_TOPLEFT || l == AVCHROMA_LOC_TOP ? 0.0f
         : l == AVCHROMA_LOC_BOTTOMLEFT || l == AVCHROMA_LOC_BOTTOM ? sy - 1

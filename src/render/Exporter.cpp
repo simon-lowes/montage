@@ -1089,6 +1089,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->global_quality = FF_QP2LAMBDA * 3;
         }
         if (spatial) o.vctx->pix_fmt = AV_PIX_FMT_YUV420P;  // (x265's multiview encoder is 8-bit 4:2:0)
+        // 4:2:2 chroma co-sited with the first luma sample of each pair, as Rec. 601 and 709 have it (and as the
+        // decoder reads untagged 4:2:2); made there by the conversion below.
+        if (const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
+            d && !(d->flags & AV_PIX_FMT_FLAG_RGB) && d->nb_components >= 3 && d->log2_chroma_w == 1 && d->log2_chroma_h == 0 &&
+            o.vctx->chroma_sample_location == AVCHROMA_LOC_UNSPECIFIED)
+            o.vctx->chroma_sample_location = AVCHROMA_LOC_LEFT;
         {
             const KeepThreadScheduling keep;  // (SVT-AV1 would leave this thread real-time, and the workers it starts later)
             rc = avcodec_open2(o.vctx, codec, &opts);
@@ -2066,7 +2072,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             const int swsFlags = SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INP;
             if (!o.sws && (o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT || o.vctx->chroma_sample_location == AVCHROMA_LOC_LEFT)) {
                 // Chroma made where the encoder's format sites it (otherwise FFmpeg's scaler centres it, as the
-                // decoder reads untagged pictures). The cached context below keeps this one, as it matches.
+                // decoder reads untagged 4:2:0 pictures). The cached context below keeps this one, as it matches.
                 o.sws = sws_alloc_context();
                 if (o.sws) {
                     av_opt_set_int(o.sws, "srcw", img.width, 0);
@@ -2077,7 +2083,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     av_opt_set_int(o.sws, "dst_format", o.vctx->pix_fmt, 0);
                     av_opt_set_int(o.sws, "sws_flags", swsFlags, 0);
                     av_opt_set_int(o.sws, "dst_h_chr_pos", 0, 0);
-                    av_opt_set_int(o.sws, "dst_v_chr_pos", o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT ? 0 : 128, 0);
+                    // (in 1/256 luma pixels: left, and top or centred between the lines it spans, as the decoder takes it)
+                    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
+                    const int spans = d ? 1 << d->log2_chroma_h : 1;
+                    av_opt_set_int(o.sws, "dst_v_chr_pos", o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT ? 0 : (spans - 1) * 128, 0);
                     if (sws_init_context(o.sws, nullptr, nullptr) < 0) {
                         sws_freeContext(o.sws);
                         o.sws = nullptr;

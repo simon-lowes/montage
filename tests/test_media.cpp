@@ -17269,8 +17269,9 @@ if __name__ == '__main__':
             {"DNxHR HQX (10-bit)", "dnxhd", "DNXHR HQX", "yuv422p10le", "pcm_s24le", 0.012},
             {"DNxHR 444 (10-bit)", "dnxhd", "DNXHR 444", "yuv444p10le", "pcm_s24le", 0.012},
             {"CineForm", "cfhd", "", "yuv422p10le", "pcm_s24le", 0.02},
-            {"FFV1 (lossless archive)", "ffv1", "", "yuv422p10le", "flac", 0.006},
-            {"Uncompressed 10-bit (v210)", "v210", "", "yuv422p10le", "pcm_s24le", 0.006},
+            // (lossless but 4:2:2, its chroma co-sited as Rec. 709 has it: what the bars lose is chroma's)
+            {"FFV1 (lossless archive)", "ffv1", "", "yuv422p10le", "flac", 0.0065},
+            {"Uncompressed 10-bit (v210)", "v210", "", "yuv422p10le", "pcm_s24le", 0.0065},
         };
         // The presets' old names, with their makers' names in front, still find them (saved settings, scripts, MCP calls).
         for (const ExportPreset& pr : exportPresets())
