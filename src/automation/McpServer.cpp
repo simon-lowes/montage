@@ -106,6 +106,7 @@
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
 #include "core/MidiMaps.h"
+#include "audio/Sampler.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectMerge.h"
 #include "core/ScriptCut.h"
@@ -4819,6 +4820,175 @@ void McpServer::Impl::addTools() {
                 text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
             }
             return result.isEmpty() ? ok(text) : ok(text, result);
+        });
+
+    add("montage_sampler", "A sound-effect sampler on an audio track: sounds on keys, played to picture in passes",
+        "A Foley sampler on an audio track: up to 128 slots, one a MIDI key (60 = middle C), each with one or more sounds "
+        "(velocity layers; sounds answering the same velocity take turns), gain, attack and release, one-shot or held "
+        "playback, a choke group (a note cuts the group's other voices) and random pitch and level variation for each hit. "
+        "show lists the slots and passes. load puts files on a key (add true adds them to the slot's sounds; vel_low and "
+        "vel_high give their velocity layer); the slot's settings change with the arguments given. slice finds the hits "
+        "in one recording (Split by Onsets) and puts them on successive keys from `key`. remove clears a key. play "
+        "records a pass from a list of notes (key, velocity, at, length in seconds or timecode): rendered to a WAV file "
+        "beside the project, put on a new take lane and given to the comp, its notes kept. revoice renders a pass's notes "
+        "again through the slots as they are now, with the same timing.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "action":{"type":"string","enum":["show","load","slice","remove","play","revoice"]},
+            "key":{"type":"integer","description":"A MIDI key 0-127 (load, remove; slice: the first key)"},
+            "file":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},
+            "add":{"type":"boolean","default":false},"vel_low":{"type":"integer"},"vel_high":{"type":"integer"},
+            "start":{"type":"number","description":"load: seconds into the file"},"end":{"type":"number","description":"load: seconds, 0 to its end"},
+            "name":{"type":"string"},"gain":{"type":"number","description":"dB"},"attack":{"type":"number"},"release":{"type":"number"},
+            "one_shot":{"type":"boolean"},"choke":{"type":"integer","description":"0 none, 1-16"},
+            "pitch_variation":{"type":"number","description":"± semitones"},"level_variation":{"type":"number","description":"± dB"},
+            "sensitivity":{"type":"number","default":50},"min_gap":{"type":"number","default":0.05},
+            "notes":{"type":"array","items":{"type":"object","properties":{"key":{"type":"integer"},"velocity":{"type":"integer","default":100},
+                "at":{"type":["number","string"]},"length":{"type":"number","default":0.1}},"required":["key","at"]}},
+            "seed":{"type":"integer","description":"play: the hits' random variation (default 1)"},
+            "lane":{"type":["number","string"],"description":"revoice: the pass's lane, by id or name"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
+            if (track.kind != TrackKind::Audio) return fail(QStringLiteral("The sampler is on audio tracks"));
+            const QString action = need(a, "action");
+            auto keyArg = [&]() {
+                const QJsonValue v = a.value("key");
+                if (!v.isDouble() || v.toInt() < 0 || v.toInt() > 127) throw ArgError{QStringLiteral("\"key\" must be a MIDI key, 0 to 127")};
+                return v.toInt();
+            };
+            auto files = [&]() {
+                QStringList out;
+                if (a.contains("file")) out << absolute(need(a, "file"));
+                for (const QJsonValue& v : a.value("files").toArray()) out << absolute(v.toString());
+                if (out.isEmpty()) throw ArgError{QStringLiteral("\"file\" or \"files\" is required")};
+                for (const QString& f : out)
+                    if (!QFileInfo::exists(f)) throw ArgError{QStringLiteral("No file %1").arg(f)};
+                return out;
+            };
+            auto kit = [&]() {
+                std::vector<std::string> missing;
+                sampler::KitPtr k = sampler::loadKit(trackAt(s, track)->sampler, s.sampleRate, &missing);
+                if (!missing.empty()) throw ArgError{QStringLiteral("Cannot read %1").arg(QString::fromStdString(missing.front()))};
+                return k;
+            };
+            auto passFile = [&](const QString& stem) {
+                const QString dir = QFileInfo(l.path).absolutePath() + QStringLiteral("/Sampler");
+                QDir().mkpath(dir);
+                for (int n = 1;; ++n) {
+                    const QString f = QStringLiteral("%1/%2 %3.wav").arg(dir, stem).arg(n);
+                    if (!QFileInfo::exists(f)) return f;
+                }
+            };
+            const Track& t0 = *trackAt(s, track);
+            const QString trackName = t0.name.empty() ? QStringLiteral("A%1").arg(track.index + 1) : QString::fromStdString(t0.name);
+            if (action == "show") {
+                QJsonArray pads, passes;
+                QString text;
+                for (const SamplerSlot& sl : t0.sampler.pads) {
+                    QJsonArray sounds;
+                    for (const SamplerSound& sd : sl.sounds)
+                        sounds.append(QJsonObject{{"file", QString::fromStdString(sd.path)}, {"start", sd.start}, {"end", sd.end}, {"vel_low", sd.velLow}, {"vel_high", sd.velHigh}});
+                    pads.append(QJsonObject{{"key", sl.key}, {"name", QString::fromStdString(sl.name)}, {"sounds", sounds}, {"gain", sl.gainDb},
+                                             {"attack", sl.attack}, {"release", sl.release}, {"one_shot", sl.oneShot}, {"choke", sl.choke},
+                                             {"pitch_variation", sl.pitchVariation}, {"level_variation", sl.levelVariation}});
+                    text += QStringLiteral("Key %1 %2: %3 sound(s)%4\n").arg(sl.key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size())
+                                .arg(sl.choke ? QStringLiteral(", choke group %1").arg(sl.choke) : QString());
+                }
+                for (const SamplerPass& ps : t0.sampler.passes) {
+                    const TakeLane* ln = edit::findTakeLane(t0, ps.lane);
+                    QJsonArray notes;
+                    for (const SamplerNote& n : ps.notes)
+                        notes.append(QJsonObject{{"key", n.key}, {"velocity", n.velocity}, {"at", double(n.at) / s.sampleRate}, {"length", double(n.length) / s.sampleRate}});
+                    passes.append(QJsonObject{{"lane", double(ps.lane)}, {"lane_name", ln ? QString::fromStdString(ln->name) : QString()}, {"seed", double(ps.seed)}, {"notes", notes}});
+                    text += QStringLiteral("Pass %1: %2 note(s)\n").arg(ln ? QString::fromStdString(ln->name) : QString::number(ps.lane)).arg(ps.notes.size());
+                }
+                if (text.isEmpty()) text = QStringLiteral("No sampler slots on %1").arg(trackName);
+                return ok(text.trimmed(), {{"slots", pads}, {"passes", passes}});
+            }
+            if (action == "load") {
+                const int key = keyArg();
+                SamplerSlot sl;
+                sl.key = key;
+                for (const SamplerSlot& e : t0.sampler.pads)
+                    if (e.key == key) sl = e;
+                if (!a.value("add").toBool(false)) sl.sounds.clear();
+                const int lo = std::clamp(a.value("vel_low").toInt(1), 1, 127), hi = std::clamp(a.value("vel_high").toInt(127), lo, 127);
+                for (const QString& f : files())
+                    sl.sounds.push_back({f.toStdString(), std::max(0.0, a.value("start").toDouble(0)), std::max(0.0, a.value("end").toDouble(0)), lo, hi});
+                if (a.contains("name")) sl.name = str(a, "name").toStdString();
+                else if (sl.name.empty()) sl.name = QFileInfo(QString::fromStdString(sl.sounds.front().path)).completeBaseName().toStdString();
+                if (a.contains("gain")) sl.gainDb = std::clamp(a.value("gain").toDouble(), -96.0, 24.0);
+                if (a.contains("attack")) sl.attack = std::clamp(a.value("attack").toDouble(), 0.0, 10.0);
+                if (a.contains("release")) sl.release = std::clamp(a.value("release").toDouble(), 0.0, 10.0);
+                if (a.contains("one_shot")) sl.oneShot = a.value("one_shot").toBool();
+                if (a.contains("choke")) sl.choke = std::clamp(a.value("choke").toInt(), 0, 16);
+                if (a.contains("pitch_variation")) sl.pitchVariation = std::clamp(a.value("pitch_variation").toDouble(), 0.0, 12.0);
+                if (a.contains("level_variation")) sl.levelVariation = std::clamp(a.value("level_variation").toDouble(), 0.0, 24.0);
+                check(sampler::setSlot(s, track, sl));
+                kit();  // (every sound readable)
+                save(l);
+                return ok(QStringLiteral("Key %1 \"%2\": %3 sound(s)").arg(key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size()),
+                          {{"key", key}, {"sounds", int(sl.sounds.size())}});
+            }
+            if (action == "slice") {
+                const QStringList f = files();
+                std::string why;
+                AudioBufferPtr buf = decodeAudio(f.front().toStdString(), s.sampleRate, &why);
+                if (!buf) return fail(QStringLiteral("Cannot read %1: %2").arg(f.front(), QString::fromStdString(why)));
+                const auto slices = sampler::splitByOnsets(*buf, std::clamp(a.value("sensitivity").toDouble(50), 0.0, 100.0),
+                                                           std::max(0.005, a.value("min_gap").toDouble(0.05)));
+                const int key = a.contains("key") ? keyArg() : 36;
+                const QString name = a.contains("name") ? str(a, "name") : QFileInfo(f.front()).completeBaseName();
+                check(sampler::addSlices(s, track, f.front().toStdString(), slices, key, name.toStdString()));
+                save(l);
+                QJsonArray hits;
+                for (size_t i = 0; i < slices.size(); ++i) hits.append(QJsonObject{{"key", key + int(i)}, {"start", slices[i].first}, {"end", slices[i].second}});
+                return ok(QStringLiteral("%1 hit(s) on keys %2 to %3").arg(slices.size()).arg(key).arg(key + int(slices.size()) - 1), {{"hits", hits}});
+            }
+            if (action == "remove") {
+                check(sampler::removeSlot(s, track, keyArg()));
+                save(l);
+                return ok(QStringLiteral("Key %1 cleared").arg(a.value("key").toInt()));
+            }
+            if (action == "play") {
+                std::vector<SamplerNote> notes;
+                for (const QJsonValue& v : a.value("notes").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    SamplerNote n;
+                    n.key = o.value("key").toInt(-1);
+                    if (n.key < 0 || n.key > 127) throw ArgError{QStringLiteral("A note's key must be 0 to 127")};
+                    n.velocity = std::clamp(o.value("velocity").toInt(100), 1, 127);
+                    const QJsonValue at = o.value("at");
+                    n.at = at.isDouble() ? std::llround(at.toDouble() * s.sampleRate)
+                                         : std::llround(double(timeArg(at, s, "at")) * s.sampleRate / s.fpsValue());
+                    if (n.at < 0) throw ArgError{QStringLiteral("A note's \"at\" must not be before the start")};
+                    n.length = std::llround(std::max(0.0, o.value("length").toDouble(0.1)) * s.sampleRate);
+                    notes.push_back(n);
+                }
+                if (notes.empty()) throw ArgError{QStringLiteral("\"notes\" is required")};
+                const uint32_t seed = uint32_t(a.value("seed").toInt(1));
+                const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
+                edit::Result r = sampler::addPass(l.project, s, track, kit(), notes, seed, file.toStdString());
+                check(r);
+                save(l);
+                const TakeLane* ln = edit::findTakeLane(*trackAt(s, track), r.created.front());
+                return ok(QStringLiteral("%1 note(s) recorded to lane %2 (%3)").arg(notes.size()).arg(QString::fromStdString(ln->name), file),
+                          {{"lane", double(ln->id)}, {"lane_name", QString::fromStdString(ln->name)}, {"file", file}, {"start", secs(ln->start, s)}});
+            }
+            if (action == "revoice") {
+                const QJsonValue v = a.value("lane");
+                Id lane = 0;
+                for (const TakeLane& ln : t0.lanes)
+                    if ((v.isDouble() && ln.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(ln.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                        lane = ln.id;
+                if (!lane) throw ArgError{QStringLiteral("No such lane on that track (see action show)")};
+                const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
+                check(sampler::revoicePass(l.project, s, track, lane, kit(), file.toStdString()));
+                save(l);
+                return ok(QStringLiteral("Voiced again into %1").arg(file), {{"file", file}});
+            }
+            return fail(QStringLiteral("Unknown action %1").arg(action));
         });
 
     add("montage_takes", "Take lanes, comps and track versions on an audio track",

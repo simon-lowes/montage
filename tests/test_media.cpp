@@ -254,6 +254,8 @@
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "core/MidiMaps.h"
+#include "audio/Sampler.h"
+#include "core/TakeLanes.h"
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
@@ -8652,6 +8654,128 @@ private slots:
         const QByteArray m3u = playlist.readAll();
         QVERIFY(m3u.contains("SCTE35-OUT=0xFC") && m3u.contains("SCTE35-IN=0xFC"));
         QDir(folder).removeRecursively();
+    }
+
+    void samplerPasses() {
+        // A Foley sampler over MCP: steps on a key (two sounds taking turns), cloth on another, a recording of hits cut
+        // onto keys; a pass played from notes lands on a take lane and in the comp, its mix the sampler's render sample for
+        // sample with each hit at its note's sample; voiced again with other sounds, the timing stays.
+        const int rate = 48000;
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> noise(-1.0f, 1.0f);
+        auto burst = [&](double seconds, double decay, float level) {
+            std::vector<float> x(size_t(seconds * rate));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = level * noise(rng) * float(std::exp(-double(i) / (decay * rate)));
+            return x;
+        };
+        const std::string stepA = path("step-a.wav"), stepB = path("step-b.wav"), cloth = path("cloth.wav"), hits = path("hits.wav");
+        QVERIFY(writeMonoWav(stepA, burst(0.2, 0.03, 0.6f), rate));
+        QVERIFY(writeMonoWav(stepB, burst(0.2, 0.03, 0.3f), rate));
+        QVERIFY(writeMonoWav(cloth, burst(0.4, 0.1, 0.2f), rate));
+        std::vector<float> rec(size_t(4 * rate));
+        for (float& v : rec) v = 1e-4f * noise(rng);
+        for (int i = 0; i < 8; ++i) {
+            const auto b = burst(0.2, 0.02, 0.5f);
+            for (size_t k = 0; k < b.size(); ++k) rec[size_t((0.2 + i * 0.45) * rate) + k] += b[k];
+        }
+        QVERIFY(writeMonoWav(hits, rec, rate));
+        Project p = makeDefaultProject();
+        const QString project = QString::fromStdString(path("sampler.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_sampler"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"action", "load"}, {"key", 60}, {"files", QJsonArray{QString::fromStdString(stepA), QString::fromStdString(stepB)}},
+                              {"name", "Steps"}, {"choke", 1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "load"}, {"key", 62}, {"file", QString::fromStdString(cloth)}, {"level_variation", 2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "slice"}, {"key", 70}, {"file", QString::fromStdString(hits)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("hits").toArray().size(), qsizetype(8));
+        QVERIFY(call({{"action", "slice"}, {"key", 125}, {"file", QString::fromStdString(hits)}}).value("isError").toBool());  // (off the keys)
+        QVERIFY(call({{"action", "load"}, {"key", 61}, {"file", "nowhere.wav"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "play"}}).value("isError").toBool());  // (no notes)
+        r = call({{"action", "show"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("slots").toArray().size(), qsizetype(10));
+        // A pass: steps, cloth and a hit, at samples between frames.
+        const QJsonArray notes{QJsonObject{{"key", 60}, {"velocity", 110}, {"at", 1.0101}}, QJsonObject{{"key", 62}, {"at", 1.2}, {"length", 0.3}},
+                               QJsonObject{{"key", 60}, {"velocity", 90}, {"at", 1.5503}}, QJsonObject{{"key", 73}, {"at", 1.9}},
+                               QJsonObject{{"key", 60}, {"velocity", 127}, {"at", 2.0}}};
+        r = call({{"action", "play"}, {"notes", notes}, {"seed", 9}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QString file = r.value("structuredContent").toObject().value("file").toString();
+        QVERIFY(QFileInfo::exists(file));
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        const Track& t = q.active()->audioTracks[0];
+        QCOMPARE(t.sampler.pads.size(), size_t(10));
+        QCOMPARE(t.sampler.passes.size(), size_t(1));
+        QCOMPARE(t.lanes.size(), size_t(1));
+        const SamplerPass pass = t.sampler.passes[0];
+        QCOMPARE(pass.lane, t.lanes[0].id);
+        QCOMPARE(pass.seed, uint32_t(9));
+        QCOMPARE(pass.notes.size(), size_t(5));
+        QCOMPARE(pass.notes[0].at, int64_t(std::llround(1.0101 * rate)));
+        QCOMPARE(t.lanes[0].start, FrameTime(30));  // (the frame the first note falls in)
+        QCOMPARE(t.clips.size(), size_t(1));         // (the comp)
+        // The mix over the pass: the sampler's render, hit for hit at the notes' samples.
+        const sampler::KitPtr kit = sampler::loadKit(t.sampler, rate);
+        const int64_t from = rate, length = 2 * rate;
+        const std::vector<float> want = sampler::renderNotes(kit, pass.notes, pass.seed, from, length);
+        auto mix = [&](const Project& pr) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(length) * 2);
+            for (int64_t at = 0; at < length; at += 4800) mixer.mix(pr, *pr.active(), from + at, 4800, out.data() + size_t(at) * 2);
+            return out;
+        };
+        const std::vector<float> got = mix(q);
+        auto firstFrom = [](const std::vector<float>& v, int64_t i) {
+            for (; i < int64_t(v.size() / 2); ++i)
+                if (v[size_t(i) * 2] != 0) return i;
+            return int64_t(-1);
+        };
+        QCOMPARE(firstFrom(got, 0) + from, pass.notes[0].at);
+        size_t loud = 0;
+        for (size_t i = 0; i < want.size(); ++i)
+            if (std::fabs(want[i]) > std::fabs(want[loud])) loud = i;
+        const double g = got[loud] / want[loud];  // (the pan law)
+        QVERIFY(g > 0.5 && g <= 1.0);
+        double worst = 0;
+        size_t worstAt = 0;
+        for (size_t i = 0; i < want.size(); ++i)
+            if (std::fabs(double(got[i]) - g * want[i]) > worst) worst = std::fabs(double(got[i]) - g * want[i]), worstAt = i;
+        QVERIFY2(worst < 1e-6, qPrintable(QStringLiteral("%1 at %2: %3 vs %4, g %5").arg(worst).arg(worstAt).arg(got[worstAt]).arg(want[worstAt]).arg(g, 0, 'g', 12)));
+        // Voiced again with other steps: the same times, another sound.
+        r = call({{"action", "load"}, {"key", 60}, {"file", QString::fromStdString(cloth)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "revoice"}, {"lane", double(pass.lane)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(r.value("structuredContent").toObject().value("file").toString() != file);
+        Project v;
+        QVERIFY(loadProject(project.toStdString(), v));
+        const Track& tv = v.active()->audioTracks[0];
+        QCOMPARE(tv.sampler.passes[0].notes, pass.notes);
+        QVERIFY(tv.lanes[0].mediaId != t.lanes[0].mediaId);
+        QCOMPARE(tv.clips[0].mediaId, tv.lanes[0].mediaId);
+        const std::vector<float> again = mix(v);
+        QCOMPARE(firstFrom(again, 0) + from, pass.notes[0].at);
+        QVERIFY(again != got);
+        const std::vector<float> wantAgain = sampler::renderNotes(sampler::loadKit(tv.sampler, rate), pass.notes, pass.seed, from, length);
+        worst = 0;
+        for (size_t i = 0; i < wantAgain.size(); ++i) worst = std::max(worst, std::fabs(double(again[i]) - g * wantAgain[i]));
+        QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        // Removing the lane forgets the pass.
+        QVERIFY(edit::removeTakeLane(*v.active(), {TrackKind::Audio, 0}, pass.lane).ok);
+        QVERIFY(v.active()->audioTracks[0].sampler.passes.empty());
     }
 
     void mcpMidiMap() {

@@ -89,6 +89,7 @@
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 #include "control/MidiMap.h"
+#include "audio/Sampler.h"
 #include "render/Titles.h"
 
 using namespace montage;
@@ -1556,6 +1557,151 @@ private slots:
         for (double db : {-60.0, -30.0, -12.0, -6.0, 0.0, 6.0, 11.0}) QVERIFY(std::fabs(mcu::faderDb(mcu::faderValue(db)) - db) < 0.01);
         QCOMPARE(mcu::faderDb(0x3F70), 12.0);
         QVERIFY(mcu::faderDb(mcu::faderValue(-6) + 100) > -6);
+    }
+
+    // The sound-effect sampler's engine: notes start at their sample, velocity layers switch at their boundaries,
+    // round robin takes turns, a choke stops the voice before within a millisecond, a held note releases, variation
+    // follows the pass's seed, a live note starts at the next block, and Split by Onsets finds hits to the millisecond.
+    void samplerEngine() {
+        using namespace sampler;
+        const int rate = 48000;
+        // Sounds of one level each, so which one played can be read off the output.
+        auto level = [&](float v, int frames) {
+            auto b = std::make_shared<AudioBuffer>();
+            b->sampleRate = rate, b->channels = 2;
+            b->samples.assign(size_t(frames) * 2, v);
+            return AudioBufferPtr(b);
+        };
+        std::map<std::string, AudioBufferPtr> files{{"a", level(0.25f, 200)}, {"b", level(0.5f, 200)}, {"c", level(0.75f, 200)},
+                                                    {"long", level(0.5f, rate)}, {"short", level(0.25f, rate)}};
+        const Loader load = [&](const std::string& path, int, std::string*) {
+            const auto it = files.find(path);
+            return it == files.end() ? AudioBufferPtr() : it->second;
+        };
+        auto sound = [](const char* path, int lo = 1, int hi = 127) { return SamplerSound{path, 0, 0, lo, hi}; };
+        SamplerSettings set;
+        SamplerSlot layered, robin, left, right, held, varied, lost;
+        layered.key = 60, layered.sounds = {sound("a", 1, 63), sound("b", 64, 127)};
+        robin.key = 62, robin.sounds = {sound("a"), sound("b"), sound("c")};
+        left.key = 64, left.choke = 1, left.sounds = {sound("long")};
+        right.key = 65, right.choke = 1, right.sounds = {sound("short")};
+        held.key = 67, held.oneShot = false, held.release = 0.01, held.sounds = {sound("long")};
+        varied.key = 69, varied.pitchVariation = 2, varied.levelVariation = 3, varied.sounds = {sound("long")};
+        lost.key = 71, lost.sounds = {sound("nowhere")};
+        set.pads = {layered, robin, left, right, held, varied, lost};
+        std::vector<std::string> missing;
+        const KitPtr kit = loadKit(set, rate, &missing, load);
+        QCOMPARE(missing, std::vector<std::string>{"nowhere"});
+        auto first = [](const std::vector<float>& v, size_t from = 0) {
+            for (size_t i = from; i < v.size() / 2; ++i)
+                if (v[i * 2] != 0) return int64_t(i);
+            return int64_t(-1);
+        };
+        auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
+
+        // A note at a known sample starts there, whatever the blocks.
+        {
+            Engine e(rate);
+            e.setKit(kit);
+            e.noteOn(60, 127, 1000);
+            std::vector<float> out(4096 * 2);
+            for (int at = 0; at < 4096; at += 300) e.render(at, std::min(300, 4096 - at), out.data() + size_t(at) * 2);
+            QCOMPARE(first(out), int64_t(1000));
+            QVERIFY(near(out[1000 * 2], 0.5) && near(out[1199 * 2 + 1], 0.5));
+            QCOMPARE(out[1200 * 2], 0.0f);  // (the sound is 200 samples long)
+            QCOMPARE(e.activeVoices(), 0);
+        }
+        // Velocity layers switch at their boundary.
+        QVERIFY(near(renderNotes(kit, {{60, 63, 0, 10}}, 1, 0, 100)[0], 0.25 * 63 / 127.0));
+        QVERIFY(near(renderNotes(kit, {{60, 64, 0, 10}}, 1, 0, 100)[0], 0.5 * 64 / 127.0));
+        // Round robin: a, b, c, a.
+        {
+            const auto out = renderNotes(kit, {{62, 127, 0, 10}, {62, 127, 1000, 10}, {62, 127, 2000, 10}, {62, 127, 3000, 10}}, 1, 0, 4000);
+            QVERIFY(near(out[0], 0.25) && near(out[2000], 0.5) && near(out[4000], 0.75) && near(out[6000], 0.25));
+        }
+        // A choke: the left foot's voice is gone within a millisecond of the right foot's note.
+        {
+            const auto out = renderNotes(kit, {{64, 127, 0, 10}, {65, 127, 4800, 10}}, 1, 0, 9600);
+            QVERIFY(near(out[4799 * 2], 0.5));
+            int64_t alone = -1;
+            for (int64_t i = 4800; i < 9600 && alone < 0; ++i)
+                if (near(out[size_t(i) * 2], 0.25)) alone = i;
+            QVERIFY2(alone >= 4800 && alone <= 4800 + rate / 1000, qPrintable(QString::number(alone)));
+            for (int64_t i = alone; i < 9600; ++i) QVERIFY(near(out[size_t(i) * 2], 0.25));
+        }
+        // A held note plays while held, then for its release.
+        {
+            const auto out = renderNotes(kit, {{67, 127, 0, 2400}}, 1, 0, 4000);
+            QVERIFY(near(out[2399 * 2], 0.5));
+            QVERIFY(out[2600 * 2] > 0 && out[2600 * 2] < 0.5f);
+            QCOMPARE(out[(2400 + 480) * 2], 0.0f);
+            QCOMPARE(renderNotes(kit, {{67, 127, 0, 2400}}, 1, 0).size(), size_t(2400 + 480) * 2);
+        }
+        // Variation: the same seed gives the same hit, another seed another, within the slot's range.
+        {
+            const auto a = renderNotes(kit, {{69, 100, 0, 10}}, 7, 0), b = renderNotes(kit, {{69, 100, 0, 10}}, 7, 0);
+            const auto c = renderNotes(kit, {{69, 100, 0, 10}}, 8, 0);
+            QVERIFY(a == b);
+            QVERIFY(a != c);
+            for (const auto* v : {&a, &c}) {
+                const double gain = (*v)[0] / (0.5 * 100 / 127.0);
+                QVERIFY(gain >= std::pow(10.0, -3 / 20.0) - 1e-6 && gain <= std::pow(10.0, 3 / 20.0) + 1e-6);
+                const double length = double(v->size() / 2) / rate;  // (a second's sound, pitched up to 2 semitones either way)
+                QVERIFY(length >= std::pow(2.0, -2 / 12.0) - 1e-3 && length <= std::pow(2.0, 2 / 12.0) + 1e-3);
+            }
+        }
+        // Played live: the note sounds at the start of the next block, and the pass, recorded at the sample the picture
+        // showed (what was sent to the device but not yet heard taken off), places the hit there.
+        {
+            const int block = 512, latency = 3840;  // (80 ms of the device's buffer)
+            const int64_t pressed = 10000;          // the sample heard when the key went down
+            Engine live(rate);
+            live.setKit(kit);
+            std::vector<float> out(size_t(20000) * 2);
+            int64_t rendered = 0;
+            bool down = false;
+            while (rendered + block <= 20000) {
+                if (!down && rendered - latency >= pressed) {  // (the device asks for its next block)
+                    live.noteOn(64, 127);
+                    down = true;
+                }
+                live.render(rendered, block, out.data() + size_t(rendered) * 2);
+                rendered += block;
+            }
+            const int64_t sounded = first(out);
+            QVERIFY(sounded >= pressed + latency && sounded < pressed + latency + block);
+            QCOMPARE(sounded % block, int64_t(0));
+            QCOMPARE(first(renderNotes(kit, {{64, 127, pressed, 100}}, 1, 0, 20000)), pressed);
+        }
+        // Split by Onsets: 20 hits found within a millisecond.
+        {
+            AudioBuffer rec;
+            rec.sampleRate = rate, rec.channels = 2;
+            rec.samples.assign(size_t(rate) * 10 * 2, 0.0f);
+            uint32_t noise = 12345;
+            auto rnd = [&] {
+                noise = noise * 1664525u + 1013904223u;
+                return float(int32_t(noise >> 8) - (1 << 23)) / float(1 << 23);
+            };
+            for (auto& v : rec.samples) v = rnd() * 1e-4f;
+            std::vector<double> hits;
+            for (int i = 0; i < 20; ++i) {
+                const double t = 0.25 + i * 0.47 + ((i * 37) % 11) * 0.003;
+                hits.push_back(t);
+                const int64_t at = std::llround(t * rate);
+                for (int64_t k = 0; k < rate / 5 && at + k < rate * 10; ++k) {
+                    const float v = rnd() * 0.5f * float(std::exp(-double(k) / (0.03 * rate)));
+                    rec.samples[size_t(at + k) * 2] += v, rec.samples[size_t(at + k) * 2 + 1] += v;
+                }
+            }
+            const auto slices = splitByOnsets(rec);
+            QCOMPARE(int(slices.size()), 20);
+            for (int i = 0; i < 20; ++i) {
+                QVERIFY2(std::fabs(slices[size_t(i)].first - hits[size_t(i)]) <= 0.001,
+                         qPrintable(QStringLiteral("hit %1 at %2, found %3").arg(i).arg(hits[size_t(i)]).arg(slices[size_t(i)].first)));
+                QVERIFY(near(slices[size_t(i)].second, i < 19 ? slices[size_t(i) + 1].first : 10.0));
+            }
+        }
     }
 
     void midiLearnMapping() {

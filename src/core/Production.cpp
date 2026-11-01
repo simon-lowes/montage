@@ -141,6 +141,9 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
                 // Take lanes bring their media; one whose media did not come is dropped.
                 for (TakeLane& l : t.lanes) l.mediaId = bring(l.mediaId);
                 std::erase_if(t.lanes, [](const TakeLane& l) { return !l.mediaId; });
+                std::erase_if(t.sampler.passes, [&](const SamplerPass& ps) {
+                    return std::none_of(t.lanes.begin(), t.lanes.end(), [&](const TakeLane& l) { return l.id == ps.lane; });
+                });
                 for (std::vector<Clip>* clips : clipLists)
                     for (Clip& c : *clips) {
                         // The clip's media and its other takes (auditions).

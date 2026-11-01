@@ -84,6 +84,7 @@ class SoundLibraryPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class SamplerPanel;
 class MonitoringPanel;
 class CueSheetPanel;
 class LinedScriptPanel;
@@ -665,6 +666,7 @@ private:
     CaptureDialog* capture_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    SamplerPanel* sampler_ = nullptr;
     MonitoringPanel* monitoring_ = nullptr;
     CueSheetPanel* cueSheet_ = nullptr;
     LinedScriptPanel* linedScript_ = nullptr;
@@ -749,6 +751,7 @@ private:
     StackedTimelineWidget* stacked_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* adrDock_ = nullptr;
+    QDockWidget* samplerDock_ = nullptr;
     QDockWidget* monitoringDock_ = nullptr;
     QDockWidget* cueSheetDock_ = nullptr;
     QDockWidget* linedScriptDock_ = nullptr;

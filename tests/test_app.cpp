@@ -185,6 +185,7 @@
 #include "core/Xlsx.h"
 #include "ControlSurface.h"
 #include "MidiLearn.h"
+#include "SamplerPanel.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
 #include "TangentControl.h"
@@ -1722,6 +1723,112 @@ private slots:
         learn->disconnectDevice();
         QVERIFY(!learn->isConnected());
     }
+    void samplerPanel() {
+        // The Sampler panel: a sound put on a key and heard from the computer's keys, a slot's setting changed in the
+        // table, the picture's sample taken back by how long ago a key went down, a pass recorded while the sequence plays
+        // (onto a take lane and the comp, as one undo step) and voiced again with another sound.
+        auto writeWav = [](const QString& file, const std::vector<float>& x) {
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        std::vector<float> click(4800), thud(9600);
+        for (size_t i = 0; i < click.size(); ++i) click[i] = 0.5f * float(std::exp(-double(i) / 480.0)) * (i % 7 < 3 ? 1.0f : -1.0f);
+        for (size_t i = 0; i < thud.size(); ++i) thud[i] = 0.3f * float(std::exp(-double(i) / 2400.0)) * (i % 40 < 20 ? 1.0f : -1.0f);
+        QVERIFY(writeWav(dir_.path() + "/click.wav", click));
+        QVERIFY(writeWav(dir_.path() + "/thud.wav", thud));
+        QVERIFY(writeWav(dir_.path() + "/bed.wav", std::vector<float>(size_t(48000) * 10, 0.0f)));
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/sampler.montage"));
+        // (ten seconds of sound on A2 for the sequence to play through)
+        const auto bed = state()->importFiles({dir_.path() + "/bed.wav"});
+        QCOMPARE(bed.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            return edit::placeMedia(p, s, bed[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+        }));
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        QVERIFY(program);
+        QAction* show = win_->findChild<QAction*>("showSampler");
+        QVERIFY(show);
+        show->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        QVERIFY(!panel->isActive());  // (nothing to play yet)
+        auto track = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        QVERIFY(panel->addSounds(48, {dir_.path() + "/click.wav"}));
+        QCOMPARE(track().sampler.pads.size(), size_t(1));
+        QCOMPARE(track().sampler.pads[0].name, std::string("click"));
+        QVERIFY(panel->isActive());
+        auto* table = panel->findChild<QTableWidget*>("samplerSlots");
+        QVERIFY(table && table->rowCount() == 1);
+        table->item(0, 7)->setText("2");  // the choke group
+        QCOMPARE(track().sampler.pads[0].choke, 2);
+        // The computer's keys: Z plays C3 (48), the sound in the sampler at once.
+        panel->setComputerKeys(true);
+        QWidget* focus = win_->findChild<TimelineWidget*>();
+        focus->setFocus();
+        QKeyEvent down(QEvent::KeyPress, Qt::Key_Z, Qt::NoModifier, QStringLiteral("z"));
+        QApplication::sendEvent(focus, &down);
+        std::vector<float> heard(512 * 2, 0.0f);
+        panel->engine()->render(0, 512, heard.data());
+        QVERIFY(std::any_of(heard.begin(), heard.end(), [](float v) { return v != 0; }));
+        QKeyEvent up(QEvent::KeyRelease, Qt::Key_Z, Qt::NoModifier, QStringLiteral("z"));
+        QApplication::sendEvent(focus, &up);
+        panel->setComputerKeys(false);
+        QCOMPARE(SamplerPanel::keyForComputerKey(Qt::Key_Q), 60);
+        QCOMPARE(SamplerPanel::keyForComputerKey(Qt::Key_F), -1);
+        // Stopped, the picture's sample is the playhead's; playing, a key pressed 20 ms ago was played against the sample
+        // heard 20 ms ago.
+        program->seek(45);
+        QCOMPARE(program->heardSample(), int64_t(45 * 48000 / 30));
+        QCOMPARE(program->heardSample(20000000), int64_t(45 * 48000 / 30));
+        QString why;
+        QVERIFY(!panel->connectMidi("No Such Keyboard", &why) && !why.isEmpty());
+        // A pass recorded while the sequence plays.
+        program->seek(0);
+        panel->setRecording(true);
+        QVERIFY(panel->isRecording() && program->isPlaying());
+        QTest::qWait(200);
+        const int64_t a = program->heardSample(), ago = program->heardSample(20000000), b = program->heardSample();
+        QVERIFY2(ago >= a - 960 - 5 && ago <= b - 960 + 5, qPrintable(QStringLiteral("%1 %2 %3").arg(a).arg(ago).arg(b)));
+        panel->noteOn(48, 110);
+        QTest::qWait(150);
+        panel->noteOff(48);
+        panel->noteOn(48, 60);
+        QTest::qWait(50);
+        panel->setRecording(false);
+        QVERIFY(!panel->isRecording() && !program->isPlaying());
+        QCOMPARE(track().lanes.size(), size_t(1));
+        QCOMPARE(track().sampler.passes.size(), size_t(1));
+        const SamplerPass pass = track().sampler.passes[0];
+        QCOMPARE(pass.notes.size(), size_t(2));
+        QVERIFY(pass.notes[0].at >= a && pass.notes[0].at < a + 48000);
+        QVERIFY(pass.notes[1].at > pass.notes[0].at);
+        QCOMPARE(pass.notes[0].velocity, 110);
+        QVERIFY(track().lanes[0].start <= FrameTime(pass.notes[0].at * 30 / 48000));
+        QVERIFY(!track().clips.empty());  // (the comp)
+        const Id media = track().lanes[0].mediaId;
+        QVERIFY(QFileInfo(QString::fromStdString(state()->project().findMedia(media)->path)).absolutePath().endsWith("/Sampler"));
+        QCOMPARE(state()->undoText(), QString("Record Sampler Pass"));
+        // Voiced again with the thud: the same notes, a new file.
+        QVERIFY(panel->addSounds(48, {dir_.path() + "/thud.wav"}));  // (round robin: click, thud)
+        QVERIFY(panel->revoice(pass.lane));
+        QCOMPARE(track().sampler.passes[0].notes, pass.notes);
+        QVERIFY(track().lanes[0].mediaId != media);
+        // Undone: the pass and its lane go together.
+        state()->undo();
+        state()->undo();
+        state()->undo();
+        QVERIFY(track().lanes.empty() && track().sampler.passes.empty());
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
+    }
+
     void oscControl() {
         state()->newProject();
         QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {

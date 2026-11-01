@@ -175,6 +175,7 @@ extern "C" {
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
+#include "SamplerPanel.h"
 #include "MonitoringPanel.h"
 #include "CueSheetPanel.h"
 #include "LinedScriptPanel.h"
@@ -676,6 +677,8 @@ void MainWindow::buildPanels() {
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
+    sampler_ = new SamplerPanel(state_, program_, this);
+    samplerDock_ = makeDock(tr("Sampler"), "sampler", sampler_);
     monitoringDock_ = makeDock(tr("Monitoring"), "monitoring", monitoring_);
     cueSheet_ = new CueSheetPanel(state_, this);
     cueSheetDock_ = makeDock(tr("Cue Sheet"), "cueSheet", cueSheet_);
@@ -1077,7 +1080,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, adrDock_, monitoringDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_, cueSheetDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, samplerDock_, monitoringDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_, cueSheetDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -2221,6 +2224,11 @@ void MainWindow::buildMenus() {
         adrDock_->show();
         adrDock_->raise();
     })->setObjectName(QStringLiteral("showAdr"));
+    add(seqM, QT_TR_NOOP("Sa&mpler (Sound Effects to Picture)…"), QKeySequence(), [this] {
+        // Sounds on keys, played and recorded in passes to picture, in its panel beside the mixer.
+        samplerDock_->show();
+        samplerDock_->raise();
+    })->setObjectName(QStringLiteral("showSampler"));
     add(seqM, QT_TR_NOOP("Audio &Description…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         // Kept open beside the work while descriptions are written.
