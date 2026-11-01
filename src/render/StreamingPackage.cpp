@@ -644,7 +644,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         e->color_range = rp->color_range == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : rp->color_range;
         e->chroma_sample_location = AVCHROMA_LOC_LEFT;
         e->bit_rate = r.bitrate;
-        e->rc_max_rate = r.bitrate * 3 / 2;
+        // (SVT-AV1 4 refuses a peak rate outside its constant-quality mode, so an AV1 rung's peak is left to its VBR)
+        if (r.codec != "libsvtav1") e->rc_max_rate = r.bitrate * 3 / 2;
         e->rc_buffer_size = int(std::min<int64_t>(INT32_MAX, r.bitrate * 2));
         e->gop_size = int(longest * 2 + 1);  // (keyframes only where forced)
         e->keyint_min = 1;
