@@ -309,8 +309,10 @@ std::vector<double> ffmpegFrameValues(const QString& ffmpeg, const QString& enco
                                       const QString& key, const QString& dir) {
     const QString meta = dir + "/" + filter + ".txt";
     QProcess pr;
+    // (the file named relative to the folder it runs in: a Windows drive's colon would end the filter's option)
+    pr.setWorkingDirectory(dir);
     pr.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-i", encode, "-i", reference, "-lavfi",
-                      QStringLiteral("[0:v][1:v]%1,metadata=mode=print:file=%2").arg(filter, meta), "-f", "null", "-"});
+                      QStringLiteral("[0:v][1:v]%1,metadata=mode=print:file=%1.txt").arg(filter), "-f", "null", "-"});
     if (!pr.waitForFinished(120000) || pr.exitCode() != 0) return {};
     QFile f(meta);
     if (!f.open(QIODevice::ReadOnly)) return {};
@@ -17741,8 +17743,11 @@ colorspaces:
             double worst = 0;
             for (size_t i = 0; i < cpu.px.size(); ++i)
                 worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]) / std::max(1.0, std::fabs(double(cpu.px[i]))));
-            // (on every device, Metal too: the LUTs are 32-bit floats read texel by texel and interpolated in the shader)
-            const double bound = 1e-4;
+            // (the LUTs on every device, Metal too: 32-bit floats read texel by texel and interpolated in the shader; but
+            // Metal compiles shaders with fast maths, and ACES's output, all arithmetic (logs, powers, an arctangent and
+            // splines), comes within about 1e-3 there)
+            const bool metal = QString::fromStdString(gpu::deviceName()).startsWith("Metal");
+            const double bound = metal && QByteArray(c.config) == "aces.ocio" ? 2e-3 : 1e-4;
             QVERIFY2(worst <= bound, qPrintable(QStringLiteral("%1: differs by %2").arg(c.name).arg(worst)));
             qInfo("%s: GPU within %.2g of OpenColorIO's CPU processor", c.name, worst);
         }

@@ -34239,7 +34239,8 @@ private slots:
         QVERIFY2(asShot < 0.03 && asShot < frameDiff(31, levelView) * 0.5, std::to_string(asShot).c_str());
         clip.effects.back().params["rolling_shutter"] = Param(1.0);
         const double noReadout = across(tiltedView);
-        QVERIFY2(noReadout > asShot * 1.25, (std::to_string(asShot) + " " + std::to_string(noReadout)).c_str());
+        // (by about 1.3 here, 1.2 on macOS, where the encode's own error, which both share, is larger)
+        QVERIFY2(noReadout > asShot * 1.15, (std::to_string(asShot) + " " + std::to_string(noReadout)).c_str());
         // Zoom to Fill crops just enough to hide every edge.
         clip.effects.back().params["rolling_shutter"] = Param(0.0);
         clip.effects.back().params["framing"] = Param(0.0);
