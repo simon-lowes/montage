@@ -33,6 +33,7 @@
 #include "render/RemoteReview.h"
 #include "render/Intelligibility.h"
 #include "render/LoudnessReport.h"
+#include "render/EncodeCompare.h"
 
 class QAction;
 class QActionGroup;
@@ -43,6 +44,8 @@ class QMenu;
 class QTabBar;
 
 namespace montage {
+
+class QualityCheckDialog;
 
 class SpectralRepairDialog;
 class PanFollowDialog;
@@ -108,6 +111,8 @@ public:
 
     EditorState* state() const { return state_; }
     TimelineWidget* timeline() const { return timeline_; }
+    // Shows each encode a Quality Check dialog compares as the timeline's quality lane.
+    void watchQualityCheck(QualityCheckDialog* dlg);
     RenderQueue* renderQueue() const { return queue_; }
     bool openProject(const QString& path);
     // Opening a shared project (core/ProjectLock.h): Ask asks whether to open it read-only when someone else is
@@ -699,6 +704,14 @@ private:
     };
     std::map<Id, LoudnessRun> loudnessRuns_;
     void showLoudnessLane();
+    // Each sequence's last Compare Encode (Quality Check), the same way.
+    struct QualityRun {
+        QualityLimits limits;
+        uint64_t revision = 0, generation = 0;
+        std::vector<TimelineWidget::IntelligibilitySpan> lane;  // (worked out once, not on every edit)
+    };
+    std::map<Id, QualityRun> qualityRuns_;
+    void showQualityLane();
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
     QDockWidget* programDock_ = nullptr;

@@ -142,7 +142,9 @@ std::string checkStreamSettings(const StreamSettings& s) {
         if (s.certificateFile.empty() != s.keyFile.empty()) return "A certificate needs its private key (and a key its certificate)";
         if (scheme == "http" && !s.certificateFile.empty()) return "A certificate needs an https:// address";
         // (plain HTTP would carry the passphrase in the clear: only for a browser on this computer)
-        if (scheme == "http" && host != "localhost" && host != "::1" && host.rfind("127.", 0) != 0)
+        // (a loopback address as such: "127.example.com" is a name, not this computer)
+        const QHostAddress where(QString::fromStdString(host));
+        if (scheme == "http" && host != "localhost" && (where.isNull() || !where.isLoopback()))
             return "Browsers on other computers need an https:// address (http:// is for this computer only, 127.0.0.1)";
         for (const std::string& ice : s.iceServers) {
             if (ice.rfind("stun:", 0) != 0 && ice.rfind("turn:", 0) != 0 && ice.rfind("turns:", 0) != 0)

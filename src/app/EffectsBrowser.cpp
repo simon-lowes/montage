@@ -347,15 +347,23 @@ void EffectsBrowser::populate() {
         auto* leaf = new QTreeWidgetItem(folder, QStringList{name});
         leaf->setData(0, language::kUntranslatedRole, true);
         leaf->setFlags(leafFlags);
-        leaf->setIcon(0, categoryIcon(EffectCategory::VideoFilter));
+        // (a transition goes among the transitions' kind, a generator makes a clip)
+        const EffectCategory kind = d.transition() ? EffectCategory::VideoTransition : d.generator() ? EffectCategory::Generator : EffectCategory::VideoFilter;
+        leaf->setIcon(0, categoryIcon(kind));
         QStringList details{QStringLiteral("OpenFX"), group, tr("version %1.%2").arg(d.versionMajor).arg(d.versionMinor)};
+        if (d.transition()) details << tr("transition");
+        if (d.generator()) details << tr("generator");
         if (d.temporal) details << tr("uses neighbouring frames");
+        if (d.overlay) details << tr("on-screen controls");
+        if (d.openGL != "false") details << tr("renders on the GPU");
         leaf->setToolTip(0, QStringLiteral("<b>%1</b><br>%2%3")
                                 .arg(name.toHtmlEscaped(), details.join(QStringLiteral(" · ")).toHtmlEscaped(),
                                      d.description.empty() ? QString() : "<br>" + QString::fromStdString(d.description).toHtmlEscaped()));
         leaf->setData(0, kTypeRole, QString::fromStdString(ofx::kTypePrefix + d.id));
-        leaf->setData(0, kCategoryRole, int(EffectCategory::VideoFilter));
-        leaf->setData(0, kSearchRole, QStringList{name, group, QStringLiteral("openfx ofx plugin")}.join(' '));
+        leaf->setData(0, kCategoryRole, int(kind));
+        leaf->setData(0, kSearchRole, QStringList{name, group, QStringLiteral("openfx ofx plugin"), d.transition() ? tr("transition") : QString(),
+                                                  d.generator() ? tr("generator") : QString()}
+                                          .join(' '));
     }
     if (ofxTop) ofxTop->setExpanded(true);
     // Effect presets saved on this computer, first.

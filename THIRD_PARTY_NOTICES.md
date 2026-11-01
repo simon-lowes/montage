@@ -99,6 +99,11 @@ Montage does not include the Blackmagic Desktop Video driver, the NDI Runtime or
 when they are installed. NDI® is a registered trademark of Vizrt NDI AB ([ndi.video](https://ndi.video)). VST® is a
 registered trademark of Steinberg Media Technologies GmbH.
 
+Nor does it include [libvmaf](https://github.com/Netflix/vmaf) or Netflix's VMAF models (BSD-2-Clause-Patent,
+Copyright Netflix, Inc.): a build configured with `MONTAGE_WITH_VMAF` (off by default) links the libvmaf installed on
+the computer for Compare Encode's VMAF scores and reads the models from `MONTAGE_VMAF_MODELS` or a `vmaf-models`
+folder beside the program.
+
 AI models are not included either: Montage downloads each one when a feature first needs it, and names the model and
 its licence when it asks to download it. One is not under a software licence: Bandit v2's weights (dialogue, music and
 effects) are CC BY-SA 4.0, so they are downloaded from the authors' Zenodo record as they are and never repackaged.

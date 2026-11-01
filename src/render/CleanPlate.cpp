@@ -223,12 +223,28 @@ struct PlateKey {
     double pixelScale = 0;
     const ColorSpace* space = nullptr;
     uint64_t sample = 0;
+    uint64_t clip = 0, media = 0;
     bool operator==(const PlateKey& o) const {
         return std::equal(s.key, s.key + 3, o.s.key) && s.balance == o.s.balance && s.threshold == o.s.threshold && s.erode == o.s.erode &&
                s.frames == o.s.frames && s.spacing == o.s.spacing && s.blur == o.s.blur && t == o.t && w == o.w && h == o.h &&
-               pixelScale == o.pixelScale && space == o.space && sample == o.sample;
+               pixelScale == o.pixelScale && space == o.space && sample == o.sample && clip == o.clip && media == o.media;
     }
 };
+// The other frames plates are made from, as they were fetched (in the effect's colours, at the picture's size), so the
+// next frame's plate decodes one new frame, not all of them again: up to 1 GiB, the least recently used going first.
+// A clip's are dropped when its picture at a time it has kept differs (an edit upstream of the keyer, a slip).
+struct KeptFrame {
+    uint64_t clip = 0, media = 0;
+    FrameTime t = 0;
+    int w = 0, h = 0;
+    const ColorSpace* space = nullptr;
+    uint64_t sample = 0;  // (of the frame's pixels, as pixelSample)
+    bool self = false;    // the picture the plate was made for (as the keyer has it), not one fetched
+    std::shared_ptr<const Image> image;
+};
+std::mutex keptMutex;
+std::deque<KeptFrame> keptFrames;  // (the most recently used first)
+constexpr size_t kKeptBytes = size_t(1) << 30, kKeptCount = 2048;
 struct MadePlate {
     PlateKey key;
     std::shared_ptr<const Image> plate;
@@ -255,7 +271,8 @@ uint64_t pixelSample(const Image& img) {
 Image makeCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, double pixelScale, std::vector<uint8_t>* found) {
     const int w = img.width, h = img.height;
     if (img.empty()) return {};
-    const PlateKey key{s, t, w, h, pixelScale, currentCleanPlate().space, s.frames > 1 ? pixelSample(img) : 0};
+    const CleanPlateContext& context = currentCleanPlate();
+    const PlateKey key{s, t, w, h, pixelScale, context.space, s.frames > 1 ? pixelSample(img) : 0, context.clip, context.media};
     if (s.frames > 1) {
         std::lock_guard lock(plateMutex);
         for (const MadePlate& m : madePlates)
@@ -283,22 +300,85 @@ Image buildCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, dou
     const int w = img.width, h = img.height;
     const double erode = s.erode * pixelScale;
     // This frame, and the others either side of it the clip has (in the colours the effect runs in).
-    std::vector<Image> others;
+    std::vector<std::shared_ptr<const Image>> others;
     if (s.frames > 1)
         if (const ofx::FrameFetch& fetch = ofx::currentFetch()) {
+            const CleanPlateContext& context = currentCleanPlate();
+            const bool keep = context.clip != 0;  // (frames of no known clip are not kept)
+            auto same = [&](const KeptFrame& k, FrameTime at, bool self) {
+                return k.clip == context.clip && k.media == context.media && k.t == at && k.w == w && k.h == h && k.space == context.space &&
+                       k.self == self;
+            };
+            if (keep) {
+                // This frame as kept before: if it has changed, so may the others.
+                const uint64_t sample = pixelSample(img);
+                std::lock_guard lock(keptMutex);
+                bool changed = false;
+                for (const KeptFrame& k : keptFrames) changed = changed || (same(k, t, true) && k.sample != sample);
+                if (changed)
+                    keptFrames.erase(std::remove_if(keptFrames.begin(), keptFrames.end(),
+                                                    [&](const KeptFrame& k) { return k.clip == context.clip; }),
+                                     keptFrames.end());
+            }
+            auto remember = [&](FrameTime at, std::shared_ptr<const Image> image, bool self) {
+                if (!keep) return;
+                const uint64_t sample = pixelSample(*image);
+                std::lock_guard lock(keptMutex);
+                for (auto it = keptFrames.begin(); it != keptFrames.end(); ++it)
+                    if (same(*it, at, self)) {
+                        keptFrames.erase(it);
+                        break;
+                    }
+                keptFrames.push_front({context.clip, context.media, at, w, h, context.space, sample, self, std::move(image)});
+                while (keptFrames.size() > kKeptCount) keptFrames.pop_back();
+                size_t bytes = 0;
+                for (auto it = keptFrames.begin(); it != keptFrames.end(); ++it) {
+                    bytes += (*it).image->px.size() * sizeof(float);
+                    if (bytes > kKeptBytes && it != keptFrames.begin()) {
+                        keptFrames.erase(it, keptFrames.end());
+                        break;
+                    }
+                }
+            };
+            auto kept = [&](FrameTime at, bool self) -> std::shared_ptr<const Image> {
+                if (!keep) return nullptr;
+                std::lock_guard lock(keptMutex);
+                for (auto it = keptFrames.begin(); it != keptFrames.end(); ++it)
+                    if (same(*it, at, self)) {
+                        KeptFrame k = std::move(*it);
+                        keptFrames.erase(it);
+                        keptFrames.push_front(k);
+                        return k.image;
+                    }
+                return nullptr;
+            };
             const int half = (s.frames - 1) / 2, extra = s.frames - 1 - 2 * half;
             for (int k = -half; k <= half + extra; ++k) {
                 if (k == 0) continue;
+                const FrameTime at = t + FrameTime(k) * s.spacing;
+                if (std::shared_ptr<const Image> o = kept(at, false)) {
+                    others.push_back(std::move(o));
+                    continue;
+                }
                 Image o;
-                if (!fetch(double(t + FrameTime(k) * s.spacing), o) || o.empty()) continue;
-                intoEffectColours(o, currentCleanPlate().space);
-                others.push_back(resized(o, w, h));
+                if (!fetch(double(at), o) || o.empty()) continue;
+                intoEffectColours(o, context.space);
+                auto made = std::make_shared<const Image>(resized(o, w, h));
+                remember(at, made, false);
+                others.push_back(std::move(made));
+            }
+            // (and this frame's sample, kept to see whether it changes: a small picture, not the frame)
+            if (keep && !kept(t, true)) {
+                const uint64_t sample = pixelSample(img);
+                std::lock_guard lock(keptMutex);
+                keptFrames.push_back({context.clip, context.media, t, w, h, context.space, sample, true, std::make_shared<const Image>()});
+                while (keptFrames.size() > kKeptCount) keptFrames.pop_back();
             }
         }
     *whole = int(others.size()) == s.frames - 1;
     std::vector<std::vector<uint8_t>> masks;
     std::vector<const Image*> frames{&img};
-    for (const Image& o : others) frames.push_back(&o);
+    for (const auto& o : others) frames.push_back(o.get());
     for (const Image* f : frames) {
         masks.push_back(screenPixels(*f, s));
         shrinkMask(masks.back(), w, h, erode);

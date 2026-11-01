@@ -264,9 +264,10 @@ int blendModeIndex(const std::string& mode);
 float blendModeChannel(int mode, float backdrop, float source);
 
 // Mixes outgoing `a` and incoming `b` (either may be empty = transparent) for
-// transition progress u in [0,1]; result has the given size.
+// transition progress u in [0,1]; result has the given size. (An OpenFX transition, type "ofx", is also told the
+// transition frame `t` and the pictures' `scale` of full size; one that fails mixes as a cross dissolve.)
 Image transitionMix(const std::string& type, const Effect& params, const Image& a, const Image& b, double u, int w,
-                    int h);
+                    int h, double t = 0, double scale = 1);
 
 // Box-blur approximation of a Gaussian, separable; radius in pixels.
 void gaussianBlur(Image& img, double radius, bool horizontal = true, bool vertical = true);

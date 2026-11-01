@@ -694,8 +694,10 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
     prog.lastFrame = frameNo_;
     QVarLengthArray<QRhiShaderResourceBinding, 8> bindings = {B::uniformBuffer(0, B::FragmentStage, ubufs_.front()),
                                                               B::sampledTexture(1, B::FragmentStage, dummy2d_, sampler_)};
-    const bool half = backend_ == QRhi::Metal;
     for (const ShaderStep::Texture& t : step.textures) {
+        // (Metal: half floats for a table the device filters, as Apple's GPUs filter 32-bit floats only on some devices
+        // and systems; tables the shader reads texel by texel, as OCIO's, keep 32-bit floats.)
+        const bool half = backend_ == QRhi::Metal && t.linear;
         const bool threeD = t.depth > 0;
         const bool red = t.channels == 1 && !threeD;
         const T::Format format = red ? (half ? T::R16F : T::R32F) : half ? T::RGBA16F : T::RGBA32F;

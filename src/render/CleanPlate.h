@@ -67,6 +67,7 @@ int cleanPlateTrack(const Sequence& seq, const Clip& c, FrameTime t, bool hidden
 struct CleanPlateContext {
     std::shared_ptr<const Image> plate;
     const ColorSpace* space = nullptr;  // (the space the clip's effects start in, which other frames are in too)
+    uint64_t clip = 0, media = 0;       // the clip's ids, so what is kept of one clip's frames is not another's
 };
 const CleanPlateContext& currentCleanPlate();
 class CleanPlateScope {

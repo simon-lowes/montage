@@ -3072,6 +3072,55 @@ void McpServer::Impl::addTools() {
                       out);
         });
 
+    add("montage_add_generator", "Add a generator clip",
+        "Add a generator clip: a built-in one (color, gradient, bars, adjustment...; montage_list_effects kind generator) or an "
+        "OpenFX generator plug-in (\"ofx:<id>\" from the same list), at a time on a video track (default: above the top one in "
+        "use), for duration seconds or frames. settings sets its parameters by name (colours as name.r / .g / .b).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"generator":{"type":"string"},"at":{"type":["number","string"]},
+            "duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}}},
+            "required":["project","generator","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const std::string type = need(a, "generator").toStdString();
+            if (ofx::isOfxType(type)) {
+                ofx::PluginDesc d;
+                if (!openFxPlugin(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d) || !d.generator())
+                    throw ArgError{QStringLiteral("No OpenFX generator \"%1\" is installed (see montage_list_effects kind generator)").arg(QString::fromStdString(type))};
+            } else if (const EffectInfo* info = findEffectInfo(type); !info || info->category != EffectCategory::Generator || info->hidden) {
+                throw ArgError{QStringLiteral("Unknown generator \"%1\" (see montage_list_effects kind generator)").arg(QString::fromStdString(type))};
+            }
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            if (t.kind != TrackKind::Video) throw ArgError{"A generator goes on a video track"};
+            const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+            Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
+            const QJsonObject settings = a.value("settings").toObject();
+            for (auto it = settings.begin(); it != settings.end(); ++it) {
+                // (an OpenFX plug-in's parameters are "param.<name>"; either spelling is taken)
+                std::string key = it.key().toStdString();
+                if (!c.generator.params.count(key) && c.generator.params.count("param." + key)) key = "param." + key;
+                if (!c.generator.params.count(key))
+                    throw ArgError{QStringLiteral("\"%1\" is not a setting of %2").arg(it.key(), QString::fromStdString(c.name))};
+                if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                c.generator.params[key] = Param(it.value().toDouble());
+            }
+            c.start = timeArg(a.value("at"), s, "at");
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)),
+                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
     add("montage_list_effects", "List effects",
         "The effects, transitions and generators (titles, shapes, particles...) Montage has, with their parameters (name, range, default).",
         R"json({"type":"object","properties":{"kind":{"type":"string","enum":["video","audio","transition","generator"],"default":"video"}}})json", true,
@@ -3098,10 +3147,11 @@ void McpServer::Impl::addTools() {
                 list.append(QJsonObject{{"type", QString::fromStdString(e.type)}, {"name", QString::fromStdString(e.displayName)},
                                         {"group", QString::fromStdString(e.group)}, {"params", params}});
             }
-            // OpenFX video plugins installed on this computer.
-            if (kind == "video") {
+            // OpenFX video plugins installed on this computer: clip effects, transitions and generators by their kind.
+            if (kind == "video" || kind == "transition" || kind == "generator") {
                 Project scratch = makeDefaultProject();
                 for (const ofx::PluginDesc& d : openFxPlugins()) {
+                    if ((kind == "transition") != d.transition() || (kind == "generator") != d.generator()) continue;
                     const Effect e = ofx::makeEffect(scratch, d);
                     QJsonArray params;
                     for (const ParamInfo& pi : effectParams(e)) {
@@ -3116,9 +3166,15 @@ void McpServer::Impl::addTools() {
                                                                                       QString::fromStdString(pi.name + ".b")};
                         params.append(po);
                     }
-                    list.append(QJsonObject{{"type", QString::fromStdString(ofx::kTypePrefix + d.id)}, {"name", QString::fromStdString(d.label)},
-                                            {"group", QString::fromStdString("OpenFX" + (d.group.empty() ? std::string() : "/" + d.group))},
-                                            {"params", params}});
+                    QJsonObject entry{{"type", QString::fromStdString(ofx::kTypePrefix + d.id)}, {"name", QString::fromStdString(d.label)},
+                                      {"group", QString::fromStdString("OpenFX" + (d.group.empty() ? std::string() : "/" + d.group))},
+                                      {"params", params}};
+                    // A General plugin's further inputs (montage_add_effect's inputs connects them).
+                    QJsonArray inputs;
+                    for (const ofx::InputDesc& in : d.inputs)
+                        inputs.append(QJsonObject{{"name", QString::fromStdString(in.name)}, {"label", QString::fromStdString(in.label)}, {"mask", in.mask}});
+                    if (!inputs.isEmpty()) entry["inputs"] = inputs;
+                    list.append(entry);
                 }
             }
             // Audio plugins installed here (CLAP, VST3, LV2, AU), as the scanner found them; "ara": an ARA plug-in, which
@@ -3225,6 +3281,7 @@ void McpServer::Impl::addTools() {
         "whose alpha is below solid (%), by amount (%), so no screen colour is left in hair and motion blur.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
+            "inputs":{"type":"object","additionalProperties":{"type":["string","number"]},"description":"An OpenFX plugin's further inputs (its \"inputs\" in montage_list_effects) connected: a video track (\"V2\", hidden from the output then), a bin item's id, \"mask\" (the effect's own mask) or \"\" (none)"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
@@ -3246,7 +3303,29 @@ void McpServer::Impl::addTools() {
                 ofx::PluginDesc d;
                 if (!openFxPlugin(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d))
                     throw ArgError{QStringLiteral("No OpenFX plugin \"%1\" is installed (see montage_list_effects)").arg(QString::fromStdString(type))};
+                if (d.transition()) throw ArgError{QStringLiteral("%1 is a transition: add it with montage_add_transition").arg(QString::fromStdString(d.label))};
+                if (d.generator()) throw ArgError{QStringLiteral("%1 is a generator: add it with montage_add_generator").arg(QString::fromStdString(d.label))};
                 plugin = ofx::makeEffect(l.project, d);
+                // Its further inputs: {"<clip>": "V2" (a video track), a bin item's id, "mask" (its own mask) or "" (none)}.
+                const QJsonObject inputs = a.value("inputs").toObject();
+                for (auto it = inputs.begin(); it != inputs.end(); ++it) {
+                    const std::string key = ofx::inputKey(it.key().toStdString());
+                    if (!plugin->strings.count(key))
+                        throw ArgError{QStringLiteral("%1 has no input \"%2\" (see montage_list_effects)").arg(QString::fromStdString(d.label), it.key())};
+                    const QString v = it.value().isDouble() ? QString::number(qint64(it.value().toDouble())) : it.value().toString();
+                    std::string connection;
+                    if (v == "mask") connection = "mask";
+                    else if (v.startsWith('V') || v.startsWith('v')) {
+                        const TrackRef tr = trackArg(v, l.seq(), false);
+                        if (tr.kind != TrackKind::Video) throw ArgError{"An input takes a video track"};
+                        connection = "track:" + std::to_string(l.seq().videoTracks[size_t(tr.index)].id);
+                    } else if (!v.isEmpty()) {
+                        const Id id = Id(v.toULongLong());
+                        if (!l.project.findMedia(id)) throw ArgError{QStringLiteral("No bin item %1").arg(v)};
+                        connection = "media:" + std::to_string(id);
+                    }
+                    plugin->strings[key] = connection;
+                }
                 type = "ofx";
             } else if (plugins::isPluginType(type)) {
                 // An audio plugin ("plugin:<id>"): its parameters as "param.<id>"; an ARA plug-in becomes an "ara" effect.
@@ -3669,7 +3748,8 @@ void McpServer::Impl::addTools() {
     add("montage_add_transition", "Add a transition",
         "Add a transition at a clip's start or end (cross_dissolve by default, centred on the cut). With `clips` "
         "instead (Premiere's Apply Default Transitions to Selection), one at both ends of every clip listed: each edit "
-        "point once, a fade where a clip meets a gap; `type` on picture clips and `audio_type` (crossfade) on sound.",
+        "point once, a fade where a clip meets a gap; `type` on picture clips and `audio_type` (crossfade) on sound. "
+        "`type` may be an OpenFX transition plug-in (\"ofx:<id>\", montage_list_effects kind transition).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
             "clips":{"type":"array","items":{"type":"number"}},
             "edge":{"type":"string","enum":["in","out"],"default":"in"},"type":{"type":"string","default":"cross_dissolve"},
@@ -3679,6 +3759,7 @@ void McpServer::Impl::addTools() {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(s.fpsValue()));
+            if (ofx::isOfxType(str(a, "type").toStdString())) (void)openFxPlugins();  // (the plug-ins found first)
             if (a.contains("clips")) {
                 std::vector<Id> ids;
                 for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
@@ -4862,7 +4943,11 @@ void McpServer::Impl::addTools() {
         "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
         "(`uncaptioned_seconds`), and a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`). Lists each "
         "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
-        "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's).",
+        "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's). `compare` sets a delivered "
+        "file against the sequence's own render (or against `reference`, another file), aligned over ±12 frames, frame by "
+        "frame: PSNR, SSIM, MS-SSIM, ΔICtCp (BT.2124) and, where Montage is built with libvmaf, VMAF (`metrics` picks "
+        "them); frames past `min_psnr`, `min_vmaf` or `max_delta_ictcp` are problems, the worst frames get orange markers "
+        "with `markers`, and `report` also writes report-quality.csv and report-quality.pdf.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -4884,13 +4969,38 @@ void McpServer::Impl::addTools() {
             "phase_seconds":{"type":"number","default":1,"description":"How long it must last"},
             "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
             "uncaptioned_seconds":{"type":"number","default":0,"description":"Sound louder than -40 dBFS outside speech with no caption over it for this long (SDH); 0 = not checked"},
-            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+            "markers":{"type":"boolean","default":false},
+            "compare":{"type":"string","description":"A delivered file to compare with the sequence's render (or with reference)"},
+            "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
+            "metrics":{"type":"array","items":{"type":"string","enum":["psnr","ssim","ms_ssim","delta_ictcp","vmaf"]},
+                "description":"What to measure (default all but vmaf)"},
+            "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
+            "min_vmaf":{"type":"number","description":"Frames with VMAF under this are problems"},
+            "max_delta_ictcp":{"type":"number","description":"Frames whose mean ΔE_ITP is over this are problems"}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
             const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
             QcSettings q;
+            EncodeComparison comparison;
+            if (a.contains("compare")) {
+                const QString file = absolute(need(a, "compare"));
+                if (!QFileInfo::exists(file)) throw ArgError{"No file at \"compare\": " + file};
+                q.compareFile = file.toStdString();
+                if (a.contains("metrics")) {
+                    q.compareMetrics = 0;
+                    for (const QJsonValue& m : a.value("metrics").toArray()) {
+                        const unsigned bit = qualityMetricFromName(m.toString().toStdString());
+                        if (!bit) throw ArgError{"Unknown metric " + m.toString()};
+                        q.compareMetrics |= bit;
+                    }
+                }
+                if ((q.compareMetrics & MetricVmaf) && !vmafAvailable()) throw ArgError{"This Montage was built without libvmaf, so it cannot measure VMAF"};
+                q.qualityLimits.minPsnr = std::max(0.0, a.value("min_psnr").toDouble(0));
+                q.qualityLimits.minVmaf = std::max(0.0, a.value("min_vmaf").toDouble(0));
+                q.qualityLimits.maxDeltaItp = std::max(0.0, a.value("max_delta_ictcp").toDouble(0));
+            }
             q.flashing = a.value("flashing").toBool(true);
             q.levels = a.value("levels").toBool(true);
             q.blackSeconds = std::max(0.0, a.value("black_seconds").toDouble(1));
@@ -4920,14 +5030,69 @@ void McpServer::Impl::addTools() {
             q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
-            const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
+            if (a.contains("reference") && q.compareFile.empty()) throw ArgError{"\"reference\" is compared with the file named by \"compare\""};
+            std::vector<QcIssue> issues;
+            // (file against file: frames are the reference file's, not the sequence's, so its spans are listed apart and
+            // put no markers on the sequence)
+            QString fileSpans;
+            const bool fileMode = a.contains("reference");
+            if (fileMode) {
+                // File against file: the sequence's own checks without the comparison, then the two files.
+                const std::string encode = q.compareFile;
+                q.compareFile.clear();
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(0.5 * f, "Checking"); });
+                const QString ref = absolute(need(a, "reference"));
+                if (!QFileInfo::exists(ref)) throw ArgError{"No file at \"reference\": " + ref};
+                CompareOptions o;
+                o.metrics = q.compareMetrics;
+                comparison = compareEncodeFiles(ref.toStdString(), encode, o, [this](double f) { if (f >= 0) progress(0.5 + 0.5 * f, "Comparing"); });
+                if (!comparison.ok) return fail(QStringLiteral("The encode could not be compared: %1").arg(QString::fromStdString(comparison.error)));
+                for (const QualitySpan& sp : qualityOverLimits(comparison, q.qualityLimits))
+                    fileSpans += QStringLiteral("Reference frames %1 - %2  Encode quality: %3\n").arg(sp.first).arg(sp.end).arg(QString::fromStdString(sp.text));
+                for (const std::string& w : comparison.warnings) fileSpans += QStringLiteral("Encode quality: %1\n").arg(QString::fromStdString(w));
+                q.compareFile = encode;
+            } else {
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); }, nullptr, &comparison);
+            }
             QString text;
             for (const QcIssue& i : issues)
                 text += QStringLiteral("%1 - %2  %3: %4\n").arg(tc(i.start, s), tc(i.end, s), QString::fromLatin1(qcKindName(i.kind)),
                                                              QString::fromStdString(i.text));
+            text += fileSpans;
+            if (comparison.ok) {
+                auto num = [](double v, int d) {
+                    return std::isnan(v) ? QStringLiteral("-") : std::isinf(v) ? QStringLiteral("inf") : QString::number(v, 'f', d);
+                };
+                text += QStringLiteral("Compared %1 frames (%2, encode offset %3): PSNR %4 dB (worst %5), SSIM %6 (worst %7), "
+                                       "MS-SSIM %8, ΔICtCp %9 (worst %10)")
+                            .arg(comparison.frames.size())
+                            .arg(QString::fromStdString(comparison.format))
+                            .arg(comparison.offset)
+                            .arg(num(comparison.mean.psnrY, 2), num(comparison.worst.psnrY, 2), num(comparison.mean.ssim, 5),
+                                 num(comparison.worst.ssim, 5), num(comparison.mean.msSsim, 5), num(comparison.mean.deltaItp, 3),
+                                 num(comparison.worst.deltaItp, 3));
+                if (comparison.vmafScored) text += QStringLiteral(", VMAF %1 (worst %2)").arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2));
+                text += '\n';
+                if (!comparison.worstFrames.empty()) {
+                    QStringList worst;
+                    for (FrameTime f : comparison.worstFrames) worst << (fileMode ? QString::number(f) : tc(f, s));
+                    text += (fileMode ? QStringLiteral("Worst frames (of the reference): %1\n") : QStringLiteral("Worst frames: %1\n")).arg(worst.join(", "));
+                }
+            }
             if (a.value("markers").toBool()) {
                 addQcMarkers(s, issues);
+                if (comparison.ok && !fileMode) addWorstFrameMarkers(s, comparison);
                 save(l);
+            }
+            if (comparison.ok && a.contains("report")) {
+                const QString base = absolute(need(a, "report")) + "-quality";
+                QDir().mkpath(QFileInfo(base).absolutePath());
+                std::string e;
+                const Sequence* timed = fileMode ? nullptr : &s;
+                if (!writeQualityCsv((base + ".csv").toStdString(), comparison, timed, &e) ||
+                    !writeQualityPdf((base + ".pdf").toStdString(), comparison, s.name, q.qualityLimits, timed, &e))
+                    return fail(QStringLiteral("No quality report: %1").arg(QString::fromStdString(e)));
+                text += QStringLiteral("Quality report: %1.pdf (and .csv)\n").arg(base);
             }
             if (a.contains("report")) {
                 LoudnessReportSpec spec;

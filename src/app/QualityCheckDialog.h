@@ -11,6 +11,7 @@ class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
+class QLineEdit;
 class QPushButton;
 class QTableWidget;
 
@@ -31,6 +32,14 @@ public:
     int addMarkers();
     // Moves the playhead to the problem in `row`.
     void activate(int row);
+    // The last check's Compare Encode (ok false when no encode was compared).
+    const EncodeComparison& comparison() const { return comparison_; }
+    // Writes it as <base>.pdf and <base>.csv. False (with the reason shown) if it cannot.
+    bool saveQualityReport(const QString& base);
+
+signals:
+    // A check compared an encode with the sequence (its id) as it was at that history revision.
+    void compared(Id sequence, uint64_t revision);
 
 private:
     EditorState* state_;
@@ -54,6 +63,14 @@ private:
     QDoubleSpinBox* intelligibilitySeconds_ = nullptr;
     QComboBox* intelligibilityPreset_ = nullptr;
     QComboBox* loudness_;
+    QLineEdit* compareFile_ = nullptr;
+    QComboBox* qualityPreset_ = nullptr;
+    QDoubleSpinBox* minPsnr_ = nullptr;
+    QDoubleSpinBox* maxDeltaItp_ = nullptr;
+    QDoubleSpinBox* minVmaf_ = nullptr;
+    QCheckBox* vmaf_ = nullptr;
+    QPushButton* report_ = nullptr;
+    EncodeComparison comparison_;
     QTableWidget* table_;
     QLabel* summary_;
     QPushButton* markers_ = nullptr;

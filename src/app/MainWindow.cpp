@@ -180,6 +180,7 @@
 #include "media/LanguageModel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
+#include "OfxOverlay.h"
 #include "PaintOverlay.h"
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
@@ -300,10 +301,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         showIntelligibility();
         showLoudnessLane();
+        showQualityLane();
     });
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (const Sequence* s = state_->sequence(); s && intelligibility_.count(s->id)) showIntelligibility();
         if (!loudnessRuns_.empty()) showLoudnessLane();
+        if (!qualityRuns_.empty()) showQualityLane();
     });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
@@ -458,6 +461,7 @@ void MainWindow::buildPanels() {
     // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
     new TransformOverlay(state_, programPanel_->viewer());
     new MaskOverlay(state_, programPanel_->viewer());
+    new OfxOverlay(state_, programPanel_->viewer());  // plugins' own controls (they take a press only on a handle)
     reviewOverlay_ = new ReviewOverlay(state_, programPanel_->viewer());
     reviewOverlay_->setShown(appSettings().value("playback/reviewDrawings", true).toBool());
     new PaintOverlay(state_, programPanel_->viewer());  // last, so an armed brush gets the pointer first
@@ -2366,6 +2370,7 @@ void MainWindow::buildMenus() {
     add(seqM, QT_TR_NOOP("&Quality Check…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         QualityCheckDialog dlg(state_, this);
+        watchQualityCheck(&dlg);
         dlg.exec();
     })->setObjectName(QStringLiteral("qualityCheck"));
     add(seqM, QT_TR_NOOP("Dialogue &Intelligibility…"), QKeySequence(), [this] {
@@ -6655,6 +6660,40 @@ void MainWindow::showLoudnessLane() {
     timeline_->setLoudnessLane(std::move(spans), run.revision != state_->history().revision());
 }
 
+void MainWindow::watchQualityCheck(QualityCheckDialog* dlg) {
+    const uint64_t generation = state_->projectGeneration();
+    connect(dlg, &QualityCheckDialog::compared, this, [this, dlg, generation](Id sequence, uint64_t revision) {
+        if (generation != state_->projectGeneration()) return;
+        // The lane: red where a frame is past a limit, amber on the worst frames, green elsewhere (one pass over the
+        // frames and the spans past the limits, both in order).
+        const EncodeComparison& result = dlg->comparison();
+        QualityRun run{dlg->settings().qualityLimits, revision, generation, {}};
+        const std::vector<QualitySpan> over = qualityOverLimits(result, run.limits);
+        const std::set<FrameTime> worst(result.worstFrames.begin(), result.worstFrames.end());
+        size_t o = 0;
+        for (const FrameQuality& q : result.frames) {
+            while (o < over.size() && over[o].end <= q.frame) ++o;
+            const int st = o < over.size() && q.frame >= over[o].first ? 2 : worst.count(q.frame) ? 1 : 0;
+            if (!run.lane.empty() && run.lane.back().status == st && run.lane.back().end == q.frame) run.lane.back().end = q.frame + 1;
+            else run.lane.push_back({q.frame, q.frame + 1, st});
+        }
+        qualityRuns_[sequence] = std::move(run);
+        showQualityLane();
+    });
+}
+
+void MainWindow::showQualityLane() {
+    std::erase_if(qualityRuns_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
+    const Sequence* s = state_->sequence();
+    const auto it = s ? qualityRuns_.find(s->id) : qualityRuns_.end();
+    if (it == qualityRuns_.end()) {
+        timeline_->setQualityLane({}, false);
+        return;
+    }
+    const QualityRun& run = it->second;
+    timeline_->setQualityLane(run.lane, run.revision != state_->history().revision());
+}
+
 void MainWindow::showIntelligibility() {
     std::erase_if(intelligibility_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
     const Sequence* s = state_->sequence();
@@ -10606,6 +10645,7 @@ void MainWindow::scanPluginsInBackground() {
         if (blocked > 0)
             state_->message(tr("%n audio plugin(s) failed to load and were blocked (Tools › Audio Plugins)", "", blocked), 8000);
     });
+    ofx::initializeGpu();  // (OpenGL for plugins is set up here, on the GUI thread; without it they render on the CPU)
     watcher->setFuture(QtConcurrent::run([] {
         plugins::ScanReport report = plugins::Registry::instance().scan();
         ofx::Registry::instance().scan();  // and the OpenFX video plugins
@@ -10628,7 +10668,7 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
         FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
         int vt = state_->targetVideoTrack();
         std::vector<Id> created;
-        state_->apply(tr("Add %1").arg(language::engine(info->displayName)), [&](Project& p, Sequence& sq) {
+        state_->apply(tr("Add %1").arg(info ? language::engine(info->displayName) : name), [&](Project& p, Sequence& sq) {
             Clip c = makeGeneratorClip(p, type, len);
             c.start = at;
             auto r = edit::overwrite(p, sq, {TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)}, c);

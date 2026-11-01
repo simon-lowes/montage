@@ -788,6 +788,58 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+
+        // Compare Encode: an export of a stretch, compared with the sequence, scores high, draws the quality lane, marks
+        // its worst frames and writes a report.
+        state()->edit("Range", [](Project&, Sequence& s) {
+            s.inPoint = 60;
+            s.outPoint = 71;
+            return true;
+        });
+        const Sequence& seq = *state()->sequence();
+        ExportSettings st;
+        st.path = (dir_.path() + "/qc-encode.mp4").toStdString();
+        st.audioCodec = "none";
+        st.in = 60;
+        st.out = 72;
+        st.width = seq.width / 2 / 2 * 2;
+        st.height = seq.height / 2 / 2 * 2;
+        std::string err;
+        QVERIFY2(exportSequence(state()->project(), seq, st, nullptr, nullptr, &err), err.c_str());
+        QualityCheckDialog compare(state(), win_.get());
+        win_->watchQualityCheck(&compare);
+        for (const char* box : {"qcFlashing", "qcLevels", "qcBlack", "qcFreeze", "qcSilence", "qcClipping", "qcPhase", "qcDcOffset", "qcSpelling", "qcSync"})
+            compare.findChild<QCheckBox*>(box)->setChecked(false);
+        compare.findChild<QLineEdit*>("qcCompareFile")->setText(QString::fromStdString(st.path));
+        auto* preset = compare.findChild<QComboBox*>("qcQualityPreset");
+        preset->setCurrentIndex(preset->findText("Broadcast", Qt::MatchStartsWith));
+        QCOMPARE(compare.findChild<QDoubleSpinBox*>("qcMinPsnr")->value(), 38.0);
+        QVERIFY(compare.runCheck());
+        QVERIFY2(compare.comparison().ok, compare.comparison().error.c_str());
+        QCOMPARE(int(compare.comparison().frames.size()), 12);
+        QCOMPARE(compare.comparison().offset, 0);
+        QVERIFY2(compare.comparison().worst.psnrY > 38, QByteArray::number(compare.comparison().worst.psnrY));
+        QVERIFY(compare.issues().empty());
+        QVERIFY(compare.findChild<QLabel*>("qcSummary")->text().contains("Encode"));
+        const auto& lane = timeline()->qualityLane();
+        QVERIFY(!lane.empty());
+        QCOMPARE(lane.front().first, FrameTime(60));
+        QCOMPARE(lane.back().end, FrameTime(72));
+        QVERIFY(std::none_of(lane.begin(), lane.end(), [](const auto& sp) { return sp.status == 2; }));
+        QVERIFY(compare.saveQualityReport(dir_.path() + "/qc-report"));
+        QVERIFY(QFileInfo(dir_.path() + "/qc-report.pdf").size() > 1000 && QFileInfo::exists(dir_.path() + "/qc-report.csv"));
+        const size_t markersBefore = state()->sequence()->markers.size();
+        QVERIFY(compare.addMarkers() >= 1);
+        const auto& ms = state()->sequence()->markers;
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Worst frame" && m.t >= 60 && m.t < 72; }));
+        state()->undo();
+        QCOMPARE(state()->sequence()->markers.size(), markersBefore);
+        // Too strict a limit: the frames past it are problems and the lane turns red there.
+        compare.findChild<QDoubleSpinBox*>("qcMaxDeltaItp")->setValue(0.5);
+        QVERIFY(compare.runCheck());
+        QVERIFY2(!compare.issues().empty() && compare.issues()[0].kind == QcKind::EncodeQuality,
+                 qPrintable(compare.findChild<QLabel*>("qcSummary")->text()));
+        QVERIFY(std::any_of(timeline()->qualityLane().begin(), timeline()->qualityLane().end(), [](const auto& sp) { return sp.status == 2; }));
     }
 
     void conformCheckDialog() {
@@ -12425,7 +12477,7 @@ const auto seq = [this] { return state()->sequence(); };
         reg.setCachePath(dir_.filePath("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
-        QCOMPARE(reg.scan(), 4);
+        QCOMPARE(reg.scan(), 7);
         auto* browser = win_->findChild<EffectsBrowser*>();
         QVERIFY(browser);
         browser->reload();
@@ -12456,6 +12508,70 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_VERIFY(titled());
         state()->undo();
         QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty());
+        // Transitions and generators are listed as such.
+        bool transition = false, generator = false;
+        for (QTreeWidgetItemIterator it(tree); *it; ++it) {
+            const QString type = (*it)->data(0, Qt::UserRole).toString();
+            transition |= type == "ofx:org.montage.test.dissolve/1";
+            generator |= type == "ofx:org.montage.test.generator/1";
+        }
+        QVERIFY(transition && generator);
+        // A General plug-in's matte input, connected in the Inspector to another video track.
+        emit browser->applyRequested("ofx:org.montage.test.matte/1", EffectCategory::VideoFilter);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+        QComboBox* input = nullptr;
+        QTRY_VERIFY((input = win_->findChild<QComboBox*>(QStringLiteral("input_Matte"))) != nullptr);
+        QVERIFY(input->findData(QStringLiteral("mask")) >= 0);
+        const Id v2 = state()->sequence()->videoTracks.at(1).id;
+        const int pick = input->findData(QStringLiteral("track:%1").arg(v2));
+        QVERIFY(pick >= 0);
+        QVERIFY(input->findData(QStringLiteral("track:%1").arg(state()->sequence()->videoTracks[0].id)) < 0);  // (not its own)
+        input->setCurrentIndex(pick);
+        emit input->activated(pick);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects[0].s("input.Matte"), "track:" + std::to_string(v2));
+        state()->undo();
+        state()->undo();
+        // The probe's on-screen control on the Program monitor: a drag on its square keys Centre at the playhead, one
+        // undo step.
+        Id probeId = 0;
+        QVERIFY(state()->edit("Probe", [&](Project& p, Sequence& s) {
+            ofx::PluginDesc d;
+            if (!reg.find("org.montage.test.probe/1", d)) return false;
+            Effect e = ofx::makeEffect(p, d);
+            e.params["param.centre.x"].addKey(0, 0.5);
+            e.params["param.centre.y"].addKey(0, 0.25);
+            probeId = e.id;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(10);
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        const auto centre = [&] { return edit::clipById(*state()->sequence(), clip)->effects.at(0).params; };
+        const size_t steps = state()->history().undoCount();
+        // (Centre (0.5, 0.25) from the bottom is three quarters of the way down the picture)
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.75));
+        QTest::mouseMove(viewer, at(0.55, 0.6));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.6, 0.5));
+        QCOMPARE(state()->history().undoCount(), steps + 1);
+        QCOMPARE(state()->undoText(), QString("Adjust Test Probe"));
+        QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(2));
+        const double px = 2.0 / r.width();
+        QVERIFY2(std::fabs(centre().at("param.centre.x").at(10) - 0.6) < px, qPrintable(QString::number(centre().at("param.centre.x").at(10))));
+        QVERIFY(std::fabs(centre().at("param.centre.y").at(10) - 0.5) < px * 2);
+        state()->undo();
+        QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
+        QCOMPARE(centre().at("param.centre.x").at(10), 0.5);
+        // A press away from the square is left to the monitor (no step).
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.1, 0.1));
+        QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
         state()->newProject();
     }
 

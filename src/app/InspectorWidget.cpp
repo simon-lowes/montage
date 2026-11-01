@@ -58,6 +58,7 @@
 #include "media/MotionData.h"
 #include "media/Rife.h"
 #include "PluginEditorWindow.h"
+#include "render/Ofx.h"
 #include "Theme.h"
 #include "audio/PluginEffect.h"
 #include "core/ClipAnimation.h"
@@ -929,6 +930,21 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             key.label = tr("Sidechain").toStdString();
             key.kind = StringKind::Track;
             shown.strings.push_back(key);
+        }
+        // An OpenFX plugin's extra inputs (mattes, second pictures): what each is connected to.
+        if (e.type == "ofx") {
+            const auto descs = ofx::descriptionsFromJson(e.s("ofx_description"));
+            for (const auto& [k, v] : e.strings) {
+                if (k.rfind("input.", 0) != 0) continue;
+                StringParamInfo in;
+                in.name = k;
+                in.label = k.substr(6);
+                in.kind = StringKind::PictureInput;
+                if (!descs.empty())
+                    for (const auto& d : descs.front().inputs)
+                        if (d.name == in.label && !d.label.empty()) in.label = d.label;
+                shown.strings.push_back(in);
+            }
         }
         const EffectInfo* info = &shown;
         Id eid = e.id;
@@ -3387,6 +3403,38 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
                         combo->addItem(QStringLiteral("A%1  %2").arg(k + 1).arg(QString::fromStdString(t.name)), QString::number(t.id));
                     }
                 }
+                const int at = combo->findData(read());
+                combo->setCurrentIndex(at < 0 ? 0 : at);
+            });
+            break;
+        }
+        case StringKind::PictureInput: {
+            // An OpenFX input: nothing, a video track (not the clip's own), the effect's own mask, or a picture in the bin.
+            auto* combo = new QComboBox(content_);
+            combo->setObjectName(QString::fromStdString("input_" + name.substr(6)));
+            form->addRow(label, combo);
+            connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
+            refreshers_.push_back([this, combo, read, target] {
+                QSignalBlocker b(combo);
+                combo->clear();
+                combo->addItem(tr("None"), QString());
+                combo->addItem(tr("Effect's Mask"), QStringLiteral("mask"));
+                if (const Sequence* s = state_->sequence()) {
+                    Id own = 0;
+                    for (Id clip : {target.clip, target.owner})
+                        if (const auto loc = clip ? edit::locate(*s, clip) : std::nullopt)
+                            if (loc->track.kind == TrackKind::Video && size_t(loc->track.index) < s->videoTracks.size())
+                                own = s->videoTracks[size_t(loc->track.index)].id;
+                    for (size_t k = 0; k < s->videoTracks.size(); ++k) {
+                        const Track& t = s->videoTracks[k];
+                        if (t.id == own) continue;
+                        combo->addItem(QStringLiteral("V%1  %2").arg(k + 1).arg(QString::fromStdString(t.name)),
+                                       QStringLiteral("track:%1").arg(t.id));
+                    }
+                }
+                for (const MediaItem& m : state_->project().media)
+                    if (m.hasVideo || m.kind == MediaKind::Image)
+                        combo->addItem(QString::fromStdString(m.name), QStringLiteral("media:%1").arg(m.id));
                 const int at = combo->findData(read());
                 combo->setCurrentIndex(at < 0 ? 0 : at);
             });

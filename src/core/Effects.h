@@ -44,7 +44,9 @@ struct ParamInfo {
 // Curve: a tone curve (in -> out). HueCurve and LevelCurve: a change against
 // hue (wrapping round) or against luma/saturation, 0.5 meaning none.
 // Track: an audio track of the sequence by its id (a sidechain key), "" = none (or what choices[0] names).
-enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic, HueCurve, LevelCurve, ColorWarp, Track };
+// PictureInput: what an OpenFX plugin's extra input shows (render/Ofx.h inputKey): "" nothing, "track:<id>" a video track,
+// "media:<id>" a bin item, "mask" the clip's own mask.
+enum class StringKind { Text, MultilineText, File, Font, Choice, Curve, Dynamic, HueCurve, LevelCurve, ColorWarp, Track, PictureInput };
 
 struct StringParamInfo {
     std::string name;

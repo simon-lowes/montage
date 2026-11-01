@@ -6,6 +6,7 @@
 #include "AudioChannels.h"
 #include "Effects.h"
 #include "Expression.h"
+#include "render/Ofx.h"
 
 namespace montage {
 
@@ -338,8 +339,16 @@ Clip makeClip(Project& p, const MediaItem& media, TrackKind kind, const Sequence
 Clip makeGeneratorClip(Project& p, const std::string& generatorType, FrameTime duration) {
     Clip c;
     c.id = p.newId();
-    c.generator = makeEffect(p, generatorType);
-    if (const EffectInfo* info = findEffectInfo(generatorType)) c.name = info->displayName;
+    ofx::PluginDesc plugin;
+    if (ofx::isOfxType(generatorType) &&
+        ofx::Registry::instance().find(generatorType.substr(std::char_traits<char>::length(ofx::kTypePrefix)), plugin) && plugin.generator()) {
+        // An OpenFX generator plug-in (render/Ofx.h).
+        c.generator = ofx::makeEffect(p, plugin);
+        c.name = plugin.label;
+    } else {
+        c.generator = makeEffect(p, generatorType);
+        if (const EffectInfo* info = findEffectInfo(generatorType)) c.name = info->displayName;
+    }
     c.duration = std::max<FrameTime>(1, duration);
     c.motion = makeEffect(p, "transform");
     c.audio = makeEffect(p, "volume");

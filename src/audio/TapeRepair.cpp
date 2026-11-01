@@ -1,8 +1,12 @@
 #include "TapeRepair.h"
 
+#include "media/Image.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <numeric>
 
 namespace montage {
@@ -45,17 +49,6 @@ size_t powerOfTwoAtLeast(double v) {
     size_t n = 1;
     while (double(n) < v) n <<= 1;
     return n;
-}
-
-std::vector<float> mono(const AudioBuffer& b) {
-    const size_t nch = size_t(std::max(1, b.channels));
-    std::vector<float> x(static_cast<size_t>(b.frames()));
-    for (size_t i = 0; i < x.size(); ++i) {
-        double s = 0;
-        for (size_t c = 0; c < nch; ++c) s += b.samples[i * nch + c];
-        x[i] = float(s / double(nch));
-    }
-    return x;
 }
 
 // A windowed sinc (Blackman, 16 zero crossings each side) tabulated, read at fractional sample positions.
@@ -134,24 +127,29 @@ double TransferSpeed::at(double seconds) const {
 TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const std::atomic<bool>* cancel) {
     TransferSpeed out;
     const double fs = in.sampleRate;
-    // (a mono sound read as it is: a copy of hours of it is gigabytes)
-    std::vector<float> mixed;
-    if (in.channels > 1) mixed = mono(in);
-    const std::vector<float>& x = in.channels > 1 ? mixed : in.samples;
+    // The channels mixed as they are read (a mixed copy of hours of a sound is gigabytes).
+    const size_t C = size_t(std::max(1, in.channels)), length = in.samples.size() / C;
+    const float* data = in.samples.data();
+    auto x = [data, C](size_t i) {
+        if (C == 1) return double(data[i]);
+        double sum = 0;
+        for (size_t c = 0; c < C; ++c) sum += data[i * C + c];
+        return sum / double(C);
+    };
     const size_t N = powerOfTwoAtLeast(fs * 0.042);  // (2048 at 48 kHz: partials 50 Hz apart are told apart)
     const size_t H = size_t(std::max(1L, std::lround(fs * 0.004)));
-    if (fs <= 0 || x.size() < N * 4) return out;
+    if (fs <= 0 || length < N * 4) return out;
     // The steady partials: narrow peaks standing well out of the long-term spectrum (four times the frame, so a peak
     // is a few bins wide), the strongest few, at least 60 Hz apart.
     const size_t L = N * 4;
     std::vector<double> power(L / 2 + 1, 0.0);
     {
         const std::vector<double> w = hann(L);
-        const size_t frames = (x.size() - L) / (L / 2) + 1, step = std::max<size_t>(1, frames / 2000);
+        const size_t frames = (length - L) / (L / 2) + 1, step = std::max<size_t>(1, frames / 2000);
         std::vector<cd> buf(L);
         for (size_t f = 0; f < frames; f += step) {
             if (cancelled(cancel)) return out;
-            for (size_t i = 0; i < L; ++i) buf[i] = x[f * (L / 2) + i] * w[i];
+            for (size_t i = 0; i < L; ++i) buf[i] = x(f * (L / 2) + i) * w[i];
             fft(buf, false);
             for (size_t k = 0; k <= L / 2; ++k) power[k] += std::norm(buf[k]);
         }
@@ -185,7 +183,7 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
     if (partials.empty()) return out;
     // Each partial's frequency hop by hop, from the phase its own DFT advances by.
     const std::vector<double> w = hann(N);
-    const size_t hops = (x.size() - N) / H;
+    const size_t hops = (length - N) / H;
     if (hops < 2) return out;
     // (ratio, weight) for each hop, from each partial in turn; a weight of 0 where it did not vote
     const size_t P = partials.size();
@@ -196,20 +194,33 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
         const double omega = 2 * M_PI * f0 / fs;
         std::vector<cd> kernel(N);
         for (size_t n = 0; n < N; ++n) kernel[n] = w[n] * std::polar(1.0, -omega * double(n));
-        std::vector<double> freq(hops), mag(hops);
-        cd prev = 0;
-        for (size_t m = 0; m <= hops; ++m) {
-            cd X = 0;
-            if ((m & 1023) == 0 && cancelled(cancel)) return {};
-            const float* p = x.data() + m * H;
-            for (size_t n = 0; n < N; ++n) X += double(p[n]) * kernel[n];
-            if (m > 0) {
-                double d = std::arg(X) - std::arg(prev) - omega * double(H);
-                d -= 2 * M_PI * std::round(d / (2 * M_PI));
-                freq[m - 1] = f0 + d * fs / (2 * M_PI * double(H));
-                mag[m - 1] = std::sqrt(std::abs(X) * std::abs(prev));
+        // (each hop's DFT on its own, the hops shared among the cores)
+        std::vector<cd> at(hops + 1);
+        std::atomic<bool> stop{false};
+        const int bands = int(std::min<size_t>((hops + 1 + 1023) / 1024, size_t(std::numeric_limits<int>::max())));
+        parallelRows(bands, [&](int b0, int b1) {
+            for (size_t m = size_t(b0) * 1024; m < std::min(hops + 1, size_t(b1) * 1024); ++m) {
+                if ((m & 1023) == 0 && (stop || cancelled(cancel))) {
+                    stop = true;
+                    return;
+                }
+                cd X = 0;
+                if (C == 1) {
+                    const float* p = data + m * H;
+                    for (size_t n = 0; n < N; ++n) X += double(p[n]) * kernel[n];
+                } else {
+                    for (size_t n = 0; n < N; ++n) X += x(m * H + n) * kernel[n];
+                }
+                at[m] = X;
             }
-            prev = X;
+        });
+        if (stop) return {};
+        std::vector<double> freq(hops), mag(hops);
+        for (size_t m = 1; m <= hops; ++m) {
+            double d = std::arg(at[m]) - std::arg(at[m - 1]) - omega * double(H);
+            d -= 2 * M_PI * std::round(d / (2 * M_PI));
+            freq[m - 1] = f0 + d * fs / (2 * M_PI * double(H));
+            mag[m - 1] = std::sqrt(std::abs(at[m]) * std::abs(at[m - 1]));
         }
         // Counted where it is within 20 dB of its loudest (it may come and go) and within 1 % of its usual frequency
         // (not a neighbour leaking into it while it is away), against that frequency.
