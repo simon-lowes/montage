@@ -697,6 +697,13 @@ private slots:
         QVERIFY2(std::fabs(frame.at(10, 18)[0] - 0.2f) <= tolerance && std::fabs(frame.at(10, 18)[2] - 0.6f) <= tolerance,
                  qPrintable(QString("%1 %2 %3").arg(frame.at(10, 18)[0]).arg(frame.at(10, 18)[1]).arg(frame.at(10, 18)[2])));
         QVERIFY2(frame.at(50, 18)[0] <= tolerance && frame.at(50, 18)[2] <= tolerance, qPrintable(QString::number(frame.at(50, 18)[0])));
+        // The matte lines up with the canvas where the clip is moved (seen back through the clip's transform, not
+        // stretched over its frame): moved 16 pixels right, it is cut at canvas x 32 still.
+        under->motion.params["pos_x"] = Param(16.0);
+        frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY2(std::fabs(frame.at(24, 18)[2] - 0.6f) <= tolerance && frame.at(40, 18)[2] <= tolerance,
+                 qPrintable(QString("%1 %2").arg(frame.at(24, 18)[2]).arg(frame.at(40, 18)[2])));
+        under->motion.params["pos_x"] = Param(0.0);
         // Not connected: the source as it is.
         under->effects[0].strings["input.Matte"] = "";
         frame = renderSequenceFrame(p, s, 3, o);
@@ -826,7 +833,15 @@ private slots:
             reg.setSearchPaths({copy.toStdString()});
             QCOMPARE(reg.scan(), 7);
             const std::string copied = ofx::findBinaries({copy.toStdString()}).at(0);
-            QFile guard(QString::fromStdString(reg.guardPath()));
+            // (as a process that has ended would leave it: this process's own guard is not a crash)
+            const QString ended = QFileInfo(QString::fromStdString(reg.guardPath())).absolutePath() + "/ofx-interact-2147483646.guard";
+            QFile own(QString::fromStdString(reg.guardPath()));
+            QVERIFY(own.open(QIODevice::WriteOnly));
+            own.write(QByteArray::fromStdString(copied));
+            own.close();
+            QCOMPARE(reg.scan(), 7);
+            QVERIFY(QFile::remove(QString::fromStdString(reg.guardPath())));
+            QFile guard(ended);
             QVERIFY(guard.open(QIODevice::WriteOnly));
             guard.write(QByteArray::fromStdString(copied));
             guard.close();

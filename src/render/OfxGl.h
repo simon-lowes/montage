@@ -19,6 +19,9 @@ bool available(std::string* why = nullptr);
 // OpenGL.
 bool run(const std::function<void()>& fn);
 bool onThread();
+// From a job on the OpenGL thread: runs `fn` on the thread waiting for the job in run() (with that thread's scopes:
+// the working space, expressions, cancelling), and waits. Elsewhere it runs `fn` here.
+void callBack(const std::function<void()>& fn);
 
 // (The rest only inside run().)
 // A premultiplied picture as an RGBA float texture, bottom row first (as OpenFX counts rows); 0 when it failed.

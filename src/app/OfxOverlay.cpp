@@ -84,7 +84,8 @@ bool OfxOverlay::view(Id clip, ofx::View& v) const {
     const Clip* c = seq ? edit::clipById(*seq, clip) : nullptr;
     const QRectF r = viewer_->imageRect();
     double fw = 0, fh = 0;
-    if (!c || r.isEmpty() || !clipFrameSize(state_->project(), *seq, *c, fw, fh) || fw <= 0 || fh <= 0) return false;
+    if (!c || r.isEmpty() || !clipEffectFrameSize(state_->project(), *seq, *c, state_->playhead(), fw, fh) || fw <= 0 || fh <= 0)
+        return false;
     // Canonical (x, y), y up from the frame's bottom, is clip frame (x / fw, 1 - y / fh); three points give the affine.
     double pts[3][2];
     const double uv[3][2] = {{0, 1}, {1, 1}, {0, 0}};
@@ -120,7 +121,12 @@ const Effect* OfxOverlay::effectOf(const Target& t) const {
 
 ofx::Interact* OfxOverlay::interactFor(const Target& t, const Effect& e) {
     Open& o = open_[{t.clip, t.effect}];
-    if (o.interact && (o.plugin != e.s("ofx_id") || o.interact->failed())) o.interact.reset();
+    // (one that failed is left alone from then on, as OpenFX asks; one that will not open is not tried again either)
+    if (o.interact && o.interact->failed()) {
+        o.interact.reset();
+        o.plugin = e.s("ofx_id") + "\n";
+    }
+    if (o.interact && o.plugin != e.s("ofx_id")) o.interact.reset();
     if (!o.interact && o.plugin != e.s("ofx_id") + "\n") {
         std::string error;
         o.interact = ofx::Interact::open(e, &error);
@@ -215,7 +221,8 @@ bool OfxOverlay::pen(ofx::Interact::Pen kind, QEvent* ev) {
             if (state_->inGesture()) state_->endGesture(changed_);
         }
         viewer_->update();
-        if (took || kind != ofx::Interact::Pen::Move) return took;
+        if (took || kind == ofx::Interact::Pen::Up) return took;
+        // (a press or a move not taken goes on to the controls below)
     }
     if (kind == ofx::Interact::Pen::Up && down_) {
         down_ = false;
@@ -227,13 +234,19 @@ bool OfxOverlay::pen(ofx::Interact::Pen kind, QEvent* ev) {
 bool OfxOverlay::eventFilter(QObject* obj, QEvent* e) {
     if (obj != viewer_) return false;
     switch (e->type()) {
+    // (a tablet event taken is accepted, so no mouse event is made from it as well)
     case QEvent::MouseButtonPress:
-    case QEvent::TabletPress:
+    case QEvent::TabletPress: {
         if (e->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent*>(e)->button() != Qt::LeftButton) return false;
-        return pen(ofx::Interact::Pen::Down, e);
+        if (down_) return true;  // (already down: the other of a tablet press and the mouse press made from it)
+        const bool took = pen(ofx::Interact::Pen::Down, e);
+        if (took) e->accept();
+        return took;
+    }
     case QEvent::MouseMove:
     case QEvent::TabletMove: {
         const bool took = pen(ofx::Interact::Pen::Move, e);
+        if (took || down_) e->accept();
         return down_ || took;
     }
     case QEvent::MouseButtonRelease:
@@ -241,6 +254,7 @@ bool OfxOverlay::eventFilter(QObject* obj, QEvent* e) {
         if (e->type() == QEvent::MouseButtonRelease && static_cast<QMouseEvent*>(e)->button() != Qt::LeftButton) return false;
         if (!down_) return false;
         pen(ofx::Interact::Pen::Up, e);
+        e->accept();
         return true;
     case QEvent::KeyPress:
     case QEvent::KeyRelease: {

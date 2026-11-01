@@ -93,6 +93,12 @@ std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
                         if (p.findMedia(t.mediaId)) used.insert(t.mediaId);
                     for (const CompositeNode& n : c.composite.nodes)  // its node graph's media inputs
                         if (n.media && p.findMedia(n.media)) used.insert(n.media);
+                    for (const Effect& e : c.effects)  // pictures in the bin its OpenFX effects read as inputs
+                        if (e.type == "ofx")
+                            for (const auto& [k, v] : e.strings)
+                                if (const Id m = k.rfind("input.", 0) == 0 && v.rfind("media:", 0) == 0 ? Id(std::strtoull(v.c_str() + 6, nullptr, 10)) : 0;
+                                    m && p.findMedia(m))
+                                    used.insert(m);
                 }
             };
             useClips(tr->clips);

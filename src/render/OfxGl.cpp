@@ -6,7 +6,9 @@
 #include <QOpenGLExtraFunctions>
 #include <QSurfaceFormat>
 #include <QThread>
+#include <atomic>
 #include <condition_variable>
+#include <algorithm>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -62,9 +64,18 @@ struct Worker {
     LoadIdentity loadIdentity = nullptr;
     Ortho ortho = nullptr;
     LoadMatrixd loadMatrix = nullptr;
-    bool ok = false;
-    std::string why = "OpenGL for plugins was not started";
+    std::atomic<bool> ok{false};
+    std::string why = "OpenGL for plugins was not started";  // (set before ok, read after it)
 };
+
+// The thread waiting in run() for the job on the OpenGL thread, and what that job asks it to do meanwhile.
+struct Caller {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::function<void()>*> asks;
+    bool done = false;
+};
+thread_local Caller* tCaller = nullptr;  // (on the OpenGL thread, during a job from run())
 
 Worker& worker() {
     static Worker* w = new Worker;  // (never destroyed: its thread may still be waiting at exit)
@@ -86,6 +97,10 @@ void loop(Worker* w) {
 
 // Sets the context up on the OpenGL thread and checks it can draw into a float framebuffer.
 void start(Worker* w) {
+    if (!QOpenGLContext::supportsThreadedOpenGL()) {
+        w->why = "OpenGL here cannot be used from a thread of its own";
+        return;
+    }
     w->context = new QOpenGLContext;
     w->context->setFormat(w->surface->format());
     if (!w->context->create() || !w->context->makeCurrent(w->surface)) {
@@ -104,8 +119,8 @@ void start(Worker* w) {
         return;
     }
     release(t);
-    w->ok = true;
     w->why.clear();
+    w->ok = true;
 }
 
 }  // namespace
@@ -151,8 +166,9 @@ bool initialize(std::string* why) {
 
 bool available(std::string* why) {
     Worker& w = worker();
-    if (why) *why = w.why;
-    return w.ok;
+    const bool ok = w.ok;
+    if (why) *why = ok ? std::string() : (w.surface ? w.why : std::string("OpenGL for plugins was not started"));
+    return ok;
 }
 
 bool onThread() {
@@ -167,18 +183,46 @@ bool run(const std::function<void()>& fn) {
         fn();
         return true;
     }
-    std::promise<void> done;
+    // The caller waits, doing what the job hands back to it (callBack) until it ends.
+    Caller caller;
     {
         std::lock_guard<std::mutex> lock(w.mutex);
         w.jobs.push_back([&] {
+            tCaller = &caller;
             fn();
             resetState();
-            done.set_value();
+            tCaller = nullptr;
+            std::lock_guard<std::mutex> l(caller.mutex);
+            caller.done = true;
+            caller.wake.notify_all();
         });
     }
     w.wake.notify_one();
-    done.get_future().wait();
+    std::unique_lock<std::mutex> lock(caller.mutex);
+    for (;;) {
+        caller.wake.wait(lock, [&] { return caller.done || !caller.asks.empty(); });
+        if (caller.asks.empty()) break;
+        std::function<void()>* ask = caller.asks.front();
+        lock.unlock();
+        (*ask)();
+        lock.lock();
+        caller.asks.pop_front();
+        caller.wake.notify_all();
+    }
     return true;
+}
+
+void callBack(const std::function<void()>& fn) {
+    Caller* c = onThread() ? tCaller : nullptr;
+    if (!c) {
+        fn();
+        return;
+    }
+    std::function<void()> ask = fn;
+    std::unique_lock<std::mutex> lock(c->mutex);
+    c->asks.push_back(&ask);
+    c->wake.notify_all();
+    c->wake.wait(lock, [&] { return std::find(c->asks.begin(), c->asks.end(), &ask) == c->asks.end(); });
 }
 
 unsigned upload(const Image& img) {

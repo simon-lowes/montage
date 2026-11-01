@@ -166,7 +166,8 @@ public:
     InputScope& operator=(const InputScope&) = delete;
 
 private:
-    InputResolver previous_;
+    InputResolver resolve_;
+    const InputResolver* previous_;
 };
 const InputResolver& currentInputs();
 // The effect's own mask (one value a pixel, the size of the picture it runs on) for an input connected to "mask".

@@ -97,6 +97,9 @@ bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, F
                          double& u, double& v);
 // The size of the clip's own frame in its media's pixels.
 bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double& w, double& h);
+// The size of that frame as its effects count it at timeline frame t (fitted to the sequence, before the clip's own
+// scale): the full-size frame an OpenFX plug-in on the clip is given.
+bool clipEffectFrameSize(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double& w, double& h);
 
 // Draws the caption on screen at frame t from `track` over `img` (the whole frame).
 // Captions are styled in SDR; `space` converts them into the picture's colour space.

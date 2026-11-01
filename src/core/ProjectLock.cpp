@@ -34,6 +34,8 @@ const std::string& processToken() {
     return token;
 }
 
+}  // namespace
+
 bool processAlive(qint64 pid) {
     if (pid <= 0) return false;
 #ifdef Q_OS_WIN
@@ -47,6 +49,8 @@ bool processAlive(qint64 pid) {
     return ::kill(pid_t(pid), 0) == 0 || errno == EPERM;
 #endif
 }
+
+namespace {
 
 QByteArray encode(const LockOwner& o) {
     const QJsonObject j{{"user", QString::fromStdString(o.user)},

@@ -27,6 +27,7 @@
 #include "audio/DynLib.h"
 #include "core/Effects.h"
 #include "core/Expression.h"
+#include "core/ProjectLock.h"
 #include "media/SuperScale.h"
 #include "render/ColorSpace.h"
 #include "render/OfxGl.h"
@@ -347,6 +348,7 @@ struct Instance {
     gl::Target target;          // the OpenGL render's output
     std::vector<unsigned> textures;  // input textures it has not freed yet
     const InputResolver* inputs = nullptr;      // the compositor's, for a General plugin's further inputs
+    std::map<std::string, Image> prefetched;     // ...those connected, made at the render's own frame beforehand
     const std::vector<float>* ownMask = nullptr;  // the effect's own mask, for an input connected to it
     std::string error;
     bool floatImages = true;
@@ -1283,8 +1285,26 @@ struct ColourPlan {
     bool rawOutput = false;
 };
 
-thread_local InputResolver tInputs;
+thread_local const InputResolver* tInputs = nullptr;
 thread_local const std::vector<float>* tOwnMask = nullptr;
+// Set while the thread does what a render on the OpenGL thread handed back to it (gl::callBack): plug-ins it renders
+// then run on the CPU, as the OpenGL thread is busy waiting for it.
+thread_local bool tNoGl = false;
+struct NoGl {
+    bool previous = tNoGl;
+    NoGl() { tNoGl = true; }
+    ~NoGl() { tNoGl = previous; }
+};
+// Runs compositor work (a frame at another time, a connected input) on the thread that asked for the render, with
+// its scopes, even when the plug-in asks from the OpenGL thread.
+bool onRenderThread(const std::function<bool()>& fn) {
+    bool ok = false;
+    gl::callBack([&] {
+        NoGl noGl;
+        ok = fn();
+    });
+    return ok;
+}
 
 const Image* inputPicture(Instance& inst, const std::string& name, double time, Image& scratch) {
     const int w = inst.width, h = inst.height;
@@ -1294,7 +1314,9 @@ const Image* inputPicture(Instance& inst, const std::string& name, double time, 
     if (auto it = inst.images.find(name); it != inst.images.end()) return it->second;
     if (name == kOfxImageEffectSimpleSourceClipName && inst.source) {
         // Another frame, sized like this one (else this one stands in).
-        if (std::fabs(time - inst.time) > 1e-6 && inst.fetch && *inst.fetch && (*inst.fetch)(time, scratch) && !scratch.empty()) {
+        const FrameFetch* fetch = inst.fetch;
+        if (std::fabs(time - inst.time) > 1e-6 && fetch && *fetch && onRenderThread([&] { return (*fetch)(time, scratch); }) &&
+            !scratch.empty()) {
             fit(scratch);
             return &scratch;
         }
@@ -1313,8 +1335,13 @@ const Image* inputPicture(Instance& inst, const std::string& name, double time, 
             for (size_t i = 0; i < m->size(); ++i) std::fill_n(&scratch.px[i * 4], 4, (*m)[i]);
         return &scratch;
     }
-    if (!inst.inputs || !*inst.inputs || !(*inst.inputs)(connection, time, scratch) || scratch.empty()) return nullptr;
-    fit(scratch);
+    if (auto it = inst.prefetched.find(name); it != inst.prefetched.end() && std::fabs(time - inst.time) <= 1e-6) {
+        scratch = it->second;
+    } else {
+        const InputResolver* inputs = inst.inputs;
+        if (!inputs || !*inputs || !onRenderThread([&] { return (*inputs)(connection, time, scratch); }) || scratch.empty()) return nullptr;
+        fit(scratch);
+    }
     if (inst.convert && inst.space)
         reencode(scratch, inst.space->primaries, inst.space->transfer, inst.convert->primaries, inst.convert->transfer);
     return &scratch;
@@ -1953,13 +1980,20 @@ int Registry::scan(std::vector<std::string>* log) {
     }
     // A plug-in whose on-screen controls were running when Montage stopped without warning: blocked like one that
     // crashes on loading, until its binary changes.
-    QString crashed;
+    // Each process has its own guard file (its id in the name); one of this process, or of another Montage still
+    // running, is not a crash.
+    QStringList crashedBinaries;
     {
-        const QString guard = QFileInfo(QString::fromStdString(cachePath)).absolutePath() + "/ofx-interact.guard";
-        QFile g(guard);
-        if (g.open(QIODevice::ReadOnly)) crashed = QString::fromUtf8(g.readAll()).trimmed();
-        g.close();
-        QFile::remove(guard);
+        QDir dir(QFileInfo(QString::fromStdString(cachePath)).absolutePath());
+        for (const QString& name : dir.entryList({"ofx-interact-*.guard"}, QDir::Files)) {
+            bool numeric = false;
+            const qint64 pid = name.mid(13, name.size() - 13 - 6).toLongLong(&numeric);
+            if (!numeric || pid == QCoreApplication::applicationPid() || processAlive(pid)) continue;
+            QFile g(dir.filePath(name));
+            if (g.open(QIODevice::ReadOnly)) crashedBinaries << QString::fromUtf8(g.readAll()).trimmed();
+            g.close();
+            QFile::remove(dir.filePath(name));
+        }
     }
     QJsonObject fresh;
     std::vector<PluginDesc> found;
@@ -1992,7 +2026,7 @@ int Registry::scan(std::vector<std::string>* log) {
         } else if (log) {
             log->push_back("cached " + bin);
         }
-        if (!crashed.isEmpty() && QString::fromStdString(bin) == crashed) {
+        if (crashedBinaries.contains(QString::fromStdString(bin))) {
             entry = QJsonObject{{"stamp", stamp}, {"error", "Crashed while showing its on-screen controls"}};
             if (log) log->push_back("blocked " + bin);
         }
@@ -2028,7 +2062,9 @@ std::vector<std::pair<std::string, std::string>> Registry::blocked() const {
 }
 std::string Registry::guardPath() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return (QFileInfo(QString::fromStdString(cachePath_)).absolutePath() + "/ofx-interact.guard").toStdString();
+    return (QFileInfo(QString::fromStdString(cachePath_)).absolutePath() + "/ofx-interact-" +
+            QString::number(QCoreApplication::applicationPid()) + ".guard")
+        .toStdString();
 }
 
 bool Registry::find(const std::string& id, PluginDesc& out) const {
@@ -2221,8 +2257,32 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         if (error) *error = why;
         return false;
     };
+    // A plug-in that renders one at a time, reached again from its own render (an input whose clips run it too):
+    // refused rather than waiting for itself.
+    thread_local std::vector<const Loaded*> held;
+    if (l->unsafe && std::find(held.begin(), held.end(), l) != held.end())
+        return fail(d.label + " cannot render inside its own render (it renders one frame at a time)");
+    // Connected inputs, made at this frame before the plug-in is locked (and on this thread, not OpenGL's).
+    std::map<std::string, Image> prefetched;
+    if (tInputs && *tInputs && job.effect)
+        for (const InputDesc& in : d.inputs) {
+            const std::string connection = job.effect->s(inputKey(in.name));
+            if (connection.empty() || connection == "mask") continue;
+            Image pic;
+            if (!(*tInputs)(connection, job.t, pic) || pic.empty()) continue;
+            if (pic.width != job.width || pic.height != job.height) pic = resizeImage(pic, job.width, job.height);
+            prefetched[in.name] = std::move(pic);
+        }
     std::unique_lock<std::mutex> serial(l->renderMutex, std::defer_lock);
     if (l->unsafe) serial.lock();
+    if (l->unsafe) held.push_back(l);
+    struct Release {
+        std::vector<const Loaded*>& held;
+        bool on;
+        ~Release() {
+            if (on) held.pop_back();
+        }
+    } release{held, l->unsafe};
     Image out(job.width, job.height);
     inst->effect = job.effect;
     inst->time = job.t;
@@ -2236,7 +2296,8 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
     inst->error.clear();
     inst->wrote = false;
     inst->convert = nullptr;
-    inst->inputs = &tInputs;
+    inst->inputs = tInputs;
+    inst->prefetched = std::move(prefetched);
     inst->ownMask = tOwnMask;
     const double fullW = job.width / inst->scale, fullH = job.height / inst->scale;
     inst->projectW = fullW, inst->projectH = fullH;
@@ -2282,10 +2343,11 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         inst->output = nullptr;
         inst->convert = nullptr;
         inst->inputs = nullptr;
+        inst->prefetched.clear();
         inst->ownMask = nullptr;
     };
     // OpenGL, where the plug-in renders with it.
-    const bool gpu = d.openGL != "false" && gUseGpu && !inst->glRefused && gl::available();
+    const bool gpu = d.openGL != "false" && gUseGpu && !inst->glRefused && !tNoGl && gl::available();
     if (d.openGL == "needed" && !gpu) {
         clear();
         return fail(d.label + " needs OpenGL, which is not available here");
@@ -2483,9 +2545,13 @@ bool usesOwnMask(const Effect& e) {
     return false;
 }
 
-InputScope::InputScope(InputResolver resolve) : previous_(std::move(tInputs)) { tInputs = std::move(resolve); }
-InputScope::~InputScope() { tInputs = std::move(previous_); }
-const InputResolver& currentInputs() { return tInputs; }
+// (each scope keeps its own resolver: one running is never assigned over by a scope it opens)
+InputScope::InputScope(InputResolver resolve) : resolve_(std::move(resolve)), previous_(tInputs) { tInputs = &resolve_; }
+InputScope::~InputScope() { tInputs = previous_; }
+const InputResolver& currentInputs() {
+    static const InputResolver none;
+    return tInputs ? *tInputs : none;
+}
 OwnMaskScope::OwnMaskScope(const std::vector<float>* matte) : previous_(tOwnMask) { tOwnMask = matte; }
 OwnMaskScope::~OwnMaskScope() { tOwnMask = previous_; }
 
@@ -2736,7 +2802,7 @@ bool Interact::pen(Pen kind, const Effect& e, double t, const View& v, double vx
     PropertySet a = d.args(v, t);
     const auto c = v.toCanonical(vx, vy);
     a.setDouble(kOfxInteractPropPenPosition, {c[0], c[1]});
-    a.setInt(kOfxInteractPropPenViewportPosition, {int(std::lround(vx)), int(std::lround(vy))});
+    a.setInt(kOfxInteractPropPenViewportPosition, {int(std::lround(vx)), int(std::lround(v.height - vy))});  // (y up)
     a.setDouble(kOfxInteractPropPenPressure, {pressure});
     const char* action = kind == Pen::Down ? kOfxInteractActionPenDown : kind == Pen::Up ? kOfxInteractActionPenUp : kOfxInteractActionPenMotion;
     const OfxStatus st = d.plugin->overlay(action, &d.obj, handle(&a), nullptr);

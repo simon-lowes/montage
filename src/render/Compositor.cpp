@@ -1779,6 +1779,8 @@ namespace {
 thread_local int tOfxInputDepth = 0;
 }
 
+bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g);  // (below)
+
 bool ofxInputPicture(const Project& p, const Sequence& seq, const Clip& c, const RenderOptions& o, const std::string& connection, double at,
                      Image& pic) {
     // (an input whose picture runs a plug-in connected back here ends after a step)
@@ -1789,11 +1791,38 @@ bool ofxInputPicture(const Project& p, const Sequence& seq, const Clip& c, const
     } depth;
     const FrameTime t = c.start + FrameTime(std::floor(at + 1e-6));
     const int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
+    // What the input shows on the canvas, seen back through the clip's transform: the part of it over each point of the
+    // clip's own frame (where the effect works), as a mask drawn on the clip lines up.
+    auto intoFrame = [&](Image& canvas) {
+        Geometry g;
+        if (canvas.empty() || !clipGeometry(p, seq, c, t, g) || g.mw <= 0 || g.mh <= 0) return;
+        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * W);
+        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * H);
+        Image frame(pw, ph);
+        std::fill(frame.px.begin(), frame.px.end(), 0.0f);
+        for (int j = 0; j < ph; ++j)
+            for (int i = 0; i < pw; ++i) {
+                const double rx = ((i + 0.5) / pw * g.mw - g.mw / 2 - g.ax) * g.sx, ry = ((j + 0.5) / ph * g.mh - g.mh / 2 - g.ay) * g.sy;
+                const double X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale * canvas.width / W - 0.5;
+                const double Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale * canvas.height / H - 0.5;
+                if (X < -0.5 || Y < -0.5 || X > canvas.width - 0.5 || Y > canvas.height - 0.5) continue;
+                const int x0 = std::clamp(int(std::floor(X)), 0, canvas.width - 1), y0 = std::clamp(int(std::floor(Y)), 0, canvas.height - 1);
+                const int x1 = std::min(x0 + 1, canvas.width - 1), y1 = std::min(y0 + 1, canvas.height - 1);
+                const float fx = float(std::clamp(X - x0, 0.0, 1.0)), fy = float(std::clamp(Y - y0, 0.0, 1.0));
+                float* d = frame.at(i, j);
+                for (int k = 0; k < 4; ++k)
+                    d[k] = (canvas.at(x0, y0)[k] * (1 - fx) + canvas.at(x1, y0)[k] * fx) * (1 - fy) +
+                           (canvas.at(x0, y1)[k] * (1 - fx) + canvas.at(x1, y1)[k] * fx) * fy;
+            }
+        canvas = std::move(frame);
+    };
     if (const int m = ofxInputTrack(seq, connection); m >= 0) {
         // What the track shows (not the clip's own track).
         const auto own = edit::locate(seq, c.id);
         if (own && own->track.kind == TrackKind::Video && own->track.index == m) return false;
         pic = trackPicture(p, seq, size_t(m), t, o, W, H);
+        intoFrame(pic);
         return !pic.empty();
     }
     if (connection.rfind("media:", 0) == 0) {
@@ -1809,6 +1838,7 @@ bool ofxInputPicture(const Project& p, const Sequence& seq, const Clip& c, const
         tc.timing = makeEffect("time", 0);
         tc.audio = makeEffect("volume", 0);
         pic = clipLayer(p, seq, tc, t, o, nullptr);
+        intoFrame(pic);
         return !pic.empty();
     }
     return false;
@@ -2836,6 +2866,17 @@ bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double&
     if (!clipGeometry(p, seq, c, c.start, g)) return false;
     w = g.mw;
     h = g.mh;
+    return true;
+}
+
+bool clipEffectFrameSize(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double& w, double& h) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
+    Geometry g;
+    if (!clipGeometry(p, seq, c, t, g) || g.mw <= 0) return false;
+    // (as effectPixelScale counts the effects' pixels: the frame as fitted to the sequence, before the clip's own scale)
+    const double perPixel = effectPixelScale(c, t - c.start, g.sx, g.mw, 1);
+    w = perPixel > 0 ? 1 / perPixel : g.mw;
+    h = g.mh * w / g.mw;
     return true;
 }
 

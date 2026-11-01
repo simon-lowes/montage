@@ -10,6 +10,7 @@
 #include "media/VideoDepth.h"
 
 #include <QCryptographicHash>
+#include <set>
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
@@ -239,9 +240,18 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
     if (!seq.workingSpace.empty()) h.addData(QByteArray::fromStdString("|working " + seq.workingSpace + ' ' + seq.outputTransform));
     if (seq.stereo3d) h.addData("|stereo");  // clips placed in depth (a nested sequence's too)
     bool any = false;
+    // Tracks an OpenFX effect here reads as an input (render/Ofx.h inputKey): they count even when not shown.
+    std::set<std::string> inputs;
+    for (const Track& track : seq.videoTracks)
+        for (const Clip& c : track.clips)
+            if (c.contains(t))
+                for (const Effect& e : c.effects)
+                    if (e.type == "ofx")
+                        for (const auto& [k, v] : e.strings)
+                            if (k.rfind("input.", 0) == 0 && v.rfind("track:", 0) == 0) inputs.insert(v.substr(6));
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
-        if (o.soloVideoTrack >= 0 ? int(ti) != o.soloVideoTrack : track.muted) continue;
+        if ((o.soloVideoTrack >= 0 ? int(ti) != o.soloVideoTrack : track.muted) && !inputs.count(std::to_string(track.id))) continue;
         h.addData(QByteArray("|track") + QByteArray::number(qint64(ti)));
         // A transition here decides the frame from both its clips.
         bool inTransition = false;

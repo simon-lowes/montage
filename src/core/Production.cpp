@@ -165,6 +165,16 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
                         remap(c.mediaId);
                         for (Take& tk : c.takes) remap(tk.mediaId);
                         // A Dialogue Alignment names the take it was made for (audio/DialogueAlign.h): its media's new id.
+                        // An OpenFX effect's inputs: a picture in the bin comes along; a track keeps its id (followed
+                        // to its copy below, by duplicateSequence).
+                        for (Effect& e : c.effects)
+                            if (e.type == "ofx")
+                                for (auto& [k, v] : e.strings)
+                                    if (k.rfind("input.", 0) == 0 && v.rfind("media:", 0) == 0) {
+                                        Id m = Id(std::strtoull(v.c_str() + 6, nullptr, 10));
+                                        remap(m);
+                                        v = m ? "media:" + std::to_string(m) : std::string();
+                                    }
                         std::erase_if(c.effects, [&](Effect& e) {
                             if (e.type != "dialogue_align" || e.s("media").empty()) return false;
                             Id made = Id(std::strtoull(e.s("media").c_str(), nullptr, 10));

@@ -12,6 +12,9 @@
 
 namespace montage {
 
+// Whether process `pid` is running on this machine.
+bool processAlive(qint64 pid);
+
 struct LockOwner {
     std::string user, host, app;
     qint64 pid = 0;
