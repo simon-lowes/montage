@@ -8607,6 +8607,52 @@ private slots:
         QVERIFY(call({{"min_seconds", 60}}).value("isError").toBool());
     }
 
+    void mcpStreamingPackage() {
+        // An ad-break marker made over MCP, then a streaming package rendered with it: the cue in the playlists.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 200)).ok);
+        const QString project = QString::fromStdString(path("streaming-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const QString& tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_add_marker", {{"at", 3}, {"duration", 2}, {"ad_break", true}, {"name", "Break"}});  // (seconds)
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->markers.size(), size_t(1));
+        QVERIFY(back.active()->markers[0].adBreak && back.active()->markers[0].t == 75 && back.active()->markers[0].duration == 50);
+        // A clip ad break is refused, as are a short segment and an unknown cue.
+        QVERIFY(call("montage_add_marker", {{"at", 1}, {"ad_break", true}, {"clip", double(back.active()->videoTracks[0].clips[0].id)}}).value("isError").toBool());
+        const QString folder = QString::fromStdString(path("streaming-mcp"));
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"segment_seconds", 1}}}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"cue", "mid_roll"}}}}).value("isError").toBool());
+        r = call("montage_render", {{"output", folder},
+                                    {"streaming", QJsonObject{{"segment_seconds", 2}, {"dash", false}, {"audio_codec", "none"},
+                                                              {"ladder", QJsonArray{QJsonObject{{"width", 192}, {"height", 108}, {"bitrate", 150000}}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("hls").toString().endsWith("master.m3u8"));
+        QVERIFY(out.value("dash").toString().isEmpty());
+        QCOMPARE(out.value("segments").toArray().size(), 5);  // 0, 50, 75 (the break), 125 (its end), 175
+        QCOMPARE(out.value("ad_breaks").toArray().size(), 1);
+        QFile playlist(folder + "/" + out.value("renditions").toArray().at(0).toString() + "/playlist.m3u8");
+        QVERIFY(playlist.open(QIODevice::ReadOnly));
+        const QByteArray m3u = playlist.readAll();
+        QVERIFY(m3u.contains("SCTE35-OUT=0xFC") && m3u.contains("SCTE35-IN=0xFC"));
+        QDir(folder).removeRecursively();
+    }
+
     void mcpTransitionsOnClips() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

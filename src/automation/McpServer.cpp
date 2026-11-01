@@ -187,6 +187,7 @@
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
+#include "render/StreamingPackage.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -3784,6 +3785,8 @@ void McpServer::Impl::addTools() {
         "at `at`, and travels with the clip.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false},
+            "ad_break":{"type":"boolean","default":false,"description":"An ad break: SCTE 35 cues in streaming packages (montage_render streaming)"},
+            "duration":{"type":["number","string"],"description":"The marker's length (an ad break's)"},
             "at_samples":{"type":"integer","description":"Instead of at: a timeline sample, so the marker can sit between frames"},
             "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -3796,6 +3799,9 @@ void McpServer::Impl::addTools() {
             const FrameTime at = bySample ? FrameTime(std::floor(atSample + 1e-9)) : timeArg(a.value("at"), s, "at");
             const bool chapter = a.value("chapter").toBool();
             Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            m.adBreak = a.value("ad_break").toBool();
+            if (a.contains("duration")) m.duration = std::max<FrameTime>(0, timeArg(a.value("duration"), s, "duration"));
+            if (m.adBreak && a.contains("clip")) throw ArgError{"An ad break is a timeline marker: leave out clip"};
             if (bySample) m.sub = std::clamp(atSample - double(at), 0.0, 0.999999);
             if (a.contains("clip")) {
                 const Clip& c = clipArg(l, a);
@@ -3806,7 +3812,7 @@ void McpServer::Impl::addTools() {
             edit::addMarker(s, m);
             save(l);
             const QString where = bySample ? QString::fromStdString(formatTimecodeSamples(atSample, s.fps, s.sampleRate > 0 ? s.sampleRate : 48000)) : tc(at, s);
-            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), where));
+            return ok(QStringLiteral("%1 at %2").arg(m.adBreak ? QStringLiteral("Ad break") : chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), where));
         });
 
     add("montage_chapters", "List chapters",
@@ -11370,6 +11376,17 @@ void McpServer::Impl::addTools() {
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
+            "streaming":{"type":"object","description":"A streaming package instead of a file: output is its folder. The sequence rendered once, encoded as a ladder of renditions whose segments start on keyframes at the same frames, packaged as CMAF for HLS (master.m3u8) and DASH (manifest.mpd), with the mix and audio_streams as languages, each caption track as WebVTT (and IMSC for DASH), chapters, and ad-break markers (montage_add_marker ad_break) as SCTE 35 cues","properties":{
+                "ladder":{"type":"array","items":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"},"bitrate":{"type":"integer","description":"bits a second"},"codec":{"type":"string","enum":["libx264","libx265","libsvtav1"]}},"required":["width","bitrate"]},"description":"The rungs (default: from the picture's size down to 360 lines)"},
+                "codec":{"type":"string","enum":["libx264","libx265","libsvtav1"],"default":"libx264","description":"The default ladder's codec"},
+                "segment_seconds":{"type":"number","minimum":2,"maximum":6,"default":4},
+                "cut_aligned":{"type":"boolean","default":false,"description":"Segments end at the cut nearest each nominal end"},
+                "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
+                "iframe_playlists":{"type":"boolean","default":true},
+                "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
+                "audio_codec":{"type":"string","enum":["aac","libopus","none"],"default":"aac"},
+                "audio_bitrate":{"type":"integer","default":128000},
+                "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
             "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265 and AV1 with rate control per segment; image sequences frame by frame). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
@@ -11568,6 +11585,59 @@ void McpServer::Impl::addTools() {
                 if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in this kind of export (a single mp4, mov, wav, mp3, jpg, png or tif file can hold them)"};
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
+            }
+            if (a.contains("streaming")) {
+                if (!a.value("streaming").isObject()) throw ArgError{"\"streaming\" is an object"};
+                if (a.contains("farm")) throw ArgError{"A streaming package is made here, not on a render farm"};
+                const QJsonObject so = a.value("streaming").toObject();
+                StreamingSettings ss;
+                ss.folder = st.path;
+                ss.in = st.in, ss.out = st.out;
+                ss.colorSpace = st.colorSpace, ss.toneMapping = st.toneMapping;
+                ss.audioName = st.audioName.empty() ? "Main" : st.audioName;
+                ss.audioLanguage = st.audioLanguage;
+                ss.extraAudio = st.extraAudio;
+                ss.segmentSeconds = so.value("segment_seconds").toDouble(4);
+                if (ss.segmentSeconds < 2 || ss.segmentSeconds > 6) throw ArgError{"\"segment_seconds\" is 2 to 6"};
+                ss.cutAligned = so.value("cut_aligned").toBool();
+                ss.hls = so.value("hls").toBool(true), ss.dash = so.value("dash").toBool(true);
+                ss.iframePlaylists = so.value("iframe_playlists").toBool(true);
+                ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
+                if (ss.cueCommand != "splice_insert" && ss.cueCommand != "time_signal") throw ArgError{"\"cue\" is splice_insert or time_signal"};
+                ss.audioCodec = str(so, "audio_codec", "aac").toStdString();
+                if (ss.audioCodec != "aac" && ss.audioCodec != "libopus" && ss.audioCodec != "none") throw ArgError{"\"audio_codec\" is aac, libopus or none"};
+                ss.audioBitrate = so.value("audio_bitrate").toInteger(128000);
+                if (ss.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
+                ss.startDate = str(so, "start_date").toStdString();
+                const std::string codec = str(so, "codec", "libx264").toStdString();
+                for (const QJsonValue& v : so.value("ladder").toArray()) {
+                    const QJsonObject r = v.toObject();
+                    StreamingRung rung;
+                    rung.width = r.value("width").toInt(), rung.height = r.value("height").toInt();
+                    rung.bitrate = r.value("bitrate").toInteger();
+                    rung.codec = str(r, "codec", QString::fromStdString(codec)).toStdString();
+                    if (rung.width <= 0 || rung.bitrate <= 0) throw ArgError{"Each rung needs a width and a bitrate"};
+                    ss.rungs.push_back(rung);
+                }
+                if (ss.rungs.empty()) {
+                    const ColorSpace* cs = findColorSpace(ss.colorSpace.empty() ? s.colorSpace : ss.colorSpace);
+                    ss.rungs = defaultLadder(s.width, s.height, codec, cs && cs->hdr());
+                }
+                std::string why;
+                StreamingResult res;
+                if (!exportStreamingPackage(l.project, s, ss, [this](double f, FrameTime) { progress(f, "Packaging"); }, nullptr, &why, &res))
+                    return fail(QString::fromStdString(why));
+                QJsonArray renditions, segments, breaks;
+                for (const std::string& r : res.renditions) renditions.append(QString::fromStdString(r));
+                for (FrameTime f : res.segments) segments.append(double(f));
+                for (const StreamingAdBreak& b : res.breaks) breaks.append(QJsonObject{{"id", double(b.id)}, {"at", tc(b.at + std::max<FrameTime>(0, ss.in), s)}, {"duration", double(b.duration)}});
+                QJsonObject o{{"folder", QString::fromStdString(ss.folder)}, {"renditions", renditions}, {"segments", segments}, {"ad_breaks", breaks}};
+                QString text = QStringLiteral("Wrote a streaming package in %1: %2 renditions, %3 segments").arg(QString::fromStdString(ss.folder)).arg(res.renditions.size()).arg(res.segments.size());
+                if (!res.hls.empty()) o["hls"] = QString::fromStdString(res.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(res.hls));
+                if (!res.dash.empty()) o["dash"] = QString::fromStdString(res.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(res.dash));
+                if (!res.breaks.empty()) text += QStringLiteral("\n%1 ad break(s) as SCTE 35 cues").arg(res.breaks.size());
+                for (const std::string& w : res.warnings) text += QStringLiteral("\n") + QString::fromStdString(w);
+                return ok(text, o);
             }
             if (a.contains("farm")) {
                 // Sent to a render farm's nodes instead (render/RenderFarm.h): the project as it is now.

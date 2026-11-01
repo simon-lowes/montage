@@ -315,6 +315,7 @@ public:
     bool exportAdmTo(const QString& path, const AdmSettings& settings, AdmResult* result = nullptr);
     void exportAdmDialog();
     // File › Export Immersive Audio (IAMF)…: the mix as IAMF in an MP4 or the bare stream (render/Iamf.h), in the background.
+    void exportStreamingDialog();
     bool exportIamfTo(const QString& path, const IamfSettings& settings, IamfResult* result = nullptr);
     void exportIamfDialog();
     bool addToColorGroup(Id group);
@@ -560,6 +561,7 @@ private:
     void matchFrame();
     void addMarker();
     void addChapterMarker();
+    void addAdBreakMarker();
     void addClipMarker();
     void jumpMarker(bool forward);
     void markClip();

@@ -182,6 +182,7 @@ Marker otioMarker(const QJsonObject& m, double rate) {
     mk.comment = m.value("comment").toString().toStdString();
     const QJsonObject own = m.value("metadata").toObject().value("montage").toObject();
     mk.chapter = own.value("chapter").toBool();
+    mk.adBreak = own.value("ad_break").toBool();
     mk.color = std::clamp(own.value("color").toInt(0), 0, 11);
     return mk;
 }

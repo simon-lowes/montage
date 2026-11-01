@@ -87,6 +87,10 @@
 #include <QToolBar>
 #include <QToolButton>
 #include <QVBoxLayout>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -244,6 +248,7 @@
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
+#include "render/StreamingPackage.h"
 #include "render/Processing.h"
 #include "render/FrameRepair.h"
 
@@ -1300,6 +1305,8 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("exportAdm"));
     add(file, QT_TR_NOOP("Export Immersive Audio (&IAMF)…"), QKeySequence(), [this] { exportIamfDialog(); })
         ->setObjectName(QStringLiteral("exportIamf"));
+    add(file, QT_TR_NOOP("Export &Streaming Package (HLS, DASH)…"), QKeySequence(), [this] { exportStreamingDialog(); })
+        ->setObjectName(QStringLiteral("exportStreaming"));
     add(file, QT_TR_NOOP("Watch Remote Review…"), QKeySequence(), [this] {
         auto* w = new ReviewViewerWindow(this);
         w->show();
@@ -2317,6 +2324,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("selectClipAtPlayhead"));
     add(seqM, QT_TR_NOOP("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
     add(seqM, QT_TR_NOOP("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
+    add(seqM, QT_TR_NOOP("Add A&d Break Marker"), QKeySequence(), [this] { addAdBreakMarker(); })->setObjectName(QStringLiteral("addAdBreak"));
     add(seqM, QT_TR_NOOP("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
     add(seqM, QT_TR_NOOP("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
     add(seqM, QT_TR_NOOP("Suggest Chapters…"), QKeySequence(), [this] { suggestChapterMarkers(); })->setObjectName(QStringLiteral("suggestChapters"));
@@ -4382,6 +4390,29 @@ void MainWindow::addChapterMarker() {
                 return true;
             }
         edit::addMarker(s, Marker{t, 0, "Chapter " + std::to_string(n), "", 0, true});
+        return true;
+    });
+}
+
+void MainWindow::addAdBreakMarker() {
+    if (active_ == Monitor::Source || !state_->sequence()) return;
+    const Sequence* seq = state_->sequence();
+    // An ad break at the playhead, as long as In to Out when the playhead is the In point (else a place for one).
+    const FrameTime t = state_->playhead();
+    const FrameTime length = seq->inPoint == t && seq->outPoint >= t ? seq->outPoint + 1 - t : 0;  // (Out is the last frame in)
+    int n = 1;
+    for (const Marker& m : seq->markers) n += m.adBreak;
+    state_->edit(tr("Add Ad Break Marker"), [t, n, length](Project&, Sequence& s) {
+        for (Marker& m : s.markers)
+            if (m.t == t) {
+                if (m.adBreak) return false;
+                m.adBreak = true;
+                if (length > 0) m.duration = length;
+                return true;
+            }
+        Marker m{t, length, "Ad Break " + std::to_string(n), "", 0};
+        m.adBreak = true;
+        edit::addMarker(s, m);
         return true;
     });
 }
@@ -8037,6 +8068,112 @@ void MainWindow::exportIamfDialog() {
     st.inOut = inOut->isChecked();
     st.title = s->name;
     exportIamfTo(QFileInfo(path).suffix().isEmpty() ? path + QStringLiteral(".mp4") : path, st);
+}
+
+void MainWindow::exportStreamingDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Export Streaming Package"));
+    auto* form = new QFormLayout(&dlg);
+    auto* about = new QLabel(tr("The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF for HLS and "
+                                "DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers "
+                                "as SCTE 35 cues."));
+    about->setWordWrap(true);
+    form->addRow(about);
+    const ColorSpace* cs = findColorSpace(s->colorSpace);
+    const bool hdr = cs && cs->hdr();
+    auto* codec = new QComboBox;
+    codec->setObjectName(QStringLiteral("streamingCodec"));
+    codec->addItem(tr("H.264"), QStringLiteral("libx264"));
+    if (avcodec_find_encoder_by_name("libx265")) codec->addItem(tr("HEVC"), QStringLiteral("libx265"));
+    if (avcodec_find_encoder_by_name("libsvtav1")) codec->addItem(tr("AV1"), QStringLiteral("libsvtav1"));
+    if (hdr && codec->count() > 1) codec->setCurrentIndex(1);
+    form->addRow(tr("Codec:"), codec);
+    auto* ladder = new QListWidget;
+    ladder->setObjectName(QStringLiteral("streamingLadder"));
+    auto fillLadder = [ladder, codec, s, hdr] {
+        ladder->clear();
+        for (const StreamingRung& r : defaultLadder(s->width, s->height, codec->currentData().toString().toStdString(), hdr)) {
+            auto* item = new QListWidgetItem(tr("%1 × %2, %3 Mb/s").arg(r.width).arg(r.height).arg(double(r.bitrate) / 1e6, 0, 'f', 1));
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(Qt::Checked);
+            item->setData(Qt::UserRole, QVariantList{r.width, r.height, qlonglong(r.bitrate)});
+            ladder->addItem(item);
+        }
+    };
+    fillLadder();
+    connect(codec, &QComboBox::currentIndexChanged, &dlg, fillLadder);
+    form->addRow(tr("Ladder:"), ladder);
+    auto* seconds = new QDoubleSpinBox;
+    seconds->setObjectName(QStringLiteral("streamingSegment"));
+    seconds->setRange(2, 6);
+    seconds->setValue(4);
+    seconds->setSuffix(tr(" s"));
+    form->addRow(tr("Segments:"), seconds);
+    auto* cutAligned = new QCheckBox(tr("End segments at cuts"));
+    form->addRow(cutAligned);
+    auto* hls = new QCheckBox(tr("HLS"));
+    auto* dash = new QCheckBox(tr("DASH"));
+    hls->setChecked(true), dash->setChecked(true);
+    auto* formats = new QHBoxLayout;
+    formats->addWidget(hls), formats->addWidget(dash), formats->addStretch();
+    form->addRow(tr("Formats:"), formats);
+    auto* audio = new QComboBox;
+    audio->addItem(tr("AAC"), QStringLiteral("aac"));
+    audio->addItem(tr("Opus"), QStringLiteral("libopus"));
+    audio->addItem(tr("No sound"), QStringLiteral("none"));
+    form->addRow(tr("Sound:"), audio);
+    auto* cue = new QComboBox;
+    cue->addItem(tr("splice_insert"), QStringLiteral("splice_insert"));
+    cue->addItem(tr("time_signal with segmentation descriptors"), QStringLiteral("time_signal"));
+    form->addRow(tr("Ad-break cues:"), cue);
+    auto* inOut = new QCheckBox(tr("In to Out only"));
+    inOut->setChecked(s->inPoint >= 0 && s->outPoint >= s->inPoint);
+    inOut->setEnabled(inOut->isChecked());
+    form->addRow(inOut);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    StreamingSettings st;
+    for (int i = 0; i < ladder->count(); ++i) {
+        const QListWidgetItem* item = ladder->item(i);
+        if (item->checkState() != Qt::Checked) continue;
+        const QVariantList v = item->data(Qt::UserRole).toList();
+        st.rungs.push_back({v[0].toInt(), v[1].toInt(), v[2].toLongLong(), codec->currentData().toString().toStdString()});
+    }
+    if (st.rungs.empty() || (!hls->isChecked() && !dash->isChecked())) {
+        state_->message(tr("Choose at least one rung and HLS or DASH"));
+        return;
+    }
+    const QString folder = QFileDialog::getExistingDirectory(this, tr("Folder for the streaming package"));
+    if (folder.isEmpty()) return;
+    QString sub = QString::fromStdString(s->name).trimmed();
+    sub.replace(QRegularExpression(QStringLiteral("[/\\\\:*?\"<>|]")), QStringLiteral("_"));
+    if (sub.isEmpty() || sub == "." || sub == "..") sub = QStringLiteral("Package");
+    st.folder = QDir(folder).filePath(sub).toStdString();
+    st.segmentSeconds = seconds->value();
+    st.cutAligned = cutAligned->isChecked();
+    st.hls = hls->isChecked(), st.dash = dash->isChecked();
+    st.audioCodec = audio->currentData().toString().toStdString();
+    st.cueCommand = cue->currentData().toString().toStdString();
+    if (inOut->isChecked()) st.in = s->inPoint, st.out = s->outPoint + 1;
+    // From a copy, off the UI thread.
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    StreamingResult result;
+    const bool ok = runWithProgress(this, state_, tr("Packaging %1 for streaming…").arg(QString::fromStdString(seq.name)),
+                                    [&](const auto& progress, const std::atomic<bool>* cancel, std::string* err) {
+                                        return exportStreamingPackage(project, seq, st, [&](double f, FrameTime) { progress(f); }, cancel, err, &result);
+                                    });
+    if (!ok) return;
+    state_->message(tr("Streaming package written in %1: %2 renditions, %3 segments").arg(QString::fromStdString(st.folder)).arg(result.renditions.size()).arg(result.segments.size()),
+                    10000);
 }
 
 void MainWindow::exportImfDialog() {

@@ -107,3 +107,7 @@ folder beside the program.
 AI models are not included either: Montage downloads each one when a feature first needs it, and names the model and
 its licence when it asks to download it. One is not under a software licence: Bandit v2's weights (dialogue, music and
 effects) are CC BY-SA 4.0, so they are downloaded from the authors' Zenodo record as they are and never repackaged.
+
+The streaming package test plays packages with [hls.js](https://github.com/video-dev/hls.js) (Apache-2.0) and
+[dash.js](https://github.com/Dash-Industry-Forum/dash.js) (BSD-3-Clause), fetched from npm when the build is configured
+(`MONTAGE_TEST_STREAMING_PLAYERS`); neither is part of Montage or its packages.

@@ -19,6 +19,8 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
+#include <QXmlStreamReader>
 #include <cmath>
 #include <complex>
 #include <cstring>
@@ -83,6 +85,8 @@
 #include "core/TranscriptEdit.h"
 #include "render/Exporter.h"
 #include "render/EncodeCompare.h"
+#include "render/Scte35.h"
+#include "render/StreamingPackage.h"
 #include "render/HdrStill.h"
 #include "media/GainMap.h"
 #include "render/Gallery.h"
@@ -17445,6 +17449,557 @@ colorspaces:
                                                            .arg(int(siting)).arg(av_get_pix_fmt_name(fmt)).arg(scale).arg(worst)));
                 }
             }
+    }
+    void scte35SampleMessages() {
+        // ANSI/SCTE 35 2023r1's own sample messages (section 14: a placement opportunity's start, a splice_insert, the
+        // opportunity's end) read, and written again byte for byte.
+        using namespace montage::scte35;
+        using Cue = montage::scte35::Cue;
+        const std::string start = "0xFC3034000000000000FFFFF00506FE72BD0050001E021C435545494800008E7FCF0001A599B00808000000002CA0A18A3402009AC9D17E";
+        const std::string insert = "0xFC302F000000000000FFFFF014054800008F7FEFFE7369C02EFE0052CCF500000000000A0008435545490000013562DBA30A";
+        const std::string end = "0xFC302F000000000000FFFFF00506FE746290A000190217435545494800008E7F9F0808000000002CA0A18A350200A9CC6758";
+        Cue c;
+        std::string err;
+        QVERIFY2(decode(fromHex(insert), c, &err), err.c_str());
+        QCOMPARE(c.command, Cue::Insert);
+        QCOMPARE(c.eventId, 0x4800008fu);
+        QVERIFY(c.outOfNetwork && !c.immediate && c.autoReturn);
+        QCOMPARE(c.ptsTime, int64_t(0x07369c02e));  // 21514.559089 s
+        QCOMPARE(c.breakDuration, int64_t(0x00052ccf5));  // 60.293567 s
+        QCOMPARE(c.tier, 0xfff);
+        QCOMPARE(c.avails, std::vector<uint32_t>{309});
+        QCOMPARE(toHex(encode(c)), insert);
+        QCOMPARE(toBase64(fromHex(insert)), std::string("/DAvAAAAAAAA///wFAVIAACPf+/+c2nALv4AUsz1AAAAAAAKAAhDVUVJAAABNWLbowo="));
+        QCOMPARE(fromBase64("/DAvAAAAAAAA///wFAVIAACPf+/+c2nALv4AUsz1AAAAAAAKAAhDVUVJAAABNWLbowo="), fromHex(insert));
+
+        QVERIFY2(decode(fromHex(start), c, &err), err.c_str());
+        QCOMPARE(c.command, Cue::TimeSignal);
+        QCOMPARE(c.ptsTime, int64_t(0x072bd0050));
+        QCOMPARE(c.segmentations.size(), size_t(1));
+        const Segmentation& s = c.segmentations[0];
+        QCOMPARE(s.eventId, 0x4800008eu);
+        QCOMPARE(s.typeId, 0x34);  // placement opportunity start
+        QCOMPARE(s.duration, int64_t(0x0001a599b0));  // 307 s
+        QCOMPARE(s.upidType, 8);
+        QCOMPARE(s.upid, (std::vector<uint8_t>{0, 0, 0, 0, 0x2c, 0xa0, 0xa1, 0x8a}));
+        QVERIFY(!s.deliveryNotRestricted && !s.webDeliveryAllowed && s.noRegionalBlackout && s.archiveAllowed && s.deviceRestrictions == 3);
+        QCOMPARE(s.segmentNum, 2);
+        QCOMPARE(s.segmentsExpected, 0);
+        QCOMPARE(toHex(encode(c)), start);
+
+        QVERIFY2(decode(fromHex(end), c, &err), err.c_str());
+        QCOMPARE(c.segmentations.at(0).typeId, 0x35);
+        QCOMPARE(c.segmentations.at(0).duration, int64_t(-1));
+        QVERIFY(c.segmentations.at(0).webDeliveryAllowed);
+        QCOMPARE(toHex(encode(c)), end);
+
+        // A changed bit fails the CRC; a byte short, the length; not hex, nothing.
+        std::vector<uint8_t> bytes = fromHex(insert);
+        bytes[20] ^= 1;
+        QVERIFY(!decode(bytes, c, &err) && err.find("CRC") != std::string::npos);
+        bytes = fromHex(insert);
+        bytes.pop_back();
+        QVERIFY(!decode(bytes, c, &err));
+        QVERIFY(fromHex("0xFZ").empty());
+    }
+    void streamingPackage() {
+        // A twelve-second sequence (a cut at 4 s), captions in two languages, two chapters and a two-second ad break
+        // at 5 s, packaged as a ladder of three renditions in two-second segments, with the mix and a French stream.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 100));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.1f, 0.3f, 0.9f, 100, 200));
+        CaptionTrack en, fr;
+        en.name = "English", en.language = "en";
+        fr.name = "Français", fr.language = "fr";
+        Caption c;
+        c.start = 10, c.end = 60, c.text = "Hello there";
+        en.captions.push_back(c);
+        fr.captions.push_back((c.text = "Bonjour", c));
+        c.start = 140, c.end = 200, c.text = "After the cut";
+        en.captions.push_back(c);
+        s.captionTracks = {en, fr};
+        Marker chapter;
+        chapter.chapter = true;
+        chapter.name = "Opening";
+        s.markers.push_back(chapter);
+        chapter.t = 150, chapter.name = "Middle";
+        s.markers.push_back(chapter);
+        Marker ad;
+        ad.t = 125, ad.duration = 50, ad.adBreak = true, ad.name = "Break A";
+        s.markers.push_back(ad);
+
+        StreamingSettings st;
+        st.folder = (dir.path() + "/package").toStdString();
+        st.segmentSeconds = 2;
+        st.rungs = {{320, 180, 400000, "libx264"}, {192, 108, 160000, "libx264"}};
+        const bool av1 = avcodec_find_encoder_by_name("libsvtav1") != nullptr;
+        if (av1) st.rungs.push_back({160, 90, 120000, "libsvtav1"});
+        st.audioLanguage = "en";
+        ExportSettings::AudioStream french;
+        french.name = "Français", french.language = "fr";
+        french.tracks.assign(s.audioTracks.size(), true);
+        st.extraAudio = {french};
+        st.startDate = "2026-11-01T10:00:00.000Z";
+        StreamingResult res;
+        std::string err;
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        // Every two seconds, and at the break's start and end (5 s and 7 s).
+        QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50, 100, 125, 175, 225, 275}));
+        QCOMPARE(res.breaks.size(), size_t(1));
+        QCOMPARE(res.breaks[0].id, 1u);
+        const QDir pkg(QString::fromStdString(st.folder));
+        auto text = [&](const QString& name) {
+            QFile f(pkg.filePath(name));
+            return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) : QString();
+        };
+
+        // Every rendition's segments start on keyframes at the same times: each segment read after the init segment.
+        const QStringList videos = pkg.entryList({"v*"}, QDir::Dirs);
+        QCOMPARE(videos.size(), int(st.rungs.size()));
+        for (const QString& v : videos)
+            for (size_t i = 0; i < res.segments.size(); ++i) {
+                QFile init(pkg.filePath(v + "/init.mp4")), seg(pkg.filePath(v + QString("/seg%1.m4s").arg(i + 1, 5, 10, QChar('0'))));
+                QVERIFY(init.open(QIODevice::ReadOnly) && seg.open(QIODevice::ReadOnly));
+                const QByteArray segment = seg.readAll();
+                const QString joined = dir.filePath("joined.mp4");
+                QFile out(joined);
+                QVERIFY(out.open(QIODevice::WriteOnly | QIODevice::Truncate));
+                out.write(init.readAll() + segment);
+                out.close();
+                AVFormatContext* fmt = nullptr;
+                QVERIFY(avformat_open_input(&fmt, joined.toUtf8().constData(), nullptr, nullptr) >= 0);
+                AVPacket* pkt = av_packet_alloc();
+                QVERIFY(av_read_frame(fmt, pkt) >= 0);
+                const AVRational tb = fmt->streams[0]->time_base;
+                QVERIFY2(pkt->flags & AV_PKT_FLAG_KEY, qPrintable(v + " " + QString::number(i)));
+                // Its presentation time as MP4 defines it (decode time plus composition offset, read from the fragment:
+                // FFmpeg's reader shifts pictures with negative offsets later when there is no edit list).
+                auto be = [&](qsizetype at) { return quint32(quint8(segment[at])) << 24 | quint32(quint8(segment[at + 1])) << 16 | quint32(quint8(segment[at + 2])) << 8 | quint8(segment[at + 3]); };
+                const qsizetype tfdt = segment.indexOf("tfdt") + 4, trun = segment.indexOf("trun") + 4;
+                QVERIFY(tfdt > 4 && trun > 4);
+                const qint64 decode = segment[tfdt] == 1 ? qint64(quint64(be(tfdt + 4)) << 32 | be(tfdt + 8)) : qint64(be(tfdt + 4));
+                const quint32 flags = be(trun) & 0xffffff;
+                qint64 composition = 0;
+                if (flags & 0x800) {
+                    const qsizetype at = trun + 8 + (flags & 0x1 ? 4 : 0) + (flags & 0x4 ? 4 : 0) + (flags & 0x100 ? 4 : 0) + (flags & 0x200 ? 4 : 0) + (flags & 0x400 ? 4 : 0);
+                    composition = segment[trun] == 1 ? qint64(qint32(be(at))) : qint64(be(at));
+                }
+                QCOMPARE(av_rescale_q(decode + composition, tb, {1, 25}), res.segments[i]);
+                av_packet_free(&pkt);
+                avformat_close_input(&fmt);
+            }
+        // The sound's segments start at the same times (within one AAC frame, 1024 samples), its priming left out.
+        for (const QString& a : pkg.entryList({"a*"}, QDir::Dirs))
+            for (size_t i = 0; i < res.segments.size(); ++i) {
+                QFile init(pkg.filePath(a + "/init.mp4")), seg(pkg.filePath(a + QString("/seg%1.m4s").arg(i + 1, 5, 10, QChar('0'))));
+                QVERIFY(init.open(QIODevice::ReadOnly) && seg.open(QIODevice::ReadOnly));
+                const QString joined = dir.filePath("joined.mp4");
+                QFile out(joined);
+                QVERIFY(out.open(QIODevice::WriteOnly | QIODevice::Truncate));
+                out.write(init.readAll() + seg.readAll());
+                out.close();
+                AVFormatContext* fmt = nullptr;
+                QVERIFY(avformat_open_input(&fmt, joined.toUtf8().constData(), nullptr, nullptr) >= 0);
+                AVPacket* pkt = av_packet_alloc();
+                QVERIFY(av_read_frame(fmt, pkt) >= 0);
+                const double t = double(pkt->pts) * av_q2d(fmt->streams[0]->time_base), want = double(res.segments[i]) / 25;
+                QVERIFY2(t >= want - 1e-6 && t < want + 1024.0 / 48000, qPrintable(a + " " + QString::number(i) + " " + QString::number(t)));
+                av_packet_free(&pkt);
+                avformat_close_input(&fmt);
+            }
+
+        // The multivariant playlist: three renditions with their codecs (from the files' own configurations), the
+        // sound in two languages, captions in two, I-frame playlists and the chapters.
+        const QString master = text("master.m3u8");
+        QCOMPARE(master.count("#EXT-X-STREAM-INF:"), int(st.rungs.size()));
+        QCOMPARE(master.count("#EXT-X-I-FRAME-STREAM-INF:"), int(st.rungs.size()));
+        QVERIFY(master.contains(QRegularExpression("CODECS=\"avc1\\.[0-9A-F]{6},mp4a\\.40\\.2\",RESOLUTION=320x180,FRAME-RATE=25\\.000,VIDEO-RANGE=SDR")));
+        if (av1) QVERIFY(master.contains(QRegularExpression("CODECS=\"av01\\.0\\.\\d\\dM\\.08,mp4a\\.40\\.2\",RESOLUTION=160x90")));
+        QVERIFY2(master.contains("TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Main\",LANGUAGE=\"en\",DEFAULT=YES"), qPrintable(master));
+        QVERIFY2(master.contains("TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Français\",LANGUAGE=\"fr\",DEFAULT=NO"), qPrintable(master));
+        QCOMPARE(master.count("TYPE=SUBTITLES"), 2);
+        QVERIFY(master.contains("URI=\"chapters.vtt\""));
+        // The H.264 codec name matches the stream's profile and level.
+        {
+            AVFormatContext* fmt = nullptr;
+            QFile init(pkg.filePath(videos[0] + "/init.mp4")), seg(pkg.filePath(videos[0] + "/seg00001.m4s")), out(dir.filePath("joined.mp4"));
+            QVERIFY(init.open(QIODevice::ReadOnly) && seg.open(QIODevice::ReadOnly) && out.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            out.write(init.readAll() + seg.readAll());
+            out.close();
+            QVERIFY(avformat_open_input(&fmt, dir.filePath("joined.mp4").toUtf8().constData(), nullptr, nullptr) >= 0);
+            QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
+            const AVCodecParameters* par = fmt->streams[0]->codecpar;
+            QVERIFY2(master.contains(QString::asprintf("avc1.%02X", par->profile)) && master.contains(QString::asprintf("%02X,mp4a", par->level)), qPrintable(QString::asprintf("profile %d level %d", par->profile, par->level)));
+            avformat_close_input(&fmt);
+        }
+
+        // The ad break in the media playlists: SCTE35-OUT before the segment at 5 s and SCTE35-IN before the one at 7 s,
+        // each decoding to the marker's time and number.
+        const QString media = text(videos[0] + "/playlist.m3u8");
+        QVERIFY(media.contains("#EXT-X-PROGRAM-DATE-TIME:2026-11-01T10:00:00.000Z"));
+        const QRegularExpressionMatch out =
+            QRegularExpression("#EXT-X-DATERANGE:ID=\"break-1\",START-DATE=\"2026-11-01T10:00:05.000Z\",PLANNED-DURATION=2.000,SCTE35-OUT=(0x[0-9A-F]+)\n#EXTINF:[0-9.]+,\nseg00004.m4s")
+                .match(media);
+        QVERIFY2(out.hasMatch(), qPrintable(media));
+        const QRegularExpressionMatch back =
+            QRegularExpression("#EXT-X-DATERANGE:ID=\"break-1\",START-DATE=\"2026-11-01T10:00:05.000Z\",DURATION=2.000,SCTE35-IN=(0x[0-9A-F]+)\n#EXTINF:[0-9.]+,\nseg00005.m4s")
+                .match(media);
+        QVERIFY2(back.hasMatch(), qPrintable(media));
+        scte35::Cue cue;
+        QVERIFY2(scte35::decode(scte35::fromHex(out.captured(1).toStdString()), cue, &err), err.c_str());
+        QVERIFY(cue.command == scte35::Cue::Insert && cue.eventId == 1 && cue.outOfNetwork);
+        QCOMPARE(cue.ptsTime, int64_t(5 * 90000));
+        QCOMPARE(cue.breakDuration, int64_t(2 * 90000));
+        QVERIFY2(scte35::decode(scte35::fromHex(back.captured(1).toStdString()), cue, &err), err.c_str());
+        QVERIFY(cue.command == scte35::Cue::Insert && cue.eventId == 1 && !cue.outOfNetwork);
+        QCOMPARE(cue.ptsTime, int64_t(7 * 90000));
+        QVERIFY(text(QString::fromStdString(res.renditions[videos.size()]) + "/playlist.m3u8").contains("SCTE35-OUT"));
+
+        // I-frame playlists: each range is the fragment's header and its keyframe, which reads on its own.
+        const QString iframes = text(videos[0] + "/iframes.m3u8");
+        QVERIFY(iframes.contains("#EXT-X-I-FRAMES-ONLY"));
+        const QRegularExpressionMatch range = QRegularExpression("#EXT-X-BYTERANGE:(\\d+)@0\nseg00002.m4s").match(iframes);
+        QVERIFY(range.hasMatch());
+        {
+            QFile init(pkg.filePath(videos[0] + "/init.mp4")), seg(pkg.filePath(videos[0] + "/seg00002.m4s"));
+            QVERIFY(init.open(QIODevice::ReadOnly) && seg.open(QIODevice::ReadOnly));
+            const qint64 n = range.captured(1).toLongLong();
+            QVERIFY(n > 100 && n < seg.size());
+            QFile out(dir.filePath("iframe.mp4"));
+            QVERIFY(out.open(QIODevice::WriteOnly));
+            out.write(init.readAll() + seg.read(n));
+            out.close();
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, out.fileName().toUtf8().constData(), nullptr, nullptr) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            QVERIFY(av_read_frame(fmt, pkt) >= 0 && (pkt->flags & AV_PKT_FLAG_KEY));
+            const AVCodec* codec = avcodec_find_decoder(fmt->streams[0]->codecpar->codec_id);
+            AVCodecContext* d = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(d, fmt->streams[0]->codecpar);
+            QVERIFY(avcodec_open2(d, codec, nullptr) >= 0);
+            AVFrame* f = av_frame_alloc();
+            QVERIFY(avcodec_send_packet(d, pkt) >= 0);
+            avcodec_send_packet(d, nullptr);
+            QVERIFY(avcodec_receive_frame(d, f) >= 0);
+            QCOMPARE(f->width, 320);
+            av_frame_free(&f);
+            avcodec_free_context(&d);
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+        }
+
+        // Captions: WebVTT segments mapped to the media's times, and whole files (WebVTT, IMSC) for DASH.
+        const QString sub = text("s1_en/seg00001.vtt");
+        QVERIFY(sub.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000") && sub.contains("Hello there") && !sub.contains("After the cut"));
+        QVERIFY(text("s1_en/seg00004.vtt").contains("00:00:05.600 --> 00:00:08.000"));
+        QVERIFY(text("s2_fr/all.ttml").contains("Bonjour"));
+        QVERIFY(text("chapters.vtt").contains("Opening") && text("chapters.vtt").contains("00:00:06.000"));
+
+        // The MPD: the cue pair in an EventStream, a segment timeline as long as the range, the sound's languages.
+        const QString mpd = text("manifest.mpd");
+        QXmlStreamReader xml(mpd);
+        int events = 0, representations = 0, textSets = 0;
+        QStringList languages;
+        std::vector<int64_t> eventTimes;
+        while (!xml.atEnd()) {
+            if (xml.readNext() != QXmlStreamReader::StartElement) continue;
+            if (xml.name() == QLatin1String("Event")) {
+                ++events;
+                eventTimes.push_back(xml.attributes().value("presentationTime").toLongLong());
+            } else if (xml.name() == QLatin1String("Binary") && events == 1) {
+                QVERIFY(scte35::decode(scte35::fromBase64(xml.readElementText().toStdString()), cue, &err));
+                QCOMPARE(cue.ptsTime, int64_t(450000));
+            } else if (xml.name() == QLatin1String("Representation")) {
+                ++representations;
+            } else if (xml.name() == QLatin1String("AdaptationSet")) {
+                if (xml.attributes().value("contentType") == QLatin1String("audio")) languages << xml.attributes().value("lang").toString();
+                if (xml.attributes().value("contentType") == QLatin1String("text")) ++textSets;
+            }
+        }
+        QVERIFY2(!xml.hasError(), qPrintable(xml.errorString()));
+        QCOMPARE(events, 2);
+        QCOMPARE(eventTimes, (std::vector<int64_t>{450000, 630000}));
+        QCOMPARE(languages, (QStringList{"en", "fr"}));
+        QCOMPARE(textSets, 4);
+        QCOMPARE(representations, int(st.rungs.size()) + 2 + 4);
+        QVERIFY(mpd.contains("mediaPresentationDuration=\"PT12.000S\""));
+
+        // FFmpeg's own HLS reader plays the package.
+        AVFormatContext* fmt = nullptr;
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "protocol_whitelist", "file", 0);
+        QVERIFY(avformat_open_input(&fmt, res.hls.c_str(), nullptr, &opts) >= 0);
+        av_dict_free(&opts);
+        QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
+        int videoStreams = 0, audioStreams = 0;
+        for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? videoStreams : audioStreams) +=
+                fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO || fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+        QCOMPARE(videoStreams, int(st.rungs.size()));
+        QVERIFY(audioStreams >= 2);
+        avformat_close_input(&fmt);
+        QVERIFY(!QFileInfo::exists(pkg.filePath("work")));
+
+        // time_signal cues instead: segmentation descriptors for a provider placement opportunity's start and end.
+        st.cueCommand = "time_signal";
+        st.rungs.resize(1);
+        st.dash = false;
+        st.audioCodec = "none";
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        const QRegularExpressionMatch ts = QRegularExpression("SCTE35-OUT=(0x[0-9A-F]+)").match(text(videos[0] + "/playlist.m3u8"));
+        QVERIFY(ts.hasMatch());
+        QVERIFY(scte35::decode(scte35::fromHex(ts.captured(1).toStdString()), cue, &err));
+        QCOMPARE(cue.command, scte35::Cue::TimeSignal);
+        QCOMPARE(cue.ptsTime, int64_t(450000));
+        QCOMPARE(cue.segmentations.size(), size_t(1));
+        QVERIFY(cue.segmentations[0].eventId == 1 && cue.segmentations[0].typeId == 0x34 && cue.segmentations[0].duration == 180000);
+        QVERIFY(!text("master.m3u8").contains("TYPE=AUDIO"));
+        // The earlier package's MPD, smaller rungs and sound are gone; its captions were made again.
+        QVERIFY(!pkg.exists("manifest.mpd"));
+        QCOMPARE(pkg.entryList({"v*", "a*"}, QDir::Dirs), QStringList{videos[0]});
+        QVERIFY(pkg.exists("s1_en/seg00001.vtt"));
+    }
+    void streamingPackagePlays() {
+        // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the
+        // build is configured), switching between rungs, with the captions, the cues and the times they fall at.
+#ifndef MONTAGE_TEST_STREAMING_PLAYERS
+        QSKIP("hls.js and dash.js were not fetched when the build was configured");
+#else
+        const std::string exe = ografBrowser();
+        if (exe.empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 100));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.1f, 0.3f, 0.9f, 100, 200));
+        CaptionTrack en;
+        en.name = "English", en.language = "en";
+        Caption c;
+        c.start = 10, c.end = 60, c.text = "Hello there";
+        en.captions.push_back(c);
+        s.captionTracks = {en};
+        Marker ad;
+        ad.t = 125, ad.duration = 50, ad.adBreak = true;
+        s.markers.push_back(ad);
+        StreamingSettings st;
+        st.folder = (dir.path() + "/package").toStdString();
+        st.segmentSeconds = 2;
+        st.rungs = {{320, 180, 400000, "libx264"}, {192, 108, 160000, "libx264"}};
+        st.startDate = "2026-11-01T10:00:00.000Z";
+        std::string err;
+        StreamingResult res;
+        QVERIFY(QDir().mkpath(QString::fromStdString(st.folder)));
+
+        const QDir package(QString::fromStdString(st.folder)), players(QStringLiteral(MONTAGE_TEST_STREAMING_PLAYERS));
+        bool sandbox = true;
+#ifndef _WIN32
+        sandbox = geteuid() != 0;
+#endif
+        HeadlessBrowser::Options options;
+        options.extraArgs = {"--autoplay-policy=no-user-gesture-required"};
+        auto browser = std::make_unique<HeadlessBrowser>();
+        if (!browser->start(exe, 640, 360, sandbox, &err, options)) {
+            if (!sandbox) QFAIL(err.c_str());
+            browser = std::make_unique<HeadlessBrowser>();
+            QVERIFY2(browser->start(exe, 640, 360, false, &err, options), err.c_str());
+        }
+        HeadlessBrowser& b = *browser;
+        // Served from the package's folder and the players' (no network): http://stream.localhost/...
+        b.onEvent = [&](const QString& method, const QJsonObject& prm) {
+            if (method != "Fetch.requestPaused") return;
+            const QUrl url(prm.value("request").toObject().value("url").toString());
+            const QString path = QDir::cleanPath(url.path(QUrl::FullyDecoded));
+            QByteArray body;
+            QString type = "text/plain";
+            int code = 404;
+            auto serve = [&](const QDir& root, const QString& rel) {
+                QFile f(root.filePath(rel));
+                if (rel.contains("..") || !f.open(QIODevice::ReadOnly)) return;
+                body = f.readAll();
+                code = 200;
+                type = rel.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : rel.endsWith(".mpd") ? "application/dash+xml"
+                       : rel.endsWith(".js") ? "text/javascript" : rel.endsWith(".vtt") ? "text/vtt" : rel.endsWith(".ttml") ? "application/ttml+xml"
+                       : rel.endsWith(".m4s") || rel.endsWith(".mp4") ? "video/mp4" : "application/octet-stream";
+            };
+            if (url.host() != "stream.localhost") {
+                b.post("Fetch.failRequest", {{"requestId", prm.value("requestId")}, {"errorReason", "BlockedByClient"}});
+                return;
+            }
+            if (path == "/harness.html") {
+                body = "<!doctype html><html><body><video width=\"320\" height=\"180\" muted playsinline></video></body></html>";
+                type = "text/html", code = 200;
+            } else if (path.startsWith("/package/")) {
+                serve(package, path.mid(9));
+            } else if (path.startsWith("/players/")) {
+                serve(players, path.mid(9));
+            }
+            b.post("Fetch.fulfillRequest", {{"requestId", prm.value("requestId")}, {"responseCode", code},
+                                            {"responseHeaders", QJsonArray{QJsonObject{{"name", "Content-Type"}, {"value", type}},
+                                                                           QJsonObject{{"name", "Access-Control-Allow-Origin"}, {"value", "*"}}}},
+                                            {"body", QString::fromLatin1(body.toBase64())}});
+        };
+        auto js = [&](const QString& expression) {
+            QJsonObject r;
+            std::string e;
+            if (!b.call("Runtime.evaluate", {{"expression", expression}, {"awaitPromise", true}, {"returnByValue", true}}, &r, &e, true, 30000)) {
+                qWarning("%s", e.c_str());
+                return QJsonValue();
+            }
+            if (r.contains("exceptionDetails")) qWarning("%s", QJsonDocument(r.value("exceptionDetails").toObject()).toJson().constData());
+            return r.value("result").toObject().value("value");
+        };
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (js(expression).toBool()) return true;
+                QThread::msleep(100);
+            }
+            return false;
+        };
+        QJsonObject r;
+        QVERIFY2(b.call("Fetch.enable", {{"patterns", QJsonArray{QJsonObject{{"urlPattern", "*"}}}}}, &r, &err), err.c_str());
+        auto open = [&] {
+            QJsonObject nav;
+            return b.call("Page.navigate", {{"url", "http://stream.localhost/harness.html"}}, &nav, &err) && until("document.readyState === 'complete'", 20);
+        };
+        const QString load = "new Promise((ok, bad) => { const s = document.createElement('script'); s.src = '%1'; s.onload = ok; "
+                             "s.onerror = () => bad(new Error('no %1')); document.head.appendChild(s); })";
+        QVERIFY(open());
+        // H.264 and AAC where the browser plays them (Chrome, Edge), else AV1 and Opus (Chromium builds without them).
+        auto plays = [&](const QString& c) { return js(QString("MediaSource.isTypeSupported('video/mp4; codecs=\"%1\"')").arg(c)).toBool(); };
+        if (!plays("avc1.640015,mp4a.40.2") && plays("av01.0.04M.08,opus") && avcodec_find_encoder_by_name("libsvtav1") && avcodec_find_encoder_by_name("libopus")) {
+            for (StreamingRung& rung : st.rungs) rung.codec = "libsvtav1";
+            st.audioCodec = "libopus";
+        }
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        const QString codecs = QRegularExpression("CODECS=\"([^\"]+)\"").match(QString::fromUtf8([&] {
+                                                     QFile f(package.filePath("master.m3u8"));
+                                                     return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+                                                 }())).captured(1);
+        if (!js(QString("MediaSource.isTypeSupported('video/mp4; codecs=\"%1\"')").arg(codecs)).toBool())
+            QSKIP(qPrintable("This browser does not play " + codecs));
+
+        // HLS: plays, starts on one rung, switches to the other, reads the cues' date ranges and the captions.
+        QVERIFY(js("(async () => { await " + load.arg("/players/hls.min.js") + R"js(;
+            window.r = {levels: 0, error: '', ranges: {}};
+            const v = document.querySelector('video');
+            const h = new Hls({renderTextTracksNatively: true});
+            window.h = h;
+            h.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) r.error = d.type + ' ' + d.details; });
+            h.on(Hls.Events.MANIFEST_PARSED, (e, d) => { r.levels = d.levels.length; h.subtitleTrack = 0; h.subtitleDisplay = true; });
+            h.on(Hls.Events.LEVEL_UPDATED, (e, d) => {
+                const ranges = d.details.dateRanges || {};
+                for (const id of Object.keys(ranges))
+                    r.ranges[id] = {start: ranges[id].startDate.toISOString(), out: ranges[id].attr['SCTE35-OUT'] || '', back: ranges[id].attr['SCTE35-IN'] || ''};
+            });
+            h.loadSource('/package/master.m3u8');
+            h.attachMedia(v);
+            v.muted = true;
+            v.play().catch(e => r.error = String(e));
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 2.5", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QCOMPARE(js("r.levels").toInt(), 2);
+        for (int height : {108, 180}) {
+            js(QString("h.currentLevel = h.levels.findIndex(l => l.height === %1)").arg(height));
+            QVERIFY2(until(QString("r.error !== '' || document.querySelector('video').videoHeight === %1").arg(height), 30),
+                     qPrintable(js("JSON.stringify(r)").toString()));
+            QCOMPARE(js("r.error").toString(), QString());
+        }
+        QVERIFY(until("document.querySelector('video').currentTime > 7.2", 30));
+        // The caption shown from 0.4 s (frame 10) to 2.4 s, as the segments' timestamp map places it.
+        const QJsonArray cue = js("(() => { for (const t of document.querySelector('video').textTracks) for (const c of (t.cues || [])) "
+                                  "if (c.text.includes('Hello')) return [c.startTime, c.endTime]; return []; })()").toArray();
+        QCOMPARE(cue.size(), 2);
+        QVERIFY2(std::fabs(cue[0].toDouble() - 0.4) < 0.05 && std::fabs(cue[1].toDouble() - 2.4) < 0.05,
+                 qPrintable(QString("%1 %2").arg(cue[0].toDouble()).arg(cue[1].toDouble())));
+        // The break's date range, as the player reads it, with both cues.
+        const QJsonObject range = js("r.ranges['break-1'] || {}").toObject();
+        QCOMPARE(range.value("start").toString(), QString("2026-11-01T10:00:05.000Z"));
+        scte35::Cue cueOut, cueIn;
+        QVERIFY(scte35::decode(scte35::fromHex(range.value("out").toString().toStdString()), cueOut, &err));
+        QVERIFY(scte35::decode(scte35::fromHex(range.value("back").toString().toStdString()), cueIn, &err));
+        QVERIFY(cueOut.outOfNetwork && !cueIn.outOfNetwork && cueOut.ptsTime == 450000 && cueIn.ptsTime == 630000);
+
+        // DASH: plays, switches rungs, and raises the SCTE 35 events at 5 s and 7 s.
+        QVERIFY(open());
+        QVERIFY(js("(async () => { await " + load.arg("/players/dash.all.min.js") + R"js(;
+            window.r = {error: '', events: [], qualities: 0, texts: 0};
+            const v = document.querySelector('video');
+            const p = dashjs.MediaPlayer().create();
+            window.p = p;
+            p.updateSettings({debug: {logLevel: 0}, streaming: {abr: {autoSwitchBitrate: {video: false}}}});
+            p.on(dashjs.MediaPlayer.events.ERROR, e => r.error = JSON.stringify(e.error && (e.error.message || e.error.code) || e));
+            p.on('urn:scte:scte35:2014:xml+bin', e => r.events.push([e.event.calculatedPresentationTime, e.event.id]), null,
+                 {mode: 'eventModeOnStart'});  // (dash.js's EVENT_MODE_ON_START)
+            p.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+                r.qualities = p.getBitrateInfoListFor('video').length;
+                r.texts = p.getTracksFor('text').length;
+            });
+            v.muted = true;
+            p.initialize(v, '/package/manifest.mpd', true);
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 1.5", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QCOMPARE(js("r.qualities").toInt(), 2);
+        QCOMPARE(js("r.texts").toInt(), 2);  // (WebVTT and IMSC)
+        for (int height : {108, 180}) {
+            js(QString("p.setQualityFor('video', p.getBitrateInfoListFor('video').findIndex(q => q.height === %1), true)").arg(height));
+            QVERIFY2(until(QString("r.error !== '' || document.querySelector('video').videoHeight === %1").arg(height), 30),
+                     qPrintable(js("JSON.stringify(r)").toString()));
+        }
+        QVERIFY2(until("r.events.length >= 2", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        const QJsonArray events = js("r.events").toArray();
+        QVERIFY(std::fabs(events[0].toArray()[0].toDouble() - 5) < 1e-6 && std::fabs(events[1].toArray()[0].toDouble() - 7) < 1e-6);
+        QCOMPARE(js("r.error").toString(), QString());
+#endif
+    }
+    void streamingSegmentsAndLadder() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 1, 0, 0, 0, 90));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0, 1, 0, 90, 140));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0, 0, 1, 230, 170));
+        // Every 4 s; the last part kept whole when it would be under a second.
+        QCOMPARE(streamingSegments(s, 0, 400, 4, false, {}), (std::vector<FrameTime>{0, 100, 200, 300}));
+        QCOMPARE(streamingSegments(s, 0, 410, 4, false, {}), (std::vector<FrameTime>{0, 100, 200, 300}));
+        // At the cuts nearest each 4 s (90 and 230), then every 4 s.
+        QCOMPARE(streamingSegments(s, 0, 400, 4, true, {}), (std::vector<FrameTime>{0, 90, 230, 330}));
+        // A split comes first; one just after a nominal end moves that end to it.
+        QCOMPARE(streamingSegments(s, 0, 400, 4, false, {150}), (std::vector<FrameTime>{0, 100, 150, 250, 350}));
+        QCOMPARE(streamingSegments(s, 0, 400, 4, false, {110}), (std::vector<FrameTime>{0, 110, 210, 310}));
+        // A split under a second before the end, after a segment moved late to a cut, still starts a segment.
+        {
+            Project q = makeDefaultProject();
+            Sequence& late = *q.active();
+            late.fps = {25, 1};
+            late.videoTracks[0].clips.push_back(colorClip(q, 1, 0, 0, 0, 345));
+            late.videoTracks[0].clips.push_back(colorClip(q, 0, 1, 0, 345, 20));
+            QCOMPARE(streamingSegments(late, 0, 365, 4, true, {360}), (std::vector<FrameTime>{0, 100, 200, 345, 360}));
+        }
+        // A range: times from its start.
+        QCOMPARE(streamingSegments(s, 100, 300, 4, true, {}), (std::vector<FrameTime>{0, 130}));
+        // Ladders: down to 360 lines, the picture's shape kept, HEVC cheaper than H.264.
+        const std::vector<StreamingRung> l = defaultLadder(1920, 1080);
+        QCOMPARE(l.size(), size_t(4));
+        QCOMPARE(l.back().width, 640);
+        QCOMPARE(l.back().height, 360);
+        QVERIFY(l[0].bitrate > l[1].bitrate && l[0].bitrate > 4000000 && l[0].bitrate < 7000000);
+        QVERIFY(defaultLadder(1920, 1080, "libx265")[0].bitrate < l[0].bitrate);
+        QCOMPARE(defaultLadder(1080, 1920)[0].width, 1080);
+        QCOMPARE(defaultLadder(1080, 1920)[1].width, 810);
+        // Codec names from configuration records.
+        QCOMPARE(streamingCodecName("h264", {1, 0x64, 0, 0x28}), std::string("avc1.640028"));
+        // (HEVC Main 10, level 4, tier main: the example in ISO/IEC 14496-15 Annex E is "hev1.2.4.L120.B0")
+        QCOMPARE(streamingCodecName("hevc", {1, 0x02, 0x20, 0, 0, 0, 0xb0, 0, 0, 0, 0, 0, 120}), std::string("hvc1.2.4.L120.B0"));
+        QCOMPARE(streamingCodecName("av1", {0x81, 0x08, 0x4c}), std::string("av01.0.08M.10"));
+        QCOMPARE(streamingCodecName("aac", {}, 1), std::string("mp4a.40.2"));
     }
     void cpuYcbcrMatchesTheScaler() {
         // The exact Y′CbCr conversion high-quality frames at their own size take (and the GPU's conversion matches)

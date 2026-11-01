@@ -275,6 +275,7 @@ struct Marker {
     std::string reviewStatusAt;  // when the note's status was last set (the later status wins on import)
     FrameTime drawingFrame() const { return drawnAt >= 0 ? drawnAt : t; }
     double sub = 0;  // between frames (0..1): it sits at t + sub (a sync point in the sound)
+    bool adBreak = false;  // an ad break (duration: the break's length; 0 a place for one): SCTE 35 cues in streaming packages
     bool operator==(const Marker&) const = default;
 };
 

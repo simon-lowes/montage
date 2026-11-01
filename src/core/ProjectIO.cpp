@@ -341,6 +341,7 @@ QJsonArray markersToJson(const std::vector<Marker>& markers) {
         QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
         if (mk.chapter) mo["chapter"] = true;
         if (mk.shotChange) mo["shot_change"] = true;
+        if (mk.adBreak) mo["ad_break"] = true;
         if (mk.sub != 0) mo["sub"] = mk.sub;
         if (!mk.drawing.empty()) mo["drawing"] = qs(mk.drawing);
         if (mk.drawnAt >= 0) mo["drawn_at"] = double(mk.drawnAt);
@@ -364,6 +365,7 @@ std::vector<Marker> markersFromJson(const QJsonValue& v) {
         mk.color = mo.value("color").toInt(0);
         mk.chapter = mo.value("chapter").toBool(false);
         mk.shotChange = mo.value("shot_change").toBool(false);
+        mk.adBreak = mo.value("ad_break").toBool(false);
         mk.drawing = ss(mo.value("drawing"));
         mk.drawnAt = mo.contains("drawn_at") ? i64(mo.value("drawn_at")) : -1;
         mk.reviewId = ss(mo.value("review_id"));

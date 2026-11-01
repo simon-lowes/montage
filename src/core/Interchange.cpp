@@ -162,6 +162,7 @@ QJsonObject otioMarker(const Marker& m, double rate) {
     // OTIO's colour names are coarser than Montage's labels: the label rides along in Montage's metadata.
     QJsonObject own;
     if (m.chapter) own["chapter"] = true;
+    if (m.adBreak) own["ad_break"] = true;
     if (m.color) own["color"] = m.color;
     QJsonObject meta;
     if (!own.isEmpty()) meta["montage"] = own;
