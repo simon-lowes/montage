@@ -105,6 +105,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
+#include "core/MidiMaps.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectMerge.h"
 #include "core/ScriptCut.h"
@@ -1097,6 +1098,109 @@ void McpServer::Impl::addTools() {
             const QString name = QString::fromStdString(productionName(folder.toStdString()));
             return ok(QStringLiteral("Production \"%1\": %2 project(s)%3").arg(name).arg(projects.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
                       QJsonObject{{"production", name}, {"folder", folder}, {"projects", projects}});
+        });
+
+    add("montage_midi_map", "MIDI controller maps",
+        "The maps MIDI Learn keeps for each MIDI controller (one JSON file per device, found again by its name when it is "
+        "plugged back in): `list` the devices with maps and the MIDI inputs plugged in now; `show` a device's mappings; "
+        "`map` a control onto a target (replacing that control's mapping for that panel); `unmap` it. Controls: "
+        "cc:<channel>:<n>, cc14:<channel>:<n> (the 14-bit pair n and n+32, n 0-31), note:<channel>:<n>, "
+        "nrpn:<channel>:<parameter> and rpn:<channel>:<parameter> (0-16383), bend:<channel>:0, program:<channel>:<n>, "
+        "channels counted from 1. Targets: command:<a menu command's id as Keyboard Shortcuts lists it, e.g. "
+        "Sequence/Add Marker>, widget:<panel>/<control name> (e.g. widget:inspector/param_3_opacity; add #x or #y for a "
+        "colour wheel's axis), strip:<n>:volume|pan|mute|solo (n from 1, counted from the bank's first track), "
+        "master:volume, bank:previous|next. Encodings: absolute (faders, knobs), button, and relative encoders: "
+        "twos-complement, sign-magnitude, offset-64. A running Montage uses the change at once.",
+        R"json({"type":"object","properties":{
+            "action":{"type":"string","enum":["list","show","map","unmap"],"default":"list"},
+            "device":{"type":"string","description":"The controller's MIDI input name"},
+            "control":{"type":"string","description":"e.g. cc:1:7"},
+            "target":{"type":"string"},
+            "encoding":{"type":"string","enum":["absolute","button","twos-complement","sign-magnitude","offset-64"]},
+            "panel":{"type":"string","description":"Only while this panel has focus (inspector, mixer, main...); default every panel"},
+            "low":{"type":"number","minimum":0,"maximum":1,"description":"The part of the target's range the control covers, from"},
+            "high":{"type":"number","minimum":0,"maximum":1,"description":"... to"},
+            "curve":{"type":"number","description":"Above 1 finer at the bottom of the travel"},
+            "invert":{"type":"boolean"},"toggle":{"type":"boolean","description":"Buttons: each press flips the target"},
+            "pickup":{"type":"boolean","description":"Soft takeover (default true)"},
+            "step":{"type":"number","description":"Relative encoders: the part of the range one step turns (default 1/128)"},
+            "bank_size":{"type":"integer","minimum":1,"maximum":64},
+            "folder":{"type":"string","description":"Where maps are kept (default Montage's own)"}}})json",
+        false, [](const QJsonObject& a) {
+            const QString action = str(a, "action", QStringLiteral("list"));
+            const QString dir = a.contains("folder") ? absolute(need(a, "folder")) : midimaps::folder();
+            if (action == QLatin1String("list")) {
+                QJsonArray devices, inputs;
+                for (const QString& d : midimaps::devices(dir)) devices.append(d);
+                for (const MidiPortInfo& p : midiInputs()) inputs.append(QString::fromStdString(p.name));
+                QStringList names;
+                for (const auto& d : devices) names << d.toString();
+                return ok(QStringLiteral("%1 map(s)%2; %3 MIDI input(s) plugged in")
+                              .arg(devices.size())
+                              .arg(names.isEmpty() ? QString() : QStringLiteral(": ") + names.join(QStringLiteral(", ")))
+                              .arg(inputs.size()),
+                          QJsonObject{{"folder", dir}, {"devices", devices}, {"inputs", inputs}});
+            }
+            const QString device = need(a, "device");
+            const QString file = midimaps::fileFor(dir, device);
+            midimaps::Map map;
+            map.device = device;
+            if (QFile::exists(file)) {
+                QString why;
+                if (!midimaps::load(file, map, &why)) return fail(why);
+                map.device = device;
+            }
+            auto describe = [&] {
+                QStringList lines;
+                for (const midimap::Mapping& m : map.mappings)
+                    lines << QStringLiteral("%1 → %2%3")
+                                 .arg(QString::fromStdString(midimap::keyName(m.key)), QString::fromStdString(m.target),
+                                      m.layer.empty() ? QString() : QStringLiteral(" (in %1)").arg(QString::fromStdString(m.layer)));
+                return lines;
+            };
+            auto saved = [&](const QString& what) {
+                QString why;
+                if (!midimaps::save(file, map, &why)) return fail(why);
+                const QStringList lines = describe();
+                return ok(QStringLiteral("%1. %2: %3 mapping(s)%4").arg(what, device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                          midimaps::toJson(map));
+            };
+            if (a.contains("bank_size")) map.bankSize = std::clamp(a.value("bank_size").toInt(8), 1, 64);
+            if (action == QLatin1String("show")) {
+                if (!QFile::exists(file)) return fail(QStringLiteral("no map for %1 (in %2)").arg(device, dir));
+                const QStringList lines = describe();
+                return ok(QStringLiteral("%1: %2 mapping(s)%3").arg(device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                          midimaps::toJson(map));
+            }
+            if (action == QLatin1String("map")) {
+                QJsonObject o{{"control", need(a, "control")}, {"target", need(a, "target")}};
+                for (const char* k : {"encoding", "low", "high", "curve", "invert", "toggle", "pickup", "step"})
+                    if (a.contains(k)) o[k] = a.value(k);
+                if (a.contains("panel")) o["layer"] = a.value("panel");
+                midimap::Mapping m;
+                QString why;
+                if (!midimaps::fromJson(o, m, &why)) return fail(why);
+                bool replaced = false;
+                for (midimap::Mapping& old : map.mappings)
+                    if (old.key == m.key && old.layer == m.layer) {
+                        old = m;
+                        replaced = true;
+                    }
+                if (!replaced) map.mappings.push_back(m);
+                return saved(QStringLiteral("%1 %2 → %3").arg(replaced ? QStringLiteral("Remapped") : QStringLiteral("Mapped"),
+                                                             QString::fromStdString(midimap::keyLabel(m.key)), QString::fromStdString(m.target)));
+            }
+            if (action == QLatin1String("unmap")) {
+                const auto key = midimap::keyFromName(need(a, "control").toStdString());
+                if (!key) return fail(QStringLiteral("unknown control \"%1\"").arg(str(a, "control")));
+                const std::string layer = str(a, "panel").toStdString();
+                const auto it = std::find_if(map.mappings.begin(), map.mappings.end(),
+                                             [&](const midimap::Mapping& m) { return m.key == *key && m.layer == layer; });
+                if (it == map.mappings.end()) return fail(QStringLiteral("%1 has no mapping for %2").arg(device, str(a, "control")));
+                map.mappings.erase(it);
+                return saved(QStringLiteral("Unmapped %1").arg(QString::fromStdString(midimap::keyLabel(*key))));
+            }
+            return fail(QStringLiteral("unknown action \"%1\" (list, show, map, unmap)").arg(action));
         });
 
     add("montage_import_from_project", "Bring sequences from another project",

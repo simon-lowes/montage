@@ -253,6 +253,7 @@
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
+#include "core/MidiMaps.h"
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
@@ -8653,6 +8654,56 @@ private slots:
         QDir(folder).removeRecursively();
     }
 
+    void mcpMidiMap() {
+        // MIDI Learn's maps edited over MCP: a mapping added, shown, replaced and removed, in the file the app reads.
+        QTemporaryDir dir;
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["folder"] = dir.path();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_midi_map"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc14:1:7"}, {"target", "strip:1:volume"},
+                              {"curve", 2}, {"bank_size", 4}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:1:16"}, {"target", "widget:inspector/param_3_opacity"},
+                  {"encoding", "offset-64"}, {"panel", "inspector"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "note:1:36"}, {"target", "command:Sequence/Add Marker"}})
+                     .value("isError").toBool());
+        // Refused: an unknown control, target or encoding.
+        QVERIFY(call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:17:1"}, {"target", "master:volume"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:1:1"}, {"target", "strip:0:volume"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:1:1"}, {"target", "master:volume"}, {"encoding", "spin"}})
+                    .value("isError").toBool());
+        // The file the app reads: found by the device's name.
+        midimaps::Map map;
+        QVERIFY(midimaps::load(midimaps::fileFor(dir.path(), "X-Touch Mini"), map));
+        QCOMPARE(map.device, QString("X-Touch Mini"));
+        QCOMPARE(map.bankSize, 4);
+        QCOMPARE(map.mappings.size(), size_t(3));
+        QVERIFY(map.mappings[0].key == (midimap::Key{midimap::Kind::Cc14, 0, 7}) && map.mappings[0].curve == 2 && map.mappings[0].pickup);
+        QVERIFY(map.mappings[1].encoding == midimap::Encoding::Offset64 && map.mappings[1].layer == "inspector");
+        QVERIFY(map.mappings[2].encoding == midimap::Encoding::Button && map.mappings[2].target == "command:Sequence/Add Marker");
+        r = call({{"action", "show"}, {"device", "X-Touch Mini"}});
+        QVERIFY(r.value("content").toArray()[0].toObject().value("text").toString().contains("cc14:1:7 → strip:1:volume"));
+        r = call({{"action", "list"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("devices").toArray(), QJsonArray{"X-Touch Mini"});
+        // Replaced for the same control (and panel), then removed.
+        QVERIFY(!call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc14:1:7"}, {"target", "master:volume"}, {"pickup", false}})
+                     .value("isError").toBool());
+        QVERIFY(!call({{"action", "unmap"}, {"device", "X-Touch Mini"}, {"control", "cc:1:16"}, {"panel", "inspector"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "unmap"}, {"device", "X-Touch Mini"}, {"control", "cc:1:16"}}).value("isError").toBool());
+        QVERIFY(midimaps::load(midimaps::fileFor(dir.path(), "X-Touch Mini"), map));
+        QCOMPARE(map.mappings.size(), size_t(2));
+        QVERIFY(map.mappings[0].target == "master:volume" && !map.mappings[0].pickup);
+        QVERIFY(call({{"action", "show"}, {"device", "Nobody"}}).value("isError").toBool());
+    }
     void mcpTransitionsOnClips() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

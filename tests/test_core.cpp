@@ -3,7 +3,10 @@
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QImage>
+#include <cmath>
+#include <map>
 #include <set>
+#include <tuple>
 #include <random>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -85,6 +88,7 @@
 #include "control/Hid.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
+#include "control/MidiMap.h"
 #include "render/Titles.h"
 
 using namespace montage;
@@ -1554,6 +1558,292 @@ private slots:
         QVERIFY(mcu::faderDb(mcu::faderValue(-6) + 100) > -6);
     }
 
+    void midiLearnMapping() {
+        using namespace montage::midimap;
+        // ---- Decoding: synthetic byte streams through MidiParser and the decoder.
+        Decoder decoder;
+        auto decode = [&](const std::vector<uint8_t>& bytes) {
+            std::vector<Event> events;
+            MidiParser parser;
+            parser.feed(bytes.data(), bytes.size(), [&](const MidiMessage& m) {
+                decoder.feed(m, [&](const Event& e) { events.push_back(e); });
+            });
+            return events;
+        };
+        auto events = decode({0x99, 36, 100, 0x89, 36, 0x40, 0xC2, 5, 0xE0, 0x7F, 0x7F, 0xF8});
+        QCOMPARE(events.size(), size_t(4));
+        QVERIFY(events[0].key == (Key{Kind::Note, 9, 36}) && events[0].value == 100);
+        QVERIFY(events[1].key == (Key{Kind::Note, 9, 36}) && events[1].value == 0);
+        QVERIFY(events[2].key == (Key{Kind::Program, 2, 5}));
+        QVERIFY(events[3].key == (Key{Kind::PitchBend, 0, 0}) && events[3].value == 16383 && events[3].position() == 1.0);
+        // Every controller reads as 7-bit; one followed straight away by its partner (n + 32) is a 14-bit pair too,
+        // reported on the fine half.
+        decoder.reset();
+        events = decode({0xB0, 7, 64, 0xB0, 39, 1, 0xB0, 7, 65, 0xB0, 39, 2, 0xB0, 20, 3});
+        QCOMPARE(events.size(), size_t(7));
+        QVERIFY(events[0].key == (Key{Kind::Cc, 0, 7}) && events[0].value == 64 && events[0].resolution == 128);
+        QVERIFY(events[1].key == (Key{Kind::Cc, 0, 39}) && events[1].value == 1);
+        QVERIFY(events[2].key == (Key{Kind::Cc14, 0, 7}) && events[2].value == (64 << 7 | 1) && events[2].resolution == 16384);
+        QVERIFY(events[5].key == (Key{Kind::Cc14, 0, 7}) && events[5].value == (65 << 7 | 2));
+        QVERIFY(events[6].key == (Key{Kind::Cc, 0, 20}) && events[6].value == 3);
+        // A fader on CC 0 and a button on CC 32 (as a nanoKONTROL2 has): the button's press, even straight after the
+        // fader, leaves both working as 7-bit controllers; only a fine half arriving alone after a real pair has been
+        // seen a few times counts as one.
+        decoder.reset();
+        events = decode({0xB0, 0, 10, 0xB0, 32, 127, 0xB0, 0, 11, 0xB0, 16, 1, 0xB0, 32, 0});
+        QCOMPARE(std::count_if(events.begin(), events.end(), [](const Event& e) { return e.key.kind == Kind::Cc; }), 5);
+        QVERIFY(events.back().key == (Key{Kind::Cc, 0, 32}) && events.back().value == 0);
+        decoder.reset();
+        events = decode({0xB0, 7, 1, 0xB0, 39, 1, 0xB0, 7, 1, 0xB0, 39, 2, 0xB0, 7, 1, 0xB0, 39, 3, 0xB0, 7, 1, 0xB0, 39, 4, 0xB0, 39, 5});
+        QVERIFY(events.back().key == (Key{Kind::Cc14, 0, 7}) && events.back().value == (1 << 7 | 5));
+        // NRPN 3:4 sending both halves, RPN 0:0 only the coarse one, then data entry with no parameter chosen.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 6, 10, 0xB1, 38, 20, 0xB1, 6, 11, 0xB1, 38, 21, 0xB1, 101, 0,
+                         0xB1, 100, 0, 0xB1, 6, 2, 0xB1, 101, 127, 0xB1, 100, 127, 0xB1, 6, 9});
+        QCOMPARE(events.size(), size_t(5));
+        const Key nrpn{Kind::Nrpn, 1, 3 << 7 | 4};
+        QVERIFY(events[0].key == nrpn && events[0].value == 10 && events[0].resolution == 128);
+        QVERIFY(events[1].key == nrpn && events[1].value == (10 << 7 | 20) && events[1].resolution == 16384);
+        QVERIFY(events[2].key == nrpn && events[2].value == (11 << 7 | 21));
+        QVERIFY(events[3].key == (Key{Kind::Rpn, 1, 0}) && events[3].value == 2);
+        QVERIFY(events[4].key == (Key{Kind::Cc, 1, 6}) && events[4].value == 9);
+
+        // ---- Names, as maps are saved.
+        QCOMPARE(keyName(nrpn), std::string("nrpn:2:388"));
+        QVERIFY(keyFromName("nrpn:2:388") == nrpn);
+        QVERIFY(keyFromName("cc14:1:7") == (Key{Kind::Cc14, 0, 7}));
+        QVERIFY(!keyFromName("cc:17:1") && !keyFromName("cc:1:128") && !keyFromName("cc14:1:32") && !keyFromName("knob:1:1"));
+        QCOMPARE(keyLabel({Kind::Note, 9, 60}), std::string("Note C4 (ch 10)"));
+        QCOMPARE(encodingFromName(encodingName(Encoding::SignMagnitude)), std::optional<Encoding>(Encoding::SignMagnitude));
+
+        // ---- Learning: which control, and how it encodes.
+        auto cc = [](int n, int v) { return Event{{Kind::Cc, 0, n}, v, 128}; };
+        auto learn = [&](const std::vector<int>& values) {
+            Learner l;
+            for (int v : values) l.add(cc(16, v));
+            return l.finish()->encoding;
+        };
+        QCOMPARE(learn({30, 31, 32, 33, 34, 35}), Encoding::Absolute);          // a fader sweeping
+        QCOMPARE(learn({1, 2, 3, 4, 5, 6}), Encoding::Absolute);                // ... even through an encoder's band
+        QCOMPARE(learn({1, 1, 2, 127, 127}), Encoding::TwosComplement);
+        QCOMPARE(learn({1, 1, 65, 66}), Encoding::SignMagnitude);
+        QCOMPARE(learn({65, 65, 63, 62}), Encoding::Offset64);
+        QCOMPARE(learn({65, 65, 66}), Encoding::Offset64);
+        QCOMPARE(learn({127, 0}), Encoding::Button);
+        QCOMPARE(learn({127}), Encoding::Button);                        // a button that sends no release
+        QCOMPARE(learn({127, 127, 127}), Encoding::TwosComplement);      // an encoder turned down slowly
+        QCOMPARE(learn({10, 64, 64}), Encoding::Absolute);
+        QCOMPARE(relativeSteps(Encoding::TwosComplement, 125), -3);
+        QCOMPARE(relativeSteps(Encoding::SignMagnitude, 67), -3);
+        QCOMPARE(relativeSteps(Encoding::Offset64, 61), -3);
+        QCOMPARE(relativeSteps(Encoding::TwosComplement, 67), -3);  // a sign-and-magnitude encoder learnt turning up
+        {
+            Learner l;
+            l.add({{Kind::Note, 0, 40}, 0, 128});  // a note let go from before
+            QVERIFY(!l.ready());
+            l.add(cc(7, 64));
+            QVERIFY(!l.ready());
+            l.add({{Kind::Cc14, 0, 7}, 64 << 7, 16384});  // the controller is a 14-bit pair
+            l.add(cc(8, 3));                               // another control: ignored
+            QVERIFY(l.ready());
+            const auto got = l.finish();
+            QVERIFY(got && got->key == (Key{Kind::Cc14, 0, 7}) && got->encoding == Encoding::Absolute);
+            QVERIFY(l.empty() && !l.finish());
+            l.add({{Kind::Note, 9, 36}, 90, 128});
+            QVERIFY(l.ready() && l.finish()->encoding == Encoding::Button);
+        }
+
+        // ---- Mapping: resolution. A 14-bit fader, byte by byte, gives the target 16,384 distinct values; 7-bit 128.
+        std::map<std::string, double> values;
+        std::vector<Change> changes;
+        Targets targets{[&](const Mapping& m) { return values.count(m.target) ? values[m.target] : std::nan(""); },
+                        [&](const Mapping& m, const Change& c) {
+                            values[m.target] = c.value;
+                            changes.push_back(c);
+                        }};
+        Mapper mapper;
+        Mapping fader;
+        fader.key = {Kind::Cc14, 0, 7};
+        fader.target = "fine";
+        fader.pickup = false;
+        mapper.map(fader);
+        values["fine"] = 0;
+        decoder.reset();
+        std::set<double> seen;
+        for (int v = 0; v < 16384; ++v) {
+            const std::vector<uint8_t> bytes{0xB0, 7, uint8_t(v >> 7), 0xB0, 39, uint8_t(v & 127)};
+            for (const Event& e : decode(bytes)) mapper.handle(e, targets);
+            seen.insert(values["fine"]);
+        }
+        QCOMPARE(seen.size(), size_t(16384));
+        QCOMPARE(values["fine"], 1.0);
+        Mapping coarse = fader;
+        coarse.key = {Kind::Cc, 0, 1};
+        coarse.target = "coarse";
+        mapper.map(coarse);
+        seen.clear();
+        for (int v = 0; v < 128; ++v) {
+            mapper.handle(cc(1, v), targets);
+            seen.insert(values["coarse"]);
+        }
+        QCOMPARE(seen.size(), size_t(128));
+
+        // Range, curve and inversion, and back again.
+        Mapping shaped;
+        shaped.low = 0.2;
+        shaped.high = 0.6;
+        shaped.curve = 2;
+        shaped.invert = true;
+        QCOMPARE(Mapper::toTarget(shaped, 0), 0.6);
+        QCOMPARE(Mapper::toTarget(shaped, 1), 0.2);
+        QVERIFY(std::fabs(Mapper::toTarget(shaped, 0.5) - 0.3) < 1e-12);
+        QVERIFY(std::fabs(Mapper::toPosition(shaped, 0.3) - 0.5) < 1e-12);
+
+        // Relative encoders, in each encoding, turn by ±n steps (and stop at the ends).
+        for (auto [encoding, upValue, downValue] : {std::tuple{Encoding::TwosComplement, 3, 125},
+                                                    std::tuple{Encoding::SignMagnitude, 3, 67},
+                                                    std::tuple{Encoding::Offset64, 67, 61}}) {
+            Mapper m;
+            Mapping knob;
+            knob.key = {Kind::Cc, 0, 21};
+            knob.encoding = encoding;
+            knob.target = "knob";
+            m.map(knob);
+            values["knob"] = 0.5;
+            m.handle(cc(21, upValue), targets);
+            QVERIFY(std::fabs(values["knob"] - (0.5 + 3.0 / 128)) < 1e-12);
+            m.handle(cc(21, downValue), targets);
+            m.handle(cc(21, downValue), targets);
+            QVERIFY(std::fabs(values["knob"] - (0.5 - 3.0 / 128)) < 1e-12);
+            values["knob"] = 0.99;
+            m.handle(cc(21, upValue), targets);
+            QCOMPARE(values["knob"], 1.0);
+        }
+
+        // Soft takeover: a fader is ignored until it reaches (or crosses) the target's value, and again after the
+        // target moves some other way.
+        {
+            Mapper m;
+            Mapping f;
+            f.key = {Kind::Cc, 0, 30};
+            f.target = "level";
+            m.map(f);
+            values["level"] = 0.5;
+            m.handle(cc(30, 10), targets);
+            m.handle(cc(30, 20), targets);
+            QCOMPARE(values["level"], 0.5);
+            QVERIFY(m.waiting(0));
+            m.handle(cc(30, 70), targets);  // crossed 0.5 (63.5) on the way
+            QCOMPARE(values["level"], 70 / 127.0);
+            QVERIFY(!m.waiting(0));
+            m.handle(cc(30, 80), targets);
+            QCOMPARE(values["level"], 80 / 127.0);
+            values["level"] = 0.1;  // the mouse
+            m.handle(cc(30, 81), targets);
+            QCOMPARE(values["level"], 0.1);
+            m.handle(cc(30, 5), targets);
+            QCOMPARE(values["level"], 5 / 127.0);
+            Mapping jump = m.mappings()[0];
+            jump.pickup = false;
+            m.setMappingOptions(0, jump);
+            values["level"] = 0.9;
+            m.handle(cc(30, 6), targets);
+            QCOMPARE(values["level"], 6 / 127.0);
+        }
+
+        // Buttons: momentary (on while held) and toggles; edges for commands.
+        {
+            Mapper m;
+            Mapping b;
+            b.key = {Kind::Note, 0, 36};
+            b.encoding = Encoding::Button;
+            b.target = "button";
+            m.map(b);
+            values["button"] = 0;
+            changes.clear();
+            m.handle({b.key, 100, 128}, targets);
+            QVERIFY(values["button"] == 1 && changes.back().edge == Change::Press);
+            m.handle({b.key, 0, 128}, targets);
+            QVERIFY(values["button"] == 0 && changes.back().edge == Change::Release);
+            Mapping toggle = m.mappings()[0];
+            toggle.toggle = true;
+            m.setMappingOptions(0, toggle);
+            changes.clear();
+            m.handle({b.key, 100, 128}, targets);
+            m.handle({b.key, 0, 128}, targets);
+            QVERIFY(values["button"] == 1 && changes.size() == 1);
+            m.handle({b.key, 100, 128}, targets);
+            m.handle({b.key, 0, 128}, targets);
+            QVERIFY(values["button"] == 0 && changes.size() == 2);
+        }
+
+        // Feedback: what changed is sent, once; a fader's own moves are not echoed back; encoders' rings are.
+        {
+            Mapper m;
+            Mapping f;
+            f.key = {Kind::Cc, 0, 7};
+            f.target = "fb";
+            f.pickup = false;
+            Mapping ring = f;
+            ring.key = {Kind::Cc, 0, 16};
+            ring.encoding = Encoding::Offset64;
+            ring.target = "ring";
+            Mapping light;
+            light.key = {Kind::Note, 0, 36};
+            light.encoding = Encoding::Button;
+            light.target = "light";
+            m.map(f);
+            m.map(ring);
+            m.map(light);
+            values["fb"] = 0.5;
+            values["ring"] = 0;
+            values["light"] = 1;
+            auto get = targets.get;
+            QCOMPARE(m.refresh(get), (std::vector<MidiMessage>{{0xB0, 7, 64}, {0xB0, 16, 0}, {0x90, 36, 127}}));
+            QVERIFY(m.refresh(get).empty());
+            values["fb"] = 1;
+            QCOMPARE(m.refresh(get), (std::vector<MidiMessage>{{0xB0, 7, 127}}));
+            m.handle(cc(7, 40), targets);
+            QVERIFY(m.refresh(get).empty());
+            m.handle(cc(16, 66), targets);
+            QCOMPARE(m.refresh(get), (std::vector<MidiMessage>{{0xB0, 16, 2}}));
+            m.reshow();
+            QCOMPARE(m.refresh(get).size(), size_t(3));
+            Mapping wide;
+            wide.key = {Kind::Cc14, 2, 1};
+            QCOMPARE(Mapper::feedback(wide, 1.0), (std::vector<MidiMessage>{{0xB2, 1, 127}, {0xB2, 33, 127}}));
+            wide.key = nrpn;
+            QCOMPARE(Mapper::feedback(wide, 0.0),
+                     (std::vector<MidiMessage>{{0xB1, 99, 3}, {0xB1, 98, 4}, {0xB1, 6, 0}, {0xB1, 38, 0}}));
+            wide.key = {Kind::PitchBend, 0, 0};
+            QCOMPARE(Mapper::feedback(wide, 1.0), (std::vector<MidiMessage>{{0xE0, 127, 127}}));
+        }
+
+        // Layers: a mapping for the focused panel takes over the control's mapping for every panel.
+        {
+            Mapper m;
+            Mapping all;
+            all.key = {Kind::Cc, 0, 50};
+            all.target = "everywhere";
+            all.pickup = false;
+            Mapping colour = all;
+            colour.layer = "color";
+            colour.target = "colour";
+            m.map(all);
+            m.map(colour);
+            values["everywhere"] = values["colour"] = 0;
+            m.handle(cc(50, 127), targets);
+            QVERIFY(values["everywhere"] == 1 && values["colour"] == 0);
+            m.setLayer("color");
+            m.handle(cc(50, 0), targets);
+            QVERIFY(values["everywhere"] == 1 && values["colour"] == 0 && !m.active(0) && m.active(1));
+            m.setLayer("timeline");
+            m.handle(cc(50, 0), targets);
+            QVERIFY(values["everywhere"] == 0);
+            m.unmap(all.key, "");
+            QCOMPARE(m.mappings().size(), size_t(1));
+        }
+    }
     void oscMessages() {
         using osc::Message;
         // A message with no arguments: the address and an empty type tag string, each padded to four bytes.

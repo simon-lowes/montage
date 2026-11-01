@@ -168,6 +168,7 @@ extern "C" {
 #include "RenderQueuePanel.h"
 #include "MixerPanel.h"
 #include "ControlSurface.h"
+#include "MidiLearn.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
 #include "TangentControl.h"
@@ -540,6 +541,9 @@ void MainWindow::buildPanels() {
     connect(program_, &PlaybackController::audioLevels, surface_, &ControlSurface::setLevels);
     // OSC (Bitfocus Companion's Stream Deck and Loupedeck buttons, TouchOSC, lighting desks) works them too.
     osc_ = new OscControl(state_, mixer_, program_, liveLink_, this, this);
+    // Any MIDI controller, its knobs, faders and buttons mapped by MIDI Learn.
+    midiLearn_ = new MidiLearn(state_, mixer_, this, this);
+    QTimer::singleShot(0, midiLearn_, [this] { midiLearn_->restore(); });
     const std::pair<const char*, std::function<void()>> transportCommands[] = {
         {"marker", [this] { addMarker(); }},
         {"save", [this] { save(); }},
@@ -1545,6 +1549,21 @@ void MainWindow::buildMenus() {
     }
     editM->addSeparator();
     add(editM, QT_TR_NOOP("Control &Surface…"), QKeySequence(), [this] { controlSurfaceDialog(); })->setObjectName(QStringLiteral("controlSurface"));
+    {
+        // MIDI Learn: on, a control moved and a parameter clicked are mapped together.
+        QAction* learn = add(editM, QT_TR_NOOP("MIDI &Learn"), QKeySequence(), [this](bool on) {
+            midiLearn_->setLearning(on);
+            if (on && !midiLearn_->isConnected()) midiLearn_->openDialog(this);
+        });
+        learn->setObjectName(QStringLiteral("midiLearn"));
+        learn->setCheckable(true);
+        connect(midiLearn_, &MidiLearn::learningChanged, learn, [learn](bool on) {
+            const QSignalBlocker block(learn);
+            learn->setChecked(on);
+        });
+        add(editM, QT_TR_NOOP("MIDI &Map…"), QKeySequence(), [this] { midiLearn_->openDialog(this); })
+            ->setObjectName(QStringLiteral("midiMap"));
+    }
 
     // ---- Clip
     QMenu* clipM = menuIn(menuBar(), QT_TR_NOOP("&Clip"));

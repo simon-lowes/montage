@@ -76,6 +76,7 @@ class TrimPanel;
 class ScopesWidget;
 class MixerPanel;
 class ControlSurface;
+class MidiLearn;
 class CaptionsPanel;
 class TranscriptPanel;
 class ShotSearchPanel;
@@ -254,6 +255,7 @@ public:
     // Edit > Control Surface: the Mackie Control surface's MIDI ports (one dialog, shown and returned).
     QDialog* controlSurfaceDialog();
     ControlSurface* controlSurface() const { return surface_; }
+    MidiLearn* midiLearn() const { return midiLearn_; }
     OscControl* oscControl() const { return osc_; }
     // The Speed Editor's keys (from Edit > Control Surface): what each does, any menu command.
     QDialog* speedEditorKeysDialog(QWidget* parent = nullptr);
@@ -657,6 +659,7 @@ private:
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;
+    MidiLearn* midiLearn_ = nullptr;
     SpeedEditorControl* speedEditor_ = nullptr;
     TangentControl* tangent_ = nullptr;
     CaptureDialog* capture_ = nullptr;
