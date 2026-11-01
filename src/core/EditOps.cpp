@@ -17,6 +17,7 @@
 #include "CompositeGraph.h"
 #include "Effects.h"
 #include "GradeGraph.h"
+#include "render/Ofx.h"
 
 namespace montage::edit {
 
@@ -1616,10 +1617,19 @@ Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::s
     std::string ty = type;
     const EffectInfo* info = findEffectInfo(ty);
     bool audio = loc->track.kind == TrackKind::Audio;
-    if (audio && (!info || info->category != EffectCategory::AudioTransition)) ty = "crossfade";
-    if (!audio && (!info || info->category != EffectCategory::VideoTransition)) ty = "cross_dissolve";
-    tr.type = ty;
-    tr.params = makeEffect(ty, p.newId());
+    if (!audio && ofx::isOfxType(ty)) {
+        // An OpenFX transition plug-in (render/Ofx.h): type "ofx", its plug-in and settings in its parameters.
+        ofx::PluginDesc d;
+        if (!ofx::Registry::instance().find(ty.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d) || !d.transition())
+            return Result::fail("That OpenFX plug-in is not an installed transition");
+        tr.type = "ofx";
+        tr.params = ofx::makeEffect(p, d);
+    } else {
+        if (audio && (!info || info->category != EffectCategory::AudioTransition)) ty = "crossfade";
+        if (!audio && (!info || info->category != EffectCategory::VideoTransition)) ty = "cross_dissolve";
+        tr.type = ty;
+        tr.params = makeEffect(ty, p.newId());
+    }
     if (edge == Edge::Out) {
         tr.clipA = c.id;
         if (loc->index + 1 < t->clips.size() && t->clips[loc->index + 1].start == c.end())
@@ -2151,6 +2161,9 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     std::map<std::string, std::string> tracks;
     for (size_t k = 0; k < s.audioTracks.size() && k < src->audioTracks.size(); ++k)
         tracks[std::to_string(src->audioTracks[k].id)] = std::to_string(s.audioTracks[k].id);
+    std::map<std::string, std::string> videoTracks;
+    for (size_t k = 0; k < s.videoTracks.size() && k < src->videoTracks.size(); ++k)
+        videoTracks[std::to_string(src->videoTracks[k].id)] = std::to_string(s.videoTracks[k].id);
     auto retarget = [&](Effect& e) {
         const EffectInfo* info = e.type.empty() ? nullptr : findEffectInfo(e.type);
         if (!info) return;
@@ -2164,6 +2177,13 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
             const auto to = tracks.find(it->second);
             it->second = to == tracks.end() ? std::string() : to->second;
         }
+        // An OpenFX plugin's input on a video track follows it too.
+        if (e.type == "ofx")
+            for (auto& [k, v] : e.strings)
+                if (k.rfind("input.", 0) == 0 && v.rfind("track:", 0) == 0) {
+                    const auto to = videoTracks.find(v.substr(6));
+                    v = to == videoTracks.end() ? std::string() : "track:" + to->second;
+                }
     };
     for (Bus& b : s.buses)
         for (Effect& e : b.effects) retarget(e);

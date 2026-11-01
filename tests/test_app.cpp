@@ -12425,7 +12425,7 @@ const auto seq = [this] { return state()->sequence(); };
         reg.setCachePath(dir_.filePath("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
-        QCOMPARE(reg.scan(), 4);
+        QCOMPARE(reg.scan(), 7);
         auto* browser = win_->findChild<EffectsBrowser*>();
         QVERIFY(browser);
         browser->reload();
@@ -12456,6 +12456,70 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_VERIFY(titled());
         state()->undo();
         QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty());
+        // Transitions and generators are listed as such.
+        bool transition = false, generator = false;
+        for (QTreeWidgetItemIterator it(tree); *it; ++it) {
+            const QString type = (*it)->data(0, Qt::UserRole).toString();
+            transition |= type == "ofx:org.montage.test.dissolve/1";
+            generator |= type == "ofx:org.montage.test.generator/1";
+        }
+        QVERIFY(transition && generator);
+        // A General plug-in's matte input, connected in the Inspector to another video track.
+        emit browser->applyRequested("ofx:org.montage.test.matte/1", EffectCategory::VideoFilter);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects.size(), size_t(1));
+        QComboBox* input = nullptr;
+        QTRY_VERIFY((input = win_->findChild<QComboBox*>(QStringLiteral("input_Matte"))) != nullptr);
+        QVERIFY(input->findData(QStringLiteral("mask")) >= 0);
+        const Id v2 = state()->sequence()->videoTracks.at(1).id;
+        const int pick = input->findData(QStringLiteral("track:%1").arg(v2));
+        QVERIFY(pick >= 0);
+        QVERIFY(input->findData(QStringLiteral("track:%1").arg(state()->sequence()->videoTracks[0].id)) < 0);  // (not its own)
+        input->setCurrentIndex(pick);
+        emit input->activated(pick);
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->effects[0].s("input.Matte"), "track:" + std::to_string(v2));
+        state()->undo();
+        state()->undo();
+        // The probe's on-screen control on the Program monitor: a drag on its square keys Centre at the playhead, one
+        // undo step.
+        Id probeId = 0;
+        QVERIFY(state()->edit("Probe", [&](Project& p, Sequence& s) {
+            ofx::PluginDesc d;
+            if (!reg.find("org.montage.test.probe/1", d)) return false;
+            Effect e = ofx::makeEffect(p, d);
+            e.params["param.centre.x"].addKey(0, 0.5);
+            e.params["param.centre.y"].addKey(0, 0.25);
+            probeId = e.id;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(10);
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        const auto centre = [&] { return edit::clipById(*state()->sequence(), clip)->effects.at(0).params; };
+        const size_t steps = state()->history().undoCount();
+        // (Centre (0.5, 0.25) from the bottom is three quarters of the way down the picture)
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.75));
+        QTest::mouseMove(viewer, at(0.55, 0.6));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.6, 0.5));
+        QCOMPARE(state()->history().undoCount(), steps + 1);
+        QCOMPARE(state()->undoText(), QString("Adjust Test Probe"));
+        QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(2));
+        const double px = 2.0 / r.width();
+        QVERIFY2(std::fabs(centre().at("param.centre.x").at(10) - 0.6) < px, qPrintable(QString::number(centre().at("param.centre.x").at(10))));
+        QVERIFY(std::fabs(centre().at("param.centre.y").at(10) - 0.5) < px * 2);
+        state()->undo();
+        QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
+        QCOMPARE(centre().at("param.centre.x").at(10), 0.5);
+        // A press away from the square is left to the monitor (no step).
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.1, 0.1));
+        QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
         state()->newProject();
     }
 

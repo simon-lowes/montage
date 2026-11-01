@@ -153,6 +153,10 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
     } else if (g.type == "particles") {
         // (Clips draw it through clipSource, which knows the sequence's size.)
         return renderParticles(g, t, w, h, std::max(1, int(std::lround(w / scale))), std::max(1, int(std::lround(h / scale))), fps);
+    } else if (g.type == "ofx") {
+        // An OpenFX generator plug-in (render/Ofx.h); nothing when it fails.
+        Image made;
+        if (ofx::renderGenerator(g, double(t), w, h, scale, made, nullptr, &currentWorkingSpace()) && made.width == w && made.height == h) return made;
     }
     // (OGraf graphics are drawn by clipLayer: they need the sequence's size.)
     return img;
@@ -737,6 +741,7 @@ struct ClipSource {
     std::string sourcePath;     // the video file, for its analysed depth (media/VideoDepth.h); "" for any other picture
     std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
+    ofx::InputResolver ofxInputs;  // the pictures OpenFX plugins' further inputs are connected to
     bool displayReferred = false;  // graded scene-referred, it came in through the inverse output transform
 };
 
@@ -837,9 +842,35 @@ std::function<Image(int)> modelLightLayer(const Project& p, const Sequence& seq,
     };
 }
 
+// The picture an OpenFX plugin's further input on clip `c` is connected to (render/Ofx.h) at clip frame `at`, on the canvas.
+bool ofxInputPicture(const Project& p, const Sequence& seq, const Clip& c, const RenderOptions& o, const std::string& connection, double at,
+                     Image& pic);  // (below)
+
+// The track an OpenFX plugin's input names ("track:<id>"), or -1.
+int ofxInputTrack(const Sequence& seq, const std::string& connection) {
+    if (connection.rfind("track:", 0) != 0) return -1;
+    const Id id = Id(std::strtoull(connection.c_str() + 6, nullptr, 10));
+    for (size_t m = 0; m < seq.videoTracks.size(); ++m)
+        if (seq.videoTracks[m].id == id) return int(m);
+    return -1;
+}
+
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
                 bool deferFrame, ClipSource& out) {
+    // (for OpenFX plugins whose further inputs are connected: the pictures there, made on demand)
+    for (const Effect& e : c.effects) {
+        if (!e.enabled || e.type != "ofx") continue;
+        const bool connected = std::any_of(e.strings.begin(), e.strings.end(), [](const auto& kv) {
+            return kv.first.rfind("input.", 0) == 0 && !kv.second.empty() && kv.second != "mask";
+        });
+        if (connected) {
+            out.ofxInputs = [&p, &seq, &c, &o](const std::string& connection, double at, Image& pic) {
+                return ofxInputPicture(p, seq, c, o, connection, at, pic);
+            };
+            break;
+        }
+    }
     // Stop Motion: the clip steps, each frame held for a few.
     for (const Effect& e : c.effects)
         if (e.enabled && e.type == "stop_motion") {
@@ -1406,6 +1437,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     SurfaceScope surfaceScope(std::move(surface));
     SlowEffectsScope slowScope({o.highQuality || o.slowEffects, o.cancel, o.issues});
     ofx::FetchScope fetchScope(ofxFetch);
+    ofx::InputScope inputScope(cs.ofxInputs);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
     // (Its colour group's, and its own and its shared nodes' that take part.)
     std::vector<const Effect*> redactions;
@@ -1635,6 +1667,12 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             // A Keyer's clean plate.
             if (const int m = cleanPlateTrack(seq, *c, t, true); m >= 0) hidden[size_t(m)] = true;
+            // A track an OpenFX plugin takes as an input (a matte, a second picture), as a track matte's is.
+            for (const Effect& e : c->effects)
+                if (e.enabled && e.type == "ofx")
+                    for (const auto& [key, value] : e.strings)
+                        if (key.rfind("input.", 0) == 0)
+                            if (const int m = ofxInputTrack(seq, value); m >= 0 && m != int(ti)) hidden[size_t(m)] = true;
             // A depth map made into depth, and a deep holdout, when they are to be hidden.
             if (const Effect* e = enabledEffect(seq, *c, "make_deep"); e && std::lround(e->p("source", t - c->start, 0)) == 0 &&
                                                                      e->p("hide", t - c->start, 1) > 0.5)
@@ -1702,9 +1740,10 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
     Image la = (A && A->enabled) ? layerOf(*A, t) : Image();
     Image lb = (B && B->enabled) ? layerOf(*B, t) : Image();
     const SceneGrading* sg = currentSceneGrading();
-    if (!sg || !shown) return transitionMix(tr.type, tr.params, la, lb, u, W, H);
+    const double at = double(t - from), scale = double(W) / std::max(1, seq.width);  // (an OpenFX transition's frame and scale)
+    if (!sg || !shown) return transitionMix(tr.type, tr.params, la, lb, u, W, H, at, scale);
     for (Image* l : {&la, &lb}) outputTransform(*l, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
-    Image mix = transitionMix(tr.type, tr.params, la, lb, u, W, H);
+    Image mix = transitionMix(tr.type, tr.params, la, lb, u, W, H, at, scale);
     inverseOutputTransform(mix, *sg->display, *sg->linear, sg->peakNits, sg->kind);
     if (displayReferred) *displayReferred = true;
     return mix;
@@ -1734,6 +1773,45 @@ Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t,
         return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H, {}, displayReferred);
     if (const Clip* c = clipAt(track, t)) return clipLayer(p, seq, *c, t, o, nullptr, displayReferred);
     return {};
+}
+
+namespace {
+thread_local int tOfxInputDepth = 0;
+}
+
+bool ofxInputPicture(const Project& p, const Sequence& seq, const Clip& c, const RenderOptions& o, const std::string& connection, double at,
+                     Image& pic) {
+    // (an input whose picture runs a plug-in connected back here ends after a step)
+    if (tOfxInputDepth >= 2) return false;
+    struct Depth {
+        Depth() { ++tOfxInputDepth; }
+        ~Depth() { --tOfxInputDepth; }
+    } depth;
+    const FrameTime t = c.start + FrameTime(std::floor(at + 1e-6));
+    const int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
+    if (const int m = ofxInputTrack(seq, connection); m >= 0) {
+        // What the track shows (not the clip's own track).
+        const auto own = edit::locate(seq, c.id);
+        if (own && own->track.kind == TrackKind::Video && own->track.index == m) return false;
+        pic = trackPicture(p, seq, size_t(m), t, o, W, H);
+        return !pic.empty();
+    }
+    if (connection.rfind("media:", 0) == 0) {
+        // A bin item, placed as a new clip would be over this clip's span.
+        const Id id = Id(std::strtoull(connection.c_str() + 6, nullptr, 10));
+        const MediaItem* m = p.findMedia(id);
+        if (!m) return false;
+        Clip tc;
+        tc.mediaId = id;
+        tc.start = c.start;
+        tc.duration = c.duration;
+        tc.motion = makeEffect("transform", 0);
+        tc.timing = makeEffect("time", 0);
+        tc.audio = makeEffect("volume", 0);
+        pic = clipLayer(p, seq, tc, t, o, nullptr);
+        return !pic.empty();
+    }
+    return false;
 }
 
 bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g);  // (below)

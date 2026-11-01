@@ -45,6 +45,7 @@
 #include "core/Multicam.h"
 #include "media/MediaPool.h"
 #include "render/ColorSpace.h"
+#include "render/Ofx.h"
 
 namespace montage {
 
@@ -3055,7 +3056,10 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     std::string type = typeQ.toStdString();
     const EffectInfo* info = findEffectInfo(type);
     const bool plugin = plugins::isPluginType(type);
-    if ((!info && !plugin) || !s) return;
+    // (an OpenFX plug-in: a clip effect, a transition or a generator, as it says)
+    ofx::PluginDesc openFx;
+    const bool ofxType = ofx::isOfxType(type) && ofx::Registry::instance().find(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), openFx);
+    if ((!info && !plugin && !ofxType) || !s) return;
     if (type == "lens_correction") {
         // Which lens first (it goes first on the clip): Clip > Correct Lens...
         const Hit hit = hitTest(pos);
@@ -3065,7 +3069,11 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     if (!ensureEffectModel(window(), type)) return;
     s = state_->sequence();  // the download waited in an event loop
     if (!s) return;
-    const EffectCategory category = plugin ? EffectCategory::AudioFilter : info->category;
+    const EffectCategory category = plugin    ? EffectCategory::AudioFilter
+                                    : ofxType ? (openFx.transition()  ? EffectCategory::VideoTransition
+                                                 : openFx.generator() ? EffectCategory::Generator
+                                                                      : EffectCategory::VideoFilter)
+                                              : info->category;
     const QString name = QString::fromStdString(plugins::effectTypeName(type));
     Hit h = hitTest(pos);
     auto row = rowAt(pos.y());
@@ -3117,7 +3125,7 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
             FrameTime f = snapFrame(frameRound(pos.x()), {});
             FrameTime len = FrameTime(std::llround(5 * s->fpsValue()));
             std::vector<Id> created;
-            state_->apply(tr("Add %1").arg(language::engine(info->displayName)), [&](Project& p, Sequence& sq) {
+            state_->apply(tr("Add %1").arg(info ? language::engine(info->displayName) : name), [&](Project& p, Sequence& sq) {
                 Clip c = makeGeneratorClip(p, type, len);
                 c.start = f;
                 auto r = edit::overwrite(p, sq, {TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)}, c);

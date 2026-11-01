@@ -180,6 +180,7 @@
 #include "media/LanguageModel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
+#include "OfxOverlay.h"
 #include "PaintOverlay.h"
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
@@ -458,6 +459,7 @@ void MainWindow::buildPanels() {
     // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
     new TransformOverlay(state_, programPanel_->viewer());
     new MaskOverlay(state_, programPanel_->viewer());
+    new OfxOverlay(state_, programPanel_->viewer());  // plugins' own controls (they take a press only on a handle)
     reviewOverlay_ = new ReviewOverlay(state_, programPanel_->viewer());
     reviewOverlay_->setShown(appSettings().value("playback/reviewDrawings", true).toBool());
     new PaintOverlay(state_, programPanel_->viewer());  // last, so an armed brush gets the pointer first
@@ -10606,6 +10608,7 @@ void MainWindow::scanPluginsInBackground() {
         if (blocked > 0)
             state_->message(tr("%n audio plugin(s) failed to load and were blocked (Tools › Audio Plugins)", "", blocked), 8000);
     });
+    ofx::initializeGpu();  // (OpenGL for plugins is set up here, on the GUI thread; without it they render on the CPU)
     watcher->setFuture(QtConcurrent::run([] {
         plugins::ScanReport report = plugins::Registry::instance().scan();
         ofx::Registry::instance().scan();  // and the OpenFX video plugins
@@ -10628,7 +10631,7 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
         FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
         int vt = state_->targetVideoTrack();
         std::vector<Id> created;
-        state_->apply(tr("Add %1").arg(language::engine(info->displayName)), [&](Project& p, Sequence& sq) {
+        state_->apply(tr("Add %1").arg(info ? language::engine(info->displayName) : name), [&](Project& p, Sequence& sq) {
             Clip c = makeGeneratorClip(p, type, len);
             c.start = at;
             auto r = edit::overwrite(p, sq, {TrackKind::Video, std::min(vt, int(sq.videoTracks.size()) - 1)}, c);

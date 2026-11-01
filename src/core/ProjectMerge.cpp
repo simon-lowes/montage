@@ -64,6 +64,14 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         if (e.type == "plugin") names.insert("sidechain");
         for (const std::string& name : names)
             if (const auto it = e.strings.find(name); it != e.strings.end()) text(it->second);
+        // An OpenFX plugin's inputs: "track:<id>" or "media:<id>".
+        if (e.type == "ofx")
+            for (auto& [k, v] : e.strings)
+                if (const size_t colon = v.find(':'); k.rfind("input.", 0) == 0 && colon != std::string::npos) {
+                    std::string id = v.substr(colon + 1);
+                    text(id);
+                    v = v.substr(0, colon + 1) + id;
+                }
     };
     auto fxs = [&](std::vector<Effect>& v) {
         for (Effect& e : v) fx(e);

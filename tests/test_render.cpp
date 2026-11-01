@@ -16762,6 +16762,108 @@ colorspaces:
 
     // A frame the GPU cannot draw (an adjustment layer) falls back to the CPU whole, and a clip it cannot grade (a
     // mask with Refine Edges) is made on the CPU and composited there; either way the picture is the CPU's.
+    // OpenFX plug-ins' on-screen controls and OpenGL: controls drawn with the Draw Suite are painted at the pixels they
+    // name; a plug-in rendering with OpenGL gives what it gives on the CPU (within 1/1023); controls drawn with OpenGL
+    // land where they say. (The OpenGL parts skip where OpenGL cannot start.)
+    void ofxControlsAndOpenGl() {
+        QTemporaryDir dir;
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath((dir.path() + "/ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc probe, invert;
+        QVERIFY(reg.find("org.montage.test.probe/1", probe) && reg.find("org.montage.test.invert/1", invert));
+        Project p = makeDefaultProject();
+        std::string err;
+        // A 400 x 200 frame shown at its own size, y down in the view: Centre (0.5, 0.25) is at view (200, 150).
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        Effect pr = ofx::makeEffect(p, probe);
+        std::unique_ptr<ofx::Interact> controls = ofx::Interact::open(pr, &err);
+        QVERIFY2(controls, err.c_str());
+        ofx::Overlay drawn;
+        QVERIFY(controls->draw(pr, 0, v, drawn));
+        QVERIFY(drawn.gl.isNull());
+        QImage view(400, 200, QImage::Format_ARGB32_Premultiplied);
+        view.fill(Qt::transparent);
+        {
+            QPainter painter(&view);
+            ofx::paintOverlay(painter, drawn, v);
+        }
+        auto red = [](QRgb c) { return qAlpha(c) > 200 && qRed(c) > 200 && qGreen(c) < 40 && qBlue(c) < 40; };
+        // (a one-pixel line on a pixel edge covers the two rows beside it by half)
+        auto yellowNear = [&](int x, int y) {
+            for (int dy = -1; dy <= 0; ++dy) {
+                const QRgb c = view.pixel(x, y + dy);
+                if (qAlpha(c) > 100 && qRed(c) > 100 && qGreen(c) > 100 && qBlue(c) < 30) return true;
+            }
+            return false;
+        };
+        QVERIFY(red(view.pixel(200, 150)) && red(view.pixel(191, 141)) && red(view.pixel(208, 158)));  // the square, filled
+        QCOMPARE(qAlpha(view.pixel(188, 150)) > 0 && !red(view.pixel(188, 150)), true);  // past its edge: the cross
+        QCOMPARE(qAlpha(view.pixel(212, 138)), 0);
+        QVERIFY(yellowNear(175, 150) && yellowNear(225, 150));  // the cross's arms, 30 pixels each way
+        QVERIFY(yellowNear(200, 125) || yellowNear(201, 125));
+        QCOMPARE(qAlpha(view.pixel(235, 150)) + qAlpha(view.pixel(235, 149)), 0);  // (and no further)
+        controls.reset();
+
+        // OpenGL.
+        std::string why;
+        if (!ofx::initializeGpu(&why)) QSKIP(why.c_str());
+        if (invert.openGL != "true") QSKIP("The test plug-in was built without OpenGL");
+        Effect e = ofx::makeEffect(p, invert);
+        e.params["param.amount"] = Param(0.7);
+        e.params["param.tint.g"] = Param(0.5);
+        Image picture(96, 54);
+        for (int y = 0; y < picture.height; ++y)
+            for (int x = 0; x < picture.width; ++x) {
+                const float a = 0.25f + 0.75f * float(x) / picture.width;
+                float* px = picture.at(x, y);
+                px[0] = a * float(y) / picture.height, px[1] = a * 0.5f, px[2] = a * (1 - float(x) / picture.width), px[3] = a;
+            }
+        Image cpu = picture, gl = picture;
+        ofx::setGpuRendering(false);
+        QVERIFY2(ofx::applyEffect(e, 0, cpu, 1.0, {}, &err), err.c_str());
+        ofx::setGpuRendering(true);
+        const int before = ofx::gpuRenders();
+        QVERIFY2(ofx::applyEffect(e, 0, gl, 1.0, {}, &err), err.c_str());
+        QCOMPARE(ofx::gpuRenders(), before + 1);
+        float worst = 0;
+        for (size_t k = 0; k < cpu.px.size(); ++k) worst = std::max(worst, std::fabs(cpu.px[k] - gl.px[k]));
+        QVERIFY2(worst <= 1.0f / 1023, qPrintable(QString::number(worst)));
+        // (and it did change the picture: the first row's red was 0, inverted by 0.7 of its alpha)
+        QVERIFY(std::fabs(gl.at(48, 0)[0] - 0.7f * picture.at(48, 0)[3]) < 1e-3f);
+        // At half size too (as the monitor may show it).
+        Image halfCpu(48, 27), halfGl(48, 27);
+        for (Image* i : {&halfCpu, &halfGl}) i->fill(0.2f, 0.4f, 0.6f, 1.0f);
+        ofx::setGpuRendering(false);
+        QVERIFY(ofx::applyEffect(e, 0, halfCpu, 0.5, {}, &err));
+        ofx::setGpuRendering(true);
+        QVERIFY(ofx::applyEffect(e, 0, halfGl, 0.5, {}, &err));
+        QVERIFY(std::fabs(halfCpu.at(20, 10)[1] - halfGl.at(20, 10)[1]) <= 1.0f / 1023);
+        // OpenGL controls: a green square from canonical (100, 100) to (200, 200), that is view x 100 to 200, y 0 to 100.
+        controls = ofx::Interact::open(e, &err);
+        QVERIFY2(controls, err.c_str());
+        QVERIFY(controls->draw(e, 0, v, drawn));
+        QVERIFY(!drawn.gl.isNull());
+        QCOMPARE(drawn.gl.size(), QSize(400, 200));
+        const QColor in = drawn.gl.pixelColor(150, 50), out = drawn.gl.pixelColor(150, 150), beside = drawn.gl.pixelColor(250, 50);
+        QVERIFY2(in.alpha() == 255 && in.green() == 255 && in.red() == 0, qPrintable(in.name(QColor::HexArgb)));
+        QCOMPARE(out.alpha(), 0);
+        QCOMPARE(beside.alpha(), 0);
+        QVERIFY(drawn.gl.pixelColor(102, 2).green() == 255 && drawn.gl.pixelColor(197, 97).green() == 255);
+        QCOMPARE(drawn.gl.pixelColor(150, 103).alpha(), 0);
+        view.fill(Qt::transparent);
+        {
+            QPainter painter(&view);
+            ofx::paintOverlay(painter, drawn, v);
+        }
+        QCOMPARE(qGreen(view.pixel(150, 50)), 255);
+        QCOMPARE(qAlpha(view.pixel(150, 150)), 0);
+    }
+
     void gpuFallback() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());

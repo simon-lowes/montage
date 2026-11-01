@@ -8,6 +8,8 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPainter>
+#include <QPainterPath>
 #include <QProcess>
 #include <QSaveFile>
 #include <QStandardPaths>
@@ -27,9 +29,15 @@
 #include "core/Expression.h"
 #include "media/SuperScale.h"
 #include "render/ColorSpace.h"
+#include "render/OfxGl.h"
 #include "ofxColour.h"
 #include "ofxCore.h"
+#include "ofxDrawSuite.h"
+#include "ofxGPURender.h"
 #include "ofxImageEffect.h"
+#include "ofxInteract.h"
+#include "ofxKeySyms.h"
+#include "ofxOld.h"
 #include "ofxMemory.h"
 #include "ofxMessage.h"
 #include "ofxMultiThread.h"
@@ -307,21 +315,39 @@ struct Binary {
 struct Loaded {
     PluginDesc desc;
     OfxPlugin* plugin = nullptr;
-    std::unique_ptr<EffectObj> descriptor, filter;  // as described, and described in the filter context
+    std::unique_ptr<EffectObj> descriptor, filter;  // as described, and described in the context Montage runs it in
     std::string context = kOfxImageEffectContextFilter;
     bool unsafe = false;  // renders one at a time
+    OfxPluginEntryPoint* overlay = nullptr;  // its overlay interact's main entry
+    int overlayVersion = 0;                  // 1: draws with OpenGL, 2: with the Draw Suite
     std::mutex renderMutex;
 };
+
+struct NativeSpace;
 
 // What an instance is rendering now: the frames and the effect's values.
 struct Instance {
     Loaded* plugin = nullptr;
     EffectObj obj;
     const Effect* effect = nullptr;
-    const Image* source = nullptr;
+    const Image* source = nullptr;                // the Source clip's picture now (a filter's)
+    std::map<std::string, const Image*> images;   // pictures given whole by name (a transition's SourceFrom and SourceTo)
+    int width = 0, height = 0;                    // the pictures' size
     double time = 0, scale = 1;
+    double progress = -1;                         // a transition's, driving its Transition parameter
     const FrameFetch* fetch = nullptr;
+    const NativeSpace* convert = nullptr;         // colourspace pictures fetched now go into (colour management)
+    const ColorSpace* space = nullptr;            // ...from this one
     Image* output = nullptr;
+    Effect* editing = nullptr;  // where an on-screen control's parameter changes go, while it holds the pen
+    bool edited = false;        // ...and whether it made any
+    bool gl = false;            // rendering with OpenGL now
+    bool glAttached = false;    // kOfxActionOpenGLContextAttached has been sent
+    bool glRefused = false;     // it failed kOfxActionOpenGLContextAttached: rendered on the CPU
+    gl::Target target;          // the OpenGL render's output
+    std::vector<unsigned> textures;  // input textures it has not freed yet
+    const InputResolver* inputs = nullptr;      // the compositor's, for a General plugin's further inputs
+    const std::vector<float>* ownMask = nullptr;  // the effect's own mask, for an input connected to it
     std::string error;
     bool floatImages = true;
     std::string colourStyle;  // the colour management agreed (OpenFX 1.5), empty for none
@@ -461,6 +487,8 @@ OfxStatus paramGetPropertySet(OfxParamHandle h, OfxPropertySetHandle* props) {
 
 // The parameter's value at OFX time `t` (clip frames): the effect's keyframed value, else the plugin's own.
 double valueAt(const ParamObj& p, int k, double t) {
+    // A transition's Transition parameter is its progress, set by Montage.
+    if (p.owner && p.owner->progress >= 0 && p.name == kOfxImageEffectTransitionParamName) return p.owner->progress;
     const int axis = normalisedAxis(p.props, k);
     const double size = axis < 0 || !p.owner ? 1.0 : axis == 0 ? p.owner->projectW : p.owner->projectH;
     if (p.owner && p.owner->effect) {
@@ -538,23 +566,47 @@ OfxStatus paramGetIntegral(OfxParamHandle h, OfxTime t1, OfxTime t2, ...) {
     va_end(ap);
     return n && !integerType(p->type) ? kOfxStatOK : kOfxStatErrUnsupported;
 }
-OfxStatus setValues(ParamObj* p, va_list ap) {
+// A value the plug-in sets: while an on-screen control holds the pen, into the effect being edited (keyed at `t` where
+// the parameter is animated, as the Inspector keys one), else its own.
+OfxStatus setValues(ParamObj* p, double t, va_list ap) {
     const int n = dimensionsOf(p->type);
+    Effect* editing = p->owner ? p->owner->editing : nullptr;
     if (stringType(p->type)) {
         const char* s = va_arg(ap, const char*);
-        p->text = s ? s : "";
+        auto it = editing ? editing->strings.find("str." + p->name) : std::map<std::string, std::string>::iterator{};
+        if (editing && it != editing->strings.end()) {
+            if (it->second != (s ? s : "")) p->owner->edited = true;
+            it->second = s ? s : "";
+        } else {
+            p->text = s ? s : "";
+        }
         return kOfxStatOK;
     }
     if (n == 0) return kOfxStatOK;  // a push button "set" is nothing
-    p->value.resize(size_t(n));
-    for (int k = 0; k < n; ++k) p->value[size_t(k)] = integerType(p->type) ? double(va_arg(ap, int)) : va_arg(ap, double);
+    std::vector<double> v(static_cast<size_t>(n));
+    for (int k = 0; k < n; ++k) v[size_t(k)] = integerType(p->type) ? double(va_arg(ap, int)) : va_arg(ap, double);
+    bool kept = false;
+    if (editing) {
+        const FrameTime at = FrameTime(std::floor(t + 1e-6));
+        for (int k = 0; k < n; ++k) {
+            auto it = editing->params.find(effectKey(p->type, p->name, k));
+            if (it == editing->params.end()) continue;
+            const int axis = normalisedAxis(p->props, k);
+            const double size = axis < 0 ? 1.0 : axis == 0 ? p->owner->projectW : p->owner->projectH;
+            const double value = v[size_t(k)] / std::max(1e-9, size);
+            if (std::fabs(it->second.at(at) - value) > 1e-12) p->owner->edited = true;
+            it->second.set(at, value);
+            kept = true;
+        }
+    }
+    if (!kept) p->value = std::move(v);
     return kOfxStatOK;
 }
 OfxStatus paramSetValue(OfxParamHandle h, ...) {
     if (!h) return kOfxStatErrBadHandle;
     va_list ap;
     va_start(ap, h);
-    const OfxStatus st = setValues(param(h), ap);
+    const OfxStatus st = setValues(param(h), ownerTime(*param(h)), ap);
     va_end(ap);
     return st;
 }
@@ -562,7 +614,7 @@ OfxStatus paramSetValueAtTime(OfxParamHandle h, OfxTime time, ...) {
     if (!h) return kOfxStatErrBadHandle;
     va_list ap;
     va_start(ap, time);
-    const OfxStatus st = setValues(param(h), ap);
+    const OfxStatus st = setValues(param(h), time, ap);
     va_end(ap);
     return st;
 }
@@ -684,10 +736,11 @@ std::string imageIdentifier(const Image& from, bool isOutput) {
     return buf;
 }
 
-// An image for the plugin, bottom row first as OFX counts, from a premultiplied float image.
-ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput) {
+// An image for the plugin, bottom row first as OFX counts, from a premultiplied float image (an output: `w` x `h`,
+// to be written).
+ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput, int outW = 0, int outH = 0) {
     auto* img = new ImageObj;
-    const int w = from.width, h = from.height;
+    const int w = isOutput ? outW : from.width, h = isOutput ? outH : from.height;
     const size_t n = size_t(w) * size_t(h) * 4;
     void* data = nullptr;
     int rowBytes = 0;
@@ -725,30 +778,29 @@ ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput) {
     return img;
 }
 
+// The picture input clip `name` holds at `time` (null when it has none: an input connected to nothing), sized as the
+// render's pictures; `scratch` holds it when it is made here. (Defined after colour management.)
+const Image* inputPicture(Instance& inst, const std::string& name, double time, Image& scratch);
+
 OfxStatus clipGetImage(OfxImageClipHandle h, OfxTime time, const OfxRectD*, OfxPropertySetHandle* imageHandle) {
     if (!h || !imageHandle) return kOfxStatErrBadHandle;
     ClipObj* c = clipObj(h);
     Instance* inst = c->effect ? c->effect->instance : nullptr;
-    if (!inst || !inst->source) return kOfxStatFailed;
+    if (!inst || inst->width <= 0 || inst->height <= 0) return kOfxStatFailed;
     ImageObj* img = nullptr;
     if (c->name == kOfxImageEffectOutputClipName) {
-        img = makeImage(*inst, *inst->source, true);
         if (!inst->output) return kOfxStatFailed;
+        img = makeImage(*inst, Image(), true, inst->width, inst->height);
         // Where the plugin writes: kept so render() can read it back.
-        inst->output->width = inst->source->width;
-        inst->output->height = inst->source->height;
+        inst->output->width = inst->width;
+        inst->output->height = inst->height;
         img->props.setPointer("montage.output", inst->output);
         img->owner = inst;
     } else {
-        Image other;
-        // Another frame, sized like this one (else this one stands in).
-        if (std::fabs(time - inst->time) > 1e-6 && inst->fetch && *inst->fetch && (*inst->fetch)(time, other) && !other.empty()) {
-            if (other.width != inst->source->width || other.height != inst->source->height)
-                other = resizeImage(other, inst->source->width, inst->source->height);
-            img = makeImage(*inst, other, false);
-        } else {
-            img = makeImage(*inst, *inst->source, false);
-        }
+        Image scratch;
+        const Image* pic = inputPicture(*inst, c->name, time, scratch);
+        if (!pic) return kOfxStatFailed;  // (an input connected to nothing: the plugin takes it as transparent)
+        img = makeImage(*inst, *pic, false);
     }
     *imageHandle = handle(&img->props);
     return kOfxStatOK;
@@ -781,7 +833,7 @@ OfxStatus clipReleaseImage(OfxPropertySetHandle h) {
 OfxStatus clipGetRegionOfDefinition(OfxImageClipHandle h, OfxTime, OfxRectD* bounds) {
     if (!h || !bounds) return kOfxStatErrBadHandle;
     Instance* inst = clipObj(h)->effect ? clipObj(h)->effect->instance : nullptr;
-    const double w = inst && inst->source ? inst->source->width / inst->scale : 0, hh = inst && inst->source ? inst->source->height / inst->scale : 0;
+    const double w = inst ? inst->width / inst->scale : 0, hh = inst ? inst->height / inst->scale : 0;
     *bounds = OfxRectD{0, 0, w, hh};
     return kOfxStatOK;
 }
@@ -818,6 +870,170 @@ OfxStatus imageMemoryUnlock(OfxImageMemoryHandle h) {
 OfxImageEffectSuiteV1 gImageEffectSuite = {getPropertySet, getParamSet, clipDefine, clipGetHandle, clipGetPropertySet, clipGetImage,
                                            clipReleaseImage, clipGetRegionOfDefinition, effectAbort, imageMemoryAlloc, imageMemoryFree,
                                            imageMemoryLock, imageMemoryUnlock};
+
+// ---- OpenGL render suite --------------------------------------------------------------------------------------------
+
+constexpr int kGlTexture2D = 0x0DE1;
+std::atomic<int> gGpuRenders{0};
+
+struct TextureObj {
+    PropertySet props;
+    unsigned texture = 0;
+    bool output = false;
+    Instance* inst = nullptr;
+};
+
+OfxStatus clipLoadTexture(OfxImageClipHandle h, OfxTime time, const char*, const OfxRectD*, OfxPropertySetHandle* out) {
+    if (!h || !out) return kOfxStatErrBadHandle;
+    ClipObj* c = clipObj(h);
+    Instance* inst = c->effect ? c->effect->instance : nullptr;
+    if (!inst || !inst->gl || !gl::onThread() || inst->width <= 0) return kOfxStatFailed;
+    auto t = std::make_unique<TextureObj>();
+    t->inst = inst;
+    std::string id;
+    if (c->name == kOfxImageEffectOutputClipName) {
+        // The output: the framebuffer's texture, which is drawn into from now.
+        t->texture = inst->target.texture;
+        t->output = true;
+        gl::bind(inst->target);
+        id = "out:" + std::to_string(++gImageSerial);
+    } else {
+        Image scratch;
+        const Image* pic = inputPicture(*inst, c->name, time, scratch);
+        if (!pic) return kOfxStatFailed;
+        t->texture = gl::upload(*pic);
+        if (!t->texture) return kOfxStatErrMemory;
+        inst->textures.push_back(t->texture);
+        id = imageIdentifier(*pic, false);
+    }
+    PropertySet& p = t->props;
+    p.setInt(kOfxImageEffectPropOpenGLTextureIndex, {int(t->texture)});
+    p.setInt(kOfxImageEffectPropOpenGLTextureTarget, {kGlTexture2D});
+    p.setString(kOfxImageEffectPropPixelDepth, {kOfxBitDepthFloat});
+    p.setString(kOfxImageEffectPropComponents, {kOfxImageComponentRGBA});
+    p.setString(kOfxImageEffectPropPreMultiplication, {kOfxImagePreMultiplied});
+    p.setDouble(kOfxImageEffectPropRenderScale, {inst->scale, inst->scale});
+    p.setDouble(kOfxImagePropPixelAspectRatio, {1.0});
+    p.setInt(kOfxImagePropBounds, {0, 0, inst->width, inst->height});
+    p.setInt(kOfxImagePropRegionOfDefinition, {0, 0, inst->width, inst->height});
+    p.setInt(kOfxImagePropRowBytes, {inst->width * 16});
+    p.setString(kOfxImagePropField, {kOfxImageFieldNone});
+    p.setString(kOfxImagePropUniqueIdentifier, {id});
+    p.setPointer("montage.texture", t.get());
+    *out = handle(&t.release()->props);
+    return kOfxStatOK;
+}
+
+OfxStatus clipFreeTexture(OfxPropertySetHandle h) {
+    if (!h) return kOfxStatErrBadHandle;
+    void* self = nullptr;
+    if (propGetPointer(h, "montage.texture", 0, &self) != kOfxStatOK || !self) return kOfxStatErrBadHandle;
+    auto* t = static_cast<TextureObj*>(self);
+    // (an input's texture goes with it; the output's stays for Montage to read back)
+    if (!t->output && gl::onThread() && t->inst) {
+        auto& live = t->inst->textures;
+        if (auto it = std::find(live.begin(), live.end(), t->texture); it != live.end()) {
+            live.erase(it);
+            gl::destroyTexture(t->texture);
+        }
+    }
+    delete t;
+    return kOfxStatOK;
+}
+
+OfxStatus flushResources() { return kOfxStatReplyDefault; }
+
+OfxImageEffectOpenGLRenderSuiteV1 gOpenGLSuite = {clipLoadTexture, clipFreeTexture, flushResources};
+
+// ---- Interact and draw suites (on-screen controls) ------------------------------------------------------------------
+
+struct InteractObj {
+    PropertySet props;
+    bool redraw = false;
+};
+InteractObj* interactObj(OfxInteractHandle h) { return reinterpret_cast<InteractObj*>(h); }
+
+OfxStatus interactSwapBuffers(OfxInteractHandle h) { return h ? kOfxStatOK : kOfxStatErrBadHandle; }
+OfxStatus interactRedraw(OfxInteractHandle h) {
+    if (!h) return kOfxStatErrBadHandle;
+    interactObj(h)->redraw = true;
+    return kOfxStatOK;
+}
+OfxStatus interactGetPropertySet(OfxInteractHandle h, OfxPropertySetHandle* props) {
+    if (!h || !props) return kOfxStatErrBadHandle;
+    *props = handle(&interactObj(h)->props);
+    return kOfxStatOK;
+}
+OfxInteractSuiteV1 gInteractSuite = {interactSwapBuffers, interactRedraw, interactGetPropertySet};
+
+// What a control draws through the Draw Suite during one draw: recorded, and painted by the editor.
+struct DrawCtx {
+    Overlay* out = nullptr;
+    std::array<float, 4> colour{1, 1, 1, 1};
+    float width = 0;
+    int stipple = 0;
+};
+DrawCtx* drawCtx(OfxDrawContextHandle h) { return reinterpret_cast<DrawCtx*>(h); }
+
+OfxStatus drawGetColour(OfxDrawContextHandle h, OfxStandardColour which, OfxRGBAColourF* c) {
+    if (!h || !c) return kOfxStatFailed;
+    // (Montage's overlay colours: the TransformOverlay's white box, its yellow while dragged)
+    switch (which) {
+        case kOfxStandardColourOverlayBackground: *c = {0, 0, 0, 1}; break;
+        case kOfxStandardColourOverlayActive: *c = {1, 0.85f, 0.2f, 1}; break;
+        case kOfxStandardColourOverlaySelected: *c = {1, 0.85f, 0.2f, 1}; break;
+        case kOfxStandardColourOverlayDeselected: *c = {1, 1, 1, 1}; break;
+        case kOfxStandardColourOverlayMarqueeFG: *c = {1, 1, 1, 1}; break;
+        case kOfxStandardColourOverlayMarqueeBG: *c = {0, 0, 0, 0.5f}; break;
+        case kOfxStandardColourOverlayText: *c = {1, 1, 1, 1}; break;
+        default: return kOfxStatErrValue;
+    }
+    return kOfxStatOK;
+}
+OfxStatus drawSetColour(OfxDrawContextHandle h, const OfxRGBAColourF* c) {
+    if (!h || !c) return kOfxStatFailed;
+    drawCtx(h)->colour = {c->r, c->g, c->b, c->a};
+    return kOfxStatOK;
+}
+OfxStatus drawSetLineWidth(OfxDrawContextHandle h, float width) {
+    if (!h) return kOfxStatFailed;
+    drawCtx(h)->width = std::max(0.0f, width);
+    return kOfxStatOK;
+}
+OfxStatus drawSetLineStipple(OfxDrawContextHandle h, OfxDrawLineStipplePattern pattern) {
+    if (!h) return kOfxStatFailed;
+    if (pattern < kOfxDrawLineStipplePatternSolid || pattern > kOfxDrawLineStipplePatternDotDash) return kOfxStatErrValue;
+    drawCtx(h)->stipple = int(pattern);
+    return kOfxStatOK;
+}
+OfxStatus drawDraw(OfxDrawContextHandle h, OfxDrawPrimitive primitive, const OfxPointD* points, int count) {
+    if (!h || !drawCtx(h)->out) return kOfxStatFailed;
+    if (!points || count <= 0 || primitive < kOfxDrawPrimitiveLines || primitive > kOfxDrawPrimitiveEllipse) return kOfxStatErrValue;
+    const bool twoCorners = primitive == kOfxDrawPrimitiveRectangle || primitive == kOfxDrawPrimitiveEllipse;
+    if ((twoCorners && count != 2) || (primitive == kOfxDrawPrimitiveLines && count % 2) || count > 1000000) return kOfxStatErrValue;
+    DrawOp op;
+    op.kind = DrawOp::Kind(int(primitive));
+    op.colour = drawCtx(h)->colour;
+    op.width = drawCtx(h)->width;
+    op.stipple = drawCtx(h)->stipple;
+    op.points.reserve(size_t(count));
+    for (int i = 0; i < count; ++i) op.points.push_back({points[i].x, points[i].y});
+    drawCtx(h)->out->ops.push_back(std::move(op));
+    return kOfxStatOK;
+}
+OfxStatus drawText(OfxDrawContextHandle h, const char* text, const OfxPointD* pos, int alignment) {
+    if (!h || !drawCtx(h)->out) return kOfxStatFailed;
+    if (!text || !pos) return kOfxStatErrValue;
+    DrawOp op;
+    op.kind = DrawOp::Text;
+    op.colour = drawCtx(h)->colour;
+    op.points = {{pos->x, pos->y}};
+    op.text = text;
+    op.align = alignment;
+    drawCtx(h)->out->ops.push_back(std::move(op));
+    return kOfxStatOK;
+}
+OfxDrawSuiteV1 gDrawSuite = {drawGetColour, drawSetColour, drawSetLineWidth, drawSetLineStipple, drawDraw, drawText};
 
 // ---- Memory, threads, messages, progress, timeline --------------------------------------------------------------------
 
@@ -1067,6 +1283,43 @@ struct ColourPlan {
     bool rawOutput = false;
 };
 
+thread_local InputResolver tInputs;
+thread_local const std::vector<float>* tOwnMask = nullptr;
+
+const Image* inputPicture(Instance& inst, const std::string& name, double time, Image& scratch) {
+    const int w = inst.width, h = inst.height;
+    auto fit = [&](Image& img) {
+        if (img.width != w || img.height != h) img = resizeImage(img, w, h);
+    };
+    if (auto it = inst.images.find(name); it != inst.images.end()) return it->second;
+    if (name == kOfxImageEffectSimpleSourceClipName && inst.source) {
+        // Another frame, sized like this one (else this one stands in).
+        if (std::fabs(time - inst.time) > 1e-6 && inst.fetch && *inst.fetch && (*inst.fetch)(time, scratch) && !scratch.empty()) {
+            fit(scratch);
+            return &scratch;
+        }
+        return inst.source;
+    }
+    // A General plugin's further input: what its effect connects it to.
+    if (!inst.effect) return nullptr;
+    const std::string connection = inst.effect->s(inputKey(name));
+    if (connection.empty()) return nullptr;
+    if (connection == "mask") {
+        // (no mask drawn: all of the picture)
+        const std::vector<float>* m = inst.ownMask;
+        scratch = Image(w, h);
+        if (!m || m->size() != size_t(w) * size_t(h)) std::fill(scratch.px.begin(), scratch.px.end(), 1.0f);
+        else
+            for (size_t i = 0; i < m->size(); ++i) std::fill_n(&scratch.px[i * 4], 4, (*m)[i]);
+        return &scratch;
+    }
+    if (!inst.inputs || !*inst.inputs || !(*inst.inputs)(connection, time, scratch) || scratch.empty()) return nullptr;
+    fit(scratch);
+    if (inst.convert && inst.space)
+        reencode(scratch, inst.space->primaries, inst.space->transfer, inst.convert->primaries, inst.convert->transfer);
+    return &scratch;
+}
+
 // ---- The host -------------------------------------------------------------------------------------------------------
 
 PropertySet& hostProps() {
@@ -1079,12 +1332,13 @@ PropertySet& hostProps() {
         h->setInt(kOfxPropVersion, {0, 1, 0});
         h->setString(kOfxPropVersionLabel, {"0.1"});
         h->setInt(kOfxImageEffectHostPropIsBackground, {0});
-        h->setInt(kOfxImageEffectPropSupportsOverlays, {0});
+        h->setInt(kOfxImageEffectPropSupportsOverlays, {1});
         h->setInt(kOfxImageEffectPropSupportsMultiResolution, {1});
         h->setInt(kOfxImageEffectPropSupportsTiles, {0});
         h->setInt(kOfxImageEffectPropTemporalClipAccess, {1});
         h->setString(kOfxImageEffectPropSupportedComponents, {kOfxImageComponentRGBA});
-        h->setString(kOfxImageEffectPropSupportedContexts, {kOfxImageEffectContextFilter, kOfxImageEffectContextGeneral});
+        h->setString(kOfxImageEffectPropSupportedContexts,
+                     {kOfxImageEffectContextFilter, kOfxImageEffectContextGeneral, kOfxImageEffectContextTransition, kOfxImageEffectContextGenerator});
         h->setString(kOfxImageEffectPropSupportedPixelDepths, {kOfxBitDepthFloat, kOfxBitDepthByte});
         h->setInt(kOfxImageEffectPropSupportsMultipleClipDepths, {0});
         h->setInt(kOfxImageEffectPropSupportsMultipleClipPARs, {0});
@@ -1100,6 +1354,9 @@ PropertySet& hostProps() {
         h->setInt(kOfxParamHostPropMaxPages, {0});
         h->setInt(kOfxParamHostPropPageRowColumnCount, {0, 0});
         h->setPointer(kOfxPropHostOSHandle, nullptr);
+        // OpenGL rendering (render/OfxGl; a plugin that needs it fails with why where there is none).
+        h->setString(kOfxImageEffectPropOpenGLRenderSupported, {"true"});
+        h->setString(kOfxImageEffectPropCPURenderSupported, {"true"});
         // Colour management (OpenFX 1.5): the core colourspaces of the native config.
         h->setString(kOfxImageEffectPropColourManagementStyle, {kOfxImageEffectColourManagementCore});
         h->setString(kOfxImageEffectPropColourManagementAvailableConfigs, {kNativeConfig});
@@ -1121,6 +1378,9 @@ const void* fetchSuite(OfxPropertySetHandle, const char* name, int version) {
     if (n == kOfxProgressSuite && version == 1) return &gProgressSuiteV1;
     if (n == kOfxProgressSuite && version == 2) return &gProgressSuiteV2;
     if (n == kOfxTimeLineSuite && version == 1) return &gTimeLineSuite;
+    if (n == kOfxInteractSuite && version == 1) return &gInteractSuite;
+    if (n == kOfxDrawSuite && version == 1) return &gDrawSuite;
+    if (n == kOfxOpenGLRenderSuite && version == 1) return &gOpenGLSuite;
     return nullptr;
 }
 
@@ -1220,11 +1480,13 @@ std::unique_ptr<Loaded> describe(Binary* bin, int index, std::string* error) {
         if (error) *error = std::string(plugin->pluginIdentifier) + " failed to describe itself";
         return nullptr;
     }
+    // The first context it takes of: Filter, General (clip effects), Transition, Generator.
     const std::vector<std::string> contexts = dp.strings(kOfxImageEffectPropSupportedContexts);
-    if (std::find(contexts.begin(), contexts.end(), kOfxImageEffectContextFilter) != contexts.end()) l->context = kOfxImageEffectContextFilter;
-    else if (std::find(contexts.begin(), contexts.end(), kOfxImageEffectContextGeneral) != contexts.end()) l->context = kOfxImageEffectContextGeneral;
-    else {
-        if (error) *error = std::string(plugin->pluginIdentifier) + " is not a filter (generators and transitions are not supported yet)";
+    l->context.clear();
+    for (const char* c : {kOfxImageEffectContextFilter, kOfxImageEffectContextGeneral, kOfxImageEffectContextTransition, kOfxImageEffectContextGenerator})
+        if (l->context.empty() && std::find(contexts.begin(), contexts.end(), c) != contexts.end()) l->context = c;
+    if (l->context.empty()) {
+        if (error) *error = std::string(plugin->pluginIdentifier) + " takes none of the contexts Montage runs (filter, general, transition, generator)";
         return nullptr;
     }
     l->filter = std::make_unique<EffectObj>();
@@ -1233,7 +1495,7 @@ std::unique_ptr<Loaded> describe(Binary* bin, int index, std::string* error) {
     PropertySet in;
     in.setString(kOfxImageEffectPropContext, {l->context});
     if (!ok(plugin->mainEntry(kOfxImageEffectActionDescribeInContext, reinterpret_cast<OfxImageEffectHandle>(l->filter.get()), handle(&in), nullptr))) {
-        if (error) *error = std::string(plugin->pluginIdentifier) + " failed to describe itself as a filter";
+        if (error) *error = std::string(plugin->pluginIdentifier) + " failed to describe itself in the " + l->context.substr(21) + " context";
         return nullptr;
     }
     const PropertySet& fp = l->filter->props;
@@ -1253,12 +1515,34 @@ std::unique_ptr<Loaded> describe(Binary* bin, int index, std::string* error) {
     d.floatImages = depths.empty() || std::find(depths.begin(), depths.end(), kOfxBitDepthFloat) != depths.end();
     d.colour = colourStyleWith(fp);
     l->unsafe = fp.getString(kOfxImageEffectPluginRenderThreadSafety) == kOfxImageEffectRenderUnsafe;
+    d.context = l->context;
+    if (l->context == kOfxImageEffectContextGeneral)
+        for (const auto& c : l->filter->clips)
+            if (c->name != kOfxImageEffectOutputClipName && c->name != kOfxImageEffectSimpleSourceClipName)
+                d.inputs.push_back(InputDesc{c->name, c->props.getString(kOfxPropLabel, c->name), c->props.getInt(kOfxImageClipPropIsMask) != 0,
+                                             c->props.getInt(kOfxImageClipPropOptional) != 0});
+    const std::string gpu = fp.getString(kOfxImageEffectPropOpenGLRenderSupported, "false");
+    d.openGL = gpu == "true" || gpu == "needed" ? gpu : "false";
+    // Its on-screen controls: the Draw Suite's (V2) where it has both.
+    void* entry = nullptr;
+    for (const auto& [name, version] : {std::pair{kOfxImageEffectPluginPropOverlayInteractV2, 2}, std::pair{kOfxImageEffectPluginPropOverlayInteractV1, 1}}) {
+        auto it = fp.props.find(name);
+        if (!entry && it != fp.props.end() && it->second.type == 'p' && !it->second.p.empty() && it->second.p[0]) {
+            entry = it->second.p[0];
+            l->overlayVersion = version;
+        }
+    }
+    l->overlay = reinterpret_cast<OfxPluginEntryPoint*>(entry);
+    d.overlay = l->overlay ? l->overlayVersion : 0;
     describeParams(*l->filter, d);
     return l;
 }
 
 QJsonObject toJson(const PluginDesc& d) {
-    QJsonArray params;
+    QJsonArray params, inputs;
+    for (const InputDesc& in : d.inputs)
+        inputs.append(QJsonObject{{"name", QString::fromStdString(in.name)}, {"label", QString::fromStdString(in.label)}, {"mask", in.mask},
+                                  {"optional", in.optional}});
     for (const ParamDesc& p : d.params) {
         QJsonArray def, choices;
         for (double v : p.def) def.append(v);
@@ -1273,7 +1557,9 @@ QJsonObject toJson(const PluginDesc& d) {
                        {"versionMajor", d.versionMajor}, {"versionMinor", d.versionMinor}, {"label", QString::fromStdString(d.label)},
                        {"group", QString::fromStdString(d.group)}, {"description", QString::fromStdString(d.description)},
                        {"binary", QString::fromStdString(d.binary)}, {"bundle", QString::fromStdString(d.bundle)}, {"index", d.index},
-                       {"temporal", d.temporal}, {"float", d.floatImages}, {"colour", QString::fromStdString(d.colour)}, {"params", params}};
+                       {"temporal", d.temporal}, {"float", d.floatImages}, {"colour", QString::fromStdString(d.colour)}, {"params", params},
+                       {"context", QString::fromStdString(d.context)}, {"inputs", inputs}, {"openGL", QString::fromStdString(d.openGL)},
+                       {"overlay", d.overlay}};
 }
 
 PluginDesc fromJson(const QJsonObject& o) {
@@ -1291,6 +1577,14 @@ PluginDesc fromJson(const QJsonObject& o) {
     d.temporal = o.value("temporal").toBool();
     d.floatImages = o.value("float").toBool(true);
     d.colour = o.value("colour").toString().toStdString();
+    d.context = o.value("context").toString(kOfxImageEffectContextFilter).toStdString();
+    for (const QJsonValue& v : o.value("inputs").toArray()) {
+        const QJsonObject io = v.toObject();
+        d.inputs.push_back(InputDesc{io.value("name").toString().toStdString(), io.value("label").toString().toStdString(),
+                                     io.value("mask").toBool(), io.value("optional").toBool()});
+    }
+    d.openGL = o.value("openGL").toString("false").toStdString();
+    d.overlay = o.value("overlay").toInt();
     for (const QJsonValue& v : o.value("params").toArray()) {
         const QJsonObject po = v.toObject();
         ParamDesc p;
@@ -1350,7 +1644,7 @@ Loaded* loadPlugin(const PluginDesc& d, std::string* error) {
 }
 
 // Makes an instance of `l` (kOfxActionCreateInstance) with the host's clip and parameter objects.
-std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
+std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error, bool interactive = false) {
     auto inst = std::make_unique<Instance>();
     inst->plugin = l;
     inst->floatImages = l->desc.floatImages;
@@ -1367,7 +1661,7 @@ std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
     o.props.setDouble(kOfxImageEffectPropProjectPixelAspectRatio, {1.0});
     o.props.setDouble(kOfxImageEffectInstancePropEffectDuration, {1e6});
     o.props.setDouble(kOfxImageEffectPropFrameRate, {25.0});
-    o.props.setInt(kOfxPropIsInteractive, {0});
+    o.props.setInt(kOfxPropIsInteractive, {interactive ? 1 : 0});
     o.props.setInt(kOfxImageEffectInstancePropSequentialRender, {0});
     if (!inst->colourStyle.empty()) {
         o.props.setString(kOfxImageEffectPropColourManagementStyle, {inst->colourStyle});
@@ -1384,7 +1678,10 @@ std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
         auto copy = std::make_unique<ClipObj>(*c);
         copy->effect = &o;
         PropertySet& cp = copy->props;
-        cp.setInt(kOfxImageClipPropConnected, {1});
+        // (a General plugin's further inputs are connected as its effect says, at each render)
+        const bool extra = l->context == kOfxImageEffectContextGeneral && c->name != kOfxImageEffectOutputClipName &&
+                           c->name != kOfxImageEffectSimpleSourceClipName;
+        cp.setInt(kOfxImageClipPropConnected, {extra ? 0 : 1});
         cp.setString(kOfxImageEffectPropPixelDepth, {inst->floatImages ? kOfxBitDepthFloat : kOfxBitDepthByte});
         cp.setString(kOfxImageEffectPropComponents, {kOfxImageComponentRGBA});
         cp.setString(kOfxImageClipPropUnmappedPixelDepth, {inst->floatImages ? kOfxBitDepthFloat : kOfxBitDepthByte});
@@ -1409,7 +1706,11 @@ std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
 
 void destroyInstance(std::unique_ptr<Instance> inst) {
     if (!inst) return;
-    inst->plugin->plugin->mainEntry(kOfxActionDestroyInstance, reinterpret_cast<OfxImageEffectHandle>(&inst->obj), nullptr, nullptr);
+    auto entry = inst->plugin->plugin->mainEntry;
+    const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
+    // (what it set up on Montage's OpenGL context, let go there)
+    if (inst->glAttached) gl::run([&] { entry(kOfxActionOpenGLContextDetached, h, nullptr, nullptr); });
+    entry(kOfxActionDestroyInstance, h, nullptr, nullptr);
     --gLiveInstances;
 }
 
@@ -1584,7 +1885,7 @@ std::vector<PluginDesc> describeBinary(const std::string& binary, std::string* e
         out.push_back(l->desc);
         loadedPlugins()[l->desc.id] = std::move(l);
     }
-    if (out.empty() && error && error->empty()) *error = "No OpenFX filters in " + binary;
+    if (out.empty() && error && error->empty()) *error = "No OpenFX image effects Montage can run in " + binary;
     return out;
 }
 
@@ -1650,13 +1951,24 @@ int Registry::scan(std::vector<std::string>* log) {
         QFile f(QString::fromStdString(cachePath));
         if (f.open(QIODevice::ReadOnly)) cache = QJsonDocument::fromJson(f.readAll()).object();
     }
+    // A plug-in whose on-screen controls were running when Montage stopped without warning: blocked like one that
+    // crashes on loading, until its binary changes.
+    QString crashed;
+    {
+        const QString guard = QFileInfo(QString::fromStdString(cachePath)).absolutePath() + "/ofx-interact.guard";
+        QFile g(guard);
+        if (g.open(QIODevice::ReadOnly)) crashed = QString::fromUtf8(g.readAll()).trimmed();
+        g.close();
+        QFile::remove(guard);
+    }
     QJsonObject fresh;
     std::vector<PluginDesc> found;
     std::vector<std::pair<std::string, std::string>> blocked;
     for (const std::string& bin : findBinaries(dirs)) {
         const QFileInfo fi(QString::fromStdString(bin));
-        // (The last number is the description's version: a description from before colour management is made again.)
-        const QString stamp = QString::number(fi.size()) + ":" + QString::number(fi.lastModified().toMSecsSinceEpoch()) + ":2";
+        // (The last number is the description's version: a description from before it is made again.)
+        // (3: since contexts, inputs, OpenGL and overlays were described)
+        const QString stamp = QString::number(fi.size()) + ":" + QString::number(fi.lastModified().toMSecsSinceEpoch()) + ":3";
         QJsonObject entry = cache.value(QString::fromStdString(bin)).toObject();
         if (entry.value("stamp").toString() != stamp) {
             // New or changed: described in the probe, out of this process.
@@ -1679,6 +1991,10 @@ int Registry::scan(std::vector<std::string>* log) {
             if (log) log->push_back((entry.contains("error") ? "blocked " : "probed ") + bin);
         } else if (log) {
             log->push_back("cached " + bin);
+        }
+        if (!crashed.isEmpty() && QString::fromStdString(bin) == crashed) {
+            entry = QJsonObject{{"stamp", stamp}, {"error", "Crashed while showing its on-screen controls"}};
+            if (log) log->push_back("blocked " + bin);
         }
         fresh[QString::fromStdString(bin)] = entry;
         if (entry.contains("error")) blocked.push_back({bin, entry.value("error").toString().toStdString()});
@@ -1710,6 +2026,11 @@ std::vector<std::pair<std::string, std::string>> Registry::blocked() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return blocked_;
 }
+std::string Registry::guardPath() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return (QFileInfo(QString::fromStdString(cachePath_)).absolutePath() + "/ofx-interact.guard").toStdString();
+}
+
 bool Registry::find(const std::string& id, PluginDesc& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const PluginDesc& d : plugins_)
@@ -1797,6 +2118,226 @@ ColourPlan planColour(Instance& inst, const ColorSpace& working) {
     return plan;
 }
 
+// The plug-in for effect `e`, loaded, and an instance of it checked out (given back by the caller).
+Instance* acquire(const Effect& e, PluginDesc& d, Loaded*& l, std::string* error) {
+    // Only a plug-in this computer's scan found and did not block runs: never a binary named by the project file, which
+    // could be anything, or one that crashed the probe (or crashed while showing its controls).
+    Registry& registry = Registry::instance();
+    registry.ensureScanned();
+    if (!registry.find(e.s("ofx_id"), d)) {
+        const std::vector<PluginDesc> saved = descriptionsFromJson(e.s("ofx_description"));
+        const std::string name = effectName(e);
+        if (error) *error = name + " is not installed";
+        if (!saved.empty())
+            for (const auto& [binary, why] : registry.blocked())
+                if (binary == saved.front().binary && error) *error = name + " is blocked: " + why;
+        return nullptr;
+    }
+    l = loadPlugin(d, error);
+    if (!l) return nullptr;
+    return checkOut(l, e.id, error);
+}
+
+struct GiveBack {
+    Instance* inst;
+    ~GiveBack() {
+        if (inst) checkIn(inst);
+    }
+};
+
+// What one render is of.
+struct Job {
+    const Effect* effect = nullptr;
+    double t = 0, scale = 1;
+    int width = 0, height = 0;
+    const Image* source = nullptr;  // a filter's
+    const FrameFetch* fetch = nullptr;
+    std::map<std::string, const Image*> images;  // a transition's
+    double progress = -1;
+};
+
+// A General plugin's further inputs connected (or not) as the effect says, telling an instance that has rendered before
+// when that changed.
+void updateConnections(Instance& inst, const Effect& e) {
+    if (inst.plugin->context != kOfxImageEffectContextGeneral) return;
+    std::vector<std::string> changed;
+    for (auto& c : inst.obj.clips) {
+        if (c->name == kOfxImageEffectOutputClipName || c->name == kOfxImageEffectSimpleSourceClipName) continue;
+        const int connected = e.s(inputKey(c->name)).empty() ? 0 : 1;
+        if (c->props.getInt(kOfxImageClipPropConnected) == connected) continue;
+        c->props.setInt(kOfxImageClipPropConnected, {connected});
+        changed.push_back(c->name);
+    }
+    if (changed.empty() || inst.fresh) return;
+    auto entry = inst.plugin->plugin->mainEntry;
+    const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst.obj);
+    PropertySet reason;
+    reason.setString(kOfxPropChangeReason, {kOfxChangeUserEdited});
+    entry(kOfxActionBeginInstanceChanged, h, handle(&reason), nullptr);
+    for (const std::string& name : changed) {
+        PropertySet args;
+        args.setString(kOfxPropType, {kOfxTypeClip});
+        args.setString(kOfxPropName, {name});
+        args.setString(kOfxPropChangeReason, {kOfxChangeUserEdited});
+        args.setDouble(kOfxPropTime, {inst.time});
+        args.setDouble(kOfxImageEffectPropRenderScale, {inst.scale, inst.scale});
+        entry(kOfxActionInstanceChanged, h, handle(&args), nullptr);
+    }
+    entry(kOfxActionEndInstanceChanged, h, handle(&reason), nullptr);
+}
+
+// Begin, Render and End sequence render; Render's status.
+OfxStatus sendRender(Instance& inst, double t, bool gl) {
+    auto entry = inst.plugin->plugin->mainEntry;
+    const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst.obj);
+    PropertySet seq;
+    seq.setDouble(kOfxImageEffectPropFrameRange, {t, t});
+    seq.setDouble(kOfxImageEffectPropFrameStep, {1.0});
+    seq.setInt(kOfxPropIsInteractive, {0});
+    seq.setDouble(kOfxImageEffectPropRenderScale, {inst.scale, inst.scale});
+    seq.setInt(kOfxImageEffectPropSequentialRenderStatus, {0});
+    seq.setInt(kOfxImageEffectPropInteractiveRenderStatus, {0});
+    seq.setInt(kOfxImageEffectPropOpenGLEnabled, {gl ? 1 : 0});
+    entry(kOfxImageEffectActionBeginSequenceRender, h, handle(&seq), nullptr);
+    PropertySet args;
+    args.setDouble(kOfxPropTime, {t});
+    args.setString(kOfxImageEffectPropFieldToRender, {kOfxImageFieldNone});
+    args.setInt(kOfxImageEffectPropRenderWindow, {0, 0, inst.width, inst.height});
+    args.setDouble(kOfxImageEffectPropRenderScale, {inst.scale, inst.scale});
+    args.setInt(kOfxImageEffectPropSequentialRenderStatus, {0});
+    args.setInt(kOfxImageEffectPropInteractiveRenderStatus, {0});
+    args.setInt(kOfxImageEffectPropRenderQualityDraft, {0});
+    args.setInt(kOfxImageEffectPropOpenGLEnabled, {gl ? 1 : 0});
+    const OfxStatus st = entry(kOfxImageEffectActionRender, h, handle(&args), nullptr);
+    entry(kOfxImageEffectActionEndSequenceRender, h, handle(&seq), nullptr);
+    return st;
+}
+
+std::atomic<bool> gUseGpu{true};
+
+// Renders `job` with `inst` into `result` (on the GPU where the plug-in renders with OpenGL and it can, else on the CPU).
+bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, Image& result, std::string* error, const ColorSpace* working) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    std::unique_lock<std::mutex> serial(l->renderMutex, std::defer_lock);
+    if (l->unsafe) serial.lock();
+    Image out(job.width, job.height);
+    inst->effect = job.effect;
+    inst->time = job.t;
+    inst->scale = std::max(1e-3, job.scale);
+    inst->width = job.width, inst->height = job.height;
+    inst->progress = job.progress;
+    inst->fetch = job.fetch;
+    inst->source = job.source;
+    inst->images = job.images;
+    inst->output = &out;
+    inst->error.clear();
+    inst->wrote = false;
+    inst->convert = nullptr;
+    inst->inputs = &tInputs;
+    inst->ownMask = tOwnMask;
+    const double fullW = job.width / inst->scale, fullH = job.height / inst->scale;
+    inst->projectW = fullW, inst->projectH = fullH;
+    inst->obj.props.setDouble(kOfxImageEffectPropProjectSize, {fullW, fullH});
+    inst->obj.props.setDouble(kOfxImageEffectPropProjectExtent, {fullW, fullH});
+    updateConnections(*inst, *job.effect);
+    announceChanges(*inst, *job.effect, job.t);
+    // Colour management: the pictures in the colourspace the plugin asked for, its output back into the working space.
+    const ColorSpace& space = working ? *working : rec709Space();
+    inst->space = &space;
+    const ColourPlan plan = inst->colourStyle.empty() ? ColourPlan{} : planColour(*inst, space);
+    Image convertedSource;
+    std::map<std::string, Image> convertedImages;
+    FrameFetch convertedFetch;
+    if (const NativeSpace* to = plan.source) {
+        inst->convert = to;
+        if (job.source) {
+            convertedSource = *job.source;
+            reencode(convertedSource, space.primaries, space.transfer, to->primaries, to->transfer);
+            inst->source = &convertedSource;
+        }
+        for (const auto& [name, img] : job.images)
+            if (img) {
+                Image& c = convertedImages[name] = *img;
+                reencode(c, space.primaries, space.transfer, to->primaries, to->transfer);
+                inst->images[name] = &c;
+            }
+        if (job.fetch && *job.fetch) {
+            const FrameFetch& fetch = *job.fetch;
+            convertedFetch = [&fetch, &space, to](double at, Image& other) {
+                if (!fetch(at, other)) return false;
+                reencode(other, space.primaries, space.transfer, to->primaries, to->transfer);
+                return true;
+            };
+            inst->fetch = &convertedFetch;
+        }
+    }
+    auto clear = [&] {
+        inst->effect = nullptr;
+        inst->source = nullptr;
+        inst->images.clear();
+        inst->fetch = nullptr;
+        inst->output = nullptr;
+        inst->convert = nullptr;
+        inst->inputs = nullptr;
+        inst->ownMask = nullptr;
+    };
+    // OpenGL, where the plug-in renders with it.
+    const bool gpu = d.openGL != "false" && gUseGpu && !inst->glRefused && gl::available();
+    if (d.openGL == "needed" && !gpu) {
+        clear();
+        return fail(d.label + " needs OpenGL, which is not available here");
+    }
+    OfxStatus st = kOfxStatFailed;
+    bool rendered = false;
+    if (gpu) {
+        auto entry = l->plugin->mainEntry;
+        const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
+        const ExpressionContext where = currentExpressionContext();
+        gl::run([&] {
+            ExpressionScope scope(where.project, where.sequence, where.clip, where.cancel);
+            if (!inst->glAttached) {
+                if (entry(kOfxActionOpenGLContextAttached, h, nullptr, nullptr) == kOfxStatFailed) inst->glRefused = true;
+                else inst->glAttached = true;
+            }
+            if (inst->glAttached && gl::makeTarget(inst->target, job.width, job.height)) {
+                inst->gl = true;
+                gl::bind(inst->target);
+                gl::clear();
+                st = sendRender(*inst, job.t, true);
+                if (ok(st)) gl::read(inst->target, out);
+                gl::release(inst->target);
+                inst->gl = false;
+            }
+            for (unsigned t : inst->textures) gl::destroyTexture(t);
+            inst->textures.clear();
+        });
+        rendered = ok(st);
+        if (rendered) ++gGpuRenders;
+        else if (d.openGL == "needed") {
+            clear();
+            return fail(inst->error.empty() ? d.label + " failed to render with OpenGL" : d.label + ": " + inst->error);
+        }
+        // (else on the CPU, as kOfxStatGLRenderFailed asks)
+    }
+    if (!rendered) {
+        inst->error.clear();
+        inst->wrote = false;
+        st = sendRender(*inst, job.t, false);
+        if (ok(st) && (!inst->wrote || out.px.size() != size_t(job.width) * size_t(job.height) * 4)) {
+            clear();
+            return fail(d.label + " gave no picture back");
+        }
+    }
+    clear();
+    if (!ok(st)) return fail(inst->error.empty() ? d.label + " failed to render" : d.label + ": " + inst->error);
+    if (const NativeSpace* from = plan.output) reencode(out, from->primaries, from->transfer, space.primaries, space.transfer);
+    result = std::move(out);
+    return true;
+}
+
 }  // namespace
 
 Effect makeEffect(Project& p, const PluginDesc& d) {
@@ -1808,8 +2349,11 @@ Effect makeEffect(Project& p, const PluginDesc& d) {
     e.strings["ofx_identifier"] = d.identifier;
     e.strings["ofx_version"] = std::to_string(d.versionMajor);
     e.strings["ofx_description"] = descriptionsToJson({d});
+    // A General plugin's further inputs, connected to nothing at first.
+    for (const InputDesc& in : d.inputs) e.strings[inputKey(in.name)] = "";
     for (const ParamDesc& pd : d.params) {
         if (pd.secret) continue;
+        if (d.transition() && pd.name == kOfxImageEffectTransitionParamName) continue;  // (the transition's progress drives it)
         if (stringType(pd.type)) {
             e.strings["str." + pd.name] = pd.stringDefault;
             continue;
@@ -1858,93 +2402,368 @@ std::string effectName(const Effect& e) {
 }
 
 bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch, std::string* error, const ColorSpace* working) {
-    auto fail = [&](const std::string& why) {
-        if (error) *error = why;
-        return false;
-    };
     if (img.empty()) return true;
-    // Only a plug-in this computer's scan found and did not block runs: never a binary named by the project file, which
-    // could be anything, or one that crashed the probe.
+    PluginDesc d;
+    Loaded* l = nullptr;
+    GiveBack inst{acquire(e, d, l, error)};
+    if (!inst.inst) return false;
+    if (d.transition() || d.generator()) {
+        if (error) *error = d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect";
+        return false;
+    }
+    Job job;
+    job.effect = &e;
+    job.t = t;
+    job.scale = scale;
+    job.width = img.width, job.height = img.height;
+    job.source = &img;
+    job.fetch = &fetch;
+    Image out;
+    if (!runRender(d, l, inst.inst, job, out, error, working)) return false;
+    img = std::move(out);
+    return true;
+}
+
+bool applyTransition(const Effect& e, double t, double progress, const Image& from, const Image& to, Image& out, double scale, std::string* error,
+                     const ColorSpace* working) {
+    const Image& sized = from.empty() ? to : from;
+    if (sized.empty()) {
+        out = Image();
+        return true;
+    }
+    const int w = sized.width, h = sized.height;
+    // (a side with nothing is transparent; the other is fitted to the first)
+    Image a = from.empty() ? Image(w, h) : from;
+    Image b = to.empty() ? Image(w, h) : to.width == w && to.height == h ? to : resizeImage(to, w, h);
+    PluginDesc d;
+    Loaded* l = nullptr;
+    GiveBack inst{acquire(e, d, l, error)};
+    if (!inst.inst) return false;
+    if (!d.transition()) {
+        if (error) *error = d.label + " is not a transition";
+        return false;
+    }
+    Job job;
+    job.effect = &e;
+    job.t = t;
+    job.scale = scale;
+    job.width = w, job.height = h;
+    job.images = {{kOfxImageEffectTransitionSourceFromClipName, &a}, {kOfxImageEffectTransitionSourceToClipName, &b}};
+    job.progress = std::clamp(progress, 0.0, 1.0);
+    return runRender(d, l, inst.inst, job, out, error, working);
+}
+
+bool renderGenerator(const Effect& e, double t, int w, int h, double scale, Image& out, std::string* error, const ColorSpace* working) {
+    if (w <= 0 || h <= 0) return false;
+    PluginDesc d;
+    Loaded* l = nullptr;
+    GiveBack inst{acquire(e, d, l, error)};
+    if (!inst.inst) return false;
+    if (!d.generator()) {
+        if (error) *error = d.label + " is not a generator";
+        return false;
+    }
+    Job job;
+    job.effect = &e;
+    job.t = t;
+    job.scale = scale;
+    job.width = w, job.height = h;
+    return runRender(d, l, inst.inst, job, out, error, working);
+}
+
+bool PluginDesc::transition() const { return context == kOfxImageEffectContextTransition; }
+bool PluginDesc::generator() const { return context == kOfxImageEffectContextGenerator; }
+
+std::string inputKey(const std::string& clip) { return "input." + clip; }
+
+bool usesOwnMask(const Effect& e) {
+    if (e.type != "ofx") return false;
+    for (const auto& [key, value] : e.strings)
+        if (key.rfind("input.", 0) == 0 && value == "mask") return true;
+    return false;
+}
+
+InputScope::InputScope(InputResolver resolve) : previous_(std::move(tInputs)) { tInputs = std::move(resolve); }
+InputScope::~InputScope() { tInputs = std::move(previous_); }
+const InputResolver& currentInputs() { return tInputs; }
+OwnMaskScope::OwnMaskScope(const std::vector<float>* matte) : previous_(tOwnMask) { tOwnMask = matte; }
+OwnMaskScope::~OwnMaskScope() { tOwnMask = previous_; }
+
+bool initializeGpu(std::string* why) { return gl::initialize(why); }
+bool gpuAvailable(std::string* why) { return gl::available(why); }
+void setGpuRendering(bool on) { gUseGpu = on; }
+bool gpuRendering() { return gUseGpu && gl::available(); }
+int gpuRenders() { return gGpuRenders.load(); }
+
+// ---- On-screen controls ---------------------------------------------------------------------------------------------
+
+double View::pixelScale() const {
+    const double screen = std::hypot(m[0], m[3]);
+    return screen > 1e-12 ? 1.0 / screen : 1.0;
+}
+std::array<double, 2> View::toView(double x, double y) const { return {m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]}; }
+std::array<double, 2> View::toCanonical(double vx, double vy) const {
+    const double det = m[0] * m[4] - m[1] * m[3];
+    if (std::fabs(det) < 1e-18) return {0, 0};
+    const double dx = vx - m[2], dy = vy - m[5];
+    return {(m[4] * dx - m[1] * dy) / det, (-m[3] * dx + m[0] * dy) / det};
+}
+
+void paintOverlay(QPainter& p, const Overlay& o, const View& v) {
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    if (!o.gl.isNull()) p.drawImage(QPointF(0, 0), o.gl);
+    auto at = [&](const std::array<double, 2>& c) {
+        const auto w = v.toView(c[0], c[1]);
+        return QPointF(w[0], w[1]);
+    };
+    for (const DrawOp& op : o.ops) {
+        const QColor colour = QColor::fromRgbF(std::clamp(op.colour[0], 0.f, 1.f), std::clamp(op.colour[1], 0.f, 1.f), std::clamp(op.colour[2], 0.f, 1.f),
+                                               std::clamp(op.colour[3], 0.f, 1.f));
+        QPen pen(colour, op.width <= 0 ? 1.0 : double(op.width));
+        pen.setCosmetic(true);
+        static const Qt::PenStyle styles[] = {Qt::SolidLine, Qt::DotLine, Qt::DashLine, Qt::DashLine, Qt::DashDotLine};
+        pen.setStyle(styles[std::clamp(op.stipple, 0, 4)]);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        QPolygonF poly;
+        for (const auto& c : op.points) poly << at(c);
+        switch (op.kind) {
+            case DrawOp::Lines:
+                for (int i = 0; i + 1 < poly.size(); i += 2) p.drawLine(poly[i], poly[i + 1]);
+                break;
+            case DrawOp::LineStrip: p.drawPolyline(poly); break;
+            case DrawOp::LineLoop: p.drawPolygon(poly); break;
+            case DrawOp::Rectangle:
+            case DrawOp::Polygon: {
+                QPolygonF fill = poly;
+                if (op.kind == DrawOp::Rectangle && op.points.size() == 2) {
+                    const auto& a = op.points[0];
+                    const auto& b = op.points[1];
+                    fill = QPolygonF{at({a[0], a[1]}), at({b[0], a[1]}), at({b[0], b[1]}), at({a[0], b[1]})};
+                }
+                p.setPen(Qt::NoPen);
+                p.setBrush(colour);
+                p.drawPolygon(fill);
+                break;
+            }
+            case DrawOp::Ellipse: {
+                if (op.points.size() != 2) break;
+                const double cx = (op.points[0][0] + op.points[1][0]) / 2, cy = (op.points[0][1] + op.points[1][1]) / 2;
+                const double rx = std::fabs(op.points[1][0] - op.points[0][0]) / 2, ry = std::fabs(op.points[1][1] - op.points[0][1]) / 2;
+                QPolygonF ring;
+                for (int k = 0; k < 96; ++k) {
+                    const double a = 2 * M_PI * k / 96;
+                    ring << at({cx + rx * std::cos(a), cy + ry * std::sin(a)});
+                }
+                p.drawPolygon(ring);
+                break;
+            }
+            case DrawOp::Text: {
+                if (poly.isEmpty()) break;
+                const QFontMetricsF fm(p.font());
+                const QString text = QString::fromStdString(op.text);
+                const double w = fm.horizontalAdvance(text);
+                double x = poly[0].x(), y = poly[0].y();
+                const bool left = op.align & kOfxDrawTextAlignmentLeft, right = op.align & kOfxDrawTextAlignmentRight;
+                if (left && right) x -= w / 2;
+                else if (right) x -= w;
+                const bool top = op.align & kOfxDrawTextAlignmentTop, base = op.align & kOfxDrawTextAlignmentBaseline;
+                if (top && base) y += (fm.ascent() - fm.descent()) / 2;
+                else if (top) y += fm.ascent();
+                else if (op.align & kOfxDrawTextAlignmentBottom) y -= fm.descent();
+                p.drawText(QPointF(x, y), text);
+                break;
+            }
+        }
+    }
+    p.restore();
+}
+
+namespace {
+
+// While a plug-in's on-screen control runs, a file names its binary; Montage stopping then (a crash inside it) leaves
+// the file, and the next scan blocks the plug-in (Registry::scan).
+thread_local int tGuardDepth = 0;
+struct CrashGuard {
+    std::string path;
+    explicit CrashGuard(const std::string& binary) {
+        if (tGuardDepth++ > 0) return;
+        path = Registry::instance().guardPath();
+        QFile f(QString::fromStdString(path));
+        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            f.write(QByteArray::fromStdString(binary));
+            f.flush();
+        }
+    }
+    ~CrashGuard() {
+        if (--tGuardDepth == 0 && !path.empty()) QFile::remove(QString::fromStdString(path));
+    }
+};
+
+}  // namespace
+
+struct Interact::Impl {
+    PluginDesc desc;
+    Loaded* plugin = nullptr;
+    std::unique_ptr<Instance> inst;
+    InteractObj descriptor, obj;
+    bool created = false;
+
+    ~Impl() {
+        if (created) {
+            CrashGuard guard(desc.binary);
+            plugin->overlay(kOfxActionDestroyInstance, &obj, nullptr, nullptr);
+        }
+        if (inst) destroyInstance(std::move(inst));
+    }
+    // The instance reading `e` at `t`, its frame as the view says.
+    void prepare(const Effect& e, double t, const View& v) {
+        inst->effect = &e;
+        inst->time = t;
+        inst->scale = std::max(1e-3, v.renderScale);
+        inst->projectW = v.frameW > 0 ? v.frameW : inst->projectW;
+        inst->projectH = v.frameH > 0 ? v.frameH : inst->projectH;
+        inst->width = int(std::lround(inst->projectW * inst->scale));
+        inst->height = int(std::lround(inst->projectH * inst->scale));
+        inst->obj.props.setDouble(kOfxImageEffectPropProjectSize, {inst->projectW, inst->projectH});
+        inst->obj.props.setDouble(kOfxImageEffectPropProjectExtent, {inst->projectW, inst->projectH});
+        const double ps = v.pixelScale();
+        obj.props.setDouble(kOfxInteractPropPixelScale, {ps, ps});
+        obj.props.setInt(kOfxInteractPropViewportSize, {v.width, v.height});
+    }
+    PropertySet args(const View& v, double t) const {
+        PropertySet a;
+        const double ps = v.pixelScale();
+        a.setPointer(kOfxPropEffectInstance, reinterpret_cast<void*>(&inst->obj));
+        a.setDouble(kOfxInteractPropPixelScale, {ps, ps});
+        a.setDouble(kOfxInteractPropBackgroundColour, {0, 0, 0});
+        a.setDouble(kOfxPropTime, {t});
+        a.setDouble(kOfxImageEffectPropRenderScale, {inst->scale, inst->scale});
+        return a;
+    }
+    void done() {
+        inst->effect = nullptr;
+        inst->editing = nullptr;
+    }
+};
+
+Interact::Interact(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Interact::~Interact() = default;
+
+std::unique_ptr<Interact> Interact::open(const Effect& e, std::string* error) {
+    if (e.type != "ofx") return nullptr;
     Registry& registry = Registry::instance();
     registry.ensureScanned();
     PluginDesc d;
-    if (!registry.find(e.s("ofx_id"), d)) {
-        const std::vector<PluginDesc> saved = descriptionsFromJson(e.s("ofx_description"));
-        const std::string name = effectName(e);
-        if (!saved.empty())
-            for (const auto& [binary, why] : registry.blocked())
-                if (binary == saved.front().binary) return fail(name + " is blocked: " + why);
-        return fail(name + " is not installed");
+    if (!registry.find(e.s("ofx_id"), d) || d.overlay == 0) return nullptr;
+    Loaded* l = loadPlugin(d, error);
+    if (!l || !l->overlay) return nullptr;
+    auto impl = std::make_unique<Impl>();
+    impl->desc = d;
+    impl->plugin = l;
+    CrashGuard guard(d.binary);
+    impl->inst = createInstance(l, error, true);
+    if (!impl->inst) return nullptr;
+    ++gLiveInstances;
+    for (InteractObj* o : {&impl->descriptor, &impl->obj}) {
+        PropertySet& p = o->props;
+        p.setInt(kOfxInteractPropHasAlpha, {1});
+        p.setInt(kOfxInteractPropBitDepth, {8});
+        p.setPointer(kOfxPropInstanceData, nullptr);
+        p.setDouble(kOfxInteractPropPixelScale, {1, 1});
+        p.setDouble(kOfxInteractPropBackgroundColour, {0, 0, 0});
+        p.setDouble(kOfxInteractPropSuggestedColour, {1, 1, 1});
+        p.setString(kOfxInteractPropSlaveToParam, {});
+        p.setInt(kOfxInteractPropViewportSize, {0, 0});
     }
-    Loaded* l = loadPlugin(d, error ? error : nullptr);
-    if (!l) return false;
-    Instance* inst = checkOut(l, e.id, error);
-    if (!inst) return false;
-    struct Return {
-        Instance* inst;
-        ~Return() { checkIn(inst); }
-    } giveBack{inst};
-    std::unique_lock<std::mutex> serial(l->renderMutex, std::defer_lock);
-    if (l->unsafe) serial.lock();
-    Image out(img.width, img.height);
-    inst->effect = &e;
-    inst->source = &img;
-    inst->time = t;
-    inst->scale = std::max(1e-3, scale);
-    inst->fetch = &fetch;
-    inst->output = &out;
-    inst->error.clear();
-    inst->wrote = false;
-    const double fullW = img.width / inst->scale, fullH = img.height / inst->scale;
-    inst->projectW = fullW, inst->projectH = fullH;
-    inst->obj.props.setDouble(kOfxImageEffectPropProjectSize, {fullW, fullH});
-    inst->obj.props.setDouble(kOfxImageEffectPropProjectExtent, {fullW, fullH});
-    announceChanges(*inst, e, t);
-    // Colour management: the pictures in the colourspace the plugin asked for, its output back into the working space.
-    const ColorSpace& space = working ? *working : rec709Space();
-    const ColourPlan plan = inst->colourStyle.empty() ? ColourPlan{} : planColour(*inst, space);
-    Image converted;
-    FrameFetch convertedFetch;
-    if (const NativeSpace* to = plan.source) {
-        converted = img;
-        reencode(converted, space.primaries, space.transfer, to->primaries, to->transfer);
-        inst->source = &converted;
-        convertedFetch = [&fetch, &space, to](double at, Image& other) {
-            if (!fetch || !fetch(at, other)) return false;
-            reencode(other, space.primaries, space.transfer, to->primaries, to->transfer);
-            return true;
-        };
-        inst->fetch = &convertedFetch;
+    impl->obj.props.setPointer(kOfxPropEffectInstance, reinterpret_cast<void*>(&impl->inst->obj));
+    l->overlay(kOfxActionDescribe, &impl->descriptor, nullptr, nullptr);
+    if (!ok(l->overlay(kOfxActionCreateInstance, &impl->obj, nullptr, nullptr))) {
+        if (error) *error = d.label + "'s on-screen controls could not start";
+        return nullptr;
     }
-    auto entry = l->plugin->mainEntry;
-    const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
-    PropertySet seq;
-    seq.setDouble(kOfxImageEffectPropFrameRange, {t, t});
-    seq.setDouble(kOfxImageEffectPropFrameStep, {1.0});
-    seq.setInt(kOfxPropIsInteractive, {0});
-    seq.setDouble(kOfxImageEffectPropRenderScale, {inst->scale, inst->scale});
-    seq.setInt(kOfxImageEffectPropSequentialRenderStatus, {0});
-    seq.setInt(kOfxImageEffectPropInteractiveRenderStatus, {0});
-    entry(kOfxImageEffectActionBeginSequenceRender, h, handle(&seq), nullptr);
-    PropertySet args;
-    args.setDouble(kOfxPropTime, {t});
-    args.setString(kOfxImageEffectPropFieldToRender, {kOfxImageFieldNone});
-    args.setInt(kOfxImageEffectPropRenderWindow, {0, 0, img.width, img.height});
-    args.setDouble(kOfxImageEffectPropRenderScale, {inst->scale, inst->scale});
-    args.setInt(kOfxImageEffectPropSequentialRenderStatus, {0});
-    args.setInt(kOfxImageEffectPropInteractiveRenderStatus, {0});
-    args.setInt(kOfxImageEffectPropRenderQualityDraft, {0});
-    const OfxStatus st = entry(kOfxImageEffectActionRender, h, handle(&args), nullptr);
-    entry(kOfxImageEffectActionEndSequenceRender, h, handle(&seq), nullptr);
-    inst->effect = nullptr;
-    inst->source = nullptr;
-    inst->fetch = nullptr;
-    inst->output = nullptr;
-    if (!ok(st)) return fail(inst->error.empty() ? d.label + " failed to render" : d.label + ": " + inst->error);
-    if (!inst->wrote || out.px.size() != img.px.size()) return fail(d.label + " gave no picture back");
-    if (const NativeSpace* from = plan.output) reencode(out, from->primaries, from->transfer, space.primaries, space.transfer);
-    img = std::move(out);
+    impl->created = true;
+    PropertySet focus = impl->args(View{}, 0);
+    l->overlay(kOfxInteractActionGainFocus, &impl->obj, handle(&focus), nullptr);
+    return std::unique_ptr<Interact>(new Interact(std::move(impl)));
+}
+
+bool Interact::draw(const Effect& e, double t, const View& v, Overlay& out) {
+    out = Overlay{};
+    if (failed_ || v.width <= 0 || v.height <= 0) return false;
+    Impl& d = *impl_;
+    CrashGuard guard(d.desc.binary);
+    d.prepare(e, t, v);
+    DrawCtx ctx;
+    ctx.out = &out;
+    PropertySet a = d.args(v, t);
+    a.setPointer(kOfxInteractPropDrawContext, &ctx);
+    OfxStatus st = kOfxStatReplyDefault;
+    if (d.plugin->overlayVersion == 1 && gl::available()) {
+        // Drawn with OpenGL, in canonical coordinates, into a picture the size of the view.
+        gl::run([&] {
+            gl::Target target;
+            if (!gl::makeTarget(target, v.width, v.height)) return;
+            gl::bind(target);
+            gl::clear();
+            gl::overlayProjection(v.width, v.height, v.m);
+            st = d.plugin->overlay(kOfxInteractActionDraw, &d.obj, handle(&a), nullptr);
+            out.gl = gl::readOverlay(target);
+            gl::release(target);
+        });
+    } else if (d.plugin->overlayVersion == 2) {
+        st = d.plugin->overlay(kOfxInteractActionDraw, &d.obj, handle(&a), nullptr);
+    }  // (an OpenGL control without OpenGL here draws nothing)
+    d.done();
+    if (st == kOfxStatFailed || st == kOfxStatErrFatal) {
+        failed_ = true;
+        return false;
+    }
     return true;
+}
+
+bool Interact::pen(Pen kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed) {
+    changed = false;
+    if (failed_) return false;
+    Impl& d = *impl_;
+    CrashGuard guard(d.desc.binary);
+    d.prepare(e, t, v);
+    edited = e;
+    d.inst->effect = &edited;
+    d.inst->editing = &edited;
+    d.inst->edited = false;
+    PropertySet a = d.args(v, t);
+    const auto c = v.toCanonical(vx, vy);
+    a.setDouble(kOfxInteractPropPenPosition, {c[0], c[1]});
+    a.setInt(kOfxInteractPropPenViewportPosition, {int(std::lround(vx)), int(std::lround(vy))});
+    a.setDouble(kOfxInteractPropPenPressure, {pressure});
+    const char* action = kind == Pen::Down ? kOfxInteractActionPenDown : kind == Pen::Up ? kOfxInteractActionPenUp : kOfxInteractActionPenMotion;
+    const OfxStatus st = d.plugin->overlay(action, &d.obj, handle(&a), nullptr);
+    changed = d.inst->edited;
+    d.done();
+    if (st == kOfxStatFailed || st == kOfxStatErrFatal) failed_ = true;
+    return st == kOfxStatOK;
+}
+
+bool Interact::key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed) {
+    changed = false;
+    if (failed_) return false;
+    Impl& d = *impl_;
+    CrashGuard guard(d.desc.binary);
+    d.prepare(e, t, v);
+    edited = e;
+    d.inst->effect = &edited;
+    d.inst->editing = &edited;
+    d.inst->edited = false;
+    PropertySet a = d.args(v, t);
+    a.setInt(kOfxPropKeySym, {keysym});
+    a.setString(kOfxPropKeyString, {text});
+    const OfxStatus st = d.plugin->overlay(down ? kOfxInteractActionKeyDown : kOfxInteractActionKeyUp, &d.obj, handle(&a), nullptr);
+    changed = d.inst->edited;
+    d.done();
+    if (st == kOfxStatFailed || st == kOfxStatErrFatal) failed_ = true;
+    return st == kOfxStatOK;
 }
 
 int instancesCreated() { return gInstances.load(); }

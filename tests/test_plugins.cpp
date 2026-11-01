@@ -320,13 +320,13 @@ private slots:
     void hostsOpenFxVideoPlugins() {
         const std::string good = MONTAGE_TEST_OFX_DIR "/good", crash = MONTAGE_TEST_OFX_DIR "/crash";
         QCOMPARE(ofx::findBinaries({good, crash}).size(), size_t(2));
-        // Scanned in the probe: the good bundle's four filters described, the one that crashes blocklisted.
+        // Scanned in the probe: the good bundle's seven plug-ins described, the one that crashes blocklisted.
         ofx::Registry& reg = ofx::Registry::instance();
         reg.setCachePath(path("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({good, crash});
         std::vector<std::string> log;
-        QCOMPARE(reg.scan(&log), 4);
+        QCOMPARE(reg.scan(&log), 7);
         QCOMPARE(reg.blocked().size(), size_t(1));
         // (A crash on Linux and macOS; on Windows the test plugin ends its process without the crash dialog.)
         QVERIFY2(reg.blocked()[0].first.find("MontageTestOfxCrash") != std::string::npos &&
@@ -335,7 +335,7 @@ private slots:
         QCOMPARE(log.size(), size_t(2));
         // Unchanged files come from the cache, without the probe.
         log.clear();
-        QCOMPARE(reg.scan(&log), 4);
+        QCOMPARE(reg.scan(&log), 7);
         QVERIFY(std::all_of(log.begin(), log.end(), [](const std::string& l) { return l.rfind("cached", 0) == 0; }));
         QCOMPARE(ofx::instancesCreated(), 0);  // nothing loaded in this process yet
         ofx::PluginDesc invert, temporal;
@@ -582,6 +582,261 @@ private slots:
         QVERIFY2(err.find("blocked") != std::string::npos, err.c_str());
         QCOMPARE(ofx::instancesCreated(), before);
         QVERIFY(std::fabs(keep.at(1, 1)[0] - 0.1f) < 1e-6);
+    }
+
+    void hostsOpenFxTransitionsGeneratorsAndInputs() {
+        const std::string good = MONTAGE_TEST_OFX_DIR "/good", crash = MONTAGE_TEST_OFX_DIR "/crash";
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({good, crash});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc dissolve, generator, matte, probe, invert;
+        QVERIFY(reg.find("org.montage.test.dissolve/1", dissolve) && reg.find("org.montage.test.generator/1", generator) &&
+                reg.find("org.montage.test.matte/1", matte) && reg.find("org.montage.test.probe/1", probe) &&
+                reg.find("org.montage.test.invert/1", invert));
+        QVERIFY(dissolve.transition() && !dissolve.generator() && generator.generator() && !invert.transition());
+        QCOMPARE(matte.context, std::string("OfxImageEffectContextGeneral"));
+        QCOMPARE(matte.inputs.size(), size_t(1));
+        QVERIFY(matte.inputs[0].name == "Matte" && matte.inputs[0].mask && matte.inputs[0].optional);
+        QCOMPARE(probe.overlay, 2);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        std::string err;
+        const float tolerance = 1.0f / 1023;
+
+        // A transition plug-in: the plug-in's Transition parameter is the progress, not a setting.
+        Effect fx = ofx::makeEffect(p, dissolve);
+        QVERIFY(!fx.params.count("param.Transition"));
+        Image plain(4, 4);
+        QVERIFY(!ofx::applyEffect(fx, 0, plain, 1.0, {}, &err));
+        Image from(8, 4), to(8, 4), mixed;
+        from.fill(0.9f, 0.2f, 0.1f, 1.0f);
+        to.fill(0.1f, 0.6f, 0.8f, 1.0f);
+        for (const double k : {0.25, 0.5, 0.75}) {
+            QVERIFY2(ofx::applyTransition(fx, 0, k, from, to, mixed, 1.0, &err), err.c_str());
+            QCOMPARE(mixed.width, 8);
+            for (int c = 0; c < 4; ++c) {
+                const float want = float(from.at(3, 2)[c] * (1 - k) + to.at(3, 2)[c] * k);
+                QVERIFY2(std::fabs(mixed.at(3, 2)[c] - want) <= tolerance, qPrintable(QString("%1 %2 %3").arg(k).arg(mixed.at(3, 2)[c]).arg(want)));
+            }
+        }
+        // Either side missing is transparent.
+        QVERIFY(ofx::applyTransition(fx, 0, 0.5, Image(), to, mixed, 1.0, &err));
+        QVERIFY(std::fabs(mixed.at(1, 1)[3] - 0.5f) <= tolerance && std::fabs(mixed.at(1, 1)[1] - 0.3f) <= tolerance);
+        // Between two clips on the timeline: the same pictures as the built-in Cross Dissolve.
+        auto colour = [&](float r, float g, float b, FrameTime len) {
+            Clip c = makeGeneratorClip(p, "color", len);
+            c.generator.params["color.r"] = Param(r);
+            c.generator.params["color.g"] = Param(g);
+            c.generator.params["color.b"] = Param(b);
+            return c;
+        };
+        RenderOptions o;
+        {
+            Sequence& t = s;
+            const auto first = edit::overwrite(p, t, {TrackKind::Video, 0}, colour(0.9f, 0.2f, 0.1f, 30));
+            Clip second = colour(0.1f, 0.6f, 0.8f, 30);
+            second.start = 30;
+            edit::overwrite(p, t, {TrackKind::Video, 0}, second);
+            Project q = p;
+            const edit::Result added = edit::addTransition(p, t, first.created[0], edit::Edge::Out, "ofx:org.montage.test.dissolve/1", 8);
+            QVERIFY2(added.ok, added.error.c_str());
+            QVERIFY(edit::addTransition(q, *q.active(), first.created[0], edit::Edge::Out, "cross_dissolve", 8).ok);
+            const Transition* tr = nullptr;
+            for (const Transition& x : t.videoTracks[0].transitions) tr = &x;
+            QVERIFY(tr && tr->type == "ofx" && tr->params.s("ofx_id") == "org.montage.test.dissolve/1");
+            for (FrameTime f = 26; f <= 32; f += 2) {
+                const Image a = renderSequenceFrame(p, t, f, o), b = renderSequenceFrame(q, *q.active(), f, o);
+                for (int c = 0; c < 3; ++c)
+                    QVERIFY2(std::fabs(a.at(32, 18)[c] - b.at(32, 18)[c]) <= tolerance,
+                             qPrintable(QString("frame %1: %2 %3").arg(f).arg(a.at(32, 18)[c]).arg(b.at(32, 18)[c])));
+            }
+            QVERIFY(saveProject(p, path("ofx-transition.montage").toStdString()));
+            Project back;
+            QVERIFY(loadProject(path("ofx-transition.montage").toStdString(), back));
+            const Image a = renderSequenceFrame(p, t, 28, o), b = renderSequenceFrame(back, *back.active(), 28, o);
+            QVERIFY(std::fabs(a.at(32, 18)[0] - b.at(32, 18)[0]) <= tolerance);
+            t.videoTracks[0].clips.clear();
+            t.videoTracks[0].transitions.clear();
+        }
+
+        // A generator plug-in makes a generator clip: its colour left of Split, nothing right of it.
+        Clip gen = makeGeneratorClip(p, "ofx:org.montage.test.generator/1", 25);
+        QCOMPARE(gen.generator.type, std::string("ofx"));
+        QCOMPARE(gen.name, std::string("Test Generator"));
+        edit::overwrite(p, s, {TrackKind::Video, 0}, gen);
+        Image frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY2(std::fabs(frame.at(10, 18)[0] - 0.25f) <= tolerance && std::fabs(frame.at(10, 18)[1] - 0.5f) <= tolerance &&
+                     std::fabs(frame.at(10, 18)[2] - 0.75f) <= tolerance,
+                 qPrintable(QString("%1 %2 %3").arg(frame.at(10, 18)[0]).arg(frame.at(10, 18)[1]).arg(frame.at(10, 18)[2])));
+        QVERIFY(frame.at(50, 18)[0] <= tolerance && frame.at(50, 18)[2] <= tolerance);
+        s.videoTracks[0].clips[0].generator.params["param.split"] = Param(0.25);
+        frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY(std::fabs(frame.at(10, 18)[2] - 0.75f) <= tolerance && frame.at(20, 18)[2] <= tolerance);
+        // Placed where the clip is moved to (as any generator clip).
+        s.videoTracks[0].clips[0].motion.params["pos_x"] = Param(32.0);
+        frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY(frame.at(10, 18)[2] <= tolerance && std::fabs(frame.at(40, 18)[2] - 0.75f) <= tolerance);
+        s.videoTracks[0].clips.clear();
+
+        // A General plug-in's matte input reads the track it is connected to (which then is not seen itself), a bin
+        // item, or nothing.
+        const auto base = edit::overwrite(p, s, {TrackKind::Video, 0}, colour(0.2f, 0.4f, 0.6f, 25));
+        if (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        Clip half = makeGeneratorClip(p, "ofx:org.montage.test.generator/1", 25);
+        half.generator.params["param.colour.r"] = Param(1.0);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, half);
+        Effect m = ofx::makeEffect(p, matte);
+        QVERIFY(m.strings.count("input.Matte") && m.s("input.Matte").empty());
+        m.strings["input.Matte"] = "track:" + std::to_string(s.videoTracks[1].id);
+        Clip* under = edit::clipById(s, base.created[0]);
+        under->effects.push_back(m);
+        frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY2(std::fabs(frame.at(10, 18)[0] - 0.2f) <= tolerance && std::fabs(frame.at(10, 18)[2] - 0.6f) <= tolerance,
+                 qPrintable(QString("%1 %2 %3").arg(frame.at(10, 18)[0]).arg(frame.at(10, 18)[1]).arg(frame.at(10, 18)[2])));
+        QVERIFY2(frame.at(50, 18)[0] <= tolerance && frame.at(50, 18)[2] <= tolerance, qPrintable(QString::number(frame.at(50, 18)[0])));
+        // Not connected: the source as it is.
+        under->effects[0].strings["input.Matte"] = "";
+        frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY(std::fabs(frame.at(50, 18)[2] - 0.6f) <= tolerance);
+        // The effect's own mask, with none drawn: everything.
+        under->effects[0].strings["input.Matte"] = "mask";
+        frame = renderSequenceFrame(p, s, 3, o);
+        QVERIFY(std::fabs(frame.at(50, 18)[2] - 0.6f) <= tolerance);
+        // A picture in the bin: opaque in its top half only.
+        {
+            QImage q(64, 36, QImage::Format_ARGB32);
+            q.fill(Qt::transparent);
+            for (int y = 0; y < 18; ++y)
+                for (int x = 0; x < 64; ++x) q.setPixel(x, y, qRgba(255, 255, 255, 255));
+            QVERIFY(q.save(path("ofx-matte.png")));
+            MediaItem item;
+            item.id = p.newId();
+            QVERIFY(probeMedia(path("ofx-matte.png").toStdString(), item));
+            p.media.push_back(item);
+            under->effects[0].strings["input.Matte"] = "media:" + std::to_string(item.id);
+            frame = renderSequenceFrame(p, s, 3, o);
+            QVERIFY2(std::fabs(frame.at(50, 5)[2] - 0.6f) <= tolerance && frame.at(50, 30)[2] <= tolerance,
+                     qPrintable(QString("%1 %2").arg(frame.at(50, 5)[2]).arg(frame.at(50, 30)[2])));
+        }
+        // Saved and loaded, and over MCP (a transition and a generator by their types; inputs by track).
+        QVERIFY(saveProject(p, path("ofx-inputs.montage").toStdString()));
+        {
+            McpServer server;
+            auto call = [&](const QString& tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            const QString project = path("ofx-inputs.montage");
+            QJsonObject r = call("montage_list_effects", {{"kind", "transition"}});
+            QVERIFY(QJsonDocument(r).toJson().contains("ofx:org.montage.test.dissolve/1"));
+            r = call("montage_list_effects", {{"kind", "generator"}});
+            QVERIFY(QJsonDocument(r).toJson().contains("ofx:org.montage.test.generator/1"));
+            r = call("montage_add_effect", {{"project", project}, {"clip", double(base.created[0])}, {"effect", "ofx:org.montage.test.dissolve/1"}});
+            QVERIFY(r.value("isError").toBool());
+            r = call("montage_add_generator", {{"project", project}, {"generator", "ofx:org.montage.test.generator/1"}, {"at", 30},
+                                               {"duration", 10}, {"track", "V1"}, {"settings", QJsonObject{{"split", 0.75}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            Project added;
+            QVERIFY(loadProject(project.toStdString(), added));
+            const Clip* made = nullptr;
+            for (const Clip& c : added.active()->videoTracks[0].clips)
+                if (c.generator.type == "ofx") made = &c;
+            QVERIFY(made && std::fabs(made->generator.params.at("param.split").value - 0.75) < 1e-9);
+            r = call("montage_add_transition", {{"project", project}, {"clip", double(base.created[0])}, {"edge", "out"},
+                                                {"type", "ofx:org.montage.test.dissolve/1"}, {"duration", 4}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            r = call("montage_add_effect", {{"project", project}, {"clip", double(base.created[0])}, {"effect", "ofx:org.montage.test.matte/1"},
+                                            {"inputs", QJsonObject{{"Matte", "V2"}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QVERIFY(loadProject(project.toStdString(), added));
+            const Sequence& as = *added.active();
+            QVERIFY(!as.videoTracks[0].transitions.empty() && as.videoTracks[0].transitions.back().type == "ofx");
+            const Clip* c = edit::clipById(as, base.created[0]);
+            QVERIFY(c && c->effects.size() == 2);
+            QCOMPARE(c->effects[1].s("input.Matte"), "track:" + std::to_string(as.videoTracks[1].id));
+        }
+
+        // On-screen controls (drawn with the Draw Suite): a 400 x 200 frame shown at its own size, y down in the view.
+        Effect pr = ofx::makeEffect(p, probe);
+        std::unique_ptr<ofx::Interact> in = ofx::Interact::open(pr, &err);
+        QVERIFY2(in, err.c_str());
+        QVERIFY(!ofx::Interact::open(ofx::makeEffect(p, dissolve)));  // (no controls)
+        ofx::View v;
+        v.width = 400, v.height = 200, v.frameW = 400, v.frameH = 200;
+        v.m[0] = 1, v.m[1] = 0, v.m[2] = 0, v.m[3] = 0, v.m[4] = -1, v.m[5] = 200;
+        QCOMPARE(v.pixelScale(), 1.0);
+        ofx::Overlay drawn;
+        QVERIFY(in->draw(pr, 0, v, drawn));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(reg.guardPath())));  // (only while it runs)
+        QCOMPARE(drawn.ops.size(), size_t(2));
+        QCOMPARE(int(drawn.ops[0].kind), int(ofx::DrawOp::Lines));
+        QCOMPARE(drawn.ops[0].points.size(), size_t(4));
+        QCOMPARE(drawn.ops[0].colour[2], 0.0f);  // yellow
+        QCOMPARE(int(drawn.ops[1].kind), int(ofx::DrawOp::Rectangle));
+        // Centre (0.5, 0.25) of the frame is canonical (200, 50): the square round it, 10 screen pixels each way.
+        QCOMPARE(drawn.ops[1].points[0][0], 190.0);
+        QCOMPARE(drawn.ops[1].points[0][1], 40.0);
+        QCOMPARE(drawn.ops[1].points[1][0], 210.0);
+        QCOMPARE(drawn.ops[1].points[1][1], 60.0);
+        // Seen at half size: still 10 screen pixels, 20 canonical.
+        ofx::View small = v;
+        small.width = 200, small.height = 100, small.m[0] = 0.5, small.m[4] = -0.5, small.m[5] = 100;
+        QVERIFY(in->draw(pr, 0, small, drawn) && drawn.ops.size() == 2);
+        QCOMPARE(drawn.ops[1].points[0][0], 180.0);
+        // A press beside the square is not taken; one on it is, and a drag keys Centre where it is animated.
+        Effect edited;
+        bool changed = true;
+        QVERIFY(!in->pen(ofx::Interact::Pen::Down, pr, 10, v, 20, 20, 1, edited, changed));
+        QVERIFY(!changed);
+        pr.params["param.centre.x"].addKey(0, 0.5);
+        pr.params["param.centre.y"].addKey(0, 0.25);
+        QVERIFY(in->pen(ofx::Interact::Pen::Down, pr, 10, v, 205, 148, 1, edited, changed));
+        QVERIFY(!changed);
+        QVERIFY(in->pen(ofx::Interact::Pen::Move, pr, 10, v, 300, 100, 1, edited, changed));
+        QVERIFY(changed);
+        QCOMPARE(edited.params.at("param.centre.x").keys.size(), size_t(2));
+        QCOMPARE(edited.params.at("param.centre.x").at(10), 0.75);  // 300 of 400
+        QCOMPARE(edited.params.at("param.centre.y").at(10), 0.5);   // 100 up from the bottom of 200
+        QCOMPARE(edited.params.at("param.centre.x").at(0), 0.5);    // (the key before kept)
+        QCOMPARE(pr.params.at("param.centre.x").keys.size(), size_t(1));  // (the effect itself untouched)
+        QVERIFY(in->pen(ofx::Interact::Pen::Up, edited, 10, v, 300, 100, 1, edited, changed));
+        QVERIFY(!in->pen(ofx::Interact::Pen::Move, edited, 10, v, 320, 100, 1, edited, changed));  // let go
+        // Not animated: the value itself.
+        Effect still = ofx::makeEffect(p, probe);
+        QVERIFY(in->pen(ofx::Interact::Pen::Down, still, 3, v, 200, 150, 1, edited, changed));
+        QVERIFY(in->pen(ofx::Interact::Pen::Up, still, 3, v, 100, 150, 1, edited, changed) && changed);
+        QVERIFY(edited.params.at("param.centre.x").keys.empty());
+        QCOMPARE(edited.params.at("param.centre.x").value, 0.25);
+        in.reset();
+
+        // A plug-in Montage stopped in while its controls were showing is blocked at the next scan, until it changes.
+        {
+            const QString copy = path("ofx-interact-crash");
+            const QString from = QString::fromStdString(good);
+            QVERIFY(QDir().mkpath(copy));
+            std::string binary;
+            for (const std::string& b : ofx::findBinaries({good})) binary = b;
+            const QString rel = QDir(from).relativeFilePath(QString::fromStdString(binary));
+            QVERIFY(QDir().mkpath(QFileInfo(copy + "/" + rel).absolutePath()));
+            QVERIFY(QFile::copy(QString::fromStdString(binary), copy + "/" + rel));
+            reg.setSearchPaths({copy.toStdString()});
+            QCOMPARE(reg.scan(), 7);
+            const std::string copied = ofx::findBinaries({copy.toStdString()}).at(0);
+            QFile guard(QString::fromStdString(reg.guardPath()));
+            QVERIFY(guard.open(QIODevice::WriteOnly));
+            guard.write(QByteArray::fromStdString(copied));
+            guard.close();
+            QCOMPARE(reg.scan(), 0);
+            QCOMPARE(reg.blocked().size(), size_t(1));
+            QCOMPARE(reg.blocked()[0].second, std::string("Crashed while showing its on-screen controls"));
+            QCOMPARE(reg.scan(), 0);  // (still, from the cache)
+            reg.setSearchPaths({good, crash});
+            QCOMPARE(reg.scan(), 7);
+        }
     }
 
 #ifdef __APPLE__

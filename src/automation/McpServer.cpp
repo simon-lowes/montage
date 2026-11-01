@@ -3072,6 +3072,55 @@ void McpServer::Impl::addTools() {
                       out);
         });
 
+    add("montage_add_generator", "Add a generator clip",
+        "Add a generator clip: a built-in one (color, gradient, bars, adjustment...; montage_list_effects kind generator) or an "
+        "OpenFX generator plug-in (\"ofx:<id>\" from the same list), at a time on a video track (default: above the top one in "
+        "use), for duration seconds or frames. settings sets its parameters by name (colours as name.r / .g / .b).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"generator":{"type":"string"},"at":{"type":["number","string"]},
+            "duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}}},
+            "required":["project","generator","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const std::string type = need(a, "generator").toStdString();
+            if (ofx::isOfxType(type)) {
+                ofx::PluginDesc d;
+                if (!openFxPlugin(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d) || !d.generator())
+                    throw ArgError{QStringLiteral("No OpenFX generator \"%1\" is installed (see montage_list_effects kind generator)").arg(QString::fromStdString(type))};
+            } else if (const EffectInfo* info = findEffectInfo(type); !info || info->category != EffectCategory::Generator || info->hidden) {
+                throw ArgError{QStringLiteral("Unknown generator \"%1\" (see montage_list_effects kind generator)").arg(QString::fromStdString(type))};
+            }
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            if (t.kind != TrackKind::Video) throw ArgError{"A generator goes on a video track"};
+            const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+            Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
+            const QJsonObject settings = a.value("settings").toObject();
+            for (auto it = settings.begin(); it != settings.end(); ++it) {
+                // (an OpenFX plug-in's parameters are "param.<name>"; either spelling is taken)
+                std::string key = it.key().toStdString();
+                if (!c.generator.params.count(key) && c.generator.params.count("param." + key)) key = "param." + key;
+                if (!c.generator.params.count(key))
+                    throw ArgError{QStringLiteral("\"%1\" is not a setting of %2").arg(it.key(), QString::fromStdString(c.name))};
+                if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                c.generator.params[key] = Param(it.value().toDouble());
+            }
+            c.start = timeArg(a.value("at"), s, "at");
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)),
+                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
     add("montage_list_effects", "List effects",
         "The effects, transitions and generators (titles, shapes, particles...) Montage has, with their parameters (name, range, default).",
         R"json({"type":"object","properties":{"kind":{"type":"string","enum":["video","audio","transition","generator"],"default":"video"}}})json", true,
@@ -3098,10 +3147,11 @@ void McpServer::Impl::addTools() {
                 list.append(QJsonObject{{"type", QString::fromStdString(e.type)}, {"name", QString::fromStdString(e.displayName)},
                                         {"group", QString::fromStdString(e.group)}, {"params", params}});
             }
-            // OpenFX video plugins installed on this computer.
-            if (kind == "video") {
+            // OpenFX video plugins installed on this computer: clip effects, transitions and generators by their kind.
+            if (kind == "video" || kind == "transition" || kind == "generator") {
                 Project scratch = makeDefaultProject();
                 for (const ofx::PluginDesc& d : openFxPlugins()) {
+                    if ((kind == "transition") != d.transition() || (kind == "generator") != d.generator()) continue;
                     const Effect e = ofx::makeEffect(scratch, d);
                     QJsonArray params;
                     for (const ParamInfo& pi : effectParams(e)) {
@@ -3116,9 +3166,15 @@ void McpServer::Impl::addTools() {
                                                                                       QString::fromStdString(pi.name + ".b")};
                         params.append(po);
                     }
-                    list.append(QJsonObject{{"type", QString::fromStdString(ofx::kTypePrefix + d.id)}, {"name", QString::fromStdString(d.label)},
-                                            {"group", QString::fromStdString("OpenFX" + (d.group.empty() ? std::string() : "/" + d.group))},
-                                            {"params", params}});
+                    QJsonObject entry{{"type", QString::fromStdString(ofx::kTypePrefix + d.id)}, {"name", QString::fromStdString(d.label)},
+                                      {"group", QString::fromStdString("OpenFX" + (d.group.empty() ? std::string() : "/" + d.group))},
+                                      {"params", params}};
+                    // A General plugin's further inputs (montage_add_effect's inputs connects them).
+                    QJsonArray inputs;
+                    for (const ofx::InputDesc& in : d.inputs)
+                        inputs.append(QJsonObject{{"name", QString::fromStdString(in.name)}, {"label", QString::fromStdString(in.label)}, {"mask", in.mask}});
+                    if (!inputs.isEmpty()) entry["inputs"] = inputs;
+                    list.append(entry);
                 }
             }
             // Audio plugins installed here (CLAP, VST3, LV2, AU), as the scanner found them; "ara": an ARA plug-in, which
@@ -3225,6 +3281,7 @@ void McpServer::Impl::addTools() {
         "whose alpha is below solid (%), by amount (%), so no screen colour is left in hair and motion blur.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
+            "inputs":{"type":"object","additionalProperties":{"type":["string","number"]},"description":"An OpenFX plugin's further inputs (its \"inputs\" in montage_list_effects) connected: a video track (\"V2\", hidden from the output then), a bin item's id, \"mask\" (the effect's own mask) or \"\" (none)"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
@@ -3246,7 +3303,29 @@ void McpServer::Impl::addTools() {
                 ofx::PluginDesc d;
                 if (!openFxPlugin(type.substr(std::char_traits<char>::length(ofx::kTypePrefix)), d))
                     throw ArgError{QStringLiteral("No OpenFX plugin \"%1\" is installed (see montage_list_effects)").arg(QString::fromStdString(type))};
+                if (d.transition()) throw ArgError{QStringLiteral("%1 is a transition: add it with montage_add_transition").arg(QString::fromStdString(d.label))};
+                if (d.generator()) throw ArgError{QStringLiteral("%1 is a generator: add it with montage_add_generator").arg(QString::fromStdString(d.label))};
                 plugin = ofx::makeEffect(l.project, d);
+                // Its further inputs: {"<clip>": "V2" (a video track), a bin item's id, "mask" (its own mask) or "" (none)}.
+                const QJsonObject inputs = a.value("inputs").toObject();
+                for (auto it = inputs.begin(); it != inputs.end(); ++it) {
+                    const std::string key = ofx::inputKey(it.key().toStdString());
+                    if (!plugin->strings.count(key))
+                        throw ArgError{QStringLiteral("%1 has no input \"%2\" (see montage_list_effects)").arg(QString::fromStdString(d.label), it.key())};
+                    const QString v = it.value().isDouble() ? QString::number(qint64(it.value().toDouble())) : it.value().toString();
+                    std::string connection;
+                    if (v == "mask") connection = "mask";
+                    else if (v.startsWith('V') || v.startsWith('v')) {
+                        const TrackRef tr = trackArg(v, l.seq(), false);
+                        if (tr.kind != TrackKind::Video) throw ArgError{"An input takes a video track"};
+                        connection = "track:" + std::to_string(l.seq().videoTracks[size_t(tr.index)].id);
+                    } else if (!v.isEmpty()) {
+                        const Id id = Id(v.toULongLong());
+                        if (!l.project.findMedia(id)) throw ArgError{QStringLiteral("No bin item %1").arg(v)};
+                        connection = "media:" + std::to_string(id);
+                    }
+                    plugin->strings[key] = connection;
+                }
                 type = "ofx";
             } else if (plugins::isPluginType(type)) {
                 // An audio plugin ("plugin:<id>"): its parameters as "param.<id>"; an ARA plug-in becomes an "ara" effect.
@@ -3669,7 +3748,8 @@ void McpServer::Impl::addTools() {
     add("montage_add_transition", "Add a transition",
         "Add a transition at a clip's start or end (cross_dissolve by default, centred on the cut). With `clips` "
         "instead (Premiere's Apply Default Transitions to Selection), one at both ends of every clip listed: each edit "
-        "point once, a fade where a clip meets a gap; `type` on picture clips and `audio_type` (crossfade) on sound.",
+        "point once, a fade where a clip meets a gap; `type` on picture clips and `audio_type` (crossfade) on sound. "
+        "`type` may be an OpenFX transition plug-in (\"ofx:<id>\", montage_list_effects kind transition).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
             "clips":{"type":"array","items":{"type":"number"}},
             "edge":{"type":"string","enum":["in","out"],"default":"in"},"type":{"type":"string","default":"cross_dissolve"},
@@ -3679,6 +3759,7 @@ void McpServer::Impl::addTools() {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(s.fpsValue()));
+            if (ofx::isOfxType(str(a, "type").toStdString())) (void)openFxPlugins();  // (the plug-ins found first)
             if (a.contains("clips")) {
                 std::vector<Id> ids;
                 for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));

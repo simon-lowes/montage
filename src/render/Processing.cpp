@@ -17,6 +17,7 @@
 #include "core/Effects.h"
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
+#include "media/SuperScale.h"
 #include "media/DepthMap.h"
 #include "media/Exr.h"
 #include "media/Matting.h"
@@ -2108,6 +2109,14 @@ void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixel
         applyEffectUnmasked(e, t, img, pixelScale);
         return;
     }
+    if (e.type == "ofx" && ofx::usesOwnMask(e) && e.p("mask.show", t) <= 0.5) {
+        // An OpenFX plugin with an input on its own mask takes the mask itself (render/Ofx.h); its result is not cut by
+        // the mask again.
+        const std::vector<float> matte = hasMask(e, t) ? effectMatte(e, t, img, pixelScale, sourceSeconds) : std::vector<float>{};
+        const ofx::OwnMaskScope scope(matte.empty() ? nullptr : &matte);
+        applyEffectUnmasked(e, t, img, pixelScale);
+        return;
+    }
     if (!hasMask(e, t)) {
         applyEffectUnmasked(e, t, img, pixelScale);
         return;
@@ -3080,7 +3089,14 @@ Face projectFace(const double corners[4][3], double f, int w, int h) {
 }  // namespace
 
 Image transitionMix(const std::string& type, const Effect& params, const Image& aIn, const Image& bIn, double u, int w,
-                    int h) {
+                    int h, double t, double scale) {
+    if (type == "ofx") {
+        // An OpenFX transition plug-in (render/Ofx.h).
+        Image mixed;
+        if (ofx::applyTransition(params, t, u, aIn, bIn, mixed, scale, nullptr, &currentWorkingSpace()) && !mixed.empty())
+            return mixed.width == w && mixed.height == h ? mixed : resizeImage(mixed, w, h);
+        return transitionMix("cross_dissolve", params, aIn, bIn, u, w, h);
+    }
     Image out(w, h);
     const Image empty;
     const Image& a = aIn.empty() ? empty : aIn;

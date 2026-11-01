@@ -5,12 +5,29 @@
 // Plugins are found in the standard folders (OFX_PLUGIN_PATH first) as *.ofx.bundle folders, and each new or changed
 // binary is described in montage-plugin-probe, a separate process, so one that crashes or hangs while loading cannot
 // take the editor down; descriptions are cached by path, size and time, and failures are blocklisted until the file
-// changes. A plugin runs in the Filter context (one Source clip, one Output) on premultiplied RGBA float frames (or
-// 8-bit, when that is all it takes), with the host suites a filter needs: properties, image effect, parameters,
-// memory, multithreading, messages, progress and timeline. Its parameters become the clip effect's (type "ofx"),
-// keyframed like any other, and the plugin reads them at any time it asks for.
+// changes. A plugin runs in one of four contexts, the first it takes of: Filter (one Source clip, one Output) or
+// General (a Source and further inputs: mattes and second pictures, each connected to a video track, a bin item or the
+// effect's own mask) as a clip effect; Transition (SourceFrom and SourceTo, its Transition parameter driven by the
+// transition's progress) among the transitions; Generator (an Output alone) as a generator clip. Pictures are
+// premultiplied RGBA float (or 8-bit, when that is all it takes), with the host suites: properties, image effect,
+// parameters, memory, multithreading, messages, progress, timeline, interact and draw (on-screen controls) and OpenGL
+// render. Its parameters become the effect's (type "ofx"), keyframed like any other, and the plugin reads them at any
+// time it asks for.
+//
+// On-screen controls: a plugin's overlay interact draws over the Program monitor, through the OpenFX 1.5 Draw Suite
+// (its V2 overlay; painted with QPainter over whatever draws the picture) or OpenGL (V1; drawn in an offscreen OpenGL
+// context and laid over the picture). Pen and key events reach it, and the parameters it sets while it holds the pen
+// are written keyframe-aware into a copy of the effect, which the editor makes one undo step. A plugin that crashes
+// while its controls run is blocked, as one that crashes on loading is, until its binary changes.
+//
+// GPU: a plugin that renders with OpenGL (kOfxImageEffectPropOpenGLRenderSupported) does so in Montage's own OpenGL
+// context, on a thread of its own, texture in and texture out; the pictures go up and come back. Without OpenGL, or
+// when it fails, the CPU render is used (a plugin that needs OpenGL then fails with why). CUDA, OpenCL and Metal
+// rendering are not offered.
 #pragma once
 
+#include <QImage>
+#include <array>
 #include <functional>
 #include <map>
 #include <memory>
@@ -20,6 +37,8 @@
 
 #include "core/Model.h"
 #include "media/Image.h"
+
+class QPainter;
 
 namespace montage {
 struct ColorSpace;
@@ -40,6 +59,14 @@ struct ParamDesc {
     bool numeric() const;
 };
 
+// An input clip of a plugin in the General context beyond its Source (a matte, a second picture).
+struct InputDesc {
+    std::string name, label;
+    bool mask = false;      // kOfxImageClipPropIsMask
+    bool optional = false;  // kOfxImageClipPropOptional
+    bool operator==(const InputDesc&) const = default;
+};
+
 struct PluginDesc {
     std::string id;          // "ofx:" + identifier + "/" + major version
     std::string identifier;  // the plug-in's own
@@ -51,7 +78,13 @@ struct PluginDesc {
     bool temporal = false;  // asks for frames other than the one rendered
     bool floatImages = true;  // takes 32-bit float images (else 8-bit)
     std::string colour;       // the colour management it takes (OpenFX 1.5: Basic, Core; empty for none)
+    std::string context = "OfxImageEffectContextFilter";  // the context Montage runs it in (kOfxImageEffectContext*)
+    std::vector<InputDesc> inputs;  // General: its inputs other than Source
+    std::string openGL = "false";   // kOfxImageEffectPropOpenGLRenderSupported: "false", "true" or "needed"
+    int overlay = 0;                // its on-screen controls: 0 none, 1 OpenGL (V1), 2 the Draw Suite (V2)
     std::vector<ParamDesc> params;
+    bool transition() const;  // a transition (the Transition context)
+    bool generator() const;   // a generator (the Generator context)
     bool operator==(const PluginDesc&) const = default;
 };
 
@@ -69,7 +102,7 @@ std::vector<PluginDesc> descriptionsFromJson(const std::string& json);
 class Registry {
 public:
     static Registry& instance();
-    void setCachePath(const std::string& path);
+    void setCachePath(const std::string& path);  // (the crash guard for on-screen controls sits beside it)
     void setProbeExecutable(const std::string& path);  // default: montage-plugin-probe beside the program
     void setSearchPaths(const std::vector<std::string>& dirs);  // empty: the defaults
     // Finds and describes the plugins (new or changed binaries in the probe process). How many there are.
@@ -78,6 +111,8 @@ public:
     std::vector<PluginDesc> plugins() const;
     std::vector<std::pair<std::string, std::string>> blocked() const;  // binary, why
     bool find(const std::string& id, PluginDesc& out) const;
+    // The file naming the plug-in whose on-screen controls are running (the next scan blocks it if Montage stopped then).
+    std::string guardPath() const;
 
 private:
     Registry();
@@ -106,6 +141,110 @@ std::string effectName(const Effect& e);
 using FrameFetch = std::function<bool(double t, Image& out)>;
 bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch = {}, std::string* error = nullptr,
                  const ColorSpace* working = nullptr);
+// A transition plugin's picture at `progress` (0 at the transition's first frame, 1 past its last) from `from` to `to`
+// (premultiplied, the same size; either may be empty: transparent), at transition frame `t`. False (with `error`) as
+// applyEffect; `out` is then untouched.
+bool applyTransition(const Effect& e, double t, double progress, const Image& from, const Image& to, Image& out, double scale,
+                     std::string* error = nullptr, const ColorSpace* working = nullptr);
+// A generator plugin's picture at clip frame `t`, `w` x `h` at `scale` of full size.
+bool renderGenerator(const Effect& e, double t, int w, int h, double scale, Image& out, std::string* error = nullptr,
+                     const ColorSpace* working = nullptr);
+
+// A General plugin's inputs: the effect string "input.<clip name>" says what each is connected to: "" (nothing),
+// "track:<id>" (what that video track shows), "media:<id>" (a bin item, placed as a new clip would be) or "mask" (the
+// effect's own mask, as its alpha; the effect's result is then not cut by the mask again).
+std::string inputKey(const std::string& clip);
+bool usesOwnMask(const Effect& e);
+// The pictures connected inputs show at clip frame `t`, sized as the compositor makes them (they are fitted to the
+// source): set by the compositor around a clip's effects.
+using InputResolver = std::function<bool(const std::string& connection, double t, Image& out)>;
+class InputScope {
+public:
+    explicit InputScope(InputResolver resolve);
+    ~InputScope();
+    InputScope(const InputScope&) = delete;
+    InputScope& operator=(const InputScope&) = delete;
+
+private:
+    InputResolver previous_;
+};
+const InputResolver& currentInputs();
+// The effect's own mask (one value a pixel, the size of the picture it runs on) for an input connected to "mask".
+class OwnMaskScope {
+public:
+    explicit OwnMaskScope(const std::vector<float>* matte);
+    ~OwnMaskScope();
+    OwnMaskScope(const OwnMaskScope&) = delete;
+    OwnMaskScope& operator=(const OwnMaskScope&) = delete;
+
+private:
+    const std::vector<float>* previous_;
+};
+
+// ---- GPU (the OpenGL render suite) ----
+// Makes the offscreen surface OpenGL renders and controls use (the GUI thread, once; the app does at startup). False,
+// with why, where there is no OpenGL; plugins then render on the CPU.
+bool initializeGpu(std::string* why = nullptr);
+bool gpuAvailable(std::string* why = nullptr);
+void setGpuRendering(bool on);  // use OpenGL for plugins that take it (on by default once initialised)
+bool gpuRendering();
+int gpuRenders();  // renders made with OpenGL in this process (for tests)
+
+// ---- On-screen controls (overlay interacts) ----
+// What a control drew: Draw Suite primitives, in canonical coordinates (the effect's full-size frame, y up), and what
+// it drew with OpenGL, as a premultiplied picture the size of the view.
+struct DrawOp {
+    enum Kind { Lines, LineStrip, LineLoop, Rectangle, Polygon, Ellipse, Text } kind = Lines;
+    std::array<float, 4> colour{1, 1, 1, 1};
+    float width = 0;  // 0: one pixel
+    int stipple = 0;  // OfxDrawLineStipplePattern
+    std::vector<std::array<double, 2>> points;
+    std::string text;
+    int align = 0;  // OfxDrawTextAlignment
+};
+struct Overlay {
+    std::vector<DrawOp> ops;
+    QImage gl;  // (null when it drew nothing with OpenGL)
+};
+// Where the effect's frame is on screen: canonical (x, y) shows at (m[0] x + m[1] y + m[2], m[3] x + m[4] y + m[5])
+// in a view `width` x `height` pixels (y down).
+struct View {
+    int width = 0, height = 0;
+    double m[6] = {1, 0, 0, 0, -1, 0};
+    double renderScale = 1;       // of the pictures the monitor shows
+    double frameW = 0, frameH = 0;  // the effect's full-size frame (canonical extent); 0: the project's
+    double pixelScale() const;      // canonical pixels a screen pixel
+    std::array<double, 2> toView(double x, double y) const;
+    std::array<double, 2> toCanonical(double vx, double vy) const;
+};
+// Draws `o` with `p` (a QPainter on the view).
+void paintOverlay(QPainter& p, const Overlay& o, const View& v);
+
+// A plugin effect's on-screen control: an instance of its own (interactive) and its overlay interact. Calls come from
+// the GUI thread.
+class Interact {
+public:
+    // Null (with `error` when something failed) when the effect's plugin has no overlay.
+    static std::unique_ptr<Interact> open(const Effect& e, std::string* error = nullptr);
+    ~Interact();
+    Interact(const Interact&) = delete;
+    Interact& operator=(const Interact&) = delete;
+    // What it draws at clip frame `t`. False when it failed (it is then closed).
+    bool draw(const Effect& e, double t, const View& v, Overlay& out);
+    enum class Pen { Down, Move, Up };
+    // A pen event at view point (vx, vy). True when the plugin took it; `edited` (a copy of `e`) then holds the
+    // parameters it set, keyed at `t` where they are animated, and `changed` says whether it set any.
+    bool pen(Pen kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed);
+    // A key (an OfxKeySyms code, and its text) pressed or let go.
+    bool key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed);
+    bool failed() const { return failed_; }
+    struct Impl;
+
+private:
+    explicit Interact(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+    bool failed_ = false;
+};
 
 // The frames of the clip being rendered on this thread, for plugins that ask for other times: set by the compositor
 // around a clip's effects.

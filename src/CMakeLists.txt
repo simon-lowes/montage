@@ -162,7 +162,7 @@ add_library(montage_engine STATIC
   media/Translator.h media/Translator.cpp
   media/InterfaceDrafts.h media/InterfaceDrafts.cpp
   render/Processing.h render/Processing.cpp render/TransferTables.h
-  render/Ofx.h render/Ofx.cpp
+  render/Ofx.h render/Ofx.cpp render/OfxGl.h render/OfxGl.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
