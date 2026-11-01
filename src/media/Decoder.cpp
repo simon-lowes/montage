@@ -1594,6 +1594,10 @@ std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f) {
         p->stride[i] = held->linesize[i];
     }
     p->owner = held;
+    // (what the frame's buffers hold, padding and the decoder's pool rounding included, for the frame cache's count)
+    for (int i = 0; i < AV_NUM_DATA_POINTERS && held->buf[i]; ++i) p->heldBytes += held->buf[i]->size;
+    for (int i = 0; i < held->nb_extended_buf; ++i)
+        if (held->extended_buf[i]) p->heldBytes += held->extended_buf[i]->size;
     return p;
 }
 

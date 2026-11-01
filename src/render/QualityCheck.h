@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "render/EncodeCompare.h"
 
 namespace montage {
 
@@ -56,9 +57,14 @@ struct QcSettings {
     // Sound without a caption, for SDH: sound louder than -40 dBFS outside speech (the transcripts' words) with no
     // caption of the shown track over it for this long; 0 = not checked.
     double uncaptionedSeconds = 0;
+    // Compare Encode (render/EncodeCompare.h): this delivered file against the sequence's own render over the range,
+    // its frames past the limits reported ("" = not compared).
+    std::string compareFile;
+    unsigned compareMetrics = MetricPsnr | MetricSsim | MetricMsSsim | MetricDeltaItp;
+    QualityLimits qualityLimits;
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness, EncodeQuality };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;
@@ -97,12 +103,17 @@ private:
     Track lum_, red_;
 };
 
-// Runs the checks over [in, out) (out < 0: to the end), in time order.
+// Runs the checks over [in, out) (out < 0: to the end), in time order. With compareFile, the comparison is also
+// handed back in `comparison`.
 std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime in, FrameTime out, const QcSettings& settings,
-                                  const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr);
+                                  const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
+                                  EncodeComparison* comparison = nullptr);
 
 // Red markers spanning each issue, named "QC: <kind>", in place of earlier QC markers. Returns how many.
 int addQcMarkers(Sequence& s, const std::vector<QcIssue>& issues);
+// Orange markers on a comparison's worst frames, named "Worst frame" with their scores, in place of earlier ones.
+// Returns how many.
+int addWorstFrameMarkers(Sequence& s, const EncodeComparison& c);
 
 // Makes a picture broadcast safe in place (EBU R103 or strict 0-100 %): over-range colours are pulled towards their
 // own luma (keeping hue) until every channel fits, then luma is limited; a soft knee keeps gradations. With

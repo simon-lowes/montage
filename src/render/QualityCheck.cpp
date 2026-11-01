@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 
@@ -70,6 +71,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::DcOffset: return "DC offset";
         case QcKind::Uncaptioned: return "Sound without a caption";
         case QcKind::CinemaLoudness: return "Leq(M)";
+        case QcKind::EncodeQuality: return "Encode quality";
     }
     return "";
 }
@@ -152,8 +154,13 @@ std::pair<int, int> FlashDetector::lastSecondSpan(bool red) const {
 }
 
 std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime in, FrameTime out, const QcSettings& q,
-                                  const std::function<void(double)>& progress, const std::atomic<bool>* cancel) {
+                                  const std::function<void(double)>& progressAll, const std::atomic<bool>* cancel,
+                                  EncodeComparison* comparison) {
     std::vector<QcIssue> issues;
+    // With an encode to compare, the other checks take the first half of the progress.
+    const bool compare = !q.compareFile.empty();
+    const std::function<void(double)> progress =
+        !progressAll ? progressAll : compare ? std::function<void(double)>([&](double f) { progressAll(0.5 * f); }) : progressAll;
     if (out < 0) out = s.duration();
     in = std::max<FrameTime>(0, in);
     if (out <= in || s.width <= 0) return issues;
@@ -504,8 +511,30 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                               "'" + c->name + "' is " + fmt("%g", std::round(frames * 10) / 10) + (frames == 1 ? " frame " : " frames ") +
                                   (o.frames > 0 ? "late" : "early") + " against '" + a->name + "', the clip it is linked to"});
         }
+    if (compare && !(cancel && cancel->load())) {
+        CompareOptions o;
+        o.metrics = q.compareMetrics;
+        // Checked over a range, the encode is taken to be an export of the range, unless it is as long as the whole
+        // sequence (a delivery of it): then it is compared from the range's start on.
+        FrameTime startsAt = -1;
+        if (in > 0) {
+            const int64_t length = pictureFileLength(q.compareFile);
+            if (length > 0 && std::llabs(length - int64_t(s.duration())) < std::llabs(length - int64_t(out - in))) startsAt = 0;
+        }
+        const EncodeComparison c = compareEncodeWithSequence(p, s, in, out, q.compareFile, o, [&](double f) {
+            if (progressAll && f >= 0) progressAll(0.5 + 0.5 * f);
+        }, cancel, startsAt);
+        if (!c.ok)
+            issues.push_back({QcKind::EncodeQuality, in, std::min(out, in + 1), "The encode could not be compared: " + c.error});
+        for (std::string w : c.warnings) {
+            if (!w.empty()) w[0] = char(std::toupper(static_cast<unsigned char>(w[0])));
+            issues.push_back({QcKind::EncodeQuality, in, std::min(out, in + 1), w});
+        }
+        for (const QualitySpan& sp : qualityOverLimits(c, q.qualityLimits)) issues.push_back({QcKind::EncodeQuality, sp.first, sp.end, sp.text});
+        if (comparison) *comparison = c;
+    }
     std::stable_sort(issues.begin(), issues.end(), [](const QcIssue& a, const QcIssue& b) { return a.start < b.start; });
-    if (progress) progress(1.0);
+    if (progressAll) progressAll(1.0);
     return issues;
 }
 
@@ -515,6 +544,29 @@ int addQcMarkers(Sequence& s, const std::vector<QcIssue>& issues) {
         s.markers.push_back(Marker{i.start, std::max<FrameTime>(0, i.end - i.start - 1), std::string("QC: ") + qcKindName(i.kind), i.text, kRedLabel});
     std::stable_sort(s.markers.begin(), s.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
     return int(issues.size());
+}
+
+int addWorstFrameMarkers(Sequence& s, const EncodeComparison& c) {
+    constexpr int kMangoLabel = 8;  // core/MediaLog.h "Mango"
+    std::erase_if(s.markers, [](const Marker& m) { return m.name == "Worst frame"; });
+    int added = 0;
+    for (FrameTime f : c.worstFrames) {
+        const auto it = std::find_if(c.frames.begin(), c.frames.end(), [f](const FrameQuality& q) { return q.frame == f; });
+        if (it == c.frames.end()) continue;
+        std::string text;
+        auto add = [&](const char* name, double v, const char* unit, int decimals) {
+            if (std::isnan(v)) return;
+            text += (text.empty() ? "" : ", ") + std::string(name) + " " + fmt(decimals == 2 ? "%.2f" : "%.4f", v) + unit;
+        };
+        add("PSNR", it->psnrY, " dB", 2);
+        add("SSIM", it->ssim, "", 4);
+        add("ΔICtCp", it->deltaItp, "", 2);
+        add("VMAF", it->vmaf, "", 2);
+        s.markers.push_back(Marker{f, 0, "Worst frame", text, kMangoLabel});
+        ++added;
+    }
+    std::stable_sort(s.markers.begin(), s.markers.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+    return added;
 }
 
 int broadcastSafe(float* rgba, int w, int h, bool strict, double knee, bool highlight) {

@@ -1737,6 +1737,12 @@ void TimelineWidget::setLoudnessLane(std::vector<IntelligibilitySpan> spans, boo
     viewport()->update();
 }
 
+void TimelineWidget::setQualityLane(std::vector<IntelligibilitySpan> spans, bool stale) {
+    qualityLane_ = std::move(spans);
+    qualityLaneStale_ = stale;
+    viewport()->update();
+}
+
 void TimelineWidget::setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges) {
     rendered_ = std::move(ranges);
     viewport()->update();
@@ -1801,6 +1807,14 @@ void TimelineWidget::paintRuler(QPainter& p) {
         QColor c = sp.status == 0 ? QColor(63, 185, 80) : sp.status == 1 ? QColor(210, 153, 34) : QColor(248, 81, 73);
         if (loudnessLaneStale_) c.setAlpha(90);
         p.fillRect(QRect(xa, kRulerH - 14, std::max(1, xb - xa), 3), c);
+    }
+    // Encode quality lane above that: green within the limits, amber on the worst frames, red past a limit.
+    for (const IntelligibilitySpan& sp : qualityLane_) {
+        const int xa = xForFrame(sp.first), xb = xForFrame(sp.end);
+        if (xb < kHeaderW || xa > W) continue;
+        QColor c = sp.status == 0 ? QColor(63, 185, 80) : sp.status == 1 ? QColor(210, 153, 34) : QColor(248, 81, 73);
+        if (qualityLaneStale_) c.setAlpha(90);
+        p.fillRect(QRect(xa, kRulerH - 18, std::max(1, xb - xa), 3), c);
     }
     // In/out band.
     if (s->inPoint >= 0 || s->outPoint >= 0) {

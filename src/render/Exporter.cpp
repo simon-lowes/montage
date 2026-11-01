@@ -1091,9 +1091,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (spatial) o.vctx->pix_fmt = AV_PIX_FMT_YUV420P;  // (x265's multiview encoder is 8-bit 4:2:0)
         // 4:2:2 chroma co-sited with the first luma sample of each pair, as Rec. 601 and 709 have it (and as the
         // decoder reads untagged 4:2:2); made there by the conversion below.
+        // And 4:2:0 for H.264, HEVC and MPEG-2 to the left between the two lines, as those standards' default has it
+        // (FFmpeg reports untagged H.264 so, and players read it so), tagged.
         if (const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
-            d && !(d->flags & AV_PIX_FMT_FLAG_RGB) && d->nb_components >= 3 && d->log2_chroma_w == 1 && d->log2_chroma_h == 0 &&
-            o.vctx->chroma_sample_location == AVCHROMA_LOC_UNSPECIFIED)
+            d && !(d->flags & AV_PIX_FMT_FLAG_RGB) && d->nb_components >= 3 && d->log2_chroma_w == 1 &&
+            o.vctx->chroma_sample_location == AVCHROMA_LOC_UNSPECIFIED &&
+            (d->log2_chroma_h == 0 || (d->log2_chroma_h == 1 && (o.vctx->codec_id == AV_CODEC_ID_H264 || o.vctx->codec_id == AV_CODEC_ID_HEVC ||
+                                                                 o.vctx->codec_id == AV_CODEC_ID_MPEG2VIDEO))))
             o.vctx->chroma_sample_location = AVCHROMA_LOC_LEFT;
         {
             const KeepThreadScheduling keep;  // (SVT-AV1 would leave this thread real-time, and the workers it starts later)

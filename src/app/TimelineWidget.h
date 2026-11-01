@@ -137,6 +137,10 @@ public:
     // short-term loudness over the target (1) or its true peak over the ceiling (2).
     void setLoudnessLane(std::vector<IntelligibilitySpan> spans, bool stale);
     const std::vector<IntelligibilitySpan>& loudnessLane() const { return loudnessLane_; }
+    // The encode quality lane above them (Quality Check's Compare Encode): within the limits (0), the worst frames (1),
+    // past a limit (2).
+    void setQualityLane(std::vector<IntelligibilitySpan> spans, bool stale);
+    const std::vector<IntelligibilitySpan>& qualityLane() const { return qualityLane_; }
     // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
     QRect lineBand(montage::Id clip) const;
     // Where a caption is drawn on its lane (widget coordinates), for tests; empty if there is no such caption.
@@ -355,6 +359,8 @@ private:
     std::vector<IntelligibilitySpan> intelligibility_;
     bool intelligibilityStale_ = false;
     std::vector<IntelligibilitySpan> loudnessLane_;
+    std::vector<IntelligibilitySpan> qualityLane_;
+    bool qualityLaneStale_ = false;
     bool loudnessLaneStale_ = false;
 };
 

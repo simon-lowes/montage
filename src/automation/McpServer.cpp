@@ -4943,7 +4943,11 @@ void McpServer::Impl::addTools() {
         "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
         "(`uncaptioned_seconds`), and a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`). Lists each "
         "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
-        "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's).",
+        "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's). `compare` sets a delivered "
+        "file against the sequence's own render (or against `reference`, another file), aligned over ±12 frames, frame by "
+        "frame: PSNR, SSIM, MS-SSIM, ΔICtCp (BT.2124) and, where Montage is built with libvmaf, VMAF (`metrics` picks "
+        "them); frames past `min_psnr`, `min_vmaf` or `max_delta_ictcp` are problems, the worst frames get orange markers "
+        "with `markers`, and `report` also writes report-quality.csv and report-quality.pdf.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -4965,13 +4969,38 @@ void McpServer::Impl::addTools() {
             "phase_seconds":{"type":"number","default":1,"description":"How long it must last"},
             "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
             "uncaptioned_seconds":{"type":"number","default":0,"description":"Sound louder than -40 dBFS outside speech with no caption over it for this long (SDH); 0 = not checked"},
-            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+            "markers":{"type":"boolean","default":false},
+            "compare":{"type":"string","description":"A delivered file to compare with the sequence's render (or with reference)"},
+            "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
+            "metrics":{"type":"array","items":{"type":"string","enum":["psnr","ssim","ms_ssim","delta_ictcp","vmaf"]},
+                "description":"What to measure (default all but vmaf)"},
+            "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
+            "min_vmaf":{"type":"number","description":"Frames with VMAF under this are problems"},
+            "max_delta_ictcp":{"type":"number","description":"Frames whose mean ΔE_ITP is over this are problems"}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
             const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
             QcSettings q;
+            EncodeComparison comparison;
+            if (a.contains("compare")) {
+                const QString file = absolute(need(a, "compare"));
+                if (!QFileInfo::exists(file)) throw ArgError{"No file at \"compare\": " + file};
+                q.compareFile = file.toStdString();
+                if (a.contains("metrics")) {
+                    q.compareMetrics = 0;
+                    for (const QJsonValue& m : a.value("metrics").toArray()) {
+                        const unsigned bit = qualityMetricFromName(m.toString().toStdString());
+                        if (!bit) throw ArgError{"Unknown metric " + m.toString()};
+                        q.compareMetrics |= bit;
+                    }
+                }
+                if ((q.compareMetrics & MetricVmaf) && !vmafAvailable()) throw ArgError{"This Montage was built without libvmaf, so it cannot measure VMAF"};
+                q.qualityLimits.minPsnr = std::max(0.0, a.value("min_psnr").toDouble(0));
+                q.qualityLimits.minVmaf = std::max(0.0, a.value("min_vmaf").toDouble(0));
+                q.qualityLimits.maxDeltaItp = std::max(0.0, a.value("max_delta_ictcp").toDouble(0));
+            }
             q.flashing = a.value("flashing").toBool(true);
             q.levels = a.value("levels").toBool(true);
             q.blackSeconds = std::max(0.0, a.value("black_seconds").toDouble(1));
@@ -5001,14 +5030,69 @@ void McpServer::Impl::addTools() {
             q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
-            const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
+            if (a.contains("reference") && q.compareFile.empty()) throw ArgError{"\"reference\" is compared with the file named by \"compare\""};
+            std::vector<QcIssue> issues;
+            // (file against file: frames are the reference file's, not the sequence's, so its spans are listed apart and
+            // put no markers on the sequence)
+            QString fileSpans;
+            const bool fileMode = a.contains("reference");
+            if (fileMode) {
+                // File against file: the sequence's own checks without the comparison, then the two files.
+                const std::string encode = q.compareFile;
+                q.compareFile.clear();
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(0.5 * f, "Checking"); });
+                const QString ref = absolute(need(a, "reference"));
+                if (!QFileInfo::exists(ref)) throw ArgError{"No file at \"reference\": " + ref};
+                CompareOptions o;
+                o.metrics = q.compareMetrics;
+                comparison = compareEncodeFiles(ref.toStdString(), encode, o, [this](double f) { if (f >= 0) progress(0.5 + 0.5 * f, "Comparing"); });
+                if (!comparison.ok) return fail(QStringLiteral("The encode could not be compared: %1").arg(QString::fromStdString(comparison.error)));
+                for (const QualitySpan& sp : qualityOverLimits(comparison, q.qualityLimits))
+                    fileSpans += QStringLiteral("Reference frames %1 - %2  Encode quality: %3\n").arg(sp.first).arg(sp.end).arg(QString::fromStdString(sp.text));
+                for (const std::string& w : comparison.warnings) fileSpans += QStringLiteral("Encode quality: %1\n").arg(QString::fromStdString(w));
+                q.compareFile = encode;
+            } else {
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); }, nullptr, &comparison);
+            }
             QString text;
             for (const QcIssue& i : issues)
                 text += QStringLiteral("%1 - %2  %3: %4\n").arg(tc(i.start, s), tc(i.end, s), QString::fromLatin1(qcKindName(i.kind)),
                                                              QString::fromStdString(i.text));
+            text += fileSpans;
+            if (comparison.ok) {
+                auto num = [](double v, int d) {
+                    return std::isnan(v) ? QStringLiteral("-") : std::isinf(v) ? QStringLiteral("inf") : QString::number(v, 'f', d);
+                };
+                text += QStringLiteral("Compared %1 frames (%2, encode offset %3): PSNR %4 dB (worst %5), SSIM %6 (worst %7), "
+                                       "MS-SSIM %8, ΔICtCp %9 (worst %10)")
+                            .arg(comparison.frames.size())
+                            .arg(QString::fromStdString(comparison.format))
+                            .arg(comparison.offset)
+                            .arg(num(comparison.mean.psnrY, 2), num(comparison.worst.psnrY, 2), num(comparison.mean.ssim, 5),
+                                 num(comparison.worst.ssim, 5), num(comparison.mean.msSsim, 5), num(comparison.mean.deltaItp, 3),
+                                 num(comparison.worst.deltaItp, 3));
+                if (comparison.vmafScored) text += QStringLiteral(", VMAF %1 (worst %2)").arg(num(comparison.mean.vmaf, 2), num(comparison.worst.vmaf, 2));
+                text += '\n';
+                if (!comparison.worstFrames.empty()) {
+                    QStringList worst;
+                    for (FrameTime f : comparison.worstFrames) worst << (fileMode ? QString::number(f) : tc(f, s));
+                    text += (fileMode ? QStringLiteral("Worst frames (of the reference): %1\n") : QStringLiteral("Worst frames: %1\n")).arg(worst.join(", "));
+                }
+            }
             if (a.value("markers").toBool()) {
                 addQcMarkers(s, issues);
+                if (comparison.ok && !fileMode) addWorstFrameMarkers(s, comparison);
                 save(l);
+            }
+            if (comparison.ok && a.contains("report")) {
+                const QString base = absolute(need(a, "report")) + "-quality";
+                QDir().mkpath(QFileInfo(base).absolutePath());
+                std::string e;
+                const Sequence* timed = fileMode ? nullptr : &s;
+                if (!writeQualityCsv((base + ".csv").toStdString(), comparison, timed, &e) ||
+                    !writeQualityPdf((base + ".pdf").toStdString(), comparison, s.name, q.qualityLimits, timed, &e))
+                    return fail(QStringLiteral("No quality report: %1").arg(QString::fromStdString(e)));
+                text += QStringLiteral("Quality report: %1.pdf (and .csv)\n").arg(base);
             }
             if (a.contains("report")) {
                 LoudnessReportSpec spec;

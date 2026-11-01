@@ -91,6 +91,7 @@ struct YcbcrPlanes {
     const uint8_t* data[3] = {};
     int stride[3] = {};                // bytes a row
     std::shared_ptr<const void> owner;  // what keeps the samples
+    size_t heldBytes = 0;               // what the owner holds, when known (more than the samples shown: padding)
     int chromaWidth() const { return (width + (1 << log2ChromaW) - 1) >> log2ChromaW; }
     int chromaHeight() const { return (height + (1 << log2ChromaH) - 1) >> log2ChromaH; }
     size_t bytes() const;

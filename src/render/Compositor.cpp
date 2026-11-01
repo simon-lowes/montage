@@ -1504,6 +1504,7 @@ thread_local std::vector<const Clip*> tMakingPlate;
 CleanPlateContext cleanPlateFor(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o) {
     CleanPlateContext out;
     out.space = &currentWorkingSpace();
+    out.clip = uint64_t(c.id), out.media = uint64_t(c.mediaId);
     const int m = cleanPlateTrack(seq, c, t);
     if (m < 0 || std::find(tMakingPlate.begin(), tMakingPlate.end(), &c) != tMakingPlate.end()) return out;
     const Clip* pc = clipAt(seq.videoTracks[size_t(m)], t);

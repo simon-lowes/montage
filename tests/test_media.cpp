@@ -4384,6 +4384,69 @@ private slots:
         QVERIFY2(text(r).contains("No problems"), qPrintable(text(r)));
     }
 
+    // Phase 13 #2 over MCP: montage_quality_check compares a delivered file with the sequence, or with another file.
+    void qualityCheckComparesAnEncode() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 96;
+        s.fps = {25, 1};
+        for (int i = 0; i < 2; ++i) {
+            Clip c = makeGeneratorClip(p, "color", 12);
+            c.start = 12 * i;
+            c.generator.params["color.r"] = i ? 0.1 : 0.8;
+            c.generator.params["color.g"] = 0.3;
+            c.generator.params["color.b"] = i ? 0.9 : 0.1;
+            s.videoTracks[0].clips.push_back(c);
+        }
+        ExportSettings st;
+        st.path = path("delivered.mp4");
+        st.audioCodec = "none";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        const QString project = QString::fromStdString(path("compare.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& extra) {
+            QJsonObject args{{"project", project}, {"flashing", false}, {"levels", false}, {"black_seconds", 0}, {"freeze_seconds", 0},
+                             {"silence_seconds", 0}, {"clipping", false}, {"spelling", false}, {"sync", false}, {"phase", false},
+                             {"dc_offset_db", 0}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_quality_check"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        // Against the sequence: aligned, high scores, markers on the worst frames, a report.
+        QJsonObject r = call({{"compare", QString::fromStdString(st.path)}, {"markers", true}, {"report", QString::fromStdString(path("qc"))},
+                              {"metrics", QJsonArray{"psnr", "ssim", "delta_ictcp"}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY2(text(r).contains("Compared 24 frames") && text(r).contains("encode offset 0"), qPrintable(text(r)));
+        QVERIFY2(text(r).contains("Quality report:"), qPrintable(text(r)));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(path("qc-quality.csv"))) && QFileInfo::exists(QString::fromStdString(path("qc-quality.pdf"))));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        int worst = 0;
+        for (const Marker& m : back.active()->markers) worst += m.name == "Worst frame";
+        QVERIFY2(worst >= 1, qPrintable(text(r)));
+        // A limit the encode does not meet (flat colours keep their luma exactly, but the chroma moves a little).
+        r = call({{"compare", QString::fromStdString(st.path)}, {"max_delta_ictcp", 0.01}, {"min_psnr", 20}});
+        QVERIFY2(text(r).contains("Encode quality") && text(r).contains("over 0.01") && !text(r).contains("PSNR inf dB under"), qPrintable(text(r)));
+        // File against file: the same file is identical.
+        r = call({{"compare", QString::fromStdString(st.path)}, {"reference", QString::fromStdString(st.path)}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("PSNR inf dB"), qPrintable(text(r)));
+        // A reference with nothing to compare with it is refused, not passed over.
+        r = call({{"reference", QString::fromStdString(st.path)}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("compare"), qPrintable(text(r)));
+        // Unknown metrics and missing files are refused; VMAF only where Montage has libvmaf.
+        QVERIFY(call({{"compare", QString::fromStdString(st.path)}, {"metrics", QJsonArray{"butteraugli"}}}).value("isError").toBool());
+        QVERIFY(call({{"compare", QString::fromStdString(path("missing.mp4"))}}).value("isError").toBool());
+        if (!vmafAvailable()) QVERIFY(call({{"compare", QString::fromStdString(st.path)}, {"metrics", QJsonArray{"vmaf"}}}).value("isError").toBool());
+    }
+
     void dereverbSpeech() {
         constexpr int sr = 16000;
         std::string err;

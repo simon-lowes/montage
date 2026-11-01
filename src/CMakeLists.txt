@@ -229,6 +229,7 @@ add_library(montage_engine STATIC
   render/AudioReactive.h render/AudioReactive.cpp
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
+  render/EncodeCompare.h render/EncodeCompare.cpp
   render/SdhDraft.h render/SdhDraft.cpp
   render/LutExport.h render/LutExport.cpp
   render/LutToGrade.h render/LutToGrade.cpp
@@ -417,6 +418,16 @@ if(MONTAGE_WITH_LIBRAW)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
   else()
     message(STATUS "LibRaw not found: camera raw stills are not read")
+  endif()
+endif()
+if(MONTAGE_WITH_VMAF)
+  pkg_check_modules(LIBVMAF IMPORTED_TARGET GLOBAL libvmaf>=3.0)
+  if(LIBVMAF_FOUND)
+    message(STATUS "libvmaf ${LIBVMAF_VERSION}: VMAF in Compare Encode enabled")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::LIBVMAF)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_VMAF)
+  else()
+    message(STATUS "libvmaf not found: Compare Encode measures without VMAF")
   endif()
 endif()
 if(MONTAGE_WITH_MYSOFA)

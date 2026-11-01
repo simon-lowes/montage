@@ -7,6 +7,10 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QEventLoop>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QLineEdit>
+#include <QMessageBox>
 #include <QFormLayout>
 #include <QFutureWatcher>
 #include <QHBoxLayout>
@@ -19,6 +23,7 @@
 #include <QVBoxLayout>
 #include <QtConcurrent>
 #include <atomic>
+#include <cmath>
 #include <memory>
 
 #include "EditorState.h"
@@ -140,6 +145,79 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     sync_->setObjectName(QStringLiteral("qcSync"));
     sync_->setChecked(true);
     form->addRow(tr("Sync:"), sync_);
+    {
+        // Compare Encode (render/EncodeCompare.h): a delivered file against the sequence's own render.
+        auto* w = new QWidget(this);
+        auto* h = new QHBoxLayout(w);
+        h->setContentsMargins(0, 0, 0, 0);
+        compareFile_ = new QLineEdit(w);
+        compareFile_->setObjectName(QStringLiteral("qcCompareFile"));
+        compareFile_->setPlaceholderText(tr("A delivered file to compare with the sequence (optional)"));
+        auto* browse = new QPushButton(tr("Browse…"), w);
+        browse->setObjectName(QStringLiteral("qcCompareBrowse"));
+        connect(browse, &QPushButton::clicked, this, [this] {
+            const QString f = QFileDialog::getOpenFileName(this, tr("Compare Encode"), QFileInfo(compareFile_->text()).absolutePath(),
+                                                           tr("Video (*.mp4 *.mov *.mxf *.mkv *.m4v *.ts *.y4m *.webm);;All files (*)"));
+            if (!f.isEmpty()) compareFile_->setText(f);
+        });
+        h->addWidget(compareFile_, 1);
+        h->addWidget(browse);
+        compareFile_->setToolTip(tr("Set the encode against the sequence's own render, aligned and compared frame by frame: PSNR, "
+                                    "SSIM, MS-SSIM and the colour difference ΔICtCp (ITU-R BT.2124)%1")
+                                     .arg(vmafAvailable() ? tr(", and VMAF") : QString()));
+        form->addRow(tr("Encode:"), w);
+
+        auto* lw = new QWidget(this);
+        auto* lh = new QHBoxLayout(lw);
+        lh->setContentsMargins(0, 0, 0, 0);
+        auto spin = [&](const char* name, const QString& prefix, double max, int decimals, const QString& suffix) {
+            auto* sp = new QDoubleSpinBox(lw);
+            sp->setObjectName(QString::fromLatin1(name));
+            sp->setRange(0, max);
+            sp->setDecimals(decimals);
+            sp->setPrefix(prefix);
+            sp->setSuffix(suffix);
+            sp->setSpecialValueText(prefix + tr("off"));
+            return sp;
+        };
+        qualityPreset_ = new QComboBox(lw);
+        qualityPreset_->setObjectName(QStringLiteral("qcQualityPreset"));
+        // Limits: lowest worst-frame PSNR (dB), largest ΔICtCp, lowest VMAF.
+        struct Preset { const char* name; double psnr, itp, vmaf; };
+        const Preset presets[] = {{QT_TR_NOOP("No limits"), 0, 0, 0},
+                                  {QT_TR_NOOP("Mezzanine: PSNR 45 dB, ΔICtCp 1"), 45, 1, 0},
+                                  {QT_TR_NOOP("Broadcast: PSNR 38 dB, ΔICtCp 2"), 38, 2, 0},
+                                  {QT_TR_NOOP("Streaming: PSNR 33 dB, ΔICtCp 3, VMAF 80"), 33, 3, 80}};
+        for (const Preset& pr : presets) {
+            if (pr.vmaf > 0 && !vmafAvailable()) continue;
+            qualityPreset_->addItem(tr(pr.name), QVariantList{pr.psnr, pr.itp, pr.vmaf});
+        }
+        minPsnr_ = spin("qcMinPsnr", tr("PSNR ≥ "), 100, 1, tr(" dB"));
+        maxDeltaItp_ = spin("qcMaxDeltaItp", tr("ΔICtCp ≤ "), 100, 1, QString());
+        minVmaf_ = spin("qcMinVmaf", tr("VMAF ≥ "), 100, 1, QString());
+        vmaf_ = new QCheckBox(tr("VMAF"), lw);
+        vmaf_->setObjectName(QStringLiteral("qcVmaf"));
+        if (!vmafAvailable()) {
+            vmaf_->setEnabled(false);
+            minVmaf_->setEnabled(false);
+            vmaf_->setToolTip(tr("This copy of Montage was built without libvmaf"));
+        }
+        connect(qualityPreset_, &QComboBox::currentIndexChanged, this, [this] {
+            const QVariantList v = qualityPreset_->currentData().toList();
+            if (v.size() != 3) return;
+            minPsnr_->setValue(v[0].toDouble());
+            maxDeltaItp_->setValue(v[1].toDouble());
+            minVmaf_->setValue(v[2].toDouble());
+            if (v[2].toDouble() > 0) vmaf_->setChecked(true);
+        });
+        lh->addWidget(qualityPreset_);
+        lh->addWidget(minPsnr_);
+        lh->addWidget(maxDeltaItp_);
+        lh->addWidget(minVmaf_);
+        lh->addWidget(vmaf_);
+        lh->addStretch();
+        form->addRow(tr("Limits:"), lw);
+    }
     layout->addLayout(form);
 
     auto* check = new QPushButton(tr("Check"), this);
@@ -168,6 +246,16 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     markers_->setObjectName(QStringLiteral("qcMarkers"));
     markers_->setEnabled(false);
     connect(markers_, &QPushButton::clicked, this, [this] { addMarkers(); });
+    report_ = buttons->addButton(tr("Save Quality Report…"), QDialogButtonBox::ActionRole);
+    report_->setObjectName(QStringLiteral("qcQualityReport"));
+    report_->setEnabled(false);
+    connect(report_, &QPushButton::clicked, this, [this] {
+        QString base = QFileDialog::getSaveFileName(this, tr("Save Quality Report"), QFileInfo(compareFile_->text()).completeBaseName() + "-quality",
+                                                    tr("Quality report (*.pdf)"));
+        if (base.isEmpty()) return;
+        if (base.endsWith(".pdf", Qt::CaseInsensitive) || base.endsWith(".csv", Qt::CaseInsensitive)) base.chop(4);
+        saveQualityReport(base);
+    });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
 }
@@ -194,6 +282,11 @@ QcSettings QualityCheckDialog::settings() const {
     q.intelligibility = intelligibility_->isChecked() ? intelligibilityPreset_->currentData().toDouble() : 0;
     q.intelligibilitySeconds = intelligibilitySeconds_->value();
     q.titleLanguage = titleSpellingLanguage().toStdString();
+    q.compareFile = compareFile_->text().trimmed().toStdString();
+    if (vmaf_->isChecked() && vmafAvailable()) q.compareMetrics |= MetricVmaf;
+    q.qualityLimits.minPsnr = minPsnr_->value();
+    q.qualityLimits.maxDeltaItp = maxDeltaItp_->value();
+    q.qualityLimits.minVmaf = vmafAvailable() ? minVmaf_->value() : 0;
     return q;
 }
 
@@ -217,8 +310,10 @@ bool QualityCheckDialog::runCheck() {
     QFutureWatcher<std::vector<QcIssue>> watcher;
     QEventLoop wait;
     connect(&watcher, &QFutureWatcher<std::vector<QcIssue>>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([project, sequence, in, out, q, cancel, done] {
-        return qualityCheck(project, sequence, in, out, q, [done](double f) { *done = int(f * 999); }, cancel.get());
+    const uint64_t revision = state_->history().revision();
+    auto comparison = std::make_shared<EncodeComparison>();
+    watcher.setFuture(QtConcurrent::run([project, sequence, in, out, q, cancel, done, comparison] {
+        return qualityCheck(project, sequence, in, out, q, [done](double f) { *done = int(f * 999); }, cancel.get(), comparison.get());
     }));
     if (!watcher.isFinished()) wait.exec();
     tick.stop();
@@ -236,21 +331,49 @@ bool QualityCheckDialog::runCheck() {
         table_->setItem(r, 1, new QTableWidgetItem(tc(i.end)));
         table_->setItem(r, 2, new QTableWidgetItem(QString::fromStdString(i.text)));
     }
-    summary_->setText(issues_.empty() ? tr("No problems found.") : tr("%n problem(s) found. Double-click one to go to it.", nullptr, int(issues_.size())));
-    markers_->setEnabled(!issues_.empty());
+    comparison_ = *comparison;
+    QString text = issues_.empty() ? tr("No problems found.") : tr("%n problem(s) found. Double-click one to go to it.", nullptr, int(issues_.size()));
+    if (comparison_.ok) {
+        auto num = [](double v, int d) { return std::isinf(v) ? QStringLiteral("∞") : QString::number(v, 'f', d); };
+        text += ' ' + tr("Encode (%1): PSNR %2 dB, worst %3 dB; SSIM %4; MS-SSIM %5; ΔICtCp %6")
+                          .arg(QString::fromStdString(comparison_.format), num(comparison_.mean.psnrY, 2), num(comparison_.worst.psnrY, 2),
+                               num(comparison_.mean.ssim, 4), num(comparison_.mean.msSsim, 4), num(comparison_.mean.deltaItp, 2));
+        if (comparison_.vmafScored) text += tr("; VMAF %1").arg(num(comparison_.mean.vmaf, 1));
+        if (comparison_.offset) text += ' ' + tr("(the encode is %n frame(s) off the sequence)", nullptr, std::abs(comparison_.offset));
+        emit compared(sequence.id, revision);
+    }
+    summary_->setText(text);
+    markers_->setEnabled(!issues_.empty() || (comparison_.ok && !comparison_.worstFrames.empty()));
+    report_->setEnabled(comparison_.ok);
     return true;
 }
 
 int QualityCheckDialog::addMarkers() {
-    if (issues_.empty()) return 0;
+    const bool worst = comparison_.ok && !comparison_.worstFrames.empty();
+    if (issues_.empty() && !worst) return 0;
     const std::vector<QcIssue> issues = issues_;
+    const EncodeComparison c = comparison_;
     int added = 0;
     state_->edit(tr("Quality Check Markers"), [&](Project&, Sequence& s) {
         added = addQcMarkers(s, issues);
+        if (worst) added += addWorstFrameMarkers(s, c);
         return true;
     });
     state_->message(tr("Marked %n problem(s) on the timeline", nullptr, added), 5000);
     return added;
+}
+
+bool QualityCheckDialog::saveQualityReport(const QString& base) {
+    if (!comparison_.ok) return false;
+    const Sequence* s = state_->sequence();
+    std::string e;
+    if (!writeQualityCsv((base + ".csv").toStdString(), comparison_, s, &e) ||
+        !writeQualityPdf((base + ".pdf").toStdString(), comparison_, s ? s->name : std::string(), settings().qualityLimits, s, &e)) {
+        QMessageBox::warning(this, tr("Save Quality Report"), QString::fromStdString(e));
+        return false;
+    }
+    state_->message(tr("Wrote %1.pdf and .csv").arg(base), 5000);
+    return true;
 }
 
 void QualityCheckDialog::activate(int row) {

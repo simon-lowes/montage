@@ -301,10 +301,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         showIntelligibility();
         showLoudnessLane();
+        showQualityLane();
     });
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (const Sequence* s = state_->sequence(); s && intelligibility_.count(s->id)) showIntelligibility();
         if (!loudnessRuns_.empty()) showLoudnessLane();
+        if (!qualityRuns_.empty()) showQualityLane();
     });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
@@ -2368,6 +2370,7 @@ void MainWindow::buildMenus() {
     add(seqM, QT_TR_NOOP("&Quality Check…"), QKeySequence(), [this] {
         if (!state_->sequence()) return;
         QualityCheckDialog dlg(state_, this);
+        watchQualityCheck(&dlg);
         dlg.exec();
     })->setObjectName(QStringLiteral("qualityCheck"));
     add(seqM, QT_TR_NOOP("Dialogue &Intelligibility…"), QKeySequence(), [this] {
@@ -6655,6 +6658,40 @@ void MainWindow::showLoudnessLane() {
         else spans.push_back({a, e, st});
     }
     timeline_->setLoudnessLane(std::move(spans), run.revision != state_->history().revision());
+}
+
+void MainWindow::watchQualityCheck(QualityCheckDialog* dlg) {
+    const uint64_t generation = state_->projectGeneration();
+    connect(dlg, &QualityCheckDialog::compared, this, [this, dlg, generation](Id sequence, uint64_t revision) {
+        if (generation != state_->projectGeneration()) return;
+        // The lane: red where a frame is past a limit, amber on the worst frames, green elsewhere (one pass over the
+        // frames and the spans past the limits, both in order).
+        const EncodeComparison& result = dlg->comparison();
+        QualityRun run{dlg->settings().qualityLimits, revision, generation, {}};
+        const std::vector<QualitySpan> over = qualityOverLimits(result, run.limits);
+        const std::set<FrameTime> worst(result.worstFrames.begin(), result.worstFrames.end());
+        size_t o = 0;
+        for (const FrameQuality& q : result.frames) {
+            while (o < over.size() && over[o].end <= q.frame) ++o;
+            const int st = o < over.size() && q.frame >= over[o].first ? 2 : worst.count(q.frame) ? 1 : 0;
+            if (!run.lane.empty() && run.lane.back().status == st && run.lane.back().end == q.frame) run.lane.back().end = q.frame + 1;
+            else run.lane.push_back({q.frame, q.frame + 1, st});
+        }
+        qualityRuns_[sequence] = std::move(run);
+        showQualityLane();
+    });
+}
+
+void MainWindow::showQualityLane() {
+    std::erase_if(qualityRuns_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
+    const Sequence* s = state_->sequence();
+    const auto it = s ? qualityRuns_.find(s->id) : qualityRuns_.end();
+    if (it == qualityRuns_.end()) {
+        timeline_->setQualityLane({}, false);
+        return;
+    }
+    const QualityRun& run = it->second;
+    timeline_->setQualityLane(run.lane, run.revision != state_->history().revision());
 }
 
 void MainWindow::showIntelligibility() {

@@ -788,6 +788,58 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+
+        // Compare Encode: an export of a stretch, compared with the sequence, scores high, draws the quality lane, marks
+        // its worst frames and writes a report.
+        state()->edit("Range", [](Project&, Sequence& s) {
+            s.inPoint = 60;
+            s.outPoint = 71;
+            return true;
+        });
+        const Sequence& seq = *state()->sequence();
+        ExportSettings st;
+        st.path = (dir_.path() + "/qc-encode.mp4").toStdString();
+        st.audioCodec = "none";
+        st.in = 60;
+        st.out = 72;
+        st.width = seq.width / 2 / 2 * 2;
+        st.height = seq.height / 2 / 2 * 2;
+        std::string err;
+        QVERIFY2(exportSequence(state()->project(), seq, st, nullptr, nullptr, &err), err.c_str());
+        QualityCheckDialog compare(state(), win_.get());
+        win_->watchQualityCheck(&compare);
+        for (const char* box : {"qcFlashing", "qcLevels", "qcBlack", "qcFreeze", "qcSilence", "qcClipping", "qcPhase", "qcDcOffset", "qcSpelling", "qcSync"})
+            compare.findChild<QCheckBox*>(box)->setChecked(false);
+        compare.findChild<QLineEdit*>("qcCompareFile")->setText(QString::fromStdString(st.path));
+        auto* preset = compare.findChild<QComboBox*>("qcQualityPreset");
+        preset->setCurrentIndex(preset->findText("Broadcast", Qt::MatchStartsWith));
+        QCOMPARE(compare.findChild<QDoubleSpinBox*>("qcMinPsnr")->value(), 38.0);
+        QVERIFY(compare.runCheck());
+        QVERIFY2(compare.comparison().ok, compare.comparison().error.c_str());
+        QCOMPARE(int(compare.comparison().frames.size()), 12);
+        QCOMPARE(compare.comparison().offset, 0);
+        QVERIFY2(compare.comparison().worst.psnrY > 38, QByteArray::number(compare.comparison().worst.psnrY));
+        QVERIFY(compare.issues().empty());
+        QVERIFY(compare.findChild<QLabel*>("qcSummary")->text().contains("Encode"));
+        const auto& lane = timeline()->qualityLane();
+        QVERIFY(!lane.empty());
+        QCOMPARE(lane.front().first, FrameTime(60));
+        QCOMPARE(lane.back().end, FrameTime(72));
+        QVERIFY(std::none_of(lane.begin(), lane.end(), [](const auto& sp) { return sp.status == 2; }));
+        QVERIFY(compare.saveQualityReport(dir_.path() + "/qc-report"));
+        QVERIFY(QFileInfo(dir_.path() + "/qc-report.pdf").size() > 1000 && QFileInfo::exists(dir_.path() + "/qc-report.csv"));
+        const size_t markersBefore = state()->sequence()->markers.size();
+        QVERIFY(compare.addMarkers() >= 1);
+        const auto& ms = state()->sequence()->markers;
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Worst frame" && m.t >= 60 && m.t < 72; }));
+        state()->undo();
+        QCOMPARE(state()->sequence()->markers.size(), markersBefore);
+        // Too strict a limit: the frames past it are problems and the lane turns red there.
+        compare.findChild<QDoubleSpinBox*>("qcMaxDeltaItp")->setValue(0.5);
+        QVERIFY(compare.runCheck());
+        QVERIFY2(!compare.issues().empty() && compare.issues()[0].kind == QcKind::EncodeQuality,
+                 qPrintable(compare.findChild<QLabel*>("qcSummary")->text()));
+        QVERIFY(std::any_of(timeline()->qualityLane().begin(), timeline()->qualityLane().end(), [](const auto& sp) { return sp.status == 2; }));
     }
 
     void conformCheckDialog() {

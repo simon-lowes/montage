@@ -1,6 +1,7 @@
 #include "Nmos.h"
 
 #include <QDnsLookup>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QHostInfo>
@@ -169,34 +170,69 @@ bool Node::start(const NodeOptions& o, QString* error) {
         return false;
     }
     // The APIs listen on every interface, so what anyone on the network can hold open is bounded: so many connections
-    // in all and from one address, a request's headers and body, and how long a connection may sit without finishing
-    // one (a request trickled in a byte at a time is cut off).
-    constexpr int kMaxClients = 64, kMaxClientsFrom = 8, kIdleMs = 15000;
+    // in all and from one address (an IPv6 /64 counted as one, as one computer can have many addresses in it), a
+    // request's headers and body, how long a connection may sit without finishing one (a request trickled in a byte at
+    // a time is cut off), and how long it is kept alive at all. When every place is taken, a newcomer takes the place of
+    // the connection that has been quiet longest from the address holding the most, so a few hosts cannot keep the
+    // others out.
+    constexpr int kMaxClients = 64, kMaxClientsFrom = 4, kIdleMs = 15000, kLifeMs = 60000;
     constexpr qsizetype kMaxHeader = 64 << 10, kMaxBody = 1 << 20;
-    auto from = std::make_shared<std::map<QString, int>>();
-    auto clients = std::make_shared<int>(0);
-    connect(server_, &QTcpServer::newConnection, this, [this, from, clients] {
+    struct Client {
+        QString from;
+        qint64 lastRequest = 0;
+    };
+    auto clients = std::make_shared<std::map<QTcpSocket*, Client>>();
+    auto clock = std::make_shared<QElapsedTimer>();
+    clock->start();
+    connect(server_, &QTcpServer::newConnection, this, [this, clients, clock] {
         while (QTcpSocket* s = server_->nextPendingConnection()) {
-            const QString peer = s->peerAddress().toString();
-            if (*clients >= kMaxClients || (*from)[peer] >= kMaxClientsFrom) {
-                if ((*from)[peer] == 0) from->erase(peer);
+            const QHostAddress address = s->peerAddress();
+            QString peer = address.toString();
+            bool v4 = false;
+            address.toIPv4Address(&v4);
+            if (!v4 && address.protocol() == QAbstractSocket::IPv6Protocol) {
+                Q_IPV6ADDR ip = address.toIPv6Address();
+                for (int i = 8; i < 16; ++i) ip[i] = 0;
+                peer = QHostAddress(ip).toString() + "/64";
+            }
+            std::map<QString, int> count;
+            for (const auto& [socket, c] : *clients) ++count[c.from];
+            if (count[peer] >= kMaxClientsFrom) {
                 s->abort();
                 s->deleteLater();
                 continue;
             }
-            ++*clients;
-            ++(*from)[peer];
+            if (int(clients->size()) >= kMaxClients) {
+                QTcpSocket* quietest = nullptr;
+                int most = 0;
+                qint64 quiet = 0;
+                for (const auto& [socket, c] : *clients) {
+                    const int n = count[c.from];
+                    if (n > most || (n == most && c.lastRequest < quiet)) quietest = socket, most = n, quiet = c.lastRequest;
+                }
+                if (quietest) {
+                    clients->erase(quietest);
+                    quietest->abort();
+                }
+            }
+            (*clients)[s] = {peer, clock->elapsed()};
             auto buffer = std::make_shared<QByteArray>();
+            auto retire = std::make_shared<bool>(false);
             auto idle = new QTimer(s);
             idle->setSingleShot(true);
             idle->start(kIdleMs);
             connect(idle, &QTimer::timeout, s, &QTcpSocket::abort);
-            connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
-            connect(s, &QObject::destroyed, this, [from, clients, peer] {
-                --*clients;
-                if (--(*from)[peer] <= 0) from->erase(peer);
+            // (kept alive a minute: then closed after the request it is on, or at once between requests)
+            auto life = new QTimer(s);
+            life->setSingleShot(true);
+            life->start(kLifeMs);
+            connect(life, &QTimer::timeout, s, [s, buffer, retire] {
+                *retire = true;
+                if (buffer->isEmpty()) s->disconnectFromHost();
             });
-            connect(s, &QTcpSocket::readyRead, s, [this, s, buffer, idle] {
+            connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
+            connect(s, &QObject::destroyed, this, [clients, s] { clients->erase(s); });
+            connect(s, &QTcpSocket::readyRead, s, [this, s, buffer, idle, retire, clients, clock] {
                 if (stopping_) return;  // (nothing more taken while it unregisters)
                 *buffer += s->readAll();
                 if (buffer->size() > kMaxHeader + kMaxBody) {
@@ -238,6 +274,8 @@ bool Node::start(const NodeOptions& o, QString* error) {
                     const QByteArray body = buffer->mid(end + 4, length);
                     buffer->remove(0, end + 4 + length);
                     idle->start(kIdleMs);
+                    if (auto c = clients->find(s); c != clients->end()) c->second.lastRequest = clock->elapsed();
+                    close = close || *retire;
                     const QByteArray method = request.value(0);
                     Response r = request.size() < 3 ? errorResponse(400, QStringLiteral("Not an HTTP request"))
                                                     : handle(method, QUrl::fromPercentEncoding(request.value(1)), body);

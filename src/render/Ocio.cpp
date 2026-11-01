@@ -202,6 +202,43 @@ bool applyOcio(const Effect& e, Image& img, std::string* error) {
     return true;
 }
 
+// GLSL reading the table `name` (a 1D table made a 2D texture one texel high, 2D or 3D) at normalised coordinates as
+// texture() would with clamping at the edges: linearly between texels, or the nearest, in 32-bit floats.
+static std::string samplingFunction(const std::string& name, int dims, bool linear) {
+    const std::string N = name;
+    std::string f;
+    if (dims == 1) {
+        f = "vec4 " + N + "_at(float x) {\n    const int n = textureSize(" + N + ", 0).x;\n";
+        if (!linear) return f + "    return texelFetch(" + N + ", ivec2(clamp(int(floor(x * float(n))), 0, n - 1), 0), 0);\n}\n";
+        return f + "    const float p = clamp(x * float(n) - 0.5, 0.0, float(n - 1));\n"
+                   "    const int i = int(floor(p)), j = min(i + 1, n - 1);\n"
+                   "    return mix(texelFetch(" + N + ", ivec2(i, 0), 0), texelFetch(" + N + ", ivec2(j, 0), 0), p - float(i));\n}\n";
+    }
+    if (dims == 2) {
+        f = "vec4 " + N + "_at(vec2 c) {\n    const ivec2 n = textureSize(" + N + ", 0);\n";
+        if (!linear) return f + "    return texelFetch(" + N + ", clamp(ivec2(floor(c * vec2(n))), ivec2(0), n - 1), 0);\n}\n";
+        return f + "    const vec2 p = clamp(c * vec2(n) - 0.5, vec2(0.0), vec2(n - 1));\n"
+                   "    const ivec2 i = ivec2(floor(p)), j = min(i + 1, n - 1);\n"
+                   "    const vec2 t = p - vec2(i);\n"
+                   "    const vec4 a = mix(texelFetch(" + N + ", i, 0), texelFetch(" + N + ", ivec2(j.x, i.y), 0), t.x);\n"
+                   "    const vec4 b = mix(texelFetch(" + N + ", ivec2(i.x, j.y), 0), texelFetch(" + N + ", j, 0), t.x);\n"
+                   "    return mix(a, b, t.y);\n}\n";
+    }
+    f = "vec4 " + N + "_at(vec3 c) {\n    const ivec3 n = textureSize(" + N + ", 0);\n";
+    if (!linear) return f + "    return texelFetch(" + N + ", clamp(ivec3(floor(c * vec3(n))), ivec3(0), n - 1), 0);\n}\n";
+    auto at = [&](const char* x, const char* y, const char* z) {
+        return "texelFetch(" + N + ", ivec3(" + x + ", " + y + ", " + z + "), 0)";
+    };
+    return f + "    const vec3 p = clamp(c * vec3(n) - 0.5, vec3(0.0), vec3(n - 1));\n"
+               "    const ivec3 i = ivec3(floor(p)), j = min(i + 1, n - 1);\n"
+               "    const vec3 t = p - vec3(i);\n"
+               "    const vec4 a = mix(mix(" + at("i.x", "i.y", "i.z") + ", " + at("j.x", "i.y", "i.z") + ", t.x), mix(" + at("i.x", "j.y", "i.z") + ", " +
+               at("j.x", "j.y", "i.z") + ", t.x), t.y);\n"
+               "    const vec4 b = mix(mix(" + at("i.x", "i.y", "j.z") + ", " + at("j.x", "i.y", "j.z") + ", t.x), mix(" + at("i.x", "j.y", "j.z") + ", " +
+               at("j.x", "j.y", "j.z") + ", t.x), t.y);\n"
+               "    return mix(a, b, t.z);\n}\n";
+}
+
 std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::string* error) {
     OCIO::ConstProcessorRcPtr proc = processorOf(e, error);
     if (!proc) return nullptr;
@@ -240,6 +277,7 @@ std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::stri
         step->function = "ocioTransform";
         // Each sampler's binding, from 2 in the order its texture comes (1D textures, then 3D).
         std::map<std::string, int> binding;
+        std::map<std::string, bool> interpolate;
         for (unsigned i = 0; i < desc->getNumTextures(); ++i) {
             const char *texName = nullptr, *sampler = nullptr;
             unsigned w = 0, h = 0;
@@ -255,7 +293,8 @@ std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::stri
             desc->getTextureValues(i, values);
             gpu::ShaderStep::Texture t;
             t.width = int(w), t.height = int(std::max(1u, h)), t.channels = channel == OCIO::GpuShaderDesc::TEXTURE_RED_CHANNEL ? 1 : 3;
-            t.linear = interp != OCIO::INTERP_NEAREST;
+            interpolate[sampler] = interp != OCIO::INTERP_NEAREST;
+            t.linear = false;  // (read texel by texel and interpolated in 32-bit floats by the shader; see below)
             t.values.assign(values, values + size_t(t.width) * size_t(t.height) * size_t(t.channels));
             binding[sampler] = 2 + int(step->textures.size());
             step->textures.push_back(std::move(t));
@@ -269,19 +308,23 @@ std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::stri
             desc->get3DTextureValues(i, values);
             gpu::ShaderStep::Texture t;
             t.width = t.height = t.depth = int(edge);
-            t.linear = interp != OCIO::INTERP_NEAREST;
+            interpolate[sampler] = interp != OCIO::INTERP_NEAREST;
+            t.linear = false;
             t.values.assign(values, values + size_t(edge) * edge * edge * 3);
             binding[sampler] = 2 + int(step->textures.size());
             step->textures.push_back(std::move(t));
         }
-        // The samplers given their bindings, 1D ones as 2D textures one texel high (read through a function of their
-        // own, which `texture(name, x)` becomes).
+        // The samplers given their bindings, 1D ones as 2D textures one texel high. Each is read through a function of
+        // its own, which `texture(name, ...)` becomes: it fetches the texels and interpolates them in 32-bit floats, as
+        // OCIO's CPU path does, so the tables keep full precision (no half floats) and need no filtering of float
+        // textures (which some devices lack: optional on Vulkan, an extension on GLES, some Apple GPUs only).
         std::string text = desc->getShaderText();
         static const std::regex declaration(R"(uniform\s+sampler([123])D\s+(\w+)\s*;)");
-        std::vector<std::string> oneD;
+        std::vector<std::string> names;
         for (auto d = std::sregex_iterator(text.begin(), text.end(), declaration); d != std::sregex_iterator(); ++d)
-            if ((*d)[1] == "1") oneD.push_back((*d)[2]);
-        for (const std::string& name : oneD) text = std::regex_replace(text, std::regex("texture\\s*\\(\\s*" + name + "\\s*,"), name + "_1d(");
+            names.push_back((*d)[2]);
+        for (const std::string& name : names)
+            text = std::regex_replace(text, std::regex("texture\\s*\\(\\s*" + name + "\\s*,"), name + "_at(");
         std::string out;
         auto it = std::sregex_iterator(text.begin(), text.end(), declaration);
         size_t last = 0;
@@ -292,8 +335,8 @@ std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::stri
             if (b == binding.end()) return keep(nullptr, "the shader names a texture it does not list: " + name);
             out += text.substr(last, size_t(m.position(0)) - last);
             const std::string dim = m[1] == "3" ? "3D" : "2D";
-            out += "layout(binding = " + std::to_string(b->second) + ") uniform sampler" + dim + " " + name + ";";
-            if (m[1] == "1") out += "\nvec4 " + name + "_1d(float x) { return texture(" + name + ", vec2(x, 0.5)); }";
+            out += "layout(binding = " + std::to_string(b->second) + ") uniform sampler" + dim + " " + name + ";\n";
+            out += samplingFunction(name, m[1] == "3" ? 3 : m[1] == "2" ? 2 : 1, interpolate[name]);
             last = size_t(m.position(0) + m.length(0));
         }
         out += text.substr(last);

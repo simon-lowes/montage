@@ -42,7 +42,7 @@ void Image::fill(float r, float g, float b, float a) {
 
 size_t YcbcrPlanes::bytes() const {
     const size_t sample = wide ? 2 : 1;
-    return size_t(width) * size_t(height) * sample + size_t(chromaWidth()) * size_t(chromaHeight()) * sample * 2;
+    return std::max(heldBytes, size_t(width) * size_t(height) * sample + size_t(chromaWidth()) * size_t(chromaHeight()) * sample * 2);
 }
 
 std::vector<float> resampleRgba(const float* src, int sw, int sh, int dw, int dh) {
