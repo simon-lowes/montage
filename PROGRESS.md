@@ -1759,3 +1759,23 @@ Nightly fixes (30 Oct): a colour space id with many "+display" endings is refuse
   - Tests: render `browserReview` (settings checks; the 24-bit frame code burnt into the picture read back exactly; the certificate's names; then headless Chrome on loopback with the frame code read from a canvas each frame shown: a wrong passphrase refused, parked on frame 500 every picture read as 500 (within 1, the roadmap's bound) with its tag and timecode exactly 500's, playing for 4 s every picture within 2 frames of its tag (0 measured) and the frame shown a median 1 to 3 frames, 40 to 120 ms, behind the playhead (the bound is under 0.5 s), sound arriving, a note with a drawing at frame 700 landing as a marker there with its stroke and author, the pointer, a second WHEP player counted and let go, a wrong bearer token refused), app `browserReviewFromThePanel` (the panel switched to browsers, the link and passphrase shown, its own certificate made and served, `/config` refused and accepted, MCP `status` and `start` with `webrtc`). Playwright's Chromium has no H.264, so it is tested there with AV1; CI's Google Chrome takes H.264.
   - The roadmap's "within 1 frame playing / within 2 parked" is read as: parked, the frame code read equals the playhead (within 1); playing, each picture's frame code is within 2 of the frame its tag names, so the timecode a reviewer sees is the picture's. How far behind the playhead the page is, is latency, measured separately.
   - Not done or out of reach: NAT traversal and TURN beyond loopback (no second network in CI), Safari and Firefox, HDR or 10-bit to browsers, simulcast (one bit rate for every viewer).
+
+# Phase 13
+
+The twelfth gap analysis (`docs/research/phase13-roadmap.md`, October 2026) ranks what is still missing against the latest Premiere, After Effects, Resolve, Final Cut Pro, Media Composer, Nuke, Baselight, Pro Tools, Nuendo and RX, and open tools and standards, two days after Phase 12's; SCTE 35 is now free to download and VMAF has an HDR model. Items 1–12 can be tested fully in CI; 13–15 each name the part CI cannot check. Approved 31 October 2026.
+
+- [ ] 1. OpenFX hosting completed: transition and generator plug-ins, extra inputs for mattes, on-screen controls, and rendering on the GPU (M)
+- [ ] 2. Encode quality against the master: PSNR, SSIM, MS-SSIM, ΔICtCp and VMAF (with the new HDR model) frame by frame, worst frames marked, limits in Quality Check (S–M)
+- [ ] 3. Streaming packages: HLS and DASH over CMAF with a ladder of renditions, audio and caption languages, HDR signalling and SCTE-35 ad breaks from markers (M)
+- [ ] 4. MIDI learn for any controller: faders, knobs, encoders and pads mapped to any parameter or command, with feedback, soft takeover and automation (S–M)
+- [ ] 5. A sound-effect sampler played to picture: footsteps, cloth and props on MIDI keys, pads or the computer's keys, recorded in passes onto take lanes (S–M)
+- [ ] 6. Camera colour still missing: Canon Log 2 / Cinema Gamut, Sony's VENICE gamuts, ADX for film scans and Adobe RGB as Montage's own spaces, the ASWF colour interop IDs, and DNG opcode lists (S–M)
+- [ ] 7. Camera projection and 3D layers finished: footage projected through a camera onto models and cards, and 3D layers lit, casting shadows and in depth of field (M)
+- [ ] 8. Long-GOP exports that copy untouched pictures: H.264, HEVC and XDCAM HD422 re-encoded only around edits, effects and titles (M)
+- [ ] 9. Requests for big timelines: tracks pinned to the top, multicam keys for up to 25 angles, and script and MCP calls that run in the background (S)
+- [ ] 10. Masters split across render nodes: IMF and DCP packages, MXF and MPEG-TS joins, hardware encoders, and two-pass rate control across segments (S–M)
+- [ ] 11. JPEG XL stills, sequences and animations in and out: lossless and lossy, 8 to 32 bits, alpha, and HDR in PQ and HLG (S)
+- [ ] 12. Displacement by another layer, painterly filters, and the hard mix blend mode (S)
+- [ ] 13. Deck control over Sony 9-pin RS-422: decks cued, batch-captured from a log and recorded to, and Montage driven as a deck by a DAW or edit controller, chasing LTC (M)
+- [ ] 14. Capture over IP: SMPTE ST 2110 receivers for video, audio and ancillary data, connected through NMOS, with ST 2022-7 redundancy, and 4:4:4 and 12-bit both ways (M)
+- [ ] 15. IMF with ProRes pictures: SMPTE RDD 45 (Application ProRes) packages, with ProRes in MXF as RDD 44 maps it, written and read (S–M)
