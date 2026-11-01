@@ -56,6 +56,7 @@ private:
     QDoubleSpinBox* tint_ = nullptr;
     QComboBox* highlights_ = nullptr;
     QCheckBox* half_ = nullptr;
+    QCheckBox* opcodes_ = nullptr;
     bool raw_ = false;  // the settings apply (camera RAW media)
     bool highlightsShown_ = true;
 };

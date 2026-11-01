@@ -2000,6 +2000,9 @@ private slots:
             {"ARRI_ALEXA-LOGC-EI800-AWG_to_ACES2065-1", "logc3-awg3"},
             {"PANASONIC_VLOG-VGAMUT_to_ACES2065-1", "vlog-vgamut"},
             {"CANON_CLOG3-CGAMUT_to_ACES2065-1", "clog3-cinemagamut"},
+            {"CANON_CLOG2-CGAMUT_to_ACES2065-1", "clog2-cinemagamut"},
+            {"SONY_SLOG3-SGAMUT3-VENICE_to_ACES2065-1", "slog3-sgamut3venice"},
+            {"SONY_SLOG3-SGAMUT3.CINE-VENICE_to_ACES2065-1", "slog3-sgamut3cinevenice"},
             {"ACEScct_to_ACES2065-1", "acescct"},
             {"IDENTITY", "aces2065-1"}};
         const float codes[4][3] = {{0.2f, 0.4f, 0.6f}, {0.5f, 0.5f, 0.5f}, {0.7f, 0.3f, 0.15f}, {0.1f, 0.12f, 0.9f}};
@@ -2023,10 +2026,78 @@ private slots:
                 }
             }
         }
+        // ADX (film scans' printing density): its matrices are not one per channel, so the whole conversion is compared,
+        // in ACES itself, over the densities a scan holds.
+        for (const auto& [style, id] : {std::pair{"ADX10_to_ACES2065-1", "adx10"}, std::pair{"ADX16_to_ACES2065-1", "adx16"}}) {
+            const bool ten = std::string(id) == "adx10";
+            const float scans[5][3] = {{0.2f, 0.3f, 0.4f}, {0.45f, 0.45f, 0.45f}, {0.6f, 0.4f, 0.3f}, {0.15f, 0.2f, 0.55f}, {0.7f, 0.7f, 0.65f}};
+            Image img(5, 1);
+            float ref[15];
+            for (int k = 0; k < 5; ++k)
+                for (int j = 0; j < 4; ++j) {
+                    // (ADX16 codes are a quarter of ADX10's for the same density: 8.191875 against 2.046 a unit)
+                    const float code = j == 3 ? 1.0f : ten ? scans[k][j] : scans[k][j] * 2.046f / 8.191875f;
+                    img.at(k, 0)[j] = code;
+                    if (j < 3) ref[k * 3 + j] = code;
+                }
+            std::string err;
+            QVERIFY2(applyOcioBuiltin(style, ref, 5, false, &err), err.c_str());
+            convertExactly(img, *findColorSpace(id), *findColorSpace("aces2065-1"));
+            for (int k = 0; k < 5; ++k)
+                for (int j = 0; j < 3; ++j)
+                    QVERIFY2(std::fabs(img.at(k, 0)[j] - ref[k * 3 + j]) < 1e-5 + 1e-5 * std::fabs(ref[k * 3 + j]),
+                             qPrintable(QString("%1 %2/%3: %4 vs OCIO %5").arg(id).arg(k).arg(j).arg(img.at(k, 0)[j]).arg(ref[k * 3 + j])));
+            // And back.
+            convertExactly(img, *findColorSpace("aces2065-1"), *findColorSpace(id));
+            for (int k = 0; k < 5; ++k)
+                for (int j = 0; j < 3; ++j) {
+                    const float code = ten ? scans[k][j] : scans[k][j] * 2.046f / 8.191875f;
+                    QVERIFY2(std::fabs(img.at(k, 0)[j] - code) < 1e-5, qPrintable(QString("%1 back %2 vs %3").arg(id).arg(img.at(k, 0)[j]).arg(code)));
+                }
+        }
         // PQ, in OCIO's units (1.0 = 100 nits).
         float pq[3] = {0.5f, 0.58f, 0.75f};
         QVERIFY(applyOcioBuiltin("CURVE - ST-2084_to_LINEAR", pq, 1));
         for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(toLinear(Transfer::Pq, (i == 0 ? 0.5 : i == 1 ? 0.58 : 0.75)) * 2.03 - pq[i]) < 1e-4 * pq[i]);
+    }
+
+    void cameraColourSpaces() {
+        // Canon Log 2: Canon's published curve (code 0.092864125 is black; 18% grey near 0.39), a round trip at seven
+        // exposures, and code values below black reaching negative light.
+        auto clog2 = [](double v) {
+            const double l = v < 0.092864125 ? -(std::pow(10.0, (0.092864125 - v) / 0.24136077) - 1) / 87.09937546
+                                             : (std::pow(10.0, (v - 0.092864125) / 0.24136077) - 1) / 87.09937546;
+            return l * 0.9;
+        };
+        for (double v : {0.05, 0.092864125, 0.2, 0.39, 0.5, 0.7, 0.9}) QVERIFY(std::fabs(toLinear(Transfer::CLog2, v) - clog2(v)) < 1e-9);
+        QVERIFY(toLinear(Transfer::CLog2, 0.05) < 0 && std::fabs(toLinear(Transfer::CLog2, 0.092864125)) < 1e-12);
+        for (double stops = -6; stops <= 6; stops += 2) {
+            const double l = 0.18 * std::pow(2.0, stops);
+            QVERIFY2(std::fabs(toLinear(Transfer::CLog2, fromLinear(Transfer::CLog2, l)) / l - 1) < 1e-6, qPrintable(QString::number(stops)));
+        }
+        // Adobe RGB (1998): its primaries and its pure 2.2 power (563/256).
+        const ColorSpace* adobe = findColorSpace("adobergb");
+        QVERIFY(adobe && !adobe->sceneReferred && !adobe->hdr());
+        QVERIFY(std::fabs(toLinear(adobe->transfer, 0.5) - std::pow(0.5, 563.0 / 256.0)) < 1e-12);
+        QVERIFY(std::fabs(fromLinear(adobe->transfer, std::pow(0.5, 563.0 / 256.0)) - 0.5) < 1e-12);
+        double m[9];
+        primariesToXyz(adobe->primaries, m);
+        auto xy = [&](int c) { const double sum = m[c] + m[3 + c] + m[6 + c]; return std::pair{m[c] / sum, m[3 + c] / sum}; };
+        QVERIFY(std::fabs(xy(0).first - 0.64) < 1e-6 && std::fabs(xy(1).second - 0.71) < 1e-6 && std::fabs(xy(2).first - 0.15) < 1e-6);
+        QVERIFY(std::fabs(m[3] + m[4] + m[5] - 1) < 1e-9);  // (white is D65: Y 1)
+        // Its pure green, out of Rec.709, shown in Rec.709: clipped, still green.
+        float green[3] = {0, 1, 0};
+        convertPixel(green, *adobe, *findColorSpace("rec709"));
+        QVERIFY2(green[1] > 0.9f && green[0] < 0.05f && green[2] < 0.05f, qPrintable(QString("%1 %2 %3").arg(green[0]).arg(green[1]).arg(green[2])));
+        // ADX's grey: the printing density 0.7 above the base (code 445 of 1023) is 18% grey in ACES.
+        Image grey(1, 1);
+        grey.fill(445.0f / 1023, 445.0f / 1023, 445.0f / 1023, 1);
+        convertExactly(grey, *findColorSpace("adx10"), *findColorSpace("aces2065-1"));
+        QVERIFY2(std::fabs(grey.at(0, 0)[1] - 0.18f) < 0.002f, qPrintable(QString::number(grey.at(0, 0)[1])));
+        // Offered to read footage as, not as a working space.
+        for (const char* id : {"clog2-cinemagamut", "slog3-sgamut3venice", "slog3-sgamut3cinevenice", "adx10", "adx16", "adobergb"})
+            QVERIFY2(findColorSpace(id), id);
+        for (const ColorSpace* w : workingColorSpaces()) QVERIFY(w->id != "adx10" && w->id != "adx16");
     }
 
     void ocioTransformEffect() {

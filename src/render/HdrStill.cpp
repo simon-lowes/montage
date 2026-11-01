@@ -285,6 +285,7 @@ int cicpTransfer(const ColorSpace& space) {
     switch (space.transfer) {
         case Transfer::Bt1886: return 1;
         case Transfer::Srgb: return 13;
+        case Transfer::Gamma22: return 4;
         case Transfer::Pq: return 16;
         case Transfer::Hlg: return 18;
         default: return -1;
@@ -522,6 +523,7 @@ Av1Picture ycbcr420(const Image& img, const ColorSpace& space, int bits, AVColor
                    : space.transfer == Transfer::Pq    ? AVCOL_TRC_SMPTE2084
                    : space.transfer == Transfer::Hlg   ? AVCOL_TRC_ARIB_STD_B67
                    : space.transfer == Transfer::Srgb  ? AVCOL_TRC_IEC61966_2_1
+                   : space.transfer == Transfer::Gamma22 ? AVCOL_TRC_GAMMA22
                                                        : AVCOL_TRC_BT709;
     pic.matrix = wide ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
     return pic;

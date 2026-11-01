@@ -531,7 +531,7 @@ bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interp
             if (!m) continue;
             Interpretation i = how;
             if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
-            if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false;
+            if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false, i.rawNoOpcodes = false;
             else if (keepHighlights) i.rawHighlights = interpretationOf(*m).rawHighlights;
             if (auto it = each.find(id); it != each.end()) i.pulldown = it->second;
             const edit::Result r = edit::interpretFootage(p, id, i);

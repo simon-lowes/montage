@@ -12,6 +12,7 @@
 #include <QLineEdit>
 #include <QRadioButton>
 #include <QVBoxLayout>
+#include <cctype>
 #include <cmath>
 
 #include "media/ImageSequence.h"
@@ -264,14 +265,26 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     half_ = new QCheckBox(tr("Decode at half size (faster playback)"), rawBox);
     half_->setObjectName(QStringLiteral("interpretRawHalf"));
     half_->setChecked(now.rawHalf);
+    opcodes_ = new QCheckBox(tr("Apply the lens and sensor corrections recorded in the DNG"), rawBox);
+    opcodes_->setObjectName(QStringLiteral("interpretRawOpcodes"));
+    opcodes_->setToolTip(tr("The DNG's opcode lists: lens shading and vignetting, distortion and chromatic aberration, bad pixels"));
+    opcodes_->setChecked(!now.rawNoOpcodes);
     rawForm->addRow(tr("Exposure:"), exposure_);
     rawForm->addRow(tr("White balance:"), whiteBalance_);
     rawForm->addRow(tr("Temperature:"), temperature_);
     rawForm->addRow(tr("Tint:"), tint_);
     rawForm->addRow(tr("Highlights:"), highlights_);
     rawForm->addRow(QString(), half_);
+    rawForm->addRow(QString(), opcodes_);
     raw_ = isRawMedia(first);
     rawBox->setVisible(raw_);
+    {
+        const std::string file = uninterpretedPath(first.path);
+        const size_t dot = file.find_last_of('.');
+        std::string ext = dot == std::string::npos ? std::string() : file.substr(dot + 1);
+        for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+        rawForm->setRowVisible(opcodes_, ext == "dng");
+    }
     // ProRes RAW clips its highlights at the sensor's white itself (LibRaw's recovery modes are for stills and DNGs).
     if (first.videoCodec == "prores_raw" || first.videoCodec == "mlv") {
         highlightsShown_ = false;
@@ -311,6 +324,7 @@ Interpretation InterpretFootageDialog::interpretation() const {
         i.rawTint = tint_->value();
         i.rawHighlights = highlights_->currentData().toString().toStdString();
         i.rawHalf = half_->isChecked();
+        i.rawNoOpcodes = !opcodes_->isChecked();
     }
     return i;
 }

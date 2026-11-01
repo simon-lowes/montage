@@ -36,11 +36,19 @@ enum class Transfer {
     GoProLog,             // GoPro GP-Log (HERO12 and HERO13 Black)
     GoProLog2,            // GoPro GP-Log2 (MISSION 1)
     LLog,                 // Leica L-Log
+    CLog2,                // Canon Log 2
+    Gamma22,              // a pure power of 563/256 (Adobe RGB (1998))
+    // ADX (Academy Density Exchange, SMPTE ST 2065-3) for film scans, 10 and 16 bits: printing densities, not a curve
+    // on each channel. Through the conversions (and here, on a neutral) exact; elsewhere a channel at a time, exact on
+    // greys. Its linear light is ACES2065-1's (AP0).
+    Adx10,
+    Adx16,
 };
 
 enum class Primaries {
     Bt709, Bt2020, P3D65, SGamut3Cine, AlexaWideGamut3, AlexaWideGamut4, VGamut, CinemaGamut, Ap1, Ap0,
-    SGamut3, DGamut, RedWideGamut, BmdWideGamut, DavinciWideGamut, AppleWideGamut
+    SGamut3, DGamut, RedWideGamut, BmdWideGamut, DavinciWideGamut, AppleWideGamut,
+    SGamut3Venice, SGamut3CineVenice, AdobeRgb
 };
 
 // How SDR and HDR meet. Montage's own: SDR white at HDR reference white (203 nits, BT.2408), and HDR into SDR through a
@@ -65,6 +73,15 @@ struct ColorSpace {
     ToneMapping toneMapping = ToneMapping::Montage;
     bool hdr() const { return transfer == Transfer::Pq || transfer == Transfer::Hlg; }
 };
+
+// A space's colour interop ID (the ASWF Color Interop Forum's, as OpenColorIO 2.5 and later and OpenEXR's
+// colorInteropID attribute carry them): the Forum's own for the spaces it has published ("lin_ap1_scene",
+// "g24_rec709_display"), OpenColorIO's Studio config's for camera spaces ("ocio:arrilogc4_awg4_scene"), else one in
+// Montage's namespace ("montage:flog2-fgamut"); "" for a space that is not Montage's own.
+std::string colorInteropId(const ColorSpace& s);
+// The space an interop ID names (the leftmost namespace dropped when the whole ID is unknown, as the Forum's lookup
+// does), or null.
+const ColorSpace* colorSpaceForInteropId(const std::string& id);
 
 // Every colour space Montage knows, Rec.709 first.
 const std::vector<ColorSpace>& colorSpaces();

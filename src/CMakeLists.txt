@@ -92,6 +92,7 @@ add_library(montage_engine STATIC
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
+  media/DngOpcodes.h media/DngOpcodes.cpp
   media/ProResRaw.h media/ProResRaw.cpp
   media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp

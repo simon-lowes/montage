@@ -291,6 +291,21 @@ bool readExrChromaticities(const std::string& file, double xy[8]) {
 #endif
 }
 
+std::string readExrColorInteropId(const std::string& file) {
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        Imf::InputFile in(file.c_str(), 1);
+        const auto* a = in.header().findTypedAttribute<Imf::StringAttribute>("colorInteropID");
+        return a ? a->value() : std::string();
+    } catch (const std::exception&) {
+        return {};
+    }
+#else
+    (void)file;
+    return {};
+#endif
+}
+
 bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error) {
     out = {};
 #ifdef MONTAGE_WITH_OPENEXR

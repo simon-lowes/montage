@@ -21,6 +21,7 @@
 #include "History.h"
 #include "ImportBuilder.h"
 #include "Interchange.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -389,6 +390,11 @@ struct OtioReader {
                         const double avail = rtValue(ref.value("available_range").toObject().value("duration"), rate);
                         const Id mid = b.media(path.toStdString(), ref.value("name").toString().toStdString(), video, !video,
                                                avail > 0 ? avail / rate : (srcStart + dur * std::fabs(scalar)) / rate);
+                        // Read as the colour space the reference names by its colour interop ID, where the file does
+                        // not say it already (and Interpret Colour has not been set).
+                        if (const ColorSpace* cs = colorSpaceForInteropId(ref.value("metadata").toObject().value("colorInteropID").toString().toStdString()))
+                            if (MediaItem* m = b.project().findMedia(mid); m && m->colorOverride.empty() && !sameColorSpace(mediaColorSpace(*m), *cs))
+                                m->colorOverride = cs->id;
                         // Sound placed to the sample (times in fractions of a frame): whole frames round it, the silent
                         // parts of its first and last frames its head and tail.
                         FrameTime at = start, frames = len;

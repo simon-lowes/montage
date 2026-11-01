@@ -441,6 +441,7 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.rawTint != 0) o["raw_tint"] = i.rawTint;
     if (!i.rawHighlights.empty()) o["raw_highlights"] = QString::fromStdString(i.rawHighlights);
     if (i.rawHalf) o["raw_half"] = true;
+    if (i.rawNoOpcodes) o["dng_opcodes"] = false;
     if (!i.stereo.empty()) o["stereo"] = QString::fromStdString(i.stereo);
     if (i.swapEyes) o["swap_eyes"] = true;
     if (!i.layer.empty()) o["layer"] = QString::fromStdString(i.layer);
@@ -9885,6 +9886,7 @@ void McpServer::Impl::addTools() {
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
             "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"],"description":"Camera RAW stills and CinemaDNG (ProRes RAW clips at the sensor's white)"},
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
+            "dng_opcodes":{"type":"boolean","description":"DNG: apply the file's opcode lists (lens shading, vignetting, distortion and chromatic aberration warps, bad pixels); default true"},
             "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed, or mv for MV-HEVC's two views), none for a flat picture"},
             "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
             "sdr_expand":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"SDR footage in an HDR sequence: \"\" at HDR reference white (203 nits), or brought up into HDR by ITU-R BT.2446 Method A (SDR white at 1000 nits) or Method C (SDR white at about 330 nits). Titles and graphics stay at reference white"},
@@ -9947,6 +9949,7 @@ void McpServer::Impl::addTools() {
                 if (a.contains("raw_tint")) i.rawTint = a.value("raw_tint").toDouble();
                 if (a.contains("raw_highlights")) i.rawHighlights = str(a, "raw_highlights") == "clip" ? "" : str(a, "raw_highlights").toStdString();
                 if (a.contains("raw_half")) i.rawHalf = a.value("raw_half").toBool();
+                if (a.contains("dng_opcodes")) i.rawNoOpcodes = !a.value("dng_opcodes").toBool(true);
                 if (a.contains("stereo")) i.stereo = str(a, "stereo") == "file" ? "" : str(a, "stereo").toStdString();
                 if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();
                 const edit::Result r = edit::interpretFootage(l.project, m->id, i);

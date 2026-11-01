@@ -6,6 +6,8 @@
 #include <cstring>
 #include <memory>
 
+#include "DngOpcodes.h"
+
 #ifdef MONTAGE_WITH_LIBRAW
 #include <libraw/libraw.h>
 #endif
@@ -51,6 +53,57 @@ std::unique_ptr<LibRaw> openRaw(const std::string& path, std::string* error) {
         return nullptr;
     }
     return raw;
+}
+
+// LibRaw's output curve (dcraw's gamma_curve, mode 2): a power `pwr` with a straight part of slope `ts` at the
+// bottom, as LibRaw makes the Rec.709 curve from 0.45 and 4.5. Linear 0..1 in, 0..1 out.
+struct OutputCurve {
+    double g[5]{};
+    OutputCurve(double pwr, double ts) {
+        g[0] = pwr, g[1] = ts;
+        double bnd[2] = {0, 0};
+        bnd[g[1] >= 1] = 1;
+        if (g[1] != 0 && (g[1] - 1) * (g[0] - 1) <= 0) {
+            for (int i = 0; i < 48; ++i) {
+                g[2] = (bnd[0] + bnd[1]) / 2;
+                if (g[0] != 0) bnd[(std::pow(g[2] / g[1], -g[0]) - 1) / g[0] - 1 / g[2] > -1] = g[2];
+                else bnd[g[2] / std::exp(1 - 1 / g[2]) < g[1]] = g[2];
+            }
+            g[3] = g[2] / g[1];
+            if (g[0] != 0) g[4] = g[2] * (1 / g[0] - 1);
+        }
+    }
+    double operator()(double r) const {
+        if (r >= 1) return 1;
+        if (r <= 0) return 0;
+        return r < g[3] ? r * g[1] : std::pow(r, g[0]) * (1 + g[4]) - g[4];
+    }
+};
+
+// A DNG's opcode lists 1 and 2 applied to its mosaic as LibRaw unpacked it (list 1 to the whole stored picture, list 2
+// to the active area); Bayer mosaics only (a linear DNG's lists are passed over).
+void applyMosaicOpcodes(LibRaw& raw, const DngOpcodeLists& lists) {
+    auto& rd = raw.imgdata.rawdata;
+    const auto& sz = raw.imgdata.sizes;
+    if (!rd.raw_image || !raw.imgdata.idata.filters || sz.raw_pitch < 2) return;
+    const int stride = int(sz.raw_pitch / 2);
+    const auto& col = raw.imgdata.color;
+    if (!lists.list[0].empty()) applyDngMosaicOpcodes(lists.list[0], 1, rd.raw_image, sz.raw_width, sz.raw_height, stride, 0, 65535);
+    if (!lists.list[1].empty() && sz.top_margin + sz.height <= sz.raw_height && sz.left_margin + sz.width <= sz.raw_width) {
+        // The black level by position: each mosaic colour's, and the DNG's BlackLevel pattern (its repeat in cblack[4], [5],
+        // its values from cblack[6]) where LibRaw has not yet folded it in.
+        const unsigned pr = col.cblack[4], pc = col.cblack[5];
+        const bool repeat = pr > 0 && pc > 0 && pr <= 64 && pc <= 64 && 6 + pr * pc <= LIBRAW_CBLACK_SIZE;
+        const int rows = repeat ? int(pr % 2 ? pr * 2 : pr) : 2, cols = repeat ? int(pc % 2 ? pc * 2 : pc) : 2;
+        std::vector<double> pattern(size_t(rows) * size_t(cols));
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < cols; ++x)
+                pattern[size_t(y) * size_t(cols) + size_t(x)] = col.cblack[std::clamp(raw.COLOR(y, x), 0, 3)] +
+                                                              (repeat ? col.cblack[6 + (unsigned(y) % pr) * pc + unsigned(x) % pc] : 0);
+        uint16_t* active = rd.raw_image + size_t(sz.top_margin) * size_t(stride) + sz.left_margin;
+        applyDngMosaicOpcodes(lists.list[1], 2, active, sz.width, sz.height, stride, col.black, col.maximum > 0 ? col.maximum : 65535,
+                              pattern.data(), rows, cols);
+    }
 }
 
 std::string cameraName(const LibRaw& raw) {
@@ -193,7 +246,19 @@ bool developRaw(const std::string& path, RawImage& out, std::string* error, cons
         if (lo > 0) p.bright *= hi / lo;
     }
     if (settings.half) p.half_size = 1;
+    DngOpcodeLists opcodes;
+    if (settings.dngOpcodes) readDngOpcodeLists(path, opcodes);
+    // List 3 works on the demosaiced picture as the sensor saw it (before it is turned upright), linear: LibRaw is asked
+    // for that, and the output curve and the turn are made here once the opcodes are applied.
+    const bool pictureOpcodes = !opcodes.list[2].empty();
+    const int flip = raw->imgdata.sizes.flip;
+    const int fullWidth = raw->imgdata.sizes.width, fullHeight = raw->imgdata.sizes.height;
+    if (pictureOpcodes) {
+        p.user_flip = 0;
+        p.gamm[0] = p.gamm[1] = 1;
+    }
     int rc = raw->unpack();
+    if (rc == LIBRAW_SUCCESS && !opcodes.empty()) applyMosaicOpcodes(*raw, opcodes);
     if (rc == LIBRAW_SUCCESS) rc = raw->dcraw_process();
     if (rc != LIBRAW_SUCCESS) {
         if (error) *error = "Cannot develop " + path + ": " + libraw_strerror(rc);
@@ -210,10 +275,35 @@ bool developRaw(const std::string& path, RawImage& out, std::string* error, cons
         if (error) *error = "Unexpected developed image from " + path;
         return false;
     }
+    const auto* src = reinterpret_cast<const uint16_t*>(img->data);
+    if (pictureOpcodes) {
+        const int w = img->width, h = img->height, planes = img->colors;
+        std::vector<float> lin(size_t(w) * size_t(h) * size_t(planes));
+        for (size_t i = 0; i < lin.size(); ++i) lin[i] = src[i] / 65535.0f;
+        applyDngPictureOpcodes(opcodes.list[2], lin.data(), w, h, planes, fullWidth, fullHeight);
+        // The Rec.709 curve LibRaw would have made, then the turn upright (dcraw's flip_index).
+        const OutputCurve curve(0.45, 4.5);
+        std::vector<uint16_t> table(65536);
+        for (size_t i = 0; i < table.size(); ++i) table[i] = uint16_t(std::lround(std::min(65535.0, 65536.0 * curve(double(i) / 65536.0))));
+        const bool swap = flip & 4;
+        out.width = swap ? h : w;
+        out.height = swap ? w : h;
+        out.rgb.resize(size_t(out.width) * size_t(out.height) * 3);
+        for (int row = 0; row < out.height; ++row)
+            for (int c = 0; c < out.width; ++c) {
+                int r = row, k = c;
+                if (swap) std::swap(r, k);
+                if (flip & 2) r = h - 1 - r;
+                if (flip & 1) k = w - 1 - k;
+                const float* s = &lin[(size_t(r) * size_t(w) + size_t(k)) * size_t(planes)];
+                uint16_t* d = &out.rgb[(size_t(row) * size_t(out.width) + size_t(c)) * 3];
+                for (int ch = 0; ch < 3; ++ch) d[ch] = table[size_t(std::clamp(std::lround(s[planes == 3 ? ch : 0] * 65535.0f), 0L, 65535L))];
+            }
+        return true;
+    }
     out.width = img->width;
     out.height = img->height;
     out.rgb.resize(size_t(out.width) * size_t(out.height) * 3);
-    const auto* src = reinterpret_cast<const uint16_t*>(img->data);
     if (img->colors == 3) std::memcpy(out.rgb.data(), src, out.rgb.size() * sizeof(uint16_t));
     else
         for (size_t i = 0; i < size_t(out.width) * size_t(out.height); ++i) out.rgb[i * 3] = out.rgb[i * 3 + 1] = out.rgb[i * 3 + 2] = src[i];

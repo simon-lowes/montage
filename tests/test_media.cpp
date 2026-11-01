@@ -259,6 +259,7 @@
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
+#include "media/DngOpcodes.h"
 #include "media/ProResRaw.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
@@ -396,8 +397,9 @@ void writeVoiceWav(const std::string& path, double seconds, double hz, const std
 // "camera" whose sensor sees linear sRGB, so it develops back to the scene.
 // `neutral`: the camera's response to the light (raw = scene x neutral, undone by its AsShotNeutral); `frameRate` > 0
 // marks it a CinemaDNG frame.
+// `opcodes`: its opcode lists 1 to 3 (bytes as stored; empty for none).
 bool writeTestDng(const std::string& path, int w, int h, const std::function<std::array<double, 3>(int, int)>& scene, int orientation = 1,
-                  std::array<double, 3> neutral = {1, 1, 1}, double frameRate = 0) {
+                  std::array<double, 3> neutral = {1, 1, 1}, double frameRate = 0, const std::array<std::vector<uint8_t>, 3>& opcodes = {}) {
     struct Entry {
         uint16_t tag, type;
         uint32_t count;
@@ -440,6 +442,8 @@ bool writeTestDng(const std::string& path, int w, int h, const std::function<std
     rationals(50721, 10, {3.2406, -1.5372, -0.4986, -0.9689, 1.8758, 0.0415, 0.0557, -0.2040, 1.0570});
     rationals(50728, 5, {neutral[0], neutral[1], neutral[2]});
     shorts(50778, {21});
+    for (int k = 0; k < 3; ++k)
+        if (!opcodes[size_t(k)].empty()) entries.push_back({uint16_t(k == 0 ? 51008 : k == 1 ? 51009 : 51022), 7, uint32_t(opcodes[size_t(k)].size()), opcodes[size_t(k)]});
     if (frameRate > 0) rationals(51044, 10, {frameRate});
     std::vector<uint8_t> file = {'I', 'I', 42, 0};
     const uint32_t ifd = 8 + dataBytes;
@@ -6228,6 +6232,302 @@ private slots:
         checkStereoMedia(saved);
         QCOMPARE(saved.media.back().colorSpace, std::string("acescct"));
         QCOMPARE(saved.media.back().width, info.width);
+    }
+
+    void dngOpcodeLists() {
+        // Opcode parameters as the specification stores them (big-endian).
+        struct Params {
+            std::vector<uint8_t> b;
+            Params& u32(uint32_t v) {
+                for (int s = 24; s >= 0; s -= 8) b.push_back(uint8_t(v >> s));
+                return *this;
+            }
+            Params& f64(double d) {
+                uint64_t v;
+                std::memcpy(&v, &d, 8);
+                for (int s = 56; s >= 0; s -= 8) b.push_back(uint8_t(v >> s));
+                return *this;
+            }
+            Params& f32(float f) {
+                uint32_t v;
+                std::memcpy(&v, &f, 4);
+                return u32(v);
+            }
+        };
+        // A gain map over the picture (or every second row and column from `top`, `left`): `gains` across, one row of
+        // them repeated down.
+        auto gainMap = [](std::vector<float> gains, uint32_t top = 0, uint32_t left = 0, uint32_t pitch = 1, uint32_t planes = 1) {
+            Params p;
+            p.u32(top).u32(left).u32(100000).u32(100000).u32(0).u32(planes).u32(pitch).u32(pitch).u32(2).u32(uint32_t(gains.size()));
+            p.f64(1).f64(gains.size() > 1 ? 1.0 / double(gains.size() - 1) : 1).f64(0).f64(0).u32(1);
+            for (int r = 0; r < 2; ++r)
+                for (float g : gains) p.f32(g);
+            return DngOpcode{kGainMap, 0x01030000, 0, p.b};
+        };
+        auto opLists = [](std::vector<uint8_t> a, std::vector<uint8_t> b, std::vector<uint8_t> c) {
+            return std::array<std::vector<uint8_t>, 3>{std::move(a), std::move(b), std::move(c)};
+        };
+        auto warp = [](uint32_t id, std::vector<double> k) {
+            Params p;
+            p.u32(1);
+            for (double v : k) p.f64(v);
+            p.f64(0.5).f64(0.5);
+            return DngOpcode{id, 0x01030000, 0, p.b};
+        };
+
+        // Lists read back as written, and the warps' geometry as the specification gives it.
+        const DngOpcodeList list{gainMap({1.0f, 0.5f}), warp(kWarpRectilinear, {1, 0.05, 0, 0, 0.001, -0.002}),
+                                 DngOpcode{77, 0x01030000, 1, {1, 2, 3}}};
+        DngOpcodeList back;
+        const std::vector<uint8_t> bytes = dngOpcodeListBytes(list);
+        QVERIFY(parseDngOpcodeList(bytes.data(), bytes.size(), back) && back.size() == 3);
+        QVERIFY(back[1].id == kWarpRectilinear && back[1].params == list[1].params && back[2].flags == 1 && back[2].params.size() == 3);
+        QVERIFY(!parseDngOpcodeList(bytes.data(), bytes.size() - 1, back));
+        {
+            // A gain map whose origin is not a number is passed over (it would index outside its gains).
+            DngOpcode nan = gainMap({0.5f});
+            const uint8_t quiet[8] = {0x7f, 0xf8, 0, 0, 0, 0, 0, 0};
+            std::memcpy(nan.params.data() + 56, quiet, 8);
+            std::vector<float> px(size_t(8) * 8 * 3, 0.5f);
+            QCOMPARE(applyDngPictureOpcodes({nan}, px.data(), 8, 8, 3), 0);
+            QCOMPARE(applyDngPictureOpcodes({gainMap({0.5f})}, px.data(), 8, 8, 3), 1);
+            QCOMPARE(px[0], 0.25f);
+        }
+        {
+            const int W = 101, H = 61;
+            const double cx = 50, cy = 30, m = std::sqrt(50.0 * 50 + 30.0 * 30);
+            double sx, sy;
+            QVERIFY(dngWarpSource(list[1], 0, cx, cy, W, H, sx, sy) && std::fabs(sx - cx) < 1e-9 && std::fabs(sy - cy) < 1e-9);
+            QVERIFY(dngWarpSource(list[1], 0, 100, 60, W, H, sx, sy));
+            const double dx = 50 / m, dy = 30 / m, r2 = dx * dx + dy * dy, f = 1 + 0.05 * r2;
+            const double ex = cx + m * (f * dx + 0.001 * 2 * dx * dy - 0.002 * (r2 + 2 * dx * dx));
+            const double ey = cy + m * (f * dy - 0.002 * 2 * dx * dy + 0.001 * (r2 + 2 * dy * dy));
+            QVERIFY2(std::fabs(sx - ex) < 1e-9 && std::fabs(sy - ey) < 1e-9, qPrintable(QString("%1 %2 / %3 %4").arg(sx).arg(sy).arg(ex).arg(ey)));
+            const DngOpcode fish = warp(kWarpFisheye, {0.9, 0.1, 0, 0});
+            QVERIFY(dngWarpSource(fish, 0, 100, 60, W, H, sx, sy));
+            const double t = std::atan(1.0), ff = (0.9 * t + 0.1 * t * t * t) / 1.0;
+            QVERIFY(std::fabs(sx - (cx + m * ff * dx)) < 1e-9 && std::fabs(sy - (cy + m * ff * dy)) < 1e-9);
+            QVERIFY(!dngWarpSource(list[0], 0, 1, 1, W, H, sx, sy));
+        }
+        if (!rawAvailable()) QSKIP("Built without LibRaw");
+
+        // Developed: the DNG's corrections applied (raw grey 0.25 here; the test camera sees linear sRGB).
+        const int W = 96, H = 64;
+        auto grey = [](double v) { return [v](int, int) { return std::array<double, 3>{v, v, v}; }; };
+        auto develop = [&](const std::string& file, bool opcodes = true, RawImage* into = nullptr) {
+            RawImage img;
+            RawSettings rs;
+            rs.dngOpcodes = opcodes;
+            std::string err;
+            if (!developRaw(file, img, &err, rs)) qWarning("%s", err.c_str());
+            if (into) *into = img;
+            return img;
+        };
+        auto at = [](const RawImage& img, int x, int y, int c) { return img.rgb[(size_t(y) * size_t(img.width) + size_t(x)) * 3 + size_t(c)] / 65535.0; };
+        const std::string plain = path("op_plain.dng"), half = path("op_half.dng");
+        QVERIFY(writeTestDng(plain, W, H, grey(0.25)));
+        QVERIFY(writeTestDng(half, W, H, grey(0.125)));
+        const RawImage ref = develop(plain), refHalf = develop(half);
+        QVERIFY(ref.width == W && refHalf.width == W);
+
+        // List 2: lens shading as a phone writes it, a gain map for each colour of the mosaic (here red halved, the
+        // greens and blue halved), and the same picture as a scene that dark.
+        {
+            const std::string file = path("op_gain.dng");
+            const DngOpcodeList shading{gainMap({0.5f}, 0, 0, 2), gainMap({0.5f}, 0, 1, 2), gainMap({0.5f}, 1, 0, 2), gainMap({0.5f}, 1, 1, 2)};
+            QVERIFY(writeTestDng(file, W, H, grey(0.25), 1, {1, 1, 1}, 0, opLists({}, dngOpcodeListBytes(shading), {})));
+            DngOpcodeLists lists;
+            QVERIFY(readDngOpcodeLists(file, lists) && lists.list[0].empty() && lists.list[1].size() == 4 && lists.list[2].empty());
+            const RawImage got = develop(file);
+            double worst = 0;
+            for (int y = 4; y < H - 4; ++y)
+                for (int x = 4; x < W - 4; ++x)
+                    for (int c = 0; c < 3; ++c) worst = std::max(worst, std::fabs(at(got, x, y, c) - at(refHalf, x, y, c)));
+            QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+            // Switched off: as the file is without them.
+            QVERIFY(develop(file, false).rgb == ref.rgb);
+            // Red alone: a redder scene's picture.
+            const std::string red = path("op_red.dng"), cyan = path("op_cyan.dng");
+            QVERIFY(writeTestDng(red, W, H, grey(0.25), 1, {1, 1, 1}, 0, opLists({}, dngOpcodeListBytes({gainMap({0.5f}, 0, 0, 2)}), {})));
+            QVERIFY(writeTestDng(cyan, W, H, [](int, int) { return std::array<double, 3>{0.125, 0.25, 0.25}; }));
+            const RawImage r = develop(red), c = develop(cyan);
+            QVERIFY2(std::fabs(at(r, 40, 30, 0) - at(c, 40, 30, 0)) < 1e-4 && at(r, 40, 30, 0) < at(ref, 40, 30, 0) - 0.05,
+                     qPrintable(QString("%1 %2").arg(at(r, 40, 30, 0)).arg(at(c, 40, 30, 0))));
+            // A gradient across (whole gain 1 on the left to 0.5 on the right): each column the scene that much darker.
+            const std::string ramp = path("op_ramp.dng"), rampRef = path("op_rampref.dng");
+            QVERIFY(writeTestDng(ramp, W, H, grey(0.25), 1, {1, 1, 1}, 0, opLists({}, dngOpcodeListBytes({gainMap({1.0f, 0.5f})}), {})));
+            QVERIFY(writeTestDng(rampRef, W, H, [&](int x, int) {
+                const double g = 1 - 0.5 * (x + 0.5) / W;
+                return std::array<double, 3>{0.25 * g, 0.25 * g, 0.25 * g};
+            }));
+            const RawImage rg = develop(ramp), rr = develop(rampRef);
+            worst = 0;
+            for (int x = 4; x < W - 4; ++x) worst = std::max(worst, std::fabs(at(rg, x, 30, 1) - at(rr, x, 30, 1)));
+            QVERIFY2(worst < 2e-3, qPrintable(QString::number(worst)));
+        }
+
+        // Bad pixels: one listed (stuck bright), and one at the constant the camera marks them with (0); both filled.
+        {
+            auto spot = [](int px, int py, double v) {
+                return [=](int x, int y) {
+                    const double s = x == px && y == py ? v : 0.25;
+                    return std::array<double, 3>{s, s, s};
+                };
+            };
+            const std::string hot = path("op_hot.dng"), dead = path("op_dead.dng");
+            const DngOpcode listed{kFixBadPixelsList, 0x01030000, 0, Params().u32(0).u32(1).u32(0).u32(20).u32(30).b};
+            const DngOpcode constant{kFixBadPixelsConstant, 0x01030000, 0, Params().u32(0).u32(0).b};
+            QVERIFY(writeTestDng(hot, W, H, spot(30, 20, 1.0), 1, {1, 1, 1}, 0, opLists(dngOpcodeListBytes({listed}), {}, {})));
+            QVERIFY(writeTestDng(dead, W, H, spot(41, 33, 0.0), 1, {1, 1, 1}, 0, opLists(dngOpcodeListBytes({constant}), {}, {})));
+            for (const auto& [file, x, y] : {std::tuple{hot, 30, 20}, std::tuple{dead, 41, 33}}) {
+                double fixed = 0, unfixed = 0;
+                const RawImage on = develop(file), off = develop(file, false);
+                for (int yy = y - 3; yy <= y + 3; ++yy)
+                    for (int xx = x - 3; xx <= x + 3; ++xx)
+                        for (int c = 0; c < 3; ++c) {
+                            fixed = std::max(fixed, std::fabs(at(on, xx, yy, c) - at(ref, xx, yy, c)));
+                            unfixed = std::max(unfixed, std::fabs(at(off, xx, yy, c) - at(ref, xx, yy, c)));
+                        }
+                QVERIFY2(fixed < 2e-3 && unfixed > 0.02, qPrintable(QString("%1: %2 (off %3)").arg(QString::fromStdString(file)).arg(fixed).arg(unfixed)));
+            }
+        }
+
+        // List 3: a distortion warp, where each pixel is taken from, to within 0.05 pixel (a ramp across, then down, read
+        // back to the position its value comes from).
+        {
+            const DngOpcode barrel = warp(kWarpRectilinear, {1, 0.06, 0, 0, 0.002, 0});
+            for (int axis = 0; axis < 2; ++axis) {
+                const int extent = axis == 0 ? W : H;
+                auto rampAt = [&](double pos) { return 0.05 + 0.5 * pos / (extent - 1); };
+                const std::string warped = path(axis == 0 ? "op_warp_x.dng" : "op_warp_y.dng");
+                const std::string straight = path(axis == 0 ? "op_ramp_x.dng" : "op_ramp_y.dng");
+                auto scene = [&](int x, int y) {
+                    const double v = rampAt(axis == 0 ? x : y);
+                    return std::array<double, 3>{v, v, v};
+                };
+                QVERIFY(writeTestDng(warped, W, H, scene, 1, {1, 1, 1}, 0, opLists({}, {}, dngOpcodeListBytes({barrel}))));
+                QVERIFY(writeTestDng(straight, W, H, scene));
+                const RawImage got = develop(warped), flat = develop(straight);
+                QVERIFY(got.width == W && got.height == H);
+                // The straight picture's value along the ramp, read back to a position (it rises steadily).
+                auto positionOf = [&](double v, int across) {
+                    for (int k = 0; k + 1 < extent; ++k) {
+                        const double a = axis == 0 ? at(flat, k, across, 1) : at(flat, across, k, 1);
+                        const double b = axis == 0 ? at(flat, k + 1, across, 1) : at(flat, across, k + 1, 1);
+                        if (v >= a && v <= b && b > a) return k + (v - a) / (b - a);
+                    }
+                    return -1.0;
+                };
+                double worst = 0;
+                int checked = 0;
+                for (int y = 6; y < H - 6; y += 5)
+                    for (int x = 6; x < W - 6; x += 7) {
+                        double sx, sy;
+                        QVERIFY(dngWarpSource(barrel, 1, x, y, W, H, sx, sy));
+                        const double want = axis == 0 ? sx : sy;
+                        if (want < 4 || want > extent - 5) continue;
+                        const double found = positionOf(at(got, x, y, 1), axis == 0 ? y : x);
+                        worst = std::max(worst, std::fabs(found - want));
+                        ++checked;
+                    }
+                QVERIFY2(checked > 20 && worst < 0.05, qPrintable(QString("axis %1: %2 px over %3").arg(axis).arg(worst).arg(checked)));
+            }
+            // Turned upright after the warp (a portrait DNG): as without it when the warp moves nothing.
+            const std::string tall = path("op_tall.dng"), tallRef = path("op_tallref.dng");
+            auto scene = [&](int x, int y) { return std::array<double, 3>{0.05 + 0.4 * x / W, 0.1 + 0.3 * y / H, 0.2}; };
+            QVERIFY(writeTestDng(tall, W, H, scene, 6, {1, 1, 1}, 0, opLists({}, {}, dngOpcodeListBytes({warp(kWarpRectilinear, {1, 0, 0, 0, 0, 0})}))));
+            QVERIFY(writeTestDng(tallRef, W, H, scene, 6));
+            const RawImage t = develop(tall), tr = develop(tallRef);
+            QVERIFY2(t.width == H && t.height == W && tr.width == H && tr.height == W, qPrintable(QString("%1x%2").arg(t.width).arg(t.height)));
+            double worst = 0;
+            for (size_t i = 0; i < t.rgb.size(); ++i) worst = std::max(worst, std::fabs(t.rgb[i] - double(tr.rgb[i])) / 65535);
+            QVERIFY2(worst < 5e-4, qPrintable(QString::number(worst)));
+        }
+
+        // The switch is kept with the media (Interpret Footage).
+        Interpretation off;
+        off.rawNoOpcodes = true;
+        MediaItem item;
+        item.path = interpretedPath(plain, off);
+        QVERIFY(off.hasRaw() && interpretationOf(item).rawNoOpcodes);
+        QVERIFY(item.path.find("rawop=0") != std::string::npos);
+    }
+
+    void colourInteropIds() {
+        // Every colour space has an ID (the ASWF Color Interop Forum's, OpenColorIO's for camera spaces, Montage's own
+        // otherwise) that leads back to it; another namespace in front is dropped once.
+        for (const ColorSpace& cs : colorSpaces()) {
+            const std::string id = colorInteropId(cs);
+            const ColorSpace* back = id.empty() ? nullptr : colorSpaceForInteropId(id);
+            QVERIFY2(back && sameColorSpace(*back, cs), qPrintable(QString::fromStdString(cs.id + " -> " + id)));
+        }
+        QCOMPARE(colorInteropId(*findColorSpace("rec709")), std::string("g24_rec709_display"));
+        QCOMPARE(colorInteropId(*findColorSpace("acescg")), std::string("lin_ap1_scene"));
+        QCOMPARE(colorInteropId(*findColorSpace("clog2-cinemagamut")), std::string("ocio:canonlog2_cgamutd55_scene"));
+        QCOMPARE(colorSpaceForInteropId("studio:lin_ap0_scene")->id, std::string("aces2065-1"));
+        QCOMPARE(colorSpaceForInteropId("pq_rec2020_display")->id, std::string("rec2100pq"));
+        QVERIFY(!colorSpaceForInteropId("a:b:lin_ap0_scene") && !colorSpaceForInteropId("nothing"));
+        // Linear light in primaries no listed space has: a space media can keep (found again by its id).
+        const ColorSpace* lin2020 = colorSpaceForInteropId("lin_rec2020_scene");
+        QVERIFY(lin2020 && lin2020->transfer == Transfer::Linear && lin2020->primaries == Primaries::Bt2020 && findColorSpace(lin2020->id) == lin2020);
+        QVERIFY(!findColorSpace("linear:99") && !findColorSpace("linear:x") && !findColorSpace("linear:"));
+
+        // OpenTimelineIO: a media reference's colour space, by its ID, kept on its way through.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            QImage png(16, 16, QImage::Format_RGB32);
+            png.fill(Qt::gray);
+            const std::string still = path("interop_plate.png");
+            QVERIFY(png.save(QString::fromStdString(still)));
+            MediaItem m = probeOrFail(p, still);
+            m.colorOverride = "slog3-sgamut3venice";
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+            const std::string otio = exportOtio(p, s);
+            QVERIFY2(otio.find("ocio:slog3_sgamut3venice_scene") != std::string::npos, otio.c_str());
+            Project q = makeDefaultProject();
+            QVERIFY(importOtio(q, otio).ok);
+            bool found = false;
+            for (const MediaItem& in : q.media)
+                if (in.path == still) {
+                    found = true;
+                    QCOMPARE(in.colorOverride, std::string("slog3-sgamut3venice"));
+                }
+            QVERIFY(found);
+        }
+
+        // OpenEXR: written by every float export, and read as the file's colour space.
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 32, s.height = 18, s.fps = Rational{25, 1};
+        QImage png(32, 18, QImage::Format_RGB32);
+        png.fill(QColor(200, 120, 60));
+        const std::string still = path("interop_src.png");
+        QVERIFY(png.save(QString::fromStdString(still)));
+        MediaItem m = probeOrFail(p, still);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 5, {TrackKind::Video, 0}, {}, false).ok);
+        ExportSettings st;
+        st.path = path("interop_out.%04d.exr");
+        st.videoCodec = "exr";
+        st.audioCodec = "none";
+        st.colorSpace = "acescg";
+        st.in = 0, st.out = 1;
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        const std::string out = path("interop_out.0000.exr");
+        QCOMPARE(readExrColorInteropId(out), std::string("lin_ap1_scene"));
+        QCOMPARE(probeOrFail(p, out).colorSpace, std::string("acescg"));
+        // A camera space from a file another application wrote.
+        ExrOutLayer layer;
+        layer.channels = {"R", "G", "B"};
+        layer.data.assign(size_t(8) * 8 * 3, 0.4f);
+        const std::string cam = path("interop_clog2.exr");
+        QVERIFY(writeExr(cam, 8, 8, {layer}, "zip", {{"colorInteropID", "ocio:canonlog2_cgamutd55_scene"}}, &err));
+        QCOMPARE(readExrColorInteropId(cam), std::string("ocio:canonlog2_cgamutd55_scene"));
+        QCOMPARE(probeOrFail(p, cam).colorSpace, std::string("clog2-cinemagamut"));
     }
 
     void cameraRawSettingsAndCinemaDng() {

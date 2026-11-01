@@ -121,6 +121,48 @@ double goProToLinear(double v, double b) { return (std::pow(b, v) - 1) / (b - 1)
 double linearToLlog(double x) { return x <= 0.006 ? 8 * x + 0.09 : 0.27 * std::log10(1.3 * x + 0.0115) + 0.6; }
 double llogToLinear(double v) { return v <= 0.138 ? (v - 0.09) / 8 : (std::pow(10.0, (v - 0.6) / 0.27) - 0.0115) / 1.3; }
 
+// Canon Log 2 (Canon's "Canon Log Gamma Curves" and the ACES input transform; 18 % grey at 0.9 x the curve's
+// linear, as Canon Log 3).
+double clog2ToLinear(double v) {
+    const double x = v < 0.092864125 ? -(std::pow(10.0, (0.092864125 - v) / 0.24136077) - 1) / 87.09937546
+                                     : (std::pow(10.0, (v - 0.092864125) / 0.24136077) - 1) / 87.09937546;
+    return x * 0.9;
+}
+double linearToClog2(double l) {
+    const double x = l / 0.9;
+    return x < 0 ? -0.24136077 * std::log10(-x * 87.09937546 + 1) + 0.092864125 : 0.24136077 * std::log10(x * 87.09937546 + 1) + 0.092864125;
+}
+// Adobe RGB (1998): a pure power of 563/256.
+constexpr double kAdobeGamma = 563.0 / 256;
+
+// ADX (the Academy's ADX input transforms): code value to channel-dependent density (CDD), to channel-independent
+// density (CID) through a matrix, to log exposure through the published table (and a straight line above it), and
+// exposure to ACES2065-1 through a second matrix. Both matrices' rows sum to one, so a neutral stays neutral.
+constexpr double kAdxCddToCid[9] = {0.75573, 0.22197, 0.02230, 0.05901, 0.96928, -0.02829, 0.16134, 0.07406, 0.76460};
+constexpr double kAdxExpToAces[9] = {0.72286, 0.12630, 0.15084, 0.11923, 0.76418, 0.11659, 0.01427, 0.08213, 0.90359};
+constexpr double kAdxTable[11][2] = {{-0.19, -6.0},          {0.01, -2.721718645},  {0.028, -2.521718645}, {0.054, -2.321718645},
+                                     {0.095, -2.121718645},  {0.145, -1.921718645}, {0.22, -1.721718645},  {0.3, -1.521718645},
+                                     {0.4, -1.321718645},    {0.5, -1.121718645},   {0.6, -0.926545676714876}};
+const double kAdxRef = (7120.0 - 1520.0) / 8000.0 * (100.0 / 55.0) - std::log10(0.18);
+double adxScale(Transfer t) { return t == Transfer::Adx16 ? 65535.0 / 8000 : 1023.0 / 500; }
+double adxOffset(Transfer t) { return t == Transfer::Adx16 ? 1520.0 / 8000 : 95.0 / 500; }
+double adxLogExposure(double cid) {
+    if (cid > 0.6) return 100.0 / 55 * cid - kAdxRef;
+    int i = 0;
+    while (i < 9 && cid > kAdxTable[i + 1][0]) ++i;  // (the first and last pieces carry on beyond the table)
+    return kAdxTable[i][1] + (cid - kAdxTable[i][0]) * (kAdxTable[i + 1][1] - kAdxTable[i][1]) / (kAdxTable[i + 1][0] - kAdxTable[i][0]);
+}
+double adxDensity(double logE) {
+    if (logE > adxLogExposure(0.6)) return (logE + kAdxRef) * 55 / 100;
+    int i = 0;
+    while (i < 9 && logE > kAdxTable[i + 1][1]) ++i;
+    return kAdxTable[i][0] + (logE - kAdxTable[i][1]) * (kAdxTable[i + 1][0] - kAdxTable[i][0]) / (kAdxTable[i + 1][1] - kAdxTable[i][1]);
+}
+// On a neutral (all three channels alike).
+double adxToLinear(Transfer t, double v) { return std::pow(10.0, adxLogExposure(v * adxScale(t) - adxOffset(t))); }
+double linearToAdx(Transfer t, double l) { return (adxDensity(std::log10(std::max(l, 1e-10))) + adxOffset(t)) / adxScale(t); }
+bool isAdx(Transfer t) { return t == Transfer::Adx10 || t == Transfer::Adx16; }
+
 double acescctToLinear(double v) {
     if (v <= 0.155251141552511) return (v - 0.0729055341958355) / 10.5402377416545;
     return std::min(65504.0, std::pow(2.0, v * 17.52 - 9.72));
@@ -150,6 +192,9 @@ Chroma chroma(Primaries p) {
         case Primaries::BmdWideGamut: return {0.7177215, 0.3171181, 0.2280410, 0.8615690, 0.1005841, -0.0820452, 0.3127170, 0.3290312};
         case Primaries::DavinciWideGamut: return {0.8000, 0.3130, 0.1682, 0.9877, 0.0790, -0.1155, wx, wy};
         case Primaries::AppleWideGamut: return {0.725, 0.301, 0.221, 0.814, 0.068, -0.076, wx, wy};  // Apple Gamut (Apple Log 2)
+        case Primaries::AdobeRgb: return {0.64, 0.33, 0.21, 0.71, 0.15, 0.06, wx, wy};
+        case Primaries::SGamut3Venice:      // (by Sony's matrices to ACES, primariesToXyz)
+        case Primaries::SGamut3CineVenice: break;
     }
     return chroma(Primaries::Bt709);
 }
@@ -202,6 +247,40 @@ void bradford(double wx1, double wy1, double wx2, double wy2, double m[9]) {
 
 double luminance2020(double r, double g, double b) { return 0.2627 * r + 0.6780 * g + 0.0593 * b; }
 
+// A colour's code values to linear light and back, its three channels together (ADX's densities mix them; every other
+// curve is a channel's own).
+void decode3(Transfer t, const float v[3], double l[3]) {
+    if (!isAdx(t)) {
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(t, v[i]);
+        return;
+    }
+    double cdd[3], e[3];
+    for (int i = 0; i < 3; ++i) cdd[i] = v[i] * adxScale(t) - adxOffset(t);
+    for (int r = 0; r < 3; ++r)
+        e[r] = std::pow(10.0, adxLogExposure(kAdxCddToCid[r * 3] * cdd[0] + kAdxCddToCid[r * 3 + 1] * cdd[1] + kAdxCddToCid[r * 3 + 2] * cdd[2]));
+    for (int r = 0; r < 3; ++r) l[r] = kAdxExpToAces[r * 3] * e[0] + kAdxExpToAces[r * 3 + 1] * e[1] + kAdxExpToAces[r * 3 + 2] * e[2];
+}
+void encode3(Transfer t, const double l[3], double v[3]) {
+    if (!isAdx(t)) {
+        for (int i = 0; i < 3; ++i) v[i] = fromLinear(t, l[i]);
+        return;
+    }
+    static const auto inverses = [] {
+        std::array<double, 18> m{};
+        invert3(kAdxExpToAces, m.data());
+        invert3(kAdxCddToCid, m.data() + 9);
+        return m;
+    }();
+    const double* toExp = inverses.data();
+    const double* toCdd = inverses.data() + 9;
+    double cid[3];
+    for (int r = 0; r < 3; ++r) {
+        const double e = toExp[r * 3] * l[0] + toExp[r * 3 + 1] * l[1] + toExp[r * 3 + 2] * l[2];
+        cid[r] = adxDensity(std::log10(std::max(e, 1e-10)));
+    }
+    for (int r = 0; r < 3; ++r) v[r] = ((toCdd[r * 3] * cid[0] + toCdd[r * 3 + 1] * cid[1] + toCdd[r * 3 + 2] * cid[2]) + adxOffset(t)) / adxScale(t);
+}
+
 }  // namespace
 
 const std::vector<ColorSpace>& colorSpaces() {
@@ -213,12 +292,16 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"rec2100pq", "Rec.2100 PQ (HDR10)", Primaries::Bt2020, Transfer::Pq, false},
         {"rec2100hlg", "Rec.2100 HLG", Primaries::Bt2020, Transfer::Hlg, false},
         {"p3d65pq", "P3-D65 PQ (HDR mastering)", Primaries::P3D65, Transfer::Pq, false},
+        {"adobergb", "Adobe RGB (1998)", Primaries::AdobeRgb, Transfer::Gamma22, false},
         {"slog3-sgamut3cine", "Sony S-Log3 / S-Gamut3.Cine", Primaries::SGamut3Cine, Transfer::SLog3, true},
         {"logc3-awg3", "ARRI LogC3 / ALEXA Wide Gamut 3", Primaries::AlexaWideGamut3, Transfer::LogC3, true},
         {"logc4-awg4", "ARRI LogC4 / ALEXA Wide Gamut 4", Primaries::AlexaWideGamut4, Transfer::LogC4, true},
         {"vlog-vgamut", "Panasonic V-Log / V-Gamut", Primaries::VGamut, Transfer::VLog, true},
         {"clog3-cinemagamut", "Canon Log 3 / Cinema Gamut", Primaries::CinemaGamut, Transfer::CLog3, true},
+        {"clog2-cinemagamut", "Canon Log 2 / Cinema Gamut", Primaries::CinemaGamut, Transfer::CLog2, true},
         {"slog3-sgamut3", "Sony S-Log3 / S-Gamut3", Primaries::SGamut3, Transfer::SLog3, true},
+        {"slog3-sgamut3venice", "Sony S-Log3 / S-Gamut3 (VENICE)", Primaries::SGamut3Venice, Transfer::SLog3, true},
+        {"slog3-sgamut3cinevenice", "Sony S-Log3 / S-Gamut3.Cine (VENICE)", Primaries::SGamut3CineVenice, Transfer::SLog3, true},
         {"applelog-rec2020", "Apple Log (iPhone) / Rec.2020", Primaries::Bt2020, Transfer::AppleLog, true},
         {"applelog2-applewg", "Apple Log 2 (iPhone 17 Pro) / Apple Gamut", Primaries::AppleWideGamut, Transfer::AppleLog, true},
         {"dlog-dgamut", "DJI D-Log / D-Gamut", Primaries::DGamut, Transfer::DLog, true},
@@ -230,6 +313,8 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"gplog2-rec2020", "GoPro GP-Log2 / Rec.2020", Primaries::Bt2020, Transfer::GoProLog2, true},
         {"llog-rec2020", "Leica L-Log / Rec.2020", Primaries::Bt2020, Transfer::LLog, true},
         {"di-dwg", "DaVinci Intermediate / Wide Gamut", Primaries::DavinciWideGamut, Transfer::DavinciIntermediate, true},
+        {"adx10", "ADX10 (film scan, 10-bit printing density)", Primaries::Ap0, Transfer::Adx10, true},
+        {"adx16", "ADX16 (film scan, 16-bit printing density)", Primaries::Ap0, Transfer::Adx16, true},
         {"acescct", "ACEScct", Primaries::Ap1, Transfer::AcesCct, true},
         {"aces2065-1", "ACES2065-1 (linear AP0)", Primaries::Ap0, Transfer::Linear, true},
         {"acescg", "ACEScg (linear AP1)", Primaries::Ap1, Transfer::Linear, true},
@@ -247,6 +332,11 @@ const ColorSpace* findColorSpace(const std::string& id) {
         for (const auto& c : colorSpaces())
             if (c.id == baseId) return c.sceneReferred ? &displayLightOf(c) : nullptr;
         return nullptr;
+    }
+    // Linear light in primaries no listed space has (an OpenEXR's interop ID can name one, and media keep it)
+    if (id.rfind("linear:", 0) == 0 && id.size() > 7 && id.size() <= 9 && std::all_of(id.begin() + 7, id.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        const int p = std::stoi(id.substr(7));
+        return p >= 0 && p <= int(Primaries::AdobeRgb) ? &linearColorSpace(Primaries(p)) : nullptr;
     }
     // (an SDR space with a tone mapping)
     const size_t plus = id.find('+');
@@ -352,7 +442,7 @@ const ColorSpace& sequenceColorSpace(const Sequence& s) {
 std::vector<const ColorSpace*> workingColorSpaces() {
     std::vector<const ColorSpace*> out;
     for (const auto& c : colorSpaces())
-        if (c.sceneReferred) out.push_back(&c);
+        if (c.sceneReferred && !isAdx(c.transfer)) out.push_back(&c);  // (ADX's channels mix: not graded in)
     return out;
 }
 
@@ -379,6 +469,92 @@ const ColorSpace& linearColorSpace(Primaries p) {
     for (const auto& c : colorSpaces())
         if (c.transfer == Transfer::Linear && c.primaries == p) return c;
     return madeSpace(p, Transfer::Linear, "linear:", "Linear (scene)");
+}
+
+namespace {
+// Linear light in each primaries, by its interop ID (the Forum's where it has one, else OpenColorIO's Studio config's).
+const char* linearInteropId(Primaries p) {
+    switch (p) {
+        case Primaries::Bt709: return "lin_rec709_scene";
+        case Primaries::Bt2020: return "lin_rec2020_scene";
+        case Primaries::P3D65: return "lin_p3d65_scene";
+        case Primaries::Ap1: return "lin_ap1_scene";
+        case Primaries::Ap0: return "lin_ap0_scene";
+        case Primaries::AdobeRgb: return "lin_adobergb_scene";
+        case Primaries::SGamut3: return "ocio:lin_sgamut3_scene";
+        case Primaries::SGamut3Cine: return "ocio:lin_sgamut3cine_scene";
+        case Primaries::SGamut3Venice: return "ocio:lin_sgamut3venice_scene";
+        case Primaries::SGamut3CineVenice: return "ocio:lin_sgamut3cinevenice_scene";
+        case Primaries::AlexaWideGamut3: return "ocio:lin_awg3_scene";
+        case Primaries::AlexaWideGamut4: return "ocio:lin_awg4_scene";
+        case Primaries::VGamut: return "ocio:lin_vgamut_scene";
+        case Primaries::CinemaGamut: return "ocio:lin_cgamutd55_scene";
+        case Primaries::DGamut: return "ocio:lin_dgamut_scene";
+        case Primaries::RedWideGamut: return "ocio:lin_rwg_scene";
+        case Primaries::BmdWideGamut: return "ocio:lin_bmdwg5_scene";
+        case Primaries::DavinciWideGamut: return "ocio:lin_dwg_scene";
+        case Primaries::AppleWideGamut: return "ocio:lin_applewg_scene";
+    }
+    return nullptr;
+}
+// Montage's spaces by their interop IDs (the Color Interop Forum's recommendations for textures and for displays, and
+// OpenColorIO-Config-ACES's Studio config mapping for camera spaces).
+const std::pair<const char*, const char*> kInteropIds[] = {
+    {"rec709", "g24_rec709_display"},
+    {"srgb", "srgb_rec709_display"},
+    {"p3d65", "srgb_p3d65_display"},
+    {"rec2100pq", "pq_rec2020_display"},
+    {"rec2100hlg", "hlg_rec2020_display"},
+    {"p3d65pq", "pq_p3d65_display"},
+    {"adobergb", "g22_adobergb_display"},
+    {"slog3-sgamut3cine", "ocio:slog3_sgamut3cine_scene"},
+    {"slog3-sgamut3", "ocio:slog3_sgamut3_scene"},
+    {"slog3-sgamut3venice", "ocio:slog3_sgamut3venice_scene"},
+    {"slog3-sgamut3cinevenice", "ocio:slog3_sgamut3cinevenice_scene"},
+    {"logc3-awg3", "ocio:arrilogc3_awg3_scene"},
+    {"logc4-awg4", "ocio:arrilogc4_awg4_scene"},
+    {"vlog-vgamut", "ocio:vlog_vgamut_scene"},
+    {"clog3-cinemagamut", "ocio:canonlog3_cgamutd55_scene"},
+    {"clog2-cinemagamut", "ocio:canonlog2_cgamutd55_scene"},
+    {"applelog-rec2020", "ocio:applelog_rec2020_scene"},
+    {"applelog2-applewg", "ocio:applelog_applewg_scene"},
+    {"dlog-dgamut", "ocio:djilog_dgamut_scene"},
+    {"log3g10-rwg", "ocio:redlog3g10_rwg_scene"},
+    {"bmdfilm5-bmdwg", "ocio:bmdfilm5_wg5_scene"},
+    {"di-dwg", "ocio:davinci_dwg_scene"},
+    {"adx10", "ocio:adx10_apd_scene"},
+    {"adx16", "ocio:adx16_apd_scene"},
+    {"acescct", "ocio:acescct_ap1_scene"},
+};
+constexpr const char* kMontageNamespace = "montage:";
+}  // namespace
+
+std::string colorInteropId(const ColorSpace& s) {
+    const ColorSpace* base = findColorSpace(s.id.substr(0, s.id.find('+')));  // (a tone mapping holds the same values)
+    if (!base) {
+        if (s.transfer == Transfer::Linear) return linearInteropId(s.primaries);  // (one made for its primaries)
+        return {};
+    }
+    if (s.id.ends_with("+display")) return kMontageNamespace + s.id;
+    if (base->transfer == Transfer::Linear) return linearInteropId(base->primaries);
+    for (const auto& [id, interop] : kInteropIds)
+        if (base->id == id) return interop;
+    return kMontageNamespace + base->id;
+}
+
+const ColorSpace* colorSpaceForInteropId(const std::string& wanted) {
+    auto find = [](const std::string& id) -> const ColorSpace* {
+        if (id.rfind(kMontageNamespace, 0) == 0) return findColorSpace(id.substr(std::char_traits<char>::length(kMontageNamespace)));
+        for (const auto& [mine, interop] : kInteropIds)
+            if (id == interop) return findColorSpace(mine);
+        for (int p = int(Primaries::Bt709); p <= int(Primaries::AdobeRgb); ++p)
+            if (const char* lin = linearInteropId(Primaries(p)); lin && id == lin) return &linearColorSpace(Primaries(p));
+        return nullptr;
+    };
+    if (const ColorSpace* c = find(wanted)) return c;
+    // (the Forum's lookup: the leftmost namespace dropped, once)
+    const size_t colon = wanted.find(':');
+    return colon == std::string::npos ? nullptr : find(wanted.substr(colon + 1));
 }
 
 const ColorSpace& logColorSpace(Primaries p) {
@@ -451,15 +627,17 @@ bool aces2View(const ColorSpace& space, double peakNits, std::string& display, s
 // A colour from one space's code values to another's exactly: linear light through the first's curve, its primaries
 // into the second's, out through the second's curve.
 void exactly(const double m[9], Transfer a, Transfer b, float v[3]) {
-    double l[3];
-    for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
-    for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, m[i * 3] * l[0] + m[i * 3 + 1] * l[1] + m[i * 3 + 2] * l[2]));
+    double l[3], o[3], c[3];
+    decode3(a, v, l);
+    for (int i = 0; i < 3; ++i) o[i] = m[i * 3] * l[0] + m[i * 3 + 1] * l[1] + m[i * 3 + 2] * l[2];
+    encode3(b, o, c);
+    for (int i = 0; i < 3; ++i) v[i] = float(c[i]);
 }
 
 // Scene light in `from` (code values) to a display through the filmic transform.
 void filmicPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, const ToneScale& ts, const double m[9]) {
     double c[3], l[3];
-    for (int i = 0; i < 3; ++i) c[i] = toLinear(from.transfer, rgb[i]);
+    decode3(from.transfer, rgb, c);
     const double unit = to.hdr() ? kSdrWhiteNits : 100;
     for (int r = 0; r < 3; ++r) l[r] = ts.nits(m[r * 3] * c[0] + m[r * 3 + 1] * c[1] + m[r * 3 + 2] * c[2]) / unit;
     encodeDisplayLight(to, l, rgb);
@@ -521,7 +699,9 @@ void filmicInverse(float rgb[3], const ColorSpace& from, const ColorSpace& to, c
     const double unit = from.hdr() ? kSdrWhiteNits : 100;
     for (int i = 0; i < 3; ++i) l[i] = ts.scene(std::max(0.0, l[i]) * unit);
     for (int r = 0; r < 3; ++r) c[r] = m[r * 3] * l[0] + m[r * 3 + 1] * l[1] + m[r * 3 + 2] * l[2];
-    for (int i = 0; i < 3; ++i) rgb[i] = float(fromLinear(to.transfer, c[i]));
+    double e[3];
+    encode3(to.transfer, c, e);
+    for (int i = 0; i < 3; ++i) rgb[i] = float(e[i]);
 }
 
 // Display code values (`count`, packed RGB) back through ACES 2.0 into scene light in `to`; false (left as they were)
@@ -724,6 +904,10 @@ double toLinear(Transfer t, double v) {
         case Transfer::GoProLog: return goProToLinear(v, 400);
         case Transfer::GoProLog2: return goProToLinear(v, 600);
         case Transfer::LLog: return llogToLinear(v);
+        case Transfer::CLog2: return clog2ToLinear(v);
+        case Transfer::Gamma22: return std::pow(std::max(v, 0.0), kAdobeGamma);
+        case Transfer::Adx10:
+        case Transfer::Adx16: return adxToLinear(t, v);
     }
     return v;
 }
@@ -751,6 +935,10 @@ double fromLinear(Transfer t, double l) {
         case Transfer::GoProLog: return linearToGoPro(l, 400);
         case Transfer::GoProLog2: return linearToGoPro(l, 600);
         case Transfer::LLog: return linearToLlog(l);
+        case Transfer::CLog2: return linearToClog2(l);
+        case Transfer::Gamma22: return std::pow(std::max(l, 0.0), 1 / kAdobeGamma);
+        case Transfer::Adx10:
+        case Transfer::Adx16: return linearToAdx(t, l);
     }
     return l;
 }
@@ -918,14 +1106,16 @@ void convertPixelWith(float rgb[3], const ColorSpace& from, const ColorSpace& to
         encodeDisplayLight(to, l, rgb);
         return;
     }
-    for (int i = 0; i < 3; ++i) rgb[i] = float(fromLinear(to.transfer, l[i]));
+    double e[3];
+    encode3(to.transfer, l, e);
+    for (int i = 0; i < 3; ++i) rgb[i] = float(e[i]);
 }
 }  // namespace
 
 double toneMappingWhiteNits(ToneMapping t) { return t == ToneMapping::Bt2446A ? 1000.0 : t == ToneMapping::Bt2446C ? kCWhite : 0.0; }
 
 void displayLight(const ColorSpace& space, const float rgb[3], double c[3]) {
-    for (int i = 0; i < 3; ++i) c[i] = toLinear(space.transfer, rgb[i]);
+    decode3(space.transfer, rgb, c);
     if (space.transfer == Transfer::Hlg) {
         // HLG OOTF (1000-nit display, system gamma 1.2): scene light to display light.
         const double ys = std::max(0.0, luminance2020(c[0], c[1], c[2]));
@@ -1013,10 +1203,16 @@ void primariesToXyz(Primaries p, double m[9]) {
     static const double awg3[9] = {0.680206, 0.236137, 0.083658, 0.085415, 1.017471, -0.102886, 0.002057, -0.062563, 1.060506};
     static const double cinemaGamut[9] = {0.763064455, 0.149021161, 0.087914384, 0.003657457, 1.10696038,
                                           -0.110617837, -0.009407794, -0.218383305, 1.227791099};
-    const double* toAp0 = p == Primaries::SGamut3Cine       ? sgamut3cine
-                          : p == Primaries::AlexaWideGamut3 ? awg3
-                          : p == Primaries::CinemaGamut     ? cinemaGamut
-                                                            : nullptr;
+    static const double sgamut3venice[9] = {0.7933297411, 0.0890786256, 0.1175916333, 0.0155810585, 1.0327123069,
+                                            -0.0482933654, -0.0188647478, 0.0127694121, 1.0060953358};
+    static const double sgamut3cinevenice[9] = {0.6742570921, 0.2205717359, 0.1051711720, -0.0093136061, 1.1059588614,
+                                                -0.0966452553, -0.0382090673, -0.0179383766, 1.0561474439};
+    const double* toAp0 = p == Primaries::SGamut3Cine         ? sgamut3cine
+                          : p == Primaries::AlexaWideGamut3   ? awg3
+                          : p == Primaries::CinemaGamut       ? cinemaGamut
+                          : p == Primaries::SGamut3Venice     ? sgamut3venice
+                          : p == Primaries::SGamut3CineVenice ? sgamut3cinevenice
+                                                              : nullptr;
     if (toAp0) {
         double ap0[9];
         primariesToXyz(Primaries::Ap0, ap0);
@@ -1043,6 +1239,7 @@ double codeToNits(const ColorSpace& space, double code) {
         case Transfer::Pq: return pqToNits(code);
         case Transfer::Hlg: return kHlgPeak * std::pow(hlgInverseOetf(code), kHlgGamma);  // neutral: Ys is E
         case Transfer::Bt1886:
+        case Transfer::Gamma22:
         case Transfer::Srgb: return 100 * toLinear(space.transfer, std::clamp(code, 0.0, 1.0));
         default: return -1;
     }
@@ -1054,6 +1251,7 @@ double nitsToCode(const ColorSpace& space, double nits) {
         case Transfer::Pq: return nitsToPq(nits);
         case Transfer::Hlg: return hlgOetf(std::pow(std::min(nits / kHlgPeak, 1.0), 1 / kHlgGamma));
         case Transfer::Bt1886:
+        case Transfer::Gamma22:
         case Transfer::Srgb: return std::clamp(fromLinear(space.transfer, nits / 100), 0.0, 1.0);
         default: return -1;
     }

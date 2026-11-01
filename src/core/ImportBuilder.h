@@ -15,6 +15,7 @@ public:
     TimelineBuilder(Project& p, const std::string& name, Rational fps, const MediaProber& probe);
 
     Sequence& sequence() { return seq_; }
+    Project& project() { return p_; }
     Rational sequenceFps() const { return seq_.fps; }
     int sequenceWidth() const { return seq_.width; }
     int sequenceHeight() const { return seq_.height; }
