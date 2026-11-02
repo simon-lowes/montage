@@ -842,6 +842,17 @@ std::function<Image(int)> modelLightLayer(const Project& p, const Sequence& seq,
     };
 }
 
+// The same at another frame (a picture projected onto a model, held at one frame).
+std::function<Image(int, FrameTime)> modelLayerAt(const Project& p, const Sequence& seq, const RenderOptions& o) {
+    return [&p, &seq, o](int track, FrameTime at) {
+        if (track < 0 || size_t(track) >= seq.videoTracks.size()) return Image();
+        for (const Clip& lc : seq.videoTracks[size_t(track)].clips)
+            if (lc.enabled && at >= lc.start && at < lc.end() && !(lc.isGenerator() && lc.generator.type == "model3d"))
+                return clipLayer(p, seq, lc, at, o, nullptr);
+        return Image();
+    };
+}
+
 // The picture an OpenFX plugin's further input on clip `c` is connected to (render/Ofx.h) at clip frame `at`, on the canvas.
 bool ofxInputPicture(const Project& p, const Sequence& seq, const Clip& c, const RenderOptions& o, const std::string& connection, double at,
                      Image& pic);  // (below)
@@ -906,7 +917,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         std::string modelError;
-        src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError)
+        src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
+                                                                      modelLayerAt(p, seq, o))
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
@@ -1683,6 +1695,9 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
             // The picture lighting a 3D model.
             if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("env_hide", t - c->start, 1) > 0.5)
                 if (const int m = modelLightTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
+            // The picture projected onto a 3D model.
+            if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("proj_hide", t - c->start, 1) > 0.5)
+                if (const int m = modelProjectionTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
             // The picture on a 3D model's surface.
             if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("texture_hide", t - c->start, 1) > 0.5)
                 if (const int m = modelTextureTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
@@ -1712,7 +1727,9 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
         if (const Effect* l3 = model ? nullptr : enabledEffect(seq, c, "layer_3d"); l3 && !l.empty() && l.width == W && l.height == H) {
             Image card;
             std::string error;
-            if (renderClipLayer3D(p, seq, c, *l3, at, l, double(W) / seq.width, card, nullptr, &error)) l = std::move(card);
+            if (renderClipLayer3D(p, seq, c, *l3, at, l, double(W) / seq.width, card, nullptr, &error,
+                                  [&](const Clip& k) { return clipLayer(p, seq, k, at, o, nullptr); }))
+                l = std::move(card);
             else if (o.issues && !error.empty()) o.issues->note(error);
         }
         shown |= display;
@@ -2046,7 +2063,8 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         std::string error;
         Geometry g;
         if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
-        Image layer = renderModelClip(p, seq, c, t, W, H, double(W) / seq.width, modelLightLayer(p, seq, t, o), &depth, &error);
+        Image layer = renderModelClip(p, seq, c, t, W, H, double(W) / seq.width, modelLightLayer(p, seq, t, o), &depth, &error,
+                                      modelLayerAt(p, seq, o));
         if (!error.empty() && o.issues) o.issues->note(error);
         if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         intoWorking(layer, rec709Space(), seq, true);
@@ -2058,7 +2076,8 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         Image card;
         std::vector<float> depth;
         std::string error;
-        if (!renderClipLayer3D(p, seq, c, *l3, t, layer, double(W) / seq.width, card, &depth, &error)) {
+        if (!renderClipLayer3D(p, seq, c, *l3, t, layer, double(W) / seq.width, card, &depth, &error,
+                               [&](const Clip& k) { return clipLayer(p, seq, k, t, o, nullptr); })) {
             if (o.issues && !error.empty()) o.issues->note(error);
             return DeepFrame::blank(W, H);
         }

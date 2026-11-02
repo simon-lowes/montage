@@ -308,8 +308,18 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
         m.texelWorld = 2 * m.extent / size;
     }
     m.depth.assign(size_t(size) * size_t(size), std::numeric_limits<float>::infinity());
-    // The triangles in the map's pixels, both sides, the nearest kept.
-    const PosedTriangles& t = s.triangles;
+    // The triangles in the map's pixels, both sides, the nearest kept: the scene's (a picture laid over them casting
+    // where its alpha is at least a half), then the casters'.
+    struct Source {
+        const PosedTriangles* t;
+        const ModelTexture* coverage;
+        int material;  // the triangles the coverage is on (-1: all)
+    };
+    std::vector<Source> sources{{&s.triangles, s.picture && !s.picture->levels.empty() ? s.picture.get() : nullptr, s.pictureMaterial}};
+    for (const ModelShadowCaster& c : s.casters)
+        sources.push_back({&c.triangles, c.coverage && !c.coverage->levels.empty() ? c.coverage.get() : nullptr, -1});
+    for (const Source& src : sources) {
+    const PosedTriangles& t = *src.t;
     struct P {
         double u, v, d;
         bool ok;
@@ -319,12 +329,20 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
         P& p = pts[i];
         p.ok = m.map({t.positions[i * 3], t.positions[i * 3 + 1], t.positions[i * 3 + 2]}, p.u, p.v, p.d);
     }
+    bool hasUv = t.uvs.size() >= pts.size() * 2;
+    for (const uint32_t i : t.indices) hasUv = hasUv && i < pts.size();
+    if (!hasUv && !src.coverage) hasUv = true;  // (nothing sampled)
     const int bands = (size + 63) / 64;
     eachBand(bands, serial, [&](int b) {
         const int y0 = b * 64, y1 = std::min(size, y0 + 64);
         for (size_t i = 0; i + 2 < t.indices.size(); i += 3) {
+            if (t.indices[i] >= pts.size() || t.indices[i + 1] >= pts.size() || t.indices[i + 2] >= pts.size()) continue;
             const P &a = pts[t.indices[i]], &bb = pts[t.indices[i + 1]], &c = pts[t.indices[i + 2]];
             if (!a.ok || !bb.ok || !c.ok) continue;
+            const size_t tri = i / 3;
+            const ModelTexture* cover = src.coverage && hasUv && (src.material < 0 || (tri < t.materials.size() && t.materials[tri] == src.material))
+                                            ? src.coverage
+                                            : nullptr;
             const double area = (bb.u - a.u) * (c.v - a.v) - (bb.v - a.v) * (c.u - a.u);
             if (std::fabs(area) < 1e-12) continue;
             const int ty0 = std::max(y0, pixelFloor(std::min({a.v, bb.v, c.v}))), ty1 = std::min(y1 - 1, pixelCeil(std::max({a.v, bb.v, c.v})));
@@ -339,10 +357,27 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
                     // (depth along the light: straight across an orthographic map, its reciprocal across a perspective one)
                     const float d = float(m.perspective ? 1 / (w0 / a.d + w1 / bb.d + w2 / c.d) : w0 * a.d + w1 * bb.d + w2 * c.d);
                     float& z = m.depth[size_t(y) * size_t(size) + size_t(x)];
-                    if (d < z) z = d;
+                    if (!(d < z)) continue;
+                    if (cover) {
+                        // (the picture's alpha there, its uvs perspective-correct across a perspective map)
+                        double k0 = w0, k1 = w1, k2 = w2;
+                        if (m.perspective) {
+                            k0 /= a.d, k1 /= bb.d, k2 /= c.d;
+                            const double sum = k0 + k1 + k2;
+                            k0 /= sum, k1 /= sum, k2 /= sum;
+                        }
+                        const uint32_t i0 = t.indices[i], i1 = t.indices[i + 1], i2 = t.indices[i + 2];
+                        const double u = k0 * t.uvs[i0 * 2] + k1 * t.uvs[i1 * 2] + k2 * t.uvs[i2 * 2];
+                        const double v = k0 * t.uvs[i0 * 2 + 1] + k1 * t.uvs[i1 * 2 + 1] + k2 * t.uvs[i2 * 2 + 1];
+                        float cv[4];
+                        bilinear(*cover, 0, u, v, cv);
+                        if (cv[3] < 0.5f) continue;
+                    }
+                    z = d;
                 }
         }
     });
+    }
     return m;
 }
 
@@ -389,6 +424,16 @@ bool incoming(const ModelLight& l, const V3& P, V3& L, double* E) {
     return k > 0;
 }
 
+// ---- Projection ----------------------------------------------------------------------------------------------------
+
+// The nearest surface's depth in front of a projector, over its picture (at most 2048 texels across), both sides of
+// every triangle; +inf where nothing is.
+struct ProjectorDepth {
+    int w = 0, h = 0;
+    double k = 1;  // texels a projector pixel
+    std::vector<float> z;
+};
+
 }  // namespace
 
 bool ModelCamera::project(const std::array<double, 3>& X, double& px, double& py, double* z) const {
@@ -432,6 +477,84 @@ void weightsAt(const ScreenTri& t, double px, double py, double* w, double* iz =
     if (iz) *iz = z;
     const double k0 = l0 * t.iz[0] / z, k1 = l1 * t.iz[1] / z, k2 = l2 * t.iz[2] / z;
     for (int c = 0; c < 3; ++c) w[c] = k0 * t.b[0][c] + k1 * t.b[1][c] + k2 * t.b[2][c];
+}
+
+ProjectorDepth buildProjectorDepth(const PosedTriangles& T, const ModelProjection& pr, bool serial) {
+    ProjectorDepth d;
+    d.k = std::min(1.0, 2048 / std::max({pr.width, pr.height, 1.0}));
+    d.w = std::max(1, int(std::ceil(pr.width * d.k))), d.h = std::max(1, int(std::ceil(pr.height * d.k)));
+    d.z.assign(size_t(d.w) * size_t(d.h), std::numeric_limits<float>::infinity());
+    struct Pt {
+        double u, v, z;
+        bool ok;
+    };
+    std::vector<Pt> pts(T.positions.size() / 3);
+    for (size_t i = 0; i < pts.size(); ++i) {
+        Pt& q = pts[i];
+        double px = 0, py = 0;
+        q.ok = pr.camera.project({T.positions[i * 3], T.positions[i * 3 + 1], T.positions[i * 3 + 2]}, px, py, &q.z);
+        q.u = px * d.k, q.v = py * d.k;
+    }
+    const int bands = (d.h + 63) / 64;
+    eachBand(bands, serial, [&](int b) {
+        const int y0 = b * 64, y1 = std::min(d.h, y0 + 64);
+        for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
+            // (a triangle reaching behind the projector is left out: it hides nothing in its picture)
+            const Pt &a = pts[T.indices[i]], &bb = pts[T.indices[i + 1]], &c = pts[T.indices[i + 2]];
+            if (!a.ok || !bb.ok || !c.ok) continue;
+            const double area = (bb.u - a.u) * (c.v - a.v) - (bb.v - a.v) * (c.u - a.u);
+            if (std::fabs(area) < 1e-12) continue;
+            const int ty0 = std::max(y0, pixelFloor(std::min({a.v, bb.v, c.v}))), ty1 = std::min(y1 - 1, pixelCeil(std::max({a.v, bb.v, c.v})));
+            const int tx0 = std::max(0, pixelFloor(std::min({a.u, bb.u, c.u}))), tx1 = std::min(d.w - 1, pixelCeil(std::max({a.u, bb.u, c.u})));
+            for (int y = ty0; y <= ty1; ++y)
+                for (int x = tx0; x <= tx1; ++x) {
+                    const double px = x + 0.5, py = y + 0.5;
+                    const double w0 = ((bb.u - px) * (c.v - py) - (bb.v - py) * (c.u - px)) / area;
+                    const double w1 = ((c.u - px) * (a.v - py) - (c.v - py) * (a.u - px)) / area;
+                    const double w2 = 1 - w0 - w1;
+                    if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+                    const float z = float(1 / (w0 / a.z + w1 / bb.z + w2 / c.z));
+                    float& o = d.z[size_t(y) * size_t(d.w) + size_t(x)];
+                    if (z < o) o = z;
+                }
+        }
+    });
+    return d;
+}
+
+// A coordinate within a millionth of a pixel of a texel's middle taken as it (so a picture seen back through its own
+// projector is sampled exactly).
+double snappedTexel(double v) {
+    const double r = std::floor(v) + 0.5;
+    return std::fabs(v - r) < 1e-6 ? r : v;
+}
+
+// How much of the projector's picture reaches P (0..1, over 2 x 2 texels) and where in it (pixels): none behind it,
+// facing away from it (`front`: the surface's front normal) or behind a nearer surface.
+double projectorReaches(const ModelProjection& pr, const ProjectorDepth& d, const V3& P, const V3& front, double& px, double& py) {
+    double z = 0;
+    if (!pr.camera.project(P, px, py, &z)) return 0;
+    const V3 to = unit(pr.camera.C - P);
+    const double facing = dot(front, to);
+    if (facing <= 0) return 0;
+    // (a texel's width on the surface there, wider as it turns away from the projector, against its own depth)
+    const double focal = std::max(1e-9, std::hypot(pr.camera.screen[0], pr.camera.screen[3]));
+    const double slope = std::sqrt(std::max(0.0, 1 - facing * facing)) / std::max(0.1, facing);
+    const double bias = z / (focal * d.k) * (1.5 + 1.5 * std::min(slope, 10.0)) + z * 1e-6;
+    // (the four texels round it, weighted as bilinear filtering weighs them: a point on a texel's middle takes that
+    // texel alone, so the picture seen back through its own projector reaches every surface it shows)
+    const double u = snappedTexel(px * d.k) - 0.5, v = snappedTexel(py * d.k) - 0.5;
+    const int x0 = int(std::floor(u)), y0 = int(std::floor(v));
+    const double fx = u - x0, fy = v - y0;
+    double seen = 0;
+    for (int dy = 0; dy <= 1; ++dy)
+        for (int dx = 0; dx <= 1; ++dx) {
+            const double wgt = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
+            if (wgt <= 0) continue;
+            const int x = std::clamp(x0 + dx, 0, d.w - 1), y = std::clamp(y0 + dy, 0, d.h - 1);
+            seen += d.z[size_t(y) * size_t(d.w) + size_t(x)] + bias >= z ? wgt : 0;
+        }
+    return seen;
 }
 
 const ModelMaterial& defaultMaterial() {
@@ -542,7 +665,16 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
     double radius = 1;
     {
         std::array<double, 3> lo, hi;
-        if (modelBounds(T, lo, hi)) {
+        bool any = modelBounds(T, lo, hi);
+        for (const ModelShadowCaster& c : s.casters) {  // (and what casts onto them)
+            std::array<double, 3> clo, chi;
+            if (!modelBounds(c.triangles, clo, chi)) continue;
+            for (int a = 0; a < 3; ++a)
+                lo[size_t(a)] = any ? std::min(lo[size_t(a)], clo[size_t(a)]) : clo[size_t(a)],
+                hi[size_t(a)] = any ? std::max(hi[size_t(a)], chi[size_t(a)]) : chi[size_t(a)];
+            any = true;
+        }
+        if (any) {
             centre = {(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2};
             radius = std::max(1e-6, std::sqrt(dot(V3{hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]}, V3{hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]})) / 2);
         }
@@ -554,6 +686,28 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
     const std::shared_ptr<const ModelEnvironment::Prepared> env =
         s.environment ? prepare(*s.environment, o.serial) : nullptr;
     const V3 eye = cam.C;
+    const ModelProjection* projection =
+        s.projection && s.projection->picture && !s.projection->picture->levels.empty() && s.projection->width > 0 && s.projection->height > 0
+            ? s.projection.get()
+            : nullptr;
+    const ProjectorDepth projectorDepth = projection ? buildProjectorDepth(T, *projection, o.serial) : ProjectorDepth{};
+    // The projected picture at P on model triangle `tri` (straight colour) and how much of it is laid over (0: none).
+    auto paintAt = [&](uint32_t tri, const V3& P, float* rgb) {
+        if (!projection) return 0.0f;
+        if (projection->material >= 0 && !(tri < T.materials.size() && T.materials[tri] == projection->material)) return 0.0f;
+        const uint32_t i0 = T.indices[size_t(tri) * 3], i1 = T.indices[size_t(tri) * 3 + 1], i2 = T.indices[size_t(tri) * 3 + 2];
+        const V3 front = unit(cross(position(i1) - position(i0), position(i2) - position(i0)));
+        double px = 0, py = 0;
+        const double reach = projectorReaches(*projection, projectorDepth, P, front, px, py);
+        if (!(reach > 0)) return 0.0f;
+        const double u = snappedTexel(px) / projection->width, v = snappedTexel(py) / projection->height;
+        if (!(u >= 0 && v >= 0 && u <= 1 && v <= 1)) return 0.0f;
+        float c[4];
+        bilinear(*projection->picture, 0, u, v, c);
+        if (!(c[3] > 1e-6f)) return 0.0f;
+        for (int k = 0; k < 3; ++k) rgb[k] = c[k] / c[3];
+        return float(std::clamp(double(c[3]), 0.0, 1.0) * reach * std::clamp(double(projection->mix), 0.0, 1.0));
+    };
 
     // The triangles reaching each band of rows, in order.
     const int bands = (h + kBand - 1) / kBand;
@@ -581,14 +735,27 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             return true;
         };
         float base[4] = {m.baseColor[0], m.baseColor[1], m.baseColor[2], m.baseColor[3]}, c[4];
+        float paint[3] = {0, 0, 0};
+        const float painted = paintAt(tri, P, paint);
+        // (a picture projected as it is, over what is there)
+        // (straight colour: the paint over the surface's own share of the pixel)
+        auto overlay = [&] {
+            if (!(painted > 0) || projection->lit) return;
+            const float a = std::clamp(rgba[3], 0.0f, 1.0f), out = painted + a * (1 - painted);
+            for (int k = 0; k < 3; ++k) rgba[k] = out > 0 ? (paint[k] * painted + rgba[k] * a * (1 - painted)) / out : 0.0f;
+            rgba[3] = out;
+        };
         const bool pictured = pictureOn(tri);
         if (pictured) {
             sampleTexture(*s.picture, u, v, dux, dvx, duy, dvy, c);  // (premultiplied)
             for (int k = 0; k < 3; ++k) base[k] = c[3] > 1e-6f ? c[k] / c[3] : 0.0f;
             base[3] *= c[3];
             if (s.pictureAsIs) {
+                if (painted > 0 && projection->lit)  // (over the picture shown as it is: in place of its colour)
+                    for (int k = 0; k < 3; ++k) base[k] += (paint[k] - base[k]) * painted;
                 for (int k = 0; k < 3; ++k) rgba[k] = base[k];
                 rgba[3] = std::clamp(base[3], 0.0f, 1.0f);
+                overlay();
                 return;
             }
         } else {
@@ -596,6 +763,8 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
                 for (int k = 0; k < 4; ++k) base[k] *= c[k];
             for (int k = 0; k < 4; ++k) base[k] *= float(lerp(T.colors, 4, size_t(k), wt));
         }
+        if (painted > 0 && projection->lit)
+            for (int k = 0; k < 3; ++k) base[k] += (paint[k] - base[k]) * painted;
         double metallic = m.metallic, rough = m.roughness;
         if (tex(m.metallicRoughnessTexture, c)) rough *= c[1], metallic *= c[2];
         rough = std::clamp(rough, 0.03, 1.0), metallic = std::clamp(metallic, 0.0, 1.0);
@@ -660,6 +829,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             rgba[k] = float(col[k] + cd[k] * diff[k] * (1 - ks) + spec[k] * ks + em[k]);
         }
         rgba[3] = m.alpha == ModelMaterial::Alpha::Blend || pictured ? std::clamp(base[3], 0.0f, 1.0f) : 1.0f;
+        overlay();
     };
     // What a masked material lets through at a sample.
     auto maskPasses = [&](uint32_t tri, const double* wt) {

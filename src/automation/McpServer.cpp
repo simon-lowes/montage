@@ -282,6 +282,64 @@ double secs(FrameTime f, const Sequence& s) { return double(f) / s.fpsValue(); }
 
 QString absolute(const QString& path) { return QString::fromStdString(std::filesystem::absolute(path.toStdString()).string()); }
 
+// A model's "projection" argument: a track's picture projected onto it through a camera, as the proj_* settings.
+void projectionArg(const QJsonObject& a, const Sequence& s, Clip& c) {
+    if (!a.contains("projection")) return;
+    if (!a.value("projection").isObject()) throw ArgError{"\"projection\" is an object: {track, camera, ...}"};
+    const QJsonObject p = a.value("projection").toObject();
+    auto& params = c.generator.params;
+    const QJsonValue tv = p.value("track");
+    int track = 0;
+    if (tv.isDouble()) track = tv.toInt();
+    else if (tv.isString()) {
+        const TrackRef r = trackArg(tv.toString(), s, false);
+        if (r.kind != TrackKind::Video) throw ArgError{"\"projection.track\" is a video track (V1, V2...)"};
+        track = r.index + 1;
+    } else throw ArgError{"\"projection.track\" names the video track whose picture is projected (V2 or 2)"};
+    if (track < 1 || track > int(s.videoTracks.size())) throw ArgError{QStringLiteral("There is no video track %1").arg(track)};
+    params["proj_track"] = Param(double(track));
+    const QStringList modes{"own", "solved", "file", "scene"};
+    const QString mode = p.contains("camera") ? p.value("camera").toString() : p.contains("camera_file") ? QStringLiteral("file") : QStringLiteral("solved");
+    const int m = int(modes.indexOf(mode));
+    if (m < 0) throw ArgError{"\"projection.camera\" is own, solved, file or scene"};
+    params["proj_camera"] = Param(double(m));
+    if (m == 2) {
+        if (!p.value("camera_file").isString() || p.value("camera_file").toString().isEmpty())
+            throw ArgError{"A file's camera needs \"projection.camera_file\" (a USD or glTF file)"};
+        const QFileInfo cf(absolute(p.value("camera_file").toString()));
+        if (!cf.isFile()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(p.value("camera_file").toString())};
+        c.generator.strings["proj_camera_file"] = cf.absoluteFilePath().toStdString();
+    }
+    auto number = [&](const char* key, const char* param, double lo, double hi, double scale = 1) {
+        if (!p.contains(key)) return;
+        if (!p.value(key).isDouble()) throw ArgError{QStringLiteral("\"projection.%1\" is a number").arg(key)};
+        params[param] = Param(std::clamp(p.value(key).toDouble() * scale, lo, hi));
+    };
+    if (p.contains("camera_track")) {
+        const QJsonValue ct = p.value("camera_track");
+        int v = -1;
+        if (ct.isString()) {
+            const TrackRef r = trackArg(ct.toString(), s, false);
+            if (r.kind == TrackKind::Video) v = r.index + 1;
+        } else if (ct.isDouble() && ct.toDouble() == std::floor(ct.toDouble())) {
+            v = ct.toInt();
+        }
+        if (v < 0 || v > int(s.videoTracks.size()))
+            throw ArgError{"\"projection.camera_track\" is the video track with the solved footage or the Camera clip (V1, V2..., or 0: found)"};
+        params["proj_camera_track"] = Param(double(v));
+    }
+    number("camera_index", "proj_camera_index", 1, 999);
+    number("fov", "proj_fov", 5, 120);
+    number("mix", "proj_mix", 0, 100);
+    number("material", "proj_material", 0, 999);
+    if (p.contains("frame") && !p.value("frame").isNull()) {
+        params["proj_hold"] = Param(1.0);
+        params["proj_frame"] = Param(double(timeArg(p.value("frame"), s, "projection.frame")));
+    }
+    if (p.contains("lit")) params["proj_light"] = Param(p.value("lit").toBool() ? 1.0 : 0.0);
+    if (p.contains("hide")) params["proj_hide"] = Param(p.value("hide").toBool(true) ? 1.0 : 0.0);
+}
+
 // ---- Projects on disk ---------------------------------------------------------------
 
 struct Loaded {
@@ -2733,14 +2791,24 @@ void McpServer::Impl::addTools() {
         "shape_color, shape_metal and shape_rough (settings). Any model can carry a track's picture: settings "
         "texture_track (the track's number, 1 for V1; hidden unless texture_hide 0), on one material (texture_material, "
         "1-based; 0 all), lit by the scene or as it is (texture_light 1). camera 0 with settings camera 3 sees it through "
-        "the scene's Camera clip (montage_add_camera).",
+        "the scene's Camera clip (montage_add_camera). projection projects a video track's picture onto the model through a "
+        "camera, as a projector would: {track (V2), camera (solved: the solve of camera_track's footage, the default; own: "
+        "fov; file: camera_file and camera_index; scene: the Camera clip), frame (hold that frame of the sequence, in seconds "
+        "or a timecode; left out, it follows time), mix (%), material (1-based; 0 all), lit (true: lit by the scene; "
+        "false: as it is), hide (the track, true by default)}; a surface hidden from the projector or facing away from "
+        "it takes none of the picture.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
             "shape":{"type":"string","enum":["plane","box","sphere","cylinder"]},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
             "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
             "camera":{"type":"integer","minimum":0},"camera_file":{"type":"string"},
-            "settings":{"type":"object","additionalProperties":{"type":"number"}}},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}},
+            "projection":{"type":"object","properties":{"track":{"type":["string","integer"]},
+                "camera":{"type":"string","enum":["own","solved","file","scene"]},"camera_track":{"type":["string","integer"]},
+                "camera_index":{"type":"integer","minimum":1},"camera_file":{"type":"string"},"fov":{"type":"number"},
+                "frame":{"type":["number","string","null"]},"mix":{"type":"number"},"material":{"type":"integer","minimum":0},
+                "lit":{"type":"boolean"},"hide":{"type":"boolean"}},"required":["track"]}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -2769,6 +2837,7 @@ void McpServer::Impl::addTools() {
                     if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
                     c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
                 }
+                projectionArg(a, s, c);
                 if (a.contains("position")) {
                     const QJsonArray pos = a.value("position").toArray();
                     if (pos.size() != 3) throw ArgError{"\"position\" is [x, y, z]"};
@@ -2800,6 +2869,7 @@ void McpServer::Impl::addTools() {
             const std::shared_ptr<const SplatCloud> cloud = splats ? cachedSplats(path, &err) : nullptr;
             const std::shared_ptr<const Model> model = splats ? nullptr : cachedModel(path, &err);
             if (!cloud && !model) return fail(QString::fromStdString(err));
+            if (cloud && a.contains("projection")) throw ArgError{"Splats take no projection: their colours are their own"};
             Clip c = makeGeneratorClip(l.project, "model3d", 1);
             c.generator.strings["file"] = path;
             // The file the camera is in: camera_file, else the model's own.
@@ -2879,6 +2949,7 @@ void McpServer::Impl::addTools() {
                 if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
                 c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
             }
+            projectionArg(a, s, c);
             c.start = at;
             c.duration = std::max<FrameTime>(1, len);
             const auto r = edit::overwrite(l.project, s, t, c);
@@ -3379,7 +3450,11 @@ void McpServer::Impl::addTools() {
         "through the scene's Camera clip (camera 3, the default; montage_add_camera; without one, the camera that sees the "
         "frame as it is), its own (camera 0, lens fov), the solve montage_camera_track made (camera 1, width in the "
         "scene's units, camera_track the footage's track) or a file's (camera 2, strings.camera_file); 3D layers, models "
-        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet. "
+        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet; lit 1 lights "
+        "the card as a 3D Model's plane (its picture the base colour, its alpha its coverage; light_kind, light_angle, "
+        "light_height, light_strength, ambient, rough as montage_add_model's settings), shadows 1 casts its shadow onto "
+        "other lit cards and onto a ground (ground 1 at height ground_y), and depth_of_field 1 blurs it by a thin lens "
+        "focused at focus_distance (0: the card's middle) at fstop, a 36 mm sensor and units_m scene units a metre. "
         "crosstalk is a 3 x 3 matrix on linear light whose rows sum to 1 (neutrals stay neutral): red_hue, green_hue and "
         "blue_hue pull each primary towards its neighbour (degrees, -60..60, positive towards the next: red to green, green "
         "to blue, blue to red), red_strength etc. (%) take it towards grey or past itself, invert 1 inverts it, and "

@@ -32375,6 +32375,485 @@ if ui["pressed"] == "add":
         QVERIFY(call("montage_add_model", {{"project", project}, {"shape", "cone"}}).value("isError").toBool());
     }
 
+    void cameraProjectionAndLitCards() {
+        const int W = 320, H = 180;
+        using V = std::array<double, 3>;
+        auto sub = [](const V& a, const V& b) { return V{a[0] - b[0], a[1] - b[1], a[2] - b[2]}; };
+        auto dot = [](const V& a, const V& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        auto cross = [](const V& a, const V& b) { return V{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]}; };
+        // A rectangle mid ± r ± up facing r x up, its picture's top left at uv (0, 0), on the default material.
+        auto face = [&](PosedTriangles& T, const V& mid, const V& r, const V& up) {
+            V n = cross(r, up);
+            const double l = std::sqrt(dot(n, n));
+            for (double& c : n) c /= l;
+            const uint32_t base = uint32_t(T.positions.size() / 3);
+            for (int k = 0; k < 4; ++k) {
+                const double sx = k & 1 ? 1 : -1, sy = k & 2 ? -1 : 1;
+                for (int a = 0; a < 3; ++a) T.positions.push_back(float(mid[size_t(a)] + r[size_t(a)] * sx + up[size_t(a)] * sy)), T.normals.push_back(float(n[size_t(a)]));
+                T.uvs.push_back(k & 1 ? 1.0f : 0.0f), T.uvs.push_back(k & 2 ? 1.0f : 0.0f);
+            }
+            T.indices.insert(T.indices.end(), {base, base + 2, base + 1, base + 1, base + 2, base + 3});
+            T.materials.insert(T.materials.end(), {-1, -1});
+        };
+        // A ground (y = 0, 12 across) with a unit box standing on it.
+        const V boxMid{0.8, 0.5, 0.3};
+        const double h = 0.5;
+        PosedTriangles T;
+        face(T, {0, 0, 0}, {6, 0, 0}, {0, 0, -6});
+        face(T, {boxMid[0], boxMid[1], boxMid[2] + h}, {h, 0, 0}, {0, h, 0});
+        face(T, {boxMid[0], boxMid[1], boxMid[2] - h}, {-h, 0, 0}, {0, h, 0});
+        face(T, {boxMid[0] + h, boxMid[1], boxMid[2]}, {0, 0, -h}, {0, h, 0});
+        face(T, {boxMid[0] - h, boxMid[1], boxMid[2]}, {0, 0, h}, {0, h, 0});
+        face(T, {boxMid[0], boxMid[1] + h, boxMid[2]}, {h, 0, 0}, {0, 0, -h});
+        // A picture as a projected texture (linear, premultiplied, whole), w x h.
+        auto picture = [](int w, int ph, const std::function<std::array<float, 3>(double, double)>& at) {
+            std::vector<float> rgba(size_t(w) * size_t(ph) * 4);
+            for (int y = 0; y < ph; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const std::array<float, 3> c = at(x + 0.5, y + 0.5);
+                    float* o = rgba.data() + (size_t(y) * size_t(w) + size_t(x)) * 4;
+                    o[0] = c[0], o[1] = c[1], o[2] = c[2], o[3] = 1;
+                }
+            auto t = std::make_shared<ModelTexture>(linearModelTexture(w, ph, std::move(rgba)));
+            t->wrapS = t->wrapT = ModelTexture::Wrap::Clamp;
+            return std::shared_ptr<const ModelTexture>(t);
+        };
+        // (no light: what no picture reaches is black)
+        auto sceneWith = [&](const ModelCamera& projector, std::shared_ptr<const ModelTexture> pic) {
+            ModelScene scene;
+            scene.triangles = T;
+            scene.ambient = {0, 0, 0};
+            auto pr = std::make_shared<ModelProjection>();
+            pr->picture = std::move(pic);
+            pr->camera = projector;
+            pr->width = W, pr->height = H;
+            scene.projection = pr;
+            return scene;
+        };
+
+        // ---- Projected from the camera it is seen through, the picture comes back as it was (to 1/255), away from
+        // the box's outline (where a pixel holds two surfaces).
+        {
+            auto smooth = [&](double x, double y) {
+                return std::array<float, 3>{float(0.2 + 0.6 * x / W), float(0.3 + 0.5 * y / H), float(0.5 + 0.3 * std::sin(2 * M_PI * x / W) * std::cos(M_PI * y / H))};
+            };
+            const ModelCamera cam = lookAt({0.4, 1.8, 5}, {0.2, 0.3, 0}, 280, W, H);
+            std::vector<float> depth;
+            const Image img = renderModel(sceneWith(cam, picture(W, H, smooth)), cam, W, H, &depth);
+            float worst = 0;
+            int checked = 0;
+            for (int y = 1; y + 1 < H; ++y)
+                for (int x = 1; x + 1 < W; ++x) {
+                    const float z = depth[size_t(y) * W + size_t(x)];
+                    if (!(z > 0) || img.at(x, y)[3] < 0.999f) continue;
+                    bool edge = false;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const float n = depth[size_t(y + dy) * W + size_t(x + dx)];
+                            edge |= !(n > 0) || std::fabs(n - z) > 0.03f * z;
+                        }
+                    if (edge) continue;
+                    const std::array<float, 3> want = smooth(x + 0.5, y + 0.5);
+                    for (int k = 0; k < 3; ++k) worst = std::max(worst, std::fabs(img.at(x, y)[k] - want[size_t(k)]));
+                    ++checked;
+                }
+            QVERIFY2(checked > W * H / 2 && worst <= 1.0f / 255, qPrintable(QString("%1 pixels, %2 off at most").arg(checked).arg(worst)));
+        }
+
+        // ---- A checkerboard projected from one camera, seen through another: every pixel takes the square its point
+        // of the scene is in from the projector (so the corners land where they should to well within half a
+        // pixel), and the ground the box hides from the projector and the box's sides facing away from it take
+        // nothing. Worked out by casting rays here.
+        {
+            const ModelCamera projector = lookAt({-0.6, 2.2, 4.5}, {0.3, 0.2, 0}, 260, W, H);
+            const ModelCamera viewer = lookAt({2.5, 2.0, 3.5}, {0.2, 0.3, -0.2}, 280, W, H);
+            const int square = 20;
+            const std::array<float, 3> white{1, 1, 1}, blue{0.1f, 0.3f, 0.9f};
+            auto checker = [&](double x, double y) { return (int(std::floor(x / square)) + int(std::floor(y / square))) % 2 ? blue : white; };
+            const ModelScene scene = sceneWith(projector, picture(W, H, checker));
+            // The box's outline in the projector's picture (the hull of its corners), to keep clear of.
+            std::vector<std::array<double, 2>> pts;
+            for (int k = 0; k < 8; ++k) {
+                double px, py;
+                QVERIFY(projector.project({boxMid[0] + (k & 1 ? h : -h), boxMid[1] + (k & 2 ? h : -h), boxMid[2] + (k & 4 ? h : -h)}, px, py));
+                pts.push_back({px, py});
+            }
+            std::sort(pts.begin(), pts.end());
+            std::vector<std::array<double, 2>> hull;
+            auto turn = [](const std::array<double, 2>& o, const std::array<double, 2>& a, const std::array<double, 2>& b) {
+                return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+            };
+            for (int pass = 0; pass < 2; ++pass) {
+                const size_t start = hull.size();
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    const auto& q = pass ? pts[pts.size() - 1 - i] : pts[i];
+                    while (hull.size() >= start + 2 && turn(hull[hull.size() - 2], hull.back(), q) <= 0) hull.pop_back();
+                    hull.push_back(q);
+                }
+                hull.pop_back();
+            }
+            auto nearOutline = [&](double px, double py) {
+                for (size_t i = 0; i < hull.size(); ++i) {
+                    const auto& a = hull[i];
+                    const auto& b = hull[(i + 1) % hull.size()];
+                    const double ex = b[0] - a[0], ey = b[1] - a[1];
+                    const double t = std::clamp(((px - a[0]) * ex + (py - a[1]) * ey) / (ex * ex + ey * ey), 0.0, 1.0);
+                    if (std::hypot(px - a[0] - t * ex, py - a[1] - t * ey) < 2) return true;
+                }
+                return false;
+            };
+            // Where a ray first meets the box (its entry, along the ray; -1: it misses), and which face.
+            auto hitBox = [&](const V& o, const V& d, double tMin, int* faceOut) {
+                double t0 = tMin, t1 = 1e300;
+                int faceIn = -1;
+                for (int a = 0; a < 3; ++a) {
+                    const double lo = boxMid[size_t(a)] - h, hi = boxMid[size_t(a)] + h;
+                    if (std::fabs(d[size_t(a)]) < 1e-15) {
+                        if (o[size_t(a)] < lo || o[size_t(a)] > hi) return -1.0;
+                        continue;
+                    }
+                    double ta = (lo - o[size_t(a)]) / d[size_t(a)], tb = (hi - o[size_t(a)]) / d[size_t(a)];
+                    int fa = a * 2, fb = a * 2 + 1;
+                    if (ta > tb) std::swap(ta, tb), std::swap(fa, fb);
+                    if (ta > t0) t0 = ta, faceIn = fa;
+                    t1 = std::min(t1, tb);
+                }
+                if (t0 > t1 || faceIn < 0) return -1.0;
+                if (faceOut) *faceOut = faceIn;
+                return t0;
+            };
+            // What the viewer sees through picture point (x, y): -1 nothing, 0 painted (colour), 1 hidden from the
+            // projector, 2 facing away from it; with the projector's picture point.
+            auto expect = [&](double x, double y, std::array<float, 3>& colour, double& qx, double& qy, bool& unsure) {
+                const V d = viewer.ray(x, y);
+                const V o = viewer.C;
+                int f = -1;
+                double t = hitBox(o, d, 1e-9, &f);
+                V n{0, 0, 0};
+                if (t > 0) {
+                    n[size_t(f / 2)] = f % 2 ? 1 : -1;
+                    if (f == 2) return -1;  // (the bottom: not drawn, on the ground)
+                } else if (d[1] < 0) {
+                    t = -o[1] / d[1];
+                    const V X{o[0] + d[0] * t, 0, o[2] + d[2] * t};
+                    if (std::fabs(X[0]) > 6 || std::fabs(X[2]) > 6) return -1;
+                    n = {0, 1, 0};
+                } else {
+                    return -1;
+                }
+                const V X{o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t};
+                const V to = sub(projector.C, X);
+                const double facing = dot(n, to) / std::sqrt(dot(to, to));
+                if (!projector.project(X, qx, qy)) return 2;
+                unsure = std::fabs(facing) < 0.05 || nearOutline(qx, qy) || qx < 1 || qy < 1 || qx > W - 1 || qy > H - 1;
+                if (facing <= 0) return 2;
+                if (n[1] == 1 && X[1] == 0 && hitBox(X, to, 1e-7, nullptr) > 0) return 1;
+                const double ex = std::fmod(qx, square), ey = std::fmod(qy, square);
+                unsure |= ex < 1 || ex > square - 1 || ey < 1 || ey > square - 1;
+                colour = checker(qx, qy);
+                return 0;
+            };
+            ModelRenderOptions serial;
+            serial.serial = true;
+            const Image img = renderModel(scene, viewer, W, H, nullptr, serial);
+            int painted = 0, hidden = 0, away = 0, wrong = 0;
+            QString first;
+            for (int y = 1; y + 1 < H; ++y)
+                for (int x = 1; x + 1 < W; ++x) {
+                    std::array<float, 3> colour{0, 0, 0};
+                    double qx = 0, qy = 0;
+                    bool unsure = false;
+                    const int kind = expect(x + 0.5, y + 0.5, colour, qx, qy, unsure);
+                    if (kind < 0 || unsure) continue;
+                    // (the same surface and outcome a little either side of the pixel's middle)
+                    bool mixed = false;
+                    for (int k = 0; k < 4 && !mixed; ++k) {
+                        std::array<float, 3> c2{0, 0, 0};
+                        double q2x = 0, q2y = 0;
+                        bool u2 = false;
+                        mixed = expect(x + (k & 1 ? 0.95 : 0.05), y + (k & 2 ? 0.95 : 0.05), c2, q2x, q2y, u2) != kind || u2 || c2 != colour;
+                    }
+                    if (mixed) continue;
+                    const float* got = img.at(x, y);
+                    float off = 0;
+                    for (int k = 0; k < 3; ++k) off = std::max(off, std::fabs(got[k] - colour[size_t(k)]));
+                    if (off > 1.0f / 255) {
+                        if (!wrong++) first = QString("pixel %1, %2 (%3): %4 %5 %6, not %7 %8 %9").arg(x).arg(y).arg(kind).arg(got[0]).arg(got[1]).arg(got[2])
+                                                  .arg(colour[0]).arg(colour[1]).arg(colour[2]);
+                    }
+                    (kind == 0 ? painted : kind == 1 ? hidden : away)++;
+                }
+            QVERIFY2(wrong == 0 && painted > 5000 && hidden > 200 && away > 200,
+                     qPrintable(QString("%1 wrong (%2); %3 painted, %4 hidden, %5 facing away").arg(wrong).arg(first).arg(painted).arg(hidden).arg(away)));
+            // The same on every core.
+            const Image parallel = renderModel(scene, viewer, W, H);
+            QVERIFY(parallel.px == img.px);
+        }
+
+        // ---- Over MCP, onto a plane filling the frame through its own camera, from a projector of the same lens: the
+        // gradient on V1 comes back as it was (to 1/255), its track hidden.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 4) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        auto maxDiff = [](const Image& a, const Image& b) {
+            float d = a.width == b.width && a.height == b.height ? 0.0f : 1e9f;
+            for (size_t i = 0; d < 1e9f && i < a.px.size(); ++i) d = std::max(d, std::fabs(a.px[i] - b.px[i]));
+            return d;
+        };
+        Clip grad;
+        grad.id = p.newId();
+        grad.duration = 10;
+        grad.generator = makeEffect(p, "gradient");
+        s.videoTracks[0].clips.push_back(grad);
+        const Image flat = renderSequenceFrame(p, s, 3, o);
+        const QString project = QString::fromStdString(path("projection.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            if (r.value("isError").toBool()) qWarning() << QJsonDocument(r).toJson().constData();
+            return r;
+        };
+        QVERIFY(call("montage_add_model", {{"project", project}, {"shape", "plane"}, {"projection", QJsonObject{{"track", "V9"}}}}).value("isError").toBool());
+        QVERIFY(!call("montage_add_model", {{"project", project}, {"shape", "plane"}, {"track", "V2"}, {"duration", 10},
+                                            {"settings", QJsonObject{{"size", W}, {"ground", 0}, {"rot_y", 0}}},
+                                            {"projection", QJsonObject{{"track", "V1"}, {"camera", "own"}}}})
+                     .value("isError").toBool());
+        {
+            Project q;
+            std::string err;
+            QVERIFY(loadProject(project.toStdString(), q, &err));
+            const Sequence& qs = *q.active();
+            const Effect& g = qs.videoTracks[1].clips[0].generator;
+            QVERIFY(g.p("proj_track", 0, 0) == 1.0 && g.p("proj_camera", 0, 1) == 0.0 && g.p("proj_light", 0, 0) == 0.0);
+            const Image back = renderSequenceFrame(q, qs, 3, o);
+            const float d = maxDiff(back, flat);
+            int wx = 0, wy = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int k = 0; k < 4; ++k)
+                        if (std::fabs(back.at(x, y)[k] - flat.at(x, y)[k]) == d) wx = x, wy = y;
+            QVERIFY2(d <= 1.0f / 255, qPrintable(QString("projected back: %1 off at %2, %3 (%4 %5 %6 %7 against %8 %9 %10 %11)").arg(d).arg(wx).arg(wy)
+                                                     .arg(back.at(wx, wy)[0]).arg(back.at(wx, wy)[1]).arg(back.at(wx, wy)[2]).arg(back.at(wx, wy)[3])
+                                                     .arg(flat.at(wx, wy)[0]).arg(flat.at(wx, wy)[1]).arg(flat.at(wx, wy)[2]).arg(flat.at(wx, wy)[3])));
+        }
+
+        // ---- A lit card is a 3D Model's plane carrying the same picture under the same light (to 1/1023).
+        Clip card = grad;
+        card.id = p.newId();
+        Effect lit = makeEffect(p, "layer_3d");
+        lit.params["camera"] = 0.0;
+        lit.params["rot_y"] = 25.0, lit.params["rot_x"] = -10.0;
+        lit.params["lit"] = 1.0;
+        lit.params["light_angle"] = 30.0, lit.params["light_height"] = 35.0, lit.params["ambient"] = 20.0;
+        card.effects.push_back(lit);
+        s.videoTracks[0].clips = {card};
+        const Image litCard = renderSequenceFrame(p, s, 3, o);
+        {
+            Clip plane;
+            plane.id = p.newId();
+            plane.duration = 10;
+            plane.generator = makeEffect(p, "model3d");
+            plane.generator.params["shape"] = 1.0;
+            plane.generator.params["size"] = double(W);
+            plane.generator.params["rot_y"] = 25.0, plane.generator.params["rot_x"] = -10.0;
+            plane.generator.params["ground"] = 0.0;
+            plane.generator.params["texture_track"] = 1.0;
+            plane.generator.params["light_angle"] = 30.0, plane.generator.params["light_height"] = 35.0, plane.generator.params["ambient"] = 20.0;
+            s.videoTracks[0].clips = {grad};
+            s.videoTracks[1].clips = {plane};
+            const Image modelled = renderSequenceFrame(p, s, 3, o);
+            const float d = maxDiff(litCard, modelled);
+            QVERIFY2(d <= 1.0f / 1023, qPrintable(QString("lit card against the plane: %1 off").arg(d)));
+            QVERIFY2(maxDiff(litCard, flat) > 0.05f, "lit, it is not the flat picture");
+            s.videoTracks[1].clips.clear();
+        }
+        // The same on one core as on every core.
+        {
+            ModelCamera cam;
+            std::string err;
+            QVERIFY(effectCamera(p, s, card, lit, 3, 1, cam, &err));
+            const Layer3DPlace place = layer3dPlace(lit, 3, W, H);
+            const Image one = renderLitLayer3D(s, lit, 3, flat, place, cam, {}, nullptr, true);
+            const Image all = renderLitLayer3D(s, lit, 3, flat, place, cam, {}, nullptr, false);
+            QVERIFY(one.px == all.px);
+        }
+
+        // ---- A small square card standing up, lit by a low sun from the front right and casting its shadow onto a
+        // ground below it: the shadow where a ray from each ground point towards the sun meets the square (its
+        // middle to a pixel).
+        {
+            Clip sq = grad;
+            sq.id = p.newId();
+            sq.generator = makeEffect(p, "color");
+            sq.generator.params["color.r"] = 1.0, sq.generator.params["color.g"] = 1.0, sq.generator.params["color.b"] = 1.0;
+            sq.motion.params["scale"] = 20.0;
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            e.params["lit"] = 1.0, e.params["shadows"] = 1.0, e.params["ground"] = 1.0;
+            e.params["ground_y"] = -40.0, e.params["ground_strength"] = 100.0;
+            e.params["light_angle"] = 35.0, e.params["light_height"] = 30.0;
+            sq.effects.push_back(e);
+            s.videoTracks[0].clips = {sq};
+            const Image img = renderSequenceFrame(p, s, 3, o);
+            ModelCamera cam;
+            std::string err;
+            QVERIFY(effectCamera(p, s, sq, e, 3, 1, cam, &err));
+            const double az = 35 * M_PI / 180, el = 30 * M_PI / 180;
+            const V towards{std::cos(el) * std::sin(az), std::sin(el), std::cos(el) * std::cos(az)};
+            const double hw = W * 0.2 / 2, hh = H * 0.2 / 2;  // (the square's half sizes, on the card at z = 0)
+            double wx = 0, wy = 0, wn = 0, gx = 0, gy = 0, gn = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const V d = cam.ray(x + 0.5, y + 0.5);
+                    if (d[1] >= 0) continue;
+                    const double t = (-40 - cam.C[1]) / d[1];
+                    const V X{cam.C[0] + d[0] * t, -40, cam.C[2] + d[2] * t};
+                    // (hidden behind the square itself, as the camera sees it)
+                    const double tc = -cam.C[2] / d[2];
+                    const double cx = cam.C[0] + d[0] * tc, cy = cam.C[1] + d[1] * tc;
+                    if (tc > 0 && tc < t && std::fabs(cx) <= hw && std::fabs(cy) <= hh) continue;
+                    if (X[2] < 0 && towards[2] > 0) {
+                        const double u = -X[2] / towards[2];
+                        const double sx = X[0] + towards[0] * u, sy = X[1] + towards[1] * u;
+                        if (std::fabs(sx) <= hw && std::fabs(sy) <= hh) wx += x, wy += y, ++wn;
+                    }
+                    const float a = img.at(x, y)[3];
+                    if (a > 0 && img.at(x, y)[0] < 0.01f) gx += x * a, gy += y * a, gn += a;
+                }
+            QVERIFY2(wn > 50 && gn > 0 && std::hypot(gx / gn - wx / wn, gy / gn - wy / wn) <= 1,
+                     qPrintable(QString("shadow at %1, %2 (%3), worked out %4, %5 (%6)").arg(gx / std::max(gn, 1e-9)).arg(gy / std::max(gn, 1e-9)).arg(gn)
+                                    .arg(wx / std::max(wn, 1.0)).arg(wy / std::max(wn, 1.0)).arg(wn)));
+            // And onto another card: a second lit square behind it, a little lower, takes its shadow.
+            Clip back = sq;
+            back.id = p.newId();
+            back.motion.params["scale"] = 60.0;
+            back.effects[0].params["pos_z"] = -60.0;
+            back.effects[0].params["shadows"] = 0.0, back.effects[0].params["ground"] = 0.0;
+            s.videoTracks[1].clips = {back};
+            s.videoTracks[0].clips[0].effects[0].params["ground"] = 0.0;
+            const Image both = renderSequenceFrame(p, s, 3, o);
+            // (the back card's point behind the front square along the sun, as the camera sees it)
+            const V onBack{0 - towards[0] / towards[2] * 60, 0 - towards[1] / towards[2] * 60, -60};
+            double px, py;
+            QVERIFY(cam.project(onBack, px, py));
+            const float* in = both.at(int(px), int(py));
+            const float* lit2 = both.at(int(px), int(py) - 30);
+            QVERIFY2(in[0] < lit2[0] * 0.8f, qPrintable(QString("the back card at %1, %2: %3 in the shadow, %4 beside it").arg(px).arg(py).arg(in[0]).arg(lit2[0])));
+            s.videoTracks[1].clips.clear();
+        }
+
+        // ---- Depth of field: a square card twice the focus distance away is blurred by the thin lens's circle of
+        // confusion (fitted to its edge, to half a pixel); in focus it is exactly as it was.
+        {
+            Clip sq = grad;
+            sq.id = p.newId();
+            sq.generator = makeEffect(p, "color");
+            sq.generator.params["color.r"] = 1.0, sq.generator.params["color.g"] = 1.0, sq.generator.params["color.b"] = 1.0;
+            sq.motion.params["scale"] = 50.0;
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            sq.effects.push_back(e);
+            s.videoTracks[0].clips = {sq};
+            const Image sharp = renderSequenceFrame(p, s, 3, o);
+            s.videoTracks[0].clips[0].effects[0].params["depth_of_field"] = 1.0;
+            QCOMPARE(maxDiff(renderSequenceFrame(p, s, 3, o), sharp), 0.0f);
+            ModelCamera cam;
+            std::string err;
+            QVERIFY(effectCamera(p, s, sq, e, 3, 1, cam, &err));
+            const double F = cam.C[2];  // (the frame's plane: its own camera looks down -z at it)
+            s.videoTracks[0].clips[0].effects[0].params["focus_distance"] = F;
+            s.videoTracks[0].clips[0].effects[0].params["pos_z"] = -F;
+            s.videoTracks[0].clips[0].effects[0].params["fstop"] = 2.0;
+            const Image soft = renderSequenceFrame(p, s, 3, o);
+            // Thin lens: the sensor 36 mm across the picture, 1000 units a metre; a point at 2F focused at F.
+            const double pitch = 36.0 / W, f = cam.screen[0] * pitch, A = f / 2.0;
+            const double zf = F, z = 2 * F;  // (its own camera's scene: a pixel a unit, a millimetre a unit)
+            const double want = A * f * (z - zf) / (z * (zf - f)) / 2 / pitch;
+            QVERIFY2(std::fabs(want + layer3dCoc(cam, W, z, zf, 2.0, 1000)) < 1e-9, "the circle of confusion as worked out (negative: farther)");
+            QVERIFY(want > 2);
+            // The square's left edge along the middle row: its alpha against a step blurred by a disc of radius r.
+            const int y = H / 2;
+            int edge = 0;
+            for (int x = 1; x < W; ++x)
+                if (sharp.at(x - 1, y)[3] < 0.5f && sharp.at(x, y)[3] >= 0.5f) edge = x;
+            const double e0 = W / 2.0 + (edge - W / 2.0) / 2;  // (twice as far: half as far from the middle)
+            auto stepThrough = [](double r, double dx) {  // (the share of a disc of radius r right of a line dx from its middle)
+                if (dx <= -r) return 1.0;
+                if (dx >= r) return 0.0;
+                const double a = std::acos(dx / r);
+                return (a * r * r - dx * std::sqrt(r * r - dx * dx)) / (M_PI * r * r);
+            };
+            double best = 0, bestErr = 1e300;
+            for (double r = 0.5; r < 20; r += 0.02) {
+                double err2 = 0;
+                for (int x = int(e0 - 25); x <= int(e0 + 25); ++x) {
+                    const double dd = soft.at(x, y)[3] - stepThrough(r, e0 - (x + 0.5));
+                    err2 += dd * dd;
+                }
+                if (err2 < bestErr) bestErr = err2, best = r;
+            }
+            QVERIFY2(std::fabs(best - want) <= 0.5, qPrintable(QString("blurred by %1 px, the thin lens gives %2").arg(best).arg(want)));
+        }
+
+        // ---- Cards in a solved scene go into its USD export, read back where they stand (to 1e-6).
+        {
+            CameraSolve solve;
+            solve.width = W, solve.height = H, solve.focal = 250, solve.fps = 25, solve.oriented = true;
+            for (int i = 0; i < 10; ++i) {
+                const ModelCamera c = lookAt({-1 + 0.08 * i, 1.6, 6}, {0, 0.5, 0}, 1, 1, 1);
+                SolvedCamera sc;
+                sc.valid = true;
+                std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+                sc.C = {c.C[0], c.C[1], c.C[2]};
+                solve.cameras.push_back(sc);
+            }
+            Clip plate = grad;
+            plate.id = p.newId();
+            Effect track = makeEffect(p, "camera_track");
+            track.strings["solve"] = cameraSolveToString(solve);
+            plate.effects = {track};
+            Clip sc = grad;
+            sc.id = p.newId();
+            sc.name = "Sign";
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 1.0, e.params["width"] = 1.5;
+            e.params["pos_x"] = 0.3, e.params["pos_y"] = 0.6, e.params["pos_z"] = -0.4, e.params["rot_y"] = 20.0;
+            sc.effects = {e};
+            s.videoTracks[0].clips = {plate};
+            s.videoTracks[1].clips = {sc};
+            const std::vector<SolvedSceneMesh> meshes = solvedSceneModels(p, s, 0, s.videoTracks[0].clips[0]);
+            QVERIFY(meshes.size() == 1 && meshes[0].card && meshes[0].name == "Sign");
+            const std::string file = path("cards.usda");
+            std::string err;
+            QVERIFY2(writeSolveUsda(solve, file, meshes, &err), err.c_str());
+            usd::Stage stage;
+            QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+            const auto* prim = stage.prim("/Solve/Models/Card_1");
+            QVERIFY(prim && prim->attribute("points") && prim->attribute("primvars:st"));
+            const std::vector<double> pts = prim->attribute("points")->value.numbers;
+            const Layer3DPlace place = layer3dPlace(e, 0, W, H);
+            QCOMPARE(pts.size(), meshes[0].positions.size());
+            double worst = 0;
+            for (size_t i = 0; i < pts.size() / 3; ++i) {
+                // (each corner where the card's frame puts it)
+                const double u = meshes[0].uvs[i * 2], v = meshes[0].uvs[i * 2 + 1];
+                const std::array<double, 3> want = place.point(u * W, v * H);
+                for (int a = 0; a < 3; ++a) worst = std::max(worst, std::fabs(pts[i * 3 + size_t(a)] - want[size_t(a)]));
+            }
+            QVERIFY2(worst <= 1e-6, qPrintable(QString("card corners %1 off").arg(worst)));
+            Model back;
+            QVERIFY2(loadModel(file, back, &err), err.c_str());
+        }
+    }
+
     void shapeLayersAsVectorGraphics() {
         // A Shape layer's contents: groups of shapes, paints and the operators that change the paths above them.
         const int W = 400, H = 300;

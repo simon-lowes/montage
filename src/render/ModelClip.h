@@ -25,9 +25,12 @@ namespace montage {
 // `scale` (output pixels a sequence pixel): the scene (in the world) and the camera. `trackLayer(track)` gives that
 // video track's picture at t in the sequence's working space (for image-based light), empty when it has none. False
 // with `error` when the model cannot be read or the solved camera is missing at t.
+// `trackLayerAt(track, at)` gives a track's picture at another frame (a projected picture held at one; without it,
+// the picture at t is projected).
 bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                     const std::function<Image(int track)>& trackLayer, ModelScene& scene, ModelCamera& camera,
-                    std::shared_ptr<const Model>& model, std::string* error = nullptr);
+                    std::shared_ptr<const Model>& model, std::string* error = nullptr,
+                    const std::function<Image(int track, FrameTime at)>& trackLayerAt = {});
 
 // The same for a clip of Gaussian splats: the cloud showing at t, where it is placed, the camera and how it is drawn.
 bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double scale,
@@ -38,7 +41,7 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
 // the camera: pixels for its own camera, the scene's units for a solved or a file's one; 0 where nothing), w x h.
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                       const std::function<Image(int track)>& trackLayer, std::vector<float>* depth = nullptr,
-                      std::string* error = nullptr);
+                      std::string* error = nullptr, const std::function<Image(int track, FrameTime at)>& trackLayerAt = {});
 
 // The video track whose solved camera the clip uses at t (-1: none): its "camera_track" (1-based), else the nearest
 // track below it whose clip at t carries a solve.
@@ -56,9 +59,25 @@ bool effectCamera(const Project& p, const Sequence& seq, const Clip& c, const Ef
 int modelLightTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
 // The track whose picture covers its surface ("texture_track"; -1: none).
 int modelTextureTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
+// The track whose picture is projected onto it through a camera ("proj_track"; -1: none), and the sequence frame it is
+// taken at (t, or the frame held).
+int modelProjectionTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
+FrameTime modelProjectionFrame(const Clip& c, FrameTime t);
+
+// A shape made in place of a file's model (1 plane, the frame's shape a unit tall, facing +z; 2 box; 3 sphere; 4
+// cylinder, each a unit across), in one material; a picture's top left at uv (0, 0), the right way round from outside.
+std::shared_ptr<const Model> shapeModel(int shape, double aspect, const std::array<float, 4>& color, float metal, float rough);
+// A track's picture (premultiplied, the sequence's colour; graded scene-referred, the linear light layers are mixed in)
+// as a texture: linear light, Rec. 709 primaries, premultiplied, at most `largest` pixels across (averaged down).
+std::shared_ptr<const ModelTexture> pictureTexture(const Image& layer, const Sequence& seq, int largest = 2048);
+// The light an effect's settings make at its frame `lt` (light_kind 0 a sun, 1 a point, 2 a spot; light_angle and
+// light_height, light_distance times `size` from `mid`, light_color, light_strength, spot_angle, shadows), and the
+// ambient light (`ambient`).
+ModelLight settingsLight(const Effect& g, FrameTime lt, const std::array<double, 3>& mid, double size, float* ambient = nullptr);
 
 // The models placed in the scene solved on `footage` (on video track `track`): each model clip seen through that
-// solve, as it stands at its first frame, one mesh a material (for writeSolveUsda).
+// solve, as it stands at its first frame, one mesh a material, then each 3D layer's card seen through it (for
+// writeSolveUsda).
 std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence& seq, size_t track, const Clip& footage);
 
 }  // namespace montage

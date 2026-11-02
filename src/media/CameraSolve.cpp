@@ -1289,12 +1289,17 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
         o << (i ? ", " : "") << f3(X.x, k * X.y, k * X.z, true);
     }
     o << "]\n        float[] widths = [0.01] (\n            interpolation = \"constant\"\n        )\n    }\n";
-    // The models, each with its material.
+    // The models and cards, each with its material (numbered among its kind).
+    auto meshName = [&](size_t m) {
+        size_t n = 0;
+        for (size_t i = 0; i <= m; ++i) n += models[i].card == models[m].card;
+        return (models[m].card ? "Card_" : "Model_") + std::to_string(n);
+    };
     if (!models.empty()) {
         o << "\n    def Scope \"Models\"\n    {\n";
         for (size_t m = 0; m < models.size(); ++m) {
             const SolvedSceneMesh& mesh = models[m];
-            const std::string name = "Model_" + std::to_string(m + 1);
+            const std::string name = meshName(m);
             o << "        def Mesh \"" << name << "\" (\n            prepend apiSchemas = [\"MaterialBindingAPI\"]\n        )\n        {\n";
             if (!mesh.name.empty()) o << "            string montage:name = " << usd::quoted(mesh.name) << "\n";
             o << "            uniform bool doubleSided = " << (mesh.doubleSided ? 1 : 0) << "\n";
@@ -1312,13 +1317,20 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
                     o << (i ? ", " : "") << f3(mesh.normals[i], k * mesh.normals[i + 1], k * mesh.normals[i + 2], true);
                 o << "] (\n                interpolation = \"vertex\"\n            )\n";
             }
+            if (!mesh.uvs.empty() && mesh.uvs.size() / 2 == mesh.positions.size() / 3) {
+                // (USD's st runs up from the bottom left)
+                o << "            texCoord2f[] primvars:st = [";
+                for (size_t i = 0; i + 1 < mesh.uvs.size(); i += 2)
+                    o << (i ? ", " : "") << "(" << formatNumber(mesh.uvs[i], true) << ", " << formatNumber(1 - double(mesh.uvs[i + 1]), true) << ")";
+                o << "] (\n                interpolation = \"vertex\"\n            )\n";
+            }
             o << "            uniform token subdivisionScheme = \"none\"\n";
             o << "            rel material:binding = </Solve/Looks/" << name << ">\n        }\n";
         }
         o << "    }\n\n    def Scope \"Looks\"\n    {\n";
         for (size_t m = 0; m < models.size(); ++m) {
             const SolvedSceneMesh& mesh = models[m];
-            const std::string name = "Model_" + std::to_string(m + 1);
+            const std::string name = meshName(m);
             o << "        def Material \"" << name << "\"\n        {\n            token outputs:surface.connect = </Solve/Looks/" << name
               << "/Surface.outputs:surface>\n\n            def Shader \"Surface\"\n            {\n"
               << "                uniform token info:id = \"UsdPreviewSurface\"\n"

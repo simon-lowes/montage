@@ -6,9 +6,11 @@
 // textures stay sharp at grazing angles), directional, point and spot lights (shadow maps for directional and spot
 // lights, filtered over 3 x 3 texels), and light from a picture of the scene (a latitude-longitude HDR image: its
 // diffuse light from spherical harmonics, its reflections from copies blurred for each roughness, with an analytic
-// split-sum term). A ground plane can catch the model's shadows alone, as a picture to lay over the footage.
+// split-sum term). A ground plane can catch the model's shadows alone, as a picture to lay over the footage. A picture
+// can be projected onto the surfaces through a camera (camera projection, as matte paintings are put on geometry).
 // Only the nearest surface is kept at each sample, so a blended (see-through) material shows what is behind the model,
-// not the model's own faces behind it; point lights cast no shadows, and masked materials cast them whole.
+// not the model's own faces behind it; point lights cast no shadows, and masked materials cast them whole (a picture
+// laid over the surfaces casts them where its alpha is at least a half).
 #pragma once
 
 #include <array>
@@ -55,6 +57,26 @@ struct ModelEnvironment {
     mutable std::shared_ptr<const Prepared> prepared;
 };
 
+// A picture projected through a camera onto the surfaces (as a slide projector would): each point of a surface is
+// taken into the projector's picture and painted with it there, unless another surface is nearer the projector at that
+// place (a depth test from the projector) or it faces away from it. Over the material's base colour, lit with it, or
+// over the lit surface as it is.
+struct ModelProjection {
+    std::shared_ptr<const ModelTexture> picture;  // linear, premultiplied
+    ModelCamera camera;                           // its pixels: the picture's, `width` x `height`
+    double width = 0, height = 0;
+    int material = -1;  // the surfaces of one material, or all (-1)
+    float mix = 1;      // how much of the picture is laid over (where its alpha is whole)
+    bool lit = false;   // as base colour, lit as the surface is (else shown as it is)
+};
+
+// A surface that casts shadows but is not drawn (another 3D layer's card, say): its triangles in the world, casting
+// where its picture's alpha (`coverage`, the triangles' uvs into it; null: everywhere) is at least a half.
+struct ModelShadowCaster {
+    PosedTriangles triangles;
+    std::shared_ptr<const ModelTexture> coverage;
+};
+
 struct ModelScene {
     PosedTriangles triangles;  // in the world
     const Model* model = nullptr;  // their materials and textures (null: the default material)
@@ -74,6 +96,9 @@ struct ModelScene {
     std::shared_ptr<const ModelTexture> picture;
     int pictureMaterial = -1;
     bool pictureAsIs = false;
+    std::shared_ptr<const ModelProjection> projection;
+    // Surfaces casting shadows onto these (and the ground) without being drawn.
+    std::vector<ModelShadowCaster> casters;
 };
 
 struct ModelRenderOptions {
