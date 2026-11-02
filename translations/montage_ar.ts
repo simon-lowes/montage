@@ -11253,10 +11253,6 @@ The certificate must be issued by a certificate authority (not signed by itself)
         <translation type="unfinished">الإطارات التي هي واحدة لم تمس بالفعل في هذا ProRes نكهة أو DNxHR، حجم ونسبة نسخ من المصدر بدلا من أن يتم تشفيرها مرة أخرى: أسرع، و بالضبط الصور الأصلية</translation>
     </message>
     <message>
-        <source>Smart rendering works with ProRes and DNxHR</source>
-        <translation type="unfinished">عمل ذكي مع مكتب المدعي العام و DNxHR</translation>
-    </message>
-    <message>
         <source>Chapters can be written into MP4, MOV and MKV files</source>
         <translation type="unfinished">يمكن كتابة الفصول في ملفات MP4 و MOV و MKV</translation>
     </message>
@@ -11417,6 +11413,14 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>The framing of the footage on screen, from its Framing Decision List (FDL)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untouched footage already coded as this export is (H.264, HEVC or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

@@ -11077,10 +11077,6 @@ The certificate must be issued by a certificate authority (not signed by itself)
         <translation type="unfinished">Los marcos que ya son un clip intacto en este sabor, tamaño y tasa ProRes o DNxHR se copian de la fuente en lugar de ser codificados de nuevo: más rápido, y exactamente las imágenes originales</translation>
     </message>
     <message>
-        <source>Smart rendering works with ProRes and DNxHR</source>
-        <translation type="unfinished">Renderizado inteligente funciona con ProRes y DNxHR</translation>
-    </message>
-    <message>
         <source>Chapters can be written into MP4, MOV and MKV files</source>
         <translation type="unfinished">Los capítulos pueden ser escritos en archivos MP4, MOV y MKV</translation>
     </message>
@@ -11241,6 +11237,14 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>The framing of the footage on screen, from its Framing Decision List (FDL)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untouched footage already coded as this export is (H.264, HEVC or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

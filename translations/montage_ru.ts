@@ -11121,10 +11121,6 @@ The certificate must be issued by a certificate authority (not signed by itself)
         <translation type="unfinished">Рамки, которые уже нетронуты в этом вкусе, размера и скорости, копируются из источника, а не снова кодируются: быстрее, и точно оригинальные фотографии</translation>
     </message>
     <message>
-        <source>Smart rendering works with ProRes and DNxHR</source>
-        <translation type="unfinished">Смарт-передача работает с ProRes и DNxHR</translation>
-    </message>
-    <message>
         <source>Chapters can be written into MP4, MOV and MKV files</source>
         <translation type="unfinished">Главы можно записать в файлы MP4, MOV и MKV</translation>
     </message>
@@ -11285,6 +11281,14 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>The framing of the footage on screen, from its Framing Decision List (FDL)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untouched footage already coded as this export is (H.264, HEVC or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

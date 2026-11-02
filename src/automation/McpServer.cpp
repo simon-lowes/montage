@@ -11685,7 +11685,9 @@ void McpServer::Impl::addTools() {
         "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\"), "
         "optionally normalising the mix's loudness for where it is going. Broadcast deliveries: the XDCAM HD422, AVC-Intra 100 "
         "and DNxHR MXF presets write MXF OP1a with each sound channel a mono track; start_timecode sets the file's timecode. "
-        "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion.",
+        "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion. "
+        "Smart rendering: where the preset codes video as the footage is (ProRes, DNxHR; H.264, HEVC and XDCAM HD422 a GOP "
+        "at a time), untouched pictures are copied from the source; the result's copied_frames says how many.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
@@ -12028,10 +12030,14 @@ void McpServer::Impl::addTools() {
             LightLevels light;
             const QString report = QString::fromStdString(loudnessReportBase(st.path)) + ".pdf";
             if (st.loudnessReport) QFile::remove(report);  // (one from before is not this one's)
-            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
+            int copiedFrames = 0;
+            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, &copiedFrames, &light))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
+            // Smart rendering: pictures of untouched footage copied from the source, not encoded again.
+            o["copied_frames"] = copiedFrames;
+            if (copiedFrames > 0) text += QStringLiteral("\n%1 frame%2 copied from the source as coded (smart rendering)").arg(copiedFrames).arg(copiedFrames == 1 ? "" : "s");
             if (st.hdr10Plus) {
                 // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
                 const std::string carriage = hdr10PlusCarriage(s, st);

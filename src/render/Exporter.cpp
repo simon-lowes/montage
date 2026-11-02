@@ -13,6 +13,7 @@
 #include "core/Cea708.h"
 #include "core/Teletext.h"
 #include "render/BroadcastMxf.h"
+#include "render/LongGopCopy.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
 #include "render/RateConversion.h"
@@ -365,9 +366,11 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
                 p.settings.smartRender = false;
                 return p;
             };
-            v.push_back(broadcast(preset("XDCAM HD422 (MXF)", "mxf", "Sony's broadcast MPEG-2: 1080 lines, 4:2:2 at 50 Mb/s, eight mono 24-bit tracks",
-                                         "mpeg2video", "pcm_s24le", 0, "", "", "yuv422p"),
-                                  8));
+            ExportPreset xdcam = broadcast(preset("XDCAM HD422 (MXF)", "mxf", "Sony's broadcast MPEG-2: 1080 lines, 4:2:2 at 50 Mb/s, eight mono 24-bit tracks",
+                                                  "mpeg2video", "pcm_s24le", 0, "", "", "yuv422p"),
+                                           8);
+            xdcam.settings.smartRender = true;  // XDCAM footage's untouched GOPs copied (render/LongGopCopy.h)
+            v.push_back(xdcam);
             v.push_back(broadcast(preset("AVC-Intra 100 (MXF)", "mxf", "10-bit 4:2:2 intra H.264 at 100 Mb/s, four mono 24-bit tracks (as the DPP's AS-11 asks)",
                                          "libx264", "pcm_s24le", 0, "", "avci100", "yuv422p10le"),
                                   4));
@@ -679,6 +682,36 @@ bool identityMotion(const Clip& c, FrameTime local) {
     return true;
 }
 
+}  // namespace
+
+// The one visible clip at f when nothing else in the program touches it (render/LongGopCopy.h).
+const Clip* untouchedClipAt(const Sequence& seq, FrameTime f) {
+    const Clip* found = nullptr;
+    for (size_t i = 0; i < seq.videoTracks.size(); ++i) {
+        const Track& t = seq.videoTracks[i];
+        if (t.muted) continue;
+        for (const Clip& c : t.clips) {
+            if (!c.contains(f) || !c.enabled) continue;
+            if (found) return nullptr;
+            found = &c;
+        }
+        for (const Transition& tr : t.transitions) {
+            FrameTime a, b;
+            if (edit::transitionRange(t, tr, a, b) && f >= a && f < b) return nullptr;
+        }
+    }
+    bool grouped = false;  // (a colour group's grades run on it)
+    if (found)
+        for (const ColorGroup* g : colorGroupsOf(seq, *found)) grouped = grouped || !g->pre.empty() || !g->post.empty();
+    if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped ||
+        found->blendMode != "normal" || found->speed != 1.0 ||
+        found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
+        return nullptr;
+    return found;
+}
+
+namespace {
+
 class SmartRenderer {
 public:
     // `profile` is the export's ProRes or DNxHR profile option ("hq", "4444", "dnxhr_sq"...).
@@ -736,31 +769,7 @@ private:
         bool usable = false;
     };
 
-    // The one visible clip at f when nothing else in the program touches it.
-    const Clip* onlyClip(FrameTime f) const {
-        const Clip* found = nullptr;
-        for (size_t i = 0; i < seq_.videoTracks.size(); ++i) {
-            const Track& t = seq_.videoTracks[i];
-            if (t.muted) continue;
-            for (const Clip& c : t.clips) {
-                if (!c.contains(f) || !c.enabled) continue;
-                if (found) return nullptr;
-                found = &c;
-            }
-            for (const Transition& tr : t.transitions) {
-                FrameTime a, b;
-                if (edit::transitionRange(t, tr, a, b) && f >= a && f < b) return nullptr;
-            }
-        }
-        bool grouped = false;  // (a colour group's grades run on it)
-        if (found)
-            for (const ColorGroup* g : colorGroupsOf(seq_, *found)) grouped = grouped || !g->pre.empty() || !g->post.empty();
-        if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped ||
-            found->blendMode != "normal" || found->speed != 1.0 ||
-            found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
-            return nullptr;
-        return found;
-    }
+    const Clip* onlyClip(FrameTime f) const { return untouchedClipAt(seq_, f); }
 
     Source* source(const Clip& c) {
         auto it = sources_.find(c.mediaId);
@@ -936,6 +945,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames;
     std::vector<AdaptiveHdrScene> adaptive;
     double renderFrom = 0;  // where the render's share of the progress starts
+    std::string x265Params;  // (kept for smart rendering's encoded parts)
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
@@ -1043,6 +1053,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     params += buf;
                 }
                 av_dict_set(&opts, "x265-params", params.c_str(), 0);
+                x265Params = params;
                 o.vctx->codec_tag = MKTAG('h', 'v', 'c', '1');  // plays in QuickTime / Apple devices
             }
         } else if (c == "prores_ks") {
@@ -1503,6 +1514,21 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (!s.startTimecode.empty()) av_dict_set(&o.oc->metadata, "timecode", s.startTimecode.c_str(), 0);
     for (const auto& [key, value] : s.formatMetadata) av_dict_set(&o.oc->metadata, key.c_str(), value.c_str(), 0);
     if (s.chapters) addChapters(o.oc, dseq, din, dout);
+    // Smart rendering of long-GOP video (render/LongGopCopy.h): planned before the header, which carries the copied
+    // sources' parameter sets. Only where nothing would change the source's pictures for the whole export, as below.
+    std::unique_ptr<LongGopCopier> longGop;
+    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
+        !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && !s.alpha && !wantHdr10 && !wantAdaptive && sameColorSpace(outSpace, seqSpace) &&
+        !trim && !sceneReferredWorking(seq) && !conv.active() && s.profile != "avci100") {
+        LongGopEncoder lge;
+        lge.preset = s.preset;
+        lge.x265Params = x265Params;
+        lge.crf = s.crf;
+        lge.bitrate = s.videoBitrate;
+        lge.main = o.vctx;
+        longGop = LongGopCopier::plan(p, seq, in, out, seqSpace, lge, o.oc, o.vst);
+        if (longGop && !longGop->prepareStream(nullptr)) longGop.reset();
+    }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
 
@@ -2030,7 +2056,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     for (FrameTime f = din; f < dout; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
-        if (wantVideo && smart && smart->copy(f, in, o.oc)) {
+        int longGopCopied = 0;
+        std::string longGopError;
+        if (wantVideo && longGop && (longGopCopied = longGop->copy(f - din, &longGopError)) < 0) return fail(longGopError);
+        if (longGopCopied > 0) {
+            // copied from the source, a GOP at a time
+        } else if (wantVideo && smart && smart->copy(f, in, o.oc)) {
             // copied from the source
         } else if (wantVideo) {
             Image img = deliveredFrame(f);
@@ -2156,8 +2187,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vframe->pts = f - din;
             if (interlacedOut) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
             if (!attach608(f - din)) return fail("Out of memory");
-            if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
-            if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + videoError(o, rc));
+            if (longGop) {
+                if (!longGop->encode(o.vframe, f - din, &longGopError)) return fail(longGopError);
+            } else {
+                if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
+                if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + videoError(o, rc));
+            }
             }
         }
         if (wantAudio) {
@@ -2239,11 +2274,14 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
     if (wantVideo) {
+        std::string e;
+        if (longGop && !longGop->finish(&e)) return fail(e);
         if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
             return fail("Finishing video failed: " + videoError(o, rc));
     }
+    const int copiedFrames = (smart ? smart->copied() : 0) + (longGop ? longGop->copiedFrames() : 0);
     // HDR10 light levels as measured (MP4 and MOV write their clli box with the index, at the end).
-    if (pq && measured.frames > 0 && o.vst && !(smart && smart->copied() > 0))  // copied frames go unmeasured
+    if (pq && measured.frames > 0 && o.vst && copiedFrames == 0)  // copied frames go unmeasured
         if (const AVPacketSideData* sd = av_packet_side_data_get(o.vst->codecpar->coded_side_data, o.vst->codecpar->nb_coded_side_data,
                                                                  AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) {
             auto* cl = reinterpret_cast<AVContentLightMetadata*>(sd->data);
@@ -2293,7 +2331,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!writeLoudnessCsv(base + ".csv", d, spec, seq, &e) || !writeLoudnessPdf(base + ".pdf", d, spec, seq, &e))
             qWarning("Loudness report not written beside %s: %s", s.path.c_str(), e.c_str());
     }
-    if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
+    if (smartRendered) *smartRendered = copiedFrames;
     if (light) *light = measured;
     return true;
 }

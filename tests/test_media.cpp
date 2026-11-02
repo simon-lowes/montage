@@ -17,6 +17,7 @@
 #include <QJsonArray>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -281,6 +282,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
+#include <libavutil/display.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/pixdesc.h>
@@ -19709,6 +19711,312 @@ if ui["pressed"] == "add":
         ex.burnIn.timecode = true;
         QVERIFY(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied));
         QCOMPARE(copied, 0);
+    }
+
+    void longGopSmartRendering() {
+        // Video packets in decode order: their bytes and the frame each shows.
+        struct Coded {
+            QByteArray data;
+            int64_t frame = 0;
+        };
+        auto packets = [](const std::string& file) {
+            std::vector<Coded> out;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            if (v >= 0) {
+                const AVStream* st = fmt->streams[v];
+                const AVRational rate = st->avg_frame_rate.num > 0 ? st->avg_frame_rate : st->r_frame_rate;
+                const int64_t start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
+                AVPacket* pkt = av_packet_alloc();
+                while (av_read_frame(fmt, pkt) >= 0) {
+                    if (pkt->stream_index == v)
+                        out.push_back({QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size),
+                                       av_rescale_q(pkt->pts - start, st->time_base, av_inv_q(rate))});
+                    av_packet_unref(pkt);
+                }
+                av_packet_free(&pkt);
+            }
+            avformat_close_input(&fmt);
+            return out;
+        };
+        // Every picture's luma, in the order shown, decoded with FFmpeg's error checks on (`errors` counts what it found,
+        // and what it logged as an error).
+        static std::atomic<int> loggedErrors{0};
+        auto decodeAll = [](const std::string& file, int& errors) {
+            loggedErrors = 0;
+            av_log_set_callback([](void* avcl, int level, const char* fmt, va_list vl) {
+                if (level <= AV_LOG_ERROR) ++loggedErrors;
+                av_log_default_callback(avcl, level, fmt, vl);
+            });
+            std::vector<std::vector<uint8_t>> out;
+            errors = 0;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) >= 0) {
+                avformat_find_stream_info(fmt, nullptr);
+                const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                const AVCodec* codec = v >= 0 ? avcodec_find_decoder(fmt->streams[v]->codecpar->codec_id) : nullptr;
+                AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+                if (ctx) {
+                    avcodec_parameters_to_context(ctx, fmt->streams[v]->codecpar);
+                    ctx->err_recognition = AV_EF_CRCCHECK | AV_EF_EXPLODE;  // (not BITSTREAM: MPEG-2 at a constant rate pads its pictures)
+                    ctx->thread_count = 1;
+                }
+                if (ctx && avcodec_open2(ctx, codec, nullptr) >= 0) {
+                    AVPacket* pkt = av_packet_alloc();
+                    AVFrame* fr = av_frame_alloc();
+                    auto take = [&] {
+                        while (avcodec_receive_frame(ctx, fr) >= 0) {
+                            if (fr->decode_error_flags || (fr->flags & AV_FRAME_FLAG_CORRUPT)) ++errors;
+                            std::vector<uint8_t> y(size_t(fr->width) * size_t(fr->height));
+                            for (int r = 0; r < fr->height; ++r)
+                                std::memcpy(&y[size_t(r) * size_t(fr->width)], fr->data[0] + size_t(r) * size_t(fr->linesize[0]), size_t(fr->width));
+                            out.push_back(std::move(y));
+                            av_frame_unref(fr);
+                        }
+                    };
+                    while (av_read_frame(fmt, pkt) >= 0) {
+                        if (pkt->stream_index == v && avcodec_send_packet(ctx, pkt) < 0) ++errors;
+                        av_packet_unref(pkt);
+                        take();
+                    }
+                    avcodec_send_packet(ctx, nullptr);
+                    take();
+                    av_frame_free(&fr);
+                    av_packet_free(&pkt);
+                }
+                avcodec_free_context(&ctx);
+                avformat_close_input(&fmt);
+            }
+            av_log_set_callback(av_log_default_callback);
+            errors += loggedErrors;
+            return out;
+        };
+        auto psnr = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+            double se = 0;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) se += double(int(a[i]) - int(b[i])) * double(int(a[i]) - int(b[i]));
+            const double mse = se / double(std::max<size_t>(1, a.size()));
+            return mse <= 1e-12 ? 99.0 : 10 * std::log10(255.0 * 255.0 / mse);
+        };
+        struct Case {
+            const char* name;
+            const char* codec;
+            const char* file;
+            const char* preset;
+            int w, h;
+        };
+        for (const Case& k : {Case{"H.264", "libx264", "lg-h264.mp4", "veryfast", 320, 180}, Case{"HEVC", "libx265", "lg-hevc.mp4", "ultrafast", 320, 180},
+                              Case{"XDCAM HD422", "mpeg2video", "lg-xdcam.mxf", "", 1920, 1080}}) {
+            const bool xdcam = std::string(k.codec) == "mpeg2video";
+            // The footage: four seconds of a turning gradient with light grain and a ball rolling across it, in GOPs of 12.
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = k.w, gs.height = k.h, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", 100);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(99, 140.0);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = 0.05;
+            grad.effects.push_back(grain);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+            edit::addTrack(gen, gs, TrackKind::Video);
+            Clip ball = makeGeneratorClip(gen, "shape", 100);
+            ball.generator.params["shape"] = 1.0;
+            ball.generator.params["width"] = 60.0;
+            ball.generator.params["height"] = 60.0;
+            ball.generator.params["pos_x"].addKey(0, -140.0);
+            ball.generator.params["pos_x"].addKey(99, 140.0);
+            edit::overwrite(gen, gs, {TrackKind::Video, 1}, ball);
+            const ExportPreset* xd = findExportPreset("XDCAM HD422 (MXF)");
+            QVERIFY(xd);
+            ExportSettings st;
+            if (xdcam) st = xd->settings;
+            st.videoCodec = k.codec;
+            st.audioCodec = "none";
+            st.preset = k.preset;
+            st.crf = 23;
+            st.gop = 12;
+            st.path = path((std::string("src-") + k.file).c_str());
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+            // The cut: source frames 5-44, then 58-97 (neither on the footage's GOPs); a title over 20-25 and an effect on
+            // 60-65.
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = k.w, s.height = k.h, s.fps = Rational{25, 1};
+            MediaItem m = probeOrFail(p, st.path);
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 5, 45, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(edit::placeMedia(p, s, m.id, 40, 58, 98, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 60).ok);
+            QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 66).ok);
+            for (Clip& c : s.videoTracks[0].clips)
+                if (c.start == 60) c.effects.push_back(makeEffect(p, "invert"));
+            if (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+            Clip title = makeGeneratorClip(p, "title", 6);
+            title.start = 20;
+            edit::overwrite(p, s, {TrackKind::Video, 1}, title);
+            auto sourceFrameOf = [](int64_t e) { return e < 40 ? e + 5 : e - 40 + 58; };
+            ExportSettings ex = st;
+            ex.path = path(k.file);
+            if (xdcam) ex.mxfDelivery = "rdd9", ex.audioCodec = xd->settings.audioCodec;
+            int copied = -1;
+            QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+            QVERIFY2(copied > 0, k.name);
+            if (xdcam) {
+                // RDD 9, as bmx reads it.
+                BroadcastMxfInfo info;
+                QVERIFY2(readBroadcastMxf(ex.path, info, &err), err.c_str());
+                QVERIFY2(info.pictureEssence.rfind("MPEG_2_Long_GOP_422P_HL_1080", 0) == 0, info.pictureEssence.c_str());
+                QCOMPARE(info.duration, int64_t(80));
+            }
+            // Every frame there, decoding cleanly.
+            int errors = -1;
+            const auto out = decodeAll(ex.path, errors);
+            QVERIFY2(out.size() == 80 && errors == 0, qPrintable(QString("%1: %2 frames, %3 errors").arg(k.name).arg(out.size()).arg(errors)));
+            // As many pictures as were reported are the footage's packets, byte for byte. (HEVC's first after an encoded
+            // part may have the source's parameter sets in front, and a CRA's slices marked BLA_W_RADL.)
+            const auto source = packets(st.path), smart = packets(ex.path);
+            std::map<int64_t, QByteArray> byFrame;
+            for (const Coded& c : source) byFrame[c.frame] = c.data;
+            auto sameCoded = [&](const QByteArray& got, const QByteArray& want) {
+                if (got == want) return true;
+                if (std::string(k.codec) != "libx265" || want.isEmpty() || got.size() < want.size()) return false;
+                const QByteArray tail = got.right(want.size());
+                int i = 0;
+                while (i + 4 < want.size()) {
+                    const int len = int(uchar(want[i])) << 24 | int(uchar(want[i + 1])) << 16 | int(uchar(want[i + 2])) << 8 | int(uchar(want[i + 3]));
+                    const int h = i + 4;
+                    if (len < 2 || h + len > want.size()) return false;
+                    if (tail.mid(i, 4) != want.mid(i, 4) || tail.mid(h + 1, len - 1) != want.mid(h + 1, len - 1)) return false;
+                    const int wt = (uchar(want[h]) >> 1) & 0x3f, gt = (uchar(tail[h]) >> 1) & 0x3f;
+                    if (wt != gt && !(wt == 21 && gt == 17)) return false;
+                    i = h + len;
+                }
+                return i == want.size();
+            };
+            std::set<int64_t> copiedFrames, encoded;
+            for (const Coded& c : smart) (sameCoded(c.data, byFrame[sourceFrameOf(c.frame)]) ? copiedFrames : encoded).insert(c.frame);
+            QCOMPARE(int(copiedFrames.size()), copied);
+            for (int64_t e : copiedFrames) QVERIFY2((e < 20 || e >= 26) && (e < 60 || e >= 66), k.name);
+            // The copied frames show the footage exactly (XDCAM's open GOPs: their leading B-pictures after an encoded
+            // part decode from the encoded picture before, so nearly).
+            const auto src = decodeAll(st.path, errors);
+            QCOMPARE(int(src.size()), 100);
+            int exact = 0;
+            double worst = 99;
+            for (int64_t e : copiedFrames) {
+                const double q = psnr(out[size_t(e)], src[size_t(sourceFrameOf(e))]);
+                exact += q >= 99;
+                worst = std::min(worst, q);
+            }
+            qInfo("%s: %d frames copied, %d exactly, worst %.2f dB", k.name, copied, exact, worst);
+            QVERIFY2(xdcam ? worst > 45 && exact >= copied * 3 / 4 : exact == copied, k.name);
+            // The pictures encoded again are within 0.5 dB of the export encoded whole with the same settings (both
+            // against the cut made losslessly).
+            ExportSettings lossless = ex;
+            lossless.videoCodec = "ffv1";
+            lossless.pixFmt = "yuv420p";
+            lossless.mxfDelivery.clear(), lossless.audioCodec = "none";
+            lossless.path = path((std::string("ref-") + k.file + ".mkv").c_str());
+            QVERIFY2(exportSequence(p, s, lossless, nullptr, nullptr, &err), err.c_str());
+            ExportSettings whole = ex;
+            whole.smartRender = false;
+            whole.path = path((std::string("whole-") + k.file).c_str());
+            QVERIFY2(exportSequence(p, s, whole, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+            QCOMPARE(copied, 0);
+            {
+                const auto ref = decodeAll(lossless.path, errors);
+                const auto full = decodeAll(whole.path, errors);
+                QVERIFY(ref.size() == 80 && full.size() == 80);
+                double qs = 0, qf = 0;
+                for (int64_t e : encoded) qs += psnr(out[size_t(e)], ref[size_t(e)]), qf += psnr(full[size_t(e)], ref[size_t(e)]);
+                qs /= double(encoded.size()), qf /= double(encoded.size());
+                qInfo("%s: %d frames encoded again at %.2f dB, encoded whole %.2f dB", k.name, int(encoded.size()), qs, qf);
+                QVERIFY2(qs > qf - 0.5, k.name);
+            }
+            QFile::remove(QString::fromStdString(lossless.path));
+            QFile::remove(QString::fromStdString(whole.path));
+            if (std::string(k.codec) == "libx264") {
+                // Settings the footage was not coded with: encoded whole.
+                ExportSettings other = ex;
+                other.pixFmt = "yuv444p";
+                other.path = path("lg-444.mp4");
+                QVERIFY2(exportSequence(p, s, other, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+                QCOMPARE(copied, 0);
+                QCOMPARE(int(decodeAll(other.path, errors).size()), 80);
+                QCOMPARE(errors, 0);
+                // Footage shown turned (a phone held upside down: a display matrix of 180 degrees) is decoded turned, so
+                // its packets are not copied.
+                const std::string turned = path("lg-turned.mp4");
+                {
+                    AVFormatContext* in = nullptr;
+                    AVFormatContext* o = nullptr;
+                    QVERIFY(avformat_open_input(&in, st.path.c_str(), nullptr, nullptr) >= 0);
+                    QVERIFY(avformat_find_stream_info(in, nullptr) >= 0);
+                    QVERIFY(avformat_alloc_output_context2(&o, nullptr, nullptr, turned.c_str()) >= 0);
+                    AVStream* os = avformat_new_stream(o, nullptr);
+                    avcodec_parameters_copy(os->codecpar, in->streams[0]->codecpar);
+                    os->codecpar->codec_tag = 0;
+                    os->time_base = in->streams[0]->time_base;
+                    int32_t matrix[9];
+                    av_display_rotation_set(matrix, 180);
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+                    AVPacketSideData* sd = av_packet_side_data_new(&os->codecpar->coded_side_data, &os->codecpar->nb_coded_side_data,
+                                                                   AV_PKT_DATA_DISPLAYMATRIX, sizeof matrix, 0);
+#else
+                    uint8_t* sd = av_stream_new_side_data(os, AV_PKT_DATA_DISPLAYMATRIX, sizeof matrix);
+#endif
+                    QVERIFY(sd);
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+                    std::memcpy(sd->data, matrix, sizeof matrix);
+#else
+                    std::memcpy(sd, matrix, sizeof matrix);
+#endif
+                    QVERIFY(avio_open(&o->pb, turned.c_str(), AVIO_FLAG_WRITE) >= 0);
+                    QVERIFY(avformat_write_header(o, nullptr) >= 0);
+                    AVPacket* pkt = av_packet_alloc();
+                    while (av_read_frame(in, pkt) >= 0) {
+                        av_packet_rescale_ts(pkt, in->streams[0]->time_base, os->time_base);
+                        pkt->stream_index = 0;
+                        av_interleaved_write_frame(o, pkt);
+                    }
+                    av_packet_free(&pkt);
+                    av_write_trailer(o);
+                    avio_closep(&o->pb);
+                    avformat_free_context(o);
+                    avformat_close_input(&in);
+                }
+                Project q = p;
+                MediaItem tm = probeOrFail(q, turned);
+                q.media.push_back(tm);
+                for (Clip& c : q.active()->videoTracks[0].clips) c.mediaId = tm.id;
+                other = ex;
+                other.path = path("lg-turned-out.mp4");
+                QVERIFY2(exportSequence(q, *q.active(), other, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+                QCOMPARE(copied, 0);
+            }
+            if (xdcam) {
+                // Over MCP: the frames copied, reported.
+                const QString project = QString::fromStdString(path("lg-xdcam.montage"));
+                QVERIFY(saveProject(p, project.toStdString()));
+                McpServer server;
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", "montage_render"},
+                                                             {"arguments", QJsonObject{{"project", project}, {"output", QString::fromStdString(path("lg-mcp.mxf"))},
+                                                                                       {"preset", "XDCAM HD422 (MXF)"}, {"mxf_delivery", "rdd9"}}},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+                const QJsonObject result = r.value("result").toObject();
+                QVERIFY2(!result.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                QCOMPARE(result.value("structuredContent").toObject().value("copied_frames").toInt(), int(copiedFrames.size()));
+                QVERIFY(result.value("content").toArray().at(0).toObject().value("text").toString().contains("copied from the source as coded"));
+                QFile::remove(QString::fromStdString(path("lg-mcp.mxf")));
+            }
+        }
     }
 
     void exportedChapters() {
