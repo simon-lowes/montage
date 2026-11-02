@@ -568,6 +568,7 @@ QJsonObject trackToJson(const Track& t) {
     if (t.volumeDb != 0) o["volumeDb"] = t.volumeDb;
     if (t.pan != 0) o["pan"] = t.pan;
     if (t.height) o["height"] = t.height;
+    if (t.pinned) o["pinned"] = true;
     if (!t.effects.empty()) {
         QJsonArray fx;
         for (const auto& e : t.effects) fx.append(effectToJson(e));
@@ -671,6 +672,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     t.volumeDb = o.value("volumeDb").toDouble(0);
     t.pan = o.value("pan").toDouble(0);
     t.height = o.value("height").toInt(0);
+    t.pinned = o.value("pinned").toBool(false);
     for (const auto& e : o.value("effects").toArray()) t.effects.push_back(effectFromJson(e));
     t.output = Id(i64(o.value("output")));
     if (o.contains("surround")) t.surround = surroundFromJson(o.value("surround"));

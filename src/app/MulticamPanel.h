@@ -1,8 +1,11 @@
 // Montage — the Multicam panel: every angle of the multicam clip under the
-// playhead side by side. Clicking an angle (or pressing 1–9) switches to it:
-// while the program plays, the clip is cut at the playhead, so a whole scene
-// can be cut live; when stopped, the current shot changes (Shift cuts
-// instead). Auto Switch cuts to whoever is speaking.
+// playhead side by side (up to 25, five by five). Clicking an angle (or
+// pressing its key) switches to it: while the program plays, the clip is cut
+// at the playhead, so a whole scene can be cut live; when stopped, the
+// current shot changes (Shift cuts instead). Auto Switch cuts to whoever is
+// speaking. The keys 1–9 (and the keypad's) reach a bank of nine angles: the
+// bank of the angle on, unless another was picked with Alt+1–3 (or the Speed
+// Editor's LIVE O/WR held with CAM 1–3).
 #pragma once
 
 #include <QFutureWatcher>
@@ -35,6 +38,13 @@ public:
     int angleCount() const { return int(views_.size()); }
     // Shows `angle` (0-based). Cuts at the playhead while playing or when `cut`.
     bool switchTo(int angle, bool cut = false);
+    // Banks of nine angles for the keys: the bank they reach (0-based), how many there are, picking one (false when
+    // there is no such bank), and the key's angle in it (`key` 0–8 for 1–9) switched to.
+    static constexpr int kBankSize = 9;
+    int bank() const;
+    int bankCount() const;
+    bool setBank(int bank);
+    bool switchKey(int key, bool cut = false);
     // The angle images last rendered (for tests).
     std::vector<QImage> angleImages() const;
     bool audioFollowsVideo() const;
@@ -69,6 +79,7 @@ private:
     QFutureWatcher<std::vector<QImage>> watcher_;
     bool renderPending_ = false;
     Id clip_ = 0;
+    int bank_ = -1;  // picked; -1: the bank of the angle on
     std::vector<std::string> names_;
 };
 

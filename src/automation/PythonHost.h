@@ -4,7 +4,9 @@
 // module as Lua's table: `montage.add_title(text="Hello", at=2)` (keywords or a dict) calls montage_add_title,
 // `montage.call("montage_...", {...})` any tool, results are dicts (a tool's structured result, its text as
 // "message"; else {"text": ...}), and a tool's error raises montage.ToolError. montage.tools(), montage.args (also
-// sys.argv[1:]), montage.project, montage.json(value), montage.panel(...) and montage.set_panel(...) as in Lua; print()
+// sys.argv[1:]), montage.project, montage.json(value), montage.panel(...), montage.set_panel(...) and background calls
+// (montage.call_async(name, args, callback): a montage.Job with status(), progress(), cancel(), done() and wait()) as
+// in Lua; print()
 // and sys.stderr write to the script's output. Scripts have no standard input. Stop ends the process. A panel opening
 // again by itself (quiet) runs with Python's audit hooks refusing programs and changes to files.
 #pragma once

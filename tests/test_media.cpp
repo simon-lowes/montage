@@ -19117,6 +19117,188 @@ if __name__ == '__main__':
         QVERIFY(error.contains("no panel"));
     }
 
+    void backgroundToolCalls() {
+        // Forty seconds of colour bars at 640x360: an export that takes long enough to watch.
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/bg.montage";
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 640;
+            s.height = 360;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "bars", 1000));
+            QVERIFY(saveProject(p, project.toStdString()));
+        }
+        McpServer server;
+        auto request = [&](const QString& method, const QJsonObject& params) {
+            static int id = 1000;
+            const QJsonObject msg{{"jsonrpc", "2.0"}, {"id", ++id}, {"method", method}, {"params", params}};
+            const auto lines = server.handle(QJsonDocument(msg).toJson(QJsonDocument::Compact).toStdString());
+            return lines.empty() ? QJsonObject() : QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+        };
+        auto call = [&](const QString& name, const QJsonObject& args) {
+            return request("tools/call", {{"name", name}, {"arguments", args}}).value("result").toObject();
+        };
+        auto job = [&](const QString& id, const QString& action = "status") {
+            return call("montage_job", {{"job", id}, {"action", action}}).value("structuredContent").toObject();
+        };
+        // While it runs, the caller's event loop is never held up for 50 ms (allowing one hiccup under 150 ms, from a
+        // loaded machine's scheduling: the export's threads use every core).
+        QElapsedTimer sinceTick;
+        qint64 longestWait = 0;
+        int slowTicks = 0;
+        auto heldUp = [&] { return longestWait >= 150 || slowTicks > 1; };
+        auto tick = [&] {
+            QCoreApplication::processEvents();
+            if (sinceTick.isValid()) longestWait = std::max(longestWait, sinceTick.elapsed());
+            if (sinceTick.isValid() && sinceTick.elapsed() >= 50) ++slowTicks;
+            sinceTick.restart();
+        };
+
+        // ---- Over MCP: "async": true answers at once with a job; montage_job reads its progress, then its result.
+        const QString out = dir.path() + "/bars.mp4";
+        QElapsedTimer t;
+        t.start();
+        const QJsonObject started = call("montage_render", {{"project", project}, {"output", out}, {"async", true}});
+        QVERIFY2(t.elapsed() < 50, qPrintable(QString::number(t.elapsed())));
+        const QString id = started.value("structuredContent").toObject().value("job").toString();
+        QVERIFY2(!id.isEmpty(), qPrintable(QJsonDocument(started).toJson()));
+        QCOMPARE(started.value("structuredContent").toObject().value("status").toString(), QString("queued"));
+        int partway = 0;  // reports of a fraction between 0 and 1
+        QString step;
+        QJsonObject report;
+        sinceTick.start();
+        while (t.elapsed() < 120000) {
+            tick();
+            report = job(id);
+            const QString status = report.value("status").toString();
+            const double f = report.value("progress").toDouble();
+            if (status == "running" && f > 0 && f < 1) {
+                ++partway;
+                step = report.value("step").toString();
+            }
+            if (status != "queued" && status != "running") break;
+            QThread::msleep(5);
+        }
+        QVERIFY2(!heldUp(), qPrintable(QString("%1 ms, %2 waits over 50 ms").arg(longestWait).arg(slowTicks)));
+        QCOMPARE(report.value("status").toString(), QString("done"));
+        QVERIFY(partway > 0);
+        QCOMPARE(step, QString("Rendering"));
+        QCOMPARE(report.value("progress").toDouble(), 1.0);
+        QVERIFY(report.value("result").toObject().value("message").toString().contains("bars.mp4"));
+        QVERIFY(QFileInfo(out).size() > 1000);
+        // A second one cancelled while it runs, a third while it waits behind it: both end "cancelled" (the third never
+        // started: no file), and the list has all three.
+        const QString out2 = dir.path() + "/cancelled.mp4", out3 = dir.path() + "/queued.mp4";
+        const QString id2 = call("montage_render", {{"project", project}, {"output", out2}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
+        const QString id3 = call("montage_render", {{"project", project}, {"output", out3}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
+        QTRY_VERIFY_WITH_TIMEOUT(job(id2).value("progress").toDouble() > 0, 30000);
+        QCOMPARE(job(id3).value("status").toString(), QString("queued"));
+        QCOMPARE(job(id3, "cancel").value("status").toString(), QString("cancelled"));
+        job(id2, "cancel");
+        report = call("montage_job", {{"job", id2}, {"wait", 10}}).value("structuredContent").toObject();
+        QCOMPARE(report.value("status").toString(), QString("cancelled"));
+        QVERIFY(!QFileInfo::exists(out3));
+        const QJsonArray all = call("montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray();
+        QCOMPARE(all.size(), 3);
+        QCOMPARE(all[0].toObject().value("status").toString(), QString("done"));
+        // A job that doesn't exist is an error naming the way to find them.
+        QVERIFY(call("montage_job", {{"job", "job-99"}}).value("isError").toBool());
+
+        if (!scriptingAvailable()) QSKIP("built without Lua");
+        // ---- From Lua: montage.call_async returns a job at once; its progress read while the script sleeps, its callback
+        // run with the result when waited for; one cancelled.
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        bool measuring = false;
+        o.print = [&](const QString& line) {
+            printed << line;
+            if (line == "measure") {
+                measuring = true;
+                longestWait = 0;
+                slowTicks = 0;
+                sinceTick.restart();
+            } else if (line == "measured") {
+                tick();
+                measuring = false;
+            }
+        };
+        o.tick = [&] {
+            if (measuring) tick();
+        };
+        const QString lua = QStringLiteral(R"lua(
+            local got
+            local j = montage.call_async("render", {output = [[%1]]}, function(result, err) got = result end)
+            local fractions = 0
+            while not j:done() do
+              local f, step = j:progress()
+              if f > 0 and f < 1 then fractions = fractions + 1 end
+              montage.sleep(0.02)
+            end
+            print("progress seen", fractions > 0, j:status())
+            local r = j:wait()
+            print("result", got ~= nil and got == r, r.message ~= nil and r.message:find("lua.mp4", 1, true) ~= nil)
+            local k = montage.call_async("montage_render", {output = [[%2]]})
+            while k:progress() == 0 do montage.sleep(0.01) end
+            k:cancel()
+            local finished, err = pcall(k.wait, k, 10)
+            print("cancelled", finished, k:status())
+          )lua").arg(dir.path() + "/lua.mp4", dir.path() + "/lua-cancelled.mp4");
+        QString error;
+        QVERIFY2(runScript(lua, "bg.lua", o, &error), qPrintable(error));
+        QCOMPARE(printed, (QStringList{"progress seen\ttrue\tdone", "result\ttrue\ttrue", "cancelled\tfalse\tcancelled"}));
+        QVERIFY(QFileInfo(dir.path() + "/lua.mp4").size() > 1000);
+        // Waiting for jobs keeps the event loop going.
+        printed.clear();
+        const QString waited = QStringLiteral(R"lua(
+            print("measure")
+            local j = montage.call_async("render", {output = [[%1]]}, function(r) print("callback", r.message ~= nil) end)
+            montage.wait_all()
+            print("measured")
+          )lua").arg(dir.path() + "/lua2.mp4");
+        QVERIFY2(runScript(waited, "wait.lua", o, &error), qPrintable(error));
+        QVERIFY2(!heldUp(), qPrintable(QString("%1 ms, %2 waits over 50 ms").arg(longestWait).arg(slowTicks)));
+        QCOMPARE(printed, (QStringList{"measure", "callback\ttrue", "measured"}));
+        // A script that ends while its job runs waits for it and runs its callback; one that fails cancels its jobs.
+        printed.clear();
+        QVERIFY2(runScript(QStringLiteral("montage.call_async('render', {output = [[%1]]}, function(r) print('finished') end)").arg(dir.path() + "/end.mp4"), "end.lua", o, &error), qPrintable(error));
+        QCOMPARE(printed, QStringList{"finished"});
+        QVERIFY(!runScript(QStringLiteral("J = montage.call_async('render', {output = [[%1]]})\nerror('stop')").arg(dir.path() + "/failed.mp4"), "fail.lua", o, &error));
+        auto lastStatus = [&] {
+            const QJsonArray jobs = call("montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray();
+            return jobs.last().toObject().value("status").toString();
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(lastStatus(), QString("cancelled"), 10000);
+
+        // ---- From Python: the same.
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later");
+        printed.clear();
+        const QString py = QStringLiteral(
+            "import montage\n"
+            "print('measure')\n"
+            "got = []\n"
+            "j = montage.call_async('render', {'output': %1}, lambda r, e, job: got.append(r))\n"
+            "seen = False\n"
+            "while not j.done():\n"
+            "    f, step = j.progress()\n"
+            "    seen = seen or (0 < f < 1 and step == 'Rendering')\n"
+            "    montage.sleep(0.02)\n"
+            "print('progress seen', seen, j.status(), bool(got) and 'py.mp4' in got[0]['message'])\n"
+            "k = montage.call_async('montage_render', output=%2)\n"
+            "while k.progress()[0] == 0:\n"
+            "    montage.sleep(0.01)\n"
+            "k.cancel()\n"
+            "while not k.done():\n"
+            "    montage.sleep(0.01)\n"
+            "print('cancelled', k.status())\n"
+            "print('measured')\n")
+                               .arg(QString("r'%1'").arg(dir.path() + "/py.mp4"), QString("r'%1'").arg(dir.path() + "/py-cancelled.mp4"));
+        QVERIFY2(runScript(py, "bg.py", o, &error), qPrintable(error));
+        QCOMPARE(printed, (QStringList{"measure", "progress seen True done True", "cancelled cancelled", "measured"}));
+        QVERIFY2(!heldUp(), qPrintable(QString("%1 ms, %2 waits over 50 ms").arg(longestWait).arg(slowTicks)));
+        QVERIFY(QFileInfo(dir.path() + "/py.mp4").size() > 1000);
+    }
+
     void luaScripts() {
         if (!scriptingAvailable()) QSKIP("built without Lua");
         QTemporaryDir dir;

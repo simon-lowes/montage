@@ -112,9 +112,14 @@ private:
         std::vector<Row> out;
         const Sequence* s = w_->sequence();
         if (!s) return out;
+        // (no vertical scrolling here: pinned tracks come first, so they are the ones always in view)
         int y = kRuler;
-        for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i, y += kVideoH) out.push_back({{TrackKind::Video, i}, y, kVideoH});
-        for (int i = 0; i < int(s->audioTracks.size()); ++i, y += kAudioH) out.push_back({{TrackKind::Audio, i}, y, kAudioH});
+        for (const bool pinned : {true, false}) {
+            for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
+                if (s->videoTracks[size_t(i)].pinned == pinned) out.push_back({{TrackKind::Video, i}, y, kVideoH}), y += kVideoH;
+            for (int i = 0; i < int(s->audioTracks.size()); ++i)
+                if (s->audioTracks[size_t(i)].pinned == pinned) out.push_back({{TrackKind::Audio, i}, y, kAudioH}), y += kAudioH;
+        }
         return out;
     }
     FrameTime length() const {

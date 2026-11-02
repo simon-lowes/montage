@@ -154,7 +154,7 @@ bool viewField(const QString& key, const std::string& path) {
         const std::string name = path.substr(list == std::string::npos ? 0 : list + 1, item - (list == std::string::npos ? 0 : list + 1));
         return name == "video" || name == "audio" || name == "captions";
     }
-    return key == "activeSequence" || key == "nextId" || key == "playhead" || key == "lanesShown" || key == "collapsedFolders";
+    return key == "activeSequence" || key == "nextId" || key == "playhead" || key == "lanesShown" || key == "pinned" || key == "collapsedFolders";
 }
 // Fields merged whole (analyses, masks and drawings are not merged part by part).
 bool wholeField(const QString& key) {

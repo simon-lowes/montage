@@ -7,13 +7,17 @@
 // A tool runs on a copy of the open project saved beside it (so files it writes land beside the project), off the
 // UI thread; when it changed the copy, the copy becomes the open project in one undo step, unless the editor
 // changed the project meanwhile (then nothing is applied and the agent is told). Calls run one at a time.
+// A call with "async": true is answered at once with a job id and runs in its turn as any other; montage_job, answered
+// at once on the UI thread, reads its status, progress and result (the change applied when it finishes) or cancels it.
 #pragma once
 
 #include <QByteArray>
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <QJsonValue>
 #include <atomic>
+#include <mutex>
 #include <deque>
 #include <functional>
 #include <map>
@@ -82,7 +86,28 @@ private:
         std::function<void(QByteArray)> done;
         bool external = false;  // from an agent over HTTP (the Assistant panel calls in-process)
         QString label, group;   // a script's: its undo step's name and merge key ("" for the Assistant's and agents')
+        QString async;          // a background call's job id (its message runs under that id)
     };
+    // Background calls, by job id.
+    struct AsyncJob {
+        QString tool, status = QStringLiteral("queued");  // queued, running, done, failed, cancelled
+        QJsonObject result;  // the tool's, when finished
+        bool cancel = false;
+    };
+    std::map<QString, AsyncJob> asyncJobs_;
+    int asyncMade_ = 0;
+    QString runningAsync_;  // the background call running ("" for none)
+    // Progress the tools report, by the token their call carried (a job's id), from the worker's thread.
+    struct ProgressBoard {
+        std::mutex m;
+        std::map<QString, std::pair<double, QString>> of;
+    };
+    std::shared_ptr<ProgressBoard> progress_ = std::make_shared<ProgressBoard>();
+    QJsonObject jobReport(const QString& id);
+    // montage_job: `done` gets the result (at once, or once the job has finished when asked to wait).
+    void answerJob(const QJsonObject& args, std::function<void(const QJsonObject& result)> done);
+    void cancelJob(const QString& id);
+    void settleJob(const QString& id, const QByteArray& reply);
     void dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label, const QString& group);
     QString runningGroup_;  // the script whose call is running ("" for others)
     struct ToolInfo {

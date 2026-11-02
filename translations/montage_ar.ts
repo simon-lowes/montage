@@ -7530,6 +7530,10 @@ Download it now?</source>
         <source>Angle %1: %2 (key %1; Shift-click cuts at the playhead)</source>
         <translation type="unfinished">الزاوية %1: %2 (المفتاح %1؛ نقلة - نقرة تُقطع عند رأس اللعبة)</translation>
     </message>
+    <message>
+        <source>Angle %1: %2 (key %3 in bank %4, picked with Alt+%4; Shift-click cuts at the playhead)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::AssistantPanel</name>
@@ -24516,6 +24520,22 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Multicam</source>
         <translation type="unfinished">متعدد الكمّات</translation>
     </message>
+    <message>
+        <source>Keys 1–%1: angles %2–%3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live: click an angle or press 1–%1 to cut to angles %2–%3.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Click an angle or press 1–%1 to switch this shot to angles %2–%3; Shift cuts at the playhead.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Alt+1–%1 picks the nine the keys reach.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::OffloadDialog</name>
@@ -28738,6 +28758,10 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
         <source>Dissolve</source>
         <translation type="unfinished">انحل</translation>
     </message>
+    <message>
+        <source>No bank %1 of angles here</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::StackedTimelineCanvas</name>
@@ -29430,6 +29454,22 @@ Right-click: width, LFE, height and audio object.</source>
     </message>
     <message>
         <source>%1 % | %2 %</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pin Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Unpin Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pin to Top</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keeps the track in a band under the ruler that stays put while the other tracks scroll</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

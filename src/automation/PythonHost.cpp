@@ -18,7 +18,7 @@ namespace {
 // output pointed at standard error and standard input at nothing, so programs it runs cannot break the protocol), says
 // it is ready, reads the script and what goes with it, and runs it.
 const char* kBoot = R"py(
-import json, linecache, os, sys, threading, types, traceback
+import json, linecache, os, sys, threading, time, types, traceback
 
 _in = open(os.dup(0), "rb")
 _out = open(os.dup(1), "wb")
@@ -219,8 +219,105 @@ def set_panel(values=None, /, **kw):
         raise ToolError(r["error"])
 
 
+_unfinished = []
+
+
+class Job:
+    """A tool call running in the background (montage.call_async)."""
+
+    def __init__(self, r, tool, callback):
+        self.id, self.tool, self.callback = r["job"], tool, callback
+        self.state, self.fraction, self.step = r.get("status", "queued"), 0.0, ""
+        self.result = self.error = None
+        self.finished = False
+
+    def _settle(self, r):
+        self.state = r.get("status", self.state)
+        self.fraction = r.get("progress", self.fraction)
+        self.step = r.get("step", self.step)
+        if self.state in ("done", "failed", "cancelled") and not self.finished:
+            self.finished = True
+            self.result = r.get("result")
+            if self.state != "done":
+                self.error = r.get("error") or self.state
+            if self in _unfinished:
+                _unfinished.remove(self)
+            if self.callback is not None:
+                self.callback(self.result, self.error, self)
+        return self
+
+    def poll(self):
+        """Asks how it is doing (its callback runs if it has finished)."""
+        if not self.finished:
+            self._settle(call("montage_job", {"job": self.id}))
+        return self
+
+    def status(self):
+        """queued, running, done, failed or cancelled."""
+        return self.poll().state
+
+    def progress(self):
+        """How far it is (0 to 1) and what it is doing."""
+        self.poll()
+        return self.fraction, self.step
+
+    def done(self):
+        return self.poll().finished
+
+    def cancel(self):
+        """Stops it (work that can stop does)."""
+        if not self.finished:
+            self._settle(call("montage_job", {"job": self.id, "action": "cancel"}))
+        return self
+
+    def wait(self, timeout=None):
+        """Its result once it has finished (the tool's error raised as ToolError); None if `timeout` seconds pass first."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.poll().finished:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+        if self.state != "done":
+            raise ToolError("%s: %s" % (self.tool, self.error))
+        return self.result
+
+    def __repr__(self):
+        return "<montage.Job %s (%s, %s)>" % (self.id, self.tool, self.state)
+
+
+def call_async(name, args=None, callback=None, /, **kw):
+    """Runs tool `name` in the background: a Job at once. `callback(result, error, job)` runs when it is seen to finish
+    (polled, waited for, or at the end of the script, which waits for its jobs)."""
+    name = str(name)
+    if not name.startswith("montage_"):
+        name = "montage_" + name
+    a = _args(args, kw)
+    a["async"] = True
+    job = Job(call(name, a), name, callback)
+    _unfinished.append(job)
+    return job
+
+
+def jobs():
+    """The background calls not yet seen to finish."""
+    return list(_unfinished)
+
+
+def poll():
+    """Asks each unfinished job how it is doing; how many are left."""
+    for j in jobs():
+        j.poll()
+    return len(_unfinished)
+
+
+def wait_all():
+    while poll() > 0:
+        time.sleep(0.02)
+
+
 _m = types.ModuleType("montage", "Montage's tools, as the MCP server's (montage.tools() lists them).")
 _m.ToolError, _m.call, _m.tools, _m.json, _m.panel, _m.set_panel = ToolError, call, tools, to_json, panel, set_panel
+_m.Job, _m.call_async, _m.jobs, _m.poll, _m.wait_all, _m.sleep, _m.now = Job, call_async, jobs, poll, wait_all, time.sleep, time.monotonic
 _m.args, _m.project, _m.null = list(_init["args"]), _init["project"], None
 
 
@@ -284,11 +381,18 @@ _main.__file__, _main.montage = _file, _m
 sys.modules["__main__"] = _main
 try:
     exec(compile(_code, _file, "exec"), _main.__dict__)
+    wait_all()  # (its background calls finish, their callbacks run, before it ends)
 except SystemExit as e:
     if e.code is None or e.code == 0:
+        wait_all()
         _end(True)
     _end(False, "%s: exited with %s" % (_name, e.code))
 except BaseException as e:
+    for _j in jobs():  # (its background calls stop with it)
+        try:
+            _j.cancel()
+        except BaseException:
+            pass
     # Where in the script it went wrong: its last line there (or the syntax error's), and its own lines of the
     # traceback (Montage's are no help to the script's author).
     frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == _file]

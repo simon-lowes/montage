@@ -60,9 +60,18 @@ public:
         update();
     }
     const QImage& image() const { return image_; }
-    void setName(const QString& name) {
+    void setName(const QString& name, int banks) {
         name_ = name;
-        setToolTip(tr("Angle %1: %2 (key %1; Shift-click cuts at the playhead)").arg(index_ + 1).arg(name));
+        const int key = index_ % MulticamPanel::kBankSize + 1, bank = index_ / MulticamPanel::kBankSize + 1;
+        setToolTip(banks > 1 ? tr("Angle %1: %2 (key %3 in bank %4, picked with Alt+%4; Shift-click cuts at the playhead)")
+                                   .arg(index_ + 1).arg(name).arg(key).arg(bank)
+                             : tr("Angle %1: %2 (key %1; Shift-click cuts at the playhead)").arg(index_ + 1).arg(name));
+        update();
+    }
+    // Outside the bank the keys reach: drawn dimmer.
+    void setInBank(bool in) {
+        if (in == inBank_) return;
+        inBank_ = in;
         update();
     }
     void setLive(bool live, bool playing) {
@@ -90,8 +99,9 @@ protected:
         lr.setHeight(p.fontMetrics().height() + 2);
         p.fillRect(lr.adjusted(0, 0, 0, 0).intersected(QRect(lr.topLeft(), QSize(p.fontMetrics().horizontalAdvance(label) + 8, lr.height()))),
                    QColor(0, 0, 0, 150));
-        p.setPen(Qt::white);
+        p.setPen(inBank_ ? Qt::white : QColor(150, 150, 150));
         p.drawText(lr.adjusted(4, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter, label);
+        if (!inBank_) p.fillRect(rect(), QColor(0, 0, 0, 90));
         if (live_) {
             // Red while cutting live, yellow when stopped (as editors expect).
             p.setPen(QPen(playing_ ? QColor(230, 40, 40) : QColor(240, 200, 40), 4));
@@ -100,7 +110,7 @@ protected:
         }
     }
     void mousePressEvent(QMouseEvent* e) override {
-        if (e->button() == Qt::LeftButton) panel_->switchTo(index_, e->modifiers() & Qt::ShiftModifier);
+        if (e->button() == Qt::LeftButton) panel_->switchTo(index_, e->modifiers() & Qt::ShiftModifier);  // (the keys follow it)
     }
 
 private:
@@ -109,7 +119,7 @@ private:
     QImage image_;
     CalibratedPicture calibrated_;
     QString name_;
-    bool live_ = false, playing_ = false;
+    bool live_ = false, playing_ = false, inBank_ = true;
 };
 
 MulticamPanel::MulticamPanel(EditorState* state, PlaybackController* program, QWidget* parent)
@@ -197,17 +207,47 @@ void MulticamPanel::rebuildGrid(const std::vector<std::string>& names) {
     for (AngleView* v : views_) delete v;
     views_.clear();
     const int n = int(names.size());
-    const int cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4;
+    const int cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : n <= 16 ? 4 : 5;
+    const int banks = (n + kBankSize - 1) / kBankSize;
     for (int i = 0; i < n; ++i) {
         auto* v = new AngleView(i, this);
-        v->setName(QString::fromStdString(names[size_t(i)]));
+        v->setName(QString::fromStdString(names[size_t(i)]), banks);
         grid_->addWidget(v, i / cols, i % cols);
         views_.push_back(v);
     }
     names_ = names;
 }
 
+int MulticamPanel::bankCount() const { return (angleCount() + kBankSize - 1) / kBankSize; }
+
+int MulticamPanel::bank() const {
+    if (bank_ >= 0 && bank_ < bankCount()) return bank_;
+    const Sequence* s = state_->sequence();
+    const Clip* c = clip_ && s ? edit::clipById(*s, clip_) : nullptr;
+    return c && c->angle > 0 ? std::min(c->angle / kBankSize, std::max(0, bankCount() - 1)) : 0;
+}
+
+bool MulticamPanel::setBank(int bank) {
+    if (!currentClip() || bank < 0 || bank >= bankCount()) return false;
+    bank_ = bank;
+    refresh();
+    const int first = bank * kBankSize + 1, last = std::min(angleCount(), first + kBankSize - 1);
+    state_->message(tr("Keys 1–%1: angles %2–%3").arg(last - first + 1).arg(first).arg(last), 3000);
+    return true;
+}
+
+bool MulticamPanel::switchKey(int key, bool cut) {
+    if (key < 0 || key >= kBankSize || !currentClip()) return false;
+    const int picked = bank_;
+    const Id before = currentClip();
+    const bool ok = switchTo(bank() * kBankSize + key, cut);
+    if (currentClip() == before) bank_ = picked;  // the keys stay on the bank picked, unless a cut made a new shot
+    refresh();
+    return ok;
+}
+
 void MulticamPanel::refresh() {
+    if (currentClip() != clip_) bank_ = -1;  // another clip: the keys follow its angle
     clip_ = currentClip();
     const Sequence* s = state_->sequence();
     const Clip* c = clip_ && s ? edit::clipById(*s, clip_) : nullptr;
@@ -215,14 +255,23 @@ void MulticamPanel::refresh() {
     const std::vector<std::string> names = mc ? angleNames(*mc) : std::vector<std::string>{};
     if (names != names_) rebuildGrid(names);
     const bool playing = program_->isPlaying();
-    for (size_t i = 0; i < views_.size(); ++i) views_[i]->setLive(c && c->angle == int(i), playing);
+    const int b = bank(), banks = bankCount();
+    for (size_t i = 0; i < views_.size(); ++i) {
+        views_[i]->setLive(c && c->angle == int(i), playing);
+        views_[i]->setInBank(banks <= 1 || int(i) / kBankSize == b);
+    }
     autoButton_->setEnabled(mc != nullptr);
+    const int keys = std::min<int>(kBankSize, int(names.size()) - b * kBankSize);
     if (!mc)
         status_->setText(tr("Put a multicam clip under the playhead (Media › Create Multicam Clip) to switch angles here."));
+    else if (banks > 1)
+        status_->setText((playing ? tr("Live: click an angle or press 1–%1 to cut to angles %2–%3.")
+                                  : tr("Click an angle or press 1–%1 to switch this shot to angles %2–%3; Shift cuts at the playhead."))
+                             .arg(keys).arg(b * kBankSize + 1).arg(b * kBankSize + keys) +
+                         QLatin1Char(' ') + tr("Alt+1–%1 picks the nine the keys reach.").arg(banks));
     else
-        status_->setText(playing ? tr("Live: click an angle or press 1–%1 to cut to it.").arg(std::min<size_t>(9, names.size()))
-                                 : tr("Click an angle or press 1–%1 to switch this shot; Shift cuts at the playhead.")
-                                       .arg(std::min<size_t>(9, names.size())));
+        status_->setText(playing ? tr("Live: click an angle or press 1–%1 to cut to it.").arg(keys)
+                                 : tr("Click an angle or press 1–%1 to switch this shot; Shift cuts at the playhead.").arg(keys));
     if (mc && isVisible() && !throttle_->isActive()) throttle_->start();
 }
 

@@ -10,7 +10,8 @@
 //   AUDIO LEVEL, TRANS DUR (held)   the wheel sets the level of the sound at the playhead (or the selected sound
 //                     clips), or the length of the transition at the nearest edit
 //   CUT, DIS, SMTH CUT   the nearest edit made a cut, a dissolve or a smooth cut (their lights show which it is)
-//   CAM 1-9           the multicam clip's angle (cut at the playhead while playing, or with LIVE O/WR lit)
+//   CAM 1-9           the multicam clip's angle in the bank of nine they reach (cut at the playhead while playing, or with
+//                     LIVE O/WR lit); LIVE O/WR held with CAM 1-3 picks the bank (angles 1-9, 10-18, 19-25)
 //   VIDEO ONLY, AUDIO ONLY, SNAP   switches, lit while on
 //   the rest          the menu commands of the same name (source edits, In and Out, Ripple Delete, Split...); pressed
 //                     twice, keys do what their brackets say (IN [CLR], ESC [UNDO], AUDIO LEVEL [MARK], TRANS [TITLE])
@@ -51,8 +52,10 @@ public:
         std::function<bool(int side)> selectEdit;         // trim mode on the nearest edit: 0 both, 1 outgoing, 2 incoming
         std::function<bool(FrameTime)> trimBy;            // the selected edit
         std::function<bool()> trimming;
-        std::function<bool(int angle, bool cut)> switchAngle;
+        std::function<bool(int key, bool cut)> switchAngle;  // the angle of key 0-8 (CAM 1-9) in the bank
         std::function<int()> angle;                       // the current multicam clip's (-1: none)
+        std::function<int()> bank;                        // the bank of nine angles the CAM keys reach
+        std::function<bool(int bank)> setBank;
     };
     SpeedEditorControl(EditorState* state, QWidget* window, Hooks hooks, QObject* parent = nullptr);
     ~SpeedEditorControl() override;
@@ -150,6 +153,8 @@ private:
     bool wheelModeKnown_ = false;
     enum class Target { None, Slip, Slide, Level, TransitionDuration } target_ = Target::None;
     speed::Key holding_ = speed::Key::None;
+    speed::Key liveHeld_ = speed::Key::None;  // LIVE O/WR down: a CAM key picks the bank (and it does not latch)
+    bool bankPicked_ = false;
     Id targetClip_ = 0;
     Id rollClip_ = 0;  // the clip at the playhead when ROLL was pressed (ROLL twice slides it)
     bool second_ = false;  // a key's second press running

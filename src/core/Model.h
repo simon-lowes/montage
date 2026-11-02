@@ -668,6 +668,7 @@ struct Track {
     double volumeDb = 0;  // audio track fader
     double pan = 0;       // audio track pan -1..1
     int height = 0;       // UI hint, 0 = default
+    bool pinned = false;  // UI: drawn in the band under the timeline's ruler that stays put while the rest scrolls
     std::vector<Effect> effects;  // audio track inserts, before the fader (keyframes in timeline frames)
     Id output = 0;                // audio: the bus the track feeds, 0 = master
     SurroundPan surround;         // audio, in 5.1 and 7.1 sequences
