@@ -68,6 +68,7 @@ public:
     bool running() const;
     int port() const;
     QString apiUrl() const;  // "http://address:port"
+    int clientCount() const { return clientCount_ ? clientCount_() : 0; }  // the APIs' open connections
 
     // What the senders send, and where: the reference output's format and the options it sends with; `active`
     // whether it is sending. Changing them changes the resources (and tells the registry).
@@ -150,6 +151,7 @@ private:
 
     NodeOptions o_;
     QTcpServer* server_ = nullptr;
+    std::function<int()> clientCount_;
     QNetworkAccessManager* net_ = nullptr;
     QTimer* heartbeat_ = nullptr;
     QTimer* rediscover_ = nullptr;

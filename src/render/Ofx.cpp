@@ -15,11 +15,13 @@
 #include <QStandardPaths>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -319,6 +321,7 @@ struct Loaded {
     std::unique_ptr<EffectObj> descriptor, filter;  // as described, and described in the context Montage runs it in
     std::string context = kOfxImageEffectContextFilter;
     bool unsafe = false;  // renders one at a time
+    std::atomic<const std::atomic<bool>*> holderWaiting{nullptr};  // (that render's thread's gl::waitingFlag)
     OfxPluginEntryPoint* overlay = nullptr;  // its overlay interact's main entry
     int overlayVersion = 0;                  // 1: draws with OpenGL, 2: with the Draw Suite
     std::mutex renderMutex;
@@ -741,7 +744,8 @@ std::string imageIdentifier(const Image& from, bool isOutput) {
 // An image for the plugin, bottom row first as OFX counts, from a premultiplied float image (an output: `w` x `h`,
 // to be written).
 ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput, int outW = 0, int outH = 0) {
-    auto* img = new ImageObj;
+    std::unique_ptr<ImageObj> owned(new ImageObj);  // (freed if a picture too large throws)
+    ImageObj* img = owned.get();
     const int w = isOutput ? outW : from.width, h = isOutput ? outH : from.height;
     const size_t n = size_t(w) * size_t(h) * 4;
     void* data = nullptr;
@@ -777,14 +781,14 @@ ImageObj* makeImage(const Instance& inst, const Image& from, bool isOutput, int 
     p.setString(kOfxImagePropField, {kOfxImageFieldNone});
     p.setString(kOfxImagePropUniqueIdentifier, {imageIdentifier(from, isOutput)});
     p.setPointer("montage.image", img);  // found again on release
-    return img;
+    return owned.release();
 }
 
 // The picture input clip `name` holds at `time` (null when it has none: an input connected to nothing), sized as the
 // render's pictures; `scratch` holds it when it is made here. (Defined after colour management.)
 const Image* inputPicture(Instance& inst, const std::string& name, double time, Image& scratch);
 
-OfxStatus clipGetImage(OfxImageClipHandle h, OfxTime time, const OfxRectD*, OfxPropertySetHandle* imageHandle) {
+OfxStatus clipGetImageUnguarded(OfxImageClipHandle h, OfxTime time, OfxPropertySetHandle* imageHandle) {
     if (!h || !imageHandle) return kOfxStatErrBadHandle;
     ClipObj* c = clipObj(h);
     Instance* inst = c->effect ? c->effect->instance : nullptr;
@@ -806,6 +810,16 @@ OfxStatus clipGetImage(OfxImageClipHandle h, OfxTime time, const OfxRectD*, OfxP
     }
     *imageHandle = handle(&img->props);
     return kOfxStatOK;
+}
+// (nothing thrown crosses back into the plug-in: a picture too large for memory is an error it is told of)
+OfxStatus clipGetImage(OfxImageClipHandle h, OfxTime time, const OfxRectD*, OfxPropertySetHandle* imageHandle) {
+    try {
+        return clipGetImageUnguarded(h, time, imageHandle);
+    } catch (const std::bad_alloc&) {
+        return kOfxStatErrMemory;
+    } catch (...) {
+        return kOfxStatFailed;
+    }
 }
 
 OfxStatus clipReleaseImage(OfxPropertySetHandle h) {
@@ -847,10 +861,15 @@ struct MemoryBlock {
 };
 OfxStatus imageMemoryAlloc(OfxImageEffectHandle, size_t n, OfxImageMemoryHandle* out) {
     if (!out) return kOfxStatErrBadHandle;
-    auto* m = new MemoryBlock;
-    m->bytes.resize(n);
-    *out = reinterpret_cast<OfxImageMemoryHandle>(m);
-    return kOfxStatOK;
+    try {
+        auto m = std::make_unique<MemoryBlock>();
+        m->bytes.resize(n);
+        *out = reinterpret_cast<OfxImageMemoryHandle>(m.release());
+        return kOfxStatOK;
+    } catch (...) {
+        *out = nullptr;
+        return kOfxStatErrMemory;
+    }
 }
 OfxStatus imageMemoryFree(OfxImageMemoryHandle h) {
     delete reinterpret_cast<MemoryBlock*>(h);
@@ -885,7 +904,7 @@ struct TextureObj {
     Instance* inst = nullptr;
 };
 
-OfxStatus clipLoadTexture(OfxImageClipHandle h, OfxTime time, const char*, const OfxRectD*, OfxPropertySetHandle* out) {
+OfxStatus clipLoadTextureUnguarded(OfxImageClipHandle h, OfxTime time, OfxPropertySetHandle* out) {
     if (!h || !out) return kOfxStatErrBadHandle;
     ClipObj* c = clipObj(h);
     Instance* inst = c->effect ? c->effect->instance : nullptr;
@@ -944,6 +963,17 @@ OfxStatus clipFreeTexture(OfxPropertySetHandle h) {
 }
 
 OfxStatus flushResources() { return kOfxStatReplyDefault; }
+
+// (as clipGetImage: nothing thrown crosses back into the plug-in)
+OfxStatus clipLoadTexture(OfxImageClipHandle h, OfxTime time, const char*, const OfxRectD*, OfxPropertySetHandle* out) {
+    try {
+        return clipLoadTextureUnguarded(h, time, out);
+    } catch (const std::bad_alloc&) {
+        return kOfxStatErrMemory;
+    } catch (...) {
+        return kOfxStatFailed;
+    }
+}
 
 OfxImageEffectOpenGLRenderSuiteV1 gOpenGLSuite = {clipLoadTexture, clipFreeTexture, flushResources};
 
@@ -1990,7 +2020,13 @@ int Registry::scan(std::vector<std::string>* log) {
             const qint64 pid = name.mid(13, name.size() - 13 - 6).toLongLong(&numeric);
             if (!numeric || pid == QCoreApplication::applicationPid() || processAlive(pid)) continue;
             QFile g(dir.filePath(name));
-            if (g.open(QIODevice::ReadOnly)) crashedBinaries << QString::fromUtf8(g.readAll()).trimmed();
+            if (g.open(QIODevice::ReadOnly)) {
+                QByteArray b = g.readAll();
+                b.truncate(b.indexOf('\0') < 0 ? b.size() : b.indexOf('\0'));
+                // ('1' then the binary: a control was running; '0': none was. An older file is the binary alone.)
+                if (b.startsWith("1\n")) crashedBinaries << QString::fromUtf8(b.mid(2)).trimmed();
+                else if (!b.startsWith("0\n") && !b.trimmed().isEmpty()) crashedBinaries << QString::fromUtf8(b).trimmed();
+            }
             g.close();
             QFile::remove(dir.filePath(name));
         }
@@ -2274,15 +2310,31 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
             prefetched[in.name] = std::move(pic);
         }
     std::unique_lock<std::mutex> serial(l->renderMutex, std::defer_lock);
-    if (l->unsafe) serial.lock();
-    if (l->unsafe) held.push_back(l);
+    if (l->unsafe) {
+        if (!gl::servingOpenGl()) {
+            serial.lock();
+        } else {
+            // Here for a render on the OpenGL thread, which waits for this one: if whoever renders the plug-in now is
+            // itself waiting for the OpenGL thread, neither would ever go on, so this render is refused instead.
+            while (!serial.try_lock()) {
+                const std::atomic<bool>* holder = l->holderWaiting.load();
+                if (holder && holder->load())
+                    return fail(d.label + " is busy in another render that waits for OpenGL (it renders one frame at a time)");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        l->holderWaiting = gl::waitingFlag();
+        held.push_back(l);
+    }
     struct Release {
         std::vector<const Loaded*>& held;
-        bool on;
+        Loaded* l;
         ~Release() {
-            if (on) held.pop_back();
+            if (!l) return;
+            held.pop_back();
+            l->holderWaiting = nullptr;
         }
-    } release{held, l->unsafe};
+    } release{held, l->unsafe ? l : nullptr};
     Image out(job.width, job.height);
     inst->effect = job.effect;
     inst->time = job.t;
@@ -2358,24 +2410,36 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         auto entry = l->plugin->mainEntry;
         const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
         const ExpressionContext where = currentExpressionContext();
-        gl::run([&] {
+        // (whatever is thrown, the target and textures are let go and the render counts as failed, not as a picture)
+        const bool ran = gl::run([&] {
+            struct Textures {
+                Instance* inst;
+                ~Textures() {
+                    for (unsigned t : inst->textures) gl::destroyTexture(t);
+                    inst->textures.clear();
+                }
+            } textures{inst};
             ExpressionScope scope(where.project, where.sequence, where.clip, where.cancel);
             if (!inst->glAttached) {
                 if (entry(kOfxActionOpenGLContextAttached, h, nullptr, nullptr) == kOfxStatFailed) inst->glRefused = true;
                 else inst->glAttached = true;
             }
             if (inst->glAttached && gl::makeTarget(inst->target, job.width, job.height)) {
+                struct Target {
+                    Instance* inst;
+                    ~Target() {
+                        gl::release(inst->target);
+                        inst->gl = false;
+                    }
+                } target{inst};
                 inst->gl = true;
                 gl::bind(inst->target);
                 gl::clear();
                 st = sendRender(*inst, job.t, true);
                 if (ok(st)) gl::read(inst->target, out);
-                gl::release(inst->target);
-                inst->gl = false;
             }
-            for (unsigned t : inst->textures) gl::destroyTexture(t);
-            inst->textures.clear();
         });
+        if (!ran) st = kOfxStatFailed;
         rendered = ok(st);
         if (rendered) ++gGpuRenders;
         else if (d.openGL == "needed") {
@@ -2649,21 +2713,54 @@ void paintOverlay(QPainter& p, const Overlay& o, const View& v) {
 namespace {
 
 // While a plug-in's on-screen control runs, a file names its binary; Montage stopping then (a crash inside it) leaves
-// the file, and the next scan blocks the plug-in (Registry::scan).
+// the file saying so, and the next scan blocks the plug-in (Registry::scan). The file is made once and kept mapped:
+// marking it costs a few bytes in memory (which the system writes out even after a crash), not a file written and
+// removed on every mouse move. Its first byte is '1' while a control runs, '0' between; then the binary's path.
+// Plug-in renders are not guarded: they run all through playback, so a crash anywhere then would block them.
 thread_local int tGuardDepth = 0;
+struct GuardFile {
+    std::mutex mutex;
+    QFile file;
+    uchar* map = nullptr;
+    static constexpr qint64 kSize = 4096;
+    static GuardFile& instance() {
+        static GuardFile* g = new GuardFile;  // (never destroyed: its mapping lasts the process)
+        return *g;
+    }
+    void mark(const std::string& binary) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (map && file.size() < kSize) {  // (cut short by someone else: made again, never written past its end)
+            file.unmap(map);
+            file.close();
+            map = nullptr;
+        }
+        if (!map) {
+            file.setFileName(QString::fromStdString(Registry::instance().guardPath()));
+            if (!file.open(QIODevice::ReadWrite | QIODevice::Truncate) || !file.resize(kSize)) return;
+            map = file.map(0, kSize);
+            if (!map) return;
+        }
+        const size_t n = std::min(binary.size(), size_t(kSize) - 3);
+        std::memcpy(map + 2, binary.data(), n);
+        map[2 + n] = '\0';
+        map[1] = '\n';
+        map[0] = '1';
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (map && file.size() >= kSize) map[0] = '0';
+    }
+};
 struct CrashGuard {
-    std::string path;
+    bool on = false;
     explicit CrashGuard(const std::string& binary) {
         if (tGuardDepth++ > 0) return;
-        path = Registry::instance().guardPath();
-        QFile f(QString::fromStdString(path));
-        if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            f.write(QByteArray::fromStdString(binary));
-            f.flush();
-        }
+        GuardFile::instance().mark(binary);
+        on = true;
     }
     ~CrashGuard() {
-        if (--tGuardDepth == 0 && !path.empty()) QFile::remove(QString::fromStdString(path));
+        --tGuardDepth;
+        if (on) GuardFile::instance().clear();
     }
 };
 
@@ -2759,7 +2856,6 @@ bool Interact::draw(const Effect& e, double t, const View& v, Overlay& out) {
     out = Overlay{};
     if (failed_ || v.width <= 0 || v.height <= 0) return false;
     Impl& d = *impl_;
-    CrashGuard guard(d.desc.binary);
     d.prepare(e, t, v);
     DrawCtx ctx;
     ctx.out = &out;
@@ -2767,18 +2863,25 @@ bool Interact::draw(const Effect& e, double t, const View& v, Overlay& out) {
     a.setPointer(kOfxInteractPropDrawContext, &ctx);
     OfxStatus st = kOfxStatReplyDefault;
     if (d.plugin->overlayVersion == 1 && gl::available()) {
-        // Drawn with OpenGL, in canonical coordinates, into a picture the size of the view.
-        gl::run([&] {
-            gl::Target target;
-            if (!gl::makeTarget(target, v.width, v.height)) return;
-            gl::bind(target);
-            gl::clear();
-            gl::overlayProjection(v.width, v.height, v.m);
-            st = d.plugin->overlay(kOfxInteractActionDraw, &d.obj, handle(&a), nullptr);
-            out.gl = gl::readOverlay(target);
-            gl::release(target);
-        });
+        // Drawn with OpenGL, in canonical coordinates, into a picture the size of the view: ahead of renders waiting
+        // for the OpenGL thread, and guarded only while the control itself draws (not while it waits).
+        gl::run(
+            [&] {
+                gl::Target target;
+                if (!gl::makeTarget(target, v.width, v.height)) return;
+                gl::bind(target);
+                gl::clear();
+                gl::overlayProjection(v.width, v.height, v.m);
+                {
+                    CrashGuard guard(d.desc.binary);
+                    st = d.plugin->overlay(kOfxInteractActionDraw, &d.obj, handle(&a), nullptr);
+                }
+                out.gl = gl::readOverlay(target);
+                gl::release(target);
+            },
+            true);
     } else if (d.plugin->overlayVersion == 2) {
+        CrashGuard guard(d.desc.binary);
         st = d.plugin->overlay(kOfxInteractActionDraw, &d.obj, handle(&a), nullptr);
     }  // (an OpenGL control without OpenGL here draws nothing)
     d.done();

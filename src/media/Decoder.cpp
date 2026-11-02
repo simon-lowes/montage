@@ -19,6 +19,7 @@
 #include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
+#include <QColorSpace>
 #include <QFile>
 #include <QFileInfo>
 #include <QString>
@@ -349,6 +350,43 @@ int openMediaInput(AVFormatContext** fmt, const std::string& decorated) {
     }
     return avformat_open_input(fmt, path.c_str(), nullptr, nullptr);
 }
+
+namespace {
+
+// The colour space a still image's embedded ICC profile names, for images whose tags name none ("" when it has no
+// profile, or one of no space Montage reads differently: an sRGB profile reads as the Rec.709 default).
+std::string iccColorSpace(const std::string& path) {
+    AVFormatContext* fmt = nullptr;
+    if (openMediaInput(&fmt, path) < 0) return {};
+    std::string out;
+    AVCodecContext* dec = nullptr;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    const AVCodec* codec = nullptr;
+    const int v = avformat_find_stream_info(fmt, nullptr) >= 0 ? av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0) : -1;
+    if (v >= 0 && codec && pkt && frame && (dec = avcodec_alloc_context3(codec)) &&
+        avcodec_parameters_to_context(dec, fmt->streams[v]->codecpar) >= 0 && avcodec_open2(dec, codec, nullptr) >= 0) {
+        bool got = false;
+        for (int packets = 0; !got && packets < 16 && av_read_frame(fmt, pkt) >= 0; ++packets) {
+            if (pkt->stream_index == v && avcodec_send_packet(dec, pkt) >= 0) got = avcodec_receive_frame(dec, frame) == 0;
+            av_packet_unref(pkt);
+        }
+        if (!got && avcodec_send_packet(dec, nullptr) >= 0) got = avcodec_receive_frame(dec, frame) == 0;
+        if (got)
+            if (const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_ICC_PROFILE)) {
+                const QColorSpace cs = QColorSpace::fromIccProfile(QByteArray(reinterpret_cast<const char*>(sd->data), int(sd->size)));
+                if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::AdobeRgb) out = "adobergb";
+                else if (cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) out = "p3d65";
+            }
+    }
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&dec);
+    avformat_close_input(&fmt);
+    return out;
+}
+
+}  // namespace
 
 bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Caption>& out, const std::function<void(double)>& progress,
                           const std::atomic<bool>* cancel, std::string* error, CaptionStandard standard) {
@@ -708,6 +746,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         const char* trc = av_color_transfer_name(st->codecpar->color_trc);
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
+        // A still whose primaries are not tagged: an embedded ICC profile may say (Adobe RGB has no tag of its own).
+        if (st->codecpar->color_primaries == AVCOL_PRI_UNSPECIFIED &&
+            (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_MJPEG || st->codecpar->codec_id == AV_CODEC_ID_TIFF ||
+             st->codecpar->codec_id == AV_CODEC_ID_WEBP) &&
+            (fmt->nb_streams == 1 && (st->nb_frames <= 1 || std::strcmp(fmt->iformat->name, "image2") == 0 || std::strstr(fmt->iformat->name, "_pipe"))))
+            if (const std::string icc = iccColorSpace(path); !icc.empty()) m.colorSpace = icc;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
         // OpenEXR naming its colour space (the colorInteropID attribute).
         if (st->codecpar->codec_id == AV_CODEC_ID_EXR && exrAvailable()) {

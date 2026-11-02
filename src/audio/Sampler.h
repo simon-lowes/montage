@@ -104,6 +104,8 @@ private:
     int64_t chokeLen_;
     mutable std::mutex kitMutex_, eventMutex_;
     KitPtr pendingKit_, kit_;
+    // Kits the audio thread let go of, freed outside it once no voice plays them (nothing is freed in the callback).
+    std::vector<KitPtr> retired_;
     std::vector<Event> queued_, due_;
     uint64_t order_ = 0, serial_ = 0;
     std::vector<Voice> voices_;
@@ -132,7 +134,7 @@ edit::Result removeSlot(Sequence& s, TrackRef track, int key);
 edit::Result addSlices(Sequence& s, TrackRef track, const std::string& path, const std::vector<std::pair<double, double>>& slices,
                        int firstKey, const std::string& name = {});
 // A recorded pass: its notes rendered through `kit` to `file` (from the frame of its first note, or `from` when that
-// is earlier), the file added to the project and put on a new take lane, the lane given to the comp over the pass,
+// is earlier, by at most two seconds), the file added to the project and put on a new take lane, the lane given to the comp over the pass,
 // and the notes kept. created: the lane, then the comp clip.
 edit::Result addPass(Project& p, Sequence& s, TrackRef track, const KitPtr& kit, std::vector<SamplerNote> notes, uint32_t seed,
                      const std::string& file, FrameTime from = -1, const std::string& name = {});

@@ -91,7 +91,10 @@ void loop(Worker* w) {
             job = std::move(w->jobs.front());
             w->jobs.pop_front();
         }
-        job();
+        try {
+            job();
+        } catch (...) {  // (the OpenGL thread outlives any one job)
+        }
     }
 }
 
@@ -176,27 +179,48 @@ bool onThread() {
     return w.ok && std::this_thread::get_id() == w.id;
 }
 
-bool run(const std::function<void()>& fn) {
+namespace {
+thread_local std::atomic<bool> tWaiting{false};
+thread_local bool tServing = false;
+}
+
+const std::atomic<bool>* waitingFlag() { return &tWaiting; }
+bool servingOpenGl() { return tServing; }
+
+bool run(const std::function<void()>& fn, bool first) {
     Worker& w = worker();
     if (!w.ok) return false;
     if (onThread()) {
         fn();
         return true;
     }
-    // The caller waits, doing what the job hands back to it (callBack) until it ends.
+    // The caller waits, doing what the job hands back to it (callBack) until it ends. Nothing thrown leaves either
+    // side early: the job ends (and says so) whatever it threw, and an exception in what it handed back stays here,
+    // so neither thread is left holding the other's stack.
     Caller caller;
+    bool threw = false;
     {
         std::lock_guard<std::mutex> lock(w.mutex);
-        w.jobs.push_back([&] {
+        auto job = [&] {
             tCaller = &caller;
-            fn();
+            try {
+                fn();
+            } catch (...) {
+                threw = true;
+            }
             resetState();
             tCaller = nullptr;
             std::lock_guard<std::mutex> l(caller.mutex);
             caller.done = true;
             caller.wake.notify_all();
-        });
+        };
+        if (first) w.jobs.push_front(job);
+        else w.jobs.push_back(job);
     }
+    struct Waiting {
+        Waiting() { tWaiting = true; }
+        ~Waiting() { tWaiting = false; }
+    } waiting;
     w.wake.notify_one();
     std::unique_lock<std::mutex> lock(caller.mutex);
     for (;;) {
@@ -204,12 +228,20 @@ bool run(const std::function<void()>& fn) {
         if (caller.asks.empty()) break;
         std::function<void()>* ask = caller.asks.front();
         lock.unlock();
-        (*ask)();
+        tWaiting = false;  // (doing the job's work here, not waiting)
+        const bool serving = tServing;
+        tServing = true;
+        try {
+            (*ask)();
+        } catch (...) {
+        }
+        tServing = serving;
+        tWaiting = true;
         lock.lock();
         caller.asks.pop_front();
         caller.wake.notify_all();
     }
-    return true;
+    return !threw;
 }
 
 void callBack(const std::function<void()>& fn) {

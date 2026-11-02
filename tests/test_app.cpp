@@ -57,6 +57,7 @@
 #include <QTimer>
 #include <QTextEdit>
 #include <QToolButton>
+#include <QRandomGenerator>
 #include <QUdpSocket>
 #include <QTreeView>
 #include <QTreeWidget>
@@ -19349,12 +19350,13 @@ print("added " + ui["name"])
         QVERIFY(monitor);
         auto* exposure = monitor->findChild<QComboBox*>("exposureView");
         QVERIFY(exposure);
-        int port = 0;  // (one with the next two free as well: the notes, and a stream that is not there)
+        // A port with the next two free as well (the notes, and a stream that is not there), below the range the system
+        // hands out by itself: Windows hands those out in turn, so the client's own socket could take the next one.
+        int port = 0;
         for (int tries = 0; tries < 50 && !port; ++tries) {
+            const quint16 p = quint16(20000 + QRandomGenerator::global()->bounded(10000));
             QUdpSocket a, b, c;
-            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1) &&
-                c.bind(QHostAddress::LocalHost, a.localPort() + 2))
-                port = a.localPort();
+            if (a.bind(QHostAddress::LocalHost, p) && b.bind(QHostAddress::LocalHost, p + 1) && c.bind(QHostAddress::LocalHost, p + 2)) port = p;
         }
         QVERIFY(port > 0);
         const QString address = QStringLiteral("srt://127.0.0.1:%1").arg(port);

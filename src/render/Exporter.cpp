@@ -20,6 +20,7 @@
 #include "audio/TimeStretch.h"
 #include "media/Rife.h"
 
+#include <QColorSpace>
 #include <QDir>
 #include <QFileInfo>
 #include <QImage>
@@ -146,6 +147,8 @@ ColorTags colorTags(const ColorSpace& c) {
         t.trc = AVCOL_TRC_BT2020_10;
     } else if (c.primaries == Primaries::P3D65) {
         t.primaries = AVCOL_PRI_SMPTE432;
+    } else if (c.primaries == Primaries::AdobeRgb) {
+        t.primaries = AVCOL_PRI_UNSPECIFIED;  // (no code point names Adobe RGB: its ICC profile says it, where a format carries one)
     }
     if (c.transfer == Transfer::Pq) t.trc = AVCOL_TRC_SMPTE2084;
     else if (c.transfer == Transfer::Hlg) t.trc = AVCOL_TRC_ARIB_STD_B67;
@@ -1214,6 +1217,20 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 std::memcpy(sd->data, &cl, sizeof cl);
             if (AVMasteringDisplayMetadata* f = av_mastering_display_metadata_create_side_data(o.vframe)) *f = md;
             if (AVContentLightMetadata* f = av_content_light_metadata_create_side_data(o.vframe)) *f = cl;
+        }
+        if (outSpace.primaries == Primaries::AdobeRgb) {
+            // Adobe RGB as an ICC profile, on every frame (PNG, JPEG and TIFF write it) and on the stream (for muxers
+            // that do); a format with neither plays it as its untagged default.
+            const QByteArray icc = QColorSpace(QColorSpace::AdobeRgb).iccProfile();
+            if (!icc.isEmpty()) {
+                if (AVFrameSideData* sd = av_frame_new_side_data(o.vframe, AV_FRAME_DATA_ICC_PROFILE, size_t(icc.size())))
+                    std::memcpy(sd->data, icc.constData(), size_t(icc.size()));
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
+                if (AVPacketSideData* sd = av_packet_side_data_new(&o.vst->codecpar->coded_side_data, &o.vst->codecpar->nb_coded_side_data,
+                                                                   AV_PKT_DATA_ICC_PROFILE, size_t(icc.size()), 0))
+                    std::memcpy(sd->data, icc.constData(), size_t(icc.size()));
+#endif
+            }
         }
     }
 

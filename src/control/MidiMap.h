@@ -72,6 +72,7 @@ private:
     };
     Channel ch_[16];
     std::set<std::tuple<int, bool, int>> fine_;  // (channel, rpn, parameter) seen sending data entry's fine half
+    std::map<std::tuple<int, bool, int>, int> coarse_;  // each parameter's last coarse half (for fine-only updates)
 };
 
 // How a control's values are read.

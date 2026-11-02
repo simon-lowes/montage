@@ -623,6 +623,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             if (ao.language.empty()) ao.language = "und";
             const std::string given = k == 0 ? a.audioName : size_t(k - 1) < s.extraAudio.size() ? s.extraAudio[size_t(k - 1)].name : "";
             ao.label = !given.empty() ? given : title ? title->value : "Audio " + std::to_string(k + 1);
+            for (int n = 2; std::any_of(audio.begin(), audio.end(), [&](const AudioOut& o) { return o.label == ao.label; }); ++n)
+                ao.label = (!given.empty() ? given : title ? std::string(title->value) : "Audio " + std::to_string(k + 1)) + " " + std::to_string(n);
             ao.described = (st->disposition & AV_DISPOSITION_DESCRIPTIONS) != 0;
             ao.channels = st->codecpar->ch_layout.nb_channels;
             ao.sampleRate = st->codecpar->sample_rate;
@@ -909,6 +911,9 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             if (to.captions.empty()) continue;
             to.language = t.language.empty() ? "und" : t.language;
             to.label = t.name.empty() ? to.language : t.name;
+            // (NAME is unique within an HLS group: a second unnamed track of a language is numbered)
+            for (int n = 2; std::any_of(texts.begin(), texts.end(), [&](const TextOut& o) { return o.label == to.label; }); ++n)
+                to.label = (t.name.empty() ? to.language : t.name) + " " + std::to_string(n);
             to.style = t.style;
             to.name = "s" + std::to_string(texts.size() + 1) + "_" + pathName(to.language);
             texts.push_back(std::move(to));

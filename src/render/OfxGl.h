@@ -5,6 +5,7 @@
 #pragma once
 
 #include <QImage>
+#include <atomic>
 #include <functional>
 #include <string>
 
@@ -16,9 +17,14 @@ namespace montage::ofx::gl {
 bool initialize(std::string* why = nullptr);
 bool available(std::string* why = nullptr);
 // Runs `fn` on the OpenGL thread with the context current, and waits (inline when already there). False without
-// OpenGL.
-bool run(const std::function<void()>& fn);
+// OpenGL, or when `fn` threw. `first`: ahead of the jobs already waiting (an on-screen control the view waits for).
+bool run(const std::function<void()>& fn, bool first = false);
 bool onThread();
+// This thread's flag, true while it waits in run() for the OpenGL thread (read from other threads to tell whether
+// waiting for this thread could deadlock).
+const std::atomic<bool>* waitingFlag();
+// True on a thread doing what a job on the OpenGL thread handed back to it (callBack): the OpenGL thread waits for it.
+bool servingOpenGl();
 // From a job on the OpenGL thread: runs `fn` on the thread waiting for the job in run() (with that thread's scopes:
 // the working space, expressions, cancelling), and waits. Elsewhere it runs `fn` here.
 void callBack(const std::function<void()>& fn);

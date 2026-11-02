@@ -87,11 +87,31 @@ KitPtr loadKit(const SamplerSettings& settings, int sampleRate, std::vector<std:
 
 // ---- Engine -----------------------------------------------------------------------------------------------------
 
-Engine::Engine(int sampleRate) : rate_(std::max(1, sampleRate)), chokeLen_(std::max<int64_t>(1, rate_ / 1000)) { voices_.reserve(kMaxVoices); }
+// (room made here, outside the audio thread, so render() never allocates)
+constexpr size_t kRobinCapacity = 1024, kEventCapacity = 4096;
+
+Engine::Engine(int sampleRate) : rate_(std::max(1, sampleRate)), chokeLen_(std::max<int64_t>(1, rate_ / 1000)) {
+    voices_.reserve(kMaxVoices);
+    robinKeys_.reserve(kRobinCapacity);
+    robinTurns_.reserve(kRobinCapacity);
+    queued_.reserve(kEventCapacity);
+    due_.reserve(kEventCapacity);
+    retired_.reserve(4);
+}
 
 void Engine::setKit(KitPtr kit) {
-    std::lock_guard<std::mutex> lock(kitMutex_);
-    pendingKit_ = std::move(kit);
+    KitPtr pending;  // (the one replaced, freed after the lock)
+    std::vector<KitPtr> freed;
+    {
+        std::lock_guard<std::mutex> lock(kitMutex_);
+        pending = std::move(pendingKit_);
+        pendingKit_ = std::move(kit);
+        // Kits the audio thread has let go of and no voice still plays.
+        for (auto it = retired_.begin(); it != retired_.end();)
+            if (it->use_count() == 1) freed.push_back(std::move(*it)), it = retired_.erase(it);
+            else ++it;
+        retired_.reserve(retired_.size() + 2);  // (room for the audio thread to retire the current one)
+    }
 }
 
 KitPtr Engine::kit() const {
@@ -125,16 +145,30 @@ void Engine::reset() {
 void Engine::startVoice(const Event& e, const KitPtr& kit) {
     const Kit::Slot* slot = kit ? kit->slot(e.key) : nullptr;
     if (!slot || slot->sounds.empty()) return;
-    std::vector<int> layer;
+    // (counted rather than listed: nothing allocated on the audio thread)
+    auto answers = [&](const Kit::Sound& sd) { return e.velocity >= sd.velLow && e.velocity <= sd.velHigh; };
+    size_t layerSize = 0;
+    int firstSound = -1;
     for (size_t i = 0; i < slot->sounds.size(); ++i)
-        if (e.velocity >= slot->sounds[i].velLow && e.velocity <= slot->sounds[i].velHigh) layer.push_back(int(i));
-    if (layer.empty()) return;
+        if (answers(slot->sounds[i])) {
+            if (firstSound < 0) firstSound = int(i);
+            ++layerSize;
+        }
+    if (!layerSize) return;
     // Round robin among the sounds answering this velocity.
-    const std::pair<int, int> robin{e.key, layer.front()};
+    const std::pair<int, int> robin{e.key, firstSound};
     size_t r = 0;
     while (r < robinKeys_.size() && robinKeys_[r] != robin) ++r;
-    if (r == robinKeys_.size()) robinKeys_.push_back(robin), robinTurns_.push_back(0);
-    const Kit::Sound& sound = slot->sounds[size_t(layer[robinTurns_[r]++ % layer.size()])];
+    uint32_t turn = 0;
+    if (r < robinKeys_.size()) turn = robinTurns_[r]++;
+    else if (robinKeys_.size() < kRobinCapacity) robinKeys_.push_back(robin), robinTurns_.push_back(1);
+    size_t pick = turn % layerSize, chosen = 0;
+    for (size_t i = 0; i < slot->sounds.size(); ++i)
+        if (answers(slot->sounds[i]) && pick-- == 0) {
+            chosen = i;
+            break;
+        }
+    const Kit::Sound& sound = slot->sounds[chosen];
     const SamplerSlot& st = slot->settings;
     // Choke: every voice of the group fades out within a millisecond.
     if (st.choke)
@@ -215,17 +249,26 @@ void Engine::renderVoices(float* out, int frames) {
 
 void Engine::render(int64_t start, int frames, float* out) {
     if (frames <= 0) return;
-    if (std::unique_lock<std::mutex> lock(kitMutex_, std::try_to_lock); lock.owns_lock()) kit_ = pendingKit_;
+    if (std::unique_lock<std::mutex> lock(kitMutex_, std::try_to_lock);
+        lock.owns_lock() && kit_ != pendingKit_ && (!kit_ || retired_.size() < retired_.capacity())) {
+        // (the kit let go of is kept for setKit to free, in the room made for it there)
+        if (kit_) retired_.push_back(std::move(kit_));
+        kit_ = pendingKit_;
+    }
     if (std::unique_lock<std::mutex> lock(eventMutex_, std::try_to_lock); lock.owns_lock()) {
         if (resetPending_) {
             voices_.clear(), due_.clear(), robinKeys_.clear(), robinTurns_.clear();
             resetPending_ = false;
         }
-        due_.insert(due_.end(), queued_.begin(), queued_.end());
-        queued_.clear();
+        if (due_.empty()) std::swap(due_, queued_);  // (buffers traded, not copied)
+        else {
+            due_.insert(due_.end(), queued_.begin(), queued_.end());
+            queued_.clear();
+        }
     }
-    // In time order (as played, for notes at the same sample).
-    std::stable_sort(due_.begin(), due_.end(), [&](const Event& a, const Event& b) {
+    if (due_.empty() && voices_.empty()) return;  // (silent: nothing to do)
+    // In time order (as played, for notes at the same sample; `order` makes it total, so no stable sort's buffer).
+    std::sort(due_.begin(), due_.end(), [&](const Event& a, const Event& b) {
         const int64_t ta = a.at < 0 ? start : std::max(a.at, start), tb = b.at < 0 ? start : std::max(b.at, start);
         return ta != tb ? ta < tb : a.order < b.order;
     });
@@ -279,6 +322,10 @@ std::vector<float> renderNotes(const KitPtr& kit, const std::vector<SamplerNote>
 }
 
 bool writeWav(const std::string& path, const std::vector<float>& stereo, int sampleRate, std::string* error) {
+    if (stereo.size() * 4 > size_t(UINT32_MAX) - 36) {  // (a WAV file's sizes are 32-bit: about 3 hours here)
+        if (error) *error = "The pass is too long for a WAV file";
+        return false;
+    }
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) {
         if (error) *error = "Cannot write " + path;
@@ -408,7 +455,10 @@ edit::Result addPass(Project& p, Sequence& s, TrackRef track, const KitPtr& kit,
     FrameTime noteFrame = FrameTime(std::floor(double(std::max<int64_t>(0, earliest)) * fps / s.sampleRate));
     // (the frame's first sample must not come after the note: llround of a frame's sample can land past it)
     while (noteFrame > 0 && std::llround(double(noteFrame) * s.sampleRate / fps) > earliest) --noteFrame;
-    const FrameTime first = from >= 0 ? std::min(noteFrame, from) : noteFrame;
+    // (from where recording started, at most two seconds before the first note: a pass started long before its
+    // first hit is not rendered as minutes of silence)
+    const FrameTime lead = FrameTime(std::ceil(2 * fps));
+    const FrameTime first = from >= 0 ? std::max(std::min(noteFrame, from), std::max<FrameTime>(0, noteFrame - lead)) : noteFrame;
     int64_t frames = 0;
     const Id media = passMedia(p, s, kit, notes, seed, first, file, frames, why);
     if (!media) return edit::Result::fail(why);

@@ -1147,9 +1147,10 @@ void McpServer::Impl::addTools() {
             const QString file = midimaps::fileFor(dir, device);
             midimaps::Map map;
             map.device = device;
+            QStringList skipped;  // (mappings that could not be read: kept in a copy before the file is written)
             if (QFile::exists(file)) {
                 QString why;
-                if (!midimaps::load(file, map, &why)) return fail(why);
+                if (!midimaps::load(file, map, &why, &skipped)) return fail(why);
                 map.device = device;
             }
             auto describe = [&] {
@@ -1161,10 +1162,18 @@ void McpServer::Impl::addTools() {
                 return lines;
             };
             auto saved = [&](const QString& what) {
-                QString why;
+                QString why, aside;
+                if (!skipped.isEmpty()) {  // (as the app does: the file as it was kept beside it, not lost)
+                    aside = file + QStringLiteral(".unread");
+                    QFile::remove(aside);
+                    if (!QFile::copy(file, aside)) return fail(QStringLiteral("cannot keep a copy of %1 (%2 mapping(s) in it could not be read)").arg(file).arg(skipped.size()));
+                }
                 if (!midimaps::save(file, map, &why)) return fail(why);
                 const QStringList lines = describe();
-                return ok(QStringLiteral("%1. %2: %3 mapping(s)%4").arg(what, device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                const QString note = aside.isEmpty() ? QString()
+                                                     : QStringLiteral("\n%1 mapping(s) that could not be read were left out (%2); the file as it was is kept as %3")
+                                                           .arg(skipped.size()).arg(skipped.join(QStringLiteral("; ")), aside);
+                return ok(QStringLiteral("%1. %2: %3 mapping(s)%4%5").arg(what, device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n'), note),
                           midimaps::toJson(map));
             };
             if (a.contains("bank_size")) map.bankSize = std::clamp(a.value("bank_size").toInt(8), 1, 64);

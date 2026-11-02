@@ -778,7 +778,11 @@ private slots:
         QCOMPARE(v.pixelScale(), 1.0);
         ofx::Overlay drawn;
         QVERIFY(in->draw(pr, 0, v, drawn));
-        QVERIFY(!QFileInfo::exists(QString::fromStdString(reg.guardPath())));  // (only while it runs)
+        auto guardMark = [&] {  // (the guard file says '1' only while a control runs)
+            QFile g(QString::fromStdString(reg.guardPath()));
+            return g.open(QIODevice::ReadOnly) ? g.read(1) : QByteArray();
+        };
+        QCOMPARE(guardMark(), QByteArray("0"));
         QCOMPARE(drawn.ops.size(), size_t(2));
         QCOMPARE(int(drawn.ops[0].kind), int(ofx::DrawOp::Lines));
         QCOMPARE(drawn.ops[0].points.size(), size_t(4));
@@ -836,12 +840,20 @@ private slots:
             // (as a process that has ended would leave it: this process's own guard is not a crash)
             const QString ended = QFileInfo(QString::fromStdString(reg.guardPath())).absolutePath() + "/ofx-interact-2147483646.guard";
             QFile own(QString::fromStdString(reg.guardPath()));
-            QVERIFY(own.open(QIODevice::WriteOnly));
-            own.write(QByteArray::fromStdString(copied));
+            QVERIFY(own.open(QIODevice::ReadWrite));  // (written in place: this process keeps it mapped)
+            own.write("1\n" + QByteArray::fromStdString(copied) + QByteArray(1, '\0'));
             own.close();
             QCOMPARE(reg.scan(), 7);
-            QVERIFY(QFile::remove(QString::fromStdString(reg.guardPath())));
-            QFile guard(ended);
+            QVERIFY(own.open(QIODevice::ReadWrite));
+            own.write("0");
+            own.close();
+            QFile idle(ended);  // (an ended process that was not in a control at the time)
+            QVERIFY(idle.open(QIODevice::WriteOnly));
+            idle.write("0\n" + QByteArray::fromStdString(copied) + QByteArray(1, '\0'));
+            idle.close();
+            QCOMPARE(reg.scan(), 7);
+            QVERIFY(!QFileInfo::exists(ended));
+            QFile guard(ended);  // (one from before guards were marked: the binary alone)
             QVERIFY(guard.open(QIODevice::WriteOnly));
             guard.write(QByteArray::fromStdString(copied));
             guard.close();

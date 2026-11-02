@@ -112,6 +112,7 @@ Decoder::Channel::Channel() {
 void Decoder::reset() {
     for (Channel& c : ch_) c = Channel();
     fine_.clear();
+    coarse_.clear();
 }
 
 void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>& out) {
@@ -149,10 +150,15 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
         const auto id = std::make_tuple(ch, c.rpn, param);
         if (n == 6) {
             c.dataMsb = v;
+            coarse_[id] = v;
             if (!fine_.count(id)) out({key, v, 128});  // a parameter that sends only the coarse half
         } else if (n == 38) {
             fine_.insert(id);
-            out({key, (std::max(c.dataMsb, 0) << 7) | v, 16384});
+            // (a fine half alone, after the parameter was chosen again: with the coarse half it last had)
+            int msb = c.dataMsb;
+            if (msb < 0)
+                if (const auto it = coarse_.find(id); it != coarse_.end()) msb = it->second;
+            out({key, (std::max(msb, 0) << 7) | v, 16384});
         }
         return;  // (increment and decrement are not read: no controller in common use sends them for knobs)
     }

@@ -9033,6 +9033,16 @@ private slots:
         QCOMPARE(pass.notes[0].at, int64_t(std::llround(1.0101 * rate)));
         QCOMPARE(t.lanes[0].start, FrameTime(30));  // (the frame the first note falls in)
         QCOMPARE(t.clips.size(), size_t(1));         // (the comp)
+        // Recording started at 0 and the first hit at 40 s: the pass starts two seconds before it, not at 0.
+        {
+            Project late = q;
+            Sequence& ls = *late.active();
+            const std::vector<SamplerNote> hit{{60, 100, int64_t(40) * rate, rate / 10}};
+            const auto lr = sampler::addPass(late, ls, {TrackKind::Audio, 0}, sampler::loadKit(t.sampler, rate), hit, 3, path("sampler-late.wav"), 0);
+            QVERIFY2(lr.ok, lr.error.c_str());
+            QCOMPARE(ls.audioTracks[0].lanes.back().start, FrameTime(40 * 30 - 60));
+            QVERIFY(QFileInfo(QString::fromStdString(path("sampler-late.wav"))).size() < 4 * 48000 * 8);
+        }
         // The mix over the pass: the sampler's render, hit for hit at the notes' samples.
         const sampler::KitPtr kit = sampler::loadKit(t.sampler, rate);
         const int64_t from = rate, length = 2 * rate;

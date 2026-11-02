@@ -505,6 +505,12 @@ public:
         return -1;
     }
     double rate() const { return rate_; }
+    // When a frame is shown (seconds), or NaN without a timestamp.
+    double timeOf(const AVFrame* f) const {
+        const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
+        if (ts == AV_NOPTS_VALUE) return std::numeric_limits<double>::quiet_NaN();
+        return double(ts) * av_q2d(fmt_->streams[stream_]->time_base);
+    }
 
     // The next frame decoded, or null at the end. Data the decoder refuses (a damaged packet) is noted against the
     // next frame it gives, rather than ending the stream there.
@@ -564,6 +570,7 @@ public:
             p.log2ChromaH = like->log2ChromaH;
             p.rgb = like->rgb;
             p.fullRange = like->fullRange;
+            p.chromaLeft = like->chromaLeft;
             p.kr = like->kr;
             p.kb = like->kb;
         } else {
@@ -574,6 +581,8 @@ public:
             p.log2ChromaW = srcRgb ? 0 : d->log2_chroma_w;
             p.log2ChromaH = srcRgb ? 0 : d->log2_chroma_h;
             p.fullRange = srcFull;
+            p.chromaLeft = f->chroma_location != AVCHROMA_LOC_CENTER && f->chroma_location != AVCHROMA_LOC_TOP &&
+                           f->chroma_location != AVCHROMA_LOC_BOTTOM;
             p.kr = srcKr, p.kb = srcKb;
         }
         p.transfer = transfer;
@@ -668,6 +677,7 @@ PictureSource openPictureFile(const std::string& path, const QualityPicture* lik
         AVFrame* f = reader->nextFrame(damaged);
         if (!f || !reader->toPicture(f, shape.get(), o, out)) return false;
         out.damaged = damaged;
+        out.time = reader->timeOf(f);
         return true;
     };
 }
@@ -1000,9 +1010,10 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         if (!enc(skip)) break;
     for (int i = 0; i < std::max(0, -res.offset); ++i)
         if (!ref(skip)) break;
-    // (as many frames at once as there are threads, fewer for big pictures with MS-SSIM: about 12 bytes a pixel each)
-    if (o.metrics & MetricMsSsim) {
-        const double perFrame = double(shape.width) * shape.height * 12 + 1;
+    // (as many frames at once as there are threads, fewer for big pictures: each pair held is up to 12 bytes a pixel
+    // (two 16-bit 4:4:4 pictures), with MS-SSIM's working space about 12 more; about 2 GB in all)
+    {
+        const double perFrame = double(shape.width) * shape.height * ((o.metrics & MetricMsSsim) ? 24 : 12) + 1;
         threads = std::clamp(int(double(size_t(2) << 30) / perFrame), 1, threads);
     }
     const bool wantVmaf = (o.metrics & MetricVmaf) && !shape.rgb &&
@@ -1022,31 +1033,66 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
     if (wantVmaf) res.vmafModel = "";
 #endif
     const int batch = std::max(1, threads);
-    FrameTime index = std::max(0, -res.offset);
+    const FrameTime firstIndex = std::max(0, -res.offset);
+    // Frames are matched by the encode's timestamps where it has them (a dropped or repeated frame, or a variable
+    // rate, keeps the rest in step), else one after another.
+    int64_t refRead = 0;  // reference frames read since the offset
+    // (each frame's place from the gap since the one before, so a rate a little off, as Matroska's estimate, never adds up)
+    double encPrev = std::numeric_limits<double>::quiet_NaN();
+    int64_t encPlace = 0;
+    const double encRate = shape.frameRate;
     bool more = true, encodeEnded = false, referenceEnded = false;
+    std::vector<QualityPicture> refs(static_cast<size_t>(batch)), encs(static_cast<size_t>(batch));
+    std::vector<FrameTime> shows(static_cast<size_t>(batch));
     while (more) {
         if (cancelled()) {
             res.error = "cancelled";
             return res;
         }
-        std::vector<QualityPicture> refs(static_cast<size_t>(batch)), encs(static_cast<size_t>(batch));
         int n = 0;
-        for (; n < batch; ++n) {
-            if (o.maxFrames > 0 && int(res.frames.size()) + n >= o.maxFrames) {
-                more = false;
-                break;
+        try {
+            while (n < batch) {
+                if (o.maxFrames > 0 && int(res.frames.size()) + n >= o.maxFrames) {
+                    more = false;
+                    break;
+                }
+                QualityPicture& e = encs[size_t(n)];
+                encodeEnded = !enc(e);
+                if (encodeEnded) {
+                    more = false;
+                    break;
+                }
+                if (e.damaged) ++res.damagedFrames;
+                if (encRate > 0 && !std::isnan(e.time)) {
+                    if (!std::isnan(encPrev)) encPlace += std::max<int64_t>(0, std::llround((e.time - encPrev) * encRate));
+                    encPrev = e.time;
+                    const int64_t want = encPlace;
+                    if (want < refRead) {  // (shown again, or out of step: left out)
+                        ++res.repeatedFrames;
+                        continue;
+                    }
+                    while (refRead < want && !referenceEnded) {  // (frames the encode does not have)
+                        referenceEnded = !ref(skip);
+                        if (referenceEnded) break;
+                        ++res.droppedFrames;
+                        ++refRead;
+                    }
+                }
+                referenceEnded = referenceEnded || !ref(refs[size_t(n)]);
+                if (referenceEnded) {
+                    more = false;
+                    break;
+                }
+                shows[size_t(n)] = firstIndex + FrameTime(refRead++);
+                if (!e.sameLayout(refs[size_t(n)])) {
+                    res.error = "the reference could not be brought to the encode's size and format";
+                    return res;
+                }
+                ++n;
             }
-            encodeEnded = !enc(encs[size_t(n)]);
-            referenceEnded = !encodeEnded && !ref(refs[size_t(n)]);
-            if (encodeEnded || referenceEnded) {
-                more = false;
-                break;
-            }
-            if (encs[size_t(n)].damaged) ++res.damagedFrames;
-            if (!encs[size_t(n)].sameLayout(refs[size_t(n)])) {
-                res.error = "the reference could not be brought to the encode's size and format";
-                return res;
-            }
+        } catch (const std::bad_alloc&) {
+            res.error = "there is not memory enough to compare pictures this size";
+            return res;
         }
         std::vector<FrameQuality> got(static_cast<size_t>(n));
         if (!parallelFor(n, threads, [&](int i) { got[size_t(i)] = measure(refs[size_t(i)], encs[size_t(i)], o.metrics); })) {
@@ -1058,7 +1104,7 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
             return res;
         }
         for (int i = 0; i < n; ++i) {
-            got[size_t(i)].frame = index++;
+            got[size_t(i)].frame = shows[size_t(i)];
 #ifdef MONTAGE_WITH_VMAF
             if (vmaf && !vmaf->add(refs[size_t(i)], encs[size_t(i)])) {
                 res.error = "libvmaf refused a picture";
@@ -1095,10 +1141,11 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         QualityPicture rest;
         int64_t extraEnc = 0, extraRef = 0;
         if (referenceEnded) {
+            extraEnc = 1;  // (the one read when the reference ran out)
             while (!cancelled() && enc(rest)) ++extraEnc;
             extraRef = 0;
         } else if (encodeEnded) {
-            if (referenceLength >= 0) extraRef = std::max<int64_t>(0, referenceLength - std::max(0, -res.offset) - compared);
+            if (referenceLength >= 0) extraRef = std::max<int64_t>(0, referenceLength - std::max(0, -res.offset) - refRead);
             else
                 while (!cancelled() && ref(rest)) ++extraRef;
         }
@@ -1106,8 +1153,8 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
             res.error = "cancelled";
             return res;
         }
-        res.encodeFrames = compared + extraEnc;
-        res.referenceFrames = compared + extraRef;
+        res.encodeFrames = compared + res.repeatedFrames + extraEnc;
+        res.referenceFrames = refRead + extraRef;
         if (extraRef > 0)
             res.warnings.push_back("the encode ends " + std::to_string(extraRef) + (extraRef == 1 ? " frame" : " frames") + " before the reference");
         if (extraEnc > 0)
@@ -1117,6 +1164,12 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
         res.warnings.push_back("the encode has " + std::to_string(res.offset) + (res.offset == 1 ? " frame" : " frames") + " before the reference's first");
     else if (res.offset < 0)
         res.warnings.push_back("the encode starts " + std::to_string(-res.offset) + (res.offset == -1 ? " frame" : " frames") + " into the reference");
+    if (res.droppedFrames > 0)
+        res.warnings.push_back("the encode leaves out " + std::to_string(res.droppedFrames) + (res.droppedFrames == 1 ? " frame" : " frames") +
+                               " of the reference (matched by its timestamps)");
+    if (res.repeatedFrames > 0)
+        res.warnings.push_back("the encode shows " + std::to_string(res.repeatedFrames) + (res.repeatedFrames == 1 ? " frame" : " frames") +
+                               " again or out of step (left out)");
     if (res.damagedFrames > 0)
         res.warnings.push_back("the decoder reported damage in " + std::to_string(res.damagedFrames) + (res.damagedFrames == 1 ? " frame" : " frames") +
                                " of the encode");
@@ -1236,24 +1289,33 @@ void signalToPicture(const Image& img, const QualityPicture& like, QualityPictur
             ycc(rgb, Y, Cb, Cr);
             out.plane[0][size_t(y) * size_t(w) + size_t(x)] = clampCode(like.fullRange ? Y * peak : (16 + 219 * Y) * scale);
         }
-    // Chroma: the mean of the block of pixels each sample covers.
+    // Chroma: the mean of the block of pixels each sample covers (centred siting), or, sited with the left luma
+    // sample as the encode says (and as Montage's own exports are), across that sample and its two neighbours
+    // (1, 2, 1) in each row of the block: so siting alone is not counted as the encode's loss.
     const int cw = like.planeWidth(1), ch = like.planeHeight(1), sx = 1 << like.log2ChromaW, sy = 1 << like.log2ChromaH;
+    const bool left = like.chromaLeft && sx == 2;
     for (int y = 0; y < ch; ++y)
         for (int x = 0; x < cw; ++x) {
-            double cb = 0, cr = 0;
-            int n = 0;
-            for (int dy = 0; dy < sy; ++dy)
-                for (int dx = 0; dx < sx; ++dx) {
-                    if (x * sx + dx >= w || y * sy + dy >= h) continue;
+            double cb = 0, cr = 0, n = 0;
+            for (int dy = 0; dy < sy; ++dy) {
+                if (y * sy + dy >= h) continue;
+                auto add = [&](int px, double weight) {
                     double rgb[3], Y, Cb, Cr;
-                    pixel(x * sx + dx, y * sy + dy, rgb);
+                    pixel(std::clamp(px, 0, w - 1), y * sy + dy, rgb);
                     ycc(rgb, Y, Cb, Cr);
-                    cb += Cb;
-                    cr += Cr;
-                    ++n;
+                    cb += weight * Cb;
+                    cr += weight * Cr;
+                    n += weight;
+                };
+                if (left) {
+                    add(x * 2 - 1, 1), add(x * 2, 2), add(x * 2 + 1, 1);
+                } else {
+                    for (int dx = 0; dx < sx; ++dx)
+                        if (x * sx + dx < w) add(x * sx + dx, 1);
                 }
-            cb /= std::max(1, n);
-            cr /= std::max(1, n);
+            }
+            cb /= std::max(1e-9, n);
+            cr /= std::max(1e-9, n);
             const size_t i = size_t(y) * size_t(cw) + size_t(x);
             out.plane[1][i] = clampCode(like.fullRange ? (cb * peak + 128 * scale) : (128 + 224 * cb) * scale);
             out.plane[2][i] = clampCode(like.fullRange ? (cr * peak + 128 * scale) : (128 + 224 * cr) * scale);

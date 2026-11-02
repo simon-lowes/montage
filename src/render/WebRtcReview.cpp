@@ -268,6 +268,7 @@ Choice choose(const rtc::Description::Media& m, const std::vector<std::string>& 
 struct Failures {
     int count = 0;
     Clock::time_point last;
+    Clock::time_point nextRefusal;  // (each wrong one from here told a second after the one before)
 };
 
 // A token bucket for one address's requests.
@@ -394,7 +395,6 @@ struct BrowserReviewBackend::Impl {
     std::map<QString, Failures> failures;  // (that thread's)
     std::map<QString, PeerBucket> peerBuckets;          // (that thread's) by guesser()
     std::map<QString, Clock::time_point> trusted;       // (that thread's) addresses that gave the right passphrase lately
-    Clock::time_point nextRefusal;
     double guesses = kGuessBurst;  // passphrases that may be tried now
     Clock::time_point guessesAt = Clock::now();
 
@@ -470,10 +470,29 @@ struct BrowserReviewBackend::Impl {
         // (counted by IPv6 /64, as one computer can have many addresses in one)
         const QString from = guesser(c->peerAddress());
         const auto fromThere = std::count_if(open.begin(), open.end(), [&](QSslSocket* o) { return guesser(o->peerAddress()) == from; });
-        if (open.size() > kMaxConnections || fromThere > kMaxConnectionsFrom) {
+        if (fromThere > kMaxConnectionsFrom) {
             c->abort();
             c->deleteLater();
             return;
+        }
+        if (open.size() > kMaxConnections) {
+            // Full. A reviewer who gave the passphrase lately still gets in, in the place of the oldest connection
+            // still waiting to be answered from anyone else; no one else does.
+            QSslSocket* oldest = nullptr;
+            const auto now = Clock::now();  // (trust that has run out counts for nothing here either)
+            for (auto it = trusted.begin(); it != trusted.end();) it = now - it->second > kTrustedMemory ? trusted.erase(it) : std::next(it);
+            if (trusted.count(from))
+                for (QSslSocket* o : open)
+                    if (o != c && !o->property("answered").toBool() && !trusted.count(guesser(o->peerAddress()))) {
+                        oldest = o;
+                        break;  // (children are listed oldest first)
+                    }
+            if (!oldest) {
+                c->abort();
+                c->deleteLater();
+                return;
+            }
+            oldest->abort();
         }
         QObject::connect(c, &QAbstractSocket::disconnected, c, &QObject::deleteLater);
         QObject::connect(c, &QAbstractSocket::readyRead, c, [this, c] { read(c); });
@@ -485,7 +504,8 @@ struct BrowserReviewBackend::Impl {
         idle->start(https ? kHandshakeMs : 20000);
         if (https) {
             // A handshake gets a few seconds; once it is done, the request gets the rest.
-            QObject::connect(c, &QSslSocket::encrypted, idle, [idle] { idle->start(20000 - kHandshakeMs); });
+            // (the request follows at once: a connection that sends none is not kept holding its place)
+            QObject::connect(c, &QSslSocket::encrypted, idle, [idle] { idle->start(kHandshakeMs); });
             QSslConfiguration conf = QSslConfiguration::defaultConfiguration();
             conf.setLocalCertificate(certificate);
             conf.setPrivateKey(key);
@@ -507,6 +527,7 @@ struct BrowserReviewBackend::Impl {
         c->setProperty("in", in);
         if (got == 0) return;
         c->setProperty("answered", true);
+        if (auto* idle = c->findChild<QTimer*>()) idle->start(20000);  // (the answer may take a moment: a wrong passphrase's)
         if (got == -2) return respond(c, "413 Content Too Large", {}, "Too large");
         if (got < 0) return respond(c, "400 Bad Request", {}, "Not understood");
         handle(c, r);
@@ -528,7 +549,7 @@ struct BrowserReviewBackend::Impl {
     // The passphrase as a bearer token. An address that has guessed wrong too often lately is refused at once; each
     // address (IPv6 /64) may try only so many a second, and all of them together only so many more (the rest refused
     // untried), except addresses that gave the right one lately, so that guessing elsewhere never shuts reviewers
-    // already in out. Wrong ones are told a second after the one before, whoever sent them.
+    // already in out. Wrong ones are told a second after the one before from the same address.
     bool authorised(QSslSocket* c, const Request& r) {
         const QString peer = guesser(c->peerAddress());
         const auto now = Clock::now();
@@ -540,12 +561,13 @@ struct BrowserReviewBackend::Impl {
         forget(peerBuckets, [&](const PeerBucket& b) { return now - b.at > std::chrono::minutes(1); });
         while (failures.size() > 4096)
             failures.erase(std::min_element(failures.begin(), failures.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
+        const bool known = trusted.count(peer) > 0;
+        // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
         auto blocked = failures.find(peer);
-        if (blocked != failures.end() && blocked->second.count >= 10) {
+        if (blocked != failures.end() && blocked->second.count >= (known ? 100 : 10)) {
             respond(c, "429 Too Many Requests", {}, "Too many wrong passphrases from this address: try again later");
             return false;
         }
-        const bool known = trusted.count(peer) > 0;
         if (!known) {
             if (peerBuckets.size() > 4096) peerBuckets.clear();  // (a flood of addresses: they start full again)
             PeerBucket& mine = peerBuckets[peer];
@@ -558,7 +580,7 @@ struct BrowserReviewBackend::Impl {
             mine.tokens -= 1;
             guesses = std::min(kGuessBurst, guesses + std::chrono::duration<double>(now - guessesAt).count() * kGuessRate);
             guessesAt = now;
-            if (guesses < 1 || nextRefusal - now > std::chrono::seconds(10)) {
+            if (guesses < 1) {
                 respond(c, "429 Too Many Requests", {{"Retry-After", "5"}}, "Too many passphrases tried: try again shortly");
                 return false;
             }
@@ -574,8 +596,10 @@ struct BrowserReviewBackend::Impl {
         Failures& f = failures[peer];
         ++f.count;
         f.last = now;
-        nextRefusal = std::max(now, nextRefusal) + std::chrono::seconds(1);
-        const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(nextRefusal - now).count());
+        // (per address: wrong guesses from elsewhere never hold back anyone's answer, the shared bucket above bounds
+        // how fast all of them together may guess)
+        f.nextRefusal = std::max(now, f.nextRefusal) + std::chrono::seconds(1);
+        const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(f.nextRefusal - now).count());
         QTimer::singleShot(ms, c, [this, c] {
             respond(c, "401 Unauthorized", {{"WWW-Authenticate", "Bearer realm=\"Montage review\""}}, "Wrong passphrase");
         });
@@ -983,15 +1007,35 @@ struct BrowserReviewBackend::Impl {
     // ---- Encoding ----
 
     // Whether there is an encoder for the codec ("h264", "av1", "hevc"), as encoder() would look for one.
+    // A hardware encoder counts only when it opens: one built in with no such GPU here would give viewers black.
     bool canEncode(const std::string& codec) const {
         std::vector<const char*> names;
         if (codec == "h264") names = {"libx264", settings.hardware ? "h264_nvenc" : ""};
         else if (codec == "av1") names = {"libsvtav1", "libaom-av1"};
         else if (codec == "hevc") names = {"libx265", settings.hardware ? "hevc_nvenc" : ""};
         for (const char* n : names)
-            if (*n && avcodec_find_encoder_by_name(n)) return true;
+            if (*n && avcodec_find_encoder_by_name(n) && (!std::strstr(n, "_nvenc") || hardwareOpens(n))) return true;
         return false;
     }
+    bool hardwareOpens(const char* name) const {
+        std::lock_guard lock(hardwareMutex);
+        if (const auto it = hardwareWorks.find(name); it != hardwareWorks.end()) return it->second;
+        bool works = false;
+        if (const AVCodec* codec = avcodec_find_encoder_by_name(name))
+            if (AVCodecContext* ctx = avcodec_alloc_context3(codec)) {
+                ctx->width = 256, ctx->height = 144;
+                ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+                ctx->time_base = AVRational{1, 30};
+                ctx->framerate = AVRational{30, 1};
+                works = avcodec_open2(ctx, codec, nullptr) >= 0;
+                avcodec_free_context(&ctx);
+            }
+        // (only a success is kept: one refused while the card's encoders were all busy, an export say, is tried again)
+        if (works) hardwareWorks[name] = works;
+        return works;
+    }
+    mutable std::mutex hardwareMutex;
+    mutable std::map<std::string, bool> hardwareWorks;
 
     VideoEncoder* encoder(const std::string& codec) {
         auto it = encoders.find(codec);

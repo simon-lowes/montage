@@ -554,15 +554,20 @@ protected:
                     else reinterpret_cast<float*>(data)[size_t(i) * size_t(channels) + size_t(c)] = v;
                 }
         } else {
-            std::vector<float> heard;  // what the speakers get, when it is not buf_ (which the meters still read)
+            // What the speakers get, when it is not buf_ (which the meters still read): kept from one call to the next,
+            // so the audio thread does not allocate for it each time.
+            std::vector<float>& heard = heard_;
+            bool own = true;
             if (muted_) heard.assign(buf_.size(), 0.0f);  // (Global Mute silences the beeps too)
             else if (cycle || sampled) {
-                heard = buf_;
+                heard.assign(buf_.begin(), buf_.end());
                 if (cycle) addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
                 if (sampled)
                     for (size_t i = 0; i < heard.size(); ++i) heard[i] += smp_[i];
+            } else {
+                own = false;
             }
-            const std::vector<float>& out = heard.empty() ? buf_ : heard;
+            const std::vector<float>& out = own ? heard : buf_;
             if (int16_) {
                 auto* d = reinterpret_cast<int16_t*>(data);
                 for (size_t i = 0; i < out.size(); ++i) d[i] = int16_t(std::lround(std::clamp(out[i], -1.0f, 1.0f) * 32767.0f));
@@ -648,7 +653,7 @@ private:
     AudioMixer mixer_;
     std::unique_ptr<Monitor> monitor_;  // the monitoring section, while it is on
     bool binaural_ = false;
-    std::vector<float> buf_, mon_;
+    std::vector<float> buf_, mon_, heard_;
     QMutex meterM_;
     std::unique_ptr<LoudnessMeter> meter_;
     std::unique_ptr<StereoAnalyser> stereo_;  // (afresh each play)
