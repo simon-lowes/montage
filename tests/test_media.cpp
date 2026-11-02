@@ -32530,6 +32530,7 @@ if ui["pressed"] == "add":
                 int f = -1;
                 double t = hitBox(o, d, 1e-9, &f);
                 V n{0, 0, 0};
+                bool ground = false;
                 if (t > 0) {
                     n[size_t(f / 2)] = f % 2 ? 1 : -1;
                     if (f == 2) return -1;  // (the bottom: not drawn, on the ground)
@@ -32538,16 +32539,18 @@ if ui["pressed"] == "add":
                     const V X{o[0] + d[0] * t, 0, o[2] + d[2] * t};
                     if (std::fabs(X[0]) > 6 || std::fabs(X[2]) > 6) return -1;
                     n = {0, 1, 0};
+                    ground = true;
                 } else {
                     return -1;
                 }
-                const V X{o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t};
+                // (on the ground exactly 0: o + d * t need not be, where the compiler fuses the multiply and add)
+                const V X{o[0] + d[0] * t, ground ? 0.0 : o[1] + d[1] * t, o[2] + d[2] * t};
                 const V to = sub(projector.C, X);
                 const double facing = dot(n, to) / std::sqrt(dot(to, to));
                 if (!projector.project(X, qx, qy)) return 2;
                 unsure = std::fabs(facing) < 0.05 || nearOutline(qx, qy) || qx < 1 || qy < 1 || qx > W - 1 || qy > H - 1;
                 if (facing <= 0) return 2;
-                if (n[1] == 1 && X[1] == 0 && hitBox(X, to, 1e-7, nullptr) > 0) return 1;
+                if (ground && hitBox(X, to, 1e-7, nullptr) > 0) return 1;
                 const double ex = std::fmod(qx, square), ey = std::fmod(qy, square);
                 unsure |= ex < 1 || ex > square - 1 || ey < 1 || ey > square - 1;
                 colour = checker(qx, qy);
