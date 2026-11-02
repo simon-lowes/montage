@@ -8826,18 +8826,22 @@ void McpServer::Impl::addTools() {
                 if (!soundSearchAvailable()) return fail("This build of Montage cannot search sound by what it sounds like (no ONNX Runtime)");
                 if (!soundModel().installed())
                     return fail("The sound search model is not downloaded: run `scripts/fetch-models.sh` or search Sounds Like in the app once");
+                // The sound to match is found first: a wrong one is refused without listening to the whole library.
+                std::optional<SoundLibraryEntry> like;
+                if (a.contains("more_like")) {
+                    const QString which = str(a, "more_like");
+                    bool isId = false;
+                    const qint64 id = which.toLongLong(&isId);
+                    like = isId ? lib->entry(id) : lib->entryForPath(which.toStdString());
+                    if (!like) return fail(QStringLiteral("No sound \"%1\" in the library").arg(which));
+                }
                 if (lib->unheard() > 0 &&
                     lib->listen([&](int done, int total) { progress(total > 0 ? double(done) / total : 1.0, QStringLiteral("Listening to the library")); },
                                 nullptr, &err) < 0)
                     return fail(QString::fromStdString(err));
                 std::vector<SoundLibrary::Match> hits;
-                if (a.contains("more_like")) {
-                    const QString which = str(a, "more_like");
-                    bool isId = false;
-                    const qint64 id = which.toLongLong(&isId);
-                    const auto e = isId ? lib->entry(id) : lib->entryForPath(which.toStdString());
-                    if (!e) return fail(QStringLiteral("No sound \"%1\" in the library").arg(which));
-                    hits = lib->moreLike(e->id, max);
+                if (like) {
+                    hits = lib->moreLike(like->id, max);
                 } else {
                     auto model = SoundModel::load(&err);
                     const std::vector<float> q = model ? model->text(str(a, "sounds_like").toStdString(), &err) : std::vector<float>{};

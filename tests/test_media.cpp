@@ -3542,6 +3542,12 @@ private slots:
             QCOMPARE(res.value("structuredContent").toObject().value("sounds").toArray().size(), 100);
             res = call("montage_search_sound_library", {{"more_like", "/no/such.wav"}});
             QVERIFY(res.value("isError").toBool());
+            // Refused before listening: none of the 500 sounds heard for it (with the model, that took minutes).
+            {
+                SoundLibrary mcpLib;
+                QVERIFY(mcpLib.open(path("sfx-mcp.sqlite")));
+                QCOMPARE(mcpLib.unheard(), 500);
+            }
             if (before.isNull()) qunsetenv("MONTAGE_SOUND_LIBRARY");
             else qputenv("MONTAGE_SOUND_LIBRARY", before);
         }
