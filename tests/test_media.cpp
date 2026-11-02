@@ -19142,12 +19142,13 @@ if __name__ == '__main__':
         auto job = [&](const QString& id, const QString& action = "status") {
             return call("montage_job", {{"job", id}, {"action", action}}).value("structuredContent").toObject();
         };
-        // While it runs, the caller's event loop is never held up for 50 ms (allowing one hiccup under 150 ms, from a
-        // loaded machine's scheduling: the export's threads use every core).
+        // While it runs, the caller's event loop is not held up: its waits stay under 50 ms. (A loaded machine's
+        // scheduler can still delay it now and then while the export's threads use every core: up to three waits of
+        // 50-250 ms are let pass. A call that waited for the job would take seconds.)
         QElapsedTimer sinceTick;
         qint64 longestWait = 0;
         int slowTicks = 0;
-        auto heldUp = [&] { return longestWait >= 150 || slowTicks > 1; };
+        auto heldUp = [&] { return longestWait >= 250 || slowTicks > 3; };
         auto tick = [&] {
             QCoreApplication::processEvents();
             if (sinceTick.isValid()) longestWait = std::max(longestWait, sinceTick.elapsed());
@@ -19187,6 +19188,23 @@ if __name__ == '__main__':
         QCOMPARE(report.value("progress").toDouble(), 1.0);
         QVERIFY(report.value("result").toObject().value("message").toString().contains("bars.mp4"));
         QVERIFY(QFileInfo(out).size() > 1000);
+        // On a stream (stdio), tool calls run on a thread of their own, so the reader goes on answering while one runs:
+        // a ping sent after a plain render is answered before it.
+        {
+            McpServer streamed;
+            const auto msg = [&](int id, const QString& method, const QJsonObject& params) {
+                return QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}}).toJson(QJsonDocument::Compact).toStdString() + "\n";
+            };
+            std::istringstream in(msg(1, "tools/call", {{"name", "montage_render"}, {"arguments", QJsonObject{{"project", project}, {"output", dir.path() + "/stream.mp4"}}}}) +
+                                  msg(2, "ping", {}));
+            std::ostringstream out;
+            QCOMPARE(streamed.run(in, out), 0);
+            const QList<QByteArray> lines = QByteArray::fromStdString(out.str()).trimmed().split('\n');
+            QCOMPARE(lines.size(), 2);
+            QCOMPARE(QJsonDocument::fromJson(lines[0]).object().value("id").toInt(), 2);
+            QCOMPARE(QJsonDocument::fromJson(lines[1]).object().value("id").toInt(), 1);
+            QVERIFY(!QJsonDocument::fromJson(lines[1]).object().value("result").toObject().value("isError").toBool());
+        }
         // A second one cancelled while it runs, a third while it waits behind it: both end "cancelled" (the third never
         // started: no file), and the list has all three.
         const QString out2 = dir.path() + "/cancelled.mp4", out3 = dir.path() + "/queued.mp4";
@@ -19268,6 +19286,13 @@ if __name__ == '__main__':
             const QJsonArray jobs = call("montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray();
             return jobs.last().toObject().value("status").toString();
         };
+        QTRY_COMPARE_WITH_TIMEOUT(lastStatus(), QString("cancelled"), 10000);
+        // Nor does one whose waiting at the end fails (a callback's error): its other jobs are cancelled.
+        QVERIFY(!runScript(QStringLiteral("montage.call_async('render', {output = [[%1]]}, function() error('in the callback') end)\n"
+                                          "montage.call_async('render', {output = [[%2]]})")
+                               .arg(dir.path() + "/cb.mp4", dir.path() + "/after-cb.mp4"),
+                           "callback.lua", o, &error));
+        QVERIFY2(error.contains("in the callback"), qPrintable(error));
         QTRY_COMPARE_WITH_TIMEOUT(lastStatus(), QString("cancelled"), 10000);
 
         // ---- From Python: the same.

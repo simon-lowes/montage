@@ -14678,6 +14678,9 @@ const auto seq = [this] { return state()->sequence(); };
         QTest::keyClick(win_.get(), Qt::Key_9);
         QCOMPARE(angle(), 24);
         QVERIFY(!panel->setBank(3));
+        // Clicking an angle (switchTo) goes back to following: the keys reach that angle's bank.
+        QVERIFY(panel->switchTo(3));
+        QCOMPARE(panel->bank(), 0);
         // Shift cuts at the playhead; the new shot under it has no bank picked, so the keys follow its angle.
         QTest::keyClick(win_.get(), Qt::Key_1, Qt::AltModifier);
         QTest::keyClick(win_.get(), Qt::Key_5, Qt::ShiftModifier);

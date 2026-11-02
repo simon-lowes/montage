@@ -443,8 +443,14 @@ montage.wait_all = function()
   while montage.poll() > 0 do montage.sleep(0.02) end
 end
 return function(ok)
-  if ok then montage.wait_all() return end
+  local err
+  if ok then
+    local waited, e = pcall(montage.wait_all)
+    if waited then return end
+    err = e
+  end
   for _, j in ipairs(montage.jobs()) do pcall(j.cancel, j) end
+  if err ~= nil then error(err, 0) end
 end
 )lua";
 const char* kJobsEnd = "montage.jobs_end";

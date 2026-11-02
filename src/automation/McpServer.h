@@ -37,7 +37,9 @@ public:
     void cancel(const QJsonValue& requestId);
     // Notifications (progress) as they happen, from the thread the tool runs on, rather than among handle()'s lines.
     void setNotificationSink(std::function<void(const std::string&)> sink);
-    // Serves `in` until it closes, writing to `out`. Returns the exit code.
+    // Serves `in` until it closes, writing to `out` (answers in the order calls finish: tool calls run in turn on a
+    // thread of their own, while montage_job, cancellations and the rest are answered as they come). Returns the
+    // exit code.
     int run(std::istream& in, std::ostream& out);
 
     static const std::vector<std::string>& protocolVersions();  // newest first

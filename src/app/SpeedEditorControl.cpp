@@ -447,7 +447,7 @@ void SpeedEditorControl::runBuiltIn(const QString& id, Key k) {
     }
     if (name.startsWith(QLatin1String("cam"))) {
         const int angle = name.mid(3).toInt() - 1;
-        if (hooks_.switchAngle && !hooks_.switchAngle(angle, liveOverwrite_)) state_->message(tr("No multicam clip at the playhead"), 3000);
+        if (hooks_.switchAngle && !hooks_.switchAngle(angle, liveOverwrite_)) state_->message(tr("No angle on that key at the playhead"), 3000);
         refreshLeds();
         return;
     }

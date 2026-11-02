@@ -312,6 +312,7 @@ void MulticamPanel::requestRender() {
 bool MulticamPanel::switchTo(int angle, bool cut) {
     const Id clip = currentClip();
     if (!clip || angle < 0 || angle >= angleCount()) return false;
+    bank_ = -1;  // the keys follow the angle switched to (switchKey keeps a bank picked)
     const bool live = cut || program_->isPlaying();
     const FrameTime at = state_->playhead();
     const bool follows = audioFollows_->isChecked();

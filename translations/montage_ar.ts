@@ -28687,10 +28687,6 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
         <translation type="unfinished">%1 غير متوفر الآن</translation>
     </message>
     <message>
-        <source>No multicam clip at the playhead</source>
-        <translation type="unfinished">لا يوجد مقطع متعدد الكاميرات في لعبة الرأس</translation>
-    </message>
-    <message>
         <source>Live overwrite: angles cut at the playhead</source>
         <translation type="unfinished">اكتب على الهواء مباشرة: زوايا مقطوعة في لعبة الرأس</translation>
     </message>
@@ -28760,6 +28756,10 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>No bank %1 of angles here</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No angle on that key at the playhead</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

@@ -379,20 +379,29 @@ linecache.cache[_file] = (len(_code), None, _code.splitlines(True), _file)
 _main = types.ModuleType("__main__")
 _main.__file__, _main.montage = _file, _m
 sys.modules["__main__"] = _main
+def _cancel_jobs():
+    for j in jobs():  # (a script's background calls stop with it when it fails)
+        try:
+            j.cancel()
+        except BaseException:
+            pass
+
+
 try:
     exec(compile(_code, _file, "exec"), _main.__dict__)
     wait_all()  # (its background calls finish, their callbacks run, before it ends)
 except SystemExit as e:
     if e.code is None or e.code == 0:
-        wait_all()
+        try:
+            wait_all()
+        except BaseException as w:
+            _cancel_jobs()
+            _end(False, "%s: %s: %s" % (_name, type(w).__name__, w))
         _end(True)
+    _cancel_jobs()
     _end(False, "%s: exited with %s" % (_name, e.code))
 except BaseException as e:
-    for _j in jobs():  # (its background calls stop with it)
-        try:
-            _j.cancel()
-        except BaseException:
-            pass
+    _cancel_jobs()
     # Where in the script it went wrong: its last line there (or the syntax error's), and its own lines of the
     # traceback (Montage's are no help to the script's author).
     frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == _file]

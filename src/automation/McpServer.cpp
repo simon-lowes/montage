@@ -268,6 +268,7 @@ struct ToolJob {
     double fraction = 0;
     QString step;        // what it is doing, as its progress says
     QJsonObject result;  // when finished: the tool's result (as tools/call gives it)
+    bool read = false;   // its end reported by montage_job (finished jobs are forgotten only once read)
     bool finished() const { return status == QLatin1String("done") || status == QLatin1String("failed") || status == QLatin1String("cancelled"); }
 };
 
@@ -717,6 +718,7 @@ struct McpServer::Impl {
     std::function<void(const QJsonObject&)> notify;  // progress notifications while a tool runs
     QJsonValue progressToken;
     std::ostream* live = nullptr;  // when serving a stream: notifications go out as they happen
+    std::mutex liveMutex;          // (written from the thread reading requests and the one running calls)
     std::function<void(const std::string&)> sink;  // or given here, as they happen (from the thread the tool runs on)
 
     // Tools run one at a time: a call waits for a job running, and jobs wait their turn.
@@ -725,6 +727,7 @@ struct McpServer::Impl {
     std::mutex cancelMutex;
     QString runningRequest;
     std::set<QString> cancelledRequests;
+    std::deque<QString> cancelledOrder;  // (oldest first: the oldest forgotten past 1000)
     std::atomic<bool> callCancel{false};
     // Background calls: all of them by id (the newest finished ones kept), those waiting, and the thread that runs them.
     std::mutex jobsMutex;
@@ -750,8 +753,15 @@ struct McpServer::Impl {
     void cancelRequest(const QJsonValue& id) {
         std::lock_guard l(cancelMutex);
         const QString key = requestKey(id);
-        if (key == runningRequest) callCancel = true;
-        else if (cancelledRequests.size() < 1000) cancelledRequests.insert(key);
+        if (key == runningRequest) {
+            callCancel = true;
+        } else if (cancelledRequests.insert(key).second) {
+            cancelledOrder.push_back(key);
+            if (cancelledOrder.size() > 1000) {
+                cancelledRequests.erase(cancelledOrder.front());
+                cancelledOrder.pop_front();
+            }
+        }
     }
 
     std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args) {
@@ -761,14 +771,17 @@ struct McpServer::Impl {
         std::lock_guard l(jobsMutex);
         job->id = QStringLiteral("job-%1").arg(++jobsMade);
         jobs[job->id] = job;
-        // (the newest 200 finished ones are kept)
-        std::vector<QString> done;
+        // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
+        std::vector<QString> read, unread;
         for (auto& [id, j] : jobs) {
             std::lock_guard jl(j->m);
-            if (j->finished()) done.push_back(id);
+            if (j->finished()) (j->read ? read : unread).push_back(id);
         }
-        std::sort(done.begin(), done.end(), [](const QString& a, const QString& b) { return a.mid(4).toInt() < b.mid(4).toInt(); });
-        for (size_t i = 0; i + 200 < done.size(); ++i) jobs.erase(done[i]);
+        const auto byAge = [](const QString& a, const QString& b) { return a.mid(4).toInt() < b.mid(4).toInt(); };
+        std::sort(read.begin(), read.end(), byAge);
+        std::sort(unread.begin(), unread.end(), byAge);
+        for (size_t i = 0; i + 200 < read.size(); ++i) jobs.erase(read[i]);
+        for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
         jobQueue.push_back(job);
         if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
         jobsWake.notify_all();
@@ -820,8 +833,9 @@ struct McpServer::Impl {
     }
 
     // A job as montage_job reports it.
-    static ToolResult jobReport(ToolJob& j) {
+    static ToolResult jobReport(ToolJob& j, bool markRead = true) {
         std::lock_guard l(j.m);
+        if (markRead && j.finished()) j.read = true;
         QJsonObject o{{"job", j.id}, {"tool", j.tool}, {"status", j.status}, {"progress", j.fraction}};
         if (!j.step.isEmpty()) o["step"] = j.step;
         QString toolText;
@@ -14011,7 +14025,7 @@ void McpServer::Impl::addTools() {
                 QJsonArray list;
                 QStringList lines;
                 for (auto& j : all) {
-                    const ToolResult r = jobReport(*j);
+                    const ToolResult r = jobReport(*j, false);
                     QJsonObject o = r.structured;
                     o.remove("result");  // (read one job for its result)
                     list.append(o);
@@ -14173,6 +14187,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
             d_->notify = [&](const QJsonObject& n) {
                 if (d_->sink) return d_->sink(QJsonDocument(n).toJson(QJsonDocument::Compact).toStdString());
                 if (!d_->live) return send(n);
+                std::lock_guard l(d_->liveMutex);
                 *d_->live << QJsonDocument(n).toJson(QJsonDocument::Compact).toStdString() << '\n';
                 d_->live->flush();
             };
@@ -14205,13 +14220,50 @@ void McpServer::setNotificationSink(std::function<void(const std::string&)> sink
 
 int McpServer::run(std::istream& in, std::ostream& out) {
     d_->live = &out;
+    auto write = [&](const std::vector<std::string>& replies) {
+        std::lock_guard l(d_->liveMutex);
+        for (const std::string& reply : replies) out << reply << '\n';
+        out.flush();
+    };
+    // Tool calls run in turn on a thread of their own, so this one keeps reading: montage_job and cancellations are
+    // answered while a call (or a call waiting for a background job) runs.
+    std::mutex callsMutex;
+    std::condition_variable callsWake;
+    std::deque<std::string> calls;
+    bool closed = false;
+    std::thread caller([&] {
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock l(callsMutex);
+                callsWake.wait(l, [&] { return closed || !calls.empty(); });
+                if (calls.empty()) return;
+                line = std::move(calls.front());
+                calls.pop_front();
+            }
+            write(handle(line));
+        }
+    });
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find_first_not_of(" \t") == std::string::npos) continue;
-        for (const std::string& reply : handle(line)) out << reply << '\n';
-        out.flush();
+        const QJsonObject msg = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
+        if (msg.value("method").toString() == QLatin1String("tools/call") &&
+            msg.value("params").toObject().value("name").toString() != QLatin1String("montage_job")) {
+            std::lock_guard l(callsMutex);
+            calls.push_back(line);
+            callsWake.notify_one();
+        } else {
+            write(handle(line));
+        }
     }
+    {
+        std::lock_guard l(callsMutex);
+        closed = true;
+    }
+    callsWake.notify_one();
+    caller.join();
     return 0;
 }
 

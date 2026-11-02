@@ -87,6 +87,7 @@ private:
         bool external = false;  // from an agent over HTTP (the Assistant panel calls in-process)
         QString label, group;   // a script's: its undo step's name and merge key ("" for the Assistant's and agents')
         QString async;          // a background call's job id (its message runs under that id)
+        uint64_t generation = 0;  // the open project when it was asked for (a call on it is refused once another opens)
     };
     // Background calls, by job id.
     struct AsyncJob {
@@ -97,6 +98,7 @@ private:
     std::map<QString, AsyncJob> asyncJobs_;
     int asyncMade_ = 0;
     QString runningAsync_;  // the background call running ("" for none)
+    QJsonValue runningId_;  // the running call's request id, as its server knows it (for cancelling its work)
     // Progress the tools report, by the token their call carried (a job's id), from the worker's thread.
     struct ProgressBoard {
         std::mutex m;

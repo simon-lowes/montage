@@ -132,7 +132,11 @@ LiveLink::LiveLink(EditorState* state, QObject* parent)
 }
 
 LiveLink::~LiveLink() {
-    if (cancel_) *cancel_ = true;  // a tool still running finishes on its own and discards its copy
+    if (cancel_) {
+        // A tool still running stops where it can (so quitting doesn't wait for it) and discards its copy.
+        *cancel_ = true;
+        worker_->cancel(runningId_);
+    }
     stop();
 }
 
@@ -176,6 +180,7 @@ void LiveLink::stop() {
     if (cancel_ && runningExternal_) {
         *cancel_ = true;
         if (!runningAsync_.isEmpty()) cancelJob(runningAsync_);
+        else worker_->cancel(runningId_);
     }
     server_->close();
     delete server_;
@@ -408,6 +413,11 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         const QByteArray answer = lastLine(protocol_->handle(message.toStdString()));
         return done(QJsonDocument::fromJson(answer).object().contains("result") ? patchedToolList(answer) : answer);
     }
+    if (method == "notifications/cancelled") {
+        // The running call's work stops (its server knows it by the same id); one still waiting is cancelled as it starts.
+        worker_->cancel(msg.value("params").toObject().value("requestId"));
+        return done({});
+    }
     if (method != "tools/call" || !msg.contains("id")) return done(lastLine(protocol_->handle(message.toStdString())));
     const QJsonObject params = msg.value("params").toObject();
     const QString name = params.value("name").toString();
@@ -424,19 +434,46 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         reply["result"] = r;
         done(compact(reply));
     };
+    // Tools answered here at once: asked for in the background, a job that has already finished.
+    const bool async = name != "montage_job" && args.value("async").toBool();
+    auto give = [&](const QJsonObject& result) {
+        if (!async) return answer(result);
+        const QString id = QStringLiteral("job-%1").arg(++asyncMade_);
+        AsyncJob& j = asyncJobs_[id];
+        j.tool = name;
+        j.result = result;
+        j.status = result.value("isError").toBool() ? QStringLiteral("failed") : QStringLiteral("done");
+        answer(toolResult(QStringLiteral("%1 ran as %2: montage_job gives its result").arg(name, id),
+                          QJsonObject{{"job", id}, {"tool", name}, {"status", j.status}}, false));
+    };
     if (name == "montage_live_context") {
         bool isError = false;
-        return answer(contextResult(args, isError));
+        return give(contextResult(args, isError));
     }
     for (const auto& [tool, run] : appTools_)
         if (tool.value("name").toString() == name) {
             QJsonObject structured;
             bool isError = false;
             const QString text = run(args, structured, isError);
-            return answer(toolResult(text, structured, isError));
+            return give(toolResult(text, structured, isError));
         }
     if (name == "montage_job") return answerJob(args, answer);
-    if (args.value("async").toBool()) {
+    if (name == "montage_undo" && targetsOpenProject(args) && state_->readOnly())
+        return give(toolResult(QStringLiteral("The project is open read-only (%1 is editing it): nothing to undo here")
+                                   .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder()),
+                               {}, true));
+    if (name == "montage_undo" && targetsOpenProject(args)) {
+        // Only an agent's own change (a script's own run): the editor's are theirs to undo.
+        const QString last = state_->undoText();
+        // (A script's: this run's own step, not an earlier run of the same script.)
+        if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label && state_->lastMergeKey() == group))
+            return give(toolResult(state_->canUndo() ? QStringLiteral("The last change (%1) was the editor's; it is left alone").arg(last)
+                                                     : QStringLiteral("Nothing to undo"),
+                                   {}, true));
+        state_->undo();
+        return give(toolResult(QStringLiteral("Undid %1").arg(last), {}, false));
+    }
+    if (async) {
         // In the background: queued as any call (under the job's id, its progress reported under it), answered now.
         const QString id = QStringLiteral("job-%1").arg(++asyncMade_);
         QJsonObject a = args, p = params, m = msg;
@@ -448,27 +485,12 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         m["params"] = p;
         m["id"] = id;
         asyncJobs_[id].tool = name;
-        queue_.push_back({m, [this, id](QByteArray reply) { settleJob(id, reply); }, external, label, group, id});
+        queue_.push_back({m, [this, id](QByteArray reply) { settleJob(id, reply); }, external, label, group, id, state_->projectGeneration()});
         answer(toolResult(QStringLiteral("%1 runs in the background as %2: montage_job reads its progress and result").arg(name, id),
                           QJsonObject{{"job", id}, {"tool", name}, {"status", "queued"}}, false));
         return pump();
     }
-    if (name == "montage_undo" && targetsOpenProject(args) && state_->readOnly())
-        return answer(toolResult(QStringLiteral("The project is open read-only (%1 is editing it): nothing to undo here")
-                                     .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder()),
-                                 {}, true));
-    if (name == "montage_undo" && targetsOpenProject(args)) {
-        // Only an agent's own change (a script's own run): the editor's are theirs to undo.
-        const QString last = state_->undoText();
-        // (A script's: this run's own step, not an earlier run of the same script.)
-        if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label && state_->lastMergeKey() == group))
-            return answer(toolResult(state_->canUndo() ? QStringLiteral("The last change (%1) was the editor's; it is left alone").arg(last)
-                                                       : QStringLiteral("Nothing to undo"),
-                                     {}, true));
-        state_->undo();
-        return answer(toolResult(QStringLiteral("Undid %1").arg(last), {}, false));
-    }
-    queue_.push_back({msg, std::move(done), external, label, group, {}});
+    queue_.push_back({msg, std::move(done), external, label, group, {}, state_->projectGeneration()});
     pump();
 }
 
@@ -483,6 +505,13 @@ void LiveLink::pump() {
     QJsonObject args = params.value("arguments").toObject();
     const auto info = tools_.find(tool);
     const bool live = info != tools_.end() && info->second.takesProject && targetsOpenProject(args);
+    if (live && job.generation != state_->projectGeneration()) {
+        // Asked for on a project that has since been closed: not run on the one open now.
+        busy_ = false;
+        job.done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", msg.value("id")},
+                                     {"result", toolResult(QStringLiteral("The project %1 was asked of was closed before it ran").arg(tool), {}, true)}}));
+        return pump();
+    }
     Project before;
     QByteArray snapshot;
     QString path;
@@ -513,6 +542,7 @@ void LiveLink::pump() {
     runningExternal_ = job.external;
     runningGroup_ = job.group;
     runningAsync_ = job.async;
+    runningId_ = msg.value("id");
     if (!job.async.isEmpty()) {
         AsyncJob& a = asyncJobs_[job.async];
         a.status = QStringLiteral("running");
