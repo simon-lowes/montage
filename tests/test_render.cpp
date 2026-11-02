@@ -17814,6 +17814,21 @@ colorspaces:
         avformat_close_input(&fmt);
         QVERIFY(!QFileInfo::exists(pkg.filePath("work")));
 
+        // A folder of the user's that only looks like a rendition's is left alone; a cancelled export leaves the
+        // package as it was.
+        QVERIFY(pkg.mkpath("s2_final"));
+        {
+            QFile notes(pkg.filePath("s2_final/notes.txt"));
+            QVERIFY(notes.open(QIODevice::WriteOnly));
+            notes.write("mine");
+        }
+        {
+            std::atomic<bool> stop{true};
+            QVERIFY(!exportStreamingPackage(p, s, st, nullptr, &stop, &err, nullptr));
+            QVERIFY(pkg.exists("master.m3u8") && pkg.exists(videos[0] + "/playlist.m3u8"));
+            QVERIFY(!pkg.exists(".montage-package-new"));
+        }
+
         // time_signal cues instead: segmentation descriptors for a provider placement opportunity's start and end.
         st.cueCommand = "time_signal";
         st.rungs.resize(1);
@@ -17832,6 +17847,7 @@ colorspaces:
         QVERIFY(!pkg.exists("manifest.mpd"));
         QCOMPARE(pkg.entryList({"v*", "a*"}, QDir::Dirs), QStringList{videos[0]});
         QVERIFY(pkg.exists("s1_en/seg00001.vtt"));
+        QVERIFY(pkg.exists("s2_final/notes.txt"));
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

@@ -471,6 +471,28 @@ std::string streamingCodecName(const std::string& codec, const std::vector<uint8
     return "";
 }
 
+namespace {
+
+// The package's own record of its rendition folders, so a later export knows which folders are its to replace.
+constexpr const char* kPackageRecord = ".montage-package";
+
+bool isRenditionName(const QString& name) {
+    static const QRegularExpression ours(QStringLiteral("^(v\\d+_\\d+p_(h264|hevc|av1)|[as]\\d+_[A-Za-z0-9_-]+)$"));
+    return ours.match(name).hasMatch();
+}
+
+// A folder with nothing in it but what a rendition writes (no subfolders).
+bool holdsOnlyRenditionFiles(const QString& path) {
+    QDir d(path);
+    if (!d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System).isEmpty()) return false;
+    static const QRegularExpression file(QStringLiteral("^(seg\\d+\\.(m4s|vtt)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml)|\\.DS_Store|Thumbs\\.db|desktop\\.ini)$"));
+    for (const QString& f : d.entryList(QDir::Files | QDir::Hidden | QDir::System))
+        if (!file.match(f).hasMatch()) return false;
+    return true;
+}
+
+}  // namespace
+
 bool exportStreamingPackage(const Project& p, const Sequence& seq, const StreamingSettings& s, const ExportProgress& progress,
                             const std::atomic<bool>* cancel, std::string* error, StreamingResult* result) {
     auto fail = [&](const std::string& why) {
@@ -510,10 +532,20 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
 
     QDir root(QString::fromStdString(s.folder));
     if (!root.mkpath(".")) return fail("Cannot make the folder " + s.folder);
-    const std::string folder = root.absolutePath().toStdString();
-    // (an earlier package's playlists go first, so a failed or cancelled export leaves none pointing at what it changed)
-    for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"}) root.remove(f);
-    const std::string work = folder + "/work";
+    const std::string finalFolder = root.absolutePath().toStdString();
+    // The package is made in a folder of its own inside, and only moved into place once whole: a failed or cancelled
+    // export leaves an earlier package as it was.
+    const QString stagingName = QStringLiteral(".montage-package-new");
+    QDir(root.filePath(stagingName)).removeRecursively();
+    if (!root.mkpath(stagingName)) return fail("Cannot make " + finalFolder + "/" + stagingName.toStdString());
+    const std::string folder = root.filePath(stagingName).toStdString();
+    struct Staging {
+        QString dir;
+        ~Staging() {
+            if (!dir.isEmpty()) QDir(dir).removeRecursively();
+        }
+    } staging{QString::fromStdString(folder)};
+    const std::string work = finalFolder + "/work";
     if (!QDir().mkpath(QString::fromStdString(work))) return fail("Cannot make " + work);
     struct WorkFiles {
         std::vector<std::string> files;
@@ -525,11 +557,10 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             QDir().rmdir(QString::fromStdString(dir));
         }
     } workFiles{{}, work, s.keepWork};
-    // A rendition's folder, its earlier segments cleared.
+    // A rendition's folder (new, in the staging folder).
     auto renditionDir = [&](const std::string& name) -> std::string {
         QDir d(QString::fromStdString(folder + "/" + name));
         if (!d.mkpath(".")) return {};
-        for (const QString& f : d.entryList({"seg*.m4s", "seg*.vtt"}, QDir::Files)) d.remove(f);
         return d.absolutePath().toStdString();
     };
 
@@ -1124,11 +1155,44 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     for (auto& v : video) res.renditions.push_back(v->name);
     for (const AudioOut& ao : audio) res.renditions.push_back(ao.name);
     for (const TextOut& t : texts) res.renditions.push_back(t.name);
+    // Into place. Only folders an earlier package made are replaced or removed (those its record lists, or, for a
+    // package from before records, those holding nothing but a rendition's files); any other folder of a rendition's
+    // name stops the export with the earlier package untouched.
+    std::set<std::string> before;
+    {
+        QFile rec(root.filePath(QString::fromLatin1(kPackageRecord)));
+        if (rec.open(QIODevice::ReadOnly))
+            for (const QByteArray& line : rec.readAll().split('\n'))
+                if (const QString n = QString::fromUtf8(line).trimmed(); isRenditionName(n)) before.insert(n.toStdString());
+    }
+    auto earlier = [&](const QString& name) {
+        return QFileInfo(root.filePath(name)).isDir() && (before.count(name.toStdString()) || holdsOnlyRenditionFiles(root.filePath(name)));
+    };
+    for (const std::string& n : res.renditions) {
+        const QString q = QString::fromStdString(n);
+        if (QFileInfo::exists(root.filePath(q)) && !earlier(q))
+            return fail("The folder already has a \"" + n + "\" that this package did not make: choose an empty folder");
+    }
+    for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"}) root.remove(QString::fromLatin1(f));
+    for (const std::string& n : res.renditions) {
+        const QString q = QString::fromStdString(n);
+        if (QFileInfo::exists(root.filePath(q))) QDir(root.filePath(q)).removeRecursively();
+        if (!root.rename(stagingName + "/" + q, q)) return fail("Cannot move " + n + " into " + finalFolder);
+    }
+    for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"})
+        if (QFileInfo::exists(QString::fromStdString(folder) + "/" + f) && !root.rename(stagingName + "/" + f, QString::fromLatin1(f)))
+            return fail(std::string("Cannot move ") + f + " into " + finalFolder);
     // An earlier package's renditions this one did not make (a longer ladder, another language) are removed.
-    static const QRegularExpression ours(QStringLiteral("^(v\\d+_\\d+p_(h264|hevc|av1)|[as]\\d+_[A-Za-z0-9_-]+)$"));
     for (const QString& d : root.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
-        if (ours.match(d).hasMatch() && std::find(res.renditions.begin(), res.renditions.end(), d.toStdString()) == res.renditions.end())
+        if (isRenditionName(d) && std::find(res.renditions.begin(), res.renditions.end(), d.toStdString()) == res.renditions.end() && earlier(d))
             QDir(root.filePath(d)).removeRecursively();
+    {
+        std::string rec;
+        for (const std::string& n : res.renditions) rec += n + "\n";
+        writeFile(finalFolder + "/" + kPackageRecord, rec);
+    }
+    if (!res.hls.empty()) res.hls = finalFolder + "/master.m3u8";
+    if (!res.dash.empty()) res.dash = finalFolder + "/manifest.mpd";
     report(1);
     if (result) *result = std::move(res);
     return true;
