@@ -10,7 +10,7 @@ namespace montage {
 
 namespace {
 // Code values to linear light, keeping the sign of the display transfers' (which only take 0 and up).
-bool mirrored(Transfer t) { return t == Transfer::Bt1886 || t == Transfer::Srgb || t == Transfer::Pq || t == Transfer::Hlg; }
+bool mirrored(Transfer t) { return t == Transfer::Bt1886 || t == Transfer::Srgb || t == Transfer::Gamma22 || t == Transfer::Pq || t == Transfer::Hlg; }
 
 double linearOf(Transfer t, double v) {
     if (mirrored(t) && v < 0) return -toLinear(t, -v);

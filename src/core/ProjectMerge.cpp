@@ -114,6 +114,7 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         fxs(t.effects);
         for (Send& s : t.sends) fn(s.bus);
         for (TakeLane& l : t.lanes) fn(l.id), fn(l.mediaId);
+        for (SamplerPass& ps : t.sampler.passes) fn(ps.lane);
         for (TrackVersion& v : t.versions) {
             for (Clip& c : v.clips) clipAndOriginal(c);
             transitions(v.transitions);

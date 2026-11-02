@@ -1068,6 +1068,9 @@ bool EditorState::removeMedia(Id id, QString* error) {
                         if (gone.count(c.mediaId)) uses.push_back(c.id);
                     // Its takes, and its clips in the track's versions not shown, go too.
                     std::erase_if(t.lanes, [&](const TakeLane& l) { return gone.count(l.mediaId) > 0; });
+                    std::erase_if(t.sampler.passes, [&](const SamplerPass& ps) {
+                        return std::none_of(t.lanes.begin(), t.lanes.end(), [&](const TakeLane& l) { return l.id == ps.lane; });
+                    });
                     for (TrackVersion& v : t.versions) {
                         std::set<Id> removed;
                         for (const Clip& c : v.clips)

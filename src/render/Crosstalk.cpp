@@ -50,7 +50,7 @@ struct Linearise {
     Transfer tf;
     explicit Linearise(const ColorSpace& s)
         : linear(s.transfer == Transfer::Linear),
-          mirror(s.transfer == Transfer::Bt1886 || s.transfer == Transfer::Srgb || s.transfer == Transfer::Pq || s.transfer == Transfer::Hlg),
+          mirror(s.transfer == Transfer::Bt1886 || s.transfer == Transfer::Srgb || s.transfer == Transfer::Gamma22 || s.transfer == Transfer::Pq || s.transfer == Transfer::Hlg),
           tf(s.transfer) {}
     double lin(float v) const {
         if (linear) return v;

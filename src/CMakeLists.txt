@@ -77,6 +77,7 @@ add_library(montage_engine STATIC
   core/ProjectLock.h core/ProjectLock.cpp
   core/Production.h core/Production.cpp
   core/GraphicsTemplate.h core/GraphicsTemplate.cpp
+  core/MidiMaps.h core/MidiMaps.cpp
   core/Storyboard.h core/Storyboard.cpp
   automation/ScriptHost.h automation/ScriptHost.cpp
   automation/PythonHost.h automation/PythonHost.cpp
@@ -91,6 +92,7 @@ add_library(montage_engine STATIC
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
+  media/DngOpcodes.h media/DngOpcodes.cpp
   media/ProResRaw.h media/ProResRaw.cpp
   media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp
@@ -205,6 +207,7 @@ add_library(montage_engine STATIC
   render/Hdr10Plus.h render/Hdr10Plus.cpp
   render/AdaptiveHdr.h render/AdaptiveHdr.cpp
   control/Midi.h control/Midi.cpp
+  control/MidiMap.h control/MidiMap.cpp
   control/MackieControl.h control/MackieControl.cpp
   control/Hui.h control/Hui.cpp
   control/Osc.h control/Osc.cpp
@@ -274,6 +277,8 @@ add_library(montage_engine STATIC
   render/Exporter.h render/Exporter.cpp
   render/RenderFarm.h render/RenderFarm.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
+  render/StreamingPackage.h render/StreamingPackage.cpp
+  render/Scte35.h render/Scte35.cpp
   render/GradeGraph.h render/GradeGraph.cpp
   render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp
@@ -293,6 +298,7 @@ add_library(montage_engine STATIC
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
   audio/DialogueAlign.h audio/DialogueAlign.cpp
   audio/ElasticAudio.h audio/ElasticAudio.cpp
+  audio/Sampler.h audio/Sampler.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp

@@ -184,6 +184,8 @@
 #include "CueSheetPanel.h"
 #include "core/Xlsx.h"
 #include "ControlSurface.h"
+#include "MidiLearn.h"
+#include "SamplerPanel.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
 #include "TangentControl.h"
@@ -1394,6 +1396,7 @@ private slots:
         QTRY_COMPARE(state()->playhead(), FrameTime(13));
         surface->handle({0xB0, 0x3C, 0x41});
         QTRY_COMPARE(state()->playhead(), FrameTime(12));
+        state()->setPlayhead(17);
         const size_t markers = state()->sequence()->markers.size();
         surface->handle({0x90, uint8_t(mcu::Marker), 0x7F});
         QCOMPARE(state()->sequence()->markers.size(), markers + 1);
@@ -1486,6 +1489,344 @@ private slots:
         QTest::qWait(50);
         QVERIFY(surface->isConnected());
         surface->disconnectSurface();
+    }
+
+    void midiLearn() {
+        // A stand-in for the controller's MIDI connection: what Montage sends it is kept.
+        struct Recorder : MidiConnection {
+            std::shared_ptr<std::vector<MidiMessage>> sent = std::make_shared<std::vector<MidiMessage>>();
+            bool send(const MidiMessage& m) override {
+                sent->push_back(m);
+                return true;
+            }
+            std::string inputName() const override { return "nanoKONTROL2"; }
+            std::string outputName() const override { return "nanoKONTROL2"; }
+        };
+        QTemporaryDir maps;
+        MidiLearn* learn = win_->midiLearn();
+        QVERIFY(learn && win_->findChild<QAction*>("midiLearn") && win_->findChild<QAction*>("midiMap"));
+        learn->setFolder(maps.path());
+        learn->setHoldTime(600000);  // (held controls are let go by the test)
+        loadDemo();
+        QVERIFY(state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 10) edit::addTrack(p, s, TrackKind::Audio);
+            return true;
+        }));
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_COMPARE(mixer->trackStrips(), 10);
+        auto track = [&](int i) -> const Track& { return state()->sequence()->audioTracks.at(size_t(i)); };
+        auto rec = std::make_unique<Recorder>();
+        auto sent = rec->sent;
+        learn->setConnection(std::move(rec), "nanoKONTROL2");
+        QVERIFY(learn->isConnected() && learn->mappings().empty());
+        auto has = [&](const MidiMessage& m) { return std::find(sent->begin(), sent->end(), m) != sent->end(); };
+        auto press = [](QWidget* w) {
+            QMouseEvent e(QEvent::MouseButtonPress, QPointF(w->width() / 2.0, w->height() / 2.0), w->mapToGlobal(QPointF(w->width() / 2.0, w->height() / 2.0)),
+                          Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(w, &e);
+            QMouseEvent r(QEvent::MouseButtonRelease, e.position(), e.globalPosition(), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(w, &r);
+        };
+
+        // Learn: a fader moved, then a mixer strip's fader clicked (the click picks it without moving it).
+        QAction* learnAction = win_->findChild<QAction*>("midiLearn");
+        learnAction->trigger();
+        QVERIFY(learn->isLearning());
+        QSignalSpy learnt(learn, &MidiLearn::learnt);
+        for (int v = 10; v < 16; ++v) learn->handle({0xB0, 0, uint8_t(v)});
+        const int before = mixer->trackFader(2)->value();
+        press(mixer->trackFader(2));
+        QCOMPARE(mixer->trackFader(2)->value(), before);
+        QCOMPARE(learnt.size(), 1);
+        QCOMPARE(learnt[0][0].toString(), QString("cc:1:0"));
+        QCOMPARE(learnt[0][1].toString(), QString("strip:3:volume"));
+        // The other way round: a parameter clicked, then a relative encoder turned (decided once it rests).
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        const Id motion = clipNamed(*state()->sequence(), "Red")->motion.id;
+        state()->setSelection({red}, false);
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        auto opacityBox = [&] { return inspector->findChild<QDoubleSpinBox*>(QStringLiteral("param_%1_opacity").arg(motion)); };
+        QTRY_VERIFY(opacityBox());
+        const QString opacityTarget = learn->targetAt(opacityBox());
+        QCOMPARE(opacityTarget, QStringLiteral("widget:inspector/param_%1_opacity").arg(motion));
+        learn->learnTarget(opacityTarget);
+        learn->handle({0xB0, 16, 65});
+        learn->handle({0xB0, 16, 65});
+        learn->handle({0xB0, 16, 63});
+        QTRY_COMPARE(learnt.size(), 2);
+        QCOMPARE(learn->mappings().back().encoding, midimap::Encoding::Offset64);
+        // A note on a mute button (a toggle), and a menu command.
+        learn->handle({0x90, 37, 100});
+        learn->learnTarget(learn->targetAt(mixer->trackMute(0)));
+        learn->handle({0x80, 37, 0});
+        QAction* marker = nullptr;
+        for (QAction* a : keymap::actions(win_.get()))
+            if (keymap::idOf(a).endsWith("/Add Marker")) marker = a;
+        QVERIFY(marker);
+        learn->learnTarget("command:" + keymap::idOf(marker));
+        learn->handle({0x90, 40, 100});
+        learn->handle({0x80, 40, 0});
+        learnAction->trigger();
+        QVERIFY(!learn->isLearning());
+        QCOMPARE(learn->mappings().size(), size_t(4));
+        QVERIFY(learn->mappings()[2].toggle && learn->mappings()[2].target == "strip:1:mute");
+        QVERIFY(QFile::exists(learn->mapFile()));
+
+        // Soft takeover: the fader moves strip 3's volume only once it reaches it (0 dB is 105.8 of 127).
+        learn->handle({0xB0, 0, 20});
+        QCOMPARE(track(2).volumeDb, 0.0);
+        learn->handle({0xB0, 0, 110});
+        QCOMPARE(track(2).volumeDb, 2.4);
+        QVERIFY(mixer->trackFader(2)->isSliderDown());
+        learn->handle({0xB0, 0, 111});
+        learn->releaseHolds();
+        QVERIFY(!mixer->trackFader(2)->isSliderDown());
+        state()->undo();  // one undo step for the moves
+        QCOMPARE(track(2).volumeDb, 0.0);
+        // Feedback: the mixer moved it, so the controller is shown where it is.
+        sent->clear();
+        learn->refresh();
+        QVERIFY(has({0xB0, 0, 106}));
+        // The encoder turns opacity by its steps; the button toggles mute (and lights); the note adds a marker.
+        const double opacity = opacityBox()->value();
+        learn->handle({0xB0, 16, 61});
+        const double turned = std::max(opacityBox()->minimum(), opacity - 3 * (opacityBox()->maximum() - opacityBox()->minimum()) / 128);
+        QVERIFY(std::fabs(opacityBox()->value() - turned) <= 0.5 * std::pow(10.0, -opacityBox()->decimals()) + 1e-9);
+        sent->clear();
+        learn->handle({0x90, 37, 100});
+        learn->handle({0x90, 37, 0});
+        QVERIFY(track(0).muted);
+        QVERIFY(has({0x90, 37, 127}));
+        learn->handle({0x90, 37, 100});
+        learn->handle({0x90, 37, 0});
+        QVERIFY(!track(0).muted);
+        const size_t markers = state()->sequence()->markers.size();
+        learn->handle({0x90, 40, 100});
+        learn->handle({0x90, 40, 0});
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+
+        // Banks: strips count from the bank, which a button moves across the tracks.
+        midimap::Mapping next;
+        next.key = {midimap::Kind::Note, 0, 41};
+        next.encoding = midimap::Encoding::Button;
+        next.target = "bank:next";
+        learn->addMapping(next);
+        learn->handle({0x90, 41, 100});
+        QCOMPARE(learn->bank(), 8);
+        learn->handle({0x90, 37, 100});
+        QVERIFY(track(8).muted && !track(0).muted);
+        learn->setBank(0);
+
+        // Layers: a mapping for the Inspector takes the fader over while the Inspector has focus.
+        midimap::Mapping layered = learn->mappings()[0];
+        layered.target = opacityTarget.toStdString();
+        layered.layer = "inspector";
+        layered.pickup = false;
+        learn->addMapping(layered);
+        learn->setPanel("inspector");
+        learn->handle({0xB0, 0, 0});
+        QCOMPARE(opacityBox()->value(), opacityBox()->minimum());
+        QCOMPARE(track(2).volumeDb, 0.0);
+        learn->setPanel("mixer");
+        QCOMPARE(learn->panel(), QString("mixer"));
+
+        // A Touch pass from a mapped 14-bit fader equals the same pass from the mixer's own fader, sample for sample.
+        QVERIFY(state()->edit("Touch", [](Project&, Sequence& s) {
+            s.audioTracks[0].automation = int(AutomationMode::Touch);
+            return true;
+        }));
+        auto pass = [&](const std::function<void(FrameTime)>& at) {
+            mixer->playbackStarted(0);
+            for (FrameTime f = 0; f <= 40; ++f) {
+                at(f);
+                mixer->playbackPosition(f);
+            }
+            mixer->playbackStopped(40);
+            std::vector<double> lane;
+            for (FrameTime f = 0; f <= 40; ++f) lane.push_back(track(0).volumeAuto.at(f));
+            return lane;
+        };
+        const std::vector<double> byMouse = pass([&](FrameTime f) {
+            if (f == 10) {
+                mixer->trackFader(0)->setSliderDown(true);
+                mixer->trackFader(0)->setValue(-200);
+            }
+            if (f == 30) mixer->trackFader(0)->setSliderDown(false);
+        });
+        QCOMPARE(byMouse[20], -20.0);
+        state()->undo();
+        QVERIFY(!track(0).volumeAuto.animated());
+        midimap::Mapping fine;
+        fine.key = {midimap::Kind::Cc14, 0, 7};
+        fine.target = "strip:1:volume";
+        fine.pickup = false;
+        learn->addMapping(fine);
+        const std::vector<double> byController = pass([&](FrameTime f) {
+            if (f == 10) {
+                learn->handle({0xB0, 7, 9102 >> 7});
+                learn->handle({0xB0, 39, 9102 & 127});
+            }
+            if (f == 30) learn->releaseHolds();
+        });
+        QCOMPARE(byController, byMouse);
+
+        // A colour wheel: one axis per control, its last move made final once the control rests.
+        QVERIFY(state()->edit("Palette", [red](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "hdr_palette"));
+            return true;
+        }));
+        win_->findChild<QDockWidget*>("inspector")->show();
+        QApplication::processEvents();
+        QTRY_VERIFY(learn->targetValue("widget:inspector/wheel_global#x") == 0.5);
+        learn->applyChange("widget:inspector/wheel_global#x", {0.75, midimap::Change::None});
+        learn->releaseHolds();
+        QTRY_VERIFY(std::fabs(learn->targetValue("widget:inspector/wheel_global#x") - 0.75) < 1e-6);
+        QCOMPARE(learn->targetValue("widget:inspector/wheel_global#y"), 0.5);
+        QVERIFY(learn->targetLabel("strip:3:volume") == "strip 3 volume");
+
+        // The map as a table: a curve typed in, a mapping removed.
+        win_->findChild<QAction*>("midiMap")->trigger();
+        auto* dialog = win_->findChild<QDialog*>("midiLearnDialog");
+        QVERIFY(dialog);
+        auto* table = dialog->findChild<QTableWidget*>("midiLearnMap");
+        QCOMPARE(table->rowCount(), int(learn->mappings().size()));
+        table->item(0, 5)->setText("2");
+        QCOMPARE(learn->mappings()[0].curve, 2.0);
+        const size_t count = learn->mappings().size();
+        table->selectRow(int(count) - 1);
+        dialog->findChild<QPushButton*>("midiLearnRemove")->click();
+        QCOMPARE(learn->mappings().size(), count - 1);
+        QTRY_COMPARE(table->rowCount(), int(count - 1));
+        learn->addMapping(fine);
+        dialog->close();
+
+        // Unplugged and plugged back in (matched by name), and the map read again from its file.
+        learn->connectionLost();
+        QTRY_VERIFY(!learn->isConnected());
+        auto again = std::make_unique<Recorder>();
+        learn->setConnection(std::move(again), "nanoKONTROL2");
+        learn->setPanel("mixer");
+        learn->handle({0xB0, 0, 106});  // (taken over again from where the fader is)
+        learn->handle({0xB0, 0, 127});
+        QCOMPARE(track(2).volumeDb, 12.0);
+        learn->releaseHolds();
+        MidiLearn reopened(state(), mixer, win_.get());
+        reopened.setFolder(maps.path());
+        reopened.setConnection(std::make_unique<Recorder>(), "nanoKONTROL2");
+        QCOMPARE(reopened.mappings().size(), learn->mappings().size());
+        for (size_t i = 0; i < reopened.mappings().size(); ++i) {
+            QCOMPARE(reopened.mappings()[i].target, learn->mappings()[i].target);
+            QVERIFY(reopened.mappings()[i].key == learn->mappings()[i].key);
+            QCOMPARE(reopened.mappings()[i].layer, learn->mappings()[i].layer);
+        }
+        reopened.disconnectDevice();
+        learn->disconnectDevice();
+        QVERIFY(!learn->isConnected());
+    }
+    void samplerPanel() {
+        // The Sampler panel: a sound put on a key and heard from the computer's keys, a slot's setting changed in the
+        // table, the picture's sample taken back by how long ago a key went down, a pass recorded while the sequence plays
+        // (onto a take lane and the comp, as one undo step) and voiced again with another sound.
+        auto writeWav = [](const QString& file, const std::vector<float>& x) {
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        std::vector<float> click(4800), thud(9600);
+        for (size_t i = 0; i < click.size(); ++i) click[i] = 0.5f * float(std::exp(-double(i) / 480.0)) * (i % 7 < 3 ? 1.0f : -1.0f);
+        for (size_t i = 0; i < thud.size(); ++i) thud[i] = 0.3f * float(std::exp(-double(i) / 2400.0)) * (i % 40 < 20 ? 1.0f : -1.0f);
+        QVERIFY(writeWav(dir_.path() + "/click.wav", click));
+        QVERIFY(writeWav(dir_.path() + "/thud.wav", thud));
+        QVERIFY(writeWav(dir_.path() + "/bed.wav", std::vector<float>(size_t(48000) * 10, 0.0f)));
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/sampler.montage"));
+        // (ten seconds of sound on A2 for the sequence to play through)
+        const auto bed = state()->importFiles({dir_.path() + "/bed.wav"});
+        QCOMPARE(bed.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            return edit::placeMedia(p, s, bed[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+        }));
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        QVERIFY(program);
+        QAction* show = win_->findChild<QAction*>("showSampler");
+        QVERIFY(show);
+        show->trigger();
+        auto* panel = win_->findChild<SamplerPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        QVERIFY(!panel->isActive());  // (nothing to play yet)
+        auto track = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        QVERIFY(panel->addSounds(48, {dir_.path() + "/click.wav"}));
+        QCOMPARE(track().sampler.pads.size(), size_t(1));
+        QCOMPARE(track().sampler.pads[0].name, std::string("click"));
+        QVERIFY(panel->isActive());
+        auto* table = panel->findChild<QTableWidget*>("samplerSlots");
+        QVERIFY(table && table->rowCount() == 1);
+        table->item(0, 7)->setText("2");  // the choke group
+        QCOMPARE(track().sampler.pads[0].choke, 2);
+        // The computer's keys: Z plays C3 (48), the sound in the sampler at once.
+        panel->setComputerKeys(true);
+        QWidget* focus = win_->findChild<TimelineWidget*>();
+        focus->setFocus();
+        QKeyEvent down(QEvent::KeyPress, Qt::Key_Z, Qt::NoModifier, QStringLiteral("z"));
+        QApplication::sendEvent(focus, &down);
+        std::vector<float> heard(512 * 2, 0.0f);
+        panel->engine()->render(0, 512, heard.data());
+        QVERIFY(std::any_of(heard.begin(), heard.end(), [](float v) { return v != 0; }));
+        QKeyEvent up(QEvent::KeyRelease, Qt::Key_Z, Qt::NoModifier, QStringLiteral("z"));
+        QApplication::sendEvent(focus, &up);
+        panel->setComputerKeys(false);
+        QCOMPARE(SamplerPanel::keyForComputerKey(Qt::Key_Q), 60);
+        QCOMPARE(SamplerPanel::keyForComputerKey(Qt::Key_F), -1);
+        // Stopped, the picture's sample is the playhead's; playing, a key pressed 20 ms ago was played against the sample
+        // heard 20 ms ago.
+        program->seek(45);
+        QCOMPARE(program->heardSample(), int64_t(45 * 48000 / 30));
+        QCOMPARE(program->heardSample(20000000), int64_t(45 * 48000 / 30));
+        QString why;
+        QVERIFY(!panel->connectMidi("No Such Keyboard", &why) && !why.isEmpty());
+        // A pass recorded while the sequence plays.
+        program->seek(0);
+        panel->setRecording(true);
+        QVERIFY(panel->isRecording() && program->isPlaying());
+        QTest::qWait(200);
+        const int64_t a = program->heardSample(), ago = program->heardSample(20000000), b = program->heardSample();
+        QVERIFY2(ago >= a - 960 - 5 && ago <= b - 960 + 5, qPrintable(QStringLiteral("%1 %2 %3").arg(a).arg(ago).arg(b)));
+        panel->noteOn(48, 110);
+        QTest::qWait(150);
+        panel->noteOff(48);
+        panel->noteOn(48, 60);
+        QTest::qWait(50);
+        panel->setRecording(false);
+        QVERIFY(!panel->isRecording() && !program->isPlaying());
+        QCOMPARE(track().lanes.size(), size_t(1));
+        QCOMPARE(track().sampler.passes.size(), size_t(1));
+        const SamplerPass pass = track().sampler.passes[0];
+        QCOMPARE(pass.notes.size(), size_t(2));
+        QVERIFY(pass.notes[0].at >= a && pass.notes[0].at < a + 48000);
+        QVERIFY(pass.notes[1].at > pass.notes[0].at);
+        QCOMPARE(pass.notes[0].velocity, 110);
+        QVERIFY(track().lanes[0].start <= FrameTime(pass.notes[0].at * 30 / 48000));
+        QVERIFY(!track().clips.empty());  // (the comp)
+        const Id media = track().lanes[0].mediaId;
+        QVERIFY(QFileInfo(QString::fromStdString(state()->project().findMedia(media)->path)).absolutePath().endsWith("/Sampler"));
+        QCOMPARE(state()->undoText(), QString("Record Sampler Pass"));
+        // Voiced again with the thud: the same notes, a new file.
+        QVERIFY(panel->addSounds(48, {dir_.path() + "/thud.wav"}));  // (round robin: click, thud)
+        QVERIFY(panel->revoice(pass.lane));
+        QCOMPARE(track().sampler.passes[0].notes, pass.notes);
+        QVERIFY(track().lanes[0].mediaId != media);
+        // Undone: the pass and its lane go together.
+        state()->undo();
+        state()->undo();
+        state()->undo();
+        QVERIFY(track().lanes.empty() && track().sampler.passes.empty());
+        win_->findChild<QDockWidget*>("sampler")->hide();
+        QTRY_VERIFY(!panel->isActive());
     }
 
     void oscControl() {

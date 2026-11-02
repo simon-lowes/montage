@@ -49,6 +49,8 @@ struct ExrInfo {
 bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error = nullptr);
 // The file's chromaticities attribute (red, green, blue and white x, y); false when it has none or cannot be read.
 bool readExrChromaticities(const std::string& file, double xy[8]);
+// The file's colorInteropID attribute (its colour space by the ASWF Color Interop Forum's ID), "" when it has none.
+std::string readExrColorInteropId(const std::string& file);
 // The same, kept for the few files last asked for (null when unreadable); read again once the file changes.
 std::shared_ptr<const ExrInfo> cachedExrInfo(const std::string& file);
 

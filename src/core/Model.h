@@ -275,6 +275,7 @@ struct Marker {
     std::string reviewStatusAt;  // when the note's status was last set (the later status wins on import)
     FrameTime drawingFrame() const { return drawnAt >= 0 ? drawnAt : t; }
     double sub = 0;  // between frames (0..1): it sits at t + sub (a sync point in the sound)
+    bool adBreak = false;  // an ad break (duration: the break's length; 0 a place for one): SCTE 35 cues in streaming packages
     bool operator==(const Marker&) const = default;
 };
 
@@ -613,6 +614,47 @@ struct TrackVersion {
     bool operator==(const TrackVersion&) const = default;
 };
 
+// A sound-effect sampler on an audio track (audio/Sampler.h): sounds on keys (MIDI notes 0-127, pads, or the
+// computer's keys), played to picture and recorded in passes onto the track's take lanes. A sound is a file, or a
+// stretch of one (seconds), answering velocities velLow..velHigh; a slot's sounds at the same velocity take turns.
+struct SamplerSound {
+    std::string path;
+    double start = 0, end = 0;  // seconds in the file; end 0 = to the end
+    int velLow = 1, velHigh = 127;
+    bool operator==(const SamplerSound&) const = default;
+};
+struct SamplerSlot {
+    int key = 60;
+    std::string name;
+    std::vector<SamplerSound> sounds;
+    double gainDb = 0;
+    double attack = 0, release = 0.02;  // seconds
+    bool oneShot = true;                // plays to its end; else only while the key is held (then the release)
+    int choke = 0;                      // a choke group (1..16): a note cuts every other voice of its group; 0 none
+    double pitchVariation = 0;          // ± semitones, at random for each hit
+    double levelVariation = 0;          // ± dB, at random for each hit
+    bool operator==(const SamplerSlot&) const = default;
+};
+// A note played: `at` and `length` in samples at the sequence's rate, from the sequence's start.
+struct SamplerNote {
+    int key = 60, velocity = 100;
+    int64_t at = 0, length = 0;
+    bool operator==(const SamplerNote&) const = default;
+};
+// A recorded pass: the take lane its sound went to, and the notes, kept so it can be voiced again with other sounds.
+struct SamplerPass {
+    Id lane = 0;
+    uint32_t seed = 1;  // the hits' random variation
+    std::vector<SamplerNote> notes;
+    bool operator==(const SamplerPass&) const = default;
+};
+struct SamplerSettings {
+    std::vector<SamplerSlot> pads;   // by key, at most one a key
+    std::vector<SamplerPass> passes;
+    bool empty() const { return pads.empty() && passes.empty(); }
+    bool operator==(const SamplerSettings&) const = default;
+};
+
 struct Track {
     Id id = 0;
     TrackKind kind = TrackKind::Video;
@@ -651,6 +693,7 @@ struct Track {
     bool lanesShown = true;
     std::vector<TrackVersion> versions;
     int version = 0;
+    SamplerSettings sampler;  // audio: a sound-effect sampler (audio/Sampler.h)
     bool operator==(const Track&) const = default;
 };
 

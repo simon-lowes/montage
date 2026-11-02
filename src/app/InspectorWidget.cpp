@@ -2567,6 +2567,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     switch (pi.kind) {
         case ParamKind::Bool: {
             auto* cb = new QCheckBox(row);
+            cb->setObjectName(QStringLiteral("param_%1_%2").arg(target.effect).arg(QString::fromStdString(name)));
             h->addWidget(cb, 1);
             connect(cb, &QCheckBox::toggled, this, [write, name](bool on) { write({{name, on ? 1.0 : 0.0}}); });
             refreshWidget = [cb, read, name] {

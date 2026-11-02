@@ -253,9 +253,13 @@
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
+#include "core/MidiMaps.h"
+#include "audio/Sampler.h"
+#include "core/TakeLanes.h"
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
+#include "media/DngOpcodes.h"
 #include "media/ProResRaw.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
@@ -393,8 +397,9 @@ void writeVoiceWav(const std::string& path, double seconds, double hz, const std
 // "camera" whose sensor sees linear sRGB, so it develops back to the scene.
 // `neutral`: the camera's response to the light (raw = scene x neutral, undone by its AsShotNeutral); `frameRate` > 0
 // marks it a CinemaDNG frame.
+// `opcodes`: its opcode lists 1 to 3 (bytes as stored; empty for none).
 bool writeTestDng(const std::string& path, int w, int h, const std::function<std::array<double, 3>(int, int)>& scene, int orientation = 1,
-                  std::array<double, 3> neutral = {1, 1, 1}, double frameRate = 0) {
+                  std::array<double, 3> neutral = {1, 1, 1}, double frameRate = 0, const std::array<std::vector<uint8_t>, 3>& opcodes = {}) {
     struct Entry {
         uint16_t tag, type;
         uint32_t count;
@@ -437,6 +442,8 @@ bool writeTestDng(const std::string& path, int w, int h, const std::function<std
     rationals(50721, 10, {3.2406, -1.5372, -0.4986, -0.9689, 1.8758, 0.0415, 0.0557, -0.2040, 1.0570});
     rationals(50728, 5, {neutral[0], neutral[1], neutral[2]});
     shorts(50778, {21});
+    for (int k = 0; k < 3; ++k)
+        if (!opcodes[size_t(k)].empty()) entries.push_back({uint16_t(k == 0 ? 51008 : k == 1 ? 51009 : 51022), 7, uint32_t(opcodes[size_t(k)].size()), opcodes[size_t(k)]});
     if (frameRate > 0) rationals(51044, 10, {frameRate});
     std::vector<uint8_t> file = {'I', 'I', 42, 0};
     const uint32_t ifd = 8 + dataBytes;
@@ -6227,6 +6234,302 @@ private slots:
         QCOMPARE(saved.media.back().width, info.width);
     }
 
+    void dngOpcodeLists() {
+        // Opcode parameters as the specification stores them (big-endian).
+        struct Params {
+            std::vector<uint8_t> b;
+            Params& u32(uint32_t v) {
+                for (int s = 24; s >= 0; s -= 8) b.push_back(uint8_t(v >> s));
+                return *this;
+            }
+            Params& f64(double d) {
+                uint64_t v;
+                std::memcpy(&v, &d, 8);
+                for (int s = 56; s >= 0; s -= 8) b.push_back(uint8_t(v >> s));
+                return *this;
+            }
+            Params& f32(float f) {
+                uint32_t v;
+                std::memcpy(&v, &f, 4);
+                return u32(v);
+            }
+        };
+        // A gain map over the picture (or every second row and column from `top`, `left`): `gains` across, one row of
+        // them repeated down.
+        auto gainMap = [](std::vector<float> gains, uint32_t top = 0, uint32_t left = 0, uint32_t pitch = 1, uint32_t planes = 1) {
+            Params p;
+            p.u32(top).u32(left).u32(100000).u32(100000).u32(0).u32(planes).u32(pitch).u32(pitch).u32(2).u32(uint32_t(gains.size()));
+            p.f64(1).f64(gains.size() > 1 ? 1.0 / double(gains.size() - 1) : 1).f64(0).f64(0).u32(1);
+            for (int r = 0; r < 2; ++r)
+                for (float g : gains) p.f32(g);
+            return DngOpcode{kGainMap, 0x01030000, 0, p.b};
+        };
+        auto opLists = [](std::vector<uint8_t> a, std::vector<uint8_t> b, std::vector<uint8_t> c) {
+            return std::array<std::vector<uint8_t>, 3>{std::move(a), std::move(b), std::move(c)};
+        };
+        auto warp = [](uint32_t id, std::vector<double> k) {
+            Params p;
+            p.u32(1);
+            for (double v : k) p.f64(v);
+            p.f64(0.5).f64(0.5);
+            return DngOpcode{id, 0x01030000, 0, p.b};
+        };
+
+        // Lists read back as written, and the warps' geometry as the specification gives it.
+        const DngOpcodeList list{gainMap({1.0f, 0.5f}), warp(kWarpRectilinear, {1, 0.05, 0, 0, 0.001, -0.002}),
+                                 DngOpcode{77, 0x01030000, 1, {1, 2, 3}}};
+        DngOpcodeList back;
+        const std::vector<uint8_t> bytes = dngOpcodeListBytes(list);
+        QVERIFY(parseDngOpcodeList(bytes.data(), bytes.size(), back) && back.size() == 3);
+        QVERIFY(back[1].id == kWarpRectilinear && back[1].params == list[1].params && back[2].flags == 1 && back[2].params.size() == 3);
+        QVERIFY(!parseDngOpcodeList(bytes.data(), bytes.size() - 1, back));
+        {
+            // A gain map whose origin is not a number is passed over (it would index outside its gains).
+            DngOpcode nan = gainMap({0.5f});
+            const uint8_t quiet[8] = {0x7f, 0xf8, 0, 0, 0, 0, 0, 0};
+            std::memcpy(nan.params.data() + 56, quiet, 8);
+            std::vector<float> px(size_t(8) * 8 * 3, 0.5f);
+            QCOMPARE(applyDngPictureOpcodes({nan}, px.data(), 8, 8, 3), 0);
+            QCOMPARE(applyDngPictureOpcodes({gainMap({0.5f})}, px.data(), 8, 8, 3), 1);
+            QCOMPARE(px[0], 0.25f);
+        }
+        {
+            const int W = 101, H = 61;
+            const double cx = 50, cy = 30, m = std::sqrt(50.0 * 50 + 30.0 * 30);
+            double sx, sy;
+            QVERIFY(dngWarpSource(list[1], 0, cx, cy, W, H, sx, sy) && std::fabs(sx - cx) < 1e-9 && std::fabs(sy - cy) < 1e-9);
+            QVERIFY(dngWarpSource(list[1], 0, 100, 60, W, H, sx, sy));
+            const double dx = 50 / m, dy = 30 / m, r2 = dx * dx + dy * dy, f = 1 + 0.05 * r2;
+            const double ex = cx + m * (f * dx + 0.001 * 2 * dx * dy - 0.002 * (r2 + 2 * dx * dx));
+            const double ey = cy + m * (f * dy - 0.002 * 2 * dx * dy + 0.001 * (r2 + 2 * dy * dy));
+            QVERIFY2(std::fabs(sx - ex) < 1e-9 && std::fabs(sy - ey) < 1e-9, qPrintable(QString("%1 %2 / %3 %4").arg(sx).arg(sy).arg(ex).arg(ey)));
+            const DngOpcode fish = warp(kWarpFisheye, {0.9, 0.1, 0, 0});
+            QVERIFY(dngWarpSource(fish, 0, 100, 60, W, H, sx, sy));
+            const double t = std::atan(1.0), ff = (0.9 * t + 0.1 * t * t * t) / 1.0;
+            QVERIFY(std::fabs(sx - (cx + m * ff * dx)) < 1e-9 && std::fabs(sy - (cy + m * ff * dy)) < 1e-9);
+            QVERIFY(!dngWarpSource(list[0], 0, 1, 1, W, H, sx, sy));
+        }
+        if (!rawAvailable()) QSKIP("Built without LibRaw");
+
+        // Developed: the DNG's corrections applied (raw grey 0.25 here; the test camera sees linear sRGB).
+        const int W = 96, H = 64;
+        auto grey = [](double v) { return [v](int, int) { return std::array<double, 3>{v, v, v}; }; };
+        auto develop = [&](const std::string& file, bool opcodes = true, RawImage* into = nullptr) {
+            RawImage img;
+            RawSettings rs;
+            rs.dngOpcodes = opcodes;
+            std::string err;
+            if (!developRaw(file, img, &err, rs)) qWarning("%s", err.c_str());
+            if (into) *into = img;
+            return img;
+        };
+        auto at = [](const RawImage& img, int x, int y, int c) { return img.rgb[(size_t(y) * size_t(img.width) + size_t(x)) * 3 + size_t(c)] / 65535.0; };
+        const std::string plain = path("op_plain.dng"), half = path("op_half.dng");
+        QVERIFY(writeTestDng(plain, W, H, grey(0.25)));
+        QVERIFY(writeTestDng(half, W, H, grey(0.125)));
+        const RawImage ref = develop(plain), refHalf = develop(half);
+        QVERIFY(ref.width == W && refHalf.width == W);
+
+        // List 2: lens shading as a phone writes it, a gain map for each colour of the mosaic (here red halved, the
+        // greens and blue halved), and the same picture as a scene that dark.
+        {
+            const std::string file = path("op_gain.dng");
+            const DngOpcodeList shading{gainMap({0.5f}, 0, 0, 2), gainMap({0.5f}, 0, 1, 2), gainMap({0.5f}, 1, 0, 2), gainMap({0.5f}, 1, 1, 2)};
+            QVERIFY(writeTestDng(file, W, H, grey(0.25), 1, {1, 1, 1}, 0, opLists({}, dngOpcodeListBytes(shading), {})));
+            DngOpcodeLists lists;
+            QVERIFY(readDngOpcodeLists(file, lists) && lists.list[0].empty() && lists.list[1].size() == 4 && lists.list[2].empty());
+            const RawImage got = develop(file);
+            double worst = 0;
+            for (int y = 4; y < H - 4; ++y)
+                for (int x = 4; x < W - 4; ++x)
+                    for (int c = 0; c < 3; ++c) worst = std::max(worst, std::fabs(at(got, x, y, c) - at(refHalf, x, y, c)));
+            QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+            // Switched off: as the file is without them.
+            QVERIFY(develop(file, false).rgb == ref.rgb);
+            // Red alone: a redder scene's picture.
+            const std::string red = path("op_red.dng"), cyan = path("op_cyan.dng");
+            QVERIFY(writeTestDng(red, W, H, grey(0.25), 1, {1, 1, 1}, 0, opLists({}, dngOpcodeListBytes({gainMap({0.5f}, 0, 0, 2)}), {})));
+            QVERIFY(writeTestDng(cyan, W, H, [](int, int) { return std::array<double, 3>{0.125, 0.25, 0.25}; }));
+            const RawImage r = develop(red), c = develop(cyan);
+            QVERIFY2(std::fabs(at(r, 40, 30, 0) - at(c, 40, 30, 0)) < 1e-4 && at(r, 40, 30, 0) < at(ref, 40, 30, 0) - 0.05,
+                     qPrintable(QString("%1 %2").arg(at(r, 40, 30, 0)).arg(at(c, 40, 30, 0))));
+            // A gradient across (whole gain 1 on the left to 0.5 on the right): each column the scene that much darker.
+            const std::string ramp = path("op_ramp.dng"), rampRef = path("op_rampref.dng");
+            QVERIFY(writeTestDng(ramp, W, H, grey(0.25), 1, {1, 1, 1}, 0, opLists({}, dngOpcodeListBytes({gainMap({1.0f, 0.5f})}), {})));
+            QVERIFY(writeTestDng(rampRef, W, H, [&](int x, int) {
+                const double g = 1 - 0.5 * (x + 0.5) / W;
+                return std::array<double, 3>{0.25 * g, 0.25 * g, 0.25 * g};
+            }));
+            const RawImage rg = develop(ramp), rr = develop(rampRef);
+            worst = 0;
+            for (int x = 4; x < W - 4; ++x) worst = std::max(worst, std::fabs(at(rg, x, 30, 1) - at(rr, x, 30, 1)));
+            QVERIFY2(worst < 2e-3, qPrintable(QString::number(worst)));
+        }
+
+        // Bad pixels: one listed (stuck bright), and one at the constant the camera marks them with (0); both filled.
+        {
+            auto spot = [](int px, int py, double v) {
+                return [=](int x, int y) {
+                    const double s = x == px && y == py ? v : 0.25;
+                    return std::array<double, 3>{s, s, s};
+                };
+            };
+            const std::string hot = path("op_hot.dng"), dead = path("op_dead.dng");
+            const DngOpcode listed{kFixBadPixelsList, 0x01030000, 0, Params().u32(0).u32(1).u32(0).u32(20).u32(30).b};
+            const DngOpcode constant{kFixBadPixelsConstant, 0x01030000, 0, Params().u32(0).u32(0).b};
+            QVERIFY(writeTestDng(hot, W, H, spot(30, 20, 1.0), 1, {1, 1, 1}, 0, opLists(dngOpcodeListBytes({listed}), {}, {})));
+            QVERIFY(writeTestDng(dead, W, H, spot(41, 33, 0.0), 1, {1, 1, 1}, 0, opLists(dngOpcodeListBytes({constant}), {}, {})));
+            for (const auto& [file, x, y] : {std::tuple{hot, 30, 20}, std::tuple{dead, 41, 33}}) {
+                double fixed = 0, unfixed = 0;
+                const RawImage on = develop(file), off = develop(file, false);
+                for (int yy = y - 3; yy <= y + 3; ++yy)
+                    for (int xx = x - 3; xx <= x + 3; ++xx)
+                        for (int c = 0; c < 3; ++c) {
+                            fixed = std::max(fixed, std::fabs(at(on, xx, yy, c) - at(ref, xx, yy, c)));
+                            unfixed = std::max(unfixed, std::fabs(at(off, xx, yy, c) - at(ref, xx, yy, c)));
+                        }
+                QVERIFY2(fixed < 2e-3 && unfixed > 0.02, qPrintable(QString("%1: %2 (off %3)").arg(QString::fromStdString(file)).arg(fixed).arg(unfixed)));
+            }
+        }
+
+        // List 3: a distortion warp, where each pixel is taken from, to within 0.05 pixel (a ramp across, then down, read
+        // back to the position its value comes from).
+        {
+            const DngOpcode barrel = warp(kWarpRectilinear, {1, 0.06, 0, 0, 0.002, 0});
+            for (int axis = 0; axis < 2; ++axis) {
+                const int extent = axis == 0 ? W : H;
+                auto rampAt = [&](double pos) { return 0.05 + 0.5 * pos / (extent - 1); };
+                const std::string warped = path(axis == 0 ? "op_warp_x.dng" : "op_warp_y.dng");
+                const std::string straight = path(axis == 0 ? "op_ramp_x.dng" : "op_ramp_y.dng");
+                auto scene = [&](int x, int y) {
+                    const double v = rampAt(axis == 0 ? x : y);
+                    return std::array<double, 3>{v, v, v};
+                };
+                QVERIFY(writeTestDng(warped, W, H, scene, 1, {1, 1, 1}, 0, opLists({}, {}, dngOpcodeListBytes({barrel}))));
+                QVERIFY(writeTestDng(straight, W, H, scene));
+                const RawImage got = develop(warped), flat = develop(straight);
+                QVERIFY(got.width == W && got.height == H);
+                // The straight picture's value along the ramp, read back to a position (it rises steadily).
+                auto positionOf = [&](double v, int across) {
+                    for (int k = 0; k + 1 < extent; ++k) {
+                        const double a = axis == 0 ? at(flat, k, across, 1) : at(flat, across, k, 1);
+                        const double b = axis == 0 ? at(flat, k + 1, across, 1) : at(flat, across, k + 1, 1);
+                        if (v >= a && v <= b && b > a) return k + (v - a) / (b - a);
+                    }
+                    return -1.0;
+                };
+                double worst = 0;
+                int checked = 0;
+                for (int y = 6; y < H - 6; y += 5)
+                    for (int x = 6; x < W - 6; x += 7) {
+                        double sx, sy;
+                        QVERIFY(dngWarpSource(barrel, 1, x, y, W, H, sx, sy));
+                        const double want = axis == 0 ? sx : sy;
+                        if (want < 4 || want > extent - 5) continue;
+                        const double found = positionOf(at(got, x, y, 1), axis == 0 ? y : x);
+                        worst = std::max(worst, std::fabs(found - want));
+                        ++checked;
+                    }
+                QVERIFY2(checked > 20 && worst < 0.05, qPrintable(QString("axis %1: %2 px over %3").arg(axis).arg(worst).arg(checked)));
+            }
+            // Turned upright after the warp (a portrait DNG): as without it when the warp moves nothing.
+            const std::string tall = path("op_tall.dng"), tallRef = path("op_tallref.dng");
+            auto scene = [&](int x, int y) { return std::array<double, 3>{0.05 + 0.4 * x / W, 0.1 + 0.3 * y / H, 0.2}; };
+            QVERIFY(writeTestDng(tall, W, H, scene, 6, {1, 1, 1}, 0, opLists({}, {}, dngOpcodeListBytes({warp(kWarpRectilinear, {1, 0, 0, 0, 0, 0})}))));
+            QVERIFY(writeTestDng(tallRef, W, H, scene, 6));
+            const RawImage t = develop(tall), tr = develop(tallRef);
+            QVERIFY2(t.width == H && t.height == W && tr.width == H && tr.height == W, qPrintable(QString("%1x%2").arg(t.width).arg(t.height)));
+            double worst = 0;
+            for (size_t i = 0; i < t.rgb.size(); ++i) worst = std::max(worst, std::fabs(t.rgb[i] - double(tr.rgb[i])) / 65535);
+            QVERIFY2(worst < 5e-4, qPrintable(QString::number(worst)));
+        }
+
+        // The switch is kept with the media (Interpret Footage).
+        Interpretation off;
+        off.rawNoOpcodes = true;
+        MediaItem item;
+        item.path = interpretedPath(plain, off);
+        QVERIFY(off.hasRaw() && interpretationOf(item).rawNoOpcodes);
+        QVERIFY(item.path.find("rawop=0") != std::string::npos);
+    }
+
+    void colourInteropIds() {
+        // Every colour space has an ID (the ASWF Color Interop Forum's, OpenColorIO's for camera spaces, Montage's own
+        // otherwise) that leads back to it; another namespace in front is dropped once.
+        for (const ColorSpace& cs : colorSpaces()) {
+            const std::string id = colorInteropId(cs);
+            const ColorSpace* back = id.empty() ? nullptr : colorSpaceForInteropId(id);
+            QVERIFY2(back && sameColorSpace(*back, cs), qPrintable(QString::fromStdString(cs.id + " -> " + id)));
+        }
+        QCOMPARE(colorInteropId(*findColorSpace("rec709")), std::string("g24_rec709_display"));
+        QCOMPARE(colorInteropId(*findColorSpace("acescg")), std::string("lin_ap1_scene"));
+        QCOMPARE(colorInteropId(*findColorSpace("clog2-cinemagamut")), std::string("ocio:canonlog2_cgamutd55_scene"));
+        QCOMPARE(colorSpaceForInteropId("studio:lin_ap0_scene")->id, std::string("aces2065-1"));
+        QCOMPARE(colorSpaceForInteropId("pq_rec2020_display")->id, std::string("rec2100pq"));
+        QVERIFY(!colorSpaceForInteropId("a:b:lin_ap0_scene") && !colorSpaceForInteropId("nothing"));
+        // Linear light in primaries no listed space has: a space media can keep (found again by its id).
+        const ColorSpace* lin2020 = colorSpaceForInteropId("lin_rec2020_scene");
+        QVERIFY(lin2020 && lin2020->transfer == Transfer::Linear && lin2020->primaries == Primaries::Bt2020 && findColorSpace(lin2020->id) == lin2020);
+        QVERIFY(!findColorSpace("linear:99") && !findColorSpace("linear:x") && !findColorSpace("linear:"));
+
+        // OpenTimelineIO: a media reference's colour space, by its ID, kept on its way through.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            QImage png(16, 16, QImage::Format_RGB32);
+            png.fill(Qt::gray);
+            const std::string still = path("interop_plate.png");
+            QVERIFY(png.save(QString::fromStdString(still)));
+            MediaItem m = probeOrFail(p, still);
+            m.colorOverride = "slog3-sgamut3venice";
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+            const std::string otio = exportOtio(p, s);
+            QVERIFY2(otio.find("ocio:slog3_sgamut3venice_scene") != std::string::npos, otio.c_str());
+            Project q = makeDefaultProject();
+            QVERIFY(importOtio(q, otio).ok);
+            bool found = false;
+            for (const MediaItem& in : q.media)
+                if (in.path == still) {
+                    found = true;
+                    QCOMPARE(in.colorOverride, std::string("slog3-sgamut3venice"));
+                }
+            QVERIFY(found);
+        }
+
+        // OpenEXR: written by every float export, and read as the file's colour space.
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 32, s.height = 18, s.fps = Rational{25, 1};
+        QImage png(32, 18, QImage::Format_RGB32);
+        png.fill(QColor(200, 120, 60));
+        const std::string still = path("interop_src.png");
+        QVERIFY(png.save(QString::fromStdString(still)));
+        MediaItem m = probeOrFail(p, still);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 5, {TrackKind::Video, 0}, {}, false).ok);
+        ExportSettings st;
+        st.path = path("interop_out.%04d.exr");
+        st.videoCodec = "exr";
+        st.audioCodec = "none";
+        st.colorSpace = "acescg";
+        st.in = 0, st.out = 1;
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        const std::string out = path("interop_out.0000.exr");
+        QCOMPARE(readExrColorInteropId(out), std::string("lin_ap1_scene"));
+        QCOMPARE(probeOrFail(p, out).colorSpace, std::string("acescg"));
+        // A camera space from a file another application wrote.
+        ExrOutLayer layer;
+        layer.channels = {"R", "G", "B"};
+        layer.data.assign(size_t(8) * 8 * 3, 0.4f);
+        const std::string cam = path("interop_clog2.exr");
+        QVERIFY(writeExr(cam, 8, 8, {layer}, "zip", {{"colorInteropID", "ocio:canonlog2_cgamutd55_scene"}}, &err));
+        QCOMPARE(readExrColorInteropId(cam), std::string("ocio:canonlog2_cgamutd55_scene"));
+        QCOMPARE(probeOrFail(p, cam).colorSpace, std::string("clog2-cinemagamut"));
+    }
+
     void cameraRawSettingsAndCinemaDng() {
         if (!rawAvailable()) QSKIP("Built without LibRaw");
         // A grey card under daylight (the test camera sees linear sRGB, white balanced as shot).
@@ -8607,6 +8910,224 @@ private slots:
         QVERIFY(call({{"min_seconds", 60}}).value("isError").toBool());
     }
 
+    void mcpStreamingPackage() {
+        // An ad-break marker made over MCP, then a streaming package rendered with it: the cue in the playlists.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 200)).ok);
+        const QString project = QString::fromStdString(path("streaming-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const QString& tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_add_marker", {{"at", 3}, {"duration", 2}, {"ad_break", true}, {"name", "Break"}});  // (seconds)
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->markers.size(), size_t(1));
+        QVERIFY(back.active()->markers[0].adBreak && back.active()->markers[0].t == 75 && back.active()->markers[0].duration == 50);
+        // A clip ad break is refused, as are a short segment and an unknown cue.
+        QVERIFY(call("montage_add_marker", {{"at", 1}, {"ad_break", true}, {"clip", double(back.active()->videoTracks[0].clips[0].id)}}).value("isError").toBool());
+        const QString folder = QString::fromStdString(path("streaming-mcp"));
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"segment_seconds", 1}}}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"cue", "mid_roll"}}}}).value("isError").toBool());
+        r = call("montage_render", {{"output", folder},
+                                    {"streaming", QJsonObject{{"segment_seconds", 2}, {"dash", false}, {"audio_codec", "none"},
+                                                              {"ladder", QJsonArray{QJsonObject{{"width", 192}, {"height", 108}, {"bitrate", 150000}}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("hls").toString().endsWith("master.m3u8"));
+        QVERIFY(out.value("dash").toString().isEmpty());
+        QCOMPARE(out.value("segments").toArray().size(), 5);  // 0, 50, 75 (the break), 125 (its end), 175
+        QCOMPARE(out.value("ad_breaks").toArray().size(), 1);
+        QFile playlist(folder + "/" + out.value("renditions").toArray().at(0).toString() + "/playlist.m3u8");
+        QVERIFY(playlist.open(QIODevice::ReadOnly));
+        const QByteArray m3u = playlist.readAll();
+        QVERIFY(m3u.contains("SCTE35-OUT=0xFC") && m3u.contains("SCTE35-IN=0xFC"));
+        QDir(folder).removeRecursively();
+    }
+
+    void samplerPasses() {
+        // A Foley sampler over MCP: steps on a key (two sounds taking turns), cloth on another, a recording of hits cut
+        // onto keys; a pass played from notes lands on a take lane and in the comp, its mix the sampler's render sample for
+        // sample with each hit at its note's sample; voiced again with other sounds, the timing stays.
+        const int rate = 48000;
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> noise(-1.0f, 1.0f);
+        auto burst = [&](double seconds, double decay, float level) {
+            std::vector<float> x(size_t(seconds * rate));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = level * noise(rng) * float(std::exp(-double(i) / (decay * rate)));
+            return x;
+        };
+        const std::string stepA = path("step-a.wav"), stepB = path("step-b.wav"), cloth = path("cloth.wav"), hits = path("hits.wav");
+        QVERIFY(writeMonoWav(stepA, burst(0.2, 0.03, 0.6f), rate));
+        QVERIFY(writeMonoWav(stepB, burst(0.2, 0.03, 0.3f), rate));
+        QVERIFY(writeMonoWav(cloth, burst(0.4, 0.1, 0.2f), rate));
+        std::vector<float> rec(size_t(4 * rate));
+        for (float& v : rec) v = 1e-4f * noise(rng);
+        for (int i = 0; i < 8; ++i) {
+            const auto b = burst(0.2, 0.02, 0.5f);
+            for (size_t k = 0; k < b.size(); ++k) rec[size_t((0.2 + i * 0.45) * rate) + k] += b[k];
+        }
+        QVERIFY(writeMonoWav(hits, rec, rate));
+        Project p = makeDefaultProject();
+        const QString project = QString::fromStdString(path("sampler.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_sampler"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"action", "load"}, {"key", 60}, {"files", QJsonArray{QString::fromStdString(stepA), QString::fromStdString(stepB)}},
+                              {"name", "Steps"}, {"choke", 1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "load"}, {"key", 62}, {"file", QString::fromStdString(cloth)}, {"level_variation", 2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "slice"}, {"key", 70}, {"file", QString::fromStdString(hits)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("hits").toArray().size(), qsizetype(8));
+        QVERIFY(call({{"action", "slice"}, {"key", 125}, {"file", QString::fromStdString(hits)}}).value("isError").toBool());  // (off the keys)
+        QVERIFY(call({{"action", "load"}, {"key", 61}, {"file", "nowhere.wav"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "play"}}).value("isError").toBool());  // (no notes)
+        r = call({{"action", "show"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("slots").toArray().size(), qsizetype(10));
+        // A pass: steps, cloth and a hit, at samples between frames.
+        const QJsonArray notes{QJsonObject{{"key", 60}, {"velocity", 110}, {"at", 1.0101}}, QJsonObject{{"key", 62}, {"at", 1.2}, {"length", 0.3}},
+                               QJsonObject{{"key", 60}, {"velocity", 90}, {"at", 1.5503}}, QJsonObject{{"key", 73}, {"at", 1.9}},
+                               QJsonObject{{"key", 60}, {"velocity", 127}, {"at", 2.0}}};
+        r = call({{"action", "play"}, {"notes", notes}, {"seed", 9}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QString file = r.value("structuredContent").toObject().value("file").toString();
+        QVERIFY(QFileInfo::exists(file));
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        const Track& t = q.active()->audioTracks[0];
+        QCOMPARE(t.sampler.pads.size(), size_t(10));
+        QCOMPARE(t.sampler.passes.size(), size_t(1));
+        QCOMPARE(t.lanes.size(), size_t(1));
+        const SamplerPass pass = t.sampler.passes[0];
+        QCOMPARE(pass.lane, t.lanes[0].id);
+        QCOMPARE(pass.seed, uint32_t(9));
+        QCOMPARE(pass.notes.size(), size_t(5));
+        QCOMPARE(pass.notes[0].at, int64_t(std::llround(1.0101 * rate)));
+        QCOMPARE(t.lanes[0].start, FrameTime(30));  // (the frame the first note falls in)
+        QCOMPARE(t.clips.size(), size_t(1));         // (the comp)
+        // The mix over the pass: the sampler's render, hit for hit at the notes' samples.
+        const sampler::KitPtr kit = sampler::loadKit(t.sampler, rate);
+        const int64_t from = rate, length = 2 * rate;
+        const std::vector<float> want = sampler::renderNotes(kit, pass.notes, pass.seed, from, length);
+        auto mix = [&](const Project& pr) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(length) * 2);
+            for (int64_t at = 0; at < length; at += 4800) mixer.mix(pr, *pr.active(), from + at, 4800, out.data() + size_t(at) * 2);
+            return out;
+        };
+        const std::vector<float> got = mix(q);
+        auto firstFrom = [](const std::vector<float>& v, int64_t i) {
+            for (; i < int64_t(v.size() / 2); ++i)
+                if (v[size_t(i) * 2] != 0) return i;
+            return int64_t(-1);
+        };
+        QCOMPARE(firstFrom(got, 0) + from, pass.notes[0].at);
+        size_t loud = 0;
+        for (size_t i = 0; i < want.size(); ++i)
+            if (std::fabs(want[i]) > std::fabs(want[loud])) loud = i;
+        const double g = got[loud] / want[loud];  // (the pan law)
+        QVERIFY(g > 0.5 && g <= 1.0);
+        double worst = 0;
+        size_t worstAt = 0;
+        for (size_t i = 0; i < want.size(); ++i)
+            if (std::fabs(double(got[i]) - g * want[i]) > worst) worst = std::fabs(double(got[i]) - g * want[i]), worstAt = i;
+        QVERIFY2(worst < 1e-6, qPrintable(QStringLiteral("%1 at %2: %3 vs %4, g %5").arg(worst).arg(worstAt).arg(got[worstAt]).arg(want[worstAt]).arg(g, 0, 'g', 12)));
+        // Voiced again with other steps: the same times, another sound.
+        r = call({{"action", "load"}, {"key", 60}, {"file", QString::fromStdString(cloth)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"action", "revoice"}, {"lane", double(pass.lane)}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(r.value("structuredContent").toObject().value("file").toString() != file);
+        Project v;
+        QVERIFY(loadProject(project.toStdString(), v));
+        const Track& tv = v.active()->audioTracks[0];
+        QCOMPARE(tv.sampler.passes[0].notes, pass.notes);
+        QVERIFY(tv.lanes[0].mediaId != t.lanes[0].mediaId);
+        QCOMPARE(tv.clips[0].mediaId, tv.lanes[0].mediaId);
+        const std::vector<float> again = mix(v);
+        QCOMPARE(firstFrom(again, 0) + from, pass.notes[0].at);
+        QVERIFY(again != got);
+        const std::vector<float> wantAgain = sampler::renderNotes(sampler::loadKit(tv.sampler, rate), pass.notes, pass.seed, from, length);
+        worst = 0;
+        for (size_t i = 0; i < wantAgain.size(); ++i) worst = std::max(worst, std::fabs(double(again[i]) - g * wantAgain[i]));
+        QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        // Removing the lane forgets the pass.
+        QVERIFY(edit::removeTakeLane(*v.active(), {TrackKind::Audio, 0}, pass.lane).ok);
+        QVERIFY(v.active()->audioTracks[0].sampler.passes.empty());
+    }
+
+    void mcpMidiMap() {
+        // MIDI Learn's maps edited over MCP: a mapping added, shown, replaced and removed, in the file the app reads.
+        QTemporaryDir dir;
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            args["folder"] = dir.path();
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_midi_map"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc14:1:7"}, {"target", "strip:1:volume"},
+                              {"curve", 2}, {"bank_size", 4}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:1:16"}, {"target", "widget:inspector/param_3_opacity"},
+                  {"encoding", "offset-64"}, {"panel", "inspector"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "note:1:36"}, {"target", "command:Sequence/Add Marker"}})
+                     .value("isError").toBool());
+        // Refused: an unknown control, target or encoding.
+        QVERIFY(call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:17:1"}, {"target", "master:volume"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:1:1"}, {"target", "strip:0:volume"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc:1:1"}, {"target", "master:volume"}, {"encoding", "spin"}})
+                    .value("isError").toBool());
+        // The file the app reads: found by the device's name.
+        midimaps::Map map;
+        QVERIFY(midimaps::load(midimaps::fileFor(dir.path(), "X-Touch Mini"), map));
+        QCOMPARE(map.device, QString("X-Touch Mini"));
+        QCOMPARE(map.bankSize, 4);
+        QCOMPARE(map.mappings.size(), size_t(3));
+        QVERIFY(map.mappings[0].key == (midimap::Key{midimap::Kind::Cc14, 0, 7}) && map.mappings[0].curve == 2 && map.mappings[0].pickup);
+        QVERIFY(map.mappings[1].encoding == midimap::Encoding::Offset64 && map.mappings[1].layer == "inspector");
+        QVERIFY(map.mappings[2].encoding == midimap::Encoding::Button && map.mappings[2].target == "command:Sequence/Add Marker");
+        r = call({{"action", "show"}, {"device", "X-Touch Mini"}});
+        QVERIFY(r.value("content").toArray()[0].toObject().value("text").toString().contains("cc14:1:7 → strip:1:volume"));
+        r = call({{"action", "list"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("devices").toArray(), QJsonArray{"X-Touch Mini"});
+        // Replaced for the same control (and panel), then removed.
+        QVERIFY(!call({{"action", "map"}, {"device", "X-Touch Mini"}, {"control", "cc14:1:7"}, {"target", "master:volume"}, {"pickup", false}})
+                     .value("isError").toBool());
+        QVERIFY(!call({{"action", "unmap"}, {"device", "X-Touch Mini"}, {"control", "cc:1:16"}, {"panel", "inspector"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "unmap"}, {"device", "X-Touch Mini"}, {"control", "cc:1:16"}}).value("isError").toBool());
+        QVERIFY(midimaps::load(midimaps::fileFor(dir.path(), "X-Touch Mini"), map));
+        QCOMPARE(map.mappings.size(), size_t(2));
+        QVERIFY(map.mappings[0].target == "master:volume" && !map.mappings[0].pickup);
+        QVERIFY(call({{"action", "show"}, {"device", "Nobody"}}).value("isError").toBool());
+    }
     void mcpTransitionsOnClips() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

@@ -105,6 +105,8 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
+#include "core/MidiMaps.h"
+#include "audio/Sampler.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectMerge.h"
 #include "core/ScriptCut.h"
@@ -187,6 +189,7 @@
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
+#include "render/StreamingPackage.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -438,6 +441,7 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.rawTint != 0) o["raw_tint"] = i.rawTint;
     if (!i.rawHighlights.empty()) o["raw_highlights"] = QString::fromStdString(i.rawHighlights);
     if (i.rawHalf) o["raw_half"] = true;
+    if (i.rawNoOpcodes) o["dng_opcodes"] = false;
     if (!i.stereo.empty()) o["stereo"] = QString::fromStdString(i.stereo);
     if (i.swapEyes) o["swap_eyes"] = true;
     if (!i.layer.empty()) o["layer"] = QString::fromStdString(i.layer);
@@ -1096,6 +1100,109 @@ void McpServer::Impl::addTools() {
             const QString name = QString::fromStdString(productionName(folder.toStdString()));
             return ok(QStringLiteral("Production \"%1\": %2 project(s)%3").arg(name).arg(projects.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
                       QJsonObject{{"production", name}, {"folder", folder}, {"projects", projects}});
+        });
+
+    add("montage_midi_map", "MIDI controller maps",
+        "The maps MIDI Learn keeps for each MIDI controller (one JSON file per device, found again by its name when it is "
+        "plugged back in): `list` the devices with maps and the MIDI inputs plugged in now; `show` a device's mappings; "
+        "`map` a control onto a target (replacing that control's mapping for that panel); `unmap` it. Controls: "
+        "cc:<channel>:<n>, cc14:<channel>:<n> (the 14-bit pair n and n+32, n 0-31), note:<channel>:<n>, "
+        "nrpn:<channel>:<parameter> and rpn:<channel>:<parameter> (0-16383), bend:<channel>:0, program:<channel>:<n>, "
+        "channels counted from 1. Targets: command:<a menu command's id as Keyboard Shortcuts lists it, e.g. "
+        "Sequence/Add Marker>, widget:<panel>/<control name> (e.g. widget:inspector/param_3_opacity; add #x or #y for a "
+        "colour wheel's axis), strip:<n>:volume|pan|mute|solo (n from 1, counted from the bank's first track), "
+        "master:volume, bank:previous|next. Encodings: absolute (faders, knobs), button, and relative encoders: "
+        "twos-complement, sign-magnitude, offset-64. A running Montage uses the change at once.",
+        R"json({"type":"object","properties":{
+            "action":{"type":"string","enum":["list","show","map","unmap"],"default":"list"},
+            "device":{"type":"string","description":"The controller's MIDI input name"},
+            "control":{"type":"string","description":"e.g. cc:1:7"},
+            "target":{"type":"string"},
+            "encoding":{"type":"string","enum":["absolute","button","twos-complement","sign-magnitude","offset-64"]},
+            "panel":{"type":"string","description":"Only while this panel has focus (inspector, mixer, main...); default every panel"},
+            "low":{"type":"number","minimum":0,"maximum":1,"description":"The part of the target's range the control covers, from"},
+            "high":{"type":"number","minimum":0,"maximum":1,"description":"... to"},
+            "curve":{"type":"number","description":"Above 1 finer at the bottom of the travel"},
+            "invert":{"type":"boolean"},"toggle":{"type":"boolean","description":"Buttons: each press flips the target"},
+            "pickup":{"type":"boolean","description":"Soft takeover (default true)"},
+            "step":{"type":"number","description":"Relative encoders: the part of the range one step turns (default 1/128)"},
+            "bank_size":{"type":"integer","minimum":1,"maximum":64},
+            "folder":{"type":"string","description":"Where maps are kept (default Montage's own)"}}})json",
+        false, [](const QJsonObject& a) {
+            const QString action = str(a, "action", QStringLiteral("list"));
+            const QString dir = a.contains("folder") ? absolute(need(a, "folder")) : midimaps::folder();
+            if (action == QLatin1String("list")) {
+                QJsonArray devices, inputs;
+                for (const QString& d : midimaps::devices(dir)) devices.append(d);
+                for (const MidiPortInfo& p : midiInputs()) inputs.append(QString::fromStdString(p.name));
+                QStringList names;
+                for (const auto& d : devices) names << d.toString();
+                return ok(QStringLiteral("%1 map(s)%2; %3 MIDI input(s) plugged in")
+                              .arg(devices.size())
+                              .arg(names.isEmpty() ? QString() : QStringLiteral(": ") + names.join(QStringLiteral(", ")))
+                              .arg(inputs.size()),
+                          QJsonObject{{"folder", dir}, {"devices", devices}, {"inputs", inputs}});
+            }
+            const QString device = need(a, "device");
+            const QString file = midimaps::fileFor(dir, device);
+            midimaps::Map map;
+            map.device = device;
+            if (QFile::exists(file)) {
+                QString why;
+                if (!midimaps::load(file, map, &why)) return fail(why);
+                map.device = device;
+            }
+            auto describe = [&] {
+                QStringList lines;
+                for (const midimap::Mapping& m : map.mappings)
+                    lines << QStringLiteral("%1 → %2%3")
+                                 .arg(QString::fromStdString(midimap::keyName(m.key)), QString::fromStdString(m.target),
+                                      m.layer.empty() ? QString() : QStringLiteral(" (in %1)").arg(QString::fromStdString(m.layer)));
+                return lines;
+            };
+            auto saved = [&](const QString& what) {
+                QString why;
+                if (!midimaps::save(file, map, &why)) return fail(why);
+                const QStringList lines = describe();
+                return ok(QStringLiteral("%1. %2: %3 mapping(s)%4").arg(what, device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                          midimaps::toJson(map));
+            };
+            if (a.contains("bank_size")) map.bankSize = std::clamp(a.value("bank_size").toInt(8), 1, 64);
+            if (action == QLatin1String("show")) {
+                if (!QFile::exists(file)) return fail(QStringLiteral("no map for %1 (in %2)").arg(device, dir));
+                const QStringList lines = describe();
+                return ok(QStringLiteral("%1: %2 mapping(s)%3").arg(device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                          midimaps::toJson(map));
+            }
+            if (action == QLatin1String("map")) {
+                QJsonObject o{{"control", need(a, "control")}, {"target", need(a, "target")}};
+                for (const char* k : {"encoding", "low", "high", "curve", "invert", "toggle", "pickup", "step"})
+                    if (a.contains(k)) o[k] = a.value(k);
+                if (a.contains("panel")) o["layer"] = a.value("panel");
+                midimap::Mapping m;
+                QString why;
+                if (!midimaps::fromJson(o, m, &why)) return fail(why);
+                bool replaced = false;
+                for (midimap::Mapping& old : map.mappings)
+                    if (old.key == m.key && old.layer == m.layer) {
+                        old = m;
+                        replaced = true;
+                    }
+                if (!replaced) map.mappings.push_back(m);
+                return saved(QStringLiteral("%1 %2 → %3").arg(replaced ? QStringLiteral("Remapped") : QStringLiteral("Mapped"),
+                                                             QString::fromStdString(midimap::keyLabel(m.key)), QString::fromStdString(m.target)));
+            }
+            if (action == QLatin1String("unmap")) {
+                const auto key = midimap::keyFromName(need(a, "control").toStdString());
+                if (!key) return fail(QStringLiteral("unknown control \"%1\"").arg(str(a, "control")));
+                const std::string layer = str(a, "panel").toStdString();
+                const auto it = std::find_if(map.mappings.begin(), map.mappings.end(),
+                                             [&](const midimap::Mapping& m) { return m.key == *key && m.layer == layer; });
+                if (it == map.mappings.end()) return fail(QStringLiteral("%1 has no mapping for %2").arg(device, str(a, "control")));
+                map.mappings.erase(it);
+                return saved(QStringLiteral("Unmapped %1").arg(QString::fromStdString(midimap::keyLabel(*key))));
+            }
+            return fail(QStringLiteral("unknown action \"%1\" (list, show, map, unmap)").arg(action));
         });
 
     add("montage_import_from_project", "Bring sequences from another project",
@@ -3784,6 +3891,8 @@ void McpServer::Impl::addTools() {
         "at `at`, and travels with the clip.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false},
+            "ad_break":{"type":"boolean","default":false,"description":"An ad break: SCTE 35 cues in streaming packages (montage_render streaming)"},
+            "duration":{"type":["number","string"],"description":"The marker's length (an ad break's)"},
             "at_samples":{"type":"integer","description":"Instead of at: a timeline sample, so the marker can sit between frames"},
             "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -3796,6 +3905,9 @@ void McpServer::Impl::addTools() {
             const FrameTime at = bySample ? FrameTime(std::floor(atSample + 1e-9)) : timeArg(a.value("at"), s, "at");
             const bool chapter = a.value("chapter").toBool();
             Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            m.adBreak = a.value("ad_break").toBool();
+            if (a.contains("duration")) m.duration = std::max<FrameTime>(0, timeArg(a.value("duration"), s, "duration"));
+            if (m.adBreak && a.contains("clip")) throw ArgError{"An ad break is a timeline marker: leave out clip"};
             if (bySample) m.sub = std::clamp(atSample - double(at), 0.0, 0.999999);
             if (a.contains("clip")) {
                 const Clip& c = clipArg(l, a);
@@ -3806,7 +3918,7 @@ void McpServer::Impl::addTools() {
             edit::addMarker(s, m);
             save(l);
             const QString where = bySample ? QString::fromStdString(formatTimecodeSamples(atSample, s.fps, s.sampleRate > 0 ? s.sampleRate : 48000)) : tc(at, s);
-            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), where));
+            return ok(QStringLiteral("%1 at %2").arg(m.adBreak ? QStringLiteral("Ad break") : chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), where));
         });
 
     add("montage_chapters", "List chapters",
@@ -4709,6 +4821,175 @@ void McpServer::Impl::addTools() {
                 text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
             }
             return result.isEmpty() ? ok(text) : ok(text, result);
+        });
+
+    add("montage_sampler", "A sound-effect sampler on an audio track: sounds on keys, played to picture in passes",
+        "A Foley sampler on an audio track: up to 128 slots, one a MIDI key (60 = middle C), each with one or more sounds "
+        "(velocity layers; sounds answering the same velocity take turns), gain, attack and release, one-shot or held "
+        "playback, a choke group (a note cuts the group's other voices) and random pitch and level variation for each hit. "
+        "show lists the slots and passes. load puts files on a key (add true adds them to the slot's sounds; vel_low and "
+        "vel_high give their velocity layer); the slot's settings change with the arguments given. slice finds the hits "
+        "in one recording (Split by Onsets) and puts them on successive keys from `key`. remove clears a key. play "
+        "records a pass from a list of notes (key, velocity, at, length in seconds or timecode): rendered to a WAV file "
+        "beside the project, put on a new take lane and given to the comp, its notes kept. revoice renders a pass's notes "
+        "again through the slots as they are now, with the same timing.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "action":{"type":"string","enum":["show","load","slice","remove","play","revoice"]},
+            "key":{"type":"integer","description":"A MIDI key 0-127 (load, remove; slice: the first key)"},
+            "file":{"type":"string"},"files":{"type":"array","items":{"type":"string"}},
+            "add":{"type":"boolean","default":false},"vel_low":{"type":"integer"},"vel_high":{"type":"integer"},
+            "start":{"type":"number","description":"load: seconds into the file"},"end":{"type":"number","description":"load: seconds, 0 to its end"},
+            "name":{"type":"string"},"gain":{"type":"number","description":"dB"},"attack":{"type":"number"},"release":{"type":"number"},
+            "one_shot":{"type":"boolean"},"choke":{"type":"integer","description":"0 none, 1-16"},
+            "pitch_variation":{"type":"number","description":"± semitones"},"level_variation":{"type":"number","description":"± dB"},
+            "sensitivity":{"type":"number","default":50},"min_gap":{"type":"number","default":0.05},
+            "notes":{"type":"array","items":{"type":"object","properties":{"key":{"type":"integer"},"velocity":{"type":"integer","default":100},
+                "at":{"type":["number","string"]},"length":{"type":"number","default":0.1}},"required":["key","at"]}},
+            "seed":{"type":"integer","description":"play: the hits' random variation (default 1)"},
+            "lane":{"type":["number","string"],"description":"revoice: the pass's lane, by id or name"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
+            if (track.kind != TrackKind::Audio) return fail(QStringLiteral("The sampler is on audio tracks"));
+            const QString action = need(a, "action");
+            auto keyArg = [&]() {
+                const QJsonValue v = a.value("key");
+                if (!v.isDouble() || v.toInt() < 0 || v.toInt() > 127) throw ArgError{QStringLiteral("\"key\" must be a MIDI key, 0 to 127")};
+                return v.toInt();
+            };
+            auto files = [&]() {
+                QStringList out;
+                if (a.contains("file")) out << absolute(need(a, "file"));
+                for (const QJsonValue& v : a.value("files").toArray()) out << absolute(v.toString());
+                if (out.isEmpty()) throw ArgError{QStringLiteral("\"file\" or \"files\" is required")};
+                for (const QString& f : out)
+                    if (!QFileInfo::exists(f)) throw ArgError{QStringLiteral("No file %1").arg(f)};
+                return out;
+            };
+            auto kit = [&]() {
+                std::vector<std::string> missing;
+                sampler::KitPtr k = sampler::loadKit(trackAt(s, track)->sampler, s.sampleRate, &missing);
+                if (!missing.empty()) throw ArgError{QStringLiteral("Cannot read %1").arg(QString::fromStdString(missing.front()))};
+                return k;
+            };
+            auto passFile = [&](const QString& stem) {
+                const QString dir = QFileInfo(l.path).absolutePath() + QStringLiteral("/Sampler");
+                QDir().mkpath(dir);
+                for (int n = 1;; ++n) {
+                    const QString f = QStringLiteral("%1/%2 %3.wav").arg(dir, stem).arg(n);
+                    if (!QFileInfo::exists(f)) return f;
+                }
+            };
+            const Track& t0 = *trackAt(s, track);
+            const QString trackName = t0.name.empty() ? QStringLiteral("A%1").arg(track.index + 1) : QString::fromStdString(t0.name);
+            if (action == "show") {
+                QJsonArray pads, passes;
+                QString text;
+                for (const SamplerSlot& sl : t0.sampler.pads) {
+                    QJsonArray sounds;
+                    for (const SamplerSound& sd : sl.sounds)
+                        sounds.append(QJsonObject{{"file", QString::fromStdString(sd.path)}, {"start", sd.start}, {"end", sd.end}, {"vel_low", sd.velLow}, {"vel_high", sd.velHigh}});
+                    pads.append(QJsonObject{{"key", sl.key}, {"name", QString::fromStdString(sl.name)}, {"sounds", sounds}, {"gain", sl.gainDb},
+                                             {"attack", sl.attack}, {"release", sl.release}, {"one_shot", sl.oneShot}, {"choke", sl.choke},
+                                             {"pitch_variation", sl.pitchVariation}, {"level_variation", sl.levelVariation}});
+                    text += QStringLiteral("Key %1 %2: %3 sound(s)%4\n").arg(sl.key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size())
+                                .arg(sl.choke ? QStringLiteral(", choke group %1").arg(sl.choke) : QString());
+                }
+                for (const SamplerPass& ps : t0.sampler.passes) {
+                    const TakeLane* ln = edit::findTakeLane(t0, ps.lane);
+                    QJsonArray notes;
+                    for (const SamplerNote& n : ps.notes)
+                        notes.append(QJsonObject{{"key", n.key}, {"velocity", n.velocity}, {"at", double(n.at) / s.sampleRate}, {"length", double(n.length) / s.sampleRate}});
+                    passes.append(QJsonObject{{"lane", double(ps.lane)}, {"lane_name", ln ? QString::fromStdString(ln->name) : QString()}, {"seed", double(ps.seed)}, {"notes", notes}});
+                    text += QStringLiteral("Pass %1: %2 note(s)\n").arg(ln ? QString::fromStdString(ln->name) : QString::number(ps.lane)).arg(ps.notes.size());
+                }
+                if (text.isEmpty()) text = QStringLiteral("No sampler slots on %1").arg(trackName);
+                return ok(text.trimmed(), {{"slots", pads}, {"passes", passes}});
+            }
+            if (action == "load") {
+                const int key = keyArg();
+                SamplerSlot sl;
+                sl.key = key;
+                for (const SamplerSlot& e : t0.sampler.pads)
+                    if (e.key == key) sl = e;
+                if (!a.value("add").toBool(false)) sl.sounds.clear();
+                const int lo = std::clamp(a.value("vel_low").toInt(1), 1, 127), hi = std::clamp(a.value("vel_high").toInt(127), lo, 127);
+                for (const QString& f : files())
+                    sl.sounds.push_back({f.toStdString(), std::max(0.0, a.value("start").toDouble(0)), std::max(0.0, a.value("end").toDouble(0)), lo, hi});
+                if (a.contains("name")) sl.name = str(a, "name").toStdString();
+                else if (sl.name.empty()) sl.name = QFileInfo(QString::fromStdString(sl.sounds.front().path)).completeBaseName().toStdString();
+                if (a.contains("gain")) sl.gainDb = std::clamp(a.value("gain").toDouble(), -96.0, 24.0);
+                if (a.contains("attack")) sl.attack = std::clamp(a.value("attack").toDouble(), 0.0, 10.0);
+                if (a.contains("release")) sl.release = std::clamp(a.value("release").toDouble(), 0.0, 10.0);
+                if (a.contains("one_shot")) sl.oneShot = a.value("one_shot").toBool();
+                if (a.contains("choke")) sl.choke = std::clamp(a.value("choke").toInt(), 0, 16);
+                if (a.contains("pitch_variation")) sl.pitchVariation = std::clamp(a.value("pitch_variation").toDouble(), 0.0, 12.0);
+                if (a.contains("level_variation")) sl.levelVariation = std::clamp(a.value("level_variation").toDouble(), 0.0, 24.0);
+                check(sampler::setSlot(s, track, sl));
+                kit();  // (every sound readable)
+                save(l);
+                return ok(QStringLiteral("Key %1 \"%2\": %3 sound(s)").arg(key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size()),
+                          {{"key", key}, {"sounds", int(sl.sounds.size())}});
+            }
+            if (action == "slice") {
+                const QStringList f = files();
+                std::string why;
+                AudioBufferPtr buf = decodeAudio(f.front().toStdString(), s.sampleRate, &why);
+                if (!buf) return fail(QStringLiteral("Cannot read %1: %2").arg(f.front(), QString::fromStdString(why)));
+                const auto slices = sampler::splitByOnsets(*buf, std::clamp(a.value("sensitivity").toDouble(50), 0.0, 100.0),
+                                                           std::max(0.005, a.value("min_gap").toDouble(0.05)));
+                const int key = a.contains("key") ? keyArg() : 36;
+                const QString name = a.contains("name") ? str(a, "name") : QFileInfo(f.front()).completeBaseName();
+                check(sampler::addSlices(s, track, f.front().toStdString(), slices, key, name.toStdString()));
+                save(l);
+                QJsonArray hits;
+                for (size_t i = 0; i < slices.size(); ++i) hits.append(QJsonObject{{"key", key + int(i)}, {"start", slices[i].first}, {"end", slices[i].second}});
+                return ok(QStringLiteral("%1 hit(s) on keys %2 to %3").arg(slices.size()).arg(key).arg(key + int(slices.size()) - 1), {{"hits", hits}});
+            }
+            if (action == "remove") {
+                check(sampler::removeSlot(s, track, keyArg()));
+                save(l);
+                return ok(QStringLiteral("Key %1 cleared").arg(a.value("key").toInt()));
+            }
+            if (action == "play") {
+                std::vector<SamplerNote> notes;
+                for (const QJsonValue& v : a.value("notes").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    SamplerNote n;
+                    n.key = o.value("key").toInt(-1);
+                    if (n.key < 0 || n.key > 127) throw ArgError{QStringLiteral("A note's key must be 0 to 127")};
+                    n.velocity = std::clamp(o.value("velocity").toInt(100), 1, 127);
+                    const QJsonValue at = o.value("at");
+                    n.at = at.isDouble() ? std::llround(at.toDouble() * s.sampleRate)
+                                         : std::llround(double(timeArg(at, s, "at")) * s.sampleRate / s.fpsValue());
+                    if (n.at < 0) throw ArgError{QStringLiteral("A note's \"at\" must not be before the start")};
+                    n.length = std::llround(std::max(0.0, o.value("length").toDouble(0.1)) * s.sampleRate);
+                    notes.push_back(n);
+                }
+                if (notes.empty()) throw ArgError{QStringLiteral("\"notes\" is required")};
+                const uint32_t seed = uint32_t(a.value("seed").toInt(1));
+                const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
+                edit::Result r = sampler::addPass(l.project, s, track, kit(), notes, seed, file.toStdString());
+                check(r);
+                save(l);
+                const TakeLane* ln = edit::findTakeLane(*trackAt(s, track), r.created.front());
+                return ok(QStringLiteral("%1 note(s) recorded to lane %2 (%3)").arg(notes.size()).arg(QString::fromStdString(ln->name), file),
+                          {{"lane", double(ln->id)}, {"lane_name", QString::fromStdString(ln->name)}, {"file", file}, {"start", secs(ln->start, s)}});
+            }
+            if (action == "revoice") {
+                const QJsonValue v = a.value("lane");
+                Id lane = 0;
+                for (const TakeLane& ln : t0.lanes)
+                    if ((v.isDouble() && ln.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(ln.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                        lane = ln.id;
+                if (!lane) throw ArgError{QStringLiteral("No such lane on that track (see action show)")};
+                const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
+                check(sampler::revoicePass(l.project, s, track, lane, kit(), file.toStdString()));
+                save(l);
+                return ok(QStringLiteral("Voiced again into %1").arg(file), {{"file", file}});
+            }
+            return fail(QStringLiteral("Unknown action %1").arg(action));
         });
 
     add("montage_takes", "Take lanes, comps and track versions on an audio track",
@@ -9605,6 +9886,7 @@ void McpServer::Impl::addTools() {
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
             "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"],"description":"Camera RAW stills and CinemaDNG (ProRes RAW clips at the sensor's white)"},
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
+            "dng_opcodes":{"type":"boolean","description":"DNG: apply the file's opcode lists (lens shading, vignetting, distortion and chromatic aberration warps, bad pixels); default true"},
             "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed, or mv for MV-HEVC's two views), none for a flat picture"},
             "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
             "sdr_expand":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"SDR footage in an HDR sequence: \"\" at HDR reference white (203 nits), or brought up into HDR by ITU-R BT.2446 Method A (SDR white at 1000 nits) or Method C (SDR white at about 330 nits). Titles and graphics stay at reference white"},
@@ -9667,6 +9949,7 @@ void McpServer::Impl::addTools() {
                 if (a.contains("raw_tint")) i.rawTint = a.value("raw_tint").toDouble();
                 if (a.contains("raw_highlights")) i.rawHighlights = str(a, "raw_highlights") == "clip" ? "" : str(a, "raw_highlights").toStdString();
                 if (a.contains("raw_half")) i.rawHalf = a.value("raw_half").toBool();
+                if (a.contains("dng_opcodes")) i.rawNoOpcodes = !a.value("dng_opcodes").toBool(true);
                 if (a.contains("stereo")) i.stereo = str(a, "stereo") == "file" ? "" : str(a, "stereo").toStdString();
                 if (a.contains("swap_eyes")) i.swapEyes = a.value("swap_eyes").toBool();
                 const edit::Result r = edit::interpretFootage(l.project, m->id, i);
@@ -11370,6 +11653,17 @@ void McpServer::Impl::addTools() {
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
+            "streaming":{"type":"object","description":"A streaming package instead of a file: output is its folder. The sequence rendered once, encoded as a ladder of renditions whose segments start on keyframes at the same frames, packaged as CMAF for HLS (master.m3u8) and DASH (manifest.mpd), with the mix and audio_streams as languages, each caption track as WebVTT (and IMSC for DASH), chapters, and ad-break markers (montage_add_marker ad_break) as SCTE 35 cues","properties":{
+                "ladder":{"type":"array","items":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"},"bitrate":{"type":"integer","description":"bits a second"},"codec":{"type":"string","enum":["libx264","libx265","libsvtav1"]}},"required":["width","bitrate"]},"description":"The rungs (default: from the picture's size down to 360 lines)"},
+                "codec":{"type":"string","enum":["libx264","libx265","libsvtav1"],"default":"libx264","description":"The default ladder's codec"},
+                "segment_seconds":{"type":"number","minimum":2,"maximum":6,"default":4},
+                "cut_aligned":{"type":"boolean","default":false,"description":"Segments end at the cut nearest each nominal end"},
+                "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
+                "iframe_playlists":{"type":"boolean","default":true},
+                "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
+                "audio_codec":{"type":"string","enum":["aac","libopus","none"],"default":"aac"},
+                "audio_bitrate":{"type":"integer","default":128000},
+                "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
             "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265 and AV1 with rate control per segment; image sequences frame by frame). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
@@ -11568,6 +11862,59 @@ void McpServer::Impl::addTools() {
                 if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in this kind of export (a single mp4, mov, wav, mp3, jpg, png or tif file can hold them)"};
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
+            }
+            if (a.contains("streaming")) {
+                if (!a.value("streaming").isObject()) throw ArgError{"\"streaming\" is an object"};
+                if (a.contains("farm")) throw ArgError{"A streaming package is made here, not on a render farm"};
+                const QJsonObject so = a.value("streaming").toObject();
+                StreamingSettings ss;
+                ss.folder = st.path;
+                ss.in = st.in, ss.out = st.out;
+                ss.colorSpace = st.colorSpace, ss.toneMapping = st.toneMapping;
+                ss.audioName = st.audioName.empty() ? "Main" : st.audioName;
+                ss.audioLanguage = st.audioLanguage;
+                ss.extraAudio = st.extraAudio;
+                ss.segmentSeconds = so.value("segment_seconds").toDouble(4);
+                if (ss.segmentSeconds < 2 || ss.segmentSeconds > 6) throw ArgError{"\"segment_seconds\" is 2 to 6"};
+                ss.cutAligned = so.value("cut_aligned").toBool();
+                ss.hls = so.value("hls").toBool(true), ss.dash = so.value("dash").toBool(true);
+                ss.iframePlaylists = so.value("iframe_playlists").toBool(true);
+                ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
+                if (ss.cueCommand != "splice_insert" && ss.cueCommand != "time_signal") throw ArgError{"\"cue\" is splice_insert or time_signal"};
+                ss.audioCodec = str(so, "audio_codec", "aac").toStdString();
+                if (ss.audioCodec != "aac" && ss.audioCodec != "libopus" && ss.audioCodec != "none") throw ArgError{"\"audio_codec\" is aac, libopus or none"};
+                ss.audioBitrate = so.value("audio_bitrate").toInteger(128000);
+                if (ss.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
+                ss.startDate = str(so, "start_date").toStdString();
+                const std::string codec = str(so, "codec", "libx264").toStdString();
+                for (const QJsonValue& v : so.value("ladder").toArray()) {
+                    const QJsonObject r = v.toObject();
+                    StreamingRung rung;
+                    rung.width = r.value("width").toInt(), rung.height = r.value("height").toInt();
+                    rung.bitrate = r.value("bitrate").toInteger();
+                    rung.codec = str(r, "codec", QString::fromStdString(codec)).toStdString();
+                    if (rung.width <= 0 || rung.bitrate <= 0) throw ArgError{"Each rung needs a width and a bitrate"};
+                    ss.rungs.push_back(rung);
+                }
+                if (ss.rungs.empty()) {
+                    const ColorSpace* cs = findColorSpace(ss.colorSpace.empty() ? s.colorSpace : ss.colorSpace);
+                    ss.rungs = defaultLadder(s.width, s.height, codec, cs && cs->hdr());
+                }
+                std::string why;
+                StreamingResult res;
+                if (!exportStreamingPackage(l.project, s, ss, [this](double f, FrameTime) { progress(f, "Packaging"); }, nullptr, &why, &res))
+                    return fail(QString::fromStdString(why));
+                QJsonArray renditions, segments, breaks;
+                for (const std::string& r : res.renditions) renditions.append(QString::fromStdString(r));
+                for (FrameTime f : res.segments) segments.append(double(f));
+                for (const StreamingAdBreak& b : res.breaks) breaks.append(QJsonObject{{"id", double(b.id)}, {"at", tc(b.at + std::max<FrameTime>(0, ss.in), s)}, {"duration", double(b.duration)}});
+                QJsonObject o{{"folder", QString::fromStdString(ss.folder)}, {"renditions", renditions}, {"segments", segments}, {"ad_breaks", breaks}};
+                QString text = QStringLiteral("Wrote a streaming package in %1: %2 renditions, %3 segments").arg(QString::fromStdString(ss.folder)).arg(res.renditions.size()).arg(res.segments.size());
+                if (!res.hls.empty()) o["hls"] = QString::fromStdString(res.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(res.hls));
+                if (!res.dash.empty()) o["dash"] = QString::fromStdString(res.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(res.dash));
+                if (!res.breaks.empty()) text += QStringLiteral("\n%1 ad break(s) as SCTE 35 cues").arg(res.breaks.size());
+                for (const std::string& w : res.warnings) text += QStringLiteral("\n") + QString::fromStdString(w);
+                return ok(text, o);
             }
             if (a.contains("farm")) {
                 // Sent to a render farm's nodes instead (render/RenderFarm.h): the project as it is now.

@@ -73,7 +73,7 @@ int bandOf(double light) { return std::clamp(int(std::floor(std::log2(std::max(l
 // the curve itself stops at 0.
 // (Display curves carried on past their range, so code values outside 0..1 keep apart: mirrored below black, HLG's log
 // curve on past 1, PQ straight on at its slope there.)
-bool displayCurve(Transfer t) { return t == Transfer::Bt1886 || t == Transfer::Srgb || t == Transfer::Pq || t == Transfer::Hlg; }
+bool displayCurve(Transfer t) { return t == Transfer::Bt1886 || t == Transfer::Srgb || t == Transfer::Gamma22 || t == Transfer::Pq || t == Transfer::Hlg; }
 constexpr double kHlgA = 0.17883277, kHlgB = 1 - 4 * kHlgA, kHlgC = 0.55991073;
 double pqTopSlope() {
     static const double s = (toLinear(Transfer::Pq, 1) - toLinear(Transfer::Pq, 1 - 1e-4)) / 1e-4;

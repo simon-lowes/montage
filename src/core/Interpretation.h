@@ -43,6 +43,7 @@ struct Interpretation {
     double rawTint = 0;         // + towards magenta, - towards green
     std::string rawHighlights;  // "" clipped, "blend", "rebuild"
     bool rawHalf = false;       // decoded at half size (faster)
+    bool rawNoOpcodes = false;  // a DNG's opcode lists (its lens and sensor corrections) left unapplied
     // Stereoscopic 3D: how the two eyes are packed in each frame ("" as the file says, "none" not stereo, "sbs" side
     // by side at full size, "sbs_half" squeezed side by side, "tb" top and bottom, "tb_half" squeezed top and bottom),
     // whether the eyes are the other way round, and which eye is read (0 left, 1 right; set by the renderer).
@@ -55,7 +56,7 @@ struct Interpretation {
     // A JPEG with a gain map (media/GainMap.h) read as its HDR rendition (Rec.2100 PQ) rather than its SDR picture: set
     // when it is imported, and dropped while its colour is interpreted as an SDR space or it is in an SDR sequence.
     bool gainMap = false;
-    bool hasRaw() const { return rawExposure != 0 || rawTemperature > 0 || rawTint != 0 || !rawHighlights.empty() || rawHalf; }
+    bool hasRaw() const { return rawExposure != 0 || rawTemperature > 0 || rawTint != 0 || !rawHighlights.empty() || rawHalf || rawNoOpcodes; }
     bool empty() const {
         return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && pulldown.empty() && !hasRaw() && stereo.empty() && !swapEyes &&
                eye == 0 && layer.empty() && !gainMap;

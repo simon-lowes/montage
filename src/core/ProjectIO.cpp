@@ -341,6 +341,7 @@ QJsonArray markersToJson(const std::vector<Marker>& markers) {
         QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
         if (mk.chapter) mo["chapter"] = true;
         if (mk.shotChange) mo["shot_change"] = true;
+        if (mk.adBreak) mo["ad_break"] = true;
         if (mk.sub != 0) mo["sub"] = mk.sub;
         if (!mk.drawing.empty()) mo["drawing"] = qs(mk.drawing);
         if (mk.drawnAt >= 0) mo["drawn_at"] = double(mk.drawnAt);
@@ -364,6 +365,7 @@ std::vector<Marker> markersFromJson(const QJsonValue& v) {
         mk.color = mo.value("color").toInt(0);
         mk.chapter = mo.value("chapter").toBool(false);
         mk.shotChange = mo.value("shot_change").toBool(false);
+        mk.adBreak = mo.value("ad_break").toBool(false);
         mk.drawing = ss(mo.value("drawing"));
         mk.drawnAt = mo.contains("drawn_at") ? i64(mo.value("drawn_at")) : -1;
         mk.reviewId = ss(mo.value("review_id"));
@@ -550,6 +552,9 @@ std::vector<Transition> transitionsFromJson(const QJsonValue& v) {
     return out;
 }
 
+// The project's folder while one is saved or read (sampler sounds are kept by relative path too, as media are).
+thread_local const QDir* tSoundBase = nullptr;
+
 QJsonObject trackToJson(const Track& t) {
     QJsonObject o{{"id", double(t.id)}, {"name", qs(t.name)}};
     QJsonArray clips;
@@ -601,6 +606,41 @@ QJsonObject trackToJson(const Track& t) {
         o["lanes"] = lanes;
     }
     if (!t.lanesShown) o["lanesShown"] = false;
+    if (!t.sampler.empty()) {
+        QJsonArray pads, passes;
+        for (const SamplerSlot& sl : t.sampler.pads) {
+            QJsonObject so{{"key", sl.key}};
+            if (!sl.name.empty()) so["name"] = qs(sl.name);
+            QJsonArray sounds;
+            for (const SamplerSound& sd : sl.sounds) {
+                QJsonObject d{{"path", qs(sd.path)}};
+                if (tSoundBase && !sd.path.empty()) d["relPath"] = tSoundBase->relativeFilePath(qs(sd.path));
+                if (sd.start != 0) d["start"] = sd.start;
+                if (sd.end != 0) d["end"] = sd.end;
+                if (sd.velLow != 1) d["velLow"] = sd.velLow;
+                if (sd.velHigh != 127) d["velHigh"] = sd.velHigh;
+                sounds.append(d);
+            }
+            so["sounds"] = sounds;
+            if (sl.gainDb != 0) so["gain"] = sl.gainDb;
+            if (sl.attack != 0) so["attack"] = sl.attack;
+            if (sl.release != 0.02) so["release"] = sl.release;
+            if (!sl.oneShot) so["oneShot"] = false;
+            if (sl.choke) so["choke"] = sl.choke;
+            if (sl.pitchVariation != 0) so["pitchVariation"] = sl.pitchVariation;
+            if (sl.levelVariation != 0) so["levelVariation"] = sl.levelVariation;
+            pads.append(so);
+        }
+        for (const SamplerPass& ps : t.sampler.passes) {
+            QJsonArray notes;
+            for (const SamplerNote& n : ps.notes) notes.append(QJsonArray{n.key, n.velocity, double(n.at), double(n.length)});
+            passes.append(QJsonObject{{"lane", double(ps.lane)}, {"seed", double(ps.seed)}, {"notes", notes}});
+        }
+        QJsonObject so;
+        if (!pads.isEmpty()) so["slots"] = pads;
+        if (!passes.isEmpty()) so["passes"] = passes;
+        o["sampler"] = so;
+    }
     if (!t.versions.empty()) {
         QJsonArray versions;
         for (const TrackVersion& v : t.versions) {
@@ -665,6 +705,55 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
         if (l.mediaId) t.lanes.push_back(std::move(l));
     }
     t.lanesShown = o.value("lanesShown").toBool(true);
+    {
+        const QJsonObject so = o.value("sampler").toObject();
+        for (const auto& v : so.value("slots").toArray()) {
+            const QJsonObject x = v.toObject();
+            SamplerSlot sl;
+            sl.key = std::clamp(x.value("key").toInt(60), 0, 127);
+            sl.name = ss(x.value("name"));
+            for (const auto& d : x.value("sounds").toArray()) {
+                const QJsonObject y = d.toObject();
+                SamplerSound sd;
+                sd.path = ss(y.value("path"));
+                if (tSoundBase && y.contains("relPath") && !QFileInfo::exists(qs(sd.path))) {  // (a moved project)
+                    const QString rel = tSoundBase->absoluteFilePath(y.value("relPath").toString());
+                    if (QFileInfo::exists(rel)) sd.path = QDir::cleanPath(rel).toStdString();
+                }
+                sd.start = std::max(0.0, y.value("start").toDouble(0));
+                sd.end = std::max(0.0, y.value("end").toDouble(0));
+                sd.velLow = std::clamp(y.value("velLow").toInt(1), 1, 127);
+                sd.velHigh = std::clamp(y.value("velHigh").toInt(127), sd.velLow, 127);
+                if (!sd.path.empty()) sl.sounds.push_back(std::move(sd));
+            }
+            sl.gainDb = std::clamp(x.value("gain").toDouble(0), -96.0, 24.0);
+            sl.attack = std::clamp(x.value("attack").toDouble(0), 0.0, 10.0);
+            sl.release = std::clamp(x.value("release").toDouble(0.02), 0.0, 10.0);
+            sl.oneShot = x.value("oneShot").toBool(true);
+            sl.choke = std::clamp(x.value("choke").toInt(0), 0, 16);
+            sl.pitchVariation = std::clamp(x.value("pitchVariation").toDouble(0), 0.0, 12.0);
+            sl.levelVariation = std::clamp(x.value("levelVariation").toDouble(0), 0.0, 24.0);
+            if (std::none_of(t.sampler.pads.begin(), t.sampler.pads.end(), [&](const SamplerSlot& e) { return e.key == sl.key; }))
+                t.sampler.pads.push_back(std::move(sl));
+        }
+        for (const auto& v : so.value("passes").toArray()) {
+            const QJsonObject x = v.toObject();
+            SamplerPass ps;
+            ps.lane = Id(i64(x.value("lane")));
+            ps.seed = uint32_t(i64(x.value("seed")));
+            for (const auto& n : x.value("notes").toArray()) {
+                const QJsonArray a = n.toArray();
+                if (a.size() < 4) continue;
+                SamplerNote sn;
+                sn.key = std::clamp(a[0].toInt(), 0, 127);
+                sn.velocity = std::clamp(a[1].toInt(), 1, 127);
+                sn.at = i64(a[2]);
+                sn.length = std::max<int64_t>(0, i64(a[3]));
+                ps.notes.push_back(sn);
+            }
+            if (ps.lane) t.sampler.passes.push_back(std::move(ps));
+        }
+    }
     for (const auto& v : o.value("versions").toArray()) {
         const QJsonObject vo = v.toObject();
         TrackVersion tv;
@@ -1337,7 +1426,9 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         root["smartBins"] = smart;
     }
     QJsonArray seqs;
+    tSoundBase = projectPath.empty() ? nullptr : &base;
     for (const auto& s : p.sequences) seqs.append(sequenceToJson(s));
+    tSoundBase = nullptr;
     root["sequences"] = seqs;
     if (p.mergeBase && !p.mergeBase->empty())
         if (const QJsonDocument d = QJsonDocument::fromJson(QByteArray::fromStdString(*p.mergeBase)); d.isObject()) root["mergeBase"] = d.object();
@@ -1499,7 +1590,9 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
         p.smartBins.push_back(std::move(b));
     }
+    tSoundBase = projectPath.empty() ? nullptr : &base;
     for (const auto& sv : root.value("sequences").toArray()) p.sequences.push_back(sequenceFromJson(sv.toObject()));
+    tSoundBase = nullptr;
     if (p.sequences.empty()) {
         if (error) *error = "Project has no sequences";
         return false;

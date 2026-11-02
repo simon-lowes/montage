@@ -26,6 +26,9 @@ class QIODevice;
 class QThread;
 
 namespace montage {
+namespace sampler {
+class Engine;
+}
 
 class RenderWorker;
 class MixerDevice;
@@ -107,6 +110,12 @@ public:
     void setSpectrumKWeighting(bool on);
     // What the speakers get for `frames` samples of the sequence from sample `start` (silence under Global Mute).
     std::vector<float> heard(int64_t start, int frames);
+    // A sound-effect sampler (audio/Sampler.h) heard over the programme, playing and stopped (the device is kept open
+    // while one is set); null none.
+    void setSampler(std::shared_ptr<sampler::Engine> engine);
+    // The sample of the sequence the picture shows now, or `nsAgo` nanoseconds ago (what a key pressed then was played
+    // against: the sound already sent to the device and not yet heard is taken off, as the picture's clock does).
+    int64_t heardSample(qint64 nsAgo = 0) const;
 
     // The monitoring section (render/MonitorSection.h): speaker sets, Listen As, Dim, Mono, Mute, monitor solos, the
     // reference level and the cue mix, after the mix in playback alone (never in an export). The output device is the
@@ -183,7 +192,8 @@ private:
     // The sink as playback and the monitoring section need it: the programme at normal speed, else idle for
     // calibration or talkback, else none; `reopen` opens it again (other channels or another device).
     void refreshAudio(bool reopen);
-    bool monitorKeepsAudio() const { return monitoring_.on && (calibration_ >= 0 || talkback_); }
+    bool monitorKeepsAudio() const { return (monitoring_.on && (calibration_ >= 0 || talkback_)) || sampler_ != nullptr; }
+    std::shared_ptr<sampler::Engine> sampler_;
     void startTalkbackInput();
     FrameTime clampToSequence(FrameTime t) const;
     int playStep() const;

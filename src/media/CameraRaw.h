@@ -35,6 +35,7 @@ struct RawSettings {
     double tint = 0;         // + towards magenta, - towards green (-150 to 150)
     int highlights = 0;      // 0 clipped, 1 blended, 2 rebuilt
     bool half = false;       // half size: each 2x2 block of the sensor one pixel (quick, for playback)
+    bool dngOpcodes = true;  // a DNG's opcode lists applied (media/DngOpcodes.h: lens shading, distortion, bad pixels)
 };
 bool developRaw(const std::string& path, RawImage& out, std::string* error = nullptr, const RawSettings& settings = {});
 // The white balance multipliers (red, green, blue, green = 1) that make light of `kelvin` with `tint` neutral for a camera

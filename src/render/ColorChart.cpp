@@ -126,7 +126,7 @@ struct LinearLight {
     bool hlg = false, mirror = true;
     explicit LinearLight(const ColorSpace& cs) : tr(cs.transfer) {
         hlg = tr == Transfer::Hlg;
-        mirror = tr == Transfer::Bt1886 || tr == Transfer::Srgb || tr == Transfer::Pq || hlg;
+        mirror = tr == Transfer::Bt1886 || tr == Transfer::Srgb || tr == Transfer::Gamma22 || tr == Transfer::Pq || hlg;
     }
     double lin(double v) const {
         if (!std::isfinite(v)) return 0;

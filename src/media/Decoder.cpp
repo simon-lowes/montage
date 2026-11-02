@@ -552,6 +552,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.fps = sequence ? seq.fps : m.fps;
         m.duration = sequence ? seq.frames() / seq.fps.toDouble() : 0;
         m.videoCodec = "exr";
+        if (const ColorSpace* cs = colorSpaceForInteropId(readExrColorInteropId(sequence ? imageSequenceFrame(seq, seq.first) : file))) m.colorSpace = cs->id;
         out = m;
         return true;
     }
@@ -708,6 +709,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
+        // OpenEXR naming its colour space (the colorInteropID attribute).
+        if (st->codecpar->codec_id == AV_CODEC_ID_EXR && exrAvailable()) {
+            ImageSequence exrSeq;
+            const std::string frame = parseImageSequencePath(file, exrSeq) ? imageSequenceFrame(exrSeq, exrSeq.first) : file;
+            if (const ColorSpace* cs = colorSpaceForInteropId(readExrColorInteropId(frame))) m.colorSpace = cs->id;
+        }
         // A JPEG or AVIF with a gain map: imported as its HDR rendition (said on the path, so a project saved before this
         // reads keep the SDR picture they were made with).
         GainMapJpeg jpeg;
@@ -1149,7 +1156,7 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         }
     }
     rawSettings_ = RawSettings{in.rawExposure, in.rawTemperature, in.rawTint,
-                               in.rawHighlights == "blend" ? 1 : in.rawHighlights == "rebuild" ? 2 : 0, in.rawHalf};
+                               in.rawHighlights == "blend" ? 1 : in.rawHighlights == "rebuild" ? 2 : 0, in.rawHalf, !in.rawNoOpcodes};
     // Magic Lantern Video: each frame's mosaic developed when it is shown.
     if (isMlvPath(uninterpretedPath(path))) {
         auto reader = std::make_unique<MlvReader>();

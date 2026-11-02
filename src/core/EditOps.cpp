@@ -2143,7 +2143,10 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
             };
             renewClips(t.clips, t.transitions);
             for (TrackVersion& v : t.versions) renewClips(v.clips, v.transitions);
-            for (TakeLane& l : t.lanes) l.id = p.newId();
+            std::map<Id, Id> lanes;
+            for (TakeLane& l : t.lanes) lanes[l.id] = p.newId(), l.id = lanes[l.id];
+            for (SamplerPass& ps : t.sampler.passes) ps.lane = lanes.count(ps.lane) ? lanes[ps.lane] : 0;
+            std::erase_if(t.sampler.passes, [](const SamplerPass& ps) { return !ps.lane; });
         }
     for (AdrCue& q : s.adrCues) {
         q.id = p.newId();

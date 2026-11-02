@@ -150,6 +150,7 @@ ColorTags colorTags(const ColorSpace& c) {
     if (c.transfer == Transfer::Pq) t.trc = AVCOL_TRC_SMPTE2084;
     else if (c.transfer == Transfer::Hlg) t.trc = AVCOL_TRC_ARIB_STD_B67;
     else if (c.transfer == Transfer::Srgb) t.trc = AVCOL_TRC_IEC61966_2_1;
+    else if (c.transfer == Transfer::Gamma22) t.trc = AVCOL_TRC_GAMMA22;
     return t;
 }
 
@@ -862,8 +863,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Image sequences: numbered files, no sound.
     const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
     const bool floatFrames = s.videoCodec == "exr";  // written straight from the float picture, not through 16 bits
-    // (by the OpenEXR library for another compression or more layers)
-    const bool exrLibrary = floatFrames && (!s.exrCompression.empty() || s.exrLayers);
+    // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
+    const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
         if (!floatFrames) return fail("OpenEXR compression and layers are for OpenEXR frames");
         if (!exrAvailable()) return fail("This build of Montage writes OpenEXR only through FFmpeg (ZIP compression, one layer)");
@@ -2040,6 +2041,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     }
                 });
                 std::map<std::string, std::string> attributes;
+                if (const std::string id = colorInteropId(outSpace); !id.empty()) attributes["colorInteropID"] = id;
                 std::string why;
                 if (s.exrLayers && !s.exrLayers(f, W, H, layers, attributes, why)) return fail(why);
                 char name[4096];

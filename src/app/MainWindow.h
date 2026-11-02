@@ -76,6 +76,7 @@ class TrimPanel;
 class ScopesWidget;
 class MixerPanel;
 class ControlSurface;
+class MidiLearn;
 class CaptionsPanel;
 class TranscriptPanel;
 class ShotSearchPanel;
@@ -83,6 +84,7 @@ class SoundLibraryPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class SamplerPanel;
 class MonitoringPanel;
 class CueSheetPanel;
 class LinedScriptPanel;
@@ -254,6 +256,7 @@ public:
     // Edit > Control Surface: the Mackie Control surface's MIDI ports (one dialog, shown and returned).
     QDialog* controlSurfaceDialog();
     ControlSurface* controlSurface() const { return surface_; }
+    MidiLearn* midiLearn() const { return midiLearn_; }
     OscControl* oscControl() const { return osc_; }
     // The Speed Editor's keys (from Edit > Control Surface): what each does, any menu command.
     QDialog* speedEditorKeysDialog(QWidget* parent = nullptr);
@@ -315,6 +318,7 @@ public:
     bool exportAdmTo(const QString& path, const AdmSettings& settings, AdmResult* result = nullptr);
     void exportAdmDialog();
     // File › Export Immersive Audio (IAMF)…: the mix as IAMF in an MP4 or the bare stream (render/Iamf.h), in the background.
+    void exportStreamingDialog();
     bool exportIamfTo(const QString& path, const IamfSettings& settings, IamfResult* result = nullptr);
     void exportIamfDialog();
     bool addToColorGroup(Id group);
@@ -560,6 +564,7 @@ private:
     void matchFrame();
     void addMarker();
     void addChapterMarker();
+    void addAdBreakMarker();
     void addClipMarker();
     void jumpMarker(bool forward);
     void markClip();
@@ -655,11 +660,13 @@ private:
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;
+    MidiLearn* midiLearn_ = nullptr;
     SpeedEditorControl* speedEditor_ = nullptr;
     TangentControl* tangent_ = nullptr;
     CaptureDialog* capture_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    SamplerPanel* sampler_ = nullptr;
     MonitoringPanel* monitoring_ = nullptr;
     CueSheetPanel* cueSheet_ = nullptr;
     LinedScriptPanel* linedScript_ = nullptr;
@@ -744,6 +751,7 @@ private:
     StackedTimelineWidget* stacked_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* adrDock_ = nullptr;
+    QDockWidget* samplerDock_ = nullptr;
     QDockWidget* monitoringDock_ = nullptr;
     QDockWidget* cueSheetDock_ = nullptr;
     QDockWidget* linedScriptDock_ = nullptr;

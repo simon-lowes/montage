@@ -142,6 +142,7 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "rawtint") out.rawTint = parseNumber(value);
         else if (key == "rawhl" && validRawHighlights(value)) out.rawHighlights = value == "clip" ? "" : value;
         else if (key == "rawhalf") out.rawHalf = value == "1";
+        else if (key == "rawop") out.rawNoOpcodes = value == "0";
         else if (key == "stereo" && validStereoLayout(value)) out.stereo = value;
         else if (key == "swap") out.swapEyes = value == "1";
         else if (key == "eye") out.eye = value == "1" ? 1 : 0;
@@ -177,6 +178,7 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     if (i.rawTint != 0) add("rawtint=" + number(i.rawTint));
     if (!i.rawHighlights.empty() && i.rawHighlights != "clip") add("rawhl=" + i.rawHighlights);
     if (i.rawHalf) add("rawhalf=1");
+    if (i.rawNoOpcodes) add("rawop=0");
     if (!i.stereo.empty()) add("stereo=" + i.stereo);
     if (i.swapEyes) add("swap=1");
     if (i.eye) add("eye=1");

@@ -16,6 +16,7 @@
 #include "Interpretation.h"
 #include "Multicam.h"
 #include "History.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -162,6 +163,7 @@ QJsonObject otioMarker(const Marker& m, double rate) {
     // OTIO's colour names are coarser than Montage's labels: the label rides along in Montage's metadata.
     QJsonObject own;
     if (m.chapter) own["chapter"] = true;
+    if (m.adBreak) own["ad_break"] = true;
     if (m.color) own["color"] = m.color;
     QJsonObject meta;
     if (!own.isEmpty()) meta["montage"] = own;
@@ -233,9 +235,14 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c, TrackKi
         ref = QJsonObject{{"OTIO_SCHEMA", "GeneratorReference.1"}, {"name", kind}, {"generator_kind", kind},
                           {"parameters", params}, {"metadata", QJsonObject()}, {"available_range", QJsonValue()}};
     } else if (const MediaItem* m = p.findMedia(c.mediaId)) {
+        // The colour space it is read as, by its colour interop ID (as OpenEXR's colorInteropID attribute names it),
+        // when its tags or Interpret Colour say one.
+        QJsonObject refMeta;
+        if (!m->colorOverride.empty() || !m->colorSpace.empty())
+            if (const std::string id = colorInteropId(mediaColorSpace(*m)); !id.empty()) refMeta["colorInteropID"] = QString::fromStdString(id);
         ref = QJsonObject{{"OTIO_SCHEMA", "ExternalReference.1"}, {"name", QString::fromStdString(m->name)},
                           {"target_url", QUrl::fromLocalFile(QString::fromStdString(uninterpretedPath(m->path))).toString()},
-                          {"metadata", QJsonObject()}};
+                          {"metadata", refMeta}};
         if (m->duration > 0) ref["available_range"] = range(0, std::floor(m->duration * rate), rate);
         else ref["available_range"] = QJsonValue();
     } else {

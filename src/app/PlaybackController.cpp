@@ -1,4 +1,5 @@
 #include "PlaybackController.h"
+#include "audio/Sampler.h"
 #include "render/DialogueLoudness.h"
 #include "render/TrimPasses.h"
 
@@ -410,6 +411,8 @@ public:
     // The monitoring section (off: the stereo mix as before).
     void setMonitoring(const MonitorSettings& m, int rate) {
         QMutexLocker lock(&m_);
+        // (the sampler joins after the section, so it takes the section's level, dim and mute here)
+        samplerGain_ = !m.on ? 1.0f : m.mute ? 0.0f : float(std::pow(10.0, (m.levelDb + (m.dim ? m.dimDb : 0.0)) / 20));
         if (!m.on) {
             monitor_.reset();
             return;
@@ -451,6 +454,12 @@ public:
         sample_ -= taken;
         loopIn_ = in;
         loopLength_ = length;
+    }
+    // A sound-effect sampler's voices (audio/Sampler.h), in what is heard while playing and stopped (never in the
+    // meters); null none.
+    void setSampler(std::shared_ptr<sampler::Engine> e) {
+        QMutexLocker lock(&m_);
+        sampler_ = std::move(e);
     }
     // An ADR cycle's beeps, in what is heard (never in the meters).
     void setCycle(const std::optional<AdrCycle>& c) {
@@ -506,7 +515,20 @@ protected:
             }
             first = looped(sample_);
             if (!idle) sample_ += frames;
+            if (sampler_) {
+                smp_.assign(size_t(frames) * 2, 0.0f);
+                sampler_->render(samplerClock_, frames, smp_.data());
+                samplerClock_ += frames;
+                if (samplerGain_ != 1.0f)
+                    for (float& v : smp_) v *= samplerGain_;
+            } else {
+                smp_.clear();
+            }
         }
+        const bool sampled = !smp_.empty() && !muted_;
+        if (sampled && monitored)  // (onto the first two of the monitoring section's channels)
+            for (int i = 0; i < frames; ++i)
+                for (int c = 0; c < std::min(2, monitored); ++c) mon_[size_t(i) * size_t(monitored) + size_t(c)] += smp_[size_t(i) * 2 + size_t(c)];
         if (monitored) {
             // Through the monitoring section: its channels onto the device's (Global Mute silences them all).
             if (int16_) {
@@ -522,14 +544,23 @@ protected:
                     for (int c = 0; c < channels; ++c)
                         d[size_t(i) * size_t(channels) + size_t(c)] = muted_ || c >= monitored ? 0.0f : mon_[size_t(i) * size_t(monitored) + size_t(c)];
             }
-        } else if (idle) {
+        } else if (idle && !sampled) {
             std::memset(data, 0, size_t(frames) * size_t(bytesPerFrame));
+        } else if (idle) {
+            for (int i = 0; i < frames; ++i)
+                for (int c = 0; c < channels; ++c) {
+                    const float v = c < 2 ? smp_[size_t(i) * 2 + size_t(c)] : 0.0f;
+                    if (int16_) reinterpret_cast<int16_t*>(data)[size_t(i) * size_t(channels) + size_t(c)] = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767.0f));
+                    else reinterpret_cast<float*>(data)[size_t(i) * size_t(channels) + size_t(c)] = v;
+                }
         } else {
             std::vector<float> heard;  // what the speakers get, when it is not buf_ (which the meters still read)
             if (muted_) heard.assign(buf_.size(), 0.0f);  // (Global Mute silences the beeps too)
-            else if (cycle) {
+            else if (cycle || sampled) {
                 heard = buf_;
-                addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
+                if (cycle) addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
+                if (sampled)
+                    for (size_t i = 0; i < heard.size(); ++i) heard[i] += smp_[i];
             }
             const std::vector<float>& out = heard.empty() ? buf_ : heard;
             if (int16_) {
@@ -610,6 +641,10 @@ private:
     std::atomic<bool> idle_{false};
     std::atomic<bool> muted_{false};
     std::optional<AdrCycle> cycle_;
+    std::shared_ptr<sampler::Engine> sampler_;
+    int64_t samplerClock_ = 0;  // (the sampler's own timeline: its notes start at the next block)
+    std::vector<float> smp_;
+    float samplerGain_ = 1.0f;
     AudioMixer mixer_;
     std::unique_ptr<Monitor> monitor_;  // the monitoring section, while it is on
     bool binaural_ = false;
@@ -1129,6 +1164,31 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     sink_->start(device_);
 }
 
+void PlaybackController::setSampler(std::shared_ptr<sampler::Engine> engine) {
+    if (engine == sampler_) return;
+    sampler_ = engine;
+    device_->setSampler(std::move(engine));
+    refreshAudio(false);
+}
+
+int64_t PlaybackController::heardSample(qint64 nsAgo) const {
+    const Sequence* s = sequence();
+    if (!s) return 0;
+    const double fps = s->fpsValue();
+    double t = double(position_) / fps;
+    if (speed_ == 1 && clock_.isValid()) {
+        // (as tick() finds the picture's time, without moving it)
+        double elapsed = clock_.nsecsElapsed() / 1e9;
+        if (sink_ && sink_->state() == QAudio::ActiveState) {
+            const qint64 buffered = std::max<qint64>(0, sink_->bufferSize() - sink_->bytesFree());
+            const double played = (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
+            if (played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
+        }
+        t = double(startFrame_) / fps + std::max(elapsed, lastElapsed_);
+    } else return std::llround(t * s->sampleRate);  // (stopped: the picture has not moved since)
+    return std::llround((t - double(nsAgo) / 1e9) * s->sampleRate);
+}
+
 void PlaybackController::syncAudioLoop() {
     const Sequence* s = sequence();
     if (!s || !device_) return;
@@ -1145,7 +1205,9 @@ void PlaybackController::stopAudio(bool force) {
     if (!sink_) return;
     // Calibration noise and talkback go on while stopped.
     if (!force && monitorKeepsAudio()) {
-        device_->setIdle(true);
+        // (with the sampler, the sink afresh: what it holds of the programme is not heard after the stop)
+        if (sampler_) startAudio(position_, true);
+        else device_->setIdle(true);
         return;
     }
     sink_->stop();
@@ -1191,6 +1253,7 @@ void PlaybackController::setMonitoring(const MonitorSettings& settings) {
 }
 
 void PlaybackController::refreshAudio(bool reopen) {
+    if (const Sequence* s = sequence(); sink_ && s && sink_->format().sampleRate() != s->sampleRate) reopen = true;  // (another sequence's rate)
     if (speed_ == 1) {
         if (!sink_ || reopen) {
             // (the picture's clock afresh with the sound, as after a seek)

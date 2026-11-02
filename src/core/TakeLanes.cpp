@@ -236,6 +236,7 @@ Result removeTakeLane(Sequence& s, TrackRef track, Id lane) {
     if (!t) return Result::fail(why);
     const size_t before = t->lanes.size();
     std::erase_if(t->lanes, [&](const TakeLane& l) { return l.id == lane; });
+    std::erase_if(t->sampler.passes, [&](const SamplerPass& ps) { return ps.lane == lane; });
     return t->lanes.size() < before ? Result{} : Result::fail("No such take lane");
 }
 
