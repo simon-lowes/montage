@@ -95,6 +95,13 @@ struct ExportSettings {
     // pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256 or htj2k32 (High-Throughput JPEG 2000, lossless); "" = FFmpeg's
     // writer, ZIP in blocks of 16 lines.
     std::string exrCompression;
+    // JPEG XL frames (videoCodec "jxl", written with libjxl): depth "8", "16", "half" or "float" ("" = 16 bits, half
+    // floats in linear light), 0 lossless or libjxl's distance (1 visually lossless), its effort (1-9), and alpha
+    // written premultiplied rather than straight.
+    std::string jxlDepth;
+    double jxlDistance = 0;
+    int jxlEffort = 3;
+    bool jxlPremultiplied = false;
     // More layers in each OpenEXR frame (a VFX pull's source layers and mattes, render/VfxPull.h), written with the
     // OpenEXR library: called with the frame's sequence time and the picture's size, adding to `layers` (the picture is
     // the first, "") and header `attributes`. False stops the export with `error`.
@@ -314,6 +321,7 @@ struct StillOptions {
     std::string rendition;
     int quality = 90;
     bool gainMap = false;  // an HDR AVIF or HEIF written as an SDR base with a gain map (a JPEG always is)
+    double jxlDistance = 0;  // JPEG XL: 0 lossless, else libjxl's distance (1 visually lossless)
 };
 // What was written: its space (ColorSpace.h id), bits per channel and, for HDR, the light levels it states (the
 // sequence's measured ones for its master, else the frame's own) in nits.
@@ -327,7 +335,7 @@ struct StillResult {
 // in. False with `error` for an unknown trim target.
 bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,
                     std::string* error = nullptr);
-// Writes a single frame as PNG, JPEG, TIFF or AVIF (by extension).
+// Writes a single frame as PNG, JPEG, TIFF, AVIF, HEIF or JPEG XL (by extension).
 bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error,
                  const StillOptions& options = {}, StillResult* result = nullptr);
 

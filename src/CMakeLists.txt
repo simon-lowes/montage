@@ -90,6 +90,7 @@ add_library(montage_engine STATIC
   media/Model3D.h media/Model3D.cpp
   media/Usd.h media/Usd.cpp media/UsdModel.cpp media/Splats.h media/Splats.cpp
   media/Exr.h media/Exr.cpp
+  media/Jxl.h media/Jxl.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
@@ -425,6 +426,16 @@ if(MONTAGE_WITH_LIBRAW)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
   else()
     message(STATUS "LibRaw not found: camera raw stills are not read")
+  endif()
+endif()
+if(MONTAGE_WITH_JXL)
+  pkg_check_modules(LIBJXL IMPORTED_TARGET GLOBAL libjxl>=0.7 libjxl_threads>=0.7)
+  if(LIBJXL_FOUND)
+    message(STATUS "libjxl ${LIBJXL_libjxl_VERSION}: JPEG XL read and written directly")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::LIBJXL)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_JXL)
+  else()
+    message(STATUS "libjxl not found: JPEG XL is read through FFmpeg only, and not written")
   endif()
 endif()
 if(MONTAGE_WITH_VMAF)

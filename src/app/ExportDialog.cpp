@@ -35,6 +35,7 @@
 #include "core/Surround.h"
 #include "media/ContentCredentials.h"
 #include "media/Exr.h"
+#include "media/Jxl.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -382,6 +383,15 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     exrCompression_->setToolTip(tr("How OpenEXR frames are compressed: ZIP, PIZ, Zstandard and HTJ2K keep every value; PXR24, B44 and DWA are smaller and lossy"));
     if (exrAvailable()) form->addRow(tr("OpenEXR compression:"), exrCompression_);
     else exrCompression_->hide();
+    jxlQuality_ = new QComboBox(form_);
+    jxlQuality_->setObjectName(QStringLiteral("exportJxlQuality"));
+    jxlQuality_->addItem(tr("Lossless"), 0.0);
+    jxlQuality_->addItem(tr("Visually lossless (distance 1)"), 1.0);
+    jxlQuality_->addItem(tr("Smaller (distance 2)"), 2.0);
+    jxlQuality_->setCurrentIndex(std::max(0, jxlQuality_->findData(appSettings().value("export/jxlDistance", 0.0).toDouble())));
+    jxlQuality_->setToolTip(tr("How JPEG XL frames are coded: lossless keeps every value; a distance trades a little for much smaller files"));
+    if (jxlAvailable()) form->addRow(tr("JPEG XL:"), jxlQuality_);
+    else jxlQuality_->hide();
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
     stereo_ = new QComboBox(form_);
     stereo_->setObjectName(QStringLiteral("exportStereo"));
@@ -825,11 +835,12 @@ void ExportDialog::updateControls() {
         const ColorSpace* chosen = findColorSpace(color_->currentData().toString().toStdString());
         const ColorSpace* out = chosen ? chosen : sq ? &sequenceColorSpace(*sq) : nullptr;
         const std::string vc = p ? p->settings.videoCodec : std::string();
-        hdr10Plus_->setEnabled(video && out && out->transfer == Transfer::Pq && vc != "exr" && vc != "gif");
+        hdr10Plus_->setEnabled(video && out && out->transfer == Transfer::Pq && vc != "exr" && vc != "gif" && vc != "jxl");
         toneMapping_->setEnabled(video && sq && out && !out->hdr() && !out->sceneReferred && sequenceColorSpace(*sq).hdr() &&
                                  !sceneReferredWorking(*sq) && vc != "exr");
-        adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif");
+        adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif" && vc != "jxl");
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
+        jxlQuality_->setEnabled(video && vc == "jxl" && jxlAvailable());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
     loudnessReport_->setEnabled(p && hasAudio(p->settings));
@@ -1083,6 +1094,10 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         const std::string c = exrCompression_->currentData().toString().toStdString();
         s.exrCompression = c == "zip" ? std::string() : c;  // (ZIP: FFmpeg's writer, as before)
         settings.setValue("export/exrCompression", exrCompression_->currentData());
+    }
+    if (jxlQuality_->isEnabled()) {
+        s.jxlDistance = jxlQuality_->currentData().toDouble();
+        settings.setValue("export/jxlDistance", s.jxlDistance);
     }
     if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
         const int index = streams_->currentIndex();

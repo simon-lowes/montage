@@ -5,6 +5,8 @@
 #include "core/AudioDescription.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
+#include "media/Jxl.h"
+#include "render/SegmentedExport.h"
 
 #include "core/ColorGroups.h"
 #include "core/Expression.h"
@@ -412,6 +414,13 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
                                "exr", "none", 0, ""));
             v.push_back(preset("DPX Sequence (10-bit)", "dpx", "One numbered 10-bit DPX a frame, for film and broadcast finishing", "dpx",
                                "none", 0, ""));
+            if (jxlAvailable()) {
+                ExportPreset jxl = preset("JPEG XL Sequence (lossless)", "jxl",
+                                          "One numbered lossless JPEG XL a frame, 16-bit (half float in linear light), with transparency", "jxl",
+                                          "none", 0, "");
+                jxl.settings.alpha = true;
+                v.push_back(jxl);
+            }
         }
         v.push_back(preset("Audio - WAV 24-bit", "wav", "Uncompressed mixdown", "none", "pcm_s24le", 0, ""));
         v.push_back(preset("Audio - AAC (M4A)", "m4a", "Compressed mixdown", "none", "aac", 0, ""));
@@ -875,8 +884,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool interlacedOut = s.interlaced || conv.fields;
     if (s.videoCodec == "gif") return exportGif(p, seq, s, in, out, progress, cancel, error, opened);
     // Image sequences: numbered files, no sound.
-    const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
-    const bool floatFrames = s.videoCodec == "exr";  // written straight from the float picture, not through 16 bits
+    const bool imageSequence = exportIsImageSequence(s);
+    const bool floatFrames = s.videoCodec == "exr";
+    // JPEG XL frames written with libjxl (media/Jxl.h), in the delivery's own encoding, float and alpha kept.
+    const bool jxlFrames = s.videoCodec == "jxl";
+    if (jxlFrames && wantVideo && !jxlAvailable()) return fail("This build of Montage writes no JPEG XL (libjxl)");
+    if (jxlFrames && !s.jxlDepth.empty() && s.jxlDepth != "8" && s.jxlDepth != "16" && s.jxlDepth != "half" && s.jxlDepth != "float")
+        return fail("A JPEG XL depth is 8, 16, half or float");
+    if (jxlFrames && (s.jxlDistance < 0 || s.jxlDistance > 25)) return fail("A JPEG XL distance is 0 (lossless) to 25");
+    if (jxlFrames && s.alpha && s.jxlPremultiplied && !jxlWritesPremultiplied())
+        return fail("This libjxl (before 0.9) cannot write premultiplied alpha: write it straight");  // written straight from the float picture, not through 16 bits
     // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
     const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
@@ -925,7 +942,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const ColorSpace* chosen = trim ? &seqSpace : deliverySpaceAsked(seq, s);
     // OpenEXR holds scene-linear light: Linear Rec.709 unless a linear (or any scene-referred) space is asked for.
     // DPX can hold camera log too (a VFX pull of log footage stays log).
-    const bool logOk = s.videoCodec == "dpx";
+    // JPEG XL holds linear light (half or float), but no camera log.
+    const bool logOk = s.videoCodec == "dpx" || (jxlFrames && chosen && chosen->transfer == Transfer::Linear);
     const ColorSpace& outSpace = floatFrames ? (chosen ? *chosen : *findColorSpace("linear-rec709"))
                                  : chosen && (logOk || !chosen->sceneReferred) ? *chosen
                                                                                : seqSpace;
@@ -941,10 +959,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const LightMeter meter(outSpace);
     const bool measure = wantVideo && outSpace.hdr() && meter.valid();
     // HDR10+ (measured once everything is open, just before the frames, so a missing encoder fails first).
-    const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames;
+    const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames && !jxlFrames;
     std::vector<Hdr10PlusScene> hdr10;
     // Adaptive HDR metadata (ST 2094-50) likewise, for PQ and HLG.
-    const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames;
+    const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames && !jxlFrames;
     std::vector<AdaptiveHdrScene> adaptive;
     double renderFrom = 0;  // where the render's share of the progress starts
     std::string x265Params;  // (kept for smart rendering's encoded parts)
@@ -966,7 +984,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (s.alpha || interlacedOut || s.cea608) return fail("Spatial video has no alpha, fields or CEA-608 captions");
             c = "rawvideo";
         }
-        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : c;
+        if (jxlFrames) {
+            // (FFmpeg's PNG encoder stands in, opened but never given a picture: libjxl writes each file)
+            if (!jxlCanState(outSpace)) return fail("JPEG XL cannot state " + outSpace.label + ": deliver it in a display space or linear light");
+            c = "png";
+        }
+        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
         // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
         if (c == "cfhd" && H % 8 != 0)
@@ -2085,7 +2108,27 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             Image img = deliveredFrame(f);
             if (issues.incomplete) return fail(cancel && cancel->load() ? std::string("Export cancelled") : issues.reason());
             if (measure) meter.add(img, f, measured);
-            if (exrLibrary) {
+            if (jxlFrames) {
+                // Through libjxl: lossless or at the distance asked, 16 bits (half floats in linear light) unless another
+                // depth is asked, alpha straight unless premultiplied is; HDR with its light levels as its intensity target.
+                if (img.width != W || img.height != H) img = resizeImage(img, W, H);
+                JxlWriteOptions jo;
+                const bool linear = outSpace.transfer == Transfer::Linear;
+                jo.bits = s.jxlDepth == "8" ? 8 : s.jxlDepth == "float" ? 32 : 16;
+                jo.halfFloat = s.jxlDepth == "half" || (s.jxlDepth.empty() && linear);
+                jo.distance = s.jxlDistance;
+                jo.effort = s.jxlEffort;
+                jo.alpha = s.alpha;
+                jo.premultiplied = s.jxlPremultiplied;
+                jo.sourcePremultiplied = true;
+                jo.colorSpace = outSpace.id;
+                if (outSpace.hdr()) jo.intensityTarget = outSpace.transfer == Transfer::Pq ? double(maxCll) : peakNits;
+                char name[4096];
+                if (av_get_frame_filename2(name, sizeof name, outPath.c_str(), s.startNumber + int(f - din), 0) < 0)
+                    return fail("The file name " + outPath + " has no frame number");
+                std::string why;
+                if (!writeJxl(name, W, H, img.px.data(), jo, &why)) return fail(why);
+            } else if (exrLibrary) {
                 // Through the OpenEXR library: the picture as half floats, premultiplied as OpenEXR files are (and as the
                 // layers copied beside it and Montage's own reader take them), then any more layers, under the file name
                 // FFmpeg's image writer would give it.
@@ -2449,7 +2492,7 @@ bool containerCarriesStreams(const std::string& path) {
 
 bool exportCarriesCredentials(const ExportSettings& s) {
     // One file of a kind that holds them (not numbered frames, nor a GIF).
-    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "gif"};
+    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "jxl", "gif"};
     return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
 }
 
@@ -3213,8 +3256,10 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     const bool avif = ext == ".avif";
     const bool jpeg = ext == ".jpg" || ext == ".jpeg";
     const bool heif = ext == ".heic" || ext == ".heif" || ext == ".hif";
-    if (space->hdr() && ext != ".png" && !avif && !heif && !jpeg)
-        return fail("An HDR still is written as PNG, AVIF, HEIF or JPEG (with a gain map)");
+    const bool jxl = ext == ".jxl";
+    if (jxl && !jxlAvailable()) return fail("This build of Montage writes no JPEG XL (libjxl)");
+    if (space->hdr() && ext != ".png" && !avif && !heif && !jpeg && !jxl)
+        return fail("An HDR still is written as PNG, AVIF, HEIF, JPEG XL or JPEG (with a gain map)");
     Image img = renderProgramFrame(p, seq, t, ro);
     if (img.empty()) return fail("Nothing to render at this frame");
     StillResult res;
@@ -3261,6 +3306,17 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         if (!stated) res.maxCll = res.maxFall = 0;
     } else if (heif) {
         if (!writeHeifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error)) return false;
+    } else if (jxl) {
+        // 8 bits for SDR, 16 for HDR, in the still's own encoding; HDR with the most light it holds as its intensity
+        // target (HLG: the display's peak, which its look depends on).
+        JxlWriteOptions jo;
+        jo.bits = space->hdr() ? 16 : 8;
+        jo.distance = options.jxlDistance;
+        jo.colorSpace = space->id;
+        jo.sourcePremultiplied = true;
+        if (space->hdr()) jo.intensityTarget = space->transfer == Transfer::Pq && res.maxCll > 0 ? res.maxCll : std::clamp(peak, 100.0, 10000.0);
+        if (!writeJxl(path, img.width, img.height, img.px.data(), jo, error)) return false;
+        if (!space->hdr()) res.bits = 8;
     } else if (space->hdr()) {
         if (!writeHdrPng(img, *space, peak, res.maxCll, res.maxFall, path, error)) return false;
     } else {

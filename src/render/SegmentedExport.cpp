@@ -199,7 +199,7 @@ bool mergeAvcc(std::vector<uint8_t>& merged, const AVCodecParameters* next) {
 }  // namespace
 
 bool exportIsImageSequence(const ExportSettings& s) {
-    return s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
+    return s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx" || s.videoCodec == "jxl";
 }
 
 bool exportSegmentsLongGop(const ExportSettings& s) {

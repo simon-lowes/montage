@@ -43,6 +43,8 @@ bool findStill(const std::string& folder, const std::string& album, const std::s
 // at most `maxWidth` pixels wide. False with `error` when no clip shows there.
 bool grabStill(const Project& p, const Sequence& s, FrameTime t, const std::string& folder, const std::string& album,
                GalleryStill& out, std::string* error = nullptr, int maxWidth = 1920);
+// The still's picture written out (PNG, JPEG, TIFF, or lossless JPEG XL, by extension), as Rec.709 as it is kept.
+bool exportStillPicture(const GalleryStill& still, const std::string& path, std::string* error = nullptr);
 bool removeStill(const std::string& folder, const GalleryStill& still);
 // False when another still of its album has the label.
 bool renameStill(const std::string& folder, GalleryStill& still, const std::string& label, std::string* error = nullptr);

@@ -79,6 +79,7 @@
 #include "core/AvidBinImport.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
+#include "media/Jxl.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "media/Proxy.h"
@@ -11372,7 +11373,8 @@ void McpServer::Impl::addTools() {
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
-            "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF, AVIF or HEIF by extension)"},
+            "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF, AVIF, HEIF or JPEG XL by extension)"},
+            "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "rendition":{"type":"string","description":"An HDR sequence's frame: \"\" (default) as SDR screens show it (its SDR trim target, else tone mapped to Rec.709), \"master\" (saved as a 16-bit PNG with cICP, mDCV and cLLI, a 10-bit AVIF or HEIF, or a JPEG with a gain map over its SDR rendition), or a trim target's id"},
             "gain_map":{"type":"boolean","default":false,"description":"An HDR AVIF or HEIF as an 8-bit SDR base with a gain map to the HDR rendition (ISO 21496-1), rather than 10-bit PQ or HLG"},
             "quality":{"type":"integer","minimum":0,"maximum":100,"default":90,"description":"JPEG, AVIF and HEIF quality"},
@@ -11419,6 +11421,7 @@ void McpServer::Impl::addTools() {
                     so.rendition = rendition;
                     so.quality = std::clamp(a.value("quality").toInt(90), 0, 100);
                     so.gainMap = a.value("gain_map").toBool();
+                    so.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
                     StillResult res;
                     if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err, so, &res))
                         return fail(QString::fromStdString(err));
@@ -11430,6 +11433,35 @@ void McpServer::Impl::addTools() {
             ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)%4").arg(tc(at, s)).arg(img.width).arg(img.height).arg(saved));
             r.png = png;
             return r;
+        });
+
+    add("montage_recompress_jpeg", "Recompress a JPEG as JPEG XL",
+        "Recompress a JPEG losslessly as JPEG XL (about a fifth smaller, its coefficients kept with what rebuilds the file), or "
+        "rebuild the original JPEG byte for byte from such a JPEG XL.",
+        R"json({"type":"object","properties":{"input":{"type":"string","description":"The JPEG (or, with rebuild, the JPEG XL)"},
+            "output":{"type":"string","description":"The JPEG XL (or, with rebuild, the JPEG) to write"},
+            "rebuild":{"type":"boolean","default":false,"description":"Rebuild the JPEG from a JPEG XL made from one"},
+            "effort":{"type":"integer","minimum":1,"maximum":9,"default":7}},"required":["input","output"]})json",
+        false, [](const QJsonObject& a) {
+            if (!jxlAvailable()) return fail("This build of Montage has no JPEG XL (libjxl)");
+            const std::string in = absolute(str(a, "input")).toStdString(), out = absolute(str(a, "output")).toStdString();
+            std::string err;
+            if (a.value("rebuild").toBool()) {
+                std::vector<uint8_t> jpeg;
+                if (!jxlToJpeg(in, jpeg, &err)) return fail(QString::fromStdString(err));
+                QSaveFile f(QString::fromStdString(out));
+                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(jpeg.data()), qint64(jpeg.size())) != qint64(jpeg.size()) ||
+                    !f.commit())
+                    return fail(QStringLiteral("Cannot write %1").arg(QString::fromStdString(out)));
+                return ok(QStringLiteral("Rebuilt the JPEG (%1 bytes)").arg(jpeg.size()), QJsonObject{{"bytes", double(jpeg.size())}});
+            }
+            if (!jpegToJxl(in, out, &err, std::clamp(a.value("effort").toInt(7), 1, 9))) return fail(QString::fromStdString(err));
+            const double before = double(QFileInfo(QString::fromStdString(in)).size()), after = double(QFileInfo(QString::fromStdString(out)).size());
+            return ok(QStringLiteral("Recompressed losslessly: %1 bytes to %2 (%3% smaller)")
+                          .arg(before)
+                          .arg(after)
+                          .arg(before > 0 ? std::lround(100 * (1 - after / before)) : 0),
+                      QJsonObject{{"jpeg_bytes", before}, {"jxl_bytes", after}});
         });
 
     add("montage_list_presets", "List export presets", "The export presets montage_render accepts.",
@@ -11956,6 +11988,9 @@ void McpServer::Impl::addTools() {
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
+            "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
+            "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
+            "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
             "streaming":{"type":"object","description":"A streaming package instead of a file: output is its folder. The sequence rendered once, encoded as a ladder of renditions whose segments start on keyframes at the same frames, packaged as CMAF for HLS (master.m3u8) and DASH (manifest.mpd), with the mix and audio_streams as languages, each caption track as WebVTT (and IMSC for DASH), chapters, and ad-break markers (montage_add_marker ad_break) as SCTE 35 cues","properties":{
                 "ladder":{"type":"array","items":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"},"bitrate":{"type":"integer","description":"bits a second"},"codec":{"type":"string","enum":["libx264","libx265","libsvtav1"]}},"required":["width","bitrate"]},"description":"The rungs (default: from the picture's size down to 360 lines)"},
@@ -12050,6 +12085,12 @@ void McpServer::Impl::addTools() {
             if (a.contains("exr_compression")) {
                 if (st.videoCodec != "exr") throw ArgError{"\"exr_compression\" is for the OpenEXR preset"};
                 st.exrCompression = str(a, "exr_compression").toStdString();
+            }
+            if (a.contains("jxl_depth") || a.contains("jxl_distance") || a.contains("jxl_premultiplied")) {
+                if (st.videoCodec != "jxl") throw ArgError{"\"jxl_depth\", \"jxl_distance\" and \"jxl_premultiplied\" are for the JPEG XL preset"};
+                st.jxlDepth = str(a, "jxl_depth").toStdString();
+                st.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
+                st.jxlPremultiplied = a.value("jxl_premultiplied").toBool();
             }
             if (a.contains("stereo_view")) {
                 StereoView v;

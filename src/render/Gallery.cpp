@@ -16,6 +16,7 @@
 #include <set>
 
 #include "Compositor.h"
+#include "media/Jxl.h"
 #include "core/GradeGraph.h"
 #include "core/GradeVersions.h"
 #include "core/History.h"
@@ -270,6 +271,29 @@ int moveUntitledStills(const std::string& folder) {
 void forgetUntitledStills() {
     const std::lock_guard<std::mutex> lock(untitledMutex);
     untitledStills.clear();
+}
+
+bool exportStillPicture(const GalleryStill& still, const std::string& path, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    const QImage picture = QImage(QString::fromStdString(still.picture)).convertToFormat(QImage::Format_RGBA8888);
+    if (picture.isNull()) return fail("The still's picture is missing");
+    if (!QFileInfo(QString::fromStdString(path)).suffix().compare(QStringLiteral("jxl"), Qt::CaseInsensitive)) {
+        // Lossless, 8 bits, its codes as they are, stated as Rec.709.
+        std::vector<float> rgba(size_t(picture.width()) * size_t(picture.height()) * 4);
+        for (int y = 0; y < picture.height(); ++y) {
+            const uchar* row = picture.constScanLine(y);
+            for (int i = 0; i < picture.width() * 4; ++i) rgba[size_t(y) * size_t(picture.width()) * 4 + size_t(i)] = float(row[i]) / 255.0f;
+        }
+        JxlWriteOptions o;
+        o.bits = 8;
+        o.colorSpace = "rec709";
+        return writeJxl(path, picture.width(), picture.height(), rgba.data(), o, error);
+    }
+    if (!picture.convertToFormat(QImage::Format_RGB888).save(QString::fromStdString(path))) return fail("Cannot write " + path);
+    return true;
 }
 
 bool removeStill(const std::string& folder, const GalleryStill& still) {

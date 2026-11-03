@@ -186,6 +186,10 @@ void visitSettings(S& s, V& v) {
     v("cea608", s.cea608);
     v("cea708", s.cea708);
     v("exrCompression", s.exrCompression);
+    v("jxlDepth", s.jxlDepth);
+    v("jxlDistance", s.jxlDistance);
+    v("jxlEffort", s.jxlEffort);
+    v("jxlPremultiplied", s.jxlPremultiplied);
     v("colorSpace", s.colorSpace);
     v("toneMapping", s.toneMapping);
     v("trimTarget", s.trimTarget);

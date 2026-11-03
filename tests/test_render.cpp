@@ -77,6 +77,8 @@
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 #include "media/Exr.h"
+#include "media/Jxl.h"
+#include "media/ImageSequence.h"
 #include "media/LensCalibration.h"
 #include "media/Proxy.h"
 #include "media/DescribePicture.h"
@@ -5630,6 +5632,334 @@ colorspaces:
         QVERIFY(edit::setTrimTargetToneMapping(s, "sdr", "").ok);
     }
 
+    void jpegXlInAndOut() {
+        // JPEG XL read and written with libjxl: every value kept, its colour and orientation stated, alpha straight or
+        // premultiplied, animations at their own frame durations, and JPEGs recompressed losslessly.
+        if (!jxlAvailable()) QSKIP("Built without libjxl");
+        QTemporaryDir dir;
+        auto at = [&](const char* name) { return dir.filePath(name).toStdString(); };
+        std::string err;
+        constexpr int W = 37, H = 23;  // (odd sizes: no row is a whole number of blocks)
+        auto random = [](std::vector<float>& px, uint32_t seed, double scale, double offset) {
+            px.resize(size_t(W) * H * 4);
+            for (float& v : px) {
+                seed = seed * 1664525u + 1013904223u;
+                v = float(offset + scale * double(seed >> 8) / double(1u << 24));
+            }
+        };
+
+        // Lossless round trips are bit-exact at 8 and 16 bits (codes over 255 or 65535), in half floats and in floats
+        // (past 0..1 and below 0 too), with straight alpha.
+        for (int bits : {8, 10, 16}) {
+            const double top = double((1u << bits) - 1);
+            std::vector<float> px;
+            random(px, 7u + uint32_t(bits), 1, 0);
+            for (float& v : px) v = float(std::round(v * top) / top);
+            JxlWriteOptions o;
+            o.bits = bits;
+            o.alpha = true;
+            const std::string f = at("codes.jxl");
+            QVERIFY2(writeJxl(f, W, H, px.data(), o, &err), err.c_str());
+            JxlInfo info;
+            QVERIFY2(readJxlInfo(f, info, &err), err.c_str());
+            QCOMPARE(info.bits, bits);
+            QCOMPARE(info.exponentBits, 0);
+            QVERIFY(info.alpha && !info.alphaPremultiplied && !info.animated);
+            QCOMPARE(info.colorSpace, std::string("srgb"));
+            int w = 0, h = 0;
+            std::vector<float> back;
+            QVERIFY2(readJxlFrame(f, 0, w, h, back, nullptr, &err), err.c_str());
+            QCOMPARE(w, W);
+            QCOMPARE(h, H);
+            int wrong = 0;
+            for (size_t i = 0; i < px.size(); ++i) wrong += std::lround(back[i] * top) != std::lround(px[i] * top);
+            QVERIFY2(wrong == 0, qPrintable(QString("%1 of %2 codes differ at %3 bits").arg(wrong).arg(px.size()).arg(bits)));
+        }
+        for (const bool half : {true, false}) {
+            std::vector<float> px;
+            random(px, half ? 3u : 5u, 40, -4);
+            if (half)
+                for (float& v : px) v = float(qfloat16(v));
+            JxlWriteOptions o;
+            o.bits = half ? 16 : 32;
+            o.halfFloat = half;
+            o.alpha = true;
+            o.colorSpace = "linear-rec709";
+            const std::string f = at("floats.jxl");
+            QVERIFY2(writeJxl(f, W, H, px.data(), o, &err), err.c_str());
+            JxlInfo info;
+            QVERIFY(readJxlInfo(f, info, &err));
+            QCOMPARE(info.exponentBits, half ? 5 : 8);
+            QCOMPARE(info.colorSpace, std::string("linear-rec709"));
+            int w = 0, h = 0;
+            std::vector<float> back;
+            QVERIFY2(readJxlFrame(f, 0, w, h, back, nullptr, &err), err.c_str());
+            QVERIFY2(std::memcmp(back.data(), px.data(), px.size() * sizeof(float)) == 0, half ? "half floats changed" : "floats changed");
+        }
+
+        // The colour encoding is stated and read back: display spaces, HDR, linear light (ACEScg's own white too) and
+        // Adobe RGB's curve; camera log is not stated.
+        for (const char* id : {"srgb", "rec709", "p3d65", "rec2020", "rec2100pq", "rec2100hlg", "p3d65pq", "adobergb", "linear-rec709", "acescg"}) {
+            std::vector<float> px(size_t(8) * 8 * 4, 0.25f);
+            JxlWriteOptions o;
+            o.colorSpace = id;
+            const std::string f = at("tagged.jxl");
+            QVERIFY2(writeJxl(f, 8, 8, px.data(), o, &err), (std::string(id) + ": " + err).c_str());
+            JxlInfo info;
+            QVERIFY(readJxlInfo(f, info, &err));
+            QVERIFY2(info.colorSpace == id && !info.icc, (std::string(id) + " read as " + info.colorSpace).c_str());
+        }
+        {
+            std::vector<float> px(size_t(8) * 8 * 4, 0.25f);
+            JxlWriteOptions o;
+            o.colorSpace = "slog3-sgamut3cine";
+            QVERIFY(!writeJxl(at("log.jxl"), 8, 8, px.data(), o, &err));
+            QVERIFY(!jxlCanState(*findColorSpace("slog3-sgamut3cine")) && jxlCanState(*findColorSpace("rec2100hlg")));
+            // (nor ACES AP0, whose blue lies below y = 0, which libjxl does not take)
+            QVERIFY(!jxlCanState(*findColorSpace("aces2065-1")));
+        }
+
+        // Alpha straight or premultiplied: a premultiplied file says so and keeps its colour premultiplied; read as
+        // media, its colour comes back straight.
+        {
+            std::vector<float> px(size_t(W) * H * 4);
+            for (int i = 0; i < W * H; ++i) {
+                float* q = &px[size_t(i) * 4];
+                q[0] = 0.8f, q[1] = 0.4f, q[2] = 0.2f, q[3] = i % 2 ? 0.5f : 1.0f;  // straight
+            }
+            for (const bool premultiplied : {false, true}) {
+                if (premultiplied && !jxlWritesPremultiplied()) {
+                    // (libjxl before 0.9 cannot: refused, not written wrong)
+                    JxlWriteOptions o;
+                    o.alpha = o.premultiplied = true;
+                    QVERIFY(!writeJxl(at("refused.jxl"), W, H, px.data(), o, &err));
+                    continue;
+                }
+                JxlWriteOptions o;
+                o.alpha = true;
+                o.premultiplied = premultiplied;
+                const std::string f = at(premultiplied ? "premultiplied.jxl" : "straight.jxl");
+                QVERIFY2(writeJxl(f, W, H, px.data(), o, &err), err.c_str());
+                JxlInfo info;
+                QVERIFY(readJxlInfo(f, info, &err));
+                QCOMPARE(info.alphaPremultiplied, premultiplied);
+                int w = 0, h = 0;
+                bool said = !premultiplied;
+                std::vector<float> back;
+                QVERIFY(readJxlFrame(f, 0, w, h, back, &said, &err));
+                QCOMPARE(said, premultiplied);
+                QVERIFY2(std::fabs(back[4] - (premultiplied ? 0.4f : 0.8f)) < 1.0f / 65535 * 2 && std::fabs(back[7] - 0.5f) < 1e-4,
+                         qPrintable(QString("%1 %2").arg(back[4]).arg(back[7])));
+                Frame16Ptr fr = MediaPool::instance().videoFrame(f, 0, 0, 0);
+                QVERIFY(fr);
+                const Image img = toImage(*fr);
+                const float* q = img.at(1, 0);
+                QVERIFY2(std::fabs(q[0] / q[3] - 0.8f) < 2e-3 && std::fabs(q[3] - 0.5f) < 2e-3,
+                         qPrintable(QString("%1 %2 %3 %4").arg(q[0]).arg(q[1]).arg(q[2]).arg(q[3])));
+            }
+        }
+
+        // Its orientation is honoured: three across and two down, stored turned (EXIF 6), shows two across and three
+        // down, its first column along the top.
+        {
+            std::vector<float> px(size_t(3) * 2 * 4, 1.0f);
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 3; ++x) px[size_t(y * 3 + x) * 4] = float(y * 3 + x) / 8;
+            JxlWriteOptions o;
+            o.orientation = 6;
+            const std::string f = at("turned.jxl");
+            QVERIFY2(writeJxl(f, 3, 2, px.data(), o, &err), err.c_str());
+            JxlInfo info;
+            QVERIFY(readJxlInfo(f, info, &err));
+            QCOMPARE(info.orientation, 6);
+            QCOMPARE(info.width, 2);
+            QCOMPARE(info.height, 3);
+            int w = 0, h = 0;
+            std::vector<float> back;
+            QVERIFY(readJxlFrame(f, 0, w, h, back, nullptr, &err));
+            QCOMPARE(w, 2);
+            QCOMPARE(h, 3);
+            for (int y = 0; y < 3; ++y)
+                for (int x = 0; x < 2; ++x)  // shown (x, y) is stored (y, 1 - x)
+                    QCOMPARE(std::lround(back[size_t(y * 2 + x) * 4] * 8), long((1 - x) * 3 + y));
+            MediaItem m;
+            QVERIFY(probeMedia(f, m));
+            QCOMPARE(m.width, 2);
+            QCOMPARE(m.height, 3);
+        }
+
+        // An animation plays at its frames' durations: red 100 ms, green 200 ms, blue 100 ms, as a 10 fps clip of 0.4 s.
+        {
+            std::vector<std::vector<float>> frames(3, std::vector<float>(size_t(16) * 16 * 4, 0.0f));
+            for (int k = 0; k < 3; ++k)
+                for (int i = 0; i < 16 * 16; ++i) frames[size_t(k)][size_t(i) * 4 + size_t(k)] = 1, frames[size_t(k)][size_t(i) * 4 + 3] = 1;
+            JxlWriteOptions o;
+            o.bits = 8;
+            const std::string f = at("moving.jxl");
+            QVERIFY2(writeJxl(f, 16, 16, {frames[0].data(), frames[1].data(), frames[2].data()}, o, &err, {100, 200, 100}, 1000, 1), err.c_str());
+            JxlInfo info;
+            QVERIFY(readJxlInfo(f, info, &err));
+            QVERIFY(info.animated);
+            QCOMPARE(info.durations, (std::vector<uint32_t>{100, 200, 100}));
+            QCOMPARE(info.seconds(), 0.4);
+            MediaItem m;
+            QVERIFY(probeMedia(f, m));
+            QCOMPARE(m.kind, MediaKind::Video);
+            QCOMPARE(m.fps.num, 10);
+            QCOMPARE(m.fps.den, 1);
+            QCOMPARE(m.duration, 0.4);
+            VideoDecoder d;
+            QVERIFY(d.open(f, &err));
+            auto colour = [&](double t) {
+                Frame16Ptr fr = d.frameAt(t, 16, 16, true);
+                if (!fr) return -1;
+                const Image img = toImage(*fr);
+                const float* q = img.at(8, 8);
+                return q[0] > 0.9f ? 0 : q[1] > 0.9f ? 1 : q[2] > 0.9f ? 2 : -1;
+            };
+            // (and back to the start, which reads the animation from its beginning again)
+            QCOMPARE(colour(0.05), 0);
+            QCOMPARE(colour(0.15), 1);
+            QCOMPARE(colour(0.25), 1);
+            QCOMPARE(colour(0.35), 2);
+            QCOMPARE(colour(0.05), 0);
+            QCOMPARE(colour(0.30), 2);
+        }
+
+        // A JPEG recompressed losslessly is smaller and rebuilds byte for byte; its pictures read as the JPEG's.
+        {
+            QImage q(160, 96, QImage::Format_RGB32);
+            for (int y = 0; y < q.height(); ++y)
+                for (int x = 0; x < q.width(); ++x) q.setPixel(x, y, qRgb(x * 255 / 159, y * 255 / 95, (x + y) * 255 / 254));  // (smooth: decoders upsample colour differently at edges)
+            const std::string jpeg = at("photo.jpg"), jxl = at("photo.jxl");
+            QVERIFY(q.save(QString::fromStdString(jpeg), "JPEG", 85));
+            QVERIFY2(jpegToJxl(jpeg, jxl, &err), err.c_str());
+            JxlInfo info;
+            QVERIFY(readJxlInfo(jxl, info, &err));
+            QVERIFY(info.jpeg);
+            QVERIFY2(QFileInfo(QString::fromStdString(jxl)).size() < QFileInfo(QString::fromStdString(jpeg)).size(),
+                     qPrintable(QString("%1 vs %2").arg(QFileInfo(QString::fromStdString(jxl)).size()).arg(QFileInfo(QString::fromStdString(jpeg)).size())));
+            std::vector<uint8_t> rebuilt;
+            QVERIFY2(jxlToJpeg(jxl, rebuilt, &err), err.c_str());
+            QFile in(QString::fromStdString(jpeg));
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            const QByteArray original = in.readAll();
+            QCOMPARE(QByteArray(reinterpret_cast<const char*>(rebuilt.data()), qsizetype(rebuilt.size())), original);
+            int w = 0, h = 0;
+            std::vector<float> px;
+            QVERIFY(readJxlFrame(jxl, 0, w, h, px, nullptr, &err));
+            const QImage decoded(QString::fromStdString(jpeg));
+            double worst = 0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const QRgb c = decoded.pixel(x, y);
+                    worst = std::max({worst, double(std::fabs(px[size_t(y * w + x) * 4] * 255 - qRed(c))), double(std::fabs(px[size_t(y * w + x) * 4 + 1] * 255 - qGreen(c)))});
+                }
+            QVERIFY2(worst <= 3, qPrintable(QString::number(worst)));  // (decoders' IDCTs and upsampling differ by a code or two)
+            std::vector<uint8_t> none;
+            QVERIFY(!jxlToJpeg(at("straight.jxl"), none, &err));
+        }
+
+        // A PQ master's frame as a lossless JPEG XL: tagged BT.2100 PQ with its light as its intensity target, and read
+        // back within 1/1023 of the frame.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 128, s.height = 72, s.colorSpace = "rec2100pq", s.hdrPeakNits = 1000;
+            const ColorSpace& pq = *findColorSpace("rec2100pq");
+            QImage q(128, 72, QImage::Format_RGBA64);
+            for (int y = 0; y < 72; ++y)
+                for (int x = 0; x < 128; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(float(nitsToCode(pq, 5 + x * 7.8 + (x * 37 + y * 91) % 23)), float(nitsToCode(pq, 20 + y * 5)),
+                                                           float(nitsToCode(pq, 300 + (x * 13 + y * 29) % 31)), 1));  // (with a grain lossless keeps)
+            const std::string source = at("pq.png");
+            QVERIFY(q.save(QString::fromStdString(source)));
+            MediaItem media;
+            QVERIFY(probeMedia(source, media));
+            media.id = p.newId();
+            media.colorOverride = "rec2100pq";
+            p.media.push_back(media);
+            QVERIFY(edit::placeMedia(p, s, media.id, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+            StillOptions master;
+            master.rendition = "master";
+            StillResult res;
+            const std::string f = at("pq.jxl");
+            QVERIFY2(exportStill(p, s, 0, f, &err, master, &res), err.c_str());
+            QCOMPARE(res.bits, 16);
+            QCOMPARE(res.colorSpace, std::string("rec2100pq"));
+            JxlInfo info;
+            QVERIFY(readJxlInfo(f, info, &err));
+            QCOMPARE(info.colorSpace, std::string("rec2100pq"));
+            QCOMPARE(info.bits, 16);
+            QVERIFY2(std::fabs(info.intensityTarget - res.maxCll) < 1, qPrintable(QString("%1 %2").arg(info.intensityTarget).arg(res.maxCll)));
+            MediaItem back;
+            QVERIFY(probeMedia(f, back));
+            QCOMPARE(back.colorSpace, std::string("rec2100pq"));
+            QCOMPARE(back.maxCll, double(info.intensityTarget));
+            back.id = p.newId();
+            p.media.push_back(back);
+            Sequence again = s;
+            again.videoTracks.assign(1, Track{});
+            QVERIFY(edit::placeMedia(p, again, back.id, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+            const Image want = renderProgramFrame(p, s, 0, RenderOptions()), got = renderProgramFrame(p, again, 0, RenderOptions());
+            double worst = 0;
+            for (size_t i = 0; i < want.px.size(); ++i)
+                if (i % 4 != 3) worst = std::max(worst, double(std::fabs(want.px[i] - got.px[i])));
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString::number(worst)));
+            // A visually lossless one is smaller.
+            master.jxlDistance = 1;
+            QVERIFY2(exportStill(p, s, 0, at("pq_lossy.jxl"), &err, master, &res), err.c_str());
+            QVERIFY(readJxlInfo(at("pq_lossy.jxl"), info, &err));
+            QCOMPARE(info.colorSpace, std::string("rec2100pq"));
+            QVERIFY2(QFileInfo(QString::fromStdString(at("pq_lossy.jxl"))).size() < QFileInfo(QString::fromStdString(f)).size(), qPrintable(QString("%1 vs %2").arg(QFileInfo(QString::fromStdString(at("pq_lossy.jxl"))).size()).arg(QFileInfo(QString::fromStdString(f)).size())));
+
+            // Numbered frames: lossless JPEG XL with alpha in linear light (half floats), read back as a clip of the run.
+            ExportSettings st;
+            st.path = at("run.jxl");
+            st.videoCodec = "jxl";
+            st.audioCodec = "none";
+            st.alpha = true;
+            st.colorSpace = "linear-rec709";
+            st.in = 0, st.out = 3;
+            std::string used;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), err.c_str());
+            QCOMPARE(used, std::string("libjxl"));
+            QVERIFY(QFile::exists(QString::fromStdString(at("run_000002.jxl"))));
+            QVERIFY(readJxlInfo(at("run_000000.jxl"), info, &err));
+            QCOMPARE(info.colorSpace, std::string("linear-rec709"));
+            QCOMPARE(info.exponentBits, 5);
+            QVERIFY(info.alpha);
+            ImageSequence run;
+            QVERIFY(detectImageSequence(at("run_000000.jxl"), run));
+            MediaItem clip;
+            QVERIFY(probeMedia(imageSequencePath(run), clip));
+            QCOMPARE(clip.kind, MediaKind::Video);
+            QCOMPARE(clip.videoCodec, std::string("jxl"));
+            QCOMPARE(clip.colorSpace, std::string("linear-rec709"));
+            QVERIFY2(std::fabs(clip.duration * clip.fps.toDouble() - 3) < 1e-6, qPrintable(QString::number(clip.duration)));
+        }
+
+        // A gallery still's picture out as lossless JPEG XL: its codes as they are, stated as Rec.709.
+        {
+            QImage q(24, 16, QImage::Format_RGB32);
+            for (int y = 0; y < 16; ++y)
+                for (int x = 0; x < 24; ++x) q.setPixel(x, y, qRgb(x * 10, y * 15, 77));
+            GalleryStill still;
+            still.picture = at("still.png");
+            QVERIFY(q.save(QString::fromStdString(still.picture)));
+            QVERIFY2(exportStillPicture(still, at("still.jxl"), &err), err.c_str());
+            JxlInfo info;
+            QVERIFY(readJxlInfo(at("still.jxl"), info, &err));
+            QCOMPARE(info.colorSpace, std::string("rec709"));
+            QCOMPARE(info.bits, 8);
+            int w = 0, h = 0;
+            std::vector<float> px;
+            QVERIFY(readJxlFrame(at("still.jxl"), 0, w, h, px, nullptr, &err));
+            QCOMPARE(std::lround(px[size_t(5 * 24 + 7) * 4] * 255), 70L);
+            QCOMPARE(std::lround(px[size_t(5 * 24 + 7) * 4 + 1] * 255), 75L);
+        }
+    }
+
     void hdrStillsInAndOut() {
         // A PQ master (1000 nits, with an SDR trim target) of eight flat patches, from 10 nits to its peak and in colour.
         Project p = makeDefaultProject();
@@ -6268,7 +6598,7 @@ colorspaces:
 
         // HDR goes out only as PNG, AVIF or JPEG; an unknown target is refused.
         QVERIFY(!exportStill(p, s, 0, dir.filePath("frame.tif").toStdString(), &err, master));
-        QVERIFY(err.find("PNG, AVIF, HEIF or JPEG") != std::string::npos);
+        QVERIFY(err.find("PNG, AVIF, HEIF, JPEG XL or JPEG") != std::string::npos);
         StillOptions unknown;
         unknown.rendition = "cinema";
         QVERIFY(!exportStill(p, s, 0, png, &err, unknown) && err.find("cinema") != std::string::npos);

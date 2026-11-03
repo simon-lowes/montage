@@ -47,6 +47,7 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
 struct ImageSequence;
 struct PulldownMap;
 class MlvReader;
+class JxlAnimationReader;
 namespace dcp {
 class ImfTrackReader;
 }
@@ -64,7 +65,10 @@ public:
 
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
-    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr; }
+    bool isOpen() const {
+        return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr ||
+               jxl_ != nullptr || jxlAnimation_ != nullptr || !jxlFile_.empty();
+    }
 
     // Frame displayed at media time `t` (seconds from the start of the file; of the conformed file when the path carries
     // an interpretation, core/Interpretation.h), converted to RGBA16 at exactly targetW x targetH (0 = native display size).
@@ -141,7 +145,10 @@ private:
     std::shared_ptr<const dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
-    std::vector<float> exrRgba_;              // its frame rawFrame_, straight float RGBA
+    std::vector<float> exrRgba_;              // its frame rawFrame_, straight float RGBA (JPEG XL's too)
+    std::unique_ptr<ImageSequence> jxl_;      // JPEG XL read with libjxl (media/Jxl.h): a numbered run's frames,
+    std::unique_ptr<JxlAnimationReader> jxlAnimation_;  // an animation's,
+    std::string jxlFile_;                     // or a still
     int exrW_ = 0, exrH_ = 0;
     // Pulldown removed (media/Pulldown.h): the frames the cadence gives, their rate, and the last one woven.
     std::shared_ptr<const PulldownMap> pulldown_;

@@ -27,6 +27,7 @@ option(MONTAGE_WITH_FDL "ASC Framing Decision Lists (the ASC's libfdl_core, Apac
 option(MONTAGE_WITH_LUA "Lua scripting (Lua 5.4, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibRaw 0.20+ is installed" ON)
+option(MONTAGE_WITH_JXL "JPEG XL stills, frames and animations, float, HDR and alpha kept, when libjxl 0.7+ is installed" ON)
 option(MONTAGE_WITH_MYSOFA "Measured HRTFs (SOFA files) for binaural ambisonics, when libmysofa is installed" ON)
 option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when OpenJPEG 2.5+ is installed" ON)
 option(MONTAGE_WITH_OPENSSL "Encrypted DCPs, signed compositions and KDMs, when OpenSSL 3 is installed" ON)

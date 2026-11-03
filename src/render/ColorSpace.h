@@ -180,6 +180,9 @@ double fromLinear(Transfer t, double l);
 void primariesMatrix(Primaries from, Primaries to, double m[9]);
 // Linear RGB in `p` to CIE XYZ relative to D65 (Bradford adapted when `p` has another white).
 void primariesToXyz(Primaries p, double m[9]);
+// The primaries' and white's CIE xy (red, green, blue, white), where they are published as chromaticities (false for
+// the camera gamuts known only by their makers' matrices to ACES).
+bool primariesChromaticities(Primaries p, double xy[8]);
 
 // Converts premultiplied RGBA pixels from one space to another in place.
 // HDR shown in SDR is tone mapped (BT.2390-style roll-off from `hdrPeakNits`);

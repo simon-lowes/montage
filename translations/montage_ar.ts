@@ -6156,6 +6156,14 @@
         <source>The Projected Picture</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>JPEG XL Sequence (lossless)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>One numbered lossless JPEG XL a frame, 16-bit (half float in linear light), with transparency</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -11427,6 +11435,26 @@ Do you want to replace it?</source>
         <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Lossless</source>
+        <translation type="unfinished">لا يُفقد</translation>
+    </message>
+    <message>
+        <source>Visually lossless (distance 1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smaller (distance 2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How JPEG XL frames are coded: lossless keeps every value; a distance trades a little for much smaller files</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XL:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::FootageNotesDialog</name>
@@ -11605,6 +11633,34 @@ Grabbed %4
     <message>
         <source>Still %1: %2</source>
         <translation type="unfinished">ما زال %1: %2</translation>
+    </message>
+    <message>
+        <source>Export Picture…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PNG (*.png)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG (*.jpg)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>TIFF (*.tif)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XL, lossless (*.jxl)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export Picture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Saved the still to %1</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -21823,6 +21879,18 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Streaming package written in %1: %2 renditions, %3 segments</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XL for SDR screens, lossless (*.jxl)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HDR JPEG XL, 16-bit lossless (*.jxl)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Images (*.png *.jpg *.tif *.avif *.heic *.jxl)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

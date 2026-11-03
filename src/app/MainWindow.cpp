@@ -119,6 +119,7 @@ extern "C" {
 #include "render/VfxShots.h"
 #include "render/Jpeg2000.h"
 #include "media/Exr.h"
+#include "media/Jxl.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
 #include "render/Crosstalk.h"
@@ -3686,11 +3687,14 @@ void MainWindow::exportFrame() {
                   sdrAvif = tr("AVIF for SDR screens (*.avif)"), hdrAvif = tr("HDR AVIF, 10-bit (*.avif)"),
                   hdrJpeg = tr("HDR JPEG with gain map (*.jpg)"), gainMapAvif = tr("HDR AVIF with gain map (*.avif)"),
                   sdrHeif = tr("HEIF for SDR screens (*.heic)"), hdrHeif = tr("HDR HEIF, 10-bit (*.heic)"),
-                  gainMapHeif = tr("HDR HEIF with gain map (*.heic)");
-    const QString filters = hdr ? QStringList{sdrPng, hdrPng, sdrAvif, hdrAvif, gainMapAvif, sdrHeif, hdrHeif, gainMapHeif, hdrJpeg,
-                                              tr("JPEG for SDR screens (*.jpg)"), tr("TIFF for SDR screens (*.tif)")}
-                                      .join(";;")
-                                : tr("Images (*.png *.jpg *.tif *.avif *.heic)");
+                  gainMapHeif = tr("HDR HEIF with gain map (*.heic)"), sdrJxl = tr("JPEG XL for SDR screens, lossless (*.jxl)"),
+                  hdrJxl = tr("HDR JPEG XL, 16-bit lossless (*.jxl)");
+    QStringList hdrFilters{sdrPng, hdrPng, sdrAvif, hdrAvif, gainMapAvif, sdrHeif, hdrHeif, gainMapHeif, hdrJpeg};
+    if (jxlAvailable()) hdrFilters << sdrJxl << hdrJxl;
+    hdrFilters << tr("JPEG for SDR screens (*.jpg)") << tr("TIFF for SDR screens (*.tif)");
+    const QString filters = hdr ? hdrFilters.join(";;")
+                            : jxlAvailable() ? tr("Images (*.png *.jpg *.tif *.avif *.heic *.jxl)")
+                                             : tr("Images (*.png *.jpg *.tif *.avif *.heic)");
     QString chosen;
     QString path = QFileDialog::getSaveFileName(this, tr("Export Frame"), st.value("lastExportDir").toString() + "/frame.png", filters,
                                                 &chosen);
@@ -3701,7 +3705,8 @@ void MainWindow::exportFrame() {
         if (!path.endsWith(ext, Qt::CaseInsensitive)) path = QFileInfo(path).dir().filePath(QFileInfo(path).completeBaseName() + ext);
     }
     StillOptions o;
-    if (hdr && (chosen == hdrPng || chosen == hdrAvif || chosen == hdrHeif || chosen == hdrJpeg || chosen == gainMapAvif || chosen == gainMapHeif))
+    if (hdr && (chosen == hdrPng || chosen == hdrAvif || chosen == hdrHeif || chosen == hdrJpeg || chosen == gainMapAvif || chosen == gainMapHeif ||
+                chosen == hdrJxl))
         o.rendition = "master";
     o.gainMap = hdr && (chosen == gainMapAvif || chosen == gainMapHeif);
     std::string err;
