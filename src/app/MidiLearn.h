@@ -134,6 +134,7 @@ private:
     std::optional<midimap::Key> justLearnt_;  // its moves after it was learnt are not learnt again until it rests
     qint64 justLearntAt_ = 0;
     bool loadFailed_ = false;                  // the file on disk was not read: kept aside before it is written over
+    QString mappingsFrom_;                     // the map file the mappings in use came from
     mutable std::map<QString, QPointer<QWidget>> found_;  // widgets found for targets (the refresh asks often)
     QTimer* learnTimer_ = nullptr;  // a 7-bit controller decided once it stops moving
     QTimer* refreshTimer_ = nullptr;

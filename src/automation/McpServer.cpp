@@ -14,8 +14,20 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <algorithm>
+#include <atomic>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -213,6 +225,8 @@ const char* kInstructions =
     "at once (montage_undo restores the version before the last edit). Times are seconds (numbers) or timecode "
     "strings like \"00:01:02:03\"; tracks are \"V1\", \"V2\", \"A1\"... Clips are referred to by the ids "
     "montage_project_info lists. Look at the result with montage_render_frame before rendering the whole sequence. "
+    "Any tool called with \"async\": true runs in the background: it answers at once with a job id, read (progress, "
+    "result) or cancelled with montage_job. "
     "If the project is open in the Montage app, reopen it there to see the changes.";
 
 QJsonObject serverInfo() {
@@ -230,6 +244,40 @@ struct ToolResult {
 
 ToolResult fail(const QString& message) { return {message, {}, {}, true}; }
 ToolResult ok(const QString& text, const QJsonObject& structured = {}) { return {text, structured, {}, false}; }
+
+// The result of tools/call: its content (an image, then the text), whether it failed, its structured content.
+QJsonObject resultJson(const ToolResult& r) {
+    QJsonArray content;
+    if (!r.png.isEmpty())
+        content.append(QJsonObject{{"type", "image"}, {"data", QString::fromLatin1(r.png.toBase64())}, {"mimeType", "image/png"}});
+    content.append(QJsonObject{{"type", "text"}, {"text", r.text}});
+    QJsonObject result{{"content", content}, {"isError", r.error}};
+    if (!r.structured.isEmpty()) result["structuredContent"] = r.structured;
+    return result;
+}
+
+// ---- Background calls -------------------------------------------------------------
+
+// A tool call run in the background ("async": true), one at a time after the calls before it.
+struct ToolJob {
+    QString id, tool;
+    QJsonObject args;
+    std::atomic<bool> cancel{false};
+    std::mutex m;  // what follows
+    QString status = QStringLiteral("queued");  // queued, running, done, failed, cancelled
+    double fraction = 0;
+    QString step;        // what it is doing, as its progress says
+    QJsonObject result;  // when finished: the tool's result (as tools/call gives it)
+    bool read = false;   // its end reported by montage_job (finished jobs are forgotten only once read)
+    bool finished() const { return status == QLatin1String("done") || status == QLatin1String("failed") || status == QLatin1String("cancelled"); }
+};
+
+// The job the tool running on this thread is (its progress goes there), and the flag that stops the tool.
+thread_local ToolJob* tCurrentJob = nullptr;
+thread_local const std::atomic<bool>* tCancel = nullptr;
+// What a tool passes to the work it starts: set when its call is cancelled (montage_job's cancel, MCP's
+// notifications/cancelled), so the work stops.
+const std::atomic<bool>* cancelFlag() { return tCancel; }
 
 // A tool argument problem, reported as a failed tool call (so the model can correct itself).
 struct ArgError {
@@ -281,6 +329,64 @@ QString tc(FrameTime f, const Sequence& s) { return QString::fromStdString(forma
 double secs(FrameTime f, const Sequence& s) { return double(f) / s.fpsValue(); }
 
 QString absolute(const QString& path) { return QString::fromStdString(std::filesystem::absolute(path.toStdString()).string()); }
+
+// A model's "projection" argument: a track's picture projected onto it through a camera, as the proj_* settings.
+void projectionArg(const QJsonObject& a, const Sequence& s, Clip& c) {
+    if (!a.contains("projection")) return;
+    if (!a.value("projection").isObject()) throw ArgError{"\"projection\" is an object: {track, camera, ...}"};
+    const QJsonObject p = a.value("projection").toObject();
+    auto& params = c.generator.params;
+    const QJsonValue tv = p.value("track");
+    int track = 0;
+    if (tv.isDouble()) track = tv.toInt();
+    else if (tv.isString()) {
+        const TrackRef r = trackArg(tv.toString(), s, false);
+        if (r.kind != TrackKind::Video) throw ArgError{"\"projection.track\" is a video track (V1, V2...)"};
+        track = r.index + 1;
+    } else throw ArgError{"\"projection.track\" names the video track whose picture is projected (V2 or 2)"};
+    if (track < 1 || track > int(s.videoTracks.size())) throw ArgError{QStringLiteral("There is no video track %1").arg(track)};
+    params["proj_track"] = Param(double(track));
+    const QStringList modes{"own", "solved", "file", "scene"};
+    const QString mode = p.contains("camera") ? p.value("camera").toString() : p.contains("camera_file") ? QStringLiteral("file") : QStringLiteral("solved");
+    const int m = int(modes.indexOf(mode));
+    if (m < 0) throw ArgError{"\"projection.camera\" is own, solved, file or scene"};
+    params["proj_camera"] = Param(double(m));
+    if (m == 2) {
+        if (!p.value("camera_file").isString() || p.value("camera_file").toString().isEmpty())
+            throw ArgError{"A file's camera needs \"projection.camera_file\" (a USD or glTF file)"};
+        const QFileInfo cf(absolute(p.value("camera_file").toString()));
+        if (!cf.isFile()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(p.value("camera_file").toString())};
+        c.generator.strings["proj_camera_file"] = cf.absoluteFilePath().toStdString();
+    }
+    auto number = [&](const char* key, const char* param, double lo, double hi, double scale = 1) {
+        if (!p.contains(key)) return;
+        if (!p.value(key).isDouble()) throw ArgError{QStringLiteral("\"projection.%1\" is a number").arg(key)};
+        params[param] = Param(std::clamp(p.value(key).toDouble() * scale, lo, hi));
+    };
+    if (p.contains("camera_track")) {
+        const QJsonValue ct = p.value("camera_track");
+        int v = -1;
+        if (ct.isString()) {
+            const TrackRef r = trackArg(ct.toString(), s, false);
+            if (r.kind == TrackKind::Video) v = r.index + 1;
+        } else if (ct.isDouble() && ct.toDouble() == std::floor(ct.toDouble())) {
+            v = ct.toInt();
+        }
+        if (v < 0 || v > int(s.videoTracks.size()))
+            throw ArgError{"\"projection.camera_track\" is the video track with the solved footage or the Camera clip (V1, V2..., or 0: found)"};
+        params["proj_camera_track"] = Param(double(v));
+    }
+    number("camera_index", "proj_camera_index", 1, 999);
+    number("fov", "proj_fov", 5, 120);
+    number("mix", "proj_mix", 0, 100);
+    number("material", "proj_material", 0, 999);
+    if (p.contains("frame") && !p.value("frame").isNull()) {
+        params["proj_hold"] = Param(1.0);
+        params["proj_frame"] = Param(double(timeArg(p.value("frame"), s, "projection.frame")));
+    }
+    if (p.contains("lit")) params["proj_light"] = Param(p.value("lit").toBool() ? 1.0 : 0.0);
+    if (p.contains("hide")) params["proj_hide"] = Param(p.value("hide").toBool(true) ? 1.0 : 0.0);
+}
 
 // ---- Projects on disk ---------------------------------------------------------------
 
@@ -612,8 +718,144 @@ struct McpServer::Impl {
     std::function<void(const QJsonObject&)> notify;  // progress notifications while a tool runs
     QJsonValue progressToken;
     std::ostream* live = nullptr;  // when serving a stream: notifications go out as they happen
+    std::mutex liveMutex;          // (written from the thread reading requests and the one running calls)
+    std::function<void(const std::string&)> sink;  // or given here, as they happen (from the thread the tool runs on)
+
+    // Tools run one at a time: a call waits for a job running, and jobs wait their turn.
+    std::mutex toolMutex;
+    // The call running now (its request id) and calls cancelled before they started.
+    std::mutex cancelMutex;
+    QString runningRequest;
+    std::set<QString> cancelledRequests;
+    std::deque<QString> cancelledOrder;  // (oldest first: the oldest forgotten past 1000)
+    std::atomic<bool> callCancel{false};
+    // Background calls: all of them by id (the newest finished ones kept), those waiting, and the thread that runs them.
+    std::mutex jobsMutex;
+    std::condition_variable jobsWake;
+    std::map<QString, std::shared_ptr<ToolJob>> jobs;
+    std::deque<std::shared_ptr<ToolJob>> jobQueue;
+    std::thread jobThread;
+    bool stopping = false;
+    int jobsMade = 0;
 
     Impl() { addTools(); }
+    ~Impl() {
+        {
+            std::lock_guard l(jobsMutex);
+            stopping = true;
+            for (auto& [id, j] : jobs) j->cancel = true;
+        }
+        jobsWake.notify_all();
+        if (jobThread.joinable()) jobThread.join();
+    }
+
+    static QString requestKey(const QJsonValue& id) { return QString::fromUtf8(QJsonDocument(QJsonArray{id}).toJson(QJsonDocument::Compact)); }
+    void cancelRequest(const QJsonValue& id) {
+        std::lock_guard l(cancelMutex);
+        const QString key = requestKey(id);
+        if (key == runningRequest) {
+            callCancel = true;
+        } else if (cancelledRequests.insert(key).second) {
+            cancelledOrder.push_back(key);
+            if (cancelledOrder.size() > 1000) {
+                cancelledRequests.erase(cancelledOrder.front());
+                cancelledOrder.pop_front();
+            }
+        }
+    }
+
+    std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args) {
+        auto job = std::make_shared<ToolJob>();
+        job->tool = tool.name;
+        job->args = args;
+        std::lock_guard l(jobsMutex);
+        job->id = QStringLiteral("job-%1").arg(++jobsMade);
+        jobs[job->id] = job;
+        // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
+        std::vector<QString> read, unread;
+        for (auto& [id, j] : jobs) {
+            std::lock_guard jl(j->m);
+            if (j->finished()) (j->read ? read : unread).push_back(id);
+        }
+        const auto byAge = [](const QString& a, const QString& b) { return a.mid(4).toInt() < b.mid(4).toInt(); };
+        std::sort(read.begin(), read.end(), byAge);
+        std::sort(unread.begin(), unread.end(), byAge);
+        for (size_t i = 0; i + 200 < read.size(); ++i) jobs.erase(read[i]);
+        for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
+        jobQueue.push_back(job);
+        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
+        jobsWake.notify_all();
+        return job;
+    }
+
+    void runJobs() {
+#ifdef __linux__
+        // Background work gives way to the caller: this thread, and the encoder and decoder threads it starts (which
+        // inherit it), run at a lower priority, so a caller polling its jobs is never held up by them.
+        setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 5);
+#endif
+        for (;;) {
+            std::shared_ptr<ToolJob> job;
+            {
+                std::unique_lock l(jobsMutex);
+                jobsWake.wait(l, [this] { return stopping || !jobQueue.empty(); });
+                if (stopping) return;
+                job = jobQueue.front();
+                jobQueue.pop_front();
+            }
+            const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == job->tool; });
+            std::unique_lock running(toolMutex);
+            {
+                std::lock_guard jl(job->m);
+                if (job->cancel || tool == tools.end()) {
+                    job->status = QStringLiteral("cancelled");
+                    continue;
+                }
+                job->status = QStringLiteral("running");
+            }
+            tCurrentJob = job.get();
+            tCancel = &job->cancel;
+            ToolResult r;
+            try {
+                r = tool->run(job->args);
+            } catch (const ArgError& e) {
+                r = fail(e.message);
+            } catch (const std::exception& e) {
+                r = fail(QString::fromUtf8(e.what()));
+            }
+            tCurrentJob = nullptr;
+            tCancel = nullptr;
+            std::lock_guard jl(job->m);
+            job->result = resultJson(r);
+            job->status = !r.error ? QStringLiteral("done") : job->cancel ? QStringLiteral("cancelled") : QStringLiteral("failed");
+            if (!r.error) job->fraction = 1;
+        }
+    }
+
+    // A job as montage_job reports it.
+    static ToolResult jobReport(ToolJob& j, bool markRead = true) {
+        std::lock_guard l(j.m);
+        if (markRead && j.finished()) j.read = true;
+        QJsonObject o{{"job", j.id}, {"tool", j.tool}, {"status", j.status}, {"progress", j.fraction}};
+        if (!j.step.isEmpty()) o["step"] = j.step;
+        QString toolText;
+        for (const QJsonValue& c : j.result.value("content").toArray())
+            if (c.toObject().value("type").toString() == QLatin1String("text")) toolText += c.toObject().value("text").toString();
+        if (j.status == QLatin1String("done")) {
+            QJsonObject result = j.result.value("structuredContent").toObject();
+            if (result.isEmpty()) result["text"] = toolText;
+            else result["message"] = toolText;
+            o["result"] = result;
+        } else if (j.finished() && !toolText.isEmpty()) {
+            o["error"] = toolText;
+        }
+        const QString text = j.status == QLatin1String("done")    ? QStringLiteral("%1 (%2) is done: %3").arg(j.id, j.tool, toolText)
+                             : j.status == QLatin1String("failed") ? QStringLiteral("%1 (%2) failed: %3").arg(j.id, j.tool, toolText)
+                             : j.status == QLatin1String("running")
+                                 ? QStringLiteral("%1 (%2) is running: %3 %%4").arg(j.id, j.tool).arg(std::lround(j.fraction * 100)).arg(j.step.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(j.step))
+                                 : QStringLiteral("%1 (%2) is %3").arg(j.id, j.tool, j.status);
+        return ok(text, o);
+    }
 
     void add(const char* name, const char* title, const char* description, const char* schema, bool readOnly,
              std::function<ToolResult(const QJsonObject&)> run) {
@@ -621,6 +863,12 @@ struct McpServer::Impl {
     }
 
     void progress(double fraction, const QString& message) {
+        if (ToolJob* j = tCurrentJob) {
+            std::lock_guard l(j->m);
+            j->fraction = std::clamp(fraction, 0.0, 1.0);
+            j->step = message;
+            return;
+        }
         if (!notify || progressToken.isUndefined() || progressToken.isNull()) return;
         notify(QJsonObject{{"jsonrpc", "2.0"},
                            {"method", "notifications/progress"},
@@ -695,7 +943,7 @@ QString McpServer::Impl::indexMissing(Project& p, const std::vector<Id>& only, b
         if (m.kind != MediaKind::Video || !m.hasVideo || m.path.empty() || m.subclipOf || (m.visual && !m.visual->samples.empty())) continue;
         VisualIndex v;
         std::string err;
-        if (!indexVideo(analysisSource(m), m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, nullptr, &err))
+        if (!indexVideo(analysisSource(m), m.duration, v, 0, [&](double f) { progress(f, QStringLiteral("Indexing %1").arg(QString::fromStdString(m.name))); }, cancelFlag(), &err))
             return QString::fromStdString(m.name + ": " + err);
         m.visual = std::make_shared<const VisualIndex>(std::move(v));
         changed = true;
@@ -1147,9 +1395,10 @@ void McpServer::Impl::addTools() {
             const QString file = midimaps::fileFor(dir, device);
             midimaps::Map map;
             map.device = device;
+            QStringList skipped;  // (mappings that could not be read: kept in a copy before the file is written)
             if (QFile::exists(file)) {
                 QString why;
-                if (!midimaps::load(file, map, &why)) return fail(why);
+                if (!midimaps::load(file, map, &why, &skipped)) return fail(why);
                 map.device = device;
             }
             auto describe = [&] {
@@ -1161,10 +1410,18 @@ void McpServer::Impl::addTools() {
                 return lines;
             };
             auto saved = [&](const QString& what) {
-                QString why;
+                QString why, aside;
+                if (!skipped.isEmpty()) {  // (as the app does: the file as it was kept beside it, not lost)
+                    aside = file + QStringLiteral(".unread");
+                    QFile::remove(aside);
+                    if (!QFile::copy(file, aside)) return fail(QStringLiteral("cannot keep a copy of %1 (%2 mapping(s) in it could not be read)").arg(file).arg(skipped.size()));
+                }
                 if (!midimaps::save(file, map, &why)) return fail(why);
                 const QStringList lines = describe();
-                return ok(QStringLiteral("%1. %2: %3 mapping(s)%4").arg(what, device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n')),
+                const QString note = aside.isEmpty() ? QString()
+                                                     : QStringLiteral("\n%1 mapping(s) that could not be read were left out (%2); the file as it was is kept as %3")
+                                                           .arg(skipped.size()).arg(skipped.join(QStringLiteral("; ")), aside);
+                return ok(QStringLiteral("%1. %2: %3 mapping(s)%4%5").arg(what, device).arg(lines.size()).arg(lines.isEmpty() ? QString() : "\n" + lines.join('\n'), note),
                           midimaps::toJson(map));
             };
             if (a.contains("bank_size")) map.bankSize = std::clamp(a.value("bank_size").toInt(8), 1, 64);
@@ -2724,14 +2981,24 @@ void McpServer::Impl::addTools() {
         "shape_color, shape_metal and shape_rough (settings). Any model can carry a track's picture: settings "
         "texture_track (the track's number, 1 for V1; hidden unless texture_hide 0), on one material (texture_material, "
         "1-based; 0 all), lit by the scene or as it is (texture_light 1). camera 0 with settings camera 3 sees it through "
-        "the scene's Camera clip (montage_add_camera).",
+        "the scene's Camera clip (montage_add_camera). projection projects a video track's picture onto the model through a "
+        "camera, as a projector would: {track (V2), camera (solved: the solve of camera_track's footage, the default; own: "
+        "fov; file: camera_file and camera_index; scene: the Camera clip), frame (hold that frame of the sequence, in seconds "
+        "or a timecode; left out, it follows time), mix (%), material (1-based; 0 all), lit (true: lit by the scene; "
+        "false: as it is), hide (the track, true by default)}; a surface hidden from the projector or facing away from "
+        "it takes none of the picture.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
             "shape":{"type":"string","enum":["plane","box","sphere","cylinder"]},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
             "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
             "camera":{"type":"integer","minimum":0},"camera_file":{"type":"string"},
-            "settings":{"type":"object","additionalProperties":{"type":"number"}}},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}},
+            "projection":{"type":"object","properties":{"track":{"type":["string","integer"]},
+                "camera":{"type":"string","enum":["own","solved","file","scene"]},"camera_track":{"type":["string","integer"]},
+                "camera_index":{"type":"integer","minimum":1},"camera_file":{"type":"string"},"fov":{"type":"number"},
+                "frame":{"type":["number","string","null"]},"mix":{"type":"number"},"material":{"type":"integer","minimum":0},
+                "lit":{"type":"boolean"},"hide":{"type":"boolean"}},"required":["track"]}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -2760,6 +3027,7 @@ void McpServer::Impl::addTools() {
                     if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
                     c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
                 }
+                projectionArg(a, s, c);
                 if (a.contains("position")) {
                     const QJsonArray pos = a.value("position").toArray();
                     if (pos.size() != 3) throw ArgError{"\"position\" is [x, y, z]"};
@@ -2791,6 +3059,7 @@ void McpServer::Impl::addTools() {
             const std::shared_ptr<const SplatCloud> cloud = splats ? cachedSplats(path, &err) : nullptr;
             const std::shared_ptr<const Model> model = splats ? nullptr : cachedModel(path, &err);
             if (!cloud && !model) return fail(QString::fromStdString(err));
+            if (cloud && a.contains("projection")) throw ArgError{"Splats take no projection: their colours are their own"};
             Clip c = makeGeneratorClip(l.project, "model3d", 1);
             c.generator.strings["file"] = path;
             // The file the camera is in: camera_file, else the model's own.
@@ -2870,6 +3139,7 @@ void McpServer::Impl::addTools() {
                 if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
                 c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
             }
+            projectionArg(a, s, c);
             c.start = at;
             c.duration = std::max<FrameTime>(1, len);
             const auto r = edit::overwrite(l.project, s, t, c);
@@ -3370,7 +3640,11 @@ void McpServer::Impl::addTools() {
         "through the scene's Camera clip (camera 3, the default; montage_add_camera; without one, the camera that sees the "
         "frame as it is), its own (camera 0, lens fov), the solve montage_camera_track made (camera 1, width in the "
         "scene's units, camera_track the footage's track) or a file's (camera 2, strings.camera_file); 3D layers, models "
-        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet. "
+        "with depth_merge and deep pictures are merged by depth, cutting through each other where they meet; lit 1 lights "
+        "the card as a 3D Model's plane (its picture the base colour, its alpha its coverage; light_kind, light_angle, "
+        "light_height, light_strength, ambient, rough as montage_add_model's settings), shadows 1 casts its shadow onto "
+        "other lit cards and onto a ground (ground 1 at height ground_y), and depth_of_field 1 blurs it by a thin lens "
+        "focused at focus_distance (0: the card's middle) at fstop, a 36 mm sensor and units_m scene units a metre. "
         "crosstalk is a 3 x 3 matrix on linear light whose rows sum to 1 (neutrals stay neutral): red_hue, green_hue and "
         "blue_hue pull each primary towards its neighbour (degrees, -60..60, positive towards the next: red to green, green "
         "to blue, blue to red), red_strength etc. (%) take it towards grey or past itself, invert 1 inverts it, and "
@@ -3679,7 +3953,7 @@ void McpServer::Impl::addTools() {
                 // They work from the camera's movement, measured now, and move the whole frame (so they go first).
                 std::string motion, err, gyro, gyroNote;
                 const bool steady = type == "stabilize";
-                if (!analyzeClipStabilization(l.project, l.seq(), c, motion, {}, nullptr, &err, steady ? &gyro : nullptr, &gyroNote))
+                if (!analyzeClipStabilization(l.project, l.seq(), c, motion, {}, cancelFlag(), &err, steady ? &gyro : nullptr, &gyroNote))
                     return fail(QStringLiteral("Could not measure the camera's movement: %1").arg(QString::fromStdString(err)));
                 e.strings["motion"] = motion;
                 QString note;
@@ -3730,7 +4004,7 @@ void McpServer::Impl::addTools() {
             if (type == "sky_replace" && std::lround(e.p("follow", 0, 1)) == 1) {
                 // The new sky moves with the camera, measured now (a still, or a clip it fails on, keeps the sky still).
                 std::string motion, err;
-                if (analyzeClipStabilization(l.project, l.seq(), c, motion, {}, nullptr, &err)) e.strings["motion"] = motion;
+                if (analyzeClipStabilization(l.project, l.seq(), c, motion, {}, cancelFlag(), &err)) e.strings["motion"] = motion;
                 else note = QStringLiteral(" (the sky stays still: %1)").arg(QString::fromStdString(err));
             }
             c.effects.push_back(e);
@@ -5394,7 +5668,7 @@ void McpServer::Impl::addTools() {
                 o.log = true;
                 o.gate = SpeechGate::Auto;
                 std::string e;
-                const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &e);
+                const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, cancelFlag(), &e);
                 const QString base = absolute(need(a, "report"));
                 QDir().mkpath(QFileInfo(base).absolutePath());
                 if (!e.empty() || !writeLoudnessCsv((base + ".csv").toStdString(), d, spec, s, &e) ||
@@ -5436,7 +5710,7 @@ void McpServer::Impl::addTools() {
             const double limit = a.value("limit").isDouble() ? std::clamp(a.value("limit").toDouble(), 0.0, 1.0) : limits.poor;
             const double minSeconds = std::max(0.0, a.value("min_seconds").toDouble(2));
             std::string err;
-            const Intelligibility r = measureIntelligibility(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &err);
+            const Intelligibility r = measureIntelligibility(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, cancelFlag(), &err);
             if (!r.valid) return fail(QString::fromStdString(err));
             const double fps = s.fpsValue();
             QJsonArray hard;
@@ -5526,7 +5800,7 @@ void McpServer::Impl::addTools() {
                 }
             }
             std::string why;
-            const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &why);
+            const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, cancelFlag(), &why);
             if (!why.empty()) return fail(QString::fromStdString(why));
             QString written;
             if (report) {
@@ -5832,7 +6106,7 @@ void McpServer::Impl::addTools() {
             o.keepUnused = a.value("keep_unused").toBool();
             ConsolidateResult res;
             std::string err;
-            if (!consolidateProject(l.project, o, &res, [this](double f) { progress(f, "Copying"); }, nullptr, &err))
+            if (!consolidateProject(l.project, o, &res, [this](double f) { progress(f, "Copying"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             QString text = QStringLiteral("Wrote %1: %2 file(s) copied, %3 consolidated, %4 MB")
                                .arg(QString::fromStdString(res.projectPath)).arg(res.copied).arg(res.trimmed).arg(double(res.bytes) / 1e6, 0, 'f', 1);
@@ -5860,7 +6134,7 @@ void McpServer::Impl::addTools() {
             const QString media = absolute(need(a, "media"));
             auto t = std::make_shared<Transcript>();
             std::string err;
-            if (!transcribeMedia(media.toStdString(), o, *t, [this](double f) { progress(f, "Transcribing"); }, nullptr, &err))
+            if (!transcribeMedia(media.toStdString(), o, *t, [this](double f) { progress(f, "Transcribing"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             QString text;
             for (const auto& seg : t->segments) {
@@ -5957,7 +6231,7 @@ void McpServer::Impl::addTools() {
                 const double from = std::min(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps;
                 const double to = std::max(c.sourceAt(0), c.sourceAt(double(c.duration))) / fps + 1 / fps;
                 std::vector<Caption> found;
-                if (!readBurnedInSubtitles(m->path, from, to, region, s.fps, found, language, 4, {}, nullptr, &err))
+                if (!readBurnedInSubtitles(m->path, from, to, region, s.fps, found, language, 4, {}, cancelFlag(), &err))
                     return fail(QString::fromStdString(err));
                 const std::vector<Caption> placed = captionsThroughClip(c, found);
                 if (placed.empty()) return ok("No subtitles were read in the clip's picture");
@@ -6448,7 +6722,7 @@ void McpServer::Impl::addTools() {
                 if (!clip) return fail(QString::fromStdString(err));
                 o.lookFor = clip->text(look.toStdString(), &err);
             }
-            const std::vector<HighlightMoment> moments = findHighlights(l.project, media, o, {}, nullptr, &err);
+            const std::vector<HighlightMoment> moments = findHighlights(l.project, media, o, {}, cancelFlag(), &err);
             if (moments.empty()) return fail(QString::fromStdString(err));
             const Id seq = makeHighlightSequence(l.project, moments, a.value("name").toString(QStringLiteral("Highlights")).toStdString());
             if (!seq) return fail("The highlights could not be laid out");
@@ -6512,7 +6786,7 @@ void McpServer::Impl::addTools() {
             b.reframe = a.value("reframe").toBool(true);
             b.fillers.custom = l.project.fillerWords;
             std::string err;
-            const std::vector<ShortMoment> moments = findShorts(l.project, media, o, [this](double f) { progress(f * 0.3, "Finding moments"); }, nullptr, &err);
+            const std::vector<ShortMoment> moments = findShorts(l.project, media, o, [this](double f) { progress(f * 0.3, "Finding moments"); }, cancelFlag(), &err);
             if (moments.empty()) return fail(QString::fromStdString(err));
             const bool preview = a.value("preview").toBool(false);
             const QString folder = a.contains("render_folder") ? absolute(a.value("render_folder").toString()) : QString();
@@ -6543,7 +6817,7 @@ void McpServer::Impl::addTools() {
                         st.burnInCaptions = !s->captionTracks.empty();
                         st.path = QDir(folder).filePath(QString::fromStdString(s->name) + ".mp4").toStdString();
                         const double base = 0.3 + 0.7 * double(i) / double(moments.size()), span = 0.7 / double(moments.size());
-                        if (!exportSequence(l.project, *s, st, [&](double f, FrameTime) { progress(base + span * f, "Rendering"); }, nullptr, &err))
+                        if (!exportSequence(l.project, *s, st, [&](double f, FrameTime) { progress(base + span * f, "Rendering"); }, cancelFlag(), &err))
                             return fail(QString::fromStdString(err));
                         row["output"] = QString::fromStdString(st.path);
                         ++rendered;
@@ -6633,7 +6907,7 @@ void McpServer::Impl::addTools() {
             o.duckDb = std::clamp(a.value("duck_db").toDouble(-12), -30.0, 0.0);
             o.duck = o.duckDb < 0;
             std::string err;
-            auto plan = planMix(l.project, s, o, {}, nullptr, &err);
+            auto plan = planMix(l.project, s, o, {}, cancelFlag(), &err);
             if (plan.empty()) return fail(err.empty() ? QStringLiteral("There is no audio to mix") : QString::fromStdString(err));
             const QJsonObject roles = a.value("roles").toObject();
             for (ClipMix& m : plan) {
@@ -6808,7 +7082,7 @@ void McpServer::Impl::addTools() {
             ConformOptions o;
             if (a.contains("reference_start")) o.referenceStart = timeArg(a.value("reference_start"), s, "reference_start");
             std::string err;
-            const std::vector<ConformShot> shots = conformCheck(l.project, s, ref, o, {}, nullptr, &err);
+            const std::vector<ConformShot> shots = conformCheck(l.project, s, ref, o, {}, cancelFlag(), &err);
             if (shots.empty() && !err.empty()) return fail(QString::fromStdString(err));
             QJsonArray list;
             std::map<ConformVerdict, int> n;
@@ -7364,7 +7638,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("mute") || a.contains("unmute")) done << QStringLiteral("%1 role(s) muted").arg(s.mutedRoles.size());
             if (a.value("detect").toBool()) {
                 std::string err;
-                const auto plan = planMix(l.project, s, MixOptions{}, {}, nullptr, &err);
+                const auto plan = planMix(l.project, s, MixOptions{}, {}, cancelFlag(), &err);
                 int n = 0;
                 for (const ClipMix& m : plan)
                     if (Clip* c = edit::clipById(s, m.clip); c && c->role.empty() && m.guess.role != AudioRole::Silence) {
@@ -8153,7 +8427,7 @@ void McpServer::Impl::addTools() {
             if (factor < 2 || factor > 4) throw ArgError{"\"factor\" must be 2, 3 or 4"};
             std::string err;
             if (!createSuperScaled(in, out, factor, std::clamp(a.value("strength").toDouble(1), 0.0, 1.0),
-                                   [this](double f) { progress(f, "Super Scale"); }, nullptr, &err))
+                                   [this](double f) { progress(f, "Super Scale"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             MediaItem m;
             probeMedia(out, m);
@@ -8212,7 +8486,7 @@ void McpServer::Impl::addTools() {
                 d.readText = o.value("read_text").toBool(true);
                 SdhDraft draft;
                 std::string err;
-                if (!draftSdhCaptions(l.project, s, d, draft, [this](double f) { progress(f, "Drafting SDH captions"); }, nullptr, &err))
+                if (!draftSdhCaptions(l.project, s, d, draft, [this](double f) { progress(f, "Drafting SDH captions"); }, cancelFlag(), &err))
                     return fail(QString::fromStdString(err));
                 CaptionTrack t;
                 t.id = l.project.newId();
@@ -8261,7 +8535,7 @@ void McpServer::Impl::addTools() {
                 if (!m || m->kind != MediaKind::Video) return fail("import_embedded names a video clip (see montage_project_info)");
                 std::vector<Caption> found;
                 std::string err;
-                const bool pictures = a.contains("stream") || (!readEmbeddedCaptions(m->path, s.fps, found, {}, nullptr, &err) &&
+                const bool pictures = a.contains("stream") || (!readEmbeddedCaptions(m->path, s.fps, found, {}, cancelFlag(), &err) &&
                                                                !imageSubtitleStreams(m->path).empty());
                 if (pictures) {
                     ImageSubtitleImport in;
@@ -8311,7 +8585,7 @@ void McpServer::Impl::addTools() {
                     ImageSubtitleImport got;
                     std::string err;
                     if (!readImageSubtitles(path.toStdString(), s.fps, got, a.value("stream").toInt(-1), a.value("language").toString().toStdString(),
-                                            {}, nullptr, &err))
+                                            {}, cancelFlag(), &err))
                         return fail(QString::fromStdString(err));
                     got.track.id = l.project.newId();
                     const int n = int(got.track.captions.size());
@@ -8622,7 +8896,7 @@ void McpServer::Impl::addTools() {
                                     .arg(QString::fromStdString(pack->directory())));
             std::vector<std::string> out;
             std::string err;
-            if (!translateTexts(captionTexts(source), from, to, out, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            if (!translateTexts(captionTexts(source), from, to, out, {}, cancelFlag(), &err)) return fail(QString::fromStdString(err));
             CaptionTrack t = translatedTrack(source, out, l.project.newId(), to, translationLanguageName(to));
             t.visible = false;
             const QString name = QString::fromStdString(t.name);
@@ -8756,7 +9030,7 @@ void McpServer::Impl::addTools() {
                 if (!m.hasAudio || m.path.empty() || m.subclipOf || (m.sounds && !m.sounds->samples.empty())) continue;
                 VisualIndex v;
                 if (!indexSound(m.path, m.duration, v, 0,
-                                [&](double f) { progress(f, QStringLiteral("Listening to %1").arg(QString::fromStdString(m.name))); }, nullptr, &err)) {
+                                [&](double f) { progress(f, QStringLiteral("Listening to %1").arg(QString::fromStdString(m.name))); }, cancelFlag(), &err)) {
                     skipped.append(QJsonObject{{"media", QString::fromStdString(m.path)}, {"error", QString::fromStdString(err)}});
                     continue;
                 }
@@ -8826,18 +9100,22 @@ void McpServer::Impl::addTools() {
                 if (!soundSearchAvailable()) return fail("This build of Montage cannot search sound by what it sounds like (no ONNX Runtime)");
                 if (!soundModel().installed())
                     return fail("The sound search model is not downloaded: run `scripts/fetch-models.sh` or search Sounds Like in the app once");
+                // The sound to match is found first: a wrong one is refused without listening to the whole library.
+                std::optional<SoundLibraryEntry> like;
+                if (a.contains("more_like")) {
+                    const QString which = str(a, "more_like");
+                    bool isId = false;
+                    const qint64 id = which.toLongLong(&isId);
+                    like = isId ? lib->entry(id) : lib->entryForPath(which.toStdString());
+                    if (!like) return fail(QStringLiteral("No sound \"%1\" in the library").arg(which));
+                }
                 if (lib->unheard() > 0 &&
                     lib->listen([&](int done, int total) { progress(total > 0 ? double(done) / total : 1.0, QStringLiteral("Listening to the library")); },
                                 nullptr, &err) < 0)
                     return fail(QString::fromStdString(err));
                 std::vector<SoundLibrary::Match> hits;
-                if (a.contains("more_like")) {
-                    const QString which = str(a, "more_like");
-                    bool isId = false;
-                    const qint64 id = which.toLongLong(&isId);
-                    const auto e = isId ? lib->entry(id) : lib->entryForPath(which.toStdString());
-                    if (!e) return fail(QStringLiteral("No sound \"%1\" in the library").arg(which));
-                    hits = lib->moreLike(e->id, max);
+                if (like) {
+                    hits = lib->moreLike(like->id, max);
                 } else {
                     auto model = SoundModel::load(&err);
                     const std::vector<float> q = model ? model->text(str(a, "sounds_like").toStdString(), &err) : std::vector<float>{};
@@ -9221,7 +9499,7 @@ void McpServer::Impl::addTools() {
                     outs.push_back(path.toStdString());
                 }
                 const std::string source = m->path, clipName = clip->name.empty() ? m->name : clip->name;
-                if (!separateStemsToFiles(source, from, to, clip->channels, stems, outs, {}, nullptr, &err))
+                if (!separateStemsToFiles(source, from, to, clip->channels, stems, outs, {}, cancelFlag(), &err))
                     return fail(QStringLiteral("Clip %1: %2").arg(qulonglong(id)).arg(QString::fromStdString(err)));
                 written.files.insert(written.files.end(), outs.begin(), outs.end());
                 std::vector<Id> media;
@@ -9447,7 +9725,7 @@ void McpServer::Impl::addTools() {
                 if (a.value("language_model").toBool(true) && !(lm = loadLanguageModel(err))) return fail(QString::fromStdString(err));
                 DraftOptions o;
                 o.wordsPerMinute = pace;
-                const std::vector<DescriptionDraft> drafts = draftDescriptions(l.project, s, empty, *describer, lm.get(), o, {}, nullptr, &err);
+                const std::vector<DescriptionDraft> drafts = draftDescriptions(l.project, s, empty, *describer, lm.get(), o, {}, cancelFlag(), &err);
                 if (drafts.empty()) return fail(QString::fromStdString(err));
                 for (const DescriptionDraft& d : drafts) setDescription(l.project, s, d.start, d.end, d.text);
                 save(l);
@@ -9617,7 +9895,7 @@ void McpServer::Impl::addTools() {
                 std::vector<std::string> out;
                 std::string err;
                 progress(0, QStringLiteral("Translating"));
-                if (!translateTexts(captionTexts(source), from, to, out, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+                if (!translateTexts(captionTexts(source), from, to, out, {}, cancelFlag(), &err)) return fail(QString::fromStdString(err));
                 CaptionTrack t = translatedTrack(source, out, l.project.newId(), to, translationLanguageName(to));
                 t.visible = false;
                 s.captionTracks.push_back(std::move(t));
@@ -9931,7 +10209,7 @@ void McpServer::Impl::addTools() {
                     } else if (pd == "auto") {
                         std::vector<PulldownStretch> st;
                         std::string why;
-                        if (!detectPulldown(uninterpretedPath(m->path), st, {}, nullptr, &why))
+                        if (!detectPulldown(uninterpretedPath(m->path), st, {}, cancelFlag(), &why))
                             throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(why))};
                         i.pulldown = pulldownValue(st);
                     } else if (pd.size() == 1 && pd[0] >= 'A' && pd[0] <= 'D') {
@@ -10111,7 +10389,7 @@ void McpServer::Impl::addTools() {
                 MediaItem* m = l.project.findMedia(id);
                 if (!m) continue;
                 std::string err;
-                std::vector<ShotDescription> shots = describeShots(*m, o, {}, nullptr, &err);
+                std::vector<ShotDescription> shots = describeShots(*m, o, {}, cancelFlag(), &err);
                 if (shots.empty()) {  // (the others are still described and kept)
                     failed.append(QJsonObject{{"name", QString::fromStdString(m->name)}, {"error", QString::fromStdString(err)}});
                     continue;
@@ -10269,7 +10547,7 @@ void McpServer::Impl::addTools() {
             if (edit::locate(s, c.id)->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip"};
             std::vector<DamagedFrame> found;
             std::string err;
-            if (!damagedFramesInClip(l.project, s, c, found, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            if (!damagedFramesInClip(l.project, s, c, found, {}, cancelFlag(), &err)) return fail(QString::fromStdString(err));
             int added = 0;
             if (a.value("repair").toBool(true)) {
                 added = listDamagedFrames(l.project, s, c, found);
@@ -11075,7 +11353,7 @@ void McpServer::Impl::addTools() {
             const int speed = motion == "slower" ? 0 : motion == "faster" ? 2 : 1;
             std::map<Id, std::vector<ReframeKey>> paths;
             std::string err;
-            if (!analyzeSequenceReframe(l.project, l.seq(), speed, paths, [this](double f) { progress(f, "Finding subjects"); }, nullptr, &err))
+            if (!analyzeSequenceReframe(l.project, l.seq(), speed, paths, [this](double f) { progress(f, "Finding subjects"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             int w = 0, h = 0;
             reframeSize(l.seq(), aw, ah, w, h);
@@ -11191,7 +11469,7 @@ void McpServer::Impl::addTools() {
             std::vector<Id> ids;
             std::string err;
             const Id source = l.seq().id;
-            if (!makeVersionSequences(l.project, source, shapes, ids, 1, [this](double f) { progress(f * 0.3, "Reframing"); }, nullptr, &err))
+            if (!makeVersionSequences(l.project, source, shapes, ids, 1, [this](double f) { progress(f * 0.3, "Reframing"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             save(l);
             QJsonArray files;
@@ -11201,7 +11479,7 @@ void McpServer::Impl::addTools() {
                 const ExportSettings st = versionSettings(*v, preset->settings, folder.toStdString(), a.value("captions").toBool(true),
                                                           a.value("loudness_lufs").toDouble(-14));
                 const double base = 0.3 + 0.7 * double(i) / double(ids.size()), span = 0.7 / double(ids.size());
-                if (!exportSequence(l.project, *v, st, [&](double f, FrameTime) { progress(base + span * f, "Rendering"); }, nullptr, &err))
+                if (!exportSequence(l.project, *v, st, [&](double f, FrameTime) { progress(base + span * f, "Rendering"); }, cancelFlag(), &err))
                     return fail(QStringLiteral("%1: %2").arg(QString::fromStdString(v->name), QString::fromStdString(err)));
                 files.append(QJsonObject{{"shape", QString::fromStdString(shapes[i].label)}, {"sequence", QString::fromStdString(v->name)},
                                          {"path", QString::fromStdString(st.path)}, {"width", v->width}, {"height", v->height}});
@@ -11249,7 +11527,7 @@ void McpServer::Impl::addTools() {
             QDir().mkpath(folder);
             const ReviewPackage pkg = reviewPackage(s, folder.toStdString(), o);
             std::string err;
-            if (!exportSequence(l.project, s, pkg.settings, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err))
+            if (!exportSequence(l.project, s, pkg.settings, [this](double f, FrameTime) { progress(f, "Rendering"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             if (!writeReviewPage(pkg, &err)) return fail(QString::fromStdString(err));
             return ok(QStringLiteral("Wrote %1 and %2: send both; the notes saved from the page import as markers.")
@@ -11597,7 +11875,9 @@ void McpServer::Impl::addTools() {
         "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\"), "
         "optionally normalising the mix's loudness for where it is going. Broadcast deliveries: the XDCAM HD422, AVC-Intra 100 "
         "and DNxHR MXF presets write MXF OP1a with each sound channel a mono track; start_timecode sets the file's timecode. "
-        "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion.",
+        "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion. "
+        "Smart rendering: where the preset codes video as the footage is (ProRes, DNxHR; H.264, HEVC and XDCAM HD422 a GOP "
+        "at a time), untouched pictures are copied from the source; the result's copied_frames says how many.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
@@ -11902,7 +12182,7 @@ void McpServer::Impl::addTools() {
                 }
                 std::string why;
                 StreamingResult res;
-                if (!exportStreamingPackage(l.project, s, ss, [this](double f, FrameTime) { progress(f, "Packaging"); }, nullptr, &why, &res))
+                if (!exportStreamingPackage(l.project, s, ss, [this](double f, FrameTime) { progress(f, "Packaging"); }, cancelFlag(), &why, &res))
                     return fail(QString::fromStdString(why));
                 QJsonArray renditions, segments, breaks;
                 for (const std::string& r : res.renditions) renditions.append(QString::fromStdString(r));
@@ -11940,10 +12220,14 @@ void McpServer::Impl::addTools() {
             LightLevels light;
             const QString report = QString::fromStdString(loudnessReportBase(st.path)) + ".pdf";
             if (st.loudnessReport) QFile::remove(report);  // (one from before is not this one's)
-            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
+            int copiedFrames = 0;
+            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, cancelFlag(), &err, nullptr, &copiedFrames, &light))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
+            // Smart rendering: pictures of untouched footage copied from the source, not encoded again.
+            o["copied_frames"] = copiedFrames;
+            if (copiedFrames > 0) text += QStringLiteral("\n%1 frame%2 copied from the source as coded (smart rendering)").arg(copiedFrames).arg(copiedFrames == 1 ? "" : "s");
             if (st.hdr10Plus) {
                 // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
                 const std::string carriage = hdr10PlusCarriage(s, st);
@@ -12097,7 +12381,7 @@ void McpServer::Impl::addTools() {
                     o.fieldOfView = fov;
                 }
                 CameraSolve cs;
-                if (!solveClipCamera(l.project, s, c, o, cs, {}, nullptr, &err))
+                if (!solveClipCamera(l.project, s, c, o, cs, {}, cancelFlag(), &err))
                     return fail(QStringLiteral("Could not solve the camera: %1").arg(QString::fromStdString(err)));
                 Effect* e = nullptr;
                 for (Effect& x : c.effects)
@@ -12476,7 +12760,7 @@ void McpServer::Impl::addTools() {
             QElapsedTimer clock;
             clock.start();
             const bool cached = ografCached(job);
-            if (!prepareOGraf(job, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            if (!prepareOGraf(job, {}, cancelFlag(), &err)) return fail(QString::fromStdString(err));
             return ok(cached ? QStringLiteral("Already rendered") : QStringLiteral("Rendered %1 frames").arg(job.frames),
                       QJsonObject{{"frames", job.frames}, {"seconds", cached ? 0.0 : clock.elapsed() / 1000.0},
                                   {"folder", QString::fromStdString(ografCacheFolder(job))}});
@@ -13011,7 +13295,7 @@ void McpServer::Impl::addTools() {
             const double width = a.contains("width") ? a.value("width").toDouble() : 1.0;
             if (width < 0.1 || width > 1) throw ArgError{"width is 0.1 to 1"};
             std::vector<PanFollowKey> keys;
-            if (!trackPanFollow(l.project, l.seq(), c, at, x, y, size, keys, {}, nullptr, &err)) throw ArgError{QString::fromStdString(err)};
+            if (!trackPanFollow(l.project, l.seq(), c, at, x, y, size, keys, {}, cancelFlag(), &err)) throw ArgError{QString::fromStdString(err)};
             Track& track = *trackAt(l.seq(), loc->track);
             const bool stereo = panFollowStereo(l.seq(), track);
             applyPanFollow(l.seq(), track, keys, width);
@@ -13249,7 +13533,7 @@ void McpServer::Impl::addTools() {
                     for (const Clip& c : t.clips) clips.push_back(c.id);
             std::vector<VfxShot> shots;
             std::string err;
-            if (!exportVfxPulls(l.project, l.seq(), clips, o, &shots, [this](double f, FrameTime) { progress(f, "Pulling"); }, nullptr, &err))
+            if (!exportVfxPulls(l.project, l.seq(), clips, o, &shots, [this](double f, FrameTime) { progress(f, "Pulling"); }, cancelFlag(), &err))
                 return fail(QString::fromStdString(err));
             QJsonArray list;
             QStringList lines;
@@ -13619,7 +13903,7 @@ void McpServer::Impl::addTools() {
                 // (a copy with each compositing graph's clip rendered beside the export)
                 Project baked = l.project;
                 if (o.picture && !bakeCompositeClips(baked, l.seq().id, out.toStdString(), &err)) return fail(QString::fromStdString(err));
-                if (!exportAaf(baked, *baked.findSequence(l.seq().id), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
+                if (!exportAaf(baked, *baked.findSequence(l.seq().id), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, cancelFlag(), &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;
                 for (const std::string& m : r.mediaFiles) files.append(QString::fromStdString(m));
@@ -13720,6 +14004,63 @@ void McpServer::Impl::addTools() {
             return ok(note, projectJson(l.project));
         });
 
+    add("montage_job", "Background calls",
+        "Read or cancel a tool call running in the background. Any tool called with \"async\": true answers at once with "
+        "a job id and runs in the background (after any calls before it, one at a time); this reads its status (queued, "
+        "running, done, failed, cancelled), its progress (0 to 1) and step, and once done its result (the tool's own "
+        "structured result, its text as \"message\"; a failed job's error). action cancel stops it (work that can stop "
+        "does, within a second or so), list gives every job. wait: seconds (up to 60) to wait for it to finish first.",
+        R"json({"type":"object","properties":{"job":{"type":"string","description":"The job id an async call answered with"},
+            "action":{"type":"string","enum":["status","cancel","list"],"default":"status"},
+            "wait":{"type":"number","description":"Seconds to wait for it to finish before answering (at most 60)"}}})json",
+        true, [this](const QJsonObject& a) {
+            const QString action = str(a, "action", "status");
+            if (action == "list") {
+                std::vector<std::shared_ptr<ToolJob>> all;
+                {
+                    std::lock_guard l(jobsMutex);
+                    for (auto& [id, j] : jobs) all.push_back(j);
+                }
+                std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return x->id.mid(4).toInt() < y->id.mid(4).toInt(); });
+                QJsonArray list;
+                QStringList lines;
+                for (auto& j : all) {
+                    const ToolResult r = jobReport(*j, false);
+                    QJsonObject o = r.structured;
+                    o.remove("result");  // (read one job for its result)
+                    list.append(o);
+                    lines << r.text.section(QLatin1Char('\n'), 0, 0);
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No background calls") : lines.join(QLatin1Char('\n')), QJsonObject{{"jobs", list}});
+            }
+            std::shared_ptr<ToolJob> job;
+            {
+                std::lock_guard l(jobsMutex);
+                const auto it = jobs.find(need(a, "job"));
+                if (it == jobs.end()) throw ArgError{QStringLiteral("No job %1 (montage_job with action list gives them)").arg(str(a, "job"))};
+                job = it->second;
+            }
+            if (action == "cancel") {
+                job->cancel = true;
+                std::lock_guard l(job->m);
+                if (job->status == QLatin1String("queued")) job->status = QStringLiteral("cancelled");
+            } else if (action != "status") {
+                throw ArgError{"\"action\" is status, cancel or list"};
+            }
+            // Waiting for it (not for long: other calls wait meanwhile).
+            const double wait = std::clamp(a.value("wait").toDouble(0), 0.0, 60.0);
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(qint64(wait * 1000));
+            for (;;) {
+                {
+                    std::lock_guard l(job->m);
+                    if (job->finished()) break;
+                }
+                if (std::chrono::steady_clock::now() >= until) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            return jobReport(*job);
+        });
+
     add("montage_undo", "Undo the last edit",
         "Put the project back as it was before the last edit made through these tools (one step).",
         R"json({"type":"object","properties":{"project":{"type":"string"}},"required":["project"]})json", false,
@@ -13761,7 +14102,11 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         if (isRequest) send(QJsonObject{{"jsonrpc", "2.0"}, {"id", msg.value("id")}, {"error", QJsonObject{{"code", -32600}, {"message", "Invalid request"}}}});
         return out;  // a response to us: nothing to do
     }
-    if (!isRequest) return out;  // notifications (initialized, cancelled...) need no reply
+    if (!isRequest) {
+        // (a call's cancellation: the work it started stops, where it can)
+        if (method == "notifications/cancelled") d_->cancelRequest(msg.value("params").toObject().value("requestId"));
+        return out;  // notifications (initialized, cancelled...) need no reply
+    }
     const QJsonValue id = msg.value("id");
     const QJsonObject params = msg.value("params").toObject();
     const QJsonObject meta = params.value("_meta").toObject();
@@ -13821,41 +14166,104 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         const QString name = params.value("name").toString();
         auto tool = std::find_if(d_->tools.begin(), d_->tools.end(), [&](const auto& t) { return t.name == name; });
         if (tool == d_->tools.end()) return error(-32602, QStringLiteral("Unknown tool: %1").arg(name));
-        d_->progressToken = meta.value("progressToken");
-        d_->notify = [&](const QJsonObject& n) {
-            if (!d_->live) return send(n);
-            *d_->live << QJsonDocument(n).toJson(QJsonDocument::Compact).toStdString() << '\n';
-            d_->live->flush();
-        };
+        QJsonObject args = params.value("arguments").toObject();
+        // In the background: a job id now, the call run later (montage_job reads it).
+        if (name != QLatin1String("montage_job") && args.value("async").toBool()) {
+            args.remove("async");
+            const std::shared_ptr<ToolJob> job = d_->startJob(*tool, args);
+            return reply(resultJson(ok(QStringLiteral("%1 runs in the background as %2: montage_job reads its progress and result").arg(name, job->id),
+                                       QJsonObject{{"job", job->id}, {"tool", name}, {"status", "queued"}})));
+        }
+        args.remove("async");
+        // montage_job is answered at once, while a job runs; other tools one at a time.
+        std::unique_lock<std::mutex> running(d_->toolMutex, std::defer_lock);
+        if (name != QLatin1String("montage_job")) {
+            running.lock();
+            std::lock_guard l(d_->cancelMutex);
+            d_->runningRequest = Impl::requestKey(id);
+            d_->callCancel = d_->cancelledRequests.erase(d_->runningRequest) > 0;
+            tCancel = &d_->callCancel;
+            d_->progressToken = meta.value("progressToken");
+            d_->notify = [&](const QJsonObject& n) {
+                if (d_->sink) return d_->sink(QJsonDocument(n).toJson(QJsonDocument::Compact).toStdString());
+                if (!d_->live) return send(n);
+                std::lock_guard l(d_->liveMutex);
+                *d_->live << QJsonDocument(n).toJson(QJsonDocument::Compact).toStdString() << '\n';
+                d_->live->flush();
+            };
+        }
         ToolResult r;
         try {
-            r = tool->run(params.value("arguments").toObject());
+            r = tool->run(args);
         } catch (const ArgError& e) {
             r = fail(e.message);
         } catch (const std::exception& e) {
             r = fail(QString::fromUtf8(e.what()));
         }
-        d_->notify = nullptr;
-        QJsonArray content;
-        if (!r.png.isEmpty())
-            content.append(QJsonObject{{"type", "image"}, {"data", QString::fromLatin1(r.png.toBase64())}, {"mimeType", "image/png"}});
-        content.append(QJsonObject{{"type", "text"}, {"text", r.text}});
-        QJsonObject result{{"content", content}, {"isError", r.error}};
-        if (!r.structured.isEmpty()) result["structuredContent"] = r.structured;
-        return reply(result);
+        if (running.owns_lock()) {
+            d_->notify = nullptr;
+            tCancel = nullptr;
+            std::lock_guard l(d_->cancelMutex);
+            d_->runningRequest.clear();
+        }
+        return reply(resultJson(r));
     }
     return error(-32601, QStringLiteral("Method not found: %1").arg(method));
 }
 
+void McpServer::cancel(const QJsonValue& requestId) { d_->cancelRequest(requestId); }
+
+void McpServer::setNotificationSink(std::function<void(const std::string&)> sink) {
+    std::lock_guard l(d_->toolMutex);
+    d_->sink = std::move(sink);
+}
+
 int McpServer::run(std::istream& in, std::ostream& out) {
     d_->live = &out;
+    auto write = [&](const std::vector<std::string>& replies) {
+        std::lock_guard l(d_->liveMutex);
+        for (const std::string& reply : replies) out << reply << '\n';
+        out.flush();
+    };
+    // Tool calls run in turn on a thread of their own, so this one keeps reading: montage_job and cancellations are
+    // answered while a call (or a call waiting for a background job) runs.
+    std::mutex callsMutex;
+    std::condition_variable callsWake;
+    std::deque<std::string> calls;
+    bool closed = false;
+    std::thread caller([&] {
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock l(callsMutex);
+                callsWake.wait(l, [&] { return closed || !calls.empty(); });
+                if (calls.empty()) return;
+                line = std::move(calls.front());
+                calls.pop_front();
+            }
+            write(handle(line));
+        }
+    });
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find_first_not_of(" \t") == std::string::npos) continue;
-        for (const std::string& reply : handle(line)) out << reply << '\n';
-        out.flush();
+        const QJsonObject msg = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
+        if (msg.value("method").toString() == QLatin1String("tools/call") &&
+            msg.value("params").toObject().value("name").toString() != QLatin1String("montage_job")) {
+            std::lock_guard l(callsMutex);
+            calls.push_back(line);
+            callsWake.notify_one();
+        } else {
+            write(handle(line));
+        }
     }
+    {
+        std::lock_guard l(callsMutex);
+        closed = true;
+    }
+    callsWake.notify_one();
+    caller.join();
     return 0;
 }
 

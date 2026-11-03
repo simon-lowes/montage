@@ -475,7 +475,8 @@ struct Av1Picture {
 };
 
 AVColorPrimaries avPrimaries(Primaries p) {
-    return p == Primaries::Bt2020 ? AVCOL_PRI_BT2020 : p == Primaries::P3D65 ? AVCOL_PRI_SMPTE432 : AVCOL_PRI_BT709;
+    // (Adobe RGB has no code point: left unspecified rather than called Rec.709)
+    return p == Primaries::Bt2020 ? AVCOL_PRI_BT2020 : p == Primaries::P3D65 ? AVCOL_PRI_SMPTE432 : p == Primaries::AdobeRgb ? AVCOL_PRI_UNSPECIFIED : AVCOL_PRI_BT709;
 }
 
 // `img` (code values, over black) as Y'CbCr 4:2:0 by the BT.2020 non-constant luminance matrix for its primaries, else

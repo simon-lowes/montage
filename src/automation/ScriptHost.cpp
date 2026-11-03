@@ -2,7 +2,10 @@
 
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QElapsedTimer>
 #include <QJsonValue>
+#include <QThread>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
@@ -318,6 +321,30 @@ int montageSetPanel(lua_State* L) {
     return 0;
 }
 
+// montage.sleep(seconds): waits, the host kept alive (its window answering) and Stop heard.
+int montageSleep(lua_State* L) {
+    const ScriptOptions& o = host(L);
+    const qint64 ms = qint64(std::clamp(double(luaL_checknumber(L, 1)), 0.0, 86400.0) * 1000);
+    QElapsedTimer t;
+    t.start();
+    for (;;) {
+        if (o.tick) o.tick();
+        if (o.stopped && o.stopped()) stopScript(L);
+        const qint64 left = ms - t.elapsed();
+        if (left <= 0) break;
+        QThread::msleep(std::min<qint64>(left, 5));
+    }
+    return 0;
+}
+
+// montage.now(): seconds on a steady clock (for timing waits).
+int montageNow(lua_State* L) {
+    static QElapsedTimer clock;
+    if (!clock.isValid()) clock.start();
+    lua_pushnumber(L, double(clock.nsecsElapsed()) / 1e9);
+    return 1;
+}
+
 void hook(lua_State* L, lua_Debug*) {
     lua_getfield(L, LUA_REGISTRYINDEX, kEndingKey);
     if (!lua_isnil(L, -1)) lua_error(L);  // (ending: caught somewhere, raised again)
@@ -350,6 +377,83 @@ load = function(...)
   return f, e
 end
 )lua";
+
+// Background calls, on top of montage.call and montage_job (given the montage table); returns what ends them with the
+// script: waited for (their callbacks run) when it succeeded, else cancelled.
+const char* kJobs = R"lua(
+local montage = ...
+local unfinished = {}
+local Job = {}
+Job.__index = Job
+local function settle(j, r)
+  j.state = r.status or j.state
+  j.fraction = r.progress or j.fraction
+  j.step = r.step or j.step
+  if (j.state == "done" or j.state == "failed" or j.state == "cancelled") and not j.finished then
+    j.finished = true
+    j.result = r.result
+    if j.state ~= "done" then j.err = r.error or j.state end
+    for i = #unfinished, 1, -1 do if unfinished[i] == j then table.remove(unfinished, i) end end
+    if j.callback then j.callback(j.result, j.err, j) end
+  end
+  return j
+end
+function Job:poll()
+  if not self.finished then settle(self, montage.call("montage_job", {job = self.id})) end
+  return self
+end
+function Job:status() return self:poll().state end
+function Job:progress() self:poll() return self.fraction or 0, self.step or "" end
+function Job:done() return self:poll().finished end
+function Job:cancel()
+  if not self.finished then settle(self, montage.call("montage_job", {job = self.id, action = "cancel"})) end
+  return self
+end
+function Job:wait(timeout)
+  local deadline = timeout and montage.now() + timeout
+  while not self:poll().finished do
+    if deadline and montage.now() >= deadline then return nil end
+    montage.sleep(0.02)
+  end
+  if self.state ~= "done" then error(self.tool .. ": " .. tostring(self.err), 2) end
+  return self.result
+end
+Job.__tostring = function(j) return "job " .. tostring(j.id) .. " (" .. j.tool .. ", " .. tostring(j.state) .. ")" end
+montage.call_async = function(tool, args, callback)
+  if type(args) == "function" then args, callback = nil, args end
+  local name = tostring(tool)
+  if name:sub(1, 8) ~= "montage_" then name = "montage_" .. name end
+  local a = {}
+  if args ~= nil then
+    if type(args) ~= "table" then error("montage.call_async: a tool's arguments are a table", 2) end
+    for k, v in pairs(args) do a[k] = v end
+  end
+  a.async = true
+  local r = montage.call(name, a)
+  local j = setmetatable({id = r.job, tool = name, state = r.status or "queued", fraction = 0, step = "", callback = callback}, Job)
+  unfinished[#unfinished + 1] = j
+  return j
+end
+montage.jobs = function() return table.move(unfinished, 1, #unfinished, 1, {}) end
+montage.poll = function()
+  for _, j in ipairs(montage.jobs()) do j:poll() end
+  return #unfinished
+end
+montage.wait_all = function()
+  while montage.poll() > 0 do montage.sleep(0.02) end
+end
+return function(ok)
+  local err
+  if ok then
+    local waited, e = pcall(montage.wait_all)
+    if waited then return end
+    err = e
+  end
+  for _, j in ipairs(montage.jobs()) do pcall(j.cancel, j) end
+  if err ~= nil then error(err, 0) end
+end
+)lua";
+const char* kJobsEnd = "montage.jobs_end";
 
 }  // namespace
 
@@ -418,6 +522,10 @@ static bool runLuaScript(const QString& code, const QString& name, const ScriptO
     lua_setfield(L, -2, "panel");
     lua_pushcfunction(L, montageSetPanel);
     lua_setfield(L, -2, "set_panel");
+    lua_pushcfunction(L, montageSleep);
+    lua_setfield(L, -2, "sleep");
+    lua_pushcfunction(L, montageNow);
+    lua_setfield(L, -2, "now");
     lua_createtable(L, int(options.args.size()), 0);
     for (qsizetype i = 0; i < options.args.size(); ++i) {
         lua_pushstring(L, options.args[i].toUtf8().constData());
@@ -442,6 +550,15 @@ static bool runLuaScript(const QString& code, const QString& name, const ScriptO
     lua_getfield(L, LUA_REGISTRYINDEX, kStopKey);
     lua_getfield(L, LUA_REGISTRYINDEX, kDoneKey);
     lua_call(L, 2, 0);
+    // Background calls (montage.call_async), and what ends them with the script.
+    if (luaL_loadstring(L, kJobs) != LUA_OK) {
+        if (error) *error = QString::fromUtf8(lua_tostring(L, -1));
+        lua_close(L);
+        return false;
+    }
+    lua_getglobal(L, "montage");
+    lua_call(L, 1, 1);
+    lua_setfield(L, LUA_REGISTRYINDEX, kJobsEnd);
     lua_sethook(L, hook, LUA_MASKCOUNT, 20000);
     // As lua.c reads a file: a UTF-8 byte order mark and a first "#!" line skipped (the line kept, for line numbers).
     QByteArray src = code.toUtf8();
@@ -449,6 +566,24 @@ static bool runLuaScript(const QString& code, const QString& name, const ScriptO
     if (src.startsWith('#')) src.remove(0, src.indexOf('\n') < 0 ? src.size() : src.indexOf('\n'));
     const QByteArray chunk = ("=" + name).toUtf8();
     bool ok = luaL_loadbuffer(L, src.constData(), size_t(src.size()), chunk.constData()) == LUA_OK && lua_pcall(L, 0, 0, 0) == LUA_OK;
+    {
+        // Its background calls: waited for, their callbacks run (an error there is the script's), when it succeeded;
+        // else cancelled (not when it is ending: stopped, or its panel described, which take no more calls).
+        lua_getfield(L, LUA_REGISTRYINDEX, kEndingKey);
+        const bool ending = !lua_isnil(L, -1);
+        lua_pop(L, 1);
+        if (!ending) {
+            const int top = lua_gettop(L);  // (the script's error, when it failed, stays on top)
+            lua_getfield(L, LUA_REGISTRYINDEX, kJobsEnd);
+            lua_pushboolean(L, ok);
+            if (ok) {
+                ok = lua_pcall(L, 1, 0, 0) == LUA_OK;  // (its error left on top)
+            } else {
+                lua_pcall(L, 1, 0, 0);
+                lua_settop(L, top);
+            }
+        }
+    }
     if (!ok) {
         // Ended at montage.panel, its panel described: a success.
         lua_getfield(L, LUA_REGISTRYINDEX, kDoneKey);

@@ -63,6 +63,7 @@ constexpr int kNameStrip = 16;
 constexpr int kBtn = 20;
 constexpr int kFolderH = 24;  // a track folder's header row
 constexpr int kTakeLaneH = 22;  // a take lane under an audio track
+constexpr int kPinGap = 4;      // the edge under the pinned band
 
 // A clip's line parameter (generic over the timeline's private Lane type).
 template <class L>
@@ -188,19 +189,30 @@ int TimelineWidget::captionLanesHeight() const {
 
 void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow>* foldersOut, int* divider, int* bottom) const {
     const Sequence* s = state_->sequence();
-    int y = kRulerH - verticalScrollBar()->value() + captionLanesHeight();
+    int y = scrollTop() + captionLanesHeight();
+    int pinnedY = kRulerH;  // the pinned band's rows, which do not scroll
     if (!s) {
         if (divider) *divider = y;
         if (bottom) *bottom = y + kDividerH;
         return;
     }
     // Video tracks top-down (V1 nearest the divider), audio tracks downwards; a run of tracks in one folder goes
-    // under its header, hidden while the folder is collapsed.
+    // under its header, hidden while the folder is collapsed. Pinned tracks are drawn in the band instead, in the same
+    // order (the pinned video tracks above the pinned audio ones).
+    auto pin = [&](TrackKind kind, const Track& t, int index) {
+        if (rowsOut) rowsOut->push_back({{kind, index}, pinnedY, trackHeight(t), true});
+        pinnedY += trackHeight(t) + takeLanesHeight({kind, index}, t);
+    };
     auto lay = [&](TrackKind kind, const std::vector<Track>& tracks, bool topDown) {
         const int n = int(tracks.size());
         auto at = [&](int k) { return topDown ? n - 1 - k : k; };
         for (int k = 0; k < n;) {
             const Track& t = tracks[size_t(at(k))];
+            if (t.pinned) {
+                pin(kind, t, at(k));
+                ++k;
+                continue;
+            }
             if (t.folder.empty()) {
                 if (rowsOut) rowsOut->push_back({{kind, at(k)}, y, trackHeight(t)});
                 y += trackHeight(t) + takeLanesHeight({kind, at(k)}, t);
@@ -210,8 +222,11 @@ void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow
             FolderRow f{kind, t.folder, y, kFolderH, edit::folderCollapsed(*s, kind, t.folder), {}};
             for (; k < n && tracks[size_t(at(k))].folder == t.folder; ++k) f.tracks.push_back(at(k));
             y += kFolderH;
+            for (int i : f.tracks)
+                if (tracks[size_t(i)].pinned) pin(kind, tracks[size_t(i)], i);
             if (!f.collapsed)
                 for (int i : f.tracks) {
+                    if (tracks[size_t(i)].pinned) continue;
                     if (rowsOut) rowsOut->push_back({{kind, i}, y, trackHeight(tracks[size_t(i)])});
                     y += trackHeight(tracks[size_t(i)]) + takeLanesHeight({kind, i}, tracks[size_t(i)]);
                 }
@@ -231,6 +246,37 @@ int TimelineWidget::takeLanesHeight(TrackRef ref, const Track& t) const {
     return s ? int(laneViews(state_->project(), *s, ref).size()) * kTakeLaneH : 0;
 }
 
+int TimelineWidget::pinnedHeight() const {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    int h = 0;
+    for (TrackKind kind : {TrackKind::Video, TrackKind::Audio}) {
+        const std::vector<Track>& tracks = kind == TrackKind::Video ? s->videoTracks : s->audioTracks;
+        for (size_t i = 0; i < tracks.size(); ++i)
+            if (tracks[i].pinned) h += trackHeight(tracks[i]) + takeLanesHeight({kind, int(i)}, tracks[i]);
+    }
+    return h ? h + kPinGap : 0;
+}
+
+int TimelineWidget::scrollTop() const { return kRulerH + pinnedHeight() - verticalScrollBar()->value(); }
+
+int TimelineWidget::pinnedBandBottom() const { return kRulerH + pinnedHeight(); }
+
+QRect TimelineWidget::pinnedBand() const {
+    const int h = pinnedHeight();
+    return h ? QRect(0, kRulerH, viewport()->width(), h) : QRect();
+}
+
+void TimelineWidget::setTrackPinned(TrackRef ref, bool pinned) {
+    const Sequence* s = state_->sequence();
+    const Track* t = s ? trackAt(*s, ref) : nullptr;
+    if (!t || t->pinned == pinned) return;
+    state_->edit(pinned ? tr("Pin Track") : tr("Unpin Track"), [ref, pinned](Project&, Sequence& sq) {
+        trackAt(sq, ref)->pinned = pinned;
+        return true;
+    });
+}
+
 std::vector<TimelineWidget::TakeLaneRow> TimelineWidget::takeLaneRows() const {
     std::vector<TakeLaneRow> out;
     const Sequence* s = state_->sequence();
@@ -239,7 +285,7 @@ std::vector<TimelineWidget::TakeLaneRow> TimelineWidget::takeLaneRows() const {
         if (r.ref.kind != TrackKind::Audio || !trackAt(*s, r.ref)->lanesShown) continue;
         int y = r.y + r.h;
         for (LaneView& v : laneViews(state_->project(), *s, r.ref)) {
-            out.push_back({r.ref, std::move(v), y});
+            out.push_back({r.ref, std::move(v), y, r.pinned});
             y += kTakeLaneH;
         }
     }
@@ -255,19 +301,20 @@ QRect TimelineWidget::takeLaneBounds(TrackRef track, Id lane, FrameTime from, Fr
 
 std::optional<TimelineWidget::TakeLaneRow> TimelineWidget::takeLaneAt(const QPoint& pos) const {
     if (pos.y() < kRulerH) return std::nullopt;
+    const bool inBand = pos.y() < pinnedBandBottom();
     for (TakeLaneRow& l : takeLaneRows())
-        if (pos.y() >= l.y && pos.y() < l.y + kTakeLaneH) return std::move(l);
+        if (l.pinned == inBand && pos.y() >= l.y && pos.y() < l.y + kTakeLaneH) return std::move(l);
     return std::nullopt;
 }
 
 // The lanes under audio tracks: each take where it plays, the parts the comp uses bright, a sweep being made outlined;
 // in the header column, each lane's name and rating.
-void TimelineWidget::paintTakeLanes(QPainter& p, bool header) {
+void TimelineWidget::paintTakeLanes(QPainter& p, bool header, bool band) {
     const Sequence* s = state_->sequence();
     if (!s) return;
     const int W = viewport()->width();
     for (const TakeLaneRow& l : takeLaneRows()) {
-        if (l.y + kTakeLaneH < kRulerH || l.y > viewport()->height()) continue;
+        if (l.pinned != band || l.y + kTakeLaneH < kRulerH || l.y > viewport()->height()) continue;
         const Track* t = trackAt(*s, l.ref);
         if (header) {
             const QRect hr(0, l.y, kHeaderW, kTakeLaneH);
@@ -404,6 +451,7 @@ std::vector<TimelineWidget::FolderRow> TimelineWidget::folderRows() const {
 }
 
 std::optional<TimelineWidget::FolderRow> TimelineWidget::folderRowAt(int y) const {
+    if (y < pinnedBandBottom()) return std::nullopt;  // (under the pinned band)
     for (const FolderRow& f : folderRows())
         if (y >= f.y && y < f.y + f.h) return f;
     return std::nullopt;
@@ -413,7 +461,7 @@ int TimelineWidget::contentHeight() const {
     if (!state_->sequence()) return 0;
     int bottom = 0;
     layoutRows(nullptr, nullptr, nullptr, &bottom);
-    return bottom - (kRulerH - verticalScrollBar()->value()) + 40;
+    return bottom - scrollTop() + 40;
 }
 
 int TimelineWidget::dividerY() const {
@@ -472,8 +520,11 @@ bool TimelineWidget::trackShown(TrackRef ref) const {
 }
 
 std::optional<TimelineWidget::Row> TimelineWidget::rowAt(int y) const {
+    if (y < kRulerH) return std::nullopt;
+    // In the pinned band only its rows; below it the rows scrolled there (not those scrolled under the band).
+    const bool inBand = y < pinnedBandBottom();
     for (const Row& r : rows())
-        if (y >= r.y && y < r.y + r.h) return r;
+        if (r.pinned == inBand && y >= r.y && y < r.y + r.h) return r;
     return std::nullopt;
 }
 
@@ -524,7 +575,7 @@ void TimelineWidget::updateScrollBars() {
     int content = int((double(dur) + fps * 30) * ppf_);
     horizontalScrollBar()->setPageStep(std::max(1, vw));
     horizontalScrollBar()->setRange(0, std::max(0, content - vw / 2));
-    int vh = viewport()->height() - kRulerH;
+    int vh = viewport()->height() - pinnedBandBottom();
     verticalScrollBar()->setPageStep(std::max(1, vh));
     verticalScrollBar()->setRange(0, std::max(0, contentHeight() - vh));
 }
@@ -599,9 +650,9 @@ TimelineWidget::Hit TimelineWidget::hitTest(const QPoint& pos) const {
         h.kind = pos.x() >= kHeaderW ? HitKind::Ruler : HitKind::None;
         return h;
     }
-    // Caption lanes, above the video tracks.
-    const int lanesTop = kRulerH - verticalScrollBar()->value();
-    if (pos.y() >= lanesTop && pos.y() < lanesTop + captionLanesHeight()) {
+    // Caption lanes, above the video tracks (and below the pinned band).
+    const int lanesTop = scrollTop();
+    if (pos.y() >= pinnedBandBottom() && pos.y() >= lanesTop && pos.y() < lanesTop + captionLanesHeight()) {
         const CaptionTrack& ct = s->captionTracks[size_t((pos.y() - lanesTop) / kCaptionH)];
         h.captionTrack = ct.id;
         if (pos.x() < kHeaderW) return h;
@@ -752,117 +803,141 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     if (!s) return;
     auto rs = rows();
     const int W = viewport()->width();
-
-    p.save();
-    p.setClipRect(QRect(kHeaderW, kRulerH, W - kHeaderW, viewport()->height() - kRulerH));
-    // In/Out range shading.
-    if (s->inPoint >= 0 || s->outPoint >= 0) {
-        int a = xForFrame(std::max<FrameTime>(0, s->inPoint));
-        int b = s->outPoint >= 0 ? xForFrame(s->outPoint + 1) : W;
-        p.fillRect(QRect(a, kRulerH, b - a, viewport()->height()), QColor(61, 139, 255, 18));
-    }
-    for (const Row& r : rs) {
-        if (r.y + r.h < kRulerH || r.y > viewport()->height()) continue;
-        const Track* t = trackAt(*s, r.ref);
-        QColor bg = (r.ref.index % 2) ? theme::kPanel : theme::kPanel.darker(108);
-        if (t->locked) bg = bg.darker(125);
-        p.fillRect(QRect(kHeaderW, r.y, W - kHeaderW, r.h), bg);
-        p.setPen(QColor(0, 0, 0, 90));
-        p.drawLine(kHeaderW, r.y + r.h - 1, W, r.y + r.h - 1);
-        for (const Clip& c : t->clips) {
-            int xs = xForFrame(c.start), xe = xForFrame(c.end());
-            if (xe < kHeaderW || xs > W) continue;
-            QRect cr(xs, r.y + 1, std::max(2, xe - xs), r.h - 3);
-            paintClip(p, r, c, cr);
+    // The rows that scroll, then the pinned band over them (each clipped to its part of the viewport).
+    const int bandBottom = pinnedBandBottom();
+    for (const bool band : {false, true}) {
+        if (band && bandBottom == kRulerH) break;  // nothing pinned
+        p.save();
+        if (band) {
+            p.setClipRect(QRect(kHeaderW, kRulerH, W - kHeaderW, bandBottom - kRulerH));
+            p.fillRect(QRect(kHeaderW, kRulerH, W - kHeaderW, bandBottom - kRulerH), theme::kWindow);
+        } else {
+            p.setClipRect(QRect(kHeaderW, bandBottom, W - kHeaderW, viewport()->height() - bandBottom));
         }
-        if (showTrackAuto_ && r.ref.kind == TrackKind::Audio) paintTrackLane(p, r, *t);
-        for (const auto& tr : t->transitions) {
-            FrameTime a, b;
-            if (!edit::transitionRange(*t, tr, a, b)) continue;
-            QRect tr2(xForFrame(a), r.y + r.h / 2, std::max(4, xForFrame(b) - xForFrame(a)), r.h / 2 - 2);
-            bool sel = state_->selectedTransition() == tr.id;
-            p.setPen(QPen(sel ? theme::kAccent : QColor(255, 255, 255, 160), sel ? 2 : 1));
-            p.setBrush(QColor(20, 20, 24, 170));
-            p.drawRoundedRect(tr2, 3, 3);
-            p.setPen(QColor(255, 255, 255, 120));
-            if (tr.clipA && tr.clipB) {
-                p.drawLine(tr2.bottomLeft(), tr2.topRight());
-                p.drawLine(tr2.topLeft(), tr2.bottomRight());
-            } else if (tr.clipB) {
-                p.drawLine(tr2.bottomLeft(), tr2.topRight());
-            } else {
-                p.drawLine(tr2.topLeft(), tr2.bottomRight());
+        // In/Out range shading.
+        if (s->inPoint >= 0 || s->outPoint >= 0) {
+            int a = xForFrame(std::max<FrameTime>(0, s->inPoint));
+            int b = s->outPoint >= 0 ? xForFrame(s->outPoint + 1) : W;
+            p.fillRect(QRect(a, kRulerH, b - a, viewport()->height()), QColor(61, 139, 255, 18));
+        }
+        for (const Row& r : rs) {
+            if (r.pinned != band || r.y + r.h < kRulerH || r.y > viewport()->height()) continue;
+            const Track* t = trackAt(*s, r.ref);
+            QColor bg = (r.ref.index % 2) ? theme::kPanel : theme::kPanel.darker(108);
+            if (t->locked) bg = bg.darker(125);
+            p.fillRect(QRect(kHeaderW, r.y, W - kHeaderW, r.h), bg);
+            p.setPen(QColor(0, 0, 0, 90));
+            p.drawLine(kHeaderW, r.y + r.h - 1, W, r.y + r.h - 1);
+            for (const Clip& c : t->clips) {
+                int xs = xForFrame(c.start), xe = xForFrame(c.end());
+                if (xe < kHeaderW || xs > W) continue;
+                QRect cr(xs, r.y + 1, std::max(2, xe - xs), r.h - 3);
+                paintClip(p, r, c, cr);
             }
-            if (tr2.width() > 60) {
-                const EffectInfo* info = findEffectInfo(tr.type);
-                p.setPen(theme::kText);
-                QFont f = p.font();
-                f.setPointSize(7);
-                p.setFont(f);
-                p.drawText(tr2.adjusted(3, 0, -3, 0), Qt::AlignCenter,
-                           p.fontMetrics().elidedText(info ? language::engine(info->displayName) : QString(),
-                                                      Qt::ElideRight, tr2.width() - 6));
+            if (showTrackAuto_ && r.ref.kind == TrackKind::Audio) paintTrackLane(p, r, *t);
+            for (const auto& tr : t->transitions) {
+                FrameTime a, b;
+                if (!edit::transitionRange(*t, tr, a, b)) continue;
+                QRect tr2(xForFrame(a), r.y + r.h / 2, std::max(4, xForFrame(b) - xForFrame(a)), r.h / 2 - 2);
+                bool sel = state_->selectedTransition() == tr.id;
+                p.setPen(QPen(sel ? theme::kAccent : QColor(255, 255, 255, 160), sel ? 2 : 1));
+                p.setBrush(QColor(20, 20, 24, 170));
+                p.drawRoundedRect(tr2, 3, 3);
+                p.setPen(QColor(255, 255, 255, 120));
+                if (tr.clipA && tr.clipB) {
+                    p.drawLine(tr2.bottomLeft(), tr2.topRight());
+                    p.drawLine(tr2.topLeft(), tr2.bottomRight());
+                } else if (tr.clipB) {
+                    p.drawLine(tr2.bottomLeft(), tr2.topRight());
+                } else {
+                    p.drawLine(tr2.topLeft(), tr2.bottomRight());
+                }
+                if (tr2.width() > 60) {
+                    const EffectInfo* info = findEffectInfo(tr.type);
+                    p.setPen(theme::kText);
+                    QFont f = p.font();
+                    f.setPointSize(7);
+                    p.setFont(f);
+                    p.drawText(tr2.adjusted(3, 0, -3, 0), Qt::AlignCenter,
+                               p.fontMetrics().elidedText(info ? language::engine(info->displayName) : QString(),
+                                                          Qt::ElideRight, tr2.width() - 6));
+                }
             }
         }
+        paintTakeLanes(p, false, band);
+        if (!band)
+            for (const FolderRow& f : folderRows()) paintFolderRow(p, f, false);
+        if (gap_)
+            for (const Row& r : rs)
+                if (r.pinned == band && r.ref == gap_->track) {
+                    const QRect gr(xForFrame(gap_->from), r.y + 2, std::max(2, xForFrame(gap_->to) - xForFrame(gap_->from)), r.h - 5);
+                    p.fillRect(gr, QColor(61, 139, 255, 70));
+                    p.setPen(QPen(theme::kAccent, 1, Qt::DashLine));
+                    p.setBrush(Qt::NoBrush);
+                    p.drawRect(gr.adjusted(0, 0, -1, -1));
+                }
+        // Trim mode: a bracket on each side being trimmed, ']' on the outgoing clip's end, '[' on the incoming clip's start.
+        if (trimSide_ >= 0) {
+            p.setPen(QPen(QColor(255, 70, 70), 3));
+            auto bracket = [&](Id id, bool outgoing) {
+                QRect r;
+                bool pinned = false;
+                if (!id || !clipRect(id, r, nullptr, &pinned) || pinned != band) return;
+                const int x = outgoing ? r.right() - 1 : r.left() + 1, arm = outgoing ? -7 : 7;
+                p.drawLine(x, r.top() + 1, x, r.bottom() - 1);
+                p.drawLine(x, r.top() + 1, x + arm, r.top() + 1);
+                p.drawLine(x, r.bottom() - 1, x + arm, r.bottom() - 1);
+            };
+            if (trimSide_ != 2) bracket(trimOut_, true);
+            if (trimSide_ != 1) bracket(trimIn_, false);
+        }
+        if (!band) {
+            paintCaptionLanes(p);
+            // Divider between video and audio.
+            int dy = dividerY();
+            p.fillRect(QRect(kHeaderW, dy, W - kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
+        } else {
+            // The pinned band's lower edge.
+            p.fillRect(QRect(kHeaderW, bandBottom - kPinGap, W - kHeaderW, kPinGap), QColor(0x14, 0x15, 0x18));
+            p.fillRect(QRect(kHeaderW, bandBottom - 2, W - kHeaderW, 1), theme::kAccent.darker(140));
+        }
+        // Drop ghosts.
+        for (const Ghost& g : ghosts_) {
+            for (const Row& r : rs)
+                if (r.pinned == band && r.ref == g.track) {
+                    QRect gr(xForFrame(g.start), r.y + 2, std::max(4, int(g.duration * ppf_)), r.h - 5);
+                    p.setPen(QPen(theme::kAccent, 1, Qt::DashLine));
+                    p.setBrush(QColor(61, 139, 255, 60));
+                    p.drawRoundedRect(gr, 3, 3);
+                }
+        }
+        // Snap indicator, playhead.
+        if (snapIndicator_ >= 0 && (drag_.started || !ghosts_.empty())) {
+            int x = xForFrame(snapIndicator_);
+            p.setPen(QPen(theme::kSnap, 1));
+            p.drawLine(x, kRulerH, x, viewport()->height());
+        }
+        int px = xForFrame(state_->playhead());
+        p.setPen(QPen(theme::kPlayhead, 1));
+        p.drawLine(px, kRulerH, px, viewport()->height());
+        // Rubber band.
+        if (drag_.kind == DragKind::Rubber && drag_.started) {
+            p.setPen(QPen(theme::kAccent, 1));
+            p.setBrush(QColor(61, 139, 255, 40));
+            p.drawRect(drag_.band.normalized());
+        }
+        p.restore();
     }
-    paintTakeLanes(p, false);
-    for (const FolderRow& f : folderRows()) paintFolderRow(p, f, false);
-    if (gap_)
-        for (const Row& r : rs)
-            if (r.ref == gap_->track) {
-                const QRect gr(xForFrame(gap_->from), r.y + 2, std::max(2, xForFrame(gap_->to) - xForFrame(gap_->from)), r.h - 5);
-                p.fillRect(gr, QColor(61, 139, 255, 70));
-                p.setPen(QPen(theme::kAccent, 1, Qt::DashLine));
-                p.setBrush(Qt::NoBrush);
-                p.drawRect(gr.adjusted(0, 0, -1, -1));
-            }
-    // Trim mode: a bracket on each side being trimmed, ']' on the outgoing clip's end, '[' on the incoming clip's start.
-    if (trimSide_ >= 0) {
-        p.setPen(QPen(QColor(255, 70, 70), 3));
-        auto bracket = [&](Id id, bool outgoing) {
-            QRect r;
-            if (!id || !clipRect(id, r)) return;
-            const int x = outgoing ? r.right() - 1 : r.left() + 1, arm = outgoing ? -7 : 7;
-            p.drawLine(x, r.top() + 1, x, r.bottom() - 1);
-            p.drawLine(x, r.top() + 1, x + arm, r.top() + 1);
-            p.drawLine(x, r.bottom() - 1, x + arm, r.bottom() - 1);
-        };
-        if (trimSide_ != 2) bracket(trimOut_, true);
-        if (trimSide_ != 1) bracket(trimIn_, false);
-    }
-    paintCaptionLanes(p);
-    // Divider between video and audio.
-    int dy = dividerY();
-    p.fillRect(QRect(kHeaderW, dy, W - kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
-    // Drop ghosts.
-    for (const Ghost& g : ghosts_) {
-        for (const Row& r : rs)
-            if (r.ref == g.track) {
-                QRect gr(xForFrame(g.start), r.y + 2, std::max(4, int(g.duration * ppf_)), r.h - 5);
-                p.setPen(QPen(theme::kAccent, 1, Qt::DashLine));
-                p.setBrush(QColor(61, 139, 255, 60));
-                p.drawRoundedRect(gr, 3, 3);
-            }
-    }
-    // Snap indicator, playhead.
-    if (snapIndicator_ >= 0 && (drag_.started || !ghosts_.empty())) {
-        int x = xForFrame(snapIndicator_);
-        p.setPen(QPen(theme::kSnap, 1));
-        p.drawLine(x, kRulerH, x, viewport()->height());
-    }
-    int px = xForFrame(state_->playhead());
-    p.setPen(QPen(theme::kPlayhead, 1));
-    p.drawLine(px, kRulerH, px, viewport()->height());
-    // Rubber band.
-    if (drag_.kind == DragKind::Rubber && drag_.started) {
-        p.setPen(QPen(theme::kAccent, 1));
-        p.setBrush(QColor(61, 139, 255, 40));
-        p.drawRect(drag_.band.normalized());
-    }
-    p.restore();
 
-    paintHeaders(p, rs);
-    paintTakeLanes(p, true);
+    paintHeaders(p, rs, false);
+    paintTakeLanes(p, true, false);
+    if (bandBottom > kRulerH) {
+        paintHeaders(p, rs, true);
+        p.save();
+        p.setClipRect(QRect(0, kRulerH, kHeaderW, bandBottom - kRulerH));
+        paintTakeLanes(p, true, true);
+        p.restore();
+    }
     paintRuler(p);
     // Live readout during drags.
     if (drag_.started && !drag_.label.isEmpty()) {
@@ -881,7 +956,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
 void TimelineWidget::paintCaptionLanes(QPainter& p) {
     const Sequence* s = state_->sequence();
     const int W = viewport()->width();
-    int y = kRulerH - verticalScrollBar()->value();
+    int y = scrollTop();
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
@@ -1352,7 +1427,7 @@ double TimelineWidget::laneValue(const Lane& lane, const QRect& band, int y) {
     return lane.gain ? levelToGain(level) : lane.lo + level * (lane.hi - lane.lo);
 }
 
-bool TimelineWidget::clipRect(Id clip, QRect& r, TrackKind* kind) const {
+bool TimelineWidget::clipRect(Id clip, QRect& r, TrackKind* kind, bool* pinned) const {
     const Sequence* s = state_->sequence();
     if (!s) return false;
     for (const Row& row : rows()) {
@@ -1362,6 +1437,7 @@ bool TimelineWidget::clipRect(Id clip, QRect& r, TrackKind* kind) const {
                 const int xs = xForFrame(c.start), xe = xForFrame(c.end());
                 r = QRect(xs, row.y + 1, std::max(2, xe - xs), row.h - 3);
                 if (kind) *kind = row.ref.kind;
+                if (pinned) *pinned = row.pinned;
                 return true;
             }
     }
@@ -1400,7 +1476,7 @@ bool TimelineWidget::laneOf(Id clip, Lane& lane, QRect& band) const {
 QRect TimelineWidget::captionRect(Id track, int index) const {
     const Sequence* s = state_->sequence();
     if (!s) return {};
-    int y = kRulerH - verticalScrollBar()->value();
+    int y = scrollTop();
     for (const CaptionTrack& ct : s->captionTracks) {
         if (ct.id == track && index >= 0 && size_t(index) < ct.captions.size()) {
             const int xs = xForFrame(ct.captions[size_t(index)].start), xe = xForFrame(ct.captions[size_t(index)].end);
@@ -1848,12 +1924,13 @@ void TimelineWidget::paintRuler(QPainter& p) {
     p.restore();
 }
 
-void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
+void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs, bool band) {
     const Sequence* s = state_->sequence();
-    const int H = viewport()->height();
+    const int H = viewport()->height(), bandBottom = pinnedBandBottom();
     p.save();
-    p.setClipRect(QRect(0, kRulerH, kHeaderW, H - kRulerH));
-    p.fillRect(QRect(0, kRulerH, kHeaderW, H), theme::kPanel);
+    const QRect area = band ? QRect(0, kRulerH, kHeaderW, bandBottom - kRulerH) : QRect(0, bandBottom, kHeaderW, H - bandBottom);
+    p.setClipRect(area);
+    p.fillRect(area, theme::kPanel);
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
@@ -1864,8 +1941,8 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
         p.setPen(on ? Qt::white : theme::kTextDim);
         p.drawText(r, Qt::AlignCenter, text);
     };
-    {
-        int y = kRulerH - verticalScrollBar()->value();
+    if (!band) {
+        int y = scrollTop();
         for (const CaptionTrack& ct : s->captionTracks) {
             QRect hr(0, y, kHeaderW, kCaptionH);
             p.fillRect(hr, theme::kPanelAlt.darker(112));
@@ -1879,10 +1956,12 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
         }
     }
     for (const Row& r : rs) {
+        if (r.pinned != band) continue;
         const Track* t = trackAt(*s, r.ref);
         QRect hr(0, r.y, kHeaderW, r.h);
         p.fillRect(hr, (r.ref.index % 2) ? theme::kPanelAlt : theme::kPanelAlt.darker(106));
         if (!t->folder.empty()) p.fillRect(QRect(0, r.y, 3, r.h), QColor(0xd8, 0xa8, 0x5a));  // in a folder
+        if (t->pinned) p.fillRect(QRect(kHeaderW - 4, r.y, 3, r.h), theme::kAccent);         // pinned
         p.setPen(QColor(0, 0, 0, 120));
         p.drawLine(0, r.y + r.h - 1, kHeaderW, r.y + r.h - 1);
         bool video = r.ref.kind == TrackKind::Video;
@@ -1903,7 +1982,7 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
             p.drawText(info, Qt::AlignLeft | Qt::AlignVCenter, detail);
         }
     }
-    for (const FolderRow& f : folderRows()) {
+    for (const FolderRow& f : band ? std::vector<FolderRow>() : folderRows()) {
         paintFolderRow(p, f, true);
         // Its buttons show the state of all its tracks (on when all are).
         bool muted = !f.tracks.empty(), solo = !f.tracks.empty();
@@ -1920,8 +1999,8 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs) {
             button(headerButtonRect(fake, HeaderButton::Solo), QStringLiteral("S"), solo, QColor(0xd8, 0xc2, 0x3a));
         }
     }
-    int dy = dividerY();
-    p.fillRect(QRect(0, dy, kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
+    if (!band) p.fillRect(QRect(0, dividerY(), kHeaderW, kDividerH), QColor(0x14, 0x15, 0x18));
+    else p.fillRect(QRect(0, bandBottom - kPinGap, kHeaderW, kPinGap), QColor(0x14, 0x15, 0x18));
     p.setPen(theme::kBorder);
     p.drawLine(kHeaderW - 1, kRulerH, kHeaderW - 1, H);
     p.restore();
@@ -2447,8 +2526,11 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             if (e->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier)) sel = state_->selectedClips();
             for (const Row& r : rows()) {
                 if (r.y + r.h < band.top() || r.y > band.bottom()) continue;
+                // (a scrolling row only where it shows below the pinned band)
+                const int top = r.pinned ? r.y : std::max(r.y, pinnedBandBottom());
+                if (top >= r.y + r.h) continue;
                 for (const Clip& c : trackAt(*s, r.ref)->clips) {
-                    QRect cr(xForFrame(c.start), r.y, xForFrame(c.end()) - xForFrame(c.start), r.h);
+                    QRect cr(xForFrame(c.start), top, xForFrame(c.end()) - xForFrame(c.start), r.y + r.h - top);
                     if (cr.intersects(band) && std::find(sel.begin(), sel.end(), c.id) == sel.end()) sel.push_back(c.id);
                 }
             }
@@ -2848,6 +2930,12 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
         menu.addAction(tr("Delete Track"), this, [this, ref] {
             state_->apply(tr("Delete Track"), [ref](Project&, Sequence& s) { return edit::removeTrack(s, ref); });
         });
+        QAction* pin = menu.addAction(tr("Pin to Top"));
+        pin->setObjectName(QStringLiteral("pinTrack"));
+        pin->setCheckable(true);
+        pin->setChecked(trackAt(*state_->sequence(), ref)->pinned);
+        pin->setToolTip(tr("Keeps the track in a band under the ruler that stays put while the other tracks scroll"));
+        connect(pin, &QAction::toggled, this, [this, ref](bool on) { setTrackPinned(ref, on); });
         QAction* sync = menu.addAction(tr("Sync Lock"));
         sync->setCheckable(true);
         sync->setChecked(trackAt(*state_->sequence(), ref)->syncLock);

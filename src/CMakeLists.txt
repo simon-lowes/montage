@@ -233,6 +233,7 @@ add_library(montage_engine STATIC
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
   render/EncodeCompare.h render/EncodeCompare.cpp
+  render/LongGopCopy.h render/LongGopCopy.cpp
   render/SdhDraft.h render/SdhDraft.cpp
   render/LutExport.h render/LutExport.cpp
   render/LutToGrade.h render/LutToGrade.cpp

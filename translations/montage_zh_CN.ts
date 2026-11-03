@@ -6016,6 +6016,126 @@
         <source>Solid From (alpha)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>A Camera of Its Own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A File&apos;s Camera</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ADX10 (film scan, 10-bit printing density)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ADX16 (film scan, 16-bit printing density)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Adobe RGB (1998)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Canon Log 2 / Cinema Gamut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cast Shadows (on other cards and the ground)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Depth of Field</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focus Distance (0: the card&apos;s middle)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Frame Held (sequence frame)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Ground Height (y)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hide the Projected Picture&apos;s Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Light Distance (card widths)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Lit by a Light</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Project On Material (0: all)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Project One Frame Held</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Project Picture From Track (0: none)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Project Through</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Projection Mix</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Projector Lens (field of view °)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Projector&apos;s Solved Footage or Camera Track (0: nearest below, or the highest)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Projector: Take The Camera From (USD, glTF)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Projector: The File&apos;s Camera Number</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Roughness</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scene Units a Metre (0: 1000 for its own or the scene&apos;s camera, else 1)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shadows on a Ground</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sony S-Log3 / S-Gamut3 (VENICE)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sony S-Log3 / S-Gamut3.Cine (VENICE)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Camera Solved by the 3D Camera Tracker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Projected Picture</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -7323,6 +7443,10 @@ Download it now?</source>
     <name>montage::AngleView</name>
     <message>
         <source>Angle %1: %2 (key %1; Shift-click cuts at the playhead)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Angle %1: %2 (key %3 in bank %4, picked with Alt+%4; Shift-click cuts at the playhead)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -10219,6 +10343,22 @@ Download it now?</source>
         <source>preset</source>
         <translation type="unfinished">预设</translation>
     </message>
+    <message>
+        <source>transition</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>generator</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>on-screen controls</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>renders on the GPU</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ExportDialog</name>
@@ -10897,10 +11037,6 @@ The certificate must be issued by a certificate authority (not signed by itself)
         <translation type="unfinished">已经在此 ProRes 或 DNHR 的味道、 大小和速率中未加处理的框, 而不是被重新编码: 更快, 并且完全是原始图片</translation>
     </message>
     <message>
-        <source>Smart rendering works with ProRes and DNxHR</source>
-        <translation type="unfinished">与 ProRes 和 DNxHR 一起智能化的合成工作</translation>
-    </message>
-    <message>
         <source>Chapters can be written into MP4, MOV and MKV files</source>
         <translation type="unfinished">章节可写入 MP4 、 MOV 和 MKV 文件</translation>
     </message>
@@ -11061,6 +11197,14 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>The framing of the footage on screen, from its Framing Decision List (FDL)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Untouched footage already coded as this export is (H.264, HEVC or XDCAM&apos;s MPEG-2 at this size, rate and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -13368,6 +13512,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <source>Writing ST maps...</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Effect&apos;s Mask</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::InterpretFootageDialog</name>
@@ -13634,6 +13782,14 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     <message>
         <source>Highlights:</source>
         <translation type="unfinished">突出显示 :</translation>
+    </message>
+    <message>
+        <source>Apply the lens and sensor corrections recorded in the DNG</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The DNG&apos;s opcode lists: lens shading and vignetting, distortion and chromatic aberration, bad pixels</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -20761,6 +20917,122 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Stream the Program live to reviewers elsewhere, over SRT or to any web browser, with a passphrase; their notes come back as markers</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Sampler</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export &amp;Streaming Package (HLS, DASH)…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI &amp;Learn</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI &amp;Map…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sa&amp;mpler (Sound Effects to Picture)…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add A&amp;d Break Marker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Ad Break Marker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Export Streaming Package</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF for HLS and DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers as SCTE 35 cues.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>H.264</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HEVC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AV1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 × %2, %3 Mb/s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Ladder:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Segments:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>End segments at cuts</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>HLS</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>DASH</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Formats:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>AAC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Opus</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No sound</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>splice_insert</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>time_signal with segmentation descriptors</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Ad-break cues:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose at least one rung and HLS or DASH</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Folder for the streaming package</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Packaging %1 for streaming…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Streaming package written in %1: %2 renditions, %3 segments</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -21860,6 +22132,221 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Both (theirs on a new track)</source>
         <translation type="unfinished">两者都是。</translation>
+    </message>
+</context>
+<context>
+    <name>montage::MidiLearn</name>
+    <message>
+        <source>%1 is not plugged in</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 unplugged: it is used again when it comes back</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 connected</source>
+        <translation type="unfinished">\ %1 已连接</translation>
+    </message>
+    <message>
+        <source>MIDI Learn: move a control on %1, then click a parameter (or the other way round)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>the controller</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI Learn: %1 — now click the parameter it controls</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI Learn: %1 — now move the control for it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI Learn: %1 cannot be mapped</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI Learn: %1 controls %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>volume</source>
+        <translation type="unfinished">数量</translation>
+    </message>
+    <message>
+        <source>pan</source>
+        <translation type="unfinished">平面图</translation>
+    </message>
+    <message>
+        <source>mute</source>
+        <translation type="unfinished">哑巴</translation>
+    </message>
+    <message>
+        <source>solo</source>
+        <translation type="unfinished">独奏</translation>
+    </message>
+    <message>
+        <source>strip %1 %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>master volume</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>previous bank</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>next bank</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> (across)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> (up and down)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI strips: tracks %1 to %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI map: %1 left out (%2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI map not read: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI map not saved: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI Learn</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Any MIDI controller: turn Learn on, move a knob, fader, encoder or button, then click what it should control in the Inspector, the mixer, a colour wheel or a menu. Relative encoders and 14-bit faders are recognised; a fader takes over a parameter once it reaches its value.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI input</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI output</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">无</translation>
+    </message>
+    <message>
+        <source>MIDI input:</source>
+        <translation type="unfinished">MIDI 输入 :</translation>
+    </message>
+    <message>
+        <source>Lights (MIDI output):</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Connected to %1; its map: %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not connected.</source>
+        <translation type="unfinished">没有连接 。</translation>
+    </message>
+    <message>
+        <source>%1 is not connected (it is used when it is plugged in).</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Connect</source>
+        <translation type="unfinished">连接</translation>
+    </message>
+    <message>
+        <source>Disconnect</source>
+        <translation type="unfinished">断开</translation>
+    </message>
+    <message>
+        <source>No MIDI input: plug the controller in and open this again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Learn</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Only while the panel clicked in has focus</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Strips in a bank</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Mixer strips in a bank:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>MIDI map</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Control</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Controls</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Panel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>From</source>
+        <translation type="unfinished">发件人</translation>
+    </message>
+    <message>
+        <source>To</source>
+        <translation type="unfinished">给</translation>
+    </message>
+    <message>
+        <source>Curve</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Invert</source>
+        <translation type="unfinished">反转</translation>
+    </message>
+    <message>
+        <source>Toggle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Takeover</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>relative</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Every panel</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove</source>
+        <translation type="unfinished">删除</translation>
     </message>
 </context>
 <context>
@@ -23136,6 +23623,22 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Multicam</source>
         <translation type="unfinished">多相卡</translation>
     </message>
+    <message>
+        <source>Keys 1–%1: angles %2–%3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Live: click an angle or press 1–%1 to cut to angles %2–%3.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Click an angle or press 1–%1 to switch this shot to angles %2–%3; Shift cuts at the playhead.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Alt+1–%1 picks the nine the keys reach.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::OffloadDialog</name>
@@ -23250,6 +23753,21 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished">
             <numerusform></numerusform>
         </translation>
+    </message>
+</context>
+<context>
+    <name>montage::OfxOverlay</name>
+    <message>
+        <source>%1&apos;s on-screen controls stopped working</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change %1</source>
+        <translation type="unfinished">更改 %1</translation>
+    </message>
+    <message>
+        <source>Adjust %1</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -24109,6 +24627,112 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <translation type="unfinished">
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>A delivered file to compare with the sequence (optional)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Browse…</source>
+        <translation type="unfinished">浏览…</translation>
+    </message>
+    <message>
+        <source>Compare Encode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Video (*.mp4 *.mov *.mxf *.mkv *.m4v *.ts *.y4m *.webm);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Set the encode against the sequence&apos;s own render, aligned and compared frame by frame: PSNR, SSIM, MS-SSIM and the colour difference ΔICtCp (ITU-R BT.2124)%1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, and VMAF</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Encode:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>off</source>
+        <translation type="unfinished">关闭</translation>
+    </message>
+    <message>
+        <source>No limits</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Mezzanine: PSNR 45 dB, ΔICtCp 1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Broadcast: PSNR 38 dB, ΔICtCp 2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Streaming: PSNR 33 dB, ΔICtCp 3, VMAF 80</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>PSNR ≥ </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> dB</source>
+        <translation type="unfinished"> dB 数据</translation>
+    </message>
+    <message>
+        <source>ΔICtCp ≤ </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF ≥ </source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VMAF</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This copy of Montage was built without libvmaf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Limits:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save Quality Report…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Save Quality Report</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Quality report (*.pdf)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Encode (%1): PSNR %2 dB, worst %3 dB; SSIM %4; MS-SSIM %5; ΔICtCp %6</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>; VMAF %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>(the encode is %n frame(s) off the sequence)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Wrote %1.pdf and .csv</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -25403,6 +26027,165 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     <message>
         <source>Markers to is host:port</source>
         <translation type="unfinished">标记为主机: port</translation>
+    </message>
+</context>
+<context>
+    <name>montage::SamplerPanel</name>
+    <message>
+        <source>Track:</source>
+        <translation type="unfinished">音轨 :</translation>
+    </message>
+    <message>
+        <source>MIDI:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>None</source>
+        <translation type="unfinished">无</translation>
+    </message>
+    <message>
+        <source>Computer keys</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Z to M play C3 to B3 (S, D, G, H, J the sharps); Q to P play C4 to E5</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Velocity:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Key</source>
+        <translation type="unfinished">键</translation>
+    </message>
+    <message>
+        <source>Name</source>
+        <translation type="unfinished">名称</translation>
+    </message>
+    <message>
+        <source>Sounds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gain (dB)</source>
+        <translation type="unfinished">收益(dB)</translation>
+    </message>
+    <message>
+        <source>Attack (s)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Release (s)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>One-shot</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choke</source>
+        <translation type="unfinished">刹车</translation>
+    </message>
+    <message>
+        <source>Pitch ±</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Level ±</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Sounds…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Split by Onsets…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cut a recording of hits onto successive keys from the one selected</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove</source>
+        <translation type="unfinished">删除</translation>
+    </message>
+    <message>
+        <source>Record</source>
+        <translation type="unfinished">记录</translation>
+    </message>
+    <message>
+        <source>Voice Again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Render the pass&apos;s notes again through the slots as they are now</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Sounds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sounds (*.wav *.aif *.aiff *.flac *.mp3 *.ogg *.m4a *.caf);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Split by Onsets</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove Sampler Slot</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not found: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 (%2 notes)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sampler Slot</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add Sampler Sounds</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cannot read %1: %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n hit(s) on keys from %1</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Record Sampler Pass</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n note(s) recorded to %1</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Voice Pass Again</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No MIDI input %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cannot open %1: %2</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -26822,10 +27605,6 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <source>No multicam clip at the playhead</source>
-        <translation type="unfinished">玩家没有多摄像头剪辑</translation>
-    </message>
-    <message>
         <source>Live overwrite: angles cut at the playhead</source>
         <translation type="unfinished">现场覆盖: 角切到播放头</translation>
     </message>
@@ -26892,6 +27671,14 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     <message>
         <source>Dissolve</source>
         <translation type="unfinished">解析</translation>
+    </message>
+    <message>
+        <source>No bank %1 of angles here</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No angle on that key at the playhead</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -27580,6 +28367,22 @@ Right-click: width, LFE, height and audio object.</source>
     </message>
     <message>
         <source>%1 % | %2 %</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pin Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Unpin Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Pin to Top</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keeps the track in a band under the ruler that stays put while the other tracks scroll</source>
         <translation type="unfinished"></translation>
     </message>
 </context>

@@ -660,6 +660,7 @@ void MidiLearn::loadMap() {
     if (file.isEmpty()) {
         mapper_.clear();
         bankSize_ = 8;
+        mappingsFrom_.clear();
         emit mapChanged();
         return;
     }
@@ -679,8 +680,12 @@ void MidiLearn::loadMap() {
                 state_->message(tr("MIDI map: %1 left out (%2)").arg(skipped.size()).arg(skipped.join(QStringLiteral("; "))), 8000);
             }
         } else {
-            // Not readable (half written, or edited wrongly): what was in use is kept, and the file kept aside
-            // before it is written over.
+            // Not readable (half written, or edited wrongly): what was in use is kept when it came from this file
+            // (another device's mappings are not), and the file kept aside before it is written over.
+            if (mappingsFrom_ != file) {
+                mapper_.clear();
+                bankSize_ = 8;
+            }
             loadFailed_ = true;
             state_->message(tr("MIDI map not read: %1").arg(why), 6000);
         }
@@ -688,6 +693,7 @@ void MidiLearn::loadMap() {
         if (f.open(QIODevice::ReadOnly)) saved_ = f.readAll();
         watcher_->addPath(file);
     }
+    mappingsFrom_ = file;
     QDir().mkpath(folder_);
     watcher_->addPath(folder_);  // (a map written for the first time, e.g. by the MCP tool)
     emit mapChanged();

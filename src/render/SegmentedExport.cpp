@@ -205,6 +205,9 @@ ExportSettings segmentExportSettings(const ExportSettings& s, const ExportSegmen
     x.extraCaptions.clear();
     x.chapters = false;
     x.startTimecode.clear();
+    // (A segment's GOPs copied from the footage bring the footage's parameter sets, which the one decoder configuration
+    // the join keeps would not hold for the others.)
+    if (exportSegmentsLongGop(s)) x.smartRender = false;
     if (exportIsImageSequence(s)) x.startNumber = s.startNumber + int(segment.in - rangeIn(s));
     else x.path = path;
     return x;

@@ -912,11 +912,15 @@ void ExportDialog::updateControls() {
         credentialIdentity_->setEnabled(can);
         aiTraining_->setEnabled(can && credentials_->isChecked());
     }
-    const bool intra = p && (p->settings.videoCodec == "prores_ks" || p->settings.videoCodec == "dnxhd");
-    smart_->setEnabled(intra);
+    const QString vc = p ? QString::fromStdString(p->settings.videoCodec) : QString();
+    const bool intra = vc == "prores_ks" || vc == "dnxhd";
+    const bool longGop = vc == "libx264" || vc == "libx265" || vc == "mpeg2video";
+    smart_->setEnabled(intra || longGop);
     smart_->setToolTip(intra ? tr("Frames that are one untouched clip already in this ProRes or DNxHR flavour, size and rate are copied from "
                                   "the source instead of being encoded again: faster, and exactly the original pictures")
-                             : tr("Smart rendering works with ProRes and DNxHR"));
+                       : longGop ? tr("Untouched footage already coded as this export is (H.264, HEVC or XDCAM's MPEG-2 at this size, rate "
+                                      "and sampling) is copied a GOP at a time; only the GOPs around edits, effects and titles are encoded again")
+                                 : tr("Smart rendering works with ProRes, DNxHR, H.264, HEVC and XDCAM HD422"));
     chapters_->setToolTip(!chapterFile ? tr("Chapters can be written into MP4, MOV and MKV files")
                           : anyChapters ? tr("Players and YouTube show the chapter markers as chapters")
                                         : tr("Add chapter markers (Sequence > Add Chapter Marker) to export chapters"));

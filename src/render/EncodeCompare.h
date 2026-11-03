@@ -30,10 +30,12 @@ struct QualityPicture {
     int log2ChromaW = 1, log2ChromaH = 1;
     bool rgb = false;             // planes G, B, R (as FFmpeg's planar RGB) instead of Y, Cb, Cr
     bool fullRange = false;
+    bool chromaLeft = true;       // subsampled chroma sited with the left luma sample (as MPEG's default), else centred
     double kr = 0.2126, kb = 0.0722;  // the matrix's weights
     // What the code values mean, for ΔICtCp: "bt1886" (SDR), "pq" or "hlg"; "bt709", "bt2020" or "p3" primaries.
     std::string transfer = "bt1886", primaries = "bt709";
     double frameRate = 0;         // of the file it came from (frames a second), when known
+    double time = std::numeric_limits<double>::quiet_NaN();  // when it is shown (seconds, as its file stamps it), when known
     bool damaged = false;         // the decoder reported an error in it (or in data lost just before it)
     std::vector<uint16_t> plane[3];
     int planeWidth(int i) const { return i == 0 || rgb ? width : (width + (1 << log2ChromaW) - 1) >> log2ChromaW; }
@@ -125,6 +127,9 @@ struct EncodeComparison {
     // damaged in the encode, and what is wrong but did not stop the comparison (frames missing or extra, damage).
     int64_t referenceFrames = -1, encodeFrames = -1;
     int damagedFrames = 0;
+    // Matched by the encode's timestamps: reference frames the encode does not have (dropped), and encode frames
+    // shown again (repeated) or out of step, which were left out.
+    int64_t droppedFrames = 0, repeatedFrames = 0;
     std::vector<std::string> warnings;
 };
 

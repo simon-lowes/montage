@@ -352,10 +352,14 @@ Image buildCleanPlate(const PlateSettings& s, FrameTime t, const Image& img, dou
                     }
                 return nullptr;
             };
+            // The others are taken on a grid of the spacing, around the point of it nearest this frame, so the frames
+            // around one share them, and playing decodes about one new frame each spacing, not one for every other frame.
             const int half = (s.frames - 1) / 2, extra = s.frames - 1 - 2 * half;
+            const FrameTime spacing = s.spacing, nearest = t + spacing / 2;
+            const FrameTime centre = nearest - ((nearest % spacing) + spacing) % spacing;
             for (int k = -half; k <= half + extra; ++k) {
                 if (k == 0) continue;
-                const FrameTime at = t + FrameTime(k) * s.spacing;
+                const FrameTime at = centre + FrameTime(k) * spacing;
                 if (std::shared_ptr<const Image> o = kept(at, false)) {
                     others.push_back(std::move(o));
                     continue;

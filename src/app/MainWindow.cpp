@@ -799,7 +799,9 @@ void MainWindow::buildPanels() {
         };
         hooks.trimBy = [this](FrameTime frames) { return trimSelectedEdit(frames); };
         hooks.trimming = [this] { return trimEdit_.has_value(); };
-        hooks.switchAngle = [this](int angle, bool cut) { return multicam_->currentClip() != 0 && multicam_->switchTo(angle, cut); };
+        hooks.switchAngle = [this](int key, bool cut) { return multicam_->currentClip() != 0 && multicam_->switchKey(key, cut); };
+        hooks.bank = [this] { return multicam_->bank(); };
+        hooks.setBank = [this](int bank) { return multicam_->setBank(bank); };
         hooks.angle = [this] {
             const Sequence* s = state_->sequence();
             const Id id = multicam_->currentClip();
@@ -829,12 +831,18 @@ void MainWindow::buildPanels() {
         const bool on = appSettings().value(QStringLiteral("tangent/enabled"), true).toBool();
         QTimer::singleShot(0, tangent_, [this, on] { tangent_->setEnabled(on); });
     }
-    // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
+    // 1–9 cut to an angle of the bank of nine they reach (live while playing); Shift cuts at the playhead when stopped;
+    // Alt+1–3 picks the bank (angles 1–9, 10–18, 19–25).
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
-        connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchTo(i, false); });
+        connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, false); });
         auto* cut = new QShortcut(QKeySequence(Qt::SHIFT | (Qt::Key_1 + i)), this);
-        connect(cut, &QShortcut::activated, this, [this, i] { multicam_->switchTo(i, true); });
+        connect(cut, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, true); });
+        if (i < 3) {
+            auto* bank = new QShortcut(QKeySequence(Qt::ALT | (Qt::Key_1 + i)), this);
+            bank->setObjectName(QStringLiteral("multicamBank%1").arg(i + 1));
+            connect(bank, &QShortcut::activated, this, [this, i] { multicam_->setBank(i); });
+        }
     }
     // In the Colour workspace the numeric keypad sets printer lights, as on a timer's console: 7, 8, 9 add a point of
     // red, green or blue, 4, 5, 6 take one away, + and - move all three. Elsewhere its keys do what they did: digits cut
@@ -851,7 +859,7 @@ void MainWindow::buildPanels() {
             connect(sc, &QShortcut::activated, this, [this, key, move] {
                 if (workspace_ == QLatin1String("Colour")) printerLight(move.first, move.second);
                 else if (key == Qt::Key_Minus) timeline_->zoomOut();
-                else if (key != Qt::Key_Plus) multicam_->switchTo(key - Qt::Key_1, false);
+                else if (key != Qt::Key_Plus) multicam_->switchKey(key - Qt::Key_1, false);
             });
         }
     }

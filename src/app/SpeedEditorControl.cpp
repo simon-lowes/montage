@@ -233,7 +233,7 @@ bool SpeedEditorControl::attach(std::unique_ptr<HidDevice> device, const HidDevi
     shuttleSent_ = 0;
     wheelModeKnown_ = false;
     endTarget();
-    holding_ = Key::None;
+    holding_ = liveHeld_ = Key::None;
     rollClip_ = 0;
     ledsKnown_ = false;
     setJogMode(jogMode_);
@@ -251,7 +251,7 @@ void SpeedEditorControl::detach() {
     deferred_ = Key::None;
     stopShuttle();
     endTarget();
-    holding_ = Key::None;
+    holding_ = liveHeld_ = Key::None;
     device_.reset();
     ++generation_;
     name_.clear();
@@ -357,6 +357,19 @@ void SpeedEditorControl::keyDown(Key k) {
         const Key waiting = std::exchange(deferred_, Key::None);
         run(binding(waiting), waiting);
     }
+    // LIVE O/WR latches when let go, unless a CAM key pressed while it was down picked a bank.
+    if (binding(k) == QLatin1String("speed:live_overwrite")) {
+        liveHeld_ = k;
+        bankPicked_ = false;
+        return;
+    }
+    if (liveHeld_ != Key::None && binding(k).startsWith(QLatin1String("speed:cam"))) {
+        bankPicked_ = true;
+        const int bank = binding(k).mid(9).toInt() - 1;
+        if (!hooks_.setBank || !hooks_.setBank(bank)) state_->message(tr("No bank %1 of angles here").arg(bank + 1), 3000);
+        refreshLeds();
+        return;
+    }
     const QString second = secondBinding(k);
     if (k == lastKey_ && lastPress_.isValid() && lastPress_.elapsed() < kDoublePressMs && !second.isEmpty()) {
         // Pressed twice: what the brackets say (a primary still waiting is dropped).
@@ -386,6 +399,11 @@ void SpeedEditorControl::keyDown(Key k) {
 }
 
 void SpeedEditorControl::keyUp(Key k) {
+    if (k == liveHeld_) {
+        liveHeld_ = Key::None;
+        if (!bankPicked_) run(binding(k), k);
+        return;
+    }
     if (holding_ != k) return;
     holding_ = Key::None;
     if (target_ == Target::Level || target_ == Target::TransitionDuration) endTarget();
@@ -429,7 +447,7 @@ void SpeedEditorControl::runBuiltIn(const QString& id, Key k) {
     }
     if (name.startsWith(QLatin1String("cam"))) {
         const int angle = name.mid(3).toInt() - 1;
-        if (hooks_.switchAngle && !hooks_.switchAngle(angle, liveOverwrite_)) state_->message(tr("No multicam clip at the playhead"), 3000);
+        if (hooks_.switchAngle && !hooks_.switchAngle(angle, liveOverwrite_)) state_->message(tr("No angle on that key at the playhead"), 3000);
         refreshLeds();
         return;
     }
@@ -734,7 +752,7 @@ void SpeedEditorControl::refreshLeds() {
         const QString what = binding(k);
         bool on = false;
         if (what.startsWith(QLatin1String("speed:cam"))) {
-            on = hooks_.angle && hooks_.angle() == what.mid(9).toInt() - 1;
+            on = hooks_.angle && hooks_.angle() == (hooks_.bank ? hooks_.bank() : 0) * 9 + what.mid(9).toInt() - 1;
         } else if (what == QLatin1String("speed:live_overwrite")) {
             on = liveOverwrite_;
         } else if (what == QLatin1String("speed:cut") || what == QLatin1String("speed:dissolve") || what == QLatin1String("speed:smooth_cut")) {

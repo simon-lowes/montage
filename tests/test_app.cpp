@@ -57,6 +57,7 @@
 #include <QTimer>
 #include <QTextEdit>
 #include <QToolButton>
+#include <QRandomGenerator>
 #include <QUdpSocket>
 #include <QTreeView>
 #include <QTreeWidget>
@@ -717,9 +718,13 @@ private slots:
             QVERIFY(chapters->isEnabled());
             preset->setCurrentIndex(presetIndex("gif"));
             QVERIFY(!chapters->isEnabled());
-            // Smart rendering is offered for ProRes and DNxHR only.
+            // Smart rendering is offered for ProRes, DNxHR and the long-GOP codecs (H.264 here), not for a GIF.
             auto* smart = ed.findChild<QCheckBox*>("exportSmartRender");
             QVERIFY(smart && !smart->isEnabled());
+            preset->setCurrentIndex(presetIndex("mp4"));
+            QVERIFY(smart->isEnabled());
+            preset->setCurrentIndex(presetIndex("gif"));
+            QVERIFY(!smart->isEnabled());
             for (size_t i = 0; i < exportPresets().size(); ++i)
                 if (exportPresets()[i].settings.videoCodec == "prores_ks") {
                     preset->setCurrentIndex(int(i));
@@ -12644,6 +12649,34 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(lines.size(), 2);
         QVERIFY(lines[0].contains("montage_live_context"));
         QVERIFY2(lines[1].contains("\"sequence\""), lines[1].constData());
+        // In the background: "async": true answers at once with a job; montage_job waits for it (the window kept going)
+        // and gives its result; the change is one undo step like any other.
+        {
+            auto send = [&](int id, const QString& name, const QJsonObject& args) {
+                QByteArray answer;
+                link->handle(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                                                       {"params", QJsonObject{{"name", name}, {"arguments", args}}}})
+                                 .toJson(QJsonDocument::Compact),
+                             [&](QByteArray a) { answer = a; }, true);
+                QElapsedTimer t;
+                t.start();
+                while (answer.isEmpty() && t.elapsed() < 30000) QTest::qWait(10);
+                return QJsonDocument::fromJson(answer).object().value("result").toObject().value("structuredContent").toObject();
+            };
+            const int before = int(state()->history().undoCount());
+            const QJsonObject started = send(20, "montage_add_marker", {{"at", 3}, {"name", "in the background"}, {"async", true}});
+            const QString job = started.value("job").toString();
+            QVERIFY2(!job.isEmpty(), QJsonDocument(started).toJson().constData());
+            const QJsonObject done = send(21, "montage_job", {{"job", job}, {"wait", 20}});
+            QCOMPARE(done.value("status").toString(), QString("done"));
+            QVERIFY(done.contains("result"));
+            bool marked = false;
+            for (const Marker& m : state()->sequence()->markers) marked |= m.name == "in the background";
+            QVERIFY(marked);
+            QCOMPARE(int(state()->history().undoCount()), before + 1);
+            const QJsonObject list = send(22, "montage_job", {{"action", "list"}});
+            QVERIFY(!list.value("jobs").toArray().isEmpty());
+        }
         // Off while an agent's tool runs: its result is not applied, and its calls still waiting are dropped.
         auto markerCall = [](int id, const QString& name) {
             return QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
@@ -14527,6 +14560,10 @@ const auto seq = [this] { return state()->sequence(); };
         });
         state()->setPlayhead(30);
         auto* panel = win_->findChild<MulticamPanel*>();
+        // The keys go to the window, not to a text field an earlier test left focused.
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        timeline()->setFocus();
         QVERIFY(panel);
         win_->findChild<QDockWidget*>("multicam")->show();
         win_->findChild<QDockWidget*>("multicam")->raise();
@@ -14568,6 +14605,93 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
         state()->newProject();
+    }
+
+    void multicamTwentyFiveAngles() {
+        // Twenty-five cameras (one short clip copied), grouped by their in points and placed.
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64;
+            gs.height = 36;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "color", 60));
+            ExportSettings st;
+            st.path = (dir_.path() + "/cam0.mp4").toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        QStringList files{dir_.path() + "/cam0.mp4"};
+        for (int i = 1; i < 25; ++i) {
+            files << dir_.path() + QString("/cam%1.mp4").arg(i);
+            QFile::remove(files.back());
+            QVERIFY(QFile::copy(files.front(), files.back()));
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles(files);
+        QCOMPARE(ids.size(), size_t(25));
+        const Id mc = MulticamPanel::createMulticam(state(), ids, MulticamPanel::Sync::InPoints, "Stage", win_.get());
+        QVERIFY(mc);
+        state()->apply("Place", [mc](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, mc, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        state()->setPlayhead(20);
+        auto* panel = win_->findChild<MulticamPanel*>();
+        // The keys go to the window, not to a text field an earlier test left focused.
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        timeline()->setFocus();
+        QVERIFY(panel);
+        win_->findChild<QDockWidget*>("multicam")->show();
+        win_->findChild<QDockWidget*>("multicam")->raise();
+        QTRY_COMPARE(panel->angleCount(), 25);
+        QCOMPARE(panel->bankCount(), 3);
+        QCOMPARE(panel->bank(), 0);
+        // A five by five grid: angle 6 starts the second row.
+        auto* a1 = panel->findChild<QWidget*>("angle1");
+        auto* a5 = panel->findChild<QWidget*>("angle5");
+        auto* a6 = panel->findChild<QWidget*>("angle6");
+        QVERIFY(a1 && a5 && a6);
+        QTRY_VERIFY(a5->x() > a1->x());  // (once laid out)
+        QCOMPARE(a5->y(), a1->y());
+        QCOMPARE(a6->x(), a1->x());
+        QVERIFY(a6->y() > a1->y());
+
+        // Every angle by its key: Alt+1–3 picks the bank of nine, then 1–9 the angle in it.
+        auto angle = [&] { return state()->sequence()->videoTracks[0].clips.at(0).angle; };
+        for (int a = 24; a >= 0; --a) {
+            QTest::keyClick(win_.get(), Qt::Key(Qt::Key_1 + a / 9), Qt::AltModifier);
+            QCOMPARE(panel->bank(), a / 9);
+            QTest::keyClick(win_.get(), Qt::Key(Qt::Key_1 + a % 9));
+            QCOMPARE(angle(), a);
+            QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));  // stopped: a switch, not a cut
+        }
+        // The bank stays picked: Alt+3 then 2 is angle 20, and the keypad's 7 angle 25; a key past the last angle does
+        // nothing, nor does a bank past the last.
+        QTest::keyClick(win_.get(), Qt::Key_3, Qt::AltModifier);
+        QTest::keyClick(win_.get(), Qt::Key_2);
+        QCOMPARE(angle(), 19);
+        QCOMPARE(panel->bank(), 2);
+        QTest::keyClick(win_.get(), Qt::Key_7, Qt::KeypadModifier);
+        QCOMPARE(angle(), 24);
+        QTest::keyClick(win_.get(), Qt::Key_9);
+        QCOMPARE(angle(), 24);
+        QVERIFY(!panel->setBank(3));
+        // Clicking an angle (switchTo) goes back to following: the keys reach that angle's bank.
+        QVERIFY(panel->switchTo(3));
+        QCOMPARE(panel->bank(), 0);
+        // Shift cuts at the playhead; the new shot under it has no bank picked, so the keys follow its angle.
+        QTest::keyClick(win_.get(), Qt::Key_1, Qt::AltModifier);
+        QTest::keyClick(win_.get(), Qt::Key_5, Qt::ShiftModifier);
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(2));
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.at(1).angle, 4);
+        QVERIFY(panel->switchTo(12));
+        QCOMPARE(panel->bank(), 1);
+        QTest::keyClick(win_.get(), Qt::Key_9);
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.at(1).angle, 17);
+        state()->newProject();
+        for (const QString& f : files) QFile::remove(f);
     }
 
     void trimPassesPanel() {
@@ -16581,6 +16705,85 @@ const auto seq = [this] { return state()->sequence(); };
         mute->trigger();
         QVERIFY(!program->globalMute());
         QVERIFY(peak(program->heard(4800, 4800)) > 0.1f);
+    }
+
+    void pinnedTracksOnTheTimeline() {
+        loadDemo();
+        // Twelve audio tracks, each with a clip at the start, so the timeline scrolls.
+        state()->edit("Tracks", [](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 12) edit::addTrack(p, s, TrackKind::Audio);
+            return true;
+        });
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        std::vector<Id> onTrack(12, 0);
+        for (int i = 0; i < 12; ++i)
+            QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+                auto r = edit::placeMedia(p, s, ids[0], 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, i}, false);
+                if (r.ok && !r.created.empty()) onTrack[i] = r.created.back();
+                return r;
+            }));
+        TimelineWidget* tl = win_->timeline();
+        QScrollBar* vs = tl->verticalScrollBar();
+        vs->setValue(0);
+        QCOMPARE(tl->pinnedHeight(), 0);
+        QVERIFY(tl->pinnedBand().isEmpty());
+        const Id pinned = onTrack[11], first = onTrack[0];
+        const QRect unpinned = tl->clipBounds(pinned);
+        // Pinning the last audio track moves it into the band under the ruler: one undo step.
+        tl->setTrackPinned({TrackKind::Audio, 11}, true);
+        QVERIFY(state()->sequence()->audioTracks[11].pinned);
+        state()->undo();
+        QVERIFY(!state()->sequence()->audioTracks[11].pinned);
+        QCOMPARE(tl->clipBounds(pinned), unpinned);
+        state()->redo();
+        QVERIFY(tl->pinnedHeight() > 0);
+        const QRect band = tl->pinnedBand();
+        QVERIFY(band.isValid());
+        const QRect at = tl->clipBounds(pinned);
+        QVERIFY2(band.contains(at.center()), qPrintable(QString("%1,%2 not in band %3..%4").arg(at.center().x()).arg(at.center().y()).arg(band.top()).arg(band.bottom())));
+        QVERIFY(at.top() < unpinned.top());
+        QVERIFY(tl->clipBounds(first).top() > band.bottom());  // the others start under it
+        // The rest scrolls under the band; the pinned row stays put.
+        QVERIFY2(vs->maximum() > 100, qPrintable(QString::number(vs->maximum())));
+        const int firstTop = tl->clipBounds(first).top();
+        vs->setValue(vs->maximum());
+        QCOMPARE(tl->clipBounds(pinned), at);
+        const QRect scrolled = tl->clipBounds(first);
+        QVERIFY(scrolled.isNull() || scrolled.top() == firstTop - vs->maximum());
+        // A clip that has scrolled under the band can't be picked through it: a click there selects the pinned clip.
+        Id under = 0;
+        for (int i = 0; i < 11 && !under; ++i) {
+            const QRect r = tl->clipBounds(onTrack[i]);
+            if (!r.isNull() && r.top() <= at.center().y() && r.bottom() >= at.center().y()) under = onTrack[i];
+        }
+        QVERIFY(under);
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, at.center());
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{pinned});
+        // The band is painted over what scrolls under it: the same pixels before and after scrolling.
+        const QImage scrolledGrab = tl->viewport()->grab().toImage();
+        vs->setValue(0);
+        const QImage topGrab = tl->viewport()->grab().toImage();
+        const QPoint px(at.center().x(), at.top() + 3);
+        QCOMPARE(scrolledGrab.pixelColor(px), topGrab.pixelColor(px));
+        // Zooming changes its width, not where it sits.
+        tl->zoomIn();
+        const QRect zoomed = tl->clipBounds(pinned);
+        QCOMPARE(zoomed.top(), at.top());
+        QCOMPARE(zoomed.height(), at.height());
+        QVERIFY(zoomed.width() > at.width());
+
+        // Saved with the sequence and pinned again when reopened.
+        const QString path = dir_.path() + "/pinned.montage";
+        QVERIFY(saveProject(state()->project(), path.toStdString()));
+        QVERIFY(win_->openProject(path));
+        QVERIFY(state()->sequence()->audioTracks[11].pinned);
+        QVERIFY(!state()->sequence()->audioTracks[0].pinned);
+        QVERIFY(win_->timeline()->pinnedHeight() > 0);
+        QVERIFY(win_->timeline()->pinnedBand().contains(win_->timeline()->clipBounds(pinned).center()));
+        win_->timeline()->setTrackPinned({TrackKind::Audio, 11}, false);
+        QCOMPARE(win_->timeline()->pinnedHeight(), 0);
+        state()->newProject();
     }
 
     void trackFoldersOnTheTimeline() {
@@ -19349,12 +19552,13 @@ print("added " + ui["name"])
         QVERIFY(monitor);
         auto* exposure = monitor->findChild<QComboBox*>("exposureView");
         QVERIFY(exposure);
-        int port = 0;  // (one with the next two free as well: the notes, and a stream that is not there)
+        // A port with the next two free as well (the notes, and a stream that is not there), below the range the system
+        // hands out by itself: Windows hands those out in turn, so the client's own socket could take the next one.
+        int port = 0;
         for (int tries = 0; tries < 50 && !port; ++tries) {
+            const quint16 p = quint16(20000 + QRandomGenerator::global()->bounded(10000));
             QUdpSocket a, b, c;
-            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1) &&
-                c.bind(QHostAddress::LocalHost, a.localPort() + 2))
-                port = a.localPort();
+            if (a.bind(QHostAddress::LocalHost, p) && b.bind(QHostAddress::LocalHost, p + 1) && c.bind(QHostAddress::LocalHost, p + 2)) port = p;
         }
         QVERIFY(port > 0);
         const QString address = QStringLiteral("srt://127.0.0.1:%1").arg(port);

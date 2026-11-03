@@ -2,7 +2,12 @@
 // ones, automation/PythonHost.h) that drive Montage through the same tools as its MCP server and AI agents. In a script `montage.add_title{text =
 // "Hello", at = 2}` calls montage_add_title (any tool by its name without "montage_", or montage.call("montage_...",
 // args)); arguments are tables, results come back as tables (a tool's structured result, else {text = ...}; JSON null in
-// an array as montage.null), and a tool's error stops the script with its message. `montage.tools()` lists them, `montage.args` holds the script's
+// an array as montage.null), and a tool's error stops the script with its message. In the background,
+// `montage.call_async("montage_render", {...}, function(result, err) ... end)` (or a tool's short name) returns a job at
+// once: job:status() ("queued", "running", "done", "failed", "cancelled"), job:progress() (0 to 1, and its step),
+// job:cancel(), job:done(), and job:wait() (its result, the tool's error raised); its callback runs on the script's
+// thread when the job is seen to finish (polled, waited for, or at the end of the script, which waits for its jobs).
+// montage.sleep(seconds) waits with the host kept alive, montage.now() is seconds on a steady clock. `montage.tools()` lists them, `montage.args` holds the script's
 // arguments, and print() writes to the script's output. The host decides what a call works on: montage-cli runs
 // scripts on project files, the app on the project open in it (each change one undo step). A script can have its own
 // panel (montage.panel, automation/ScriptPanel.h): described when it first runs, and run again with what the panel

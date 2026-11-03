@@ -2098,6 +2098,28 @@ private slots:
         for (const char* id : {"clog2-cinemagamut", "slog3-sgamut3venice", "slog3-sgamut3cinevenice", "adx10", "adx16", "adobergb"})
             QVERIFY2(findColorSpace(id), id);
         for (const ColorSpace* w : workingColorSpaces()) QVERIFY(w->id != "adx10" && w->id != "adx16");
+        // Delivered as Adobe RGB: a PNG with its ICC profile (no code point names it), read back as Adobe RGB.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.2f, 0.6f, 0.3f, 0, 5));
+            QTemporaryDir dir;
+            ExportSettings st;
+            st.path = dir.path().toStdString() + "/adobe.png";
+            st.videoCodec = "png";
+            st.audioCodec = "none";
+            st.colorSpace = "adobergb";
+            st.in = 0, st.out = 1;
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            const QStringList written = QDir(dir.path()).entryList({"adobe*.png"});
+            QCOMPARE(written.size(), 1);
+            const QImage still(dir.path() + "/" + written.first());
+            QCOMPARE(still.colorSpace().primaries(), QColorSpace::Primaries::AdobeRgb);
+            MediaItem m;
+            QVERIFY2(probeMedia((dir.path() + "/" + written.first()).toStdString(), m, &err), err.c_str());
+            QCOMPARE(m.colorSpace, std::string("adobergb"));
+        }
     }
 
     void ocioTransformEffect() {
@@ -10782,6 +10804,23 @@ colorspaces:
             for (size_t i = 0; i < plate3.px.size(); ++i) worst3 = std::max(worst3, double(std::fabs(plate3.px[i] - truePlate.px[i])));
             QVERIFY2(worst3 < 1e-5, qPrintable(QString::number(worst3)));
         }
+        // The other frames are on a grid of the spacing, so the frames near one share them (and playing decodes few).
+        {
+            std::vector<double> asked;
+            ofx::FetchScope fetch([&](double t, Image& out) {
+                asked.push_back(t);
+                out = shot(120 + int(std::lround(t)) * 6);
+                return true;
+            });
+            ps.frames = 5;
+            for (FrameTime t : {3, -4, 25}) {
+                asked.clear();
+                makeCleanPlate(ps, t, img, 1.0, nullptr);
+                std::sort(asked.begin(), asked.end());
+                const double c = t == 25 ? 30 : 0;
+                QVERIFY2(asked == std::vector<double>({c - 20, c - 10, c + 10, c + 20}), qPrintable(QString::number(t)));
+            }
+        }
         // Edge Extend: in the soft edge the screen mixed in is replaced by the subject's colour; the alpha is kept.
         Image keyed;
         {
@@ -13891,8 +13930,9 @@ colorspaces:
         held.clear();
 #ifdef Q_OS_LINUX
         // Sixteen hosts holding every place cannot keep a seventeenth out: it takes the place of the connection quiet
-        // longest (Linux answers on all of 127/8).
-        QTest::qWait(200);
+        // longest (Linux answers on all of 127/8). (The node first lets go of the connections above, or under load one
+        // of those, closed but not yet seen to be, would be the one given up.)
+        QTRY_COMPARE_WITH_TIMEOUT(node.clientCount(), 0, 10000);
         auto from = [&](int host) {
             auto c = std::make_unique<QTcpSocket>();
             c->bind(QHostAddress(QStringLiteral("127.0.0.%1").arg(host)));
@@ -13905,7 +13945,7 @@ colorspaces:
                 // (the event loop running meanwhile, so the node takes each connection as it comes)
                 QTRY_VERIFY_WITH_TIMEOUT(held.back()->state() == QAbstractSocket::ConnectedState, 5000);
             }
-        QTest::qWait(200);
+        QTRY_COMPARE_WITH_TIMEOUT(node.clientCount(), 64, 5000);
         for (const auto& c : held) QCOMPARE(c->state(), QAbstractSocket::ConnectedState);
         auto newcomer = from(18);
         QTRY_VERIFY_WITH_TIMEOUT(newcomer->state() == QAbstractSocket::ConnectedState, 5000);
@@ -15143,10 +15183,13 @@ colorspaces:
         // Live over loopback (a port of this test run's own).
         std::string why;
         if (!gradingAvailable(&why)) QSKIP(why.c_str());
-        int port = 0;  // (one with the next free as well, for the notes)
+        // A port with the next free as well, for the notes, below the range the system hands out by itself (Windows
+        // hands those out in turn, so the client's own socket could take the next one).
+        int port = 0;
         for (int tries = 0; tries < 50 && !port; ++tries) {
+            const quint16 p = quint16(20000 + QRandomGenerator::global()->bounded(10000));
             QUdpSocket a, b;
-            if (a.bind(QHostAddress::LocalHost, 0) && b.bind(QHostAddress::LocalHost, a.localPort() + 1)) port = a.localPort();
+            if (a.bind(QHostAddress::LocalHost, p) && b.bind(QHostAddress::LocalHost, p + 1)) port = p;
         }
         QVERIFY(port > 0);
         GradeSettings hs;
@@ -17814,6 +17857,21 @@ colorspaces:
         avformat_close_input(&fmt);
         QVERIFY(!QFileInfo::exists(pkg.filePath("work")));
 
+        // A folder of the user's that only looks like a rendition's is left alone; a cancelled export leaves the
+        // package as it was.
+        QVERIFY(pkg.mkpath("s2_final"));
+        {
+            QFile notes(pkg.filePath("s2_final/notes.txt"));
+            QVERIFY(notes.open(QIODevice::WriteOnly));
+            notes.write("mine");
+        }
+        {
+            std::atomic<bool> stop{true};
+            QVERIFY(!exportStreamingPackage(p, s, st, nullptr, &stop, &err, nullptr));
+            QVERIFY(pkg.exists("master.m3u8") && pkg.exists(videos[0] + "/playlist.m3u8"));
+            QVERIFY(!pkg.exists(".montage-package-new"));
+        }
+
         // time_signal cues instead: segmentation descriptors for a provider placement opportunity's start and end.
         st.cueCommand = "time_signal";
         st.rungs.resize(1);
@@ -17832,6 +17890,7 @@ colorspaces:
         QVERIFY(!pkg.exists("manifest.mpd"));
         QCOMPARE(pkg.entryList({"v*", "a*"}, QDir::Dirs), QStringList{videos[0]});
         QVERIFY(pkg.exists("s1_en/seg00001.vtt"));
+        QVERIFY(pkg.exists("s2_final/notes.txt"));
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

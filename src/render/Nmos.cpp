@@ -184,6 +184,7 @@ bool Node::start(const NodeOptions& o, QString* error) {
     auto clients = std::make_shared<std::map<QTcpSocket*, Client>>();
     auto clock = std::make_shared<QElapsedTimer>();
     clock->start();
+    clientCount_ = [clients] { return int(clients->size()); };
     connect(server_, &QTcpServer::newConnection, this, [this, clients, clock] {
         while (QTcpSocket* s = server_->nextPendingConnection()) {
             const QHostAddress address = s->peerAddress();

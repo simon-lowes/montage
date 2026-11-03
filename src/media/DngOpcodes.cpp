@@ -1,4 +1,5 @@
 #include "DngOpcodes.h"
+#include "Image.h"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +11,9 @@
 namespace montage {
 
 namespace {
+
+// Whole-frame passes one opcode list may cost (see the appliers).
+constexpr double kFramePassBudget = 16;
 
 // Big-endian reads from an opcode's parameters (opcode lists are always big-endian).
 struct Reader {
@@ -110,6 +114,8 @@ inline double cubicWeight(double t) {
     return 0;
 }
 float sampleCubic(const float* src, int width, int height, int planes, int plane, double x, double y) {
+    // (a far-off position, as a crafted warp gives, reads the edge: kept where the conversion to int is defined)
+    x = std::clamp(x, -4.0, double(width) + 4), y = std::clamp(y, -4.0, double(height) + 4);
     const int ix = int(std::floor(x)), iy = int(std::floor(y));
     const double fx = x - ix, fy = y - iy;
     double sum = 0;
@@ -127,14 +133,16 @@ float sampleCubic(const float* src, int width, int height, int planes, int plane
 
 void applyWarp(const WarpParams& w, float* pixels, int width, int height, int planes) {
     const std::vector<float> src(pixels, pixels + size_t(width) * size_t(height) * size_t(planes));
-    for (int y = 0; y < height; ++y)
-        for (int x = 0; x < width; ++x)
-            for (int p = 0; p < planes; ++p) {
-                double sx, sy;
-                if (!warpSource(w, p, x, y, width, height, sx, sy)) continue;
-                pixels[(size_t(y) * size_t(width) + size_t(x)) * size_t(planes) + size_t(p)] =
-                    std::clamp(sampleCubic(src.data(), width, height, planes, p, sx, sy), 0.0f, 1.0f);
-            }
+    parallelRows(height, [&](int y0, int y1) {  // (rows on every core: a camera's lens warp on each CinemaDNG frame)
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < width; ++x)
+                for (int p = 0; p < planes; ++p) {
+                    double sx, sy;
+                    if (!warpSource(w, p, x, y, width, height, sx, sy)) continue;
+                    pixels[(size_t(y) * size_t(width) + size_t(x)) * size_t(planes) + size_t(p)] =
+                        std::clamp(sampleCubic(src.data(), width, height, planes, p, sx, sy), 0.0f, 1.0f);
+                }
+    });
 }
 
 // ---- Vignette ---------------------------------------------------------------------------------------------------
@@ -228,6 +236,13 @@ void patchBadPixels(uint16_t* raw, int width, int height, int stride, uint32_t p
             if (n > 0) fixes.push_back({size_t(y) * size_t(stride) + size_t(x), uint16_t(std::lround(sum / n))});
         }
     for (const auto& [i, v] : fixes) raw[i] = v;
+}
+
+// How many whole-frame passes a gain map's area at its pitch comes to (at least a little: each opcode costs).
+double gainMapPasses(const GainMap& g, int width, int height) {
+    const double rows = (std::min<double>(g.bottom, height) - std::min<double>(g.top, height)) / std::max(1u, g.rowPitch);
+    const double cols = (std::min<double>(g.right, width) - std::min<double>(g.left, width)) / std::max(1u, g.colPitch);
+    return std::max(0.05, std::max(0.0, rows) * std::max(0.0, cols) * std::max(1u, g.planes) / std::max(1.0, double(width) * height));
 }
 
 }  // namespace
@@ -348,11 +363,16 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
         v = uint16_t(std::clamp(std::lround(b + std::clamp(l, 0.0, 1.0) * span), 0L, 65535L));
     };
     int applied = 0;
+    // The work a list may ask for, in whole-frame passes: a camera's needs a few; a crafted one of hundreds of
+    // full-frame opcodes would stall every frame of a sequence, so those past the budget are left out.
+    double budget = kFramePassBudget;
     for (const DngOpcode& op : list) {
+        if (budget <= 0) break;
         switch (op.id) {
             case kGainMap: {
                 GainMap g;
                 if (!readGainMap(op, g) || g.plane != 0) break;  // (a mosaic has one plane)
+                budget -= gainMapPasses(g, width, height);
                 const int y0 = int(std::min<uint32_t>(g.top, uint32_t(height))), y1 = int(std::min<uint32_t>(g.bottom, uint32_t(height)));
                 const int x0 = int(std::min<uint32_t>(g.left, uint32_t(width))), x1 = int(std::min<uint32_t>(g.right, uint32_t(width)));
                 for (int y = y0; y < y1; y += int(g.rowPitch))
@@ -365,10 +385,11 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
             case kFixVignetteRadial: {
                 Vignette vg;
                 if (!readVignette(op, vg)) break;
-                for (int y = 0; y < height; ++y)
-                    for (int x = 0; x < width; ++x) {
-                        scaled(raw[size_t(y) * size_t(stride) + size_t(x)], y, x, vignetteGain(vg, x, y, width, height));
-                    }
+                budget -= 1;
+                parallelRows(height, [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = 0; x < width; ++x) scaled(raw[size_t(y) * size_t(stride) + size_t(x)], y, x, vignetteGain(vg, x, y, width, height));
+                });
                 ++applied;
                 break;
             }
@@ -376,6 +397,7 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                 Reader r{op.params.data(), op.params.size()};
                 const uint32_t constant = r.u32(), phase = r.u32();
                 if (!r.ok) break;
+                budget -= 2;
                 std::vector<uint8_t> bad(size_t(width) * size_t(height));
                 for (int y = 0; y < height; ++y)
                     for (int x = 0; x < width; ++x) bad[size_t(y) * size_t(width) + size_t(x)] = raw[size_t(y) * size_t(stride) + size_t(x)] == constant;
@@ -387,6 +409,7 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                 Reader r{op.params.data(), op.params.size()};
                 const uint32_t phase = r.u32(), points = r.u32(), rects = r.u32();
                 if (!r.ok || uint64_t(points) * 8 + uint64_t(rects) * 16 > op.params.size() || rects > 4096) break;
+                budget -= 2;
                 std::vector<uint8_t> bad(size_t(width) * size_t(height));
                 for (uint32_t i = 0; i < points; ++i) {
                     const uint32_t row = r.u32(), col = r.u32();
@@ -418,7 +441,9 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
     auto scaled = [](uint32_t v, double s, int limit) { return int(std::min<double>(std::ceil(v * s - 1e-9), limit)); };
     int applied = 0, warps = 0;
     bool skipWarp = false;
+    double budget = kFramePassBudget;  // (as for the mosaic's lists)
     for (const DngOpcode& op : list) {
+        if (budget <= 0) break;
         const bool skip = skipWarp;
         skipWarp = false;
         switch (op.id) {
@@ -426,6 +451,7 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
             case kWarpFisheye: {
                 WarpParams w;
                 if (skip || ++warps > 4 || !readWarp(op, w)) break;  // (a camera writes one; each resamples the whole picture)
+                budget -= 4;  // (a cubic resample of every plane: dearer than a gain)
                 applyWarp(w, pixels, width, height, planes);
                 ++applied;
                 break;
@@ -433,18 +459,22 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
             case kFixVignetteRadial: {
                 Vignette vg;
                 if (!readVignette(op, vg)) break;
-                for (int y = 0; y < height; ++y)
-                    for (int x = 0; x < width; ++x) {
-                        const float g = float(vignetteGain(vg, x, y, width, height));
-                        float* px = pixels + (size_t(y) * size_t(width) + size_t(x)) * size_t(planes);
-                        for (int p = 0; p < planes; ++p) px[p] = std::clamp(px[p] * g, 0.0f, 1.0f);
-                    }
+                budget -= 1;
+                parallelRows(height, [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = 0; x < width; ++x) {
+                            const float g = float(vignetteGain(vg, x, y, width, height));
+                            float* px = pixels + (size_t(y) * size_t(width) + size_t(x)) * size_t(planes);
+                            for (int p = 0; p < planes; ++p) px[p] = std::clamp(px[p] * g, 0.0f, 1.0f);
+                        }
+                });
                 ++applied;
                 break;
             }
             case kGainMap: {
                 GainMap g;
                 if (!readGainMap(op, g)) break;
+                budget -= gainMapPasses(g, int(std::lround(width / scaleX)), int(std::lround(height / scaleY)));
                 const int y0 = scaled(g.top, scaleY, height), y1 = scaled(g.bottom, scaleY, height);
                 const int x0 = scaled(g.left, scaleX, width), x1 = scaled(g.right, scaleX, width);
                 const int rowStep = std::max(1, int(std::lround(g.rowPitch * scaleY))), colStep = std::max(1, int(std::lround(g.colPitch * scaleX)));

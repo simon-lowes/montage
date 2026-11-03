@@ -79,8 +79,8 @@ if(MONTAGE_WITH_WHISPER)
   set(BUILD_SHARED_LIBS OFF)
   FetchContent_Declare(whisper
     GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
-    GIT_TAG v1.9.5
-    GIT_SHALLOW TRUE)
+    # v1.9.5, pinned by its commit (a tag can be moved)
+    GIT_TAG d1be6fde11ac6e0407606b4e42fe72d34add8037)
   FetchContent_MakeAvailable(whisper)
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
 endif()
@@ -102,8 +102,8 @@ if(MONTAGE_WITH_LLAMA)
   set(BUILD_SHARED_LIBS OFF)
   FetchContent_Declare(llama
     GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-    GIT_TAG b11430
-    GIT_SHALLOW TRUE)
+    # b11430, pinned by its commit (a tag can be moved)
+    GIT_TAG 8345f333951c661d166b00e6f9362e553768f292)
   FetchContent_MakeAvailable(llama)
   # b11430's models/clef.cpp calls std::find without <algorithm>, which newer libstdc++ (GCC 16, as on MSYS2) no
   # longer brings in through <memory>.
@@ -134,8 +134,8 @@ if(MONTAGE_WITH_OPENEXR)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   FetchContent_Declare(openexr
     GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openexr.git
-    GIT_TAG v3.5.2
-    GIT_SHALLOW TRUE)
+    # v3.5.2, pinned by its commit (a tag can be moved)
+    GIT_TAG 69b2604fc76e370615438bdc8d2cd95b9349c12e)
   FetchContent_MakeAvailable(openexr)
   if(NOT WIN32)
     # zstd marks its API visibility("default") over OpenEXRCore's hidden default, so the executable would export its
@@ -171,8 +171,7 @@ if(MONTAGE_WITH_BMX)
   set(LIBMXFPP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(bmx
     GIT_REPOSITORY https://github.com/ebu/bmx.git
-    GIT_TAG v1.7
-    GIT_SHALLOW TRUE
+    GIT_TAG 346ba45dfd41f24f7582460caa56c9ef47dd9b4b  # v1.7, pinned by its commit (a tag can be moved)
     GIT_SUBMODULES "")
   FetchContent_MakeAvailable(bmx)
   if(MINGW)
@@ -340,8 +339,7 @@ if(MONTAGE_WITH_FDL)
     SOURCE_SUBDIR no-cmake)
   FetchContent_Declare(jsoncons
     GIT_REPOSITORY https://github.com/danielaparker/jsoncons.git
-    GIT_TAG v1.5.0
-    GIT_SHALLOW TRUE
+    GIT_TAG 95a220dff2d927f15e1fe0c7dac2821b7134e4c9  # v1.5.0, pinned by its commit (a tag can be moved)
     SOURCE_SUBDIR no-cmake)
   FetchContent_MakeAvailable(ascfdl jsoncons)
   set(FDL_CORE ${ascfdl_SOURCE_DIR}/native/core)

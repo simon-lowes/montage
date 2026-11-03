@@ -99,6 +99,11 @@ public:
     void clearGap();
     // Whether a track's row is shown (not inside a collapsed folder).
     bool trackShown(TrackRef ref) const;
+    // Pinned tracks (Pro Tools' track pin): drawn, in their usual order, in a band under the ruler that stays put
+    // while the other tracks scroll under it; saved with the sequence (Track::pinned). One undo step.
+    void setTrackPinned(TrackRef ref, bool pinned);
+    int pinnedHeight() const;  // the band's height (0 when nothing is pinned)
+    QRect pinnedBand() const;  // where it is, in viewport pixels (empty when nothing is pinned)
     // Where a clip is drawn, in viewport pixels (empty when its row is not shown).
     QRect clipBounds(Id clip) const {
         QRect r;
@@ -178,6 +183,7 @@ private:
         TrackRef ref;
         int y = 0;
         int h = 0;
+        bool pinned = false;  // in the pinned band
     };
     // A track folder's header row (its tracks' rows follow unless it is collapsed).
     struct FolderRow {
@@ -241,11 +247,12 @@ private:
         TrackRef ref;
         LaneView view;
         int y = 0;
+        bool pinned = false;
     };
     std::vector<TakeLaneRow> takeLaneRows() const;
     std::optional<TakeLaneRow> takeLaneAt(const QPoint& pos) const;
     int takeLanesHeight(TrackRef ref, const Track& t) const;
-    void paintTakeLanes(QPainter& p, bool header);
+    void paintTakeLanes(QPainter& p, bool header, bool band);  // the pinned band's lanes, or the others'
     void takeLaneMenu(QMenu& menu, const TakeLaneRow& lane);
     void trackVersionMenu(QMenu& menu, TrackRef ref);
     struct TrackLaneHit {
@@ -292,7 +299,7 @@ private:
     FrameTime snapDelta(const std::vector<Id>& ids, FrameTime delta);
 
     void paintRuler(QPainter& p);
-    void paintHeaders(QPainter& p, const std::vector<Row>& rs);
+    void paintHeaders(QPainter& p, const std::vector<Row>& rs, bool band);
     void paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r);
     void paintWaveform(QPainter& p, const Clip& c, const QRect& r, const QColor& col);
     // Warp markers (and the stretches between them tinted by how far they are slowed or sped up), the pitch curve.
@@ -310,7 +317,9 @@ private:
     std::optional<TrackLaneHit> trackLaneHit(const QPoint& pos) const;
     void paintTrackLane(QPainter& p, const Row& row, const Track& t);
     bool beginTrackLaneDrag(QMouseEvent* e, const TrackLaneHit& h);
-    bool clipRect(Id clip, QRect& r, TrackKind* kind = nullptr) const;
+    bool clipRect(Id clip, QRect& r, TrackKind* kind = nullptr, bool* pinned = nullptr) const;
+    int scrollTop() const;         // where the scrolling content (caption lanes, then tracks) starts, scrolled
+    int pinnedBandBottom() const;  // where the pinned band ends (kRulerH when nothing is pinned)
     bool laneOf(Id clip, Lane& lane, QRect& band) const;
     void paintLane(QPainter& p, const Clip& c, TrackKind kind, const QRect& r);
     bool beginLaneDrag(QMouseEvent* e, const LaneHit& h);

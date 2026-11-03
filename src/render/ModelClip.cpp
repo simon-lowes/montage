@@ -11,6 +11,7 @@
 #include "core/Expression.h"
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
+#include "render/Layer3D.h"
 #include "render/Compositor.h"
 
 namespace montage {
@@ -315,8 +316,8 @@ bool clipCamera(const Project& p, const Sequence& seq, const Clip& c, const Effe
     return true;
 }
 
-// A shape made in place of a file's model (1 plane, the frame's shape a unit tall, facing +z; 2 box; 3 sphere; 4
-// cylinder, each a unit across), in one material; a picture's top left at uv (0, 0), the right way round from outside.
+}  // namespace
+
 std::shared_ptr<const Model> shapeModel(int shape, double aspect, const std::array<float, 4>& color, float metal, float rough) {
     auto model = std::make_shared<Model>();
     Model& m = *model;
@@ -416,15 +417,14 @@ std::shared_ptr<const Model> shapeModel(int shape, double aspect, const std::arr
     return model;
 }
 
-// A track's picture (premultiplied, the sequence's colour; graded scene-referred, the linear light layers are mixed in)
-// as a texture: linear light, Rec. 709 primaries, premultiplied, at most 2048 pixels across (averaged down).
-std::shared_ptr<const ModelTexture> pictureTexture(const Image& layer, const Sequence& seq) {
+std::shared_ptr<const ModelTexture> pictureTexture(const Image& layer, const Sequence& seq, int largest) {
     if (layer.empty()) return nullptr;
+    largest = std::max(1, largest);
     const SceneGrading* sg = currentSceneGrading();
     const ColorSpace& from = sg ? *sg->linear : sequenceColorSpace(seq);
     double mtx[9];
     primariesMatrix(from.primaries, Primaries::Bt709, mtx);
-    const int step = std::max(1, (std::max(layer.width, layer.height) + 2047) / 2048);
+    const int step = std::max(1, (std::max(layer.width, layer.height) + largest - 1) / largest);
     const int w = (layer.width + step - 1) / step, h = (layer.height + step - 1) / step;
     std::vector<float> rgba(size_t(w) * size_t(h) * 4);
     parallelRows(h, [&](int y0, int y1) {
@@ -451,8 +451,25 @@ std::shared_ptr<const ModelTexture> pictureTexture(const Image& layer, const Seq
     return t;
 }
 
+ModelLight settingsLight(const Effect& g, FrameTime lt, const std::array<double, 3>& mid, double size, float* ambient) {
+    auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
+    const double az = P("light_angle", -40) * kDeg, el = P("light_height", 45) * kDeg;
+    const std::array<double, 3> towards{std::cos(el) * std::sin(az), std::sin(el), std::cos(el) * std::cos(az)};
+    ModelLight light;
+    const int kind = int(std::lround(P("light_kind", 0)));
+    light.kind = kind == 1 ? ModelLight::Kind::Point : kind == 2 ? ModelLight::Kind::Spot : ModelLight::Kind::Directional;
+    light.direction = {-towards[0], -towards[1], -towards[2]};
+    const double distance = P("light_distance", 3) * size;
+    light.position = {mid[0] + towards[0] * distance, mid[1] + towards[1] * distance, mid[2] + towards[2] * distance};
+    light.color = {float(P("light_color.r", 1)), float(P("light_color.g", 1)), float(P("light_color.b", 1))};
+    light.intensity = 3.14159265358979323846 * P("light_strength", 100) / 100 * (light.kind == ModelLight::Kind::Directional ? 1 : distance * distance);
+    light.outerCone = std::clamp(P("spot_angle", 30), 1.0, 85.0) * kDeg;
+    light.innerCone = light.outerCone * 0.8;
+    light.shadows = P("shadows", 1) > 0.5;
+    if (ambient) *ambient = float(P("ambient", 30) / 100);
+    return light;
+}
 
-}  // namespace
 
 int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) { return cameraTrackOf(seq, track, c.generator, t - c.start, t); }
 
@@ -517,9 +534,20 @@ int modelTextureTrack(const Sequence& seq, size_t track, const Clip& c, FrameTim
     return v > 0 && v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
 }
 
+int modelProjectionTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
+    const int v = int(std::lround(c.generator.p("proj_track", t - c.start, 0)));
+    return v > 0 && v - 1 < int(seq.videoTracks.size()) && v - 1 != int(track) ? v - 1 : -1;
+}
+
+FrameTime modelProjectionFrame(const Clip& c, FrameTime t) {
+    const FrameTime lt = t - c.start;
+    return c.generator.p("proj_hold", lt, 0) > 0.5 ? FrameTime(std::llround(c.generator.p("proj_frame", lt, 0))) : t;
+}
+
 bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
                     const std::function<Image(int track)>& trackLayer, ModelScene& scene, ModelCamera& cam,
-                    std::shared_ptr<const Model>& model, std::string* error) {
+                    std::shared_ptr<const Model>& model, std::string* error,
+                    const std::function<Image(int track, FrameTime at)>& trackLayerAt) {
     const Effect& g = c.generator;
     const FrameTime lt = t - c.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
@@ -605,20 +633,9 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     scene = ModelScene{};
     scene.triangles = std::move(posed);
     scene.model = model.get();
-    const double az = P("light_angle", -40) * kDeg, el = P("light_height", 45) * kDeg;
-    const std::array<double, 3> towards{std::cos(el) * std::sin(az), std::sin(el), std::cos(el) * std::cos(az)};
-    ModelLight light;
     const int kind = int(std::lround(P("light_kind", 0)));
-    light.kind = kind == 1 ? ModelLight::Kind::Point : kind == 2 ? ModelLight::Kind::Spot : ModelLight::Kind::Directional;
-    light.direction = {-towards[0], -towards[1], -towards[2]};
-    const double distance = P("light_distance", 3) * size;
-    light.position = {mid[0] + towards[0] * distance, mid[1] + towards[1] * distance, mid[2] + towards[2] * distance};
-    light.color = {float(P("light_color.r", 1)), float(P("light_color.g", 1)), float(P("light_color.b", 1))};
-    light.intensity = 3.14159265358979323846 * P("light_strength", 100) / 100 * (light.kind == ModelLight::Kind::Directional ? 1 : distance * distance);
-    light.outerCone = std::clamp(P("spot_angle", 30), 1.0, 85.0) * kDeg;
-    light.innerCone = light.outerCone * 0.8;
-    light.shadows = P("shadows", 1) > 0.5;
-    const float ambient = float(P("ambient", 30) / 100);
+    float ambient = 0;
+    const ModelLight light = settingsLight(g, lt, mid, size, &ambient);
     scene.ambient = {ambient, ambient, ambient};
     if (kind == 3) addFileLights(model, pose, place, k, scene);
     else if (P("light_strength", 100) > 0) scene.lights.push_back(light);
@@ -634,6 +651,34 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         scene.picture = pictureTexture(trackLayer(tt), seq);
         scene.pictureMaterial = int(std::lround(P("texture_material", 0))) - 1;
         scene.pictureAsIs = std::lround(P("texture_light", 0)) == 1;
+    }
+    // A picture projected onto it through a camera chosen as the model's is (the "proj_" settings), at t or held at
+    // one frame (with the camera as it was then).
+    if (const int pt = ti >= 0 ? modelProjectionTrack(seq, size_t(ti), c, t) : -1; pt >= 0 && (trackLayer || trackLayerAt)) {
+        const FrameTime at = modelProjectionFrame(c, t);
+        Effect pe;
+        pe.type = g.type;
+        for (const auto& [key, value] : g.params)
+            if (key.rfind("proj_", 0) == 0) pe.params[key.substr(5)] = value;
+        for (const auto& [key, value] : g.strings)
+            if (key.rfind("proj_", 0) == 0) pe.strings[key.substr(5)] = value;
+        const long pmode = std::lround(P("proj_camera", 1));
+        auto pr = std::make_shared<ModelProjection>();
+        double pg = 0;
+        bool po = false;
+        // (without its camera now, the model is drawn without the projection, and says why)
+        std::string why;
+        if (!clipCamera(p, seq, c, pe, at, scale, ti, pmode, pr->camera, pg, po, &why)) {
+            if (error) *error = "The projection: " + why;
+        } else {
+            const Image pic = at != t && trackLayerAt ? trackLayerAt(pt, at) : trackLayer ? trackLayer(pt) : trackLayerAt(pt, t);
+            pr->picture = pictureTexture(pic, seq);
+            pr->width = seq.width * scale, pr->height = seq.height * scale;
+            pr->material = int(std::lround(P("proj_material", 0))) - 1;
+            pr->mix = float(std::clamp(P("proj_mix", 100) / 100, 0.0, 1.0));
+            pr->lit = std::lround(P("proj_light", 0)) == 1;
+            if (pr->picture) scene.projection = pr;
+        }
     }
     scene.ground = onGround && P("ground", 1) > 0.5;
     scene.groundHeight = groundY;
@@ -724,11 +769,34 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 }
             }
         }
+    // The 3D layers' cards seen through that solve, as they stand at their clips' first frames.
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
+        for (const Clip& c : seq.videoTracks[ti].clips) {
+            if (!c.enabled || (c.isGenerator() && c.generator.type == "model3d")) continue;
+            const Effect* e = nullptr;
+            for (const Effect& x : c.effects)
+                if (x.enabled && x.type == "layer_3d") e = &x;
+            if (!e || std::lround(e->p("camera", 0, 3)) != 1) continue;
+            if (cameraTrackOf(seq, ti, *e, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
+            std::shared_ptr<const Model> plane;
+            const PosedTriangles tr =
+                layer3dTriangles(layer3dPlace(*e, 0, seq.width, seq.height), plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
+            SolvedSceneMesh m;
+            m.card = true;
+            m.name = c.name;
+            m.color = {1, 1, 1, 1};
+            m.roughness = float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0));
+            m.doubleSided = true;
+            m.positions = tr.positions, m.normals = tr.normals, m.uvs = tr.uvs;
+            m.indices = tr.indices;
+            out.push_back(std::move(m));
+        }
     return out;
 }
 
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,
-                      const std::function<Image(int track)>& trackLayer, std::vector<float>* depth, std::string* error) {
+                      const std::function<Image(int track)>& trackLayer, std::vector<float>* depth, std::string* error,
+                      const std::function<Image(int track, FrameTime at)>& trackLayerAt) {
     if (std::lround(c.generator.p("shape", t - c.start, 0)) == 0 && isSplatFile(c.generator.s("file"))) {
         // (already in the values the splats were trained on, as the other generators draw)
         std::shared_ptr<const SplatCloud> cloud;
@@ -744,7 +812,7 @@ Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, Fram
     ModelScene scene;
     ModelCamera cam;
     std::shared_ptr<const Model> model;
-    if (!modelClipScene(p, seq, c, t, w, h, scale, trackLayer, scene, cam, model, error)) {
+    if (!modelClipScene(p, seq, c, t, w, h, scale, trackLayer, scene, cam, model, error, trackLayerAt)) {
         if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
         return Image(std::max(1, w), std::max(1, h));
     }

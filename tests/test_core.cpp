@@ -1753,6 +1753,10 @@ private slots:
         QVERIFY(events[2].key == nrpn && events[2].value == (11 << 7 | 21));
         QVERIFY(events[3].key == (Key{Kind::Rpn, 1, 0}) && events[3].value == 2);
         QVERIFY(events[4].key == (Key{Kind::Cc, 1, 6}) && events[4].value == 9);
+        // Chosen again and moved by its fine half alone: near where it was, not near zero.
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 38, 22});
+        QCOMPARE(events.size(), size_t(1));
+        QVERIFY(events[0].key == nrpn && events[0].value == (11 << 7 | 22));
 
         // ---- Names, as maps are saved.
         QCOMPARE(keyName(nrpn), std::string("nrpn:2:388"));
