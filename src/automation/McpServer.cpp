@@ -11561,7 +11561,10 @@ void McpServer::Impl::addTools() {
             "subtitles_as":{"type":"string","enum":["subtitles","closed_captions","burn_in"],"default":"subtitles"},
             "subtitle_language":{"type":"string","description":"RFC 5646; default: the caption track's"},
             "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"},
-            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the mix's beds and objects as an IAB track (ST 429-18, Application Profile 1); the 5.1 or 7.1 then goes in 16 channels with the sync signal (ST 429-19)"}},"required":["project","folder"]})json",
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the mix's beds and objects as an IAB track (ST 429-18, Application Profile 1); the 5.1 or 7.1 then goes in 16 channels with the sync signal (ST 429-19)"},
+            "farm":{"type":"string","description":"A render farm folder: send the package there instead of making it now, in `segments` (each node codes its share of the pictures, one wraps them with the sound and the rest); returns the join's job id. `folder` is where the nodes make it (each maps paths to its own)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":4,"description":"With farm: how many shares of the pictures"},
+            "dkdm_folder":{"type":"string","description":"With farm and encrypt: where the node that makes it writes the DKDM"}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -11599,6 +11602,16 @@ void McpServer::Impl::addTools() {
             int cw = 0, ch = 0;
             if (!dcpContainer(st.container, cw, ch)) throw ArgError{"container is flat, scope or full"};
             const QString folder = absolute(need(a, "folder"));
+            if (a.contains("dkdm_folder")) st.dkdms = absolute(need(a, "dkdm_folder")).toStdString();
+            if (a.contains("farm")) {
+                const int segments = a.value("segments").toInt(4);
+                if (segments < 1 || segments > 256) throw ArgError{"\"segments\" is 1 to 256"};
+                std::string id, why;
+                const std::string farm = absolute(need(a, "farm")).toStdString();
+                if (!submitFarmDcp(farm, st.title, l.project, s.id, st, folder.toStdString(), segments, &id, &why)) return fail(QString::fromStdString(why));
+                return ok(QStringLiteral("Sent the DCP to the render farm as job %1").arg(QString::fromStdString(id)),
+                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"folder", folder}});
+            }
             QDir().mkpath(folder);
             DcpResult r;
             std::string err;
@@ -11722,7 +11735,9 @@ void McpServer::Impl::addTools() {
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
             "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
             "sadm":{"type":"boolean","default":false,"description":"Immersive sound as S-ADM: the same beds and objects as a Metadata-Guided Audio track file with an S-ADM frame each edit unit (ITU-R BS.2125), an MGASADMSignalSequence (ST 2067-203)"},
-            "adm":{"type":"boolean","default":false,"description":"Immersive sound as ADM: the same beds and objects as an ADM audio track file, the sound with its axml and chna (ST 2067-204, ST 2131), an ADMAudioSequence"}},
+            "adm":{"type":"boolean","default":false,"description":"Immersive sound as ADM: the same beds and objects as an ADM audio track file, the sound with its axml and chna (ST 2067-204, ST 2131), an ADMAudioSequence"},
+            "farm":{"type":"string","description":"A render farm folder: send the package (Application #2E, not supplemental) there instead of making it now, in `segments` (each node codes its share of the pictures, one wraps them with the sound and the rest); returns the join's job id. `folder` is where the nodes make it (each maps paths to its own)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":4,"description":"With farm: how many shares of the pictures"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -11779,6 +11794,15 @@ void McpServer::Impl::addTools() {
                 st.targetFrames.push_back(FrameTime(v.toDouble()));
             }
             const QString folder = absolute(need(a, "folder"));
+            if (a.contains("farm")) {
+                const int segments = a.value("segments").toInt(4);
+                if (segments < 1 || segments > 256) throw ArgError{"\"segments\" is 1 to 256"};
+                std::string id, why;
+                const std::string farm = absolute(need(a, "farm")).toStdString();
+                if (!submitFarmImf(farm, st.title, l.project, s.id, st, folder.toStdString(), segments, &id, &why)) return fail(QString::fromStdString(why));
+                return ok(QStringLiteral("Sent the IMF package to the render farm as job %1").arg(QString::fromStdString(id)),
+                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"folder", folder}});
+            }
             QDir().mkpath(folder);
             ImfResult r;
             std::string err;
@@ -11944,7 +11968,9 @@ void McpServer::Impl::addTools() {
                 "audio_codec":{"type":"string","enum":["aac","libopus","none"],"default":"aac"},
                 "audio_bitrate":{"type":"integer","default":128000},
                 "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
-            "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265 and AV1 with rate control per segment; image sequences frame by frame). The sound is rendered once, by the joining node. The job's id is the join's"}},
+            "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
+            "two_pass":{"type":"boolean","default":false,"description":"H.264 and H.265 with a bitrate: coded twice, the first pass measuring the pictures so the second spends the bits where they are needed (H.264 in segments: each segment's first pass measures and the bits are shared out across them; H.265 in two passes is made in one go)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265, MPEG-2 and AV1 with rate control per segment unless two_pass (H.264); hardware H.264 and H.265 by nodes with the same encoder; MOV, MP4, MKV, MXF, broadcast MXF and MPEG-TS files; image sequences frame by frame; IMF and DCP packages through montage_export_imf and montage_export_dcp with farm). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -11981,6 +12007,13 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            if (a.contains("bitrate")) {
+                st.videoBitrate = a.value("bitrate").toInteger();
+                if (st.videoBitrate < 0) throw ArgError{"\"bitrate\" is bits a second (0: by quality)"};
+            }
+            st.twoPass = a.value("two_pass").toBool();
+            if (st.twoPass && ((st.videoCodec != "libx264" && st.videoCodec != "libx265") || st.videoBitrate <= 0))
+                throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
             if (a.contains("mxf_delivery")) {
                 const std::string d = str(a, "mxf_delivery").toStdString();
@@ -12209,10 +12242,11 @@ void McpServer::Impl::addTools() {
                 QJsonObject o{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}};
                 if (segments > 1) {
                     int made = 0;
-                    for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+                    for (const FarmJob& j : farmJobs(farm)) made += j.group == id && j.pass != 1;
                     o["segments"] = made;
                     text += made > 1 ? QStringLiteral(", in %1 segments").arg(made) : QStringLiteral(" whole (the range is too short to split)");
-                    if (made > 1 && exportSegmentsLongGop(st)) text += QStringLiteral("\nRate control works per segment: a bitrate is kept within each, not across the whole");
+                    if (made > 1 && st.twoPass) text += QStringLiteral("\nTwo passes: each segment's first pass measures it, and the bits are shared out by what they found");
+                    else if (made > 1 && exportSegmentsLongGop(st)) text += QStringLiteral("\nRate control works per segment: a bitrate is kept within each, not across the whole");
                 }
                 return ok(text, o);
             }

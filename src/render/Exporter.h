@@ -49,6 +49,17 @@ struct ExportSettings {
     int crf = 18;
     int gop = 0;                         // keyframe interval in frames; 0 = 2 seconds
     int64_t videoBitrate = 0;            // bits/s; 0 = constant quality (crf)
+    // H.264 and H.265 at a bitrate coded in two passes: the first measures the pictures (at constant quality), the
+    // second spends the bits where they are needed.
+    bool twoPass = false;
+    // One pass of two alone (a farm's segments: each first pass measured, then the bits shared out for the second): 1 =
+    // the first, at constant quality (crf), its encoder's statistics written to `passStats`; 2 = the second, at
+    // videoBitrate, from them.
+    int pass = 0;
+    std::string passStats;
+    // H.264 (x264): the id its sequence and picture parameter sets take (0-31), so segments coded at different rates,
+    // whose parameter sets differ, can sit side by side in one file's decoder configuration.
+    int parameterSetId = 0;
     std::string preset = "medium";       // encoder speed preset
     std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq", x264 "avci100" (AVC-Intra 100)
     std::string pixFmt;                  // empty = sensible default for the codec
@@ -269,6 +280,11 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,
                     int* smartRendered = nullptr,  // frames copied by smart rendering
                     LightLevels* light = nullptr, bool* keptUnsigned = nullptr);
+
+struct BroadcastMxfOptions;
+// A broadcast MXF delivery (`s.mxfDelivery`) of its range made from frames already rendered (segments joined into plain
+// OP1a): its checks and the options to rewrap it with. False with `error` for what the delivery refuses.
+bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, BroadcastMxfOptions& o, std::string* error = nullptr);
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.

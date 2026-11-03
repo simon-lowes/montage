@@ -4,6 +4,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QSaveFile>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QXmlStreamReader>
@@ -28,6 +29,7 @@ extern "C" {
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
+#include "SegmentedExport.h"
 #include "DcpSecurity.h"
 #include "Iab.h"
 #include "Jpeg2000.h"
@@ -329,6 +331,13 @@ bool dcpContainer(const std::string& container, int& width, int& height, bool fo
     return true;
 }
 
+int64_t dcpPackageFrames(const Sequence& s, const DcpSettings& settings) {
+    const int step = dcpFrameStep(s, dcpFrameRate(s, settings.fps));
+    FrameTime first = 0, end = s.duration();
+    if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;
+    return end > first ? (end - first) / step : 0;
+}
+
 double dcpLeqmLimit(const std::string& kind) { return kind == "trailer" || kind == "teaser" ? 85.0 : kind == "advertisement" ? 82.0 : 0.0; }
 
 std::string defaultDcpContainer(const Sequence& s) { return s.height > 0 && double(s.width) / s.height >= 2.0 ? "scope" : "flat"; }
@@ -434,6 +443,92 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             c.start = a, c.end = b;
             captions.push_back(std::move(c));
         }
+
+    // The picture, fitted inside the container on black.
+    const double scale = std::min(double(cw) / s.width, double(ch) / s.height);
+    const int fw = std::min(cw, int(std::lround(s.width * scale / 2)) * 2), fh = std::min(ch, int(std::lround(s.height * scale / 2)) * 2);
+    const int ox = (cw - fw) / 2, oy = (ch - fh) / 2;
+    const ColorSpace* space = &sequenceColorSpace(s);
+    if (space->hdr()) space = findColorSpace("p3d65");  // tone mapped into the cinema's range, its gamut kept
+    const XyzConverter xyz(*space);
+    const int threads = settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency()));
+    // Burned in: the chosen track is the one drawn.
+    Sequence burned;
+    const Sequence* shown = &s;
+    if (subtitles && settings.burnIn) {
+        burned = s;
+        for (CaptionTrack& t : burned.captionTracks) t.visible = t.id == subtitles->id;
+        shown = &burned;
+    }
+    RenderOptions o;
+    o.scale = scale;
+    o.highQuality = true;
+    o.captions = subtitles && settings.burnIn;
+    const int eyes = stereo ? 2 : 1;
+    const int64_t jobs = frames * eyes;
+    // Job j: frame j / eyes (its right eye when j is odd in 3D), as the encoders take it.
+    auto codesFor = [&](int64_t j) {
+        RenderOptions view = o;
+        if (stereo) view.stereoView = j % 2 ? StereoView::Right : StereoView::Left;
+        Image frame = renderProgramFrame(p, *shown, first + (j / eyes) * step, view);
+        if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
+        if (space != &sequenceColorSpace(s)) convertColor(frame, sequenceColorSpace(s), *space, s.hdrPeakNits);
+        Image boxed(cw, ch);  // black around it
+        for (int y = 0; y < fh; ++y) std::copy(frame.row(y), frame.row(y) + size_t(fw) * 4, boxed.row(y + oy) + size_t(ox) * 4);
+        std::vector<uint16_t> codes;
+        xyz.convert(boxed, codes);
+        return codes;
+    };
+    const bool coded = !settings.codestreams.empty();
+    // A render farm's segment: DCP frames [codeFrom, codeTo) coded alone into the folder of codestreams, and nothing
+    // else.
+    if (settings.codeTo > settings.codeFrom) {
+        if (!coded) return fail("A segment's codestreams need a folder");
+        const int64_t from = std::max<int64_t>(0, settings.codeFrom), to = std::min<int64_t>(frames, settings.codeTo);
+        if (to <= from) return fail("The segment holds none of the package's frames");
+        if (!QDir().mkpath(QString::fromStdString(settings.codestreams))) return fail("Cannot write in " + settings.codestreams);
+        EncoderPool pool(cw, ch, fps, stereo, threads);
+        int64_t taken = from * eyes;
+        std::string err;
+        std::vector<uint8_t> cs;
+        auto writeReady = [&](bool wait) {
+            while (taken < to * eyes && (wait || pool.ready(taken)) && pool.take(taken, cs, true)) {
+                QSaveFile f(QString::fromStdString(codestreamFile(settings.codestreams, taken / eyes, taken % eyes == 1)));
+                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(cs.data()), qint64(cs.size())) != qint64(cs.size()) ||
+                    !f.commit()) {
+                    err = "Cannot write the codestreams in " + settings.codestreams;
+                    return false;
+                }
+                ++taken;
+                wait = false;
+            }
+            return pool.error().empty();
+        };
+        const size_t inHand = size_t(threads) * 2;
+        auto done = [&] { return double(taken - from * eyes) / double((to - from) * eyes); };
+        for (int64_t j = from * eyes; j < to * eyes; ++j) {
+            std::vector<uint16_t> codes = codesFor(j);
+            while (pool.pending() >= inHand && taken < j)
+                if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);
+            pool.push(j, std::move(codes));
+            if (!writeReady(false)) return fail(err.empty() ? pool.error() : err);
+            if (progress && !progress(done())) return fail("Stopped");
+        }
+        while (taken < to * eyes) {
+            if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);
+            if (progress && !progress(done())) return fail("Stopped");
+        }
+        pool.finish();
+        if (result) {
+            *result = DcpResult{};
+            result->frames = frames;
+            result->fps = fps;
+            result->width = cw, result->height = ch;
+            result->stereo = stereo;
+            result->cinemaProfile = pool.openjpeg();
+        }
+        return true;
+    }
 
     // The folder.
     const std::string date = QDate::currentDate().toString(QStringLiteral("yyyyMMdd")).toStdString();
@@ -586,43 +681,40 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             return fail(err);
     }
 
-    // The picture, fitted inside the container on black, several frames encoding at once (a 3D frame's two eyes one
-    // after the other).
-    const double scale = std::min(double(cw) / s.width, double(ch) / s.height);
-    const int fw = std::min(cw, int(std::lround(s.width * scale / 2)) * 2), fh = std::min(ch, int(std::lround(s.height * scale / 2)) * 2);
-    const int ox = (cw - fw) / 2, oy = (ch - fh) / 2;
-    const ColorSpace* space = &sequenceColorSpace(s);
-    if (space->hdr()) space = findColorSpace("p3d65");  // tone mapped into the cinema's range, its gamut kept
-    const XyzConverter xyz(*space);
-    const int threads = settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency()));
+    // The picture, several frames encoding at once (a 3D frame's two eyes one after the other), or read from the
+    // codestreams a render farm's segments made.
     bool cinema = true;
     {
-        // Burned in: the chosen track is the one drawn.
-        Sequence burned;
-        const Sequence* shown = &s;
-        if (subtitles && settings.burnIn) {
-            burned = s;
-            for (CaptionTrack& t : burned.captionTracks) t.visible = t.id == subtitles->id;
-            shown = &burned;
-        }
         dcp::PictureMxfWriter picture;
         if (settings.encrypt) picture.encryptWith(encryption(pictureKey));
         std::string err;
         if (!picture.open(QDir(folder).filePath(pictureFile).toStdString(), pictureId, fps, stereo, &err)) return fail(err);
-        EncoderPool pool(cw, ch, fps, stereo, threads);
-        RenderOptions o;
-        o.scale = scale;
-        o.highQuality = true;
-        o.captions = subtitles && settings.burnIn;
-        const int eyes = stereo ? 2 : 1;
-        const int64_t jobs = frames * eyes;
+        EncoderPool pool(cw, ch, fps, stereo, coded ? 0 : threads);
         int64_t written = 0;
         std::vector<uint8_t> cs, right;
+        auto readCoded = [&](int64_t k, bool eye, std::vector<uint8_t>& out) {
+            QFile f(QString::fromStdString(codestreamFile(settings.codestreams, k, eye)));
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            const QByteArray b = f.readAll();
+            out.assign(b.begin(), b.end());
+            return !out.empty();
+        };
         auto writeReady = [&](bool wait) {
             while (written < frames) {
                 const int64_t job = written * eyes;
-                if (!wait && !(pool.ready(job) && (!stereo || pool.ready(job + 1)))) break;
-                if (!pool.take(job, cs, true) || (stereo && !pool.take(job + 1, right, true))) break;
+                if (coded) {
+                    if (!readCoded(written, false, cs) || (stereo && !readCoded(written, true, right))) {
+                        err = "The codestream of frame " + std::to_string(written) + " is missing from " + settings.codestreams;
+                        return false;
+                    }
+                    if (progress && written % 16 == 0 && !progress(0.05 + 0.9 * double(written) / double(frames))) {
+                        err = "Stopped";
+                        return false;
+                    }
+                } else {
+                    if (!wait && !(pool.ready(job) && (!stereo || pool.ready(job + 1)))) break;
+                    if (!pool.take(job, cs, true) || (stereo && !pool.take(job + 1, right, true))) break;
+                }
                 if (written == 0) {
                     dcp::J2kHeader h;
                     if (dcp::parseJ2kHeader(cs.data(), cs.size(), h)) cinema = h.rsiz == (fourK ? 4 : 3) && pool.openjpeg();
@@ -635,16 +727,9 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             return pool.error().empty();
         };
         const size_t inHand = size_t(threads) * 2;
-        for (int64_t j = 0; j < jobs; ++j) {
-            const int64_t k = j / eyes;
-            if (stereo) o.stereoView = j % 2 ? StereoView::Right : StereoView::Left;
-            Image frame = renderProgramFrame(p, *shown, first + k * step, o);
-            if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
-            if (space != &sequenceColorSpace(s)) convertColor(frame, sequenceColorSpace(s), *space, s.hdrPeakNits);
-            Image boxed(cw, ch);  // black around it
-            for (int y = 0; y < fh; ++y) std::copy(frame.row(y), frame.row(y) + size_t(fw) * 4, boxed.row(y + oy) + size_t(ox) * 4);
-            std::vector<uint16_t> codes;
-            xyz.convert(boxed, codes);
+        if (coded && !writeReady(false)) return fail(err);
+        for (int64_t j = coded ? jobs : 0; j < jobs; ++j) {
+            std::vector<uint16_t> codes = codesFor(j);
             // Room for it: the earliest frame written first when enough are in hand.
             while (pool.pending() >= inHand && written * eyes + eyes <= j)
                 if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);

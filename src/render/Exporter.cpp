@@ -23,8 +23,10 @@
 
 #include <QColorSpace>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QRandomGenerator>
 #include <QString>
 #include <algorithm>
 #include <functional>
@@ -991,7 +993,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->thread_count = spatial ? 1 : 0;
         // Smart rendering interleaves copied packets with encoded ones, so the encoder must not hold frames back.
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
-        if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
+        // One pass of two (x264 and x265): the first at constant quality, measuring; the second at the bitrate.
+        const int pass = c == "libx264" || c == "libx265" ? s.pass : 0;
+        if (s.pass != 0 && !pass) return fail("Two passes are for H.264 and H.265 (software), not " + c);
+        if (pass == 2 && s.videoBitrate <= 0) return fail("A second pass needs a bitrate");
+        if (s.videoBitrate > 0 && pass != 1) o.vctx->bit_rate = s.videoBitrate;
+        if (pass) o.vctx->flags |= pass == 1 ? AV_CODEC_FLAG_PASS1 : AV_CODEC_FLAG_PASS2;
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         if (interlacedOut) {
             // Coded as two fields, the top first: a progressive picture's two halves (PsF), as 1080i deliveries ask.
@@ -1037,12 +1044,23 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->qmax = 28;  // the non-linear scale's largest code (a quantiser of 112)
             av_dict_set(&opts, "intra_vlc", "1", 0);
             av_dict_set(&opts, "non_linear_quant", "1", 0);
+            // (Each GOP header's timecode counts from the file's.)
+            if (!s.startTimecode.empty()) av_dict_set(&opts, "gop_timecode", s.startTimecode.c_str(), 0);
         } else if (c == "libx264" || c == "libx265") {
             if (s.cea608) av_dict_set(&opts, "a53cc", "1", 0);
-            if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
+            if (s.videoBitrate <= 0 || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
+            if (pass && c == "libx264") av_dict_set(&opts, "stats", s.passStats.c_str(), 0);
+            if (c == "libx264" && s.parameterSetId > 0)
+                av_dict_set(&opts, "x264-params", ("sps-id=" + std::to_string(std::min(s.parameterSetId, 31))).c_str(), 0);
             if (c == "libx265") {
                 std::string params = "log-level=error";
+                if (pass) {
+                    // (Quoted: the path's colons and backslashes are its own, not the list's.)
+                    std::string quoted = "'";
+                    for (const char ch : s.passStats) quoted += ch == '\'' ? std::string("'\\''") : std::string(1, ch);
+                    params += ":pass=" + std::to_string(pass) + ":stats=" + quoted + "'";
+                }
                 if (pq) {
                     // HDR10: mastering display (P3-D65 at the sequence's peak) and light levels.
                     char buf[256];
@@ -2563,9 +2581,8 @@ bool broadcastMxfOptions(const Sequence& seq, const ExportSettings& s, FrameTime
     return true;
 }
 
-// A broadcast MXF delivery: rendered by FFmpeg beside the file, then rewrapped into it.
-bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered, LightLevels* light) {
+// What a broadcast MXF delivery takes: its picture, sound and (for the UK DPP) rate and size.
+bool checkBroadcastDelivery(const Sequence& seq, const ExportSettings& s, std::string* error) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -2587,6 +2604,18 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     if (s.videoCodec == "none" || s.audioCodec == "none") return fail("Broadcast MXF deliveries have picture and sound");
     if (mpeg2 && s.monoAudioTracks != 2 && s.monoAudioTracks != 4 && s.monoAudioTracks != 8)
         return fail("RDD 9 carries 2, 4 or 8 mono sound tracks");
+    return true;
+}
+
+// A broadcast MXF delivery: rendered by FFmpeg beside the file, then rewrapped into it.
+bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered, LightLevels* light) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    const std::string& d = s.mxfDelivery;
+    if (!checkBroadcastDelivery(seq, s, error)) return false;
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());
@@ -2628,9 +2657,79 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
 
 }  // namespace
 
+bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, BroadcastMxfOptions& o, std::string* error) {
+    if (!checkBroadcastDelivery(seq, s, error)) return false;
+    if (!s.rateChange.empty()) {
+        if (error) *error = "A broadcast MXF delivered at another rate is made in one go";
+        return false;
+    }
+    const FrameTime in = s.in >= 0 ? s.in : 0;
+    FrameTime out = s.out >= 0 ? s.out : seq.duration();
+    if (seq.duration() > 0) out = std::min(out, seq.duration());
+    return broadcastMxfOptions(seq, s, in, out, o, error) && checkAs11Metadata(o, error);
+}
+
+namespace {
+
+// Two passes: the picture alone coded first at constant quality beside the output, its encoder's statistics kept; then
+// the export, coded from them at its bitrate.
+bool exportInTwoPasses(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                       const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                       LightLevels* light, bool* keptUnsigned) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (s.videoCodec != "libx264" && s.videoCodec != "libx265") return fail("Two passes are for H.264 and H.265 (software)");
+    if (s.videoBitrate <= 0) return fail("Two passes need a bitrate");
+    if (!s.mxfDelivery.empty() || s.profile == "avci100") return fail("Broadcast MXF and AVC-Intra are coded in one pass");
+    const QFileInfo out(QString::fromStdString(s.path));
+    const QString tag = QString::number(QRandomGenerator::global()->generate64(), 16);
+    ExportSettings first = s;
+    first.pass = 1;
+    first.passStats = out.dir().filePath(QStringLiteral(".montage-pass-") + tag + QStringLiteral(".log")).toStdString();
+    first.path = out.dir().filePath(QStringLiteral(".montage-pass-") + tag + "." + out.suffix()).toStdString();
+    first.audioCodec = "none";
+    first.extraAudio.clear();
+    first.describedStream = false;
+    first.monoAudioTracks = 0;
+    first.loudnessReport = false;
+    first.embedCaptions = false;
+    first.extraCaptions.clear();
+    first.chapters = false;
+    first.credentialCertificate.clear();
+    first.credentialKey.clear();
+    first.smartRender = false;
+    first.hdr10Plus = first.adaptiveHdr = false;  // (measured for the second)
+    struct Remove {
+        QStringList files;
+        ~Remove() {
+            for (const QString& f : files) QFile::remove(f);
+        }
+    } remove{{QString::fromStdString(first.path), QString::fromStdString(first.passStats),
+              QString::fromStdString(first.passStats) + QStringLiteral(".mbtree"), QString::fromStdString(first.passStats) + QStringLiteral(".cutree"),
+              QString::fromStdString(first.passStats) + QStringLiteral(".temp"), QString::fromStdString(first.passStats) + QStringLiteral(".mbtree.temp")}};
+    const ExportProgress half = [&progress](double f, FrameTime t) {
+        if (progress) progress(0.5 * f, t);
+    };
+    if (!exportSequence(p, seq, first, half, cancel, error)) return false;
+    QFile::remove(QString::fromStdString(first.path));
+    ExportSettings second = s;
+    second.pass = 2;
+    second.passStats = first.passStats;
+    second.smartRender = false;
+    const ExportProgress rest = [&progress](double f, FrameTime t) {
+        if (progress) progress(0.5 + 0.5 * f, t);
+    };
+    return exportSequence(p, seq, second, rest, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
+}
+
+}  // namespace
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light, bool* keptUnsigned) {
+    if (s.twoPass && s.pass == 0) return exportInTwoPasses(p, seq, s, progress, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
     if (!s.mxfDelivery.empty()) {
         if (keptUnsigned) *keptUnsigned = false;
         if (!s.credentialCertificate.empty()) {
@@ -2826,6 +2925,9 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
         ExportSettings one = s;
         one.path = (base.parent_path() / (stem + " - " + safe + ".wav")).string();
         one.videoCodec = "none";
+        one.twoPass = false;  // (sound alone: one pass)
+        one.pass = 0;
+        one.passStats.clear();
         one.audioCodec = "pcm_s24le";
         one.loudnessTarget = 0;  // stems keep their levels, so they add back up to the mix
         one.loudnessReport = false;  // (the delivery's report is the mix's)

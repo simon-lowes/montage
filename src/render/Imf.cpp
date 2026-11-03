@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 #include <algorithm>
@@ -39,6 +40,7 @@ extern "C" {
 #include "Jpeg2000.h"
 #include "PackageFiles.h"
 #include "RateConversion.h"
+#include "SegmentedExport.h"
 #include "core/AudioDescription.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
@@ -965,6 +967,25 @@ void timedTextDescriptor(QXmlStreamWriter& x, const dcp::ImfTimedTextWriter& w) 
 
 }  // namespace
 
+int64_t imfCompositionFrames(const Sequence& s, const ImfSettings& settings, std::string* error) {
+    int W = 0, H = 0;
+    if (!imfPictureSize(s, settings.size, W, H, error)) return 0;
+    Rational canonical;
+    if (!imfFrameRateAllowed(s.fps, W, H, &canonical)) {
+        if (error) *error = "IMF masters here are 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)";
+        return 0;
+    }
+    FrameTime first = 0, end = s.duration();
+    if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;
+    if (end <= first) {
+        if (error) *error = "The sequence is empty";
+        return 0;
+    }
+    int64_t n = end - first;
+    while ((n * 48000 * int64_t(canonical.den)) % int64_t(canonical.num) != 0) ++n;
+    return n;
+}
+
 bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings, const std::string& parent, ImfResult* result,
                const std::function<bool(double)>& progress, std::string* error) {
     auto fail = [&](const std::string& why) {
@@ -1316,6 +1337,65 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (stopped) return fail("Stopped");
         for (int64_t k = 0; k < frames; ++k)
             if (same[size_t(k)] >= 0 && differs[size_t(stretchOf[size_t(k)])]) same[size_t(k)] = -1;
+    }
+
+    // Encoders at once, within about 4 GiB for the frames waiting and being coded (an encode holds roughly 30 bytes a
+    // pixel, a waiting frame 6, two waiting per encoder): a dozen at UHD, more at HD.
+    const int encoders = std::min(std::max(1, int(4294967296.0 / (double(W) * double(H) * (30.0 + 2 * 6.0)))),
+                                  settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency())));
+    if (!settings.codestreams.empty() && (aces || supplemental))
+        return fail("Only Application #2E masters that are not supplemental are made in segments");
+    // A render farm's segment: its frames coded alone into the folder of codestreams, and nothing else.
+    if (settings.codeTo > settings.codeFrom) {
+        if (settings.codestreams.empty()) return fail("A segment's codestreams need a folder");
+        const int64_t from = std::max<int64_t>(0, settings.codeFrom), to = std::min<int64_t>(frames, settings.codeTo);
+        if (to <= from) return fail("The segment holds none of the composition's frames");
+        if (!QDir().mkpath(QString::fromStdString(settings.codestreams))) return fail("Cannot write in " + settings.codestreams);
+        ImfEncoderPool pool(W, H, bits, rsiz, maxBytes, encoders);
+        int64_t written = from;
+        std::vector<uint8_t> cs;
+        auto writeReady = [&](bool wait) {
+            while (written < to && pool.take(written, cs, wait)) {
+                dcp::J2kHeader h;
+                if (!dcp::parseJ2kHeader(cs.data(), cs.size(), h) || h.rsiz != rsiz) {
+                    err = rsiz == kHtj2kRsiz ? "OpenJPH could not code the picture as HTJ2K"
+                                             : "OpenJPEG could not code the picture in the JPEG 2000 IMF profile";
+                    return false;
+                }
+                QSaveFile f(QString::fromStdString(codestreamFile(settings.codestreams, written)));
+                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(cs.data()), qint64(cs.size())) != qint64(cs.size()) ||
+                    !f.commit()) {
+                    err = "Cannot write the codestreams in " + settings.codestreams;
+                    return false;
+                }
+                ++written;
+                wait = false;
+            }
+            return pool.error().empty();
+        };
+        const size_t inHand = size_t(encoders) * 2;
+        auto step = [&] { return double(written - from) / double(to - from); };
+        for (int64_t j = from; j < to; ++j) {
+            std::vector<uint16_t> rgb = pictureAt(j);
+            while (pool.pending() >= inHand && written < j)
+                if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);
+            pool.push(j, std::move(rgb));
+            if (!writeReady(false)) return fail(err.empty() ? pool.error() : err);
+            if (progress && !progress(step())) return fail("Stopped");
+        }
+        while (written < to) {
+            if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);
+            if (progress && !progress(step())) return fail("Stopped");
+        }
+        pool.finish();
+        if (result) {
+            *result = ImfResult{};
+            result->frames = frames;
+            result->codedFrames = to - from;
+            result->width = W, result->height = H, result->bits = bits, result->rsiz = rsiz;
+            result->rateNum = rate.num, result->rateDen = rate.den;
+        }
+        return true;
     }
 
     // The folder.
@@ -1778,21 +1858,26 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         }
     } else if (!aces && !toCode.empty()) {
         const size_t fileIndex = ownFile("VIDEO", "MainImageSequence");
-        // Encoders at once, within about 4 GiB for the frames waiting and being coded (an encode holds roughly 30 bytes
-        // a pixel, a waiting frame 6, two waiting per encoder): a dozen at UHD, more at HD.
-        const double perEncoder = double(W) * double(H) * (30.0 + 2 * 6.0);
-        const int memoryCap = std::max(1, int(4294967296.0 / perEncoder));
-        const int threads = std::min(memoryCap, settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency())));
+        const int threads = encoders;
         const int g = std::gcd(W, H);
         if (!picture.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, bits, colour, uint32_t(W / g),
                           uint32_t(H / g), &err))
             return fail(err);
-        ImfEncoderPool pool(W, H, bits, rsiz, maxBytes, threads);
         const int64_t count = int64_t(toCode.size());
+        // Coded already, by a render farm's segments: each frame's codestream read and wrapped as it is.
+        const bool coded = !settings.codestreams.empty();
+        ImfEncoderPool pool(W, H, bits, rsiz, maxBytes, coded ? 0 : threads);
         int64_t written = 0;
         std::vector<uint8_t> cs;
+        auto readCoded = [&](int64_t k) {
+            QFile f(QString::fromStdString(codestreamFile(settings.codestreams, k)));
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            const QByteArray b = f.readAll();
+            cs.assign(b.begin(), b.end());
+            return !cs.empty();
+        };
         auto writeReady = [&](bool wait) {
-            while (written < count && pool.take(written, cs, wait)) {
+            while (written < count && (coded ? readCoded(toCode[size_t(written)]) : pool.take(written, cs, wait))) {
                 if (written == 0) {
                     dcp::J2kHeader h;
                     if (!dcp::parseJ2kHeader(cs.data(), cs.size(), h) || h.rsiz != rsiz) {
@@ -1804,12 +1889,20 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 if (!picture.write(cs.data(), cs.size(), &err)) return false;
                 ++written;
                 wait = false;
+                if (coded && progress && written % 16 == 0 && !progress(0.1 + 0.85 * double(written) / double(count))) {
+                    err = "Stopped";
+                    return false;
+                }
             }
             return pool.error().empty();
         };
         const size_t inHand = size_t(threads) * 2;
         auto step = [&] { return 0.1 + 0.85 * double(written) / double(count); };
-        for (int64_t j = 0; j < count; ++j) {
+        if (coded) {
+            if (!writeReady(false)) return fail(err.empty() ? "The codestream of frame " + std::to_string(written) + " is missing from " + settings.codestreams : err);
+            if (written < count) return fail("The codestream of frame " + std::to_string(toCode[size_t(written)]) + " is missing from " + settings.codestreams);
+        }
+        for (int64_t j = coded ? count : 0; j < count; ++j) {
             std::vector<uint16_t> rgb = pictureAt(toCode[size_t(j)]);
             while (pool.pending() >= inHand && written < j)
                 if (!writeReady(true)) return fail(err.empty() ? pool.error() : err);

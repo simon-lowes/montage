@@ -250,6 +250,8 @@
 #include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
+#include "render/DcpMxf.h"
+#include "render/Imf.h"
 #include "render/SegmentedExport.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
@@ -23160,9 +23162,10 @@ if ui["pressed"] == "add":
             return !exportSplits(x, &w) && QString::fromStdString(w).contains(why);
         };
         QVERIFY(exportSplits(st, &err));
-        QVERIFY(refused([](ExportSettings& x) { x.videoCodec = "hw_h264"; }, "hardware"));
         QVERIFY(refused([](ExportSettings& x) { x.videoCodec = "gif"; }, "not joined"));
-        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mxf"; }, "MOV, MP4 or MKV"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.avi"; }, "MOV, MP4, MKV, MXF or MPEG-TS"));
+        QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.ts", x.embedCaptions = true; }, "captions inside MXF or MPEG-TS"));
+        QVERIFY(refused([](ExportSettings& x) { x.mxfDelivery = "rdd9"; }, ".mxf files"));
         QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mkv"; }, "MKV without sound"));
         QVERIFY(refused([](ExportSettings& x) { x.path = "/tmp/a.mkv", x.audioCodec = "none"; }, "") == false);
         QVERIFY(refused([](ExportSettings& x) { x.hdr10Plus = true; }, "dynamic HDR"));
@@ -23453,6 +23456,465 @@ if ui["pressed"] == "add":
         QCOMPARE(segs, 3);
         r = call("montage_render", {{"project", project}, {"output", dir.path() + "/out/mcp2.mp4"}, {"farm", farm2}, {"segments", 3}, {"rate_change", "speed"}, {"frame_rate", 30}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("cannot be split"));
+    }
+
+    void farmMastersInSegments() {
+        QTemporaryDir dir;
+        const std::string farm = (dir.path() + "/farm").toStdString();
+        std::string err;
+        // Particles, bars and a gradient with film grain over them, and a tone that rises.
+        Project p = makeDefaultProject();
+        Sequence& seq = *p.active();
+        seq.width = 320;
+        seq.height = 180;
+        seq.fps = {25, 1};  // (as XDCAM HD422 deliveries are)
+        Clip sparks = makeGeneratorClip(p, "particles", 49);
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, sparks);
+        Clip bars = makeGeneratorClip(p, "bars", 52);
+        bars.start = 49;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, bars);
+        Clip ramp = makeGeneratorClip(p, "gradient", 49);
+        ramp.start = 101;
+        edit::overwrite(p, seq, {TrackKind::Video, 0}, ramp);
+        for (Clip& c : seq.videoTracks[0].clips) c.effects.push_back(makeEffect(p, "film_grain"));
+        std::vector<float> tone(size_t(48000 * 6));
+        double phase = 0;
+        for (size_t i = 0; i < tone.size(); ++i) {
+            phase += 2 * M_PI * (220.0 + 440.0 * double(i) / double(tone.size())) / 48000.0;
+            tone[i] = float(0.3 * std::sin(phase));
+        }
+        QVERIFY(writeMonoWav((dir.path() + "/tone.wav").toStdString(), tone, 48000));
+        MediaItem wav = probeOrFail(p, (dir.path() + "/tone.wav").toStdString());
+        p.media.push_back(wav);
+        QVERIFY(edit::placeMedia(p, seq, wav.id, 0, 0, 150, {}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(QDir().mkpath(dir.path() + "/whole") && QDir().mkpath(dir.path() + "/out"));
+
+        // Sent to the farm in `segments` and rendered by two nodes until the join ends; true when every job is done.
+        QStringList log;
+        std::mutex logLock;
+        auto onFarm = [&](const ExportSettings& st, int segments, std::string* id = nullptr,
+                          const std::function<void(FarmNodeOptions&)>& setUp = {}) {
+            std::string job, e;
+            if (!submitFarmJob(farm, "Master", p, seq.id, st, 0, &job, &e, segments)) return qWarning("%s", e.c_str()), false;
+            if (id) *id = job;
+            auto ended = [&] {
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.id == job) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
+                return true;
+            };
+            std::vector<std::thread> nodes;
+            for (int n = 0; n < 2; ++n)
+                nodes.emplace_back([&, n] {
+                    FarmNodeOptions o;
+                    o.farm = farm;
+                    o.name = n == 0 ? "Node A" : "Node B";
+                    o.pollMs = 100;
+                    o.stopped = ended;
+                    o.log = [&](const std::string& l) {
+                        std::lock_guard<std::mutex> g(logLock);
+                        log << QString::fromStdString(l);
+                    };
+                    if (setUp) setUp(o);
+                    std::string x;
+                    runFarmNode(o, nullptr, &x);
+                });
+            for (std::thread& t : nodes) t.join();
+            bool done = true;
+            for (const FarmJob& j : farmJobs(farm))
+                if (j.id == job || j.group == job) {
+                    if (j.state != FarmState::Done) qWarning("%s: %s", j.name.c_str(), j.error.c_str());
+                    done &= j.state == FarmState::Done;
+                }
+            return done;
+        };
+
+        // ---- DNxHR HQ in MXF OP1a, its two mono tracks: joined from six segments, every frame and sample as the whole
+        // render's, and bmx reads it.
+        const ExportPreset* dnx = findExportPreset("DNxHR HQ (MXF)");
+        QVERIFY(dnx);
+        ExportSettings mxf = dnx->settings;
+        mxf.startTimecode = "01:00:00:00";
+        mxf.path = (dir.path() + "/out/master.mxf").toStdString();
+        QVERIFY2(exportSplits(mxf, &err), err.c_str());
+        ExportSettings whole = mxf;
+        whole.path = (dir.path() + "/whole/master.mxf").toStdString();
+        QVERIFY2(exportSequence(p, seq, whole, {}, nullptr, &err), err.c_str());
+        QVERIFY2(onFarm(mxf, 6), qPrintable(log.join('\n')));
+        const std::vector<QByteArray> wholeFrames = pictureHashes(whole.path);
+        QCOMPARE(wholeFrames.size(), size_t(150));
+        QVERIFY(pictureHashes(mxf.path) == wholeFrames);
+        for (int track = 0; track < 2; ++track) {
+            const std::vector<float> a = decodeAudioStream(whole.path, track), b = decodeAudioStream(mxf.path, track);
+            QVERIFY(a.size() >= size_t(48000 * 6));
+            QVERIFY2(a == b, qPrintable(QString("track %1: %2 and %3 samples").arg(track).arg(a.size()).arg(b.size())));
+        }
+        if (broadcastMxfAvailable()) {
+            BroadcastMxfInfo info;
+            QVERIFY2(readBroadcastMxf(mxf.path, info, &err), err.c_str());
+            QCOMPARE(info.duration, int64_t(150));
+            QCOMPARE(info.soundTracks, 2);
+            QCOMPARE(info.startTimecode, std::string("01:00:00:00"));
+        }
+        QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+
+        // ---- XDCAM HD422 delivered as RDD 9 through bmx, joined from three segments: bmx reads it as RDD 9 with its eight
+        // tracks, it decodes without errors, and each GOP's own timecode counts on from the file's across the joins.
+        if (broadcastMxfAvailable()) {
+            const ExportPreset* xd = findExportPreset("XDCAM HD422 (MXF)");
+            QVERIFY(xd);
+            ExportSettings rdd9 = xd->settings;
+            rdd9.mxfDelivery = "rdd9";
+            rdd9.startTimecode = "10:00:00:00";
+            rdd9.out = 60;
+            rdd9.path = (dir.path() + "/out/xdcam.mxf").toStdString();
+            QVERIFY2(exportSplits(rdd9, &err), err.c_str());
+            QVERIFY2(onFarm(rdd9, 3), qPrintable(log.join('\n')));
+            BroadcastMxfInfo info;
+            QVERIFY2(readBroadcastMxf(rdd9.path, info, &err), err.c_str());
+            QVERIFY2(info.pictureEssence.rfind("MPEG_2_Long_GOP_422P_HL_1080", 0) == 0, info.pictureEssence.c_str());
+            QCOMPARE(info.duration, int64_t(60));
+            QCOMPARE(info.soundTracks, 8);
+            QCOMPARE(info.startTimecode, std::string("10:00:00:00"));
+            QVERIFY(!QFileInfo::exists(QString::fromStdString(rdd9.path + ".render.mxf")));
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, rdd9.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = avcodec_find_decoder(fmt->streams[v]->codecpar->codec_id);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(ctx, fmt->streams[v]->codecpar);
+            ctx->err_recognition = AV_EF_EXPLODE;
+            QVERIFY(avcodec_open2(ctx, codec, nullptr) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            int decoded = 0, packets = 0;
+            bool broken = false;
+            std::vector<std::pair<int, int>> gops;  // (the packet it opens, its timecode as frames from 10:00:00:00)
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v) {
+                    for (int i = 0; i + 7 < pkt->size; ++i)
+                        if (pkt->data[i] == 0 && pkt->data[i + 1] == 0 && pkt->data[i + 2] == 1 && pkt->data[i + 3] == 0xB8) {
+                            const uint32_t tc = (uint32_t(pkt->data[i + 4]) << 24) | (uint32_t(pkt->data[i + 5]) << 16) |
+                                                (uint32_t(pkt->data[i + 6]) << 8) | pkt->data[i + 7];
+                            const int h = (tc >> 26) & 31, m = (tc >> 20) & 63, s = (tc >> 13) & 63, f = (tc >> 7) & 63;
+                            gops.push_back({packets, ((h - 10) * 3600 + m * 60 + s) * 25 + f});
+                            break;
+                        }
+                    ++packets;
+                    broken |= avcodec_send_packet(ctx, pkt) < 0;
+                    while (avcodec_receive_frame(ctx, fr) == 0) {
+                        broken |= (fr->flags & AV_FRAME_FLAG_CORRUPT) != 0 || fr->decode_error_flags != 0;
+                        ++decoded;
+                    }
+                }
+                av_packet_unref(pkt);
+            }
+            avcodec_send_packet(ctx, nullptr);
+            while (avcodec_receive_frame(ctx, fr) == 0) ++decoded;
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            QVERIFY(!broken);
+            QCOMPARE(decoded, 60);
+            QVERIFY(gops.size() >= 5);
+            // (Counted in coding order, as FFmpeg's encoder counts a GOP's timecode.)
+            for (const auto& [at, tc] : gops) QVERIFY2(tc == at, qPrintable(QString("GOP at %1 says %2").arg(at).arg(tc)));
+        }
+
+        // ---- H.264 and AAC in MPEG-TS from four segments: one continuous transport stream (every PID's continuity
+        // counter in step, the PCR rising), every frame decoding, the sound as a single render's, as far from the picture.
+        ExportSettings ts;
+        ts.videoCodec = "libx264";
+        ts.audioCodec = "aac";
+        ts.path = (dir.path() + "/out/web.ts").toStdString();
+        ExportSettings single = ts;
+        single.path = (dir.path() + "/whole/web.ts").toStdString();
+        QVERIFY2(exportSequence(p, seq, single, {}, nullptr, &err), err.c_str());
+        QVERIFY2(onFarm(ts, 4), qPrintable(log.join('\n')));
+        {
+            QFile f(QString::fromStdString(ts.path));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray b = f.readAll();
+            QCOMPARE(b.size() % 188, 0);
+            std::map<int, int> counter;
+            int64_t lastPcr = -1, pcrs = 0;
+            int jumps = 0;
+            for (qsizetype at = 0; at < b.size(); at += 188) {
+                const auto* t = reinterpret_cast<const uint8_t*>(b.constData() + at);
+                QCOMPARE(int(t[0]), 0x47);
+                const int pid = ((t[1] & 0x1f) << 8) | t[2], afc = (t[3] >> 4) & 3, cc = t[3] & 15;
+                if (pid == 0x1fff) continue;
+                if (afc & 1) {  // (the counter steps with each packet carrying payload)
+                    if (counter.count(pid) && cc != ((counter[pid] + 1) & 15)) ++jumps;
+                    counter[pid] = cc;
+                }
+                if ((afc & 2) && t[4] > 0 && (t[5] & 0x10)) {
+                    const int64_t base = (int64_t(t[6]) << 25) | (int64_t(t[7]) << 17) | (int64_t(t[8]) << 9) | (int64_t(t[9]) << 1) | (t[10] >> 7);
+                    QVERIFY2(base > lastPcr, qPrintable(QString::number(base)));
+                    lastPcr = base;
+                    ++pcrs;
+                }
+            }
+            QCOMPARE(jumps, 0);
+            QVERIFY(pcrs > 10);
+        }
+        auto frames = [](const std::string& file) {
+            int n = -1;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return n;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = avcodec_find_decoder(fmt->streams[v]->codecpar->codec_id);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(ctx, fmt->streams[v]->codecpar);
+            ctx->err_recognition = AV_EF_EXPLODE;
+            avcodec_open2(ctx, codec, nullptr);
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            bool broken = false;
+            n = 0;
+            while (av_read_frame(fmt, pkt) >= 0) {
+                broken |= (pkt->flags & AV_PKT_FLAG_CORRUPT) != 0;
+                if (pkt->stream_index == v) broken |= avcodec_send_packet(ctx, pkt) < 0;
+                while (avcodec_receive_frame(ctx, fr) == 0) broken |= fr->decode_error_flags != 0, ++n;
+                av_packet_unref(pkt);
+            }
+            avcodec_send_packet(ctx, nullptr);
+            while (avcodec_receive_frame(ctx, fr) == 0) ++n;
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            return broken ? -1 : n;
+        };
+        QCOMPARE(frames(ts.path), 150);
+        QVERIFY(decodeAudioStream(ts.path, 0) == decodeAudioStream(single.path, 0));
+        auto lead = [](const std::string& file) {  // the sound's start less the picture's, in seconds
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return 1e9;
+            avformat_find_stream_info(fmt, nullptr);
+            const AVStream* v = fmt->streams[av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0)];
+            const AVStream* a = fmt->streams[av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0)];
+            const double d = double(a->start_time) * av_q2d(a->time_base) - double(v->start_time) * av_q2d(v->time_base);
+            avformat_close_input(&fmt);
+            return d;
+        };
+        QVERIFY2(std::fabs(lead(ts.path) - lead(single.path)) < 1e-4, qPrintable(QString("%1 s, whole %2 s").arg(lead(ts.path)).arg(lead(single.path))));
+
+        // ---- Hardware-encoded segments go only to nodes coding with the same encoder: node A says it has one, node B
+        // has none, and whichever takes a segment first decides; the other node renders none of them.
+        ExportSettings hw;
+        hw.videoCodec = "hw_h264";
+        hw.audioCodec = "aac";
+        hw.path = (dir.path() + "/out/hardware.mp4").toStdString();
+        QVERIFY2(exportSplits(hw, &err), err.c_str());
+        QVERIFY(exportSegmentsLongGop(hw));
+        std::string hwId;
+        QVERIFY2(onFarm(hw, 4, &hwId, [](FarmNodeOptions& o) {
+                     if (o.name == "Node A") o.encoders["h264"] = "h264_test";
+                     else o.encoders["h264"] = "libx264";
+                 }),
+                 qPrintable(log.join('\n')));
+        std::set<std::string> coders;
+        for (const FarmJob& j : farmJobs(farm))
+            if (j.group == hwId) coders.insert(j.node);
+        QCOMPARE(coders.size(), size_t(1));
+        QVERIFY2(log.join('\n').contains("Segments of " + QString::fromStdString(hwId) + " are coded with"), qPrintable(log.join('\n')));
+        QCOMPARE(frames(hw.path), 150);
+        bool reported = false;
+        for (const FarmNodeInfo& n : farmNodes(farm)) reported |= n.name == "Node A" && n.encoders.count("h264") && n.encoders.at("h264") == "h264_test";
+        QVERIFY(reported);
+        // Nodes of the same kind share them.
+        QVERIFY2(onFarm(hw, 4, &hwId, [](FarmNodeOptions& o) { o.encoders["h264"] = "h264_test"; }), qPrintable(log.join('\n')));
+
+        // ---- Two passes: the bits shared out by what each first pass measured (here three times as much a frame in the
+        // first half, bounded at four times the average), the whole's average kept.
+        const std::vector<int64_t> shares = twoPassBitrates(1000000, {{0, 50}, {50, 100}}, {300, 100});
+        QCOMPARE(shares.size(), size_t(2));
+        QCOMPARE(shares[0], int64_t(1500000));
+        QCOMPARE(shares[1], int64_t(500000));
+        const std::vector<int64_t> bounded = twoPassBitrates(1000000, {{0, 10}, {10, 100}}, {1000000, 1});
+        QVERIFY(std::llabs(bounded[0] * 10 + bounded[1] * 90 - 100000000) < 200);
+        QCOMPARE(bounded[0], 16 * bounded[1]);  // (4 times the average, and a quarter of it)
+        // An H.264 export at 400 kb/s in two passes, made whole and in four segments: both within 2 % of the bitrate, the
+        // segments' first passes jobs of their own.
+        auto videoRate = [](const std::string& file) {
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return 0.0;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            int64_t bytes = 0, n = 0;
+            AVPacket* pkt = av_packet_alloc();
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v) bytes += pkt->size, ++n;
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            const double seconds = double(n) * av_q2d(av_inv_q(fmt->streams[v]->avg_frame_rate));
+            avformat_close_input(&fmt);
+            return seconds > 0 ? double(bytes) * 8 / seconds : 0.0;
+        };
+        ExportSettings twice;
+        twice.videoCodec = "libx264";
+        twice.audioCodec = "aac";
+        twice.videoBitrate = 400000;
+        twice.twoPass = true;
+        twice.path = (dir.path() + "/whole/twice.mp4").toStdString();
+        QVERIFY2(exportSequence(p, seq, twice, {}, nullptr, &err), err.c_str());
+        QVERIFY2(std::fabs(videoRate(twice.path) / 400000 - 1) < 0.02, qPrintable(QString::number(videoRate(twice.path))));
+        QVERIFY(QDir(dir.path() + "/whole").entryList({".montage-*"}, QDir::Files | QDir::Hidden).isEmpty());  // (its first pass gone)
+        twice.path = (dir.path() + "/out/twice.mp4").toStdString();
+        std::string twiceId;
+        QVERIFY2(onFarm(twice, 4, &twiceId), qPrintable(log.join('\n')));
+        int firsts = 0, seconds = 0;
+        for (const FarmJob& j : farmJobs(farm))
+            if (j.group == twiceId) (j.pass == 1 ? firsts : seconds) += j.pass > 0;
+        QCOMPARE(firsts, 4);
+        QCOMPARE(seconds, 4);
+        QCOMPARE(frames(twice.path), 150);
+        QVERIFY2(std::fabs(videoRate(twice.path) / 400000 - 1) < 0.02, qPrintable(QString::number(videoRate(twice.path))));
+        QVERIFY(!exportSplits([] { ExportSettings x; x.path = "a.mp4"; x.videoCodec = "libsvtav1"; x.videoBitrate = 1000000; x.twoPass = true; return x; }(), &err));
+        QVERIFY(QString::fromStdString(err).contains("two passes"));
+        // (x265 picks a segment's level by its bits: H.265 takes two passes in one go.)
+        QVERIFY(!exportSplits([] { ExportSettings x; x.path = "a.mp4"; x.videoCodec = "libx265"; x.videoBitrate = 1000000; x.twoPass = true; return x; }(), &err));
+        QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+
+        // ---- An IMF Application #2E master in six segments: each node codes its share of the pictures, the join wraps
+        // them with the sound; its picture essence is the one-go master's, frame for frame, and it checks out (Photon
+        // too, when MONTAGE_TEST_PHOTON is set).
+        auto packageOnFarm = [&](const std::function<bool(std::string*, std::string*)>& submit, std::string* id = nullptr) {
+            std::string job, e;
+            if (!submit(&job, &e)) return qWarning("%s", e.c_str()), false;
+            if (id) *id = job;
+            auto ended = [&] {
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.id == job) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
+                return true;
+            };
+            std::vector<std::thread> nodes;
+            for (int n = 0; n < 2; ++n)
+                nodes.emplace_back([&, n] {
+                    FarmNodeOptions o;
+                    o.farm = farm;
+                    o.name = n == 0 ? "Node A" : "Node B";
+                    o.pollMs = 100;
+                    o.stopped = ended;
+                    std::string x;
+                    runFarmNode(o, nullptr, &x);
+                });
+            for (std::thread& t : nodes) t.join();
+            bool done = true;
+            for (const FarmJob& j : farmJobs(farm))
+                if (j.id == job || j.group == job) {
+                    if (j.state != FarmState::Done) qWarning("%s: %s", j.name.c_str(), j.error.c_str());
+                    done &= j.state == FarmState::Done;
+                }
+            return done;
+        };
+        auto onlyFolder = [](const QString& parent, const QString& pattern) {
+            const QStringList found = QDir(parent).entryList({pattern}, QDir::Dirs | QDir::NoDotAndDotDot);
+            return found.size() == 1 ? QDir(parent).filePath(found.front()) : QString();
+        };
+        ImfSettings imf;
+        imf.title = "Farm master";
+        imf.threads = 2;
+        ImfResult imfWhole;
+        QVERIFY2(exportImf(p, seq, imf, (dir.path() + "/whole").toStdString(), &imfWhole, {}, &err), err.c_str());
+        QCOMPARE(imfWhole.frames, int64_t(150));
+        std::string imfId;
+        QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
+                     return submitFarmImf(farm, "IMF", p, seq.id, imf, (dir.path() + "/out").toStdString(), 6, id, e);
+                 }, &imfId),
+                 qPrintable(log.join('\n')));
+        int imfSegments = 0;
+        for (const FarmJob& j : farmJobs(farm)) imfSegments += j.group == imfId;
+        QCOMPARE(imfSegments, 6);
+        const QString farmImf = onlyFolder(dir.path() + "/out", "Farm_master_IMF_*");
+        QVERIFY(!farmImf.isEmpty());
+        {
+            std::vector<std::string> issues = verifyImf(farmImf.toStdString());
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QString jars = qEnvironmentVariable("MONTAGE_TEST_PHOTON");
+            if (!jars.isEmpty()) {
+                QProcess java;
+                java.setProcessChannelMode(QProcess::MergedChannels);
+                java.start("java", {"-cp", jars + "/*", "com.netflix.imflibrary.app.IMPAnalyzer", farmImf});
+                QVERIFY(java.waitForFinished(600000));
+                const QString said = QString::fromUtf8(java.readAll());
+                QVERIFY2(!said.contains("ERROR-"), qPrintable(said));
+            }
+            auto picture = [](const QString& folder) {
+                for (const QString& f : QDir(folder).entryList({"VIDEO_*.mxf"})) return QDir(folder).filePath(f).toStdString();
+                return std::string();
+            };
+            dcp::ImfTrackReader a, b;
+            QVERIFY2(a.open(picture(QString::fromStdString(imfWhole.folder)), &err), err.c_str());
+            QVERIFY2(b.open(picture(farmImf), &err), err.c_str());
+            QCOMPARE(b.frames(), a.frames());
+            std::vector<uint8_t> x, y;
+            for (int64_t k = 0; k < a.frames(); ++k) {
+                QVERIFY(a.frame(k, x) && b.frame(k, y));
+                QVERIFY2(x == y, qPrintable(QString("picture %1 differs").arg(k)));
+            }
+            // The sound as the one-go master's.
+            for (const QString& f : QDir(farmImf).entryList({"AUDIO_*.mxf"})) {
+                dcp::ImfTrackReader s1, s2;
+                QVERIFY(s2.open(QDir(farmImf).filePath(f).toStdString()));
+                QVERIFY(s1.open(QDir(QString::fromStdString(imfWhole.folder)).filePath(QDir(QString::fromStdString(imfWhole.folder)).entryList({"AUDIO_*.mxf"}).front()).toStdString()));
+                std::vector<int32_t> pa, pb;
+                QVERIFY(s1.samples() == s2.samples() && s1.pcm(0, s1.samples(), pa) && s2.pcm(0, s2.samples(), pb));
+                QVERIFY(pa == pb);
+            }
+        }
+        QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        // What cannot be made in segments is refused when sent.
+        ImfSettings archival = imf;
+        archival.application = 5;
+        QVERIFY(!submitFarmImf(farm, "IMF", p, seq.id, archival, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+        QVERIFY(QString::fromStdString(err).contains("Application #2E"));
+
+        // ---- A DCP in four segments: the same pictures as one made in one go, and it passes the DCP checks.
+        seq.inPoint = 0, seq.outPoint = 59;
+        DcpSettings cinema;
+        cinema.title = "Farm Trailer";
+        cinema.kind = "trailer";
+        cinema.inOut = true;
+        cinema.threads = 2;
+        DcpResult oneGo;
+        QVERIFY2(exportDcp(p, seq, cinema, (dir.path() + "/whole").toStdString(), &oneGo, {}, &err), err.c_str());
+        QCOMPARE(oneGo.frames, int64_t(60));
+        QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
+                     return submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, id, e);
+                 }),
+                 qPrintable(log.join('\n')));
+        const QString farmDcp = onlyFolder(dir.path() + "/out", "FarmTrailer_*");
+        QVERIFY(!farmDcp.isEmpty());
+        {
+            std::vector<std::string> issues = verifyDcp(farmDcp.toStdString());
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            auto picture = [](const QString& folder) {
+                for (const QString& f : QDir(folder).entryList({"*.mxf"})) {
+                    dcp::TrackFileReader r;
+                    if (r.open(QDir(folder).filePath(f).toStdString()) && !r.timedText() && !r.iab() && r.largestEditUnit() > 10000)
+                        return QDir(folder).filePath(f).toStdString();
+                }
+                return std::string();
+            };
+            dcp::TrackFileReader a, b;
+            QVERIFY2(a.open(picture(QString::fromStdString(oneGo.folder)), &err), err.c_str());
+            QVERIFY2(b.open(picture(farmDcp), &err), err.c_str());
+            QCOMPARE(b.editUnits(), int64_t(60));
+            std::vector<uint8_t> x, y;
+            for (int64_t k = 0; k < a.editUnits(); ++k) {
+                QVERIFY(a.read(k, 0, x) && b.read(k, 0, y));
+                QVERIFY2(x == y, qPrintable(QString("picture %1 differs").arg(k)));
+            }
+        }
+        QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        cinema.encrypt = true;
+        QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+        QVERIFY(QString::fromStdString(err).contains("DKDM"));
     }
 
     void mcpBuildsACutFromAScript() {
