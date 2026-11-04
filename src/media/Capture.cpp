@@ -1139,9 +1139,9 @@ void Recorder::run() {
         Input& in = inputs[item.input];
         const st2110::InputFrame& f = *item.st2110;
         const int64_t pts = f.ptpNs / 100;
-        if (!soundOnly && in.videoStream >= 0) {
-            AVFrame* pic = rasterFrame(f.picture, in.st2110Full);
-            if (!pic) return true;
+        // (a picture dropped while the encoder caught up: its sound still goes in)
+        AVFrame* pic = !soundOnly && in.videoStream >= 0 ? rasterFrame(f.picture, in.st2110Full) : nullptr;
+        if (pic) {
             const st2110::VideoFormat& v = in.st2110Video;
             pic->pts = pic->best_effort_timestamp = pts;
             const bool wide = v.colorimetry == "BT2020" || v.colorimetry == "BT2100";

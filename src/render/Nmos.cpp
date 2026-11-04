@@ -112,18 +112,16 @@ std::vector<SdpPath> sdpPaths(const QString& sdp) {
     };
     std::vector<Media> media;
     QStringList dup;
-    QString origin, sessionAddress;
+    QString sessionAddress;
     for (QString line : sdp.split('\n')) {
         line = line.trimmed();
         if (line.size() < 2 || line[1] != '=') continue;
         const QString v = line.mid(2);
         const QStringList w = v.split(' ', Qt::SkipEmptyParts);
-        if (line[0] == 'o' && w.size() >= 6) {
-            origin = w[5];
-        } else if (line[0] == 'm' && w.size() >= 2) {
+        // (the source only from a source filter: the origin's address may be another computer's)
+        if (line[0] == 'm' && w.size() >= 2) {
             Media m;
             m.path.port = w[1].section('/', 0, 0).toInt();
-            m.path.source = origin == QLatin1String("0.0.0.0") ? QString() : origin;
             m.path.address = sessionAddress;
             media.push_back(m);
         } else if (line[0] == 'c' && w.size() >= 3 && !media.empty()) {
@@ -1189,6 +1187,11 @@ Node::Response Node::putTarget(RConn& r, const QJsonObject& sender) {
         QNetworkRequest req{QUrl(href)};
         req.setTransferTimeout(5000);
         QNetworkReply* reply = net_->get(req);
+        // (anyone may name the manifest: a megabyte of it at most)
+        reply->setReadBufferSize(1 << 20);
+        connect(reply, &QNetworkReply::readyRead, this, [reply] {
+            if (reply->bytesAvailable() >= (1 << 20)) reply->abort();
+        });
         const QUuid id = r.id;
         const QJsonValue senderId = sender["id"];
         connect(reply, &QNetworkReply::finished, this, [this, reply, id, senderId] {

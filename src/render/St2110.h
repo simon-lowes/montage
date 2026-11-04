@@ -279,7 +279,8 @@ class Receiver {
 public:
     Receiver();
     ~Receiver();
-    bool open(const Endpoint& e, const std::string& interfaceAddress = {}, std::string* error = nullptr);
+    // (multicast from `source` alone when one is given and the network takes source-specific joins)
+    bool open(const Endpoint& e, const std::string& interfaceAddress = {}, std::string* error = nullptr, const std::string& source = {});
     // The next datagram within `ms`; false when none came.
     bool receive(std::vector<uint8_t>& out, int ms);
     void close();

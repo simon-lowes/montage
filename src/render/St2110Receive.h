@@ -7,6 +7,7 @@
 //    frame comes with the samples of its own time span, its time code (ST 12-2), captions and HDR metadata.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -50,6 +51,7 @@ bool frameTimecode(const std::vector<AncPacket>& anc, Rational fps, output::Time
 class PathMerger {
 public:
     explicit PathMerger(bool extended, size_t window = 512) : extended_(extended), window_(window) {}
+    void setWindow(size_t window) { window_ = std::max<size_t>(16, window); }
     void push(std::vector<uint8_t> packet, int path, std::vector<std::vector<uint8_t>>& out);
     // Everything held, in order (a pause in the stream: what is missing will not come).
     void flush(std::vector<std::vector<uint8_t>>& out);
@@ -61,6 +63,7 @@ private:
     size_t window_;
     bool started_ = false;
     int64_t next_ = 0;
+    int64_t lateRun_ = 0;  // packets in a row from before the window (a sender restarted, or one jumped ahead of)
     std::map<int64_t, std::vector<uint8_t>> held_;
     void release(std::vector<std::vector<uint8_t>>& out);
 };
@@ -122,7 +125,8 @@ private:
 
     VideoFormat video_;
     AudioFormat audio_;
-    bool hasAudio_ = false, hasAnc_ = false, ancSeen_ = false;
+    bool hasAudio_ = false, hasAnc_ = false, ancSeen_ = false, joined_ = false;
+    size_t pendingLimit_ = 16;  // frames held for the reader (fewer of large pictures)
     uint32_t ancFirst_ = 0, ancLatest_ = 0;  // the first and latest ancillary data's RTP timestamps
     InputOptions options_;
     std::vector<std::unique_ptr<Stream>> streams_;

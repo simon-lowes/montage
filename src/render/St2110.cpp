@@ -306,6 +306,10 @@ bool videoFormatOk(const VideoFormat& f, std::string* why) {
     };
     if (f.depth != 8 && f.depth != 10 && f.depth != 12) return fail("ST 2110-20 is sent here at 8, 10 or 12 bits");
     if (f.width <= 0 || f.height <= 0 || !f.fps.valid()) return fail("ST 2110 carries pictures of a size at a frame rate");
+    // (what an SDP, which anyone on the network can hand an NMOS receiver, may ask to be held)
+    if (f.width > 8192 || f.height > 4320) return fail("ST 2110 pictures here are at most 8192 x 4320");
+    if (f.fps.num <= 0 || f.fps.den <= 0 || f.fps.num > 1000000 || f.fps.den > 100000 || f.fps.toDouble() < 1 || f.fps.toDouble() > 300)
+        return fail("ST 2110 pictures here come at 1 to 300 frames a second");
     const Pgroup pg = pgroup(f.sampling, f.depth);
     if (f.width % pg.pixels)
         return fail(samplingName(f.sampling) + " at " + std::to_string(f.depth) + " bits needs a width in whole groups of " +
@@ -1147,7 +1151,7 @@ struct Receiver::Socket {
 Receiver::Receiver() = default;
 Receiver::~Receiver() = default;
 
-bool Receiver::open(const Endpoint& e, const std::string& interfaceAddress, std::string* error) {
+bool Receiver::open(const Endpoint& e, const std::string& interfaceAddress, std::string* error, const std::string& source) {
     close();
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
@@ -1168,11 +1172,23 @@ bool Receiver::open(const Endpoint& e, const std::string& interfaceAddress, std:
     }
     if (::bind(s_->s, reinterpret_cast<const sockaddr*>(&local), sizeof local) != 0) return fail("Could not listen at " + endpointText(e));
     if (multicast) {
-        ip_mreq m{};
-        ipv4(e.address, m.imr_multiaddr);
-        if (!interfaceAddress.empty()) ipv4(interfaceAddress, m.imr_interface);
-        if (setsockopt(s_->s, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&m), sizeof m) != 0)
-            return fail("Could not join " + e.address);
+        // From the one source named (source-specific: what SSM networks need, and nobody else's packets taken), else
+        // from any.
+        bool joined = false;
+        if (!source.empty() && source != "0.0.0.0") {
+            ip_mreq_source m{};  // (fields by name: their order differs between systems)
+            ipv4(e.address, m.imr_multiaddr);
+            ipv4(source, m.imr_sourceaddr);
+            if (!interfaceAddress.empty()) ipv4(interfaceAddress, m.imr_interface);
+            joined = setsockopt(s_->s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, reinterpret_cast<const char*>(&m), sizeof m) == 0;
+        }
+        if (!joined) {
+            ip_mreq m{};
+            ipv4(e.address, m.imr_multiaddr);
+            if (!interfaceAddress.empty()) ipv4(interfaceAddress, m.imr_interface);
+            if (setsockopt(s_->s, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&m), sizeof m) != 0)
+                return fail("Could not join " + e.address);
+        }
     }
     sockaddr_in bound{};
     socklen_t len = sizeof bound;
