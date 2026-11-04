@@ -15,6 +15,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <mmsystem.h>
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -887,9 +888,19 @@ struct Sender::Sockets {
     sockaddr_in video{}, audio{}, anc{}, video2{}, audio2{}, anc2{};
     std::function<bool(int, int, uint64_t)> drop;
     uint64_t sent[3] = {0, 0, 0};
+#ifdef _WIN32
+    // (Windows sleeps in steps of its timer, 15.6 ms unless asked for 1 ms: too coarse to pace packets within a frame,
+    // so a sender would fall a frame behind and skip one)
+    Sockets() { timeBeginPeriod(1); }
+#else
+    Sockets() = default;
+#endif
     ~Sockets() {
         if (s != kBad) closeSock(s);
         if (s2 != kBad) closeSock(s2);
+#ifdef _WIN32
+        timeEndPeriod(1);
+#endif
     }
     // A packet of stream 0 (video), 1 (audio) or 2 (ancillary data), on each path.
     bool to(int stream, const uint8_t* data, size_t size) {
