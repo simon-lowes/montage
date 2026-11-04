@@ -679,11 +679,12 @@ Bytes packagesImf(const std::array<Uuid, 64>& ids, const Uuid& asset, EditRate r
     return out;
 }
 
-// Frame offsets as index table segments (5000 entries to a segment), every frame a random access point.
-Bytes vbrIndex(const std::vector<uint64_t>& offsets, EditRate rate) {
+// Frame offsets as index table segments (5000 entries to a segment), every frame a random access point: frames
+// [from, to) (to -1: to the last).
+Bytes vbrIndex(const std::vector<uint64_t>& offsets, EditRate rate, int64_t from = 0, int64_t to = -1) {
     Bytes out;
-    const int64_t n = int64_t(offsets.size());
-    for (int64_t first = 0; first < n || (n == 0 && first == 0); first += int64_t(kEntriesPerSegment)) {
+    const int64_t n = to < 0 ? int64_t(offsets.size()) : std::min<int64_t>(to, int64_t(offsets.size()));
+    for (int64_t first = from; first < n || (n == from && first == from); first += int64_t(kEntriesPerSegment)) {
         const int64_t count = std::min<int64_t>(int64_t(kEntriesPerSegment), n - first);
         Set s;
         indexBase(s, rate, first, count, 0);
@@ -705,7 +706,7 @@ Bytes vbrIndex(const std::vector<uint64_t>& offsets, EditRate rate) {
         }
         s.item(0x3f0a, entries);
         putBytes(out, klv(ul("060e2b34025301010d01020101100100"), s.body));
-        if (n == 0) break;
+        if (n == from) break;
     }
     return out;
 }
@@ -931,6 +932,8 @@ bool TrackFileWriter::openFile(const std::string& path, const Uuid& asset, int f
     created_ = nowStamp();
     elements_ = 0;
     streams_.clear();
+    extra_ = 0;
+    bodies_.assign(1, Body{kHeaderSize, 0, 0, {}});
     if (encrypted_ && imf_) {
         if (error) *error = "IMF track files are not encrypted here";
         return false;
@@ -955,7 +958,8 @@ bool TrackFileWriter::openFile(const std::string& path, const Uuid& asset, int f
 }
 
 std::vector<uint8_t> TrackFileWriter::partitionPack(const uint8_t key[16], uint64_t thisPartition, uint64_t previous, uint64_t footer,
-                                                   uint64_t headerBytes, uint64_t indexBytes, uint32_t indexSid, uint32_t bodySid) const {
+                                                   uint64_t headerBytes, uint64_t indexBytes, uint32_t indexSid, uint32_t bodySid,
+                                                   uint64_t bodyOffset) const {
     Bytes v;
     put16(v, 1);              // major
     put16(v, imf_ ? 3 : 2);   // minor
@@ -966,7 +970,7 @@ std::vector<uint8_t> TrackFileWriter::partitionPack(const uint8_t key[16], uint6
     put64(v, headerBytes);
     put64(v, indexBytes);
     put32(v, indexSid);
-    put64(v, 0);  // body offset
+    put64(v, bodyOffset);
     put32(v, bodySid);
     putUl(v, imf_ ? kOp1a : kOpAtom);
     put32(v, 2);
@@ -1020,9 +1024,14 @@ bool TrackFileWriter::writeElement(const uint8_t key[16], const uint8_t* data, s
         essenceBytes_ += head.size() + esv.size() + pack.size();
         return true;
     }
+    // (RDD 44 5.3.3: a new body partition every so many frames)
+    if (index && segmentFrames_ > 0 && frames() > 0 && frames() % segmentFrames_ == 0 && !startBody(error)) return false;
     Bytes kl(key, key + 16);
-    // A frame of 16 MiB or more (lossless UHD and 4K can be) needs the 8-byte length.
-    if (size < (size_t(1) << 24)) putBer4(kl, size);
+    // A frame of 16 MiB or more (lossless UHD and 4K can be) needs the 8-byte length; RDD 44 has five bytes always.
+    if (ber5_ && size < (uint64_t(1) << 32)) {
+        put8(kl, 0x84);
+        put32(kl, size);
+    } else if (size < (size_t(1) << 24)) putBer4(kl, size);
     else putBer8(kl, size);
     if (std::fwrite(kl.data(), 1, kl.size(), f_) != kl.size() || (size && std::fwrite(data, 1, size, f_) != size)) {
         if (error) *error = "Cannot write " + path_ + " (is the disk full?)";
@@ -1033,8 +1042,72 @@ bool TrackFileWriter::writeElement(const uint8_t key[16], const uint8_t* data, s
     return true;
 }
 
+bool TrackFileWriter::startBody(std::string* error) {
+    // The partition pack (its footer and previous partition filled in on closing), then the previous partition's index.
+    Body b;
+    b.at = kHeaderSize + 140 + essenceBytes_ + extra_;
+    b.streamOffset = essenceBytes_;
+    b.first = frames();
+    b.index = vbrIndex(offsets_, rate_, bodies_.back().first, frames());
+    Bytes pack = partitionPack(ul("060e2b34020501010d01020101030400").data(), b.at, bodies_.back().at, 0, 0, b.index.size(), kIndexSid, kBodySid,
+                               b.streamOffset);
+    putBytes(pack, b.index);
+    if (std::fwrite(pack.data(), 1, pack.size(), f_) != pack.size()) {
+        if (error) *error = "Cannot write " + path_ + " (is the disk full?)";
+        return false;
+    }
+    extra_ += pack.size();
+    bodies_.push_back(std::move(b));
+    return true;
+}
+
+bool TrackFileWriter::closeSegmented(std::string* error) {
+    auto fail = [&] {
+        if (error) *error = "Cannot finish " + path_;
+        std::fclose(f_);
+        f_ = nullptr;
+        return false;
+    };
+    // The footer: every partition's index table segment (the last one's only here), then the random index pack.
+    const uint64_t footerAt = kHeaderSize + 140 + essenceBytes_ + extra_;
+    Bytes index;
+    for (size_t i = 1; i < bodies_.size(); ++i) putBytes(index, bodies_[i].index);
+    putBytes(index, vbrIndex(offsets_, rate_, bodies_.back().first, frames()));
+    Bytes tail = partitionPack(ul("060e2b34020501010d01020101040400").data(), footerAt, bodies_.back().at, footerAt, 0, index.size(), kIndexSid, 0);
+    putBytes(tail, index);
+    Bytes rip;
+    put32(rip, 0);
+    put64(rip, 0);
+    for (const Body& b : bodies_) {
+        put32(rip, kBodySid);
+        put64(rip, b.at);
+    }
+    put32(rip, 0);
+    put64(rip, footerAt);
+    put32(rip, 16 + 4 + rip.size() + 4);
+    putBytes(tail, klv(ul("060e2b34020501010d01020101110100"), rip));
+    if (std::fseek(f_, 0, SEEK_END) != 0 || std::fwrite(tail.data(), 1, tail.size(), f_) != tail.size()) return fail();
+    // Each body partition's pack again, now the footer is known.
+    for (size_t i = 0; i < bodies_.size(); ++i) {
+        const Body& b = bodies_[i];
+        const Bytes pack = partitionPack(ul("060e2b34020501010d01020101030400").data(), b.at, i ? bodies_[i - 1].at : 0, footerAt, 0, b.index.size(),
+                                         b.index.empty() ? 0 : kIndexSid, kBodySid, b.streamOffset);
+        if (std::fseek(f_, long(b.at), SEEK_SET) != 0 || std::fwrite(pack.data(), 1, pack.size(), f_) != pack.size()) return fail();
+    }
+    Bytes head = partitionPack(ul("060e2b34020501010d01020101020400").data(), 0, 0, footerAt, kHeaderSize - 140, 0, 0, 0);
+    putBytes(head, headerMetadata(duration()));
+    if (head.size() + 20 > kHeaderSize) return fail();
+    Bytes fill(kHeaderSize - head.size() - 20, 0);
+    putBytes(head, klv(ul("060e2b34010101020301021001000000"), fill));
+    if (std::fseek(f_, 0, SEEK_SET) != 0 || std::fwrite(head.data(), 1, head.size(), f_) != head.size()) return fail();
+    const bool ok = std::fclose(f_) == 0;
+    f_ = nullptr;
+    if (!ok && error) *error = "Cannot finish " + path_;
+    return ok;
+}
+
 bool TrackFileWriter::startStream(uint32_t sid, std::string* error) {
-    const uint64_t at = kHeaderSize + 140 + essenceBytes_;
+    const uint64_t at = kHeaderSize + 140 + essenceBytes_ + extra_;
     const uint64_t previous = streams_.empty() ? kHeaderSize : streams_.back().second;
     const Bytes pack = partitionPack(ul(kStreamPartition).data(), at, previous, 0, 0, 0, 0, sid);
     if (!writeRaw(pack.data(), pack.size(), error)) return false;
@@ -1051,6 +1124,7 @@ bool TrackFileWriter::close(std::string* error) {
         return false;
     };
     const uint64_t bodyStart = kHeaderSize;
+    if (imf_ && segmentFrames_ > 0) return closeSegmented(error);
     if (imf_) {
         // AS-02: the index in a partition of its own after the essence, then an empty footer; the body partition
         // pack learns where the footer is.
@@ -2099,6 +2173,144 @@ std::vector<uint8_t> ImfPictureWriter::headerMetadata(int64_t duration) const {
 
 std::vector<uint8_t> ImfPictureWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
 
+// ---- IMF Application ProRes (RDD 45) ------------------------------------------------------------------------------
+
+namespace {
+
+// The picture items a ProRes descriptor uses: the CDCI or RGBA ones, the colour and the mastering display.
+const PrimerEntry kProResPrimer[] = {
+    {0x3201, "060e2b34010101020401060100000000"}, {0x3202, "060e2b34010101010401050201000000"},
+    {0x3203, "060e2b34010101010401050202000000"}, {0x320c, "060e2b34010101010401030104000000"},
+    {0x320d, "060e2b34010101020401030205000000"}, {0x320e, "060e2b34010101010401010101000000"},
+    {0x3210, "060e2b34010101020401020101010200"}, {0x3219, "060e2b34010101090401020101060100"},
+    {0x321a, "060e2b34010101020401020101030100"}, {0x3301, "060e2b3401010102040105030a000000"},
+    {0x3302, "060e2b34010101010401050105000000"}, {0x3303, "060e2b34010101010401050106000000"},
+    {0x3304, "060e2b34010101010401050303000000"}, {0x3305, "060e2b34010101010401050304000000"},
+    {0x3306, "060e2b34010101020401050305000000"}, {0x3308, "060e2b34010101020401050110000000"},
+    {0x3401, "060e2b34010101020401050306000000"}, {0x3405, "060e2b34010101050401040401000000"},
+    {0x3406, "060e2b3401010105040105030b000000"}, {0x3407, "060e2b3401010105040105030c000000"},
+    {0x3f09, "060e2b34010101050404040106000000"}, {0xfff0, "060e2b340101010e0420040101010000"},
+    {0xffef, "060e2b340101010e0420040101020000"}, {0xffee, "060e2b340101010e0420040101030000"},
+    {0xffed, "060e2b340101010e0420040101040000"},
+};
+constexpr const char* kProResElement = "060e2b34010201010d01030115011701";  // a frame-wrapped ProRes picture (track 15011701)
+
+}  // namespace
+
+int64_t ImfProResWriter::partitionFrames(EditRate r) {
+    // 240 at 23.976, 24 and 25, 300 at 29.97 and 30, 480 at 50, 600 at 59.94 and 60: about ten seconds, never past 10.01.
+    if (!r.num || !r.den) return 240;
+    const double fps = r.value();
+    if (fps <= 25.5) return 240;
+    if (fps <= 30.5) return 300;
+    if (fps <= 50.5) return 480;
+    if (fps <= 60.5) return 600;
+    return std::max<int64_t>(1, int64_t(std::floor(fps * 10.0 + 1e-6)));  // (120: 1200)
+}
+
+bool ImfProResWriter::open(const std::string& path, const Uuid& asset, EditRate rate, const ProResFormat& format, std::string* error) {
+    if (format.profile < 1 || format.profile > 6 || format.width <= 0 || format.height <= 0 || format.colour.codingEquations.empty()) {
+        if (error) *error = "Not a ProRes picture IMF Application ProRes takes";
+        return false;
+    }
+    format_ = format;
+    constraints_ = newUuid();
+    segmentFrames_ = partitionFrames(rate);
+    ber5_ = true;
+    return openImfFile(path, asset, rate, error);
+}
+
+bool ImfProResWriter::write(const uint8_t* frame, size_t size, std::string* error) {
+    if (size < 8 || std::memcmp(frame + 4, "icpf", 4) != 0) {
+        if (error) *error = "Not a ProRes frame";
+        return false;
+    }
+    return writeElement(ul(kProResElement).data(), frame, size, error);
+}
+
+std::string ImfProResWriter::coding() const {
+    static const char* hex = "0123456789abcdef";
+    std::string c = "060e2b340401010d04010202030601" "00";
+    c[28] = hex[format_.profile >> 4];
+    c[29] = hex[format_.profile & 15];
+    return c;
+}
+
+std::array<uint8_t, 16> ImfProResWriter::essenceContainer() const { return ul(kContainer); }
+
+std::vector<uint8_t> ImfProResWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
+std::vector<uint8_t> ImfProResWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kProResPrimer), std::end(kProResPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kContainer, kPictureDef, "Image Track", 0x15011701,
+                              "File Package: SMPTE RDD 44 frame wrapping of ProRes pictures"));
+    const ProResFormat& f = format_;
+    const ImfColour& c = f.colour;
+    // Narrow range (QE.1): black at 64 and white at 940 in ten bits, scaled to the depth.
+    const uint32_t scale = 1u << (f.bits - 8);
+    const std::string code = coding();
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, {constraints_});
+        s.u32(0x3006, 1);
+        s.rational(0x3001, rate_.num, rate_.den);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kContainer);
+        s.u8(0x320c, 0);  // full frame
+        s.u32(0x3203, uint32_t(f.width));
+        s.u32(0x3202, uint32_t(f.height));
+        s.rational(0x320e, f.aspectNum, f.aspectDen);
+        s.label(0x3210, c.transfer.c_str());
+        s.label(0x3201, code.c_str());
+        s.label(0x321a, c.codingEquations.c_str());
+        s.label(0x3219, c.primaries.c_str());
+        Bytes lines;
+        put32(lines, 2);
+        put32(lines, 4);
+        put32(lines, 0);
+        put32(lines, 0);
+        s.item(0x320d, lines);
+        if (c.hdr) {
+            auto xy = [](double v) { return uint64_t(std::clamp(std::lround(v / 0.00002), 0L, 50000L)); };
+            Bytes primaries;
+            for (int i = 0; i < 6; ++i) put16(primaries, xy(c.display[i]));
+            s.item(0xfff0, primaries);
+            Bytes white;
+            put16(white, xy(c.display[6]));
+            put16(white, xy(c.display[7]));
+            s.item(0xffef, white);
+            s.u32(0xffee, uint64_t(std::llround(c.maxLuminance * 10000)));
+            s.u32(0xffed, uint64_t(std::llround(c.minLuminance * 10000)));
+        }
+        if (f.rgb) {
+            // R'G'B' of the depth, opaque (no alpha in the layout).
+            Bytes layout(16, 0);
+            layout[0] = 'R', layout[1] = uint8_t(f.bits), layout[2] = 'G', layout[3] = uint8_t(f.bits), layout[4] = 'B', layout[5] = uint8_t(f.bits);
+            s.u32(0x3406, 940 * scale);
+            s.u32(0x3407, 64 * scale);
+            s.u8(0x3405, 0);
+            s.item(0x3401, layout);
+        } else {
+            s.u32(0x3301, uint32_t(f.bits));
+            s.u32(0x3302, uint32_t(f.horizontalSubsampling()));
+            s.u32(0x3308, 1);
+            s.u32(0x3304, 64 * scale);
+            s.u32(0x3305, 940 * scale);
+            s.u32(0x3306, 897 * scale - (scale - 1));
+        }
+        putBytes(out, setKlv(f.rgb ? 0x29 : 0x28, s));
+    }
+    {
+        Set s;  // ContainerConstraintsSubDescriptor (ST 379-2): nothing but its id
+        s.uuid(0x3c0a, constraints_);
+        putBytes(out, setKlv(0x67, s));
+    }
+    return out;
+}
+
 // ---- IMF Application #5 (ACES) ------------------------------------------------------------------------------------
 
 bool ImfAcesWriter::open(const std::string& path, const Uuid& asset, EditRate rate, int width, int height, bool alpha, const AcesPicture& picture,
@@ -2901,7 +3113,10 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     asset_ = {};
     channels_ = width_ = height_ = 0;
     rate_ = {};
-    op1a_ = rgba_ = j2k_ = aces_ = false;
+    op1a_ = rgba_ = j2k_ = aces_ = prores_ = cdci_ = false;
+    proresProfile_ = 0;
+    lengthBytes_ = -1;
+    bodyFrames_.clear();
     acesAuthoring_.clear();
     targets_.clear();
     elements_.clear();
@@ -2946,6 +3161,8 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                 label.replace(14, 2, "00");
                 primer[uint16_t(e[0] << 8 | e[1])] = label;
             }
+        } else if (std::memcmp(key, ul("060e2b34020501010d01020101030000").data(), 14) == 0 && key[14] >= 1 && key[14] <= 4) {
+            bodyFrames_.push_back(0);  // (a body partition: the frames after it are counted to it)
         } else if (std::memcmp(key, ul(kStreamPartition).data(), 16) == 0 && length >= 64) {
             // (a generic stream partition: its BodySID, 60 bytes into the pack)
             Bytes v(64);
@@ -3030,6 +3247,9 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                 // (a frame a few bytes long, by the million: a damaged or hostile file, not pictures)
                 if (elements_.size() >= (size_t(1) << 24)) return fail(path + " has too many frames");
                 elements_.emplace_back(value, length);
+                if (!bodyFrames_.empty()) ++bodyFrames_.back();
+                const int lengthBytes = int(head) - 16;
+                lengthBytes_ = lengthBytes_ < 0 || lengthBytes_ == lengthBytes ? lengthBytes : 0;
             } else if (key[12] == 0x16 || key[12] == 0x17) {
                 if (clipSize_ || sound || text) return fail(path + " is not clip-wrapped");
                 (key[12] == 0x16 ? sound : text) = true;
@@ -3060,6 +3280,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                         sampleRate_ = int(std::min<uint64_t>(beOf(Bytes(a->second.begin(), a->second.begin() + 4)), 768000));
                 }
                 if (key[14] == 0x29) rgba_ = true;
+                if (key[14] == 0x28) cdci_ = true;
                 if (key[14] == 0x7b) iab = true;  // an IAB essence descriptor (ST 2067-201)
                 if (key[14] == 0x29 || key[14] == 0x28) {
                     auto size = [&](uint16_t tag) {
@@ -3080,6 +3301,13 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                                     ec->second[12] == 0x02;
                     j2k_ = gc && ec->second[13] == 0x0c;
                     aces_ = gc && ec->second[13] == 0x19;
+                    prores_ = gc && ec->second[13] == 0x1c;  // (RDD 44)
+                }
+                // (ProRes's coding label: 06.0e.2b.34.04.01.01.xx.04.01.02.02.03.06, then the profile)
+                if (auto pc = it.find(0x3201); pc != it.end() && pc->second.size() == 16 && (key[14] == 0x29 || key[14] == 0x28)) {
+                    const Bytes& u = pc->second;
+                    if (u[8] == 0x04 && u[9] == 0x01 && u[10] == 0x02 && u[11] == 0x02 && u[12] == 0x03 && u[13] == 0x06 && u[14] >= 1 && u[14] <= 6)
+                        proresProfile_ = u[14];
                 }
                 if (auto r = it.find(0x3001); r != it.end() && r->second.size() == 8)
                     rate_ = EditRate{uint32_t(beOf(Bytes(r->second.begin(), r->second.begin() + 4))), uint32_t(beOf(Bytes(r->second.begin() + 4, r->second.end())))};

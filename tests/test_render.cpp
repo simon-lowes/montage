@@ -69,6 +69,7 @@
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
+#include "render/ProRes.h"
 #include "render/Iab.h"
 #include "render/ImageSubtitles.h"
 #include "media/TextReader.h"
@@ -9069,6 +9070,159 @@ colorspaces:
         bad = st;
         bad.application = 2;
         QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("Application #5") != std::string::npos);
+        bad = sup;
+        bad.application = 2;
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("supplemental keeps") != std::string::npos);
+    }
+
+    void exportsImfProRes() {
+        if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder");
+        QTemporaryDir dir;
+        // Ten and a half seconds at 24 fps: an orange matte, then a blue one, so the track file has a second body
+        // partition (RDD 44 starts one every 240 frames at 24 fps).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0.8f, 0.3f, 0.1f, 0, 125), colorClip(p, 0.1f, 0.4f, 0.8f, 125, 127)};
+        Sequence cut1 = s;
+        cut1.id = p.newId();
+        cut1.name = "Cut 1";
+        p.sequences.push_back(cut1);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "ProRes";
+        st.captions = false;
+        st.application = 45;
+        st.prores = "hq";
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.application == 45 && r.frames == 252 && r.codedFrames == 252 && r.bits == 10 && r.colour == "rec709" && r.prores == "hq");
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        // Photon holds every track file to ST 2067-5's partitions (index tables and essence never together); RDD 45 asks
+        // for RDD 44's instead (each body partition after the first carries the previous one's index), so that one
+        // finding is expected and everything else Photon checks has to pass.
+        auto photonFindings = [](const std::string& folder) {
+            QStringList found = photonErrors(QString::fromStdString(folder));
+            found.removeIf([](const QString& e) { return e.contains("has both index table and essence"); });
+            return found;
+        };
+        QStringList photon = photonFindings(r.folder);
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        ImfComposition comp;
+        QVERIFY2(readImfComposition(r.cpl, comp, &err), err.c_str());
+        QVERIFY(comp.application == 45 && comp.prores == "hq" && comp.colour == "rec709" && comp.width == 320 && comp.height == 180);
+        const QDir out(QString::fromStdString(r.folder));
+        const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+        // The track file as RDD 44 lays it out: 422 HQ in a CDCI descriptor, five-byte lengths, 240 frames a partition.
+        dcp::ImfTrackReader reader;
+        QVERIFY2(reader.open(video, &err), err.c_str());
+        QVERIFY(reader.imfProRes() && !reader.rgba() && reader.proresProfile() == 4 && reader.frames() == 252 && reader.elementLengthBytes() == 5);
+        QVERIFY2(reader.bodyPartitionFrames() == (std::vector<int64_t>{240, 12}), qPrintable(QString::number(reader.bodyPartitionFrames().size())));
+        // Every frame as FFmpeg's demuxer reads it is the frame written, it decodes to the rendered picture, and its
+        // header carries Rec.709's colour codes (RDD 45 Table 3).
+        AVFormatContext* fmt = nullptr;
+        QVERIFY(avformat_open_input(&fmt, video.c_str(), nullptr, nullptr) >= 0);
+        QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
+        QVERIFY(fmt->nb_streams >= 1 && fmt->streams[0]->codecpar->codec_id == AV_CODEC_ID_PRORES);
+        AVPacket* pkt = av_packet_alloc();
+        RenderOptions ro;
+        ro.highQuality = true;
+        int64_t k = 0;
+        while (av_read_frame(fmt, pkt) >= 0) {
+            if (pkt->stream_index == 0) {
+                std::vector<uint8_t> mine;
+                QVERIFY(reader.frame(k, mine));
+                QVERIFY2(mine.size() == size_t(pkt->size) && std::memcmp(mine.data(), pkt->data, mine.size()) == 0, qPrintable(QString::number(k)));
+                prores::FrameHeader h;
+                QVERIFY(prores::parseFrameHeader(pkt->data, size_t(pkt->size), h));
+                QVERIFY(h.width == 320 && h.height == 180 && h.chroma == 2 && h.interlace == 0 && h.alpha == 0 && h.primaries == 1 && h.transfer == 1 && h.matrix == 1);
+                if (k == 0 || k == 124 || k == 125 || k == 240 || k == 251) {
+                    std::vector<uint16_t> rgb;
+                    int w = 0, hh = 0;
+                    QVERIFY2(prores::decode(pkt->data, size_t(pkt->size), rgb, w, hh, &err), err.c_str());
+                    const Image want = renderProgramFrame(p, now, k, ro);
+                    QVERIFY(w == 320 && hh == 180);
+                    for (int c = 0; c < 3; ++c) {
+                        const double got = rgb[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0;
+                        QVERIFY2(std::fabs(got - want.at(160, 90)[c]) < 2.0 / 255, qPrintable(QStringLiteral("frame %1 channel %2: %3, rendered %4").arg(k).arg(c).arg(got).arg(want.at(160, 90)[c])));
+                    }
+                }
+                ++k;
+            }
+            av_packet_unref(pkt);
+        }
+        av_packet_free(&pkt);
+        avformat_close_input(&fmt);
+        QCOMPARE(k, int64_t(252));
+
+        // A supplemental: the blue shot changed, so only its 127 frames are new, in the same profile.
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.6;
+        ImfSettings sup = st;
+        sup.prores = "lt";  // (a supplemental keeps the earlier package's profile)
+        sup.supplementOf = r.folder;
+        sup.originalSequence = cut1.id;
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY2(r2.supplemental && r2.codedFrames == 127 && r2.prores == "hq", qPrintable(QString::number(r2.codedFrames)));
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        photon = photonFindings(r2.folder);
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+
+        // Opened again: the sequence at its size and rate, the orange shot as it was made.
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.error.empty(), in.error.c_str());
+        const Sequence* back = q.findSequence(in.sequence);
+        QVERIFY(back && back->width == 320 && back->height == 180 && back->fps == (Rational{24, 1}) && !back->videoTracks[0].clips.empty());
+        {
+            const Image again = renderProgramFrame(q, *back, 10, ro);
+            const Image want = renderProgramFrame(p, cut1, 10, ro);
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(again.at(160, 90)[c] - want.at(160, 90)[c]) < 3.0 / 255, qPrintable(QStringLiteral("%1 %2").arg(again.at(160, 90)[c]).arg(want.at(160, 90)[c])));
+        }
+
+        // ProRes 4444 in P3-D65 PQ: R'G'B' in an RGBA descriptor, 4:4:4 in every frame, P3-D65's codes.
+        {
+            ImfSettings hdr = st;
+            hdr.title = "ProRes HDR";
+            hdr.prores = "4444";
+            hdr.colour = "p3d65-pq";
+            hdr.masteringPeak = 1000;
+            Sequence shortSeq = now;
+            shortSeq.videoTracks[0].clips = {colorClip(p, 0.8f, 0.3f, 0.1f, 0, 6)};
+            ImfResult rh;
+            QVERIFY2(exportImf(p, shortSeq, hdr, dir.path().toStdString(), &rh, {}, &err), err.c_str());
+            QVERIFY(rh.prores == "4444" && rh.colour == "p3d65-pq" && rh.bits == 10);
+            issues = verifyImf(rh.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            photon = photonFindings(rh.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            const QDir ho(QString::fromStdString(rh.folder));
+            dcp::ImfTrackReader hr;
+            QVERIFY(hr.open(ho.filePath(ho.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), &err));
+            QVERIFY(hr.imfProRes() && hr.rgba() && hr.proresProfile() == 5 && hr.frames() == 6);
+            std::vector<uint8_t> f;
+            prores::FrameHeader h;
+            QVERIFY(hr.frame(5, f) && prores::parseFrameHeader(f.data(), f.size(), h));
+            QVERIFY(h.chroma == 3 && h.primaries == 12 && h.transfer == 16 && h.matrix == 1);
+            ImfComposition hc;
+            QVERIFY(readImfComposition(rh.cpl, hc, &err) && hc.prores == "4444" && hc.colour == "p3d65-pq");
+        }
+
+        // Refused: Proxy, P3-D65 PQ in 4:2:2, an odd width, an Application #2E supplemental of this package.
+        ImfSettings bad = st;
+        bad.prores = "proxy";
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("422 LT") != std::string::npos);
+        bad = st;
+        bad.colour = "p3d65-pq";
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("4:4:4") != std::string::npos);
+        bad = st;
+        Sequence odd = now;
+        odd.width = 321;
+        QVERIFY(!exportImf(p, odd, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("even width") != std::string::npos);
         bad = sup;
         bad.application = 2;
         QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("supplemental keeps") != std::string::npos);

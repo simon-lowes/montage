@@ -96,7 +96,8 @@ protected:
     // The essence container the partitions and preface name: the encrypted one's label when encrypting.
     std::array<uint8_t, 16> containerLabel() const;
     std::vector<uint8_t> partitionPack(const uint8_t key[16], uint64_t thisPartition, uint64_t previous, uint64_t footer,
-                                       uint64_t headerBytes, uint64_t indexBytes, uint32_t indexSid, uint32_t bodySid) const;
+                                       uint64_t headerBytes, uint64_t indexBytes, uint32_t indexSid, uint32_t bodySid,
+                                       uint64_t bodyOffset = 0) const;
 
     std::FILE* f_ = nullptr;
     std::string path_;
@@ -117,6 +118,21 @@ protected:
     std::array<uint8_t, 16> micKey_{};
     uint64_t elements_ = 0;  // essence elements written (the MIC's sequence numbers count them)
     std::vector<std::pair<uint32_t, uint64_t>> streams_;  // generic stream partitions: body stream and file offset
+    // (IMF, SMPTE RDD 44 5.3.3) The essence in body partitions of this many frames, each after the first with the
+    // previous one's index table segment, all of them repeated in the footer (0: one body partition, AS-02's index).
+    int64_t segmentFrames_ = 0;
+    bool ber5_ = false;   // essence elements' lengths in five bytes (RDD 44 6.2.2)
+    uint64_t extra_ = 0;  // bytes written among the essence that are not essence (partition packs and their index)
+    struct Body {
+        uint64_t at = 0, streamOffset = 0;
+        int64_t first = 0;
+        std::vector<uint8_t> index;  // the index table segment it carries (the previous partition's)
+    };
+    std::vector<Body> bodies_;
+
+private:
+    bool startBody(std::string* error);
+    bool closeSegmented(std::string* error);
 };
 
 // SMPTE ST 429-4: one JPEG 2000 codestream per frame (2K or 4K DCI profile, XYZ 12-bit); ST 429-10 when stereoscopic,
@@ -394,6 +410,42 @@ private:
     std::vector<AcesTargetFrame> targets_;
 };
 
+// A ProRes picture (SMPTE RDD 36) as IMF Application ProRes (RDD 45) describes it.
+struct ProResFormat {
+    int width = 0, height = 0;
+    int profile = 4;  // RDD 44's coding label byte 15: 1 422 Proxy, 2 422 LT, 3 422, 4 422 HQ, 5 4444, 6 4444 XQ
+    bool rgb = false;  // decoded as R'G'B' (an RGBA descriptor), else as Y'CbCr (CDCI)
+    int bits = 10;
+    ImfColour colour;  // (the coding equations always given: RDD 44 asks for them even with RGBA)
+    uint32_t aspectNum = 16, aspectDen = 9;
+    int horizontalSubsampling() const { return profile >= 5 ? 1 : 2; }
+};
+
+// SMPTE RDD 44: one ProRes frame a KLV (five-byte lengths), frame-wrapped in OP1a, in body partitions of about ten
+// seconds each carrying the previous one's index (5.3.3, which RDD 45 asks for), with a CDCI or RGBA descriptor
+// (narrow-range components, QE.1) and a container constraints sub-descriptor.
+class ImfProResWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, EditRate rate, const ProResFormat& format, std::string* error = nullptr);
+    bool write(const uint8_t* frame, size_t size, std::string* error = nullptr);
+    const ProResFormat& format() const { return format_; }
+    EditRate rate() const { return rate_; }
+    const Uuid& constraintsId() const { return constraints_; }
+    std::string coding() const;  // the picture coding label (hex)
+    static constexpr const char* kContainer = "060e2b340401010d0d010301021c0100";  // MXF-GC frame-wrapped ProRes
+    // RDD 44 Table 1: frames to a body partition (no more than 10.01 seconds).
+    static int64_t partitionFrames(EditRate rate);
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    ProResFormat format_;
+    Uuid constraints_{};
+};
+
 // The labels an IMF sound layout carries.
 struct McaLabel {
     const char* symbol;
@@ -615,6 +667,14 @@ public:
     bool imfRgbJpeg2000() const { return kind_ == Kind::Picture && op1a_ && rgba_ && j2k_; }
     // An IMF Application #5 picture: OP1a, ACES image containers in an RGBA descriptor (ST 2065-5).
     bool imfAces() const { return kind_ == Kind::Picture && op1a_ && rgba_ && aces_; }
+    // IMF Application ProRes pictures: OP1a, ProRes frame-wrapped (RDD 44) in a CDCI or RGBA descriptor; the coding
+    // label's profile (1 Proxy ... 6 4444 XQ, 0 another label), and the frames in each body partition and the largest
+    // and smallest essence element length field (RDD 44 asks for five bytes).
+    bool imfProRes() const { return kind_ == Kind::Picture && op1a_ && prores_ && (rgba_ || cdci_); }
+    bool rgba() const { return rgba_; }
+    int proresProfile() const { return proresProfile_; }
+    const std::vector<int64_t>& bodyPartitionFrames() const { return bodyFrames_; }
+    int elementLengthBytes() const { return lengthBytes_; }  // (0: they differ)
     // Its ACES picture sub-descriptor's output transform, and its target frames, each found in its stream or not.
     const std::string& acesAuthoring() const { return acesAuthoring_; }
     struct TargetFrame {
@@ -656,7 +716,9 @@ private:
     Uuid asset_{};
     int channels_ = 0, width_ = 0, height_ = 0;
     EditRate rate_;
-    bool op1a_ = false, rgba_ = false, j2k_ = false, aces_ = false, adm_ = false;
+    bool op1a_ = false, rgba_ = false, j2k_ = false, aces_ = false, adm_ = false, prores_ = false, cdci_ = false;
+    int proresProfile_ = 0, lengthBytes_ = -1;
+    std::vector<int64_t> bodyFrames_;
     int sampleRate_ = 48000;
     std::vector<AdmChannelMapping> chna_;
     uint32_t axmlStream_ = 0;

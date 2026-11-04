@@ -116,6 +116,7 @@
 #include "render/Fdl.h"
 #include "render/VfxPull.h"
 #include "render/VfxShots.h"
+#include "render/ProRes.h"
 #include "render/Titles.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
@@ -8431,6 +8432,19 @@ private slots:
                          aces.value("target_frames").toInt() == 1 && aces.value("output_transform").toString().startsWith("urn:") &&
                          QFileInfo::exists(aces.value("amf").toString()),
                      QJsonDocument(aces).toJson().constData());
+        }
+        // A ProRes master over MCP (IMF Application ProRes): 422 HQ unless asked, 10 bits, checked.
+        if (prores::encoderAvailable()) {
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"title", "ProRes"},
+                                            {"application", "prores"}, {"prores_profile", "4444"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject pr = r.value("structuredContent").toObject();
+            QVERIFY2(pr.value("problems").toArray().isEmpty() && pr.value("application").toString() == "prores" &&
+                         pr.value("prores_profile").toString() == "4444" && pr.value("bits").toInt() == 10,
+                     QJsonDocument(pr).toJson().constData());
+            QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
+                                                {"prores_profile", "proxy"}})
+                        .value("isError").toBool());
         }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});

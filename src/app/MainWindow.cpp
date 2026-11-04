@@ -7,6 +7,7 @@
 #include "LiveBridge.h"
 #include "LiveLink.h"
 #include "render/Fdl.h"
+#include "render/ProRes.h"
 #include "render/FilmLists.h"
 #include "render/PaperworkOutput.h"
 #include "render/ImageSubtitles.h"
@@ -8283,7 +8284,18 @@ void MainWindow::exportImfDialog() {
     application->setObjectName(QStringLiteral("imfApplication"));
     if (openJpegAvailable()) application->addItem(tr("Delivery master (Application #2E, JPEG 2000)"), 2);
     if (exrAvailable()) application->addItem(tr("Archival master (Application #5, ACES OpenEXR)"), 5);
+    if (prores::encoderAvailable()) application->addItem(tr("ProRes master (Application ProRes, RDD 45)"), 45);
     form->addRow(tr("Master:"), application);
+    // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
+    auto* proresProfile = new QComboBox(&dlg);
+    proresProfile->setObjectName(QStringLiteral("imfProResProfile"));
+    proresProfile->addItem(tr("422 HQ (4:2:2)"), "hq");
+    proresProfile->addItem(tr("422 (4:2:2)"), "422");
+    proresProfile->addItem(tr("422 LT (4:2:2)"), "lt");
+    proresProfile->addItem(tr("4444 (4:4:4 RGB)"), "4444");
+    proresProfile->addItem(tr("4444 XQ (4:4:4 RGB)"), "4444xq");
+    proresProfile->setToolTip(tr("4:2:2 goes to 3840 x 2160 and 60 fps, in Rec.709, Rec.2020 PQ or HLG; 4:4:4 to 4096 x 3112 in any of the colours"));
+    form->addRow(tr("ProRes:"), proresProfile);
     auto* graded = new QComboBox(&dlg);
     graded->setObjectName(QStringLiteral("imfGraded"));
     graded->addItem(tr("Graded"), true);
@@ -8430,9 +8442,11 @@ void MainWindow::exportImfDialog() {
         // (a supplemental keeps the earlier picture's size, colour, depth and coding; an archival master's pictures are
         // ACES, uncoded)
         const bool aces = application->currentData().toInt() == 5;
+        const bool proresApp = application->currentData().toInt() == 45;
         size->setEnabled(!supplemental->isChecked());
-        for (QWidget* w : {static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
-            w->setEnabled(!supplemental->isChecked() && !aces);
+        colour->setEnabled(!supplemental->isChecked() && !aces);
+        for (QWidget* w : {static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)}) w->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
+        proresProfile->setEnabled(!supplemental->isChecked() && proresApp);
         graded->setEnabled(aces);
         target->setEnabled(aces);
     };
@@ -8478,13 +8492,14 @@ void MainWindow::exportImfDialog() {
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
     st.application = application->currentData().toInt();
+    if (st.application == 45) st.prores = proresProfile->currentData().toString().toStdString();
     if (st.application == 5) {
         st.graded = graded->currentData().toBool();
         if (target->isChecked()) st.targetFrames = {state_->playhead()};
     }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
-    st.bits = bits->currentData().toInt();
+    st.bits = st.application == 45 ? 10 : bits->currentData().toInt();
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();

@@ -11796,7 +11796,10 @@ void McpServer::Impl::addTools() {
         "2067-50): every frame an ACES 2065-1 OpenEXR image (ST 2065-4, half float) in MXF (ST 2065-5), the composition "
         "naming the output transform it is viewed through; `graded` false keeps the shots as they came in, before the "
         "grade; `target_frames` (sequence frame numbers, within what is exported) adds those frames as they are "
-        "delivered, as reference stills, with an ACES Metadata File.",
+        "delivered, as reference stills, with an ACES Metadata File. `application` \"prores\" makes a ProRes master instead "
+        "(Application ProRes, SMPTE RDD 45): the pictures in `prores_profile` (422 LT, 422 or 422 HQ as Y'CbCr 4:2:2, to "
+        "3840 x 2160 and 60 fps, not P3-D65; 4444 or 4444 XQ as R'G'B' 4:4:4, to 4096 x 3112), 10 bits, in MXF as RDD 44 "
+        "maps them; sound, timed text and supplementals as for #2E.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
@@ -11815,7 +11818,8 @@ void McpServer::Impl::addTools() {
                 "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
-            "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
+            "application":{"enum":[2,5,"prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45)"},
+            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's)"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
             "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
@@ -11868,7 +11872,14 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
-            st.application = a.value("application").toInt(2);
+            if (a.value("application").isString()) {
+                if (a.value("application").toString() != "prores") throw ArgError{"\"application\" is 2, 5 or \"prores\""};
+                st.application = 45;
+            } else {
+                st.application = a.value("application").toInt(2);
+                if (st.application != 2 && st.application != 5) throw ArgError{"\"application\" is 2, 5 or \"prores\""};
+            }
+            st.prores = str(a, "prores_profile", "hq").toStdString();
             st.graded = a.value("graded").toBool(true);
             st.immersive = a.value("iab").toBool();
             st.sadm = a.value("sadm").toBool();
@@ -11904,6 +11915,10 @@ void McpServer::Impl::addTools() {
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+            if (r.application == 45) {
+                out["application"] = "prores";
+                out["prores_profile"] = QString::fromStdString(r.prores);
+            }
             if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             if (r.sadm || r.adm)
                 out["adm"] = QJsonObject{{"bed_channels", r.admBedChannels}, {"objects", r.admObjects}, {"sadm", r.sadm}, {"adm", r.adm}};
