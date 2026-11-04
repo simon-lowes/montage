@@ -810,6 +810,16 @@ bool parseJ2kHeader(const uint8_t* d, size_t n, J2kHeader& out) {
 
 namespace {
 
+// To a place in a file being written (64-bit: long is 32 bits on Windows, and track files pass 2 GiB).
+bool seekTo(std::FILE* f, uint64_t at) {
+#ifdef _WIN32
+    return _fseeki64(f, int64_t(at), SEEK_SET) == 0;
+#else
+    return fseeko(f, off_t(at), SEEK_SET) == 0;
+#endif
+}
+
+
 // SHA-1's compression of one 64-byte block (no padding: the FIPS 186-2 generator's G function).
 void sha1Block(uint32_t h[5], const uint8_t* p) {
     auto rol = [](uint32_t v, int n) { return v << n | v >> (32 - n); };
@@ -1092,7 +1102,7 @@ bool TrackFileWriter::closeSegmented(std::string* error) {
         const Body& b = bodies_[i];
         const Bytes pack = partitionPack(ul("060e2b34020501010d01020101030400").data(), b.at, i ? bodies_[i - 1].at : 0, footerAt, 0, b.index.size(),
                                          b.index.empty() ? 0 : kIndexSid, kBodySid, b.streamOffset);
-        if (std::fseek(f_, long(b.at), SEEK_SET) != 0 || std::fwrite(pack.data(), 1, pack.size(), f_) != pack.size()) return fail();
+        if (!seekTo(f_, b.at) || std::fwrite(pack.data(), 1, pack.size(), f_) != pack.size()) return fail();
     }
     Bytes head = partitionPack(ul("060e2b34020501010d01020101020400").data(), 0, 0, footerAt, kHeaderSize - 140, 0, 0, 0);
     putBytes(head, headerMetadata(duration()));
@@ -1138,7 +1148,7 @@ bool TrackFileWriter::close(std::string* error) {
             put8(len, 0x87);
             const uint64_t n = (clipEnd_ ? clipEnd_ : essenceBytes_) - clipStart_;
             for (int k = 6; k >= 0; --k) put8(len, (n >> (8 * k)) & 0xff);
-            if (std::fseek(f_, long(clipLengthAt_), SEEK_SET) != 0 || std::fwrite(len.data(), 1, len.size(), f_) != len.size()) return fail();
+            if (!seekTo(f_, clipLengthAt_) || std::fwrite(len.data(), 1, len.size(), f_) != len.size()) return fail();
         }
         const uint64_t indexAt = bodyStart + 140 + essenceBytes_;
         const Bytes index = indexSegments();
@@ -1161,7 +1171,7 @@ bool TrackFileWriter::close(std::string* error) {
         putBytes(tail, klv(ul("060e2b34020501010d01020101110100"), rip));
         if (std::fseek(f_, 0, SEEK_END) != 0 || std::fwrite(tail.data(), 1, tail.size(), f_) != tail.size()) return fail();
         Bytes body = partitionPack(ul("060e2b34020501010d01020101030400").data(), bodyStart, 0, footerAt, 0, 0, 0, kBodySid);
-        if (std::fseek(f_, long(bodyStart), SEEK_SET) != 0 || std::fwrite(body.data(), 1, body.size(), f_) != body.size()) return fail();
+        if (!seekTo(f_, bodyStart) || std::fwrite(body.data(), 1, body.size(), f_) != body.size()) return fail();
         Bytes head = partitionPack(ul("060e2b34020501010d01020101020400").data(), 0, 0, footerAt, kHeaderSize - 140, 0, 0, 0);
         putBytes(head, headerMetadata(duration()));
         if (head.size() + 20 > kHeaderSize) return fail();
@@ -2249,7 +2259,7 @@ std::vector<uint8_t> ImfProResWriter::headerMetadata(int64_t duration) const {
     const ProResFormat& f = format_;
     const ImfColour& c = f.colour;
     // Narrow range (QE.1): black at 64 and white at 940 in ten bits, scaled to the depth.
-    const uint32_t scale = 1u << (f.bits - 8);
+    const uint32_t scale = 1u << (f.bits - 10);
     const std::string code = coding();
     {
         Set s;
@@ -3162,6 +3172,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                 primer[uint16_t(e[0] << 8 | e[1])] = label;
             }
         } else if (std::memcmp(key, ul("060e2b34020501010d01020101030000").data(), 14) == 0 && key[14] >= 1 && key[14] <= 4) {
+            if (bodyFrames_.size() >= (1u << 20)) return fail(path + " has too many partitions");
             bodyFrames_.push_back(0);  // (a body partition: the frames after it are counted to it)
         } else if (std::memcmp(key, ul(kStreamPartition).data(), 16) == 0 && length >= 64) {
             // (a generic stream partition: its BodySID, 60 bytes into the pack)

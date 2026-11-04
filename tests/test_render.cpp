@@ -9077,6 +9077,22 @@ colorspaces:
 
     void exportsImfProRes() {
         if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder");
+        // Each profile coded as itself: the same busy picture smaller in 422 LT than in 422 HQ, larger in 4444 XQ than 4444.
+        {
+            std::mt19937 rng(45);
+            std::uniform_int_distribution<int> code(0, 65535);
+            std::vector<uint16_t> busy(size_t(320) * 180 * 3);
+            for (uint16_t& v : busy) v = uint16_t(code(rng));
+            auto bytesAt = [&](int profile) {
+                prores::Encoder e;
+                std::vector<uint8_t> f;
+                std::string why;
+                return e.open(320, 180, profile, "rec709", &why) && e.encode(busy.data(), f, &why) ? f.size() : size_t(0);
+            };
+            const size_t lt = bytesAt(2), standard = bytesAt(3), hq = bytesAt(4), four = bytesAt(5), xq = bytesAt(6);
+            QVERIFY2(lt && lt < standard && standard < hq && four < xq,
+                     qPrintable(QStringLiteral("LT %1, 422 %2, HQ %3, 4444 %4, XQ %5").arg(lt).arg(standard).arg(hq).arg(four).arg(xq)));
+        }
         QTemporaryDir dir;
         // Ten and a half seconds at 24 fps: an orange matte, then a blue one, so the track file has a second body
         // partition (RDD 44 starts one every 240 frames at 24 fps).
@@ -9113,6 +9129,14 @@ colorspaces:
         ImfComposition comp;
         QVERIFY2(readImfComposition(r.cpl, comp, &err), err.c_str());
         QVERIFY(comp.application == 45 && comp.prores == "hq" && comp.colour == "rec709" && comp.width == 320 && comp.height == 180);
+        // Narrow range at ten bits in the CPL and the track file's descriptor: black 64, white 940, a range of 897.
+        {
+            QFile cplFile(QString::fromStdString(r.cpl));
+            QVERIFY(cplFile.open(QIODevice::ReadOnly));
+            const QByteArray x = cplFile.readAll();
+            QVERIFY(x.contains("<r1:BlackRefLevel>64</r1:BlackRefLevel>") && x.contains("<r1:WhiteRefLevel>940</r1:WhiteRefLevel>") &&
+                    x.contains("<r1:ColorRange>897</r1:ColorRange>"));
+        }
         const QDir out(QString::fromStdString(r.folder));
         const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
         // The track file as RDD 44 lays it out: 422 HQ in a CDCI descriptor, five-byte lengths, 240 frames a partition.
@@ -9120,6 +9144,12 @@ colorspaces:
         QVERIFY2(reader.open(video, &err), err.c_str());
         QVERIFY(reader.imfProRes() && !reader.rgba() && reader.proresProfile() == 4 && reader.frames() == 252 && reader.elementLengthBytes() == 5);
         QVERIFY2(reader.bodyPartitionFrames() == (std::vector<int64_t>{240, 12}), qPrintable(QString::number(reader.bodyPartitionFrames().size())));
+        {
+            QFile mxf(QString::fromStdString(video));
+            QVERIFY(mxf.open(QIODevice::ReadOnly));
+            const QByteArray head = mxf.read(65536);
+            for (const char* tag : {"3304000400000040", "33050004000003ac", "3306000400000381"}) QVERIFY2(head.contains(QByteArray::fromHex(tag)), tag);
+        }
         // Every frame as FFmpeg's demuxer reads it is the frame written, it decodes to the rendered picture, and its
         // header carries Rec.709's colour codes (RDD 45 Table 3).
         AVFormatContext* fmt = nullptr;
@@ -9204,6 +9234,10 @@ colorspaces:
             dcp::ImfTrackReader hr;
             QVERIFY(hr.open(ho.filePath(ho.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), &err));
             QVERIFY(hr.imfProRes() && hr.rgba() && hr.proresProfile() == 5 && hr.frames() == 6);
+            QFile mxf(ho.filePath(ho.entryList({"VIDEO_*.mxf"}).value(0)));
+            QVERIFY(mxf.open(QIODevice::ReadOnly));
+            const QByteArray head = mxf.read(65536);
+            for (const char* tag : {"34060004000003ac", "3407000400000040"}) QVERIFY2(head.contains(QByteArray::fromHex(tag)), tag);
             std::vector<uint8_t> f;
             prores::FrameHeader h;
             QVERIFY(hr.frame(5, f) && prores::parseFrameHeader(f.data(), f.size(), h));

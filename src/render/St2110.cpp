@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -64,6 +65,24 @@ void netInit() {
 template <typename T>
 void option(sock_t s, int level, int name, T value) {
     setsockopt(s, level, name, reinterpret_cast<const char*>(&value), sizeof value);
+}
+
+// A socket buffer as large as the system allows, up to `bytes`: Linux caps a request silently, but macOS and the BSDs
+// refuse one above their limit (kern.ipc.maxsockbuf) and leave the small default, so smaller sizes are tried in turn.
+void bufferSize(sock_t s, int name, int bytes) {
+    for (; bytes >= (256 << 10); bytes /= 2)
+        if (setsockopt(s, SOL_SOCKET, name, reinterpret_cast<const char*>(&bytes), sizeof bytes) == 0) return;
+}
+
+// Whether a send failed only because the socket's or interface's queue was full for a moment (macOS says so of UDP
+// rather than waiting), so it is worth trying again.
+bool queueFull() {
+#ifdef _WIN32
+    const int e = WSAGetLastError();
+    return e == WSAENOBUFS || e == WSAEWOULDBLOCK;
+#else
+    return errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
 }
 
 sock_t udpSocket() {
@@ -881,7 +900,13 @@ struct Sender::Sockets {
         for (int path = 0; path < (s2 != kBad ? 2 : 1); ++path) {
             if (drop && drop(stream, path, index)) continue;
             const sockaddr_in& a = *(path ? second : first)[stream];
-            ok = ::sendto(path ? s2 : s, reinterpret_cast<const char*>(data), int(size), 0, reinterpret_cast<const sockaddr*>(&a), sizeof a) == int(size) && ok;
+            bool sent = false;
+            for (int tries = 0; !sent && tries < 50; ++tries) {
+                sent = ::sendto(path ? s2 : s, reinterpret_cast<const char*>(data), int(size), 0, reinterpret_cast<const sockaddr*>(&a), sizeof a) == int(size);
+                if (!sent && !queueFull()) break;
+                if (!sent) std::this_thread::sleep_for(std::chrono::microseconds(50));  // (the queue drains in microseconds)
+            }
+            ok = sent && ok;
         }
         return ok;
     }
@@ -896,7 +921,7 @@ sock_t senderSocket(const SenderOptions& o, const std::string& interfaceAddress,
         *why = "Could not make a UDP socket";
         return s;
     }
-    option(s, SOL_SOCKET, SO_SNDBUF, int(8 << 20));
+    bufferSize(s, SO_SNDBUF, 8 << 20);
     option(s, IPPROTO_IP, IP_MULTICAST_TTL, int(std::clamp(o.ttl, 1, 255)));
     option(s, IPPROTO_IP, IP_TTL, int(std::clamp(o.ttl, 1, 255)));
     option(s, IPPROTO_IP, IP_TOS, int(34 << 2));  // DSCP AF41, media's class in AES67 and ST 2110 networks
@@ -1162,7 +1187,7 @@ bool Receiver::open(const Endpoint& e, const std::string& interfaceAddress, std:
     s_->s = udpSocket();
     if (s_->s == kBad) return fail("Could not make a UDP socket");
     option(s_->s, SOL_SOCKET, SO_REUSEADDR, int(1));
-    option(s_->s, SOL_SOCKET, SO_RCVBUF, int(32 << 20));
+    bufferSize(s_->s, SO_RCVBUF, 32 << 20);
     const bool multicast = isMulticast(e.address);
     sockaddr_in local = socketAddress(e);
     if (multicast) {

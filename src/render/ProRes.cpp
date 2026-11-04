@@ -115,7 +115,9 @@ bool Encoder::open(int width, int height, int profile, const std::string& imfCol
     c->height = height;
     c->pix_fmt = format;
     c->time_base = {1, 24};
-    c->profile = profile - 1;  // (FFmpeg's numbering: 0 Proxy ... 5 4444 XQ)
+    // (prores_ks takes its profile from its own option, not the context's; FFmpeg numbers them 0 Proxy ... 5 4444 XQ)
+    c->profile = profile - 1;
+    if (av_opt_set_int(c->priv_data, "profile", profile - 1, 0) < 0) return failWith(error, "FFmpeg's ProRes encoder has no such profile");
     c->color_primaries = AVColorPrimaries(codes.primaries);
     c->color_trc = AVColorTransferCharacteristic(codes.transfer);
     c->colorspace = AVColorSpace(codes.matrix);
@@ -169,8 +171,7 @@ bool decode(const uint8_t* data, size_t size, std::vector<uint16_t>& rgb, int& w
     bool ok = false;
     std::string why = "FFmpeg could not decode the ProRes frame";
     if (c && packet && frame) {
-        c->thread_count = std::max(1, int(std::thread::hardware_concurrency()));
-        c->thread_type = FF_THREAD_SLICE;
+        c->thread_count = 1;  // (one frame at a time, often several decoding at once)
         if (avcodec_open2(c, codec, nullptr) >= 0 && av_new_packet(packet, int(size)) >= 0) {
             std::memcpy(packet->data, data, size);
             packet->flags |= AV_PKT_FLAG_KEY;

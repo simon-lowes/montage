@@ -318,7 +318,7 @@ void pictureDescriptor(QXmlStreamWriter& x, const dcp::ImfPictureWriter& w, int6
 void proresDescriptor(QXmlStreamWriter& x, const dcp::ImfProResWriter& w, int64_t duration) {
     const dcp::ProResFormat& f = w.format();
     const dcp::ImfColour& c = f.colour;
-    const int scale = 1 << (f.bits - 8);
+    const int scale = 1 << (f.bits - 10);  // (narrow range: 64 to 940 in ten bits)
     x.writeStartElement(f.rgb ? "r0:RGBADescriptor" : "r0:CDCIDescriptor");
     x.writeNamespace(kGroups, "r0");
     x.writeNamespace(kElements, "r1");
@@ -1080,7 +1080,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (!readImfComposition(cpl, old, &err)) return fail(err);
         oldPicture = old.picture();
         auto appName = [](int a) { return a == 5 ? std::string("IMF Application #5") : a == 45 ? std::string("IMF Application ProRes") : a == 2 ? std::string("IMF Application #2E") : std::string("another IMF application"); };
-        if (old.application != settings.application)
+        // (an earlier package of another edition of ST 2067-21 reads as application 0: #2E's family)
+        if ((old.application ? old.application : 2) != settings.application)
             return fail("The earlier package is " + appName(old.application) + "; a supplemental keeps its application");
         if (!oldPicture || old.width <= 0 || old.height <= 0 ||
             (aces        ? old.colour != "aces2065-1"
@@ -2384,7 +2385,8 @@ namespace {
 // What RDD 45 asks of an Application ProRes picture track file, as read: its profile, descriptor, size and rate
 // (Table 1), RDD 44's five-byte lengths and body partitions of no more than 10.01 seconds, all but the last as long,
 // and every frame's header as the descriptor and Table 3 have it.
-std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const ImfComposition& comp) {
+std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const ImfComposition& comp, const std::function<bool(int64_t bytes)>& read,
+                                          bool& stopped) {
     std::vector<std::string> out;
     const int profile = r.proresProfile();
     if (profile == 0) return {"its picture coding label is not a ProRes profile"};
@@ -2429,6 +2431,10 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
         if (!r.frame(k, bytes, &err) || !prores::parseFrameHeader(bytes.data(), bytes.size(), h)) {
             out.push_back("frame " + std::to_string(k) + " is not a ProRes frame");
             break;
+        }
+        if (!read(int64_t(bytes.size()))) {
+            stopped = true;
+            return out;
         }
         std::string why;
         if (h.frameSize != bytes.size()) why = "its frame_size is not the element's";
@@ -2617,11 +2623,13 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     else if (proresPicture && !reader.imfProRes())
                         issue(QStringLiteral("%1 is not ProRes pictures as RDD 44 maps them").arg(name));
                     else if (proresPicture && inside) {
-                        for (const std::string& problem : checkProResTrack(reader, comp)) issue(name + ": " + QString::fromStdString(problem));
-                        if (!reading(qint64(reader.largestFrame()) * reader.frames())) {
+                        bool stop = false;
+                        const auto problems = checkProResTrack(reader, comp, [&](int64_t n) { return reading(qint64(n)); }, stop);
+                        if (stop) {
                             issue("Stopped");
                             return issues;
                         }
+                        for (const std::string& problem : problems) issue(name + ": " + QString::fromStdString(problem));
                     }
                     else if (acesPicture && inside) {
                         // Every frame an ACES image container as ST 2065-4 has it, of the composition's size; every
