@@ -6152,6 +6152,110 @@
         <source>One numbered lossless JPEG XL a frame, 16-bit (half float in linear light), with transparency</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Bicubic</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bilinear</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blur the Map (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clamp</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour Levels (0: off)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Contour Smear</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Displace by Layer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edges</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hard mix</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hide the Map Track</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Horizontal Amount (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Horizontal From</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Map</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Map Track (V number, 0: the one above)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Oil Paint</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Painterly</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Roundness</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sampling</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sharpness</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Smear Length (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Structure Smoothing (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Clip Itself</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Transparent</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Vertical Amount (px)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Vertical From</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Wrap</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>

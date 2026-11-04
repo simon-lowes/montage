@@ -272,6 +272,7 @@ add_library(montage_engine STATIC
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
   render/StyleFx.h render/StyleFx.cpp
+  render/PaintFx.h render/PaintFx.cpp
   render/MeshWarp.h render/MeshWarp.cpp
   render/SurfaceTrack.h render/SurfaceTrack.cpp
   render/TemporalFx.h render/TemporalFx.cpp

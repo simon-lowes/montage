@@ -991,6 +991,18 @@ std::vector<EffectInfo> buildCatalog() {
                       num("complexity", "Complexity", 1, 8, 3, 1), num("evolution", "Evolution (°)", -36000, 36000, 0, 1),
                       num("speed", "Evolution Speed (° per frame)", -90, 90, 0, 0.1), num("seed", "Random Seed", 0, 9999, 0, 1)},
                      {}});
+        // Displace by Layer (render/PaintFx.h; handled when tracks are composited): pixels moved across and down by a
+        // channel of another track's picture, or of the clip's own.
+        c.push_back({"displace_by_layer", "Displace by Layer", EffectCategory::VideoFilter, "Distort",
+                     {choice("source", "Map", {"Track", "The Clip Itself"}, 0), num("track", "Map Track (V number, 0: the one above)", 0, 99, 0, 1),
+                      boolean("hide", "Hide the Map Track", true),
+                      choice("h_channel", "Horizontal From", {"Luma", "Red", "Green", "Blue", "Alpha", "Off"}, 1),
+                      num("h_amount", "Horizontal Amount (px)", -4000, 4000, 20, 0.5),
+                      choice("v_channel", "Vertical From", {"Luma", "Red", "Green", "Blue", "Alpha", "Off"}, 2),
+                      num("v_amount", "Vertical Amount (px)", -4000, 4000, 20, 0.5),
+                      choice("edges", "Edges", {"Wrap", "Clamp", "Transparent"}, 1), choice("sampling", "Sampling", {"Bilinear", "Bicubic"}, 0),
+                      num("map_blur", "Blur the Map (px)", 0, 200, 0, 0.5)},
+                     {}});
         c.push_back({"motion_tile", "Motion Tile", EffectCategory::VideoFilter, "Distort",
                      {pct("tile_width", "Tile Width", 1, 100, 100), pct("tile_height", "Tile Height", 1, 100, 100),
                       num("offset_x", "Offset X (px)", -8000, 8000, 0, 1), num("offset_y", "Offset Y (px)", -8000, 8000, 0, 1),
@@ -1001,6 +1013,13 @@ std::vector<EffectInfo> buildCatalog() {
         c.push_back({"emboss", "Emboss", EffectCategory::VideoFilter, "Stylize",
                      {angle("direction", "Direction", 135), num("relief", "Relief (px)", 0.25, 50, 2, 0.25), pct("contrast", "Contrast", 0, 500, 100),
                       pct("blend", "Blend With Original", 0, 100, 0)},
+                     {}});
+        // Paint (render/PaintFx.h): oil paint by the anisotropic Kuwahara filter, or a smear along the contours.
+        c.push_back({"painterly", "Painterly", EffectCategory::VideoFilter, "Stylize",
+                     {choice("style", "Style", {"Oil Paint", "Contour Smear"}, 0), num("radius", "Brush Size (px)", 1, 40, 6, 0.5),
+                      num("sharpness", "Sharpness", 1, 18, 8, 0.5), num("roundness", "Roundness", 0.1, 10, 1, 0.1),
+                      num("length", "Smear Length (px)", 1, 100, 12, 0.5), num("levels", "Colour Levels (0: off)", 0, 64, 8, 1),
+                      num("detail", "Structure Smoothing (px)", 0.5, 20, 2, 0.25), pct("mix", "Mix", 0, 100, 100)},
                      {}});
         c.push_back({"halftone", "Halftone", EffectCategory::VideoFilter, "Stylize",
                      {num("dot_size", "Dot Size (px)", 2, 200, 8, 0.5), angle("angle", "Angle", 45),
@@ -1965,7 +1984,7 @@ Effect makeEffect(Project& p, const std::string& type) { return makeEffect(type,
 const std::vector<std::string>& blendModes() {
     static const std::vector<std::string> modes = {"normal",  "add",     "multiply", "screen",     "overlay",
                                                    "darken",  "lighten", "difference", "soft_light", "hard_light",
-                                                   "color_dodge", "color_burn", "subtract"};
+                                                   "color_dodge", "color_burn", "subtract", "hard_mix"};
     return modes;
 }
 

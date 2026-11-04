@@ -399,7 +399,7 @@ std::string psdBlendMode(const std::string& key) {
         {"norm", "normal"},     {"diss", "normal"},      {"pass", "normal"},     {"mul ", "multiply"},   {"lbrn", "color_burn"},
         {"idiv", "color_burn"}, {"dark", "darken"},      {"dkCl", "darken"},     {"scrn", "screen"},     {"div ", "color_dodge"},
         {"lddg", "add"},        {"lite", "lighten"},     {"lgCl", "lighten"},    {"over", "overlay"},    {"sLit", "soft_light"},
-        {"hLit", "hard_light"}, {"vLit", "hard_light"},  {"lLit", "hard_light"}, {"pLit", "hard_light"}, {"hMix", "hard_light"},
+        {"hLit", "hard_light"}, {"vLit", "hard_light"},  {"lLit", "hard_light"}, {"pLit", "hard_light"}, {"hMix", "hard_mix"},
         {"diff", "difference"}, {"smud", "difference"},  {"fsub", "subtract"}};
     const auto it = modes.find(key);
     return it == modes.end() ? std::string("normal") : it->second;

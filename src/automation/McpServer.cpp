@@ -3596,6 +3596,13 @@ void McpServer::Impl::addTools() {
         "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
         "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
         "0-100 levels the horizon from gravity). "
+        "displace_by_layer moves the clip's pixels by a map: another track's picture (source 0; track 0 is the one above, "
+        "hidden unless hide 0) or the clip's own (source 1); h_channel and v_channel (0 luma, 1 red, 2 green, 3 blue, 4 alpha, "
+        "5 off) take each pixel from h_amount and v_amount pixels right and down at 1 (so the picture moves left and up; the "
+        "other way at 0, none at mid-grey); edges 0 "
+        "wrap, 1 clamp, 2 transparent; sampling 0 bilinear, 1 bicubic; map_blur softens the map first. "
+        "painterly is oil paint (style 0: anisotropic Kuwahara with radius, sharpness and roundness) or a smear along the "
+        "picture's contours (style 1: length, posterised to levels, 0 none); detail smooths the structure the strokes follow. "
         "sky_replace finds the sky (bright, smooth, open to the top of the frame, far away when the depth model is "
         "installed) and puts the picture on another track (source 0; track 0 is the one above, hidden unless hide 0) or a "
         "gradient (source 1, colours zenith and horizon) in its place; sensitivity, lowest (the lowest the sky reaches, % "
@@ -13102,6 +13109,7 @@ void McpServer::Impl::addTools() {
             "crop_top":{"type":"number"},"crop_bottom":{"type":"number"},"fit":{"type":"string","enum":["fit","fill","stretch","none"]},
             "align":{"type":"string","enum":["center","top","bottom","left","right","top_left","top_right","bottom_left","bottom_right"]},
             "inset":{"type":"number","default":0.05},
+            "blend_mode":{"type":"string","description":"How the clip mixes with what is beneath: normal, add, multiply, screen, overlay, darken, lighten, difference, soft_light, hard_light, color_dodge, color_burn, subtract or hard_mix"},
             "remove_letterbox":{"type":"boolean","default":false,"description":"Find black bars baked into the picture (letterbox, pillarbox), crop them off and scale what is left to fill the frame"}},"required":["project","clip"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -13131,6 +13139,13 @@ void McpServer::Impl::addTools() {
                 Param& prm = c.motion.params[param];
                 if (keyed) prm.addKey(lt, v, Interp::Smooth);
                 else prm.set(lt, v);
+                ++changed;
+            }
+            if (a.contains("blend_mode")) {
+                const std::string mode = str(a, "blend_mode").toStdString();
+                if (std::find(blendModes().begin(), blendModes().end(), mode) == blendModes().end())
+                    throw ArgError{QStringLiteral("Unknown blend_mode \"%1\"").arg(QString::fromStdString(mode))};
+                c.blendMode = mode;
                 ++changed;
             }
             if (a.contains("fit")) {

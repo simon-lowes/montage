@@ -58,6 +58,7 @@
 #include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/ShotGroups.h"
+#include "render/PaintFx.h"
 #include "render/StyleFx.h"
 #include "render/Particles.h"
 #include "render/Titles.h"
@@ -4220,6 +4221,245 @@ colorspaces:
         QVERIFY2((at(10, 10, 10), near(c[2], 1)), qPrintable(at(10, 10, 10)));
         key.params["track"] = 2.0;
         QVERIFY2((at(10, 10, 10), near(c[0], 1) && near(c[2], 0)), qPrintable(at(10, 10, 10)));
+    }
+
+    void displaceByLayerPaintAndHardMix() {
+        // Hard Mix: 1 where the two values reach 1, else 0, on every pair of 8-bit values.
+        QVERIFY(std::find(montage::blendModes().begin(), montage::blendModes().end(), "hard_mix") != montage::blendModes().end());
+        const int hardMix = blendModeIndex("hard_mix");
+        int wrong = 0;
+        for (int a = 0; a < 256; ++a)
+            for (int b = 0; b < 256; ++b)
+                wrong += blendModeChannel(hardMix, a / 255.0f, b / 255.0f) != (a + b >= 255 ? 1.0f : 0.0f);
+        QCOMPARE(wrong, 0);
+
+        // A picture of noise, the same every run.
+        uint32_t seed = 12345;
+        auto rnd = [&seed] {
+            seed = seed * 1664525u + 1013904223u;
+            return float(seed >> 8) / float(1 << 24);
+        };
+        auto noise = [&](int w, int h) {
+            Image img(w, h);
+            for (float& v : img.px) v = rnd();
+            for (size_t i = 3; i < img.px.size(); i += 4) img.px[i] = 1;
+            return img;
+        };
+        auto same = [](const Image& a, const Image& b) {
+            return a.width == b.width && a.height == b.height && std::memcmp(a.px.data(), b.px.data(), a.px.size() * sizeof(float)) == 0;
+        };
+        // Run once on the worker pool and once on a single thread (inside a worker, where nothing is split further).
+        auto serially = [](const std::function<void()>& fn) {
+            parallelRows(64, [&](int y0, int) {
+                if (y0 == 0) fn();
+            });
+        };
+
+        // Displace by Layer: a mid-grey map leaves the picture as it was, bit for bit.
+        const Image pic = noise(64, 48);
+        DisplaceSettings ds;
+        ds.horizontalAmount = 9.5, ds.verticalAmount = 7.25;
+        {
+            Image img = pic;
+            displaceByMap(img, solid(64, 48, 0.5f, 0.5f, 0.5f), ds);
+            QVERIFY(same(img, pic));
+            ds.bicubic = true, ds.mapBlur = 3;
+            displaceByMap(img, solid(64, 48, 0.5f, 0.5f, 0.5f), ds);
+            QVERIFY(same(img, pic));
+            ds.bicubic = false, ds.mapBlur = 0;
+        }
+        // A ramp map: each column moved by its analytic amount, read back from a ramp picture.
+        {
+            const int W = 64, H = 8;
+            Image ramp(W, H), map(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = ramp.at(x, y);
+                    p[0] = (x + 0.5f) / W, p[3] = 1;
+                    float* m = map.at(x, y);
+                    m[0] = 0.25f + 0.5f * x / (W - 1), m[3] = 1;
+                }
+            DisplaceSettings s;
+            s.horizontalAmount = 8;
+            s.vertical = DisplaceChannel::Off;
+            for (bool bicubic : {false, true}) {
+                s.bicubic = bicubic;
+                Image img = ramp;
+                displaceByMap(img, map, s);
+                double worst = 0;
+                for (int x = 0; x < W; ++x) {
+                    const double dx = 8 * (2 * double(map.at(x, 0)[0]) - 1);
+                    if (x + 0.5 + dx < 2 || x + 0.5 + dx > W - 2) continue;  // (clamped at the edges)
+                    for (int y = 0; y < H; ++y) worst = std::max(worst, std::fabs(img.at(x, y)[0] * W - 0.5 - x - dx));
+                }
+                QVERIFY2(worst < 0.01, qPrintable(QString("%1 px").arg(worst)));
+            }
+        }
+        // Edges: a whole-pixel move of 10 wraps, holds the edge or leaves it transparent.
+        {
+            DisplaceSettings s;
+            s.horizontalAmount = 20;
+            s.vertical = DisplaceChannel::Off;
+            const Image map = solid(64, 48, 0.75f, 0.5f, 0.5f);
+            for (int edge = 0; edge < 3; ++edge)
+                for (bool bicubic : {false, true}) {
+                    s.edge = DisplaceEdge(edge), s.bicubic = bicubic;
+                    Image img = pic;
+                    displaceByMap(img, map, s);
+                    for (int y : {0, 20, 47})
+                        for (int x : {0, 30, 53, 54, 63}) {
+                            const int from = x + 10;
+                            const float* want = edge == 0 ? pic.at(from % 64, y) : edge == 1 ? pic.at(std::min(from, 63), y) : nullptr;
+                            const float* got = img.at(x, y);
+                            for (int c = 0; c < 4; ++c) {
+                                const float w = want ? want[c] : from < 64 ? pic.at(from, y)[c] : 0.0f;
+                                QVERIFY2(std::fabs(got[c] - w) < 1e-6f, qPrintable(QString("edge %1 x %2: %3 vs %4").arg(edge).arg(x).arg(got[c]).arg(w)));
+                            }
+                        }
+                }
+        }
+        // Each pixel from the input alone: the same on the pool as on one thread.
+        {
+            Image map = noise(64, 48), a = pic, b = pic;
+            ds.bicubic = true, ds.mapBlur = 4;
+            displaceByMap(a, map, ds);
+            serially([&] { displaceByMap(b, map, ds); });
+            QVERIFY(same(a, b));
+        }
+
+        // Paint, oil: a flat area stays as it is, a step edge stays where it was and sharp.
+        Project p;
+        {
+            Image flat = solid(48, 48, 0.3f, 0.5f, 0.7f);
+            KuwaharaSettings ks;
+            anisotropicKuwahara(flat, ks);
+            float worst = 0;
+            for (size_t i = 0; i < flat.px.size(); ++i) worst = std::max(worst, std::fabs(flat.px[i] - solid(1, 1, 0.3f, 0.5f, 0.7f).px[i % 4]));
+            QVERIFY2(worst < 1e-6f, qPrintable(QString::number(worst)));
+            Image step(48, 48);
+            for (int y = 0; y < 48; ++y)
+                for (int x = 0; x < 48; ++x) {
+                    float* q = step.at(x, y);
+                    q[0] = q[1] = q[2] = x < 24 ? 0.1f : 0.9f, q[3] = 1;
+                }
+            Image k = step;
+            anisotropicKuwahara(k, ks);
+            for (int y = 0; y < 48; ++y) {
+                // Where it crosses half way, within a pixel of 24; and two pixels from the edge, as it was.
+                int cross = -1;
+                for (int x = 1; x < 48 && cross < 0; ++x)
+                    if (k.at(x - 1, y)[0] < 0.5f && k.at(x, y)[0] >= 0.5f) cross = x;
+                QVERIFY2(std::abs(cross - 24) <= 1, qPrintable(QString("row %1 crosses at %2").arg(y).arg(cross)));
+                for (int x : {0, 10, 21, 22, 26, 27, 40, 47}) QVERIFY2(std::fabs(k.at(x, y)[0] - step.at(x, y)[0]) < 0.02f, qPrintable(QString("%1,%2: %3").arg(x).arg(y).arg(k.at(x, y)[0])));
+            }
+            // On noise: the same on the pool as on one thread, and through the effect at full mix.
+            Image a = noise(40, 40), b = a, e = a;
+            anisotropicKuwahara(a, ks);
+            serially([&] { anisotropicKuwahara(b, ks); });
+            QVERIFY(same(a, b));
+            // The effect: at no mix the picture as it was; at full mix smoothed (less change from pixel to pixel).
+            Effect fx = makeEffect(p, "painterly");
+            fx.params["mix"] = 0.0;
+            Image none = e;
+            applyVideoEffect(fx, 0, none, 1);
+            QVERIFY(same(none, e));
+            fx.params["mix"] = 100.0;
+            Image full = e;
+            applyVideoEffect(fx, 0, full, 1);
+            auto roughness = [](const Image& img) {
+                double sum = 0;
+                for (size_t i = 0; i + 4 < img.px.size(); i += 4) sum += std::fabs(img.px[i] - img.px[i + 4]);
+                return sum;
+            };
+            QVERIFY2(roughness(full) < roughness(e) * 0.6, qPrintable(QString("%1 vs %2").arg(roughness(full)).arg(roughness(e))));
+        }
+        // Paint, smear: on concentric rings under noise, the picture varies less along the rings than across them.
+        {
+            const int N = 96;
+            Image rings(N, N);
+            for (int y = 0; y < N; ++y)
+                for (int x = 0; x < N; ++x) {
+                    const double r = std::hypot(x + 0.5 - N / 2.0, y + 0.5 - N / 2.0);
+                    float* q = rings.at(x, y);
+                    q[0] = q[1] = q[2] = float(0.5 + 0.35 * std::sin(r / 1.6) + 0.3 * (rnd() - 0.5)), q[3] = 1;
+                }
+            auto ratio = [&](const Image& img) {
+                // Mean change one pixel along the ring over the mean change one pixel across it, between radii 15 and 40.
+                double along = 0, across = 0;
+                int n = 0;
+                for (int y = 0; y < N; ++y)
+                    for (int x = 0; x < N; ++x) {
+                        const double cx = x + 0.5 - N / 2.0, cy = y + 0.5 - N / 2.0, r = std::hypot(cx, cy);
+                        if (r < 15 || r > 40) continue;
+                        float here[4], tang[4], rad[4];
+                        const double ux = cx / r, uy = cy / r;
+                        here[0] = img.at(x, y)[0];
+                        auto at = [&](double px, double py, float out[4]) {
+                            const int X = std::clamp(int(std::lround(px - 0.5)), 0, N - 1), Y = std::clamp(int(std::lround(py - 0.5)), 0, N - 1);
+                            out[0] = img.at(X, Y)[0];
+                        };
+                        at(x + 0.5 - uy * 1.5, y + 0.5 + ux * 1.5, tang);
+                        at(x + 0.5 + ux * 1.5, y + 0.5 + uy * 1.5, rad);
+                        along += std::fabs(tang[0] - here[0]), across += std::fabs(rad[0] - here[0]);
+                        ++n;
+                    }
+                return along / std::max(1e-9, across);
+            };
+            const double before = ratio(rings);
+            Image sm = rings;
+            SmearSettings ss;
+            ss.length = 10, ss.levels = 0, ss.tensorBlur = 2.5;
+            contourSmear(sm, ss);
+            const double after = ratio(sm);
+            QVERIFY2(after < 0.5 && after < before * 0.6, qPrintable(QString("along/across %1 before, %2 after").arg(before).arg(after)));
+            Image one = rings;
+            serially([&] { contourSmear(one, ss); });
+            QVERIFY(same(one, sm));
+            // Posterised to four levels: every value one of 0, 1/3, 2/3, 1.
+            ss.levels = 4;
+            Image four = rings;
+            contourSmear(four, ss);
+            for (size_t i = 0; i < four.px.size(); i += 4) QVERIFY(std::fabs(four.px[i] * 3 - std::round(four.px[i] * 3)) < 1e-5f);
+        }
+
+        // Displace by Layer in a sequence: V1's stripes moved four pixels by V2's colour (hidden), and as they were with
+        // the effect off.
+        {
+            QTemporaryDir dir;
+            QImage q(64, 36, QImage::Format_RGB32);
+            for (int y = 0; y < 36; ++y)
+                for (int x = 0; x < 64; ++x) q.setPixel(x, y, (x / 3) % 2 ? qRgb(230, 40, 20) : qRgb(20, 60, 200));
+            const QString png = dir.filePath("stripes.png");
+            QVERIFY(q.save(png));
+            Project pr = makeDefaultProject();
+            Sequence& s = *pr.active();
+            s.width = 64, s.height = 36;
+            MediaItem m;
+            QVERIFY(probeMedia(png.toStdString(), m));
+            m.id = pr.newId();
+            pr.media.push_back(m);
+            QVERIFY(edit::placeMedia(pr, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {}, false).ok);
+            const Image plain = renderProgramFrame(pr, s, 2, RenderOptions());
+            QVERIFY(edit::overwrite(pr, s, {TrackKind::Video, 1}, colorClip(pr, 0.75f, 0.5f, 0.5f, 0, 10)).ok);
+            Clip& c = s.videoTracks[0].clips[0];
+            Effect fx = makeEffect(pr, "displace_by_layer");
+            fx.params["h_amount"] = 8.0;
+            c.effects.push_back(fx);
+            const Image moved = renderProgramFrame(pr, s, 2, RenderOptions());
+            float worst = 0;
+            for (int y = 0; y < 36; ++y)
+                for (int x = 0; x + 4 < 64; ++x)
+                    for (int k = 0; k < 3; ++k) worst = std::max(worst, std::fabs(moved.at(x, y)[k] - plain.at(x + 4, y)[k]));
+            QVERIFY2(worst < 1e-3f, qPrintable(QString::number(worst)));
+            // Where the map's track is empty (after the colour clip ends), nothing moves; shown, the map covers the picture.
+            const Image unmoved = renderProgramFrame(pr, s, 20, RenderOptions());
+            float off = 0;
+            for (size_t i = 0; i < unmoved.px.size(); ++i) off = std::max(off, std::fabs(unmoved.px[i] - plain.px[i]));
+            QVERIFY2(off < 1e-6f, qPrintable(QString::number(off)));
+            c.effects.back().params["hide"] = 0.0;
+            const Image covered = renderProgramFrame(pr, s, 2, RenderOptions());
+            QVERIFY(std::fabs(covered.at(10, 10)[0] - 0.75f) < 0.01f && std::fabs(covered.at(10, 10)[2] - 0.5f) < 0.01f);
+        }
     }
 
     void lightRaysAndApertureGlare() {
@@ -17198,6 +17438,28 @@ colorspaces:
         for (const char* mode : modes) {
             edit::clipById(s, r2.created[0])->blendMode = mode;
             compare(20, o, mode);
+        }
+        {
+            // Hard Mix jumps from 0 to 1, so where the two values sum to 1 within rounding the CPU and GPU may land
+            // either side: the same elsewhere, with very few pixels apart.
+            edit::clipById(s, r2.created[0])->blendMode = "hard_mix";
+            RenderOptions both = o;
+            both.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, 20, both);
+            const long before = gpu::stats().gpuFrames;
+            both.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, 20, both);
+            QVERIFY2(gpu::stats().gpuFrames == before + 1, qPrintable("hard_mix fell back: " + QString::fromStdString(gpu::stats().lastFallback)));
+            QCOMPARE(onGpu.width, cpu.width);
+            QCOMPARE(onGpu.height, cpu.height);
+            int apart = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x) {
+                    double d = 0;
+                    for (int c = 0; c < 4; ++c) d = std::max(d, std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]));
+                    apart += d > 2e-3;
+                }
+            QVERIFY2(apart <= cpu.width * cpu.height / 200, qPrintable(QString("hard_mix: %1 pixels apart").arg(apart)));
         }
         edit::clipById(s, r2.created[0])->blendMode = "normal";
         // At half size for playback, flipped.

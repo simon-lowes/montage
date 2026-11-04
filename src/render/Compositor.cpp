@@ -44,6 +44,7 @@
 #include "Exporter.h"
 #include "Fdl.h"
 #include "GpuCompositor.h"
+#include "PaintFx.h"
 #include "Processing.h"
 #include "SurfaceTrack.h"
 #include "Restoration.h"
@@ -1678,6 +1679,10 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = skyTrackEffect(seq, *c, t); e && e->p("hide", t - c->start, 1) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // A Displace by Layer's map.
+            if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer");
+                e && std::lround(e->p("source", t - c->start, 0)) == 0 && e->p("hide", t - c->start, 1) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             // A Keyer's clean plate.
             if (const int m = cleanPlateTrack(seq, *c, t, true); m >= 0) hidden[size_t(m)] = true;
             // A track an OpenFX plugin takes as an input (a matte, a second picture), as a track matte's is.
@@ -1874,6 +1879,75 @@ bool canvasToFrame(const Sequence& seq, const Geometry& g, double scale, int X, 
     return u >= 0 && v >= 0 && u <= 1 && v <= 1;
 }
 
+// A clip effect's mask (empty: none) drawn over the clip's own frame and carried onto the canvas, for the effects run
+// where tracks are composited.
+std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
+                                      const Effect& e, const Image& layer, int W, int H) {
+    const FrameTime lt = t - c.start;
+    std::vector<float> mask;
+    // A mask on the effect is drawn over the clip's own frame, as every effect's is: made there, from the layer seen
+    // back through the clip's transform, and carried onto the canvas the same way (so a moved, turned or keyed picture
+    // keeps it in place).
+    Geometry g;
+    if (hasMask(e, lt) && clipGeometry(p, seq, c, t, g)) {
+        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * W);
+        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * H);
+        Image pic(pw, ph);
+        for (int j = 0; j < ph; ++j)
+            for (int i = 0; i < pw; ++i) {
+                const double rx = ((i + 0.5) / pw * g.mw - g.mw / 2 - g.ax) * g.sx, ry = ((j + 0.5) / ph * g.mh - g.mh / 2 - g.ay) * g.sy;
+                const int X = int(std::floor((seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale));
+                const int Y = int(std::floor((seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale));
+                if (X >= 0 && Y >= 0 && X < layer.width && Y < layer.height) std::copy(layer.at(X, Y), layer.at(X, Y) + 4, pic.at(i, j));
+            }
+        const std::vector<float> m = effectMatte(e, lt, pic, effectPixelScale(c, lt, g.sx, g.mw, pw), c.sourceFrameAt(t) / seq.fpsValue());
+        if (m.size() == size_t(pw) * size_t(ph)) {
+            mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
+            for (int Y = 0; Y < layer.height; ++Y)
+                for (int X = 0; X < layer.width; ++X) {
+                    double u, v;
+                    if (!canvasToFrame(seq, g, o.scale, X, Y, u, v)) continue;
+                    u = u * pw - 0.5, v = v * ph - 0.5;
+                    const int i0 = std::clamp(int(std::floor(u)), 0, pw - 1), j0 = std::clamp(int(std::floor(v)), 0, ph - 1);
+                    const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
+                    const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
+                    auto at = [&](int i, int j) { return m[size_t(j) * size_t(pw) + size_t(i)]; };
+                    mask[size_t(Y) * size_t(layer.width) + size_t(X)] =
+                        (at(i0, j0) * (1 - fu) + at(i1, j0) * fu) * (1 - fv) + (at(i0, j1) * (1 - fu) + at(i1, j1) * fu) * fv;
+                }
+        }
+    }
+    return mask;
+}
+
+// Displace by Layer on clip `c` (on track `ti`) at t: its layer's pixels moved by a channel of another track's picture
+// or of the layer itself (render/PaintFx.h), the map's values as shown. Amounts are in the sequence's pixels.
+void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
+                   int H) {
+    const Effect* e = enabledEffect(seq, c, "displace_by_layer");
+    if (!e || layer.empty()) return;
+    const FrameTime lt = t - c.start;
+    Image map;
+    if (std::lround(e->p("source", lt, 0)) == 0) {
+        const int m = matteTrack(seq, ti, c, *e, t);
+        if (m < 0) return;  // (no track to take it from: nothing moves)
+        map = trackPicture(p, seq, size_t(m), t, o, W, H);
+        if (map.empty()) return;  // (nothing on the map's track now)
+    } else {
+        map = layer;
+    }
+    if (map.width != layer.width || map.height != layer.height) return;
+    if (const SceneGrading* sg = currentSceneGrading()) outputTransform(map, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
+    // (a mask on the effect: moved within it, as it was outside)
+    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
+    const Image before = mask.empty() ? Image() : layer;
+    displaceByMap(layer, map, displaceSettings(*e, lt, o.scale));
+    if (mask.size() == size_t(layer.width) * size_t(layer.height))
+        for (size_t i = 0; i < mask.size(); ++i)
+            for (size_t k = 0; k < 4; ++k) layer.px[i * 4 + k] = before.px[i * 4 + k] + (layer.px[i * 4 + k] - before.px[i * 4 + k]) * mask[i];
+}
+
 // Sky Replacement on clip `c` (on track `ti`) at t: the sky found in its layer and another put in its place
 // (render/SkyReplace.h).
 void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
@@ -1892,40 +1966,9 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
     };
     shown(layer);
     shown(sky);
-    // A mask on the effect is drawn over the clip's own frame, as every effect's is: made there, from the layer seen
-    // back through the clip's transform, and carried onto the canvas the same way (so a moved, turned or keyed picture
-    // keeps it in place).
-    std::vector<float> mask;
-    Geometry g;
-    if (hasMask(*sr, lt) && clipGeometry(p, seq, c, t, g)) {
-        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
-        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * W);
-        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * H);
-        Image pic(pw, ph);
-        for (int j = 0; j < ph; ++j)
-            for (int i = 0; i < pw; ++i) {
-                const double rx = ((i + 0.5) / pw * g.mw - g.mw / 2 - g.ax) * g.sx, ry = ((j + 0.5) / ph * g.mh - g.mh / 2 - g.ay) * g.sy;
-                const int X = int(std::floor((seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale));
-                const int Y = int(std::floor((seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale));
-                if (X >= 0 && Y >= 0 && X < layer.width && Y < layer.height) std::copy(layer.at(X, Y), layer.at(X, Y) + 4, pic.at(i, j));
-            }
-        const std::vector<float> m = effectMatte(*sr, lt, pic, effectPixelScale(c, lt, g.sx, g.mw, pw), c.sourceFrameAt(t) / seq.fpsValue());
-        if (m.size() == size_t(pw) * size_t(ph)) {
-            mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
-            for (int Y = 0; Y < layer.height; ++Y)
-                for (int X = 0; X < layer.width; ++X) {
-                    double u, v;
-                    if (!canvasToFrame(seq, g, o.scale, X, Y, u, v)) continue;
-                    u = u * pw - 0.5, v = v * ph - 0.5;
-                    const int i0 = std::clamp(int(std::floor(u)), 0, pw - 1), j0 = std::clamp(int(std::floor(v)), 0, ph - 1);
-                    const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
-                    const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
-                    auto at = [&](int i, int j) { return m[size_t(j) * size_t(pw) + size_t(i)]; };
-                    mask[size_t(Y) * size_t(layer.width) + size_t(X)] =
-                        (at(i0, j0) * (1 - fu) + at(i1, j0) * fu) * (1 - fv) + (at(i0, j1) * (1 - fu) + at(i1, j1) * fu) * fv;
-                }
-        }
-    }
+    // A mask on the effect is drawn over the clip's own frame, as every effect's is (so a moved, turned or keyed
+    // picture keeps it in place).
+    const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *sr, layer, W, H);
     // The clip's analysed depth carried onto the layer (null: found in the layer, if at all), and the frames either side
     // for a steady sky.
     auto analysedOnLayer = [&](FrameTime at, int w, int h) -> std::shared_ptr<const ValueMap> {
@@ -2336,13 +2379,18 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             const Clip* top = B ? B : A;
             bool shown = false;
             Image mix = transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H,
-                                        [&](const Clip& c, FrameTime at, Image& l) { replaceSky(p, seq, ti, c, at, o, l, W, H); }, &shown);
+                                        [&](const Clip& c, FrameTime at, Image& l) {
+                                            displaceLayer(p, seq, ti, c, at, o, l, W, H);
+                                            replaceSky(p, seq, ti, c, at, o, l, W, H);
+                                        },
+                                        &shown);
             composite(std::move(mix), top ? top->blendMode : "normal", shown);
             continue;
         }
         if (const Clip* c = clipAt(track, t)) {
             bool shown = false;
             Image layer = clipLayer(p, seq, *c, t, o, canvasEmpty ? nullptr : &canvas, &shown);
+            displaceLayer(p, seq, ti, *c, t, o, layer, W, H);
             if (const Effect* e = trackMatteOf(*c); e && !layer.empty()) {
                 // With no track to use the key does nothing; with nothing on that track now, the matte is empty.
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {
@@ -2740,6 +2788,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (trackMatteOf(*c)) return fallback("a track matte");
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
+                if (enabledEffect(seq, *c, "displace_by_layer")) return fallback("Displace by Layer");
                 if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }

@@ -29,6 +29,7 @@
 #include "media/FaceMesh.h"
 #include "Relight.h"
 #include "FilmLook.h"
+#include "PaintFx.h"
 #include "StyleFx.h"
 #include "Deconvolve.h"
 #include "GpuCompositor.h"
@@ -2006,7 +2007,7 @@ EffectDomain effectDomain(const std::string& type) {
                               "light_rays", "aperture_glare", "tilt_shift", "chromatic_aberration", "relight", "vignette", "drop_shadow",
                               "rgb_mixer", "mosaic", "focus_repair"})
             m[t] = EffectDomain::Linear;
-        for (const char* t : {"posterize", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
+        for (const char* t : {"posterize", "painterly", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
                               "screen_key", "clean_plate", "broadcast_safe", "noise", "depth_map"})
             m[t] = EffectDomain::Display;
         return m;
@@ -2024,6 +2025,7 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
     // (Sky Replacement runs when tracks are composited, render/SkyReplace.h)
     // (a compositing node's settings act through its graph, render/CompositeRender.h)
     if (!e.enabled || img.empty() || e.type == "grade_node" || e.type == "camera_track" || e.type == "sky_replace" ||
+        e.type == "displace_by_layer" ||
         e.type.rfind("composite_", 0) == 0)
         return;
     // A sequence graded scene-referred: the effect in the values it is made for, and back.
@@ -2498,6 +2500,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "find_edges") sfx::findEdges(e, t, img);
     else if (ty == "emboss") sfx::emboss(e, t, img, pixelScale);
     else if (ty == "halftone") sfx::halftone(e, t, img, pixelScale);
+    else if (ty == "painterly") paintEffect(e, t, img, pixelScale);
     else if (ty == "duotone") sfx::duotone(e, t, img);
     else if (ty == "vhs") sfx::vhs(e, t, img, pixelScale);
     else if (ty == "lens_flare") sfx::lensFlare(e, t, img);
@@ -2953,6 +2956,7 @@ inline float blendChannel(int mode, float cb, float cs) {
         case 10: return cs >= 1 ? 1.0f : std::min(1.0f, cb / (1 - cs));         // colour dodge
         case 11: return cs <= 0 ? 0.0f : 1 - std::min(1.0f, (1 - cb) / cs);     // colour burn
         case 12: return std::max(0.0f, cb - cs);                               // subtract
+        case 13: return cb + cs >= 1 - 1e-5f ? 1.0f : 0.0f;  // hard mix: 1 where the two reach 1 (rounding aside), else 0
         default: return cs;
     }
 }
@@ -2961,7 +2965,7 @@ int modeIndex(const std::string& mode) {
     static const std::map<std::string, int> idx = {
         {"normal", 0},   {"add", 1},         {"multiply", 2},    {"screen", 3},      {"overlay", 4},
         {"darken", 5},   {"lighten", 6},     {"difference", 7},  {"soft_light", 8},  {"hard_light", 9},
-        {"color_dodge", 10}, {"color_burn", 11}, {"subtract", 12}};
+        {"color_dodge", 10}, {"color_burn", 11}, {"subtract", 12}, {"hard_mix", 13}};
     auto it = idx.find(mode);
     return it == idx.end() ? 0 : it->second;
 }
