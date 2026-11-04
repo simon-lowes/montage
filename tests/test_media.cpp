@@ -1579,7 +1579,9 @@ public:
                 for (int y = 0; y < H; ++y)
                     for (int x = 0; x < W; ++x) {
                         float* p = img.at(x, y);
-                        p[0] = 0.3f, p[1] = 0.4f, p[2] = 0.2f + 0.6f * float(t) / 24.0f, p[3] = 1;
+                        // (the frame's number in its second as two base-5 digits, red and blue, steps far apart enough
+                        // for any codec's error)
+                        p[0] = 0.2f + 0.15f * float(t % 5), p[1] = 0.4f, p[2] = 0.2f + 0.15f * float(t / 5), p[3] = 1;
                     }
                 std::vector<uint8_t> o(size_t(W) * H * 4);
                 video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), o.data(), size_t(W) * 2);
@@ -2130,7 +2132,11 @@ private slots:
         bs.preroll = 1;
         const std::vector<BatchClip> clips = batchCapture(deck, log, bs);
         QCOMPARE(int(clips.size()), 5);
-        auto blueOf = [](int64_t n) { return 0.2f + 0.6f * float(n % 25) / 24.0f; };
+        // Which frame of its second a picture is (as the simulated deck draws it).
+        auto frameIn = [](const Image& img) {
+            const float* p = img.at(160, 90);
+            return int(std::lround((p[0] - 0.2f) / 0.15f)) + 5 * int(std::lround((p[2] - 0.2f) / 0.15f));
+        };
         for (const BatchClip& c : clips) {
             QVERIFY2(c.ok, (c.entry.name + ": " + c.error).c_str());
             const int64_t from = c.entry.in - 50, to = c.entry.out + 50;
@@ -2146,13 +2152,11 @@ private slots:
             for (int64_t k : {int64_t(0), int64_t(1), int64_t(50), to - from - 1}) {
                 const Frame16Ptr f = dec.frameAt((double(k) + 0.5) / 25.0);
                 QVERIFY(f);
-                const float blue = toImage(*f).at(160, 90)[2];
+                const int got = frameIn(toImage(*f)), want = int((from + k) % 25);
                 // The first frame must be the logged one; later, a picture the loaded test machine dropped on its way
                 // is held from the one before (as captureFromOmt allows).
-                const bool right = std::fabs(blue - blueOf(from + k)) < 0.0125;
-                const bool held = k > 0 && std::fabs(blue - blueOf(from + k - 1)) < 0.0125;
-                QVERIFY2(right || held,
-                         qPrintable(QStringLiteral("%1 frame %2: %3, not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(blue).arg(blueOf(from + k))));
+                QVERIFY2(got == want || (k > 0 && got == (want + 24) % 25),
+                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of its second, not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
             }
             // (the tape's name kept with the timecode)
             AVFormatContext* fc = nullptr;
@@ -2186,10 +2190,10 @@ private slots:
             QVERIFY(dec.open(plain[0].path));
             const Frame16Ptr f = dec.frameAt(0.5 / 25.0);
             QVERIFY(f);
-            const float blue = toImage(*f).at(160, 90)[2];
+            const int got = frameIn(toImage(*f)), want = int(from % 25);
             bool near = false;
-            for (int d = -1; d <= 1; ++d) near = near || std::fabs(blue - blueOf(from + d)) < 0.0125;
-            QVERIFY2(near, qPrintable(QStringLiteral("first frame's blue %1, frame %2's is %3").arg(blue).arg(from).arg(blueOf(from))));
+            for (int d = -1; d <= 1; ++d) near = near || got == (want + d + 25) % 25;
+            QVERIFY2(near, qPrintable(QStringLiteral("first frame is frame %1 of its second, not %2").arg(got).arg(want)));
         }
         tx2.stop();
 #endif
