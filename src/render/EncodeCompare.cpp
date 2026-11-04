@@ -506,6 +506,7 @@ public:
     }
     double rate() const { return rate_; }
     // When a frame is shown (seconds), or NaN without a timestamp.
+    bool clockMayJump() const { return fmt_ && fmt_->iformat && (fmt_->iformat->flags & AVFMT_TS_DISCONT); }
     double timeOf(const AVFrame* f) const {
         const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
         if (ts == AV_NOPTS_VALUE) return std::numeric_limits<double>::quiet_NaN();
@@ -678,6 +679,7 @@ PictureSource openPictureFile(const std::string& path, const QualityPicture* lik
         if (!f || !reader->toPicture(f, shape.get(), o, out)) return false;
         out.damaged = damaged;
         out.time = reader->timeOf(f);
+        out.clockMayJump = reader->clockMayJump();
         return true;
     };
 }
@@ -1064,7 +1066,14 @@ EncodeComparison compareSources(const std::function<PictureSource()>& openRefere
                 }
                 if (e.damaged) ++res.damagedFrames;
                 if (encRate > 0 && !std::isnan(e.time)) {
-                    if (!std::isnan(encPrev)) encPlace += std::max<int64_t>(0, std::llround((e.time - encPrev) * encRate));
+                    if (!std::isnan(encPrev)) {
+                        int64_t step = std::llround((e.time - encPrev) * encRate);
+                        // (in a file whose clock can start again, as a transport stream's can at a discontinuity, a
+                        // jump of more than a second either way is that, not a second of pictures dropped or shown
+                        // again: the next picture follows on)
+                        if (e.clockMayJump && (step > std::max<int64_t>(2, std::llround(encRate)) || step < -1)) step = 1;
+                        encPlace += std::max<int64_t>(0, step);
+                    }
                     encPrev = e.time;
                     const int64_t want = encPlace;
                     if (want < refRead) {  // (shown again, or out of step: left out)

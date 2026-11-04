@@ -15,11 +15,6 @@
 #include <QJsonObject>
 #include <algorithm>
 #include <atomic>
-#ifdef __linux__
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -270,6 +265,7 @@ struct ToolJob {
     QString step;        // what it is doing, as its progress says
     QJsonObject result;  // when finished: the tool's result (as tools/call gives it)
     bool read = false;   // its end reported by montage_job (finished jobs are forgotten only once read)
+    uint64_t turn = 0;   // its place among the calls (taken when asked for)
     bool finished() const { return status == QLatin1String("done") || status == QLatin1String("failed") || status == QLatin1String("cancelled"); }
 };
 
@@ -386,7 +382,17 @@ void projectionArg(const QJsonObject& a, const Sequence& s, Clip& c) {
         params["proj_frame"] = Param(double(timeArg(p.value("frame"), s, "projection.frame")));
     }
     if (p.contains("lit")) params["proj_light"] = Param(p.value("lit").toBool() ? 1.0 : 0.0);
-    if (p.contains("hide")) params["proj_hide"] = Param(p.value("hide").toBool(true) ? 1.0 : 0.0);
+    if (p.contains("hide")) {
+        if (!p.value("hide").isBool()) throw ArgError{"\"projection.hide\" is true or false"};
+        params["proj_hide"] = Param(p.value("hide").toBool() ? 1.0 : 0.0);
+    }
+}
+
+// The model's own track is not one to project from (its picture is the model).
+void checkProjectionTrack(const Clip& c, const TrackRef& t) {
+    const auto it = c.generator.params.find("proj_track");
+    if (it != c.generator.params.end() && t.kind == TrackKind::Video && std::lround(it->second.value) == t.index + 1)
+        throw ArgError{QStringLiteral("\"projection.track\" is the model's own track (V%1): project another track's picture").arg(t.index + 1)};
 }
 
 // ---- Projects on disk ---------------------------------------------------------------
@@ -722,8 +728,28 @@ struct McpServer::Impl {
     std::mutex liveMutex;          // (written from the thread reading requests and the one running calls)
     std::function<void(const std::string&)> sink;  // or given here, as they happen (from the thread the tool runs on)
 
-    // Tools run one at a time: a call waits for a job running, and jobs wait their turn.
-    std::mutex toolMutex;
+    // Tools run one at a time, in the order they were asked for (background calls and plain ones alike): each takes a
+    // turn as it arrives and runs when that turn comes.
+    std::mutex turnMutex;
+    std::condition_variable turnWake;
+    uint64_t turnsGiven = 0, turnServed = 0;
+    bool turnsStopped = false;
+    uint64_t takeTurn() {
+        std::lock_guard l(turnMutex);
+        return turnsGiven++;
+    }
+    void waitTurn(uint64_t t) {
+        std::unique_lock l(turnMutex);
+        turnWake.wait(l, [&] { return turnServed == t || turnsStopped; });
+    }
+    void endTurn() {
+        {
+            std::lock_guard l(turnMutex);
+            ++turnServed;
+        }
+        turnWake.notify_all();
+    }
+    std::mutex toolMutex;  // held while a tool runs (and while the notification sink changes)
     // The call running now (its request id) and calls cancelled before they started.
     std::mutex cancelMutex;
     QString runningRequest;
@@ -747,6 +773,11 @@ struct McpServer::Impl {
             for (auto& [id, j] : jobs) j->cancel = true;
         }
         jobsWake.notify_all();
+        {
+            std::lock_guard l(turnMutex);
+            turnsStopped = true;
+        }
+        turnWake.notify_all();
         if (jobThread.joinable()) jobThread.join();
     }
 
@@ -765,14 +796,26 @@ struct McpServer::Impl {
         }
     }
 
+    static constexpr size_t kMaxQueuedJobs = 256;
+    // Null when too many are waiting already.
     std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args) {
         auto job = std::make_shared<ToolJob>();
         job->tool = tool.name;
         job->args = args;
         std::lock_guard l(jobsMutex);
+        if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
         job->id = QStringLiteral("job-%1").arg(++jobsMade);
+        job->turn = takeTurn();
         jobs[job->id] = job;
-        // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
+        jobQueue.push_back(job);
+        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
+        jobsWake.notify_all();
+        if (jobsMade % 64 == 0) pruneJobs();
+        return job;
+    }
+    // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
+    // (jobsMutex held)
+    void pruneJobs() {
         std::vector<QString> read, unread;
         for (auto& [id, j] : jobs) {
             std::lock_guard jl(j->m);
@@ -783,18 +826,9 @@ struct McpServer::Impl {
         std::sort(unread.begin(), unread.end(), byAge);
         for (size_t i = 0; i + 200 < read.size(); ++i) jobs.erase(read[i]);
         for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
-        jobQueue.push_back(job);
-        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
-        jobsWake.notify_all();
-        return job;
     }
 
     void runJobs() {
-#ifdef __linux__
-        // Background work gives way to the caller: this thread, and the encoder and decoder threads it starts (which
-        // inherit it), run at a lower priority, so a caller polling its jobs is never held up by them.
-        setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 5);
-#endif
         for (;;) {
             std::shared_ptr<ToolJob> job;
             {
@@ -805,6 +839,15 @@ struct McpServer::Impl {
                 jobQueue.pop_front();
             }
             const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == job->tool; });
+            waitTurn(job->turn);
+            struct TurnEnd {
+                Impl* d;
+                ~TurnEnd() { d->endTurn(); }
+            } turnEnd{this};
+            {
+                std::lock_guard l(jobsMutex);
+                if (stopping) return;
+            }
             std::unique_lock running(toolMutex);
             {
                 std::lock_guard jl(job->m);
@@ -1413,8 +1456,9 @@ void McpServer::Impl::addTools() {
             auto saved = [&](const QString& what) {
                 QString why, aside;
                 if (!skipped.isEmpty()) {  // (as the app does: the file as it was kept beside it, not lost)
+                    // (beside any copy kept before, the app's or an earlier call's, not over it)
                     aside = file + QStringLiteral(".unread");
-                    QFile::remove(aside);
+                    for (int k = 2; QFile::exists(aside); ++k) aside = file + QStringLiteral(".unread-%1").arg(k);
                     if (!QFile::copy(file, aside)) return fail(QStringLiteral("cannot keep a copy of %1 (%2 mapping(s) in it could not be read)").arg(file).arg(skipped.size()));
                 }
                 if (!midimaps::save(file, map, &why)) return fail(why);
@@ -3045,6 +3089,7 @@ void McpServer::Impl::addTools() {
                 }
                 c.start = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
                 c.duration = std::max<FrameTime>(1, a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue())));
+                checkProjectionTrack(c, t);
                 const auto r = edit::overwrite(l.project, s, t, c);
                 check(r);
                 save(l);
@@ -3143,6 +3188,7 @@ void McpServer::Impl::addTools() {
             projectionArg(a, s, c);
             c.start = at;
             c.duration = std::max<FrameTime>(1, len);
+            checkProjectionTrack(c, t);
             const auto r = edit::overwrite(l.project, s, t, c);
             check(r);
             save(l);
@@ -14258,16 +14304,22 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         if (tool == d_->tools.end()) return error(-32602, QStringLiteral("Unknown tool: %1").arg(name));
         QJsonObject args = params.value("arguments").toObject();
         // In the background: a job id now, the call run later (montage_job reads it).
-        if (name != QLatin1String("montage_job") && args.value("async").toBool()) {
+        const QJsonValue async = args.value("async");
+        if (name != QLatin1String("montage_job") && (async.toBool() || async.toString().compare(QLatin1String("true"), Qt::CaseInsensitive) == 0)) {
             args.remove("async");
             const std::shared_ptr<ToolJob> job = d_->startJob(*tool, args);
+            if (!job)
+                return reply(resultJson(fail(QStringLiteral("%1 background calls are waiting their turn: ask again once some have run").arg(Impl::kMaxQueuedJobs))));
             return reply(resultJson(ok(QStringLiteral("%1 runs in the background as %2: montage_job reads its progress and result").arg(name, job->id),
                                        QJsonObject{{"job", job->id}, {"tool", name}, {"status", "queued"}})));
         }
         args.remove("async");
         // montage_job is answered at once, while a job runs; other tools one at a time.
         std::unique_lock<std::mutex> running(d_->toolMutex, std::defer_lock);
+        bool turn = false;
         if (name != QLatin1String("montage_job")) {
+            d_->waitTurn(d_->takeTurn());
+            turn = true;
             running.lock();
             std::lock_guard l(d_->cancelMutex);
             d_->runningRequest = Impl::requestKey(id);
@@ -14296,6 +14348,8 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
             std::lock_guard l(d_->cancelMutex);
             d_->runningRequest.clear();
         }
+        if (running.owns_lock()) running.unlock();
+        if (turn) d_->endTurn();
         return reply(resultJson(r));
     }
     return error(-32601, QStringLiteral("Method not found: %1").arg(method));
@@ -14334,16 +14388,41 @@ int McpServer::run(std::istream& in, std::ostream& out) {
             write(handle(line));
         }
     });
+    // montage_job asked to wait: answered on threads of their own (a few), so this one keeps reading cancels and pings.
+    std::deque<std::string> waits;
+    std::vector<std::thread> waiters;
+    size_t idleWaiters = 0;
+    auto waiter = [&] {
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock l(callsMutex);
+                ++idleWaiters;
+                callsWake.wait(l, [&] { return closed || !waits.empty(); });
+                --idleWaiters;
+                if (waits.empty()) return;
+                line = std::move(waits.front());
+                waits.pop_front();
+            }
+            write(handle(line));
+        }
+    };
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find_first_not_of(" \t") == std::string::npos) continue;
         const QJsonObject msg = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
-        if (msg.value("method").toString() == QLatin1String("tools/call") &&
-            msg.value("params").toObject().value("name").toString() != QLatin1String("montage_job")) {
+        const QJsonObject params = msg.value("params").toObject();
+        const bool call = msg.value("method").toString() == QLatin1String("tools/call");
+        if (call && params.value("name").toString() != QLatin1String("montage_job")) {
             std::lock_guard l(callsMutex);
             calls.push_back(line);
-            callsWake.notify_one();
+            callsWake.notify_all();
+        } else if (call && params.value("arguments").toObject().value("wait").toDouble(0) > 0) {
+            std::lock_guard l(callsMutex);
+            waits.push_back(line);
+            if (idleWaiters < waits.size() && waiters.size() < 8) waiters.emplace_back(waiter);
+            callsWake.notify_all();
         } else {
             write(handle(line));
         }
@@ -14352,8 +14431,9 @@ int McpServer::run(std::istream& in, std::ostream& out) {
         std::lock_guard l(callsMutex);
         closed = true;
     }
-    callsWake.notify_one();
+    callsWake.notify_all();
     caller.join();
+    for (std::thread& t : waiters) t.join();
     return 0;
 }
 

@@ -150,12 +150,13 @@ Image renderLitLayer3D(const Sequence& seq, const Effect& e, FrameTime lt, const
     scene.picture = pictureTexture(layer, seq, 4096);  // (UHD cards at their own size)
     float ambient = 0;
     ModelLight light = settingsLight(e, lt, pl.origin, pl.seqWidth * pl.unit, &ambient);
-    light.shadows = true;  // (it takes the casters' shadows, and its own on the ground)
+    light.shadows = true;  // (it takes the casters' shadows, and casts its own on the ground when it casts them)
+    scene.castsShadows = P("shadows", 0) > 0.5;
     scene.ambient = {ambient, ambient, ambient};
     if (P("light_strength", 100) > 0) scene.lights.push_back(light);
     for (const Layer3DCaster& k : casters) {
         std::shared_ptr<const Model> m;
-        scene.casters.push_back({layer3dTriangles(k.place, m), k.picture});
+        scene.casters.push_back({layer3dTriangles(k.place, m), k.picture, !k.ownGround});
     }
     scene.ground = P("ground", 0) > 0.5;
     scene.groundHeight = P("ground_y", 0);
@@ -231,7 +232,9 @@ void layer3dDepthOfField(Image& img, std::vector<float>& depth, const ModelCamer
     }
     for (size_t i = 0; i < N; ++i)
         if (!(depth[i] > 0)) d[i] = farthest;
-    const ColorSpace& working = currentWorkingSpace();
+    // (in the space the card was drawn in: scene-referred grading's linear one when it is on)
+    const SceneGrading* sg = currentSceneGrading();
+    const ColorSpace& working = sg ? *sg->linear : currentWorkingSpace();
     std::unique_ptr<TransferTables> tables;
     if (working.transfer != Transfer::Linear) tables = std::make_unique<TransferTables>(working.transfer);
     lensBlur(img, d, ls, tables.get());
@@ -277,7 +280,9 @@ bool renderClipLayer3D(const Project& p, const Sequence& seq, const Clip& c, con
                     if (k.isGenerator() && k.generator.type == "model3d") continue;
                     const Image kl = cardLayer(k);
                     if (kl.empty()) continue;
-                    casters.push_back({layer3dPlace(*ke, t - k.start, seq.width, seq.height), pictureTexture(kl, seq)});
+                    const FrameTime kt = t - k.start;
+                    casters.push_back({layer3dPlace(*ke, t - k.start, seq.width, seq.height), pictureTexture(kl, seq),
+                                       ke->p("lit", kt, 0) > 0.5 && ke->p("ground", kt, 0) > 0.5});
                 }
         out = renderLitLayer3D(seq, e, lt, layer, pl, cam, casters, d);
     } else {

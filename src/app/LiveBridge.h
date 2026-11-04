@@ -23,7 +23,10 @@ QString liveConnectionFile();
 bool writeLiveConnection(const LiveConnection& c, QString* error = nullptr);  // readable by the user only
 bool readLiveConnection(LiveConnection& out, QString* error = nullptr);
 // POSTs one JSON-RPC message to the app and waits for its answer ("" for a notification). False with `error`.
-bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteArray& response, QString* error = nullptr);
+// `session`: the link's session id for this caller (sent when set; set from the answer when Montage gives one), so its
+// cancellations reach only its own calls.
+bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteArray& response, QString* error = nullptr,
+                     QByteArray* session = nullptr);
 // Relays newline-delimited JSON-RPC between `in` / `out` and the running app until `in` closes. While the app is
 // not reachable, each request is answered with an error saying so.
 int runLiveBridge(std::istream& in, std::ostream& out);

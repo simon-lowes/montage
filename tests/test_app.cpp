@@ -12652,6 +12652,11 @@ const auto seq = [this] { return state()->sequence(); };
         // In the background: "async": true answers at once with a job; montage_job waits for it (the window kept going)
         // and gives its result; the change is one undo step like any other.
         {
+            auto hasMarkerNamed = [&](const QString& name) {
+                for (const Marker& m : state()->sequence()->markers)
+                    if (QString::fromStdString(m.name) == name) return true;
+                return false;
+            };
             auto send = [&](int id, const QString& name, const QJsonObject& args) {
                 QByteArray answer;
                 link->handle(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
@@ -12676,6 +12681,36 @@ const auto seq = [this] { return state()->sequence(); };
             QCOMPARE(int(state()->history().undoCount()), before + 1);
             const QJsonObject list = send(22, "montage_job", {{"action", "list"}});
             QVERIFY(!list.value("jobs").toArray().isEmpty());
+            // Undo asked for just after a background call waits for it, and takes it back (not the step before).
+            const QString undoText = state()->undoText();
+            const QJsonObject queued = send(23, "montage_add_marker", {{"at", 3}, {"name", "undone in turn"}, {"async", true}});
+            QVERIFY(!queued.value("job").toString().isEmpty());
+            send(24, "montage_undo", {});
+            QVERIFY(!hasMarkerNamed("undone in turn"));
+            QCOMPARE(state()->undoText(), undoText);
+            QCOMPARE(send(25, "montage_job", {{"job", queued.value("job").toString()}}).value("status").toString(), QString("done"));
+            // A cancel names only its own caller's call: another client's call with the same id goes on.
+            auto ask = [&](int id, const QString& name, const QString& caller, QByteArray& answer) {
+                link->handle(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"},
+                                                       {"params", QJsonObject{{"name", "montage_add_marker"}, {"arguments", QJsonObject{{"at", 4}, {"name", name}}}}}})
+                                 .toJson(QJsonDocument::Compact),
+                             [&](QByteArray a) { answer = a; }, true, caller);
+            };
+            auto cancel = [&](int id, const QString& caller) {
+                link->handle(QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"method", "notifications/cancelled"}, {"params", QJsonObject{{"requestId", id}}}})
+                                 .toJson(QJsonDocument::Compact),
+                             [](QByteArray) {}, true, caller);
+            };
+            QByteArray first, mine, theirs;
+            ask(30, "first", "http:a", first);
+            ask(31, "mine", "http:a", mine);
+            ask(31, "theirs", "http:b", theirs);
+            cancel(31, "http:b");  // (b's own 31, waiting)
+            cancel(31, "http:c");  // (no call of c's: nothing)
+            QTRY_VERIFY_WITH_TIMEOUT(!first.isEmpty() && !mine.isEmpty() && !theirs.isEmpty(), 30000);
+            QVERIFY2(theirs.contains("-32800"), theirs.constData());
+            QVERIFY2(!mine.contains("error") && QJsonDocument::fromJson(mine).object().value("id").toInt() == 31, mine.constData());
+            QVERIFY(hasMarkerNamed("mine") && !hasMarkerNamed("theirs"));
         }
         // Off while an agent's tool runs: its result is not applied, and its calls still waiting are dropped.
         auto markerCall = [](int id, const QString& name) {
@@ -14690,6 +14725,20 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(panel->bank(), 1);
         QTest::keyClick(win_.get(), Qt::Key_9);
         QCOMPARE(state()->sequence()->videoTracks[0].clips.at(1).angle, 17);
+        // Typing in a text field, Alt+2 (Option+2 on a Mac, a character on many layouts) is the field's, not a bank.
+        {
+            auto* field = new QLineEdit(win_.get());
+            field->show();
+            win_->activateWindow();
+            field->setFocus();
+            QTRY_VERIFY(field->hasFocus());
+            QTest::keyClick(field, Qt::Key_2, Qt::AltModifier);
+            QCOMPARE(panel->bank(), 1);
+            delete field;
+            win_->setFocus();
+            QTest::keyClick(win_.get(), Qt::Key_3, Qt::AltModifier);
+            QCOMPARE(panel->bank(), 2);
+        }
         state()->newProject();
         for (const QString& f : files) QFile::remove(f);
     }

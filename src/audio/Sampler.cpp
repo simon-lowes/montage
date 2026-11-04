@@ -122,17 +122,31 @@ KitPtr Engine::kit() const {
 void Engine::noteOn(int key, int velocity, int64_t at, uint32_t seed, uint64_t id) {
     if (key < 0 || key > 127) return;
     std::lock_guard<std::mutex> lock(eventMutex_);
+    // (the lists hold kEventCapacity, so the audio thread never makes them bigger: past that a note is not played,
+    // with room kept for the notes' ends)
+    if (queued_.size() + 256 >= kEventCapacity) return;
     queued_.push_back({true, key, std::clamp(velocity, 1, 127), at, seed, order_++, id});
 }
 
 void Engine::noteOff(int key, int64_t at, uint64_t id) {
     if (key < 0 || key > 127) return;
     std::lock_guard<std::mutex> lock(eventMutex_);
+    if (queued_.size() >= kEventCapacity) {
+        // (full: a note's end is never dropped; the latest of its starts still waiting goes instead, or else the latest
+        // start waiting)
+        auto on = std::find_if(queued_.rbegin(), queued_.rend(), [&](const Event& e) { return e.on && e.key == key; });
+        if (on == queued_.rend()) on = std::find_if(queued_.rbegin(), queued_.rend(), [](const Event& e) { return e.on; });
+        if (on == queued_.rend()) return;  // (all ends: this key's is among them or the note has gone)
+        queued_.erase(std::next(on).base());
+    }
     queued_.push_back({false, key, 0, at, 0, order_++, id});
 }
 
 void Engine::allNotesOff() {
     std::lock_guard<std::mutex> lock(eventMutex_);
+    if (queued_.size() + 128 > kEventCapacity)  // (full: the notes waiting are let go, as all of them end anyway)
+        queued_.erase(std::remove_if(queued_.begin(), queued_.end(), [](const Event& e) { return e.on; }), queued_.end());
+    if (queued_.size() + 128 > kEventCapacity) queued_.clear();
     for (int k = 0; k < 128; ++k) queued_.push_back({false, k, 0, -1, 0, order_++, 0});
 }
 
@@ -262,8 +276,10 @@ void Engine::render(int64_t start, int frames, float* out) {
         }
         if (due_.empty()) std::swap(due_, queued_);  // (buffers traded, not copied)
         else {
-            due_.insert(due_.end(), queued_.begin(), queued_.end());
-            queued_.clear();
+            // (as many as the list holds without growing: the rest wait for the next block)
+            const size_t n = std::min(queued_.size(), due_.size() < kEventCapacity ? kEventCapacity - due_.size() : size_t(0));
+            due_.insert(due_.end(), queued_.begin(), queued_.begin() + std::ptrdiff_t(n));
+            queued_.erase(queued_.begin(), queued_.begin() + std::ptrdiff_t(n));
         }
     }
     if (due_.empty() && voices_.empty()) return;  // (silent: nothing to do)

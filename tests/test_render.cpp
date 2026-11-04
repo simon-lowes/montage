@@ -18464,6 +18464,9 @@ colorspaces:
             QVERIFY(!pkg.exists(".montage-package-new"));
         }
 
+        // (and an empty folder named as a rendition is: it holds nothing a package wrote)
+        QVERIFY(pkg.mkpath("a1_storyboard"));
+
         // time_signal cues instead: segmentation descriptors for a provider placement opportunity's start and end.
         st.cueCommand = "time_signal";
         st.rungs.resize(1);
@@ -18480,9 +18483,11 @@ colorspaces:
         QVERIFY(!text("master.m3u8").contains("TYPE=AUDIO"));
         // The earlier package's MPD, smaller rungs and sound are gone; its captions were made again.
         QVERIFY(!pkg.exists("manifest.mpd"));
-        QCOMPARE(pkg.entryList({"v*", "a*"}, QDir::Dirs), QStringList{videos[0]});
+        QCOMPARE(pkg.entryList({"v*", "a*"}, QDir::Dirs), (QStringList{"a1_storyboard", videos[0]}));
         QVERIFY(pkg.exists("s1_en/seg00001.vtt"));
         QVERIFY(pkg.exists("s2_final/notes.txt"));
+        QVERIFY(pkg.exists("a1_storyboard"));
+        QVERIFY(!pkg.exists(".montage-package-old"));
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

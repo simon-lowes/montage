@@ -75,6 +75,7 @@ struct ModelProjection {
 struct ModelShadowCaster {
     PosedTriangles triangles;
     std::shared_ptr<const ModelTexture> coverage;
+    bool onGround = true;  // its shadow falls on the ground too (off: it is on a ground of its own, drawn elsewhere)
 };
 
 struct ModelScene {
@@ -99,6 +100,7 @@ struct ModelScene {
     std::shared_ptr<const ModelProjection> projection;
     // Surfaces casting shadows onto these (and the ground) without being drawn.
     std::vector<ModelShadowCaster> casters;
+    bool castsShadows = true;  // these triangles cast shadows (off: they only take the casters')
 };
 
 struct ModelRenderOptions {

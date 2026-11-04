@@ -44,6 +44,12 @@ struct LongGopEncoder {
     std::string x265Params;  // the export's own (HDR10's), which the encoded parts keep
     int crf = 23;            // x264's and x265's quality, held under the rate of the GOPs copied either side
     int64_t bitrate = 0;     // or the export's bit rate, when it has one
+    int gop = 0;             // the export's keyframe interval for the encoded parts (0: the footage's)
+    // HEVC: parameter sets in the video (hev1), needed where encoded parts or more than one source meet copied GOPs
+    // under the same ids. Apple's players refuse hev1, so without it such an export is encoded whole; copies that need
+    // only one source's sets are written hvc1.
+    bool inBandHevc = false;
+    std::string startTimecode;  // MPEG-2: the GOP headers' time codes run from it (hh:mm:ss:ff, ';' drop frame; empty: 0)
     // The export's encoder, opened: the size, pixel format, rate, colour tags, field order and (MPEG-2) rate control the
     // encoded parts are made with. Its codec is libx264, libx265 or mpeg2video.
     const AVCodecContext* main = nullptr;
@@ -77,13 +83,16 @@ public:
 
 private:
     LongGopCopier() = default;
-    bool writeGop(const Copy& c, std::string* error);
+    // A copy's packets read from its source (1), or not found as planned (0: its frames are then encoded), or -1.
+    int readGop(const Copy& c, std::vector<AVPacket*>& out, std::string* error);
+    bool writeGop(const Copy& c, const std::vector<AVPacket*>& gop, std::string* error);
     bool startPart(FrameTime rel, std::string* error);
     bool endPart(std::string* error);
     bool receive(std::string* error);
     bool flushPending(std::string* error);
     bool write(AVPacket* pkt, FrameTime display, std::string* error);
     int64_t partBitrate(FrameTime a, FrameTime b) const;
+    double ceilingBitsPerFrame() const;
     AVCodecContext* openEncoder(int64_t bitrate, std::string* error) const;
 
     LongGopEncoder enc_;
@@ -101,6 +110,12 @@ private:
     std::vector<uint8_t> activeEncoderSets_;
     std::vector<uint8_t> partSets_;       // H.264: the encoded part's (they match the configuration's unless x264 made them differently)
     int firstSource_ = -1;
+    bool hvc1_ = false;                   // HEVC: every set out of band (one source's, no encoded part)
+    int profile_ = 0, level_ = 0;         // the stream's: the highest of the sources' (and H.264's encoder's)
+    bool highTier_ = false;               // HEVC: a source of the high tier
+    int64_t vbvLevel_ = -1;               // MPEG-2 at a constant rate: the buffer's bits after the last copied GOP
+    int64_t timecodeStart_ = 0;           // MPEG-2: the export's first frame's time code, as a frame count
+    bool dropFrame_ = false;
     int gop_ = 12;
     int depth_ = 0;  // the stream's decode delay, in frames
     int64_t decoded_ = 0;

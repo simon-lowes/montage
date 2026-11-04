@@ -36,6 +36,7 @@
 #include <QGuiApplication>
 #include <QActionGroup>
 #include <QApplication>
+#include <QAbstractSpinBox>
 #include <QCloseEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -69,6 +70,8 @@
 #include <QTextDocument>
 #include <QPdfWriter>
 #include <QPlainTextEdit>
+#include <QTextEdit>
+#include <QKeySequenceEdit>
 #include <QPushButton>
 #include <QtConcurrent>
 #include <QMessageBox>
@@ -833,18 +836,25 @@ void MainWindow::buildPanels() {
         QTimer::singleShot(0, tangent_, [this, on] { tangent_->setEnabled(on); });
     }
     // 1–9 cut to an angle of the bank of nine they reach (live while playing); Shift cuts at the playhead when stopped;
-    // Alt+1–3 picks the bank (angles 1–9, 10–18, 19–25).
+    // Alt+1–9 picks the bank (angles 1–9, 10–18, 19–27...).
+    std::vector<QShortcut*> banks;
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
         connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, false); });
         auto* cut = new QShortcut(QKeySequence(Qt::SHIFT | (Qt::Key_1 + i)), this);
         connect(cut, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, true); });
-        if (i < 3) {
-            auto* bank = new QShortcut(QKeySequence(Qt::ALT | (Qt::Key_1 + i)), this);
-            bank->setObjectName(QStringLiteral("multicamBank%1").arg(i + 1));
-            connect(bank, &QShortcut::activated, this, [this, i] { multicam_->setBank(i); });
-        }
+        auto* bank = new QShortcut(QKeySequence(Qt::ALT | (Qt::Key_1 + i)), this);
+        bank->setObjectName(QStringLiteral("multicamBank%1").arg(i + 1));
+        connect(bank, &QShortcut::activated, this, [this, i] { multicam_->setBank(i); });
+        banks.push_back(bank);
     }
+    // Off while typing (Option+digit types a character on a Mac's keyboard) and where a command has been given the key
+    // in Keyboard Shortcuts (the command has it, not the bank).
+    connect(qApp, &QApplication::focusChanged, this, [this, banks](QWidget*, QWidget* now) {
+        const bool typing = qobject_cast<QLineEdit*>(now) || qobject_cast<QTextEdit*>(now) || qobject_cast<QPlainTextEdit*>(now) ||
+                            qobject_cast<QAbstractSpinBox*>(now) || qobject_cast<QKeySequenceEdit*>(now);
+        for (QShortcut* b : banks) b->setEnabled(!typing && !keymap::conflict(this, b->key()));
+    });
     // In the Colour workspace the numeric keypad sets printer lights, as on a timer's console: 7, 8, 9 add a point of
     // red, green or blue, 4, 5, 6 take one away, + and - move all three. Elsewhere its keys do what they did: digits cut
     // to an angle, - zooms out.

@@ -63,8 +63,9 @@ public:
     void setName(const QString& name, int banks) {
         name_ = name;
         const int key = index_ % MulticamPanel::kBankSize + 1, bank = index_ / MulticamPanel::kBankSize + 1;
-        setToolTip(banks > 1 ? tr("Angle %1: %2 (key %3 in bank %4, picked with Alt+%4; Shift-click cuts at the playhead)")
-                                   .arg(index_ + 1).arg(name).arg(key).arg(bank)
+        setToolTip(banks > 1 && bank <= 9 ? tr("Angle %1: %2 (key %3 in bank %4, picked with Alt+%4; Shift-click cuts at the playhead)")
+                                                .arg(index_ + 1).arg(name).arg(key).arg(bank)
+                   : banks > 1 ? tr("Angle %1: %2 (Shift-click cuts at the playhead)").arg(index_ + 1).arg(name)
                              : tr("Angle %1: %2 (key %1; Shift-click cuts at the playhead)").arg(index_ + 1).arg(name));
         update();
     }
@@ -268,7 +269,7 @@ void MulticamPanel::refresh() {
         status_->setText((playing ? tr("Live: click an angle or press 1–%1 to cut to angles %2–%3.")
                                   : tr("Click an angle or press 1–%1 to switch this shot to angles %2–%3; Shift cuts at the playhead."))
                              .arg(keys).arg(b * kBankSize + 1).arg(b * kBankSize + keys) +
-                         QLatin1Char(' ') + tr("Alt+1–%1 picks the nine the keys reach.").arg(banks));
+                         QLatin1Char(' ') + tr("Alt+1–%1 picks the nine the keys reach.").arg(std::min(banks, 9)));
     else
         status_->setText(playing ? tr("Live: click an angle or press 1–%1 to cut to it.").arg(keys)
                                  : tr("Click an angle or press 1–%1 to switch this shot; Shift cuts at the playhead.").arg(keys));

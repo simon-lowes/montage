@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -2287,6 +2288,26 @@ OfxStatus sendRender(Instance& inst, double t, bool gl) {
 
 std::atomic<bool> gUseGpu{true};
 
+// Who renders each one-at-a-time plug-in now, and which one each thread waits for: a wait that would close a loop
+// (this thread holds a plug-in another render waits for while waiting for the one it holds, as two of them stacked in
+// opposite orders on two clips can) is refused rather than waited for forever.
+struct RenderWaits {
+    std::mutex m;
+    struct Owner {
+        std::thread::id thread;
+        const std::atomic<bool>* glWaiting = nullptr;  // set while it waits for the OpenGL thread
+    };
+    std::map<const void*, Owner> owner;
+    std::map<std::thread::id, const void*> waitingFor;
+    // The thread doing the OpenGL thread's work while it waits (a render handed back to it), when that thread waits
+    // itself: a holder waiting for the OpenGL thread waits on what this one waits for.
+    std::thread::id forOpenGl;
+};
+RenderWaits& renderWaits() {
+    static RenderWaits w;
+    return w;
+}
+
 // Renders `job` with `inst` into `result` (on the GPU where the plug-in renders with OpenGL and it can, else on the CPU).
 bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, Image& result, std::string* error, const ColorSpace* working) {
     auto fail = [&](const std::string& why) {
@@ -2311,17 +2332,51 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
         }
     std::unique_lock<std::mutex> serial(l->renderMutex, std::defer_lock);
     if (l->unsafe) {
-        if (!gl::servingOpenGl()) {
-            serial.lock();
-        } else {
+        RenderWaits& w = renderWaits();
+        const std::thread::id me = std::this_thread::get_id();
+        while (!serial.try_lock()) {
             // Here for a render on the OpenGL thread, which waits for this one: if whoever renders the plug-in now is
             // itself waiting for the OpenGL thread, neither would ever go on, so this render is refused instead.
-            while (!serial.try_lock()) {
+            if (gl::servingOpenGl()) {
                 const std::atomic<bool>* holder = l->holderWaiting.load();
-                if (holder && holder->load())
+                if (holder && holder->load()) {
+                    std::lock_guard g(w.m);
+                    w.waitingFor.erase(me);
+                    if (w.forOpenGl == me) w.forOpenGl = {};
                     return fail(d.label + " is busy in another render that waits for OpenGL (it renders one frame at a time)");
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
             }
+            {
+                std::lock_guard g(w.m);
+                w.waitingFor[me] = l;
+                // (following who holds what each waits for, back to this thread: a loop)
+                if (gl::servingOpenGl()) w.forOpenGl = me;
+                const void* want = l;
+                for (int hops = 0; hops < 64; ++hops) {
+                    const auto o = w.owner.find(want);
+                    if (o == w.owner.end()) break;
+                    if (o->second.thread == me) {
+                        w.waitingFor.erase(me);
+                        if (w.forOpenGl == me) w.forOpenGl = {};
+                        return fail(d.label + " is busy in another render that waits for one this render holds (it renders one frame at a time)");
+                    }
+                    auto next = w.waitingFor.find(o->second.thread);
+                    // (a holder waiting for the OpenGL thread waits on what that thread waits for)
+                    if (next == w.waitingFor.end() && o->second.glWaiting && o->second.glWaiting->load() && w.forOpenGl != std::thread::id()) {
+                        if (w.forOpenGl == me) break;  // (this thread being it: the check above, on its holder, covers it)
+                        next = w.waitingFor.find(w.forOpenGl);
+                    }
+                    if (next == w.waitingFor.end()) break;
+                    want = next->second;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        {
+            std::lock_guard g(w.m);
+            w.waitingFor.erase(me);
+            w.owner[l] = {me, gl::waitingFlag()};
+            if (w.forOpenGl == me) w.forOpenGl = {};
         }
         l->holderWaiting = gl::waitingFlag();
         held.push_back(l);
@@ -2333,6 +2388,9 @@ bool runRender(const PluginDesc& d, Loaded* l, Instance* inst, const Job& job, I
             if (!l) return;
             held.pop_back();
             l->holderWaiting = nullptr;
+            RenderWaits& w = renderWaits();
+            std::lock_guard g(w.m);
+            w.owner.erase(l);
         }
     } release{held, l->unsafe ? l : nullptr};
     Image out(job.width, job.height);

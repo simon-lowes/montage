@@ -150,6 +150,9 @@ struct ExportSettings {
     // Smart rendering: with ProRes or DNxHR, frames that are one untouched clip of footage already in the same
     // flavour, size and rate are copied from the source, not re-encoded.
     bool smartRender = true;
+    // H.264/HEVC smart rendering: HEVC copied beside encoded parts, its parameter sets then in the video (hev1, which
+    // Apple's players refuse); off, such an export is encoded whole (render/LongGopCopy.h).
+    bool smartRenderInBandHevc = false;
     // Masters with several audio streams (Resolve 21.1's separate output tracks, broadcast and streaming deliverables):
     // the mix first (named and tagged with a language), then one stream for each of these, each hearing only its
     // tracks (empty = all) and, when given, only clips of its role ("Dialogue", "Music", "Effects", "No Role", or several

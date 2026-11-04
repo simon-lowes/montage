@@ -60,6 +60,7 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/Effects.h"
+#include "render/LongGopCopy.h"
 #include "render/MeshWarp.h"
 #include "render/Iab.h"
 #include "core/Expression.h"
@@ -19207,6 +19208,37 @@ if __name__ == '__main__':
             QCOMPARE(QJsonDocument::fromJson(lines[1]).object().value("id").toInt(), 1);
             QVERIFY(!QJsonDocument::fromJson(lines[1]).object().value("result").toObject().value("isError").toBool());
         }
+        // Calls keep their order, background ones too: a file a job writes is there for a plain call asked for after it.
+        // And montage_job asked to wait doesn't hold up the reader: a ping sent after it is answered first.
+        {
+            McpServer streamed;
+            const auto msg = [&](int id, const QString& method, const QJsonObject& params) {
+                return QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}}).toJson(QJsonDocument::Compact).toStdString() + "\n";
+            };
+            const QString early = dir.path() + "/early.mp4", late = dir.path() + "/late.mp4", later = dir.path() + "/later.mp4";
+            std::istringstream in(msg(1, "tools/call", {{"name", "montage_render"}, {"arguments", QJsonObject{{"project", project}, {"output", early}, {"async", true}}}}) +
+                                  msg(2, "tools/call", {{"name", "montage_probe_media"}, {"arguments", QJsonObject{{"path", early}}}}) +
+                                  msg(3, "tools/call", {{"name", "montage_render"}, {"arguments", QJsonObject{{"project", project}, {"output", late}, {"async", "true"}}}}) +
+                                  msg(6, "tools/call", {{"name", "montage_render"}, {"arguments", QJsonObject{{"project", project}, {"output", later}, {"async", true}}}}));
+            std::ostringstream out;
+            QCOMPARE(streamed.run(in, out), 0);
+            QJsonObject probed, second;
+            for (const QByteArray& line : QByteArray::fromStdString(out.str()).trimmed().split('\n')) {
+                const QJsonObject o = QJsonDocument::fromJson(line).object();
+                if (o.value("id").toInt() == 2) probed = o.value("result").toObject();
+                if (o.value("id").toInt() == 3) second = o.value("result").toObject().value("structuredContent").toObject();
+            }
+            QVERIFY2(!probed.value("isError").toBool(), qPrintable(QJsonDocument(probed).toJson()));
+            QCOMPARE(second.value("job").toString(), QString("job-2"));  // ("true" as text asks for the background too)
+            // (job-3 waits behind job-2's render, so the ping comes well before it ends)
+            std::istringstream in2(msg(4, "tools/call", {{"name", "montage_job"}, {"arguments", QJsonObject{{"job", "job-3"}, {"wait", 60}}}}) + msg(5, "ping", {}));
+            std::ostringstream out2;
+            QCOMPARE(streamed.run(in2, out2), 0);
+            const QList<QByteArray> lines = QByteArray::fromStdString(out2.str()).trimmed().split('\n');
+            QCOMPARE(lines.size(), 2);
+            QCOMPARE(QJsonDocument::fromJson(lines[0]).object().value("id").toInt(), 5);
+            QCOMPARE(QJsonDocument::fromJson(lines[1]).object().value("result").toObject().value("structuredContent").toObject().value("status").toString(), QString("done"));
+        }
         // A second one cancelled while it runs, a third while it waits behind it: both end "cancelled" (the third never
         // started: no file), and the list has all three.
         const QString out2 = dir.path() + "/cancelled.mp4", out3 = dir.path() + "/queued.mp4";
@@ -20069,6 +20101,7 @@ if ui["pressed"] == "add":
             auto sourceFrameOf = [](int64_t e) { return e < 40 ? e + 5 : e - 40 + 58; };
             ExportSettings ex = st;
             ex.path = path(k.file);
+            ex.smartRenderInBandHevc = true;  // (HEVC's parameter sets in the video beside the encoded parts: hev1)
             if (xdcam) ex.mxfDelivery = "rdd9", ex.audioCodec = xd->settings.audioCodec;
             int copied = -1;
             QVERIFY2(exportSequence(p, s, ex, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
@@ -20089,8 +20122,15 @@ if ui["pressed"] == "add":
             const auto source = packets(st.path), smart = packets(ex.path);
             std::map<int64_t, QByteArray> byFrame;
             for (const Coded& c : source) byFrame[c.frame] = c.data;
+            // (MPEG-2: a copied GOP's header given the time code of where it now sits)
+            auto withoutGopTimecode = [](QByteArray d) {
+                const int i = d.indexOf(QByteArray("\x00\x00\x01\xb8", 4));
+                if (i >= 0 && i + 8 <= d.size()) d[i + 4] = char(uchar(d[i + 4]) & 0x80), d[i + 5] = 0, d[i + 6] = 0, d[i + 7] = char(uchar(d[i + 7]) & 0x7f);
+                return d;
+            };
             auto sameCoded = [&](const QByteArray& got, const QByteArray& want) {
                 if (got == want) return true;
+                if (xdcam) return withoutGopTimecode(got) == withoutGopTimecode(want);
                 if (std::string(k.codec) != "libx265" || want.isEmpty() || got.size() < want.size()) return false;
                 const QByteArray tail = got.right(want.size());
                 int i = 0;
@@ -20147,7 +20187,46 @@ if ui["pressed"] == "add":
             }
             QFile::remove(QString::fromStdString(lossless.path));
             QFile::remove(QString::fromStdString(whole.path));
+            if (std::string(k.codec) == "libx265") {
+                // Not asked for parameter sets in the video, the cut with its encoded parts is encoded whole; the footage
+                // shown throughout is copied with every set out of band (hvc1, as Apple's players need).
+                ExportSettings plain = ex;
+                plain.smartRenderInBandHevc = false;
+                plain.path = path("lg-hevc-plain.mp4");
+                QVERIFY2(exportSequence(p, s, plain, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+                QCOMPARE(copied, 0);
+                Project all = makeDefaultProject();
+                Sequence& as = *all.active();
+                as.width = k.w, as.height = k.h, as.fps = Rational{25, 1};
+                MediaItem am = probeOrFail(all, st.path);
+                all.media.push_back(am);
+                QVERIFY(edit::placeMedia(all, as, am.id, 0, 0, 100, {TrackKind::Video, 0}, {}, false).ok);
+                plain.path = path("lg-hevc-all.mp4");
+                QVERIFY2(exportSequence(all, as, plain, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+                QCOMPARE(copied, 100);
+                AVFormatContext* f = nullptr;
+                QVERIFY(avformat_open_input(&f, plain.path.c_str(), nullptr, nullptr) >= 0);
+                QVERIFY(avformat_find_stream_info(f, nullptr) >= 0);
+                const uint32_t tag = f->streams[0]->codecpar->codec_tag;
+                avformat_close_input(&f);
+                QCOMPARE(tag, uint32_t(MKTAG('h', 'v', 'c', '1')));
+                QCOMPARE(int(decodeAll(plain.path, errors).size()), 100);
+                QCOMPARE(errors, 0);
+            }
             if (std::string(k.codec) == "libx264") {
+                // Exported at a much lower quality than the footage was coded at: encoded whole, not copied at the
+                // footage's rate.
+                ExportSettings draft = ex;
+                draft.crf = 40;
+                draft.path = path("lg-draft.mp4");
+                QVERIFY2(exportSequence(p, s, draft, nullptr, nullptr, &err, nullptr, &copied), err.c_str());
+                QCOMPARE(copied, 0);
+                // A clip with a compositing graph is not untouched.
+                Clip& first = s.videoTracks[0].clips.front();
+                QVERIFY(untouchedClipAt(s, 2) == &first);
+                first.composite.nodes.push_back(CompositeNode{});
+                QVERIFY(untouchedClipAt(s, 2) == nullptr);
+                first.composite.nodes.clear();
                 // Settings the footage was not coded with: encoded whole.
                 ExportSettings other = ex;
                 other.pixFmt = "yuv444p";
@@ -33576,6 +33655,69 @@ if ui["pressed"] == "add":
             QVERIFY(parallel.px == img.px);
         }
 
+        // ---- A two-sided face turned away from the projector and the camera alike shows the picture on its back; a
+        // hole in a face's own picture stays a hole; and a wall reaching behind the projector still hides what is
+        // beyond it.
+        {
+            const std::array<float, 3> red{0.8f, 0.2f, 0.1f};
+            auto plain = [&](double, double) { return red; };
+            auto sceneOf = [&](const PosedTriangles& tris, const ModelCamera& projector, const Model* model) {
+                ModelScene sc = sceneWith(projector, picture(W, H, plain));
+                sc.triangles = tris;
+                sc.model = model;
+                return sc;
+            };
+            const ModelCamera cam = lookAt({0, 0, 5}, {0, 0, 0}, 280, W, H);
+            Model twoSided;
+            twoSided.materials.resize(1);
+            twoSided.materials[0].doubleSided = true;
+            PosedTriangles turned;
+            face(turned, {0, 0, 0}, {-2, 0, 0}, {0, 2, 0});  // (facing -z, away from both)
+            turned.materials = {0, 0};
+            const float* back = renderModel(sceneOf(turned, cam, &twoSided), cam, W, H).at(W / 2, H / 2);
+            QVERIFY2(std::fabs(back[0] - red[0]) < 2.0f / 255 && std::fabs(back[1] - red[1]) < 2.0f / 255 && back[3] > 0.99f,
+                     qPrintable(QString("the back of a two-sided face: %1 %2 %3 %4").arg(back[0]).arg(back[1]).arg(back[2]).arg(back[3])));
+
+            // (the face's own picture: nothing on the left half, white on the right)
+            Model blended;
+            blended.materials.resize(1);
+            blended.materials[0].alpha = ModelMaterial::Alpha::Blend;
+            PosedTriangles holed;
+            face(holed, {0, 0, 0}, {2, 0, 0}, {0, 2, 0});
+            holed.materials = {0, 0};
+            ModelScene sc = sceneOf(holed, cam, &blended);
+            std::vector<float> half(size_t(W) * H * 4, 0.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = W / 2; x < W; ++x)
+                    for (int k = 0; k < 4; ++k) half[(size_t(y) * W + size_t(x)) * 4 + size_t(k)] = 1;
+            sc.picture = std::make_shared<ModelTexture>(linearModelTexture(W, H, std::move(half)));
+            sc.pictureMaterial = 0;
+            const Image holedImg = renderModel(sc, cam, W, H);
+            double px = 0, py = 0;
+            QVERIFY(cam.project({-1, 0, 0}, px, py));
+            const float* hole = holedImg.at(int(px), int(py));
+            QVERIFY(cam.project({1, 0, 0}, px, py));
+            const float* solid = holedImg.at(int(px), int(py));
+            QVERIFY2(hole[3] < 0.01f && solid[3] > 0.99f && std::fabs(solid[0] / solid[3] - red[0]) < 2.0f / 255,
+                     qPrintable(QString("the hole: alpha %1; beside it %2 (alpha %3)").arg(hole[3]).arg(solid[0]).arg(solid[3])));
+
+            // (the projector at the origin looking down -z; a wall at x = 0.5 from 5 behind it to 5 in front; a face
+            // beyond the wall that the projector would reach through it)
+            const ModelCamera projector = lookAt({0, 0, 0}, {0, 0, -1}, 280, W, H);
+            PosedTriangles walled;
+            face(walled, {0.5, 0, 0}, {0, 0, -5}, {0, 5, 0});
+            face(walled, {2, 0, -6}, {0, 0, 1}, {0, 1, 0});
+            const ModelCamera viewer = lookAt({1.4, 0, -2}, {2, 0, -6}, 280, W, H);
+            QVERIFY(viewer.project({2, 0, -6}, px, py));
+            const float* beyond = renderModel(sceneOf(walled, projector, nullptr), viewer, W, H).at(int(px), int(py));
+            QVERIFY2(beyond[3] > 0.99f && beyond[0] < 0.01f, qPrintable(QString("beyond the wall: %1 (alpha %2)").arg(beyond[0]).arg(beyond[3])));
+            // (without the wall the picture reaches it)
+            PosedTriangles open;
+            face(open, {2, 0, -6}, {0, 0, 1}, {0, 1, 0});
+            const float* reached = renderModel(sceneOf(open, projector, nullptr), viewer, W, H).at(int(px), int(py));
+            QVERIFY2(std::fabs(reached[0] - red[0]) < 2.0f / 255, qPrintable(QString("without the wall: %1").arg(reached[0])));
+        }
+
         // ---- Over MCP, onto a plane filling the frame through its own camera, from a projector of the same lens: the
         // gradient on V1 comes back as it was (to 1/255), its track hidden.
         Project p = makeDefaultProject();
@@ -33733,6 +33875,39 @@ if ui["pressed"] == "add":
             const float* in = both.at(int(px), int(py));
             const float* lit2 = both.at(int(px), int(py) - 30);
             QVERIFY2(in[0] < lit2[0] * 0.8f, qPrintable(QString("the back card at %1, %2: %3 in the shadow, %4 beside it").arg(px).arg(py).arg(in[0]).arg(lit2[0])));
+            // Two squares side by side, each with its ground at 80 %: each shadow as dark as one ground makes it (not
+            // darkened again by the other card's ground).
+            auto darkest = [&](const Image& im) {
+                float a = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x)
+                        if (im.at(x, y)[0] < 0.01f) a = std::max(a, im.at(x, y)[3]);
+                return a;
+            };
+            Clip left = sq, right = sq;
+            left.id = p.newId(), right.id = p.newId();
+            left.effects[0].params["pos_x"] = -90.0, right.effects[0].params["pos_x"] = 90.0;
+            left.effects[0].params["ground_strength"] = 80.0, right.effects[0].params["ground_strength"] = 80.0;
+            s.videoTracks[0].clips = {left};
+            s.videoTracks[1].clips.clear();
+            const float oneGround = darkest(renderSequenceFrame(p, s, 3, o));
+            s.videoTracks[1].clips = {right};
+            const float twoGrounds = darkest(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(oneGround > 0.3f && std::fabs(twoGrounds - oneGround) < 0.01f,
+                     qPrintable(QString("a shadow under one ground: %1, under two: %2").arg(oneGround).arg(twoGrounds)));
+            // A square that casts no shadow leaves its ground bare.
+            s.videoTracks[1].clips.clear();
+            s.videoTracks[0].clips[0].effects[0].params["shadows"] = 0.0;
+            const float none = darkest(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(none < 0.01f, qPrintable(QString("no shadows cast, yet the ground shows %1").arg(none)));
+            // A card with no ground of its own still shadows another's: one casting with its ground off, beside one
+            // with a ground that casts nothing.
+            left.effects[0].params["ground"] = 0.0;
+            right.effects[0].params["shadows"] = 0.0;
+            s.videoTracks[0].clips = {left};
+            s.videoTracks[1].clips = {right};
+            const float onAnother = darkest(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(std::fabs(onAnother - oneGround) < 0.01f, qPrintable(QString("a shadow on another card's ground: %1").arg(onAnother)));
             s.videoTracks[1].clips.clear();
         }
 

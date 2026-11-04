@@ -485,10 +485,14 @@ bool isRenditionName(const QString& name) {
 bool holdsOnlyRenditionFiles(const QString& path) {
     QDir d(path);
     if (!d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System).isEmpty()) return false;
-    static const QRegularExpression file(QStringLiteral("^(seg\\d+\\.(m4s|vtt)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml)|\\.DS_Store|Thumbs\\.db|desktop\\.ini)$"));
-    for (const QString& f : d.entryList(QDir::Files | QDir::Hidden | QDir::System))
-        if (!file.match(f).hasMatch()) return false;
-    return true;
+    static const QRegularExpression file(QStringLiteral("^(seg\\d+\\.(m4s|vtt)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml))$"));
+    static const QRegularExpression junk(QStringLiteral("^(\\.DS_Store|Thumbs\\.db|desktop\\.ini)$"));
+    bool any = false;  // (an empty folder, or one of only junk, is not a rendition's: left alone)
+    for (const QString& f : d.entryList(QDir::Files | QDir::Hidden | QDir::System)) {
+        if (file.match(f).hasMatch()) any = true;
+        else if (!junk.match(f).hasMatch()) return false;
+    }
+    return any;
 }
 
 }  // namespace
@@ -1178,15 +1182,41 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         if (QFileInfo::exists(root.filePath(q)) && !earlier(q))
             return fail("The folder already has a \"" + n + "\" that this package did not make: choose an empty folder");
     }
-    for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"}) root.remove(QString::fromLatin1(f));
-    for (const std::string& n : res.renditions) {
-        const QString q = QString::fromStdString(n);
-        if (QFileInfo::exists(root.filePath(q))) QDir(root.filePath(q)).removeRecursively();
-        if (!root.rename(stagingName + "/" + q, q)) return fail("Cannot move " + n + " into " + finalFolder);
-    }
-    for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"})
-        if (QFileInfo::exists(QString::fromStdString(folder) + "/" + f) && !root.rename(stagingName + "/" + f, QString::fromLatin1(f)))
-            return fail(std::string("Cannot move ") + f + " into " + finalFolder);
+    // Into place: what the earlier package had there moved aside first, then the new package moved in; if any move
+    // fails (a player holding a segment open, say), every move is undone, so the earlier package is left whole.
+    const QString asideName = QStringLiteral(".montage-package-old");
+    QDir(root.filePath(asideName)).removeRecursively();
+    if (!root.mkpath(asideName)) return fail("Cannot make " + finalFolder + "/" + asideName.toStdString());
+    struct Aside {
+        QString dir;
+        ~Aside() {
+            if (!dir.isEmpty()) QDir(dir).removeRecursively();
+        }
+    } aside{root.filePath(asideName)};
+    std::vector<std::pair<QString, QString>> moved;  // (from, to), relative to the folder
+    auto move = [&](const QString& from, const QString& to) {
+        if (!root.rename(from, to)) return false;
+        moved.emplace_back(from, to);
+        return true;
+    };
+    auto undo = [&](const std::string& why) {
+        bool back = true;
+        for (auto it = moved.rbegin(); it != moved.rend(); ++it) back = root.rename(it->second, it->first) && back;
+        if (back) return fail(why);
+        // (what could not be put back is kept where it was moved to, not deleted with the folders made for the move)
+        aside.dir.clear(), staging.dir.clear();
+        return fail(why + "; what could not be put back is in " + finalFolder + "/" + asideName.toStdString() + " and " + finalFolder + "/" +
+                    stagingName.toStdString());
+    };
+    std::vector<QString> moving;
+    for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"}) moving.push_back(QString::fromLatin1(f));
+    for (const std::string& n : res.renditions) moving.push_back(QString::fromStdString(n));
+    for (const QString& q : moving)
+        if (QFileInfo::exists(root.filePath(q)) && !move(q, asideName + "/" + q))
+            return undo("Cannot move the earlier " + q.toStdString() + " aside in " + finalFolder + " (is a player using it?)");
+    for (const QString& q : moving)
+        if (QFileInfo::exists(root.filePath(stagingName + "/" + q)) && !move(stagingName + "/" + q, q))
+            return undo("Cannot move " + q.toStdString() + " into " + finalFolder);
     // An earlier package's renditions this one did not make (a longer ladder, another language) are removed.
     for (const QString& d : root.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
         if (isRenditionName(d) && std::find(res.renditions.begin(), res.renditions.end(), d.toStdString()) == res.renditions.end() && earlier(d))

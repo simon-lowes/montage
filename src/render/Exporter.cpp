@@ -714,7 +714,7 @@ const Clip* untouchedClipAt(const Sequence& seq, FrameTime f) {
     bool grouped = false;  // (a colour group's grades run on it)
     if (found)
         for (const ColorGroup* g : colorGroupsOf(seq, *found)) grouped = grouped || !g->pre.empty() || !g->post.empty();
-    if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped ||
+    if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped || !found->composite.empty() ||
         found->blendMode != "normal" || found->speed != 1.0 ||
         found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
         return nullptr;
@@ -1566,6 +1566,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         lge.x265Params = x265Params;
         lge.crf = s.crf;
         lge.bitrate = s.videoBitrate;
+        lge.gop = s.gop;
+        lge.inBandHevc = s.smartRenderInBandHevc;
+        lge.startTimecode = s.startTimecode;
         lge.main = o.vctx;
         longGop = LongGopCopier::plan(p, seq, in, out, seqSpace, lge, o.oc, o.vst);
         if (longGop && !longGop->prepareStream(nullptr)) longGop.reset();
