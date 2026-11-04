@@ -1,5 +1,7 @@
 #include "Capture.h"
 
+#include "audio/Ltc.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -80,6 +82,7 @@ bool endsWith(const std::string& s, const char* tail) {
 // feed's frames come as they are, with an empty packet for their size.
 struct Item {
     int input = 0;
+    double arrived = 0;  // (captureClock())
     AVPacket* packet = nullptr;
     std::string error;
 #ifdef MONTAGE_WITH_OMT
@@ -139,6 +142,14 @@ int interrupted(void* opaque) {
     if (i->s->stopping) return 1;
     return nowMs() > i->s->deadline[i->input].load() ? 1 : 0;
 }
+
+double captureClockNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+}  // namespace
+
+double captureClock() { return captureClockNow(); }
+
+namespace {
 
 int64_t msFromNow(double seconds) { return nowMs() + int64_t(seconds * 1000); }
 
@@ -438,6 +449,12 @@ void Recorder::run() {
     int64_t audioBaseSample = 0;
     const bool mov = endsWith(cs.path, ".mov");
     int64_t frameLimit = 0;
+    const bool ranged = cs.fromFrame >= 0;
+    int64_t firstLabel = -1;  // a range's first picture's label
+    double arrival = 0;       // when the packet being decoded arrived
+    // When the video packets arrived, by their timestamp: a decoder that holds pictures back (frame threads, reordering)
+    // gives a picture out with a later packet, so it is placed by when its own packet came.
+    std::deque<std::pair<int64_t, double>> arrivals;
     int64_t soundEnd = INT64_MAX;  // (once stopped: the pictures' end)
     int width = 0, height = 0;
     int colorSpace = AVCOL_SPC_BT709;
@@ -481,6 +498,36 @@ void Recorder::run() {
         return true;
     };
 
+    // A picture's label, for a range by timecode: its own timecode (`exact`), else (with `byClock`) when it arrived.
+    bool isDropFrameFeed = cs.labelDropFrame;
+    auto labelOf = [&](const AVFrame* f, const Input& in, bool byClock, bool* exact) -> int64_t {
+        *exact = false;
+        bool standard = false;
+        AVRational rate = standardRate(in.rate, &standard);
+        if (rate.num <= 0 || rate.den <= 0) rate = {25, 1};
+        const int base = int(std::lround(av_q2d(rate)));
+        if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_S12M_TIMECODE); sd && sd->size >= 8) {
+            const auto* v = reinterpret_cast<const uint32_t*>(sd->data);
+            if (v[0] >= 1) {
+                char b[AV_TIMECODE_STR_SIZE];
+                av_timecode_make_smpte_tc_string2(b, rate, v[1], 0, 0);
+                LtcFrame l;
+                char sep = ':';
+                if (std::sscanf(b, "%d:%d:%d%c%d", &l.hours, &l.minutes, &l.seconds, &sep, &l.frames) == 5 && l.frames < base) {
+                    l.dropFrame = sep == ';' && base == 30;
+                    isDropFrameFeed = l.dropFrame;
+                    *exact = true;
+                    return ltcFrameNumber(l, base);
+                }
+            }
+        }
+        if (!byClock || !cs.label) return -1;
+        double came = arrival;
+        for (const auto& [pts, when] : arrivals)
+            if (pts == f->pts) came = when;
+        return cs.label(came);
+    };
+
     // Opens the file at the first picture (its size, rate and timecode known then).
     auto begin = [&](const AVFrame* f, Input& in) -> bool {
         bool standard = false;
@@ -494,6 +541,12 @@ void Recorder::run() {
         }
         frameLimit = cs.seconds > 0 ? int64_t(std::llround(cs.seconds * av_q2d(fps))) : 0;
         std::string tc = cs.timecode;
+        if (ranged) {
+            frameLimit = cs.frames > 0 ? cs.fromFrame + cs.frames - firstLabel : 0;
+            const int base = int(std::lround(av_q2d(fps)));
+            const LtcFrame l = ltcFrameAt(firstLabel, base, base == 30 && fps.den == 1001 && isDropFrameFeed);
+            tc = ltcLabel(l);
+        }
         if (tc.empty())
             if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_S12M_TIMECODE); sd && sd->size >= 8) {
                 const auto* v = reinterpret_cast<const uint32_t*>(sd->data);
@@ -562,6 +615,7 @@ void Recorder::run() {
         vst->time_base = venc->time_base;
         vst->avg_frame_rate = fps;
         av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);
+        if (!cs.reel.empty()) av_dict_set(&vst->metadata, "reel_name", cs.reel.c_str(), 0);
         // Its sound: the video source's, else a sound device of its own (its format known from the first sound).
         const Input& ain = inputs[1].live() ? inputs[1] : inputs[0];
         int sourceChannels = ain.audio ? ain.audio->ch_layout.nb_channels : 0;
@@ -621,6 +675,21 @@ void Recorder::run() {
 
     auto putPicture = [&](AVFrame* f, Input& in) -> bool {
         const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
+        // A range by timecode: the picture's label, and those before the range passed over. A label from the clock
+        // only chooses the first picture (the rest placed by the feed's timestamps, steadier than when they arrived).
+        int64_t label = -1;
+        bool exact = false;
+        if (ranged) {
+            label = labelOf(f, in, !headerWritten, &exact);
+            if (!headerWritten) {
+                if (label < cs.fromFrame || f->decode_error_flags || (f->flags & AV_FRAME_FLAG_CORRUPT)) return true;
+                if (cs.frames > 0 && label >= cs.fromFrame + cs.frames) {
+                    fatal = "The frames asked for had gone by before the feed was recorded";
+                    return false;
+                }
+                firstLabel = label;
+            }
+        }
         if (!headerWritten) {
             // (a feed joined between keyframes: its pictures start once they decode whole)
             if (f->decode_error_flags || (f->flags & AV_FRAME_FLAG_CORRUPT)) return true;
@@ -635,7 +704,8 @@ void Recorder::run() {
         // A jump in the feed's clock (an encoder restarted, a stream switched): taken as going on from here.
         const double late = t - (t0 + double(nextFrame) / av_q2d(fps));
         if (late > 2 || late < -1) t0 = t - double(nextFrame) / av_q2d(fps);
-        const int64_t at = int64_t(std::llround((t - t0) * av_q2d(fps)));
+        int64_t at = int64_t(std::llround((t - t0) * av_q2d(fps)));
+        if (ranged && exact) at = label - firstLabel;  // (placed by its label)
         if (at < nextFrame) {
             std::lock_guard lock(s->m);
             ++s->st.dropped;
@@ -949,6 +1019,7 @@ void Recorder::run() {
                         Item item;
                         item.input = i;
                         item.omt = f;
+                        item.arrived = captureClockNow();
                         std::lock_guard lock(s->qm);
                         if (f->header.type == omt::Video && s->queuedBytes > kQueueBytes) continue;
                         s->queuedBytes += itemBytes(item);
@@ -994,6 +1065,7 @@ void Recorder::run() {
                         continue;
                     }
                     item.packet = p;
+                    item.arrived = captureClockNow();
                     std::lock_guard lock(s->qm);
                     if (p->stream_index == in.videoStream) {
                         // Falling behind: pictures dropped, whole runs to the next keyframe (sound never).
@@ -1034,6 +1106,11 @@ void Recorder::run() {
                 }
                 if (++ended >= live || item.input == 0) break;  // (the picture ended: so does the recording)
                 continue;
+            }
+            arrival = item.arrived;
+            if (item.packet && item.packet->stream_index == inputs[item.input].videoStream && item.packet->pts != AV_NOPTS_VALUE) {
+                arrivals.emplace_back(item.packet->pts, item.arrived);
+                if (arrivals.size() > 64) arrivals.pop_front();
             }
             ok = decode(item, false);
             av_packet_free(&item.packet);

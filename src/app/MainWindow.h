@@ -60,6 +60,8 @@ class MonitorCalibrationDialog;
 class PatchGenerator;
 class ReferenceOutputController;
 class RemoteReviewController;
+class DeckController;
+class DeckDialog;
 class RemoteGradeController;
 struct ConsolidateOptions;
 class PlaybackController;
@@ -651,6 +653,8 @@ private:
     // Playback › Video Output › Reference Output…: the Program to a DeckLink card or over NDI.
     ReferenceOutputController* referenceOutput_ = nullptr;
     RemoteReviewController* remoteReview_ = nullptr;
+    DeckController* deckControl_ = nullptr;  // decks under 9-pin control, Montage as a deck, LTC chase
+    DeckDialog* deckDialog_ = nullptr;
     QAction* remoteReviewAction_ = nullptr;
     RemoteGradeController* remoteGrade_ = nullptr;
     QAction* remoteGradeAction_ = nullptr;

@@ -40,7 +40,21 @@ struct CaptureSettings {
     std::string timecode;                // the first frame's ("hh:mm:ss:ff"); "" the feed's own, else the time of day
     double seconds = 0;                  // stop after this long (0: when stopped)
     double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)
+    std::string reel;                    // the tape's name, kept with the timecode (QuickTime's reel name)
+    // A range of the feed's frames by their timecode (batch capture from a deck): pictures labelled before `fromFrame`
+    // are passed over; the file starts on the first labelled `fromFrame` or later, with that label as its timecode, and
+    // holds the pictures up to `fromFrame + frames`, each placed by its label. Labels are frame numbers at the feed's
+    // timecode rate (as audio/Ltc counts them): the feed's own timecode on each picture (SMPTE 12-M, as SDI capture
+    // and Open Media Transport give it), else `label`'s, asked with when the picture arrived (captureClock()), -1 not
+    // known.
+    int64_t fromFrame = -1;
+    int64_t frames = 0;
+    std::function<int64_t(double arrived)> label;
+    bool labelDropFrame = false;  // `label`'s frames counted in drop frame (at 29.97)
 };
+
+// The clock CaptureSettings::label is asked by (seconds, steady).
+double captureClock();
 
 // The codecs offered: id and name.
 std::vector<std::pair<std::string, std::string>> captureCodecs();

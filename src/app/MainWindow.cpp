@@ -147,6 +147,7 @@ extern "C" {
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
+#include "DeckControl.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
 #include "core/AvidBinImport.h"
@@ -1390,6 +1391,12 @@ void MainWindow::buildMenus() {
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
+    add(file, QT_TR_NOOP("&Deck Control…"), QKeySequence(), [this] {
+        if (!deckDialog_) deckDialog_ = new DeckDialog(deckControl_, state_, this);
+        deckDialog_->show();
+        deckDialog_->raise();
+        deckDialog_->activateWindow();
+    })->setObjectName(QStringLiteral("deckControl"));
     add(file, QT_TR_NOOP("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
@@ -2726,6 +2733,12 @@ void MainWindow::buildMenus() {
             return referenceOutput_->runTool(args, structured, isError);
         });
     // To reviewers elsewhere, streamed live (render/RemoteReview.h, render/WebRtcReview.h); their notes come back as markers.
+    // Decks under Sony 9-pin control, Montage answering as one, and the Program chasing LTC (app/DeckControl.h).
+    if (!deckControl_) deckControl_ = new DeckController(state_, program_, this);
+    if (liveLink_)
+        liveLink_->addAppTool(DeckController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return deckControl_->runTool(args, structured, isError);
+        });
     remoteReview_ = new RemoteReviewController(program_, this);
     remoteReviewAction_ = new QAction(tr("Remote Review…"), this);
     remoteReviewAction_->setObjectName(QStringLiteral("remoteReview"));
