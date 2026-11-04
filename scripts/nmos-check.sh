@@ -34,6 +34,13 @@ run() {
     shift
     (cd "$work/nmos-testing" && timeout 900 "$work/venv/bin/python" nmos-test.py suite "$suite" "$@" --output "$work/$suite.xml" \
         > "$work/$suite.log" 2>&1) || true
+    if [ ! -s "$work/$suite.xml" ]; then
+        # (the tool stopped before writing its report: its own output says why)
+        echo "$suite: no report; the test tool's output ends:"
+        tail -n 40 "$work/$suite.log"
+        failed=1
+        return
+    fi
     # Passed, or not applicable (no authorisation): anything failing or in error is reported.
     "$work/venv/bin/python" -I - "$work/$suite.xml" "$suite" <<'EOF' || failed=1
 import sys
