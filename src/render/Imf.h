@@ -28,6 +28,11 @@
 // pictures are brought into ACES through the inverse of the filmic one). Target frames, display-referred 16-bit TIFF
 // stills of chosen frames through that output transform, travel in the track file, with an ACES Metadata File in the
 // package. Sound, timed text and supplementals are as for Application #2E.
+//
+// ProRes masters (Application ProRes, SMPTE RDD 45): the pictures coded as ProRes (RDD 36: 422 LT, 422 or 422 HQ as
+// Y'CbCr 4:2:2; 4444 or 4444 XQ as R'G'B' 4:4:4; 10 bits, narrow range) in the colours #2E has, with RDD 45's colour
+// codes in each frame, frame-wrapped as RDD 44 maps them (body partitions of about ten seconds, each with the previous
+// one's index). Sound, timed text and supplementals are as for Application #2E; FFmpeg reads the track files back.
 #pragma once
 
 #include <cstdint>
@@ -81,9 +86,14 @@ struct ImfSettings {
     // The sequence that package was mastered from, kept as it was (a copy made before the changes): its cut is
     // compared with this one to find the pictures that changed. 0: the picture has not changed (new sound or text).
     Id originalSequence = 0;
-    // The IMF application: 2 (#2E, JPEG 2000 in the colour above) or 5 (#5, an archival master in ACES 2065-1, where the
-    // colour, depth and coding above do not apply).
+    // The IMF application: 2 (#2E, JPEG 2000 in the colour above), 5 (#5, an archival master in ACES 2065-1, where the
+    // colour, depth and coding above do not apply) or 45 (Application ProRes, SMPTE RDD 45: ProRes pictures in the colour
+    // above, 10 bits, in the profile below).
     int application = 2;
+    // Application ProRes: the profile ("lt", "422", "hq" as 4:2:2 Y'CbCr; "4444", "4444xq" as 4:4:4 R'G'B'). 4:2:2
+    // takes pictures to 3840 x 2160 in Rec.709, Rec.2020 PQ or HLG at up to 60 fps; 4:4:4 to 4096 x 3112 in any of the
+    // colours, at up to 120.
+    std::string prores = "hq";
     // Application #5: the grade in the pictures; false leaves it off.
     bool graded = true;
     // Application #5: sequence frames (within what is exported) also given as target frames.
@@ -119,6 +129,7 @@ struct ImfResult {
     int64_t newSamples = 0;      // sample frames in its own sound track files
     std::vector<std::string> trackFiles;  // the track files written
     int application = 2;
+    std::string prores;           // Application ProRes: the profile
     std::string outputTransform;  // Application #5: the output transform named (ACESAuthoringInformation)
     int targetFrames = 0;
     std::string amf;              // ... and the ACES Metadata File, when there are target frames
@@ -152,7 +163,8 @@ struct ImfComposition {
     uint16_t rsiz = 0;
     std::string colour;  // as ImfSettings::colour, or "aces2065-1" for Application #5 ("" when none of those)
     double masteringPeak = 0;
-    int application = 2;        // from its ApplicationIdentification (2 for #2E, 5 for #5, 0 for another)
+    int application = 2;        // from its ApplicationIdentification (2 for #2E, 5 for #5, 45 for ProRes, 0 for another)
+    std::string prores;         // Application ProRes: the picture's profile (as ImfSettings::prores)
     std::string acesAuthoring;  // Application #5: the output transform its pictures were made for
     std::vector<ImfVirtualTrack> tracks;
     std::map<std::string, std::string> descriptors;  // id: the descriptor's RegXML, as written
@@ -194,9 +206,11 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 
 // Checks a package: the asset map, every file at its size, the packing list's hashes, the composition's resources in
 // the package (or, for a supplemental, in the packages beside it, against the composition's hashes) with durations
-// within them and their essence descriptors listed, every virtual track as long as the picture, the Application #2E or #5
-// identification, the picture track files JPEG 2000 in an IMF profile (#5: every frame an ACES image container with
-// the attributes ST 2065-4 requires, every target frame in its stream) with as many frames as the composition says, the
+// within them and their essence descriptors listed, every virtual track as long as the picture, the Application #2E, #5
+// or ProRes identification, the picture track files JPEG 2000 in an IMF profile (#5: every frame an ACES image container
+// with the attributes ST 2065-4 requires, every target frame in its stream; ProRes: RDD 45's profiles, sizes, rates and
+// descriptors, every frame's header as the descriptor and Table 3 have it, RDD 44's partitions and five-byte lengths)
+// with as many frames as the composition says, the
 // sound 24-bit 48 kHz with as many samples, the timed text TTML. An empty list means it passed; `progress` may return
 // false to stop ("Stopped").
 std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {});

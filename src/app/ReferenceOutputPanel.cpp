@@ -15,6 +15,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -66,7 +67,8 @@ output::Config ReferenceOutputController::loadConfig() {
     c.backend = s.value("output/backend").toString().toStdString();
     c.device = s.value("output/device").toString().toStdString();
     c.mode = s.value("output/mode").toString().toStdString();
-    c.depth = s.value("output/depth", 10).toInt() == 8 ? 8 : 10;
+    c.depth = std::clamp(s.value("output/depth", 10).toInt(), 8, 12) / 2 * 2;  // (8, 10 or 12)
+    c.sampling = output::Config::Sampling(std::clamp(s.value("output/sampling", 0).toInt(), 0, 2));
     c.rec709 = s.value("output/rec709", false).toBool();
     c.hdrMetadata = s.value("output/hdrMetadata", true).toBool();
     c.scaling = output::Config::Scaling(std::clamp(s.value("output/scaling", 0).toInt(), 0, 2));
@@ -83,6 +85,7 @@ void ReferenceOutputController::saveConfig(const output::Config& c) {
     s.setValue("output/device", qs(c.device));
     s.setValue("output/mode", qs(c.mode));
     s.setValue("output/depth", c.depth);
+    s.setValue("output/sampling", int(c.sampling));
     s.setValue("output/rec709", c.rec709);
     s.setValue("output/hdrMetadata", c.hdrMetadata);
     s.setValue("output/scaling", int(c.scaling));
@@ -106,6 +109,12 @@ st2110::SenderOptions ReferenceOutputController::loadSt2110() {
     const QString clock = s.value("output/st2110/clock").toString().trimmed();
     if (!clock.isEmpty()) o.refclk = clock.toStdString();
     o.sendAnc = s.value("output/st2110/sendData", true).toBool();
+    // ST 2022-7's second path.
+    o.redundant = s.value("output/st2110/redundant", false).toBool();
+    endpoint("output/st2110/video2", o.video2);
+    endpoint("output/st2110/audio2", o.audio2);
+    endpoint("output/st2110/data2", o.anc2);
+    o.interfaceAddress2 = s.value("output/st2110/interface2").toString().trimmed().toStdString();
     return o;
 }
 
@@ -117,6 +126,11 @@ void ReferenceOutputController::saveSt2110(const st2110::SenderOptions& o) {
     s.setValue("output/st2110/ttl", o.ttl);
     s.setValue("output/st2110/clock", qs(o.refclk));
     s.setValue("output/st2110/sendData", o.sendAnc);
+    s.setValue("output/st2110/redundant", o.redundant);
+    s.setValue("output/st2110/video2", qs(st2110::endpointText(o.video2)));
+    s.setValue("output/st2110/audio2", qs(st2110::endpointText(o.audio2)));
+    s.setValue("output/st2110/data2", qs(st2110::endpointText(o.anc2)));
+    s.setValue("output/st2110/interface2", qs(o.interfaceAddress2));
 }
 
 QString ReferenceOutputController::formatKey() const {
@@ -336,7 +350,8 @@ QByteArray ReferenceOutputController::toolJson() {
 "interface":{"type":"string","description":"\"DeckLink\", \"NDI\", \"OMT\" or \"ST 2110\""},
 "device":{"type":"string","description":"A device's id or name from \"list\" (on NDI and OMT, the source's name; on ST 2110, the address of the interface to send from, \"\" for the one routing chooses)"},
 "mode":{"type":"string","description":"A mode from \"list\", such as \"1080p25\" or \"2160p23.98\"; \"\" for the sequence's"},
-"depth":{"type":"number","enum":[8,10],"description":"Bits (10 for HDR)"},
+"depth":{"type":"number","enum":[8,10,12],"description":"Bits (10 or 12 for HDR; 12 where the device takes it: ST 2110 and NDI)"},
+"sampling":{"type":"string","enum":["4:2:2","4:4:4","rgb"],"description":"4:4:4 Y'CbCr and RGB on ST 2110 only (default 4:2:2)"},
 "rec709":{"type":"boolean","description":"Send the picture as the viewer shows it (HDR tone mapped to Rec. 709) instead of the sequence's own colour"},
 "hdr_metadata":{"type":"boolean","description":"Send HDR10 mastering display and light level metadata"},
 "scaling":{"type":"string","enum":["fit","fill","none"],"description":"A picture not the mode's size: fitted, cropped to fill, or 1:1"},
@@ -350,7 +365,10 @@ QByteArray ReferenceOutputController::toolJson() {
 "data":{"type":"string","description":"Where the ancillary data goes (time code and captions)"},
 "send_data":{"type":"boolean"},
 "ttl":{"type":"number","description":"Multicast hops (1 to 255)"},
-"clock":{"type":"string","description":"The SDP's ts-refclk: \"ptp=IEEE1588-2008:traceable\" or the grandmaster's \"ptp=IEEE1588-2008:<id>:<domain>\""}}},
+"clock":{"type":"string","description":"The SDP's ts-refclk: \"ptp=IEEE1588-2008:traceable\" or the grandmaster's \"ptp=IEEE1588-2008:<id>:<domain>\""},
+"redundant":{"type":"boolean","description":"ST 2022-7: every packet sent on a second path too (video2, audio2 and data2, from interface2), the SDPs grouping both as duplicates"},
+"video2":{"type":"string"},"audio2":{"type":"string"},"data2":{"type":"string"},
+"interface2":{"type":"string","description":"The address of the interface the second path goes from (\"\" as routing chooses)"}}},
 "nmos":{"type":"object","description":"ST 2110's streams offered to broadcast controllers as an AMWA NMOS Node (IS-04 and IS-05; settings left out are the last used)","properties":{
 "enabled":{"type":"boolean"},
 "registry":{"type":"string","description":"The registry's Registration API, \"http://host:port\" (empty: found by DNS-SD)"},
@@ -415,7 +433,13 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
             c.device.clear();
         }
         if (has("mode")) c.mode = args.value("mode").toString().toStdString();
-        if (has("depth")) c.depth = args.value("depth").toInt() == 8 ? 8 : 10;
+        if (has("depth")) c.depth = std::clamp(args.value("depth").toInt(), 8, 12) / 2 * 2;
+        if (has("sampling")) {
+            const QString sm = args.value("sampling").toString().toLower();
+            c.sampling = sm == "4:4:4" || sm == "444" ? output::Config::Sampling::Ycc444
+                         : sm == "rgb"                ? output::Config::Sampling::Rgb
+                                                      : output::Config::Sampling::Ycc422;
+        }
         if (has("rec709")) c.rec709 = args.value("rec709").toBool();
         if (has("hdr_metadata")) c.hdrMetadata = args.value("hdr_metadata").toBool();
         if (has("scaling")) {
@@ -440,7 +464,8 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
         if (has("st2110")) {
             const QJsonObject x = args.value("st2110").toObject();
             st2110::SenderOptions o = st2110::outputOptions();
-            for (const auto& [key, endpoint] : {std::pair{"video", &o.video}, std::pair{"audio", &o.audio}, std::pair{"data", &o.anc}}) {
+            for (const auto& [key, endpoint] : {std::pair{"video", &o.video}, std::pair{"audio", &o.audio}, std::pair{"data", &o.anc},
+                                                std::pair{"video2", &o.video2}, std::pair{"audio2", &o.audio2}, std::pair{"data2", &o.anc2}}) {
                 if (!x.contains(QLatin1String(key))) continue;
                 if (!st2110::parseEndpoint(x.value(QLatin1String(key)).toString().toStdString(), *endpoint)) {
                     isError = true;
@@ -453,6 +478,8 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
             }
             if (x.contains("ttl")) o.ttl = std::clamp(x.value("ttl").toInt(), 1, 255);
             if (x.contains("clock")) o.refclk = x.value("clock").toString().trimmed().toStdString();
+            if (x.contains("redundant")) o.redundant = x.value("redundant").toBool();
+            if (x.contains("interface2")) o.interfaceAddress2 = x.value("interface2").toString().trimmed().toStdString();
             st2110::setOutputOptions(o);
         }
         if (has("nmos")) {
@@ -530,9 +557,15 @@ ReferenceOutputPanel::ReferenceOutputPanel(ReferenceOutputController* controller
     mode_ = combo("outputMode");
     form->addRow(tr("Mode:"), mode_);
     depth_ = combo("outputDepth");
-    depth_->addItem(tr("10-bit 4:2:2"), 10);
-    depth_->addItem(tr("8-bit 4:2:2"), 8);
-    depth_->setCurrentIndex(c.depth == 8 ? 1 : 0);
+    // (bits times ten plus the sampling; 12 bits, 4:4:4 and RGB where the device takes them)
+    depth_->addItem(tr("10-bit 4:2:2"), 100);
+    depth_->addItem(tr("8-bit 4:2:2"), 80);
+    depth_->addItem(tr("12-bit 4:2:2"), 120);
+    depth_->addItem(tr("10-bit 4:4:4"), 101);
+    depth_->addItem(tr("12-bit 4:4:4"), 121);
+    depth_->addItem(tr("10-bit RGB"), 102);
+    depth_->addItem(tr("12-bit RGB"), 122);
+    depth_->setCurrentIndex(std::max(0, depth_->findData(c.depth * 10 + int(c.sampling))));
     form->addRow(tr("Bit depth:"), depth_);
     colour_ = combo("outputColour");
     colour_->addItem(tr("The sequence's (HDR as HDR)"), false);
@@ -601,6 +634,26 @@ ReferenceOutputPanel::ReferenceOutputPanel(ReferenceOutputController* controller
                                  "\"ptp=IEEE1588-2008:<id>:<domain>\". Montage reads PTP time from the system clock, which linuxptp "
                                  "(ptp4l and phc2sys) or the operating system keeps in step."));
     form->addRow(tr("PTP reference:"), st2110Clock_);
+    // ST 2022-7: the same packets on a second network, the video's, sound's and data's addresses in one line.
+    st2110Redundant_ = new QCheckBox(tr("Also send on a second path (ST 2022-7)"), this);
+    st2110Redundant_->setObjectName(QStringLiteral("outputSt2110Redundant"));
+    st2110Redundant_->setChecked(so.redundant);
+    form->addRow(QString(), st2110Redundant_);
+    st2110Paths2_ = new QLineEdit(qs(st2110::endpointText(so.video2) + " " + st2110::endpointText(so.audio2) + " " + st2110::endpointText(so.anc2)), this);
+    st2110Paths2_->setObjectName(QStringLiteral("outputSt2110Paths2"));
+    st2110Paths2_->setToolTip(tr("The second path's video, sound and data addresses and ports, apart by spaces"));
+    form->addRow(tr("Second path:"), st2110Paths2_);
+    st2110Interface2_ = new QLineEdit(qs(so.interfaceAddress2), this);
+    st2110Interface2_->setObjectName(QStringLiteral("outputSt2110Interface2"));
+    st2110Interface2_->setPlaceholderText(tr("As routing chooses"));
+    st2110Interface2_->setToolTip(tr("The address of the network interface the second path goes from"));
+    form->addRow(tr("Second path from:"), st2110Interface2_);
+    auto pathsOn = [this] {
+        st2110Paths2_->setEnabled(st2110Redundant_->isChecked());
+        st2110Interface2_->setEnabled(st2110Redundant_->isChecked());
+    };
+    connect(st2110Redundant_, &QCheckBox::toggled, this, pathsOn);
+    pathsOn();
     bool nmosOn = true;
     const nmos::NodeOptions no = ReferenceOutputController::loadNmos(&nmosOn);
     nmos_ = new QCheckBox(tr("Offer to broadcast controllers (NMOS)"), this);
@@ -684,7 +737,8 @@ void ReferenceOutputPanel::fillDevices() {
     hdr_->setEnabled(!network);  // (NDI and OMT carry the colour, not HDR10's mastering metadata)
     device_->setToolTip(network ? tr("The %1 source's name (other computers see \"<this computer> (Montage)\")").arg(qs(b->name())) : QString());
     const bool ip = b && b->name() == "ST 2110";
-    for (QWidget* w : std::initializer_list<QWidget*>{st2110Video_, st2110Audio_, st2110Data_, st2110Ttl_, st2110Clock_, nmos_, nmosRegistry_, saveSdp_})
+    for (QWidget* w : std::initializer_list<QWidget*>{st2110Video_, st2110Audio_, st2110Data_, st2110Ttl_, st2110Clock_, st2110Redundant_, st2110Paths2_,
+                                                      st2110Interface2_, nmos_, nmosRegistry_, saveSdp_})
         form_->setRowVisible(w, ip);
     captions_->setEnabled(std::any_of(devices_.begin(), devices_.end(), [](const output::Device& d) { return d.captions; }));
     fillModes();    refresh();  // (Start, as there is a device now or not)
@@ -706,7 +760,8 @@ output::Config ReferenceOutputPanel::chosen() const {
     c.backend = backend_->currentData().toString().toStdString();
     c.device = device_->currentData().toString().toStdString();
     c.mode = mode_->currentData().toString().toStdString();
-    c.depth = depth_->currentData().toInt();
+    c.depth = depth_->currentData().toInt() / 10;
+    c.sampling = output::Config::Sampling(depth_->currentData().toInt() % 10);
     c.rec709 = colour_->currentData().toBool();
     c.hdrMetadata = hdr_->isChecked();
     c.scaling = output::Config::Scaling(scaling_->currentIndex());
@@ -725,6 +780,12 @@ st2110::SenderOptions ReferenceOutputPanel::chosenSt2110() const {
     o.ttl = st2110Ttl_->value();
     const QString clock = st2110Clock_->text().trimmed();
     o.refclk = clock.isEmpty() ? st2110::SenderOptions{}.refclk : clock.toStdString();
+    o.redundant = st2110Redundant_->isChecked();
+    const QStringList second = st2110Paths2_->text().split(QRegularExpression(QStringLiteral("[\\s,]+")), Qt::SkipEmptyParts);
+    st2110::Endpoint* const to2[3] = {&o.video2, &o.audio2, &o.anc2};
+    for (int i = 0; i < 3 && i < int(second.size()); ++i)
+        if (!st2110::parseEndpoint(second[i].toStdString(), *to2[i])) *to2[i] = {second[i].toStdString(), 0};
+    o.interfaceAddress2 = st2110Interface2_->text().trimmed().toStdString();
     return o;
 }
 

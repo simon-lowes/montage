@@ -43,7 +43,8 @@ std::vector<Mode> standardModes();
 const Mode* matchMode(const std::vector<Mode>& modes, int width, int height, Rational fps);
 const Mode* findMode(const std::vector<Mode>& modes, const std::string& name);
 
-enum class PixelFormat { Uyvy8, V210, P216 };
+// (Ycc444 and Rgb48: video::packYcbcr444's and packRgb48's 16-bit samples, three a pixel)
+enum class PixelFormat { Uyvy8, V210, P216, Ycc444, Rgb48 };
 size_t rowBytes(PixelFormat f, int width);
 size_t frameBytes(PixelFormat f, int width, int height);
 
@@ -60,6 +61,7 @@ struct Signal {
     bool masteringP3 = true;   // the mastering display's primaries: P3-D65, else BT.2020
     double masteringPeak = 1000, masteringMin = 0.0001;  // nits
     int maxCll = 0, maxFall = 0;
+    int bits = 10;  // the depth the interface carries (8, 10 or 12; the 16-bit formats' samples cut to it)
 };
 
 struct Timecode {
@@ -126,7 +128,9 @@ public:
 struct Config {
     std::string backend, device;  // by name and id ("" = the first)
     std::string mode;             // a mode's name; "" = the sequence's
-    int depth = 10;               // 8 or 10 bits (P216's 16 on NDI for 10)
+    int depth = 10;               // 8, 10 or 12 bits (P216's 16 on NDI for 10 and 12)
+    // 4:2:2 Y'CbCr, or (where the device takes it: ST 2110) 4:4:4 Y'CbCr or RGB.
+    enum class Sampling { Ycc422, Ycc444, Rgb } sampling = Sampling::Ycc422;
     bool rec709 = false;          // the picture as the viewer shows it (HDR tone mapped to SDR); else the sequence's own
     bool hdrMetadata = true;
     enum class Scaling { Fit, Fill, None } scaling = Scaling::Fit;

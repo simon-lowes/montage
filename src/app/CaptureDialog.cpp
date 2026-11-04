@@ -8,6 +8,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QJsonArray>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -16,13 +17,17 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
 
 #include "EditorState.h"
+#include "ReferenceOutputPanel.h"
 #include "Settings.h"
 #include "media/ImageSequence.h"
+#include "render/Nmos.h"
+#include "render/St2110Receive.h"
 #ifdef MONTAGE_WITH_OMT
 #include "media/Omt.h"
 #endif
@@ -39,6 +44,7 @@ QString deviceLabel(const QString& kind) {
     if (kind == QLatin1String("dshow")) return QObject::tr("DirectShow camera or capture card");
     if (kind == QLatin1String("lavfi")) return QObject::tr("Test pattern (FFmpeg filter)");
     if (kind == QLatin1String("omt")) return QObject::tr("Open Media Transport source (on the network)");
+    if (kind == QLatin1String("st2110")) return QObject::tr("SMPTE ST 2110 streams (from their SDP files)");
     return kind;
 }
 
@@ -75,8 +81,14 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     find_ = new QPushButton(tr("Find…"), this);
     find_->setObjectName(QStringLiteral("captureFindSources"));
     urlRow->addWidget(find_);
-#ifdef MONTAGE_WITH_OMT
     connect(find_, &QPushButton::clicked, this, [this] {
+        if (kind_->currentData().toString() == QLatin1String("st2110")) {
+            // (the video's SDP, and the sound's and ancillary data's when they come in files of their own)
+            const QStringList files = QFileDialog::getOpenFileNames(this, tr("SDP Files"), QString(), tr("SDP files (*.sdp);;All files (*)"));
+            if (!files.isEmpty()) url_->setText(files.join(QLatin1Char(';')));
+            return;
+        }
+#ifdef MONTAGE_WITH_OMT
         setCursor(Qt::WaitCursor);
         std::string why;
         const std::vector<omt::Source> sources = omt::discover(1.5, &why);
@@ -88,8 +100,8 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
         }
         if (sources.empty()) menu.addAction(why.empty() ? tr("No sources found") : tr("No sources found (%1)").arg(QString::fromStdString(why)))->setEnabled(false);
         menu.exec(find_->mapToGlobal(QPoint(0, find_->height())));
-    });
 #endif
+    });
     form->addRow(tr("Address or device:"), urlRow);
     sound_ = new QLineEdit(this);
     sound_->setObjectName(QStringLiteral("captureSound"));
@@ -99,17 +111,39 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     options_->setObjectName(QStringLiteral("captureOptions"));
     options_->setPlaceholderText(tr("FFmpeg's input options, e.g. video_size=1920x1080 framerate=25"));
     form->addRow(tr("Options:"), options_);
+    // ST 2110 receivers for a facility's broadcast controller to connect (its registry as the reference output's).
+    nmos_ = new QCheckBox(tr("Offer to NMOS controllers (their connection becomes the feed)"), this);
+    nmos_->setObjectName(QStringLiteral("captureNmos"));
+    nmosStatus_ = new QLabel(this);
+    nmosStatus_->setObjectName(QStringLiteral("captureNmosStatus"));
+    nmosStatus_->setWordWrap(true);
+    auto* nmosBox = new QVBoxLayout;
+    nmosBox->setContentsMargins(0, 0, 0, 0);
+    nmosBox->addWidget(nmos_);
+    nmosBox->addWidget(nmosStatus_);
+    form->addRow(QString(), nmosBox);
+    connect(nmos_, &QCheckBox::toggled, this, [this](bool on) {
+        if (bool(node_ && node_->running()) == on) return;
+        QString why;
+        if (!offerNmos(on, &why)) nmosStatus_->setText(why);
+    });
     auto placeholders = [this] {
         const QString k = kind_->currentData().toString();
         url_->setPlaceholderText(k.isEmpty() ? tr("srt://0.0.0.0:9000?mode=listener") : k == QLatin1String("v4l2") ? QStringLiteral("/dev/video0")
                                                : k == QLatin1String("avfoundation")                                 ? QStringLiteral("0:0")
                                                : k == QLatin1String("dshow")                                        ? tr("video=Camera name")
                                                : k == QLatin1String("omt")                                          ? tr("omt://host:6400, or HOST (Name)")
+                                               : k == QLatin1String("st2110")                                       ? tr("SDP files, apart by ;")
                                                                                                                     : QString());
-        const bool omt = k == QLatin1String("omt");
-        sound_->setEnabled(!k.isEmpty() && !omt);
+        const bool omt = k == QLatin1String("omt"), ip = k == QLatin1String("st2110");
+        sound_->setEnabled(!k.isEmpty() && !omt && !ip);
         options_->setEnabled(!omt);
-        find_->setVisible(omt);
+        options_->setPlaceholderText(ip ? tr("interface=address interface2=address (ST 2022-7's second path)")
+                                        : tr("FFmpeg's input options, e.g. video_size=1920x1080 framerate=25"));
+        find_->setText(ip ? tr("Choose…") : tr("Find…"));
+        find_->setVisible(omt || ip);
+        nmos_->setVisible(ip);
+        nmosStatus_->setVisible(ip && !nmosStatus_->text().isEmpty());
     };
     connect(kind_, &QComboBox::currentIndexChanged, this, placeholders);
     if (const int i = kind_->findData(settings.value(QStringLiteral("capture/kind")).toString()); i >= 0) kind_->setCurrentIndex(i);
@@ -180,6 +214,77 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
 CaptureDialog::~CaptureDialog() {
     // (the recorder's notices, queued to this, go with it)
     if (recorder_) recorder_->stop();
+    if (node_) node_->stop();
+}
+
+bool CaptureDialog::offerNmos(bool on, QString* error) {
+    auto show = [this](const QString& text) {
+        nmosStatus_->setText(text);
+        nmosStatus_->setVisible(nmos_->isVisible() && !text.isEmpty());
+    };
+    if (!on) {
+        if (node_) node_->stop();
+        const QSignalBlocker block(nmos_);
+        nmos_->setChecked(false);
+        show(QString());
+        return true;
+    }
+    if (!node_) {
+        node_ = new nmos::Node(this);
+        node_->onReceiverActivated = [this](const nmos::ReceiverConnection&) { nmosConnected(); };
+        node_->onRegistered = [this](bool) { nmosStatus_->setText(nmosStatus()); };
+    }
+    nmos::NodeOptions o = ReferenceOutputController::loadNmos();
+    o.label = tr("Montage capture");
+    o.port = 0;  // (the reference output's node may hold the one set)
+    o.senders = false;
+    o.receivers = true;
+    // (the paths' interfaces, as the options give them)
+    for (const QString& part : options_->text().split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
+        if (part.startsWith(QLatin1String("interface="))) o.address = part.mid(10);
+        if (part.startsWith(QLatin1String("interface2="))) o.interface2 = part.mid(11);
+    }
+    if (node_->running()) node_->stop();
+    QString why;
+    if (!node_->start(o, &why)) {
+        const QSignalBlocker block(nmos_);
+        nmos_->setChecked(false);
+        why = tr("NMOS: %1").arg(why);
+        show(why);
+        if (error) *error = why;
+        return false;
+    }
+    const QSignalBlocker block(nmos_);
+    nmos_->setChecked(true);
+    show(nmosStatus());
+    return true;
+}
+
+QString CaptureDialog::nmosStatus() const {
+    if (!node_ || !node_->running()) return QString();
+    const QString where = node_->registered() ? tr("registered with %1").arg(node_->registry()) : tr("at %1, no registry yet").arg(node_->apiUrl());
+    const nmos::ReceiverConnection c = node_->receiverConnection(0);
+    if (!c.active) return tr("Offered to NMOS controllers (%1): not connected").arg(where);
+    return tr("Connected by an NMOS controller (%1)%2").arg(where, isRecording() ? tr(", for the next recording") : QString());
+}
+
+void CaptureDialog::nmosConnected() {
+    // What the receivers now take, as the feed: the streams' SDPs (their paths as the controller placed them) and the
+    // legs' interfaces.
+    QString why;
+    const std::vector<st2110::SdpStream> streams = node_->receiverStreams(&why);
+    std::string text;
+    for (const st2110::SdpStream& s : streams) text += st2110::sdpText(s);
+    if (!streams.empty()) {
+        setSource(QStringLiteral("st2110"), QString::fromStdString(text));
+        const nmos::ReceiverConnection c = node_->receiverConnection(0);
+        QStringList options;
+        if (c.leg[0].enabled) options << QStringLiteral("interface=") + c.leg[0].interfaceIp;
+        if (c.leg[1].enabled && c.leg[0].enabled) options << QStringLiteral("interface2=") + c.leg[1].interfaceIp;
+        setOptions(options.join(QLatin1Char(' ')));
+    }
+    nmosStatus_->setText(why.isEmpty() ? nmosStatus() : tr("NMOS: %1").arg(why));
+    nmosStatus_->setVisible(nmos_->isVisible());
 }
 
 void CaptureDialog::setSource(const QString& kind, const QString& url) {
@@ -242,7 +347,7 @@ bool CaptureDialog::record() {
         }
         cs.video.options[o.left(eq).toStdString()] = o.mid(eq + 1).toStdString();
     }
-    if (!kind.isEmpty() && kind != QLatin1String("omt") && !sound_->text().trimmed().isEmpty()) cs.audio = CaptureSource{sound_->text().trimmed().toStdString(), kind.toStdString(), {}};
+    if (!kind.isEmpty() && kind != QLatin1String("omt") && kind != QLatin1String("st2110") && !sound_->text().trimmed().isEmpty()) cs.audio = CaptureSource{sound_->text().trimmed().toStdString(), kind.toStdString(), {}};
     cs.codec = codec_->currentData().toString().toStdString();
     cs.path = path_.toStdString();
     cs.timecode = tc.toStdString();
@@ -320,6 +425,88 @@ void CaptureDialog::finished(int generation, bool ok, const QString& message) {
 }
 
 QString CaptureDialog::statusText() const { return status_->text(); }
+
+// ---- The agent link's tool
+
+QByteArray CaptureDialog::toolJson() {
+    return QByteArrayLiteral(R"json({"name":"montage_capture","title":"Capture (record a live feed)",
+"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url.",
+"inputSchema":{"type":"object","properties":{
+"action":{"type":"string","enum":["kinds","record","stop","status","nmos"]},"offer":{"type":"boolean"},
+"kind":{"type":"string"},"url":{"type":"string"},"options":{"type":"string"},"sound":{"type":"string"},
+"codec":{"type":"string"},"wrapper":{"type":"string","enum":["mov","mxf"]},"folder":{"type":"string"},"name":{"type":"string"},
+"timecode":{"type":"string"},"seconds":{"type":"number","minimum":0}},"required":["action"]}})json");
+}
+
+QString CaptureDialog::runTool(const QJsonObject& args, QJsonObject& structured, bool& isError) {
+    isError = false;
+    const QString action = args.value("action").toString();
+    if (action == QLatin1String("kinds")) {
+        QJsonArray kinds, codecs;
+        for (const std::string& k : captureDeviceKinds()) kinds.append(QString::fromStdString(k));
+        for (const auto& [id, name] : captureCodecs()) codecs.append(QJsonObject{{"id", QString::fromStdString(id)}, {"name", QString::fromStdString(name)}});
+        structured["kinds"] = kinds;
+        structured["codecs"] = codecs;
+        return tr("%n kind(s) of device", nullptr, int(kinds.size()));
+    }
+    if (action == QLatin1String("record")) {
+        if (isRecording()) {
+            isError = true;
+            return tr("Already recording %1").arg(QDir::toNativeSeparators(path_));
+        }
+        const QString kind = args.value("kind").toString();
+        if (kind_->findData(kind) < 0) {
+            isError = true;
+            return tr("This build does not open \"%1\" (see \"kinds\")").arg(kind);
+        }
+        // (no url: the feed as it is, an NMOS controller's connection say)
+        const bool same = !args.contains("url") && kind == kind_->currentData().toString();
+        setSource(kind, same ? url_->text() : args.value("url").toString());
+        setSoundDevice(args.value("sound").toString());
+        if (!same || args.contains("options")) setOptions(args.value("options").toString());
+        if (args.contains("codec")) setCodec(args.value("codec").toString());
+        if (args.contains("wrapper")) setWrapper(args.value("wrapper").toString());
+        if (args.contains("folder")) setFolder(args.value("folder").toString());
+        if (args.contains("name")) setClipName(args.value("name").toString());
+        setTimecode(args.value("timecode").toString());
+        setSeconds(args.value("seconds").toDouble(0));
+        if (!record()) {
+            isError = true;
+            return statusText();
+        }
+        structured["path"] = path_;
+        return tr("Recording to %1").arg(QDir::toNativeSeparators(path_));
+    }
+    if (action == QLatin1String("stop")) {
+        stop();
+        return isRecording() ? tr("Stopping") : tr("Not recording");
+    }
+    if (action == QLatin1String("status")) {
+        refresh();
+        structured["recording"] = isRecording();
+        structured["path"] = path_;
+        structured["status"] = statusText();
+        if (imported_) structured["media"] = double(imported_);
+        return statusText();
+    }
+    if (action == QLatin1String("nmos")) {
+        QString why;
+        if (!offerNmos(args.value("offer").toBool(true), &why)) {
+            isError = true;
+            return why;
+        }
+        if (node_ && node_->running()) {
+            structured["node"] = node_->apiUrl();
+            QJsonArray ids;
+            for (int i = 0; i < 3; ++i) ids.append(node_->receiverId(i).toString(QUuid::WithoutBraces));
+            structured["receivers"] = ids;
+            structured["connected"] = node_->receiverConnection(0).active;
+        }
+        return node_ && node_->running() ? nmosStatus() : tr("Not offered to NMOS controllers");
+    }
+    isError = true;
+    return tr("Unknown action %1").arg(action);
+}
 
 void CaptureDialog::refresh() {
     if (!recorder_) {

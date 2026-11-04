@@ -37,5 +37,9 @@ void packUyvy(const Ycbcr422& in, uint8_t* dst, size_t stride);
 // P216: a plane of 16-bit Y (little-endian), then one of interleaved 16-bit Cb Cr pairs as tall, starting `stride`
 // times the height after the first; `stride` bytes a row in both.
 void packP216(const Ycbcr422& in, uint8_t* dst, size_t stride);
+// Full-resolution colour at 16 bits (codes as Ycbcr422's), three little-endian samples a pixel in ST 2110-20's order:
+// Cb Y' Cr (4:4:4 Y'CbCr), or R' G' B' in the same narrow range (16 + 219 v) 256.
+void packYcbcr444(const Image& rgb, YcbcrMatrix matrix, uint8_t* dst, size_t stride);
+void packRgb48(const Image& rgb, uint8_t* dst, size_t stride);
 
 }  // namespace montage::video

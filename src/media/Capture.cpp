@@ -16,6 +16,8 @@
 
 #include <QFile>
 
+#include "render/St2110Receive.h"
+
 #ifdef MONTAGE_WITH_OMT
 #include "Omt.h"
 #endif
@@ -88,6 +90,7 @@ struct Item {
 #ifdef MONTAGE_WITH_OMT
     std::shared_ptr<omt::Frame> omt;
 #endif
+    std::shared_ptr<st2110::InputFrame> st2110;  // an ST 2110 frame, its sound and ancillary data with it
 };
 
 // An Open Media Transport source: "omt" as the device, or an omt:// URL.
@@ -95,18 +98,130 @@ int64_t itemBytes(const Item& i) {
 #ifdef MONTAGE_WITH_OMT
     if (i.omt) return int64_t(i.omt->data.size());
 #endif
+    if (i.st2110) return int64_t(i.st2110->picture.samples.size() * 2 + i.st2110->audio.size() * 4);
     return i.packet ? i.packet->size : 0;
 }
 bool hasData(const Item& i) {
 #ifdef MONTAGE_WITH_OMT
     if (i.omt) return true;
 #endif
-    return i.packet != nullptr;
+    return i.packet != nullptr || i.st2110 != nullptr;
 }
 
 bool isOmt(const CaptureSource& src) {
     return src.device == "omt" || (src.device.empty() && src.url.size() > 6 &&
                                    std::equal(src.url.begin(), src.url.begin() + 6, "omt://", [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; }));
+}
+
+// SMPTE ST 2110 streams: "st2110" as the device (the URL their SDP files, or SDP text), or a URL of an .sdp file that
+// describes ST 2110-20 video.
+bool isSt2110(const CaptureSource& src) {
+    if (src.device == "st2110") return true;
+    if (!src.device.empty() || !endsWith(src.url, ".sdp")) return false;
+    QFile f(QString::fromStdString(src.url));
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray text = f.read(1 << 16);
+    return text.contains("raw/90000") && text.contains("SMPTE2110");
+}
+
+// The streams the SDP files (apart by ';' or new lines) or SDP text describe: each session parsed by itself.
+std::vector<st2110::SdpStream> st2110Streams(const std::string& url, std::string* error) {
+    std::vector<std::string> sessions;
+    auto split = [&](const std::string& text) {
+        // (sessions begin at their "v=" lines)
+        std::string cur;
+        size_t at = 0;
+        while (at < text.size()) {
+            const size_t nl = text.find('\n', at);
+            const std::string line = text.substr(at, nl == std::string::npos ? std::string::npos : nl - at + 1);
+            at = nl == std::string::npos ? text.size() : nl + 1;
+            if (line.rfind("v=", 0) == 0 && !cur.empty()) sessions.push_back(cur), cur.clear();
+            cur += line;
+        }
+        if (!cur.empty()) sessions.push_back(cur);
+    };
+    const auto start = url.find_first_not_of(" \t\r\n");
+    if (start != std::string::npos && url.compare(start, 2, "v=") == 0) {
+        split(url);
+    } else {
+        std::string part;
+        for (size_t i = 0; i <= url.size(); ++i) {
+            if (i < url.size() && url[i] != ';' && url[i] != '\n') {
+                part += url[i];
+                continue;
+            }
+            const auto a = part.find_first_not_of(" \t\r"), b = part.find_last_not_of(" \t\r");
+            part = a == std::string::npos ? std::string() : part.substr(a, b - a + 1);
+            if (!part.empty()) {
+                QFile f(QString::fromStdString(part));
+                if (!f.open(QIODevice::ReadOnly) || f.size() > (1 << 20)) {
+                    if (error) *error = "Cannot read the SDP file " + part;
+                    return {};
+                }
+                split(f.readAll().toStdString());
+            }
+            part.clear();
+        }
+    }
+    std::vector<st2110::SdpStream> out;
+    for (const std::string& sdp : sessions) {
+        const auto found = st2110::parseSdp(sdp, error);
+        if (found.empty()) return {};
+        out.insert(out.end(), found.begin(), found.end());
+    }
+    if (out.empty() && error) *error = "No SDP was given";
+    return out;
+}
+
+// An ST 2110 picture as FFmpeg's frame: 4:2:2 8-bit as UYVY, else planar at its depth (RGB as GBR planes, from the
+// narrow range ST 2110 sends unless the SDP said full, as FFmpeg takes RGB full).
+AVFrame* rasterFrame(const st2110::Raster& r, bool fullRange) {
+    const int d = r.depth;
+    const bool deep = d > 8;
+    AVPixelFormat fmt;
+    switch (r.sampling) {
+    case st2110::Sampling::Ycc422: fmt = !deep ? AV_PIX_FMT_UYVY422 : d == 10 ? AV_PIX_FMT_YUV422P10LE : AV_PIX_FMT_YUV422P12LE; break;
+    case st2110::Sampling::Ycc444: fmt = !deep ? AV_PIX_FMT_YUV444P : d == 10 ? AV_PIX_FMT_YUV444P10LE : AV_PIX_FMT_YUV444P12LE; break;
+    default: fmt = !deep ? AV_PIX_FMT_GBRP : d == 10 ? AV_PIX_FMT_GBRP10LE : AV_PIX_FMT_GBRP12LE; break;
+    }
+    AVFrame* f = av_frame_alloc();
+    if (!f) return nullptr;
+    f->format = fmt;
+    f->width = r.width;
+    f->height = r.height;
+    if (r.width <= 0 || r.height <= 0 || r.samples.size() < size_t(r.rowSamples()) * size_t(r.height) || av_frame_get_buffer(f, 0) < 0) {
+        av_frame_free(&f);
+        return nullptr;
+    }
+    const int top = (1 << d) - 1, black = 16 << (d - 8), span = 219 << (d - 8);
+    auto full = [&](uint16_t v) { return uint16_t(std::clamp((int(v) - black) * top / span, 0, top)); };
+    auto put = [&](int plane, int y, int x, uint16_t v) {
+        uint8_t* row = f->data[plane] + ptrdiff_t(y) * f->linesize[plane];
+        if (deep) reinterpret_cast<uint16_t*>(row)[x] = v;  // (FFmpeg's LE formats; Montage's platforms are little-endian)
+        else row[x] = uint8_t(v);
+    };
+    for (int y = 0; y < r.height; ++y) {
+        const uint16_t* s = r.row(y);
+        if (r.sampling == st2110::Sampling::Ycc422) {
+            if (!deep) {
+                uint8_t* row = f->data[0] + ptrdiff_t(y) * f->linesize[0];
+                for (int i = 0; i < r.width * 2; ++i) row[i] = uint8_t(s[i]);  // (Cb Y Cr Y: UYVY's order)
+                continue;
+            }
+            for (int x = 0; x < r.width / 2; ++x) {
+                put(1, y, x, s[4 * x]), put(0, y, 2 * x, s[4 * x + 1]), put(2, y, x, s[4 * x + 2]), put(0, y, 2 * x + 1, s[4 * x + 3]);
+            }
+        } else if (r.sampling == st2110::Sampling::Ycc444) {
+            for (int x = 0; x < r.width; ++x) put(1, y, x, s[3 * x]), put(0, y, x, s[3 * x + 1]), put(2, y, x, s[3 * x + 2]);
+        } else {
+            for (int x = 0; x < r.width; ++x) {
+                const uint16_t R = s[3 * x], G = s[3 * x + 1], B = s[3 * x + 2];
+                put(0, y, x, fullRange ? G : full(G)), put(1, y, x, fullRange ? B : full(B)), put(2, y, x, fullRange ? R : full(R));
+            }
+        }
+    }
+    f->color_range = r.sampling == st2110::Sampling::Rgb ? AVCOL_RANGE_JPEG : fullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+    return f;
 }
 
 }  // namespace
@@ -169,10 +284,17 @@ struct Input {
     omt::VmxDecoder vmx;
     int omtChannels = 0;
 #endif
+    // SMPTE ST 2110 streams: their receiver, the frames read while it was opened, and what the video's SDP said.
+    std::unique_ptr<st2110::Input> st2110;
+    std::deque<std::shared_ptr<st2110::InputFrame>> early2110;
+    st2110::VideoFormat st2110Video;
+    bool st2110Full = false;
+    int st2110Channels = 0;
     bool live() const {
 #ifdef MONTAGE_WITH_OMT
         if (omt) return true;
 #endif
+        if (st2110) return true;
         return fmt != nullptr;
     }
     ~Input() {
@@ -244,7 +366,55 @@ bool openOmt(Recorder::State* s, const CaptureSource& src, bool wantVideo, bool 
 }
 #endif
 
+// Joins ST 2110 streams from their SDPs and waits for the first whole frame.
+bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bool wantAudio, Input& in, std::string* error) {
+    if (!wantVideo) {
+        if (error) *error = "ST 2110 streams are recorded as the picture's source, with their own sound";
+        return false;
+    }
+    std::vector<st2110::SdpStream> streams = st2110Streams(src.url, error);
+    if (streams.empty()) return false;
+    if (!wantAudio) {
+        streams.erase(std::remove_if(streams.begin(), streams.end(), [](const st2110::SdpStream& x) { return x.media == "audio"; }), streams.end());
+    }
+    st2110::InputOptions o;
+    auto option = [&](const char* name) {
+        const auto it = src.options.find(name);
+        return it == src.options.end() ? std::string() : it->second;
+    };
+    o.interfaceAddress[0] = option("interface");
+    o.interfaceAddress[1] = option("interface2");
+    if (const std::string w = option("wait"); !w.empty()) o.waitMs = std::clamp(std::atoi(w.c_str()), 0, 2000);
+    in.st2110 = std::make_unique<st2110::Input>();
+    if (!in.st2110->open(streams, o, error)) {
+        in.st2110.reset();
+        return false;
+    }
+    for (const auto& x : streams)
+        if (x.encoding == "raw") in.st2110Full = x.fullRange;
+    in.st2110Video = in.st2110->video();
+    in.st2110Channels = in.st2110->hasAudio() ? in.st2110->audio().channels : 0;
+    const auto until = Clock::now() + std::chrono::milliseconds(int64_t(s->settings.openTimeout * 1000));
+    while (!s->stopping && Clock::now() < until) {
+        auto f = std::make_shared<st2110::InputFrame>();
+        if (!in.st2110->next(*f, 50)) continue;
+        in.early2110.push_back(f);
+        break;
+    }
+    if (in.early2110.empty()) {
+        if (error) *error = s->stopping ? "Stopped" : "No ST 2110 video came (check the SDP's addresses and the network interface)";
+        in.st2110.reset();
+        return false;
+    }
+    in.rate = {in.st2110Video.fps.num, in.st2110Video.fps.den};
+    in.videoStream = 0;
+    in.audioStream = in.st2110Channels > 0 ? 1 : -1;
+    in.videoTb = in.audioTb = {1, 10000000};
+    return true;
+}
+
 bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wantVideo, bool wantAudio, Input& in, std::string* error) {
+    if (isSt2110(src)) return openSt2110(s, src, wantVideo, wantAudio, in, error);
 #ifdef MONTAGE_WITH_OMT
     if (isOmt(src)) return openOmt(s, src, wantVideo, wantAudio, in, error);
 #else
@@ -356,6 +526,7 @@ std::vector<std::string> captureDeviceKinds() {
 #ifdef MONTAGE_WITH_OMT
     if (omt::vmxAvailable()) out.push_back("omt");
 #endif
+    out.push_back("st2110");
 #ifdef MONTAGE_WITH_AVDEVICE
     avdevice_register_all();
     for (const char* name : {"v4l2", "alsa", "pulse", "avfoundation", "dshow", "lavfi"})
@@ -622,6 +793,7 @@ void Recorder::run() {
 #ifdef MONTAGE_WITH_OMT
         if (ain.omt) sourceChannels = ain.omtChannels;
 #endif
+        if (ain.st2110) sourceChannels = ain.st2110Channels;
         if (ain.audioStream >= 0 && sourceChannels > 0) {
             const AVCodec* pcm = avcodec_find_encoder(AV_CODEC_ID_PCM_S24LE);
             aenc = avcodec_alloc_context3(pcm);
@@ -961,11 +1133,61 @@ void Recorder::run() {
     };
 #endif
 
+    // An ST 2110 frame: its picture, with the colour its SDP gave and the time code its ancillary data carried, then its
+    // sound (the samples of its own time span).
+    auto decodeSt2110 = [&](Item& item, bool soundOnly) -> bool {
+        Input& in = inputs[item.input];
+        const st2110::InputFrame& f = *item.st2110;
+        const int64_t pts = f.ptpNs / 100;
+        // (a picture dropped while the encoder caught up: its sound still goes in)
+        AVFrame* pic = !soundOnly && in.videoStream >= 0 ? rasterFrame(f.picture, in.st2110Full) : nullptr;
+        if (pic) {
+            const st2110::VideoFormat& v = in.st2110Video;
+            pic->pts = pic->best_effort_timestamp = pts;
+            const bool wide = v.colorimetry == "BT2020" || v.colorimetry == "BT2100";
+            pic->colorspace = f.picture.sampling == st2110::Sampling::Rgb ? AVCOL_SPC_RGB : wide ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
+            pic->color_primaries = wide ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
+            pic->color_trc = v.tcs == "PQ" ? AVCOL_TRC_SMPTE2084 : v.tcs == "HLG" ? AVCOL_TRC_ARIB_STD_B67 : wide ? AVCOL_TRC_BT2020_10 : AVCOL_TRC_BT709;
+            if (v.interlaced) pic->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+            if (f.lostPackets) pic->flags |= AV_FRAME_FLAG_CORRUPT;
+            // (its time code, as the feed's own: SMPTE 12-M side data, as FFmpeg gives it)
+            if (f.hasTimecode)
+                if (AVFrameSideData* sd = av_frame_new_side_data(pic, AV_FRAME_DATA_S12M_TIMECODE, sizeof(uint32_t) * 4)) {
+                    auto* w = reinterpret_cast<uint32_t*>(sd->data);
+                    const auto& t = f.timecode;
+                    w[0] = 1;
+                    w[1] = av_timecode_get_smpte(in.rate, t.dropFrame ? 1 : 0, t.hours, t.minutes, t.seconds, t.frames);
+                    w[2] = w[3] = 0;
+                }
+            const bool ok = putPicture(pic, in);
+            av_frame_free(&pic);
+            if (!ok) return false;
+        }
+        if (in.audioStream >= 0 && f.channels > 0 && !f.audio.empty()) {
+            const st2110::AudioFormat a = in.st2110->audio();
+            AVFrame* sound = av_frame_alloc();
+            sound->format = AV_SAMPLE_FMT_FLT;
+            sound->sample_rate = a.rate;
+            sound->nb_samples = int(f.audio.size() / size_t(f.channels));
+            av_channel_layout_default(&sound->ch_layout, f.channels);
+            bool ok = av_frame_get_buffer(sound, 0) >= 0;
+            if (ok) {
+                std::memcpy(sound->data[0], f.audio.data(), f.audio.size() * sizeof(float));
+                sound->pts = sound->best_effort_timestamp = pts;
+                ok = putSound(sound, item.input == 0, in.audioTb);
+            }
+            av_frame_free(&sound);
+            return ok;
+        }
+        return true;
+    };
+
     // One packet decoded: pictures (unless only sound is wanted now) and sound.
     auto decode = [&](Item& item, bool soundOnly) -> bool {
 #ifdef MONTAGE_WITH_OMT
         if (item.omt) return decodeOmt(item, soundOnly);
 #endif
+        if (item.st2110) return decodeSt2110(item, soundOnly);
         Input& in = inputs[item.input];
         const bool isVideo = item.packet->stream_index == in.videoStream;
         if (isVideo && soundOnly) return true;
@@ -992,6 +1214,45 @@ void Recorder::run() {
     if (opened && cs.audio) opened = openInput(s, 1, *cs.audio, false, true, inputs[1], &fatal);
     if (opened) {
         for (int i = 0; i < 2; ++i) {
+            if (inputs[i].st2110) {
+                // ST 2110: its frames as the receiver puts them together (dropped when the queue is full).
+                readers.emplace_back([s, i, &inputs] {
+                    Input& in = inputs[i];
+                    const double patience = std::max(5.0, s->settings.openTimeout);
+                    int64_t heard = nowMs();
+                    while (!s->stopping) {
+                        auto f = std::make_shared<st2110::InputFrame>();
+                        if (!in.early2110.empty()) {
+                            f = in.early2110.front();
+                            in.early2110.pop_front();
+                        } else if (!in.st2110->next(*f, 100)) {
+                            if (nowMs() - heard < int64_t(patience * 1000)) continue;
+                            Item item;
+                            item.input = i;
+                            item.error = "The ST 2110 streams stopped";
+                            std::lock_guard lock(s->qm);
+                            s->queue.push_back(item);
+                            s->qc.notify_all();
+                            return;
+                        }
+                        heard = nowMs();
+                        Item item;
+                        item.input = i;
+                        item.st2110 = f;
+                        item.arrived = captureClockNow();
+                        std::lock_guard lock(s->qm);
+                        if (s->queuedBytes > kQueueBytes) {
+                            // (the sound kept, as for other feeds: the picture let go)
+                            f->picture = {};
+                            if (f->audio.empty()) continue;
+                        }
+                        s->queuedBytes += itemBytes(item);
+                        s->queue.push_back(item);
+                        s->qc.notify_all();
+                    }
+                });
+                continue;
+            }
 #ifdef MONTAGE_WITH_OMT
             if (inputs[i].omt) {
                 // An Open Media Transport feed: its frames as they come (pictures dropped when falling behind).

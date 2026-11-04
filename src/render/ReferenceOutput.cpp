@@ -80,6 +80,8 @@ size_t rowBytes(PixelFormat f, int width) {
         // (4:2:2 in pairs of pixels: an odd width's last pixel has a pair of its own, its chroma too)
         case PixelFormat::Uyvy8: return size_t((width + 1) / 2) * 4;
         case PixelFormat::P216: return size_t((width + 1) / 2) * 4;
+        case PixelFormat::Ycc444:
+        case PixelFormat::Rgb48: return size_t(width) * 6;
     }
     return 0;
 }
@@ -189,13 +191,20 @@ bool Scheduler::start(const Device& device, const Mode& mode, const Sequence& s,
     stop();
     auto has = [&](PixelFormat f) { return std::find(device.formats.begin(), device.formats.end(), f) != device.formats.end(); };
     PixelFormat format = PixelFormat::Uyvy8;
-    if (config.depth > 8) format = has(PixelFormat::V210) ? PixelFormat::V210 : has(PixelFormat::P216) ? PixelFormat::P216 : PixelFormat::Uyvy8;
+    if (config.sampling == Config::Sampling::Ycc444) format = PixelFormat::Ycc444;
+    else if (config.sampling == Config::Sampling::Rgb) format = PixelFormat::Rgb48;
+    else if (config.depth > 10 && has(PixelFormat::P216)) format = PixelFormat::P216;
+    else if (config.depth > 8) format = has(PixelFormat::V210) ? PixelFormat::V210 : has(PixelFormat::P216) ? PixelFormat::P216 : PixelFormat::Uyvy8;
     if (!has(format)) {
-        if (error) *error = "The device takes none of Montage's pixel formats";
+        if (error)
+            *error = config.sampling != Config::Sampling::Ycc422 ? "The device takes 4:2:2 only (ST 2110 carries 4:4:4 and RGB)"
+                                                                 : "The device takes none of Montage's pixel formats";
         return false;
     }
     Signal signal;
     if (!signalFor(s, config, format, signal, error)) return false;
+    // (the depth the wire carries: 8 for UYVY, 10 for v210, as asked for the 16-bit formats)
+    signal.bits = format == PixelFormat::Uyvy8 ? 8 : format == PixelFormat::V210 ? 10 : std::clamp(config.depth, 8, 12);
     if (signal.eotf != Eotf::Sdr && !device.hdr && !config.rec709 && signal.hdrMetadata) signal.hdrMetadata = false;
     device_ = device;
     mode_ = mode;
@@ -387,14 +396,24 @@ std::shared_ptr<const Scheduler::Packed> Scheduler::packRaw(const Image& img) co
         fitted = fitInto(*src, mode_.width, mode_.height, config_.scaling);
         src = &fitted;
     }
-    const video::Ycbcr422 yc = video::toYcbcr422(*src, signal_.matrix);
     auto out = std::make_shared<Packed>();
     out->data.resize(frameBytes(signal_.format, mode_.width, mode_.height));
     const size_t stride = rowBytes(signal_.format, mode_.width);
+    if (signal_.format == PixelFormat::Ycc444) {
+        video::packYcbcr444(*src, signal_.matrix, out->data.data(), stride);
+        return out;
+    }
+    if (signal_.format == PixelFormat::Rgb48) {
+        video::packRgb48(*src, out->data.data(), stride);
+        return out;
+    }
+    const video::Ycbcr422 yc = video::toYcbcr422(*src, signal_.matrix);
     switch (signal_.format) {
         case PixelFormat::V210: video::packV210(yc, out->data.data(), stride); break;
         case PixelFormat::Uyvy8: video::packUyvy(yc, out->data.data(), stride); break;
         case PixelFormat::P216: video::packP216(yc, out->data.data(), stride); break;
+        case PixelFormat::Ycc444:
+        case PixelFormat::Rgb48: break;
     }
     return out;
 }

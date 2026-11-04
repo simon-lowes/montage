@@ -1,0 +1,528 @@
+#include "St2110Receive.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <sstream>
+
+namespace montage::st2110 {
+
+namespace {
+
+uint32_t get16(const uint8_t* p) { return uint32_t(p[0]) << 8 | p[1]; }
+
+// a * b / c, rounded down, without overflowing where a * b would (a >= 0; (c - 1) * b fits).
+int64_t mulDiv(int64_t a, int64_t b, int64_t c) { return a / c * b + a % c * b / c; }
+
+std::string trim(const std::string& t) {
+    const auto a = t.find_first_not_of(" \t\r"), b = t.find_last_not_of(" \t\r");
+    return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+}
+
+bool rational(const std::string& text, Rational& out) {
+    const auto slash = text.find('/');
+    char* end = nullptr;
+    const long n = std::strtol(text.c_str(), &end, 10);
+    long d = 1;
+    if (slash != std::string::npos) d = std::strtol(text.c_str() + slash + 1, nullptr, 10);
+    if (n <= 0 || d <= 0 || n > 1000000 || d > 1000000) return false;
+    out = {int(n), int(d)};
+    return true;
+}
+
+// A media description as an SDP gives it.
+struct Media {
+    SdpStream stream;
+    std::string mid, address, source;
+    int port = 0;
+    std::map<std::string, std::string> fmtp;
+    std::string rtpmap;
+    double ptimeMs = 1;
+};
+
+// An RTP timestamp at `rate` as a whole count of its ticks since the PTP epoch, taken to be the one nearest now.
+int64_t unwrap(uint32_t ts, int64_t rate) {
+    const int64_t now = mulDiv(ptpNowNs(), rate, 1000000000);
+    return now + int32_t(ts - uint32_t(now));
+}
+
+}  // namespace
+
+std::string sdpText(const SdpStream& s) {
+    SdpOptions o;
+    o.source = s.source[0];
+    o.source2 = s.source[1];
+    const Endpoint* to2 = s.redundant() ? &s.path[1] : nullptr;
+    if (s.media == "audio") return audioSdp(s.audio, s.path[0], s.payloadType, o, to2);
+    if (s.encoding == "smpte291") return ancSdp(s.video, s.path[0], s.payloadType, o, {{0x60, 0x60}, {0x61, 0x01}}, to2);
+    std::string text = videoSdp(s.video, s.path[0], s.payloadType, o, to2);
+    if (s.fullRange) {
+        const size_t at = text.find("RANGE=NARROW");
+        if (at != std::string::npos) text.replace(at, 12, "RANGE=FULL");
+    }
+    return text;
+}
+
+std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return std::vector<SdpStream>{};
+    };
+    std::vector<Media> media;
+    std::vector<std::vector<std::string>> dup;
+    std::istringstream in(sdp);
+    for (std::string line; std::getline(in, line);) {
+        line = trim(line);
+        if (line.size() < 2 || line[1] != '=') continue;
+        const std::string v = line.substr(2);
+        Media* m = media.empty() ? nullptr : &media.back();
+        // (the sender's address is taken only from a source filter: the origin's may be another computer's)
+        if (line[0] == 'm') {
+            Media n;
+            std::istringstream ms(v);
+            std::string port;
+            ms >> n.stream.media >> port;
+            std::string proto;
+            ms >> proto >> n.stream.payloadType;
+            n.port = std::atoi(port.c_str());
+            media.push_back(n);
+        } else if (line[0] == 'c' && m) {
+            std::istringstream cs(v);
+            std::string net, type, addr;
+            cs >> net >> type >> addr;
+            m->address = addr.substr(0, addr.find('/'));
+        } else if (line[0] == 'a') {
+            const auto colon = v.find(':');
+            const std::string name = v.substr(0, colon), value = colon == std::string::npos ? std::string() : trim(v.substr(colon + 1));
+            if (name == "group" && value.rfind("DUP", 0) == 0) {
+                std::istringstream g(value.substr(3));
+                std::vector<std::string> ids;
+                for (std::string id; g >> id;) ids.push_back(id);
+                dup.push_back(ids);
+            } else if (!m) {
+                continue;
+            } else if (name == "mid") {
+                m->mid = value;
+            } else if (name == "rtpmap") {
+                m->rtpmap = trim(value.substr(value.find(' ') + 1));
+            } else if (name == "ptime") {
+                m->ptimeMs = std::atof(value.c_str());
+            } else if (name == "source-filter") {
+                // ("incl IN IP4 <destination> <source>")
+                std::istringstream f(value);
+                std::string w;
+                std::vector<std::string> words;
+                while (f >> w) words.push_back(w);
+                if (words.size() >= 5 && words[0] == "incl") m->source = words[4];
+            } else if (name == "fmtp") {
+                std::istringstream params(value.substr(value.find(' ') + 1));
+                for (std::string p; std::getline(params, p, ';');) {
+                    p = trim(p);
+                    if (p.empty()) continue;
+                    const auto eq = p.find('=');
+                    m->fmtp[eq == std::string::npos ? p : p.substr(0, eq)] = eq == std::string::npos ? std::string() : p.substr(eq + 1);
+                }
+            }
+        }
+    }
+    if (media.empty()) return fail("The SDP describes no streams");
+    // What each carries.
+    for (Media& m : media) {
+        SdpStream& s = m.stream;
+        s.path[0] = {m.address, m.port};
+        s.source[0] = m.source;
+        const auto slash = m.rtpmap.find('/');
+        s.encoding = m.rtpmap.substr(0, slash);
+        if (m.address.empty() || m.port <= 0 || m.port > 65535) return fail("A stream in the SDP has no address and port");
+        if (s.encoding == "raw") {
+            VideoFormat& f = s.video;
+            if (!parseSampling(m.fmtp["sampling"], f.sampling)) return fail("Montage receives YCbCr-4:2:2, YCbCr-4:4:4 and RGB, not " + m.fmtp["sampling"]);
+            f.width = std::atoi(m.fmtp["width"].c_str());
+            f.height = std::atoi(m.fmtp["height"].c_str());
+            f.depth = std::atoi(m.fmtp["depth"].c_str());
+            f.interlaced = m.fmtp.count("interlace") > 0;
+            if (!rational(m.fmtp["exactframerate"], f.fps)) return fail("The video's SDP gives no exactframerate");
+            if (m.fmtp.count("TCS")) f.tcs = m.fmtp["TCS"];
+            if (m.fmtp.count("colorimetry")) f.colorimetry = m.fmtp["colorimetry"];
+            s.fullRange = m.fmtp["RANGE"].rfind("FULL", 0) == 0;
+            std::string why;
+            if (!videoFormatOk(f, &why)) return fail(why);
+        } else if (s.encoding == "smpte291") {
+            if (m.fmtp.count("exactframerate")) rational(m.fmtp["exactframerate"], s.video.fps);
+        } else if (s.encoding == "L24" || s.encoding == "L16") {
+            AudioFormat& a = s.audio;
+            a.bits = s.encoding == "L16" ? 16 : 24;
+            std::istringstream r(m.rtpmap.substr(slash + 1));
+            std::string rate, ch;
+            std::getline(r, rate, '/');
+            std::getline(r, ch, '/');
+            a.rate = std::atoi(rate.c_str());
+            a.channels = ch.empty() ? 1 : std::atoi(ch.c_str());
+            a.packetUs = int(std::lround(m.ptimeMs * 1000));
+            if (a.rate <= 0 || a.channels < 1 || a.channels > 64 || a.packetUs <= 0) return fail("The audio's SDP gives no rate, channels or packet time");
+            if (a.rate != 44100 && a.rate != 48000 && a.rate != 96000) return fail("ST 2110-30 here is at 44.1, 48 or 96 kHz");
+            if (a.packetUs > 20000) return fail("The audio's packets are at most 20 ms here");
+        } else {
+            return fail("Montage receives ST 2110-20, -30 and -40 streams, not " + m.rtpmap);
+        }
+    }
+    // ST 2022-7: a group's second description is its first's other path.
+    std::vector<SdpStream> out;
+    std::vector<bool> used(media.size());
+    for (const auto& ids : dup) {
+        int first = -1, second = -1;
+        for (size_t i = 0; i < media.size(); ++i) {
+            if (ids.size() > 0 && media[i].mid == ids[0]) first = int(i);
+            if (ids.size() > 1 && media[i].mid == ids[1]) second = int(i);
+        }
+        if (first < 0 || second < 0) continue;
+        SdpStream s = media[size_t(first)].stream;
+        s.path[1] = media[size_t(second)].stream.path[0];
+        s.source[1] = media[size_t(second)].stream.source[0];
+        used[size_t(first)] = used[size_t(second)] = true;
+        out.push_back(s);
+    }
+    for (size_t i = 0; i < media.size(); ++i)
+        if (!used[i]) out.push_back(media[i].stream);
+    return out;
+}
+
+bool frameTimecode(const std::vector<AncPacket>& anc, Rational fps, output::Timecode& out) {
+    const double rate = fps.toDouble();
+    const bool pairs = rate > 30.5;
+    const int r = int(std::lround(pairs ? rate / 2 : rate));
+    const int count = r == 25 ? 25 : r == 24 ? 24 : 30;
+    bool have = false;
+    for (const AncPacket& p : anc) {
+        output::Timecode tc;
+        AtcType type;
+        bool mark = false;
+        if (!parseAtc(p, tc, &type, &mark, count)) continue;
+        if (pairs) {
+            // (a frame pair's time address: the second frame's VITC2 carries the field mark)
+            if (type == AtcType::Ltc) continue;
+            tc.frames = tc.frames * 2 + (type == AtcType::Vitc2 && mark ? 1 : 0);
+            out = tc;
+            return true;
+        }
+        if (type == AtcType::Ltc) {
+            out = tc;
+            return true;
+        }
+        if (!have) out = tc, have = true;
+    }
+    return have;
+}
+
+// ---- ST 2022-7.
+
+void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::vector<uint8_t>>& out) {
+    if (packet.size() < 12) return;
+    ++received[path & 1];
+    const uint32_t low = get16(packet.data() + 2);
+    // (RFC 4175's extended sequence number: the payload's first two bytes above the header's)
+    const size_t head = 12 + size_t(packet[0] & 15) * 4;
+    const uint32_t seq = extended_ && packet.size() >= head + 2 ? get16(packet.data() + head) << 16 | low : low;
+    if (!started_) {
+        started_ = true;
+        next_ = seq;
+    }
+    const int64_t n = extended_ ? next_ + int32_t(seq - uint32_t(next_)) : next_ + int16_t(uint16_t(seq - uint16_t(next_)));
+    if (n < next_) {
+        // (the other path's copy of what was given out, or one too late to place)
+        if (n >= next_ - int64_t(window_)) {
+            ++duplicates;
+        } else {
+            ++late;
+            // A window's worth in a row from far before: the sender started again with other numbers (or a stray
+            // packet far ahead was jumped to), so the count starts again from these.
+            if (++lateRun_ > int64_t(window_)) {
+                std::vector<std::vector<uint8_t>> rest;
+                flush(rest);
+                for (auto& r : rest) out.push_back(std::move(r));
+                started_ = false;
+                lateRun_ = 0;
+                push(std::move(packet), path, out);
+                --received[path & 1];
+            }
+        }
+        return;
+    }
+    lateRun_ = 0;
+    if (!held_.emplace(n, std::move(packet)).second) {
+        ++duplicates;
+        return;
+    }
+    release(out);
+    // A gap the other path has not filled in a window's packets: given up on.
+    while (held_.size() > window_) {
+        lost += held_.begin()->first - next_;
+        next_ = held_.begin()->first;
+        release(out);
+    }
+}
+
+void PathMerger::release(std::vector<std::vector<uint8_t>>& out) {
+    while (!held_.empty() && held_.begin()->first == next_) {
+        out.push_back(std::move(held_.begin()->second));
+        held_.erase(held_.begin());
+        ++next_;
+    }
+}
+
+void PathMerger::flush(std::vector<std::vector<uint8_t>>& out) {
+    while (!held_.empty()) {
+        lost += held_.begin()->first - next_;
+        next_ = held_.begin()->first;
+        release(out);
+    }
+}
+
+// ---- The input.
+
+struct Input::Stream {
+    int kind = 0;  // 0 video, 1 audio, 2 ancillary data
+    SdpStream sdp;
+    Receiver socket[2];
+    std::mutex m;
+    PathMerger merger{true};
+    std::unique_ptr<VideoAssembler> assembler;
+    std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
+    Stream(int k, const SdpStream& s) : kind(k), sdp(s), merger(k == 0) {}
+};
+
+Input::Input() = default;
+Input::~Input() { close(); }
+
+bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, std::string* error) {
+    close();
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        close();
+        return false;
+    };
+    options_ = o;
+    stop_ = false;
+    for (const SdpStream& s : streams) {
+        const int kind = s.encoding == "raw" ? 0 : s.encoding == "smpte291" ? 2 : 1;
+        for (const auto& have : streams_)
+            if (have->kind == kind) return fail("Montage takes one video, one audio and one ancillary data stream at a time");
+        auto st = std::make_unique<Stream>(kind, s);
+        if (kind == 0) {
+            std::string why;
+            if (!videoFormatOk(s.video, &why)) return fail(why);
+            video_ = s.video;
+            st->assembler = std::make_unique<VideoAssembler>(s.video.width, s.video.height, s.video.sampling, s.video.depth, s.video.interlaced);
+            // ST 2022-7's paths may be some milliseconds apart: a gap is waited on for 30 ms of the stream's packets
+            // (from its bytes a second; packets carry at most about 1,400 bytes of pixels), and fewer large pictures
+            // are held for a reader that falls behind.
+            const Pgroup pg = pgroup(s.video.sampling, s.video.depth);
+            const double frameBytes = double(s.video.width) * s.video.height * pg.bytes / pg.pixels;
+            st->merger.setWindow(std::max<size_t>(512, size_t(frameBytes * s.video.fps.toDouble() * 0.03 / 1000)));
+            pendingLimit_ = size_t(std::clamp(256e6 / frameBytes, 4.0, 16.0));
+        } else if (kind == 1) {
+            audio_ = s.audio;
+            hasAudio_ = true;
+        } else {
+            hasAnc_ = true;
+        }
+        for (int p = 0; p < (s.redundant() ? 2 : 1); ++p) {
+            std::string why;
+            if (!st->socket[p].open(s.path[p], o.interfaceAddress[p], &why, s.source[p])) return fail(why);
+        }
+        streams_.push_back(std::move(st));
+    }
+    bool video = false;
+    for (const auto& s : streams_) video = video || s->kind == 0;
+    if (!video) return fail("The SDP has no video stream (ST 2110-20)");
+    for (const auto& s : streams_)
+        for (int p = 0; p < (s->sdp.redundant() ? 2 : 1); ++p) threads_.emplace_back([this, st = s.get(), p] { receive(st, p); });
+    return true;
+}
+
+void Input::close() {
+    stop_ = true;
+    cv_.notify_all();
+    for (std::thread& t : threads_) t.join();
+    threads_.clear();
+    streams_.clear();
+    std::lock_guard lock(m_);
+    pending_.clear();
+    anc_.clear();
+    sound_.clear();
+    soundStart_ = -1;
+    hasAudio_ = hasAnc_ = ancSeen_ = joined_ = false;
+    stats_ = {};
+}
+
+bool Input::isOpen() const { return !streams_.empty(); }
+
+InputStats Input::stats() const {
+    InputStats s;
+    {
+        std::lock_guard lock(m_);
+        s = stats_;
+    }
+    // (a stream's lock is taken before the input's while packets come in, so never the other way round)
+    for (const auto& st : streams_) {
+        std::lock_guard sl(st->m);
+        s.packets[st->kind][0] = st->merger.received[0];
+        s.packets[st->kind][1] = st->merger.received[1];
+        s.duplicates += st->merger.duplicates;
+        s.lost += st->merger.lost;
+    }
+    return s;
+}
+
+void Input::receive(Stream* s, int path) {
+    std::vector<uint8_t> buf;
+    std::vector<std::vector<uint8_t>> out;
+    while (!stop_) {
+        const bool got = s->socket[path].receive(buf, 20);
+        std::lock_guard lock(s->m);
+        out.clear();
+        const auto now = std::chrono::steady_clock::now();
+        if (got) {
+            s->last[path] = now;
+            s->merger.push(std::move(buf), path, out);
+        } else if (!s->sdp.redundant() || now - s->last[path ^ 1] > std::chrono::milliseconds(20)) {
+            s->merger.flush(out);  // (a pause on every path: nothing more is coming for a gap)
+        }
+        for (const auto& p : out) take(*s, p);
+        buf = {};
+    }
+}
+
+void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
+    RtpPacket p;
+    if (!parseRtp(packet.data(), packet.size(), p)) return;
+    if (s.sdp.payloadType >= 0 && p.payloadType != s.sdp.payloadType) return;
+    if (s.kind == 0) {
+        if (!s.assembler->add(p)) return;
+        std::lock_guard lock(m_);
+        // (a reader that falls behind loses the oldest frames, not the newest)
+        while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
+        pending_.push_back({s.assembler->raster(), s.assembler->timestamp(), s.assembler->lostInFrame(), std::chrono::steady_clock::now()});
+        if (s.assembler->lostInFrame()) ++stats_.incomplete;
+        cv_.notify_all();
+    } else if (s.kind == 1) {
+        const AudioFormat& a = s.sdp.audio;
+        const std::vector<float> samples = unpackAudio(p.payload, p.size, a.channels, a.bits);
+        const int64_t at = unwrap(p.timestamp, a.rate);
+        const int64_t frames = int64_t(samples.size()) / a.channels;
+        std::lock_guard lock(m_);
+        if (soundStart_ < 0 || at > soundStart_ + int64_t(sound_.size()) / a.channels + a.rate) {
+            // (the first, or after a long gap: from here)
+            sound_.clear();
+            soundStart_ = at;
+        }
+        const int64_t end = soundStart_ + int64_t(sound_.size()) / a.channels;
+        if (at + frames <= end) return;  // (already held)
+        if (at > end) sound_.insert(sound_.end(), size_t(at - end) * size_t(a.channels), 0.0f);  // (a gap: silence)
+        const int64_t skip = std::max<int64_t>(0, end - at);
+        sound_.insert(sound_.end(), samples.begin() + ptrdiff_t(skip * a.channels), samples.end());
+        // (two seconds kept)
+        const int64_t keep = int64_t(a.rate) * 2;
+        const int64_t extra = int64_t(sound_.size()) / a.channels - keep;
+        if (extra > 0) {
+            sound_.erase(sound_.begin(), sound_.begin() + ptrdiff_t(extra * a.channels));
+            soundStart_ += extra;
+        }
+        cv_.notify_all();
+    } else {
+        std::vector<AncPacket> anc;
+        if (!unpackAnc(p.payload, p.size, anc)) return;
+        std::lock_guard lock(m_);
+        auto& at = anc_[p.timestamp];
+        // (a frame carries a few dozen packets: no more held for one time, whatever a sender repeats)
+        if (at.size() + anc.size() > 256) return;
+        at.insert(at.end(), anc.begin(), anc.end());
+        while (anc_.size() > 64) anc_.erase(anc_.begin());
+        if (!ancSeen_ || int32_t(p.timestamp - ancLatest_) > 0) ancLatest_ = p.timestamp;
+        if (!ancSeen_) ancFirst_ = p.timestamp;
+        ancSeen_ = true;
+        cv_.notify_all();
+    }
+}
+
+namespace {
+struct Span {
+    int64_t number, startNs, from, to;  // the frame's count, start, and its samples [from, to)
+};
+Span spanOf(uint32_t ts, Rational fps, int rate) {
+    const int64_t num = fps.num, den = fps.den, second = 1000000000;
+    // (the frame count nearest its 90 kHz timestamp; its start and samples as the sender reckons them)
+    const int64_t ticks = unwrap(ts, 90000);
+    // (wider than 64 bits: ticks since the PTP epoch times a numerator such as 60000 is past 2^63)
+    const int64_t n = int64_t((__int128(ticks) * num + 45000 * den) / (90000 * den));
+    const int64_t start = mulDiv(n, second * den, num), end = mulDiv(n + 1, second * den, num);
+    return {n, start, mulDiv(start, rate, second), mulDiv(end, rate, second)};
+}
+}  // namespace
+
+bool Input::ready(const Pending& p, std::chrono::steady_clock::time_point now) {
+    if (now - p.at > std::chrono::milliseconds(options_.waitMs)) return true;
+    // (its ancillary data, sent alongside on a socket of its own, may come a little after the picture)
+    if (hasAnc_ && !(ancSeen_ && int32_t(ancLatest_ - p.ts) >= 0)) return false;
+    if (!hasAudio_) return true;
+    const Span sp = spanOf(p.ts, video_.fps, audio_.rate);
+    return soundStart_ >= 0 && soundStart_ + int64_t(sound_.size()) / audio_.channels >= sp.to;
+}
+
+void Input::build(Pending& p, InputFrame& out) {
+    const Span sp = spanOf(p.ts, video_.fps, hasAudio_ ? audio_.rate : 48000);
+    out.picture = std::move(p.picture);
+    out.rtpTimestamp = p.ts;
+    out.number = sp.number;
+    out.ptpNs = sp.startNs;
+    out.lostPackets = p.lost;
+    out.channels = hasAudio_ ? audio_.channels : 0;
+    out.audio.clear();
+    if (hasAudio_) {
+        const int ch = audio_.channels;
+        out.audio.assign(size_t(sp.to - sp.from) * size_t(ch), 0.0f);
+        for (int64_t i = std::max(sp.from, soundStart_); soundStart_ >= 0 && i < sp.to; ++i) {
+            const int64_t k = (i - soundStart_) * ch;
+            if (k + ch > int64_t(sound_.size())) break;
+            for (int c = 0; c < ch; ++c) out.audio[size_t((i - sp.from) * ch + c)] = sound_[size_t(k + c)];
+        }
+    }
+    // Its ancillary data: the packets timed within the frame (both fields'), and its time code.
+    out.anc.clear();
+    const uint32_t span90 = uint32_t(int64_t(90000) * video_.fps.den / std::max(1, video_.fps.num));
+    for (auto it = anc_.begin(); it != anc_.end();) {
+        const uint32_t d = it->first - p.ts;
+        if (d < span90) {
+            out.anc.insert(out.anc.end(), it->second.begin(), it->second.end());
+            it = anc_.erase(it);
+        } else if (int32_t(d) < 0) {
+            it = anc_.erase(it);  // (an earlier frame's, not taken)
+        } else {
+            ++it;
+        }
+    }
+    out.hasTimecode = frameTimecode(out.anc, video_.fps, out.timecode);
+}
+
+bool Input::next(InputFrame& out, int ms) {
+    std::unique_lock lock(m_);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!pending_.empty() && ready(pending_.front(), now)) {
+            Pending p = std::move(pending_.front());
+            pending_.pop_front();
+            // (joining streams already going: frames from before the first ancillary data heard are passed over, as
+            // their time code went by before the input listened)
+            if (hasAnc_ && ancSeen_ && !joined_ && int32_t(p.ts - ancFirst_) < 0) continue;
+            joined_ = true;
+            build(p, out);
+            ++stats_.frames;
+            return true;
+        }
+        if (stop_ || now >= until) return false;
+        cv_.wait_until(lock, std::min(until, now + std::chrono::milliseconds(10)));
+    }
+}
+
+}  // namespace montage::st2110

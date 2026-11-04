@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs AMWA's NMOS test suites (nmos-testing, Apache-2.0) against Montage's NMOS Node: IS-04's Node API and
 # registration (IS-04-01), IS-05's Connection API (IS-05-01) and the two together (IS-05-02), with the registry found by
-# unicast DNS-SD from the test tool's own DNS server. The Node is `montage-cli st2110`, sending colour bars and tone.
+# unicast DNS-SD from the test tool's own DNS server. The Node is `montage-cli st2110`, sending colour bars and tone
+# and offering receivers.
 #
 #   sudo scripts/nmos-check.sh build/src/montage-cli <work directory>
 #
@@ -22,7 +23,7 @@ printf "from . import Config as CONFIG\nCONFIG.DNS_SD_MODE = 'unicast'\n" > "$wo
 # The address the tool's DNS server and mock registries use: the default route's interface's.
 host=$("$work/venv/bin/python" -I -c "import netifaces as n; i = n.gateways()['default'][n.AF_INET][1]; print(n.ifaddresses(i)[n.AF_INET][0]['addr'])")
 QT_QPA_PLATFORM=offscreen "$cli" st2110 --mode 720p50 --interface "$host" --nmos-port 8080 --domain testsuite.nmos.tv \
-    --dns-server "$host" --seconds 3600 > "$work/node.log" 2>&1 &
+    --dns-server "$host" --seconds 3600 --receivers > "$work/node.log" 2>&1 &
 node=$!
 trap 'kill $node 2> /dev/null || true' EXIT
 sleep 2
@@ -33,7 +34,14 @@ run() {
     shift
     (cd "$work/nmos-testing" && timeout 900 "$work/venv/bin/python" nmos-test.py suite "$suite" "$@" --output "$work/$suite.xml" \
         > "$work/$suite.log" 2>&1) || true
-    # Passed, or not applicable (no receivers, no authorisation): anything failing or in error is reported.
+    if [ ! -s "$work/$suite.xml" ]; then
+        # (the tool stopped before writing its report: its own output says why)
+        echo "$suite: no report; the test tool's output ends:"
+        tail -n 40 "$work/$suite.log"
+        failed=1
+        return
+    fi
+    # Passed, or not applicable (no authorisation): anything failing or in error is reported.
     "$work/venv/bin/python" -I - "$work/$suite.xml" "$suite" <<'EOF' || failed=1
 import sys
 import xml.etree.ElementTree as ET

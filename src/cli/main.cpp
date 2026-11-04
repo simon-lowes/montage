@@ -42,6 +42,7 @@
 #include "media/Loudness.h"
 #include "render/Nmos.h"
 #include "render/St2110.h"
+#include "render/St2110Receive.h"
 #include "render/VideoPacking.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
@@ -125,8 +126,12 @@ int usage() {
                  "  montage-cli st2110 [--mode 1080p25] [--depth 10|8] [--video ADDR:PORT] [--audio ADDR:PORT] [--data ADDR:PORT]\n"
                  "                     [--interface ADDR] [--ttl N] [--channels 2|8] [--seconds N] [--no-nmos] [--nmos-port N]\n"
                  "                     [--label NAME] [--registry URL | --domain DOMAIN [--dns-server ADDR]]\n"
+                 "                     [--video2 ADDR:PORT --audio2 ADDR:PORT --data2 ADDR:PORT [--send-interface2 ADDR]]\n"
+                 "                     [--receivers [--interface2 ADDR]]\n"
                  "                     (colour bars and a tone sent as SMPTE ST 2110 video, sound and time code, their SDP files\n"
-                 "                      printed; an NMOS node registers them and lets a controller route them)\n"
+                 "                      printed; an NMOS node registers them and lets a controller route them; with --receivers\n"
+                 "                      it offers receivers too, and says what a controller connects them to brings; the\n"
+                 "                      second path's addresses send every packet twice, as ST 2022-7 does)\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif|.heic> [--rendition master|<trim target>] [--gain-map]\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -717,6 +722,10 @@ int cmdSt2110(const std::vector<std::string>& args) {
         else if (a == "--video") { if (!endpoint(so.video)) return 2; }
         else if (a == "--audio") { if (!endpoint(so.audio)) return 2; }
         else if (a == "--data") { if (!endpoint(so.anc)) return 2; }
+        else if (a == "--video2") { if (!endpoint(so.video2)) return 2; so.redundant = true; }
+        else if (a == "--audio2") { if (!endpoint(so.audio2)) return 2; so.redundant = true; }
+        else if (a == "--data2") { if (!endpoint(so.anc2)) return 2; so.redundant = true; }
+        else if (a == "--send-interface2") so.interfaceAddress2 = next();
         else if (a == "--interface") so.interfaceAddress = next();
         else if (a == "--ttl") so.ttl = std::clamp(std::atoi(next().c_str()), 1, 255);
         else if (a == "--no-nmos") nmosOn = false;
@@ -725,7 +734,13 @@ int cmdSt2110(const std::vector<std::string>& args) {
         else if (a == "--registry") no.registry = QString::fromStdString(next());
         else if (a == "--domain") no.domain = QString::fromStdString(next());
         else if (a == "--dns-server") no.dnsServer = QString::fromStdString(next());
+        else if (a == "--receivers") no.receivers = true;
+        else if (a == "--interface2") no.interface2 = QString::fromStdString(next());
         else return usage();
+    }
+    if (no.receivers && !nmosOn) {
+        std::fprintf(stderr, "error: --receivers needs the NMOS node\n");
+        return 2;
     }
     const auto modes = standardModes();
     const Mode* mode = findMode(modes, modeName);
@@ -798,8 +813,62 @@ int cmdSt2110(const std::vector<std::string>& args) {
             ++frame;
         }
     });
+    // The receivers: what a controller connects them to, received, and a line a second on what came.
+    std::vector<st2110::SdpStream> inStreams;
+    st2110::InputOptions inOptions;
+    bool reconnect = false;
+    std::thread receiving([&] {
+        st2110::Input in;
+        auto last = std::chrono::steady_clock::now();
+        int64_t frames = 0;
+        while (!gStopSending) {
+            {
+                std::lock_guard lock(m);
+                if (reconnect) {
+                    reconnect = false;
+                    in.close();
+                    frames = 0;
+                    std::string why;
+                    if (!inStreams.empty() && !in.open(inStreams, inOptions, &why)) std::fprintf(stderr, "Not receiving: %s\n", why.c_str());
+                    else if (in.isOpen()) std::printf("Receiving %dx%d%s from %s%s\n", in.video().width, in.video().height, in.video().interlaced ? "i" : "p",
+                                                      st2110::endpointText(inStreams[0].path[0]).c_str(), inStreams[0].redundant() ? " (two paths)" : "");
+                    else std::printf("Receivers disconnected\n");
+                    std::fflush(stdout);
+                }
+            }
+            if (!in.isOpen()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            st2110::InputFrame f;
+            if (in.next(f, 100)) ++frames;
+            if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(1)) {
+                last = std::chrono::steady_clock::now();
+                const st2110::InputStats st = in.stats();
+                char tc[32] = "";
+                if (f.hasTimecode)
+                    std::snprintf(tc, sizeof tc, ", time code %02d:%02d:%02d%c%02d", f.timecode.hours, f.timecode.minutes, f.timecode.seconds,
+                                  f.timecode.dropFrame ? ';' : ':', f.timecode.frames);
+                std::printf("Received %lld frames (%lld incomplete, %lld packets lost after merging)%s\n", (long long)frames, (long long)st.incomplete,
+                            (long long)st.lost, tc);
+                std::fflush(stdout);
+            }
+        }
+        in.close();
+    });
     nmos::Node node;
     if (nmosOn) {
+        node.onReceiverActivated = [&](const nmos::ReceiverConnection&) {
+            QString why;
+            std::vector<st2110::SdpStream> streams = node.receiverStreams(&why);
+            if (!why.isEmpty()) std::fprintf(stderr, "A receiver's transport file: %s\n", why.toUtf8().constData());
+            const nmos::ReceiverConnection c = node.receiverConnection(0);
+            std::lock_guard lock(m);
+            inStreams = std::move(streams);
+            inOptions.interfaceAddress[0] = c.leg[0].interfaceIp.toStdString();
+            inOptions.interfaceAddress[1] = c.leg[1].interfaceIp.toStdString();
+            reconnect = true;
+        };
         node.setStreams(vf, af, so, true);
         node.onActivated = [&](const st2110::SenderOptions& o) {
             std::lock_guard lock(m);
@@ -815,6 +884,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
             std::fprintf(stderr, "error: %s\n", why.toUtf8().constData());
             gStopSending = true;
             sending.join();
+            receiving.join();
             return 1;
         }
         std::printf("NMOS node at %s (IS-04 v1.3, IS-05 v1.1)\n", node.apiUrl().toUtf8().constData());
@@ -829,6 +899,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
     QCoreApplication::exec();
     gStopSending = true;
     sending.join();
+    receiving.join();
     node.stop();
     return 0;
 }

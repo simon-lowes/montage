@@ -1,5 +1,5 @@
-// Montage — an AMWA NMOS Node for the ST 2110 reference output (render/St2110.h), so a facility's broadcast controller
-// finds and routes it as it does other IP gear:
+// Montage — an AMWA NMOS Node for the ST 2110 reference output (render/St2110.h) and for receiving ST 2110
+// (render/St2110Receive.h), so a facility's broadcast controller finds and routes it as it does other IP gear:
 //  - IS-04 v1.3: the Node API over HTTP (the node, its device, the video, sound and data sources, flows and senders),
 //    registered with the registry found by DNS-SD (unicast DNS: _nmos-register._tcp in the search domain, from a
 //    given server or the system's; the best priority first, failing over to the next) or named outright, and kept
@@ -7,7 +7,11 @@
 //  - IS-05 v1.1: the Connection API for the three senders: their constraints, staged and active transport parameters
 //    (source and destination addresses and ports, on or off), activation at once or scheduled (absolute or relative
 //    TAI times), bulk changes, and the SDP transport file each sends.
-// Activating changes the sender (`onActivated`); the resources' versions change with it, and the registry is told.
+//  - Receivers (video, audio and ancillary data), each with two legs for ST 2022-7: staged from a sender's SDP
+//    transport file or by their parameters (the multicast group, the source to take, the interface and port), and
+//    connected in IS-04 too by a PUT of a sender to their target (its manifest fetched).
+// Activating changes the sender (`onActivated`) or what is received (`onReceiverActivated`); the resources' versions
+// change with it, and the registry is told.
 #pragma once
 
 #include <QHostAddress>
@@ -22,6 +26,7 @@
 #include <vector>
 
 #include "render/St2110.h"
+#include "render/St2110Receive.h"
 
 class QTcpServer;
 class QTcpSocket;
@@ -47,6 +52,22 @@ struct NodeOptions {
     QString dnsServer;
     bool discover = true;          // look for a registry at all (else the Node API alone, peer to peer)
     int heartbeatMs = 5000;
+    bool senders = true;           // offer the reference output's senders
+    bool receivers = false;        // offer receivers
+    QString interface2;            // the receivers' second leg's interface address ("" = the first's)
+};
+
+// What a receiver takes now (its active connection).
+struct ReceiverConnection {
+    int stream = 0;  // 0 video, 1 audio, 2 data
+    bool active = false;
+    QString senderId;   // "" when none was named
+    QString transportFile;  // the sender's SDP, as staged with it ("" none)
+    struct Leg {
+        bool enabled = false;
+        QString sourceIp, multicastIp, interfaceIp;  // (source and multicast "" when none)
+        int port = 5004;
+    } leg[2];
 };
 
 // A registry DNS-SD offered.
@@ -96,6 +117,13 @@ public:
 
     // A sender's activation changed where (or whether) the streams go: the options to send with now.
     std::function<void(const st2110::SenderOptions&)> onActivated;
+    // A receiver's activation changed what it takes.
+    std::function<void(const ReceiverConnection&)> onReceiverActivated;
+    QUuid receiverId(int stream) const;  // 0 video, 1 audio, 2 data
+    ReceiverConnection receiverConnection(int stream) const;
+    // The streams the active receivers take, as their transport files describe them and their parameters place them
+    // (a receiver with no transport file, or one Montage cannot read, left out).
+    std::vector<st2110::SdpStream> receiverStreams(QString* why = nullptr) const;
     std::function<void(bool registered)> onRegistered;
 
 private:
@@ -128,6 +156,7 @@ private:
     QJsonArray flowResources() const;
     QJsonArray senderResources() const;
     QJsonObject senderResource(int stream) const;
+    QJsonArray receiverResources() const;
     QJsonObject connectionJson(const Connection& c, bool staged) const;
     QJsonObject legJson(const Leg& l, int stream, bool resolve) const;
     QJsonArray constraintsJson(int stream) const;
@@ -139,6 +168,40 @@ private:
     st2110::Endpoint endpointOf(int stream) const;
     QString interfaceName() const;
     QString sourceAddress() const;
+
+    // Receivers.
+    struct RLeg {
+        QJsonValue sourceIp = QJsonValue::Null, multicastIp = QJsonValue::Null;
+        QString interfaceIp = QStringLiteral("auto");
+        QJsonValue destinationPort = QStringLiteral("auto");
+        bool rtpEnabled = true;
+    };
+    struct RConn {
+        QUuid id;
+        int stream = 0;
+        QJsonValue senderId = QJsonValue::Null;
+        bool masterEnable = false;
+        RLeg leg[2];
+        QJsonValue fileData = QJsonValue::Null, fileType = QJsonValue::Null;
+        QJsonValue stagedSenderId = QJsonValue::Null;
+        bool stagedMasterEnable = false;
+        RLeg stagedLeg[2];
+        QJsonValue stagedFileData = QJsonValue::Null, stagedFileType = QJsonValue::Null;
+        QJsonValue mode = QJsonValue::Null, requestedTime = QJsonValue::Null;
+        int64_t activationNs = 0;
+        QTimer* timer = nullptr;
+        QString lastActivation, lastMode, lastRequested;
+        QString version;
+    };
+    QJsonObject receiverResource(const RConn& r) const;
+    QJsonObject receiverJson(const RConn& r, bool staged) const;
+    QJsonObject rlegJson(const RLeg& l, int index, bool resolve) const;
+    QJsonArray receiverConstraints() const;
+    QString legInterface(int index) const;  // the address of leg `index`'s interface
+    Response patchReceiver(RConn& r, const QJsonObject& patch);
+    void activateReceiver(RConn& r, const QString& mode);
+    Response putTarget(RConn& r, const QJsonObject& sender);
+    std::vector<RConn> receivers_;
 
     // Registration.
     void discover();

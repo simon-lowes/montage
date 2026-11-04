@@ -1,5 +1,7 @@
 #include "Nmos.h"
 
+#include "render/St2110Receive.h"
+
 #include <QDnsLookup>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -97,6 +99,55 @@ QString systemDomain() {
     return domain;
 }
 
+// The network parts of an SDP transport file: each path's destination (address and port) and the source it filters
+// for (two paths in an ST 2022-7 "DUP" group, else the first media description's one).
+struct SdpPath {
+    QString address, source;
+    int port = 0;
+};
+std::vector<SdpPath> sdpPaths(const QString& sdp) {
+    struct Media {
+        SdpPath path;
+        QString mid;
+    };
+    std::vector<Media> media;
+    QStringList dup;
+    QString sessionAddress;
+    for (QString line : sdp.split('\n')) {
+        line = line.trimmed();
+        if (line.size() < 2 || line[1] != '=') continue;
+        const QString v = line.mid(2);
+        const QStringList w = v.split(' ', Qt::SkipEmptyParts);
+        // (the source only from a source filter: the origin's address may be another computer's)
+        if (line[0] == 'm' && w.size() >= 2) {
+            Media m;
+            m.path.port = w[1].section('/', 0, 0).toInt();
+            m.path.address = sessionAddress;
+            media.push_back(m);
+        } else if (line[0] == 'c' && w.size() >= 3 && !media.empty()) {
+            media.back().path.address = w[2].section('/', 0, 0);
+        } else if (line[0] == 'c' && w.size() >= 3) {
+            // (a session-level connection: every description's that gives none)
+            sessionAddress = w[2].section('/', 0, 0);
+        } else if (line[0] == 'a') {
+            if (v.startsWith(QLatin1String("group:DUP"))) dup = v.mid(9).split(' ', Qt::SkipEmptyParts);
+            else if (v.startsWith(QLatin1String("mid:")) && !media.empty()) media.back().mid = v.mid(4).trimmed();
+            else if (v.startsWith(QLatin1String("source-filter:")) && !media.empty() && w.size() >= 6 && w[1] == QLatin1String("incl"))
+                media.back().path.source = w[5];
+        }
+    }
+    std::vector<SdpPath> out;
+    if (dup.size() >= 2) {
+        for (int k = 0; k < 2; ++k)
+            for (const Media& m : media)
+                if (m.mid == dup[k]) out.push_back(m.path);
+        if (out.size() == 2) return out;
+        out.clear();
+    }
+    if (!media.empty()) out.push_back(media.front().path);
+    return out;
+}
+
 }  // namespace
 
 QString taiText(int64_t ns) {
@@ -126,6 +177,12 @@ bool Node::running() const { return server_ && server_->isListening(); }
 int Node::port() const { return running() ? int(server_->serverPort()) : 0; }
 
 QString Node::apiUrl() const { return running() ? QStringLiteral("http://%1:%2").arg(address_).arg(port()) : QString(); }
+
+QUuid Node::receiverId(int stream) const {
+    for (const RConn& r : receivers_)
+        if (r.stream == stream) return r.id;
+    return {};
+}
 
 QUuid Node::senderId(int stream) const { return stream >= 0 && stream < int(connections_.size()) ? connections_[size_t(stream)].id : QUuid(); }
 
@@ -175,17 +232,22 @@ bool Node::start(const NodeOptions& o, QString* error) {
     // a time is cut off), and how long it is kept alive at all. When every place is taken, a newcomer takes the place of
     // the connection that has been quiet longest from the address holding the most, so a few hosts cannot keep the
     // others out.
+    // An address at its own limit has its quietest connection between requests let go for a newcomer (a client's pool
+    // opens another when it needs one); only when all of them are mid-request is the newcomer refused.
     constexpr int kMaxClients = 64, kMaxClientsFrom = 4, kIdleMs = 15000, kLifeMs = 60000;
     constexpr qsizetype kMaxHeader = 64 << 10, kMaxBody = 1 << 20;
     struct Client {
         QString from;
         qint64 lastRequest = 0;
+        std::shared_ptr<QByteArray> buffer;  // (what has come of the request it is on: empty between requests)
+        uint64_t order = 0;                  // (when it came, among the others: the earlier is the quieter of two alike)
     };
+    auto arrivals = std::make_shared<uint64_t>(0);
     auto clients = std::make_shared<std::map<QTcpSocket*, Client>>();
     auto clock = std::make_shared<QElapsedTimer>();
     clock->start();
     clientCount_ = [clients] { return int(clients->size()); };
-    connect(server_, &QTcpServer::newConnection, this, [this, clients, clock] {
+    connect(server_, &QTcpServer::newConnection, this, [this, clients, clock, arrivals] {
         while (QTcpSocket* s = server_->nextPendingConnection()) {
             const QHostAddress address = s->peerAddress();
             QString peer = address.toString();
@@ -199,25 +261,36 @@ bool Node::start(const NodeOptions& o, QString* error) {
             std::map<QString, int> count;
             for (const auto& [socket, c] : *clients) ++count[c.from];
             if (count[peer] >= kMaxClientsFrom) {
-                s->abort();
-                s->deleteLater();
-                continue;
+                QTcpSocket* quietest = nullptr;
+                std::pair<qint64, uint64_t> quiet;
+                for (const auto& [socket, c] : *clients)
+                    if (c.from == peer && c.buffer && c.buffer->isEmpty() && socket->bytesToWrite() == 0 &&
+                        (!quietest || std::pair(c.lastRequest, c.order) < quiet))
+                        quietest = socket, quiet = {c.lastRequest, c.order};
+                if (!quietest) {
+                    s->abort();
+                    s->deleteLater();
+                    continue;
+                }
+                clients->erase(quietest);
+                quietest->disconnectFromHost();  // (closed in turn, so the client sees it gone before it reuses it)
+                --count[peer];
             }
             if (int(clients->size()) >= kMaxClients) {
                 QTcpSocket* quietest = nullptr;
                 int most = 0;
-                qint64 quiet = 0;
+                std::pair<qint64, uint64_t> quiet;
                 for (const auto& [socket, c] : *clients) {
                     const int n = count[c.from];
-                    if (n > most || (n == most && c.lastRequest < quiet)) quietest = socket, most = n, quiet = c.lastRequest;
+                    if (n > most || (n == most && std::pair(c.lastRequest, c.order) < quiet)) quietest = socket, most = n, quiet = {c.lastRequest, c.order};
                 }
                 if (quietest) {
                     clients->erase(quietest);
                     quietest->abort();
                 }
             }
-            (*clients)[s] = {peer, clock->elapsed()};
             auto buffer = std::make_shared<QByteArray>();
+            (*clients)[s] = {peer, clock->elapsed(), buffer, ++*arrivals};
             auto retire = std::make_shared<bool>(false);
             auto idle = new QTimer(s);
             idle->setSingleShot(true);
@@ -302,13 +375,22 @@ bool Node::start(const NodeOptions& o, QString* error) {
     });
     // The senders' connections: as the output sends now.
     connections_.clear();
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < (o.senders ? 3 : 0); ++i) {
         Connection c;
         c.id = id(QStringLiteral("sender/") + kStreams[i]);
         c.stream = i;
         c.receiverId = c.stagedReceiverId = QJsonValue::Null;
         c.mode = c.requestedTime = QJsonValue::Null;
         connections_.push_back(c);
+    }
+    // The receivers: not connected, until a controller connects them.
+    receivers_.clear();
+    for (int i = 0; i < (o.receivers ? 3 : 0); ++i) {
+        RConn r;
+        r.id = id(QStringLiteral("receiver/") + kStreams[i]);
+        r.stream = i;
+        r.version = newVersion();
+        receivers_.push_back(r);
     }
     nodeVersion_ = newVersion();
     deviceVersion_ = newVersion();
@@ -337,6 +419,10 @@ void Node::stop() {
         delete c.timer;
         c.timer = nullptr;
     }
+    for (RConn& r : receivers_) {
+        delete r.timer;
+        r.timer = nullptr;
+    }
     delete heartbeat_;
     heartbeat_ = nullptr;
     delete rediscover_;
@@ -356,6 +442,7 @@ void Node::stop() {
         reply->deleteLater();
     }
     connections_.clear();
+    receivers_.clear();
     delete net_;
     net_ = nullptr;
     delete server_;
@@ -466,17 +553,18 @@ QJsonObject Node::nodeResource() const {
 }
 
 QJsonObject Node::deviceResource() const {
-    QJsonArray senders;
+    QJsonArray senders, receivers;
     for (const Connection& c : connections_) senders.append(idText(c.id));
+    for (const RConn& r : receivers_) receivers.append(idText(r.id));
     return QJsonObject{{"id", idText(deviceId_)},
                        {"version", deviceVersion_},
                        {"label", o_.label},
-                       {"description", text("ST 2110 reference output")},
+                       {"description", o_.senders ? text("ST 2110 reference output") : text("ST 2110 capture")},
                        {"tags", QJsonObject{}},
                        {"type", "urn:x-nmos:device:generic"},
                        {"node_id", idText(nodeId_)},
                        {"senders", senders},
-                       {"receivers", QJsonArray{}},
+                       {"receivers", receivers},
                        {"controls", QJsonArray{QJsonObject{{"href", QStringLiteral("http://%1:%2/x-nmos/connection/v1.1/").arg(address_).arg(port())},
                                                            {"type", "urn:x-nmos:control:sr-ctrl/v1.1"},
                                                            {"authorization", false}}}}};
@@ -484,6 +572,7 @@ QJsonObject Node::deviceResource() const {
 
 QJsonArray Node::sourceResources() const {
     QJsonArray out;
+    if (!o_.senders) return out;
     static const char* const labels[3] = {"Picture", "Sound", "Ancillary data"};
     for (int i = 0; i < 3; ++i) {
         QJsonObject s{{"id", idText(sourceIds_[i])},
@@ -517,6 +606,7 @@ QJsonArray Node::sourceResources() const {
 
 QJsonArray Node::flowResources() const {
     QJsonArray out;
+    if (!o_.senders) return out;
     static const char* const labels[3] = {"Picture", "Sound", "Ancillary data"};
     for (int i = 0; i < 3; ++i) {
         QJsonObject f{{"id", idText(flowIds_[i])},
@@ -537,14 +627,16 @@ QJsonArray Node::flowResources() const {
             f["colorspace"] = QString::fromStdString(video_.colorimetry);
             f["transfer_characteristic"] = QString::fromStdString(video_.tcs);
             f["media_type"] = "video/raw";
-            f["components"] = QJsonArray{QJsonObject{{"name", "Y"}, {"width", w}, {"height", h}, {"bit_depth", d}},
-                                         QJsonObject{{"name", "Cb"}, {"width", w / 2}, {"height", h}, {"bit_depth", d}},
-                                         QJsonObject{{"name", "Cr"}, {"width", w / 2}, {"height", h}, {"bit_depth", d}}};
+            const int cw = video_.sampling == st2110::Sampling::Ycc422 ? w / 2 : w;
+            const bool rgb = video_.sampling == st2110::Sampling::Rgb;
+            f["components"] = QJsonArray{QJsonObject{{"name", rgb ? "R" : "Y"}, {"width", w}, {"height", h}, {"bit_depth", d}},
+                                         QJsonObject{{"name", rgb ? "G" : "Cb"}, {"width", cw}, {"height", h}, {"bit_depth", d}},
+                                         QJsonObject{{"name", rgb ? "B" : "Cr"}, {"width", cw}, {"height", h}, {"bit_depth", d}}};
         } else if (i == 1) {
             f["format"] = "urn:x-nmos:format:audio";
             f["sample_rate"] = QJsonObject{{"numerator", audio_.rate}, {"denominator", 1}};
-            f["media_type"] = "audio/L24";
-            f["bit_depth"] = 24;
+            f["media_type"] = audio_.bits == 16 ? "audio/L16" : "audio/L24";
+            f["bit_depth"] = audio_.bits;
         } else {
             f["format"] = "urn:x-nmos:format:data";
             f["grain_rate"] = rational(video_.fps);
@@ -793,6 +885,347 @@ void Node::applyActive() {
     if (onActivated) onActivated(o);
 }
 
+// ---- Receivers.
+
+QString Node::legInterface(int index) const {
+    if (index == 1 && !o_.interface2.isEmpty()) return o_.interface2;
+    return sourceAddress();
+}
+
+QJsonObject Node::receiverResource(const RConn& r) const {
+    static const char* const labels[3] = {"Picture", "Sound", "Ancillary data"};
+    static const char* const formats[3] = {"urn:x-nmos:format:video", "urn:x-nmos:format:audio", "urn:x-nmos:format:data"};
+    const QJsonArray types = r.stream == 0 ? QJsonArray{"video/raw"} : r.stream == 1 ? QJsonArray{"audio/L24", "audio/L16"} : QJsonArray{"video/smpte291"};
+    // (each leg bound to its interface)
+    auto nameOf = [&](const QString& address) {
+        for (const QNetworkInterface& i : QNetworkInterface::allInterfaces())
+            for (const QNetworkAddressEntry& e : i.addressEntries())
+                if (e.ip().toString() == address) return i.name();
+        return interfaceName();
+    };
+    return QJsonObject{{"id", idText(r.id)},
+                       {"version", r.version},
+                       {"label", o_.label + " " + labels[r.stream] + " in"},
+                       {"description", text("ST 2110-%1 receiver (ST 2022-7)").arg(r.stream == 0 ? "20" : r.stream == 1 ? "30" : "40")},
+                       {"tags", QJsonObject{}},
+                       {"device_id", idText(deviceId_)},
+                       {"transport", "urn:x-nmos:transport:rtp"},
+                       {"interface_bindings", QJsonArray{nameOf(legInterface(0)), nameOf(legInterface(1))}},
+                       {"subscription", QJsonObject{{"sender_id", r.masterEnable ? r.senderId : QJsonValue(QJsonValue::Null)}, {"active", r.masterEnable}}},
+                       {"format", formats[r.stream]},
+                       {"caps", QJsonObject{{"media_types", types}}}};
+}
+
+QJsonArray Node::receiverResources() const {
+    QJsonArray out;
+    for (const RConn& r : receivers_) out.append(receiverResource(r));
+    return out;
+}
+
+QJsonObject Node::rlegJson(const RLeg& l, int index, bool resolve) const {
+    QJsonObject o{{"source_ip", l.sourceIp}, {"multicast_ip", l.multicastIp}, {"interface_ip", l.interfaceIp},
+                  {"destination_port", l.destinationPort}, {"rtp_enabled", l.rtpEnabled}};
+    if (resolve) {
+        if (l.interfaceIp == "auto") o["interface_ip"] = legInterface(index);
+        if (l.destinationPort.isString()) o["destination_port"] = 5004;
+    }
+    return o;
+}
+
+QJsonObject Node::receiverJson(const RConn& r, bool staged) const {
+    if (staged) {
+        const QJsonObject activation{{"mode", r.mode}, {"requested_time", r.requestedTime},
+                                     {"activation_time", r.mode.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue(taiText(r.activationNs))}};
+        return QJsonObject{{"sender_id", r.stagedSenderId},
+                           {"master_enable", r.stagedMasterEnable},
+                           {"activation", activation},
+                           {"transport_file", QJsonObject{{"data", r.stagedFileData}, {"type", r.stagedFileType}}},
+                           {"transport_params", QJsonArray{rlegJson(r.stagedLeg[0], 0, false), rlegJson(r.stagedLeg[1], 1, false)}}};
+    }
+    const QJsonObject activation{{"mode", r.lastMode.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(r.lastMode)},
+                                 {"requested_time", r.lastRequested.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(r.lastRequested)},
+                                 {"activation_time", r.lastActivation.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(r.lastActivation)}};
+    return QJsonObject{{"sender_id", r.senderId},
+                       {"master_enable", r.masterEnable},
+                       {"activation", activation},
+                       {"transport_file", QJsonObject{{"data", r.fileData}, {"type", r.fileType}}},
+                       {"transport_params", QJsonArray{rlegJson(r.leg[0], 0, true), rlegJson(r.leg[1], 1, true)}}};
+}
+
+QJsonArray Node::receiverConstraints() const {
+    QJsonArray out;
+    for (int i = 0; i < 2; ++i) {
+        QJsonArray interfaces;
+        const QString own = legInterface(i);
+        interfaces.append(own);
+        for (const QHostAddress& a : QNetworkInterface::allAddresses())
+            if (a.protocol() == QAbstractSocket::IPv4Protocol && a.toString() != own) interfaces.append(a.toString());
+        out.append(QJsonObject{{"source_ip", QJsonObject{}},
+                               {"multicast_ip", QJsonObject{}},
+                               {"interface_ip", QJsonObject{{"enum", interfaces}}},
+                               {"destination_port", QJsonObject{}},
+                               {"rtp_enabled", QJsonObject{}}});
+    }
+    return out;
+}
+
+Node::Response Node::patchReceiver(RConn& r, const QJsonObject& patch) {
+    for (const QString& key : patch.keys())
+        if (key != "sender_id" && key != "master_enable" && key != "activation" && key != "transport_params" && key != "transport_file")
+            return errorResponse(400, text("Unknown property \"%1\"").arg(key));
+    static const QRegularExpression uuid(QStringLiteral("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"));
+    if (patch.contains("sender_id")) {
+        const QJsonValue v = patch["sender_id"];
+        if (!v.isNull() && !(v.isString() && uuid.match(v.toString()).hasMatch())) return errorResponse(400, text("sender_id is a UUID or null"));
+    }
+    if (patch.contains("master_enable") && !patch["master_enable"].isBool()) return errorResponse(400, text("master_enable is true or false"));
+    RLeg legs[2] = {r.stagedLeg[0], r.stagedLeg[1]};
+    QJsonValue fileData = r.stagedFileData, fileType = r.stagedFileType;
+    // A transport file: its paths become the legs' parameters (those patched beside it applied after).
+    if (patch.contains("transport_file")) {
+        if (!patch["transport_file"].isObject()) return errorResponse(400, text("transport_file is an object"));
+        const QJsonObject f = patch["transport_file"].toObject();
+        for (const QString& key : f.keys())
+            if (key != "data" && key != "type") return errorResponse(400, text("Unknown transport_file property \"%1\"").arg(key));
+        const QJsonValue data = f.value("data"), type = f.value("type");
+        if (!(data.isNull() || data.isString() || data.isUndefined()) || !(type.isNull() || type.isString() || type.isUndefined()))
+            return errorResponse(400, text("transport_file's data and type are strings or null"));
+        if (data.isString() && !data.toString().isEmpty()) {
+            if (!type.isString() || type.toString() != "application/sdp") return errorResponse(400, text("The transport file is application/sdp"));
+            const std::vector<SdpPath> paths = sdpPaths(data.toString());
+            if (paths.empty() || paths[0].port <= 0 || paths[0].port > 65535 || !isIpv4(paths[0].address))
+                return errorResponse(400, text("The SDP gives no IPv4 address and port to receive at"));
+            for (int i = 0; i < 2; ++i) {
+                RLeg& l = legs[i];
+                if (i >= int(paths.size())) {
+                    l.rtpEnabled = false;
+                    continue;
+                }
+                const SdpPath& p = paths[size_t(i)];
+                const bool multicast = st2110::isMulticast(p.address.toStdString());
+                l.multicastIp = multicast ? QJsonValue(p.address) : QJsonValue(QJsonValue::Null);
+                l.sourceIp = isIpv4(p.source) ? QJsonValue(p.source) : QJsonValue(QJsonValue::Null);
+                // (unicast: to the interface it names)
+                if (!multicast) l.interfaceIp = p.address;
+                l.destinationPort = p.port;
+                l.rtpEnabled = true;
+            }
+        }
+        fileData = data.isUndefined() ? QJsonValue(QJsonValue::Null) : data;
+        fileType = type.isUndefined() ? QJsonValue(QJsonValue::Null) : type;
+    }
+    if (patch.contains("transport_params")) {
+        if (!patch["transport_params"].isArray()) return errorResponse(400, text("transport_params is an array"));
+        const QJsonArray given = patch["transport_params"].toArray();
+        if (given.size() != 2) return errorResponse(400, text("This receiver has two legs"));
+        const QJsonArray constraints = receiverConstraints();
+        for (int i = 0; i < 2; ++i) {
+            if (!given[i].isObject()) return errorResponse(400, text("A leg is an object"));
+            const QJsonObject p = given[i].toObject();
+            RLeg& l = legs[i];
+            for (const QString& key : p.keys()) {
+                const QJsonValue v = p[key];
+                if (key == "source_ip" || key == "multicast_ip") {
+                    if (!v.isNull() && !(v.isString() && isIpv4(v.toString()))) return errorResponse(400, text("%1 is an IPv4 address or null").arg(key));
+                    if (key == "multicast_ip" && v.isString() && !st2110::isMulticast(v.toString().toStdString()))
+                        return errorResponse(400, text("%1 is not a multicast address").arg(v.toString()));
+                    (key == "source_ip" ? l.sourceIp : l.multicastIp) = v;
+                } else if (key == "interface_ip") {
+                    if (!v.isString() || (v.toString() != "auto" && !isIpv4(v.toString()))) return errorResponse(400, text("interface_ip is an IPv4 address or \"auto\""));
+                    if (v.toString() != "auto" && !constraints[i].toObject()["interface_ip"].toObject()["enum"].toArray().contains(v))
+                        return errorResponse(400, text("No interface has %1").arg(v.toString()));
+                    l.interfaceIp = v.toString();
+                } else if (key == "destination_port") {
+                    const bool ok = (v.isString() && v.toString() == "auto") ||
+                                    (v.isDouble() && v.toDouble() == std::floor(v.toDouble()) && v.toInt() >= 1 && v.toInt() <= 65535);
+                    if (!ok) return errorResponse(400, text("destination_port is a port or \"auto\""));
+                    l.destinationPort = v.isString() ? v : QJsonValue(v.toInt());
+                } else if (key == "rtp_enabled") {
+                    if (!v.isBool()) return errorResponse(400, text("rtp_enabled is true or false"));
+                    l.rtpEnabled = v.toBool();
+                } else {
+                    return errorResponse(400, text("This receiver has no parameter \"%1\"").arg(key));
+                }
+            }
+        }
+    }
+    QJsonValue mode = QJsonValue::Undefined, requested = QJsonValue::Null;
+    if (patch.contains("activation")) {
+        if (!patch["activation"].isObject()) return errorResponse(400, text("activation is an object"));
+        const QJsonObject a = patch["activation"].toObject();
+        for (const QString& key : a.keys())
+            if (key != "mode" && key != "requested_time") return errorResponse(400, text("Unknown activation property \"%1\"").arg(key));
+        if (!a.contains("mode")) return errorResponse(400, text("activation needs a mode"));
+        mode = a["mode"];
+        const QString m = mode.toString();
+        if (!mode.isNull() && m != "activate_immediate" && m != "activate_scheduled_absolute" && m != "activate_scheduled_relative")
+            return errorResponse(400, text("Not an activation mode"));
+        requested = a.value("requested_time");
+        if (requested.isUndefined()) requested = QJsonValue::Null;
+        int64_t ns = 0;
+        if (!requested.isNull() && !(requested.isString() && parseTai(requested.toString(), ns)))
+            return errorResponse(400, text("requested_time is \"<seconds>:<nanoseconds>\""));
+        if ((m == "activate_scheduled_absolute" || m == "activate_scheduled_relative") && requested.isNull())
+            return errorResponse(400, text("A scheduled activation needs requested_time"));
+    }
+    if (!r.mode.isNull() && !(mode.isNull() && !mode.isUndefined())) return errorResponse(423, text("An activation is scheduled: cancel it first"));
+    if (patch.contains("sender_id")) r.stagedSenderId = patch["sender_id"];
+    if (patch.contains("master_enable")) r.stagedMasterEnable = patch["master_enable"].toBool();
+    r.stagedLeg[0] = legs[0], r.stagedLeg[1] = legs[1];
+    r.stagedFileData = fileData, r.stagedFileType = fileType;
+    if (mode.isNull() && !mode.isUndefined()) {
+        delete r.timer;
+        r.timer = nullptr;
+        r.mode = r.requestedTime = QJsonValue::Null;
+        return jsonResponse(200, receiverJson(r, true));
+    }
+    if (mode.isUndefined()) return jsonResponse(200, receiverJson(r, true));
+    const QString m = mode.toString();
+    if (m == "activate_immediate") {
+        r.requestedTime = QJsonValue::Null;
+        activateReceiver(r, m);
+        QJsonObject out = receiverJson(r, true);
+        out["activation"] = QJsonObject{{"mode", m}, {"requested_time", QJsonValue::Null}, {"activation_time", r.lastActivation}};
+        return jsonResponse(200, out);
+    }
+    int64_t at = 0;
+    parseTai(requested.toString(), at);
+    const int64_t now = st2110::ptpNowNs();
+    if (m == "activate_scheduled_relative") at = at > std::numeric_limits<int64_t>::max() - now ? std::numeric_limits<int64_t>::max() : at + now;
+    r.mode = m;
+    r.requestedTime = requested;
+    r.activationNs = at;
+    delete r.timer;
+    r.timer = new QTimer(this);
+    r.timer->setSingleShot(true);
+    r.timer->setTimerType(Qt::PreciseTimer);
+    const QUuid id = r.id;
+    connect(r.timer, &QTimer::timeout, this, [this, id] {
+        for (RConn& x : receivers_)
+            if (x.id == id) {
+                const int64_t left = x.activationNs - st2110::ptpNowNs();
+                if (left > 0) {
+                    x.timer->start(int(std::min<int64_t>((left + 999999) / 1000000, 24 * 3600 * 1000)));
+                    return;
+                }
+                const QString mm = x.mode.toString();
+                x.timer->deleteLater();
+                x.timer = nullptr;
+                activateReceiver(x, mm);
+                return;
+            }
+    });
+    r.timer->start(int(std::clamp<int64_t>((at - now + 999999) / 1000000, 0, 24 * 3600 * 1000)));
+    return jsonResponse(202, receiverJson(r, true));
+}
+
+void Node::activateReceiver(RConn& r, const QString& mode) {
+    r.lastMode = mode;
+    r.lastRequested = r.requestedTime.isString() ? r.requestedTime.toString() : QString();
+    const bool scheduled = mode == QLatin1String("activate_scheduled_relative") || mode == QLatin1String("activate_scheduled_absolute");
+    r.lastActivation = taiText(scheduled ? std::max(st2110::ptpNowNs(), r.activationNs) : st2110::ptpNowNs());
+    r.senderId = r.stagedSenderId;
+    r.masterEnable = r.stagedMasterEnable;
+    r.leg[0] = r.stagedLeg[0], r.leg[1] = r.stagedLeg[1];
+    r.fileData = r.stagedFileData, r.fileType = r.stagedFileType;
+    r.mode = r.requestedTime = QJsonValue::Null;
+    r.version = newVersion();
+    resourceChanged(QStringLiteral("receiver"), receiverResource(r));
+    if (onReceiverActivated) onReceiverActivated(receiverConnection(r.stream));
+}
+
+ReceiverConnection Node::receiverConnection(int stream) const {
+    ReceiverConnection c;
+    c.stream = stream;
+    for (const RConn& r : receivers_) {
+        if (r.stream != stream) continue;
+        c.active = r.masterEnable;
+        c.senderId = r.senderId.toString();
+        c.transportFile = r.fileData.toString();
+        for (int i = 0; i < 2; ++i) {
+            const QJsonObject l = rlegJson(r.leg[i], i, true);
+            c.leg[i].enabled = r.masterEnable && r.leg[i].rtpEnabled;
+            c.leg[i].sourceIp = l["source_ip"].toString();
+            c.leg[i].multicastIp = l["multicast_ip"].toString();
+            c.leg[i].interfaceIp = l["interface_ip"].toString();
+            c.leg[i].port = l["destination_port"].toInt();
+        }
+    }
+    return c;
+}
+
+std::vector<st2110::SdpStream> Node::receiverStreams(QString* why) const {
+    std::vector<st2110::SdpStream> out;
+    for (const RConn& r : receivers_) {
+        const ReceiverConnection c = receiverConnection(r.stream);
+        if (!c.active || c.transportFile.isEmpty() || !(c.leg[0].enabled || c.leg[1].enabled)) continue;
+        std::string error;
+        const std::vector<st2110::SdpStream> found = st2110::parseSdp(c.transportFile.toStdString(), &error);
+        if (found.empty()) {
+            if (why) *why = QString::fromStdString(error);
+            continue;
+        }
+        // The format from the file, where to listen from the parameters (which a controller may have changed since).
+        st2110::SdpStream s = found.front();
+        int n = 0;
+        for (int i = 0; i < 2; ++i) {
+            if (!c.leg[i].enabled) continue;
+            s.path[n] = {(c.leg[i].multicastIp.isEmpty() ? c.leg[i].interfaceIp : c.leg[i].multicastIp).toStdString(), c.leg[i].port};
+            s.source[n] = c.leg[i].sourceIp.toStdString();
+            ++n;
+        }
+        if (n < 2) s.path[1] = {}, s.source[1].clear();
+        out.push_back(s);
+    }
+    return out;
+}
+
+Node::Response Node::putTarget(RConn& r, const QJsonObject& sender) {
+    // IS-04's basic connection management: a sender connects the receiver (its manifest fetched for the transport
+    // file), an empty object disconnects it.
+    if (r.timer) {
+        delete r.timer;
+        r.timer = nullptr;
+        r.mode = r.requestedTime = QJsonValue::Null;
+    }
+    if (sender.isEmpty()) {
+        r.stagedSenderId = QJsonValue::Null;
+        r.stagedMasterEnable = false;
+        activateReceiver(r, QStringLiteral("activate_immediate"));
+        return jsonResponse(202, QJsonObject{});
+    }
+    if (!sender["id"].isString()) return errorResponse(400, text("The target is a sender, or an empty object"));
+    r.stagedSenderId = sender["id"];
+    r.stagedMasterEnable = true;
+    activateReceiver(r, QStringLiteral("activate_immediate"));
+    const QString href = sender["manifest_href"].toString();
+    if (!href.isEmpty() && net_) {
+        QNetworkRequest req{QUrl(href)};
+        req.setTransferTimeout(5000);
+        QNetworkReply* reply = net_->get(req);
+        // (anyone may name the manifest: a megabyte of it at most)
+        reply->setReadBufferSize(1 << 20);
+        connect(reply, &QNetworkReply::readyRead, this, [reply] {
+            if (reply->bytesAvailable() >= (1 << 20)) reply->abort();
+        });
+        const QUuid id = r.id;
+        const QJsonValue senderId = sender["id"];
+        connect(reply, &QNetworkReply::finished, this, [this, reply, id, senderId] {
+            reply->deleteLater();
+            if (stopping_ || reply->error() != QNetworkReply::NoError) return;
+            const QString sdp = QString::fromUtf8(reply->read(1 << 20));
+            for (RConn& x : receivers_)
+                if (x.id == id && x.senderId == senderId && x.masterEnable && x.mode.isNull()) {
+                    // (staged and made active as if a controller had patched it so)
+                    const Response p = patchReceiver(x, QJsonObject{{"transport_file", QJsonObject{{"data", sdp}, {"type", "application/sdp"}}},
+                                                                    {"activation", QJsonObject{{"mode", "activate_immediate"}}}});
+                    (void)p;
+                }
+        });
+    }
+    return jsonResponse(202, sender);
+}
+
 // ---- The APIs.
 
 Node::Response Node::handle(const QByteArray& method, const QString& rawPath, const QByteArray& body) {
@@ -817,7 +1250,19 @@ Node::Response Node::handle(const QByteArray& method, const QString& rawPath, co
         if (seg.size() == 3) return get ? jsonResponse(200, listing({"self/", "sources/", "flows/", "devices/", "senders/", "receivers/"})) : notAllowed();
         const QString what = seg[3];
         if (what == "receivers") {
-            if (seg.size() == 4) return get ? jsonResponse(200, QJsonArray{}) : notAllowed();
+            if (seg.size() == 4) return get ? jsonResponse(200, receiverResources()) : notAllowed();
+            RConn* r = nullptr;
+            for (RConn& x : receivers_)
+                if (idText(x.id) == seg[4]) r = &x;
+            if (!r) return notFound();
+            if (seg.size() == 5) return get ? jsonResponse(200, receiverResource(*r)) : notAllowed();
+            if (seg.size() == 6 && seg[5] == "target") {
+                if (method != "PUT") return notAllowed();
+                QJsonParseError pe;
+                const QJsonDocument doc = QJsonDocument::fromJson(body, &pe);
+                if (pe.error != QJsonParseError::NoError || !doc.isObject()) return errorResponse(400, text("The body is a JSON object"));
+                return putTarget(*r, doc.object());
+            }
             return notFound();
         }
         QJsonArray all;
@@ -859,14 +1304,18 @@ Node::Response Node::handle(const QByteArray& method, const QString& rawPath, co
             const QJsonObject o = item.toObject();
             const QString id = o["id"].toString();
             Connection* c = nullptr;
+            RConn* rc = nullptr;
             if (seg[4] == "senders")
                 for (Connection& x : connections_)
                     if (idText(x.id) == id) c = &x;
-            if (!c) {
+            if (seg[4] == "receivers")
+                for (RConn& x : receivers_)
+                    if (idText(x.id) == id) rc = &x;
+            if (!c && !rc) {
                 results.append(QJsonObject{{"id", id}, {"code", 404}, {"error", text("No such %1").arg(seg[4].chopped(1))}});
                 continue;
             }
-            const Response r = patchStaged(*c, o["params"].toObject(), true);
+            const Response r = c ? patchStaged(*c, o["params"].toObject(), true) : patchReceiver(*rc, o["params"].toObject());
             QJsonObject result{{"id", id}, {"code", r.code}};
             if (r.code >= 400) result["error"] = QJsonDocument::fromJson(r.body).object()["error"];
             results.append(result);
@@ -876,7 +1325,35 @@ Node::Response Node::handle(const QByteArray& method, const QString& rawPath, co
     if (seg[3] != "single") return notFound();
     if (seg.size() == 4) return get ? jsonResponse(200, listing({"senders/", "receivers/"})) : notAllowed();
     if (seg[4] == "receivers") {
-        if (seg.size() == 5) return get ? jsonResponse(200, QJsonArray{}) : notAllowed();
+        if (seg.size() == 5) {
+            if (!get) return notAllowed();
+            QJsonArray ids;
+            for (const RConn& r : receivers_) ids.append(idText(r.id) + "/");
+            return jsonResponse(200, ids);
+        }
+        RConn* r = nullptr;
+        for (RConn& x : receivers_)
+            if (idText(x.id) == seg[5]) r = &x;
+        if (!r) return notFound();
+        if (seg.size() == 6) return get ? jsonResponse(200, listing({"constraints/", "staged/", "active/", "transporttype/"})) : notAllowed();
+        if (seg.size() != 7) return notFound();
+        const QString what = seg[6];
+        if (what == "constraints") return get ? jsonResponse(200, receiverConstraints()) : notAllowed();
+        if (what == "active") return get ? jsonResponse(200, receiverJson(*r, false)) : notAllowed();
+        if (what == "transporttype") {
+            if (!get) return notAllowed();
+            Response t;
+            t.body = "\"urn:x-nmos:transport:rtp\"";
+            return t;
+        }
+        if (what == "staged") {
+            if (get) return jsonResponse(200, receiverJson(*r, true));
+            if (method != "PATCH") return notAllowed();
+            QJsonParseError pe;
+            const QJsonDocument doc = QJsonDocument::fromJson(body, &pe);
+            if (pe.error != QJsonParseError::NoError || !doc.isObject()) return errorResponse(400, text("The body is a JSON object"));
+            return patchReceiver(*r, doc.object());
+        }
         return notFound();
     }
     if (seg[4] != "senders") return notFound();
@@ -1036,6 +1513,7 @@ void Node::registerAll() {
     for (const QJsonValue& v : sourceResources()) queue_.emplace_back(QStringLiteral("source"), v.toObject());
     for (const QJsonValue& v : flowResources()) queue_.emplace_back(QStringLiteral("flow"), v.toObject());
     for (const QJsonValue& v : senderResources()) queue_.emplace_back(QStringLiteral("sender"), v.toObject());
+    for (const QJsonValue& v : receiverResources()) queue_.emplace_back(QStringLiteral("receiver"), v.toObject());
     registering_ = true;
     deleteFirst_ = false;
     postNext();

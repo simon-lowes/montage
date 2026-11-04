@@ -3,9 +3,12 @@
 // device (a camera or capture card and a sound card, as FFmpeg names them), recorded to ProRes or DNxHR with its
 // timecode into a folder. A second into the recording the file is imported into the "Captures" bin, where it grows
 // as it records (EditorState's growing media), so it can be cut in at once. The dialog stays open beside the editor.
+// SMPTE ST 2110 streams are recorded from their SDP files (with ST 2022-7's two paths, and the time code their
+// ancillary data carries), or offered as NMOS receivers for a facility's controller to connect.
 #pragma once
 
 #include <QDialog>
+#include <QJsonObject>
 #include <memory>
 
 #include "core/Model.h"
@@ -21,6 +24,9 @@ class QTimer;
 
 namespace montage {
 
+namespace nmos {
+class Node;
+}
 class EditorState;
 
 class CaptureDialog : public QDialog {
@@ -48,6 +54,16 @@ public:
     Id importedMedia() const { return imported_; }
     QString statusText() const;
 
+    // ST 2110 receivers offered to NMOS controllers (IS-04, with IS-05 connections): what one connects them to
+    // becomes the feed. False with why when the node cannot start.
+    bool offerNmos(bool on, QString* error = nullptr);
+    nmos::Node* nmosNode() const { return node_; }
+    QString nmosStatus() const;
+
+    // The agent link's tool (montage_capture).
+    static QByteArray toolJson();
+    QString runTool(const QJsonObject& args, QJsonObject& structured, bool& isError);
+
 signals:
     void recordingChanged();
 
@@ -55,6 +71,7 @@ private:
     void refresh();
     void finished(int generation, bool ok, const QString& message);
     void importNow();
+    void nmosConnected();
 
     EditorState* state_;
     QComboBox* kind_;
@@ -62,6 +79,9 @@ private:
     QPushButton* find_;
     QLineEdit* sound_;
     QLineEdit* options_;
+    QCheckBox* nmos_;
+    QLabel* nmosStatus_;
+    nmos::Node* node_ = nullptr;
     QComboBox* codec_;
     QComboBox* wrapper_;
     QLineEdit* folder_;
