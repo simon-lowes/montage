@@ -14664,9 +14664,13 @@ const auto seq = [this] { return state()->sequence(); };
             if (i > 0 && seen[i].second + 5 < seen[i - 1].second) wraps.push_back(seen[i].first);  // (back to In, not a frame)
         }
         QVERIFY2(wraps.size() >= 2, qPrintable(QString::number(wraps.size())));
+        // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
+        // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
+        // themselves did not, with a background app's timers coalesced to a tenth of a second.)
         const double fps = state()->sequence()->fpsValue();
-        const double pass = (wraps.back() - wraps.front()) / double(wraps.size() - 1);
-        QVERIFY2(std::fabs(pass - 10 / fps * 1000) < 60, qPrintable(QString::number(pass)));
+        const double frames = double(seen.back().second - seen.front().second) + 10.0 * double(wraps.size());
+        const double rate = frames / (double(seen.back().first - seen.front().first) / 1000.0);
+        QVERIFY2(std::fabs(rate - fps) < fps * 0.1, qPrintable(QStringLiteral("%1 frames a second, not %2").arg(rate).arg(fps)));
         state()->newProject();
     }
 
