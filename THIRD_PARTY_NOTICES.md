@@ -91,7 +91,9 @@ one with its exact version, licence and source.
 - [OpenColorIO](https://opencolorio.org) (BSD-3-Clause), [ONNX Runtime](https://onnxruntime.ai) (MIT, with its own
   third-party notices), [LibRaw](https://www.libraw.org) (LGPL-2.1 or CDDL-1.0), [lilv](https://drobilla.net/software/lilv)
   (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause), [OpenJPEG](https://www.openjpeg.org)
-  (BSD-2-Clause) and [OpenSSL](https://www.openssl.org) 3 (Apache-2.0; encrypted DCPs, signatures and KDMs).
+  (BSD-2-Clause), [libjxl](https://github.com/libjxl/libjxl) (BSD-3-Clause, with the royalty-free patent grant in its
+  `PATENTS` file; JPEG XL in and out) with Highway (Apache-2.0 or BSD-3-Clause), Brotli (MIT) and Little CMS (MIT),
+  and [OpenSSL](https://www.openssl.org) 3 (Apache-2.0; encrypted DCPs, signatures and KDMs).
 
 ## Not included
 

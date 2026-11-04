@@ -105,6 +105,7 @@ int usage() {
                  "                     not given; conflicts take mine, or theirs, and their overlapping clips a new track)\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies] [--gpu]\n"
+                 "                     [--bitrate BITS_PER_SECOND [--two-pass]]  (two passes: H.264 and H.265)\n"
                  "                     [--loudness LUFS [--ceiling dBTP] [--dialogue-gated]]  (e.g. --loudness -14: normalise the mix;\n"
                  "                     --loudness -27 --ceiling -2 --dialogue-gated: by its dialogue, as Netflix asks)\n"
                  "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
@@ -404,6 +405,8 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     std::string projectPath = args[0], outPath, presetName = "H.264 - High Quality", inTc, outTc;
     st = ExportSettings();
     int width = 0, height = 0, crf = -1;
+    int64_t bitrate = 0;
+    bool twoPass = false;
     std::string vcodec, acodec;
     bool proxies = false, gpuFrames = false;
     double loudness = 0, ceiling = -1;
@@ -422,6 +425,8 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
         else if (a == "--width") width = std::atoi(next().c_str());
         else if (a == "--height") height = std::atoi(next().c_str());
         else if (a == "--crf") crf = std::atoi(next().c_str());
+        else if (a == "--bitrate") bitrate = std::atoll(next().c_str());
+        else if (a == "--two-pass") twoPass = true;
         else if (a == "--vcodec") vcodec = next();
         else if (a == "--acodec") acodec = next();
         else if (a == "--proxies") proxies = true;
@@ -481,6 +486,8 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     if (height > 0) st.height = height;
     if (width > 0 && height <= 0) st.height = int(std::lround(double(width) * s->height / s->width));
     if (crf >= 0) st.crf = crf;
+    if (bitrate > 0) st.videoBitrate = bitrate;
+    st.twoPass = st.twoPass || twoPass;
     if (!vcodec.empty()) st.videoCodec = vcodec;
     if (!acodec.empty()) st.audioCodec = acodec;
     st.useProxies = proxies;
@@ -576,10 +583,10 @@ int cmdFarm(const std::vector<std::string>& args) {
         }
         if (segments > 1) {
             int made = 0;
-            for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+            for (const FarmJob& j : farmJobs(farm)) made += j.group == id && j.pass != 1;
             if (made > 1) std::fprintf(stderr, "In %d segments, joined by job %s\n", made, id.c_str());
             else std::fprintf(stderr, "Sent whole: the range is too short to split\n");
-            if (made > 1 && exportSegmentsLongGop(st))
+            if (made > 1 && exportSegmentsLongGop(st) && !st.twoPass)
                 std::fprintf(stderr, "warning: rate control works per segment (a bitrate is kept within each, not across the whole)\n");
         }
         std::printf("%s\n", id.c_str());

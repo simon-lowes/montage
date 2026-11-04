@@ -36,6 +36,7 @@
 #include <QGuiApplication>
 #include <QActionGroup>
 #include <QApplication>
+#include <QAbstractSpinBox>
 #include <QCloseEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -69,6 +70,8 @@
 #include <QTextDocument>
 #include <QPdfWriter>
 #include <QPlainTextEdit>
+#include <QTextEdit>
+#include <QKeySequenceEdit>
 #include <QPushButton>
 #include <QtConcurrent>
 #include <QMessageBox>
@@ -119,6 +122,7 @@ extern "C" {
 #include "render/VfxShots.h"
 #include "render/Jpeg2000.h"
 #include "media/Exr.h"
+#include "media/Jxl.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
 #include "render/Crosstalk.h"
@@ -143,6 +147,7 @@ extern "C" {
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
+#include "DeckControl.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
 #include "core/AvidBinImport.h"
@@ -832,18 +837,25 @@ void MainWindow::buildPanels() {
         QTimer::singleShot(0, tangent_, [this, on] { tangent_->setEnabled(on); });
     }
     // 1–9 cut to an angle of the bank of nine they reach (live while playing); Shift cuts at the playhead when stopped;
-    // Alt+1–3 picks the bank (angles 1–9, 10–18, 19–25).
+    // Alt+1–9 picks the bank (angles 1–9, 10–18, 19–27...).
+    std::vector<QShortcut*> banks;
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
         connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, false); });
         auto* cut = new QShortcut(QKeySequence(Qt::SHIFT | (Qt::Key_1 + i)), this);
         connect(cut, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, true); });
-        if (i < 3) {
-            auto* bank = new QShortcut(QKeySequence(Qt::ALT | (Qt::Key_1 + i)), this);
-            bank->setObjectName(QStringLiteral("multicamBank%1").arg(i + 1));
-            connect(bank, &QShortcut::activated, this, [this, i] { multicam_->setBank(i); });
-        }
+        auto* bank = new QShortcut(QKeySequence(Qt::ALT | (Qt::Key_1 + i)), this);
+        bank->setObjectName(QStringLiteral("multicamBank%1").arg(i + 1));
+        connect(bank, &QShortcut::activated, this, [this, i] { multicam_->setBank(i); });
+        banks.push_back(bank);
     }
+    // Off while typing (Option+digit types a character on a Mac's keyboard) and where a command has been given the key
+    // in Keyboard Shortcuts (the command has it, not the bank).
+    connect(qApp, &QApplication::focusChanged, this, [this, banks](QWidget*, QWidget* now) {
+        const bool typing = qobject_cast<QLineEdit*>(now) || qobject_cast<QTextEdit*>(now) || qobject_cast<QPlainTextEdit*>(now) ||
+                            qobject_cast<QAbstractSpinBox*>(now) || qobject_cast<QKeySequenceEdit*>(now);
+        for (QShortcut* b : banks) b->setEnabled(!typing && !keymap::conflict(this, b->key()));
+    });
     // In the Colour workspace the numeric keypad sets printer lights, as on a timer's console: 7, 8, 9 add a point of
     // red, green or blue, 4, 5, 6 take one away, + and - move all three. Elsewhere its keys do what they did: digits cut
     // to an angle, - zooms out.
@@ -1379,6 +1391,12 @@ void MainWindow::buildMenus() {
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
+    add(file, QT_TR_NOOP("&Deck Control…"), QKeySequence(), [this] {
+        if (!deckDialog_) deckDialog_ = new DeckDialog(deckControl_, state_, this);
+        deckDialog_->show();
+        deckDialog_->raise();
+        deckDialog_->activateWindow();
+    })->setObjectName(QStringLiteral("deckControl"));
     add(file, QT_TR_NOOP("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
@@ -2715,6 +2733,12 @@ void MainWindow::buildMenus() {
             return referenceOutput_->runTool(args, structured, isError);
         });
     // To reviewers elsewhere, streamed live (render/RemoteReview.h, render/WebRtcReview.h); their notes come back as markers.
+    // Decks under Sony 9-pin control, Montage answering as one, and the Program chasing LTC (app/DeckControl.h).
+    if (!deckControl_) deckControl_ = new DeckController(state_, program_, this);
+    if (liveLink_)
+        liveLink_->addAppTool(DeckController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return deckControl_->runTool(args, structured, isError);
+        });
     remoteReview_ = new RemoteReviewController(program_, this);
     remoteReviewAction_ = new QAction(tr("Remote Review…"), this);
     remoteReviewAction_->setObjectName(QStringLiteral("remoteReview"));
@@ -3686,11 +3710,14 @@ void MainWindow::exportFrame() {
                   sdrAvif = tr("AVIF for SDR screens (*.avif)"), hdrAvif = tr("HDR AVIF, 10-bit (*.avif)"),
                   hdrJpeg = tr("HDR JPEG with gain map (*.jpg)"), gainMapAvif = tr("HDR AVIF with gain map (*.avif)"),
                   sdrHeif = tr("HEIF for SDR screens (*.heic)"), hdrHeif = tr("HDR HEIF, 10-bit (*.heic)"),
-                  gainMapHeif = tr("HDR HEIF with gain map (*.heic)");
-    const QString filters = hdr ? QStringList{sdrPng, hdrPng, sdrAvif, hdrAvif, gainMapAvif, sdrHeif, hdrHeif, gainMapHeif, hdrJpeg,
-                                              tr("JPEG for SDR screens (*.jpg)"), tr("TIFF for SDR screens (*.tif)")}
-                                      .join(";;")
-                                : tr("Images (*.png *.jpg *.tif *.avif *.heic)");
+                  gainMapHeif = tr("HDR HEIF with gain map (*.heic)"), sdrJxl = tr("JPEG XL for SDR screens, lossless (*.jxl)"),
+                  hdrJxl = tr("HDR JPEG XL, 16-bit lossless (*.jxl)");
+    QStringList hdrFilters{sdrPng, hdrPng, sdrAvif, hdrAvif, gainMapAvif, sdrHeif, hdrHeif, gainMapHeif, hdrJpeg};
+    if (jxlAvailable()) hdrFilters << sdrJxl << hdrJxl;
+    hdrFilters << tr("JPEG for SDR screens (*.jpg)") << tr("TIFF for SDR screens (*.tif)");
+    const QString filters = hdr ? hdrFilters.join(";;")
+                            : jxlAvailable() ? tr("Images (*.png *.jpg *.tif *.avif *.heic *.jxl)")
+                                             : tr("Images (*.png *.jpg *.tif *.avif *.heic)");
     QString chosen;
     QString path = QFileDialog::getSaveFileName(this, tr("Export Frame"), st.value("lastExportDir").toString() + "/frame.png", filters,
                                                 &chosen);
@@ -3701,7 +3728,8 @@ void MainWindow::exportFrame() {
         if (!path.endsWith(ext, Qt::CaseInsensitive)) path = QFileInfo(path).dir().filePath(QFileInfo(path).completeBaseName() + ext);
     }
     StillOptions o;
-    if (hdr && (chosen == hdrPng || chosen == hdrAvif || chosen == hdrHeif || chosen == hdrJpeg || chosen == gainMapAvif || chosen == gainMapHeif))
+    if (hdr && (chosen == hdrPng || chosen == hdrAvif || chosen == hdrHeif || chosen == hdrJpeg || chosen == gainMapAvif || chosen == gainMapHeif ||
+                chosen == hdrJxl))
         o.rendition = "master";
     o.gainMap = hdr && (chosen == gainMapAvif || chosen == gainMapHeif);
     std::string err;

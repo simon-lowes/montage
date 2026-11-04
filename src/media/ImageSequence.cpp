@@ -174,7 +174,7 @@ bool cinemaDng(const std::string& file, double* fps) {
 }
 
 bool isFrameFormat(const std::string& file) {
-    static const QStringList exts = {"exr", "dpx", "png", "tif", "tiff", "tga", "bmp", "cin", "sgi"};
+    static const QStringList exts = {"exr", "dpx", "png", "tif", "tiff", "tga", "bmp", "cin", "sgi", "jxl"};
     const QString ext = QFileInfo(QString::fromStdString(file)).suffix().toLower();
     // A numbered run of DNG files is a CinemaDNG clip only when its frames say so (DNG photos are numbered too).
     return exts.contains(ext) || (ext == "dng" && cinemaDng(file));

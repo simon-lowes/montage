@@ -58,6 +58,7 @@ float blendChannel(int mode, float cb, float cs) {
     if (mode == 10) return cs >= 1.0 ? 1.0 : min(1.0, cb / (1.0 - cs));
     if (mode == 11) return cs <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - cb) / cs);
     if (mode == 12) return max(0.0, cb - cs);
+    if (mode == 13) return cb + cs >= 1.0 - 1e-5 ? 1.0 : 0.0;
     return cs;
 }
 

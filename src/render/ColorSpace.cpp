@@ -1196,6 +1196,14 @@ double deltaE2000(const double a[3], const double b[3]) {
 void invertMatrix3(const double m[9], double out[9]) { invert3(m, out); }
 void multiplyMatrix3(const double a[9], const double b[9], double out[9]) { mul3(a, b, out); }
 
+bool primariesChromaticities(Primaries p, double xy[8]) {
+    if (p == Primaries::SGamut3Venice || p == Primaries::SGamut3CineVenice) return false;
+    const Chroma c = chroma(p);
+    const double v[8] = {c.rx, c.ry, c.gx, c.gy, c.bx, c.by, c.wx, c.wy};
+    std::copy(v, v + 8, xy);
+    return true;
+}
+
 void primariesToXyz(Primaries p, double m[9]) {
     // The makers' published matrices to ACES AP0 (the ACES IDTs).
     static const double sgamut3cine[9] = {0.6387886672, 0.2723514337, 0.0888598992, -0.0039159061, 1.0880732308,

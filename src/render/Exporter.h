@@ -49,6 +49,17 @@ struct ExportSettings {
     int crf = 18;
     int gop = 0;                         // keyframe interval in frames; 0 = 2 seconds
     int64_t videoBitrate = 0;            // bits/s; 0 = constant quality (crf)
+    // H.264 and H.265 at a bitrate coded in two passes: the first measures the pictures (at constant quality), the
+    // second spends the bits where they are needed.
+    bool twoPass = false;
+    // One pass of two alone (a farm's segments: each first pass measured, then the bits shared out for the second): 1 =
+    // the first, at constant quality (crf), its encoder's statistics written to `passStats`; 2 = the second, at
+    // videoBitrate, from them.
+    int pass = 0;
+    std::string passStats;
+    // H.264 (x264): the id its sequence and picture parameter sets take (0-31), so segments coded at different rates,
+    // whose parameter sets differ, can sit side by side in one file's decoder configuration.
+    int parameterSetId = 0;
     std::string preset = "medium";       // encoder speed preset
     std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq", x264 "avci100" (AVC-Intra 100)
     std::string pixFmt;                  // empty = sensible default for the codec
@@ -84,6 +95,13 @@ struct ExportSettings {
     // pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256 or htj2k32 (High-Throughput JPEG 2000, lossless); "" = FFmpeg's
     // writer, ZIP in blocks of 16 lines.
     std::string exrCompression;
+    // JPEG XL frames (videoCodec "jxl", written with libjxl): depth "8", "16", "half" or "float" ("" = 16 bits, half
+    // floats in linear light), 0 lossless or libjxl's distance (1 visually lossless), its effort (1-9), and alpha
+    // written premultiplied rather than straight.
+    std::string jxlDepth;
+    double jxlDistance = 0;
+    int jxlEffort = 3;
+    bool jxlPremultiplied = false;
     // More layers in each OpenEXR frame (a VFX pull's source layers and mattes, render/VfxPull.h), written with the
     // OpenEXR library: called with the frame's sequence time and the picture's size, adding to `layers` (the picture is
     // the first, "") and header `attributes`. False stops the export with `error`.
@@ -132,6 +150,9 @@ struct ExportSettings {
     // Smart rendering: with ProRes or DNxHR, frames that are one untouched clip of footage already in the same
     // flavour, size and rate are copied from the source, not re-encoded.
     bool smartRender = true;
+    // H.264/HEVC smart rendering: HEVC copied beside encoded parts, its parameter sets then in the video (hev1, which
+    // Apple's players refuse); off, such an export is encoded whole (render/LongGopCopy.h).
+    bool smartRenderInBandHevc = false;
     // Masters with several audio streams (Resolve 21.1's separate output tracks, broadcast and streaming deliverables):
     // the mix first (named and tagged with a language), then one stream for each of these, each hearing only its
     // tracks (empty = all) and, when given, only clips of its role ("Dialogue", "Music", "Effects", "No Role", or several
@@ -270,6 +291,11 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
                     int* smartRendered = nullptr,  // frames copied by smart rendering
                     LightLevels* light = nullptr, bool* keptUnsigned = nullptr);
 
+struct BroadcastMxfOptions;
+// A broadcast MXF delivery (`s.mxfDelivery`) of its range made from frames already rendered (segments joined into plain
+// OP1a): its checks and the options to rewrap it with. False with `error` for what the delivery refuses.
+bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, BroadcastMxfOptions& o, std::string* error = nullptr);
+
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.
 // Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444
@@ -298,6 +324,7 @@ struct StillOptions {
     std::string rendition;
     int quality = 90;
     bool gainMap = false;  // an HDR AVIF or HEIF written as an SDR base with a gain map (a JPEG always is)
+    double jxlDistance = 0;  // JPEG XL: 0 lossless, else libjxl's distance (1 visually lossless)
 };
 // What was written: its space (ColorSpace.h id), bits per channel and, for HDR, the light levels it states (the
 // sequence's measured ones for its master, else the frame's own) in nits.
@@ -311,7 +338,7 @@ struct StillResult {
 // in. False with `error` for an unknown trim target.
 bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,
                     std::string* error = nullptr);
-// Writes a single frame as PNG, JPEG, TIFF or AVIF (by extension).
+// Writes a single frame as PNG, JPEG, TIFF, AVIF, HEIF or JPEG XL (by extension).
 bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error,
                  const StillOptions& options = {}, StillResult* result = nullptr);
 

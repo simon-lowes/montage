@@ -101,6 +101,14 @@ bool readsProject(const QJsonObject& tool) {
 }
 
 constexpr qint64 kMaxRequest = 16 * 1024 * 1024;  // bytes: far beyond any tool call
+constexpr size_t kMaxWaiting = 256;                 // calls waiting their turn (more are refused until some have run)
+constexpr qint64 kMaxWaitingBytes = 256 * 1024 * 1024;
+
+// "async": true, or "true" as text.
+bool asksAsync(const QJsonObject& args) {
+    const QJsonValue v = args.value("async");
+    return v.toBool() || (v.isString() && v.toString().compare(QLatin1String("true"), Qt::CaseInsensitive) == 0);
+}
 
 }  // namespace
 
@@ -119,7 +127,10 @@ LiveLink::LiveLink(EditorState* state, QObject* parent)
         if (n.value("method").toString() != QLatin1String("notifications/progress")) return;
         const QJsonObject p = n.value("params").toObject();
         std::lock_guard l(board->m);
-        board->of[p.value("progressToken").toString()] = {p.value("progress").toDouble(), p.value("message").toString()};
+        // (only background calls' own tokens, entered as they are queued: another caller's token, a number or a
+        // string, is not kept)
+        if (const auto it = board->of.find(p.value("progressToken").toString()); it != board->of.end() && p.value("progressToken").isString())
+            it->second = {p.value("progress").toDouble(), p.value("message").toString()};
     });
     // The connection file names the open project.
     connect(state_, &EditorState::fileStateChanged, this, [this] {
@@ -209,7 +220,7 @@ void LiveLink::onConnection() {
     }
 }
 
-void LiveLink::respond(QTcpSocket* socket, int status, const QByteArray& body) {
+void LiveLink::respond(QTcpSocket* socket, int status, const QByteArray& body, const QByteArray& session) {
     static const std::map<int, const char*> reasons = {{200, "OK"}, {202, "Accepted"}, {400, "Bad Request"}, {401, "Unauthorized"},
                                                       {403, "Forbidden"}, {404, "Not Found"}, {405, "Method Not Allowed"},
                                                       {413, "Payload Too Large"}};
@@ -217,6 +228,7 @@ void LiveLink::respond(QTcpSocket* socket, int status, const QByteArray& body) {
     if (!body.isEmpty()) head += "Content-Type: application/json\r\n";
     if (status == 401) head += "WWW-Authenticate: Bearer\r\n";
     if (status == 405) head += "Allow: POST\r\n";
+    if (!session.isEmpty()) head += "Mcp-Session-Id: " + session + "\r\n";
     head += "Content-Length: " + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n";
     socket->write(head + body);
     socket->disconnectFromHost();
@@ -256,14 +268,23 @@ void LiveLink::onReadable(QTcpSocket* socket) {
     if (buf.size() - headerEnd - 4 < length) return;  // the rest of the body is on its way
     const QByteArray body = buf.mid(headerEnd + 4, length);
     buf.clear();
+    // Each agent its own session (given with its initialize, sent back with its calls), so a cancellation reaches only
+    // its own calls, whatever ids another agent uses.
+    QByteArray session = headers.count("mcp-session-id") ? headers["mcp-session-id"] : QByteArray();
+    QByteArray given;
+    if (session.isEmpty() && QJsonDocument::fromJson(body).object().value("method").toString() == QLatin1String("initialize")) {
+        QByteArray key(16, Qt::Uninitialized);
+        for (char& c : key) c = char(QRandomGenerator::system()->bounded(256));
+        session = given = key.toHex();
+    }
     QPointer<QTcpSocket> alive(socket);
     handle(
         body,
-        [this, alive](QByteArray answer) {
+        [this, alive, given](QByteArray answer) {
             if (!alive) return;
-            respond(alive, answer.isEmpty() ? 202 : 200, answer);
+            respond(alive, answer.isEmpty() ? 202 : 200, answer, given);
         },
-        true);
+        true, QStringLiteral("http:") + QString::fromLatin1(session));
 }
 
 // ---- MCP --------------------------------------------------------------------------------------------------------
@@ -381,12 +402,12 @@ QJsonObject LiveLink::contextResult(const QJsonObject& args, bool& isError) {
     return toolResult(text, info, false);
 }
 
-void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external) {
-    dispatch(message, std::move(done), external, {}, {});
+void LiveLink::handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& caller) {
+    dispatch(message, std::move(done), external, {}, {}, caller.isEmpty() ? (external ? QStringLiteral("http:") : QStringLiteral("app")) : caller);
 }
 
 void LiveLink::handleScript(const QByteArray& message, std::function<void(QByteArray)> done, const QString& label, const QString& group) {
-    dispatch(message, std::move(done), false, label, group);
+    dispatch(message, std::move(done), false, label, group, QStringLiteral("script:") + group);
 }
 
 void LiveLink::cancelScript(const QString& group) {
@@ -406,7 +427,7 @@ void LiveLink::cancelScript(const QString& group) {
 }
 
 void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label,
-                        const QString& group) {
+                        const QString& group, const QString& caller) {
     const QJsonObject msg = QJsonDocument::fromJson(message).object();
     const QString method = msg.value("method").toString();
     if (method == "tools/list") {
@@ -414,8 +435,9 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         return done(QJsonDocument::fromJson(answer).object().contains("result") ? patchedToolList(answer) : answer);
     }
     if (method == "notifications/cancelled") {
-        // The running call's work stops (its server knows it by the same id); one still waiting is cancelled as it starts.
-        worker_->cancel(msg.value("params").toObject().value("requestId"));
+        // This caller's call by that id: one waiting is taken out (answered as cancelled), one running stops where it
+        // can. Another caller's call under the same id is left alone, and an id not asked for is forgotten.
+        cancelCall(caller, msg.value("params").toObject().value("requestId"));
         return done({});
     }
     if (method != "tools/call" || !msg.contains("id")) return done(lastLine(protocol_->handle(message.toStdString())));
@@ -435,7 +457,15 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         done(compact(reply));
     };
     // Tools answered here at once: asked for in the background, a job that has already finished.
-    const bool async = name != "montage_job" && args.value("async").toBool();
+    const bool async = name != "montage_job" && asksAsync(args);
+    // Too many calls waiting (or too much asked of them): refused until some have run.
+    if (name != "montage_job" && name != "montage_live_context") {
+        qint64 bytes = message.size();
+        for (const Job& j : queue_) bytes += j.size;
+        if (queue_.size() >= kMaxWaiting || bytes > kMaxWaitingBytes)
+            return done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", msg.value("id")},
+                                            {"result", toolResult(QStringLiteral("%1 calls are waiting their turn: ask again once some have run").arg(queue_.size()), {}, true)}}));
+    }
     auto give = [&](const QJsonObject& result) {
         if (!async) return answer(result);
         const QString id = QStringLiteral("job-%1").arg(++asyncMade_);
@@ -463,15 +493,44 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
                                    .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder()),
                                {}, true));
     if (name == "montage_undo" && targetsOpenProject(args)) {
-        // Only an agent's own change (a script's own run): the editor's are theirs to undo.
-        const QString last = state_->undoText();
-        // (A script's: this run's own step, not an earlier run of the same script.)
-        if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label && state_->lastMergeKey() == group))
-            return give(toolResult(state_->canUndo() ? QStringLiteral("The last change (%1) was the editor's; it is left alone").arg(last)
-                                                     : QStringLiteral("Nothing to undo"),
-                                   {}, true));
-        state_->undo();
-        return give(toolResult(QStringLiteral("Undid %1").arg(last), {}, false));
+        auto undo = [this, label, group] {
+            // Only an agent's own change (a script's own run): the editor's are theirs to undo.
+            const QString last = state_->undoText();
+            // (A script's: this run's own step, not an earlier run of the same script.)
+            if (!state_->canUndo() || !(label.isEmpty() ? last.startsWith(QStringLiteral("Assistant: ")) : last == label && state_->lastMergeKey() == group))
+                return toolResult(state_->canUndo() ? QStringLiteral("The last change (%1) was the editor's; it is left alone").arg(last)
+                                                    : QStringLiteral("Nothing to undo"),
+                                  {}, true);
+            state_->undo();
+            return toolResult(QStringLiteral("Undid %1").arg(last), {}, false);
+        };
+        if (!busy_ && queue_.empty()) return give(undo());
+        // Calls asked for before it (background ones too) run first: it undoes the last of them, not a step before.
+        Job j;
+        j.message = msg;
+        j.external = external;
+        j.label = label, j.group = group, j.caller = caller;
+        j.generation = state_->projectGeneration();
+        j.size = message.size();
+        if (async) {
+            const QString id = QStringLiteral("job-%1").arg(++asyncMade_);
+            asyncJobs_[id].tool = name;
+            j.async = id;
+            j.done = [this, id](QByteArray reply) { settleJob(id, reply); };  // (when a stopped script drops it)
+            j.local = [this, id, undo] {
+                AsyncJob& a = asyncJobs_[id];
+                if (a.cancel) return void(a.status = QStringLiteral("cancelled"));
+                a.result = undo();
+                a.status = a.result.value("isError").toBool() ? QStringLiteral("failed") : QStringLiteral("done");
+            };
+            answer(toolResult(QStringLiteral("%1 runs in the background as %2: montage_job reads its progress and result").arg(name, id),
+                              QJsonObject{{"job", id}, {"tool", name}, {"status", "queued"}}, false));
+        } else {
+            j.done = done;  // (answered as not run when the project closes, a cancel or a stopped script drops it)
+            j.local = [undo, answer] { answer(undo()); };
+        }
+        queue_.push_back(std::move(j));
+        return pump();
     }
     if (async) {
         // In the background: queued as any call (under the job's id, its progress reported under it), answered now.
@@ -485,13 +544,49 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         m["params"] = p;
         m["id"] = id;
         asyncJobs_[id].tool = name;
-        queue_.push_back({m, [this, id](QByteArray reply) { settleJob(id, reply); }, external, label, group, id, state_->projectGeneration()});
+        {
+            std::lock_guard l(progress_->m);
+            progress_->of[id] = {0.0, QString()};  // (its progress kept from here)
+        }
+        Job j{m, [this, id](QByteArray reply) { settleJob(id, reply); }, external, label, group, id, state_->projectGeneration()};
+        j.caller = caller, j.size = message.size();
+        queue_.push_back(std::move(j));
+        pruneJobs();
         answer(toolResult(QStringLiteral("%1 runs in the background as %2: montage_job reads its progress and result").arg(name, id),
                           QJsonObject{{"job", id}, {"tool", name}, {"status", "queued"}}, false));
         return pump();
     }
-    queue_.push_back({msg, std::move(done), external, label, group, {}, state_->projectGeneration()});
+    Job j{msg, std::move(done), external, label, group, {}, state_->projectGeneration()};
+    j.caller = caller, j.size = message.size();
+    queue_.push_back(std::move(j));
     pump();
+}
+
+void LiveLink::cancelCall(const QString& caller, const QJsonValue& id) {
+    for (auto it = queue_.begin(); it != queue_.end(); ++it)
+        if (it->caller == caller && it->async.isEmpty() && it->message.value("id") == id) {
+            Job j = std::move(*it);
+            queue_.erase(it);
+            j.done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"error", QJsonObject{{"code", -32800}, {"message", "Cancelled before it ran"}}}}));
+            return;
+        }
+    if (busy_ && runningCaller_ == caller && runningAsync_.isEmpty() && runningOriginalId_ == id && !runningId_.isUndefined()) worker_->cancel(runningId_);
+}
+
+void LiveLink::pruneJobs() {
+    // Finished background calls: the newest 200 whose result was read kept, and up to 10,000 not read yet.
+    std::vector<QString> read, unread;
+    for (const auto& [id, j] : asyncJobs_)
+        if (j.status != QLatin1String("queued") && j.status != QLatin1String("running")) (j.read ? read : unread).push_back(id);
+    if (read.size() <= 200 && unread.size() <= 10000) return;
+    const auto byAge = [](const QString& a, const QString& b) { return a.mid(4).toInt() < b.mid(4).toInt(); };
+    std::sort(read.begin(), read.end(), byAge);
+    std::sort(unread.begin(), unread.end(), byAge);
+    std::vector<QString> gone;
+    for (size_t i = 0; i + 200 < read.size(); ++i) gone.push_back(read[i]);
+    for (size_t i = 0; i + 10000 < unread.size(); ++i) gone.push_back(unread[i]);
+    std::lock_guard l(progress_->m);
+    for (const QString& id : gone) asyncJobs_.erase(id), progress_->of.erase(id);
 }
 
 void LiveLink::pump() {
@@ -499,6 +594,15 @@ void LiveLink::pump() {
     busy_ = true;
     Job job = std::move(queue_.front());
     queue_.pop_front();
+    if (job.local) {
+        // Answered here in its turn (montage_undo asked for behind other calls).
+        if (job.generation == state_->projectGeneration()) job.local();
+        else if (!job.async.isEmpty()) asyncJobs_[job.async].status = QStringLiteral("cancelled");
+        else job.done(compact(QJsonObject{{"jsonrpc", "2.0"}, {"id", job.message.value("id")},
+                                          {"result", toolResult(QStringLiteral("The project it was asked of was closed before it ran"), {}, true)}}));
+        busy_ = false;
+        return pump();
+    }
     QJsonObject msg = job.message;
     QJsonObject params = msg.value("params").toObject();
     const QString tool = params.value("name").toString();
@@ -542,6 +646,11 @@ void LiveLink::pump() {
     runningExternal_ = job.external;
     runningGroup_ = job.group;
     runningAsync_ = job.async;
+    runningCaller_ = job.caller;
+    runningOriginalId_ = msg.value("id");
+    // The worker's own id for it, unique across callers (two clients may both use id 1); a background call's is its
+    // job id already. The answer goes back under the caller's id.
+    if (job.async.isEmpty()) msg["id"] = QStringLiteral("live-%1").arg(++callsMade_);
     runningId_ = msg.value("id");
     if (!job.async.isEmpty()) {
         AsyncJob& a = asyncJobs_[job.async];
@@ -550,8 +659,15 @@ void LiveLink::pump() {
     }
     const std::string line = compact(msg).toStdString();
     connect(watcher, &QFutureWatcher<std::string>::finished, this, [this, watcher, job, tool, live, before, snapshot, path, cancel] {
-        const std::string answer = watcher->result();
+        std::string answer = watcher->result();
         watcher->deleteLater();
+        if (job.async.isEmpty() && !answer.empty()) {
+            QJsonObject reply = QJsonDocument::fromJson(QByteArray::fromStdString(answer)).object();
+            reply["id"] = job.message.value("id");
+            answer = compact(reply).toStdString();
+        }
+        runningCaller_.clear();
+        runningOriginalId_ = QJsonValue();
         cancel_.reset();
         runningAsync_.clear();
         if (*cancel) {
@@ -579,7 +695,8 @@ void LiveLink::pump() {
 QJsonObject LiveLink::jobReport(const QString& id) {
     const auto it = asyncJobs_.find(id);
     if (it == asyncJobs_.end()) return toolResult(QStringLiteral("No job %1 (montage_job with action list gives them)").arg(id), {}, true);
-    const AsyncJob& j = it->second;
+    AsyncJob& j = it->second;
+    if (j.status != QLatin1String("queued") && j.status != QLatin1String("running")) j.read = true;
     double fraction = j.status == QLatin1String("done") ? 1.0 : 0.0;
     QString step;
     {

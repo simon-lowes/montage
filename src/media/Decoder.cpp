@@ -4,6 +4,7 @@
 
 #include "FieldRecorder.h"
 #include "Exr.h"
+#include "Jxl.h"
 #include "render/DcpMxf.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
@@ -69,6 +70,33 @@ bool exrByLibrary(const std::string& file, const Interpretation&, ImageSequence*
     if (seq) *seq = s;
     ExrInfo info;
     return readExrInfo(sequence ? imageSequenceFrame(s, s.first) : file, info);
+}
+
+// JPEG XL read with libjxl rather than FFmpeg whenever it is built in: float and HDR values, alpha, the file's colour
+// and orientation, and an animation's own frame durations, as they are.
+bool jxlByLibrary(const std::string& file, ImageSequence* seq) {
+    if (!jxlAvailable()) return false;
+    ImageSequence s;
+    const bool sequence = parseImageSequencePath(file, s);
+    if (!isJxlPath(sequence ? s.pattern : file)) return false;
+    if (seq) *seq = s;
+    return true;
+}
+
+// An animation's rate: its ticks' rate over the frames' common duration, else (no common duration that is a rate) its
+// frames over its length.
+Rational jxlRate(const JxlInfo& i) {
+    uint64_t g = 0;
+    for (uint32_t d : i.durations) g = std::gcd(g, uint64_t(d));
+    if (g > 0 && i.tpsNum > 0) {
+        uint64_t num = i.tpsNum, den = uint64_t(i.tpsDen) * g;
+        const uint64_t r = std::gcd(num, den);
+        num /= r, den /= r;
+        if (num <= 1000000 && den <= 1000000 && double(num) / double(den) <= 240) return Rational{int(num), int(den)};
+    }
+    const double fps = i.seconds() > 0 ? double(i.frames()) / i.seconds() : 25.0;
+    const AVRational q = av_d2q(std::clamp(fps, 1.0, 240.0), 1001);
+    return Rational{q.num, q.den};
 }
 
 std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h);
@@ -594,6 +622,37 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // JPEG XL read with libjxl: a still, a numbered run or an animation, in its own colour.
+    if (ImageSequence seq; jxlByLibrary(file, &seq)) {
+        const bool sequence = isImageSequencePath(file);
+        JxlInfo info;
+        if (!readJxlInfo(sequence ? imageSequenceFrame(seq, seq.first) : file, info, error)) return false;
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = sequence ? imageSequenceName(seq) : file.substr(file.find_last_of("/\\") + 1);
+        const bool moving = sequence || info.animated;
+        m.kind = moving ? MediaKind::Video : MediaKind::Image;
+        m.hasVideo = true;
+        m.hasAudio = false;
+        m.width = std::max(1, int(std::lround(info.width * (in.par > 0 ? in.par : 1.0))));
+        m.height = info.height;
+        if (sequence) {
+            m.fps = seq.fps;
+            m.duration = seq.frames() / seq.fps.toDouble();
+        } else if (info.animated) {
+            m.fps = jxlRate(info);
+            m.duration = info.seconds() / in.timeScale();
+        } else {
+            m.duration = 0;
+        }
+        m.videoCodec = "jxl";
+        m.colorSpace = info.colorSpace;
+        // An HDR picture's intensity target is the most light it holds (libjxl's default for PQ, 10,000 nits, says nothing).
+        if (const ColorSpace* cs = findColorSpace(info.colorSpace); cs && cs->hdr() && info.intensityTarget > 0 && info.intensityTarget < 10000)
+            m.maxCll = info.intensityTarget;
+        out = m;
+        return true;
+    }
     // IMF immersive sound (IAB, MGA with S-ADM, ADM): each channel a speaker of its bed or one of its objects.
     if (ImmersiveTrackInfo ii; immersiveSound(file, &ii)) {
         MediaItem m = out;
@@ -970,6 +1029,9 @@ void VideoDecoder::close() {
     rawSequence_.reset();
     mlv_.reset();
     exr_.reset();
+    jxl_.reset();
+    jxlAnimation_.reset();
+    jxlFile_.clear();
     imf_.reset();
     pulldown_.reset();
     av_frame_free(&woven_);
@@ -1172,6 +1234,35 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         fps_ = sequence ? seq.fps.toDouble() : 25.0;
         duration_ = sequence ? seq.frames() / fps_ : 0;
         still_ = !sequence;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
+    // JPEG XL read with libjxl: a numbered run's frames, an animation's (read on in order), or a still.
+    if (ImageSequence seq; jxlByLibrary(uninterpretedPath(path), &seq)) {
+        const std::string file = uninterpretedPath(path);
+        const bool sequence = isImageSequencePath(file);
+        JxlInfo info;
+        if (sequence) {
+            if (!readJxlInfo(imageSequenceFrame(seq, seq.first), info, error)) return false;
+            jxl_ = std::make_unique<ImageSequence>(seq);
+        } else if (!readJxlInfo(file, info, error)) {
+            return false;
+        } else if (info.animated) {
+            auto reader = std::make_unique<JxlAnimationReader>();
+            if (!reader->open(file, error)) return false;
+            jxlAnimation_ = std::move(reader);
+        } else {
+            jxlFile_ = file;
+        }
+        rawFrame_ = -1;
+        exrRgba_.clear();
+        dispW_ = std::max(1, int(std::lround(info.width * (par_ > 0 ? par_ : 1.0))));
+        dispH_ = info.height;
+        fps_ = sequence ? seq.fps.toDouble() : info.animated ? jxlRate(info).toDouble() : 25.0;
+        duration_ = sequence ? seq.frames() / fps_ : info.animated ? info.seconds() : 0;
+        still_ = !sequence && !info.animated;
         rotation_ = 0;
         origin_ = 0;
         curPts_ = nextPts_ = -1;
@@ -1977,6 +2068,56 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             stillFrame_ = made;
         }
         curPts_ = double(n - seq.first) / fps_;
+        return stillFrame_;
+    }
+    if (jxl_ || jxlAnimation_ || !jxlFile_.empty()) {
+        // The frame shown at `t` (a run's, an animation's by its frames' durations, or the still), read once and kept
+        // while it is asked for again, its values as they are (straight alpha).
+        // (`t` and the frame's time in the clip's time; curPts_ in the file's, as position() expects)
+        int n = 0;
+        double pts = 0;
+        if (jxl_) {
+            n = jxl_->first + std::clamp(int(std::floor(std::max(0.0, t) * timeScale_ * fps_ + 1e-6)), 0, jxl_->frames() - 1);
+            pts = double(n - jxl_->first) / fps_;
+        } else if (jxlAnimation_) {
+            n = jxlAnimation_->info().frameAt(std::max(0.0, t) * timeScale_);
+            pts = jxlAnimation_->info().frameStart(n);
+        }
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_ || exrRgba_.empty()) {
+            std::string err;
+            bool premultiplied = false;
+            exrRgba_.clear();
+            bool ok = false;
+            if (jxlAnimation_) {
+                premultiplied = jxlAnimation_->info().alphaPremultiplied;
+                ok = jxlAnimation_->frame(n, exrW_, exrH_, exrRgba_, &err);
+            } else {
+                ok = readJxlFrame(jxl_ ? imageSequenceFrame(*jxl_, n) : jxlFile_, 0, exrW_, exrH_, exrRgba_, &premultiplied, &err);
+            }
+            if (!ok || exrRgba_.size() != size_t(exrW_) * size_t(exrH_) * 4) {
+                exrRgba_.clear();
+                return nullptr;
+            }
+            // Straight colour: a premultiplied file's (as it says, or as Interpret Footage says) divided by its alpha.
+            if ((alpha_.empty() && premultiplied) || alpha_ == "premultiplied")
+                parallelRows(exrH_, [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        float* q = &exrRgba_[size_t(y) * size_t(exrW_) * 4];
+                        for (int x = 0; x < exrW_; ++x, q += 4)
+                            if (q[3] > 0 && q[3] != 1) q[0] /= q[3], q[1] /= q[3], q[2] /= q[3];
+                    }
+                });
+            rawFrame_ = n;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH) {
+            auto made = halfFrame(exrRgba_.data(), exrW_, exrH_, targetW, targetH, pts / timeScale_);
+            if (alpha_ == "ignore" || alpha_ == "invert") interpretAlpha(*made, alpha_);
+            stillFrame_ = made;
+        }
+        curPts_ = pts;
         return stillFrame_;
     }
     if (rawSequence_) {

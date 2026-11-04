@@ -56,7 +56,7 @@ bool readLiveConnection(LiveConnection& out, QString* error) {
     return true;
 }
 
-bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteArray& response, QString* error) {
+bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteArray& response, QString* error, QByteArray* session) {
     auto fail = [&](const QString& why) {
         if (error) *error = why;
         return false;
@@ -67,7 +67,7 @@ bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteAr
     if (!socket.waitForConnected(10000)) return fail(QStringLiteral("Cannot reach Montage at %1: %2").arg(c.url(), socket.errorString()));
     QByteArray request = "POST /mcp HTTP/1.1\r\nHost: " + c.host.toUtf8() + ':' + QByteArray::number(c.port) +
                          "\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAuthorization: Bearer " +
-                         c.token.toUtf8() + "\r\nContent-Length: " + QByteArray::number(message.size()) + "\r\nConnection: close\r\n\r\n" + message;
+                         c.token.toUtf8() + (session && !session->isEmpty() ? "\r\nMcp-Session-Id: " + *session : QByteArray()) + "\r\nContent-Length: " + QByteArray::number(message.size()) + "\r\nConnection: close\r\n\r\n" + message;
     socket.write(request);
     if (!socket.waitForBytesWritten(10000)) return fail(socket.errorString());
     // The answer comes when the tool has finished, which can take minutes (transcription, renders).
@@ -85,6 +85,7 @@ bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteAr
                 for (const QByteArray& l : lines) {
                     const int colon = int(l.indexOf(':'));
                     if (colon > 0 && l.left(colon).trimmed().toLower() == "content-length") length = l.mid(colon + 1).trimmed().toLongLong();
+                    if (colon > 0 && session && l.left(colon).trimmed().toLower() == "mcp-session-id") *session = l.mid(colon + 1).trimmed();
                 }
             }
         }
@@ -109,13 +110,14 @@ bool postLiveMessage(const LiveConnection& c, const QByteArray& message, QByteAr
 
 int runLiveBridge(std::istream& in, std::ostream& out) {
     std::string line;
+    QByteArray session;  // (this bridge's, as Montage gave it)
     while (std::getline(in, line)) {
         if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
         const QByteArray message = QByteArray::fromStdString(line);
         LiveConnection c;
         QString err;
         QByteArray response;
-        const bool sent = readLiveConnection(c, &err) && postLiveMessage(c, message, response, &err);
+        const bool sent = readLiveConnection(c, &err) && postLiveMessage(c, message, response, &err, &session);
         if (sent) {
             if (!response.trimmed().isEmpty()) out << QJsonDocument::fromJson(response).toJson(QJsonDocument::Compact).toStdString() << '\n';
         } else {

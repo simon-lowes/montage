@@ -292,7 +292,9 @@ struct ShadowMap {
 
 V3 basisUp(const V3& f) { return std::fabs(f[1]) < 0.99 ? V3{0, 1, 0} : V3{1, 0, 0}; }
 
-ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& centre, double radius, int size, bool serial) {
+// `own`: the scene's own triangles cast too. `forGround`: only the casters whose shadows fall on the ground.
+ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& centre, double radius, int size, bool serial, bool own = true,
+                      bool forGround = false) {
     ShadowMap m;
     m.size = size;
     m.forward = unit(light.direction);
@@ -315,9 +317,11 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
         const ModelTexture* coverage;
         int material;  // the triangles the coverage is on (-1: all)
     };
-    std::vector<Source> sources{{&s.triangles, s.picture && !s.picture->levels.empty() ? s.picture.get() : nullptr, s.pictureMaterial}};
+    std::vector<Source> sources;
+    if (own) sources.push_back({&s.triangles, s.picture && !s.picture->levels.empty() ? s.picture.get() : nullptr, s.pictureMaterial});
     for (const ModelShadowCaster& c : s.casters)
-        sources.push_back({&c.triangles, c.coverage && !c.coverage->levels.empty() ? c.coverage.get() : nullptr, -1});
+        if (!forGround || c.onGround)
+            sources.push_back({&c.triangles, c.coverage && !c.coverage->levels.empty() ? c.coverage.get() : nullptr, -1});
     for (const Source& src : sources) {
     const PosedTriangles& t = *src.t;
     struct P {
@@ -486,22 +490,55 @@ ProjectorDepth buildProjectorDepth(const PosedTriangles& T, const ModelProjectio
     d.z.assign(size_t(d.w) * size_t(d.h), std::numeric_limits<float>::infinity());
     struct Pt {
         double u, v, z;
-        bool ok;
     };
-    std::vector<Pt> pts(T.positions.size() / 3);
-    for (size_t i = 0; i < pts.size(); ++i) {
-        Pt& q = pts[i];
+    const ModelCamera& cam = pr.camera;
+    const double nearZ = std::max(cam.nearZ, 1e-9) * 2;
+    auto depthOf = [&](const V3& X) {
+        const V3 q = X - V3{cam.C[0], cam.C[1], cam.C[2]};
+        return cam.R[6] * q[0] + cam.R[7] * q[1] + cam.R[8] * q[2];
+    };
+    auto toPt = [&](const V3& X, Pt& p) {
         double px = 0, py = 0;
-        q.ok = pr.camera.project({T.positions[i * 3], T.positions[i * 3 + 1], T.positions[i * 3 + 2]}, px, py, &q.z);
-        q.u = px * d.k, q.v = py * d.k;
+        if (!cam.project({X[0], X[1], X[2]}, px, py, &p.z)) return false;
+        p.u = px * d.k, p.v = py * d.k;
+        return true;
+    };
+    // The screen triangles: each model triangle cut where it crosses the projector's near plane (the part in front of
+    // it kept), so a wall reaching behind the projector still hides what is beyond it.
+    std::vector<std::array<Pt, 3>> tris;
+    const size_t n = T.positions.size() / 3;
+    for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
+        if (T.indices[i] >= n || T.indices[i + 1] >= n || T.indices[i + 2] >= n) continue;
+        V3 X[3];
+        double z[3];
+        for (int k = 0; k < 3; ++k) {
+            const size_t j = T.indices[i + size_t(k)];
+            X[k] = {T.positions[j * 3], T.positions[j * 3 + 1], T.positions[j * 3 + 2]};
+            z[k] = depthOf(X[k]);
+        }
+        V3 poly[4];
+        int m = 0;
+        for (int k = 0; k < 3; ++k) {
+            const int l = (k + 1) % 3;
+            const bool in = z[k] >= nearZ, nextIn = z[l] >= nearZ;
+            if (in) poly[m++] = X[k];
+            if (in != nextIn) {
+                const double t = (nearZ - z[k]) / (z[l] - z[k]);
+                poly[m++] = X[k] + (X[l] - X[k]) * t;
+            }
+        }
+        if (m < 3) continue;
+        Pt q[4];
+        bool ok = true;
+        for (int k = 0; k < m && ok; ++k) ok = toPt(poly[k], q[k]);
+        if (!ok) continue;
+        for (int k = 1; k + 1 < m; ++k) tris.push_back({q[0], q[k], q[k + 1]});
     }
     const int bands = (d.h + 63) / 64;
     eachBand(bands, serial, [&](int b) {
         const int y0 = b * 64, y1 = std::min(d.h, y0 + 64);
-        for (size_t i = 0; i + 2 < T.indices.size(); i += 3) {
-            // (a triangle reaching behind the projector is left out: it hides nothing in its picture)
-            const Pt &a = pts[T.indices[i]], &bb = pts[T.indices[i + 1]], &c = pts[T.indices[i + 2]];
-            if (!a.ok || !bb.ok || !c.ok) continue;
+        for (const auto& tri : tris) {
+            const Pt &a = tri[0], &bb = tri[1], &c = tri[2];
             const double area = (bb.u - a.u) * (c.v - a.v) - (bb.v - a.v) * (c.u - a.u);
             if (std::fabs(area) < 1e-12) continue;
             const int ty0 = std::max(y0, pixelFloor(std::min({a.v, bb.v, c.v}))), ty1 = std::min(y1 - 1, pixelCeil(std::max({a.v, bb.v, c.v})));
@@ -534,6 +571,7 @@ double snappedTexel(double v) {
 double projectorReaches(const ModelProjection& pr, const ProjectorDepth& d, const V3& P, const V3& front, double& px, double& py) {
     double z = 0;
     if (!pr.camera.project(P, px, py, &z)) return 0;
+    if (!(px >= -1 && py >= -1 && px <= pr.width + 1 && py <= pr.height + 1)) return 0;  // (outside its picture)
     const V3 to = unit(pr.camera.C - P);
     const double facing = dot(front, to);
     if (facing <= 0) return 0;
@@ -682,7 +720,18 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
     std::vector<std::unique_ptr<ShadowMap>> shadows(s.lights.size());
     for (size_t i = 0; i < s.lights.size(); ++i)
         if (s.lights[i].shadows && s.lights[i].kind != ModelLight::Kind::Point && nt > 0)
-            shadows[i] = std::make_unique<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial));
+            shadows[i] = std::make_unique<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial, s.castsShadows));
+    // The ground's, when some casters' shadows stay off it (cards whose own grounds take them, so two grounds don't
+    // darken the same shadow twice).
+    const bool someOff = s.ground && std::any_of(s.casters.begin(), s.casters.end(), [](const ModelShadowCaster& c) { return !c.onGround; });
+    std::vector<std::unique_ptr<ShadowMap>> groundShadows;
+    if (someOff) {
+        groundShadows.resize(s.lights.size());
+        for (size_t i = 0; i < s.lights.size(); ++i)
+            if (shadows[i])
+                groundShadows[i] = std::make_unique<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial, s.castsShadows, true));
+    }
+    const auto& groundMaps = someOff ? groundShadows : shadows;
     const std::shared_ptr<const ModelEnvironment::Prepared> env =
         s.environment ? prepare(*s.environment, o.serial) : nullptr;
     const V3 eye = cam.C;
@@ -696,7 +745,9 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
         if (!projection) return 0.0f;
         if (projection->material >= 0 && !(tri < T.materials.size() && T.materials[tri] == projection->material)) return 0.0f;
         const uint32_t i0 = T.indices[size_t(tri) * 3], i1 = T.indices[size_t(tri) * 3 + 1], i2 = T.indices[size_t(tri) * 3 + 2];
-        const V3 front = unit(cross(position(i1) - position(i0), position(i2) - position(i0)));
+        V3 front = unit(cross(position(i1) - position(i0), position(i2) - position(i0)));
+        // (a two-sided face seen from behind shows its back: the picture lands on the side towards the camera)
+        if (material(tri).doubleSided && dot(front, eye - P) < 0) front = front * -1.0;
         double px = 0, py = 0;
         const double reach = projectorReaches(*projection, projectorDepth, P, front, px, py);
         if (!(reach > 0)) return 0.0f;
@@ -738,12 +789,11 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
         float paint[3] = {0, 0, 0};
         const float painted = paintAt(tri, P, paint);
         // (a picture projected as it is, over what is there)
-        // (straight colour: the paint over the surface's own share of the pixel)
+        // (straight colour: the paint over the surface, as much of the pixel as the surface covers: a hole in it stays
+        // a hole)
         auto overlay = [&] {
             if (!(painted > 0) || projection->lit) return;
-            const float a = std::clamp(rgba[3], 0.0f, 1.0f), out = painted + a * (1 - painted);
-            for (int k = 0; k < 3; ++k) rgba[k] = out > 0 ? (paint[k] * painted + rgba[k] * a * (1 - painted)) / out : 0.0f;
-            rgba[3] = out;
+            for (int k = 0; k < 3; ++k) rgba[k] = paint[k] * painted + rgba[k] * (1 - painted);
         };
         const bool pictured = pictureOn(tri);
         if (pictured) {
@@ -859,7 +909,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             const float Ef[3] = {float(E[0]), float(E[1]), float(E[2])};
             const double e = luma(Ef) * NdotL;
             all += e;
-            lit += e * (shadows[li] ? lightVisible(*shadows[li], P, NdotL) : 1);
+            lit += e * (groundMaps[li] ? lightVisible(*groundMaps[li], P, NdotL) : 1);
         }
         float amb[3];
         if (env) {

@@ -36,6 +36,7 @@ struct QualityPicture {
     std::string transfer = "bt1886", primaries = "bt709";
     double frameRate = 0;         // of the file it came from (frames a second), when known
     double time = std::numeric_limits<double>::quiet_NaN();  // when it is shown (seconds, as its file stamps it), when known
+    bool clockMayJump = false;    // its file's clock can start again part way (MPEG-TS and the like): a jump is not a gap
     bool damaged = false;         // the decoder reported an error in it (or in data lost just before it)
     std::vector<uint16_t> plane[3];
     int planeWidth(int i) const { return i == 0 || rgb ? width : (width + (1 << log2ChromaW) - 1) >> log2ChromaW; }

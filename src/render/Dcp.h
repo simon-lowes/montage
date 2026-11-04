@@ -54,6 +54,11 @@ struct DcpSettings {
     // (SMPTE ST 429-18, Application Profile 1), the main sound then in ST 429-19's 16 channels with the FSK sync signal
     // that keeps the immersive sound in step in channel 14.
     bool immersive = false;
+    // A render farm's segments (render/RenderFarm): with codeTo above codeFrom, only DCP frames [codeFrom, codeTo) are
+    // coded, as JPEG 2000 codestreams into the folder `codestreams` (codestreamFile's names, a 3D frame's right eye
+    // "-R"), and nothing else is written; with `codestreams` alone, the package is made with the pictures coded there.
+    std::string codestreams;
+    int64_t codeFrom = 0, codeTo = 0;
 };
 
 struct DcpResult {
@@ -88,6 +93,8 @@ std::string defaultDcpContainer(const Sequence& s);
 int dcpFrameRate(const Sequence& s, int requested);
 // How many sequence frames make a DCP frame at `rate`: 2 for 50 and 60 (59.94) at 25 and 30, else 1.
 int dcpFrameStep(const Sequence& s, int rate);
+// The DCP frames a package of `s` made with `settings` holds (0 when the range is empty).
+int64_t dcpPackageFrames(const Sequence& s, const DcpSettings& settings);
 // "Title_FTR_F_EN-XX_XX_51_2K_DI_20261009_MTG_SMPTE_OV": title in camel case (14 characters at most), content kind,
 // aspect, language and subtitles, territory, audio ("51-IAB" with an immersive track), resolution, studio, date,
 // facility, standard, package type (the ISDCF Digital Cinema Naming Convention; studio and facility only when given).

@@ -5,6 +5,8 @@
 #include "core/AudioDescription.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
+#include "media/Jxl.h"
+#include "render/SegmentedExport.h"
 
 #include "core/ColorGroups.h"
 #include "core/Expression.h"
@@ -23,8 +25,10 @@
 
 #include <QColorSpace>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QRandomGenerator>
 #include <QString>
 #include <algorithm>
 #include <functional>
@@ -410,6 +414,13 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
                                "exr", "none", 0, ""));
             v.push_back(preset("DPX Sequence (10-bit)", "dpx", "One numbered 10-bit DPX a frame, for film and broadcast finishing", "dpx",
                                "none", 0, ""));
+            if (jxlAvailable()) {
+                ExportPreset jxl = preset("JPEG XL Sequence (lossless)", "jxl",
+                                          "One numbered lossless JPEG XL a frame, 16-bit (half float in linear light), with transparency", "jxl",
+                                          "none", 0, "");
+                jxl.settings.alpha = true;
+                v.push_back(jxl);
+            }
         }
         v.push_back(preset("Audio - WAV 24-bit", "wav", "Uncompressed mixdown", "none", "pcm_s24le", 0, ""));
         v.push_back(preset("Audio - AAC (M4A)", "m4a", "Compressed mixdown", "none", "aac", 0, ""));
@@ -703,7 +714,7 @@ const Clip* untouchedClipAt(const Sequence& seq, FrameTime f) {
     bool grouped = false;  // (a colour group's grades run on it)
     if (found)
         for (const ColorGroup* g : colorGroupsOf(seq, *found)) grouped = grouped || !g->pre.empty() || !g->post.empty();
-    if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped ||
+    if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || grouped || !found->composite.empty() ||
         found->blendMode != "normal" || found->speed != 1.0 ||
         found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
         return nullptr;
@@ -873,8 +884,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool interlacedOut = s.interlaced || conv.fields;
     if (s.videoCodec == "gif") return exportGif(p, seq, s, in, out, progress, cancel, error, opened);
     // Image sequences: numbered files, no sound.
-    const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
-    const bool floatFrames = s.videoCodec == "exr";  // written straight from the float picture, not through 16 bits
+    const bool imageSequence = exportIsImageSequence(s);
+    const bool floatFrames = s.videoCodec == "exr";
+    // JPEG XL frames written with libjxl (media/Jxl.h), in the delivery's own encoding, float and alpha kept.
+    const bool jxlFrames = s.videoCodec == "jxl";
+    if (jxlFrames && wantVideo && !jxlAvailable()) return fail("This build of Montage writes no JPEG XL (libjxl)");
+    if (jxlFrames && !s.jxlDepth.empty() && s.jxlDepth != "8" && s.jxlDepth != "16" && s.jxlDepth != "half" && s.jxlDepth != "float")
+        return fail("A JPEG XL depth is 8, 16, half or float");
+    if (jxlFrames && (s.jxlDistance < 0 || s.jxlDistance > 25)) return fail("A JPEG XL distance is 0 (lossless) to 25");
+    if (jxlFrames && s.alpha && s.jxlPremultiplied && !jxlWritesPremultiplied())
+        return fail("This libjxl (before 0.9) cannot write premultiplied alpha: write it straight");  // written straight from the float picture, not through 16 bits
     // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
     const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
@@ -923,7 +942,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const ColorSpace* chosen = trim ? &seqSpace : deliverySpaceAsked(seq, s);
     // OpenEXR holds scene-linear light: Linear Rec.709 unless a linear (or any scene-referred) space is asked for.
     // DPX can hold camera log too (a VFX pull of log footage stays log).
-    const bool logOk = s.videoCodec == "dpx";
+    // JPEG XL holds linear light (half or float), but no camera log.
+    const bool logOk = s.videoCodec == "dpx" || (jxlFrames && chosen && chosen->transfer == Transfer::Linear);
     const ColorSpace& outSpace = floatFrames ? (chosen ? *chosen : *findColorSpace("linear-rec709"))
                                  : chosen && (logOk || !chosen->sceneReferred) ? *chosen
                                                                                : seqSpace;
@@ -939,10 +959,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const LightMeter meter(outSpace);
     const bool measure = wantVideo && outSpace.hdr() && meter.valid();
     // HDR10+ (measured once everything is open, just before the frames, so a missing encoder fails first).
-    const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames;
+    const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames && !jxlFrames;
     std::vector<Hdr10PlusScene> hdr10;
     // Adaptive HDR metadata (ST 2094-50) likewise, for PQ and HLG.
-    const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames;
+    const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames && !jxlFrames;
     std::vector<AdaptiveHdrScene> adaptive;
     double renderFrom = 0;  // where the render's share of the progress starts
     std::string x265Params;  // (kept for smart rendering's encoded parts)
@@ -964,7 +984,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (s.alpha || interlacedOut || s.cea608) return fail("Spatial video has no alpha, fields or CEA-608 captions");
             c = "rawvideo";
         }
-        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : c;
+        if (jxlFrames) {
+            // (FFmpeg's PNG encoder stands in, opened but never given a picture: libjxl writes each file)
+            if (!jxlCanState(outSpace)) return fail("JPEG XL cannot state " + outSpace.label + ": deliver it in a display space or linear light");
+            c = "png";
+        }
+        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
         // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
         if (c == "cfhd" && H % 8 != 0)
@@ -991,7 +1016,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->thread_count = spatial ? 1 : 0;
         // Smart rendering interleaves copied packets with encoded ones, so the encoder must not hold frames back.
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
-        if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
+        // One pass of two (x264 and x265): the first at constant quality, measuring; the second at the bitrate.
+        const int pass = c == "libx264" || c == "libx265" ? s.pass : 0;
+        if (s.pass != 0 && !pass) return fail("Two passes are for H.264 and H.265 (software), not " + c);
+        if (pass == 2 && s.videoBitrate <= 0) return fail("A second pass needs a bitrate");
+        if (s.videoBitrate > 0 && pass != 1) o.vctx->bit_rate = s.videoBitrate;
+        if (pass) o.vctx->flags |= pass == 1 ? AV_CODEC_FLAG_PASS1 : AV_CODEC_FLAG_PASS2;
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         if (interlacedOut) {
             // Coded as two fields, the top first: a progressive picture's two halves (PsF), as 1080i deliveries ask.
@@ -1037,12 +1067,23 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->qmax = 28;  // the non-linear scale's largest code (a quantiser of 112)
             av_dict_set(&opts, "intra_vlc", "1", 0);
             av_dict_set(&opts, "non_linear_quant", "1", 0);
+            // (Each GOP header's timecode counts from the file's.)
+            if (!s.startTimecode.empty()) av_dict_set(&opts, "gop_timecode", s.startTimecode.c_str(), 0);
         } else if (c == "libx264" || c == "libx265") {
             if (s.cea608) av_dict_set(&opts, "a53cc", "1", 0);
-            if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
+            if (s.videoBitrate <= 0 || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
+            if (pass && c == "libx264") av_dict_set(&opts, "stats", s.passStats.c_str(), 0);
+            if (c == "libx264" && s.parameterSetId > 0)
+                av_dict_set(&opts, "x264-params", ("sps-id=" + std::to_string(std::min(s.parameterSetId, 31))).c_str(), 0);
             if (c == "libx265") {
                 std::string params = "log-level=error";
+                if (pass) {
+                    // (Quoted: the path's colons and backslashes are its own, not the list's.)
+                    std::string quoted = "'";
+                    for (const char ch : s.passStats) quoted += ch == '\'' ? std::string("'\\''") : std::string(1, ch);
+                    params += ":pass=" + std::to_string(pass) + ":stats=" + quoted + "'";
+                }
                 if (pq) {
                     // HDR10: mastering display (P3-D65 at the sequence's peak) and light levels.
                     char buf[256];
@@ -1525,6 +1566,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         lge.x265Params = x265Params;
         lge.crf = s.crf;
         lge.bitrate = s.videoBitrate;
+        lge.gop = s.gop;
+        lge.inBandHevc = s.smartRenderInBandHevc;
+        lge.startTimecode = s.startTimecode;
         lge.main = o.vctx;
         longGop = LongGopCopier::plan(p, seq, in, out, seqSpace, lge, o.oc, o.vst);
         if (longGop && !longGop->prepareStream(nullptr)) longGop.reset();
@@ -2067,7 +2111,27 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             Image img = deliveredFrame(f);
             if (issues.incomplete) return fail(cancel && cancel->load() ? std::string("Export cancelled") : issues.reason());
             if (measure) meter.add(img, f, measured);
-            if (exrLibrary) {
+            if (jxlFrames) {
+                // Through libjxl: lossless or at the distance asked, 16 bits (half floats in linear light) unless another
+                // depth is asked, alpha straight unless premultiplied is; HDR with its light levels as its intensity target.
+                if (img.width != W || img.height != H) img = resizeImage(img, W, H);
+                JxlWriteOptions jo;
+                const bool linear = outSpace.transfer == Transfer::Linear;
+                jo.bits = s.jxlDepth == "8" ? 8 : s.jxlDepth == "float" ? 32 : 16;
+                jo.halfFloat = s.jxlDepth == "half" || (s.jxlDepth.empty() && linear);
+                jo.distance = s.jxlDistance;
+                jo.effort = s.jxlEffort;
+                jo.alpha = s.alpha;
+                jo.premultiplied = s.jxlPremultiplied;
+                jo.sourcePremultiplied = true;
+                jo.colorSpace = outSpace.id;
+                if (outSpace.hdr()) jo.intensityTarget = outSpace.transfer == Transfer::Pq ? double(maxCll) : peakNits;
+                char name[4096];
+                if (av_get_frame_filename2(name, sizeof name, outPath.c_str(), s.startNumber + int(f - din), 0) < 0)
+                    return fail("The file name " + outPath + " has no frame number");
+                std::string why;
+                if (!writeJxl(name, W, H, img.px.data(), jo, &why)) return fail(why);
+            } else if (exrLibrary) {
                 // Through the OpenEXR library: the picture as half floats, premultiplied as OpenEXR files are (and as the
                 // layers copied beside it and Montage's own reader take them), then any more layers, under the file name
                 // FFmpeg's image writer would give it.
@@ -2431,7 +2495,7 @@ bool containerCarriesStreams(const std::string& path) {
 
 bool exportCarriesCredentials(const ExportSettings& s) {
     // One file of a kind that holds them (not numbered frames, nor a GIF).
-    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "gif"};
+    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "jxl", "gif"};
     return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
 }
 
@@ -2563,9 +2627,8 @@ bool broadcastMxfOptions(const Sequence& seq, const ExportSettings& s, FrameTime
     return true;
 }
 
-// A broadcast MXF delivery: rendered by FFmpeg beside the file, then rewrapped into it.
-bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered, LightLevels* light) {
+// What a broadcast MXF delivery takes: its picture, sound and (for the UK DPP) rate and size.
+bool checkBroadcastDelivery(const Sequence& seq, const ExportSettings& s, std::string* error) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -2587,6 +2650,18 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     if (s.videoCodec == "none" || s.audioCodec == "none") return fail("Broadcast MXF deliveries have picture and sound");
     if (mpeg2 && s.monoAudioTracks != 2 && s.monoAudioTracks != 4 && s.monoAudioTracks != 8)
         return fail("RDD 9 carries 2, 4 or 8 mono sound tracks");
+    return true;
+}
+
+// A broadcast MXF delivery: rendered by FFmpeg beside the file, then rewrapped into it.
+bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered, LightLevels* light) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    const std::string& d = s.mxfDelivery;
+    if (!checkBroadcastDelivery(seq, s, error)) return false;
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());
@@ -2628,9 +2703,79 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
 
 }  // namespace
 
+bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, BroadcastMxfOptions& o, std::string* error) {
+    if (!checkBroadcastDelivery(seq, s, error)) return false;
+    if (!s.rateChange.empty()) {
+        if (error) *error = "A broadcast MXF delivered at another rate is made in one go";
+        return false;
+    }
+    const FrameTime in = s.in >= 0 ? s.in : 0;
+    FrameTime out = s.out >= 0 ? s.out : seq.duration();
+    if (seq.duration() > 0) out = std::min(out, seq.duration());
+    return broadcastMxfOptions(seq, s, in, out, o, error) && checkAs11Metadata(o, error);
+}
+
+namespace {
+
+// Two passes: the picture alone coded first at constant quality beside the output, its encoder's statistics kept; then
+// the export, coded from them at its bitrate.
+bool exportInTwoPasses(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                       const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                       LightLevels* light, bool* keptUnsigned) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (s.videoCodec != "libx264" && s.videoCodec != "libx265") return fail("Two passes are for H.264 and H.265 (software)");
+    if (s.videoBitrate <= 0) return fail("Two passes need a bitrate");
+    if (!s.mxfDelivery.empty() || s.profile == "avci100") return fail("Broadcast MXF and AVC-Intra are coded in one pass");
+    const QFileInfo out(QString::fromStdString(s.path));
+    const QString tag = QString::number(QRandomGenerator::global()->generate64(), 16);
+    ExportSettings first = s;
+    first.pass = 1;
+    first.passStats = out.dir().filePath(QStringLiteral(".montage-pass-") + tag + QStringLiteral(".log")).toStdString();
+    first.path = out.dir().filePath(QStringLiteral(".montage-pass-") + tag + "." + out.suffix()).toStdString();
+    first.audioCodec = "none";
+    first.extraAudio.clear();
+    first.describedStream = false;
+    first.monoAudioTracks = 0;
+    first.loudnessReport = false;
+    first.embedCaptions = false;
+    first.extraCaptions.clear();
+    first.chapters = false;
+    first.credentialCertificate.clear();
+    first.credentialKey.clear();
+    first.smartRender = false;
+    first.hdr10Plus = first.adaptiveHdr = false;  // (measured for the second)
+    struct Remove {
+        QStringList files;
+        ~Remove() {
+            for (const QString& f : files) QFile::remove(f);
+        }
+    } remove{{QString::fromStdString(first.path), QString::fromStdString(first.passStats),
+              QString::fromStdString(first.passStats) + QStringLiteral(".mbtree"), QString::fromStdString(first.passStats) + QStringLiteral(".cutree"),
+              QString::fromStdString(first.passStats) + QStringLiteral(".temp"), QString::fromStdString(first.passStats) + QStringLiteral(".mbtree.temp")}};
+    const ExportProgress half = [&progress](double f, FrameTime t) {
+        if (progress) progress(0.5 * f, t);
+    };
+    if (!exportSequence(p, seq, first, half, cancel, error)) return false;
+    QFile::remove(QString::fromStdString(first.path));
+    ExportSettings second = s;
+    second.pass = 2;
+    second.passStats = first.passStats;
+    second.smartRender = false;
+    const ExportProgress rest = [&progress](double f, FrameTime t) {
+        if (progress) progress(0.5 + 0.5 * f, t);
+    };
+    return exportSequence(p, seq, second, rest, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
+}
+
+}  // namespace
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light, bool* keptUnsigned) {
+    if (s.twoPass && s.pass == 0) return exportInTwoPasses(p, seq, s, progress, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
     if (!s.mxfDelivery.empty()) {
         if (keptUnsigned) *keptUnsigned = false;
         if (!s.credentialCertificate.empty()) {
@@ -2826,6 +2971,9 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
         ExportSettings one = s;
         one.path = (base.parent_path() / (stem + " - " + safe + ".wav")).string();
         one.videoCodec = "none";
+        one.twoPass = false;  // (sound alone: one pass)
+        one.pass = 0;
+        one.passStats.clear();
         one.audioCodec = "pcm_s24le";
         one.loudnessTarget = 0;  // stems keep their levels, so they add back up to the mix
         one.loudnessReport = false;  // (the delivery's report is the mix's)
@@ -3111,8 +3259,10 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     const bool avif = ext == ".avif";
     const bool jpeg = ext == ".jpg" || ext == ".jpeg";
     const bool heif = ext == ".heic" || ext == ".heif" || ext == ".hif";
-    if (space->hdr() && ext != ".png" && !avif && !heif && !jpeg)
-        return fail("An HDR still is written as PNG, AVIF, HEIF or JPEG (with a gain map)");
+    const bool jxl = ext == ".jxl";
+    if (jxl && !jxlAvailable()) return fail("This build of Montage writes no JPEG XL (libjxl)");
+    if (space->hdr() && ext != ".png" && !avif && !heif && !jpeg && !jxl)
+        return fail("An HDR still is written as PNG, AVIF, HEIF, JPEG XL or JPEG (with a gain map)");
     Image img = renderProgramFrame(p, seq, t, ro);
     if (img.empty()) return fail("Nothing to render at this frame");
     StillResult res;
@@ -3159,6 +3309,17 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         if (!stated) res.maxCll = res.maxFall = 0;
     } else if (heif) {
         if (!writeHeifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error)) return false;
+    } else if (jxl) {
+        // 8 bits for SDR, 16 for HDR, in the still's own encoding; HDR with the most light it holds as its intensity
+        // target (HLG: the display's peak, which its look depends on).
+        JxlWriteOptions jo;
+        jo.bits = space->hdr() ? 16 : 8;
+        jo.distance = options.jxlDistance;
+        jo.colorSpace = space->id;
+        jo.sourcePremultiplied = true;
+        if (space->hdr()) jo.intensityTarget = space->transfer == Transfer::Pq && res.maxCll > 0 ? res.maxCll : std::clamp(peak, 100.0, 10000.0);
+        if (!writeJxl(path, img.width, img.height, img.px.data(), jo, error)) return false;
+        if (!space->hdr()) res.bits = 8;
     } else if (space->hdr()) {
         if (!writeHdrPng(img, *space, peak, res.maxCll, res.maxFall, path, error)) return false;
     } else {

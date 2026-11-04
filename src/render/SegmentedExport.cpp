@@ -12,8 +12,10 @@
 #include <memory>
 
 #include "core/Chapters.h"
+#include "core/History.h"
 #include "core/Surround.h"
 #include "media/SpatialAudio.h"
+#include "render/BroadcastMxf.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -118,36 +120,116 @@ QByteArray codingSettings(const AVCodecParameters* par) {
     return kept;
 }
 
+// H.264 segments coded at different rates (two passes) have parameter sets of their own, each segment's under its own
+// id (ExportSettings::parameterSetId): `next`'s avcC record merged into `merged` (the first segment's to begin with),
+// its level the highest. False when they cannot share one (another profile or length size, an id held differently).
+bool mergeAvcc(std::vector<uint8_t>& merged, const AVCodecParameters* next) {
+    struct Record {
+        uint8_t profile = 0, compat = 0, level = 0, lengths = 0;
+        std::vector<std::vector<uint8_t>> sps, pps;
+        std::vector<uint8_t> tail;
+    };
+    auto parse = [](const uint8_t* d, size_t n, Record& r) {
+        if (n < 7 || d[0] != 1) return false;
+        r.profile = d[1], r.compat = d[2], r.level = d[3], r.lengths = d[4] & 3;
+        size_t i = 6;
+        auto sets = [&](int count, std::vector<std::vector<uint8_t>>& out) {
+            for (int k = 0; k < count; ++k) {
+                if (i + 2 > n) return false;
+                const size_t len = size_t(d[i]) << 8 | d[i + 1];
+                i += 2;
+                if (len < 2 || i + len > n) return false;
+                out.emplace_back(d + i, d + i + len);
+                i += len;
+            }
+            return true;
+        };
+        if (!sets(d[5] & 31, r.sps) || i >= n) return false;
+        const int ppsCount = d[i++];
+        if (!sets(ppsCount, r.pps)) return false;
+        r.tail.assign(d + i, d + n);
+        return true;
+    };
+    // A parameter set's id: the first Exp-Golomb number after `skip` bytes (the NAL header, and an SPS's profile,
+    // constraint flags and level; never two zero bytes in a row, so no emulation prevention comes before it).
+    auto id = [](const std::vector<uint8_t>& nal, size_t skip) {
+        size_t bit = skip * 8;
+        auto at = [&](size_t b) { return b / 8 < nal.size() ? (nal[b / 8] >> (7 - b % 8)) & 1 : 1; };
+        int zeros = 0;
+        while (!at(bit) && zeros < 32) ++zeros, ++bit;
+        ++bit;
+        int value = 0;
+        for (int k = 0; k < zeros; ++k) value = value << 1 | at(bit++);
+        return (1 << zeros) - 1 + value;
+    };
+    if (!next->extradata) return false;
+    Record a, b;
+    if (!parse(merged.data(), merged.size(), a) || !parse(next->extradata, size_t(next->extradata_size), b)) return false;
+    if (a.profile != b.profile || a.lengths != b.lengths || a.tail != b.tail) return false;
+    auto add = [&](std::vector<std::vector<uint8_t>>& have, const std::vector<std::vector<uint8_t>>& adding, size_t skip) {
+        for (const auto& s : adding) {
+            bool known = false;
+            for (const auto& h : have) {
+                if (id(h, skip) != id(s, skip)) continue;
+                if (h != s) return false;
+                known = true;
+            }
+            if (!known) have.push_back(s);
+        }
+        return true;
+    };
+    if (!add(a.sps, b.sps, 4) || !add(a.pps, b.pps, 1) || a.sps.size() > 31) return false;
+    a.compat &= b.compat;
+    a.level = std::max(a.level, b.level);
+    std::vector<uint8_t> o{1, a.profile, a.compat, a.level, uint8_t(0xfc | a.lengths), uint8_t(0xe0 | a.sps.size())};
+    auto put = [&](const std::vector<std::vector<uint8_t>>& sets) {
+        for (const auto& s : sets) {
+            o.push_back(uint8_t(s.size() >> 8)), o.push_back(uint8_t(s.size()));
+            o.insert(o.end(), s.begin(), s.end());
+        }
+    };
+    put(a.sps);
+    o.push_back(uint8_t(a.pps.size()));
+    put(a.pps);
+    o.insert(o.end(), a.tail.begin(), a.tail.end());
+    merged = std::move(o);
+    return true;
+}
+
 }  // namespace
 
 bool exportIsImageSequence(const ExportSettings& s) {
-    return s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
+    return s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx" || s.videoCodec == "jxl";
 }
 
 bool exportSegmentsLongGop(const ExportSettings& s) {
-    return (s.videoCodec == "libx264" || s.videoCodec == "libx265" || s.videoCodec == "libsvtav1") && s.gop != 1;
+    return (s.videoCodec == "libx264" || s.videoCodec == "libx265" || s.videoCodec == "libsvtav1" || s.videoCodec == "mpeg2video" ||
+            s.videoCodec == "hw_h264" || s.videoCodec == "hw_hevc") &&
+           s.gop != 1;
 }
 
 bool exportSplits(const ExportSettings& s, std::string* why) {
     static const char* const intra[] = {"prores_ks", "dnxhd", "ffv1", "cfhd", "v210", "mjpeg"};
-    static const char* const longGop[] = {"libx264", "libx265", "libsvtav1"};
+    static const char* const longGop[] = {"libx264", "libx265", "libsvtav1", "mpeg2video", "hw_h264", "hw_hevc"};
     const bool image = exportIsImageSequence(s);
     const bool known = image || std::find_if(std::begin(intra), std::end(intra), [&](const char* c) { return s.videoCodec == c; }) != std::end(intra) ||
                        std::find_if(std::begin(longGop), std::end(longGop), [&](const char* c) { return s.videoCodec == c; }) != std::end(longGop);
     if (s.videoCodec == "none" || s.videoCodec.empty()) return fail(why, "an export without video is made in one go");
-    if (s.videoCodec == "hw_h264" || s.videoCodec == "hw_hevc")
-        return fail(why, "each computer's hardware encoder codes differently: choose H.264 or H.265 (software)");
     if (!known) return fail(why, s.videoCodec + " is not joined segment by segment (ProRes, DNxHR, FFV1, CineForm, uncompressed, Motion JPEG, "
-                                                "H.264, H.265, AV1 and image sequences are)");
-    if (!image) {
-        const std::string ext = extensionOf(s.path);
-        if (ext != "mov" && ext != "mp4" && ext != "m4v" && ext != "mkv") return fail(why, "segments are joined into MOV, MP4 or MKV files");
-    }
-    if (!s.format.empty()) return fail(why, "segments are joined into MOV, MP4 or MKV files");
+                                                "H.264, H.265 (software or hardware), AV1, MPEG-2 and image sequences are)");
+    const std::string ext = image ? std::string() : extensionOf(s.path);
+    const bool mxf = ext == "mxf", ts = ext == "ts" || ext == "m2ts";
+    if (!image && ext != "mov" && ext != "mp4" && ext != "m4v" && ext != "mkv" && !mxf && !ts)
+        return fail(why, "segments are joined into MOV, MP4, MKV, MXF or MPEG-TS files");
+    if (!s.format.empty()) return fail(why, "segments are joined into files of the kind their name says (MOV, MP4, MKV, MXF or MPEG-TS)");
     // (Matroska moves a sound-only file's timestamps to start at 0, losing the encoder's delay the picture keeps.)
-    if (!image && extensionOf(s.path) == "mkv" && !s.audioCodec.empty() && s.audioCodec != "none")
+    if (ext == "mkv" && !s.audioCodec.empty() && s.audioCodec != "none")
         return fail(why, "segments with sound are joined into MOV or MP4 files (MKV without sound)");
-    if (!s.mxfDelivery.empty()) return fail(why, "broadcast MXF is made in one go");
+    if (!s.mxfDelivery.empty() && !mxf) return fail(why, "broadcast MXF deliveries are .mxf files");
+    if ((mxf || ts) && s.embedCaptions) return fail(why, "captions inside MXF or MPEG-TS are made in one go");
+    // (x265 picks each segment's level by its share of the bits, and segments at different levels cannot be joined.)
+    if (s.twoPass && (s.videoCodec != "libx264" || s.videoBitrate <= 0))
+        return fail(why, "two passes across segments are for H.264 (software) at a bitrate; H.265 takes two passes in one go");
     if (s.stereo == "mv") return fail(why, "spatial video is made in one go");
     if (!s.rateChange.empty()) return fail(why, "a frame rate conversion is made in one go");
     if (s.hdr10Plus || s.adaptiveHdr) return fail(why, "dynamic HDR metadata is measured over the whole range in one go");
@@ -190,7 +272,7 @@ std::vector<ExportSegment> planExportSegments(const Sequence& seq, const ExportS
     return parts;
 }
 
-ExportSettings segmentExportSettings(const ExportSettings& s, const ExportSegment& segment, const std::string& path) {
+ExportSettings segmentExportSettings(const ExportSettings& s, const ExportSegment& segment, const std::string& path, Rational fps) {
     ExportSettings x = s;
     x.in = segment.in;
     x.out = segment.out;
@@ -205,12 +287,52 @@ ExportSettings segmentExportSettings(const ExportSettings& s, const ExportSegmen
     x.extraCaptions.clear();
     x.chapters = false;
     x.startTimecode.clear();
+    // MPEG-2 states a timecode in every GOP's header: a segment's counts on from where it falls in the whole.
+    if (s.videoCodec == "mpeg2video" && fps.num > 0) {
+        FrameTime start = 0;
+        const bool drop = s.startTimecode.find(';') != std::string::npos;
+        if (!s.startTimecode.empty() && !parseTimecode(s.startTimecode, fps, start)) start = 0;
+        x.startTimecode = formatTimecode(start + segment.in - rangeIn(s), fps, drop);
+    }
+    // A broadcast MXF delivery's segments are plain MXF, rewrapped once joined (as, interlaced, the whole one's render).
+    if (!s.mxfDelivery.empty()) {
+        x.mxfDelivery.clear();
+        if (s.mxfDelivery == "as11-dpp") x.interlaced = true;
+    }
     // (A segment's GOPs copied from the footage bring the footage's parameter sets, which the one decoder configuration
     // the join keeps would not hold for the others.)
     if (exportSegmentsLongGop(s)) x.smartRender = false;
     if (exportIsImageSequence(s)) x.startNumber = s.startNumber + int(segment.in - rangeIn(s));
     else x.path = path;
     return x;
+}
+
+std::vector<int64_t> twoPassBitrates(int64_t bitrate, const std::vector<ExportSegment>& parts, const std::vector<int64_t>& measured) {
+    std::vector<int64_t> rates(parts.size(), bitrate);
+    if (parts.empty() || measured.size() != parts.size()) return rates;
+    // Each segment's need a frame (what its first pass took), against the whole's; kept within 4 times either way of the
+    // average, then scaled so the frames' bits add up to the whole's budget.
+    double frames = 0, need = 0;
+    for (size_t k = 0; k < parts.size(); ++k) {
+        frames += double(parts[k].out - parts[k].in);
+        need += double(std::max<int64_t>(measured[k], 1));
+    }
+    if (frames <= 0) return rates;
+    std::vector<double> weight(parts.size());
+    double spent = 0;
+    for (size_t k = 0; k < parts.size(); ++k) {
+        const double len = std::max<double>(double(parts[k].out - parts[k].in), 1);
+        weight[k] = std::clamp((double(std::max<int64_t>(measured[k], 1)) / len) / (need / frames), 0.25, 4.0);
+        spent += weight[k] * len;
+    }
+    for (size_t k = 0; k < parts.size(); ++k) rates[k] = std::max<int64_t>(int64_t(std::llround(double(bitrate) * weight[k] * frames / spent)), 1000);
+    return rates;
+}
+
+std::string codestreamFile(const std::string& folder, int64_t frame, bool right) {
+    char name[40];
+    std::snprintf(name, sizeof name, "frame-%08lld%s.j2c", static_cast<long long>(frame), right ? "-R" : "");
+    return QDir(QString::fromStdString(folder)).filePath(QString::fromLatin1(name)).toStdString();
 }
 
 std::string segmentFileName(const ExportSettings& s, int index) {
@@ -257,6 +379,29 @@ bool checkExportSegment(const ExportSettings& segment, SegmentCheck& out, std::s
     return true;
 }
 
+bool checkCodestreams(const std::string& folder, int64_t from, int64_t to, bool stereo, SegmentCheck& out, std::string* error,
+                      const std::atomic<bool>* cancel, const std::function<void(double)>& progress) {
+    out = {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    for (int64_t k = from; k < to; ++k) {
+        for (int eye = 0; eye < (stereo ? 2 : 1); ++eye) {
+            const QString file = QString::fromStdString(codestreamFile(folder, k, eye == 1));
+            if (!QFileInfo::exists(file)) {
+                if (progress) progress(1);
+                out.sha256 = hash.result().toHex().toStdString();
+                return true;
+            }
+            if (!hashFile(file, hash, out.bytes, cancel))
+                return fail(error, cancel && cancel->load() ? std::string("Cancelled") : "Cannot read " + file.toStdString());
+        }
+        ++out.frames;
+        if (progress && (k - from) % 16 == 0) progress(double(k - from) / double(to - from));
+    }
+    out.sha256 = hash.result().toHex().toStdString();
+    if (progress) progress(1);
+    return true;
+}
+
 bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSettings& s, int stems, const std::vector<std::string>& files,
                         const std::vector<ExportSegment>& parts, const ExportProgress& progress, const std::atomic<bool>* cancel,
                         std::string* error) {
@@ -272,6 +417,25 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
     };
     if (!image) {
         if (files.size() != parts.size()) return fail(error, "A segment's file is missing");
+        // MXF holds no file of sound alone, and MPEG-TS moves a sound file's start: the sound for those is rendered into
+        // MOV (still named for the output). A broadcast MXF delivery is joined into plain OP1a beside it, then rewrapped.
+        const std::string ext = extensionOf(s.path);
+        const bool soundInMov = ext == "mxf" || ext == "ts" || ext == "m2ts";
+        const bool delivery = !s.mxfDelivery.empty();
+        BroadcastMxfOptions deliver;
+        if (delivery) {
+            ExportSettings whole = s;
+            whole.in = in;
+            whole.out = out;
+            if (!broadcastMxfJoinOptions(seq, whole, deliver, error)) return false;
+        }
+        const std::string target = delivery ? s.path + ".render.mxf" : s.path;
+        struct RemoveStaged {
+            std::string path;
+            ~RemoveStaged() {
+                if (!path.empty()) QFile::remove(QString::fromStdString(path));
+            }
+        } removeStaged{delivery ? target : std::string()};
         // The sound (and embedded captions, the reports beside it) for the whole range, in the output's own kind of
         // file: rendered where the output goes (so what goes beside it is named for it), then put aside for the join.
         std::string soundPath;
@@ -290,6 +454,11 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
             a.chapters = false;       // (the join's)
             a.startTimecode.clear();  // (stated with the video)
             a.burnIn = {};
+            a.mxfDelivery.clear();
+            a.twoPass = false;  // (the sound alone: one pass)
+            a.pass = 0;
+            a.passStats.clear();
+            if (soundInMov) a.format = "mov";
             std::string err;
             if (!exportSequence(p, seq, a, part(0, soundShare), cancel, &err)) return fail(error, "The sound: " + err);
             const QFileInfo made(QString::fromStdString(s.path));
@@ -303,16 +472,26 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
         // settings) for their video to follow on in one stream.
         std::vector<std::unique_ptr<Input>> segs;
         int maxCll = -1, maxFall = -1;
+        std::vector<uint8_t> avcc;  // (the first segment's decoder configuration, merged with the others' when H.264's differ)
+        bool mergedAvcc = false;
         for (size_t k = 0; k < files.size(); ++k) {
             auto inp = std::make_unique<Input>();
             if (!inp->open(files[k], error)) return false;
             const int v = inp->v;
             if (v < 0) return fail(error, "Segment " + std::to_string(k + 1) + " has no video");
             const AVCodecParameters* par = inp->fmt->streams[v]->codecpar;
+            if (k == 0 && par->extradata) avcc.assign(par->extradata, par->extradata + par->extradata_size);
             if (k > 0) {
                 const AVCodecParameters* first = segs[0]->fmt->streams[segs[0]->v]->codecpar;
-                const bool same = par->codec_id == first->codec_id && par->width == first->width && par->height == first->height &&
-                                  par->format == first->format && codingSettings(par) == codingSettings(first);
+                bool same = par->codec_id == first->codec_id && par->width == first->width && par->height == first->height &&
+                            par->format == first->format;
+                // (H.264 parameter sets that differ: side by side in one avcC, each under its id; in MPEG-TS each
+                // segment's go with its pictures.)
+                if (same && codingSettings(par) != codingSettings(first)) {
+                    const bool annexB = !par->extradata || par->extradata_size < 1 || par->extradata[0] != 1;
+                    same = par->codec_id == AV_CODEC_ID_H264 && (annexB ? !avcc.empty() && avcc[0] != 1 : mergeAvcc(avcc, par));
+                    mergedAvcc |= same && !annexB;
+                }
                 if (!same)
                     return fail(error, "Segment " + std::to_string(k + 1) +
                                            " was coded differently from the first (another version of the encoder?): it cannot be joined to it");
@@ -327,7 +506,7 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
         if (!soundPath.empty() && !sound.open(soundPath, error)) return false;
 
         AVFormatContext* oc = nullptr;
-        int rc = avformat_alloc_output_context2(&oc, nullptr, nullptr, s.path.c_str());
+        int rc = avformat_alloc_output_context2(&oc, nullptr, delivery ? "mxf" : nullptr, target.c_str());
         if (rc < 0 || !oc) return fail(error, "Unknown output format for " + s.path);
         struct Close {
             AVFormatContext*& oc;
@@ -343,12 +522,19 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
                 avio_closep(&oc->pb);
                 close.opened = false;
             }
-            if (written) QFile::remove(QString::fromStdString(s.path));
+            if (written) QFile::remove(QString::fromStdString(target));
             return fail(error, e);
         };
         const AVStream* firstVideo = segs[0]->fmt->streams[segs[0]->v];
         AVStream* vst = avformat_new_stream(oc, nullptr);
         if (!vst || avcodec_parameters_copy(vst->codecpar, firstVideo->codecpar) < 0) return drop("Out of memory");
+        if (mergedAvcc) {
+            av_freep(&vst->codecpar->extradata);
+            vst->codecpar->extradata = static_cast<uint8_t*>(av_mallocz(avcc.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!vst->codecpar->extradata) return drop("Out of memory");
+            std::copy(avcc.begin(), avcc.end(), vst->codecpar->extradata);
+            vst->codecpar->extradata_size = int(avcc.size());
+        }
         vst->time_base = firstVideo->time_base;
         // (MOV's demuxer keeps the pixel aspect on the stream; its muxer writes it from the parameters.)
         vst->sample_aspect_ratio = firstVideo->sample_aspect_ratio;
@@ -396,7 +582,7 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
                 }
             }
         }
-        if ((rc = avio_open(&oc->pb, s.path.c_str(), AVIO_FLAG_WRITE)) < 0) return drop("Cannot write " + s.path + ": " + averr(rc));
+        if ((rc = avio_open(&oc->pb, target.c_str(), AVIO_FLAG_WRITE)) < 0) return drop("Cannot write " + target + ": " + averr(rc));
         close.opened = written = true;
         if ((rc = avformat_write_header(oc, nullptr)) < 0) return drop("Cannot write header: " + averr(rc));
 
@@ -463,7 +649,8 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
             return false;
         };
         auto when = [](const AVPacket* pkt) { return pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts; };
-        const double videoFrom = soundShare, videoShare = 1 - stemShare - soundShare;
+        const double rewrapShare = delivery ? 0.05 * (1 - stemShare) : 0;
+        const double videoFrom = soundShare, videoShare = 1 - stemShare - soundShare - rewrapShare;
         for (;;) {
             if (cancel && cancel->load()) return drop("Cancelled");
             if (!haveV) haveV = nextVideo();
@@ -486,6 +673,15 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
         if (oc->pb->error < 0) return drop("Writing the file failed: " + averr(oc->pb->error));
         avio_closep(&oc->pb);
         close.opened = false;
+        if (delivery) {
+            std::string why;
+            const double from = 1 - stemShare - rewrapShare;
+            const bool rewrapped = rewrapBroadcastMxf(target, s.path, deliver, &why, [&](double f) {
+                if (progress) progress(from + rewrapShare * f, in + FrameTime(std::lround(f * double(out - in))));
+                return !(cancel && cancel->load());
+            });
+            if (!rewrapped) return fail(error, why);
+        }
         // An ambisonic mix: its Spatial Audio box again (the join wrote the stream without it).
         const std::string layout = s.downmixStereo || s.monoAudioTracks > 0 ? seq.audioLayout : exportAudioLayout(seq.audioLayout, s.audioCodec);
         if (wantAudio && ambisonicLayout(layout) && !s.downmixStereo) {

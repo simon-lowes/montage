@@ -61,7 +61,9 @@ public:
     // once the tool has run.
     // `external`: from an agent outside the app (the HTTP endpoint), so dropped or not applied when the link stops;
     // the Assistant panel's calls are not.
-    void handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external = false);
+    // `caller`: who asked (an HTTP client's session, the Assistant panel, a script), so a cancel names only its own
+    // calls even when two clients use the same JSON-RPC ids.
+    void handle(const QByteArray& message, std::function<void(QByteArray)> done, bool external = false, const QString& caller = {});
     // A script's call (app/ScriptConsole.h): as the Assistant's, but a change it makes is undone as `label` and joins
     // the run's other changes in one undo step (`group`: the run's merge key, set with EditorState::setUndoGroup);
     // montage_undo takes back only the run's own step.
@@ -88,17 +90,26 @@ private:
         QString label, group;   // a script's: its undo step's name and merge key ("" for the Assistant's and agents')
         QString async;          // a background call's job id (its message runs under that id)
         uint64_t generation = 0;  // the open project when it was asked for (a call on it is refused once another opens)
+        QString caller;           // who asked (for cancelling)
+        qint64 size = 0;          // the message's size (the queue is bounded)
+        std::function<void()> local;  // run on the UI thread in its turn instead of a tool (montage_undo behind queued calls)
     };
     // Background calls, by job id.
     struct AsyncJob {
         QString tool, status = QStringLiteral("queued");  // queued, running, done, failed, cancelled
         QJsonObject result;  // the tool's, when finished
         bool cancel = false;
+        bool read = false;   // its result was read once finished (read jobs are forgotten first)
     };
     std::map<QString, AsyncJob> asyncJobs_;
     int asyncMade_ = 0;
     QString runningAsync_;  // the background call running ("" for none)
     QJsonValue runningId_;  // the running call's request id, as its server knows it (for cancelling its work)
+    QJsonValue runningOriginalId_;  // the id its caller gave
+    QString runningCaller_;
+    uint64_t callsMade_ = 0;  // for the worker's own request ids, unique across callers
+    void cancelCall(const QString& caller, const QJsonValue& id);
+    void pruneJobs();
     // Progress the tools report, by the token their call carried (a job's id), from the worker's thread.
     struct ProgressBoard {
         std::mutex m;
@@ -110,7 +121,8 @@ private:
     void answerJob(const QJsonObject& args, std::function<void(const QJsonObject& result)> done);
     void cancelJob(const QString& id);
     void settleJob(const QString& id, const QByteArray& reply);
-    void dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label, const QString& group);
+    void dispatch(const QByteArray& message, std::function<void(QByteArray)> done, bool external, const QString& label, const QString& group,
+                  const QString& caller);
     QString runningGroup_;  // the script whose call is running ("" for others)
     struct ToolInfo {
         QString title;
@@ -118,7 +130,7 @@ private:
     };
     void onConnection();
     void onReadable(QTcpSocket* socket);
-    void respond(QTcpSocket* socket, int status, const QByteArray& body);
+    void respond(QTcpSocket* socket, int status, const QByteArray& body, const QByteArray& session = {});
     QByteArray patchedToolList(const QByteArray& list) const;
     QJsonObject contextResult(const QJsonObject& args, bool& isError);
     bool targetsOpenProject(const QJsonObject& args) const;

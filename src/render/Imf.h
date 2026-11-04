@@ -98,6 +98,12 @@ struct ImfSettings {
     // audio (and IAB, when asked for too).
     bool sadm = false;
     bool adm = false;
+    // A render farm's segments (render/RenderFarm, Application #2E only, not supplemental): with codeTo above codeFrom,
+    // only composition frames [codeFrom, codeTo) are coded, as JPEG 2000 codestreams into the folder `codestreams`
+    // (codestreamFile's names), and nothing else is written; with `codestreams` alone, the package is made with the
+    // pictures coded there rather than coding them again.
+    std::string codestreams;
+    int64_t codeFrom = 0, codeTo = 0;
 };
 
 struct ImfResult {
@@ -176,6 +182,10 @@ bool imfFrameRateAllowed(const Sequence& s);
 bool imfFrameRateAllowed(Rational fps, int width, int height, Rational* canonical = nullptr);
 // The picture size for `size`, or false (with the reason) when it is too large for Application #2E.
 bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error = nullptr);
+
+// The frames a master of `s` made with `settings` holds (its programme, padded at 29.97 and 59.94); 0 with `error` when
+// it cannot be made at that size and rate.
+int64_t imfCompositionFrames(const Sequence& s, const ImfSettings& settings, std::string* error = nullptr);
 
 // Writes the package into a new folder (named after the title and the date) under `parent`. `progress` (0..1) may
 // return false to stop (the half-written folder is removed).

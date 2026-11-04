@@ -90,6 +90,7 @@ private:
     QCheckBox* hdr10Plus_ = nullptr;    // HDR10+ dynamic metadata (PQ)
     QCheckBox* adaptiveHdr_ = nullptr;  // adaptive HDR metadata (PQ and HLG)
     QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
+    QComboBox* jxlQuality_ = nullptr;      // JPEG XL frames: lossless or a distance
     QCheckBox* smart_ = nullptr;
     QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
     // Broadcast MXF by the book (render/BroadcastMxf.h): the delivery, its AS-11 metadata, captions as ancillary

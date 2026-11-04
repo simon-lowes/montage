@@ -90,6 +90,7 @@ add_library(montage_engine STATIC
   media/Model3D.h media/Model3D.cpp
   media/Usd.h media/Usd.cpp media/UsdModel.cpp media/Splats.h media/Splats.cpp
   media/Exr.h media/Exr.cpp
+  media/Jxl.h media/Jxl.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
@@ -214,6 +215,9 @@ add_library(montage_engine STATIC
   control/Hid.h control/Hid.cpp
   control/SpeedEditor.h control/SpeedEditor.cpp
   control/Tangent.h control/Tangent.cpp
+  control/SerialPort.h control/SerialPort.cpp
+  control/NinePin.h control/NinePin.cpp
+  control/DeckCapture.h control/DeckCapture.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
@@ -271,6 +275,7 @@ add_library(montage_engine STATIC
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
   render/StyleFx.h render/StyleFx.cpp
+  render/PaintFx.h render/PaintFx.cpp
   render/MeshWarp.h render/MeshWarp.cpp
   render/SurfaceTrack.h render/SurfaceTrack.cpp
   render/TemporalFx.h render/TemporalFx.cpp
@@ -302,6 +307,7 @@ add_library(montage_engine STATIC
   audio/Sampler.h audio/Sampler.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
+  audio/LtcChase.h audio/LtcChase.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp
   audio/TapeRepair.h audio/TapeRepair.cpp
   audio/SpectralRepair.h audio/SpectralRepair.cpp
@@ -425,6 +431,16 @@ if(MONTAGE_WITH_LIBRAW)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
   else()
     message(STATUS "LibRaw not found: camera raw stills are not read")
+  endif()
+endif()
+if(MONTAGE_WITH_JXL)
+  pkg_check_modules(LIBJXL IMPORTED_TARGET GLOBAL libjxl>=0.7 libjxl_threads>=0.7)
+  if(LIBJXL_FOUND)
+    message(STATUS "libjxl ${LIBJXL_libjxl_VERSION}: JPEG XL read and written directly")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::LIBJXL)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_JXL)
+  else()
+    message(STATUS "libjxl not found: JPEG XL is read through FFmpeg only, and not written")
   endif()
 endif()
 if(MONTAGE_WITH_VMAF)

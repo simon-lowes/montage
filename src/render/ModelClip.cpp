@@ -775,7 +775,7 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
             if (!c.enabled || (c.isGenerator() && c.generator.type == "model3d")) continue;
             const Effect* e = nullptr;
             for (const Effect& x : c.effects)
-                if (x.enabled && x.type == "layer_3d") e = &x;
+                if (!e && x.enabled && x.type == "layer_3d") e = &x;  // (its first, as the card is drawn by)
             if (!e || std::lround(e->p("camera", 0, 3)) != 1) continue;
             if (cameraTrackOf(seq, ti, *e, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
             std::shared_ptr<const Model> plane;

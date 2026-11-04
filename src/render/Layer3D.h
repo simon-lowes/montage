@@ -49,6 +49,7 @@ Image renderLayer3D(const Image& layer, const Layer3DPlace& place, const ModelCa
 struct Layer3DCaster {
     Layer3DPlace place;
     std::shared_ptr<const ModelTexture> picture;
+    bool ownGround = false;  // lit with a ground of its own, which takes its shadow (so this card's ground does not)
 };
 
 // The card's plane in the world: a 3D Model's plane shape (the frame's shape, its picture's top left at uv 0, 0) laid

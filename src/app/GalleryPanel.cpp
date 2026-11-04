@@ -2,6 +2,7 @@
 #include "Language.h"
 
 #include <QComboBox>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -18,6 +19,7 @@
 #include "core/EditOps.h"
 #include "render/Compositor.h"
 #include "render/Gallery.h"
+#include "media/Jxl.h"
 
 namespace montage {
 
@@ -92,6 +94,20 @@ GalleryPanel::GalleryPanel(EditorState* state, QWidget* parent) : QWidget(parent
             std::string err;
             if (renameStill(folder().toStdString(), s, label.trimmed().toStdString(), &err)) refresh();
             else state_->message(QString::fromStdString(err.empty() ? "Cannot rename the still" : err), 4000);
+        });
+        menu.addAction(tr("Export Picture…"), this, [this] {
+            GalleryStill s;
+            if (!still(selectedStill(), s)) return;
+            QStringList filters{tr("PNG (*.png)"), tr("JPEG (*.jpg)"), tr("TIFF (*.tif)")};
+            if (jxlAvailable()) filters.prepend(tr("JPEG XL, lossless (*.jxl)"));
+            QString chosen;
+            QString path = QFileDialog::getSaveFileName(this, tr("Export Picture"), QString::fromStdString(s.label), filters.join(";;"), &chosen);
+            if (path.isEmpty()) return;
+            if (const qsizetype open = chosen.lastIndexOf("(*."); open >= 0 && QFileInfo(path).suffix().isEmpty())
+                path += chosen.mid(open + 2).chopped(1);
+            std::string err;
+            if (exportStillPicture(s, path.toStdString(), &err)) state_->message(tr("Saved the still to %1").arg(path), 4000);
+            else state_->message(QString::fromStdString(err), 5000);
         });
         menu.addAction(tr("Delete…"), this, [this] {
             if (QMessageBox::question(this, tr("Delete Still"), tr("Delete this still and its grade from the gallery?")) == QMessageBox::Yes)

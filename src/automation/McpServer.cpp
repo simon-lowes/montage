@@ -15,11 +15,6 @@
 #include <QJsonObject>
 #include <algorithm>
 #include <atomic>
-#ifdef __linux__
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -79,6 +74,7 @@
 #include "core/AvidBinImport.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
+#include "media/Jxl.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "media/Proxy.h"
@@ -269,6 +265,7 @@ struct ToolJob {
     QString step;        // what it is doing, as its progress says
     QJsonObject result;  // when finished: the tool's result (as tools/call gives it)
     bool read = false;   // its end reported by montage_job (finished jobs are forgotten only once read)
+    uint64_t turn = 0;   // its place among the calls (taken when asked for)
     bool finished() const { return status == QLatin1String("done") || status == QLatin1String("failed") || status == QLatin1String("cancelled"); }
 };
 
@@ -385,7 +382,17 @@ void projectionArg(const QJsonObject& a, const Sequence& s, Clip& c) {
         params["proj_frame"] = Param(double(timeArg(p.value("frame"), s, "projection.frame")));
     }
     if (p.contains("lit")) params["proj_light"] = Param(p.value("lit").toBool() ? 1.0 : 0.0);
-    if (p.contains("hide")) params["proj_hide"] = Param(p.value("hide").toBool(true) ? 1.0 : 0.0);
+    if (p.contains("hide")) {
+        if (!p.value("hide").isBool()) throw ArgError{"\"projection.hide\" is true or false"};
+        params["proj_hide"] = Param(p.value("hide").toBool() ? 1.0 : 0.0);
+    }
+}
+
+// The model's own track is not one to project from (its picture is the model).
+void checkProjectionTrack(const Clip& c, const TrackRef& t) {
+    const auto it = c.generator.params.find("proj_track");
+    if (it != c.generator.params.end() && t.kind == TrackKind::Video && std::lround(it->second.value) == t.index + 1)
+        throw ArgError{QStringLiteral("\"projection.track\" is the model's own track (V%1): project another track's picture").arg(t.index + 1)};
 }
 
 // ---- Projects on disk ---------------------------------------------------------------
@@ -721,8 +728,28 @@ struct McpServer::Impl {
     std::mutex liveMutex;          // (written from the thread reading requests and the one running calls)
     std::function<void(const std::string&)> sink;  // or given here, as they happen (from the thread the tool runs on)
 
-    // Tools run one at a time: a call waits for a job running, and jobs wait their turn.
-    std::mutex toolMutex;
+    // Tools run one at a time, in the order they were asked for (background calls and plain ones alike): each takes a
+    // turn as it arrives and runs when that turn comes.
+    std::mutex turnMutex;
+    std::condition_variable turnWake;
+    uint64_t turnsGiven = 0, turnServed = 0;
+    bool turnsStopped = false;
+    uint64_t takeTurn() {
+        std::lock_guard l(turnMutex);
+        return turnsGiven++;
+    }
+    void waitTurn(uint64_t t) {
+        std::unique_lock l(turnMutex);
+        turnWake.wait(l, [&] { return turnServed == t || turnsStopped; });
+    }
+    void endTurn() {
+        {
+            std::lock_guard l(turnMutex);
+            ++turnServed;
+        }
+        turnWake.notify_all();
+    }
+    std::mutex toolMutex;  // held while a tool runs (and while the notification sink changes)
     // The call running now (its request id) and calls cancelled before they started.
     std::mutex cancelMutex;
     QString runningRequest;
@@ -746,6 +773,11 @@ struct McpServer::Impl {
             for (auto& [id, j] : jobs) j->cancel = true;
         }
         jobsWake.notify_all();
+        {
+            std::lock_guard l(turnMutex);
+            turnsStopped = true;
+        }
+        turnWake.notify_all();
         if (jobThread.joinable()) jobThread.join();
     }
 
@@ -764,14 +796,26 @@ struct McpServer::Impl {
         }
     }
 
+    static constexpr size_t kMaxQueuedJobs = 256;
+    // Null when too many are waiting already.
     std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args) {
         auto job = std::make_shared<ToolJob>();
         job->tool = tool.name;
         job->args = args;
         std::lock_guard l(jobsMutex);
+        if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
         job->id = QStringLiteral("job-%1").arg(++jobsMade);
+        job->turn = takeTurn();
         jobs[job->id] = job;
-        // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
+        jobQueue.push_back(job);
+        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
+        jobsWake.notify_all();
+        if (jobsMade % 64 == 0) pruneJobs();
+        return job;
+    }
+    // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
+    // (jobsMutex held)
+    void pruneJobs() {
         std::vector<QString> read, unread;
         for (auto& [id, j] : jobs) {
             std::lock_guard jl(j->m);
@@ -782,18 +826,9 @@ struct McpServer::Impl {
         std::sort(unread.begin(), unread.end(), byAge);
         for (size_t i = 0; i + 200 < read.size(); ++i) jobs.erase(read[i]);
         for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
-        jobQueue.push_back(job);
-        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
-        jobsWake.notify_all();
-        return job;
     }
 
     void runJobs() {
-#ifdef __linux__
-        // Background work gives way to the caller: this thread, and the encoder and decoder threads it starts (which
-        // inherit it), run at a lower priority, so a caller polling its jobs is never held up by them.
-        setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 5);
-#endif
         for (;;) {
             std::shared_ptr<ToolJob> job;
             {
@@ -804,6 +839,15 @@ struct McpServer::Impl {
                 jobQueue.pop_front();
             }
             const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == job->tool; });
+            waitTurn(job->turn);
+            struct TurnEnd {
+                Impl* d;
+                ~TurnEnd() { d->endTurn(); }
+            } turnEnd{this};
+            {
+                std::lock_guard l(jobsMutex);
+                if (stopping) return;
+            }
             std::unique_lock running(toolMutex);
             {
                 std::lock_guard jl(job->m);
@@ -1412,8 +1456,9 @@ void McpServer::Impl::addTools() {
             auto saved = [&](const QString& what) {
                 QString why, aside;
                 if (!skipped.isEmpty()) {  // (as the app does: the file as it was kept beside it, not lost)
+                    // (beside any copy kept before, the app's or an earlier call's, not over it)
                     aside = file + QStringLiteral(".unread");
-                    QFile::remove(aside);
+                    for (int k = 2; QFile::exists(aside); ++k) aside = file + QStringLiteral(".unread-%1").arg(k);
                     if (!QFile::copy(file, aside)) return fail(QStringLiteral("cannot keep a copy of %1 (%2 mapping(s) in it could not be read)").arg(file).arg(skipped.size()));
                 }
                 if (!midimaps::save(file, map, &why)) return fail(why);
@@ -3044,6 +3089,7 @@ void McpServer::Impl::addTools() {
                 }
                 c.start = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
                 c.duration = std::max<FrameTime>(1, a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue())));
+                checkProjectionTrack(c, t);
                 const auto r = edit::overwrite(l.project, s, t, c);
                 check(r);
                 save(l);
@@ -3142,6 +3188,7 @@ void McpServer::Impl::addTools() {
             projectionArg(a, s, c);
             c.start = at;
             c.duration = std::max<FrameTime>(1, len);
+            checkProjectionTrack(c, t);
             const auto r = edit::overwrite(l.project, s, t, c);
             check(r);
             save(l);
@@ -3595,6 +3642,13 @@ void McpServer::Impl::addTools() {
         "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
         "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
         "0-100 levels the horizon from gravity). "
+        "displace_by_layer moves the clip's pixels by a map: another track's picture (source 0; track 0 is the one above, "
+        "hidden unless hide 0) or the clip's own (source 1); h_channel and v_channel (0 luma, 1 red, 2 green, 3 blue, 4 alpha, "
+        "5 off) take each pixel from h_amount and v_amount pixels right and down at 1 (so the picture moves left and up; the "
+        "other way at 0, none at mid-grey); edges 0 "
+        "wrap, 1 clamp, 2 transparent; sampling 0 bilinear, 1 bicubic; map_blur softens the map first. "
+        "painterly is oil paint (style 0: anisotropic Kuwahara with radius, sharpness and roundness) or a smear along the "
+        "picture's contours (style 1: length, posterised to levels, 0 none); detail smooths the structure the strokes follow. "
         "sky_replace finds the sky (bright, smooth, open to the top of the frame, far away when the depth model is "
         "installed) and puts the picture on another track (source 0; track 0 is the one above, hidden unless hide 0) or a "
         "gradient (source 1, colours zenith and horizon) in its place; sensitivity, lowest (the lowest the sky reaches, % "
@@ -11372,7 +11426,8 @@ void McpServer::Impl::addTools() {
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
-            "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF, AVIF or HEIF by extension)"},
+            "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF, AVIF, HEIF or JPEG XL by extension)"},
+            "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "rendition":{"type":"string","description":"An HDR sequence's frame: \"\" (default) as SDR screens show it (its SDR trim target, else tone mapped to Rec.709), \"master\" (saved as a 16-bit PNG with cICP, mDCV and cLLI, a 10-bit AVIF or HEIF, or a JPEG with a gain map over its SDR rendition), or a trim target's id"},
             "gain_map":{"type":"boolean","default":false,"description":"An HDR AVIF or HEIF as an 8-bit SDR base with a gain map to the HDR rendition (ISO 21496-1), rather than 10-bit PQ or HLG"},
             "quality":{"type":"integer","minimum":0,"maximum":100,"default":90,"description":"JPEG, AVIF and HEIF quality"},
@@ -11419,6 +11474,7 @@ void McpServer::Impl::addTools() {
                     so.rendition = rendition;
                     so.quality = std::clamp(a.value("quality").toInt(90), 0, 100);
                     so.gainMap = a.value("gain_map").toBool();
+                    so.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
                     StillResult res;
                     if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err, so, &res))
                         return fail(QString::fromStdString(err));
@@ -11430,6 +11486,35 @@ void McpServer::Impl::addTools() {
             ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)%4").arg(tc(at, s)).arg(img.width).arg(img.height).arg(saved));
             r.png = png;
             return r;
+        });
+
+    add("montage_recompress_jpeg", "Recompress a JPEG as JPEG XL",
+        "Recompress a JPEG losslessly as JPEG XL (about a fifth smaller, its coefficients kept with what rebuilds the file), or "
+        "rebuild the original JPEG byte for byte from such a JPEG XL.",
+        R"json({"type":"object","properties":{"input":{"type":"string","description":"The JPEG (or, with rebuild, the JPEG XL)"},
+            "output":{"type":"string","description":"The JPEG XL (or, with rebuild, the JPEG) to write"},
+            "rebuild":{"type":"boolean","default":false,"description":"Rebuild the JPEG from a JPEG XL made from one"},
+            "effort":{"type":"integer","minimum":1,"maximum":9,"default":7}},"required":["input","output"]})json",
+        false, [](const QJsonObject& a) {
+            if (!jxlAvailable()) return fail("This build of Montage has no JPEG XL (libjxl)");
+            const std::string in = absolute(str(a, "input")).toStdString(), out = absolute(str(a, "output")).toStdString();
+            std::string err;
+            if (a.value("rebuild").toBool()) {
+                std::vector<uint8_t> jpeg;
+                if (!jxlToJpeg(in, jpeg, &err)) return fail(QString::fromStdString(err));
+                QSaveFile f(QString::fromStdString(out));
+                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(jpeg.data()), qint64(jpeg.size())) != qint64(jpeg.size()) ||
+                    !f.commit())
+                    return fail(QStringLiteral("Cannot write %1").arg(QString::fromStdString(out)));
+                return ok(QStringLiteral("Rebuilt the JPEG (%1 bytes)").arg(jpeg.size()), QJsonObject{{"bytes", double(jpeg.size())}});
+            }
+            if (!jpegToJxl(in, out, &err, std::clamp(a.value("effort").toInt(7), 1, 9))) return fail(QString::fromStdString(err));
+            const double before = double(QFileInfo(QString::fromStdString(in)).size()), after = double(QFileInfo(QString::fromStdString(out)).size());
+            return ok(QStringLiteral("Recompressed losslessly: %1 bytes to %2 (%3% smaller)")
+                          .arg(before)
+                          .arg(after)
+                          .arg(before > 0 ? std::lround(100 * (1 - after / before)) : 0),
+                      QJsonObject{{"jpeg_bytes", before}, {"jxl_bytes", after}});
         });
 
     add("montage_list_presets", "List export presets", "The export presets montage_render accepts.",
@@ -11561,7 +11646,10 @@ void McpServer::Impl::addTools() {
             "subtitles_as":{"type":"string","enum":["subtitles","closed_captions","burn_in"],"default":"subtitles"},
             "subtitle_language":{"type":"string","description":"RFC 5646; default: the caption track's"},
             "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"},
-            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the mix's beds and objects as an IAB track (ST 429-18, Application Profile 1); the 5.1 or 7.1 then goes in 16 channels with the sync signal (ST 429-19)"}},"required":["project","folder"]})json",
+            "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the mix's beds and objects as an IAB track (ST 429-18, Application Profile 1); the 5.1 or 7.1 then goes in 16 channels with the sync signal (ST 429-19)"},
+            "farm":{"type":"string","description":"A render farm folder: send the package there instead of making it now, in `segments` (each node codes its share of the pictures, one wraps them with the sound and the rest); returns the join's job id. `folder` is where the nodes make it (each maps paths to its own)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":4,"description":"With farm: how many shares of the pictures"},
+            "dkdm_folder":{"type":"string","description":"With farm and encrypt: where the node that makes it writes the DKDM"}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -11599,6 +11687,16 @@ void McpServer::Impl::addTools() {
             int cw = 0, ch = 0;
             if (!dcpContainer(st.container, cw, ch)) throw ArgError{"container is flat, scope or full"};
             const QString folder = absolute(need(a, "folder"));
+            if (a.contains("dkdm_folder")) st.dkdms = absolute(need(a, "dkdm_folder")).toStdString();
+            if (a.contains("farm")) {
+                const int segments = a.value("segments").toInt(4);
+                if (segments < 1 || segments > 256) throw ArgError{"\"segments\" is 1 to 256"};
+                std::string id, why;
+                const std::string farm = absolute(need(a, "farm")).toStdString();
+                if (!submitFarmDcp(farm, st.title, l.project, s.id, st, folder.toStdString(), segments, &id, &why)) return fail(QString::fromStdString(why));
+                return ok(QStringLiteral("Sent the DCP to the render farm as job %1").arg(QString::fromStdString(id)),
+                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"folder", folder}});
+            }
             QDir().mkpath(folder);
             DcpResult r;
             std::string err;
@@ -11722,7 +11820,9 @@ void McpServer::Impl::addTools() {
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
             "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
             "sadm":{"type":"boolean","default":false,"description":"Immersive sound as S-ADM: the same beds and objects as a Metadata-Guided Audio track file with an S-ADM frame each edit unit (ITU-R BS.2125), an MGASADMSignalSequence (ST 2067-203)"},
-            "adm":{"type":"boolean","default":false,"description":"Immersive sound as ADM: the same beds and objects as an ADM audio track file, the sound with its axml and chna (ST 2067-204, ST 2131), an ADMAudioSequence"}},
+            "adm":{"type":"boolean","default":false,"description":"Immersive sound as ADM: the same beds and objects as an ADM audio track file, the sound with its axml and chna (ST 2067-204, ST 2131), an ADMAudioSequence"},
+            "farm":{"type":"string","description":"A render farm folder: send the package (Application #2E, not supplemental) there instead of making it now, in `segments` (each node codes its share of the pictures, one wraps them with the sound and the rest); returns the join's job id. `folder` is where the nodes make it (each maps paths to its own)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":4,"description":"With farm: how many shares of the pictures"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -11779,6 +11879,15 @@ void McpServer::Impl::addTools() {
                 st.targetFrames.push_back(FrameTime(v.toDouble()));
             }
             const QString folder = absolute(need(a, "folder"));
+            if (a.contains("farm")) {
+                const int segments = a.value("segments").toInt(4);
+                if (segments < 1 || segments > 256) throw ArgError{"\"segments\" is 1 to 256"};
+                std::string id, why;
+                const std::string farm = absolute(need(a, "farm")).toStdString();
+                if (!submitFarmImf(farm, st.title, l.project, s.id, st, folder.toStdString(), segments, &id, &why)) return fail(QString::fromStdString(why));
+                return ok(QStringLiteral("Sent the IMF package to the render farm as job %1").arg(QString::fromStdString(id)),
+                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"folder", folder}});
+            }
             QDir().mkpath(folder);
             ImfResult r;
             std::string err;
@@ -11932,6 +12041,9 @@ void McpServer::Impl::addTools() {
             "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
             "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
+            "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
+            "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
+            "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
             "streaming":{"type":"object","description":"A streaming package instead of a file: output is its folder. The sequence rendered once, encoded as a ladder of renditions whose segments start on keyframes at the same frames, packaged as CMAF for HLS (master.m3u8) and DASH (manifest.mpd), with the mix and audio_streams as languages, each caption track as WebVTT (and IMSC for DASH), chapters, and ad-break markers (montage_add_marker ad_break) as SCTE 35 cues","properties":{
                 "ladder":{"type":"array","items":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"},"bitrate":{"type":"integer","description":"bits a second"},"codec":{"type":"string","enum":["libx264","libx265","libsvtav1"]}},"required":["width","bitrate"]},"description":"The rungs (default: from the picture's size down to 360 lines)"},
@@ -11944,7 +12056,9 @@ void McpServer::Impl::addTools() {
                 "audio_codec":{"type":"string","enum":["aac","libopus","none"],"default":"aac"},
                 "audio_bitrate":{"type":"integer","default":128000},
                 "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
-            "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265 and AV1 with rate control per segment; image sequences frame by frame). The sound is rendered once, by the joining node. The job's id is the join's"}},
+            "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
+            "two_pass":{"type":"boolean","default":false,"description":"H.264 and H.265 with a bitrate: coded twice, the first pass measuring the pictures so the second spends the bits where they are needed (H.264 in segments: each segment's first pass measures and the bits are shared out across them; H.265 in two passes is made in one go)"},
+            "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265, MPEG-2 and AV1 with rate control per segment unless two_pass (H.264); hardware H.264 and H.265 by nodes with the same encoder; MOV, MP4, MKV, MXF, broadcast MXF and MPEG-TS files; image sequences frame by frame; IMF and DCP packages through montage_export_imf and montage_export_dcp with farm). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -11981,6 +12095,13 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            if (a.contains("bitrate")) {
+                st.videoBitrate = a.value("bitrate").toInteger();
+                if (st.videoBitrate < 0) throw ArgError{"\"bitrate\" is bits a second (0: by quality)"};
+            }
+            st.twoPass = a.value("two_pass").toBool();
+            if (st.twoPass && ((st.videoCodec != "libx264" && st.videoCodec != "libx265") || st.videoBitrate <= 0))
+                throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
             if (a.contains("mxf_delivery")) {
                 const std::string d = str(a, "mxf_delivery").toStdString();
@@ -12017,6 +12138,12 @@ void McpServer::Impl::addTools() {
             if (a.contains("exr_compression")) {
                 if (st.videoCodec != "exr") throw ArgError{"\"exr_compression\" is for the OpenEXR preset"};
                 st.exrCompression = str(a, "exr_compression").toStdString();
+            }
+            if (a.contains("jxl_depth") || a.contains("jxl_distance") || a.contains("jxl_premultiplied")) {
+                if (st.videoCodec != "jxl") throw ArgError{"\"jxl_depth\", \"jxl_distance\" and \"jxl_premultiplied\" are for the JPEG XL preset"};
+                st.jxlDepth = str(a, "jxl_depth").toStdString();
+                st.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
+                st.jxlPremultiplied = a.value("jxl_premultiplied").toBool();
             }
             if (a.contains("stereo_view")) {
                 StereoView v;
@@ -12209,10 +12336,11 @@ void McpServer::Impl::addTools() {
                 QJsonObject o{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}};
                 if (segments > 1) {
                     int made = 0;
-                    for (const FarmJob& j : farmJobs(farm)) made += j.group == id;
+                    for (const FarmJob& j : farmJobs(farm)) made += j.group == id && j.pass != 1;
                     o["segments"] = made;
                     text += made > 1 ? QStringLiteral(", in %1 segments").arg(made) : QStringLiteral(" whole (the range is too short to split)");
-                    if (made > 1 && exportSegmentsLongGop(st)) text += QStringLiteral("\nRate control works per segment: a bitrate is kept within each, not across the whole");
+                    if (made > 1 && st.twoPass) text += QStringLiteral("\nTwo passes: each segment's first pass measures it, and the bits are shared out by what they found");
+                    else if (made > 1 && exportSegmentsLongGop(st)) text += QStringLiteral("\nRate control works per segment: a bitrate is kept within each, not across the whole");
                 }
                 return ok(text, o);
             }
@@ -13027,6 +13155,7 @@ void McpServer::Impl::addTools() {
             "crop_top":{"type":"number"},"crop_bottom":{"type":"number"},"fit":{"type":"string","enum":["fit","fill","stretch","none"]},
             "align":{"type":"string","enum":["center","top","bottom","left","right","top_left","top_right","bottom_left","bottom_right"]},
             "inset":{"type":"number","default":0.05},
+            "blend_mode":{"type":"string","description":"How the clip mixes with what is beneath: normal, add, multiply, screen, overlay, darken, lighten, difference, soft_light, hard_light, color_dodge, color_burn, subtract or hard_mix"},
             "remove_letterbox":{"type":"boolean","default":false,"description":"Find black bars baked into the picture (letterbox, pillarbox), crop them off and scale what is left to fill the frame"}},"required":["project","clip"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -13056,6 +13185,13 @@ void McpServer::Impl::addTools() {
                 Param& prm = c.motion.params[param];
                 if (keyed) prm.addKey(lt, v, Interp::Smooth);
                 else prm.set(lt, v);
+                ++changed;
+            }
+            if (a.contains("blend_mode")) {
+                const std::string mode = str(a, "blend_mode").toStdString();
+                if (std::find(blendModes().begin(), blendModes().end(), mode) == blendModes().end())
+                    throw ArgError{QStringLiteral("Unknown blend_mode \"%1\"").arg(QString::fromStdString(mode))};
+                c.blendMode = mode;
                 ++changed;
             }
             if (a.contains("fit")) {
@@ -14168,16 +14304,22 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         if (tool == d_->tools.end()) return error(-32602, QStringLiteral("Unknown tool: %1").arg(name));
         QJsonObject args = params.value("arguments").toObject();
         // In the background: a job id now, the call run later (montage_job reads it).
-        if (name != QLatin1String("montage_job") && args.value("async").toBool()) {
+        const QJsonValue async = args.value("async");
+        if (name != QLatin1String("montage_job") && (async.toBool() || async.toString().compare(QLatin1String("true"), Qt::CaseInsensitive) == 0)) {
             args.remove("async");
             const std::shared_ptr<ToolJob> job = d_->startJob(*tool, args);
+            if (!job)
+                return reply(resultJson(fail(QStringLiteral("%1 background calls are waiting their turn: ask again once some have run").arg(Impl::kMaxQueuedJobs))));
             return reply(resultJson(ok(QStringLiteral("%1 runs in the background as %2: montage_job reads its progress and result").arg(name, job->id),
                                        QJsonObject{{"job", job->id}, {"tool", name}, {"status", "queued"}})));
         }
         args.remove("async");
         // montage_job is answered at once, while a job runs; other tools one at a time.
         std::unique_lock<std::mutex> running(d_->toolMutex, std::defer_lock);
+        bool turn = false;
         if (name != QLatin1String("montage_job")) {
+            d_->waitTurn(d_->takeTurn());
+            turn = true;
             running.lock();
             std::lock_guard l(d_->cancelMutex);
             d_->runningRequest = Impl::requestKey(id);
@@ -14206,6 +14348,8 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
             std::lock_guard l(d_->cancelMutex);
             d_->runningRequest.clear();
         }
+        if (running.owns_lock()) running.unlock();
+        if (turn) d_->endTurn();
         return reply(resultJson(r));
     }
     return error(-32601, QStringLiteral("Method not found: %1").arg(method));
@@ -14244,16 +14388,41 @@ int McpServer::run(std::istream& in, std::ostream& out) {
             write(handle(line));
         }
     });
+    // montage_job asked to wait: answered on threads of their own (a few), so this one keeps reading cancels and pings.
+    std::deque<std::string> waits;
+    std::vector<std::thread> waiters;
+    size_t idleWaiters = 0;
+    auto waiter = [&] {
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock l(callsMutex);
+                ++idleWaiters;
+                callsWake.wait(l, [&] { return closed || !waits.empty(); });
+                --idleWaiters;
+                if (waits.empty()) return;
+                line = std::move(waits.front());
+                waits.pop_front();
+            }
+            write(handle(line));
+        }
+    };
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find_first_not_of(" \t") == std::string::npos) continue;
         const QJsonObject msg = QJsonDocument::fromJson(QByteArray::fromStdString(line)).object();
-        if (msg.value("method").toString() == QLatin1String("tools/call") &&
-            msg.value("params").toObject().value("name").toString() != QLatin1String("montage_job")) {
+        const QJsonObject params = msg.value("params").toObject();
+        const bool call = msg.value("method").toString() == QLatin1String("tools/call");
+        if (call && params.value("name").toString() != QLatin1String("montage_job")) {
             std::lock_guard l(callsMutex);
             calls.push_back(line);
-            callsWake.notify_one();
+            callsWake.notify_all();
+        } else if (call && params.value("arguments").toObject().value("wait").toDouble(0) > 0) {
+            std::lock_guard l(callsMutex);
+            waits.push_back(line);
+            if (idleWaiters < waits.size() && waiters.size() < 8) waiters.emplace_back(waiter);
+            callsWake.notify_all();
         } else {
             write(handle(line));
         }
@@ -14262,8 +14431,9 @@ int McpServer::run(std::istream& in, std::ostream& out) {
         std::lock_guard l(callsMutex);
         closed = true;
     }
-    callsWake.notify_one();
+    callsWake.notify_all();
     caller.join();
+    for (std::thread& t : waiters) t.join();
     return 0;
 }
 

@@ -14,7 +14,8 @@
 // A job sent in segments (render/SegmentedExport.h) is a job for each segment, rendered by whichever nodes are free,
 // and a join job that waits for them all: the node that takes it checks each segment (its frames and the hash its node
 // wrote), renders the sound once and joins the segments into the output. A segment that fails is tried again (twice)
-// on its own, and one that does not check out at the join is rendered again alone.
+// on its own, and one that does not check out at the join is rendered again alone. IMF and DCP packages are sent in
+// segments the same way, the segments coding pictures and the join wrapping them.
 #pragma once
 
 #include <QJsonObject>
@@ -29,6 +30,9 @@
 #include "render/Exporter.h"
 
 namespace montage {
+
+struct ImfSettings;
+struct DcpSettings;
 
 // An export's settings as JSON and back (every field; what is missing keeps its default). False with `error` when a
 // value has the wrong type.
@@ -70,12 +74,16 @@ struct FarmJob {
     std::string group;
     int segment = 0, segments = 0;
     bool join = false;
+    // Two passes across segments: 1 = a segment's first pass (measuring), 2 = its second (waiting for every first).
+    int pass = 0;
 };
 struct FarmNodeInfo {
     std::string name, host, state;  // state: idle, rendering, stopped
     std::string job;                // being rendered
     std::string updated;            // ISO 8601, the node's clock
     int64_t beat = 0;
+    // The encoder it codes each hardware family with ("h264" -> "h264_nvenc"; "libx264" when it has none for it).
+    std::map<std::string, std::string> encoders;
 };
 
 // The farm's folders made when missing; false with `error` when it cannot be used.
@@ -83,9 +91,20 @@ bool openFarm(const std::string& farm, std::string* error = nullptr);
 // Sends a job: `project` as it is now, its sequence `sequence` exported with `settings` (its path where the nodes
 // write, before their mapping). `id` gets the job's. With `segments` > 1, split into that many (at cuts near equal
 // lengths; fewer for a short range) and a join job, whose id `id` gets; refused when the export cannot be split
-// (exportSplits). The segments' files go in a hidden folder beside the output, removed once joined.
+// (exportSplits). The segments' files go in a hidden folder beside the output, removed once joined. Two passes
+// (`twoPass`) send each segment's first pass as a job of its own; the second passes wait for all of them, and each
+// takes its share of the bits by what its first pass measured (twoPassBitrates).
 bool submitFarmJob(const std::string& farm, const std::string& name, const Project& project, Id sequence, const ExportSettings& settings,
                    int stems, std::string* id = nullptr, std::string* error = nullptr, int segments = 1);
+// A mastering package (render/Imf.h Application #2E, render/Dcp.h) sent in `segments`: each segment's node codes its
+// share of the pictures as JPEG 2000 codestreams into a hidden folder beside `parent` (where the package's folder is
+// made, before the nodes' mapping), and the join's checks them, makes the sound and everything else and wraps them as
+// they are (the picture track file as one node would have made it). `id` gets the join's. Refused for what cannot be
+// made in segments (Application #5, supplemental packages, an encrypted DCP without a folder for its DKDM).
+bool submitFarmImf(const std::string& farm, const std::string& name, const Project& project, Id sequence, const ImfSettings& settings,
+                   const std::string& parent, int segments, std::string* id = nullptr, std::string* error = nullptr);
+bool submitFarmDcp(const std::string& farm, const std::string& name, const Project& project, Id sequence, const DcpSettings& settings,
+                   const std::string& parent, int segments, std::string* id = nullptr, std::string* error = nullptr);
 std::vector<FarmJob> farmJobs(const std::string& farm);  // oldest first
 std::vector<FarmNodeInfo> farmNodes(const std::string& farm);
 // A waiting job is cancelled at once; a rendering one is asked to stop (its node looks every half second; a share's
@@ -126,8 +145,12 @@ struct FarmNodeOptions {
     int64_t staleMs = 60000;  // a node silent this long has its job taken back
     std::function<bool()> stopped;  // asked often: true ends the node (its job, half done, waits for another)
     std::function<void(const std::string&)> log;
+    // The encoder this node says it codes each hardware family with ("h264", "hevc"); a family left out is what it
+    // finds (render nodes compare them: one export's hardware-encoded segments all go to nodes of the same kind).
+    std::map<std::string, std::string> encoders;
 };
-// Runs a render node until stopped (or, `once`, out of work): the oldest waiting job claimed, its project read with
+// Runs a render node until stopped (or, `once`, out of work): the oldest waiting job claimed (a segment coded by a
+// hardware encoder only when the first of its export's segments to be taken went to a node with the same encoder), its project read with
 // the maps applied to every path in it and to the output, rendered with status and heartbeats every half second, then
 // done, failed or cancelled. The render goes to a folder of the claim's own beside the output and is moved into place
 // only while the node still holds the job. False with `error` only when the farm cannot be used. `rendered` counts the
