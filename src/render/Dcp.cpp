@@ -487,14 +487,26 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         const int64_t from = std::max<int64_t>(0, settings.codeFrom), to = std::min<int64_t>(frames, settings.codeTo);
         if (to <= from) return fail("The segment holds none of the package's frames");
         if (!QDir().mkpath(QString::fromStdString(settings.codestreams))) return fail("Cannot write in " + settings.codestreams);
+        // (an encrypted package's codestreams sealed before they are written: never in the clear in the farm's folder)
+        dcp::Sealer sealer;
+        if (settings.encrypt) {
+            std::string why;
+            if (settings.codestreamCertificate.empty()) return fail("An encrypted DCP's segment needs the certificate its codestreams are sealed for");
+            if (!dcp::makeSealer(settings.codestreamCertificate, sealer, &why)) return fail(why);
+        }
         EncoderPool pool(cw, ch, fps, stereo, threads);
         int64_t taken = from * eyes;
         std::string err;
-        std::vector<uint8_t> cs;
+        std::vector<uint8_t> cs, sealed;
         auto writeReady = [&](bool wait) {
             while (taken < to * eyes && (wait || pool.ready(taken)) && pool.take(taken, cs, true)) {
+                if (settings.encrypt && !dcp::seal(sealer, cs.data(), cs.size(), sealed, dcp::codestreamSealContext(taken / eyes, taken % eyes == 1))) {
+                    err = "Cannot seal a codestream";
+                    return false;
+                }
+                const std::vector<uint8_t>& out = settings.encrypt ? sealed : cs;
                 QSaveFile f(QString::fromStdString(codestreamFile(settings.codestreams, taken / eyes, taken % eyes == 1)));
-                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(cs.data()), qint64(cs.size())) != qint64(cs.size()) ||
+                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(out.data()), qint64(out.size())) != qint64(out.size()) ||
                     !f.commit()) {
                     err = "Cannot write the codestreams in " + settings.codestreams;
                     return false;
@@ -691,20 +703,32 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         if (!picture.open(QDir(folder).filePath(pictureFile).toStdString(), pictureId, fps, stereo, &err)) return fail(err);
         EncoderPool pool(cw, ch, fps, stereo, coded ? 0 : threads);
         int64_t written = 0;
-        std::vector<uint8_t> cs, right;
+        std::vector<uint8_t> cs, right, sealed;
+        // (an encrypted package's codestreams come sealed for the signer's leaf, opened here with its key)
+        dcp::Unsealer unsealer{chain.privateKey, {}};
+        std::string unsealError;
         auto readCoded = [&](int64_t k, bool eye, std::vector<uint8_t>& out) {
             QFile f(QString::fromStdString(codestreamFile(settings.codestreams, k, eye)));
             if (!f.open(QIODevice::ReadOnly)) return false;
             const QByteArray b = f.readAll();
-            out.assign(b.begin(), b.end());
-            return !out.empty();
+            if (!settings.encrypt) {
+                out.assign(b.begin(), b.end());
+                return !out.empty();
+            }
+            sealed.assign(b.begin(), b.end());
+            if (!dcp::isSealed(sealed.data(), sealed.size())) {
+                unsealError = "The codestream of frame " + std::to_string(k) + " in " + settings.codestreams + " was not sealed";
+                return false;
+            }
+            return dcp::unseal(unsealer, sealed, out, &unsealError, dcp::codestreamSealContext(k, eye)) && !out.empty();
         };
         auto writeReady = [&](bool wait) {
             while (written < frames) {
                 const int64_t job = written * eyes;
                 if (coded) {
                     if (!readCoded(written, false, cs) || (stereo && !readCoded(written, true, right))) {
-                        err = "The codestream of frame " + std::to_string(written) + " is missing from " + settings.codestreams;
+                        err = !unsealError.empty() ? unsealError
+                                                   : "The codestream of frame " + std::to_string(written) + " is missing from " + settings.codestreams;
                         return false;
                     }
                     if (progress && written % 16 == 0 && !progress(0.05 + 0.9 * double(written) / double(frames))) {

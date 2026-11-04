@@ -260,6 +260,7 @@
 #include "render/DcpMxf.h"
 #include "render/Imf.h"
 #include "render/SegmentedExport.h"
+#include "render/DcpSecurity.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -24722,6 +24723,51 @@ if ui["pressed"] == "add":
         cinema.encrypt = true;
         QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
         QVERIFY(QString::fromStdString(err).contains("DKDM"));
+        if (dcp::securityAvailable()) {
+            // ---- Encrypted: a segment's codestreams are sealed for the signer's leaf, never in the clear in the farm's
+            // folder; only that leaf's key opens them.
+            cinema.title = "Farm Sealed";
+            cinema.dkdms = (dir.path() + "/dkdm").toStdString();
+            dcp::CertificateChain chain;
+            QVERIFY2(dcp::signerCertificateChain(chain, &err, cinema.certificates), err.c_str());
+            DcpSettings seg = cinema;
+            seg.codestreams = (dir.path() + "/codes").toStdString();
+            seg.codeFrom = 0, seg.codeTo = 12;
+            QVERIFY(!exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err));
+            QVERIFY2(QString::fromStdString(err).contains("certificate"), err.c_str());
+            seg.codestreamCertificate = chain.certificates.back();
+            QVERIFY2(exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err), err.c_str());
+            QFile coded(QString::fromStdString(codestreamFile(seg.codestreams, 5)));
+            QVERIFY(coded.open(QIODevice::ReadOnly));
+            const QByteArray bytes = coded.readAll();
+            const std::vector<uint8_t> sealed(bytes.begin(), bytes.end());
+            QVERIFY(dcp::isSealed(sealed.data(), sealed.size()));
+            std::vector<uint8_t> open;
+            dcp::Unsealer mine{chain.privateKey, {}};
+            QVERIFY2(dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext(5, false)), err.c_str());
+            QVERIFY(open.size() > 64 && open[0] == 0xff && open[1] == 0x4f && open[2] == 0xff && open[3] == 0x51);
+            QVERIFY(!bytes.contains(QByteArray(reinterpret_cast<const char*>(open.data()), 64)));  // (none of it in the clear)
+            dcp::CertificateChain other;
+            QVERIFY2(dcp::makeCertificateChain("Elsewhere", other, &err), err.c_str());
+            dcp::Unsealer theirs{other.privateKey, {}};
+            QVERIFY(!dcp::unseal(theirs, sealed, open, &err, dcp::codestreamSealContext(5, false)));
+            QVERIFY2(QString::fromStdString(err).contains("another certificate"), err.c_str());
+            std::vector<uint8_t> changed = sealed;
+            changed[changed.size() / 2] ^= 1;
+            QVERIFY(!dcp::unseal(mine, changed, open, &err, dcp::codestreamSealContext(5, false)) && open.empty());
+            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext(6, false)));  // (moved to another frame)
+            // The whole package made on the farm: it passes the checks, with its DKDM, and no codestream is left.
+            QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
+                         return submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, id, e);
+                     }),
+                     qPrintable(log.join('\n')));
+            const QString farmSealed = onlyFolder(dir.path() + "/out", "FarmSealed_*");
+            QVERIFY(!farmSealed.isEmpty());
+            const std::vector<std::string> issues = verifyDcp(farmSealed.toStdString());
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QCOMPARE(QDir(dir.path() + "/dkdm").entryList(QDir::Files).size(), 1);
+            QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        }
     }
 
     void mcpBuildsACutFromAScript() {

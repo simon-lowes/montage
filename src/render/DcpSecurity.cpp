@@ -14,6 +14,7 @@
 #include <QXmlStreamReader>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <map>
@@ -30,6 +31,7 @@
 #ifdef MONTAGE_WITH_OPENSSL
 #include <openssl/bio.h>
 #include <openssl/bn.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -885,6 +887,107 @@ bool sha1(const uint8_t* data, size_t size, uint8_t out[20]) { return SHA1(data,
 
 bool randomBytes(uint8_t* out, size_t size) { return RAND_bytes(out, int(size)) == 1; }
 
+namespace {
+constexpr char kSealMagic[] = "MSEAL1";
+constexpr size_t kSealMagicSize = 6, kSealIv = 12, kSealTag = 16;
+}  // namespace
+
+bool makeSealer(const std::string& certificatePem, Sealer& out, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    Ptr<X509> c = certificateFrom(certificatePem);
+    EVP_PKEY* to = c ? X509_get0_pubkey(c.get()) : nullptr;
+    if (!to) return fail("The certificate the codestreams are sealed for cannot be read");
+    if (!randomBytes(out.key.data(), out.key.size())) return fail("The system's random source failed");
+    Ptr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(to, nullptr));
+    size_t n = 0;
+    if (!ctx || EVP_PKEY_encrypt_init(ctx.get()) != 1 || EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_OAEP_PADDING) != 1 ||
+        EVP_PKEY_encrypt(ctx.get(), nullptr, &n, out.key.data(), out.key.size()) != 1)
+        return fail("Cannot seal a key to the certificate");
+    out.wrapped.assign(n, '\0');
+    if (EVP_PKEY_encrypt(ctx.get(), reinterpret_cast<uint8_t*>(out.wrapped.data()), &n, out.key.data(), out.key.size()) != 1)
+        return fail("Cannot seal a key to the certificate");
+    out.wrapped.resize(n);
+    if (n > 0xffff) return fail("The certificate's key is too large");
+    return true;
+}
+
+bool seal(const Sealer& sealer, const uint8_t* data, size_t size, std::vector<uint8_t>& out, const std::string& context) {
+    if (sealer.wrapped.empty() || size > size_t(INT32_MAX)) return false;
+    const size_t w = sealer.wrapped.size();
+    out.assign(kSealMagicSize + 2 + w + kSealIv + size + kSealTag, 0);
+    uint8_t* p = out.data();
+    std::memcpy(p, kSealMagic, kSealMagicSize);
+    p[kSealMagicSize] = uint8_t(w >> 8), p[kSealMagicSize + 1] = uint8_t(w);
+    std::memcpy(p + kSealMagicSize + 2, sealer.wrapped.data(), w);
+    uint8_t* iv = p + kSealMagicSize + 2 + w;
+    if (!randomBytes(iv, kSealIv)) return false;
+    Ptr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
+    int n = 0, m = 0, a = 0;
+    return ctx && EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+           EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, int(kSealIv), nullptr) == 1 &&
+           EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, sealer.key.data(), iv) == 1 &&
+           (context.empty() || EVP_EncryptUpdate(ctx.get(), nullptr, &a, reinterpret_cast<const uint8_t*>(context.data()), int(context.size())) == 1) &&
+           EVP_EncryptUpdate(ctx.get(), iv + kSealIv, &n, data, int(size)) == 1 && EVP_EncryptFinal_ex(ctx.get(), iv + kSealIv + n, &m) == 1 &&
+           size_t(n + m) == size && EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, int(kSealTag), iv + kSealIv + size) == 1;
+}
+
+bool isSealed(const uint8_t* data, size_t size) { return size >= kSealMagicSize && std::memcmp(data, kSealMagic, kSealMagicSize) == 0; }
+std::string codestreamSealContext(int64_t frame, bool right) { return "codestream " + std::to_string(frame) + (right ? " right" : " left"); }
+
+bool unseal(Unsealer& u, const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* error, const std::string& context) {
+    auto fail = [&](const std::string& why) {
+        out.clear();
+        if (error) *error = why;
+        return false;
+    };
+    if (!isSealed(in.data(), in.size()) || in.size() < kSealMagicSize + 2) return fail("Not a sealed codestream");
+    const size_t w = size_t(in[kSealMagicSize]) << 8 | in[kSealMagicSize + 1];
+    const size_t head = kSealMagicSize + 2 + w + kSealIv;
+    if (in.size() < head + kSealTag) return fail("A sealed codestream is cut short");
+    const std::string wrapped(reinterpret_cast<const char*>(in.data() + kSealMagicSize + 2), w);
+    const std::array<uint8_t, 32>* key = nullptr;
+    for (const auto& [form, k] : u.keys)
+        if (form == wrapped) key = &k;
+    if (!key) {
+        Ptr<EVP_PKEY> pk = privateKeyFrom(u.privateKey);
+        if (!pk) return fail("The private key cannot be read");
+        Ptr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(pk.get(), nullptr));
+        size_t n = 0;
+        std::array<uint8_t, 32> k{};
+        std::vector<uint8_t> plain;
+        if (!ctx || EVP_PKEY_decrypt_init(ctx.get()) != 1 || EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_OAEP_PADDING) != 1 ||
+            EVP_PKEY_decrypt(ctx.get(), nullptr, &n, reinterpret_cast<const uint8_t*>(wrapped.data()), w) != 1)
+            return fail("The codestreams were sealed for another certificate than this node's");
+        plain.resize(n);
+        if (EVP_PKEY_decrypt(ctx.get(), plain.data(), &n, reinterpret_cast<const uint8_t*>(wrapped.data()), w) != 1 || n != k.size())
+            return fail("The codestreams were sealed for another certificate than this node's");
+        std::memcpy(k.data(), plain.data(), k.size());
+        OPENSSL_cleanse(plain.data(), plain.size());
+        u.keys.emplace_back(wrapped, k);
+        OPENSSL_cleanse(k.data(), k.size());
+        key = &u.keys.back().second;
+    }
+    const uint8_t* iv = in.data() + kSealMagicSize + 2 + w;
+    const size_t size = in.size() - head - kSealTag;
+    if (size > size_t(INT32_MAX)) return fail("A sealed codestream is too large");
+    out.assign(size, 0);
+    std::vector<uint8_t> tag(in.end() - kSealTag, in.end());
+    Ptr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
+    int n = 0, m = 0, a = 0;
+    uint8_t spare[16];
+    if (!ctx || EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, int(kSealIv), nullptr) != 1 ||
+        EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key->data(), iv) != 1 ||
+        (!context.empty() && EVP_DecryptUpdate(ctx.get(), nullptr, &a, reinterpret_cast<const uint8_t*>(context.data()), int(context.size())) != 1) ||
+        EVP_DecryptUpdate(ctx.get(), out.data(), &n, iv + kSealIv, int(size)) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, int(kSealTag), tag.data()) != 1 || EVP_DecryptFinal_ex(ctx.get(), spare, &m) != 1)
+        return fail("A sealed codestream has been changed");
+    return true;
+}
+
 #else  // no OpenSSL
 
 namespace {
@@ -914,6 +1017,11 @@ bool aesCbcDecrypt(const uint8_t*, const uint8_t*, const uint8_t*, size_t, uint8
 bool hmacSha1(const uint8_t*, size_t, const uint8_t*, size_t, uint8_t*) { return false; }
 bool sha1(const uint8_t*, size_t, uint8_t*) { return false; }
 bool randomBytes(uint8_t*, size_t) { return false; }
+bool makeSealer(const std::string&, Sealer&, std::string* error) { return none(error); }
+bool seal(const Sealer&, const uint8_t*, size_t, std::vector<uint8_t>&, const std::string&) { return false; }
+bool isSealed(const uint8_t* data, size_t size) { return size >= 6 && std::memcmp(data, "MSEAL1", 6) == 0; }
+std::string codestreamSealContext(int64_t frame, bool right) { return "codestream " + std::to_string(frame) + (right ? " right" : " left"); }
+bool unseal(Unsealer&, const std::vector<uint8_t>&, std::vector<uint8_t>&, std::string* error, const std::string&) { return none(error); }
 
 #endif
 

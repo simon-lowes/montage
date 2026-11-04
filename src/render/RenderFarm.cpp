@@ -17,6 +17,7 @@
 #include "media/HwAccel.h"
 #include "render/BroadcastMxf.h"
 #include "render/Dcp.h"
+#include "render/DcpSecurity.h"
 #include "render/Imf.h"
 #include "render/SegmentedExport.h"
 
@@ -281,6 +282,7 @@ void visitDcp(S& s, V& v) {
     v("codestreams", s.codestreams);
     v("codeFrom", s.codeFrom);
     v("codeTo", s.codeTo);
+    v("codestreamCertificate", s.codestreamCertificate);
 }
 
 QJsonObject imfToJson(const ImfSettings& s) {
@@ -811,8 +813,20 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
     if (settings.encrypt && settings.dkdms.empty()) return fail(error, "An encrypted DCP made on a render farm needs a folder for its DKDM");
     const int64_t frames = dcpPackageFrames(*seq, settings);
     if (frames < dcpFrameRate(*seq, settings.fps)) return fail(error, "A DCP must last at least a second (cinema servers refuse shorter reels)");
+    // (an encrypted package's codestreams are sealed for the signer's leaf, so they are never in the clear in the farm's
+    // folder: the joining node opens them with that leaf's key, so it needs the same certificates folder)
+    std::string sealFor;
+    if (settings.encrypt) {
+        dcp::CertificateChain chain;
+        std::string err;
+        if (!dcp::securityAvailable()) return fail(error, "This build cannot encrypt (it has no OpenSSL)");
+        if (!dcp::signerCertificateChain(chain, &err, settings.certificates) || chain.empty())
+            return fail(error, "Cannot read the certificates the package is signed with: " + err);
+        sealFor = chain.certificates.back();
+    }
     auto settingsFor = [&](const std::string& folder, int64_t from, int64_t to) {
         DcpSettings x = settings;
+        x.codestreamCertificate = sealFor;
         x.codestreams = folder;
         x.codeFrom = from, x.codeTo = to;
         return dcpToJson(x);

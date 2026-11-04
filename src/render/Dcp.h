@@ -57,8 +57,12 @@ struct DcpSettings {
     // A render farm's segments (render/RenderFarm): with codeTo above codeFrom, only DCP frames [codeFrom, codeTo) are
     // coded, as JPEG 2000 codestreams into the folder `codestreams` (codestreamFile's names, a 3D frame's right eye
     // "-R"), and nothing else is written; with `codestreams` alone, the package is made with the pictures coded there.
+    // An encrypted package's codestreams are sealed (dcp::seal) for `codestreamCertificate`, the PEM certificate of the
+    // signer's leaf as the sender has it, and opened by the joining node with that leaf's private key: they are never in
+    // the clear in the farm's folder.
     std::string codestreams;
     int64_t codeFrom = 0, codeTo = 0;
+    std::string codestreamCertificate;
 };
 
 struct DcpResult {
