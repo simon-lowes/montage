@@ -15012,19 +15012,29 @@ colorspaces:
         // (its answer, unless the rest of what was sent, arriving after it closed, reset the connection first)
         QVERIFY2(answer.isEmpty() || answer.startsWith("HTTP/1.1 431"), answer.constData());
         QTest::qWait(200);
-        // ... and one address has no more than four connections at once.
+        // ... and one address has no more than four connections at once: a fifth takes the place of its quietest
+        // between requests, and is refused while the other four are each in the middle of one.
         std::vector<std::unique_ptr<QTcpSocket>> held;
         for (int i = 0; i < 5; ++i) {
             held.push_back(std::make_unique<QTcpSocket>());
             held.back()->connectToHost(QHostAddress::LocalHost, quint16(node.port()));
             QVERIFY(held.back()->waitForConnected(5000));
+            if (i < 4) QTRY_COMPARE_WITH_TIMEOUT(node.clientCount(), i + 1, 5000);
         }
-        QTRY_VERIFY_WITH_TIMEOUT(held[4]->state() == QAbstractSocket::UnconnectedState, 5000);
-        for (int i = 0; i < 4; ++i) QVERIFY2(held[size_t(i)]->state() == QAbstractSocket::ConnectedState, qPrintable(QString::number(i)));
-        held[0]->write("GET /x-nmos/ HTTP/1.1\r\nHost: x\r\n\r\n");
-        QTRY_VERIFY_WITH_TIMEOUT(held[0]->bytesAvailable() > 0, 5000);
-        QVERIFY(held[0]->readAll().startsWith("HTTP/1.1 200 OK"));
+        QTRY_VERIFY_WITH_TIMEOUT(held[0]->state() == QAbstractSocket::UnconnectedState, 5000);
+        for (int i = 1; i < 5; ++i) QVERIFY2(held[size_t(i)]->state() == QAbstractSocket::ConnectedState, qPrintable(QString::number(i)));
+        held[4]->write("GET /x-nmos/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        QTRY_VERIFY_WITH_TIMEOUT(held[4]->bytesAvailable() > 0, 5000);
+        QVERIFY(held[4]->readAll().startsWith("HTTP/1.1 200 OK"));
+        for (int i = 1; i < 5; ++i) held[size_t(i)]->write("GET /x-nmos/ HTTP/1.1\r\n");  // (each mid-request)
+        QTRY_COMPARE_WITH_TIMEOUT(node.clientCount(), 4, 5000);
+        QTest::qWait(100);
+        auto turnedAway = std::make_unique<QTcpSocket>();
+        turnedAway->connectToHost(QHostAddress::LocalHost, quint16(node.port()));
+        QTRY_VERIFY_WITH_TIMEOUT(turnedAway->state() == QAbstractSocket::UnconnectedState, 5000);
+        for (int i = 1; i < 5; ++i) QVERIFY2(held[size_t(i)]->state() == QAbstractSocket::ConnectedState, qPrintable(QString::number(i)));
         held.clear();
+        turnedAway.reset();
 #ifdef Q_OS_LINUX
         // Sixteen hosts holding every place cannot keep a seventeenth out: it takes the place of the connection quiet
         // longest (Linux answers on all of 127/8). (The node first lets go of the connections above, or under load one

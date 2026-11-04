@@ -232,17 +232,22 @@ bool Node::start(const NodeOptions& o, QString* error) {
     // a time is cut off), and how long it is kept alive at all. When every place is taken, a newcomer takes the place of
     // the connection that has been quiet longest from the address holding the most, so a few hosts cannot keep the
     // others out.
+    // An address at its own limit has its quietest connection between requests let go for a newcomer (a client's pool
+    // opens another when it needs one); only when all of them are mid-request is the newcomer refused.
     constexpr int kMaxClients = 64, kMaxClientsFrom = 4, kIdleMs = 15000, kLifeMs = 60000;
     constexpr qsizetype kMaxHeader = 64 << 10, kMaxBody = 1 << 20;
     struct Client {
         QString from;
         qint64 lastRequest = 0;
+        std::shared_ptr<QByteArray> buffer;  // (what has come of the request it is on: empty between requests)
+        uint64_t order = 0;                  // (when it came, among the others: the earlier is the quieter of two alike)
     };
+    auto arrivals = std::make_shared<uint64_t>(0);
     auto clients = std::make_shared<std::map<QTcpSocket*, Client>>();
     auto clock = std::make_shared<QElapsedTimer>();
     clock->start();
     clientCount_ = [clients] { return int(clients->size()); };
-    connect(server_, &QTcpServer::newConnection, this, [this, clients, clock] {
+    connect(server_, &QTcpServer::newConnection, this, [this, clients, clock, arrivals] {
         while (QTcpSocket* s = server_->nextPendingConnection()) {
             const QHostAddress address = s->peerAddress();
             QString peer = address.toString();
@@ -256,25 +261,36 @@ bool Node::start(const NodeOptions& o, QString* error) {
             std::map<QString, int> count;
             for (const auto& [socket, c] : *clients) ++count[c.from];
             if (count[peer] >= kMaxClientsFrom) {
-                s->abort();
-                s->deleteLater();
-                continue;
+                QTcpSocket* quietest = nullptr;
+                std::pair<qint64, uint64_t> quiet;
+                for (const auto& [socket, c] : *clients)
+                    if (c.from == peer && c.buffer && c.buffer->isEmpty() && socket->bytesToWrite() == 0 &&
+                        (!quietest || std::pair(c.lastRequest, c.order) < quiet))
+                        quietest = socket, quiet = {c.lastRequest, c.order};
+                if (!quietest) {
+                    s->abort();
+                    s->deleteLater();
+                    continue;
+                }
+                clients->erase(quietest);
+                quietest->disconnectFromHost();  // (closed in turn, so the client sees it gone before it reuses it)
+                --count[peer];
             }
             if (int(clients->size()) >= kMaxClients) {
                 QTcpSocket* quietest = nullptr;
                 int most = 0;
-                qint64 quiet = 0;
+                std::pair<qint64, uint64_t> quiet;
                 for (const auto& [socket, c] : *clients) {
                     const int n = count[c.from];
-                    if (n > most || (n == most && c.lastRequest < quiet)) quietest = socket, most = n, quiet = c.lastRequest;
+                    if (n > most || (n == most && std::pair(c.lastRequest, c.order) < quiet)) quietest = socket, most = n, quiet = {c.lastRequest, c.order};
                 }
                 if (quietest) {
                     clients->erase(quietest);
                     quietest->abort();
                 }
             }
-            (*clients)[s] = {peer, clock->elapsed()};
             auto buffer = std::make_shared<QByteArray>();
+            (*clients)[s] = {peer, clock->elapsed(), buffer, ++*arrivals};
             auto retire = std::make_shared<bool>(false);
             auto idle = new QTimer(s);
             idle->setSingleShot(true);
