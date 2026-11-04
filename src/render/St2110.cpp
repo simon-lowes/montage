@@ -1102,9 +1102,12 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
             std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<int64_t>(left, 2000000)));
         }
     };
-    // The frame's slot: the next one, or (behind by more than a frame, or starting) the next to start from now.
+    // The frame's slot: the next one, or (starting, or behind by more than a fifth of a second) the next to start from
+    // now. A moment's hold-up (a busy machine) loses nothing: late frames go out at once in their own slots, the
+    // receiver placing them by their timestamps, until the sender has caught up.
     const int64_t now = ptpNowNs();
-    if (nextFrame_ == 0 || frameStart(nextFrame_ + 1) < now) {
+    const int64_t catchUp = std::max<int64_t>(1, num / (5 * den));
+    if (nextFrame_ == 0 || frameStart(nextFrame_ + catchUp) < now) {
         nextFrame_ = mulDiv(now, num, second * den) + 1;
         audioSample_ = mulDiv(frameStart(nextFrame_), audio_.rate, second);
         audioFifo_.clear();
