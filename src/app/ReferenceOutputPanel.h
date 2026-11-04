@@ -114,6 +114,9 @@ private:
     QLineEdit* st2110Data_;
     QSpinBox* st2110Ttl_;
     QLineEdit* st2110Clock_;
+    QCheckBox* st2110Redundant_;
+    QLineEdit* st2110Paths2_;
+    QLineEdit* st2110Interface2_;
     QCheckBox* nmos_;
     QLineEdit* nmosRegistry_;
     QPushButton* saveSdp_;

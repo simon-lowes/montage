@@ -106,6 +106,8 @@
 #include "RepairMediaDialog.h"
 #include "CaptureDialog.h"
 #include "media/Capture.h"
+#include "render/St2110.h"
+#include "render/Nmos.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
@@ -2424,6 +2426,96 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 20000);
         QTRY_VERIFY(!dlg->statusText().contains("Waiting"));
         QCOMPARE(dlg->importedMedia(), Id(0));
+        dlg->hide();
+    }
+
+    // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the
+    // streams' time code.
+    void captureSt2110OverTheAgentLink() {
+        namespace st = st2110;
+        state()->newProject();
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        st::VideoFormat v;
+        v.width = 320, v.height = 180, v.fps = {25, 1}, v.sampling = st::Sampling::Ycc444, v.depth = 12;
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        const st::Raster grey(320, 180, st::Sampling::Ycc444, 12);
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const std::vector<float> sound(1920 * 2, 0.25f);
+            for (int t = 0; !stop && t < 25 * 30; ++t) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(grey, sound.data(), 1920, &tc, {}, &stop)) break;
+            }
+        });
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "kinds"}});
+        QVERIFY(r.value("structuredContent").toObject().value("kinds").toArray().contains(QStringLiteral("st2110")));
+        QTemporaryDir dir;
+        const QString sdp = QString::fromStdString(tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc());
+        r = call({{"action", "record"}, {"kind", "st2110"}, {"url", sdp}, {"folder", dir.path()}, {"name", "Feed 01"},
+                  {"codec", "prores_lt"}, {"wrapper", "mov"}, {"seconds", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        CaptureDialog* dlg = win_->captureDialog();
+        QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 20000);
+        r = call({{"action", "status"}});
+        QVERIFY2(r.value("structuredContent").toObject().value("status").toString().contains("TC 10:00:"), QJsonDocument(r).toJson().constData());
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->importedMedia() != 0, 5000);
+        const MediaItem* m = state()->project().findMedia(dlg->importedMedia());
+        QVERIFY(m && m->hasVideo && m->hasAudio && m->bin == "Captures" && m->width == 320);
+        QVERIFY(m->timecode >= 36000 && m->timecode < 36000 + 30);
+
+        // Offered as NMOS receivers instead: a controller connects them to the same sender through IS-05, and a
+        // recording with no address given takes what it connected.
+        QSettings settings = appSettings();
+        settings.setValue("output/nmos/registry", "http://127.0.0.1:9");  // (no registry here: none looked for)
+        r = call({{"action", "nmos"}, {"offer", true}});
+        settings.remove("output/nmos/registry");
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray receivers = r.value("structuredContent").toObject().value("receivers").toArray();
+        QCOMPARE(receivers.size(), 3);
+        QVERIFY(!r.value("structuredContent").toObject().value("connected").toBool());
+        const std::string files[3] = {tx.sdpVideo(), tx.sdpAudio(), tx.sdpAnc()};
+        for (int i = 0; i < 3; ++i) {
+            const QJsonObject patch{{"master_enable", true},
+                                    {"transport_file", QJsonObject{{"data", QString::fromStdString(files[i])}, {"type", "application/sdp"}}},
+                                    {"activation", QJsonObject{{"mode", "activate_immediate"}}}};
+            const auto answer = dlg->nmosNode()->handle("PATCH", "/x-nmos/connection/v1.1/single/receivers/" + receivers[i].toString() + "/staged",
+                                                        QJsonDocument(patch).toJson());
+            QCOMPARE(answer.code, 200);
+        }
+        QVERIFY2(dlg->nmosStatus().startsWith("Connected"), qPrintable(dlg->nmosStatus()));
+        r = call({{"action", "record"}, {"kind", "st2110"}, {"folder", dir.path()}, {"name", "Feed 02"}, {"seconds", 1}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const Id first = dlg->importedMedia();
+        QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 20000);
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->importedMedia() != first && dlg->importedMedia() != 0, 5000);
+        m = state()->project().findMedia(dlg->importedMedia());
+        QVERIFY(m && m->hasVideo && m->hasAudio && m->name.find("Feed 02") != std::string::npos);
+        QVERIFY(m->timecode >= 36000 && m->timecode < 36000 + 30 * 25);
+        stop = true;
+        sending.join();
+        tx.close();
+        call({{"action", "nmos"}, {"offer", false}});
+        QVERIFY(!dlg->nmosNode()->running());
         dlg->hide();
     }
 
@@ -20077,6 +20169,7 @@ print("added " + ui["name"])
         backend->setCurrentIndex(backend->findData(QStringLiteral("ST 2110")));
         QVERIFY(videoAt->isVisibleTo(dlg) && dlg->findChild<QCheckBox*>("outputCaptions")->isEnabled());
         QVERIFY(dlg->findChild<QCheckBox*>("outputNmos")->isVisibleTo(dlg));
+        QVERIFY(dlg->findChild<QCheckBox*>("outputSt2110Redundant")->isVisibleTo(dlg));
         backend->setCurrentIndex(backend->findData(QStringLiteral("DeckLink")));
         QVERIFY(!videoAt->isVisibleTo(dlg) && !dlg->findChild<QCheckBox*>("outputNmos")->isVisibleTo(dlg));
         dlg->close();
@@ -20102,6 +20195,14 @@ print("added " + ui["name"])
         QCOMPARE(r.value("structuredContent").toObject().value("address").toString(), QStringLiteral("rtp://127.0.0.1:15010"));
         QVERIFY(r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString().contains("m=video 15010 RTP/AVP 96"));
         QVERIFY(controller->nmosNode()->handle("GET", single + "transportfile", {}).body.contains("m=video 15010 RTP/AVP 96"));
+        // ST 2022-7: a second path, both in each SDP as duplicates.
+        r = call({{"action", "start"}, {"st2110", QJsonObject{{"redundant", true}, {"video2", "127.0.0.1:15104"}, {"audio2", "127.0.0.1:15106"},
+                                                              {"data2", "127.0.0.1:15108"}, {"interface2", "127.0.0.1"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "status"}});
+        const QString redundantSdp = r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString();
+        QVERIFY2(redundantSdp.contains("a=group:DUP") && redundantSdp.contains("m=video 15104 RTP/AVP 96"), qPrintable(redundantSdp));
+        QVERIFY(ReferenceOutputController::loadSt2110().redundant && ReferenceOutputController::loadSt2110().anc2.port == 15108);
         r = call({{"action", "start"}, {"st2110", QJsonObject{{"video", "not an address"}}}});
         QVERIFY(r.value("isError").toBool());
         call({{"action", "stop"}});

@@ -99,6 +99,7 @@
 #ifdef MONTAGE_WITH_OMT
 #include "media/Omt.h"
 #include "render/VideoPacking.h"
+#include "render/St2110Receive.h"
 #endif
 #include "media/Mlv.h"
 #include "media/Decoder.h"
@@ -1967,6 +1968,138 @@ private slots:
         QVERIFY(!never.status().error.empty());
         QVERIFY(!QFile::exists(QString::fromStdString(none.path)));
 #endif
+    }
+
+    // Recording SMPTE ST 2110 streams found from their SDP files, on two paths (ST 2022-7) with packets lost on each:
+    // the pictures in order with the time code their ancillary data carried, and the sound to the sample.
+    void captureFromSt2110() {
+        namespace st = st2110;
+        const std::vector<std::string> kinds = captureDeviceKinds();
+        QVERIFY(std::find(kinds.begin(), kinds.end(), "st2110") != kinds.end());
+        int ports[6];
+        {
+            st::Receiver probe[6];
+            for (int i = 0; i < 6; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.video2 = {"127.0.0.1", ports[3]}, o.audio2 = {"127.0.0.1", ports[4]}, o.anc2 = {"127.0.0.1", ports[5]};
+        o.ttl = 1, o.redundant = true;
+        o.drop = [](int, int path, uint64_t i) { return i % 20 == (path ? 13u : 7u); };
+        // 640x360 at 25p, 4:2:2 10-bit: each picture's blue its frame number (mod 25), a 1 kHz tone on the left channel.
+        const int W = 640, H = 360, spf = 1920;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        auto picture = [&](int t) {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = 0.1f + 0.8f * float(x) / W, p[1] = 0.1f + 0.8f * float(y) / H, p[2] = 0.2f + 0.6f * float(t % 25) / 24.0f, p[3] = 1;
+                }
+            const video::Ycbcr422 c = video::toYcbcr422(img, video::YcbcrMatrix::Bt709);
+            st::Raster r(W, H, st::Sampling::Ycc422, 10);
+            auto ten = [](uint16_t x) { return uint16_t(std::min(1023, (int(x) + 32) >> 6)); };
+            for (int y = 0; y < H; ++y) {
+                uint16_t* d = r.row(y);
+                for (int i = 0; i < W / 2; ++i) {
+                    const size_t at = size_t(y) * size_t(W);
+                    d[4 * i] = ten(c.cb[size_t(y) * size_t(W / 2) + size_t(i)]), d[4 * i + 1] = ten(c.y[at + size_t(2 * i)]);
+                    d[4 * i + 2] = ten(c.cr[size_t(y) * size_t(W / 2) + size_t(i)]), d[4 * i + 3] = ten(c.y[at + size_t(2 * i + 1)]);
+                }
+            }
+            return r;
+        };
+        std::vector<st::Raster> pictures;
+        for (int t = 0; t < 25; ++t) pictures.push_back(picture(t));
+        auto tone = [](int64_t n) { return float(std::lround(0.5 * 8388608.0 * std::sin(2 * M_PI * 1000.0 * double(n % 48) / 48000.0))) / 8388608.0f; };
+        // Its SDP files, as a sender or an NMOS controller gives them.
+        std::string url;
+        for (const auto& [name, text] : {std::pair{"video", tx.sdpVideo()}, {"audio", tx.sdpAudio()}, {"data", tx.sdpAnc()}}) {
+            const std::string file = path(QStringLiteral("st2110-%1.sdp").arg(QLatin1String(name)).toStdString().c_str());
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(text.c_str());
+            url += (url.empty() ? "" : ";") + file;
+        }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            for (int t = 0; !stop && t < 25 * 20; ++t) {
+                std::vector<float> sound(size_t(spf) * 2, 0.0f);
+                for (int i = 0; i < spf; ++i) sound[size_t(i) * 2] = tone(int64_t(t) * spf + i);
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                if (!tx.send(pictures[size_t(t % 25)], sound.data(), spf, &tc, {}, &stop)) break;
+            }
+        });
+        // Recorded for two seconds, with the streams' time code.
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = url;
+        cs.path = path("capture-st2110.mov");
+        cs.seconds = 2;
+        Recorder rec;
+        QVERIFY2(rec.start(cs, &err), err.c_str());
+        const bool ended = rec.wait(20);
+        stop = true;
+        sending.join();
+        tx.close();
+        QVERIFY(ended);
+        const CaptureStatus status = rec.status();
+        QVERIFY2(status.error.empty(), status.error.c_str());
+        QCOMPARE(status.frames, int64_t(50));
+        QVERIFY(status.width == W && status.height == H && status.fps == 25 && status.channels == 2);
+        QVERIFY2(QString::fromStdString(status.timecode).startsWith("10:00:"), status.timecode.c_str());
+        const int first = std::stoi(status.timecode.substr(6, 2)) * 25 + std::stoi(status.timecode.substr(9, 2));
+        MediaItem m;
+        QVERIFY(probeMedia(cs.path, m, &err));
+        QVERIFY(std::fabs(m.duration - 2.0) < 0.05);
+        QVERIFY(std::fabs(m.timecode - (36000.0 + first / 25.0)) < 1e-6);
+        QVERIFY(m.hasAudio && m.channels == 2 && m.sampleRate == 48000);
+        // Every picture the one sent at its frame (ProRes is lossy: within half a frame's step of blue).
+        VideoDecoder dec;
+        QVERIFY(dec.open(cs.path));
+        int held = 0;
+        for (int k : {0, 1, 2, 3, 24, 25, 48, 49}) {
+            const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0);
+            QVERIFY(f && f->width == W);
+            const Image img = toImage(*f);
+            const float blue = img.at(W / 2, H / 2)[2];
+            auto blueOf = [&](int n) { return 0.2f + 0.6f * float(((n % 25) + 25) % 25) / 24.0f; };
+            const bool right = std::fabs(blue - blueOf(first + k)) < 0.0125;
+            // (a frame the sender sent late on a busy machine is held over the one it missed)
+            if (!right && k > 0 && std::fabs(blue - blueOf(first + k - 1)) < 0.0125) ++held;
+            else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3").arg(k).arg(blue).arg(blueOf(first + k))));
+            QVERIFY2(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.015, qPrintable(QStringLiteral("frame %1: red %2").arg(k).arg(img.at(W / 4, H / 4)[0])));
+        }
+        QVERIFY(held <= 2);
+        // The sound to the sample: the recording's sample s is the streams' sample (the first frame's) + s.
+        AudioBufferPtr heard = decodeAudio(cs.path, 48000, &err);
+        QVERIFY2(heard, err.c_str());
+        QCOMPARE(heard->frames(), int64_t(96000));
+        double worst = 0, right = 0;
+        for (int64_t s = 2 * spf; s < 96000; ++s) {
+            worst = std::max(worst, double(std::fabs(heard->samples[size_t(s) * 2] - tone(int64_t(first) * spf + s))));
+            right = std::max(right, double(std::fabs(heard->samples[size_t(s) * 2 + 1])));
+        }
+        QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        QVERIFY(right < 1e-6);
+
+        // Streams nobody sends (the SDP given as text): given up, nothing written.
+        CaptureSettings none = cs;
+        none.video.url = st::videoSdp(v, o.video, 96, {});
+        none.path = path("capture-st2110-none.mov");
+        none.openTimeout = 2;
+        Recorder never;
+        QVERIFY(never.start(none, &err));
+        QVERIFY(never.wait(15));
+        QVERIFY(!never.status().error.empty());
+        QVERIFY(!QFile::exists(QString::fromStdString(none.path)));
     }
 
     void deckControlProtocol() {

@@ -2739,6 +2739,11 @@ void MainWindow::buildMenus() {
         liveLink_->addAppTool(DeckController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return deckControl_->runTool(args, structured, isError);
         });
+    // Live feeds recorded (File › Capture), ST 2110 streams among them.
+    if (liveLink_)
+        liveLink_->addAppTool(CaptureDialog::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return captureDialog()->runTool(args, structured, isError);
+        });
     remoteReview_ = new RemoteReviewController(program_, this);
     remoteReviewAction_ = new QAction(tr("Remote Review…"), this);
     remoteReviewAction_->setObjectName(QStringLiteral("remoteReview"));

@@ -178,6 +178,42 @@ void fromPgroups(const uint8_t* in, int pixels, bool ten, uint16_t* c) {
     }
 }
 
+// Any sampling and depth: the samples' codes one after another, most significant bit first (pixel groups are whole bytes,
+// so a row of them is one stream of bits).
+void toBits(const uint16_t* c, size_t n, int depth, uint8_t* out) {
+    if (depth == 8) {
+        for (size_t i = 0; i < n; ++i) out[i] = uint8_t(c[i]);
+        return;
+    }
+    uint32_t acc = 0;
+    int bits = 0;
+    const uint32_t mask = (1u << depth) - 1;
+    for (size_t i = 0; i < n; ++i) {
+        acc = (acc << depth) | (c[i] & mask);
+        bits += depth;
+        while (bits >= 8) {
+            bits -= 8;
+            *out++ = uint8_t(acc >> bits);
+        }
+        acc &= (1u << bits) - 1;
+    }
+    if (bits) *out = uint8_t(acc << (8 - bits));
+}
+void fromBits(const uint8_t* in, size_t n, int depth, uint16_t* c) {
+    if (depth == 8) {
+        for (size_t i = 0; i < n; ++i) c[i] = in[i];
+        return;
+    }
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < n; ++i) {
+        while (bits < depth) acc = (acc << 8) | *in++, bits += 8;
+        bits -= depth;
+        c[i] = uint16_t(acc >> bits);
+        acc &= (1u << bits) - 1;
+    }
+}
+
 // ---- ST 291 words: 8 bits, b8 their even parity, b9 its inverse.
 uint16_t word10(uint8_t v) {
     int ones = 0;
@@ -243,6 +279,40 @@ bool isMulticast(const std::string& address) {
     return ipv4(address, a) && (ntohl(a.s_addr) >> 28) == 0xE;
 }
 
+std::string samplingName(Sampling s) {
+    return s == Sampling::Ycc444 ? "YCbCr-4:4:4" : s == Sampling::Rgb ? "RGB" : "YCbCr-4:2:2";
+}
+
+bool parseSampling(const std::string& name, Sampling& out) {
+    for (Sampling s : {Sampling::Ycc422, Sampling::Ycc444, Sampling::Rgb})
+        if (name == samplingName(s)) {
+            out = s;
+            return true;
+        }
+    return false;
+}
+
+Pgroup pgroup(Sampling s, int depth) {
+    // (the fewest pixels whose samples come to whole bytes)
+    const int perPixelUnit = s == Sampling::Ycc422 ? 4 : 3, unitPixels = s == Sampling::Ycc422 ? 2 : 1;
+    for (int units = 1;; ++units)
+        if (units * perPixelUnit * depth % 8 == 0) return {units * unitPixels, units * perPixelUnit * depth / 8};
+}
+
+bool videoFormatOk(const VideoFormat& f, std::string* why) {
+    auto fail = [&](const std::string& w) {
+        if (why) *why = w;
+        return false;
+    };
+    if (f.depth != 8 && f.depth != 10 && f.depth != 12) return fail("ST 2110-20 is sent here at 8, 10 or 12 bits");
+    if (f.width <= 0 || f.height <= 0 || !f.fps.valid()) return fail("ST 2110 carries pictures of a size at a frame rate");
+    const Pgroup pg = pgroup(f.sampling, f.depth);
+    if (f.width % pg.pixels)
+        return fail(samplingName(f.sampling) + " at " + std::to_string(f.depth) + " bits needs a width in whole groups of " +
+                    std::to_string(pg.pixels) + " pixels");
+    return true;
+}
+
 int64_t ptpNowNs(std::string* source) {
     using namespace std::chrono;
 #ifdef __linux__
@@ -264,50 +334,65 @@ int64_t ptpNowNs(std::string* source) {
 
 namespace {
 
-std::string sdpHead(const Endpoint& to, const SdpOptions& o, const std::string& media, int pt) {
+std::string sdpSession(const SdpOptions& o, bool duplicated) {
     const std::string source = o.source.empty() ? "0.0.0.0" : o.source;
     std::ostringstream s;
     s << "v=0\r\n"
       << "o=- " << o.session << " " << o.session << " IN IP4 " << source << "\r\n"
       << "s=" << o.name << "\r\n"
-      << "t=0 0\r\n"
-      << "m=" << media << " " << to.port << " RTP/AVP " << pt << "\r\n"
+      << "t=0 0\r\n";
+    if (duplicated) s << "a=group:DUP primary secondary\r\n";
+    return s.str();
+}
+
+std::string sdpMedia(const Endpoint& to, const SdpOptions& o, const std::string& source, const std::string& media, int pt) {
+    std::ostringstream s;
+    s << "m=" << media << " " << to.port << " RTP/AVP " << pt << "\r\n"
       << "c=IN IP4 " << to.address << (isMulticast(to.address) ? "/" + std::to_string(o.ttl) : std::string()) << "\r\n";
-    if (isMulticast(to.address) && !o.source.empty()) s << "a=source-filter: incl IN IP4 " << to.address << " " << o.source << "\r\n";
+    if (isMulticast(to.address) && !source.empty()) s << "a=source-filter: incl IN IP4 " << to.address << " " << source << "\r\n";
     return s.str();
 }
 
 std::string sdpClock(const SdpOptions& o) { return "a=ts-refclk:" + o.refclk + "\r\na=mediaclk:direct=0\r\n"; }
 
+// The session, then each path's media description (the same attributes, its own address and "a=mid").
+std::string sdpStreams(const Endpoint& to, const SdpOptions& o, const Endpoint* to2, const std::string& media, int pt, const std::string& attributes) {
+    std::string out = sdpSession(o, to2 != nullptr) + sdpMedia(to, o, o.source, media, pt) + attributes;
+    if (!to2) return out;
+    return out + "a=mid:primary\r\n" + sdpMedia(*to2, o, o.source2, media, pt) + attributes + "a=mid:secondary\r\n";
+}
+
 }  // namespace
 
-std::string videoSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o) {
+std::string videoSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const Endpoint* to2) {
     std::ostringstream s;
-    s << sdpHead(to, o, "video", pt) << "a=rtpmap:" << pt << " raw/90000\r\n"
-      << "a=fmtp:" << pt << " sampling=YCbCr-4:2:2; width=" << f.width << "; height=" << f.height
+    // (RGB is full range in ST 2110-20's sense only when said; Montage sends it narrow, as YCbCr)
+    s << "a=rtpmap:" << pt << " raw/90000\r\n"
+      << "a=fmtp:" << pt << " sampling=" << samplingName(f.sampling) << "; width=" << f.width << "; height=" << f.height
       << "; exactframerate=" << rateText(f.fps) << "; depth=" << f.depth << "; TCS=" << f.tcs << "; colorimetry=" << f.colorimetry
       << "; RANGE=NARROW; PM=2110GPM; SSN=ST2110-20:2017; TP=2110TPW" << (f.interlaced ? "; interlace" : "") << "\r\n"
       << sdpClock(o);
-    return s.str();
+    return sdpStreams(to, o, to2, "video", pt, s.str());
 }
 
-std::string audioSdp(const AudioFormat& f, const Endpoint& to, int pt, const SdpOptions& o) {
+std::string audioSdp(const AudioFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const Endpoint* to2) {
     // Channel order: a stereo pair, or as many pairs as there are, an odd one last a mono channel (ST 2110-30's symbols).
     std::string order = "SMPTE2110.(";
     for (int i = 0; i < f.channels / 2; ++i) order += i ? ",ST" : "ST";
     if (f.channels % 2) order += f.channels > 1 ? ",M" : "M";
     order += ")";
     std::ostringstream s;
-    s << sdpHead(to, o, "audio", pt) << "a=rtpmap:" << pt << " L24/" << f.rate << "/" << f.channels << "\r\n"
+    s << "a=rtpmap:" << pt << " L" << (f.bits == 16 ? 16 : 24) << "/" << f.rate << "/" << f.channels << "\r\n"
       << "a=fmtp:" << pt << " channel-order=" << order << "\r\n"
-      << "a=ptime:1\r\n"
+      << "a=ptime:" << (f.packetUs == 125 ? "0.125" : "1") << "\r\n"
       << sdpClock(o);
-    return s.str();
+    return sdpStreams(to, o, to2, "audio", pt, s.str());
 }
 
-std::string ancSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const std::vector<std::pair<int, int>>& ids) {
+std::string ancSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const std::vector<std::pair<int, int>>& ids,
+                   const Endpoint* to2) {
     std::ostringstream s;
-    s << sdpHead(to, o, "video", pt) << "a=rtpmap:" << pt << " smpte291/90000\r\n"
+    s << "a=rtpmap:" << pt << " smpte291/90000\r\n"
       << "a=fmtp:" << pt << " ";
     char id[32];
     for (const auto& [did, sdid] : ids) {
@@ -316,7 +401,7 @@ std::string ancSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOp
     }
     s << "exactframerate=" << rateText(f.fps) << "; SSN=ST2110-40:2018\r\n"
       << sdpClock(o);
-    return s.str();
+    return sdpStreams(to, o, to2, "video", pt, s.str());
 }
 
 std::map<std::string, std::string> sdpParameters(const std::string& sdp, std::string* encoding) {
@@ -327,8 +412,11 @@ std::map<std::string, std::string> sdpParameters(const std::string& sdp, std::st
         const auto a = t.find_first_not_of(" \t\r"), b = t.find_last_not_of(" \t\r");
         return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
     };
+    int media = 0;
     while (std::getline(in, line)) {
         line = trim(line);
+        // (the first media description's: a second is the same stream's other path)
+        if (line.rfind("m=", 0) == 0 && ++media > 1) break;
         if (encoding && line.rfind("a=rtpmap:", 0) == 0) {
             const auto sp = line.find(' ');
             if (sp != std::string::npos) *encoding = trim(line.substr(sp + 1));
@@ -379,26 +467,18 @@ bool parseRtp(const uint8_t* data, size_t size, RtpPacket& out) {
 
 namespace {
 
-int pgroupBytes(bool ten) { return ten ? 5 : 4; }
-
 // Bytes of pixels a packet carries: whole pixel groups, at most `maxPayload`.
-int packetData(bool ten, int maxPayload) { return std::max(1, maxPayload / pgroupBytes(ten)) * pgroupBytes(ten); }
+int packetData(const Pgroup& pg, int maxPayload) { return std::max(1, maxPayload / pg.bytes) * pg.bytes; }
 
-}  // namespace
-
-bool packVideo(const uint8_t* data, size_t stride, output::PixelFormat format, int width, int height, int field, uint32_t timestamp,
-               RtpState& rtp, const PacketSink& send, int maxPayload) {
-    if (format == output::PixelFormat::P216 || width <= 0 || width % 2 || height <= 0 || !data) return false;
-    const bool ten = tenBit(format);
+// The packets of a picture's rows (or a field's), each row's pixel groups from `line` (row number, out).
+bool packRows(int width, int height, int field, const Pgroup& pg, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload,
+              const std::function<void(int row, uint8_t* out)>& line) {
     const int rows = field ? (height + (field == 1 ? 1 : 0)) / 2 : height;
-    const size_t lineBytes = size_t(width / 2) * size_t(pgroupBytes(ten));
-    const size_t chunk = size_t(packetData(ten, maxPayload));
-    std::vector<uint16_t> comps(size_t(width) * 2);
-    std::vector<uint8_t> line(lineBytes), packet(12 + 2 + 6 + chunk);
+    const size_t lineBytes = size_t(width / pg.pixels) * size_t(pg.bytes);
+    const size_t chunk = size_t(packetData(pg, maxPayload));
+    std::vector<uint8_t> bytes(lineBytes + 8), packet(12 + 2 + 6 + chunk);
     for (int r = 0; r < rows; ++r) {
-        const int src = field ? r * 2 + (field - 1) : r;
-        rowComponents(data + size_t(src) * stride, format, width, comps.data());
-        toPgroups(comps.data(), width, ten, line.data());
+        line(field ? r * 2 + (field - 1) : r, bytes.data());
         for (size_t off = 0; off < lineBytes; off += chunk) {
             const size_t n = std::min(chunk, lineBytes - off);
             const bool last = r == rows - 1 && off + n == lineBytes;
@@ -407,8 +487,8 @@ bool packVideo(const uint8_t* data, size_t stride, output::PixelFormat format, i
             put16(p + 12, rtp.sequence >> 16);
             put16(p + 14, uint32_t(n));
             put16(p + 16, uint32_t(field == 2 ? 0x8000 : 0) | uint32_t(r & 0x7FFF));
-            put16(p + 18, uint32_t(off / size_t(pgroupBytes(ten)) * 2) & 0x7FFF);
-            std::memcpy(p + 20, line.data() + off, n);
+            put16(p + 18, uint32_t(off / size_t(pg.bytes) * size_t(pg.pixels)) & 0x7FFF);
+            std::memcpy(p + 20, bytes.data() + off, n);
             ++rtp.sequence;
             if (!send(p, 20 + n)) return false;
         }
@@ -416,24 +496,48 @@ bool packVideo(const uint8_t* data, size_t stride, output::PixelFormat format, i
     return true;
 }
 
-int videoPacketCount(int width, int height, int depth, bool interlaced, int maxPayload) {
-    const bool ten = depth > 8;
-    const int64_t lineBytes = int64_t(width / 2) * pgroupBytes(ten), chunk = packetData(ten, maxPayload);
+}  // namespace
+
+bool packVideo(const uint8_t* data, size_t stride, output::PixelFormat format, int width, int height, int field, uint32_t timestamp,
+               RtpState& rtp, const PacketSink& send, int maxPayload) {
+    if (format == output::PixelFormat::P216 || width <= 0 || width % 2 || height <= 0 || !data) return false;
+    const bool ten = tenBit(format);
+    std::vector<uint16_t> comps(size_t(width) * 2);
+    return packRows(width, height, field, pgroup(Sampling::Ycc422, ten ? 10 : 8), timestamp, rtp, send, maxPayload, [&](int row, uint8_t* out) {
+        rowComponents(data + size_t(row) * stride, format, width, comps.data());
+        toPgroups(comps.data(), width, ten, out);
+    });
+}
+
+bool packVideo(const Raster& picture, int field, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload) {
+    VideoFormat f;
+    f.width = picture.width, f.height = picture.height, f.sampling = picture.sampling, f.depth = picture.depth;
+    if (!videoFormatOk(f) || picture.samples.size() < size_t(picture.rowSamples()) * size_t(picture.height)) return false;
+    const size_t n = size_t(picture.rowSamples());
+    return packRows(picture.width, picture.height, field, pgroup(picture.sampling, picture.depth), timestamp, rtp, send, maxPayload,
+                    [&](int row, uint8_t* out) { toBits(picture.row(row), n, picture.depth, out); });
+}
+
+int videoPacketCount(int width, int height, int depth, bool interlaced, int maxPayload, Sampling sampling) {
+    const Pgroup pg = pgroup(sampling, depth);
+    const int64_t lineBytes = int64_t(width / pg.pixels) * pg.bytes, chunk = packetData(pg, maxPayload);
     (void)interlaced;  // (the same rows, in two fields)
     return int(height * ((lineBytes + chunk - 1) / chunk));
 }
 
 VideoAssembler::VideoAssembler(int width, int height, output::PixelFormat format, bool interlaced)
-    : width_(width), height_(height), format_(format), interlaced_(interlaced), stride_(output::rowBytes(format, width)) {
-    components_.assign(size_t(width) * 2 * size_t(height), 0);
-}
+    : width_(width), height_(height), format_(format), bytes_(true), interlaced_(interlaced), stride_(output::rowBytes(format, width)),
+      pg_(pgroup(Sampling::Ycc422, tenBit(format) ? 10 : 8)), building_(width, height, Sampling::Ycc422, tenBit(format) ? 10 : 8) {}
+
+VideoAssembler::VideoAssembler(int width, int height, Sampling sampling, int depth, bool interlaced)
+    : width_(width), height_(height), bytes_(false), interlaced_(interlaced), pg_(pgroup(sampling, depth)), building_(width, height, sampling, depth) {}
 
 bool VideoAssembler::add(const RtpPacket& p) {
     if (p.size < 2 + 6) return false;
     const uint32_t seq = get16(p.payload) << 16 | p.sequence;
     if (lastSeq_ >= 0) {
         const uint32_t gap = seq - uint32_t(lastSeq_) - 1;
-        if (gap > 0 && gap < (1u << 20)) lost_ += gap;
+        if (gap > 0 && gap < (1u << 20)) lost_ += gap, frameLost_ += gap;
     }
     lastSeq_ = seq;
     // The sample row data headers, then their pixels in turn.
@@ -457,14 +561,17 @@ bool VideoAssembler::add(const RtpPacket& p) {
         fieldsDone_ = 0;
         started_ = true;
     }
-    const bool ten = tenBit(format_);
-    const int pg = pgroupBytes(ten);
+    const size_t perPixel = building_.sampling == Sampling::Ycc422 ? 2 : 3;
+    const bool fast422 = building_.sampling == Sampling::Ycc422 && building_.depth <= 10;
     for (const Srd& s : srds) {
         if (at + s.length > p.size) return false;
         const int row = interlaced_ ? int(s.row) * 2 + (s.second ? 1 : 0) : int(s.row);
-        const int pixels = int(s.length) / pg * 2;
-        if (row < height_ && int(s.offset) + pixels <= width_)
-            fromPgroups(p.payload + at, pixels, ten, components_.data() + (size_t(row) * size_t(width_) + s.offset) * 2);
+        const int pixels = int(s.length) / pg_.bytes * pg_.pixels;
+        if (row < height_ && int(s.offset) + pixels <= width_) {
+            uint16_t* dst = building_.row(row) + size_t(s.offset) * perPixel;
+            if (fast422) fromPgroups(p.payload + at, pixels, building_.depth == 10, dst);
+            else fromBits(p.payload + at, size_t(pixels) * perPixel, building_.depth, dst);
+        }
         at += s.length;
     }
     if (!p.marker) return false;
@@ -478,36 +585,51 @@ bool VideoAssembler::add(const RtpPacket& p) {
 }
 
 void VideoAssembler::finish() {
-    done_.assign(stride_ * size_t(height_), 0);
-    for (int r = 0; r < height_; ++r)
-        componentsRow(components_.data() + size_t(r) * size_t(width_) * 2, format_, width_, done_.data() + size_t(r) * stride_, stride_);
+    if (bytes_) {
+        done_.assign(stride_ * size_t(height_), 0);
+        for (int r = 0; r < height_; ++r) componentsRow(building_.row(r), format_, width_, done_.data() + size_t(r) * stride_, stride_);
+    } else {
+        doneRaster_ = building_;
+    }
     doneTimestamp_ = timestamp_;
+    doneLost_ = frameLost_;
+    frameLost_ = 0;
     fieldsDone_ = 0;
 }
 
 // ---- ST 2110-30.
 
-bool packAudio(const float* samples, int frames, int channels, uint32_t timestamp, RtpState& rtp, const PacketSink& send) {
+bool packAudio(const float* samples, int frames, int channels, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int bits) {
     if (frames <= 0 || channels <= 0) return false;
-    std::vector<uint8_t> packet(12 + size_t(frames) * size_t(channels) * 3);
+    const bool l16 = bits == 16;
+    const size_t bytes = l16 ? 2 : 3;
+    const double full = l16 ? 32768.0 : 8388608.0;
+    std::vector<uint8_t> packet(12 + size_t(frames) * size_t(channels) * bytes);
     rtpHeader(packet.data(), false, rtp, timestamp);
     uint8_t* p = packet.data() + 12;
-    for (size_t i = 0, n = size_t(frames) * size_t(channels); i < n; ++i, p += 3) {
+    for (size_t i = 0, n = size_t(frames) * size_t(channels); i < n; ++i, p += bytes) {
         const float x = samples ? samples[i] : 0.0f;
-        const double v = std::nearbyint(double(std::isfinite(x) ? x : 0.0f) * 8388608.0);
-        const int32_t s = int32_t(std::clamp(v, -8388608.0, 8388607.0));
-        p[0] = uint8_t(s >> 16), p[1] = uint8_t(s >> 8), p[2] = uint8_t(s);
+        const double v = std::nearbyint(double(std::isfinite(x) ? x : 0.0f) * full);
+        const int32_t s = int32_t(std::clamp(v, -full, full - 1));
+        if (l16) p[0] = uint8_t(s >> 8), p[1] = uint8_t(s);
+        else p[0] = uint8_t(s >> 16), p[1] = uint8_t(s >> 8), p[2] = uint8_t(s);
     }
     ++rtp.sequence;
     return send(packet.data(), packet.size());
 }
 
-std::vector<float> unpackAudio(const uint8_t* payload, size_t size, int channels) {
+std::vector<float> unpackAudio(const uint8_t* payload, size_t size, int channels, int bits) {
     std::vector<float> out;
     if (channels <= 0) return out;
-    const size_t n = size / 3 / size_t(channels) * size_t(channels);
+    const bool l16 = bits == 16;
+    const size_t bytes = l16 ? 2 : 3;
+    const size_t n = size / bytes / size_t(channels) * size_t(channels);
     out.resize(n);
-    for (size_t i = 0; i < n; ++i, payload += 3) {
+    for (size_t i = 0; i < n; ++i, payload += bytes) {
+        if (l16) {
+            out[i] = float(double(int16_t(uint16_t(payload[0] << 8 | payload[1]))) / 32768.0);
+            continue;
+        }
         int32_t s = int32_t(uint32_t(payload[0]) << 16 | uint32_t(payload[1]) << 8 | payload[2]);
         if (s & 0x800000) s -= 0x1000000;
         out[i] = float(double(s) / 8388608.0);
@@ -738,15 +860,85 @@ SenderOptions outputOptions() {
 // ---- Sender.
 
 struct Sender::Sockets {
-    sock_t s = kBad;
-    sockaddr_in video{}, audio{}, anc{};
+    sock_t s = kBad, s2 = kBad;  // (the second path's: ST 2022-7)
+    sockaddr_in video{}, audio{}, anc{}, video2{}, audio2{}, anc2{};
+    std::function<bool(int, int, uint64_t)> drop;
+    uint64_t sent[3] = {0, 0, 0};
     ~Sockets() {
         if (s != kBad) closeSock(s);
+        if (s2 != kBad) closeSock(s2);
     }
-    bool to(const sockaddr_in& a, const uint8_t* data, size_t size) {
-        return ::sendto(s, reinterpret_cast<const char*>(data), int(size), 0, reinterpret_cast<const sockaddr*>(&a), sizeof a) == int(size);
+    // A packet of stream 0 (video), 1 (audio) or 2 (ancillary data), on each path.
+    bool to(int stream, const uint8_t* data, size_t size) {
+        const uint64_t index = sent[stream]++;
+        const sockaddr_in* first[3] = {&video, &audio, &anc};
+        const sockaddr_in* second[3] = {&video2, &audio2, &anc2};
+        bool ok = true;
+        for (int path = 0; path < (s2 != kBad ? 2 : 1); ++path) {
+            if (drop && drop(stream, path, index)) continue;
+            const sockaddr_in& a = *(path ? second : first)[stream];
+            ok = ::sendto(path ? s2 : s, reinterpret_cast<const char*>(data), int(size), 0, reinterpret_cast<const sockaddr*>(&a), sizeof a) == int(size) && ok;
+        }
+        return ok;
     }
 };
+
+namespace {
+
+// A sending socket: TTL, DSCP and (when given) its interface and port.
+sock_t senderSocket(const SenderOptions& o, const std::string& interfaceAddress, std::string* why) {
+    sock_t s = udpSocket();
+    if (s == kBad) {
+        *why = "Could not make a UDP socket";
+        return s;
+    }
+    option(s, SOL_SOCKET, SO_SNDBUF, int(8 << 20));
+    option(s, IPPROTO_IP, IP_MULTICAST_TTL, int(std::clamp(o.ttl, 1, 255)));
+    option(s, IPPROTO_IP, IP_TTL, int(std::clamp(o.ttl, 1, 255)));
+    option(s, IPPROTO_IP, IP_TOS, int(34 << 2));  // DSCP AF41, media's class in AES67 and ST 2110 networks
+    in_addr iface{};
+    iface.s_addr = htonl(INADDR_ANY);
+    if (!interfaceAddress.empty() && !ipv4(interfaceAddress, iface)) {
+        *why = "Not an IPv4 address: " + interfaceAddress;
+        closeSock(s);
+        return kBad;
+    }
+    if (!interfaceAddress.empty() || o.sourcePort > 0) {
+        // From the interface (and port) asked for; a port in use gives way to any free one.
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_addr = iface;
+        local.sin_port = htons(uint16_t(std::clamp(o.sourcePort, 0, 65535)));
+        option(s, SOL_SOCKET, SO_REUSEADDR, int(1));
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof local) != 0) {
+            local.sin_port = 0;
+            if (::bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof local) != 0) {
+                *why = "This computer has no interface at " + interfaceAddress;
+                closeSock(s);
+                return kBad;
+            }
+        }
+        if (!interfaceAddress.empty()) setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, reinterpret_cast<const char*>(&iface), sizeof iface);
+    }
+    return s;
+}
+
+// The address packets to `to` leave from: the interface's, else the one routing picks.
+std::string sourceAddress(const std::string& interfaceAddress, const sockaddr_in& to) {
+    if (!interfaceAddress.empty()) return interfaceAddress;
+    std::string out;
+    sock_t t = udpSocket();
+    sockaddr_in local{};
+    socklen_t len = sizeof local;
+    char text[INET_ADDRSTRLEN] = {};
+    if (t != kBad && ::connect(t, reinterpret_cast<const sockaddr*>(&to), sizeof to) == 0 &&
+        ::getsockname(t, reinterpret_cast<sockaddr*>(&local), &len) == 0 && inet_ntop(AF_INET, &local.sin_addr, text, sizeof text))
+        out = text;
+    if (t != kBad) closeSock(t);
+    return out == "0.0.0.0" ? std::string() : out;
+}
+
+}  // namespace
 
 Sender::Sender() = default;
 Sender::~Sender() { close(); }
@@ -758,37 +950,28 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
         s_.reset();
         return false;
     };
-    if (video.width <= 0 || video.width % 2 || video.height <= 0 || !video.fps.valid())
-        return fail("ST 2110 carries pictures of an even width at a frame rate");
+    std::string why;
+    if (!videoFormatOk(video, &why)) return fail(why);
     in_addr probe;
     for (const Endpoint* e : {&o.video, &o.audio, &o.anc})
         if (!ipv4(e->address, probe) || e->port <= 0 || e->port > 65535) return fail("Not an IPv4 address and port: " + endpointText(*e));
-    if (o.sendAudio && (audio.rate != 48000 || audio.channels < 1 || audio.channels > 8))
-        return fail("ST 2110-30 here carries 1 to 8 channels at 48 kHz");
+    if (o.redundant)
+        for (const Endpoint* e : {&o.video2, &o.audio2, &o.anc2})
+            if (!ipv4(e->address, probe) || e->port <= 0 || e->port > 65535) return fail("Not an IPv4 address and port: " + endpointText(*e));
+    if (o.sendAudio && (audio.rate != 48000 || audio.channels < 1 || audio.channels > 8 || (audio.bits != 24 && audio.bits != 16) ||
+                        (audio.packetUs != 1000 && audio.packetUs != 125)))
+        return fail("ST 2110-30 here carries 1 to 8 channels at 48 kHz, L24 or L16, in 1 ms or 125 µs packets");
     s_ = std::make_unique<Sockets>();
-    s_->s = udpSocket();
-    if (s_->s == kBad) return fail("Could not make a UDP socket");
-    option(s_->s, SOL_SOCKET, SO_SNDBUF, int(8 << 20));
-    option(s_->s, IPPROTO_IP, IP_MULTICAST_TTL, int(std::clamp(o.ttl, 1, 255)));
-    option(s_->s, IPPROTO_IP, IP_TTL, int(std::clamp(o.ttl, 1, 255)));
-    option(s_->s, IPPROTO_IP, IP_TOS, int(34 << 2));  // DSCP AF41, media's class in AES67 and ST 2110 networks
-    in_addr iface{};
-    iface.s_addr = htonl(INADDR_ANY);
-    if (!o.interfaceAddress.empty() && !ipv4(o.interfaceAddress, iface)) return fail("Not an IPv4 address: " + o.interfaceAddress);
-    if (!o.interfaceAddress.empty() || o.sourcePort > 0) {
-        // From the interface (and port) asked for; a port in use gives way to any free one.
-        sockaddr_in local{};
-        local.sin_family = AF_INET;
-        local.sin_addr = iface;
-        local.sin_port = htons(uint16_t(std::clamp(o.sourcePort, 0, 65535)));
-        option(s_->s, SOL_SOCKET, SO_REUSEADDR, int(1));
-        if (::bind(s_->s, reinterpret_cast<const sockaddr*>(&local), sizeof local) != 0) {
-            local.sin_port = 0;
-            if (::bind(s_->s, reinterpret_cast<const sockaddr*>(&local), sizeof local) != 0)
-                return fail("This computer has no interface at " + o.interfaceAddress);
-        }
-        if (!o.interfaceAddress.empty()) setsockopt(s_->s, IPPROTO_IP, IP_MULTICAST_IF, reinterpret_cast<const char*>(&iface), sizeof iface);
+    s_->s = senderSocket(o, o.interfaceAddress, &why);
+    if (s_->s == kBad) return fail(why);
+    if (o.redundant) {
+        s_->s2 = senderSocket(o, o.interfaceAddress2, &why);
+        if (s_->s2 == kBad) return fail(why);
+        s_->video2 = socketAddress(o.video2);
+        s_->audio2 = socketAddress(o.audio2);
+        s_->anc2 = socketAddress(o.anc2);
     }
+    s_->drop = o.drop;
     s_->video = socketAddress(o.video);
     s_->audio = socketAddress(o.audio);
     s_->anc = socketAddress(o.anc);
@@ -806,20 +989,8 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     frameAnc_.clear();
     frames_ = 0;
     ptpNowNs(&clock_);
-    // The address the streams come from (the interface's, else the one routing picks for the video's destination).
-    source_ = o.interfaceAddress;
-    if (source_.empty()) {
-        sock_t t = udpSocket();
-        sockaddr_in dst = s_->video;
-        sockaddr_in local{};
-        socklen_t len = sizeof local;
-        char text[INET_ADDRSTRLEN] = {};
-        if (t != kBad && ::connect(t, reinterpret_cast<const sockaddr*>(&dst), sizeof dst) == 0 &&
-            ::getsockname(t, reinterpret_cast<sockaddr*>(&local), &len) == 0 && inet_ntop(AF_INET, &local.sin_addr, text, sizeof text))
-            source_ = text;
-        if (t != kBad) closeSock(t);
-        if (source_ == "0.0.0.0") source_.clear();
-    }
+    source_ = sourceAddress(o.interfaceAddress, s_->video);
+    source2_ = o.redundant ? sourceAddress(o.interfaceAddress2, s_->video2) : std::string();
     return true;
 }
 
@@ -828,9 +999,10 @@ void Sender::close() { s_.reset(); }
 bool Sender::isOpen() const { return s_ != nullptr; }
 
 namespace {
-SdpOptions sdpOptions(const SenderOptions& o, const std::string& source) {
+SdpOptions sdpOptions(const SenderOptions& o, const std::string& source, const std::string& source2) {
     SdpOptions s;
     s.source = source;
+    s.source2 = source2;
     s.refclk = o.refclk;
     s.ttl = o.ttl;
     s.session = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -838,20 +1010,44 @@ SdpOptions sdpOptions(const SenderOptions& o, const std::string& source) {
 }
 }  // namespace
 
-std::string Sender::sdpVideo() const { return isOpen() && o_.sendVideo ? videoSdp(video_, o_.video, o_.videoPayload, sdpOptions(o_, source_)) : std::string(); }
+std::string Sender::sdpVideo() const {
+    return isOpen() && o_.sendVideo
+               ? videoSdp(video_, o_.video, o_.videoPayload, sdpOptions(o_, source_, source2_), o_.redundant ? &o_.video2 : nullptr)
+               : std::string();
+}
 std::string Sender::sdpAudio() const {
-    return isOpen() && o_.sendAudio ? audioSdp(audio_, o_.audio, o_.audioPayload, sdpOptions(o_, source_)) : std::string();
+    return isOpen() && o_.sendAudio
+               ? audioSdp(audio_, o_.audio, o_.audioPayload, sdpOptions(o_, source_, source2_), o_.redundant ? &o_.audio2 : nullptr)
+               : std::string();
 }
 std::string Sender::sdpAnc() const {
     if (!isOpen() || !o_.sendAnc) return {};
     std::vector<std::pair<int, int>> ids{{0x60, 0x60}, {0x61, 0x01}};
     for (const AncPacket& a : frameAnc_)
         if (std::find(ids.begin(), ids.end(), std::pair<int, int>{a.did, a.sdid}) == ids.end()) ids.emplace_back(a.did, a.sdid);
-    return ancSdp(video_, o_.anc, o_.ancPayload, sdpOptions(o_, source_), ids);
+    return ancSdp(video_, o_.anc, o_.ancPayload, sdpOptions(o_, source_, source2_), ids, o_.redundant ? &o_.anc2 : nullptr);
 }
 
 bool Sender::send(const uint8_t* data, size_t stride, output::PixelFormat format, const float* audio, int audioFrames,
                   const output::Timecode* timecode, const std::vector<AncPacket>& anc, const std::atomic<bool>* stop) {
+    if (!s_) return false;
+    // (rows of the reference output: 4:2:2 at the video format's size)
+    return sendFrame([&](int field, uint32_t ts, const PacketSink& keep) {
+        return packVideo(data, stride, format, video_.width, video_.height, field, ts, rtpVideo_, keep, o_.maxPayload);
+    }, audio, audioFrames, timecode, anc, stop);
+}
+
+bool Sender::send(const Raster& picture, const float* audio, int audioFrames, const output::Timecode* timecode,
+                  const std::vector<AncPacket>& anc, const std::atomic<bool>* stop) {
+    if (!s_ || picture.width != video_.width || picture.height != video_.height || picture.sampling != video_.sampling ||
+        picture.depth != video_.depth)
+        return false;
+    return sendFrame([&](int field, uint32_t ts, const PacketSink& keep) { return packVideo(picture, field, ts, rtpVideo_, keep, o_.maxPayload); },
+                     audio, audioFrames, timecode, anc, stop);
+}
+
+bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const PacketSink& keep)>& pack, const float* audio, int audioFrames,
+                       const output::Timecode* timecode, const std::vector<AncPacket>& anc, const std::atomic<bool>* stop) {
     if (!s_) return false;
     const int64_t num = video_.fps.num, den = video_.fps.den;
     const int64_t second = 1000000000;
@@ -879,12 +1075,12 @@ bool Sender::send(const uint8_t* data, size_t stride, output::PixelFormat format
 
     bool ok = true;
     auto sendAudioDue = [&](int64_t until) {
-        // 1 ms packets whose last sample's time has come.
-        const int per = audio_.rate / 1000, ch = audio_.channels;
+        // Packets (1 ms or 125 µs) whose last sample's time has come.
+        const int per = std::max(1, audio_.packetSamples()), ch = audio_.channels;
         while (ok && o_.sendAudio && audioFifo_.size() >= size_t(per) * size_t(ch) &&
                mulDiv(audioSample_ + per, second, audio_.rate) <= until) {
             ok = packAudio(audioFifo_.data(), per, ch, uint32_t(audioSample_), rtpAudio_,
-                           [&](const uint8_t* p, size_t n) { return s_->to(s_->audio, p, n); });
+                           [&](const uint8_t* p, size_t n) { return s_->to(1, p, n); }, audio_.bits);
             audioFifo_.erase(audioFifo_.begin(), audioFifo_.begin() + ptrdiff_t(per) * ch);
             audioSample_ += per;
         }
@@ -906,16 +1102,14 @@ bool Sender::send(const uint8_t* data, size_t stride, output::PixelFormat format
                 out.insert(out.end(), frameAnc_.begin(), frameAnc_.end());
                 out.insert(out.end(), anc.begin(), anc.end());
             }
-            ok = packAnc(out, field, ts, rtpAnc_, [&](const uint8_t* p, size_t n) { return s_->to(s_->anc, p, n); });
+            ok = packAnc(out, field, ts, rtpAnc_, [&](const uint8_t* p, size_t n) { return s_->to(2, p, n); });
         }
         packets.clear();
         if (ok && o_.sendVideo)
-            ok = packVideo(data, stride, format, video_.width, video_.height, field, ts, rtpVideo_,
-                           [&](const uint8_t* p, size_t n) {
-                               packets.emplace_back(p, p + n);
-                               return true;
-                           },
-                           o_.maxPayload);
+            ok = pack(field, ts, [&](const uint8_t* p, size_t n) {
+                packets.emplace_back(p, p + n);
+                return true;
+            });
         // From ST 2110-21's default offset (43 lines of 1125 into a progressive frame, 22 into a field), spread over
         // most of what is left (a wide sender's pacing), in bursts of what is due.
         const int64_t troffset = (end - start) * (video_.interlaced ? 22 : 43) / 1125;
@@ -925,7 +1119,7 @@ bool Sender::send(const uint8_t* data, size_t stride, output::PixelFormat format
         while (ok && i < packets.size()) {
             const int64_t t = ptpNowNs();
             const size_t due = std::min(packets.size(), size_t(std::max<int64_t>(1, (t - vStart) * int64_t(packets.size()) / std::max<int64_t>(1, span) + 1)));
-            for (; ok && i < due; ++i) ok = s_->to(s_->video, packets[i].data(), packets[i].size());
+            for (; ok && i < due; ++i) ok = s_->to(0, packets[i].data(), packets[i].size());
             sendAudioDue(t);
             if (i < packets.size()) {
                 if (stopped()) return false;
@@ -1060,7 +1254,8 @@ public:
             d.id = id;
             d.name = name;
             d.modes = standardModes();
-            d.formats = {PixelFormat::V210, PixelFormat::Uyvy8};
+            // (4:2:2 at 8 and 10 bits from UYVY and v210; 12 bits, 4:4:4 and RGB from the 16-bit formats)
+            d.formats = {PixelFormat::V210, PixelFormat::Uyvy8, PixelFormat::P216, PixelFormat::Ycc444, PixelFormat::Rgb48};
             d.hdr = true;  // (said by the SDP's TCS and colorimetry)
             d.audioChannels = {2, 8};
             d.audioRates = {48000};
@@ -1080,7 +1275,10 @@ public:
         v.height = mode.height;
         v.fps = mode.fps;
         v.interlaced = mode.interlaced;
-        v.depth = signal.format == PixelFormat::V210 ? 10 : 8;
+        v.depth = signal.format == PixelFormat::V210 ? 10 : signal.format == PixelFormat::Uyvy8 ? 8 : std::clamp(signal.bits, 8, 12);
+        v.sampling = signal.format == PixelFormat::Ycc444 ? st2110::Sampling::Ycc444
+                     : signal.format == PixelFormat::Rgb48 ? st2110::Sampling::Rgb
+                                                           : st2110::Sampling::Ycc422;
         v.tcs = signal.eotf == Eotf::Pq ? "PQ" : signal.eotf == Eotf::Hlg ? "HLG" : "SDR";
         v.colorimetry = signal.eotf != Eotf::Sdr ? "BT2100" : signal.bt2020 ? "BT2020" : "BT709";
         st2110::AudioFormat a;
@@ -1103,7 +1301,33 @@ public:
             std::memcpy(cc.data(), f.cc, cc.size() * 3);
             anc.push_back(st2110::captionPacket(captionCdp(cc, fps_, cdpSequence_++)));
         }
-        return sender_.send(f.data, f.stride, f.format, a.channels > 0 ? a.samples : nullptr, a.channels > 0 ? a.frames : 0, &f.timecode, anc, &stop_);
+        const float* audio = a.channels > 0 ? a.samples : nullptr;
+        const int audioFrames = a.channels > 0 ? a.frames : 0;
+        if (f.format == PixelFormat::V210 || f.format == PixelFormat::Uyvy8)
+            return sender_.send(f.data, f.stride, f.format, audio, audioFrames, &f.timecode, anc, &stop_);
+        // The 16-bit formats' samples cut to the stream's depth.
+        const st2110::VideoFormat& v = sender_.videoFormat();
+        st2110::Raster r(v.width, v.height, v.sampling, v.depth);
+        const int shift = 16 - v.depth, top = (1 << v.depth) - 1;
+        auto cut = [&](const uint8_t* p) { return uint16_t(std::min(top, (int(p[0] | p[1] << 8) + (1 << (shift - 1))) >> shift)); };
+        for (int y = 0; y < v.height; ++y) {
+            uint16_t* out = r.row(y);
+            if (f.format == PixelFormat::P216) {
+                // (a plane of Y, then one of Cb Cr pairs: to Cb Y Cr Y)
+                const uint8_t* py = f.data + size_t(y) * f.stride;
+                const uint8_t* puv = f.data + f.stride * size_t(v.height) + size_t(y) * f.stride;
+                for (int x = 0; x < v.width; x += 2) {
+                    out[2 * x] = cut(puv + 2 * x);
+                    out[2 * x + 1] = cut(py + 2 * x);
+                    out[2 * x + 2] = cut(puv + 2 * x + 2);
+                    out[2 * x + 3] = cut(py + 2 * x + 2);
+                }
+            } else {
+                const uint8_t* p = f.data + size_t(y) * f.stride;
+                for (int i = 0; i < v.width * 3; ++i) out[i] = cut(p + 2 * i);
+            }
+        }
+        return sender_.send(r, audio, audioFrames, &f.timecode, anc, &stop_);
     }
     void close() override {
         std::lock_guard lock(m_);

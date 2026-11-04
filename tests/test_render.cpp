@@ -154,6 +154,7 @@
 #include "render/ReferenceOutput.h"
 #include "render/Nmos.h"
 #include "render/St2110.h"
+#include "render/St2110Receive.h"
 #ifdef MONTAGE_WITH_OMT
 #include "media/Omt.h"
 #include "media/OmtNet.h"
@@ -14327,6 +14328,344 @@ colorspaces:
         sched.stop();
         QVERIFY(backend->address().empty());
         st::setOutputOptions({});
+    }
+
+    // Receiving ST 2110: every sampling and depth back bit for bit, L16 and 125 µs packets, ST 2022-7's two paths merged
+    // with packets lost on each, and frames put together with their own sound and time code.
+    void st2110Receive() {
+        using namespace montage::output;
+        namespace st = montage::st2110;
+        std::mt19937 rng(2022);
+        auto raster = [&](st::Sampling s, int depth, int w, int h) {
+            st::Raster r(w, h, s, depth);
+            std::uniform_int_distribution<int> code(0, (1 << depth) - 1);
+            for (auto& v : r.samples) v = uint16_t(code(rng));
+            return r;
+        };
+        // Pixel groups as ST 2110-20's table gives them, and widths that are not whole groups refused.
+        auto group = [](st::Sampling s, int d) { return std::make_pair(st::pgroup(s, d).pixels, st::pgroup(s, d).bytes); };
+        QVERIFY(group(st::Sampling::Ycc422, 8) == std::make_pair(2, 4) && group(st::Sampling::Ycc422, 10) == std::make_pair(2, 5));
+        QVERIFY(group(st::Sampling::Ycc422, 12) == std::make_pair(2, 6) && group(st::Sampling::Ycc444, 8) == std::make_pair(1, 3));
+        QVERIFY(group(st::Sampling::Ycc444, 10) == std::make_pair(4, 15) && group(st::Sampling::Rgb, 12) == std::make_pair(2, 9));
+        st::VideoFormat bad;
+        bad.width = 322, bad.height = 180, bad.sampling = st::Sampling::Rgb, bad.depth = 10;
+        QVERIFY(!st::videoFormatOk(bad));
+        bad.width = 320;
+        QVERIFY(st::videoFormatOk(bad));
+        // Packed and put back together: the same samples, progressive and interlaced, at every sampling and depth.
+        auto trip = [&](st::Sampling s, int depth, int w, int h, bool interlaced) {
+            const st::Raster pic = raster(s, depth, w, h);
+            st::RtpState rtp{96, 1, 65000};
+            std::vector<std::vector<uint8_t>> packets;
+            auto keep = [&](const uint8_t* d, size_t n) {
+                packets.emplace_back(d, d + n);
+                return true;
+            };
+            if (interlaced ? !(st::packVideo(pic, 1, 9000, rtp, keep) && st::packVideo(pic, 2, 10800, rtp, keep)) : !st::packVideo(pic, 0, 9000, rtp, keep))
+                return false;
+            if (int(packets.size()) != st::videoPacketCount(w, h, depth, interlaced, 1200, s)) return false;
+            st::VideoAssembler as(w, h, s, depth, interlaced);
+            int done = 0;
+            for (const auto& p : packets) {
+                st::RtpPacket rp;
+                if (!st::parseRtp(p.data(), p.size(), rp)) return false;
+                done += as.add(rp) ? 1 : 0;
+            }
+            return done == 1 && as.lost() == 0 && as.raster() == pic && as.timestamp() == 9000;
+        };
+        for (auto s : {st::Sampling::Ycc422, st::Sampling::Ycc444, st::Sampling::Rgb})
+            for (int depth : {8, 10, 12}) {
+                const QString what = QStringLiteral("%1 %2-bit").arg(QString::fromStdString(st::samplingName(s))).arg(depth);
+                QVERIFY2(trip(s, depth, 320, 180, false), qPrintable(what));
+                QVERIFY2(trip(s, depth, 64, 36, true), qPrintable(what + " interlaced"));
+            }
+        // L16: 16-bit samples exactly.
+        std::vector<float> samples(12);
+        for (size_t i = 0; i < samples.size(); ++i) samples[i] = float(int(i * 5461 % 65536) - 32768) / 32768.0f;
+        std::vector<uint8_t> bytes;
+        st::RtpState audioRtp{97, 6, 0};
+        QVERIFY(st::packAudio(samples.data(), 6, 2, 0, audioRtp, [&](const uint8_t* d, size_t n) {
+            bytes.assign(d, d + n);
+            return true;
+        }, 16));
+        st::RtpPacket rp;
+        QVERIFY(st::parseRtp(bytes.data(), bytes.size(), rp) && rp.size == 24);
+        QVERIFY(st::unpackAudio(rp.payload, rp.size, 2, 16) == samples);
+
+        // ST 2022-7 by hand: each path missing packets the other has (across the sequence number's wrap), out once each
+        // and in order; a gap neither fills given up when the stream pauses.
+        auto rtpPacket = [](uint32_t seq, bool extended) {
+            std::vector<uint8_t> p(16, 0);
+            p[0] = 0x80, p[2] = uint8_t(seq >> 8), p[3] = uint8_t(seq);
+            if (extended) p[12] = uint8_t(seq >> 24), p[13] = uint8_t(seq >> 16);
+            return p;
+        };
+        auto seqOf = [](const std::vector<uint8_t>& p, bool extended) {
+            const uint32_t low = uint32_t(p[2]) << 8 | p[3];
+            return extended ? (uint32_t(p[12]) << 24 | uint32_t(p[13]) << 16 | low) : low;
+        };
+        for (bool extended : {false, true}) {
+            st::PathMerger merger(extended, 8);
+            std::vector<std::vector<uint8_t>> out;
+            const uint32_t first = extended ? 0x1FFF0 : 65530;
+            for (uint32_t i = 0; i < 40; ++i) {
+                if (i % 5 != 1) merger.push(rtpPacket(first + i, extended), 0, out);
+                if (i % 5 != 3) merger.push(rtpPacket(first + i, extended), 1, out);
+            }
+            QCOMPARE(int(out.size()), 40);
+            for (uint32_t i = 0; i < 40; ++i) QCOMPARE(seqOf(out[i], extended), (first + i) & (extended ? 0xFFFFFFFFu : 0xFFFFu));
+            QVERIFY(merger.duplicates == 24 && merger.lost == 0 && merger.received[0] == 32 && merger.received[1] == 32);
+            merger.push(rtpPacket(first + 50, extended), 0, out);
+            QCOMPARE(int(out.size()), 40);
+            merger.flush(out);
+            QVERIFY(out.size() == 41 && merger.lost == 10);
+        }
+
+        // Over the loopback interface: a sender's streams found from its SDPs, received, and each frame matched by its
+        // time code with the picture and sound sent with it.
+        auto loopback = [&](st::VideoFormat v, st::AudioFormat a, bool redundant, int frames) -> std::string {
+            // (free ports: bound, noted and let go)
+            int ports[6];
+            {
+                st::Receiver probe[6];
+                for (int i = 0; i < 6; ++i) {
+                    if (!probe[i].open({"127.0.0.1", 0})) return "no free port";
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+            o.video2 = {"127.0.0.1", ports[3]}, o.audio2 = {"127.0.0.1", ports[4]}, o.anc2 = {"127.0.0.1", ports[5]};
+            o.ttl = 1, o.redundant = redundant;
+            // (one packet in twenty lost on each path, never the same one)
+            if (redundant) o.drop = [](int, int path, uint64_t i) { return i % 20 == (path ? 11u : 3u); };
+            st::Sender snd;
+            std::string why;
+            if (!snd.open(o, v, a, &why)) return why;
+            std::vector<st::SdpStream> streams;
+            for (const std::string& sdp : {snd.sdpVideo(), snd.sdpAudio(), snd.sdpAnc()}) {
+                const auto found = st::parseSdp(sdp, &why);
+                if (found.size() != 1) return "SDP: " + why;
+                if (found[0].redundant() != redundant || found[0].path[0].port <= 0) return "SDP paths";
+                streams.push_back(found[0]);
+            }
+            if (!(streams[0].video.width == v.width && streams[0].video.sampling == v.sampling && streams[0].video.depth == v.depth &&
+                  streams[0].video.interlaced == v.interlaced && streams[0].video.fps == v.fps))
+                return "SDP video format";
+            if (!(streams[1].audio.bits == a.bits && streams[1].audio.packetUs == a.packetUs && streams[1].audio.channels == a.channels))
+                return "SDP audio format";
+            if (redundant && streams[0].path[1].port != ports[3]) return "SDP second path";
+            st::Input in;
+            if (!in.open(streams, {}, &why)) return why;
+            const st::Raster picA = raster(v.sampling, v.depth, v.width, v.height), picB = raster(v.sampling, v.depth, v.width, v.height);
+            const int perFrame = int(int64_t(a.rate) * v.fps.den / v.fps.num);
+            const int scale = a.bits == 16 ? 32768 : 8388608;
+            std::vector<float> sound(size_t(frames) * size_t(perFrame) * size_t(a.channels));
+            for (size_t i = 0; i < sound.size(); ++i) sound[i] = float(int64_t(i * 7919) % (2 * scale) - scale) / float(scale);
+            const int base = 36000 * int(std::lround(v.fps.toDouble()));
+            std::atomic<bool> stop{false};
+            std::thread sending([&] {
+                for (int k = 0; k < frames && !stop; ++k) {
+                    const Timecode t = timecodeOf(FrameTime(base + k), v.fps);
+                    snd.send(k % 2 ? picB : picA, sound.data() + size_t(k) * size_t(perFrame) * size_t(a.channels), perFrame, &t, {}, &stop);
+                }
+            });
+            std::string error;
+            std::vector<bool> seen(static_cast<size_t>(frames), false);
+            int got = 0;
+            int64_t lastNumber = -1;
+            for (int idle = 0; got < frames && idle < 10 && error.empty();) {
+                st::InputFrame f;
+                if (!in.next(f, 300)) {
+                    ++idle;
+                    continue;
+                }
+                idle = 0;
+                if (!f.hasTimecode) {
+                    error = "a frame without its time code";
+                    break;
+                }
+                const Timecode& t = f.timecode;
+                const int k = ((t.hours * 60 + t.minutes) * 60 + t.seconds) * int(std::lround(v.fps.toDouble())) + t.frames - base;
+                if (k < 0 || k >= frames || seen[size_t(k)]) {
+                    error = "time code " + std::to_string(k);
+                    break;
+                }
+                seen[size_t(k)] = true;
+                ++got;
+                if (f.number <= lastNumber) error = "frames out of order";
+                lastNumber = f.number;
+                if (!(f.picture == (k % 2 ? picB : picA)) || f.lostPackets) error = "picture " + std::to_string(k);
+                const auto from = sound.begin() + ptrdiff_t(k) * perFrame * a.channels;
+                if (f.channels != a.channels || f.audio.size() != size_t(perFrame) * size_t(a.channels) ||
+                    !std::equal(f.audio.begin(), f.audio.end(), from))
+                    error = "sound of frame " + std::to_string(k);
+            }
+            stop = true;
+            sending.join();
+            if (error.empty() && got != frames) error = std::to_string(got) + " of " + std::to_string(frames) + " frames";
+            const st::InputStats s = in.stats();
+            if (error.empty() && (s.lost || s.incomplete)) error = "packets lost after merging";
+            if (error.empty() && redundant && !(s.duplicates > 0 && s.packets[0][1] > 0 && s.packets[1][1] > 0 && s.packets[2][1] > 0))
+                error = "the second path unused";
+            in.close();
+            return error;
+        };
+        st::VideoFormat v;
+        v.width = 320, v.height = 180, v.fps = {50, 1}, v.sampling = st::Sampling::Ycc444, v.depth = 12;
+        st::AudioFormat a;
+        a.bits = 16, a.packetUs = 125;
+        std::string why = loopback(v, a, true, 50);
+        QVERIFY2(why.empty(), why.c_str());
+        v.sampling = st::Sampling::Rgb, v.depth = 10, v.fps = {25, 1}, v.interlaced = true;
+        a = {};
+        a.channels = 4;
+        why = loopback(v, a, false, 20);
+        QVERIFY2(why.empty(), why.c_str());
+    }
+
+    // NMOS receivers: a controller hands each one a sender's SDP (two paths, ST 2022-7) through IS-05, the parameters
+    // follow it, and the streams those parameters describe are received; IS-04's target connects and disconnects.
+    void nmosReceivers() {
+        using namespace montage::output;
+        namespace st = montage::st2110;
+        int ports[6];
+        {
+            st::Receiver probe[6];
+            for (int i = 0; i < 6; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions so;
+        so.video = {"127.0.0.1", ports[0]}, so.audio = {"127.0.0.1", ports[1]}, so.anc = {"127.0.0.1", ports[2]};
+        so.video2 = {"127.0.0.1", ports[3]}, so.audio2 = {"127.0.0.1", ports[4]}, so.anc2 = {"127.0.0.1", ports[5]};
+        so.ttl = 1, so.redundant = true;
+        so.drop = [](int, int path, uint64_t i) { return i % 20 == (path ? 13u : 7u); };
+        st::VideoFormat v;
+        v.width = 320, v.height = 180, v.fps = {25, 1}, v.depth = 10;
+        st::AudioFormat a;
+        st::Sender snd;
+        std::string error;
+        QVERIFY2(snd.open(so, v, a, &error), error.c_str());
+
+        montage::nmos::Node node;
+        montage::nmos::NodeOptions no;
+        no.address = QStringLiteral("127.0.0.1");
+        no.discover = false;
+        no.senders = false;
+        no.receivers = true;
+        QString why;
+        QVERIFY2(node.start(no, &why), qPrintable(why));
+        std::vector<montage::nmos::ReceiverConnection> activated;
+        node.onReceiverActivated = [&](const montage::nmos::ReceiverConnection& c) { activated.push_back(c); };
+        auto json = [&](const QByteArray& method, const QString& path, const QJsonValue& body = QJsonValue::Undefined) {
+            const QByteArray b = body.isObject() ? QJsonDocument(body.toObject()).toJson() : body.isArray() ? QJsonDocument(body.toArray()).toJson() : QByteArray();
+            const montage::nmos::Node::Response r = node.handle(method, path, b);
+            return std::pair{r.code, QJsonDocument::fromJson(r.body)};
+        };
+        const QString nodeApi = QStringLiteral("/x-nmos/node/v1.3/");
+        // Receivers alone: no senders, three receivers with two legs each.
+        QCOMPARE(json("GET", nodeApi + "senders").second.array().size(), 0);
+        const QJsonArray receivers = json("GET", nodeApi + "receivers").second.array();
+        QCOMPARE(receivers.size(), 3);
+        QCOMPARE(receivers[0].toObject()["caps"].toObject()["media_types"].toArray()[0].toString(), QStringLiteral("video/raw"));
+        QCOMPARE(receivers[0].toObject()["interface_bindings"].toArray().size(), 2);
+        QCOMPARE(json("GET", nodeApi + "devices").second.array()[0].toObject()["receivers"].toArray().size(), 3);
+        const QString videoId = node.receiverId(0).toString(QUuid::WithoutBraces), audioId = node.receiverId(1).toString(QUuid::WithoutBraces);
+        const QString single = QStringLiteral("/x-nmos/connection/v1.1/single/receivers/%1/").arg(videoId);
+        QCOMPARE(json("GET", single + "constraints").second.array().size(), 2);
+        // Parameters that cannot be are refused, and nothing staged.
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{}}}}).first, 400);
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"multicast_ip", "10.0.0.1"}}, QJsonObject{}}}}).first, 400);
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"colour", 1}}, QJsonObject{}}}}).first, 400);
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_file", QJsonObject{{"data", "v=0"}, {"type", "application/sdp"}}}}).first, 400);
+
+        // The sender's SDP: both paths become the legs, at once; the IS-04 receiver says whom it takes from.
+        const QString senderId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        auto connectTo = [&](const QString& path, const std::string& sdp) {
+            return json("PATCH", path + "staged", QJsonObject{{"sender_id", senderId}, {"master_enable", true},
+                                                              {"transport_file", QJsonObject{{"data", QString::fromStdString(sdp)}, {"type", "application/sdp"}}},
+                                                              {"activation", QJsonObject{{"mode", "activate_immediate"}}}});
+        };
+        const auto done = connectTo(single, snd.sdpVideo());
+        QCOMPARE(done.first, 200);
+        QCOMPARE(int(activated.size()), 1);
+        const QJsonArray legs = json("GET", single + "active").second.object()["transport_params"].toArray();
+        QCOMPARE(legs[0].toObject()["destination_port"].toInt(), ports[0]);
+        QCOMPARE(legs[1].toObject()["destination_port"].toInt(), ports[3]);
+        QVERIFY(legs[0].toObject()["rtp_enabled"].toBool() && legs[1].toObject()["rtp_enabled"].toBool());
+        QVERIFY(legs[0].toObject()["multicast_ip"].isNull());
+        QCOMPARE(legs[0].toObject()["interface_ip"].toString(), QStringLiteral("127.0.0.1"));
+        const QJsonObject subscribed = json("GET", nodeApi + "receivers/" + videoId).second.object()["subscription"].toObject();
+        QVERIFY(subscribed["active"].toBool() && subscribed["sender_id"].toString() == senderId);
+        // The sound in bulk.
+        const auto bulk = json("POST", "/x-nmos/connection/v1.1/bulk/receivers",
+            QJsonArray{QJsonObject{{"id", audioId}, {"params", QJsonObject{{"sender_id", senderId}, {"master_enable", true},
+                {"transport_file", QJsonObject{{"data", QString::fromStdString(snd.sdpAudio())}, {"type", "application/sdp"}}},
+                {"activation", QJsonObject{{"mode", "activate_immediate"}}}}}}});
+        QCOMPARE(bulk.first, 200);
+        QCOMPARE(bulk.second.array()[0].toObject()["code"].toInt(), 200);
+        QCOMPARE(int(activated.size()), 2);
+        QVERIFY(activated[1].stream == 1 && activated[1].leg[1].enabled && activated[1].leg[1].port == ports[4]);
+
+        // What the receivers now take, received: two paths each, the pictures and sound as sent.
+        const std::vector<st::SdpStream> streams = node.receiverStreams(&why);
+        QVERIFY2(streams.size() == 2, qPrintable(why));
+        QVERIFY(streams[0].redundant() && streams[0].path[1].port == ports[3] && streams[0].video.width == 320);
+        QVERIFY(streams[1].redundant() && streams[1].media == "audio");
+        st::Input in;
+        QVERIFY2(in.open(streams, {}, &error), error.c_str());
+        st::Raster pic(v.width, v.height, v.sampling, v.depth);
+        for (size_t i = 0; i < pic.samples.size(); ++i) pic.samples[i] = uint16_t(64 + i * 37 % 876);
+        const int perFrame = a.rate / 25;
+        std::vector<float> sound(size_t(perFrame) * size_t(a.channels));
+        for (size_t i = 0; i < sound.size(); ++i) sound[i] = float(int(i * 4099 % 16384) - 8192) / 8388608.0f;
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            for (int k = 0; k < 30 && !stop; ++k) snd.send(pic, sound.data(), perFrame, nullptr, {}, &stop);
+        });
+        int got = 0;
+        for (int idle = 0; got < 10 && idle < 10;) {
+            st::InputFrame f;
+            if (!in.next(f, 300)) {
+                ++idle;
+                continue;
+            }
+            // (the first, joined mid-frame, may be short of sound)
+            if (f.picture == pic && f.lostPackets == 0 && f.audio == sound) ++got;
+        }
+        stop = true;
+        sending.join();
+        QVERIFY2(got >= 10, qPrintable(QString::number(got)));
+        const st::InputStats s = in.stats();
+        QVERIFY(s.duplicates > 0 && s.packets[0][1] > 0);
+        in.close();
+
+        // IS-04's target: an empty one disconnects, and nothing is taken.
+        QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", QJsonObject{}).first, 202);
+        QVERIFY(!json("GET", nodeApi + "receivers/" + videoId).second.object()["subscription"].toObject()["active"].toBool());
+        QVERIFY(!node.receiverConnection(0).active);
+        QCOMPARE(int(node.receiverStreams().size()), 1);
+        // A sender as target: its manifest fetched and taken as the transport file.
+        QTcpServer manifest;
+        QVERIFY(manifest.listen(QHostAddress::LocalHost));
+        // (another port, to tell the manifest's from what was staged before)
+        const QByteArray sdp = QByteArray::fromStdString(snd.sdpVideo()).replace("m=video " + QByteArray::number(ports[0]), "m=video 5099");
+        connect(&manifest, &QTcpServer::newConnection, this, [&] {
+            QTcpSocket* sock = manifest.nextPendingConnection();
+            connect(sock, &QTcpSocket::readyRead, sock, [sock, sdp] {
+                if (!sock->readAll().contains("\r\n\r\n")) return;
+                sock->write("HTTP/1.1 200 OK\r\nContent-Type: application/sdp\r\nContent-Length: " + QByteArray::number(sdp.size()) + "\r\nConnection: close\r\n\r\n" + sdp);
+                sock->disconnectFromHost();
+            });
+        });
+        const QJsonObject target{{"id", senderId}, {"manifest_href", QStringLiteral("http://127.0.0.1:%1/sdp").arg(manifest.serverPort())}};
+        QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", target).first, 202);
+        QTRY_COMPARE_WITH_TIMEOUT(node.receiverConnection(0).leg[0].port, 5099, 5000);
+        QVERIFY(node.receiverConnection(0).active && node.receiverConnection(0).leg[1].port == ports[3]);
+        snd.close();
+        node.stop();
     }
 
     // The NMOS Node: its IS-04 resources registered with a registry in order and kept there by heartbeats, and IS-05

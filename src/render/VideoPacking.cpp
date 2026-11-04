@@ -125,4 +125,34 @@ void packP216(const Ycbcr422& in, uint8_t* dst, size_t stride) {
     });
 }
 
+void packYcbcr444(const Image& rgb, YcbcrMatrix matrix, uint8_t* dst, size_t stride) {
+    const double kr = matrix == YcbcrMatrix::Bt2020 ? 0.2627 : 0.2126;
+    const double kb = matrix == YcbcrMatrix::Bt2020 ? 0.0593 : 0.0722;
+    const double kg = 1 - kr - kb;
+    parallelRows(rgb.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const float* p = rgb.row(y);
+            uint8_t* d = dst + size_t(y) * stride;
+            for (int x = 0; x < rgb.width; ++x, p += 4, d += 6) {
+                const double r = p[0], g = p[1], b = p[2];
+                const double luma = kr * r + kg * g + kb * b;
+                put16(d, code16(128 + 224 * (b - luma) / (2 * (1 - kb))));
+                put16(d + 2, code16(16 + 219 * luma));
+                put16(d + 4, code16(128 + 224 * (r - luma) / (2 * (1 - kr))));
+            }
+        }
+    });
+}
+
+void packRgb48(const Image& rgb, uint8_t* dst, size_t stride) {
+    parallelRows(rgb.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const float* p = rgb.row(y);
+            uint8_t* d = dst + size_t(y) * stride;
+            for (int x = 0; x < rgb.width; ++x, p += 4, d += 6)
+                for (int c = 0; c < 3; ++c) put16(d + 2 * c, code16(16 + 219 * double(p[c])));
+        }
+    });
+}
+
 }  // namespace montage::video

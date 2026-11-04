@@ -1,8 +1,10 @@
 // Montage — SMPTE ST 2110 over IP: the program as a facility's IP plant takes it, as DeckLink IP and AJA's IP cards
 // send it.
-//  - ST 2110-20 video: RFC 4175 pixel groups, 4:2:2 at 10 or 8 bits, progressive or interlaced (each field on its own),
-//    one sample row range per packet (the general packing mode), sent spread over each frame's time (wide pacing).
-//  - ST 2110-30 audio: AES67's L24, 1 ms packets, up to 8 channels at 48 kHz.
+//  - ST 2110-20 video: RFC 4175 pixel groups, YCbCr 4:2:2 or 4:4:4 or RGB at 8, 10 or 12 bits, progressive or
+//    interlaced (each field on its own), one sample row range per packet (the general packing mode), sent spread over
+//    each frame's time (wide pacing).
+//  - ST 2110-30 audio: AES67's L24 or L16, 1 ms or 125 µs packets, up to 8 channels at 48 kHz.
+//  - ST 2022-7: each stream sent on two paths at once (and merged again by RTP sequence number where received).
 //  - ST 2110-40 ancillary data (RFC 8331): ancillary time code (ST 12-2), CEA-608/708 captions in a CDP (ST 334) and
 //    HDR static metadata (ST 2108-1), a packet each frame or field even with none.
 //  - An SDP file for each stream, with the parameters ST 2110-20, -30 and -40 require.
@@ -39,17 +41,25 @@ bool isMulticast(const std::string& address);
 int64_t ptpNowNs(std::string* source = nullptr);
 
 // ---- What the streams carry.
+// ST 2110-20's samplings: YCbCr 4:2:2 (Cb Y Cr Y for each pair of pixels), 4:4:4 (Cb Y Cr for each) and RGB (R G B).
+enum class Sampling { Ycc422, Ycc444, Rgb };
+std::string samplingName(Sampling s);  // as the SDP names it ("YCbCr-4:2:2", "YCbCr-4:4:4", "RGB")
+bool parseSampling(const std::string& name, Sampling& out);
 struct VideoFormat {
     int width = 1920, height = 1080;
     Rational fps{25, 1};  // frames a second (an interlaced format's frames are its field pairs)
     bool interlaced = false;
-    int depth = 10;       // 10 or 8
+    Sampling sampling = Sampling::Ycc422;
+    int depth = 10;       // 8, 10 or 12
     std::string colorimetry = "BT709";  // BT709, BT2020 or BT2100
     std::string tcs = "SDR";            // SDR, PQ or HLG
 };
 struct AudioFormat {
     int channels = 2;
     int rate = 48000;
+    int bits = 24;          // L24, or L16
+    int packetUs = 1000;    // 1 ms packets (ST 2110-30 level A), or 125 µs (level C)
+    int packetSamples() const { return int(int64_t(rate) * packetUs / 1000000); }
 };
 struct SdpOptions {
     std::string source;          // the sender's address ("" = 0.0.0.0)
@@ -57,12 +67,15 @@ struct SdpOptions {
     std::string refclk = "ptp=IEEE1588-2008:traceable";  // ts-refclk (a grandmaster's "ptp=IEEE1588-2008:<id>:<domain>")
     uint64_t session = 1;
     int ttl = 16;
+    std::string source2;  // the second path's sender address (ST 2022-7)
 };
-std::string videoSdp(const VideoFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o);
-std::string audioSdp(const AudioFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o);
+// A stream's SDP; with a second destination `to2` (ST 2022-7), both as one session's two media descriptions grouped as
+// duplicates (RFC 7104's "a=group:DUP"), the second from `o.source2`.
+std::string videoSdp(const VideoFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o, const Endpoint* to2 = nullptr);
+std::string audioSdp(const AudioFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o, const Endpoint* to2 = nullptr);
 // (`ids`: the DID/SDID pairs it carries)
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o,
-                   const std::vector<std::pair<int, int>>& ids = {{0x60, 0x60}, {0x61, 0x01}});
+                   const std::vector<std::pair<int, int>>& ids = {{0x60, 0x60}, {0x61, 0x01}}, const Endpoint* to2 = nullptr);
 // An SDP's media format parameters (its a=fmtp line's "name=value;" pairs) and rtpmap encoding ("raw/90000").
 std::map<std::string, std::string> sdpParameters(const std::string& sdp, std::string* encoding = nullptr);
 
@@ -83,43 +96,74 @@ struct RtpPacket {
 };
 bool parseRtp(const uint8_t* data, size_t size, RtpPacket& out);
 
+// A picture's samples as ST 2110-20's pixel groups order them (see Sampling), each its code at `depth` bits, rows in
+// turn.
+struct Raster {
+    int width = 0, height = 0;
+    Sampling sampling = Sampling::Ycc422;
+    int depth = 10;
+    std::vector<uint16_t> samples;
+    Raster() = default;
+    Raster(int w, int h, Sampling s, int d) : width(w), height(h), sampling(s), depth(d), samples(size_t(rowSamples()) * size_t(std::max(h, 0))) {}
+    int rowSamples() const { return sampling == Sampling::Ycc422 ? width * 2 : width * 3; }
+    uint16_t* row(int r) { return samples.data() + size_t(r) * size_t(rowSamples()); }
+    const uint16_t* row(int r) const { return samples.data() + size_t(r) * size_t(rowSamples()); }
+    bool operator==(const Raster& o) const = default;
+};
+// A pixel group: the fewest pixels whose samples fill whole bytes (RFC 4175 and ST 2110-20's table).
+struct Pgroup {
+    int pixels = 2, bytes = 5;
+};
+Pgroup pgroup(Sampling s, int depth);
+// Whether ST 2110-20 carries a picture of this width in whole pixel groups at this sampling and depth.
+bool videoFormatOk(const VideoFormat& f, std::string* why = nullptr);
+
 // One picture (a frame, or with `field` 1 or 2 an interlaced frame's field: its rows of that parity) as ST 2110-20
 // packets: `format` V210 or UYVY rows (the reference output's), `stride` bytes apart, cut into packets of at most
 // `maxPayload` bytes of pixels (whole pixel groups, a row range each), the last marked.
 using PacketSink = std::function<bool(const uint8_t* data, size_t size)>;
 bool packVideo(const uint8_t* data, size_t stride, output::PixelFormat format, int width, int height, int field, uint32_t timestamp,
                RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
+// The same from a raster, at its sampling and depth.
+bool packVideo(const Raster& picture, int field, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
 // Packets a picture makes (for pacing).
-int videoPacketCount(int width, int height, int depth, bool interlaced, int maxPayload = 1200);
-// Rebuilds pictures from ST 2110-20 packets into rows of the same format (fields woven into their frame).
+int videoPacketCount(int width, int height, int depth, bool interlaced, int maxPayload = 1200, Sampling sampling = Sampling::Ycc422);
+// Rebuilds pictures from ST 2110-20 packets (fields woven into their frame): into rows of V210 or UYVY, or a raster.
 class VideoAssembler {
 public:
     VideoAssembler(int width, int height, output::PixelFormat format, bool interlaced);
-    // A packet; true when it completed a frame (`frame()` then holds it, and `timestamp()` its first field's).
+    VideoAssembler(int width, int height, Sampling sampling, int depth, bool interlaced);
+    // A packet; true when it completed a frame (`frame()` or `raster()` then holds it, and `timestamp()` its first
+    // field's).
     bool add(const RtpPacket& p);
     const std::vector<uint8_t>& frame() const { return done_; }
+    const Raster& raster() const { return doneRaster_; }
     uint32_t timestamp() const { return doneTimestamp_; }
     int64_t lost() const { return lost_; }  // packets missing by their sequence numbers
+    // Packets missing from the frame last completed (0: whole).
+    int64_t lostInFrame() const { return doneLost_; }
 
 private:
     int width_, height_;
-    output::PixelFormat format_;
+    output::PixelFormat format_ = output::PixelFormat::V210;
+    bool bytes_ = true;  // (rows of `format_`, else a raster)
     bool interlaced_;
-    size_t stride_;
+    size_t stride_ = 0;
+    Pgroup pg_;
     std::vector<uint8_t> done_;
+    Raster building_, doneRaster_;
     uint32_t timestamp_ = 0, doneTimestamp_ = 0;
     bool started_ = false;
     int fieldsDone_ = 0;
-    int64_t lost_ = 0;
+    int64_t lost_ = 0, frameLost_ = 0, doneLost_ = 0;
     int64_t lastSeq_ = -1;
-    std::vector<uint16_t> components_;  // the picture being built: Cb Y Cr Y a row
     void finish();
 };
 
-// Audio as L24 (24-bit big-endian, interleaved), one packet of `frames` samples.
-bool packAudio(const float* samples, int frames, int channels, uint32_t timestamp, RtpState& rtp, const PacketSink& send);
-// The samples of an L24 payload, as floats (exactly what was sent, to 24 bits).
-std::vector<float> unpackAudio(const uint8_t* payload, size_t size, int channels);
+// Audio as L24 (24-bit big-endian, interleaved) or with `bits` 16 L16, one packet of `frames` samples.
+bool packAudio(const float* samples, int frames, int channels, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int bits = 24);
+// The samples of an L24 (or L16) payload, as floats (exactly what was sent, to its bits).
+std::vector<float> unpackAudio(const uint8_t* payload, size_t size, int channels, int bits = 24);
 
 // ---- Ancillary data (ST 291 packets), as RFC 8331 carries them.
 struct AncPacket {
@@ -169,6 +213,13 @@ struct SenderOptions {
     int videoPayload = 96, audioPayload = 97, ancPayload = 100;
     int maxPayload = 1200;  // bytes of pixels a packet
     std::string refclk = "ptp=IEEE1588-2008:traceable";
+    // ST 2022-7: every packet also sent to these (from `interfaceAddress2`), when `redundant`.
+    bool redundant = false;
+    Endpoint video2{"239.101.0.1", 5004}, audio2{"239.101.0.2", 5004}, anc2{"239.101.0.3", 5004};
+    std::string interfaceAddress2;
+    // (for tests: a packet of stream 0 video, 1 audio or 2 ancillary data, numbered from 0 as sent, left unsent on
+    // path 0 or 1 when this says so)
+    std::function<bool(int stream, int path, uint64_t index)> drop;
 };
 // Options the reference output's ST 2110 backend uses when it opens (the app's settings or MCP set them).
 void setOutputOptions(const SenderOptions& o);
@@ -188,6 +239,9 @@ public:
     // when sending failed (or `stop`).
     bool send(const uint8_t* data, size_t stride, output::PixelFormat format, const float* audio, int audioFrames,
               const output::Timecode* timecode, const std::vector<AncPacket>& anc, const std::atomic<bool>* stop = nullptr);
+    // The same with the picture as a raster, at the video format's sampling and depth (4:4:4, RGB and 12 bits).
+    bool send(const Raster& picture, const float* audio, int audioFrames, const output::Timecode* timecode,
+              const std::vector<AncPacket>& anc, const std::atomic<bool>* stop = nullptr);
     // Ancillary packets sent with every frame from now (ST 2108-1's HDR metadata), and named in the SDP.
     void setFrameAnc(const std::vector<AncPacket>& anc) { frameAnc_ = anc; }
     void close();
@@ -200,6 +254,8 @@ public:
     int64_t framesSent() const { return frames_; }
 
 private:
+    bool sendFrame(const std::function<bool(int field, uint32_t ts, const PacketSink& keep)>& pack, const float* audio, int audioFrames,
+                   const output::Timecode* timecode, const std::vector<AncPacket>& anc, const std::atomic<bool>* stop);
     struct Sockets;
     std::unique_ptr<Sockets> s_;
     SenderOptions o_;
@@ -210,7 +266,7 @@ private:
     int64_t audioSample_ = 0;     // the next audio packet's first sample (PTP time at the audio rate)
     std::vector<float> audioFifo_;
     std::vector<AncPacket> frameAnc_;
-    std::string clock_, source_;
+    std::string clock_, source_, source2_;
     int64_t frames_ = 0;
 };
 
