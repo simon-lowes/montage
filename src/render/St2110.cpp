@@ -888,6 +888,7 @@ struct Sender::Sockets {
     sockaddr_in video{}, audio{}, anc{}, video2{}, audio2{}, anc2{};
     std::function<bool(int, int, uint64_t)> drop;
     uint64_t sent[3] = {0, 0, 0};
+    int64_t queueDrops = 0;  // packets the system's queue had no room for
 #ifdef _WIN32
     // (Windows sleeps in steps of its timer, 15.6 ms unless asked for 1 ms: too coarse to pace packets within a frame,
     // so a sender would fall a frame behind and skip one)
@@ -911,13 +912,16 @@ struct Sender::Sockets {
         for (int path = 0; path < (s2 != kBad ? 2 : 1); ++path) {
             if (drop && drop(stream, path, index)) continue;
             const sockaddr_in& a = *(path ? second : first)[stream];
-            bool sent = false;
-            for (int tries = 0; !sent && tries < 50; ++tries) {
+            // (a queue still full after a few milliseconds loses the packet, as a network would: the stream goes on)
+            bool sent = false, full = false;
+            for (int tries = 0; !sent && tries < 100; ++tries) {
                 sent = ::sendto(path ? s2 : s, reinterpret_cast<const char*>(data), int(size), 0, reinterpret_cast<const sockaddr*>(&a), sizeof a) == int(size);
-                if (!sent && !queueFull()) break;
-                if (!sent) std::this_thread::sleep_for(std::chrono::microseconds(50));  // (the queue drains in microseconds)
+                full = !sent && queueFull();
+                if (!full) break;
+                std::this_thread::sleep_for(std::chrono::microseconds(50));  // (the queue drains in microseconds)
             }
-            ok = sent && ok;
+            if (full) ++queueDrops;
+            ok = (sent || full) && ok;
         }
         return ok;
     }
@@ -1037,6 +1041,7 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
 void Sender::close() { s_.reset(); }
 
 bool Sender::isOpen() const { return s_ != nullptr; }
+int64_t Sender::packetsDropped() const { return s_ ? s_->queueDrops : 0; }
 
 namespace {
 SdpOptions sdpOptions(const SenderOptions& o, const std::string& source, const std::string& source2) {

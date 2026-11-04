@@ -2065,6 +2065,12 @@ private slots:
         VideoDecoder dec;
         QVERIFY(dec.open(cs.path));
         int held = 0;
+        // (what went on, for a failure: the pictures as recorded by the frame they show, and what was dropped where)
+        QString seen = QStringLiteral("recorder dropped %1, repeated %2; sender sent %3 frames, %4 packets lost to a full queue; frames:")
+                           .arg(status.dropped).arg(status.repeated).arg(tx.framesSent()).arg(tx.packetsDropped());
+        for (int k = 0; k < 50; ++k)
+            if (const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0))
+                seen += QStringLiteral(" %1").arg(std::lround((toImage(*f).at(W / 2, H / 2)[2] - 0.2f) * 24.0f / 0.6f));
         for (int k : {0, 1, 2, 3, 24, 25, 48, 49}) {
             const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0);
             QVERIFY(f && f->width == W);
@@ -2074,10 +2080,10 @@ private slots:
             const bool right = std::fabs(blue - blueOf(first + k)) < 0.0125;
             // (a frame the sender sent late on a busy machine is held over the one it missed)
             if (!right && k > 0 && std::fabs(blue - blueOf(first + k - 1)) < 0.0125) ++held;
-            else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3").arg(k).arg(blue).arg(blueOf(first + k))));
+            else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3; %4").arg(k).arg(blue).arg(blueOf(first + k)).arg(seen)));
             QVERIFY2(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.015, qPrintable(QStringLiteral("frame %1: red %2").arg(k).arg(img.at(W / 4, H / 4)[0])));
         }
-        QVERIFY(held <= 2);
+        QVERIFY2(held <= 2, qPrintable(seen));
         // The sound to the sample: the recording's sample s is the streams' sample (the first frame's) + s.
         AudioBufferPtr heard = decodeAudio(cs.path, 48000, &err);
         QVERIFY2(heard, err.c_str());

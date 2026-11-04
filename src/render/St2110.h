@@ -252,6 +252,7 @@ public:
     const VideoFormat& videoFormat() const { return video_; }
     const AudioFormat& audioFormat() const { return audio_; }
     int64_t framesSent() const { return frames_; }
+    int64_t packetsDropped() const;  // packets lost because the system's send queue stayed full
 
 private:
     bool sendFrame(const std::function<bool(int field, uint32_t ts, const PacketSink& keep)>& pack, const float* audio, int audioFrames,
