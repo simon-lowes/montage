@@ -1989,7 +1989,9 @@ private slots:
         o.video2 = {"127.0.0.1", ports[3]}, o.audio2 = {"127.0.0.1", ports[4]}, o.anc2 = {"127.0.0.1", ports[5]};
         o.ttl = 1, o.redundant = true;
         o.drop = [](int, int path, uint64_t i) { return i % 20 == (path ? 13u : 7u); };
-        // 640x360 at 25p, 4:2:2 10-bit: each picture's blue its frame number (mod 25), a 1 kHz tone on the left channel.
+        // 640x360 at 25p, 4:2:2 10-bit: each picture's frame number (mod 25) in five squares along the top, dark for 0
+        // and light for 1 (a level of blue per frame was too fine: a decoder's error at strong blues moved it a step),
+        // and a 1 kHz tone on the left channel.
         const int W = 640, H = 360, spf = 1920;
         st::VideoFormat v;
         v.width = W, v.height = H, v.fps = {25, 1};
@@ -2001,7 +2003,9 @@ private slots:
             for (int y = 0; y < H; ++y)
                 for (int x = 0; x < W; ++x) {
                     float* p = img.at(x, y);
-                    p[0] = 0.1f + 0.8f * float(x) / W, p[1] = 0.1f + 0.8f * float(y) / H, p[2] = 0.2f + 0.6f * float(t % 25) / 24.0f, p[3] = 1;
+                    p[0] = 0.1f + 0.8f * float(x) / W, p[1] = 0.1f + 0.8f * float(y) / H, p[2] = 0.5f, p[3] = 1;
+                    if (y >= 8 && y < 56 && x >= 16 && x < 16 + 5 * 96 && (x - 16) % 96 < 64)
+                        p[0] = p[1] = p[2] = ((t % 25) >> ((x - 16) / 96)) & 1 ? 0.9f : 0.1f;
                 }
             const video::Ycbcr422 c = video::toYcbcr422(img, video::YcbcrMatrix::Bt709);
             st::Raster r(W, H, st::Sampling::Ycc422, 10);
@@ -2061,26 +2065,30 @@ private slots:
         QVERIFY(std::fabs(m.duration - 2.0) < 0.05);
         QVERIFY(std::fabs(m.timecode - (36000.0 + first / 25.0)) < 1e-6);
         QVERIFY(m.hasAudio && m.channels == 2 && m.sampleRate == 48000);
-        // Every picture the one sent at its frame (ProRes is lossy: within half a frame's step of blue).
+        // Every picture the one sent at its frame (read from its squares).
         VideoDecoder dec;
         QVERIFY(dec.open(cs.path));
         int held = 0;
+        auto numberOf = [&](const Image& img) {
+            int n = 0;
+            for (int i = 0; i < 5; ++i) n |= (img.at(16 + 96 * i + 32, 32)[1] > 0.5f ? 1 : 0) << i;
+            return n;
+        };
         // (what went on, for a failure: the pictures as recorded by the frame they show, and what was dropped where)
         QString seen = QStringLiteral("recorder dropped %1, repeated %2; sender sent %3 frames, %4 packets lost to a full queue; frames:")
                            .arg(status.dropped).arg(status.repeated).arg(tx.framesSent()).arg(tx.packetsDropped());
         for (int k = 0; k < 50; ++k)
             if (const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0))
-                seen += QStringLiteral(" %1").arg(std::lround((toImage(*f).at(W / 2, H / 2)[2] - 0.2f) * 24.0f / 0.6f));
+                seen += QStringLiteral(" %1").arg(numberOf(toImage(*f)));
         for (int k : {0, 1, 2, 3, 24, 25, 48, 49}) {
             const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0);
             QVERIFY(f && f->width == W);
             const Image img = toImage(*f);
-            const float blue = img.at(W / 2, H / 2)[2];
-            auto blueOf = [&](int n) { return 0.2f + 0.6f * float(((n % 25) + 25) % 25) / 24.0f; };
-            const bool right = std::fabs(blue - blueOf(first + k)) < 0.0125;
+            const int number = numberOf(img);
+            const bool right = number == (first + k) % 25;
             // (a frame the sender sent late on a busy machine is held over the one it missed)
-            if (!right && k > 0 && std::fabs(blue - blueOf(first + k - 1)) < 0.0125) ++held;
-            else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3; %4").arg(k).arg(blue).arg(blueOf(first + k)).arg(seen)));
+            if (!right && k > 0 && number == (first + k - 1) % 25) ++held;
+            else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3; %4").arg(k).arg(number).arg((first + k) % 25).arg(seen)));
             QVERIFY2(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.015, qPrintable(QStringLiteral("frame %1: red %2").arg(k).arg(img.at(W / 4, H / 4)[0])));
         }
         QVERIFY2(held <= 2, qPrintable(seen));
