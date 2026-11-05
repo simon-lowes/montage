@@ -13290,6 +13290,8 @@ const auto seq = [this] { return state()->sequence(); };
         // the JPEG XL preset only.
         if (!jxlAvailable()) QSKIP("Built without libjxl");
         loadDemo();
+        // (the dialog keeps the preset last used: put back as it was, so later exports are not JPEG XL frames)
+        const QVariant lastPreset = appSettings().value("export/preset");
         RenderQueue* queue = win_->renderQueue();
         const size_t jobs = queue->jobs().size();
         int jxl = -1, mp4 = -1;
@@ -13322,6 +13324,8 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(job.settings.jxlPremultiplied, jxlWritesPremultiplied());
         queue->remove(job.id);
         for (const char* key : {"export/jxlDistance", "export/jxlDepth", "export/jxlPremultiplied"}) appSettings().remove(key);
+        if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+        else appSettings().remove("export/preset");
     }
 
     void frameRateDelivery() {
