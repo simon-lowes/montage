@@ -24228,6 +24228,37 @@ if ui["pressed"] == "add":
         ranged.in = 140;
         ranged.out = 143;
         QCOMPARE(planExportSegments(seq, ranged, 6).size(), size_t(3));  // (no fewer than a frame each)
+        // MPEG-2's cuts fall on its GOPs (XDCAM's 12 frames, 15 at 30 frames a second): every segment but the last a whole
+        // number of them, the range still covered.
+        ExportSettings m2 = st;
+        m2.videoCodec = "mpeg2video";
+        m2.path = (dir.path() + "/out/xdcam.mxf").toStdString();
+        const int gop = exportMpeg2Gop(m2, seq.fps);
+        QVERIFY(gop == 12 || gop == 15);
+        parts = planExportSegments(seq, m2, 6);
+        QVERIFY(parts.size() >= 2);
+        QCOMPARE(parts.front().in, FrameTime(0));
+        QCOMPARE(parts.back().out, FrameTime(150));
+        for (size_t k = 0; k + 1 < parts.size(); ++k) {
+            QCOMPARE(parts[k].out, parts[k + 1].in);
+            QVERIFY2((parts[k].out - parts[k].in) % gop == 0, qPrintable(QString("%1 to %2").arg(parts[k].in).arg(parts[k].out)));
+        }
+        // A package segment's hash has its codestreams' lengths in it: bytes moved from one frame's file to the next
+        // change it.
+        {
+            const std::string codes = (dir.path() + "/framing").toStdString();
+            QVERIFY(QDir().mkpath(QString::fromStdString(codes)));
+            auto put = [&](int64_t k, const QByteArray& b) {
+                QFile f(QString::fromStdString(codestreamFile(codes, k)));
+                return f.open(QIODevice::WriteOnly) && f.write(b) == b.size();
+            };
+            SegmentCheck a, b;
+            QVERIFY(put(0, "ab") && put(1, "c") && checkCodestreams(codes, 0, 2, false, a));
+            QVERIFY(put(0, "a") && put(1, "bc") && checkCodestreams(codes, 0, 2, false, b));
+            QCOMPARE(a.frames, int64_t(2));
+            QCOMPARE(a.bytes, b.bytes);
+            QVERIFY(a.sha256 != b.sha256);
+        }
         // What is made in one go is refused.
         auto refused = [&](const std::function<void(ExportSettings&)>& change, const char* why) {
             ExportSettings x = st;
@@ -24567,10 +24598,11 @@ if ui["pressed"] == "add":
         QStringList log;
         std::mutex logLock;
         auto onFarm = [&](const ExportSettings& st, int segments, std::string* id = nullptr,
-                          const std::function<void(FarmNodeOptions&)>& setUp = {}) {
+                          const std::function<void(FarmNodeOptions&)>& setUp = {}, const std::function<void(const std::string&)>& prepare = {}) {
             std::string job, e;
             if (!submitFarmJob(farm, "Master", p, seq.id, st, 0, &job, &e, segments)) return qWarning("%s", e.c_str()), false;
             if (id) *id = job;
+            if (prepare) prepare(job);
             auto ended = [&] {
                 for (const FarmJob& j : farmJobs(farm))
                     if (j.id == job) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
@@ -24776,6 +24808,41 @@ if ui["pressed"] == "add":
         };
         QVERIFY2(std::fabs(lead(ts.path) - lead(single.path)) < 1e-4, qPrintable(QString("%1 s, whole %2 s").arg(lead(ts.path)).arg(lead(single.path))));
 
+        // ---- A segment coded differently is refused by the join in Annex B (MPEG-TS, MXF) as in an avcC: here the
+        // second's parameter sets have the same ids but come from another preset (fewer reference frames). Coded alike,
+        // the two join.
+        for (const QString ext : {QStringLiteral("ts"), QStringLiteral("mxf")}) {
+            ExportSettings base;
+            base.videoCodec = "libx264";
+            base.audioCodec = "none";
+            base.path = (dir.path() + "/out/odd." + ext).toStdString();
+            QVERIFY2(exportSplits(base, &err), err.c_str());
+            const std::vector<ExportSegment> halves{{0, 24}, {24, 48}};
+            ExportSettings whole = base;
+            whole.in = 0, whole.out = 48;
+            std::vector<std::string> files;
+            for (const char* second : {"veryfast", "medium"}) {
+                files.clear();
+                for (int k = 0; k < 2; ++k) {
+                    const std::string file = (dir.path() + QString("/whole/odd-%1.").arg(k) + ext).toStdString();
+                    ExportSettings x = segmentExportSettings(base, halves[size_t(k)], file, seq.fps);
+                    if (k == 1) x.preset = second;
+                    QVERIFY2(exportSequence(p, seq, x, {}, nullptr, &err), err.c_str());
+                    files.push_back(file);
+                }
+                const bool joined = joinExportSegments(p, seq, whole, 0, files, halves, {}, nullptr, &err);
+                if (std::string(second) == "veryfast") {
+                    QVERIFY2(!joined, qPrintable(ext));
+                    QVERIFY2(QString::fromStdString(err).contains("Segment 2 was coded differently"), err.c_str());
+                } else {
+                    QVERIFY2(joined, err.c_str());
+                    QCOMPARE(frames(whole.path), 48);
+                }
+            }
+            for (const std::string& f : files) QFile::remove(QString::fromStdString(f));
+            QFile::remove(QString::fromStdString(whole.path));
+        }
+
         // ---- Hardware-encoded segments go only to nodes coding with the same encoder: node A says it has one, node B
         // has none, and whichever takes a segment first decides; the other node renders none of them.
         ExportSettings hw;
@@ -24801,6 +24868,38 @@ if ui["pressed"] == "add":
         QVERIFY(reported);
         // Nodes of the same kind share them.
         QVERIFY2(onFarm(hw, 4, &hwId, [](FarmNodeOptions& o) { o.encoders["h264"] = "h264_test"; }), qPrintable(log.join('\n')));
+        // The node holding the pin gone (stopped), with none of the segments coded yet: the pin passes to the nodes that
+        // answer, which code them all. With one coded by it already, the others cannot match it: they fail, and so the
+        // join, saying why.
+        auto gone = [&](bool oneCoded) {
+            return [&, oneCoded](const std::string& job) {
+                const QString jobs = QString::fromStdString(farm) + "/jobs/";
+                QFile pin(jobs + QString::fromStdString(job) + "/encoder");
+                QVERIFY(pin.open(QIODevice::WriteOnly) && pin.write("h264_gone") == 9);
+                pin.close();
+                QFile node(QString::fromStdString(farm) + "/nodes/Gone.json");
+                QVERIFY(node.open(QIODevice::WriteOnly));
+                node.write(QJsonDocument(QJsonObject{{"name", "Gone"}, {"state", "stopped"}, {"beat", 7}, {"encoders", QJsonObject{{"h264", "h264_gone"}}}})
+                               .toJson());
+                node.close();
+                if (oneCoded)
+                    for (const FarmJob& j : farmJobs(farm))
+                        if (j.group == job && j.segment == 1) {
+                            QFile done(jobs + QString::fromStdString(j.id) + "/status.json");
+                            QVERIFY(done.open(QIODevice::WriteOnly) && done.write(QJsonDocument(QJsonObject{{"state", "done"}, {"node", "Gone"}}).toJson()) > 0);
+                        }
+            };
+        };
+        const auto sameKind = [](FarmNodeOptions& o) { o.encoders["h264"] = "h264_test"; };
+        log.clear();
+        QVERIFY2(onFarm(hw, 4, &hwId, sameKind, gone(false)), qPrintable(log.join('\n')));
+        QVERIFY2(log.join('\n').contains("No node coding with h264_gone answers"), qPrintable(log.join('\n')));
+        QCOMPARE(frames(hw.path), 150);
+        QVERIFY(!onFarm(hw, 4, &hwId, sameKind, gone(true)));
+        for (const FarmJob& j : farmJobs(farm))
+            if (j.id == hwId) QVERIFY2(QString::fromStdString(j.error).contains("coded with h264_gone, and no node coding with it is answering"), j.error.c_str());
+        QVERIFY(removeFarmJob(farm, hwId, &err));
+        QFile::remove(QString::fromStdString(farm) + "/nodes/Gone.json");
 
         // ---- Two passes: the bits shared out by what each first pass measured (here three times as much a frame in the
         // first half, bounded at four times the average), the whole's average kept.
@@ -24948,6 +25047,46 @@ if ui["pressed"] == "add":
         QVERIFY(!submitFarmImf(farm, "IMF", p, seq.id, archival, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
         QVERIFY(QString::fromStdString(err).contains("Application #2E"));
 
+        // ---- At 29.97 a master's composition is padded to a whole number of sound samples a frame (37 frames to 40):
+        // made in three segments, its pictures are the one-go master's, the padding's too, and it checks out.
+        {
+            const FrameTime inWas = seq.inPoint, outWas = seq.outPoint;
+            seq.fps = {30000, 1001};
+            seq.inPoint = 0, seq.outPoint = 36;
+            ImfSettings ntsc = imf;
+            ntsc.title = "Farm NTSC";
+            ntsc.inOut = true;
+            QCOMPARE(imfCompositionFrames(seq, ntsc), int64_t(40));
+            ImfResult one;
+            QVERIFY2(exportImf(p, seq, ntsc, (dir.path() + "/whole").toStdString(), &one, {}, &err), err.c_str());
+            QCOMPARE(one.frames, int64_t(40));
+            QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
+                         return submitFarmImf(farm, "IMF", p, seq.id, ntsc, (dir.path() + "/out").toStdString(), 3, id, e);
+                     }),
+                     qPrintable(log.join('\n')));
+            const QString made = onlyFolder(dir.path() + "/out", "Farm_NTSC_IMF_*");
+            QVERIFY(!made.isEmpty());
+            const std::vector<std::string> issues = verifyImf(made.toStdString());
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            auto picture = [](const QString& folder) {
+                for (const QString& f : QDir(folder).entryList({"VIDEO_*.mxf"})) return QDir(folder).filePath(f).toStdString();
+                return std::string();
+            };
+            dcp::ImfTrackReader a, b;
+            QVERIFY2(a.open(picture(QString::fromStdString(one.folder)), &err), err.c_str());
+            QVERIFY2(b.open(picture(made), &err), err.c_str());
+            QCOMPARE(a.frames(), int64_t(40));
+            QCOMPARE(b.frames(), a.frames());
+            std::vector<uint8_t> x, y;
+            for (int64_t k = 0; k < a.frames(); ++k) {
+                QVERIFY(a.frame(k, x) && b.frame(k, y));
+                QVERIFY2(x == y, qPrintable(QString("picture %1 differs").arg(k)));
+            }
+            QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+            seq.fps = {25, 1};
+            seq.inPoint = inWas, seq.outPoint = outWas;
+        }
+
         // ---- A DCP in four segments: the same pictures as one made in one go, and it passes the DCP checks.
         seq.inPoint = 0, seq.outPoint = 59;
         DcpSettings cinema;
@@ -24986,6 +25125,33 @@ if ui["pressed"] == "add":
             }
         }
         QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        // Its folder's name taken already: refused when sent, not once every segment is coded.
+        QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("There is already a folder called FarmTrailer_"), err.c_str());
+        // A codestream not in the DCI profile (as FFmpeg's own encoder codes them, on a node without OpenJPEG) stops the
+        // join, which says which frame; no package is left.
+        {
+            seq.outPoint = 24;  // (a second)
+            DcpSettings seg = cinema;
+            seg.title = "Farm Profile";
+            seg.codestreams = (dir.path() + "/profile").toStdString();
+            seg.codeFrom = 0, seg.codeTo = 25;
+            DcpResult coded;
+            QVERIFY2(exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), &coded, {}, &err), err.c_str());
+            QVERIFY(coded.cinemaProfile);
+            QFile f(QString::fromStdString(codestreamFile(seg.codestreams, 7)));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QByteArray b = f.readAll();
+            QCOMPARE(int(uint8_t(b[6])) << 8 | int(uint8_t(b[7])), 3);  // (its SIZ marker's Rsiz: the DCI 2K profile)
+            b[7] = 0;
+            QVERIFY(f.seek(0) && f.write(b) == b.size());
+            f.close();
+            seg.codeFrom = seg.codeTo = 0;
+            QVERIFY(!exportDcp(p, seq, seg, (dir.path() + "/whole").toStdString(), nullptr, {}, &err));
+            QVERIFY2(QString::fromStdString(err).contains("frame 7") && QString::fromStdString(err).contains("DCI 2K profile"), err.c_str());
+            QVERIFY(QDir(dir.path() + "/whole").entryList({"FarmProfile_*"}, QDir::Dirs).isEmpty());
+            seq.outPoint = 59;
+        }
         cinema.encrypt = true;
         QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
         QVERIFY(QString::fromStdString(err).contains("DKDM"));

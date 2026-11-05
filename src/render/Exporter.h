@@ -291,6 +291,16 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
                     int* smartRendered = nullptr,  // frames copied by smart rendering
                     LightLevels* light = nullptr, bool* keptUnsigned = nullptr);
 
+// An MPEG-2 (XDCAM HD422) export's GOP at `fps`: the one asked for, else 12 frames (15 at 30 and 60 frames a second).
+int exportMpeg2Gop(const ExportSettings& s, Rational fps);
+// The picture an export codes: the chosen size (or the sequence's), each eye's when a stereoscopic sequence's eyes are
+// packed side by side or one above the other, made even.
+void codedPictureSize(const Sequence& seq, const ExportSettings& s, int& width, int& height);
+// The encoder a hardware export (hw_h264, hw_hevc) codes with on this computer: the one found for its picture
+// (codedPictureSize) at `fps` (the sequence's when not valid), else x264 or x265. Render farm nodes route hardware
+// segments by it, so the encoder a node says it has is the one its export uses.
+std::string exportHwEncoder(const Sequence& seq, const ExportSettings& s, Rational fps = {0, 1});
+
 struct BroadcastMxfOptions;
 // A broadcast MXF delivery (`s.mxfDelivery`) of its range made from frames already rendered (segments joined into plain
 // OP1a): its checks and the options to rewrap it with. False with `error` for what the delivery refuses.

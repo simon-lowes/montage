@@ -928,13 +928,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (stereoView == StereoView::Difference) return fail("The eyes' difference is for checking, not delivering");
     int across = 1, down = 1;
     stereoPacking(stereoView, across, down);
-    // A chosen size is each eye's.
-    int W = (s.width > 0 ? s.width : seq.width) * across;
-    int H = (s.height > 0 ? s.height : seq.height) * down;
-    W += W & 1;  // most codecs need even dimensions
-    H += H & 1;
-    if (across == 2) W += 2 * ((W / 2) & 1);  // each eye even too
-    if (down == 2) H += 2 * ((H / 2) & 1);
+    int W = 0, H = 0;
+    codedPictureSize(seq, s, W, H);
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
     // (A trim pass's pictures are in its target's space and delivered so.)
@@ -969,11 +964,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (wantVideo) {
         std::string c = s.videoCodec;
         const bool hardware = c == "hw_h264" || c == "hw_hevc";
-        if (hardware) {
-            const std::string family = c.substr(3);
-            c = pickHwEncoder(family, W, H, fps.num, fps.den);
-            if (c.empty()) c = family == "hevc" ? "libx265" : "libx264";  // no hardware encoder here
-        }
+        if (hardware) c = exportHwEncoder(seq, s, Rational{fps.num, fps.den});
         if (spatial) {
             // MV-HEVC: FFmpeg's raw "encoder" hands over each picture with both eyes, coded by x265's multiview
             // encoder (render/SpatialVideo.h).
@@ -1060,7 +1051,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
             o.vctx->rc_buffer_size = 17825792;
             o.vctx->rc_initial_buffer_occupancy = 17825792;
-            o.vctx->gop_size = s.gop > 0 ? s.gop : (std::lround(dseq.fpsValue()) % 25 == 0 ? 12 : 15);
+            o.vctx->gop_size = exportMpeg2Gop(s, dseq.fps);
             o.vctx->max_b_frames = 2;
             o.vctx->intra_dc_precision = 2;
             o.vctx->qmin = 1;
@@ -2771,6 +2762,30 @@ bool exportInTwoPasses(const Project& p, const Sequence& seq, const ExportSettin
 }
 
 }  // namespace
+
+int exportMpeg2Gop(const ExportSettings& s, Rational fps) { return s.gop > 0 ? s.gop : std::lround(fps.toDouble()) % 25 == 0 ? 12 : 15; }
+
+void codedPictureSize(const Sequence& seq, const ExportSettings& s, int& W, int& H) {
+    StereoView view = StereoView::Left;
+    int across = 1, down = 1;
+    if (seq.stereo3d && stereoViewFromName(s.stereo.empty() || s.stereo == "mv" ? "sbs" : s.stereo, view)) stereoPacking(view, across, down);
+    // A chosen size is each eye's.
+    W = (s.width > 0 ? s.width : seq.width) * across;
+    H = (s.height > 0 ? s.height : seq.height) * down;
+    W += W & 1;  // most codecs need even dimensions
+    H += H & 1;
+    if (across == 2) W += 2 * ((W / 2) & 1);  // each eye even too
+    if (down == 2) H += 2 * ((H / 2) & 1);
+}
+
+std::string exportHwEncoder(const Sequence& seq, const ExportSettings& s, Rational fps) {
+    const std::string family = s.videoCodec == "hw_hevc" ? "hevc" : "h264";
+    int W = 0, H = 0;
+    codedPictureSize(seq, s, W, H);
+    if (!fps.valid()) fps = seq.fps;
+    const std::string c = pickHwEncoder(family, W, H, fps.num, fps.den);
+    return !c.empty() ? c : family == "hevc" ? "libx265" : "libx264";  // (no hardware encoder here)
+}
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,

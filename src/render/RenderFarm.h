@@ -145,8 +145,9 @@ struct FarmNodeOptions {
     int64_t staleMs = 60000;  // a node silent this long has its job taken back
     std::function<bool()> stopped;  // asked often: true ends the node (its job, half done, waits for another)
     std::function<void(const std::string&)> log;
-    // The encoder this node says it codes each hardware family with ("h264", "hevc"); a family left out is what it
-    // finds (render nodes compare them: one export's hardware-encoded segments all go to nodes of the same kind).
+    // The encoder this node says it codes each hardware family with ("h264", "hevc"); a family left out is what its
+    // exports pick (exportHwEncoder), the same choice its routing makes (render nodes compare them: one export's
+    // hardware-encoded segments all go to nodes of the same kind). A family given here is only what it says (tests).
     std::map<std::string, std::string> encoders;
 };
 // Runs a render node until stopped (or, `once`, out of work): the oldest waiting job claimed (a segment coded by a

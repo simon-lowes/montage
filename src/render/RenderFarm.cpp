@@ -14,7 +14,6 @@
 #include <thread>
 
 #include "core/ProjectIO.h"
-#include "media/HwAccel.h"
 #include "render/BroadcastMxf.h"
 #include "render/Dcp.h"
 #include "render/DcpSecurity.h"
@@ -632,9 +631,8 @@ bool submitFarmJob(const std::string& farm, const std::string& name, const Proje
         }
     }
     const QByteArray proj = QByteArray::fromStdString(projectToJson(project));
-    // (The picture's size and rate, as the export codes it: what a hardware encoder is picked by.)
-    const QJsonArray picture{settings.width > 0 ? settings.width : seq->width, settings.height > 0 ? settings.height : seq->height,
-                             int(seq->fps.num), int(seq->fps.den)};
+    // (The sequence's picture size, rate and stereoscopy: what a hardware encoder is picked by, with the settings.)
+    const QJsonArray picture{seq->width, seq->height, int(seq->fps.num), int(seq->fps.den), seq->stereo3d};
     const QJsonObject job{{"name", qs(name)},
                           {"sequence", QString::number(sequence)},
                           {"stems", stems},
@@ -730,8 +728,10 @@ namespace {
 // A package's segments (each coding its share of the pictures) and the join that wraps them.
 bool submitPackage(const std::string& farm, const std::string& name, const Project& project, Id sequence, const char* kind,
                    const std::function<QJsonObject(const std::string&, int64_t, int64_t)>& settingsFor, int64_t frames,
-                   const std::string& parent, int segments, std::string* id, std::string* error) {
+                   const std::string& parent, const std::string& folderName, int segments, std::string* id, std::string* error) {
     if (parent.empty()) return fail(error, "The job has no folder for the package");
+    // (Its name taken already: refused now, not once every segment is coded.)
+    if (QFileInfo::exists(QDir(qs(parent)).filePath(qs(folderName)))) return fail(error, "There is already a folder called " + folderName + " in " + parent);
     const int n = int(std::clamp<int64_t>(segments, 1, frames));
     const QByteArray proj = QByteArray::fromStdString(projectToJson(project));
     ExportSettings where;
@@ -800,7 +800,7 @@ bool submitFarmImf(const std::string& farm, const std::string& name, const Proje
         x.codeFrom = from, x.codeTo = to;
         return imfToJson(x);
     };
-    return submitPackage(farm, name, project, sequence, "imf", settingsFor, frames, parent, segments, id, error);
+    return submitPackage(farm, name, project, sequence, "imf", settingsFor, frames, parent, imfFolderName(settings), segments, id, error);
 }
 
 bool submitFarmDcp(const std::string& farm, const std::string& name, const Project& project, Id sequence, const DcpSettings& settings,
@@ -831,7 +831,7 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
         x.codeFrom = from, x.codeTo = to;
         return dcpToJson(x);
     };
-    return submitPackage(farm, name, project, sequence, "dcp", settingsFor, frames, parent, segments, id, error);
+    return submitPackage(farm, name, project, sequence, "dcp", settingsFor, frames, parent, dcpFolderName(*seq, settings), segments, id, error);
 }
 
 std::vector<FarmJob> farmJobs(const std::string& farm) {
@@ -1007,7 +1007,13 @@ struct Node {
     }
     void heartbeat(const char* state, const std::string& job = {}) {
         QJsonObject enc;
-        for (const char* family : {"h264", "hevc"}) enc[family] = qs(encoderFor(family, 1920, 1080));
+        for (const char* family : {"h264", "hevc"}) {
+            Sequence hd;
+            hd.width = 1920, hd.height = 1080, hd.fps = {25, 1};
+            ExportSettings x;
+            x.videoCodec = std::string("hw_") + family;
+            enc[family] = qs(encoderFor(x, hd));
+        }
         writeJson(nodeFile(), QJsonObject{{"name", qs(name)},
                                           {"host", QSysInfo::machineHostName()},
                                           {"state", state},
@@ -1016,46 +1022,86 @@ struct Node {
                                           {"beat", double(++beat)},
                                           {"encoders", enc}});
     }
-    // The encoder this node codes a hardware family with at a size (as the export picks it), asked once.
-    std::string encoderFor(const std::string& family, int width, int height, int fpsNum = 25, int fpsDen = 1) {
+    // The encoder this node codes a hardware export of `seq` with: the export's own choice (exportHwEncoder), asked
+    // once for each picture.
+    std::string encoderFor(const ExportSettings& st, const Sequence& seq) {
+        const std::string family = st.videoCodec == "hw_hevc" ? "hevc" : "h264";
         if (const auto it = o.encoders.find(family); it != o.encoders.end()) return it->second;
-        const std::string key = family + " " + std::to_string(width) + "x" + std::to_string(height) + "@" + std::to_string(fpsNum) + "/" +
-                                std::to_string(fpsDen);
+        int w = 0, h = 0;
+        codedPictureSize(seq, st, w, h);
+        const std::string key = family + " " + std::to_string(w) + "x" + std::to_string(h) + "@" + std::to_string(seq.fps.num) + "/" +
+                                std::to_string(seq.fps.den);
         if (const auto it = found.find(key); it != found.end()) return it->second;
-        std::string c = pickHwEncoder(family, width, height, fpsNum, fpsDen);
-        if (c.empty()) c = family == "hevc" ? "libx265" : "libx264";
-        return found[key] = c;
+        return found[key] = exportHwEncoder(seq, st);
     }
     // Whether this node may take a segment of a hardware-encoded export: its kind pinned to the export's join by the
     // first node that takes one (a file only one creation of succeeds), the others taking them only with that kind.
-    bool mayCodeSegment(const FarmJob& j) {
+    // When no node coding with the pinned kind answers any more, the pin passes to this node if none of the segments
+    // was coded with it yet; else the segment cannot be coded to match the others, and `stranded` says why.
+    bool mayCodeSegment(const FarmJob& j, std::string* stranded) {
         if (j.segment <= 0 || j.group.empty()) return true;
         ExportSettings st;
         const QJsonObject job = readJson(QDir(jobDir(o.farm, j.id)).filePath(QStringLiteral("job.json")));
         if (!exportSettingsFromJson(job.value("settings").toObject(), st)) return true;  // (failed when rendered, saying why)
         if (st.videoCodec != "hw_h264" && st.videoCodec != "hw_hevc") return true;
+        // (The sequence's picture as the export codes it, sent with the job: its size, rate and stereoscopy.)
         const QJsonArray pic = job.value("picture").toArray();
-        auto at = [&](int i, int otherwise) { return pic.size() == 4 && pic.at(i).toInt() > 0 ? pic.at(i).toInt() : otherwise; };
-        const std::string mine = encoderFor(st.videoCodec.substr(3), at(0, st.width > 0 ? st.width : 1920), at(1, st.height > 0 ? st.height : 1080),
-                                            at(2, 25), at(3, 1));
+        auto at = [&](int i, int otherwise) { return pic.size() >= 4 && pic.at(i).toInt() > 0 ? pic.at(i).toInt() : otherwise; };
+        Sequence seq;
+        seq.width = at(0, 1920), seq.height = at(1, 1080), seq.fps = {at(2, 25), at(3, 1)};
+        seq.stereo3d = pic.size() >= 5 && pic.at(4).toBool();
+        const std::string family = st.videoCodec.substr(3);
+        const std::string mine = encoderFor(st, seq);
         const QString pin = QDir(jobDir(o.farm, j.group)).filePath(QStringLiteral("encoder"));
-        QFile f(pin);
-        if (f.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+        auto pinIt = [&] {
+            QFile f(pin);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::NewOnly)) return false;
             f.write(QByteArray::fromStdString(mine));
             f.close();
             log("Segments of " + j.group + " are coded with " + mine);
             return true;
-        }
+        };
+        if (pinIt()) return true;
+        QByteArray kind;
         QFile r(pin);
-        for (int tries = 0; tries < 20; ++tries) {  // (another node's, being written)
+        for (int tries = 0; tries < 20 && kind.isEmpty(); ++tries) {  // (another node's, being written)
             if (r.open(QIODevice::ReadOnly)) {
-                const QByteArray kind = r.readAll();
+                kind = r.readAll();
                 r.close();
-                if (!kind.isEmpty()) return kind == QByteArray::fromStdString(mine);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            if (kind.isEmpty()) std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
-        return false;
+        if (kind.isEmpty()) return false;
+        if (kind == QByteArray::fromStdString(mine)) return true;
+        // Another kind's: left to the nodes with it while one answers.
+        const std::string pinned = ss(QString::fromUtf8(kind));
+        for (const FarmNodeInfo& n : farmNodes(o.farm)) {
+            if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat)) continue;
+            if (const auto e = n.encoders.find(family); e != n.encoders.end() && e->second == pinned) return false;
+        }
+        // None does: its segments being coded are waited for (a silent node's are taken back), and with none coded yet
+        // the pin is this node's (put aside first, so only one node takes it over).
+        bool coded = false;
+        for (const std::string& seg : segmentIds(o.farm, j.group)) {
+            if (!jobExists(o.farm, seg)) continue;
+            const FarmState state = readJob(o.farm, seg).state;
+            if (state == FarmState::Rendering) return false;
+            coded |= state == FarmState::Done;
+        }
+        if (coded) {
+            if (stranded)
+                *stranded = "The export's other segments were coded with " + pinned + ", and no node coding with it is answering: start one, then retry the job";
+            return false;
+        }
+        const QString aside = pin + QStringLiteral("-") + QString::number(QRandomGenerator::global()->generate64(), 16);
+        if (!QFile::rename(pin, aside)) return false;
+        QFile a(aside);
+        const QByteArray held = a.open(QIODevice::ReadOnly) ? a.readAll() : QByteArray();
+        a.close();
+        QFile::remove(aside);
+        if (held != kind) return false;  // (another node took it over meanwhile)
+        log("No node coding with " + pinned + " answers");
+        return pinIt();
     }
     // Whether this node still holds the job's claim (another may have taken it back while this one was silent). Its
     // claim counts while another node has it aside for a moment, checking whether it was the stale one.
@@ -1099,12 +1145,20 @@ struct Node {
                 if (std::any_of(segs.begin(), segs.end(), [&](const std::string& seg) { return jobExists(o.farm, seg) && !ended(readJob(o.farm, seg).state); }))
                     continue;
             }
-            if (!mayCodeSegment(j)) continue;
+            std::string stranded;
+            if (!mayCodeSegment(j, &stranded) && stranded.empty()) continue;
             const QDir d(jobDir(o.farm, j.id));
             QFile c(d.filePath(QStringLiteral("claim")));
             if (!c.open(QIODevice::WriteOnly | QIODevice::NewOnly)) continue;  // (another node's)
             c.write(QByteArray::fromStdString(token));
             c.close();
+            // (A segment no node can code to match the others: it fails, and so its join, saying why.)
+            if (!stranded.empty()) {
+                writeJson(d.filePath(QStringLiteral("status.json")),
+                          QJsonObject{{"state", "failed"}, {"node", qs(name)}, {"error", qs(stranded)}, {"finished", qs(nowIso())}});
+                log("Failed " + j.id + ": " + stranded);
+                continue;
+            }
             // (Cancelled between the look and the claim: ended here.)
             if (QFileInfo::exists(d.filePath(QStringLiteral("cancel")))) {
                 writeJson(d.filePath(QStringLiteral("status.json")),
@@ -1220,7 +1274,7 @@ struct Node {
                 if (!jobExists(o.farm, segs[k])) return failJob(which + " was removed");
                 const FarmJob sj = readJob(o.farm, segs[k]);
                 if (sj.state == FarmState::Cancelled) return failJob(which + " was cancelled");
-                if (sj.state != FarmState::Done) return failJob(which + " failed: " + sj.error);
+                if (sj.state != FarmState::Done) return failJob(which + " failed" + (sj.node.empty() ? std::string() : " on " + sj.node) + ": " + sj.error);
                 const QDir sd(jobDir(o.farm, segs[k]));
                 ExportSettings x;
                 if (!exportSettingsFromJson(readJson(sd.filePath(QStringLiteral("job.json"))).value("settings").toObject(), x, &err)) return failJob(err);
@@ -1260,6 +1314,7 @@ struct Node {
         if (!QDir().mkpath(scratch)) return failJob("Cannot write in the output's folder " + ss(outDir.path()));
         const std::string finalPath = st.path;
         st.path = ss(QDir(scratch).filePath(out.fileName()));
+        const QString ownCodestreams = QDir(scratch).filePath(QStringLiteral("codestreams"));  // (a package segment's)
         // A first pass's statistics written there too, and put beside the segments only while the job is this node's.
         const std::string sharedStats = st.passStats;
         if (pass == 1) st.passStats = ss(QDir(scratch).filePath(QFileInfo(qs(sharedStats)).fileName()));
@@ -1312,18 +1367,27 @@ struct Node {
                     }
                 }
             } else if (!package.empty()) {
-                // A package's segment: its share of the pictures coded, then counted and hashed for the join.
+                // A package's segment: its share of the pictures coded into this claim's folder, then counted and
+                // hashed for the join (and moved beside the others' only while the job is this node's).
                 const auto coding = [&progress, &cancel](double f) {
                     progress = 0.95 * f;
                     return !cancel;
                 };
                 const int64_t from = package == "imf" ? imf.codeFrom : dcp.codeFrom, to = package == "imf" ? imf.codeTo : dcp.codeTo;
-                ok = package == "imf" ? exportImf(p, *sequence, imf, ss(scratch), nullptr, coding, &err)
-                                      : exportDcp(p, *sequence, dcp, ss(scratch), nullptr, coding, &err);
-                if (ok) ok = checkCodestreams(codestreams, from, to, package == "dcp" && dcp.stereo, made, &err, &cancel);
+                ImfSettings ix = imf;
+                DcpSettings dx = dcp;
+                ix.codestreams = dx.codestreams = ss(ownCodestreams);
+                // (The package's folder named now, not once every segment is coded.)
+                const QString named = qs(package == "imf" ? imfFolderName(imf) : dcpFolderName(*sequence, dcp));
+                if (QFileInfo::exists(outDir.filePath(named)))
+                    err = "There is already a folder called " + ss(named) + " in " + ss(outDir.path());
+                else
+                    ok = package == "imf" ? exportImf(p, *sequence, ix, ss(scratch), nullptr, coding, &err)
+                                          : exportDcp(p, *sequence, dx, ss(scratch), nullptr, coding, &err);
+                if (ok) ok = checkCodestreams(ss(ownCodestreams), from, to, package == "dcp" && dcp.stereo, made, &err, &cancel);
                 if (ok && made.frames != to - from) {
                     ok = false;
-                    err = "The segment has " + std::to_string(made.frames) + " pictures in " + codestreams + ", not " + std::to_string(to - from);
+                    err = "The segment has " + std::to_string(made.frames) + " pictures, not " + std::to_string(to - from);
                 }
             } else if (join) {
                 // Each segment checked (its frames and bytes as its node found them), then joined.
@@ -1385,7 +1449,21 @@ struct Node {
         worker.join();
         // The finished files (the output, its stems and sidecars, an image sequence's frames) put in place; an export
         // that could not be signed too (it is kept, unsigned, and the job fails saying where).
-        if ((ok || kept) && holds(d) && pass != 1) {
+        if (ok && !package.empty() && !join && holds(d)) {
+            // (A package segment's codestreams, beside the other segments'.)
+            if (!QDir().mkpath(qs(codestreams))) {
+                ok = false;
+                err = "Cannot write in " + codestreams;
+            }
+            for (const QFileInfo& f : QDir(ownCodestreams).entryInfoList(QDir::Files)) {
+                const QString to = QDir(qs(codestreams)).filePath(f.fileName());
+                QFile::remove(to);
+                if (ok && !QFile::rename(f.filePath(), to)) {
+                    ok = false;
+                    err = "Cannot move the segment's pictures into " + codestreams;
+                }
+            }
+        } else if ((ok || kept) && holds(d) && pass != 1) {
             // (A package's folder, which never replaces one there.)
             for (const QFileInfo& f : QDir(scratch).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
                 const QString to = outDir.filePath(f.fileName());

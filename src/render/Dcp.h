@@ -59,7 +59,8 @@ struct DcpSettings {
     // "-R"), and nothing else is written; with `codestreams` alone, the package is made with the pictures coded there.
     // An encrypted package's codestreams are sealed (dcp::seal) for `codestreamCertificate`, the PEM certificate of the
     // signer's leaf as the sender has it, and opened by the joining node with that leaf's private key: they are never in
-    // the clear in the farm's folder.
+    // the clear in the farm's folder. Every codestream must be in the DCI profile: a segment coded by FFmpeg's own
+    // encoder (no OpenJPEG) fails, and so does a package made from a codestream that is not.
     std::string codestreams;
     int64_t codeFrom = 0, codeTo = 0;
     std::string codestreamCertificate;
@@ -103,6 +104,9 @@ int64_t dcpPackageFrames(const Sequence& s, const DcpSettings& settings);
 // aspect, language and subtitles, territory, audio ("51-IAB" with an immersive track), resolution, studio, date,
 // facility, standard, package type (the ISDCF Digital Cinema Naming Convention; studio and facility only when given).
 std::string dcpName(const DcpSettings& settings, int channels, const std::string& date);
+// The name exportDcp gives the folder of a package of `s` made today (dcpName with the sequence's channels and its
+// subtitles' language).
+std::string dcpFolderName(const Sequence& s, const DcpSettings& settings);
 
 // Writes the DCP into a new folder named dcpName() under `parent`. `progress` (0..1) may return false to stop (the
 // half-written folder is removed).

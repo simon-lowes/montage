@@ -1054,6 +1054,12 @@ int64_t imfCompositionFrames(const Sequence& s, const ImfSettings& settings, std
     return n;
 }
 
+std::string imfFolderName(const ImfSettings& settings) {
+    const std::string title = settings.title.empty() ? "Untitled" : settings.title;
+    return (safeTitle(title) + (!settings.supplementOf.empty() ? "_IMF_SUPP_" : "_IMF_") + QDate::currentDate().toString(QStringLiteral("yyyyMMdd")))
+        .toStdString();
+}
+
 bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings, const std::string& parent, ImfResult* result,
                const std::function<bool(double)>& progress, std::string* error) {
     auto fail = [&](const std::string& why) {
@@ -1504,7 +1510,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     // The folder.
     const QString title = QString::fromStdString(settings.title.empty() ? "Untitled" : settings.title);
     // (a second supplemental of the day gets a number: a chain can grow by several)
-    const QString stem = safeTitle(title.toStdString()) + (supplemental ? "_IMF_SUPP_" : "_IMF_") + QDate::currentDate().toString(QStringLiteral("yyyyMMdd"));
+    const QString stem = QString::fromStdString(imfFolderName(settings));
     QString name = stem;
     if (!supplemental && QFileInfo::exists(QDir(QString::fromStdString(parent)).filePath(name)))
         return fail("There is already a folder called " + name.toStdString() + " there");

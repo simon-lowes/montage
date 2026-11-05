@@ -9116,9 +9116,11 @@ colorspaces:
         QVERIFY(r.application == 45 && r.frames == 252 && r.codedFrames == 252 && r.bits == 10 && r.colour == "rec709" && r.prores == "hq");
         std::vector<std::string> issues = verifyImf(r.folder);
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
-        // Photon holds every track file to ST 2067-5's partitions (index tables and essence never together); RDD 45 asks
-        // for RDD 44's instead (each body partition after the first carries the previous one's index), so that one
-        // finding is expected and everything else Photon checks has to pass.
+        // Photon flags these packages: it holds every track file to ST 2067-5's partitions (index tables and essence
+        // never together), and RDD 45 asks for RDD 44's instead (each body partition after the first carries the
+        // previous one's index). The RDD 44 layout is kept on purpose, as Application ProRes says, so an ingest that
+        // gates on Photon passing cleanly refuses these packages; that one finding is filtered out here, and
+        // everything else Photon checks has to pass.
         auto photonFindings = [](const std::string& folder) {
             QStringList found = photonErrors(QString::fromStdString(folder));
             found.removeIf([](const QString& e) { return e.contains("has both index table and essence"); });
