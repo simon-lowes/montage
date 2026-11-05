@@ -501,42 +501,6 @@
         <translation type="unfinished">Cuadro de fondo</translation>
     </message>
     <message>
-        <source>Band 1 (Hz)</source>
-        <translation type="unfinished">Banda 1 (Hz)</translation>
-    </message>
-    <message>
-        <source>Band 1 (dB)</source>
-        <translation type="unfinished">Banda 1 (dB)</translation>
-    </message>
-    <message>
-        <source>Band 1 Q</source>
-        <translation type="unfinished">Banda 1 Q</translation>
-    </message>
-    <message>
-        <source>Band 2 (Hz)</source>
-        <translation type="unfinished">Banda 2 (Hz)</translation>
-    </message>
-    <message>
-        <source>Band 2 (dB)</source>
-        <translation type="unfinished">Banda 2 (dB)</translation>
-    </message>
-    <message>
-        <source>Band 2 Q</source>
-        <translation type="unfinished">Banda 2 Q</translation>
-    </message>
-    <message>
-        <source>Band 3 (Hz)</source>
-        <translation type="unfinished">Banda 3 (Hz)</translation>
-    </message>
-    <message>
-        <source>Band 3 (dB)</source>
-        <translation type="unfinished">Banda 3 (dB)</translation>
-    </message>
-    <message>
-        <source>Band 3 Q</source>
-        <translation type="unfinished">Banda 3 Q</translation>
-    </message>
-    <message>
         <source>Bandwidth Extension</source>
         <translation type="unfinished">Extensión de ancho de banda</translation>
     </message>
@@ -2441,14 +2405,6 @@
         <translation type="unfinished">Alta proporción</translation>
     </message>
     <message>
-        <source>High Shelf (Hz)</source>
-        <translation type="unfinished">Plataforma alta (Hz)</translation>
-    </message>
-    <message>
-        <source>High Shelf (dB)</source>
-        <translation type="unfinished">Plataforma alta (dB)</translation>
-    </message>
-    <message>
         <source>High Threshold (dB)</source>
         <translation type="unfinished">Umbral alto (dB)</translation>
     </message>
@@ -3023,14 +2979,6 @@
     <message>
         <source>Low Ratio</source>
         <translation type="unfinished">Razón baja</translation>
-    </message>
-    <message>
-        <source>Low Shelf (Hz)</source>
-        <translation type="unfinished">Plataforma baja (Hz)</translation>
-    </message>
-    <message>
-        <source>Low Shelf (dB)</source>
-        <translation type="unfinished">Plataforma baja (dB)</translation>
     </message>
     <message>
         <source>Low Threshold (dB)</source>
@@ -6252,6 +6200,54 @@
         <source>Wrap</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>12 dB/oct</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>24 dB/oct</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>36 dB/oct</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>48 dB/oct</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band-Pass</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bell</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Shelf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Shelf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Notch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Tilt</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -7167,6 +7163,10 @@ Download it now?</source>
         <source> and </source>
         <translation type="unfinished"> y </translation>
     </message>
+    <message>
+        <source>SMPTE ST 2110 streams (from their SDP files)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>TangentControl</name>
@@ -7576,6 +7576,10 @@ Download it now?</source>
     </message>
     <message>
         <source>Angle %1: %2 (key %3 in bank %4, picked with Alt+%4; Shift-click cuts at the playhead)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Angle %1: %2 (Shift-click cuts at the playhead)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -9312,6 +9316,85 @@ Download it now?</source>
         <source>%1 dropped, %2 repeated</source>
         <translation type="unfinished">%1 cayó, %2 repetido</translation>
     </message>
+    <message>
+        <source>SDP Files</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SDP files (*.sdp);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Offer to NMOS controllers (their connection becomes the feed)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>SDP files, apart by ;</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>interface=address interface2=address (ST 2022-7&apos;s second path)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage capture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>NMOS: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>registered with %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>at %1, no registry yet</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Offered to NMOS controllers (%1): not connected</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Connected by an NMOS controller (%1)%2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>, for the next recording</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n kind(s) of device</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Already recording %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This build does not open &quot;%1&quot; (see &quot;kinds&quot;)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Recording to %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stopping</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Not offered to NMOS controllers</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Unknown action %1</source>
+        <translation type="unfinished">Acción desconocida %1</translation>
+    </message>
 </context>
 <context>
     <name>montage::ChartMatchDialog</name>
@@ -10192,6 +10275,466 @@ Download it now?</source>
     </message>
 </context>
 <context>
+    <name>montage::DeckController</name>
+    <message>
+        <source>The deck is busy: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No deck answered on %1 (%2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No deck connected</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No tape</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Record</source>
+        <translation type="unfinished">Registro</translation>
+    </message>
+    <message>
+        <source>Play</source>
+        <translation type="unfinished">Reproducir</translation>
+    </message>
+    <message>
+        <source>Fast forward</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rewind</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shuttle</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Jog</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Variable</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Standby</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop</source>
+        <translation type="unfinished">Detener</translation>
+    </message>
+    <message>
+        <source> (local)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1  %2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The deck is busy</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nothing to capture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Batch capture: starting</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip %1 of %2: %3</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Captured</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Batch Capture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Batch capture: %1 of %2 clips captured</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Program runs at %1 fps and the deck at %2: set the deck&apos;s rate to the Program&apos;s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit to tape: setting up</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit to tape: rolling</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit to tape: done</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit to tape: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No sound input to read LTC from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 has no channel %2 to read LTC from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cannot open %1</source>
+        <translation type="unfinished">No se puede abrir %1</translation>
+    </message>
+    <message>
+        <source>Not chasing</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Locked  %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Freewheeling  %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Locking…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No LTC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No serial ports</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n serial port(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>Disconnected</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stopping</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nothing running</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage no longer answers as a deck</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>program_start is not a timecode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage answers as a deck on %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chasing LTC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No deck connected: &quot;connect&quot; first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Unknown command</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>timecode is not a timecode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cueing to %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Clip %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An entry&apos;s in and out are not timecodes, In before Out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>Capturing %n clip(s): &quot;status&quot; follows it</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>in and out must be timecodes on the tape, In before Out</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No sequence open</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>program_in is not a timecode</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Editing to tape from %1 to %2: &quot;status&quot; follows it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Unknown action</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::DeckDialog</name>
+    <message>
+        <source>Deck Control</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Connect</source>
+        <translation type="unfinished">Conectar</translation>
+    </message>
+    <message>
+        <source>Serial port:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No deck connected</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rewind</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shuttle back at twice play speed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Back a frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop</source>
+        <translation type="unfinished">Detener</translation>
+    </message>
+    <message>
+        <source>Play</source>
+        <translation type="unfinished">Reproducir</translation>
+    </message>
+    <message>
+        <source>On a frame</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fast forward</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cue</source>
+        <translation type="unfinished">Cue</translation>
+    </message>
+    <message>
+        <source>The deck is busy: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Cue to:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Deck</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An ALE or CSV log (empty: the Program&apos;s In to Out, as one clip)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose…</source>
+        <translation type="unfinished">Elija…</translation>
+    </message>
+    <message>
+        <source>Capture Log</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Logs (*.ale *.csv *.txt)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Log:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Network stream</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The deck&apos;s picture:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Address or device:</source>
+        <translation type="unfinished">Dirección o dispositivo:</translation>
+    </message>
+    <message>
+        <source>Into:</source>
+        <translation type="unfinished">En:</translation>
+    </message>
+    <message>
+        <source> s</source>
+        <translation type="unfinished"> s</translation>
+    </message>
+    <message>
+        <source>Handles:</source>
+        <translation type="unfinished">Manijas:</translation>
+    </message>
+    <message>
+        <source>Pre-roll:</source>
+        <translation type="unfinished">Pre-roll:</translation>
+    </message>
+    <message>
+        <source>LTC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>VITC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Timer</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>LTC or VITC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The deck&apos;s timecode, read as it plays to place pictures that carry none of their own</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Deck timecode:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Capture</source>
+        <translation type="unfinished">Capturar</translation>
+    </message>
+    <message>
+        <source>Batch Capture</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Record In on the tape:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Assemble</source>
+        <translation type="unfinished">Conjunto</translation>
+    </message>
+    <message>
+        <source>V</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A%1</source>
+        <translation type="unfinished">A%1</translation>
+    </message>
+    <message>
+        <source>Channels:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit the Program&apos;s In to Out onto Tape</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Program plays out through Reference Output while the deck records it</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Edit to Tape</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Answer as a deck on:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The Program starts at:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Answer as a Deck</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Default input</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>LTC from:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Channel:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> frames</source>
+        <translation type="unfinished"> marcos</translation>
+    </message>
+    <message>
+        <source>Offset:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Chase LTC</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Montage as a Deck</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Disconnect</source>
+        <translation type="unfinished">Desconectar</translation>
+    </message>
+    <message>
+        <source>Mark the Program&apos;s In and Out first</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The tape&apos;s In is not a timecode</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
     <name>montage::EditorState</name>
     <message>
         <source>This project is open read-only (File › Edit Project to make changes)</source>
@@ -10513,6 +11056,363 @@ Download it now?</source>
     <message>
         <source>renders on the GPU</source>
         <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::EqDisplay</name>
+    <message>
+        <source>Bell</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Shelf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Shelf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Notch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band-Pass</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Tilt</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>EQ display</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Double-click to add a band; drag a dot to move it; scroll over a dot to change its Q; right-click a dot for more</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n band(s)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message>
+        <source>%1 kHz</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 Hz</source>
+        <translation type="unfinished">%1 Hz</translation>
+    </message>
+    <message>
+        <source>Low band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 dB</source>
+        <translation type="unfinished">%1 dB</translation>
+    </message>
+    <message>
+        <source>Q %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 dB/oct</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>off</source>
+        <translation type="unfinished">apagado</translation>
+    </message>
+    <message>
+        <source>%1, %2 dB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An EQ has at most %1 bands</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Type</source>
+        <translation type="unfinished">Tipo</translation>
+    </message>
+    <message>
+        <source>Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Delete Band</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::EqPanel</name>
+    <message>
+        <source>Add Band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add a bell at 1 kHz (or double-click the display where you want one)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Add EQ Band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Gain shown above and below 0 dB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Display range</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>±%1 dB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Spectrum</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show the spectrum of what plays behind the curve</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Large Window</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Open this EQ in a window of its own, as large as you like</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show the tips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Show tips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Move EQ Band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EQ Band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remove EQ Band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EQ Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EQ Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Switch EQ Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Switch EQ Band Off</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Bell</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Shelf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Shelf</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Cut</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Notch</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band-Pass</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Tilt</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Type</source>
+        <translation type="unfinished">Tipo</translation>
+    </message>
+    <message>
+        <source> Hz</source>
+        <translation type="unfinished"> Hz</translation>
+    </message>
+    <message>
+        <source>Freq</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> dB</source>
+        <translation type="unfinished"> dB</translation>
+    </message>
+    <message>
+        <source>Gain</source>
+        <translation type="unfinished">Ganancia</translation>
+    </message>
+    <message>
+        <source>Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 dB/oct</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>On</source>
+        <translation type="unfinished">Activar</translation>
+    </message>
+    <message>
+        <source>Solo</source>
+        <translation type="unfinished">Solo</translation>
+    </message>
+    <message>
+        <source>Hold to hear only this band&apos;s part of the sound as it plays</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Solo band (hold)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Delete</source>
+        <translation type="unfinished">Eliminar</translation>
+    </message>
+    <message>
+        <source>Delete this band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EQ Band Frequency</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EQ Band Gain</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EQ Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fold the tips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Tips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hide tips</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Double-click an empty part of the display to add a band there (up to 16). Add Band puts one at 1 kHz.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Drag a band&apos;s dot sideways to change its frequency, up or down to change its gain. Hold Shift for finer steps; hold Ctrl (Cmd on a Mac) to move in one direction only.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Scroll over a dot to make its band narrower or wider (its Q).</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Right-click a dot to change its type (bell, shelf, cut, notch, band-pass or tilt), a cut&apos;s slope, or to switch it off or delete it. Double-click a dot to switch its band off or back on.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Pick a band and press Delete to remove it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Hold Solo, or hold Alt (Option on a Mac) while you drag a dot, to hear only that band&apos;s part of the sound as it plays. Let go and everything comes back.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• The strip under the display sets the picked band exactly. With the display focused, Tab moves between bands, the arrow keys move one and Page Up or Page Down change its Q.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>• Large Window opens the EQ in a window you can make as big as you like; it stays in step with this one.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No bands yet: double-click the display to add one</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No band picked</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High band</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Parametric EQ</source>
+        <translation type="unfinished">EQ paramétrico</translation>
     </message>
 </context>
 <context>
@@ -11381,6 +12281,46 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>JPEG XL:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The preset&apos;s (16-bit, or half floats in linear light)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>8-bit</source>
+        <translation type="unfinished">8 bits</translation>
+    </message>
+    <message>
+        <source>16-bit</source>
+        <translation type="unfinished">16-bit</translation>
+    </message>
+    <message>
+        <source>Half float</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Float</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XL frames&apos; samples: integers, or half floats and floats that keep light past white</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XL alpha premultiplied</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Colour written multiplied by alpha, as compositing programs keep it; else straight</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Needs libjxl 0.9 or later: alpha is written straight</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>JPEG XL depth:</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -13743,6 +14683,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Effect&apos;s Mask</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band Settings and Keyframes</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -21365,6 +22309,42 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Images (*.png *.jpg *.tif *.avif *.heic *.jxl)</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>&amp;Deck Control…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ProRes master (Application ProRes, RDD 45)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>422 HQ (4:2:2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>422 (4:2:2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>422 LT (4:2:2)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>4444 (4:4:4 RGB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>4444 XQ (4:4:4 RGB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>4:2:2 goes to 3840 x 2160 and 60 fps, in Rec.709, Rec.2020 PQ or HLG; 4:4:4 to 4096 x 3112 in any of the colours</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>ProRes:</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -25552,6 +26532,50 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Save SDP Files</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>12-bit 4:2:2</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>10-bit 4:4:4</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>12-bit 4:4:4</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>10-bit RGB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>12-bit RGB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Also send on a second path (ST 2022-7)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The second path&apos;s video, sound and data addresses and ports, apart by spaces</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Second path:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As routing chooses</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The address of the network interface the second path goes from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Second path from:</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
