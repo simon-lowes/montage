@@ -47,23 +47,34 @@ bool frameTimecode(const std::vector<AncPacket>& anc, Rational fps, output::Time
 
 // ST 2022-7: the packets of one stream from one or two paths, each taken once, out in the order of their RTP sequence
 // numbers (RFC 4175's extended ones for video, with `extended`). A gap is waited on while `window` later packets
-// arrive, for the other path to fill it.
+// arrive (and no more than `maxBytes` of them are held), for the other path to fill it.
+// Only RTP packets of the stream's payload type (`setPayloadType`, -1 any) and of one sender (the SSRC first heard)
+// take a place: another sender's are passed over until a window's worth of them has come with none of the first's
+// between (the sender started again with a new SSRC).
 class PathMerger {
 public:
-    explicit PathMerger(bool extended, size_t window = 512) : extended_(extended), window_(window) {}
+    explicit PathMerger(bool extended, size_t window = 512, size_t maxBytes = size_t(256) << 20)
+        : extended_(extended), window_(window), maxBytes_(maxBytes) {}
     void setWindow(size_t window) { window_ = std::max<size_t>(16, window); }
+    void setPayloadType(int type) { payloadType_ = type; }
     void push(std::vector<uint8_t> packet, int path, std::vector<std::vector<uint8_t>>& out);
     // Everything held, in order (a pause in the stream: what is missing will not come).
     void flush(std::vector<std::vector<uint8_t>>& out);
+    size_t heldBytes() const { return heldBytes_; }
     int64_t received[2] = {0, 0};
     int64_t duplicates = 0, lost = 0, late = 0;
+    int64_t rejected = 0;  // not RTP, of another payload type, or another sender's
 
 private:
     bool extended_;
-    size_t window_;
-    bool started_ = false;
+    size_t window_, maxBytes_;
+    int payloadType_ = -1;
+    bool started_ = false, haveSsrc_ = false;
+    uint32_t ssrc_ = 0;
     int64_t next_ = 0;
-    int64_t lateRun_ = 0;  // packets in a row from before the window (a sender restarted, or one jumped ahead of)
+    int64_t lateRun_ = 0;      // packets in a row from before the window (a sender restarted, or one jumped ahead of)
+    int64_t strangerRun_ = 0;  // another sender's packets since the last of the one taken
+    size_t heldBytes_ = 0;     // what the packets held take (their buffers, and a little for each)
     std::map<int64_t, std::vector<uint8_t>> held_;
     void release(std::vector<std::vector<uint8_t>>& out);
 };

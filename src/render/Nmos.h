@@ -20,6 +20,7 @@
 #include <QJsonValue>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QUuid>
 #include <functional>
 #include <memory>
@@ -124,6 +125,9 @@ public:
     // The streams the active receivers take, as their transport files describe them and their parameters place them
     // (a receiver with no transport file, or one Montage cannot read, left out).
     std::vector<st2110::SdpStream> receiverStreams(QString* why = nullptr) const;
+    // The interfaces to join those paths on: receiver `stream`'s enabled legs' in turn, as its paths are (with the
+    // second leg alone, its interface is the first path's).
+    QStringList receiverInterfaces(int stream = 0) const;
     std::function<void(bool registered)> onRegistered;
 
 private:

@@ -862,11 +862,12 @@ int cmdSt2110(const std::vector<std::string>& args) {
             QString why;
             std::vector<st2110::SdpStream> streams = node.receiverStreams(&why);
             if (!why.isEmpty()) std::fprintf(stderr, "A receiver's transport file: %s\n", why.toUtf8().constData());
-            const nmos::ReceiverConnection c = node.receiverConnection(0);
+            // (each path's interface: with the second leg alone, it is the first path)
+            const QStringList interfaces = node.receiverInterfaces();
             std::lock_guard lock(m);
             inStreams = std::move(streams);
-            inOptions.interfaceAddress[0] = c.leg[0].interfaceIp.toStdString();
-            inOptions.interfaceAddress[1] = c.leg[1].interfaceIp.toStdString();
+            inOptions.interfaceAddress[0] = interfaces.value(0).toStdString();
+            inOptions.interfaceAddress[1] = interfaces.value(1).toStdString();
             reconnect = true;
         };
         node.setStreams(vf, af, so, true);

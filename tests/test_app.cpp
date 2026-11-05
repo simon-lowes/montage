@@ -2512,6 +2512,11 @@ private slots:
         m = state()->project().findMedia(dlg->importedMedia());
         QVERIFY(m && m->hasVideo && m->hasAudio && m->name.find("Feed 02") != std::string::npos);
         QVERIFY(m->timecode >= 36000 && m->timecode < 36000 + 30 * 25);
+        // The picture disconnected by the controller, what it connected is no longer the feed.
+        auto* url = dlg->findChild<QLineEdit*>(QStringLiteral("captureUrl"));
+        QVERIFY(url && url->text().contains("m=video"));
+        QCOMPARE(dlg->nmosNode()->handle("PUT", "/x-nmos/node/v1.3/receivers/" + receivers[0].toString() + "/target", "{}").code, 202);
+        QVERIFY(url->text().isEmpty());
         stop = true;
         sending.join();
         tx.close();

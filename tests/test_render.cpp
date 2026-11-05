@@ -14469,6 +14469,43 @@ colorspaces:
         QVERIFY(std::abs(got[0].start - 5) <= 1 && std::abs(got[0].end - 40) <= 1);
         snd.close();
 
+        // ST 2022-7: a path that cannot send (here to the broadcast address, which a socket not let broadcast is refused)
+        // leaves the other sending, its errors counted against it; with that path alone, the frame fails.
+        {
+            st::SenderOptions two = o;
+            two.redundant = true;
+            two.video2 = {"255.255.255.255", rv.port()}, two.audio2 = {"255.255.255.255", ra.port()}, two.anc2 = {"255.255.255.255", rx.port()};
+            st::Sender pair;
+            QVERIFY2(pair.open(two, v, st::AudioFormat{}, &why), why.c_str());
+            std::atomic<bool> halt{false};
+            std::vector<uint8_t> d;
+            while (rv.receive(d, 0)) {}
+            const size_t stride = rowBytes(PixelFormat::V210, 320);
+            QVERIFY(pair.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+            QVERIFY(rv.receive(d, 1000));
+            QCOMPARE(pair.sendErrors(0), int64_t(0));
+#ifdef __linux__
+            QVERIFY(pair.sendErrors(1) > 0);
+            st::SenderOptions alone = o;
+            alone.video = two.video2;
+            st::Sender lone;
+            QVERIFY2(lone.open(alone, v, st::AudioFormat{}, &why), why.c_str());
+            QVERIFY(!lone.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+            QVERIFY(lone.sendErrors(0) > 0);
+#endif
+            // Late by a few frames (a hold-up shorter than a fifth of a second), a frame still goes in its own slot but
+            // spread over at least half a frame's time (here 9 ms), not all at once at line rate.
+            std::this_thread::sleep_for(std::chrono::milliseconds(70));
+            const auto from = std::chrono::steady_clock::now();
+            QVERIFY(pair.send(picB.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+            const auto took = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - from).count();
+            QVERIFY2(took >= 7000, qPrintable(QString::number(took)));
+            // Stopped while catching up, it stops.
+            std::this_thread::sleep_for(std::chrono::milliseconds(70));
+            halt = true;
+            QVERIFY(!pair.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+        }
+
         // As a reference output: the Program on the loopback interface, its SDP files, captions while playing.
         const auto backend = findBackend("ST 2110");
         QVERIFY(backend && backend->available());
@@ -14607,6 +14644,131 @@ colorspaces:
             QCOMPARE(int(out.size()), 40);
             merger.flush(out);
             QVERIFY(out.size() == 41 && merger.lost == 10);
+        }
+        // Only the stream's own RTP takes a place: a datagram that is not RTP, one of another payload type and another
+        // sender's (one far ahead too) are passed over, and the packets of those numbers still taken when they come; the
+        // extended number read after a header extension. A sender started again with a new SSRC is taken once only its
+        // packets have come for a window.
+        {
+            auto rtp = [](uint32_t seq, uint8_t type, uint32_t ssrc, bool extension) {
+                std::vector<uint8_t> p(12 + (extension ? 4 + 4 : 0) + 4, 0);
+                p[0] = uint8_t(0x80 | (extension ? 0x10 : 0)), p[1] = type, p[2] = uint8_t(seq >> 8), p[3] = uint8_t(seq);
+                p[8] = uint8_t(ssrc >> 24), p[9] = uint8_t(ssrc >> 16), p[10] = uint8_t(ssrc >> 8), p[11] = uint8_t(ssrc);
+                size_t at = 12;
+                if (extension) p[15] = 1, at = 20;  // (one word of extension)
+                p[at] = uint8_t(seq >> 24), p[at + 1] = uint8_t(seq >> 16);
+                return p;
+            };
+            st::PathMerger merger(true, 16);
+            merger.setPayloadType(96);
+            std::vector<std::vector<uint8_t>> out;
+            merger.push(rtp(0x10000, 96, 7, false), 0, out);
+            std::vector<uint8_t> notRtp = rtp(0x10001, 96, 7, false);
+            notRtp[0] = 0x40;  // (RTP version 1)
+            merger.push(notRtp, 0, out);
+            merger.push(rtp(0x10001, 0, 7, false), 0, out);
+            merger.push(rtp(0x10001, 96, 8, false), 0, out);
+            merger.push(rtp(0x20000, 96, 8, false), 1, out);
+            merger.push(rtp(0x10001, 96, 7, true), 1, out);
+            merger.push(rtp(0x10002, 96, 7, false), 0, out);
+            QVERIFY(out.size() == 3 && merger.rejected == 4 && merger.duplicates == 0 && merger.late == 0 && merger.lost == 0);
+            for (uint32_t i = 0; i < 20; ++i) merger.push(rtp(500 + i, 96, 9, false), 0, out);
+            QVERIFY(out.size() == 7 && merger.rejected == 4 + 16);
+        }
+        // What is held for a gap is bounded by memory as well as by count: datagrams as large as one can be, the gap
+        // given up on rather than held past the limit.
+        {
+            st::PathMerger merger(false, 100000, 1 << 20);
+            std::vector<std::vector<uint8_t>> out;
+            bool bounded = true;
+            for (uint32_t i = 0; i < 200; ++i) {
+                if (i == 1) continue;
+                std::vector<uint8_t> p = rtpPacket(i, false);
+                p.resize(60000);
+                merger.push(std::move(p), 0, out);
+                bounded = bounded && merger.heldBytes() <= (1u << 20);
+            }
+            QVERIFY(bounded && merger.lost == 1 && out.size() > 1);
+        }
+        // A datagram received is as large as it came, not as large as one could be (a packet held keeps only its own).
+        {
+            st::Receiver r;
+            QVERIFY(r.open({"127.0.0.1", 0}));
+            QUdpSocket u;
+            QCOMPARE(u.writeDatagram(QByteArray(1200, 'x'), QHostAddress::LocalHost, quint16(r.port())), qint64(1200));
+            std::vector<uint8_t> d;
+            QVERIFY(r.receive(d, 2000) && d.size() == 1200 && d.capacity() < 4096);
+        }
+        // The SDP: a connection at the session level (before the media description, as many single-stream SDPs put
+        // it) taken for the stream; an m= line with no payload type refused rather than read as type 0; pictures as
+        // large and as fast as each may be, but not both at once.
+        {
+            st::VideoFormat f;
+            f.width = 320, f.height = 180;
+            std::string sdp = st::videoSdp(f, {"239.10.0.1", 5010}, 98, {});
+            const size_t c = sdp.find("c=IN IP4"), cEnd = sdp.find("\r\n", c) + 2;
+            const std::string connection = sdp.substr(c, cEnd - c);
+            sdp.erase(c, cEnd - c);
+            sdp.insert(sdp.find("m=video"), connection);
+            std::string why;
+            const auto found = st::parseSdp(sdp, &why);
+            QVERIFY2(found.size() == 1 && found[0].path[0].address == "239.10.0.1" && found[0].path[0].port == 5010 && found[0].payloadType == 98,
+                     why.c_str());
+            std::string noType = sdp;
+            noType.replace(noType.find("RTP/AVP 98"), 10, "RTP/AVP");
+            QVERIFY(st::parseSdp(noType, &why).empty());
+            f.width = 8192, f.height = 4320, f.fps = {300, 1};
+            QVERIFY(!st::videoFormatOk(f));
+            f.fps = {60, 1};
+            QVERIFY(st::videoFormatOk(f));
+            f.width = 1920, f.height = 1080, f.fps = {300, 1};
+            QVERIFY(st::videoFormatOk(f));
+        }
+        // Sound whose timestamps go back (a PTP step, or the sender started again) is taken from there, not passed over
+        // as already held until the timestamps pass where they were.
+        {
+            int ports[2];
+            {
+                st::Receiver probe[2];
+                for (int i = 0; i < 2; ++i) {
+                    QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::VideoFormat f;
+            f.width = 64, f.height = 36, f.fps = {25, 1};
+            std::string why;
+            std::vector<st::SdpStream> streams;
+            for (const std::string& sdp : {st::videoSdp(f, {"127.0.0.1", ports[0]}, 96, {}), st::audioSdp(st::AudioFormat{}, {"127.0.0.1", ports[1]}, 97, {})}) {
+                const auto found = st::parseSdp(sdp, &why);
+                QVERIFY2(found.size() == 1, why.c_str());
+                streams.push_back(found[0]);
+            }
+            st::Input in;
+            QVERIFY2(in.open(streams, {}, &why), why.c_str());
+            QUdpSocket u;
+            st::RtpState videoRtp{96, 1, 0}, soundRtp{97, 2, 0};
+            const st::Raster pic(64, 36, st::Sampling::Ycc422, 10);
+            const int64_t nowSeconds = st::ptpNowNs() / 1000000000;
+            // The first frame of the second `back` seconds before now, after 60 ms of its sound at `level`.
+            auto frameAt = [&](int64_t back, float level) {
+                const int64_t second = nowSeconds - back;
+                const std::vector<float> s(48 * 2, level);
+                auto to = [&](int port) {
+                    return [&u, port](const uint8_t* d, size_t n) {
+                        return u.writeDatagram(reinterpret_cast<const char*>(d), qint64(n), QHostAddress::LocalHost, quint16(port)) == qint64(n);
+                    };
+                };
+                for (int k = 0; k < 60; ++k) st::packAudio(s.data(), 48, 2, uint32_t(second * 48000 + 48 * k), soundRtp, to(ports[1]));
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                st::packVideo(pic, 0, uint32_t(second * 90000), videoRtp, to(ports[0]));
+                st::InputFrame got;
+                return in.next(got, 3000) && got.audio.size() == 1920 * 2 &&
+                       std::all_of(got.audio.begin(), got.audio.end(), [&](float x) { return x == level; });
+            };
+            QVERIFY(frameAt(2, 0.5f));
+            QVERIFY(frameAt(12, 0.25f));
+            in.close();
         }
 
         // Over the loopback interface: a sender's streams found from its SDPs, received, and each frame matched by its
@@ -14768,6 +14930,15 @@ colorspaces:
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"multicast_ip", "10.0.0.1"}}, QJsonObject{}}}}).first, 400);
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"colour", 1}}, QJsonObject{}}}}).first, 400);
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_file", QJsonObject{{"data", "v=0"}, {"type", "application/sdp"}}}}).first, 400);
+        // (and SDPs Montage could not receive: a depth it does not take, or another kind of stream than the receiver's)
+        auto file = [](const std::string& sdp) {
+            return QJsonObject{{"transport_file", QJsonObject{{"data", QString::fromStdString(sdp)}, {"type", "application/sdp"}}}};
+        };
+        std::string nineBits = snd.sdpVideo();
+        nineBits.replace(nineBits.find("depth=10"), 8, "depth=9");
+        QCOMPARE(json("PATCH", single + "staged", file(nineBits)).first, 400);
+        QCOMPARE(json("PATCH", single + "staged", file(snd.sdpAudio())).first, 400);
+        QVERIFY(json("GET", single + "staged").second.object()["transport_file"].toObject()["data"].isNull());
 
         // The sender's SDP: both paths become the legs, at once; the IS-04 receiver says whom it takes from.
         const QString senderId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -14829,6 +15000,12 @@ colorspaces:
         const st::InputStats s = in.stats();
         QVERIFY(s.duplicates > 0 && s.packets[0][1] > 0);
         in.close();
+        // With the second leg alone, its port and interface are the first path's.
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"rtp_enabled", false}}, QJsonObject{}}},
+                                                              {"activation", QJsonObject{{"mode", "activate_immediate"}}}}).first, 200);
+        const std::vector<st::SdpStream> second = node.receiverStreams();
+        QVERIFY(!second.empty() && !second[0].redundant() && second[0].path[0].port == ports[3]);
+        QCOMPARE(node.receiverInterfaces(), QStringList{node.receiverConnection(0).leg[1].interfaceIp});
 
         // IS-04's target: an empty one disconnects, and nothing is taken.
         QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", QJsonObject{}).first, 202);
@@ -14850,6 +15027,9 @@ colorspaces:
         });
         const QJsonObject target{{"id", senderId}, {"manifest_href", QStringLiteral("http://127.0.0.1:%1/sdp").arg(manifest.serverPort())}};
         QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", target).first, 202);
+        // (connected, but not with the previous sender's transport file while its own is fetched)
+        QVERIFY(node.receiverConnection(0).active && node.receiverConnection(0).transportFile.isEmpty());
+        QCOMPARE(int(node.receiverStreams().size()), 1);
         QTRY_COMPARE_WITH_TIMEOUT(node.receiverConnection(0).leg[0].port, 5099, 5000);
         QVERIFY(node.receiverConnection(0).active && node.receiverConnection(0).leg[1].port == ports[3]);
         snd.close();

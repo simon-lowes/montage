@@ -70,6 +70,8 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
     };
     std::vector<Media> media;
     std::vector<std::vector<std::string>> dup;
+    // (a session-level connection and source filter: every description's that gives none of its own)
+    std::string sessionAddress, sessionSource;
     std::istringstream in(sdp);
     for (std::string line; std::getline(in, line);) {
         line = trim(line);
@@ -80,17 +82,21 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
         if (line[0] == 'm') {
             Media n;
             std::istringstream ms(v);
-            std::string port;
-            ms >> n.stream.media >> port;
-            std::string proto;
-            ms >> proto >> n.stream.payloadType;
+            std::string port, proto, type;
+            ms >> n.stream.media >> port >> proto >> type;
             n.port = std::atoi(port.c_str());
+            // (its first format, a payload type 0 to 127; -2 when there is none, refused below)
+            char* end = nullptr;
+            const long pt = std::strtol(type.c_str(), &end, 10);
+            n.stream.payloadType = !type.empty() && end && *end == 0 && pt >= 0 && pt <= 127 ? int(pt) : -2;
+            n.address = sessionAddress;
+            n.source = sessionSource;
             media.push_back(n);
-        } else if (line[0] == 'c' && m) {
+        } else if (line[0] == 'c') {
             std::istringstream cs(v);
             std::string net, type, addr;
             cs >> net >> type >> addr;
-            m->address = addr.substr(0, addr.find('/'));
+            (m ? m->address : sessionAddress) = addr.substr(0, addr.find('/'));
         } else if (line[0] == 'a') {
             const auto colon = v.find(':');
             const std::string name = v.substr(0, colon), value = colon == std::string::npos ? std::string() : trim(v.substr(colon + 1));
@@ -100,6 +106,12 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
                 for (std::string id; g >> id;) ids.push_back(id);
                 dup.push_back(ids);
             } else if (!m) {
+                if (name == "source-filter") {
+                    std::istringstream f(value);
+                    std::vector<std::string> words;
+                    for (std::string w; f >> w;) words.push_back(w);
+                    if (words.size() >= 5 && words[0] == "incl") sessionSource = words[4];
+                }
                 continue;
             } else if (name == "mid") {
                 m->mid = value;
@@ -134,6 +146,7 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
         const auto slash = m.rtpmap.find('/');
         s.encoding = m.rtpmap.substr(0, slash);
         if (m.address.empty() || m.port <= 0 || m.port > 65535) return fail("A stream in the SDP has no address and port");
+        if (s.payloadType < 0) return fail("A stream in the SDP has no RTP payload type");
         if (s.encoding == "raw") {
             VideoFormat& f = s.video;
             if (!parseSampling(m.fmtp["sampling"], f.sampling)) return fail("Montage receives YCbCr-4:2:2, YCbCr-4:4:4 and RGB, not " + m.fmtp["sampling"]);
@@ -216,13 +229,35 @@ bool frameTimecode(const std::vector<AncPacket>& anc, Rational fps, output::Time
 
 // ---- ST 2022-7.
 
+namespace {
+// (a held packet's own bytes beside its buffer: the map's node and the vector)
+constexpr size_t kHeldOverhead = 64;
+}  // namespace
+
 void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::vector<uint8_t>>& out) {
-    if (packet.size() < 12) return;
+    // Checked before it takes a place: a stray or forged datagram must not stand in for the packet of its number.
+    RtpPacket p;
+    if (!parseRtp(packet.data(), packet.size(), p) || (payloadType_ >= 0 && p.payloadType != payloadType_)) {
+        ++rejected;
+        return;
+    }
+    if (haveSsrc_ && p.ssrc != ssrc_) {
+        if (++strangerRun_ <= int64_t(window_)) {
+            ++rejected;
+            return;
+        }
+        // (nothing but the new sender's for a window: taken from here)
+        flush(out);
+        started_ = haveSsrc_ = false;
+        lateRun_ = 0;
+    }
+    if (!haveSsrc_) haveSsrc_ = true, ssrc_ = p.ssrc;
+    strangerRun_ = 0;
     ++received[path & 1];
-    const uint32_t low = get16(packet.data() + 2);
-    // (RFC 4175's extended sequence number: the payload's first two bytes above the header's)
-    const size_t head = 12 + size_t(packet[0] & 15) * 4;
-    const uint32_t seq = extended_ && packet.size() >= head + 2 ? get16(packet.data() + head) << 16 | low : low;
+    // (RFC 4175's extended sequence number: the payload's first two bytes, after any header extension, above the
+    // header's)
+    const uint32_t low = p.sequence;
+    const uint32_t seq = extended_ && p.size >= 2 ? get16(p.payload) << 16 | low : low;
     if (!started_) {
         started_ = true;
         next_ = seq;
@@ -249,13 +284,15 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
         return;
     }
     lateRun_ = 0;
+    const size_t bytes = packet.capacity() + kHeldOverhead;
     if (!held_.emplace(n, std::move(packet)).second) {
         ++duplicates;
         return;
     }
+    heldBytes_ += bytes;
     release(out);
-    // A gap the other path has not filled in a window's packets: given up on.
-    while (held_.size() > window_) {
+    // A gap the other path has not filled in a window's packets (or in as much memory as is held for one): given up on.
+    while (!held_.empty() && (held_.size() > window_ || heldBytes_ > maxBytes_)) {
         lost += held_.begin()->first - next_;
         next_ = held_.begin()->first;
         release(out);
@@ -264,6 +301,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
 
 void PathMerger::release(std::vector<std::vector<uint8_t>>& out) {
     while (!held_.empty() && held_.begin()->first == next_) {
+        heldBytes_ -= held_.begin()->second.capacity() + kHeldOverhead;
         out.push_back(std::move(held_.begin()->second));
         held_.erase(held_.begin());
         ++next_;
@@ -308,6 +346,7 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
         for (const auto& have : streams_)
             if (have->kind == kind) return fail("Montage takes one video, one audio and one ancillary data stream at a time");
         auto st = std::make_unique<Stream>(kind, s);
+        st->merger.setPayloadType(s.payloadType);
         if (kind == 0) {
             std::string why;
             if (!videoFormatOk(s.video, &why)) return fail(why);
@@ -319,7 +358,9 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
             const Pgroup pg = pgroup(s.video.sampling, s.video.depth);
             const double frameBytes = double(s.video.width) * s.video.height * pg.bytes / pg.pixels;
             st->merger.setWindow(std::max<size_t>(512, size_t(frameBytes * s.video.fps.toDouble() * 0.03 / 1000)));
-            pendingLimit_ = size_t(std::clamp(256e6 / frameBytes, 4.0, 16.0));
+            // (each held as a raster of 16-bit samples)
+            const double rasterBytes = double(s.video.width) * s.video.height * (s.video.sampling == Sampling::Ycc422 ? 2 : 3) * 2;
+            pendingLimit_ = size_t(std::clamp(512e6 / rasterBytes, 2.0, 16.0));
         } else if (kind == 1) {
             audio_ = s.audio;
             hasAudio_ = true;
@@ -376,8 +417,12 @@ InputStats Input::stats() const {
 
 void Input::receive(Stream* s, int path) {
     std::vector<uint8_t> buf;
-    std::vector<std::vector<uint8_t>> out;
+    std::vector<std::vector<uint8_t>> out, spare;  // (spare: buffers of packets given out, used again)
     while (!stop_) {
+        if (buf.capacity() == 0 && !spare.empty()) {
+            buf = std::move(spare.back());
+            spare.pop_back();
+        }
         const bool got = s->socket[path].receive(buf, 20);
         std::lock_guard lock(s->m);
         out.clear();
@@ -388,15 +433,16 @@ void Input::receive(Stream* s, int path) {
         } else if (!s->sdp.redundant() || now - s->last[path ^ 1] > std::chrono::milliseconds(20)) {
             s->merger.flush(out);  // (a pause on every path: nothing more is coming for a gap)
         }
-        for (const auto& p : out) take(*s, p);
-        buf = {};
+        for (auto& p : out) {
+            take(*s, p);
+            if (spare.size() < 256) spare.push_back(std::move(p));
+        }
     }
 }
 
 void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
     RtpPacket p;
-    if (!parseRtp(packet.data(), packet.size(), p)) return;
-    if (s.sdp.payloadType >= 0 && p.payloadType != s.sdp.payloadType) return;
+    if (!parseRtp(packet.data(), packet.size(), p)) return;  // (the merger took RTP of the stream's payload type alone)
     if (s.kind == 0) {
         if (!s.assembler->add(p)) return;
         std::lock_guard lock(m_);
@@ -411,8 +457,10 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         const int64_t at = unwrap(p.timestamp, a.rate);
         const int64_t frames = int64_t(samples.size()) / a.channels;
         std::lock_guard lock(m_);
-        if (soundStart_ < 0 || at > soundStart_ + int64_t(sound_.size()) / a.channels + a.rate) {
-            // (the first, or after a long gap: from here)
+        const int64_t held = soundStart_ + int64_t(sound_.size()) / a.channels;
+        // (the first; after a long gap; or from well before what is held, so not a packet late by a little but time
+        // gone back, a PTP step or the sender started again: from here)
+        if (soundStart_ < 0 || at > held + a.rate || at + frames + a.rate / 50 < held) {
             sound_.clear();
             soundStart_ = at;
         }
@@ -437,8 +485,14 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         // (a frame carries a few dozen packets: no more held for one time, whatever a sender repeats)
         if (at.size() + anc.size() > 256) return;
         at.insert(at.end(), anc.begin(), anc.end());
-        while (anc_.size() > 64) anc_.erase(anc_.begin());
         if (!ancSeen_ || int32_t(p.timestamp - ancLatest_) > 0) ancLatest_ = p.timestamp;
+        // (the oldest let go: furthest behind the latest, as the map's order breaks where the timestamps wrap)
+        while (anc_.size() > 64) {
+            auto oldest = anc_.begin();
+            for (auto it = anc_.begin(); it != anc_.end(); ++it)
+                if (ancLatest_ - it->first > ancLatest_ - oldest->first) oldest = it;
+            anc_.erase(oldest);
+        }
         if (!ancSeen_) ancFirst_ = p.timestamp;
         ancSeen_ = true;
         cv_.notify_all();

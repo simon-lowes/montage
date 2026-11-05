@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <tuple>
 
 namespace montage::nmos {
 
@@ -230,8 +231,8 @@ bool Node::start(const NodeOptions& o, QString* error) {
     // in all and from one address (an IPv6 /64 counted as one, as one computer can have many addresses in it), a
     // request's headers and body, how long a connection may sit without finishing one (a request trickled in a byte at
     // a time is cut off), and how long it is kept alive at all. When every place is taken, a newcomer takes the place of
-    // the connection that has been quiet longest from the address holding the most, so a few hosts cannot keep the
-    // others out.
+    // a connection of the address holding the most, so a few hosts cannot keep the others out: its quietest between
+    // requests, else (all of them mid-request) its quietest.
     // An address at its own limit has its quietest connection between requests let go for a newcomer (a client's pool
     // opens another when it needs one); only when all of them are mid-request is the newcomer refused.
     constexpr int kMaxClients = 64, kMaxClientsFrom = 4, kIdleMs = 15000, kLifeMs = 60000;
@@ -264,7 +265,7 @@ bool Node::start(const NodeOptions& o, QString* error) {
                 QTcpSocket* quietest = nullptr;
                 std::pair<qint64, uint64_t> quiet;
                 for (const auto& [socket, c] : *clients)
-                    if (c.from == peer && c.buffer && c.buffer->isEmpty() && socket->bytesToWrite() == 0 &&
+                    if (c.from == peer && c.buffer && c.buffer->isEmpty() && socket->bytesToWrite() == 0 && socket->bytesAvailable() == 0 &&
                         (!quietest || std::pair(c.lastRequest, c.order) < quiet))
                         quietest = socket, quiet = {c.lastRequest, c.order};
                 if (!quietest) {
@@ -277,16 +278,19 @@ bool Node::start(const NodeOptions& o, QString* error) {
                 --count[peer];
             }
             if (int(clients->size()) >= kMaxClients) {
+                // (of the address holding the most, one between requests first, closed in turn: a request on its way,
+                // or its answer, is cut off only when every one of that address's connections has one)
                 QTcpSocket* quietest = nullptr;
-                int most = 0;
-                std::pair<qint64, uint64_t> quiet;
+                std::tuple<int, bool, qint64, uint64_t> quiet;
                 for (const auto& [socket, c] : *clients) {
-                    const int n = count[c.from];
-                    if (n > most || (n == most && std::pair(c.lastRequest, c.order) < quiet)) quietest = socket, most = n, quiet = {c.lastRequest, c.order};
+                    const bool busy = !(c.buffer && c.buffer->isEmpty() && socket->bytesToWrite() == 0 && socket->bytesAvailable() == 0);
+                    const std::tuple<int, bool, qint64, uint64_t> key{-count[c.from], busy, c.lastRequest, c.order};
+                    if (!quietest || key < quiet) quietest = socket, quiet = key;
                 }
                 if (quietest) {
                     clients->erase(quietest);
-                    quietest->abort();
+                    if (std::get<1>(quiet)) quietest->abort();
+                    else quietest->disconnectFromHost();
                 }
             }
             auto buffer = std::make_shared<QByteArray>();
@@ -995,6 +999,13 @@ Node::Response Node::patchReceiver(RConn& r, const QJsonObject& patch) {
             const std::vector<SdpPath> paths = sdpPaths(data.toString());
             if (paths.empty() || paths[0].port <= 0 || paths[0].port > 65535 || !isIpv4(paths[0].address))
                 return errorResponse(400, text("The SDP gives no IPv4 address and port to receive at"));
+            // (one Montage can receive, of this receiver's kind: refused now rather than taken and then not received)
+            std::string why;
+            const std::vector<st2110::SdpStream> found = st2110::parseSdp(data.toString().toStdString(), &why);
+            if (found.empty()) return errorResponse(400, QString::fromStdString(why));
+            const std::string& e = found.front().encoding;
+            if ((r.stream == 0) != (e == "raw") || (r.stream == 2) != (e == "smpte291"))
+                return errorResponse(400, text("The SDP describes another kind of stream than this receiver takes"));
             for (int i = 0; i < 2; ++i) {
                 RLeg& l = legs[i];
                 if (i >= int(paths.size())) {
@@ -1154,6 +1165,15 @@ ReceiverConnection Node::receiverConnection(int stream) const {
     return c;
 }
 
+QStringList Node::receiverInterfaces(int stream) const {
+    // (as receiverStreams places the paths: the enabled legs in turn, so the second leg alone is the first path)
+    QStringList out;
+    const ReceiverConnection c = receiverConnection(stream);
+    for (int i = 0; i < 2; ++i)
+        if (c.leg[i].enabled) out << c.leg[i].interfaceIp;
+    return out;
+}
+
 std::vector<st2110::SdpStream> Node::receiverStreams(QString* why) const {
     std::vector<st2110::SdpStream> out;
     for (const RConn& r : receivers_) {
@@ -1195,6 +1215,8 @@ Node::Response Node::putTarget(RConn& r, const QJsonObject& sender) {
         return jsonResponse(202, QJsonObject{});
     }
     if (!sender["id"].isString()) return errorResponse(400, text("The target is a sender, or an empty object"));
+    // (another sender's transport file is not this one's: none until its manifest comes)
+    if (sender["id"] != r.stagedSenderId) r.stagedFileData = r.stagedFileType = QJsonValue::Null;
     r.stagedSenderId = sender["id"];
     r.stagedMasterEnable = true;
     activateReceiver(r, QStringLiteral("activate_immediate"));
