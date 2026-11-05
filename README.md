@@ -306,7 +306,7 @@ such as Kdenlive, Shotcut and Olive also build on C++, Qt and FFmpeg.
 - **Global Mute** (Sequence menu): silences playback and scrubbing without touching any clip, track or export; the meters keep moving.
 - Peak meters with hold and clip indicators
 - Effects:
-  - EQ: 3-band and 5-band parametric EQ (low shelf, three bells, high shelf), high/low-pass.
+  - EQ: 3-band EQ, high/low-pass, and a **Parametric EQ** you shape on its display: double-click to add a band (up to 16), drag a dot for frequency and gain (Shift for fine steps, Ctrl or Cmd to keep to one direction), scroll over it for Q, right-click it for its type (bell, low or high shelf, low or high cut at 12 to 48 dB/oct, notch, band-pass, tilt), its slope, on/off or Delete. A strip under the display sets the picked band exactly; hold **Solo** (or Alt/Option while dragging) to hear only that band's part of the sound as it plays, the project untouched. The spectrum of what plays shows behind the curve, the gain range is ±6 to ±30 dB, **Large Window** opens it in a resizable window of its own, and Tips explain it all until hidden. Frequency, gain and Q are keyframeable on every band; EQs from earlier versions open with their five bands as they were.
   - Dynamics: compressor, limiter, de-esser (split-band), noise gate (threshold, range, attack, hold, release), and a three-band **multiband compressor** (Linkwitz-Riley splits that add back up flat; each band's threshold, ratio and gain, with a soft knee).
   - Space: reverb (Freeverb design) and delay.
   - Modulation: chorus, flanger (with feedback), phaser (4 to 12 stages) and tremolo or auto-pan (sine, triangle or square), with a stereo spread.

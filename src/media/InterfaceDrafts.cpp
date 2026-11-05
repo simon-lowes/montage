@@ -264,6 +264,9 @@ std::vector<std::string> engineInterfaceTexts() {
             if (sp.kind == StringKind::Track && !sp.choices.empty()) add(sp.choices.front());
         }
     }
+    // (a Parametric EQ's band types and slopes, shown in its bands' settings)
+    for (const std::string& t : eqBandTypes()) add(t);
+    for (const std::string& t : eqSlopes()) add(t);
     for (const ShapeItemKind& k : shapeItemKinds()) {
         add(k.label);
         for (const ParamInfo& p : k.params) {

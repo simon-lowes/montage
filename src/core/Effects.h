@@ -151,6 +151,31 @@ bool needsPersonMatte(const Effect& e, FrameTime t);
 // the file's first) and mask.crypto_ids (the objects picked, as 8-digit hex ids, media/Exr.h).
 bool needsCryptomatte(const Effect& e, FrameTime t);
 
+// The Parametric EQ's bands (render/AudioFx.h ParametricEq), up to kEqMaxBands, added and removed per effect. Each is
+// the params "<band>_on", "_type" (eqBandTypes), "_hz", "_db", "_q" (the three keyframeable, each on its own) and
+// "_slope" (a cut's, eqSlopes); a band is there when any of them is. Bands are "b1" to "b16", and "low" and "high":
+// the low and high shelves of an EQ made before bands could be added (shelves unless their type says otherwise), kept
+// so that older projects, presets, automation and Match Voice play as they did. They run low, b1..b16, high.
+constexpr int kEqMaxBands = 16;
+enum EqBandType { kEqBell, kEqLowShelf, kEqHighShelf, kEqLowCut, kEqHighCut, kEqNotch, kEqBandPass, kEqTilt };
+const std::vector<std::string>& eqBandTypes();  // their names, by EqBandType
+const std::vector<std::string>& eqSlopes();     // a cut's slope: 12, 24, 36 or 48 dB an octave
+bool eqTypeHasGain(int type);                   // a bell, a shelf or a tilt (not a cut, notch or band-pass)
+bool eqTypeHasSlope(int type);                  // a cut
+double eqDefaultQ(int type);                    // 1 for a bell, notch or band-pass; 0.707 (no overshoot) otherwise
+// Whether `name` is a band's param ("b4_hz"), and which band and field.
+bool isEqBandParam(const std::string& name, std::string* band = nullptr, std::string* field = nullptr);
+std::vector<std::string> eqBands(const Effect& e);  // the bands it has, in the order they run
+int eqBandType(const Effect& e, const std::string& band);
+std::string eqBandLabel(const std::string& band);  // "Band 4", "Low Band"
+double eqDefaultHz(const std::string& band);       // a band's frequency when it has none (as the five-band EQ had)
+std::vector<ParamInfo> eqBandParams(const std::string& band);
+// Adds a band named for the first free "b<k>", its params set (q 0: the type's own); "" when it has kEqMaxBands.
+std::string addEqBand(Effect& e, int type, double hz, double db = 0, double q = 0);
+void removeEqBand(Effect& e, const std::string& band);
+// Changes a band's type; a Q left at the old type's own becomes the new type's.
+void setEqBandType(Effect& e, const std::string& band, int type);
+
 // Builds an Effect of the given type populated with default values.
 Effect makeEffect(Project& p, const std::string& type);
 Effect makeEffect(const std::string& type, Id id);

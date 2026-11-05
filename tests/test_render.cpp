@@ -57,6 +57,7 @@
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
+#include "render/AudioFx.h"
 #include "render/ShotGroups.h"
 #include "render/PaintFx.h"
 #include "render/StyleFx.h"
@@ -20615,6 +20616,174 @@ colorspaces:
         }
         std::atomic<bool> cancel{true};
         QVERIFY(draftDescriptions(p, s, gaps, *describer, nullptr, {}, {}, &cancel, &err).empty());
+    }
+
+    void parametricEqBands() {
+        const double sr = 48000;
+        auto one = [&](fx::EqShape shape, double hz, double db, double q, int slope = 24) {
+            fx::ParametricEq eq;
+            eq.set(sr, std::vector<fx::EqBand>{{hz, db, q, shape, slope, true}}, 0);
+            return eq;
+        };
+        auto near = [](double got, double want, double tol) { return std::fabs(got - want) <= tol; };
+        auto say = [](double v) { return qPrintable(QString::number(v, 'f', 4)); };
+
+        // A bell lifts its frequency by its gain and leaves a decade either side nearly alone.
+        fx::ParametricEq bell = one(fx::EqShape::Bell, 1000, 6, 1);
+        QVERIFY2(near(bell.responseDb(1000), 6, 0.01), say(bell.responseDb(1000)));
+        QVERIFY(std::fabs(bell.responseDb(100)) < 0.2 && std::fabs(bell.responseDb(10000)) < 0.2);
+        // Shelves: the whole gain past the corner, half at it, none far the other side.
+        fx::ParametricEq low = one(fx::EqShape::LowShelf, 200, 6, M_SQRT1_2);
+        QVERIFY2(near(low.responseDb(20), 6, 0.2) && near(low.responseDb(200), 3, 0.05) && std::fabs(low.responseDb(5000)) < 0.1,
+                 say(low.responseDb(200)));
+        fx::ParametricEq high = one(fx::EqShape::HighShelf, 4000, -6, M_SQRT1_2);
+        QVERIFY2(near(high.responseDb(20000), -6, 0.3) && near(high.responseDb(4000), -3, 0.05) && std::fabs(high.responseDb(100)) < 0.1,
+                 say(high.responseDb(4000)));
+        // A notch takes its frequency right out; a band-pass keeps only its own (0 dB at the centre).
+        fx::ParametricEq notch = one(fx::EqShape::Notch, 1000, 0, 2);
+        QVERIFY2(notch.responseDb(1000) < -60 && std::fabs(notch.responseDb(100)) < 0.1, say(notch.responseDb(1000)));
+        fx::ParametricEq pass = one(fx::EqShape::BandPass, 1000, 0, 1);
+        QVERIFY2(near(pass.responseDb(1000), 0, 0.01) && pass.responseDb(100) < -15 && pass.responseDb(10000) < -15, say(pass.responseDb(100)));
+        // Gain does nothing to a cut, notch or band-pass (the display puts their dots on 0 dB).
+        QVERIFY(near(one(fx::EqShape::Notch, 1000, 12, 2).responseDb(300), notch.responseDb(300), 1e-9));
+
+        // Cuts are Butterworth: 3 dB down at the corner whatever the slope, and two octaves past it down by
+        // 10 log10(1 + 4^(2n)) for order n = slope / 6.
+        for (int slope : {12, 24, 36, 48}) {
+            const int n = slope / 6;
+            const double want = -10 * std::log10(1 + std::pow(4.0, 2 * n));
+            fx::ParametricEq lowCut = one(fx::EqShape::LowCut, 1000, 0, M_SQRT1_2, slope);
+            QVERIFY2(near(lowCut.responseDb(1000), -3.01, 0.05), say(lowCut.responseDb(1000)));
+            QVERIFY2(near(lowCut.responseDb(250), want, 1.0), qPrintable(QString("%1 dB/oct: %2, not %3").arg(slope).arg(lowCut.responseDb(250)).arg(want)));
+            QVERIFY(std::fabs(lowCut.responseDb(10000)) < 0.1);
+            fx::ParametricEq highCut = one(fx::EqShape::HighCut, 1000, 0, M_SQRT1_2, slope);
+            QVERIFY2(near(highCut.responseDb(1000), -3.01, 0.05), say(highCut.responseDb(1000)));
+            QVERIFY(std::fabs(highCut.responseDb(100)) < 0.1);
+            QVERIFY2(highCut.responseDb(2000) < -6 * n + 1, say(highCut.responseDb(2000)));
+        }
+        // A cut's Q above 0.707 makes a bump at the corner.
+        QVERIFY(one(fx::EqShape::LowCut, 1000, 0, 3, 12).responseDb(1000) > 6);
+
+        // A tilt is flat at its frequency and turns about it: as much up one side as down the other.
+        fx::ParametricEq tilt = one(fx::EqShape::Tilt, 1000, 6, M_SQRT1_2);
+        QVERIFY2(near(tilt.responseDb(1000), 0, 0.01), say(tilt.responseDb(1000)));
+        for (double r : {2.0, 4.0, 8.0})
+            QVERIFY2(near(tilt.responseDb(1000 * r), -tilt.responseDb(1000 / r), 0.15),
+                     qPrintable(QString("%1 %2").arg(tilt.responseDb(1000 * r)).arg(tilt.responseDb(1000 / r))));
+        QVERIFY2(near(tilt.responseDb(20), -3, 0.2) && tilt.responseDb(8000) > 2.5, say(tilt.responseDb(20)));
+
+        // Sixteen bands, each placed by hand; a seventeenth is refused.
+        Effect e = makeEffect("parametric_eq", 1);
+        QVERIFY(eqBands(e).empty());
+        for (int k = 0; k < kEqMaxBands; ++k) QCOMPARE(addEqBand(e, kEqBell, 25 * std::pow(2.0, k * 0.62), 3, 4), "b" + std::to_string(k + 1));
+        QVERIFY(addEqBand(e, kEqBell, 1000).empty());
+        QCOMPARE(eqBands(e).size(), size_t(16));
+        const std::vector<fx::EqBand> sixteen = fx::eqBandsOf(e, 0);
+        QCOMPARE(sixteen.size(), size_t(16));
+        fx::ParametricEq all;
+        all.set(sr, sixteen, 0);
+        QCOMPARE(all.bandCount(), 16);
+        for (const fx::EqBand& b : sixteen) QVERIFY2(all.responseDb(b.hz) > 2.9, say(all.responseDb(b.hz)));
+        // Bands' params are listed for the Inspector's keyframes (frequency, gain and Q each its own, keyframeable).
+        const std::vector<ParamInfo> listed = effectParams(e);
+        QCOMPARE(listed.size(), size_t(1 + 16 * 6));
+        for (const ParamInfo& pi : listed)
+            if (pi.name == "b7_hz" || pi.name == "b7_db" || pi.name == "b7_q") QVERIFY(pi.keyframeable);
+        // Removing one frees its name for the next band added.
+        removeEqBand(e, "b3");
+        QCOMPARE(eqBands(e).size(), size_t(15));
+        QCOMPARE(addEqBand(e, kEqNotch, 60), std::string("b3"));
+        QCOMPARE(eqBandType(e, "b3"), int(kEqNotch));
+        // A new type takes its own Q when the band still had the old type's.
+        Effect t = makeEffect("parametric_eq", 2);
+        const std::string b = addEqBand(t, kEqBell, 500, 4);
+        setEqBandType(t, b, kEqLowShelf);
+        QVERIFY(near(t.p(b + "_q", 0), M_SQRT1_2, 1e-6));
+        t.params[b + "_q"] = Param(2.0);
+        setEqBandType(t, b, kEqBell);
+        QCOMPARE(t.p(b + "_q", 0), 2.0);
+
+        // An EQ saved before bands could be added (low shelf, three bells, high shelf, output) sounds as it did, in
+        // its response and sample for sample: the old filters, worked out here as they were.
+        Effect old = makeEffect("parametric_eq", 3);
+        const std::pair<const char*, double> values[] = {{"low_hz", 120},  {"low_db", -4},  {"b1_hz", 300},  {"b1_db", 2.5}, {"b1_q", 0.9},
+                                                         {"b2_hz", 1200}, {"b2_db", -3},  {"b2_q", 2},     {"b3_hz", 4000}, {"b3_db", 5},
+                                                         {"b3_q", 0.7},   {"high_hz", 9000}, {"high_db", 3}, {"output_db", -1.5}};
+        for (const auto& [name, v] : values) old.params[name] = Param(v);
+        QCOMPARE(eqBands(old), (std::vector<std::string>{"low", "b1", "b2", "b3", "high"}));
+        QCOMPARE(eqBandType(old, "low"), int(kEqLowShelf));
+        QCOMPARE(eqBandType(old, "high"), int(kEqHighShelf));
+        struct Old {
+            double b0, b1, b2, a1, a2, z1[2] = {0, 0}, z2[2] = {0, 0};
+        };
+        auto norm = [](double b0, double b1, double b2, double a0, double a1, double a2) { return Old{b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0}; };
+        auto oldShelf = [&](double f0, double db, bool lowShelf) {
+            const double A = std::pow(10.0, db / 40), w0 = 2 * M_PI * f0 / sr, cs = std::cos(w0), al = std::sin(w0) / 2 * std::sqrt(2.0),
+                         sa = 2 * std::sqrt(A) * al;
+            return lowShelf ? norm(A * ((A + 1) - (A - 1) * cs + sa), 2 * A * ((A - 1) - (A + 1) * cs), A * ((A + 1) - (A - 1) * cs - sa),
+                                   (A + 1) + (A - 1) * cs + sa, -2 * ((A - 1) + (A + 1) * cs), (A + 1) + (A - 1) * cs - sa)
+                            : norm(A * ((A + 1) + (A - 1) * cs + sa), -2 * A * ((A - 1) + (A + 1) * cs), A * ((A + 1) + (A - 1) * cs - sa),
+                                   (A + 1) - (A - 1) * cs + sa, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - sa);
+        };
+        auto oldBell = [&](double f0, double q, double db) {
+            const double A = std::pow(10.0, db / 40), w0 = 2 * M_PI * f0 / sr, al = std::sin(w0) / (2 * q);
+            return norm(1 + al * A, -2 * std::cos(w0), 1 - al * A, 1 + al / A, -2 * std::cos(w0), 1 - al / A);
+        };
+        std::vector<Old> was{oldShelf(120, -4, true), oldBell(300, 0.9, 2.5), oldBell(1200, 2, -3), oldBell(4000, 0.7, 5), oldShelf(9000, 3, false)};
+        const float gain = float(std::pow(10.0, -1.5 / 20.0));
+        auto oldDb = [&](double hz) {
+            double db = 20 * std::log10(gain);
+            for (const Old& f : was) {
+                const std::complex<double> z1 = std::polar(1.0, -2 * M_PI * hz / sr), z2 = z1 * z1;
+                db += 20 * std::log10(std::abs((f.b0 + f.b1 * z1 + f.b2 * z2) / (1.0 + f.a1 * z1 + f.a2 * z2)));
+            }
+            return db;
+        };
+        fx::ParametricEq now;
+        now.set(sr, fx::eqBandsOf(old, 0), old.p("output_db", 0));
+        for (double hz = 20; hz < 20000; hz *= 1.1) QVERIFY2(near(now.responseDb(hz), oldDb(hz), 1e-6), say(now.responseDb(hz) - oldDb(hz)));
+        std::vector<float> buf(4800 * 2), ref;
+        uint32_t seed = 7;
+        for (float& x : buf) x = float(int32_t(seed = seed * 1664525u + 1013904223u) / 4294967296.0);
+        ref = buf;
+        for (int i = 0; i < 4800; ++i)
+            for (int ch = 0; ch < 2; ++ch) {
+                float v = ref[size_t(i) * 2 + size_t(ch)];
+                for (Old& f : was) {
+                    const double y = f.b0 * v + f.z1[ch];
+                    f.z1[ch] = f.b1 * v - f.a1 * y + f.z2[ch];
+                    f.z2[ch] = f.b2 * v - f.a2 * y;
+                    v = float(y);
+                }
+                ref[size_t(i) * 2 + size_t(ch)] = v * gain;
+            }
+        now.process(buf.data(), 4800);
+        double worst = 0;
+        for (size_t i = 0; i < buf.size(); ++i) worst = std::max(worst, double(std::fabs(buf[i] - ref[i])));
+        QVERIFY2(worst < 1e-5, say(worst));
+        // Keys on a band's gain change it over time, as before.
+        old.params["b2_db"].addKey(0, -3);
+        old.params["b2_db"].addKey(50, 6);
+        QVERIFY(near(fx::eqBandsOf(old, 50)[2].db, 6, 1e-9) && near(fx::eqBandsOf(old, 0)[2].db, -3, 1e-9));
+
+        // Soloed (only on the copy playback hears, while Solo is held): a bell, notch or band-pass is heard as a
+        // band-pass at its frequency and Q; a low shelf as what is below its frequency; a high shelf above.
+        old.strings["audition"] = "b2";
+        int solo = -1;
+        const std::vector<fx::EqBand> heard = fx::eqBandsOf(old, 0, &solo);
+        QCOMPARE(solo, 2);
+        fx::ParametricEq soloed;
+        soloed.set(sr, heard, -1.5, solo);
+        fx::Biquad bp;
+        bp.bandPass(sr, heard[2].hz, heard[2].q);
+        for (double hz : {100.0, 1200.0, 5000.0}) QVERIFY2(near(soloed.responseDb(hz), bp.responseDb(sr, hz), 1e-9), say(soloed.responseDb(hz)));
+        soloed.set(sr, heard, -1.5, 0);
+        QVERIFY(near(soloed.responseDb(30), 0, 0.1) && soloed.responseDb(2000) < -20);
+        soloed.set(sr, heard, -1.5, 4);
+        QVERIFY(near(soloed.responseDb(18000), 0, 0.5) && soloed.responseDb(1000) < -30);
+        // Let go, the EQ is whole again.
+        soloed.set(sr, heard, -1.5, -1);
+        QVERIFY(near(soloed.responseDb(1000), now.responseDb(1000), 1e-9));
     }
 };
 

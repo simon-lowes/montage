@@ -4,6 +4,8 @@
 #include <cmath>
 #include <complex>
 
+#include "core/Effects.h"
+
 namespace montage::fx {
 
 namespace {
@@ -25,16 +27,16 @@ void Biquad::peaking(double fs, double f0, double q, double db) {
     set(1 + al * A, -2 * std::cos(w0), 1 - al * A, 1 + al / A, -2 * std::cos(w0), 1 - al / A);
 }
 
-void Biquad::lowShelf(double fs, double f0, double db) {
+void Biquad::lowShelf(double fs, double f0, double db, double q) {
     const double A = std::pow(10.0, db / 40), w0 = 2 * M_PI * clampHz(f0, fs) / fs, cs = std::cos(w0);
-    const double al = std::sin(w0) / 2 * std::sqrt(2.0), sa = 2 * std::sqrt(A) * al;
+    const double al = std::sin(w0) / (2 * std::max(0.05, q)), sa = 2 * std::sqrt(A) * al;
     set(A * ((A + 1) - (A - 1) * cs + sa), 2 * A * ((A - 1) - (A + 1) * cs), A * ((A + 1) - (A - 1) * cs - sa),
         (A + 1) + (A - 1) * cs + sa, -2 * ((A - 1) + (A + 1) * cs), (A + 1) + (A - 1) * cs - sa);
 }
 
-void Biquad::highShelf(double fs, double f0, double db) {
+void Biquad::highShelf(double fs, double f0, double db, double q) {
     const double A = std::pow(10.0, db / 40), w0 = 2 * M_PI * clampHz(f0, fs) / fs, cs = std::cos(w0);
-    const double al = std::sin(w0) / 2 * std::sqrt(2.0), sa = 2 * std::sqrt(A) * al;
+    const double al = std::sin(w0) / (2 * std::max(0.05, q)), sa = 2 * std::sqrt(A) * al;
     set(A * ((A + 1) + (A - 1) * cs + sa), -2 * A * ((A - 1) + (A + 1) * cs), A * ((A + 1) + (A - 1) * cs - sa),
         (A + 1) - (A - 1) * cs + sa, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - sa);
 }
@@ -55,32 +57,143 @@ void Biquad::highPass(double fs, double f0, double q) {
     set((1 + cs) / 2, -(1 + cs), (1 + cs) / 2, 1 + al, -2 * cs, 1 - al);
 }
 
+void Biquad::notch(double fs, double f0, double q) {
+    const double w0 = 2 * M_PI * clampHz(f0, fs) / fs, cs = std::cos(w0), al = std::sin(w0) / (2 * std::max(0.05, q));
+    set(1, -2 * cs, 1, 1 + al, -2 * cs, 1 - al);
+}
+
+void Biquad::bandPass(double fs, double f0, double q) {
+    const double w0 = 2 * M_PI * clampHz(f0, fs) / fs, cs = std::cos(w0), al = std::sin(w0) / (2 * std::max(0.05, q));
+    set(al, 0, -al, 1 + al, -2 * cs, 1 - al);
+}
+
 // ---- Parametric EQ ----------------------------------------------------------
+
+void ParametricEq::design(Stage& st, double sr, const EqBand& b) {
+    const double q = std::max(0.05, b.q);
+    st.on = b.on;
+    switch (b.shape) {
+        case EqShape::Bell: st.count = 1, st.sections[0].peaking(sr, b.hz, q, b.db); break;
+        case EqShape::LowShelf: st.count = 1, st.sections[0].lowShelf(sr, b.hz, b.db, q); break;
+        case EqShape::HighShelf: st.count = 1, st.sections[0].highShelf(sr, b.hz, b.db, q); break;
+        case EqShape::Notch: st.count = 1, st.sections[0].notch(sr, b.hz, q); break;
+        case EqShape::BandPass: st.count = 1, st.sections[0].bandPass(sr, b.hz, q); break;
+        case EqShape::Tilt:
+            st.count = 2;
+            st.sections[0].lowShelf(sr, b.hz, -b.db / 2, q);
+            st.sections[1].highShelf(sr, b.hz, b.db / 2, q);
+            break;
+        case EqShape::LowCut:
+        case EqShape::HighCut: {
+            // A Butterworth filter of order slope / 6, as biquads: section k's Q is 1 / (2 cos((2k - 1) pi / 2n)). The
+            // band's Q scales the last (most resonant) one: at 0.707 the cut is maximally flat.
+            const int n = std::clamp(b.slope / 6, 2, 8) & ~1;
+            st.count = n / 2;
+            for (int k = 1; k <= st.count; ++k) {
+                double sq = 1 / (2 * std::cos((2 * k - 1) * M_PI / (2 * n)));
+                if (k == st.count) sq *= q / M_SQRT1_2;
+                if (b.shape == EqShape::LowCut) st.sections[size_t(k - 1)].highPass(sr, b.hz, sq);
+                else st.sections[size_t(k - 1)].lowPass(sr, b.hz, sq);
+            }
+            break;
+        }
+    }
+}
+
+void ParametricEq::soloFilter(Stage& st, double sr, const EqBand& b) {
+    st.on = true;
+    switch (b.shape) {
+        case EqShape::LowShelf:
+        case EqShape::HighCut: st.count = 1, st.sections[0].lowPass(sr, b.hz); break;
+        case EqShape::HighShelf:
+        case EqShape::LowCut: st.count = 1, st.sections[0].highPass(sr, b.hz); break;
+        case EqShape::Tilt: design(st, sr, b), st.on = true; break;
+        default: st.count = 1, st.sections[0].bandPass(sr, b.hz, b.q); break;
+    }
+}
 
 void ParametricEq::set(double sr, const EqBand& low, const EqBand& b1, const EqBand& b2, const EqBand& b3, const EqBand& high,
                        double outputDb) {
-    bands_[0].lowShelf(sr, low.hz, low.db);
-    bands_[1].peaking(sr, b1.hz, b1.q, b1.db);
-    bands_[2].peaking(sr, b2.hz, b2.q, b2.db);
-    bands_[3].peaking(sr, b3.hz, b3.q, b3.db);
-    bands_[4].highShelf(sr, high.hz, high.db);
+    EqBand l = low, h = high;
+    l.shape = EqShape::LowShelf, h.shape = EqShape::HighShelf;
+    l.q = h.q = M_SQRT1_2;
+    l.on = h.on = true;
+    EqBand bells[3] = {b1, b2, b3};
+    for (EqBand& b : bells) b.shape = EqShape::Bell, b.on = true;
+    set(sr, {l, bells[0], bells[1], bells[2], h}, outputDb);
+}
+
+void ParametricEq::set(double sr, const std::vector<EqBand>& bands, double outputDb, int solo) {
+    const size_t n = std::min(bands.size(), size_t(kMaxBands));
+    if (sr != sr_) {
+        stages_.clear();
+        solo_ = Stage{};
+    }
+    // (a band whose filter changes shape keeps its sections' state: it may click once, as any switch does)
+    stages_.resize(n);
+    for (size_t i = 0; i < n; ++i) design(stages_[i], sr, bands[i]);
+    soloing_ = solo >= 0 && size_t(solo) < n;
+    if (soloing_) soloFilter(solo_, sr, bands[size_t(solo)]);
     output_ = dbToLin(outputDb);
     sr_ = sr;
 }
 
-double ParametricEq::responseDb(double hz) const {
-    double db = 20 * std::log10(std::max(1e-12f, output_));
-    for (const Biquad& b : bands_) db += b.responseDb(sr_, hz);
+double ParametricEq::stageDb(const Stage& st, double sr, double hz) {
+    double db = 0;
+    for (int k = 0; k < st.count; ++k) db += st.sections[size_t(k)].responseDb(sr, hz);
     return db;
 }
 
+double ParametricEq::responseDb(double hz) const {
+    if (soloing_) return stageDb(solo_, sr_, hz);
+    double db = 20 * std::log10(std::max(1e-12f, output_));
+    for (const Stage& st : stages_)
+        if (st.on) db += stageDb(st, sr_, hz);
+    return db;
+}
+
+double ParametricEq::bandResponseDb(int band, double hz) const {
+    return band >= 0 && band < int(stages_.size()) ? stageDb(stages_[size_t(band)], sr_, hz) : 0.0;
+}
+
 void ParametricEq::process(float* buf, int frames) {
+    if (soloing_) {
+        for (int i = 0; i < frames; ++i)
+            for (int ch = 0; ch < 2; ++ch) {
+                float v = buf[i * 2 + ch];
+                for (int k = 0; k < solo_.count; ++k) v = solo_.sections[size_t(k)].process(ch, v);
+                buf[i * 2 + ch] = v;
+            }
+        return;
+    }
     for (int i = 0; i < frames; ++i)
         for (int ch = 0; ch < 2; ++ch) {
             float v = buf[i * 2 + ch];
-            for (Biquad& b : bands_) v = b.process(ch, v);
+            for (Stage& st : stages_)
+                if (st.on)
+                    for (int k = 0; k < st.count; ++k) v = st.sections[size_t(k)].process(ch, v);
             buf[i * 2 + ch] = v * output_;
         }
+}
+
+std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo) {
+    std::vector<EqBand> out;
+    const std::string audition = e.s("audition");
+    if (solo) *solo = -1;
+    for (const std::string& band : eqBands(e)) {
+        EqBand b;
+        const int type = eqBandType(e, band);
+        b.shape = EqShape(type);
+        b.on = e.p(band + "_on", t, 1) > 0.5;
+        b.hz = std::clamp(e.p(band + "_hz", t, eqDefaultHz(band)), 10.0, 24000.0);
+        b.db = eqTypeHasGain(type) ? e.p(band + "_db", t, 0) : 0;
+        b.q = std::clamp(e.p(band + "_q", t, eqDefaultQ(type)), 0.05, 50.0);
+        b.slope = 12 * (1 + std::clamp(int(std::lround(e.p(band + "_slope", t, 1))), 0, 3));
+        if (solo && band == audition) *solo = int(out.size());
+        out.push_back(b);
+        if (int(out.size()) == ParametricEq::kMaxBands) break;
+    }
+    return out;
 }
 
 // ---- De-esser ----------------------------------------------------------------

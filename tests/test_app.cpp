@@ -94,6 +94,8 @@
 #include "ColorWarperEditor.h"
 #include "ColorWheel.h"
 #include "CurveEditor.h"
+#include "EqDisplay.h"
+#include "EqPanel.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -19401,6 +19403,330 @@ print("added " + ui["name"])
         state()->setSelection({red});
         QApplication::processEvents();
         QVERIFY(!win_->findChild<QLabel*>("inspectorMultiClip"));
+    }
+
+    void parametricEqDisplay() {
+        // Two tones, 200 Hz and 3 kHz, on A1 for a Parametric EQ to work on.
+        std::vector<float> tones(size_t(48000) * 4);
+        for (size_t i = 0; i < tones.size(); ++i)
+            tones[i] = float(0.2 * std::sin(2 * M_PI * 200 * double(i) / 48000) + 0.2 * std::sin(2 * M_PI * 3000 * double(i) / 48000));
+        {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + "/tones.wav", 48000, 1));
+            w.write(tones.data(), qint64(tones.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/tones.wav"});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        const Id clip = state()->sequence()->audioTracks[0].clips.front().id;
+        Id eqId = 0;
+        QVERIFY(state()->edit("Add EQ", [&](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "parametric_eq");
+            eqId = e.id;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        }));
+        auto eq = [&]() -> const Effect* {
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            for (const Effect& e : c->effects)
+                if (e.id == eqId) return &e;
+            return nullptr;
+        };
+        // The tips are open the first time.
+        appSettings().remove(EqPanel::tipsHiddenKey());
+        auto tipsBack = qScopeGuard([] { appSettings().remove(EqPanel::tipsHiddenKey()); });
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto panelIn = [&](QWidget* top) -> EqPanel* {
+            for (auto* p : top->findChildren<EqPanel*>())
+                if (p->window() == top && p->isVisibleTo(top)) return p;
+            return nullptr;
+        };
+        auto display = [&] { return panelIn(win_.get()) ? panelIn(win_.get())->display() : nullptr; };
+        QVERIFY(display());
+        QVERIFY(display()->bands().empty() && display()->width() > 150 && display()->height() > 100);
+        QVERIFY(panelIn(win_.get())->tipsShown());
+        auto mouse = [](QWidget* w, QEvent::Type type, QPointF pos, Qt::MouseButton button, Qt::MouseButtons held,
+                        Qt::KeyboardModifiers mods = Qt::NoModifier) {
+            QMouseEvent ev(type, pos, w->mapToGlobal(pos), button, held, mods);
+            QApplication::sendEvent(w, &ev);
+        };
+        auto at = [&](double hz, double db) { return QPointF(display()->hzToX(hz), display()->dbToY(db)); };
+
+        // Double-click an empty place: a bell there, picked, as one undo step.
+        mouse(display(), QEvent::MouseButtonDblClick, at(1000, 6), Qt::LeftButton, Qt::LeftButton);
+        QApplication::processEvents();
+        QCOMPARE(eqBands(*eq()), std::vector<std::string>{"b1"});
+        QCOMPARE(eqBandType(*eq(), "b1"), int(kEqBell));
+        QVERIFY2(std::fabs(std::log2(eq()->p("b1_hz", 0) / 1000)) < 0.05 && std::fabs(eq()->p("b1_db", 0) - 6) < 0.5,
+                 qPrintable(QString("%1 Hz %2 dB").arg(eq()->p("b1_hz", 0)).arg(eq()->p("b1_db", 0))));
+        QCOMPARE(display()->selected(), std::string("b1"));
+        QCOMPARE(display()->bands().size(), size_t(1));
+        state()->undo();
+        QApplication::processEvents();
+        QVERIFY(eqBands(*eq()).empty());
+        state()->redo();
+        QApplication::processEvents();
+        // Near the bottom of the range it is a low cut instead.
+        mouse(display(), QEvent::MouseButtonDblClick, at(25, 3), Qt::LeftButton, Qt::LeftButton);
+        QApplication::processEvents();
+        QCOMPARE(eqBands(*eq()).size(), size_t(2));
+        QCOMPARE(eqBandType(*eq(), "b2"), int(kEqLowCut));
+
+        // Drag the bell to 2 kHz and +3 dB: both change, and one undo puts both back.
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        const double hz0 = eq()->p("b1_hz", 0), db0 = eq()->p("b1_db", 0);
+        QPointF from = display()->nodePos(display()->bandIndex("b1"));
+        mouse(display(), QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+        const QPointF to(display()->hzToX(2000), display()->dbToY(3));
+        for (double f : {0.3, 0.7, 1.0}) mouse(display(), QEvent::MouseMove, from + (to - from) * f, Qt::NoButton, Qt::LeftButton);
+        mouse(display(), QEvent::MouseButtonRelease, to, Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        QVERIFY2(std::fabs(std::log2(eq()->p("b1_hz", 0) / 2000)) < 0.03 && std::fabs(eq()->p("b1_db", 0) - 3) < 0.3,
+                 qPrintable(QString("%1 Hz %2 dB").arg(eq()->p("b1_hz", 0)).arg(eq()->p("b1_db", 0))));
+        QCOMPARE(state()->undoText(), QString("Move EQ Band"));
+        state()->undo();
+        QCOMPARE(eq()->p("b1_hz", 0), hz0);
+        QCOMPARE(eq()->p("b1_db", 0), db0);
+        state()->redo();
+        QApplication::processEvents();
+        // Ctrl keeps a drag to one direction: mostly sideways, so the gain stays.
+        const double dbBefore = eq()->p("b1_db", 0);
+        from = display()->nodePos(display()->bandIndex("b1"));
+        mouse(display(), QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton, Qt::ControlModifier);
+        mouse(display(), QEvent::MouseMove, from + QPointF(40, 12), Qt::NoButton, Qt::LeftButton, Qt::ControlModifier);
+        mouse(display(), QEvent::MouseButtonRelease, from + QPointF(40, 12), Qt::LeftButton, Qt::NoButton, Qt::ControlModifier);
+        QApplication::processEvents();
+        QCOMPARE(eq()->p("b1_db", 0), dbBefore);
+        QVERIFY(eq()->p("b1_hz", 0) > 2100);
+
+        // The wheel over a dot changes only its Q.
+        const double q0 = eq()->p("b1_q", 0), hzNow = eq()->p("b1_hz", 0);
+        from = display()->nodePos(display()->bandIndex("b1"));
+        QWheelEvent wheel(from, display()->mapToGlobal(from), QPoint(), QPoint(0, 240), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(display(), &wheel);
+        QApplication::processEvents();
+        QVERIFY2(eq()->p("b1_q", 0) > q0 * 1.1, qPrintable(QString::number(eq()->p("b1_q", 0))));
+        QCOMPARE(eq()->p("b1_hz", 0), hzNow);
+
+        // The keyboard: arrows move the picked band, Page Up widens its Q, Tab goes to the next band.
+        display()->setFocus();
+        QApplication::processEvents();
+        QCOMPARE(display()->selected(), std::string("b1"));
+        const double q1 = eq()->p("b1_q", 0), db1 = eq()->p("b1_db", 0);
+        QTest::keyClick(display(), Qt::Key_Right);
+        QTest::keyClick(display(), Qt::Key_Up);
+        QTest::keyClick(display(), Qt::Key_PageUp);
+        QVERIFY2(std::fabs(std::log2(eq()->p("b1_hz", 0) / hzNow) - 1.0 / 12) < 1e-6,
+                 qPrintable(QString("%1 from %2, display %3").arg(eq()->p("b1_hz", 0), 0, 'f', 6).arg(hzNow, 0, 'f', 6)
+                                .arg(display()->bands()[display()->bandIndex("b1")].hz, 0, 'f', 6)));
+        QVERIFY(std::fabs(eq()->p("b1_db", 0) - (std::round((db1 + 0.5) * 10) / 10)) < 1e-6);
+        QVERIFY(std::fabs(eq()->p("b1_q", 0) / q1 - std::pow(2.0, 0.25)) < 1e-6);
+        QTest::keyClick(display(), Qt::Key_Tab);
+        QCOMPARE(display()->selected(), std::string("b2"));
+
+        // The large window shows the same bands and stays in step both ways.
+        auto* open = win_->findChild<QPushButton*>("eqOpenLarge");
+        QVERIFY(open);
+        open->click();
+        QApplication::processEvents();
+        QWidget* large = EqPanel::openWindowFor(eqId);
+        QVERIFY(large && large->isVisible());
+        auto cleanup = qScopeGuard([&] {
+            if (QWidget* w = EqPanel::openWindowFor(eqId)) w->close();
+        });
+        EqDisplay* big = panelIn(large)->display();
+        QVERIFY(big->width() > display()->width());
+        QCOMPARE(big->bands(), display()->bands());
+        QCOMPARE(big->selected(), std::string("b2"));
+        // (a step in the Inspector's display shows in the large one)
+        QTest::keyClick(display(), Qt::Key_Left);
+        QApplication::processEvents();
+        QCOMPARE(big->bands(), display()->bands());
+        // (a drag in the large one shows in the Inspector's)
+        from = big->nodePos(big->bandIndex("b1"));
+        mouse(big, QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+        mouse(big, QEvent::MouseMove, from + QPointF(-60, -30), Qt::NoButton, Qt::LeftButton);
+        mouse(big, QEvent::MouseButtonRelease, from + QPointF(-60, -30), Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        QCOMPARE(display()->bands(), big->bands());
+        QCOMPARE(display()->selected(), std::string("b1"));
+        QCOMPARE(display()->bands()[size_t(display()->bandIndex("b1"))].hz, eq()->p("b1_hz", 0));
+
+        // Right-click a dot: its type changed from the menu.
+        from = display()->nodePos(display()->bandIndex("b1"));
+        QTimer::singleShot(0, [] {
+            auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+            QVERIFY(menu);
+            for (QAction* a : menu->actions())
+                if (a->menu() && a->text() == QStringLiteral("Type"))
+                    for (QAction* t : a->menu()->actions())
+                        if (t->text() == QStringLiteral("High Shelf")) t->trigger();
+            menu->close();
+        });
+        QContextMenuEvent menuEvent(QContextMenuEvent::Mouse, from.toPoint(), display()->mapToGlobal(from.toPoint()));
+        QApplication::sendEvent(display(), &menuEvent);
+        QApplication::processEvents();
+        QCOMPARE(eqBandType(*eq(), "b1"), int(kEqHighShelf));
+        QVERIFY(std::fabs(eq()->p("b1_q", 0) - M_SQRT1_2) > 0.01);  // (its Q was set by hand: kept)
+        QCOMPARE(state()->undoText(), QString("Change EQ Band Type"));
+        state()->undo();
+        QApplication::processEvents();
+        QCOMPARE(eqBandType(*eq(), "b1"), int(kEqBell));
+        // The strip sets it exactly, and back.
+        auto* type = panelIn(win_.get())->findChild<QComboBox*>("eqBandType");
+        auto* gain = panelIn(win_.get())->findChild<QDoubleSpinBox*>("eqBandDb");
+        QVERIFY(type && gain && gain->isEnabled());
+        gain->setValue(-4.5);
+        QCOMPARE(eq()->p("b1_db", 0), -4.5);
+        QCOMPARE(display()->bands()[size_t(display()->bandIndex("b1"))].db, -4.5);
+
+        // Solo: held, playback hears only the bell's part (a band-pass at 3 kHz: the 200 Hz tone all but gone); let go,
+        // both again. The project is untouched and no undo step is made.
+        QVERIFY(state()->edit("Bell at 3 kHz", [&](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, clip, eqId);
+            e->params["b1_hz"] = Param(3000.0);
+            e->params["b1_q"] = Param(2.0);
+            return true;
+        }));
+        QApplication::processEvents();
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        QVERIFY(program);
+        // (the program's copy of the project is brought up to date a moment after an edit)
+        auto played = [&]() -> const Effect* {
+            const auto snap = program->snapshot();
+            const Sequence* s = snap ? snap->active() : nullptr;
+            return s ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, eqId) : nullptr;
+        };
+        QTRY_VERIFY(played() && played()->p("b1_hz", 0) == 3000);
+        auto level = [&](double hz) {
+            const std::vector<float> out = program->heard(48000, 9600);
+            std::complex<double> acc = 0;
+            for (size_t i = 0; i < out.size() / 2; ++i) acc += double(out[i * 2]) * std::polar(1.0, -2 * M_PI * hz * double(i) / 48000);
+            return 20 * std::log10(std::abs(acc) / double(out.size() / 2) + 1e-12);
+        };
+        const double low = level(200), high = level(3000);
+        const Project before = state()->project();
+        const QString undoBefore = state()->undoText();
+        auto* solo = panelIn(win_.get())->findChild<QPushButton*>("eqBandSolo");
+        QVERIFY(solo && solo->isEnabled());
+        QTest::mousePress(solo, Qt::LeftButton);
+        QVERIFY2(level(200) < low - 25 && std::fabs(level(3000) - high) < 6, qPrintable(QString("%1 %2 / %3 %4").arg(level(200)).arg(level(3000)).arg(low).arg(high)));
+        QTest::mouseRelease(solo, Qt::LeftButton);
+        QVERIFY(std::fabs(level(200) - low) < 0.5 && std::fabs(level(3000) - high) < 0.5);
+        QVERIFY(state()->project() == before);
+        QCOMPARE(state()->undoText(), undoBefore);
+        // Alt held while dragging a dot solos it too, until the dot is let go.
+        from = display()->nodePos(display()->bandIndex("b1"));
+        mouse(display(), QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton, Qt::AltModifier);
+        QVERIFY(level(200) < low - 25);
+        mouse(display(), QEvent::MouseButtonRelease, from, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
+        QVERIFY(std::fabs(level(200) - low) < 0.5);
+        QVERIFY(state()->project() == before);
+
+        // Delete takes the picked band away.
+        display()->setFocus();
+        QCOMPARE(display()->selected(), std::string("b1"));
+        QTest::keyClick(display(), Qt::Key_Delete);
+        QApplication::processEvents();
+        QCOMPARE(eqBands(*eq()), std::vector<std::string>{"b2"});
+        QCOMPARE(EqPanel::openWindowFor(eqId) ? panelIn(EqPanel::openWindowFor(eqId))->display()->bands().size() : size_t(0), size_t(1));
+
+        // Hide tips: gone here and in every new panel, until "?" brings them back.
+        auto* hide = panelIn(win_.get())->findChild<QToolButton*>("eqHideTips");
+        QVERIFY(hide);
+        hide->click();
+        QVERIFY(!panelIn(win_.get())->tipsShown());
+        QVERIFY(appSettings().value(EqPanel::tipsHiddenKey()).toBool());
+        {
+            EqPanel fresh(state(), clip, eqId, [] { return FrameTime(0); }, false);
+            QVERIFY(!fresh.tipsShown());
+        }
+        state()->clearSelection();
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        QVERIFY(!panelIn(win_.get())->tipsShown());
+        auto* help = panelIn(win_.get())->findChild<QToolButton*>("eqShowTips");
+        QVERIFY(help && help->isVisibleTo(win_.get()));
+        help->click();
+        QVERIFY(panelIn(win_.get())->tipsShown());
+        QVERIFY(!appSettings().value(EqPanel::tipsHiddenKey()).toBool());
+
+        // An EQ from before bands could be added shows its five as dots: shelves at the ends, bells between.
+        QVERIFY(state()->edit("Old EQ", [&](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, clip, eqId);
+            e->params.clear();
+            for (const auto& [n, v] : std::initializer_list<std::pair<const char*, double>>{
+                     {"low_hz", 100}, {"low_db", -3}, {"b1_hz", 250}, {"b1_db", 0}, {"b1_q", 1}, {"b2_hz", 1000}, {"b2_db", 2}, {"b2_q", 1},
+                     {"b3_hz", 4000}, {"b3_db", 0}, {"b3_q", 1}, {"high_hz", 10000}, {"high_db", 4}, {"output_db", 0}})
+                e->params[n] = Param(v);
+            return true;
+        }));
+        QApplication::processEvents();
+        QCOMPARE(display()->bands().size(), size_t(5));
+        QCOMPARE(display()->bands().front().type, int(kEqLowShelf));
+        QCOMPARE(display()->bands().back().type, int(kEqHighShelf));
+        QVERIFY(std::fabs(display()->responseDb(20000) - 4) < 0.5 && std::fabs(display()->responseDb(20) + 3) < 0.3);
+
+        // Over MCP: an EQ added with bands of its own, by type.
+        QVERIFY(state()->save(dir_.filePath("eq.montage")));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonArray bands{QJsonObject{{"type", "low_cut"}, {"hz", 80}, {"slope", 48}}, QJsonObject{{"type", "bell"}, {"hz", 2500}, {"db", -3}, {"q", 4}},
+                               QJsonObject{{"type", "tilt"}, {"hz", 1000}, {"db", 2}, {"on", false}}};
+        QJsonObject r = call("montage_add_effect", {{"project", dir_.filePath("eq.montage")}, {"clip", double(clip)}, {"effect", "parametric_eq"},
+                                                    {"bands", bands}, {"params", QJsonObject{{"output_db", -1}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project loaded;
+        QVERIFY(loadProject(dir_.filePath("eq.montage").toStdString(), loaded));
+        const Effect* added = nullptr;
+        for (const Effect& e : edit::clipById(*loaded.active(), clip)->effects)
+            if (e.type == "parametric_eq" && e.id != eqId) added = &e;
+        QVERIFY(added);
+        QCOMPARE(eqBands(*added), (std::vector<std::string>{"b1", "b2", "b3"}));
+        QCOMPARE(eqBandType(*added, "b1"), int(kEqLowCut));
+        QCOMPARE(added->p("b1_slope", 0), 3.0);
+        QCOMPARE(added->p("b2_q", 0), 4.0);
+        QCOMPARE(eqBandType(*added, "b3"), int(kEqTilt));
+        QCOMPARE(added->p("b3_on", 0), 0.0);
+        QCOMPARE(added->p("output_db", 0), -1.0);
+        // A band's params by name work too; a cut given a gain, an unknown type and a seventeenth band are refused.
+        r = call("montage_track_effect", {{"project", dir_.filePath("eq.montage")}, {"track", "A1"}, {"effect", "parametric_eq"},
+                                          {"params", QJsonObject{{"b4_hz", 300}, {"b4_type", 5}, {"b4_q", 8}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_effect", {{"project", dir_.filePath("eq.montage")}, {"clip", double(clip)}, {"effect", "parametric_eq"},
+                                            {"bands", QJsonArray{QJsonObject{{"type", "low_cut"}, {"hz", 80}, {"db", 6}}}}})
+                    .value("isError").toBool());
+        QVERIFY(call("montage_add_effect", {{"project", dir_.filePath("eq.montage")}, {"clip", double(clip)}, {"effect", "parametric_eq"},
+                                            {"bands", QJsonArray{QJsonObject{{"type", "wobble"}, {"hz", 80}}}}})
+                    .value("isError").toBool());
+        QJsonArray many;
+        for (int k = 0; k < 17; ++k) many.append(QJsonObject{{"hz", 100 + 50 * k}});
+        QVERIFY(call("montage_add_effect", {{"project", dir_.filePath("eq.montage")}, {"clip", double(clip)}, {"effect", "parametric_eq"}, {"bands", many}})
+                    .value("isError").toBool());
+        QVERIFY(loadProject(dir_.filePath("eq.montage").toStdString(), loaded));
+        const Effect& onTrack = loaded.active()->audioTracks[0].effects.back();
+        QCOMPARE(eqBands(onTrack), std::vector<std::string>{"b4"});
+        QCOMPARE(eqBandType(onTrack, "b4"), int(kEqNotch));
+        // The effect list says how bands are made.
+        const QJsonArray list = call("montage_list_effects", {{"kind", "audio"}}).value("structuredContent").toObject().value("effects").toArray();
+        bool listed = false;
+        for (const QJsonValue& v : list)
+            if (v.toObject().value("type").toString() == "parametric_eq") listed = v.toObject().value("band_params").toArray().size() == 6;
+        QVERIFY(listed);
     }
 
     void inspectorEditsAreUndoable() {

@@ -535,6 +535,9 @@ void MainWindow::buildPanels() {
     connect(state_, &EditorState::playheadChanged, scopes_, showCrosstalk);  // (keyed handles)
     mixer_ = new MixerPanel(state_, this);
     connect(mixer_, &MixerPanel::liveMix, program_, &PlaybackController::setLiveMix);  // an automation pass heard
+    // The EQ display's held Solo band heard, and what plays analysed for its spectrum.
+    connect(state_, &EditorState::auditionChanged, program_, &PlaybackController::setAudition);
+    connect(program_, &PlaybackController::audioAnalysis, state_, &EditorState::noteHeardAnalysis);
     connect(mixer_, &MixerPanel::effectsRequested, this, [this] {
         inspectorDock_->show();
         inspectorDock_->raise();
