@@ -14692,7 +14692,7 @@ const auto seq = [this] { return state()->sequence(); };
         const auto c = connect(program, &PlaybackController::positionChanged, this, [&](FrameTime t) { seen.emplace_back(clock.elapsed(), t); });
         program->seek(10);
         program->play();
-        QTest::qWait(1500);
+        QTest::qWait(2500);
         disconnect(c);
         // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
         const FrameTime at = program->position();
@@ -14712,9 +14712,15 @@ const auto seq = [this] { return state()->sequence(); };
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
+        // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
+        size_t first = 1;
+        while (first < seen.size() && seen[first].second == seen[0].second) ++first;
+        QVERIFY(first + 10 < seen.size());
+        const qint64 start = seen[first].first;
+        const double wrapsAfter = double(std::count_if(wraps.begin(), wraps.end(), [start](qint64 w) { return w > start; }));
         const double fps = state()->sequence()->fpsValue();
-        const double frames = double(seen.back().second - seen.front().second) + 10.0 * double(wraps.size());
-        const double rate = frames / (double(seen.back().first - seen.front().first) / 1000.0);
+        const double frames = double(seen.back().second - seen[first].second) + 10.0 * wrapsAfter;
+        const double rate = frames / (double(seen.back().first - start) / 1000.0);
         QVERIFY2(std::fabs(rate - fps) < fps * 0.1, qPrintable(QStringLiteral("%1 frames a second, not %2").arg(rate).arg(fps)));
         state()->newProject();
     }

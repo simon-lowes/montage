@@ -1601,9 +1601,11 @@ public:
                 for (int y = 0; y < H; ++y)
                     for (int x = 0; x < W; ++x) {
                         float* p = img.at(x, y);
-                        // (the frame's number in its second as two base-5 digits, red and blue, and its second mod 5 in
-                        // green, steps far apart enough for any codec's error)
-                        p[0] = 0.2f + 0.15f * float(k % 5), p[1] = 0.2f + 0.15f * float(second), p[2] = 0.2f + 0.15f * float(k / 5), p[3] = 1;
+                        // (the frame's number in its second as two base-5 digits and its second mod 5, in three grey
+                        // bands left to right: grey whatever matrix a decoder reads it by, steps far apart enough for
+                        // any codec's error)
+                        const int digit = x < W / 3 ? k % 5 : x < 2 * W / 3 ? k / 5 : second;
+                        p[0] = p[1] = p[2] = 0.2f + 0.15f * float(digit), p[3] = 1;
                     }
                 std::vector<uint8_t> o(size_t(W) * H * 4);
                 video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), o.data(), size_t(W) * 2);
@@ -2470,8 +2472,8 @@ private slots:
         QCOMPARE(int(clips.size()), 5);
         // Which frame a picture is, of five seconds' (as the simulated deck draws it: a whole second's slip shows).
         auto frameIn = [](const Image& img) {
-            const float* p = img.at(160, 90);
-            return int(std::lround((p[0] - 0.2f) / 0.15f)) + 5 * int(std::lround((p[2] - 0.2f) / 0.15f)) + 25 * int(std::lround((p[1] - 0.2f) / 0.15f));
+            auto digit = [&img](int x) { return int(std::lround((img.at(x, 90)[1] - 0.2f) / 0.15f)); };
+            return digit(53) + 5 * digit(160) + 25 * digit(266);
         };
         for (const BatchClip& c : clips) {
             QVERIFY2(c.ok, (c.entry.name + ": " + c.error).c_str());
@@ -2498,8 +2500,14 @@ private slots:
             AVFormatContext* fc = nullptr;
             QVERIFY(avformat_open_input(&fc, c.path.c_str(), nullptr, nullptr) == 0);
             bool reel = false;
-            for (unsigned s = 0; s < fc->nb_streams; ++s)
+            for (unsigned s = 0; s < fc->nb_streams; ++s) {
                 if (const AVDictionaryEntry* t = av_dict_get(fc->streams[s]->metadata, "reel_name", nullptr, 0)) reel = reel || std::string(t->value) == "TAPE07";
+                // (how the file says its colour is coded: the feed's BT.709, which a decoder otherwise guesses as BT.601 at
+                // this size)
+                const AVCodecParameters* cp = fc->streams[s]->codecpar;
+                if (cp->codec_type == AVMEDIA_TYPE_VIDEO && cp->color_space != AVCOL_SPC_BT709)
+                    qInfo("%s is tagged %s, not bt709", c.entry.name.c_str(), av_color_space_name(cp->color_space));
+            }
             avformat_close_input(&fc);
             QVERIFY(reel);
         }
