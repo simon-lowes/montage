@@ -1,6 +1,7 @@
 #include "SerialPort.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #ifdef _WIN32
@@ -148,8 +149,13 @@ speed_t speedOf(int baud) {
     }
 }
 
+// A pseudo-terminal's name (Linux's /dev/pts/N, macOS's /dev/ttysNNN), as the tests stand in for the cable with.
+bool pseudoTerminal(const std::string& name) {
+    return name.rfind("/dev/pts/", 0) == 0 || (name.rfind("/dev/ttys", 0) == 0 && name.size() > 9 && std::isdigit(static_cast<unsigned char>(name[9])));
+}
+
 // Raw bytes: no echo, no line editing, no translation, 8 bits with the parity asked.
-bool makeRaw(int fd, int baud, char parity) {
+bool makeRaw(int fd, int baud, char parity, bool pty) {
     termios t{};
     if (tcgetattr(fd, &t) != 0) return false;
     cfmakeraw(&t);
@@ -163,9 +169,11 @@ bool makeRaw(int fd, int baud, char parity) {
     cfsetispeed(&t, speedOf(baud));
     cfsetospeed(&t, speedOf(baud));
     if (tcsetattr(fd, TCSANOW, &t) == 0) return true;
-    // (a pseudo-terminal has no parity to set, and newer kernels refuse it there: a line without one)
+    // (a pseudo-terminal has no parity to set, and newer kernels refuse it there: a line without one; a real port that
+    // refuses the parity cannot talk to the deck)
+    if (!pty || parity == 'N') return false;
     t.c_cflag &= ~(PARENB | PARODD);
-    return parity != 'N' && tcsetattr(fd, TCSANOW, &t) == 0;
+    return tcsetattr(fd, TCSANOW, &t) == 0;
 }
 
 }  // namespace
@@ -177,9 +185,17 @@ bool SerialPort::open(const std::string& name, int baud, char parity, std::strin
         if (error) *error = "Cannot open " + name + ": " + std::strerror(errno);
         return false;
     }
-    if (!isatty(fd) || !makeRaw(fd, baud, parity)) {
+    if (!isatty(fd)) {
         ::close(fd);
         if (error) *error = name + " is not a serial port";
+        return false;
+    }
+    if (!makeRaw(fd, baud, parity, pseudoTerminal(name))) {
+        const std::string why = std::strerror(errno);
+        ::close(fd);
+        if (error)
+            *error = name + " cannot be set to " + std::to_string(baud) + " baud" +
+                     (parity == 'O' ? ", odd parity" : parity == 'E' ? ", even parity" : "") + ": " + why;
         return false;
     }
     tcflush(fd, TCIOFLUSH);
@@ -269,7 +285,7 @@ PseudoCable::PseudoCable() {
         name = n;
         slave = ::open(n, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (slave < 0) return false;
-        makeRaw(slave, 38400, 'O');
+        makeRaw(slave, 38400, 'O', true);
         fcntl(master, F_SETFL, fcntl(master, F_GETFL) | O_NONBLOCK);
         return true;
     };

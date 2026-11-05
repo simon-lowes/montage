@@ -26,6 +26,7 @@
 #include <array>
 #include <mutex>
 #include <optional>
+#include <deque>
 #include <set>
 #include <QImage>
 #include <QMatrix4x4>
@@ -1535,14 +1536,19 @@ ModelCamera lookAt(std::array<double, 3> C, std::array<double, 3> at, double f, 
 namespace {
 
 #ifndef _WIN32
-// A deck for the tests, at the far end of a pseudo-terminal pair: a tape whose timecode runs at 25 fps, answering Sony
-// 9-pin as the manuals describe (cue, play, stop, status, timecode, an edit's settings and auto edit), and, given an
-// Open Media Transport sender, sending its picture while it plays, each frame's blue its frame number (mod 25) and,
-// when `stamp` is set, its timecode with it, as SDI capture gives it.
+// A deck for the tests, at the far end of a pseudo-terminal pair: a tape whose timecode runs at 25 fps (or `base` and
+// `drop` at 29.97), answering Sony 9-pin as the manuals describe (cue, play, stop, status, timecode, an edit's
+// settings and auto edit), and, given an Open Media Transport sender, sending its picture while it plays, each frame's
+// colours its frame number (in its second, and the second's mod 5) and, when `stamp` is set, its timecode with it, as
+// SDI capture gives it. As a real line and deck can, it can answer late, lose answers, let a late answer to an earlier
+// command come first, and take a moment to search back from where it was playing when told to edit.
 class SimulatedDeck {
 public:
     using Clock = std::chrono::steady_clock;
-    explicit SimulatedDeck(const std::string& port) {
+    explicit SimulatedDeck(const std::string& port, int base = 25, bool drop = false) : base_(base), drop_(drop && base == 30) {
+        fps = base == 25 ? 25.0 : base * 1000.0 / 1001;  // (29.97 at 30, drop frame or not)
+        pos = 36000.0 * base;  // (10:00:00:00 counted without drop frame)
+        if (drop_) pos = double(parseTimecode("10:00:00;00", 30));
         ok = port_.open(port, 38400, 'O');
         thread_ = std::thread([this] { run(); });
     }
@@ -1553,22 +1559,35 @@ public:
     }
     bool ok = false;
     std::mutex m;
-    double pos = 36000.0 * 25;  // (10:00:00:00)
+    double fps = 25;
+    double pos = 0;
     double speed = 0;
-    Clock::time_point at = Clock::now(), cuedAt = Clock::now();
+    Clock::time_point at = Clock::now(), cuedAt = Clock::now(), rolledAt = Clock::now(), searchUntil{};
     int64_t in = -1, out = -1, preroll = -1;
     std::vector<uint8_t> channels;
     bool autoEdit = false, recording = false, editDone = false;
     int64_t recordedFrom = -1, recordedTo = -1;
     int commands = 0;
+    // The line's and the deck's ways: the answers to these commands (counted from 1) lost or held back 150 ms, every
+    // answer lost while recording, a STATUS answer come late in front of the next timecode's, and how long play takes
+    // to lock its servo (-1: the deck does not say).
+    std::set<int> lose, late;
+    bool loseWhileRecording = false, staleStatus = false;
+    double servoLockAfter = 0.2;
 
-    double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * 25.0 * std::chrono::duration<double>(now - at).count(); }
+    double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
         const auto now = Clock::now();
+        if (sp == 1 && (speed != 1 || std::fabs(frame - frameNow(now)) > 1)) rolledAt = now;
         pos = frame;
         speed = sp;
         at = now;
     }
+    bool servoLocked(Clock::time_point now = Clock::now()) const {
+        return servoLockAfter >= 0 && speed == 1 && std::chrono::duration<double>(now - rolledAt).count() >= servoLockAfter;
+    }
+    // A frame number on its tape from a label sent to it (read its own way, whatever the flag).
+    int64_t label(const std::vector<uint8_t>& d) const { return ninepin::timecodeFromBytesAs(d.data(), base_, drop_); }
 
 #ifdef MONTAGE_WITH_OMT
     // Its picture out over Open Media Transport while it plays.
@@ -1576,14 +1595,15 @@ public:
         pictures_ = std::thread([this, tx, stamp] {
             const int W = 320, H = 180;
             std::vector<std::vector<uint8_t>> pics;
-            for (int t = 0; t < 25; ++t) {
+            for (int t = 0; t < 125; ++t) {
                 Image img(W, H);
+                const int k = t % 25, second = t / 25;
                 for (int y = 0; y < H; ++y)
                     for (int x = 0; x < W; ++x) {
                         float* p = img.at(x, y);
-                        // (the frame's number in its second as two base-5 digits, red and blue, steps far apart enough
-                        // for any codec's error)
-                        p[0] = 0.2f + 0.15f * float(t % 5), p[1] = 0.4f, p[2] = 0.2f + 0.15f * float(t / 5), p[3] = 1;
+                        // (the frame's number in its second as two base-5 digits, red and blue, and its second mod 5 in
+                        // green, steps far apart enough for any codec's error)
+                        p[0] = 0.2f + 0.15f * float(k % 5), p[1] = 0.2f + 0.15f * float(second), p[2] = 0.2f + 0.15f * float(k / 5), p[3] = 1;
                     }
                 std::vector<uint8_t> o(size_t(W) * H * 4);
                 video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), o.data(), size_t(W) * 2);
@@ -1598,7 +1618,7 @@ public:
                 }
                 if (f >= 0 && f != sent) {
                     omt::VideoOut v;
-                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(f % 25)].data(), v.rateN = 25, v.rateD = 1;
+                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(f % 125)].data(), v.rateN = 25, v.rateD = 1;
                     v.timestamp = f * 400000;
                     v.metadata = "<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>";
                     if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(f, 25, false) + "\"/>";
@@ -1613,8 +1633,14 @@ public:
 
 private:
     void tick() {
-        // An edit: rolling from In less the pre-roll, recording In to Out, stopping there.
+        // An edit: (searching back from where it was playing first) rolling from In less the pre-roll, recording In to
+        // Out, stopping there.
         if (!autoEdit) return;
+        if (searchUntil != Clock::time_point{}) {
+            if (Clock::now() < searchUntil) return;
+            searchUntil = {};
+            move(double(in - preroll), 1);
+        }
         const double f = frameNow();
         if (!recording && f >= double(in) && recordedFrom < 0) recording = true, recordedFrom = in;
         if (recording && f >= double(out)) {
@@ -1625,26 +1651,29 @@ private:
     ninepin::Message answer(const ninepin::Message& q) {
         using namespace ninepin;
         const Message ack{1, cmd::Ack, {}};
-        std::lock_guard lock(m);
-        ++commands;
         const int64_t here = int64_t(std::floor(frameNow() + 1e-9));
         auto timecode = [&](uint8_t c, int64_t f) {
-            const auto b = timecodeBytes(f, 25, false);
+            const auto b = timecodeBytes(f, base_, drop_);
             return Message{7, c, {b.begin(), b.end()}};
         };
         if (q.is(0, cmd::DeviceTypeRequest)) return Message{1, cmd::DeviceType, {0x21, 0x00}};
         if (q.group == 2) {
             switch (q.cmd) {
             case cmd::Play: move(here, 1); return ack;
-            case cmd::Stop: move(here, 0); return ack;
+            case cmd::Stop:
+                move(here, 0);
+                autoEdit = recording = false, searchUntil = {};
+                return ack;
             case cmd::CueUpWithData:
-                move(double(timecodeFromBytes(q.data.data(), 25)), 0);
+                move(double(label(q.data)), 0);
                 cuedAt = Clock::now() + std::chrono::milliseconds(150);  // (the tape takes a moment to get there)
                 return ack;
             case cmd::AutoEdit:
                 if (in < 0 || out <= in || preroll < 0) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
                 autoEdit = true, recording = false, recordedFrom = recordedTo = -1, editDone = false;
-                move(double(in - preroll), 1);
+                // (playing already: it plays on a moment before it searches back to the pre-roll)
+                if (speed == 1) searchUntil = Clock::now() + std::chrono::milliseconds(300);
+                else move(double(in - preroll), 1);
                 return ack;
             case cmd::ShuttleForward: move(here, speedFromData(q.data)); return ack;
             default: return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
@@ -1653,42 +1682,62 @@ private:
         if (q.group == 4) {
             if (q.data.size() < 1) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             switch (q.cmd) {
-            case cmd::InDataPreset: in = timecodeFromBytes(q.data.data(), 25); return ack;
-            case cmd::OutDataPreset: out = timecodeFromBytes(q.data.data(), 25); return ack;
-            case cmd::PrerollTimePreset: preroll = timecodeFromBytes(q.data.data(), 25); return ack;
+            case cmd::InDataPreset: in = label(q.data); return ack;
+            case cmd::OutDataPreset: out = label(q.data); return ack;
+            case cmd::PrerollTimePreset: preroll = timecodeFromBytes(q.data.data(), base_); return ack;
             case cmd::EditPreset: channels = q.data; return ack;
             default: return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             }
         }
         if (q.is(6, cmd::CurrentTimeSense)) return timecode(cmd::LtcTimeData, here);
-        if (q.is(6, cmd::StatusSense)) {
-            Status s;
-            s.play = speed == 1 && !recording;
-            s.record = recording;
-            s.stop = speed == 0;
-            s.shuttle = speed != 0 && speed != 1;
-            s.cueComplete = speed == 0 && Clock::now() >= cuedAt;
-            s.autoEdit = autoEdit;
-            s.edit = recording;
-            s.inSet = in >= 0, s.outSet = out >= 0;
-            const auto b = s.bytes();
-            return Message{7, cmd::StatusData, {b.begin(), b.end()}};
-        }
+        if (q.is(6, cmd::StatusSense)) return status();
         return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
+    }
+    ninepin::Message status() {
+        ninepin::Status s;
+        s.play = speed == 1 && !recording;
+        s.record = recording;
+        s.stop = speed == 0;
+        s.shuttle = speed != 0 && speed != 1;
+        s.cueComplete = speed == 0 && Clock::now() >= cuedAt;
+        s.servoLock = servoLocked();
+        s.autoEdit = autoEdit;
+        s.edit = recording;
+        s.inSet = in >= 0, s.outSet = out >= 0;
+        const auto b = s.bytes();
+        return ninepin::Message{7, ninepin::cmd::StatusData, {b.begin(), b.end()}};
     }
     void run() {
         ninepin::Parser parser;
         uint8_t buf[256];
+        std::deque<std::pair<Clock::time_point, std::vector<uint8_t>>> held;  // (answers held back, and when they go)
         while (!stop_) {
             const int n = port_.read(buf, sizeof buf, 2);
             if (n > 0) parser.feed(buf, size_t(n));
             ninepin::Message q;
-            for (ninepin::Parser::Result r; (r = parser.next(q)) != ninepin::Parser::None;)
-                port_.write(ninepin::encode(r == ninepin::Parser::Ok ? answer(q) : ninepin::Message{1, ninepin::cmd::Nak, {ninepin::cmd::NakChecksum}}));
+            for (ninepin::Parser::Result r; (r = parser.next(q)) != ninepin::Parser::None;) {
+                std::lock_guard lock(m);
+                ++commands;
+                const bool lost = lose.count(commands) || (loseWhileRecording && recording);
+                const ninepin::Message a = r == ninepin::Parser::Ok ? answer(q) : ninepin::Message{1, ninepin::cmd::Nak, {ninepin::cmd::NakChecksum}};
+                if (lost) continue;
+                if (staleStatus && q.is(6, ninepin::cmd::CurrentTimeSense)) {
+                    staleStatus = false;
+                    port_.write(ninepin::encode(status()));
+                }
+                if (late.count(commands)) held.emplace_back(Clock::now() + std::chrono::milliseconds(150), ninepin::encode(a));
+                else port_.write(ninepin::encode(a));
+            }
+            while (!held.empty() && Clock::now() >= held.front().first) {
+                port_.write(held.front().second);
+                held.pop_front();
+            }
             std::lock_guard lock(m);
             tick();
         }
     }
+    int base_ = 25;
+    bool drop_ = false;
     SerialPort port_;
     std::atomic<bool> stop_{false};
     std::thread thread_, pictures_;
@@ -2139,6 +2188,29 @@ private slots:
         QVERIFY(m.is(2, cmd::Play));
         QCOMPARE(p.next(m), Parser::BadChecksum);
         QCOMPARE(p.next(m), Parser::None);
+        // Back in step after a stray byte: one in front of a command (claiming three bytes of data) is passed over and
+        // the command taken, and so is one claiming more than ever comes, once the line has been quiet a while; a
+        // message cut short is given up the same way, so the next command is not read into it.
+        const auto t0 = Parser::Clock::now();
+        std::vector<uint8_t> stray = {0x63};
+        stray.insert(stray.end(), play.begin(), play.end());
+        stray.insert(stray.end(), play.begin(), play.end());
+        p.feed(stray.data(), stray.size(), t0);
+        QCOMPARE(p.next(m, t0), Parser::Ok);
+        QVERIFY(m.is(2, cmd::Play));
+        QCOMPARE(p.next(m, t0), Parser::Ok);
+        QCOMPARE(p.next(m, t0), Parser::None);
+        std::vector<uint8_t> greedy = {0x7F};
+        greedy.insert(greedy.end(), cue.begin(), cue.end());
+        p.feed(greedy.data(), greedy.size(), t0);
+        QCOMPARE(p.next(m, t0), Parser::None);
+        QCOMPARE(p.next(m, t0 + Parser::kByteGap + std::chrono::milliseconds(5)), Parser::Ok);
+        QVERIFY(m.is(2, cmd::CueUpWithData) && m.data.size() == 4);
+        p.feed(cue.data(), 4, t0);
+        p.feed(play.data(), play.size(), t0 + std::chrono::milliseconds(100));
+        QCOMPARE(p.next(m, t0 + std::chrono::milliseconds(100)), Parser::Ok);
+        QVERIFY(m.is(2, cmd::Play));
+        QCOMPARE(p.next(m, t0 + std::chrono::milliseconds(100)), Parser::None);
         // Timecode in BCD, frames first: 10:03:04:05 at 25, and drop frame at 29.97 (01:00:00;02, the first label of
         // the hour's first minute after the drop... none dropped at minute 0).
         const int64_t f25 = ((10 * 60 + 3) * 60 + 4) * 25 + 5;
@@ -2193,6 +2265,19 @@ private slots:
         QCOMPARE(fromAle[0].reel, std::string("R7"));
         QCOMPARE(fromAle[0].out - fromAle[0].in, int64_t(30));
         QCOMPARE(fromAle[0].in, parseTimecode("01:00:00;00", 30));
+        // A line whose Out is its In: no frames, not a day's worth over midnight.
+        writeTextFile(csv, "Name,Start,End\nEmpty,10:00:01:00,10:00:01:00\nLate,23:59:59:00,00:00:01:00\n");
+        const std::vector<LogEntry> edge = readCaptureLog(csv, 25, false, &err);
+        QCOMPARE(int(edge.size()), 1);
+        QCOMPARE(edge[0].out - edge[0].in, int64_t(50));
+        QVERIFY2(QString::fromStdString(err).contains("Out is its In"), err.c_str());
+        // Labels the other way at 29.97: a drop frame label is the same one without, and one drop frame skips is the
+        // next there is.
+        const int64_t df = parseTimecode("10:00:00;00", 30);
+        QCOMPARE(sameLabel(df, 30, true, false), int64_t(36000 * 30));
+        QCOMPARE(sameLabel(int64_t(36000 * 30), 30, false, true), df);
+        QCOMPARE(sameLabel(parseTimecode("00:01:00:00", 30), 30, false, true), parseTimecode("00:01:00;02", 30));
+        QCOMPARE(sameLabel(df + ltcFramesPerDay(30, true), 30, true, false), int64_t(36000 * 30) + ltcFramesPerDay(30, false));
     }
 
     void deckControlOverTheCable() {
@@ -2237,7 +2322,7 @@ private slots:
         e.out = e.in + 50;
         e.preroll = 1;
         int64_t rolledAt = -1;
-        QVERIFY2(editToTape(deck, e, [&](int64_t tapeFrame, double) { rolledAt = tapeFrame; }, nullptr, &err), err.c_str());
+        QVERIFY2(editToTape(deck, e, [&](int64_t framesToIn, double) { rolledAt = e.in - framesToIn; }, nullptr, &err), err.c_str());
         {
             std::lock_guard lock(sim.m);
             QCOMPARE(sim.in, e.in);
@@ -2249,6 +2334,109 @@ private slots:
             QCOMPARE(sim.recordedTo, e.out);
         }
         QVERIFY2(rolledAt >= e.in - 25 && rolledAt < e.in, std::to_string(rolledAt - e.in).c_str());
+
+        // A late answer to an earlier command, come first, is not taken for the timecode asked for; an answer lost or
+        // late is asked for again.
+        {
+            std::lock_guard lock(sim.m);
+            sim.staleStatus = true;
+        }
+        QCOMPARE(deck.timecode(), e.out);
+        for (std::set<int>* way : {&sim.lose, &sim.late}) {
+            {
+                std::lock_guard lock(sim.m);
+                way->insert(sim.commands + 1);
+            }
+            const auto again = deck.status();
+            QVERIFY2(again && again->stop, deck.lastError().c_str());
+            QCOMPARE(deck.timecode(), e.out);
+        }
+
+        // Told to edit while playing three seconds before In: it plays on a moment before it searches back, and the
+        // Program is started only once the deck runs up from its pre-roll at play speed, its servo locked, from where
+        // it really was then.
+        TapeEdit e2 = e;
+        e2.in = e.in + 500, e2.out = e2.in + 50;
+        {
+            std::lock_guard lock(sim.m);
+            sim.move(double(e2.in - 75), 1);
+        }
+        int rolls = 0;
+        int64_t toIn = -1;
+        double off = 99;
+        bool lockedThen = false;
+        QVERIFY2(editToTape(deck, e2,
+                            [&](int64_t framesToIn, double) {
+                                std::lock_guard lock(sim.m);
+                                ++rolls;
+                                toIn = framesToIn;
+                                off = sim.frameNow() - double(e2.in - framesToIn);
+                                lockedThen = sim.servoLocked();
+                            },
+                            nullptr, &err),
+                 err.c_str());
+        QCOMPARE(rolls, 1);
+        QVERIFY2(toIn > 0 && toIn <= 25, std::to_string(toIn).c_str());
+        QVERIFY2(off >= 0 && off < 3, std::to_string(off).c_str());
+        QVERIFY(lockedThen);
+        {
+            std::lock_guard lock(sim.m);
+            QCOMPARE(sim.recordedFrom, e2.in);
+            QCOMPARE(sim.recordedTo, e2.out);
+        }
+
+        // The deck stops answering once it records: the edit fails, and the deck is stopped there rather than left
+        // recording the Program's last picture to Out.
+        TapeEdit e3 = e;
+        e3.in = e2.in + 500, e3.out = e3.in + 75;
+        {
+            std::lock_guard lock(sim.m);
+            sim.loseWhileRecording = true;
+        }
+        QVERIFY(!editToTape(deck, e3, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("stopped answering"), err.c_str());
+        {
+            std::lock_guard lock(sim.m);
+            sim.loseWhileRecording = false;
+            QCOMPARE(sim.speed, 0.0);
+            QVERIFY(!sim.recording && !sim.autoEdit);
+            QCOMPARE(sim.recordedFrom, e3.in);
+            QCOMPARE(sim.recordedTo, int64_t(-1));
+            QVERIFY2(sim.frameNow() < double(e3.out), std::to_string(sim.frameNow() - double(e3.in)).c_str());
+        }
+
+        // A deck at 29.97 counting without drop frame, the timecodes typed for it in drop frame (as 29.97 is here):
+        // cued, edited and read by their labels, not three and a half seconds an hour away.
+        {
+            PseudoCable cable3;
+            QVERIFY(cable3.ok());
+            SimulatedDeck ndf(cable3.endB(), 30, false);
+            QVERIFY(ndf.ok);
+            Deck deck3;
+            deck3.setBase(30, true);
+            QVERIFY2(deck3.open(cable3.endA(), &err), err.c_str());
+            QVERIFY2(deck3.timecode() >= 0, deck3.lastError().c_str());
+            QVERIFY(!deck3.deckDropFrame() && deck3.dropFrame());
+            const int64_t typed = parseTimecode("10:30:00:00", 30, nullptr, true);
+            QVERIFY(deck3.cue(deck3.toDeck(typed)));
+            QVERIFY(deck3.waitForCue(deck3.toDeck(typed), 5));
+            QCOMPARE(formatTimecode(deck3.timecode(), 30, deck3.deckDropFrame()), std::string("10:30:00:00"));
+            {
+                std::lock_guard lock(ndf.m);
+                QCOMPARE(int64_t(ndf.frameNow()), int64_t((10 * 60 + 30) * 60 * 30));
+            }
+            TapeEdit n;
+            n.in = parseTimecode("10:31:00:10", 30, nullptr, true);
+            n.out = n.in + 60;
+            n.preroll = 1;
+            QVERIFY2(editToTape(deck3, n, {}, nullptr, &err), err.c_str());
+            std::lock_guard lock(ndf.m);
+            QCOMPARE(ndf.in, int64_t((10 * 60 + 31) * 60 * 30 + 10));
+            QCOMPARE(ndf.out, ndf.in + 60);
+            QCOMPARE(ndf.preroll, int64_t(30));
+            QCOMPARE(ndf.recordedFrom, ndf.in);
+            QCOMPARE(ndf.recordedTo, ndf.out);
+        }
 
 #ifdef MONTAGE_WITH_OMT
         if (!omt::vmxAvailable(&err)) QSKIP(err.c_str());
@@ -2280,10 +2468,10 @@ private slots:
         bs.preroll = 1;
         const std::vector<BatchClip> clips = batchCapture(deck, log, bs);
         QCOMPARE(int(clips.size()), 5);
-        // Which frame of its second a picture is (as the simulated deck draws it).
+        // Which frame a picture is, of five seconds' (as the simulated deck draws it: a whole second's slip shows).
         auto frameIn = [](const Image& img) {
             const float* p = img.at(160, 90);
-            return int(std::lround((p[0] - 0.2f) / 0.15f)) + 5 * int(std::lround((p[2] - 0.2f) / 0.15f));
+            return int(std::lround((p[0] - 0.2f) / 0.15f)) + 5 * int(std::lround((p[2] - 0.2f) / 0.15f)) + 25 * int(std::lround((p[1] - 0.2f) / 0.15f));
         };
         for (const BatchClip& c : clips) {
             QVERIFY2(c.ok, (c.entry.name + ": " + c.error).c_str());
@@ -2300,11 +2488,11 @@ private slots:
             for (int64_t k : {int64_t(0), int64_t(1), int64_t(50), to - from - 1}) {
                 const Frame16Ptr f = dec.frameAt((double(k) + 0.5) / 25.0);
                 QVERIFY(f);
-                const int got = frameIn(toImage(*f)), want = int((from + k) % 25);
+                const int got = frameIn(toImage(*f)), want = int((from + k) % 125);
                 // The first frame must be the logged one; later, a picture the loaded test machine dropped on its way
                 // is held from the one before (as captureFromOmt allows).
-                QVERIFY2(got == want || (k > 0 && got == (want + 24) % 25),
-                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of its second, not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
+                QVERIFY2(got == want || (k > 0 && got == (want + 124) % 125),
+                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of five seconds', not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
             }
             // (the tape's name kept with the timecode)
             AVFormatContext* fc = nullptr;
@@ -2338,10 +2526,10 @@ private slots:
             QVERIFY(dec.open(plain[0].path));
             const Frame16Ptr f = dec.frameAt(0.5 / 25.0);
             QVERIFY(f);
-            const int got = frameIn(toImage(*f)), want = int(from % 25);
+            const int got = frameIn(toImage(*f)), want = int(from % 125);
             bool near = false;
-            for (int d = -1; d <= 1; ++d) near = near || got == (want + d + 25) % 25;
-            QVERIFY2(near, qPrintable(QStringLiteral("first frame is frame %1 of its second, not %2").arg(got).arg(want)));
+            for (int d = -1; d <= 1; ++d) near = near || got == (want + d + 125) % 125;
+            QVERIFY2(near, qPrintable(QStringLiteral("first frame is frame %1 of five seconds', not %2").arg(got).arg(want)));
         }
         tx2.stop();
 #endif
@@ -2449,8 +2637,52 @@ private slots:
         QVERIFY(nak.is(1, cmd::Nak) && nak.data.size() == 1 && (nak.data[0] & cmd::NakChecksum));
         a = ask(2, cmd::Record);
         QVERIFY(a && a->is(1, cmd::Nak));
+        // A stray byte on the line, claiming more data than ever comes: passed over once the line is quiet, and the
+        // next command answered.
+        controller.write(std::vector<uint8_t>{0x7F});
+        QCOMPARE(timecodeNow(), stopped - 1);
         QVERIFY(montage.commandsAnswered() > 10);
         montage.stop();
+
+        // At 29.97 in drop frame: a controller's cue, In and Out, sent without the drop frame flag, are read by their
+        // labels as the Program counts them; a pre-roll from before 00:00:00:00 goes to it, not to 23:59.
+        {
+            DeckEmulator df;
+            df.setBase(30, true);
+            TransportState t;
+            t.fps = 30000.0 / 1001;
+            df.publish(t);
+            int64_t located = -2;
+            df.onRequest = [&](const TransportRequest& r) {
+                if (r.kind == TransportRequest::Locate) located = r.frame;
+            };
+            const int64_t ndf = (10 * 60 + 10) * 60 * 30;  // (10:10:00:00 counted without drop frame)
+            const auto nb = timecodeBytes(ndf, 30, false);
+            QVERIFY(df.answer(Message{2, cmd::CueUpWithData, {nb.begin(), nb.end()}}).is(1, cmd::Ack));
+            QCOMPARE(located, parseTimecode("10:10:00;00", 30));
+            QVERIFY(df.answer(Message{4, cmd::InDataPreset, {nb.begin(), nb.end()}}).is(1, cmd::Ack));
+            Message inData = df.answer(Message{6, cmd::InDataSense, {}});
+            QCOMPARE(timecodeFromBytes(inData.data.data(), 30), parseTimecode("10:10:00;00", 30));
+            const auto early = timecodeBytes(60, 30, false);  // (00:00:02:00, five seconds' pre-roll)
+            QVERIFY(df.answer(Message{4, cmd::InDataPreset, {early.begin(), early.end()}}).is(1, cmd::Ack));
+            QVERIFY(df.answer(Message{2, cmd::Preroll, {}}).is(1, cmd::Ack));
+            QCOMPARE(located, int64_t(0));
+            const Message now = df.answer(Message{6, cmd::CurrentTimeSense, {cmd::SenseLtc}});
+            QCOMPARE(timecodeFromBytes(now.data.data(), 30), int64_t(0));
+        }
+
+        // The adapter pulled out: the emulator stops, rather than spinning on a port that has gone.
+        {
+            DeckEmulator pulled;
+            {
+                PseudoCable gone;
+                QVERIFY(gone.ok());
+                QVERIFY2(pulled.start(gone.endB(), &err), err.c_str());
+                QVERIFY(pulled.running());
+            }
+            for (int i = 0; i < 100 && pulled.running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            QVERIFY(!pulled.running());
+        }
 #endif
     }
 
@@ -2501,6 +2733,40 @@ private slots:
             const LtcChase::Position end = chase.now();
             QVERIFY(end.state == LtcChase::State::Locked);
             QVERIFY(std::fabs(end.frame - (double(start) + double(ltc.size()) / perFrame + 3)) < 1.0);
+        }
+        // Followed either way and as a deck shuttles, past a fifth of play speed and five times it: LTC played backwards
+        // at play speed and three times it, and forwards at under a fifth and at six times (from a 192 kHz input),
+        // locked within a frame of the master and at its speed.
+        struct Shuttle {
+            double speed;
+            int rate;
+        };
+        for (const Shuttle sh : {Shuttle{-1, 48000}, Shuttle{-3, 48000}, Shuttle{0.18, 48000}, Shuttle{6, 192000}}) {
+            const double fast = std::fabs(sh.speed);
+            const int64_t start = parseTimecode("10:00:00:00", 25);
+            // (made at a rate that, read at the input's, runs at the speed)
+            const int made = int(std::lround(sh.rate / fast));
+            std::vector<float> ltc = encodeLtc(start, int64_t(std::ceil(25 * 4 * fast)), Rational{25, 1}, false, made);
+            if (sh.speed < 0) std::reverse(ltc.begin(), ltc.end());
+            const double perFrame = made / 25.0, total = double(ltc.size());
+            LtcChase chase(sh.rate, 25, false);
+            int locked = 0;
+            double worst = 0;
+            for (size_t at = 0; at < ltc.size(); at += size_t(sh.rate / 100)) {
+                const size_t n = std::min<size_t>(size_t(sh.rate / 100), ltc.size() - at);
+                chase.write(ltc.data() + at, n);
+                const double y = double(at + n), t = y / sh.rate;
+                const LtcChase::Position p = chase.now();
+                const double truth = double(start) + (sh.speed < 0 ? total - y : y) / perFrame;
+                if (t > 1.5 && y < total - perFrame) {
+                    QVERIFY2(p.state == LtcChase::State::Locked, qPrintable(QStringLiteral("%1x at %2 s").arg(sh.speed).arg(t)));
+                    QVERIFY2(std::fabs(p.speed - sh.speed) < 0.01 * fast, qPrintable(QStringLiteral("%1x read as %2x").arg(sh.speed).arg(p.speed)));
+                    worst = std::max(worst, std::fabs(p.frame - truth));
+                    ++locked;
+                }
+            }
+            QVERIFY2(locked > 50, qPrintable(QStringLiteral("%1x").arg(sh.speed)));
+            QVERIFY2(worst < 1.0, qPrintable(QStringLiteral("%1x: %2 frames out").arg(sh.speed).arg(worst)));
         }
     }
 

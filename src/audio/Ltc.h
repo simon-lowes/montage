@@ -20,8 +20,10 @@ struct LtcFrame {
     bool colourFrame = false;
     uint32_t userBits = 0;  // the eight user-bit groups, group 1 in the lowest four bits
     // Read words: where its first bit starts (the start of the video frame it labels) and where the next word would,
-    // in samples since the decoder began, to a fraction of a sample.
+    // in samples since the decoder began, to a fraction of a sample. A word read backwards (the tape in reverse) has
+    // its start after its end.
     double start = 0, end = 0;
+    bool reverse = false;
 };
 
 // The 80 bits of the word, bit 0 first. `base` (24, 25 or 30) places the bit that keeps each word starting the same
@@ -51,8 +53,9 @@ std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dr
 std::vector<float> encodeLtcPiece(int64_t start, int64_t from, int64_t to, Rational fps, bool dropFrame, int sampleRate,
                                   float level, uint32_t userBits, double& state);
 
-// Reads LTC from a stream of samples (one channel). It locks on to bits of 0.33 to 0.66 ms (23.976 to 30 fps and some
-// way either side), then follows the bit length as the speed drifts (to 0.26 to 0.79 ms).
+// Reads LTC from a stream of samples (one channel), forwards or backwards (a tape in reverse). It locks on to bits of
+// 0.066 to 3.3 ms (23.976 to 30 fps from a fifth of play speed to five times it, as a deck shuttles), then follows
+// the bit length as the speed changes.
 class LtcDecoder {
 public:
     explicit LtcDecoder(int sampleRate);

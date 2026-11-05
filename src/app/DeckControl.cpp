@@ -56,6 +56,13 @@ QString rateName(Rational r) {
     return QString::number(int(std::lround(r.toDouble())));
 }
 
+ninepin::TimeSource timeSourceNamed(const QString& name) {
+    if (name == QLatin1String("vitc")) return ninepin::TimeSource::Vitc;
+    if (name == QLatin1String("timer")) return ninepin::TimeSource::Timer1;
+    if (name == QLatin1String("auto")) return ninepin::TimeSource::Auto;
+    return ninepin::TimeSource::Ltc;
+}
+
 std::map<std::string, std::string> parseOptions(const QString& text) {
     std::map<std::string, std::string> out;
     for (const QString& kv : text.split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
@@ -116,6 +123,7 @@ bool DeckController::connectDeck(const QString& port, Rational rate, QString* er
         if (error) *error = tr("No deck answered on %1 (%2)").arg(port, why);
         return false;
     }
+    deck_.timecode();  // (how it counts its timecode, drop frame or not, from what it sends)
     return true;
 }
 
@@ -152,7 +160,7 @@ QString DeckController::deckStatus() {
                    : st->standby    ? tr("Standby")
                                     : tr("Stop");
     if (st->local) what += tr(" (local)");
-    return f >= 0 ? tr("%1  %2").arg(what, tc(f, deckRate_)) : what;
+    return f >= 0 ? tr("%1  %2").arg(what, QString::fromStdString(formatTimecode(f, deck_.base(), deck_.deckDropFrame()))) : what;
 }
 
 // ---- Work on the deck
@@ -239,6 +247,10 @@ bool DeckController::startEditToTape(const TapeEdit& e, FrameTime programIn, QSt
         if (error) *error = tr("The deck is busy");
         return false;
     }
+    if (const Sequence* s = state_->sequence(); s && s->fps != deckRate_) {
+        if (error) *error = tr("The Program runs at %1 fps and the deck at %2: set the deck's rate to the Program's").arg(rateName(s->fps), rateName(deckRate_));
+        return false;
+    }
     finishWork();
     cancel_ = false;
     workDone_ = false;
@@ -249,12 +261,12 @@ bool DeckController::startEditToTape(const TapeEdit& e, FrameTime programIn, QSt
         std::string err;
         const bool ok = editToTape(
             deck_, e,
-            [self, e, programIn, fps](int64_t tapeFrame, double clock) {
+            [self, programIn, fps](int64_t framesToIn, double clock) {
                 // The Program started so its first frame of the edit goes out as the deck reaches In.
-                QMetaObject::invokeMethod(self, [self, e, programIn, fps, tapeFrame, clock] {
+                QMetaObject::invokeMethod(self, [self, programIn, fps, framesToIn, clock] {
                     if (!self || !self->program_) return;
                     const double late = (captureClock() - clock) * fps;
-                    const FrameTime from = programIn - FrameTime(e.in - tapeFrame) + FrameTime(std::lround(late));
+                    const FrameTime from = programIn - FrameTime(framesToIn) + FrameTime(std::lround(late));
                     self->state_->setPlayhead(std::max<FrameTime>(0, from));
                     if (from >= 0) {
                         self->program_->play();
@@ -440,16 +452,23 @@ void DeckController::chaseTick() {
     if (p.state == LtcChase::State::Locked || p.state == LtcChase::State::Freewheel) {
         const FrameTime target = FrameTime(std::floor(p.frame + 1e-6)) - programStart_;
         if (target < 0) return;
-        const bool atSpeed = std::fabs(p.speed - 1) < 0.05;
-        if (atSpeed && (!program_->isPlaying() || program_->speed() != 1)) {
-            if (!program_->isPlaying()) state_->setPlayhead(target);
-            program_->play();
-        } else if (!atSpeed && std::fabs(program_->speed() - p.speed) > 0.01) {
-            program_->setSpeed(p.speed);
+        // (the fastest the Program plays either way, as PlaybackController::setSpeed takes it; faster, it is put where
+        // the master is as it goes)
+        constexpr double kFastest = 32;
+        const bool atSpeed = std::fabs(p.speed - 1) < 0.05, playable = std::fabs(p.speed) <= kFastest;
+        if (atSpeed) {
+            if (!program_->isPlaying() || program_->speed() != 1) {
+                if (!program_->isPlaying()) state_->setPlayhead(target);
+                program_->play();
+            }
+        } else if (playable) {
+            if (std::fabs(program_->speed() - p.speed) > 0.01 * std::max(1.0, std::fabs(p.speed))) program_->setSpeed(p.speed);
+        } else if (program_->isPlaying()) {
+            program_->pause();
         }
         chaseRolling_ = true;
         // (more than a frame out: put right; within it, left to run)
-        if (std::llabs(program_->position() - target) > 1) state_->setPlayhead(target);
+        if (!playable || std::llabs(program_->position() - target) > 1) state_->setPlayhead(target);
     } else if (chaseRolling_) {
         program_->pause();
         chaseRolling_ = false;
@@ -479,6 +498,7 @@ QByteArray DeckController::toolJson() {
 "handles":{"type":"number","description":"Seconds either side (2)"},
 "preroll":{"type":"number","description":"Seconds (5)"},
 "latency_frames":{"type":"number","description":"How late the picture arrives behind the deck's timecode, for a feed without its own"},
+"timecode_source":{"type":"string","enum":["ltc","vitc","timer","auto"],"description":"The deck's timecode read as it plays (ltc)"},
 "in":{"type":"string","description":"The edit's In on the tape"},
 "out":{"type":"string","description":"The edit's Out on the tape (the first frame not recorded)"},
 "program_in":{"type":"string","description":"The Program's timecode the edit starts from (default: its In mark)"},
@@ -598,7 +618,7 @@ QString DeckController::runTool(const QJsonObject& args, QJsonObject& structured
     if (action == QLatin1String("cue")) {
         int64_t f = 0;
         if (!tapeFrame("timecode", f)) return fail(tr("timecode is not a timecode"));
-        if (!deck_.cue(f)) return fail(QString::fromStdString(deck_.lastError()));
+        if (!deck_.cue(deck_.toDeck(f))) return fail(QString::fromStdString(deck_.lastError()));
         return tr("Cueing to %1").arg(tc(f, deckRate_));
     }
     if (action == QLatin1String("capture")) {
@@ -630,6 +650,7 @@ QString DeckController::runTool(const QJsonObject& args, QJsonObject& structured
         s.handles = args.value("handles").toDouble(2);
         s.preroll = args.value("preroll").toDouble(5);
         s.latencyFrames = args.value("latency_frames").toInt(0);
+        s.source = timeSourceNamed(args.value("timecode_source").toString());
         QString err;
         if (!startBatchCapture(log, s, &err)) return fail(err);
         return tr("Capturing %n clip(s): \"status\" follows it", nullptr, int(log.size()));
@@ -728,7 +749,7 @@ DeckDialog::DeckDialog(DeckController* deck, EditorState* state, QWidget* parent
             activity_->appendPlainText(tr("The deck is busy: %1").arg(deck_->lastWork()));
             return;
         }
-        if (!deck_->deck().cue(f)) activity_->appendPlainText(QString::fromStdString(deck_->deck().lastError()));
+        if (!deck_->deck().cue(deck_->deck().toDeck(f))) activity_->appendPlainText(QString::fromStdString(deck_->deck().lastError()));
     });
     cueRow->addWidget(cue_, 1);
     cueRow->addWidget(cueGo);
@@ -769,6 +790,14 @@ DeckDialog::DeckDialog(DeckController* deck, EditorState* state, QWidget* parent
     preroll_->setValue(settings.value(QStringLiteral("deck/preroll"), 5.0).toDouble());
     preroll_->setSuffix(tr(" s"));
     batchForm->addRow(tr("Pre-roll:"), preroll_);
+    timeSource_ = new QComboBox(this);
+    timeSource_->addItem(tr("LTC"), QStringLiteral("ltc"));
+    timeSource_->addItem(tr("VITC"), QStringLiteral("vitc"));
+    timeSource_->addItem(tr("Timer"), QStringLiteral("timer"));
+    timeSource_->addItem(tr("LTC or VITC"), QStringLiteral("auto"));
+    if (const int i = timeSource_->findData(settings.value(QStringLiteral("deck/timeSource"))); i >= 0) timeSource_->setCurrentIndex(i);
+    timeSource_->setToolTip(tr("The deck's timecode, read as it plays to place pictures that carry none of their own"));
+    batchForm->addRow(tr("Deck timecode:"), timeSource_);
     auto* capture = new QPushButton(tr("Capture"), this);
     capture->setObjectName(QStringLiteral("deckCapture"));
     connect(capture, &QPushButton::clicked, this, &DeckDialog::runBatch);
@@ -853,6 +882,7 @@ void DeckDialog::refresh() {
     if (deck_->chasing()) text += QStringLiteral("\n") + deck_->chaseStatus();
     status_->setText(text);
     connect_->setText(deck_->deckConnected() ? tr("Disconnect") : tr("Connect"));
+    remote_->setChecked(deck_->remoteRunning());  // (off once its port has gone)
 }
 
 void DeckDialog::connectDeck() {
@@ -891,6 +921,7 @@ void DeckDialog::runBatch() {
     QSettings settings;
     settings.setValue(QStringLiteral("deck/handles"), handles_->value());
     settings.setValue(QStringLiteral("deck/preroll"), preroll_->value());
+    settings.setValue(QStringLiteral("deck/timeSource"), timeSource_->currentData());
     BatchCaptureSettings s;
     s.capture.video.device = sourceKind_->currentData().toString().toStdString();
     s.capture.video.url = source_->text().toStdString();
@@ -899,6 +930,7 @@ void DeckDialog::runBatch() {
     s.folder = folder_->text().toStdString();
     s.handles = handles_->value();
     s.preroll = preroll_->value();
+    s.source = timeSourceNamed(timeSource_->currentData().toString());
     QString err;
     if (!deck_->startBatchCapture(log, s, &err)) activity_->appendPlainText(err);
 }

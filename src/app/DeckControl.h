@@ -149,6 +149,7 @@ private:
     QLineEdit* folder_ = nullptr;
     QDoubleSpinBox* handles_ = nullptr;
     QDoubleSpinBox* preroll_ = nullptr;
+    QComboBox* timeSource_ = nullptr;
     QLineEdit* editIn_ = nullptr;
     QCheckBox* assemble_ = nullptr;
     QCheckBox* video_ = nullptr;

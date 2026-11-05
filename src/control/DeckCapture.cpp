@@ -24,6 +24,8 @@ int64_t parseTimecode(const std::string& text, int base, bool* dropFrame, bool a
         return -1;
     f.dropFrame = (assumeDrop || c == ';' || c == '.' || c == ',') && base == 30;
     if (dropFrame) *dropFrame = f.dropFrame;
+    // (a label drop frame skips, 00:01:00;00 and ;01, stands for the next there is)
+    if (f.dropFrame && f.seconds == 0 && f.frames < 2 && f.minutes % 10 != 0) f.frames = 2;
     return ltcFrameNumber(f, base);
 }
 
@@ -104,7 +106,11 @@ std::vector<LogEntry> readCaptureLog(const std::string& path, int base, bool dro
             if (error && error->empty()) *error = "Line " + std::to_string(row + 1) + " has no usable In and Out";
             return;
         }
-        if (e.out <= e.in) e.out += ltcFramesPerDay(base, drop);  // (over midnight)
+        if (e.out == e.in) {
+            if (error && error->empty()) *error = "Line " + std::to_string(row + 1) + "'s Out is its In: the clip has no frames";
+            return;
+        }
+        if (e.out < e.in) e.out += ltcFramesPerDay(base, drop);  // (over midnight)
         e.name = cell(c.name).empty() ? "Clip " + std::to_string(out.size() + 1) : cell(c.name);
         e.reel = cell(c.reel).empty() ? defaultReel : cell(c.reel);
         e.comment = cell(c.comment);
@@ -207,10 +213,14 @@ std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEn
     auto say = [&](int i, const std::string& what) {
         if (progress) progress(i, what);
     };
+    // (how the deck counts, from its timecode: the log's labels are found on it, the clips labelled its way)
+    deck.timecode(s.source);
+    const bool drop = deck.deckDropFrame();
     for (int i = 0; i < int(log.size()); ++i) {
         BatchClip clip;
         clip.entry = log[size_t(i)];
-        const int64_t from = std::max<int64_t>(0, clip.entry.in - handle), to = clip.entry.out + handle;
+        const int64_t in = deck.toDeck(clip.entry.in), last = deck.toDeck(clip.entry.out);
+        const int64_t from = std::max<int64_t>(0, in - handle), to = last + handle;
         std::string name = safeName(clip.entry.reel.empty() ? clip.entry.name : clip.entry.reel + "_" + clip.entry.name);
         clip.path = s.folder + "/" + name + s.extension;
         for (int k = 2; std::ifstream(clip.path).good(); ++k) clip.path = s.folder + "/" + name + " " + std::to_string(k) + s.extension;
@@ -219,14 +229,14 @@ std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEn
             out.push_back(clip);
             continue;
         }
-        if (to > ltcFramesPerDay(base, deck.dropFrame())) {
+        if (to > ltcFramesPerDay(base, drop)) {
             clip.error = "The clip runs over midnight on the tape: log it as two clips";
             out.push_back(clip);
             continue;
         }
         // Cued to its pre-roll.
         const int64_t cueAt = std::max<int64_t>(0, from - preroll);
-        say(i, "Cueing to " + formatTimecode(cueAt, base, deck.dropFrame()));
+        say(i, "Cueing to " + formatTimecode(cueAt, base, drop));
         if (!deck.cue(cueAt) || !deck.waitForCue(cueAt, s.cueTimeout, cancel)) {
             clip.error = deck.lastError().empty() ? "The deck did not reach the cue" : deck.lastError();
             out.push_back(clip);
@@ -241,7 +251,7 @@ std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEn
         cs.seconds = 0;
         cs.fromFrame = from;
         cs.frames = to - from;
-        cs.labelDropFrame = deck.dropFrame();
+        cs.labelDropFrame = drop;
         const int latency = s.latencyFrames;
         cs.label = [&tape, latency](double arrived) {
             const int64_t f = tape.frameAt(arrived);
@@ -282,12 +292,12 @@ std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEn
         const CaptureStatus st = rec.status();
         clip.frames = st.frames;
         clip.timecode = st.timecode;
-        const int64_t first = parseTimecode(st.timecode, base, nullptr, deck.dropFrame());
+        const int64_t first = parseTimecode(st.timecode, base, nullptr, drop);
         if (stopped) clip.error = "Stopped";
         else if (!st.error.empty()) clip.error = st.error;
         else if (st.frames == 0) clip.error = "No pictures came from the feed while the deck played";
         else if (first != from)
-            clip.error = "The recording began at " + st.timecode + ", not " + formatTimecode(from, base, deck.dropFrame()) +
+            clip.error = "The recording began at " + st.timecode + ", not " + formatTimecode(from, base, drop) +
                          " (the deck rolled late, or the feed's timecode does not match the deck's)";
         else if (st.frames < to - from) clip.error = "The deck's picture stopped short of the clip's end";
         clip.ok = clip.error.empty();
@@ -299,41 +309,64 @@ std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEn
 
 bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void(int64_t, double)>& roll, const std::atomic<bool>* cancel,
                 std::string* error) {
+    bool told = false;  // (the deck told to record: on any failure from then, stopped)
     auto fail = [&](const std::string& why) {
+        if (told) deck.stop();
         if (error) *error = why;
         return false;
     };
     if (e.out <= e.in) return fail("The edit's Out is not after its In");
     const int base = deck.base();
-    const double fps = base == 30 ? 30000.0 / 1001 : double(base);  // (for how long to wait)
-    const int64_t preroll = int64_t(std::llround(e.preroll * base));
-    if (!deck.setEditChannels(e.channels) || !deck.setIn(e.in) || !deck.setOut(e.out) || !deck.setPrerollTime(preroll))
+    const double fps = base == 30 ? 30000.0 / 1001 : double(base);
+    // (how the deck counts, from its timecode: In found by its label there, the edit as long as asked)
+    deck.timecode(ninepin::TimeSource::Ltc);
+    const int64_t in = deck.toDeck(e.in), out = in + (e.out - e.in);
+    // (no pre-roll from before 00:00:00:00, where the deck's timecode would run back to 23:59)
+    const int64_t preroll = std::min<int64_t>(in, int64_t(std::llround(e.preroll * base)));
+    if (!deck.setEditChannels(e.channels) || !deck.setIn(in) || !deck.setOut(out) || !deck.setPrerollTime(preroll))
         return fail("The deck refused the edit: " + deck.lastError());
+    told = true;
     if (!deck.autoEdit()) return fail("The deck refused the edit: " + deck.lastError());
-    // Watched as it runs: rolling up to In (the Program started then), recording, and stopping after Out.
+    // Watched as it runs: rolling up to In (the Program started then), recording, and stopping after Out. A run of
+    // readings moving forward at play speed, each where the first and the time since put it, is the deck rolling.
     const double limit = captureClock() + double(preroll + (e.out - e.in)) / fps + 60;
-    bool rolled = false, recorded = false;
-    int64_t last = -1;
+    bool rolled = false, recorded = false, finished = false;
+    struct Run {
+        int64_t frame = -1;  // its first reading
+        double at = 0, began = 0;
+    } run, rolledOn;
     while (captureClock() < limit) {
-        if (cancel && *cancel) {
-            deck.stop();
-            return fail("Stopped");
-        }
+        if (cancel && *cancel) return fail("Stopped");
         const auto st = deck.status();
         const double before = captureClock();
         const int64_t f = deck.timecode(ninepin::TimeSource::Ltc);
+        const double after = captureClock(), mid = (before + after) / 2;
         if (!st || f < 0) return fail("The deck stopped answering: " + deck.lastError());
-        if (!rolled && st->play && f < e.in && (last < 0 || f > last)) {
-            rolled = true;
-            if (roll) roll(f, before);
-        }
+        const bool forward = st->play && !st->reverse && !st->shuttle && !st->jog && !st->var && !st->still;
+        if (!forward) run = {};
+        else if (run.frame < 0 || std::fabs(double(f - run.frame) - (mid - run.at) * fps) > 2 + (after - before) * fps) run = {f, mid, mid};
         recorded = recorded || st->record;
-        if (rolled && !st->autoEdit && !st->edit && !st->record && (st->stop || st->still || f >= e.out)) break;
-        last = f;
+        // (a deck that jumped after the Program was started, before In: the Program started again once it runs up)
+        if (rolled && !recorded && f < in && run.began != rolledOn.began) rolled = false;
+        const bool steady = run.frame >= 0 && f - run.frame >= 2;
+        const bool near = f < in && f >= in - preroll - int64_t(std::lround(fps));
+        // (servo lock, when the deck reports it; one that never does is taken as locked after a second's play, or
+        // with half a second to go)
+        const bool locked = st->servoLock || mid - run.began > 1.0 || double(in - f) < fps / 2;
+        if (!rolled && !recorded && steady && near && locked) {
+            rolled = true;
+            rolledOn = run;
+            if (roll) roll(in - f, before);
+        }
+        if ((rolled || recorded) && !st->autoEdit && !st->edit && !st->record && (st->stop || st->still || f >= out)) {
+            finished = true;
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (!rolled) return fail("The deck never rolled to the edit");
     if (!recorded) return fail("The deck did not record");
+    if (!finished) return fail("The deck did not finish the edit");
     return true;
 }
 
