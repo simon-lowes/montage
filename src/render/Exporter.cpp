@@ -855,7 +855,7 @@ private:
 
 bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                 const std::atomic<bool>* cancel, std::string* error, bool& opened, std::string* encoderUsed, int* smartRendered,
-                LightLevels* light) {
+                LightLevels* light, bool* encodeWhole = nullptr) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
@@ -2093,7 +2093,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         int longGopCopied = 0;
         std::string longGopError;
-        if (wantVideo && longGop && (longGopCopied = longGop->copy(f - din, &longGopError)) < 0) return fail(longGopError);
+        if (wantVideo && longGop && (longGopCopied = longGop->copy(f - din, &longGopError)) < 0) {
+            if (longGopCopied == -2 && encodeWhole) *encodeWhole = true;
+            return fail(longGopError);
+        }
         if (longGopCopied > 0) {
             // copied from the source, a GOP at a time
         } else if (wantVideo && smart && smart->copy(f, in, o.oc)) {
@@ -2820,6 +2823,16 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // A described master: the mix without the descriptions, then the programme with them as a stream of its own.
     const bool described = s.describedStream && hasDescriptionClips(seq) && !s.audioCodec.empty() && s.audioCodec != "none" &&
                            containerCarriesStreams(s.path);
+    // Smart rendering that cannot go on as planned (HEVC copied as hvc1 whose footage is not found where it was): made
+    // again, encoded whole.
+    auto exportOnce = [&](const Sequence& q, const ExportSettings& st) {
+        bool again = false;
+        if (exportImpl(p, q, st, progress, cancel, error, opened, encoderUsed, smartRendered, light, &again)) return true;
+        if (!again || (cancel && cancel->load())) return false;
+        ExportSettings whole = st;
+        whole.smartRender = false;
+        return exportImpl(p, q, whole, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+    };
     bool ok;
     if (layout != seq.audioLayout || described) {
         Sequence work = seq;
@@ -2848,9 +2861,9 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
             settings.extraAudio.push_back(std::move(ad));
             if (settings.audioName.empty()) settings.audioName = "Programme";
         }
-        ok = exportImpl(p, work, settings, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+        ok = exportOnce(work, settings);
     } else {
-        ok = exportImpl(p, seq, s, progress, cancel, error, opened, encoderUsed, smartRendered, light);
+        ok = exportOnce(seq, s);
     }
     // An ambisonic mix in MP4 or MOV: the Spatial Audio box, so YouTube and players hear it as a field.
     if (ok && ambisonicLayout(layout) && !s.downmixStereo && !s.audioCodec.empty() && s.audioCodec != "none") {

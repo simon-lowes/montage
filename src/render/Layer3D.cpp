@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 
 #include "core/Model.h"
 #include "render/ColorSpace.h"
@@ -269,21 +270,58 @@ bool renderClipLayer3D(const Project& p, const Sequence& seq, const Clip& c, con
         // The other cards casting shadows through the same kind of camera at t.
         std::vector<Layer3DCaster> casters;
         const long mode = std::lround(e.p("camera", lt, 3));
+        // The cards in view at t through that kind of camera, by the first 3D Layer effect each is drawn by.
+        struct Card {
+            const Clip* clip;
+            const Effect* fx;
+            size_t track;
+        };
+        std::vector<Card> cards;
+        for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+            const Track& track = seq.videoTracks[ti];
+            for (const Clip& k : track.clips) {
+                if (track.muted || !k.enabled || t < k.start || t >= k.end()) continue;
+                const Effect* ke = nullptr;
+                for (const Effect& x : k.effects)
+                    if (!ke && x.enabled && x.node == 0 && x.type == "layer_3d") ke = &x;
+                if (ke && std::lround(ke->p("camera", t - k.start, 3)) == mode) cards.push_back({&k, ke, ti});
+            }
+        }
+        if (std::none_of(cards.begin(), cards.end(), [&](const Card& g) { return g.clip->id == c.id; })) cards.push_back({&c, &e, 0});
+        auto grounded = [&](const Card& g) { return g.fx->p("lit", t - g.clip->start, 0) > 0.5 && g.fx->p("ground", t - g.clip->start, 0) > 0.5; };
+        // A caster with no ground of its own shadows one ground, not every lit card's: the nearest below its middle (with
+        // none below it, the nearest above); of grounds as high, that of the card on the nearest track under its own
+        // (else the nearest over it).
+        auto groundOf = [&](const Card& k, const Layer3DPlace& at) -> const Clip* {
+            const Card* best = nullptr;
+            double bestRise = 0;
+            for (const Card& g : cards) {
+                if (g.clip->id == k.clip->id || !grounded(g)) continue;
+                const double rise = at.origin[1] - g.fx->p("ground_y", t - g.clip->start, 0);  // (how far it is above it)
+                auto rank = [&](const Card& x, double r) {
+                    const size_t under = x.track <= k.track ? k.track - x.track : SIZE_MAX / 2 + (x.track - k.track);
+                    return std::make_tuple(r >= 0 ? 0 : 1, std::fabs(r), under);
+                };
+                if (!best || rank(g, rise) < rank(*best, bestRise)) best = &g, bestRise = rise;
+            }
+            return best ? best->clip : nullptr;
+        };
         if (cardLayer)
-            for (const Track& track : seq.videoTracks)
-                for (const Clip& k : track.clips) {
-                    if (track.muted || &k == &c || k.id == c.id || !k.enabled || t < k.start || t >= k.end()) continue;
-                    const Effect* ke = nullptr;  // (its first, as the card is drawn by)
-                    for (const Effect& x : k.effects)
-                        if (!ke && x.enabled && x.node == 0 && x.type == "layer_3d") ke = &x;
-                    if (!ke || ke->p("shadows", t - k.start, 0) <= 0.5 || std::lround(ke->p("camera", t - k.start, 3)) != mode) continue;
-                    if (k.isGenerator() && k.generator.type == "model3d") continue;
-                    const Image kl = cardLayer(k);
-                    if (kl.empty()) continue;
-                    const FrameTime kt = t - k.start;
-                    casters.push_back({layer3dPlace(*ke, t - k.start, seq.width, seq.height), pictureTexture(kl, seq),
-                                       ke->p("lit", kt, 0) > 0.5 && ke->p("ground", kt, 0) > 0.5});
-                }
+            for (const Card& kc : cards) {
+                const Clip& k = *kc.clip;
+                const Effect* ke = kc.fx;
+                if (&k == &c || k.id == c.id) continue;
+                const FrameTime kt = t - k.start;
+                if (ke->p("shadows", kt, 0) <= 0.5) continue;
+                if (k.isGenerator() && k.generator.type == "model3d") continue;
+                const Image kl = cardLayer(k);
+                if (kl.empty()) continue;
+                const Layer3DPlace kp = layer3dPlace(*ke, kt, seq.width, seq.height);
+                // (on this card's ground only when it has none of its own and this is the one it falls on)
+                const Clip* onto = grounded(kc) ? nullptr : groundOf(kc, kp);
+                const bool elsewhere = !onto || onto->id != c.id;
+                casters.push_back({kp, pictureTexture(kl, seq), elsewhere});
+            }
         out = renderLitLayer3D(seq, e, lt, layer, pl, cam, casters, d);
     } else {
         out = renderLayer3D(layer, pl, cam, scale, d);

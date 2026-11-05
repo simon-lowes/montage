@@ -18,6 +18,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/timecode.h>
 }
 
@@ -419,6 +420,64 @@ int h264ProfileRank(int idc) {
     }
 }
 
+// The profile, tier and level an opened encoder's parameter sets state (its extradata, Annex B), 0 when they state none.
+struct Stated {
+    int profile = 0, level = 0;
+    bool highTier = false;
+};
+
+Stated statedBy(int codec, const AVCodecContext* m) {
+    Stated st;
+    if (!m->extradata || m->extradata_size <= 0) return st;
+    for (const auto& [d, n] : annexBNals(m->extradata, size_t(m->extradata_size))) {
+        if (codec == kH264 && (d[0] & 31) == 7 && n >= 4) {
+            st.profile = d[1], st.level = d[3];
+            break;
+        }
+        if (codec == kHevc && n > 2 && ((d[0] >> 1) & 0x3f) == 33) {
+            // (after the SPS's VPS id, sub-layers and nesting: profile space, tier and profile, 4 bytes of compatibility
+            // flags, 6 of constraints, then the level)
+            const Bits b(d + 2, n - 2);
+            if (b.b.size() < 13) continue;
+            st.profile = b.b[1] & 0x1f, st.highTier = (b.b[1] >> 5) & 1, st.level = b.b[12];
+            break;
+        }
+    }
+    return st;
+}
+
+// HEVC: whether a decoder of the export's profile decodes the source's (the same pixels either way).
+bool hevcProfileFits(int source, int exported) {
+    return source == exported || (source == 1 && exported == 2) || (source == 3 && (exported == 1 || exported == 2));
+}
+
+// An avcC's High profiles' extension (ISO/IEC 14496-15, 5.3.3.1.2): chroma format, bit depths and the SPS extensions
+// (those of `sources`' extensions, each once). Empty for Baseline, Main and Extended.
+std::vector<uint8_t> avccHighExtension(int profile, AVPixelFormat format, const std::vector<std::vector<uint8_t>>& sources) {
+    if (profile == 66 || profile == 77 || profile == 88) return {};
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(format);
+    if (!d) return {};
+    const int chroma = d->nb_components < 3 ? 0 : d->log2_chroma_w == 1 && d->log2_chroma_h == 1 ? 1 : d->log2_chroma_w == 1 ? 2 : 3;
+    const int depth = std::clamp(d->comp[0].depth - 8, 0, 7);
+    std::vector<std::vector<uint8_t>> ext;
+    for (const auto& t : sources) {
+        if (t.size() < 4) continue;
+        for (size_t i = 4, k = 0; k < t[3] && i + 2 <= t.size(); ++k) {
+            const size_t len = size_t(t[i]) << 8 | t[i + 1];
+            if (i + 2 + len > t.size()) break;
+            std::vector<uint8_t> e(t.begin() + std::ptrdiff_t(i + 2), t.begin() + std::ptrdiff_t(i + 2 + len));
+            if (std::find(ext.begin(), ext.end(), e) == ext.end() && ext.size() < 255) ext.push_back(std::move(e));
+            i += 2 + len;
+        }
+    }
+    std::vector<uint8_t> o{uint8_t(0xfc | chroma), uint8_t(0xf8 | depth), uint8_t(0xf8 | depth), uint8_t(ext.size())};
+    for (const auto& e : ext) {
+        o.push_back(uint8_t(e.size() >> 8)), o.push_back(uint8_t(e.size()));
+        o.insert(o.end(), e.begin(), e.end());
+    }
+    return o;
+}
+
 }  // namespace
 
 // ---- The plan ----
@@ -479,16 +538,22 @@ struct LongGopCopier::Copy {
     int64_t bytes = 0;
 };
 
-// The most a frame of footage may take to be copied: a tenth over the export's own rate; at a quality (CRF), a generous
-// bound on what the encoder spends at it (H.264's CRF 23 at half a bit a pixel, about three times what camera footage
-// takes there; HEVC's 28 at half that), halved every six steps worse.
+// The most a frame of footage may take to be copied: a tenth over the export's own rate; at a quality (CRF), half as
+// much again as the encoder typically spends there (x264's CRF 23 at a tenth of a bit a pixel at 1080p, x265's CRF 28
+// at half that; more a pixel on smaller pictures, less on larger, as bits go with the pixels' count to the power 3/4;
+// twice as much at the fastest presets, which leave out most of the coding tools), halved every six steps worse. (So a
+// phone's 4K H.264 at 50 Mb/s, a fifth of a bit a pixel, is encoded for a draft at CRF 28, and its HEVC at 40 Mb/s for
+// an HEVC export at CRF 22.)
 double LongGopCopier::ceilingBitsPerFrame() const {
     const AVCodecContext* m = enc_.main;
     const double fps = m->framerate.num > 0 && m->framerate.den > 0 ? av_q2d(m->framerate) : 25.0;
     if (codec_ == kMpeg2) return m->bit_rate > 0 ? 1.1 * double(m->bit_rate) / fps : 1e300;
     if (enc_.bitrate > 0) return 1.1 * double(enc_.bitrate) / fps;
-    const double pixels = double(m->width) * double(m->height);
-    return codec_ == kHevc ? 0.25 * std::exp2((28 - enc_.crf) / 6.0) * pixels : 0.5 * std::exp2((23 - enc_.crf) / 6.0) * pixels;
+    const double pixels = std::max(1.0, double(m->width) * double(m->height));
+    const double perPixel = codec_ == kHevc ? 0.05 * std::exp2((28 - enc_.crf) / 6.0) : 0.1 * std::exp2((23 - enc_.crf) / 6.0);
+    const double size = std::pow(pixels / (1920.0 * 1080.0), -0.25);
+    const double fastest = enc_.preset == "ultrafast" || enc_.preset == "superfast" ? 2.0 : 1.0;
+    return 1.5 * perPixel * size * fastest * pixels;
 }
 
 LongGopCopier::~LongGopCopier() {
@@ -559,7 +624,9 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     }
     if (lg->runs_.empty()) return none("no untouched footage");
 
-    // The sources: the same pictures the encoder would make, in a file whose packets can be taken as they are.
+    // The sources: the same pictures the encoder would make, in a file whose packets can be taken as they are, at no
+    // profile, tier or level above what the export's encoder states (when it states them).
+    const Stated exported = statedBy(codec, m);
     std::set<int> spsIds, ppsIds;
     std::map<int, std::vector<uint8_t>> spsById, ppsById;
     for (auto& sp : lg->sources_) {
@@ -597,13 +664,22 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         src.profile = par->profile;
         src.level = par->level;
         src.config.assign(par->extradata, par->extradata + par->extradata_size);
+        bool highTier = false;
         if (codec == kHevc && src.config.size() >= 23) {
-            lg->highTier_ = lg->highTier_ || ((src.config[1] >> 5) & 1);
+            highTier = (src.config[1] >> 5) & 1;
             src.level = src.config[12];
+            if (exported.profile > 0 && (!hevcProfileFits(src.config[1] & 0x1f, exported.profile) || (highTier && !exported.highTier) ||
+                                         src.level > exported.level))
+                continue;
         }
         if (codec == kH264) {
             // Its parameter sets beside the others' in the one avcC: none under an id another holds differently.
             if (!parseAvcc(src.config.data(), src.config.size(), src.avcc)) continue;
+            bool above = false;
+            for (const auto& s : src.avcc.sps)
+                above = above || s.size() < 4 || h264ProfileRank(s[1]) == 0 ||
+                        (exported.profile > 0 && (h264ProfileRank(s[1]) > h264ProfileRank(exported.profile) || s[3] > exported.level));
+            if (above) continue;
             if (lg->firstSource_ >= 0 && src.avcc.lengthSize != lg->lengthSize_) continue;
             bool clash = false;
             for (const auto& s : src.avcc.sps) {
@@ -629,6 +705,7 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         src.held = av_packet_alloc();
         if (!src.held) continue;
         src.usable = true;
+        lg->highTier_ = lg->highTier_ || highTier;
         if (lg->firstSource_ < 0) lg->firstSource_ = int(&sp - lg->sources_.data());
     }
     if (lg->firstSource_ < 0) return none("no source coded as the export is");
@@ -737,7 +814,9 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             c.gop = gi;
             c.bytes = g.bytes;
             bool ok = false;
-            if (prev != SIZE_MAX && prev + 1 == gi && r.e0 + (g.lo - r.s0) == lastCopyEnd + 1) {
+            if (g.bytes > encoder.maxGopBytes) {
+                ok = false;  // (encoded: too large to hold while it is read)
+            } else if (prev != SIZE_MAX && prev + 1 == gi && r.e0 + (g.lo - r.s0) == lastCopyEnd + 1) {
                 // After the GOP before it, as in the source.
                 ok = g.whole && g.lo >= r.s0 && g.hi < s1;
                 c.lo = r.e0 + (g.lo - r.s0);
@@ -834,6 +913,11 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
                 all.compat &= sps[2];
                 all.level = std::max(all.level, sps[3]);
             }
+        // (raised to a High profile above the first source's, the configuration takes the extension those carry)
+        std::vector<std::vector<uint8_t>> tails;
+        for (const auto& sp : lg->sources_)
+            if (sp->usable) tails.push_back(sp->avcc.tail);
+        all.tail = avccHighExtension(all.profile, m->pix_fmt, tails);
         lg->profile_ = all.profile, lg->level_ = all.level;
         if (all.sps.size() > 31 || all.pps.size() > 255) return none("too many parameter sets");
         lg->sources_[size_t(lg->firstSource_)]->config = buildAvcc(all);
@@ -1102,9 +1186,10 @@ int LongGopCopier::copy(FrameTime rel, std::string* error) {
         std::vector<AVPacket*> gop;
         const int got = readGop(copies_[cursor_], gop, error);
         if (got < 0) return -1;
-        if (got == 0 && hvc1_) {  // (an encoded part's sets cannot go beside the source's out of band)
+        if (got == 0 && hvc1_) {
+            // (an encoded part's sets cannot go beside the source's out of band: the export is made again, encoded)
             fail(error, "Smart rendering: the HEVC footage was not found as it was planned (did the file change?)");
-            return -1;
+            return -2;
         }
         if (got == 0) {
             // Not found again as it was planned (a seek landing elsewhere, the file changed): its frames are encoded

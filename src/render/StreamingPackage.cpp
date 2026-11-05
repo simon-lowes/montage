@@ -1183,9 +1183,12 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             return fail("The folder already has a \"" + n + "\" that this package did not make: choose an empty folder");
     }
     // Into place: what the earlier package had there moved aside first, then the new package moved in; if any move
-    // fails (a player holding a segment open, say), every move is undone, so the earlier package is left whole.
-    const QString asideName = QStringLiteral(".montage-package-old");
-    QDir(root.filePath(asideName)).removeRecursively();
+    // fails (a player holding a segment open, say), every move is undone, so the earlier package is left whole. What
+    // an earlier export could not put back is kept where its message said (an aside folder still holding anything is
+    // never reused or removed here): this one moves aside into a folder of its own.
+    QString asideName = QStringLiteral(".montage-package-old");
+    for (int n = 2; QFileInfo::exists(root.filePath(asideName)) && !root.rmdir(asideName); ++n)
+        asideName = QStringLiteral(".montage-package-old-%1").arg(n);
     if (!root.mkpath(asideName)) return fail("Cannot make " + finalFolder + "/" + asideName.toStdString());
     struct Aside {
         QString dir;
@@ -1203,10 +1206,10 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         bool back = true;
         for (auto it = moved.rbegin(); it != moved.rend(); ++it) back = root.rename(it->second, it->first) && back;
         if (back) return fail(why);
-        // (what could not be put back is kept where it was moved to, not deleted with the folders made for the move)
-        aside.dir.clear(), staging.dir.clear();
-        return fail(why + "; what could not be put back is in " + finalFolder + "/" + asideName.toStdString() + " and " + finalFolder + "/" +
-                    stagingName.toStdString());
+        // (the earlier package's files that could not be put back are kept where they were moved to, not deleted with
+        // the folder made for the move; only the new package's go back to the staging folder, which goes)
+        aside.dir.clear();
+        return fail(why + "; the earlier package's files that could not be put back are in " + finalFolder + "/" + asideName.toStdString());
     };
     std::vector<QString> moving;
     for (const char* f : {"master.m3u8", "manifest.mpd", "chapters.vtt"}) moving.push_back(QString::fromLatin1(f));

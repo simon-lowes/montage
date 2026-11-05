@@ -20236,6 +20236,31 @@ if __name__ == '__main__':
             QCOMPARE(QJsonDocument::fromJson(lines[0]).object().value("id").toInt(), 5);
             QCOMPARE(QJsonDocument::fromJson(lines[1]).object().value("result").toObject().value("structuredContent").toObject().value("status").toString(), QString("done"));
         }
+        // A call that stops with an exception of any kind (here one that is no std::exception, thrown by the
+        // notification sink while the call reports its progress) is answered with an error and ends its turn: the
+        // next call runs.
+        {
+            McpServer thrown;
+            thrown.setNotificationSink([](const std::string&) { throw 7; });
+            QVERIFY(QDir().mkpath(dir.path() + "/card/DCIM"));
+            {
+                QFile f(dir.path() + "/card/DCIM/A001.MOV");
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                f.write(QByteArray(4096, 'x'));
+            }
+            const auto send = [&](int id, const QString& name, const QJsonObject& args, const QJsonObject& meta) {
+                QJsonObject params{{"name", name}, {"arguments", args}};
+                if (!meta.isEmpty()) params["_meta"] = meta;
+                const auto lines = thrown.handle(
+                    QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"}, {"params", params}}).toJson(QJsonDocument::Compact).toStdString());
+                return lines.empty() ? QJsonObject() : QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            const QJsonObject failed = send(1, "montage_offload", {{"source", dir.path() + "/card"}, {"destinations", QJsonArray{dir.path() + "/copy"}}},
+                                            {{"progressToken", "offload-1"}});
+            QVERIFY2(failed.value("isError").toBool(), qPrintable(QJsonDocument(failed).toJson()));
+            const QJsonObject next = send(2, "montage_probe_media", {{"path", out}}, {});
+            QVERIFY2(!next.value("isError").toBool(), qPrintable(QJsonDocument(next).toJson()));
+        }
         // A second one cancelled while it runs, a third while it waits behind it: both end "cancelled" (the third never
         // started: no file), and the list has all three.
         const QString out2 = dir.path() + "/cancelled.mp4", out3 = dir.path() + "/queued.mp4";
@@ -21301,6 +21326,272 @@ if ui["pressed"] == "add":
                 QVERIFY(result.value("content").toArray().at(0).toObject().value("text").toString().contains("copied from the source as coded"));
                 QFile::remove(QString::fromStdString(path("lg-mcp.mxf")));
             }
+        }
+    }
+
+    void smartRenderingLimits() {
+        // Footage made here (a turning gradient with light grain, in GOPs of 12), each file's frames placed one after
+        // another in a cut, and what an export of the cut copies.
+        auto footage = [&](const std::string& file, int w, int h, int frames, const std::function<void(ExportSettings&)>& set) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = w, gs.height = h, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", frames);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(frames - 1, 140.0);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = 0.05;
+            grad.effects.push_back(grain);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+            ExportSettings st;
+            st.audioCodec = "none";
+            st.gop = 12;
+            set(st);
+            st.path = path(file.c_str());
+            std::string err;
+            const bool made = exportSequence(gen, gs, st, nullptr, nullptr, &err);
+            if (!made) qWarning("%s: %s", file.c_str(), err.c_str());
+            return made ? st.path : std::string();
+        };
+        auto cutOf = [&](Project& p, int w, int h, const std::vector<std::pair<std::string, int>>& files) {
+            Sequence& s = *p.active();
+            s.width = w, s.height = h, s.fps = Rational{25, 1};
+            FrameTime at = 0;
+            for (const auto& [file, frames] : files) {
+                MediaItem m = probeOrFail(p, file);
+                p.media.push_back(m);
+                if (!edit::placeMedia(p, s, m.id, at, 0, frames, {TrackKind::Video, 0}, {}, false).ok) return false;
+                at += frames;
+            }
+            return true;
+        };
+        auto copiedBy = [&](const Project& p, ExportSettings ex, const std::string& file, const ExportProgress& progress = nullptr) {
+            ex.path = path(file.c_str());
+            std::string err;
+            int copied = -1;
+            if (!exportSequence(p, *p.active(), ex, progress, nullptr, &err, nullptr, &copied)) {
+                qWarning("%s: %s", file.c_str(), err.c_str());
+                return -1;
+            }
+            return copied;
+        };
+        // The pictures a file decodes to, and those it decoded with errors.
+        auto decoded = [](const std::string& file, int& errors) {
+            int frames = 0;
+            errors = 0;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return -1;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = v >= 0 ? avcodec_find_decoder(fmt->streams[v]->codecpar->codec_id) : nullptr;
+            AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+            if (ctx) {
+                avcodec_parameters_to_context(ctx, fmt->streams[v]->codecpar);
+                ctx->err_recognition = AV_EF_CRCCHECK | AV_EF_EXPLODE;
+            }
+            if (ctx && avcodec_open2(ctx, codec, nullptr) >= 0) {
+                AVPacket* pkt = av_packet_alloc();
+                AVFrame* fr = av_frame_alloc();
+                auto take = [&] {
+                    while (avcodec_receive_frame(ctx, fr) >= 0) {
+                        if (fr->decode_error_flags || (fr->flags & AV_FRAME_FLAG_CORRUPT)) ++errors;
+                        ++frames;
+                        av_frame_unref(fr);
+                    }
+                };
+                while (av_read_frame(fmt, pkt) >= 0) {
+                    if (pkt->stream_index == v && avcodec_send_packet(ctx, pkt) < 0) ++errors;
+                    av_packet_unref(pkt);
+                    take();
+                }
+                avcodec_send_packet(ctx, nullptr);
+                take();
+                av_frame_free(&fr);
+                av_packet_free(&pkt);
+            }
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            return frames;
+        };
+        // A file's video decoder configuration (avcC, hvcC) and sample entry.
+        auto configOf = [](const std::string& file, uint32_t* tag = nullptr) {
+            QByteArray config;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return config;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            if (v >= 0) {
+                const AVCodecParameters* par = fmt->streams[v]->codecpar;
+                config = QByteArray(reinterpret_cast<const char*>(par->extradata), par->extradata_size);
+                if (tag) *tag = par->codec_tag;
+            }
+            avformat_close_input(&fmt);
+            return config;
+        };
+        int errors = -1;
+
+        // ---- Coded at well over what the export would spend at its quality: encoded, not copied. A fifth of a bit a
+        // pixel (as a phone's 4K at 50 Mb/s is) is copied into an export at CRF 16, not into a draft at CRF 28; HEVC at
+        // three twentieths (as a phone's is) likewise.
+        {
+            const std::string rich = footage("lim-rich.mp4", 960, 540, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx264", st.preset = "veryfast", st.videoBitrate = int64_t(0.2 * 960 * 540 * 25);
+            });
+            QVERIFY(!rich.empty());
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 960, 540, {{rich, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx264", ex.audioCodec = "none", ex.preset = "veryfast";
+            ex.crf = 16;
+            QCOMPARE(copiedBy(p, ex, "lim-rich-16.mp4"), 48);
+            ex.crf = 28;
+            QCOMPARE(copiedBy(p, ex, "lim-rich-28.mp4"), 0);
+            // And at a profile above the export's: x264's fastest preset codes Constrained Baseline, so High footage
+            // is encoded (where the copy would have made the file High).
+            ex.crf = 16;
+            ex.preset = "ultrafast";
+            QCOMPARE(copiedBy(p, ex, "lim-rich-baseline.mp4"), 0);
+            const QByteArray baseline = configOf(path("lim-rich-baseline.mp4"));
+            QVERIFY(baseline.size() > 4 && uchar(baseline[1]) == 66);
+
+            const std::string phone = footage("lim-phone.mp4", 960, 540, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx265", st.preset = "veryfast", st.videoBitrate = int64_t(0.15 * 960 * 540 * 25);
+            });
+            QVERIFY(!phone.empty());
+            Project q = makeDefaultProject();
+            QVERIFY(cutOf(q, 960, 540, {{phone, 48}}));
+            ex.videoCodec = "libx265", ex.preset = "veryfast";
+            ex.crf = 16;
+            QCOMPARE(copiedBy(q, ex, "lim-phone-16.mp4"), 48);
+            ex.crf = 28;
+            QCOMPARE(copiedBy(q, ex, "lim-phone-28.mp4"), 0);
+            for (const char* f : {"lim-rich-16.mp4", "lim-rich-28.mp4", "lim-rich-baseline.mp4", "lim-phone-16.mp4", "lim-phone-28.mp4"})
+                QFile::remove(QString::fromStdString(path(f)));
+        }
+
+        // ---- At a level above the export's (x264's slowest presets keep sixteen pictures to refer to, which takes a
+        // higher level than one does): encoded; at the export's own, copied.
+        const std::string deep = footage("lim-deep.mp4", 320, 180, 48, [](ExportSettings& st) {
+            st.videoCodec = "libx264", st.preset = "veryslow", st.crf = 23;
+        });
+        const std::string fast = footage("lim-fast.mp4", 320, 180, 48, [](ExportSettings& st) {
+            st.videoCodec = "libx264", st.preset = "veryfast", st.crf = 23, st.parameterSetId = 1;
+        });
+        QVERIFY(!deep.empty() && !fast.empty());
+        {
+            const QByteArray d = configOf(deep), f = configOf(fast);
+            QVERIFY2(d.size() > 4 && f.size() > 4 && uchar(d[3]) > uchar(f[3]), qPrintable(QString("levels %1 and %2").arg(uchar(d[3])).arg(uchar(f[3]))));
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{deep, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx264", ex.audioCodec = "none", ex.crf = 16;
+            ex.preset = "veryfast";
+            QCOMPARE(copiedBy(p, ex, "lim-deep-fast.mp4"), 0);
+            ex.preset = "veryslow";
+            QCOMPARE(copiedBy(p, ex, "lim-deep-slow.mp4"), 48);
+            QFile::remove(QString::fromStdString(path("lim-deep-fast.mp4")));
+            QFile::remove(QString::fromStdString(path("lim-deep-slow.mp4")));
+        }
+
+        // ---- Constrained Baseline footage, then High: the file's avcC is High, so it carries the High profiles'
+        // extension (ISO/IEC 14496-15: 4:2:0, 8 bits, no SPS extensions), which the first footage's had not.
+        {
+            const std::string plain = footage("lim-plain.mp4", 320, 180, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx264", st.preset = "ultrafast", st.crf = 30;
+            });
+            QVERIFY(!plain.empty());
+            const QByteArray first = configOf(plain);
+            QVERIFY(first.size() > 4 && uchar(first[1]) == 66);
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{plain, 48}, {fast, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx264", ex.audioCodec = "none", ex.crf = 23, ex.preset = "veryfast";
+            QCOMPARE(copiedBy(p, ex, "lim-mixed.mp4"), 96);
+            const QByteArray avcc = configOf(path("lim-mixed.mp4"));
+            QVERIFY(avcc.size() > 7 && uchar(avcc[1]) == 100);
+            // (past the parameter sets: the extension's four bytes)
+            int i = 6;
+            for (int k = 0, n = uchar(avcc[5]) & 31; k < n; ++k) i += 2 + (int(uchar(avcc[i])) << 8 | uchar(avcc[i + 1]));
+            for (int k = 0, n = uchar(avcc[i++]); k < n; ++k) i += 2 + (int(uchar(avcc[i])) << 8 | uchar(avcc[i + 1]));
+            QCOMPARE(avcc.mid(i).toHex(), QByteArray("fdf8f800"));
+            QCOMPARE(decoded(path("lim-mixed.mp4"), errors), 96);
+            QCOMPARE(errors, 0);
+            QFile::remove(QString::fromStdString(path("lim-mixed.mp4")));
+        }
+
+        // ---- A GOP coded in more bytes than the copier holds while it reads one is encoded, not copied.
+        {
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{fast, 48}}));
+            const Sequence& s = *p.active();
+            const AVCodec* x264 = avcodec_find_encoder_by_name("libx264");
+            QVERIFY(x264);
+            AVCodecContext* m = avcodec_alloc_context3(x264);
+            m->width = 320, m->height = 180, m->pix_fmt = AV_PIX_FMT_YUV420P;
+            m->time_base = AVRational{1, 25}, m->framerate = AVRational{25, 1};
+            m->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            AVDictionary* opts = nullptr;
+            av_dict_set(&opts, "preset", "veryfast", 0);
+            av_dict_set(&opts, "crf", "23", 0);
+            QVERIFY(avcodec_open2(m, x264, &opts) >= 0);
+            av_dict_free(&opts);
+            AVFormatContext* oc = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&oc, nullptr, "mp4", nullptr) >= 0);
+            AVStream* vst = avformat_new_stream(oc, nullptr);
+            LongGopEncoder lge;
+            lge.preset = "veryfast";
+            lge.crf = 23;
+            lge.main = m;
+            std::string why;
+            QVERIFY2(LongGopCopier::plan(p, s, 0, 48, sequenceColorSpace(s), lge, oc, vst, &why) != nullptr, why.c_str());
+            lge.maxGopBytes = 1000;
+            QVERIFY(LongGopCopier::plan(p, s, 0, 48, sequenceColorSpace(s), lge, oc, vst, &why) == nullptr);
+            QVERIFY2(why.find("GOP") != std::string::npos, why.c_str());
+            avformat_free_context(oc);
+            avcodec_free_context(&m);
+        }
+
+        // ---- HEVC copied whole, its parameter sets out of band (hvc1): when its footage is not found as planned while
+        // the copy runs (the file it was planned from emptied, the same footage at its name again), the export is made
+        // again, encoded, rather than given up.
+        {
+            // (coded finely, so a GOP takes more than the reader holds)
+            const std::string hevc = footage("lim-hevc.mp4", 320, 180, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx265", st.preset = "ultrafast", st.crf = 4;
+            });
+            QVERIFY(!hevc.empty());
+            QVERIFY(QFileInfo(QString::fromStdString(hevc)).size() > 200000);
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{hevc, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx265", ex.audioCodec = "none", ex.crf = 4, ex.preset = "ultrafast";
+            uint32_t tag = 0;
+            QCOMPARE(copiedBy(p, ex, "lim-hevc-copy.mp4"), 48);
+            configOf(path("lim-hevc-copy.mp4"), &tag);
+            QCOMPARE(tag, uint32_t(MKTAG('h', 'v', 'c', '1')));
+            const QString src = QString::fromStdString(hevc), planned = src + ".planned";
+            bool swapped = false, emptied = false;
+            const ExportProgress swap = [&](double, FrameTime) {
+                if (swapped) return;
+                swapped = true;
+                if (!QFile::rename(src, planned)) return;  // (a file open cannot be renamed on Windows)
+                QFile::copy(planned, src);
+                QFile f(planned);
+                emptied = f.resize(0);
+                MediaPool::instance().forget(hevc);
+            };
+            const int copied = copiedBy(p, ex, "lim-hevc-lost.mp4", swap);
+            QVERIFY(swapped);
+            if (emptied) {
+                QCOMPARE(copied, 0);
+                QCOMPARE(decoded(path("lim-hevc-lost.mp4"), errors), 48);
+                QCOMPARE(errors, 0);
+            } else {
+                qInfo("The footage could not be moved while it was open: not checked here");
+            }
+            QFile::remove(planned);
+            QFile::remove(QString::fromStdString(path("lim-hevc-copy.mp4")));
+            QFile::remove(QString::fromStdString(path("lim-hevc-lost.mp4")));
         }
     }
 
@@ -35116,6 +35407,16 @@ if ui["pressed"] == "add":
             s.videoTracks[1].clips = {right};
             const float onAnother = darkest(renderSequenceFrame(p, s, 3, o));
             QVERIFY2(std::fabs(onAnother - oneGround) < 0.01f, qPrintable(QString("a shadow on another card's ground: %1").arg(onAnother)));
+            // Beside two such cards, their grounds at the same height, it lands on one ground (the card's on the
+            // nearest track to its own), not on both, which would darken it twice.
+            Clip third = right;
+            third.id = p.newId();
+            third.effects[0].params["pos_y"] = 70.0;
+            while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+            s.videoTracks[2].clips = {third};
+            const float onOne = darkest(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(std::fabs(onOne - oneGround) < 0.01f, qPrintable(QString("a shadow by two grounds: %1, by one %2").arg(onOne).arg(oneGround)));
+            s.videoTracks[2].clips.clear();
             s.videoTracks[1].clips.clear();
         }
 

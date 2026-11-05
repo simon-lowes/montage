@@ -19474,6 +19474,13 @@ colorspaces:
 
         // (and an empty folder named as a rendition is: it holds nothing a package wrote)
         QVERIFY(pkg.mkpath("a1_storyboard"));
+        // What an earlier export could not put back stays where its message said; this export moves aside elsewhere.
+        QVERIFY(pkg.mkpath(".montage-package-old/" + videos[0]));
+        {
+            QFile kept(pkg.filePath(".montage-package-old/" + videos[0] + "/seg00001.m4s"));
+            QVERIFY(kept.open(QIODevice::WriteOnly));
+            kept.write("earlier");
+        }
 
         // time_signal cues instead: segmentation descriptors for a provider placement opportunity's start and end.
         st.cueCommand = "time_signal";
@@ -19495,7 +19502,8 @@ colorspaces:
         QVERIFY(pkg.exists("s1_en/seg00001.vtt"));
         QVERIFY(pkg.exists("s2_final/notes.txt"));
         QVERIFY(pkg.exists("a1_storyboard"));
-        QVERIFY(!pkg.exists(".montage-package-old"));
+        QVERIFY(pkg.exists(".montage-package-old/" + videos[0] + "/seg00001.m4s"));
+        QVERIFY(!pkg.exists(".montage-package-old-2"));
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the
