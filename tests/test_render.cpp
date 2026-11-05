@@ -4327,6 +4327,96 @@ colorspaces:
             displaceByMap(a, map, ds);
             serially([&] { displaceByMap(b, map, ds); });
             QVERIFY(same(a, b));
+            // And with a wide blur (made of boxes): the same, and a mid-grey map still moves nothing.
+            ds.mapBlur = 60;
+            displaceByMap(a = pic, map, ds);
+            serially([&] { displaceByMap(b = pic, map, ds); });
+            QVERIFY(same(a, b));
+            displaceByMap(a = pic, solid(64, 48, 0.5f, 0.5f, 0.5f), ds);
+            QVERIFY(same(a, pic));
+            ds.bicubic = false, ds.mapBlur = 0;
+        }
+        // A wide map blur is a Gaussian's (as three boxes): a step from 0.25 to 0.75 blurred by a radius of 40 (sigma 20)
+        // moves a ramp by 8 erf(d / (sigma sqrt 2)) pixels at d from the step.
+        {
+            const int W = 256, H = 4;
+            Image ramp(W, H), map(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = ramp.at(x, y);
+                    p[0] = (x + 0.5f) / W, p[3] = 1;
+                    float* m = map.at(x, y);
+                    m[0] = x < W / 2 ? 0.25f : 0.75f, m[3] = 1;
+                }
+            DisplaceSettings s;
+            s.horizontalAmount = 8;
+            s.vertical = DisplaceChannel::Off;
+            s.mapBlur = 40;
+            Image img = ramp;
+            displaceByMap(img, map, s);
+            double worst = 0;
+            for (int x = 64; x < 192; ++x) {
+                const double d = x + 0.5 - W / 2.0, want = 4 * std::erf(d / (20 * std::sqrt(2.0)));
+                worst = std::max(worst, std::fabs(img.at(x, 1)[0] * W - 0.5 - x - want));
+            }
+            QVERIFY2(worst < 0.15, qPrintable(QString("%1 px from a Gaussian's").arg(worst)));
+        }
+        // Map values past 0 and 1 (an HDR map's) move no further than black and white; one that is not a number moves
+        // nothing.
+        {
+            DisplaceSettings s;
+            s.horizontalAmount = 6, s.verticalAmount = 3;
+            Image white = pic, hdr = pic, nan = pic;
+            displaceByMap(white, solid(64, 48, 1, 0, 0.5f), s);
+            displaceByMap(hdr, solid(64, 48, 7, -3, 0.5f), s);
+            QVERIFY(same(white, hdr));
+            Image nanMap = solid(64, 48, 0.5f, 0.5f, 0.5f);
+            for (size_t i = 0; i < nanMap.px.size(); i += 4) nanMap.px[i] = nanMap.px[i + 1] = std::numeric_limits<float>::quiet_NaN();
+            displaceByMap(nan, nanMap, s);
+            QVERIFY(same(nan, pic));
+        }
+        // Bicubic: a hard edge moved by half a pixel overshoots nowhere (each channel within its nearest pixels').
+        {
+            Image edge(32, 4);
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 32; ++x) {
+                    float* q = edge.at(x, y);
+                    q[0] = q[3] = x < 16 ? 0.0f : 1.0f, q[1] = x < 16 ? 0.2f : 0.9f, q[2] = 0.5f;
+                }
+            DisplaceSettings s;
+            s.horizontalAmount = 20, s.vertical = DisplaceChannel::Off, s.bicubic = true;
+            Image moved = edge;
+            displaceByMap(moved, solid(32, 4, 0.5125f, 0.5f, 0.5f), s);  // (half a pixel)
+            float lo = 1, hi = 0;
+            for (int x = 0; x < 32; ++x) lo = std::min(lo, moved.at(x, 1)[1]), hi = std::max(hi, moved.at(x, 1)[1]);
+            for (size_t i = 0; i < moved.px.size(); ++i) QVERIFY2(moved.px[i] >= -1e-6f && moved.px[i] <= 1 + 1e-6f, qPrintable(QString::number(moved.px[i])));
+            QVERIFY2(lo >= 0.2f - 1e-6f && hi <= 0.9f + 1e-6f, qPrintable(QString("%1 %2").arg(lo).arg(hi)));
+        }
+        // Edges within a smaller picture: a 16 x 12 picture at (20, 10) on the frame wraps, holds and ends at its own
+        // edges, and the frame about it is left as it was.
+        {
+            Image frame(64, 48);
+            for (int y = 10; y < 22; ++y)
+                for (int x = 20; x < 36; ++x) std::copy(pic.at(x, y), pic.at(x, y) + 4, frame.at(x, y));
+            DisplaceSettings s;
+            s.horizontalAmount = 20, s.vertical = DisplaceChannel::Off;  // (10 pixels right)
+            s.left = 20, s.top = 10, s.right = 36, s.bottom = 22;
+            for (int edge = 0; edge < 3; ++edge) {
+                s.edge = DisplaceEdge(edge);
+                Image img = frame;
+                displaceByMap(img, solid(64, 48, 0.75f, 0.5f, 0.5f), s);
+                for (int y : {5, 10, 15, 21, 30})
+                    for (int x : {10, 20, 25, 26, 35, 40}) {
+                        const bool inside = x >= 20 && x < 36 && y >= 10 && y < 22;
+                        const int from = x + 10;
+                        const float* want = !inside ? frame.at(x, y)
+                                            : edge == 0 ? frame.at(20 + (from - 20) % 16, y)
+                                            : edge == 1 ? frame.at(std::min(from, 35), y)
+                                            : from < 36 ? frame.at(from, y) : nullptr;
+                        for (int c = 0; c < 4; ++c)
+                            QVERIFY2(std::fabs(img.at(x, y)[c] - (want ? want[c] : 0.0f)) < 1e-6f, qPrintable(QString("edge %1 at %2,%3").arg(edge).arg(x).arg(y)));
+                    }
+            }
         }
 
         // Paint, oil: a flat area stays as it is, a step edge stays where it was and sharp.
@@ -4359,6 +4449,46 @@ colorspaces:
             anisotropicKuwahara(a, ks);
             serially([&] { anisotropicKuwahara(b, ks); });
             QVERIFY(same(a, b));
+            // A wide brush (sampled every few pixels from the picture averaged over boxes): flat stays flat, the step
+            // stays where it was, and the same on the pool as on one thread.
+            {
+                KuwaharaSettings wide;
+                wide.radius = 40;
+                Image f = solid(48, 48, 0.3f, 0.5f, 0.7f);
+                anisotropicKuwahara(f, wide);
+                float off = 0;
+                for (size_t i = 0; i < f.px.size(); ++i) off = std::max(off, std::fabs(f.px[i] - solid(1, 1, 0.3f, 0.5f, 0.7f).px[i % 4]));
+                QVERIFY2(off < 1e-5f, qPrintable(QString::number(off)));
+                Image k2 = step;
+                anisotropicKuwahara(k2, wide);
+                for (int y = 0; y < 48; y += 7) {
+                    int cross = -1;
+                    for (int x = 1; x < 48 && cross < 0; ++x)
+                        if (k2.at(x - 1, y)[0] < 0.5f && k2.at(x, y)[0] >= 0.5f) cross = x;
+                    QVERIFY2(std::abs(cross - 24) <= 2, qPrintable(QString("row %1 crosses at %2").arg(y).arg(cross)));
+                    QVERIFY(std::fabs(k2.at(4, y)[0] - 0.1f) < 0.02f && std::fabs(k2.at(44, y)[0] - 0.9f) < 0.02f);
+                }
+                Image c1 = noise(40, 40), c2 = c1;
+                anisotropicKuwahara(c1, wide);
+                serially([&] { anisotropicKuwahara(c2, wide); });
+                QVERIFY(same(c1, c2));
+            }
+            // Stopped with the render: the picture as it came, and the frame noted as not final.
+            {
+                std::atomic<bool> stop{true};
+                Image k3 = e;
+                QVERIFY(!anisotropicKuwahara(k3, ks, &stop));
+                QVERIFY(same(k3, e));
+                SmearSettings ss;
+                QVERIFY(!contourSmear(k3, ss, &stop));
+                QVERIFY(same(k3, e));
+                RenderIssues issues;
+                SlowEffectsScope slow({true, &stop, &issues});
+                Effect fx = makeEffect(p, "painterly");
+                applyVideoEffect(fx, 0, k3, 1);
+                QVERIFY(same(k3, e));
+                QVERIFY(issues.incomplete.load());
+            }
             // The effect: at no mix the picture as it was; at full mix smoothed (less change from pixel to pixel).
             Effect fx = makeEffect(p, "painterly");
             fx.params["mix"] = 0.0;
@@ -4461,6 +4591,23 @@ colorspaces:
             c.effects.back().params["hide"] = 0.0;
             const Image covered = renderProgramFrame(pr, s, 2, RenderOptions());
             QVERIFY(std::fabs(covered.at(10, 10)[0] - 0.75f) < 0.01f && std::fabs(covered.at(10, 10)[2] - 0.5f) < 0.01f);
+            // At half size (32 x 18, at 16, 9) the edges are the picture's: wrapped, its right four columns come from its
+            // left, and the black about it stays black.
+            c.effects.back().params["hide"] = 1.0;
+            c.effects.back().params["edges"] = 0.0;
+            c.motion.params["scale"] = 50.0;
+            c.effects.back().params["h_amount"] = 0.0;  // (moving nothing, the map still hidden)
+            const Image small = renderProgramFrame(pr, s, 2, RenderOptions());
+            c.effects.back().params["h_amount"] = 8.0;
+            const Image wrapped = renderProgramFrame(pr, s, 2, RenderOptions());
+            float apart = 0;
+            for (int y = 0; y < 36; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    const bool inside = x >= 16 && x < 48 && y >= 9 && y < 27;
+                    const float* want = inside ? small.at(16 + (x + 4 - 16) % 32, y) : small.at(x, y);
+                    for (int k = 0; k < 3; ++k) apart = std::max(apart, std::fabs(wrapped.at(x, y)[k] - want[k]));
+                }
+            QVERIFY2(apart < 1e-3f, qPrintable(QString::number(apart)));
         }
     }
 
@@ -6199,6 +6346,148 @@ colorspaces:
             QVERIFY(readJxlFrame(at("still.jxl"), 0, w, h, px, nullptr, &err));
             QCOMPARE(std::lround(px[size_t(5 * 24 + 7) * 4] * 255), 70L);
             QCOMPARE(std::lround(px[size_t(5 * 24 + 7) * 4 + 1] * 255), 75L);
+        }
+    }
+
+    void jpegXlDamagedLargeLossyAndProfiled() {
+        if (!jxlAvailable()) QSKIP("Built without libjxl");
+        QTemporaryDir dir;
+        auto at = [&](const char* name) { return dir.filePath(name).toStdString(); };
+        auto save = [](const std::string& f, const std::vector<uint8_t>& b) {
+            QFile out(QString::fromStdString(f));
+            return out.open(QIODevice::WriteOnly) && out.write(reinterpret_cast<const char*>(b.data()), qint64(b.size())) == qint64(b.size());
+        };
+        std::string err;
+
+        // A few bytes of header asking for 16384 x 16384 (2^28 pixels, which would take gigabytes) are refused before
+        // anything is decoded; 8192 x 8192 (2^26) passes the size and fails as the file it is, cut short.
+        auto header = [](uint32_t w, uint32_t h) {
+            std::vector<uint8_t> b{0xff, 0x0a};
+            uint64_t bits = 0;
+            int n = 0;
+            auto put = [&](uint64_t v, int count) { bits |= v << n, n += count; };
+            put(0, 1);                  // not a multiple of 8
+            put(2, 2), put(h - 1, 18);  // the height, in 18 bits
+            put(0, 3);                  // no ratio: the width follows
+            put(2, 2), put(w - 1, 18);
+            put(1, 1);                  // the image metadata all default
+            for (int i = 0; i < n; i += 8) b.push_back(uint8_t(bits >> i));
+            b.resize(b.size() + 16, 0);
+            return b;
+        };
+        QVERIFY(save(at("huge.jxl"), header(16384, 16384)));
+        JxlInfo info;
+        QVERIFY(!readJxlInfo(at("huge.jxl"), info, &err));
+        QVERIFY2(err.find("too large") != std::string::npos, err.c_str());
+        int w = 0, h = 0;
+        std::vector<float> px;
+        err.clear();
+        QVERIFY(!readJxlFrame(at("huge.jxl"), 0, w, h, px, nullptr, &err));
+        QVERIFY2(err.find("too large") != std::string::npos && px.empty(), err.c_str());
+        JxlAnimationReader reader;
+        QVERIFY(!reader.open(at("huge.jxl"), &err));
+        QVERIFY(save(at("big.jxl"), header(8192, 8192)));
+        err.clear();
+        QVERIFY(!readJxlFrame(at("big.jxl"), 0, w, h, px, nullptr, &err));
+        QVERIFY2(!err.empty() && err.find("too large") == std::string::npos, err.c_str());
+
+        // Damaged files fail with a reason and nothing else: cut short anywhere, or with bytes changed.
+        constexpr int W = 64, H = 48;
+        std::vector<float> noise(size_t(W) * H * 4);
+        uint32_t seed = 99;
+        for (float& v : noise) v = float(((seed = seed * 1664525u + 1013904223u) >> 8) & 0xffff) / 65535.0f;
+        JxlWriteOptions o;
+        std::vector<uint8_t> good;
+        QVERIFY2(encodeJxl(good, W, H, {noise.data()}, o, &err), err.c_str());
+        for (const size_t keep : {size_t(12), size_t(40), good.size() / 2, good.size() - 1}) {
+            QVERIFY(save(at("cut.jxl"), std::vector<uint8_t>(good.begin(), good.begin() + std::ptrdiff_t(keep))));
+            err.clear();
+            QVERIFY2(!readJxlFrame(at("cut.jxl"), 0, w, h, px, nullptr, &err) && !err.empty(), qPrintable(QString("kept %1 bytes").arg(keep)));
+        }
+        std::vector<uint8_t> bad = good;
+        for (size_t i = 30; i < bad.size(); i += 97) bad[i] ^= 0x5a;
+        QVERIFY(save(at("bad.jxl"), bad));
+        err.clear();
+        if (readJxlFrame(at("bad.jxl"), 0, w, h, px, nullptr, &err)) QVERIFY(w == W && h == H && px.size() == size_t(W) * H * 4);
+        else QVERIFY(!err.empty());
+        {
+            // An animation cut short: opening it, or its last frame, fails.
+            std::vector<std::vector<float>> frames(3, noise);
+            std::vector<uint8_t> moving;
+            QVERIFY2(encodeJxl(moving, W, H, {frames[0].data(), frames[1].data(), frames[2].data()}, o, &err, {1, 1, 1}, 25, 1), err.c_str());
+            moving.resize(moving.size() * 3 / 4);
+            QVERIFY(save(at("cut_moving.jxl"), moving));
+            JxlAnimationReader cut;
+            if (cut.open(at("cut_moving.jxl"), &err)) QVERIFY(!cut.frame(2, w, h, px, &err));
+        }
+
+        // Lossy (XYB): read back in the encoding it was written in, close to what was written.
+        {
+            std::vector<float> smooth(size_t(W) * H * 4, 1.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* q = &smooth[size_t(y * W + x) * 4];
+                    q[0] = float(x) / (W - 1), q[1] = float(y) / (H - 1), q[2] = 0.5f;
+                }
+            JxlWriteOptions lossy;
+            lossy.bits = 8;
+            lossy.distance = 1;
+            for (const char* id : {"srgb", "p3d65"}) {
+                lossy.colorSpace = id;
+                QVERIFY2(writeJxl(at("lossy.jxl"), W, H, smooth.data(), lossy, &err), err.c_str());
+                QVERIFY(readJxlInfo(at("lossy.jxl"), info, &err));
+                QVERIFY2(info.colorSpace == id && !info.icc, info.colorSpace.c_str());
+                QVERIFY(readJxlFrame(at("lossy.jxl"), 0, w, h, px, nullptr, &err));
+                // (on average within a hundredth: read in another encoding, it would be tenths out)
+                double sum = 0;
+                for (size_t i = 0; i < smooth.size(); ++i) sum += std::fabs(px[i] - smooth[i]);
+                QVERIFY2(sum / double(smooth.size()) < 0.01, qPrintable(QString("%1: %2 on average").arg(id).arg(sum / double(smooth.size()))));
+            }
+        }
+
+        // A colour stated by an ICC profile that is none of Montage's spaces (ProPhoto's: D50 white, a 1.8 curve) is not
+        // read as Rec.709: converted to linear Rec.709 display light, colours past its gamut kept; or, without Little
+        // CMS, refused.
+        {
+            const QByteArray icc = QColorSpace(QColorSpace::ProPhotoRgb).iccProfile();
+            QVERIFY(!icc.isEmpty());
+            constexpr int N = 32;
+            std::vector<float> pro(size_t(N) * N * 4, 1.0f);
+            for (int i = 0; i < N * N; ++i) {
+                float* q = &pro[size_t(i) * 4];
+                if (i % N >= N / 2) q[0] = 1, q[1] = 0, q[2] = 0;  // ProPhoto's red on the right
+                else q[0] = q[1] = q[2] = 0.5f;                   // grey on the left
+            }
+            for (const double distance : {0.0, 1.0}) {
+                JxlWriteOptions po;
+                po.iccProfile.assign(icc.begin(), icc.end());
+                po.distance = distance;
+                const std::string f = at(distance > 0 ? "prophoto_lossy.jxl" : "prophoto.jxl");
+                QVERIFY2(writeJxl(f, N, N, pro.data(), po, &err), err.c_str());
+                err.clear();
+                if (!jxlConvertsProfiles()) {
+                    QVERIFY(!readJxlInfo(f, info, &err));
+                    QVERIFY2(err.find("Little CMS") != std::string::npos, err.c_str());
+                    continue;
+                }
+                QVERIFY2(readJxlInfo(f, info, &err), err.c_str());
+                QCOMPARE(info.colorSpace, std::string("linear-rec709+display"));
+                QVERIFY(findColorSpace(info.colorSpace) && !findColorSpace(info.colorSpace)->sceneReferred);
+                QVERIFY2(readJxlFrame(f, 0, w, h, px, nullptr, &err), err.c_str());
+                const double tolerance = distance > 0 ? 0.03 : 3e-3;
+                const float* grey = &px[size_t(N / 2 * N + 4) * 4];
+                const float* red = &px[size_t(N / 2 * N + N - 5) * 4];
+                const double g = std::pow(0.5, 1.8);
+                QVERIFY2(std::fabs(grey[0] - g) < tolerance && std::fabs(grey[1] - g) < tolerance && std::fabs(grey[2] - g) < tolerance,
+                         qPrintable(QString("grey %1 %2 %3").arg(grey[0]).arg(grey[1]).arg(grey[2])));
+                // (ProPhoto's red in Rec.709: about 2.03, -0.23, -0.01)
+                const double off = distance > 0 ? 0.1 : 0.05;
+                QVERIFY2(std::fabs(red[0] - 2.03) < 2 * off && std::fabs(red[1] + 0.23) < off && std::fabs(red[2]) < off && std::fabs(red[3] - 1) < 1e-6,
+                         qPrintable(QString("red %1 %2 %3 %4").arg(red[0]).arg(red[1]).arg(red[2]).arg(red[3])));
+                MediaItem m;
+                QVERIFY(probeMedia(f, m));
+                QCOMPARE(m.colorSpace, std::string("linear-rec709+display"));
+            }
         }
     }
 
@@ -9116,9 +9405,11 @@ colorspaces:
         QVERIFY(r.application == 45 && r.frames == 252 && r.codedFrames == 252 && r.bits == 10 && r.colour == "rec709" && r.prores == "hq");
         std::vector<std::string> issues = verifyImf(r.folder);
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
-        // Photon holds every track file to ST 2067-5's partitions (index tables and essence never together); RDD 45 asks
-        // for RDD 44's instead (each body partition after the first carries the previous one's index), so that one
-        // finding is expected and everything else Photon checks has to pass.
+        // Photon flags these packages: it holds every track file to ST 2067-5's partitions (index tables and essence
+        // never together), and RDD 45 asks for RDD 44's instead (each body partition after the first carries the
+        // previous one's index). The RDD 44 layout is kept on purpose, as Application ProRes says, so an ingest that
+        // gates on Photon passing cleanly refuses these packages; that one finding is filtered out here, and
+        // everything else Photon checks has to pass.
         auto photonFindings = [](const std::string& folder) {
             QStringList found = photonErrors(QString::fromStdString(folder));
             found.removeIf([](const QString& e) { return e.contains("has both index table and essence"); });
@@ -14469,6 +14760,43 @@ colorspaces:
         QVERIFY(std::abs(got[0].start - 5) <= 1 && std::abs(got[0].end - 40) <= 1);
         snd.close();
 
+        // ST 2022-7: a path that cannot send (here to the broadcast address, which a socket not let broadcast is refused)
+        // leaves the other sending, its errors counted against it; with that path alone, the frame fails.
+        {
+            st::SenderOptions two = o;
+            two.redundant = true;
+            two.video2 = {"255.255.255.255", rv.port()}, two.audio2 = {"255.255.255.255", ra.port()}, two.anc2 = {"255.255.255.255", rx.port()};
+            st::Sender pair;
+            QVERIFY2(pair.open(two, v, st::AudioFormat{}, &why), why.c_str());
+            std::atomic<bool> halt{false};
+            std::vector<uint8_t> d;
+            while (rv.receive(d, 0)) {}
+            const size_t stride = rowBytes(PixelFormat::V210, 320);
+            QVERIFY(pair.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+            QVERIFY(rv.receive(d, 1000));
+            QCOMPARE(pair.sendErrors(0), int64_t(0));
+#ifdef __linux__
+            QVERIFY(pair.sendErrors(1) > 0);
+            st::SenderOptions alone = o;
+            alone.video = two.video2;
+            st::Sender lone;
+            QVERIFY2(lone.open(alone, v, st::AudioFormat{}, &why), why.c_str());
+            QVERIFY(!lone.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+            QVERIFY(lone.sendErrors(0) > 0);
+#endif
+            // Late by a few frames (a hold-up shorter than a fifth of a second), a frame still goes in its own slot but
+            // spread over at least half a frame's time (here 9 ms), not all at once at line rate.
+            std::this_thread::sleep_for(std::chrono::milliseconds(70));
+            const auto from = std::chrono::steady_clock::now();
+            QVERIFY(pair.send(picB.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+            const auto took = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - from).count();
+            QVERIFY2(took >= 7000, qPrintable(QString::number(took)));
+            // Stopped while catching up, it stops.
+            std::this_thread::sleep_for(std::chrono::milliseconds(70));
+            halt = true;
+            QVERIFY(!pair.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+        }
+
         // As a reference output: the Program on the loopback interface, its SDP files, captions while playing.
         const auto backend = findBackend("ST 2110");
         QVERIFY(backend && backend->available());
@@ -14607,6 +14935,131 @@ colorspaces:
             QCOMPARE(int(out.size()), 40);
             merger.flush(out);
             QVERIFY(out.size() == 41 && merger.lost == 10);
+        }
+        // Only the stream's own RTP takes a place: a datagram that is not RTP, one of another payload type and another
+        // sender's (one far ahead too) are passed over, and the packets of those numbers still taken when they come; the
+        // extended number read after a header extension. A sender started again with a new SSRC is taken once only its
+        // packets have come for a window.
+        {
+            auto rtp = [](uint32_t seq, uint8_t type, uint32_t ssrc, bool extension) {
+                std::vector<uint8_t> p(12 + (extension ? 4 + 4 : 0) + 4, 0);
+                p[0] = uint8_t(0x80 | (extension ? 0x10 : 0)), p[1] = type, p[2] = uint8_t(seq >> 8), p[3] = uint8_t(seq);
+                p[8] = uint8_t(ssrc >> 24), p[9] = uint8_t(ssrc >> 16), p[10] = uint8_t(ssrc >> 8), p[11] = uint8_t(ssrc);
+                size_t at = 12;
+                if (extension) p[15] = 1, at = 20;  // (one word of extension)
+                p[at] = uint8_t(seq >> 24), p[at + 1] = uint8_t(seq >> 16);
+                return p;
+            };
+            st::PathMerger merger(true, 16);
+            merger.setPayloadType(96);
+            std::vector<std::vector<uint8_t>> out;
+            merger.push(rtp(0x10000, 96, 7, false), 0, out);
+            std::vector<uint8_t> notRtp = rtp(0x10001, 96, 7, false);
+            notRtp[0] = 0x40;  // (RTP version 1)
+            merger.push(notRtp, 0, out);
+            merger.push(rtp(0x10001, 0, 7, false), 0, out);
+            merger.push(rtp(0x10001, 96, 8, false), 0, out);
+            merger.push(rtp(0x20000, 96, 8, false), 1, out);
+            merger.push(rtp(0x10001, 96, 7, true), 1, out);
+            merger.push(rtp(0x10002, 96, 7, false), 0, out);
+            QVERIFY(out.size() == 3 && merger.rejected == 4 && merger.duplicates == 0 && merger.late == 0 && merger.lost == 0);
+            for (uint32_t i = 0; i < 20; ++i) merger.push(rtp(500 + i, 96, 9, false), 0, out);
+            QVERIFY(out.size() == 7 && merger.rejected == 4 + 16);
+        }
+        // What is held for a gap is bounded by memory as well as by count: datagrams as large as one can be, the gap
+        // given up on rather than held past the limit.
+        {
+            st::PathMerger merger(false, 100000, 1 << 20);
+            std::vector<std::vector<uint8_t>> out;
+            bool bounded = true;
+            for (uint32_t i = 0; i < 200; ++i) {
+                if (i == 1) continue;
+                std::vector<uint8_t> p = rtpPacket(i, false);
+                p.resize(60000);
+                merger.push(std::move(p), 0, out);
+                bounded = bounded && merger.heldBytes() <= (1u << 20);
+            }
+            QVERIFY(bounded && merger.lost == 1 && out.size() > 1);
+        }
+        // A datagram received is as large as it came, not as large as one could be (a packet held keeps only its own).
+        {
+            st::Receiver r;
+            QVERIFY(r.open({"127.0.0.1", 0}));
+            QUdpSocket u;
+            QCOMPARE(u.writeDatagram(QByteArray(1200, 'x'), QHostAddress::LocalHost, quint16(r.port())), qint64(1200));
+            std::vector<uint8_t> d;
+            QVERIFY(r.receive(d, 2000) && d.size() == 1200 && d.capacity() < 4096);
+        }
+        // The SDP: a connection at the session level (before the media description, as many single-stream SDPs put
+        // it) taken for the stream; an m= line with no payload type refused rather than read as type 0; pictures as
+        // large and as fast as each may be, but not both at once.
+        {
+            st::VideoFormat f;
+            f.width = 320, f.height = 180;
+            std::string sdp = st::videoSdp(f, {"239.10.0.1", 5010}, 98, {});
+            const size_t c = sdp.find("c=IN IP4"), cEnd = sdp.find("\r\n", c) + 2;
+            const std::string connection = sdp.substr(c, cEnd - c);
+            sdp.erase(c, cEnd - c);
+            sdp.insert(sdp.find("m=video"), connection);
+            std::string why;
+            const auto found = st::parseSdp(sdp, &why);
+            QVERIFY2(found.size() == 1 && found[0].path[0].address == "239.10.0.1" && found[0].path[0].port == 5010 && found[0].payloadType == 98,
+                     why.c_str());
+            std::string noType = sdp;
+            noType.replace(noType.find("RTP/AVP 98"), 10, "RTP/AVP");
+            QVERIFY(st::parseSdp(noType, &why).empty());
+            f.width = 8192, f.height = 4320, f.fps = {300, 1};
+            QVERIFY(!st::videoFormatOk(f));
+            f.fps = {60, 1};
+            QVERIFY(st::videoFormatOk(f));
+            f.width = 1920, f.height = 1080, f.fps = {300, 1};
+            QVERIFY(st::videoFormatOk(f));
+        }
+        // Sound whose timestamps go back (a PTP step, or the sender started again) is taken from there, not passed over
+        // as already held until the timestamps pass where they were.
+        {
+            int ports[2];
+            {
+                st::Receiver probe[2];
+                for (int i = 0; i < 2; ++i) {
+                    QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::VideoFormat f;
+            f.width = 64, f.height = 36, f.fps = {25, 1};
+            std::string why;
+            std::vector<st::SdpStream> streams;
+            for (const std::string& sdp : {st::videoSdp(f, {"127.0.0.1", ports[0]}, 96, {}), st::audioSdp(st::AudioFormat{}, {"127.0.0.1", ports[1]}, 97, {})}) {
+                const auto found = st::parseSdp(sdp, &why);
+                QVERIFY2(found.size() == 1, why.c_str());
+                streams.push_back(found[0]);
+            }
+            st::Input in;
+            QVERIFY2(in.open(streams, {}, &why), why.c_str());
+            QUdpSocket u;
+            st::RtpState videoRtp{96, 1, 0}, soundRtp{97, 2, 0};
+            const st::Raster pic(64, 36, st::Sampling::Ycc422, 10);
+            const int64_t nowSeconds = st::ptpNowNs() / 1000000000;
+            // The first frame of the second `back` seconds before now, after 60 ms of its sound at `level`.
+            auto frameAt = [&](int64_t back, float level) {
+                const int64_t second = nowSeconds - back;
+                const std::vector<float> s(48 * 2, level);
+                auto to = [&](int port) {
+                    return [&u, port](const uint8_t* d, size_t n) {
+                        return u.writeDatagram(reinterpret_cast<const char*>(d), qint64(n), QHostAddress::LocalHost, quint16(port)) == qint64(n);
+                    };
+                };
+                for (int k = 0; k < 60; ++k) st::packAudio(s.data(), 48, 2, uint32_t(second * 48000 + 48 * k), soundRtp, to(ports[1]));
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                st::packVideo(pic, 0, uint32_t(second * 90000), videoRtp, to(ports[0]));
+                st::InputFrame got;
+                return in.next(got, 3000) && got.audio.size() == 1920 * 2 &&
+                       std::all_of(got.audio.begin(), got.audio.end(), [&](float x) { return x == level; });
+            };
+            QVERIFY(frameAt(2, 0.5f));
+            QVERIFY(frameAt(12, 0.25f));
+            in.close();
         }
 
         // Over the loopback interface: a sender's streams found from its SDPs, received, and each frame matched by its
@@ -14768,6 +15221,15 @@ colorspaces:
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"multicast_ip", "10.0.0.1"}}, QJsonObject{}}}}).first, 400);
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"colour", 1}}, QJsonObject{}}}}).first, 400);
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_file", QJsonObject{{"data", "v=0"}, {"type", "application/sdp"}}}}).first, 400);
+        // (and SDPs Montage could not receive: a depth it does not take, or another kind of stream than the receiver's)
+        auto file = [](const std::string& sdp) {
+            return QJsonObject{{"transport_file", QJsonObject{{"data", QString::fromStdString(sdp)}, {"type", "application/sdp"}}}};
+        };
+        std::string nineBits = snd.sdpVideo();
+        nineBits.replace(nineBits.find("depth=10"), 8, "depth=9");
+        QCOMPARE(json("PATCH", single + "staged", file(nineBits)).first, 400);
+        QCOMPARE(json("PATCH", single + "staged", file(snd.sdpAudio())).first, 400);
+        QVERIFY(json("GET", single + "staged").second.object()["transport_file"].toObject()["data"].isNull());
 
         // The sender's SDP: both paths become the legs, at once; the IS-04 receiver says whom it takes from.
         const QString senderId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -14829,6 +15291,12 @@ colorspaces:
         const st::InputStats s = in.stats();
         QVERIFY(s.duplicates > 0 && s.packets[0][1] > 0);
         in.close();
+        // With the second leg alone, its port and interface are the first path's.
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"rtp_enabled", false}}, QJsonObject{}}},
+                                                              {"activation", QJsonObject{{"mode", "activate_immediate"}}}}).first, 200);
+        const std::vector<st::SdpStream> second = node.receiverStreams();
+        QVERIFY(!second.empty() && !second[0].redundant() && second[0].path[0].port == ports[3]);
+        QCOMPARE(node.receiverInterfaces(), QStringList{node.receiverConnection(0).leg[1].interfaceIp});
 
         // IS-04's target: an empty one disconnects, and nothing is taken.
         QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", QJsonObject{}).first, 202);
@@ -14850,6 +15318,9 @@ colorspaces:
         });
         const QJsonObject target{{"id", senderId}, {"manifest_href", QStringLiteral("http://127.0.0.1:%1/sdp").arg(manifest.serverPort())}};
         QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", target).first, 202);
+        // (connected, but not with the previous sender's transport file while its own is fetched)
+        QVERIFY(node.receiverConnection(0).active && node.receiverConnection(0).transportFile.isEmpty());
+        QCOMPARE(int(node.receiverStreams().size()), 1);
         QTRY_COMPARE_WITH_TIMEOUT(node.receiverConnection(0).leg[0].port, 5099, 5000);
         QVERIFY(node.receiverConnection(0).active && node.receiverConnection(0).leg[1].port == ports[3]);
         snd.close();
@@ -19003,6 +19474,13 @@ colorspaces:
 
         // (and an empty folder named as a rendition is: it holds nothing a package wrote)
         QVERIFY(pkg.mkpath("a1_storyboard"));
+        // What an earlier export could not put back stays where its message said; this export moves aside elsewhere.
+        QVERIFY(pkg.mkpath(".montage-package-old/" + videos[0]));
+        {
+            QFile kept(pkg.filePath(".montage-package-old/" + videos[0] + "/seg00001.m4s"));
+            QVERIFY(kept.open(QIODevice::WriteOnly));
+            kept.write("earlier");
+        }
 
         // time_signal cues instead: segmentation descriptors for a provider placement opportunity's start and end.
         st.cueCommand = "time_signal";
@@ -19024,7 +19502,8 @@ colorspaces:
         QVERIFY(pkg.exists("s1_en/seg00001.vtt"));
         QVERIFY(pkg.exists("s2_final/notes.txt"));
         QVERIFY(pkg.exists("a1_storyboard"));
-        QVERIFY(!pkg.exists(".montage-package-old"));
+        QVERIFY(pkg.exists(".montage-package-old/" + videos[0] + "/seg00001.m4s"));
+        QVERIFY(!pkg.exists(".montage-package-old-2"));
     }
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the

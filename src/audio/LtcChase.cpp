@@ -25,17 +25,18 @@ void LtcChase::take(const LtcFrame& f) {
         if (k < -day / 2) k += day;
         if (k > day / 2) k -= day;
         frame = last.frame + k;
-        // In sequence: one word on, or several when some were lost, each about a word apart (the speed so far).
-        const double spacing = words_.size() >= 2 ? (last.start - words_.front().start) / double(last.frame - words_.front().frame) : nominal_;
+        // In sequence: one word on (back, in reverse), or several when some were lost, each about a word apart at the
+        // speed the last word was read at (its own length, signed: negative backwards).
+        const double spacing = last.end - last.start;
         const double gap = f.start - last.start;
-        const bool inTime = k >= 1 && std::fabs(gap - double(k) * spacing) < 0.5 * spacing &&
-                            (k == 1 || gap <= freewheel_ * rate_ + spacing);
+        const bool inTime = k != 0 && (k > 0) == (spacing > 0) && std::fabs(gap - double(k) * spacing) < 0.5 * std::fabs(spacing) &&
+                            (std::llabs(k) == 1 || gap <= freewheel_ * rate_ + std::fabs(spacing));
         if (!inTime) {
             words_.clear();
             locked_ = false;
         }
     }
-    words_.push_back({frame, f.start});
+    words_.push_back({frame, f.start, f.end});
     while (words_.size() > 16) words_.pop_front();
     if (int(words_.size()) >= lockWords_) locked_ = true;
 }
@@ -43,9 +44,10 @@ void LtcChase::take(const LtcFrame& f) {
 LtcChase::Position LtcChase::at(int64_t sample) const {
     Position p;
     if (words_.empty()) return p;
-    // The words' line (frame against start), fitted so a word's jitter moves little.
+    // The words' line (frame against start), fitted so a word's jitter moves little: samples a frame on, negative
+    // when the master runs backwards, at whatever speed it is read.
     const Word& last = words_.back();
-    double spacing = nominal_, intercept = last.start;
+    double spacing = last.end - last.start, intercept = last.start;
     if (words_.size() >= 2) {
         const double n = double(words_.size());
         double sx = 0, sy = 0, sxx = 0, sxy = 0;
@@ -54,15 +56,16 @@ LtcChase::Position LtcChase::at(int64_t sample) const {
             sx += x, sy += y, sxx += x * x, sxy += x * y;
         }
         const double d = n * sxx - sx * sx;
-        if (d > 0) {
-            spacing = (n * sxy - sx * sy) / d;
+        const double fitted = d > 0 ? (n * sxy - sx * sy) / d : 0;
+        if (fitted != 0 && (fitted > 0) == (spacing > 0)) {
+            spacing = fitted;
             intercept = last.start + (sy - spacing * sx) / n;
         }
-        if (!(spacing > 0.2 * nominal_ && spacing < 5 * nominal_)) spacing = nominal_, intercept = last.start;
     }
     // Words arrive one after another: half a word past the next one's end with none (the input's pieces deliver them a
-    // little late), the signal has dropped out.
-    const double since = double(sample) - (last.start + 2.5 * spacing);
+    // little late), the signal has dropped out. (A word read backwards ends at its start.)
+    const double heard = std::max(last.start, last.end);
+    const double since = double(sample) - (heard + 1.5 * std::fabs(spacing));
     if (since > freewheel_ * rate_) return p;  // (stopped)
     p.state = !locked_ ? (since > 0 ? State::Stopped : State::Locking) : since > 0 ? State::Freewheel : State::Locked;
     if (p.state == State::Stopped) return p;

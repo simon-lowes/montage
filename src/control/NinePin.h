@@ -36,17 +36,29 @@ struct Message {
 std::vector<uint8_t> encode(const Message& m);
 inline std::vector<uint8_t> encode(uint8_t group, uint8_t cmd, std::vector<uint8_t> data = {}) { return encode(Message{group, cmd, std::move(data)}); }
 
-// Messages out of a stream of bytes. A message whose checksum is wrong is reported as such (a deck then answers NAK
-// with its checksum bit); bytes that cannot start a message are passed over.
+// Messages out of a stream of bytes. Bytes that cannot start a message are passed over. A wrong sum is resynchronised
+// on a byte at a time: a good message starting inside the bad one is taken (the bytes before it were noise, or a line
+// picked up mid-message); otherwise the message was garbled, reported once as BadChecksum (a deck then answers NAK
+// with its checksum bit). A message whose bytes stop coming for longer than `kByteGap` (the protocol's time-out) has
+// its first byte passed over the same way, so a stray byte or a message cut short cannot hold the line out of step.
 class Parser {
 public:
-    void feed(const uint8_t* bytes, size_t n);
+    using Clock = std::chrono::steady_clock;
+    // How long a message may wait for its next byte: the protocol's 10 ms, with room for a USB adapter's latency timer
+    // (16 ms on most).
+    static constexpr std::chrono::milliseconds kByteGap{30};
+    void feed(const uint8_t* bytes, size_t n, Clock::time_point now = Clock::now());
     enum Result { None, Ok, BadChecksum };
-    Result next(Message& out);
-    void clear() { buf_.clear(); }
+    Result next(Message& out, Clock::time_point now = Clock::now());
+    bool pending() const { return !buf_.empty(); }
+    void clear() { buf_.clear(), came_.clear(), resyncing_ = false; }
 
 private:
+    bool goodAt(size_t k) const;  // a whole message with the right sum starts at buf_[k]
+    void drop(size_t n);          // the first n bytes
     std::vector<uint8_t> buf_;
+    std::vector<Clock::time_point> came_;  // when each byte came
+    bool resyncing_ = false;               // a bad sum reported, and no good message since
 };
 
 // Common commands (group, CMD-2).
@@ -78,6 +90,12 @@ constexpr uint8_t NakUnknownCommand = 0x01, NakChecksum = 0x04, NakParity = 0x10
 std::array<uint8_t, 4> timecodeBytes(int64_t frame, int base, bool dropFrame);
 // The frame number of four timecode bytes, or -1 when a digit is not BCD; `dropFrame` set from the frames byte.
 int64_t timecodeFromBytes(const uint8_t* b, int base, bool* dropFrame = nullptr);
+// The same, the label counted in `dropFrame` (at 30) whatever the frames byte's flag says, as a deck running its own
+// timecode takes a controller's.
+int64_t timecodeFromBytesAs(const uint8_t* b, int base, bool dropFrame);
+// A frame number counted in one way (drop frame or not, at 30) as the frame with the same label counted in the other.
+// A label drop frame skips (00:01:00:00 and :01) stands for the next one there is.
+int64_t sameLabel(int64_t frame, int base, bool fromDrop, bool toDrop);
 
 // Shuttle, jog and variable speed's data: one byte N (or N and a finer second byte) standing for 10^(N/32 - 2) times
 // play speed, so 64 is play, 32 a tenth of it and 79 about three times it (Sony's table).
@@ -113,6 +131,8 @@ enum class TimeSource { Ltc, Vitc, Timer1, Auto };
 
 // Montage controlling a deck down a serial line. Each command waits for its answer (with the protocol's 9 ms and the
 // line's time, about 30 ms in all); one at a time, from any thread.
+// Frame numbers given to and read from the deck are counted the deck's own way (deckDropFrame()); timecodes typed or
+// logged for it are counted as set (setBase), and toDeck() gives the deck's frame with the same label.
 class Deck {
 public:
     Deck() = default;
@@ -122,14 +142,21 @@ public:
     bool isOpen() const;
     std::string lastError() const;
 
-    // The deck's frame rate, for its timecode (24, 25 or 30; drop frame read from what it sends, kept for what is sent).
-    void setBase(int base, bool dropFrame = false) { base_ = base, dropFrame_ = dropFrame && base == 30; }
+    // The deck's frame rate, for its timecode (24, 25 or 30), and how the timecodes typed and logged for it count (drop
+    // frame at 29.97).
+    void setBase(int base, bool dropFrame = false) { base_ = base, dropFrame_ = dropFrame && base == 30, deckDrop_ = dropFrame_.load(); }
     int base() const { return base_; }
     bool dropFrame() const { return dropFrame_; }
+    // How the deck itself counts at 30, as the frames byte of its timecode says (until it has been read, as set).
+    bool deckDropFrame() const { return deckDrop_; }
+    // A frame number typed or logged (counted as set) as the deck's frame with that label, and back.
+    int64_t toDeck(int64_t frame) const { return sameLabel(frame, base_, dropFrame_, deckDrop_); }
+    int64_t fromDeck(int64_t frame) const { return sameLabel(frame, base_, deckDrop_, dropFrame_); }
 
-    // One command and its answer (ACK or the data asked for); nothing on no answer, a NAK or a garbled answer
-    // (lastError() says which).
-    std::optional<Message> command(const Message& m, int timeoutMs = 100);
+    // One command and its answer (ACK or the data asked for; an answer of another kind, left from a command whose
+    // answer came too late, passed over); nothing on no answer, a NAK or a garbled answer (lastError() says which).
+    // No answer, a garbled one or a NAK for the line's errors is tried again, up to `tries` times in all.
+    std::optional<Message> command(const Message& m, int timeoutMs = 100, int tries = 3);
     bool ack(uint8_t group, uint8_t c, std::vector<uint8_t> data = {});
 
     std::optional<std::array<uint8_t, 2>> deviceType();
@@ -144,7 +171,7 @@ public:
     bool shuttle(double speed);
     bool jog(double speed);
     bool variable(double speed);
-    bool step(bool forward) { return ack(2, forward ? cmd::StepForward : cmd::StepReverse); }
+    bool step(bool forward);  // (sent once: a step tried again could be taken twice)
     bool cue(int64_t frame);
     bool preroll() { return ack(2, cmd::Preroll); }
     bool setIn(int64_t frame);
@@ -156,7 +183,7 @@ public:
     bool review() { return ack(2, cmd::Review); }
 
     std::optional<Status> status();
-    // The tape's position as a frame number on its timecode; -1 when it could not be read.
+    // The tape's position as a frame number on its timecode (counted the deck's way); -1 when it could not be read.
     int64_t timecode(TimeSource source = TimeSource::Ltc);
     // Waits until a cue to `target` has finished (STATUS's CUE UP, and the timecode there, so a CUE UP left from the
     // last cue does not count), up to `seconds`; false if it has not.
@@ -168,7 +195,7 @@ private:
     Parser parser_;
     std::string error_;
     std::atomic<int> base_{25};
-    std::atomic<bool> dropFrame_{false};
+    std::atomic<bool> dropFrame_{false}, deckDrop_{false};
 };
 
 // What a deck Montage plays is doing, as the Program's transport publishes it: its frame on the Program's timecode,
@@ -199,9 +226,11 @@ public:
     ~DeckEmulator();
     bool start(const std::string& port, std::string* error = nullptr);
     void stop();
+    // False once stopped, or once its port has failed (an adapter pulled out).
     bool running() const;
 
-    void setBase(int base, bool dropFrame) { base_ = base, dropFrame_ = dropFrame; }
+    // The Program's rate and count: the timecodes a controller sends are read by their labels, counted this way.
+    void setBase(int base, bool dropFrame) { base_ = base, dropFrame_ = dropFrame && base == 30; }
     // Publishes where the Program is (call as it moves, and when a request has been carried out).
     void publish(const TransportState& s);
     TransportState state() const;
@@ -217,7 +246,7 @@ private:
     void run();
     SerialPort port_;
     std::thread thread_;
-    std::atomic<bool> stop_{false};
+    std::atomic<bool> stop_{false}, failed_{false};
     std::atomic<int64_t> answered_{0};
     mutable std::mutex m_;
     TransportState state_;

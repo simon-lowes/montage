@@ -63,9 +63,16 @@ std::string framePattern(const std::string& path) {
     return out;
 }
 
-bool hashFile(const QString& path, QCryptographicHash& hash, int64_t& bytes, const std::atomic<bool>* cancel) {
+// A file's bytes added to `hash`; `framed`, after its length (a frame of several in one hash: bytes moved from one
+// frame's file to the next change it).
+bool hashFile(const QString& path, QCryptographicHash& hash, int64_t& bytes, const std::atomic<bool>* cancel, bool framed = false) {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) return false;
+    if (framed) {
+        char size[8];
+        for (int i = 0; i < 8; ++i) size[i] = char((uint64_t(f.size()) >> (8 * i)) & 0xff);
+        hash.addData(QByteArrayView(size, 8));
+    }
     QByteArray buf;
     while (!f.atEnd()) {
         if (cancel && cancel->load()) return false;
@@ -120,36 +127,67 @@ QByteArray codingSettings(const AVCodecParameters* par) {
     return kept;
 }
 
-// H.264 segments coded at different rates (two passes) have parameter sets of their own, each segment's under its own
-// id (ExportSettings::parameterSetId): `next`'s avcC record merged into `merged` (the first segment's to begin with),
-// its level the highest. False when they cannot share one (another profile or length size, an id held differently).
-bool mergeAvcc(std::vector<uint8_t>& merged, const AVCodecParameters* next) {
-    struct Record {
-        uint8_t profile = 0, compat = 0, level = 0, lengths = 0;
-        std::vector<std::vector<uint8_t>> sps, pps;
-        std::vector<uint8_t> tail;
-    };
-    auto parse = [](const uint8_t* d, size_t n, Record& r) {
-        if (n < 7 || d[0] != 1) return false;
-        r.profile = d[1], r.compat = d[2], r.level = d[3], r.lengths = d[4] & 3;
-        size_t i = 6;
-        auto sets = [&](int count, std::vector<std::vector<uint8_t>>& out) {
-            for (int k = 0; k < count; ++k) {
-                if (i + 2 > n) return false;
-                const size_t len = size_t(d[i]) << 8 | d[i + 1];
-                i += 2;
-                if (len < 2 || i + len > n) return false;
-                out.emplace_back(d + i, d + i + len);
-                i += len;
+// An H.264 decoder configuration: an avcC record's, or Annex B's parameter sets (MPEG-TS and MXF).
+struct AvcSets {
+    bool annexB = false;
+    uint8_t profile = 0, compat = 0, level = 0, lengths = 0;
+    std::vector<std::vector<uint8_t>> sps, pps;
+    std::vector<uint8_t> tail;  // (an avcC's High profile extension)
+};
+
+bool parseAvcSets(const uint8_t* d, size_t n, AvcSets& r) {
+    r = {};
+    if (!d || n < 4) return false;
+    if (d[0] != 1) {
+        // Annex B: NAL units after start codes; its sequence and picture parameter sets kept (an encoder's SEI, naming
+        // its version and options, says nothing of how the video decodes).
+        r.annexB = true;
+        size_t i = 0;
+        auto start = [&](size_t at) { return at + 3 <= n && d[at] == 0 && d[at + 1] == 0 && d[at + 2] == 1; };
+        while (i < n && !start(i)) ++i;
+        while (i < n) {
+            const size_t from = i + 3;
+            size_t end = from;
+            while (end < n && !start(end)) ++end;
+            size_t last = end;
+            while (last > from && d[last - 1] == 0) --last;  // (a four-byte start code's leading zero; a NAL unit never ends in one)
+            if (last > from) {
+                const int type = d[from] & 0x1f;
+                if (type == 7) r.sps.emplace_back(d + from, d + last);
+                else if (type == 8) r.pps.emplace_back(d + from, d + last);
             }
-            return true;
-        };
-        if (!sets(d[5] & 31, r.sps) || i >= n) return false;
-        const int ppsCount = d[i++];
-        if (!sets(ppsCount, r.pps)) return false;
-        r.tail.assign(d + i, d + n);
+            i = end;
+        }
+        if (r.sps.empty() || r.pps.empty() || r.sps.front().size() < 4) return false;
+        r.profile = r.sps.front()[1], r.compat = r.sps.front()[2], r.level = r.sps.front()[3];
+        return true;
+    }
+    if (n < 7) return false;
+    r.profile = d[1], r.compat = d[2], r.level = d[3], r.lengths = d[4] & 3;
+    size_t i = 6;
+    auto sets = [&](int count, std::vector<std::vector<uint8_t>>& out) {
+        for (int k = 0; k < count; ++k) {
+            if (i + 2 > n) return false;
+            const size_t len = size_t(d[i]) << 8 | d[i + 1];
+            i += 2;
+            if (len < 2 || i + len > n) return false;
+            out.emplace_back(d + i, d + i + len);
+            i += len;
+        }
         return true;
     };
+    if (!sets(d[5] & 31, r.sps) || i >= n) return false;
+    const int ppsCount = d[i++];
+    if (!sets(ppsCount, r.pps)) return false;
+    r.tail.assign(d + i, d + n);
+    return true;
+}
+
+// H.264 segments coded at different rates (two passes) have parameter sets of their own, each segment's under its own
+// id (ExportSettings::parameterSetId): `next`'s merged into `merged` (the first segment's to begin with), its level the
+// highest; in an avcC record they then sit side by side, in Annex B each segment's go with its pictures. False when
+// they cannot share one decoder (another profile or length size, a parameter set's id held differently).
+bool mergeAvcSets(AvcSets& merged, const AVCodecParameters* next) {
     // A parameter set's id: the first Exp-Golomb number after `skip` bytes (the NAL header, and an SPS's profile,
     // constraint flags and level; never two zero bytes in a row, so no emulation prevention comes before it).
     auto id = [](const std::vector<uint8_t>& nal, size_t skip) {
@@ -162,10 +200,10 @@ bool mergeAvcc(std::vector<uint8_t>& merged, const AVCodecParameters* next) {
         for (int k = 0; k < zeros; ++k) value = value << 1 | at(bit++);
         return (1 << zeros) - 1 + value;
     };
-    if (!next->extradata) return false;
-    Record a, b;
-    if (!parse(merged.data(), merged.size(), a) || !parse(next->extradata, size_t(next->extradata_size), b)) return false;
-    if (a.profile != b.profile || a.lengths != b.lengths || a.tail != b.tail) return false;
+    AvcSets& a = merged;
+    AvcSets b;
+    if (!parseAvcSets(next->extradata, size_t(std::max(0, next->extradata_size)), b)) return false;
+    if (a.annexB != b.annexB || a.profile != b.profile || a.lengths != b.lengths || a.tail != b.tail) return false;
     auto add = [&](std::vector<std::vector<uint8_t>>& have, const std::vector<std::vector<uint8_t>>& adding, size_t skip) {
         for (const auto& s : adding) {
             bool known = false;
@@ -181,6 +219,11 @@ bool mergeAvcc(std::vector<uint8_t>& merged, const AVCodecParameters* next) {
     if (!add(a.sps, b.sps, 4) || !add(a.pps, b.pps, 1) || a.sps.size() > 31) return false;
     a.compat &= b.compat;
     a.level = std::max(a.level, b.level);
+    return true;
+}
+
+// An avcC record of `a`'s parameter sets.
+std::vector<uint8_t> avccRecord(const AvcSets& a) {
     std::vector<uint8_t> o{1, a.profile, a.compat, a.level, uint8_t(0xfc | a.lengths), uint8_t(0xe0 | a.sps.size())};
     auto put = [&](const std::vector<std::vector<uint8_t>>& sets) {
         for (const auto& s : sets) {
@@ -192,8 +235,7 @@ bool mergeAvcc(std::vector<uint8_t>& merged, const AVCodecParameters* next) {
     o.push_back(uint8_t(a.pps.size()));
     put(a.pps);
     o.insert(o.end(), a.tail.begin(), a.tail.end());
-    merged = std::move(o);
-    return true;
+    return o;
 }
 
 }  // namespace
@@ -256,8 +298,11 @@ std::vector<ExportSegment> planExportSegments(const Sequence& seq, const ExportS
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
     const double share = double(len) / n;
     const FrameTime reach = FrameTime(share / 8);
+    // MPEG-2's segments each a whole number of its fixed GOPs (XDCAM's 12 or 15), so the join's GOPs are all as long as
+    // a single render's, but for the last.
+    const FrameTime gop = s.videoCodec == "mpeg2video" && s.gop != 1 ? exportMpeg2Gop(s, seq.fps) : 1;
     FrameTime from = in;
-    for (int k = 1; k <= n; ++k) {
+    for (int k = 1; k <= n && from < out; ++k) {
         FrameTime to = k == n ? out : in + FrameTime(std::llround(share * k));
         if (k < n) {
             // The cut nearest the share's frame, when near enough (and leaving every segment a frame at least).
@@ -265,6 +310,10 @@ std::vector<ExportSegment> planExportSegments(const Sequence& seq, const ExportS
             for (const FrameTime c : cuts)
                 if (const FrameTime d = std::llabs(c - to); d < nearest) best = c, nearest = d;
             to = std::clamp(best, from + 1, out - FrameTime(n - k));
+            if (gop > 1) {
+                to = std::max(from + gop, in + (to - in + gop / 2) / gop * gop);
+                if (to >= out) to = out;
+            }
         }
         parts.push_back({from, to});
         from = to;
@@ -355,7 +404,7 @@ bool checkExportSegment(const ExportSettings& segment, SegmentCheck& out, std::s
             if (av_get_frame_filename2(name, sizeof name, pattern.c_str(), segment.startNumber + int(i), 0) < 0)
                 return fail(error, "The file name " + segment.path + " has no frame number");
             if (!QFileInfo::exists(QString::fromUtf8(name))) break;
-            if (!hashFile(QString::fromUtf8(name), hash, out.bytes, cancel))
+            if (!hashFile(QString::fromUtf8(name), hash, out.bytes, cancel, true))
                 return fail(error, cancel && cancel->load() ? std::string("Cancelled") : "Cannot read " + std::string(name));
             ++out.frames;
             if (progress && i % 16 == 0) progress(double(i) / double(frames));
@@ -391,7 +440,7 @@ bool checkCodestreams(const std::string& folder, int64_t from, int64_t to, bool 
                 out.sha256 = hash.result().toHex().toStdString();
                 return true;
             }
-            if (!hashFile(file, hash, out.bytes, cancel))
+            if (!hashFile(file, hash, out.bytes, cancel, true))
                 return fail(error, cancel && cancel->load() ? std::string("Cancelled") : "Cannot read " + file.toStdString());
         }
         ++out.frames;
@@ -472,25 +521,25 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
         // settings) for their video to follow on in one stream.
         std::vector<std::unique_ptr<Input>> segs;
         int maxCll = -1, maxFall = -1;
-        std::vector<uint8_t> avcc;  // (the first segment's decoder configuration, merged with the others' when H.264's differ)
-        bool mergedAvcc = false;
+        AvcSets avc;  // (the first segment's decoder configuration, merged with the others' when H.264's differ)
+        bool firstAvc = false, mergedAvcc = false;
         for (size_t k = 0; k < files.size(); ++k) {
             auto inp = std::make_unique<Input>();
             if (!inp->open(files[k], error)) return false;
             const int v = inp->v;
             if (v < 0) return fail(error, "Segment " + std::to_string(k + 1) + " has no video");
             const AVCodecParameters* par = inp->fmt->streams[v]->codecpar;
-            if (k == 0 && par->extradata) avcc.assign(par->extradata, par->extradata + par->extradata_size);
+            if (k == 0 && par->codec_id == AV_CODEC_ID_H264) firstAvc = parseAvcSets(par->extradata, size_t(std::max(0, par->extradata_size)), avc);
             if (k > 0) {
                 const AVCodecParameters* first = segs[0]->fmt->streams[segs[0]->v]->codecpar;
                 bool same = par->codec_id == first->codec_id && par->width == first->width && par->height == first->height &&
                             par->format == first->format;
-                // (H.264 parameter sets that differ: side by side in one avcC, each under its id; in MPEG-TS each
-                // segment's go with its pictures.)
+                // (H.264 parameter sets that differ, each under its own id: side by side in one avcC; in Annex B (MPEG-TS,
+                // MXF) each segment's go with its pictures. One id held differently, or another profile, is another
+                // encoder's or settings'.)
                 if (same && codingSettings(par) != codingSettings(first)) {
-                    const bool annexB = !par->extradata || par->extradata_size < 1 || par->extradata[0] != 1;
-                    same = par->codec_id == AV_CODEC_ID_H264 && (annexB ? !avcc.empty() && avcc[0] != 1 : mergeAvcc(avcc, par));
-                    mergedAvcc |= same && !annexB;
+                    same = par->codec_id == AV_CODEC_ID_H264 && firstAvc && mergeAvcSets(avc, par);
+                    mergedAvcc |= same && !avc.annexB;
                 }
                 if (!same)
                     return fail(error, "Segment " + std::to_string(k + 1) +
@@ -529,6 +578,7 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
         AVStream* vst = avformat_new_stream(oc, nullptr);
         if (!vst || avcodec_parameters_copy(vst->codecpar, firstVideo->codecpar) < 0) return drop("Out of memory");
         if (mergedAvcc) {
+            const std::vector<uint8_t> avcc = avccRecord(avc);
             av_freep(&vst->codecpar->extradata);
             vst->codecpar->extradata = static_cast<uint8_t*>(av_mallocz(avcc.size() + AV_INPUT_BUFFER_PADDING_SIZE));
             if (!vst->codecpar->extradata) return drop("Out of memory");

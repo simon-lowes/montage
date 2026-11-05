@@ -330,6 +330,9 @@ bool videoFormatOk(const VideoFormat& f, std::string* why) {
     if (f.width > 8192 || f.height > 4320) return fail("ST 2110 pictures here are at most 8192 x 4320");
     if (f.fps.num <= 0 || f.fps.den <= 0 || f.fps.num > 1000000 || f.fps.den > 100000 || f.fps.toDouble() < 1 || f.fps.toDouble() > 300)
         return fail("ST 2110 pictures here come at 1 to 300 frames a second");
+    // (and not both: what it may ask to be received a second is bounded too, at 8192 x 4320 at 60 frames)
+    if (double(f.width) * f.height * f.fps.toDouble() > 8192.0 * 4320 * 60)
+        return fail("ST 2110 pictures here are at most as many pixels a second as 8192 x 4320 at 60 frames");
     const Pgroup pg = pgroup(f.sampling, f.depth);
     if (f.width % pg.pixels)
         return fail(samplingName(f.sampling) + " at " + std::to_string(f.depth) + " bits needs a width in whole groups of " +
@@ -889,6 +892,7 @@ struct Sender::Sockets {
     std::function<bool(int, int, uint64_t)> drop;
     uint64_t sent[3] = {0, 0, 0};
     int64_t queueDrops = 0;  // packets the system's queue had no room for
+    int64_t errors[2] = {0, 0};  // packets each path could not send (its interface down, no route)
 #ifdef _WIN32
     // (Windows sleeps in steps of its timer, 15.6 ms unless asked for 1 ms: too coarse to pace packets within a frame,
     // so a sender would fall a frame behind and skip one)
@@ -903,13 +907,15 @@ struct Sender::Sockets {
         timeEndPeriod(1);
 #endif
     }
-    // A packet of stream 0 (video), 1 (audio) or 2 (ancillary data), on each path.
+    // A packet of stream 0 (video), 1 (audio) or 2 (ancillary data), on each path; false only when every path failed
+    // (ST 2022-7: one path's error leaves the other sending, the error counted against its path).
     bool to(int stream, const uint8_t* data, size_t size) {
         const uint64_t index = sent[stream]++;
         const sockaddr_in* first[3] = {&video, &audio, &anc};
         const sockaddr_in* second[3] = {&video2, &audio2, &anc2};
-        bool ok = true;
-        for (int path = 0; path < (s2 != kBad ? 2 : 1); ++path) {
+        const int paths = s2 != kBad ? 2 : 1;
+        int failed = 0;
+        for (int path = 0; path < paths; ++path) {
             if (drop && drop(stream, path, index)) continue;
             const sockaddr_in& a = *(path ? second : first)[stream];
             // (a queue still full after a few milliseconds loses the packet, as a network would: the stream goes on)
@@ -921,9 +927,9 @@ struct Sender::Sockets {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));  // (the queue drains in microseconds)
             }
             if (full) ++queueDrops;
-            ok = (sent || full) && ok;
+            if (!sent && !full) ++errors[path], ++failed;
         }
-        return ok;
+        return failed < paths;
     }
 };
 
@@ -1042,6 +1048,7 @@ void Sender::close() { s_.reset(); }
 
 bool Sender::isOpen() const { return s_ != nullptr; }
 int64_t Sender::packetsDropped() const { return s_ ? s_->queueDrops : 0; }
+int64_t Sender::sendErrors(int path) const { return s_ ? s_->errors[path & 1] : 0; }
 
 namespace {
 SdpOptions sdpOptions(const SenderOptions& o, const std::string& source, const std::string& source2) {
@@ -1108,8 +1115,8 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
         }
     };
     // The frame's slot: the next one, or (starting, or behind by more than a fifth of a second) the next to start from
-    // now. A moment's hold-up (a busy machine) loses nothing: late frames go out at once in their own slots, the
-    // receiver placing them by their timestamps, until the sender has caught up.
+    // now. A moment's hold-up (a busy machine) loses nothing: late frames go out straight away in their own slots, paced
+    // at up to twice the rate (below), the receiver placing them by their timestamps, until the sender has caught up.
     const int64_t now = ptpNowNs();
     const int64_t catchUp = std::max<int64_t>(1, num / (5 * den));
     if (nextFrame_ == 0 || frameStart(nextFrame_ + catchUp) < now) {
@@ -1159,15 +1166,24 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
                 return true;
             });
         // From ST 2110-21's default offset (43 lines of 1125 into a progressive frame, 22 into a field), spread over
-        // most of what is left (a wide sender's pacing), in bursts of what is due.
+        // most of what is left (a wide sender's pacing), in bursts of what is due. Late (catching up after a hold-up),
+        // from now over what is left of its time but at least half of it: the frames behind go out at up to twice the
+        // pace until the sender is on time again, never at once at line rate.
         const int64_t troffset = (end - start) * (video_.interlaced ? 22 : 43) / 1125;
-        const int64_t vStart = fStart + troffset, span = (fEnd - vStart) * 9 / 10;
+        int64_t vStart = fStart + troffset, span = (fEnd - vStart) * 9 / 10;
         if (!waitUntil(vStart)) return false;
+        if (const int64_t late = ptpNowNs() - vStart; late > 0) {
+            vStart += late;
+            span = std::max((fEnd - vStart) * 9 / 10, (fEnd - fStart) * 9 / 20);
+        }
         size_t i = 0;
         while (ok && i < packets.size()) {
             const int64_t t = ptpNowNs();
             const size_t due = std::min(packets.size(), size_t(std::max<int64_t>(1, (t - vStart) * int64_t(packets.size()) / std::max<int64_t>(1, span) + 1)));
-            for (; ok && i < due; ++i) ok = s_->to(0, packets[i].data(), packets[i].size());
+            for (; ok && i < due; ++i) {
+                if (stopped()) return false;
+                ok = s_->to(0, packets[i].data(), packets[i].size());
+            }
             sendAudioDue(t);
             if (i < packets.size()) {
                 if (stopped()) return false;
@@ -1187,6 +1203,7 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
 struct Receiver::Socket {
     sock_t s = kBad;
     int port = 0;
+    std::vector<uint8_t> datagram;  // (as large as one can be, made once: what came is copied out at its own size)
     ~Socket() {
         if (s != kBad) closeSock(s);
     }
@@ -1242,10 +1259,11 @@ bool Receiver::open(const Endpoint& e, const std::string& interfaceAddress, std:
 
 bool Receiver::receive(std::vector<uint8_t>& out, int ms) {
     if (!s_ || !pollIn(s_->s, ms)) return false;
-    out.resize(65536);
-    const auto n = ::recv(s_->s, reinterpret_cast<char*>(out.data()), int(out.size()), 0);
+    // (not into `out` made large: that would clear 64 KB for each packet, and a packet held would keep it all)
+    if (s_->datagram.empty()) s_->datagram.resize(65536);
+    const auto n = ::recv(s_->s, reinterpret_cast<char*>(s_->datagram.data()), int(s_->datagram.size()), 0);
     if (n <= 0) return false;
-    out.resize(size_t(n));
+    out.assign(s_->datagram.begin(), s_->datagram.begin() + ptrdiff_t(n));
     return true;
 }
 

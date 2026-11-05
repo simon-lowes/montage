@@ -25,7 +25,11 @@ std::string LtcReading::startLabel() const {
     return ltcLabel(ltcFrameAt(std::llround(start * fps.toDouble()), baseOf(fps), dropFrame));
 }
 
-bool ltcFromWords(const std::vector<LtcFrame>& words, int sampleRate, LtcReading& out, Rational hint) {
+bool ltcFromWords(const std::vector<LtcFrame>& read, int sampleRate, LtcReading& out, Rational hint) {
+    // (words read backwards are not the recording's timecode)
+    std::vector<LtcFrame> words;
+    for (const LtcFrame& w : read)
+        if (!w.reverse) words.push_back(w);
     if (words.size() < 8 || sampleRate <= 0) return false;
     // The rate's whole frames a second, from how long a word lasts (24, 25 and 30 are 4 % or more apart; a frame
     // label is not trusted for it, as one word read wrong would change everything).

@@ -1942,7 +1942,26 @@ void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip&
     // (a mask on the effect: moved within it, as it was outside)
     const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
     const Image before = mask.empty() ? Image() : layer;
-    displaceByMap(layer, map, displaceSettings(*e, lt, o.scale));
+    DisplaceSettings ds = displaceSettings(*e, lt, o.scale);
+    // The edges are the clip's picture's, where it lies square on the canvas (scaled, moved, letterboxed, cropped or
+    // turned by quarter turns): the pixels whose centres it covers. Turned at any other angle, the canvas's.
+    if (Geometry g; clipGeometry(p, seq, c, t, g) && g.sx != 0 && g.sy != 0) {
+        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        if (std::min(std::fabs(cr), std::fabs(sn)) < 1e-9) {
+            double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+            for (double u : {g.mw * g.cl, g.mw * (1 - g.cr)})
+                for (double v : {g.mh * g.ct, g.mh * (1 - g.cb)}) {
+                    const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
+                    const double X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
+                    x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
+                }
+            auto edge = [](double at, int n) { return int(std::clamp(std::ceil(at - 0.5 - 1e-6), 0.0, double(n))); };
+            ds.left = edge(x0, layer.width), ds.right = edge(x1, layer.width);
+            ds.top = edge(y0, layer.height), ds.bottom = edge(y1, layer.height);
+            if (ds.right <= ds.left || ds.bottom <= ds.top) return;  // (none of its picture on the canvas)
+        }
+    }
+    displaceByMap(layer, map, ds);
     if (mask.size() == size_t(layer.width) * size_t(layer.height))
         for (size_t i = 0; i < mask.size(); ++i)
             for (size_t k = 0; k < 4; ++k) layer.px[i * 4 + k] = before.px[i * 4 + k] + (layer.px[i * 4 + k] - before.px[i * 4 + k]) * mask[i];

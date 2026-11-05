@@ -253,6 +253,9 @@ public:
     const AudioFormat& audioFormat() const { return audio_; }
     int64_t framesSent() const { return frames_; }
     int64_t packetsDropped() const;  // packets lost because the system's send queue stayed full
+    // Packets path 0 or 1 could not send (its network down, say); with ST 2022-7 the other path goes on, and `send`
+    // fails only when both do.
+    int64_t sendErrors(int path) const;
 
 private:
     bool sendFrame(const std::function<bool(int field, uint32_t ts, const PacketSink& keep)>& pack, const float* audio, int audioFrames,

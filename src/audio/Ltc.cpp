@@ -153,8 +153,9 @@ std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dr
 }
 
 LtcDecoder::LtcDecoder(int sampleRate) : rate_(std::max(1, sampleRate)) {
-    minBit_ = 0.33e-3 * rate_;
-    maxBit_ = 0.66e-3 * rate_;
+    // (bits of 0.33 to 0.66 ms at play speed, from 23.976 to 30 fps; a fifth of that to five times it in shuttle)
+    minBit_ = 0.33e-3 / 5 * rate_;
+    maxBit_ = 0.66e-3 * 5 * rate_;
 }
 
 void LtcDecoder::write(const float* samples, size_t n) {
@@ -188,8 +189,9 @@ void LtcDecoder::edge(double t) {
     lastEdge_ = t;
     int kind = 0;  // 2 a whole bit, 1 half of one, 0 neither
     if (period_ <= 0) {
+        // (taken for a whole bit: were it half of one, the next whole bit, twice as long, starts again, and a run of
+        // half bits read so is never long enough to make a word)
         if (d >= minBit_ && d <= maxBit_) kind = 2, period_ = d;
-        else if (d >= minBit_ / 2 && d < minBit_) kind = 1, period_ = 2 * d;
     } else if (std::fabs(d - period_) < 0.25 * period_) {
         kind = 2;
     } else if (std::fabs(d - period_ / 2) < 0.25 * period_) {
@@ -202,7 +204,7 @@ void LtcDecoder::edge(double t) {
         return;
     }
     period_ += 0.1 * ((kind == 2 ? d : 2 * d) - period_);
-    period_ = std::clamp(period_, minBit_ * 0.8, maxBit_ * 1.2);
+    period_ = std::clamp(period_, minBit_, maxBit_);
     if (kind == 2) {
         if (halfStart_ >= 0) held_ = 0, halfStart_ = -1;  // a half bit without its pair: what was held is wrong
         bit(0, t - d, t);
@@ -224,11 +226,24 @@ void LtcDecoder::bit(int value, double from, double to) {
     times_[size_t(held_)] = from;
     ++held_;
     times_[size_t(held_)] = to;
-    if (held_ < 80 || std::memcmp(bits_.data() + 64, kSync, 16) != 0) return;
+    if (held_ < 80) return;
+    // A word ends in the sync word played forwards; played backwards, it comes first and reversed, the word's bits after
+    // it last to first.
+    static const auto kSyncBack = [] {
+        std::array<uint8_t, 16> b{};
+        for (int i = 0; i < 16; ++i) b[size_t(i)] = kSync[15 - i];
+        return b;
+    }();
+    const bool forward = std::memcmp(bits_.data() + 64, kSync, 16) == 0;
+    if (!forward && std::memcmp(bits_.data(), kSyncBack.data(), 16) != 0) return;
+    std::array<uint8_t, 80> word = bits_;
+    if (!forward) std::reverse(word.begin(), word.end());
     LtcFrame f;
-    if (ltcFromBits(bits_.data(), f)) {
-        f.start = times_[0];
-        f.end = times_[80];
+    if (ltcFromBits(word.data(), f)) {
+        // (backwards, the frame's start is where its bit 0 ends, the last to come)
+        f.reverse = !forward;
+        f.start = forward ? times_[0] : times_[80];
+        f.end = forward ? times_[80] : times_[0];
         out_.push_back(f);
     }
     held_ = 0;

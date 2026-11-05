@@ -80,6 +80,7 @@
 #include "Settings.h"
 #include "media/MediaPool.h"
 #include "media/Exr.h"
+#include "media/Jxl.h"
 #include "media/ImageSequence.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
@@ -2512,6 +2513,11 @@ private slots:
         m = state()->project().findMedia(dlg->importedMedia());
         QVERIFY(m && m->hasVideo && m->hasAudio && m->name.find("Feed 02") != std::string::npos);
         QVERIFY(m->timecode >= 36000 && m->timecode < 36000 + 30 * 25);
+        // The picture disconnected by the controller, what it connected is no longer the feed.
+        auto* url = dlg->findChild<QLineEdit*>(QStringLiteral("captureUrl"));
+        QVERIFY(url && url->text().contains("m=video"));
+        QCOMPARE(dlg->nmosNode()->handle("PUT", "/x-nmos/node/v1.3/receivers/" + receivers[0].toString() + "/target", "{}").code, 202);
+        QVERIFY(url->text().isEmpty());
         stop = true;
         sending.join();
         tx.close();
@@ -13279,6 +13285,49 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(restored, QStringLiteral("DNxHR HQ (MXF)"));
     }
 
+    void jpegXlExportSettings() {
+        // The export dialog sets JPEG XL frames' distance, depth and premultiplied alpha (where libjxl writes it), for
+        // the JPEG XL preset only.
+        if (!jxlAvailable()) QSKIP("Built without libjxl");
+        loadDemo();
+        // (the dialog keeps the preset last used: put back as it was, so later exports are not JPEG XL frames)
+        const QVariant lastPreset = appSettings().value("export/preset");
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        int jxl = -1, mp4 = -1;
+        for (size_t i = 0; i < exportPresets().size(); ++i) {
+            if (exportPresets()[i].settings.videoCodec == "jxl") jxl = int(i);
+            if (mp4 < 0 && exportPresets()[i].extension == "mp4") mp4 = int(i);
+        }
+        QVERIFY(jxl >= 0 && mp4 >= 0);
+        ExportDialog ed(state(), win_.get());
+        ed.setQueue(queue);
+        auto* preset = ed.findChild<QComboBox*>("exportPreset");
+        auto* distance = ed.findChild<QComboBox*>("exportJxlQuality");
+        auto* depth = ed.findChild<QComboBox*>("exportJxlDepth");
+        auto* premultiplied = ed.findChild<QCheckBox*>("exportJxlPremultiplied");
+        QVERIFY(preset && distance && depth && premultiplied);
+        preset->setCurrentIndex(mp4);
+        QVERIFY(!distance->isEnabled() && !depth->isEnabled() && !premultiplied->isEnabled());
+        preset->setCurrentIndex(jxl);
+        QVERIFY(distance->isEnabled() && depth->isEnabled());
+        QCOMPARE(premultiplied->isEnabled(), jxlWritesPremultiplied());
+        distance->setCurrentIndex(distance->findData(1.0));
+        depth->setCurrentIndex(depth->findData(QStringLiteral("float")));
+        premultiplied->setChecked(true);
+        ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/frames.jxl");
+        ed.findChild<QPushButton*>("addToQueue")->click();
+        QCOMPARE(queue->jobs().size(), jobs + 1);
+        const RenderQueue::Job& job = queue->jobs().back();
+        QCOMPARE(job.settings.jxlDistance, 1.0);
+        QCOMPARE(job.settings.jxlDepth, std::string("float"));
+        QCOMPARE(job.settings.jxlPremultiplied, jxlWritesPremultiplied());
+        queue->remove(job.id);
+        for (const char* key : {"export/jxlDistance", "export/jxlDepth", "export/jxlPremultiplied"}) appSettings().remove(key);
+        if (lastPreset.isValid()) appSettings().setValue("export/preset", lastPreset);
+        else appSettings().remove("export/preset");
+    }
+
     void frameRateDelivery() {
         // 29.97 video made from a 23.976 cut with 2:3 pulldown, then removed in Interpret Footage, starting on A.
         const QString telecined = dir_.filePath("telecined.mov");
@@ -14647,7 +14696,7 @@ const auto seq = [this] { return state()->sequence(); };
         const auto c = connect(program, &PlaybackController::positionChanged, this, [&](FrameTime t) { seen.emplace_back(clock.elapsed(), t); });
         program->seek(10);
         program->play();
-        QTest::qWait(1500);
+        QTest::qWait(2500);
         disconnect(c);
         // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
         const FrameTime at = program->position();
@@ -14667,9 +14716,15 @@ const auto seq = [this] { return state()->sequence(); };
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
+        // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
+        size_t first = 1;
+        while (first < seen.size() && seen[first].second == seen[0].second) ++first;
+        QVERIFY(first + 10 < seen.size());
+        const qint64 start = seen[first].first;
+        const double wrapsAfter = double(std::count_if(wraps.begin(), wraps.end(), [start](qint64 w) { return w > start; }));
         const double fps = state()->sequence()->fpsValue();
-        const double frames = double(seen.back().second - seen.front().second) + 10.0 * double(wraps.size());
-        const double rate = frames / (double(seen.back().first - seen.front().first) / 1000.0);
+        const double frames = double(seen.back().second - seen[first].second) + 10.0 * wrapsAfter;
+        const double rate = frames / (double(seen.back().first - start) / 1000.0);
         QVERIFY2(std::fabs(rate - fps) < fps * 0.1, qPrintable(QStringLiteral("%1 frames a second, not %2").arg(rate).arg(fps)));
         state()->newProject();
     }

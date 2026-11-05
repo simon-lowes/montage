@@ -14,7 +14,9 @@
 //    B-pictures refer to the picture before it, so it is copied only where that frame is shown just before it, encoded
 //    (an encoded part always ends on an anchor picture): those B-pictures then decode from the encoded picture, near the
 //    source's but not exactly it.
-// Footage shown turned (a display matrix), with other pixels or another range is not copied. Every picture is shown
+// Footage shown turned (a display matrix), with other pixels or another range is not copied; nor is footage coded at
+// well over what the export's own settings would spend on it, or at a profile, tier or level above the one the export's
+// encoder states (or one its decoders need not decode). Every picture is shown
 // once and decoded in order: the timestamps are rebuilt for the whole stream.
 #pragma once
 
@@ -50,6 +52,9 @@ struct LongGopEncoder {
     // only one source's sets are written hvc1.
     bool inBandHevc = false;
     std::string startTimecode;  // MPEG-2: the GOP headers' time codes run from it (hh:mm:ss:ff, ';' drop frame; empty: 0)
+    // A GOP is read whole and checked before it is written: one coded in more bytes than this (a screen recording's
+    // single IDR picture, an action camera's GOPs of several seconds) is encoded rather than held to be copied.
+    int64_t maxGopBytes = int64_t(64) << 20;
     // The export's encoder, opened: the size, pixel format, rate, colour tags, field order and (MPEG-2) rate control the
     // encoded parts are made with. Its codec is libx264, libx265 or mpeg2video.
     const AVCodecContext* main = nullptr;
@@ -66,7 +71,8 @@ public:
     // sets; HEVC: the first copied source's, as hev1).
     bool prepareStream(std::string* error);
     // Frame `rel` of the export (0 = `in`): 1 when it is copied (the whole GOP is written at its first frame), 0 when it
-    // is to be rendered and given to encode(), -1 on failure.
+    // is to be rendered and given to encode(), -1 on failure, -2 when the export is to be made again encoded whole
+    // (HEVC written hvc1 whose footage was not found as planned: no encoded part can sit beside its sets).
     int copy(FrameTime rel, std::string* error);
     // A rendered frame `rel`, in the main encoder's format, for the encoded part it falls in.
     bool encode(AVFrame* frame, FrameTime rel, std::string* error);

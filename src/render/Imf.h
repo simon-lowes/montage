@@ -199,6 +199,10 @@ bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int&
 // it cannot be made at that size and rate.
 int64_t imfCompositionFrames(const Sequence& s, const ImfSettings& settings, std::string* error = nullptr);
 
+// The name exportImf gives the folder of a package made today: the title and the date ("Title_IMF_20261105"; a
+// supplemental package's "_IMF_SUPP_", numbered on when there is one of the day already).
+std::string imfFolderName(const ImfSettings& settings);
+
 // Writes the package into a new folder (named after the title and the date) under `parent`. `progress` (0..1) may
 // return false to stop (the half-written folder is removed).
 bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings, const std::string& parent, ImfResult* result = nullptr,

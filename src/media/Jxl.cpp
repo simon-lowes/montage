@@ -1,6 +1,7 @@
 // Montage — JPEG XL through libjxl (see Jxl.h).
 #include "Jxl.h"
 
+#include "media/Image.h"
 #include "render/ColorSpace.h"
 
 #include <QByteArray>
@@ -13,6 +14,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <numeric>
 
@@ -21,6 +23,9 @@
 #include <jxl/encode.h>
 #include <jxl/thread_parallel_runner.h>
 #include <jxl/version.h>
+#ifdef MONTAGE_WITH_LCMS2
+#include <lcms2.h>
+#endif
 #endif
 
 namespace montage {
@@ -79,6 +84,7 @@ bool unbuilt(std::string* error) {
 
 bool jxlAvailable() { return false; }
 bool jxlWritesPremultiplied() { return false; }
+bool jxlConvertsProfiles() { return false; }
 bool readJxlInfo(const std::string&, JxlInfo&, std::string* error) { return unbuilt(error); }
 bool readJxlFrame(const std::string&, int, int&, int&, std::vector<float>&, bool*, std::string* error) { return unbuilt(error); }
 struct JxlAnimationReader::State {
@@ -108,6 +114,14 @@ bool jxlAvailable() { return true; }
 
 // (libjxl 0.7 aborts on premultiplied alpha given as its extra channel, and drops it given in the header alone)
 bool jxlWritesPremultiplied() { return JPEGXL_NUMERIC_VERSION >= JPEGXL_COMPUTE_NUMERIC_VERSION(0, 9, 0); }
+
+bool jxlConvertsProfiles() {
+#ifdef MONTAGE_WITH_LCMS2
+    return true;
+#else
+    return false;
+#endif
+}
 
 namespace {
 
@@ -145,20 +159,60 @@ bool readAll(const std::string& file, std::vector<uint8_t>& out, std::string* er
     return true;
 }
 
-// Threads for decoding or encoding pixels (made when first wanted: header-only passes need none).
+// libjxl's thread pools, made once and lent to one decoder or encoder at a time (a pool runs one job at a time), so
+// a run of frames does not start and stop threads for each.
+class RunnerPool {
+public:
+    void* take() {
+        {
+            std::lock_guard lock(m_);
+            if (!idle_.empty()) {
+                void* r = idle_.back();
+                idle_.pop_back();
+                return r;
+            }
+        }
+        return JxlThreadParallelRunnerCreate(nullptr, JxlThreadParallelRunnerDefaultNumWorkerThreads());
+    }
+    void give(void* r) {
+        {
+            std::lock_guard lock(m_);
+            if (idle_.size() < 4) {
+                idle_.push_back(r);
+                return;
+            }
+        }
+        JxlThreadParallelRunnerDestroy(r);
+    }
+
+private:
+    std::mutex m_;
+    std::vector<void*> idle_;
+};
+RunnerPool& runnerPool() {
+    static RunnerPool* pool = new RunnerPool;  // (kept to the end: its threads are not joined while the program exits)
+    return *pool;
+}
+
+// Threads for decoding or encoding pixels (taken when first wanted: header-only passes need none).
 struct Runner {
     void* r = nullptr;
     Runner() = default;
     bool make() {
-        if (!r) r = JxlThreadParallelRunnerCreate(nullptr, JxlThreadParallelRunnerDefaultNumWorkerThreads());
+        if (!r) r = runnerPool().take();
         return r != nullptr;
     }
     Runner(const Runner&) = delete;
     Runner& operator=(const Runner&) = delete;
     ~Runner() {
-        if (r) JxlThreadParallelRunnerDestroy(r);
+        if (r) runnerPool().give(r);
     }
 };
+
+// The most pixels a picture may have (as the other readers), and the most memory decoding one may take: libjxl's
+// planes, the samples it gives and the RGBA made from them.
+constexpr uint64_t kMaxPixels = uint64_t(1) << 26;
+constexpr uint64_t kMaxDecodeBytes = uint64_t(2) << 30;
 
 struct DecoderDeleter {
     void operator()(JxlDecoder* d) const { JxlDecoderDestroy(d); }
@@ -290,6 +344,40 @@ std::string spaceForIcc(const QByteArray& icc) {
     }
 }
 
+#ifdef MONTAGE_WITH_LCMS2
+struct TransformDeleter {
+    void operator()(void* t) const { cmsDeleteTransform(t); }
+};
+using Transform = std::unique_ptr<void, TransformDeleter>;
+
+// A conversion of `channels`-sample pixels (grey, grey and alpha, or RGBA, as libjxl gives them) from an ICC profile's
+// colours to linear Rec.709 display light, in float and unbounded (colours past Rec.709's gamut kept, below 0 or past
+// 1), alpha copied; null with `why` for a profile Little CMS cannot read or of another colour model (CMYK).
+Transform iccToDisplayLight(const QByteArray& icc, int channels, std::string& why) {
+    cmsHPROFILE in = cmsOpenProfileFromMem(icc.constData(), cmsUInt32Number(icc.size()));
+    if (!in) return why = "The JPEG XL file's colour profile cannot be read", nullptr;
+    const bool gray = channels <= 2;
+    if (cmsGetColorSpace(in) != (gray ? cmsSigGrayData : cmsSigRgbData)) {
+        cmsCloseProfile(in);
+        return why = "The JPEG XL file's colours are not RGB or grey (CMYK is not read)", nullptr;
+    }
+    const cmsCIExyY d65{0.3127, 0.3290, 1};
+    const cmsCIExyYTRIPLE rec709{{0.64, 0.33, 1}, {0.30, 0.60, 1}, {0.15, 0.06, 1}};
+    cmsToneCurve* linear = cmsBuildGamma(nullptr, 1.0);
+    cmsToneCurve* curves[3] = {linear, linear, linear};
+    cmsHPROFILE out = linear ? cmsCreateRGBProfile(&d65, &rec709, curves) : nullptr;
+    if (linear) cmsFreeToneCurve(linear);
+    const cmsUInt32Number from = channels == 1 ? TYPE_GRAY_FLT : channels == 2 ? TYPE_GRAYA_FLT : TYPE_RGBA_FLT;
+    // (no cache: shared by the threads converting rows; a grey picture without alpha has its alpha filled in)
+    const cmsUInt32Number flags = cmsFLAGS_NOCACHE | (channels == 1 ? 0 : cmsFLAGS_COPY_ALPHA);
+    cmsHTRANSFORM t = out ? cmsCreateTransform(in, from, out, TYPE_RGBA_FLT, INTENT_RELATIVE_COLORIMETRIC, flags) : nullptr;
+    cmsCloseProfile(in);
+    if (out) cmsCloseProfile(out);
+    if (!t) why = "The JPEG XL file's colour profile cannot be converted";
+    return Transform(t);
+}
+#endif
+
 // Whether a JPEG XL container holds a JPEG's reconstruction data (a jbrd box).
 bool hasJpegBox(const std::vector<uint8_t>& d) {
     static const uint8_t sig[12] = {0, 0, 0, 0x0c, 'J', 'X', 'L', ' ', 0x0d, 0x0a, 0x87, 0x0a};
@@ -326,6 +414,18 @@ struct Session {
     bool started = false;
     std::vector<float> buf;
     int channels = 4;
+    int planes = 4;           // libjxl's own: colour and extra channels
+    std::string colourError;  // why its colour cannot be read
+#ifdef MONTAGE_WITH_LCMS2
+    Transform toDisplayLight;  // its ICC profile's colours to linear Rec.709 display light
+#endif
+    bool converted() const {
+#ifdef MONTAGE_WITH_LCMS2
+        return toDisplayLight != nullptr;
+#else
+        return false;
+#endif
+    }
 
     bool start(bool wantPixels, std::string* error) {
         pixels = wantPixels;
@@ -367,9 +467,10 @@ struct Session {
         info.tpsDen = bi.have_animation ? std::max<uint32_t>(1, bi.animation.tps_denominator) : 1;
         usesOriginal = bi.uses_original_profile;
         channels = info.gray ? (info.alpha ? 2 : 1) : 4;
+        planes = int(bi.num_color_channels + bi.num_extra_channels);
         if (info.width <= 0 || info.height <= 0) return fail(error, "The JPEG XL file has no picture");
-        // (level 10's pictures go to 2^30 a side; past a quarter of a billion pixels is more than a frame can hold)
-        if (uint64_t(info.width) * uint64_t(info.height) > (uint64_t(1) << 28)) return fail(error, "The JPEG XL picture is too large");
+        // (level 10's pictures go to 2^30 a side: a few hundred bytes of header can ask for any of them)
+        if (uint64_t(info.width) * uint64_t(info.height) > kMaxPixels) return fail(error, "The JPEG XL picture is too large (over 67 million pixels)");
         if (skip > 0) {
             JxlDecoderSkipFrames(dec.get(), size_t(skip));
             next += skip;
@@ -384,14 +485,45 @@ struct Session {
         info.icc = !encoded;
         // Lossy pictures (coded in XYB) come out in their own encoding when it is one: libjxl converts XYB to any.
         if (encoded && !usesOriginal) JxlDecoderSetPreferredColorProfile(dec.get(), &original);
+        colourError.clear();
+#ifdef MONTAGE_WITH_LCMS2
+        toDisplayLight.reset();
+#endif
         JxlColorEncoding data;
+        QByteArray icc;
         if (encodedProfile(dec.get(), JXL_COLOR_PROFILE_TARGET_DATA, &data) == JXL_DEC_SUCCESS) {
             info.colorSpace = spaceFor(data);
-        } else if (QByteArray icc; iccProfile(dec.get(), JXL_COLOR_PROFILE_TARGET_DATA, icc)) {
+        } else if (iccProfile(dec.get(), JXL_COLOR_PROFILE_TARGET_DATA, icc)) {
             info.colorSpace = spaceForIcc(icc);
         } else {
             info.colorSpace.clear();
         }
+        // (a lossy picture whose colour is an ICC profile comes out in libjxl's linear sRGB: its display's light)
+        if (!info.colorSpace.empty() && !usesOriginal && !encoded)
+            if (const ColorSpace* cs = findColorSpace(info.colorSpace)) info.colorSpace = displayLightOf(*cs).id;
+        if (!info.colorSpace.empty()) return;
+        // Any other colour (an ICC profile, or an encoding, that is none of Montage's spaces: ProPhoto, Rec.2020 PQ by
+        // profile, DCI white): converted through its ICC profile (libjxl makes one for an encoding) to linear Rec.709
+        // display light, else refused rather than read as Rec.709.
+        if (icc.isEmpty() && !iccProfile(dec.get(), JXL_COLOR_PROFILE_TARGET_DATA, icc)) {
+            colourError = "The JPEG XL file states no colour Montage can read";
+            return;
+        }
+#ifdef MONTAGE_WITH_LCMS2
+        toDisplayLight = iccToDisplayLight(icc, channels, colourError);
+        if (toDisplayLight) info.colorSpace = displayLightOf(linearColorSpace(Primaries::Bt709)).id;
+#else
+        colourError = "The JPEG XL file's colour profile is none of Montage's spaces (this build has no Little CMS to convert it)";
+#endif
+    }
+
+    // Whether decoding a frame fits: libjxl's planes, the samples it gives, and the RGBA made from them (where it is
+    // not those samples themselves).
+    bool fits(std::string* error) const {
+        const uint64_t perPixel = uint64_t(planes) * 4 + uint64_t(channels) * 4 + (channels != 4 || converted() ? 16 : 0);
+        if (uint64_t(info.width) * uint64_t(info.height) * perPixel > kMaxDecodeBytes)
+            return fail(error, "The JPEG XL picture is too large to decode (over 2 GB)");
+        return true;
     }
 
     // Runs until frame `want` is decoded into `buf` (with pixels), or to the end gathering frame headers (want < 0).
@@ -404,7 +536,11 @@ struct Session {
                 case JXL_DEC_BASIC_INFO:
                     if (!basicInfo(error)) return false;
                     break;
-                case JXL_DEC_COLOR_ENCODING: colour(); break;
+                case JXL_DEC_COLOR_ENCODING:
+                    colour();
+                    if (!colourError.empty()) return fail(error, colourError);
+                    if (!fits(error)) return false;
+                    break;
                 case JXL_DEC_FRAME:
                     if (info.animated) {
                         JxlFrameHeader fh;
@@ -432,20 +568,49 @@ struct Session {
         }
     }
 
-    // The frame just decoded as RGBA.
-    void rgba(int& w, int& h, std::vector<float>& out) const {
+    // The frame just decoded as RGBA, its samples handed over (none kept here between frames).
+    void rgba(int& w, int& h, std::vector<float>& out) {
         w = info.width, h = info.height;
         const size_t n = size_t(w) * size_t(h);
-        out.resize(n * 4);
-        if (channels == 4) {
-            std::copy(buf.begin(), buf.begin() + std::min(buf.size(), out.size()), out.begin());
+#ifdef MONTAGE_WITH_LCMS2
+        if (toDisplayLight) {
+            const bool alpha = channels == 2 || channels == 4, premultiplied = alpha && info.alphaPremultiplied;
+            out.assign(n * 4, 1.0f);
+            // (the profile's curves work on straight colour)
+            parallelRows(h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    float* in = &buf[size_t(y) * size_t(w) * size_t(channels)];
+                    float* o = &out[size_t(y) * size_t(w) * 4];
+                    if (premultiplied)
+                        for (int x = 0; x < w; ++x) {
+                            float* q = in + size_t(x) * size_t(channels);
+                            const float a = q[channels - 1];
+                            if (a > 0)
+                                for (int c = 0; c < channels - 1; ++c) q[c] /= a;
+                        }
+                    cmsDoTransform(toDisplayLight.get(), in, o, cmsUInt32Number(w));
+                    if (premultiplied)
+                        for (int x = 0; x < w; ++x)
+                            for (int c = 0; c < 3; ++c) o[size_t(x) * 4 + size_t(c)] *= o[size_t(x) * 4 + 3];
+                }
+            });
+            std::vector<float>().swap(buf);
             return;
         }
+#endif
+        if (channels == 4) {
+            out = std::move(buf);
+            out.resize(n * 4);
+            std::vector<float>().swap(buf);
+            return;
+        }
+        out.resize(n * 4);
         for (size_t i = 0; i < n; ++i) {
             const float v = buf[i * size_t(channels)];
             out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = v;
             out[i * 4 + 3] = channels == 2 ? buf[i * 2 + 1] : 1.0f;
         }
+        std::vector<float>().swap(buf);
     }
 };
 
@@ -574,7 +739,8 @@ bool encodeJxl(std::vector<uint8_t>& out, int width, int height, const std::vect
         return fail(error, "This libjxl (before 0.9) cannot write premultiplied alpha: write it straight");
     const ColorSpace* space = o.colorSpace.empty() ? findColorSpace("srgb") : findColorSpace(o.colorSpace);
     JxlColorEncoding colour;
-    if (!space || !encodingFor(*space, colour)) return fail(error, "JPEG XL cannot state the colour space " + o.colorSpace + " (camera log): write it as linear light");
+    if (o.iccProfile.empty() && (!space || !encodingFor(*space, colour)))
+        return fail(error, "JPEG XL cannot state the colour space " + o.colorSpace + " (camera log): write it as linear light");
 
     Runner runner;  // (declared before the encoder, which uses it, so it outlives it)
     std::unique_ptr<JxlEncoder, EncoderDeleter> enc(JxlEncoderCreate(nullptr));
@@ -612,7 +778,9 @@ bool encodeJxl(std::vector<uint8_t>& out, int width, int height, const std::vect
         eci.alpha_premultiplied = bi.alpha_premultiplied;
         if (JxlEncoderSetExtraChannelInfo(enc.get(), 0, &eci) != JXL_ENC_SUCCESS) return fail(error, "libjxl refused the alpha channel");
     }
-    if (JxlEncoderSetColorEncoding(enc.get(), &colour) != JXL_ENC_SUCCESS) return fail(error, "libjxl refused the colour encoding");
+    if (!o.iccProfile.empty() ? JxlEncoderSetICCProfile(enc.get(), o.iccProfile.data(), o.iccProfile.size()) != JXL_ENC_SUCCESS
+                              : JxlEncoderSetColorEncoding(enc.get(), &colour) != JXL_ENC_SUCCESS)
+        return fail(error, "libjxl refused the colour encoding");
     JxlEncoderFrameSettings* fs = JxlEncoderFrameSettingsCreate(enc.get(), nullptr);
     if (!fs) return fail(error, "Out of memory");
     JxlEncoderFrameSettingsSetOption(fs, JXL_ENC_FRAME_SETTING_EFFORT, std::clamp(o.effort, 1, 9));

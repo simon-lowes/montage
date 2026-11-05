@@ -21,25 +21,70 @@ std::vector<uint8_t> encode(const Message& m) {
     return out;
 }
 
-void Parser::feed(const uint8_t* bytes, size_t n) {
+void Parser::feed(const uint8_t* bytes, size_t n, Clock::time_point now) {
     buf_.insert(buf_.end(), bytes, bytes + n);
-    if (buf_.size() > 4096) buf_.erase(buf_.begin(), buf_.end() - 64);  // (a line full of noise)
+    came_.insert(came_.end(), n, now);
+    if (buf_.size() > 4096) drop(buf_.size() - 64);  // (a line full of noise)
 }
 
-Parser::Result Parser::next(Message& out) {
-    // (groups 0-7 only: a byte above starts nothing, as on a line picked up mid-message)
-    while (!buf_.empty() && (buf_[0] >> 4) > 7) buf_.erase(buf_.begin());
-    if (buf_.size() < 3) return None;
-    const size_t n = buf_[0] & 0x0F, total = n + 3;
-    if (buf_.size() < total) return None;
+void Parser::drop(size_t n) {
+    buf_.erase(buf_.begin(), buf_.begin() + ptrdiff_t(n));
+    came_.erase(came_.begin(), came_.begin() + ptrdiff_t(n));
+}
+
+bool Parser::goodAt(size_t k) const {
+    if (k >= buf_.size() || (buf_[k] >> 4) > 7) return false;
+    const size_t total = (buf_[k] & 0x0F) + 3;
+    if (buf_.size() - k < total) return false;
     uint8_t sum = 0;
-    for (size_t i = 0; i + 1 < total; ++i) sum = uint8_t(sum + buf_[i]);
-    out.group = uint8_t(buf_[0] >> 4);
-    out.cmd = buf_[1];
-    out.data.assign(buf_.begin() + 2, buf_.begin() + ptrdiff_t(2 + n));
-    const bool good = sum == buf_[total - 1];
-    buf_.erase(buf_.begin(), buf_.begin() + ptrdiff_t(total));
-    return good ? Ok : BadChecksum;
+    for (size_t i = k; i + 1 < k + total; ++i) sum = uint8_t(sum + buf_[i]);
+    return sum == buf_[k + total - 1];
+}
+
+Parser::Result Parser::next(Message& out, Clock::time_point now) {
+    for (;;) {
+        // (groups 0-7 only: a byte above starts nothing, as on a line picked up mid-message)
+        size_t skip = 0;
+        while (skip < buf_.size() && (buf_[skip] >> 4) > 7) ++skip;
+        drop(skip);
+        if (buf_.empty()) {
+            resyncing_ = false;
+            return None;
+        }
+        const size_t total = (buf_[0] & 0x0F) + 3, have = std::min(total, buf_.size());
+        // A message whose bytes stopped coming for longer than kByteGap (before the next came, or until now while it
+        // is short) was not one: its first byte passed over.
+        bool broken = have < total && now - came_[have - 1] > kByteGap;
+        for (size_t i = 1; i < have && !broken; ++i) broken = came_[i] - came_[i - 1] > kByteGap;
+        if (broken) {
+            drop(1);
+            continue;
+        }
+        if (have < total) return None;
+        if (goodAt(0)) {
+            out.group = uint8_t(buf_[0] >> 4);
+            out.cmd = buf_[1];
+            out.data.assign(buf_.begin() + 2, buf_.begin() + ptrdiff_t(total - 1));
+            drop(total);
+            resyncing_ = false;
+            return Ok;
+        }
+        // A wrong sum: a good message starting inside this one is taken, the bytes before it noise.
+        size_t k = 1;
+        while (k < total && !goodAt(k)) ++k;
+        if (k < total) {
+            drop(k);
+            continue;
+        }
+        // Garbled: reported once, then passed over a byte at a time until the line is back in step.
+        out.group = uint8_t(buf_[0] >> 4);
+        out.cmd = buf_[1];
+        out.data.clear();
+        drop(1);
+        if (resyncing_) continue;
+        resyncing_ = true;
+        return BadChecksum;
+    }
 }
 
 namespace {
@@ -56,6 +101,30 @@ std::array<uint8_t, 4> timecodeBytes(int64_t frame, int base, bool dropFrame) {
     return {uint8_t(bcd(f.frames) | (f.dropFrame ? 0x40 : 0)), bcd(f.seconds), bcd(f.minutes), bcd(f.hours)};
 }
 
+namespace {
+// A label as a frame number, counted the way it says; one drop frame skips stands for the next there is.
+int64_t labelNumber(LtcFrame f, int base) {
+    if (f.dropFrame && base == 30 && f.seconds == 0 && f.frames < 2 && f.minutes % 10 != 0) f.frames = 2;
+    return ltcFrameNumber(f, base);
+}
+}  // namespace
+
+int64_t sameLabel(int64_t frame, int base, bool fromDrop, bool toDrop) {
+    fromDrop = fromDrop && base == 30, toDrop = toDrop && base == 30;
+    if (fromDrop == toDrop || frame < 0) return frame;
+    // (whole days kept: a clip logged over midnight runs on into the next)
+    const int64_t days = frame / ltcFramesPerDay(base, fromDrop);
+    LtcFrame f = ltcFrameAt(frame, base, fromDrop);
+    f.dropFrame = toDrop;
+    return labelNumber(f, base) + days * ltcFramesPerDay(base, toDrop);
+}
+
+int64_t timecodeFromBytesAs(const uint8_t* b, int base, bool dropFrame) {
+    bool flagged = false;
+    const int64_t f = timecodeFromBytes(b, base, &flagged);
+    return sameLabel(f, base, flagged, dropFrame);
+}
+
 int64_t timecodeFromBytes(const uint8_t* b, int base, bool* dropFrame) {
     LtcFrame f;
     f.dropFrame = (b[0] & 0x40) != 0 && base == 30;
@@ -66,7 +135,7 @@ int64_t timecodeFromBytes(const uint8_t* b, int base, bool* dropFrame) {
     if (dropFrame) *dropFrame = f.dropFrame;
     if (f.frames < 0 || f.seconds < 0 || f.minutes < 0 || f.hours < 0 || f.frames >= base || f.seconds > 59 || f.minutes > 59 || f.hours > 23)
         return -1;
-    return ltcFrameNumber(f, base);
+    return labelNumber(f, base);
 }
 
 double speedFromData(const std::vector<uint8_t>& data) {
@@ -162,50 +231,86 @@ std::string Deck::lastError() const {
     return error_;
 }
 
-std::optional<Message> Deck::command(const Message& m, int timeoutMs) {
+namespace {
+// Whether `a` can be the answer to `q`: a NAK, or the kind of answer `q` asks for (so one left from an earlier command
+// that came too late is not taken for it).
+bool answers(const Message& q, const Message& a) {
+    if (a.is(1, cmd::Nak)) return true;
+    if (q.group == 0 && q.cmd == cmd::DeviceTypeRequest) return a.is(1, cmd::DeviceType);
+    if (q.group != 6) return a.is(1, cmd::Ack);
+    if (a.group != 7) return false;
+    if (q.cmd != cmd::CurrentTimeSense) return a.cmd == q.cmd;  // (STATUS SENSE to STATUS DATA, IN DATA SENSE to IN DATA...)
+    const uint8_t ask = q.data.empty() ? cmd::SenseLtc : q.data[0];
+    switch (a.cmd) {
+    case cmd::LtcTimeData: return (ask & cmd::SenseLtc) != 0;
+    case cmd::VitcTimeData: return (ask & cmd::SenseVitc) != 0;
+    case cmd::Timer1Data: return (ask & cmd::SenseTimer1) != 0;
+    case cmd::Timer2Data: return (ask & cmd::SenseTimer2) != 0;
+    case cmd::LtcUserBitsData: return (ask & cmd::SenseLtcUserBits) != 0;
+    case cmd::VitcUserBitsData: return (ask & cmd::SenseVitcUserBits) != 0;
+    default: return false;
+    }
+}
+}  // namespace
+
+std::optional<Message> Deck::command(const Message& m, int timeoutMs, int tries) {
     std::lock_guard lock(m_);
     if (!port_.isOpen()) {
         error_ = "No deck connected";
         return std::nullopt;
     }
-    // (anything left from an answer that came too late is not this one's)
-    port_.flushInput();
-    parser_.clear();
-    if (!port_.write(encode(m))) {
-        error_ = "The deck's port failed";
-        return std::nullopt;
-    }
-    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    uint8_t buf[64];
-    for (;;) {
-        Message reply;
-        const Parser::Result r = parser_.next(reply);
-        if (r == Parser::BadChecksum) {
-            error_ = "The deck's answer was garbled";
-            return std::nullopt;
-        }
-        if (r == Parser::Ok) {
-            if (reply.is(1, cmd::Nak)) {
-                const uint8_t why = reply.data.empty() ? 0 : reply.data[0];
-                error_ = why & cmd::NakUnknownCommand ? "The deck does not know that command"
-                         : why & cmd::NakChecksum     ? "The deck heard a garbled command"
-                         : why & cmd::NakTimeout      ? "The deck timed out on the command"
-                                                      : "The deck refused the command (NAK " + std::to_string(int(why)) + ")";
-                return std::nullopt;
-            }
-            error_.clear();
-            return reply;
-        }
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
-        if (left <= 0) break;
-        const int n = port_.read(buf, sizeof buf, int(left));
-        if (n < 0) {
+    const std::vector<uint8_t> bytes = encode(m);
+    for (int attempt = 0; attempt < std::max(1, tries); ++attempt) {
+        // (anything left from an answer that came too late is not this one's)
+        port_.flushInput();
+        parser_.clear();
+        if (!port_.write(bytes)) {
             error_ = "The deck's port failed";
             return std::nullopt;
         }
-        parser_.feed(buf, size_t(n));
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        uint8_t buf[64];
+        bool again = false;
+        for (;;) {
+            Message reply;
+            const Parser::Result r = parser_.next(reply);
+            if (r == Parser::BadChecksum) {
+                error_ = "The deck's answer was garbled";
+                again = true;
+                break;
+            }
+            if (r == Parser::Ok) {
+                if (!answers(m, reply)) continue;
+                if (reply.is(1, cmd::Nak)) {
+                    const uint8_t why = reply.data.empty() ? 0 : reply.data[0];
+                    error_ = why & cmd::NakUnknownCommand ? "The deck does not know that command"
+                             : why & cmd::NakChecksum     ? "The deck heard a garbled command"
+                             : why & cmd::NakTimeout      ? "The deck timed out on the command"
+                                                          : "The deck refused the command (NAK " + std::to_string(int(why)) + ")";
+                    // (the line's errors are worth another try; a command the deck will not take is not)
+                    again = !(why & cmd::NakUnknownCommand) &&
+                            (why & (cmd::NakChecksum | cmd::NakParity | cmd::NakOverrun | cmd::NakFraming | cmd::NakTimeout));
+                    if (again) break;
+                    return std::nullopt;
+                }
+                error_.clear();
+                return reply;
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
+            if (left <= 0) {
+                error_ = "The deck did not answer";
+                again = true;
+                break;
+            }
+            const int n = port_.read(buf, sizeof buf, int(std::min<int64_t>(left, Parser::kByteGap.count())));
+            if (n < 0) {
+                error_ = "The deck's port failed";
+                return std::nullopt;
+            }
+            parser_.feed(buf, size_t(n));
+        }
+        if (!again) break;
     }
-    error_ = "The deck did not answer";
     return std::nullopt;
 }
 
@@ -217,6 +322,11 @@ bool Deck::ack(uint8_t group, uint8_t c, std::vector<uint8_t> data) {
         return false;
     }
     return r.has_value();
+}
+
+bool Deck::step(bool forward) {
+    const auto r = command(Message{2, forward ? cmd::StepForward : cmd::StepReverse, {}}, 100, 1);
+    return r && r->is(1, cmd::Ack);
 }
 
 std::optional<std::array<uint8_t, 2>> Deck::deviceType() {
@@ -241,17 +351,17 @@ bool Deck::variable(double speed) {
 }
 
 bool Deck::cue(int64_t frame) {
-    const auto b = timecodeBytes(frame, base_, dropFrame_);
+    const auto b = timecodeBytes(frame, base_, deckDrop_);
     return ack(2, cmd::CueUpWithData, {b.begin(), b.end()});
 }
 
 bool Deck::setIn(int64_t frame) {
-    const auto b = timecodeBytes(frame, base_, dropFrame_);
+    const auto b = timecodeBytes(frame, base_, deckDrop_);
     return ack(4, cmd::InDataPreset, {b.begin(), b.end()});
 }
 
 bool Deck::setOut(int64_t frame) {
-    const auto b = timecodeBytes(frame, base_, dropFrame_);
+    const auto b = timecodeBytes(frame, base_, deckDrop_);
     return ack(4, cmd::OutDataPreset, {b.begin(), b.end()});
 }
 
@@ -273,12 +383,12 @@ int64_t Deck::timecode(TimeSource source) {
                         : source == TimeSource::Vitc  ? cmd::SenseVitc
                         : source == TimeSource::Timer1 ? cmd::SenseTimer1
                                                        : uint8_t(cmd::SenseLtc | cmd::SenseVitc);
-    const auto r = command(Message{6, cmd::CurrentTimeSense, {ask}});
+    const auto r = command(Message{6, cmd::CurrentTimeSense, {ask}});  // (only a time of the kind asked is taken)
     if (!r || r->group != 7 || r->data.size() < 4) return -1;
     bool drop = false;
     const int base = base_;
     const int64_t f = timecodeFromBytes(r->data.data(), base, &drop);
-    if (f >= 0 && base == 30) dropFrame_ = drop;
+    if (f >= 0 && base == 30) deckDrop_ = drop;
     return f;
 }
 
@@ -311,7 +421,7 @@ DeckEmulator::~DeckEmulator() { stop(); }
 bool DeckEmulator::start(const std::string& port, std::string* error) {
     stop();
     if (!port_.open(port, 38400, 'O', error)) return false;
-    stop_ = false;
+    stop_ = false, failed_ = false;
     thread_ = std::thread([this] { run(); });
     return true;
 }
@@ -322,7 +432,7 @@ void DeckEmulator::stop() {
     port_.close();
 }
 
-bool DeckEmulator::running() const { return thread_.joinable() && !stop_; }
+bool DeckEmulator::running() const { return thread_.joinable() && !stop_ && !failed_; }
 
 void DeckEmulator::publish(const TransportState& s) {
     std::lock_guard lock(m_);
@@ -347,7 +457,8 @@ Message DeckEmulator::answer(const Message& m) {
     std::unique_lock lock(m_);
     const auto now = std::chrono::steady_clock::now();
     const TransportState s = state_;
-    const int64_t here = int64_t(std::floor(s.frameNow(now) + 1e-6));
+    // (not before 00:00:00:00, where the Program starts: no 23:59 from a reverse shuttle or a pre-roll there)
+    const int64_t here = std::max<int64_t>(0, int64_t(std::floor(s.frameNow(now) + 1e-6)));
     auto setState = [&](int64_t frame, double speed, bool cueing) {
         state_.frame = frame, state_.speed = speed, state_.at = now, state_.cueing = cueing;
     };
@@ -393,13 +504,14 @@ Message DeckEmulator::answer(const Message& m) {
             break;
         case cmd::CueUpWithData:
             if (m.data.size() < 4) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
-            r.kind = TransportRequest::Locate, r.frame = timecodeFromBytes(m.data.data(), base_);
+            // (by its label, counted as the Program counts, whatever the controller's drop frame flag)
+            r.kind = TransportRequest::Locate, r.frame = timecodeFromBytesAs(m.data.data(), base_, dropFrame_);
             if (r.frame < 0) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             setState(r.frame, 0, true);
             break;
         case cmd::Preroll:
             if (in_ < 0) return ack;
-            r.kind = TransportRequest::Locate, r.frame = in_ - preroll_;
+            r.kind = TransportRequest::Locate, r.frame = std::max<int64_t>(0, in_ - preroll_);
             setState(r.frame, 0, true);
             break;
         case cmd::StandbyOn:
@@ -420,7 +532,8 @@ Message DeckEmulator::answer(const Message& m) {
         case cmd::OutDataPreset:
         case cmd::PrerollTimePreset: {
             if (m.data.size() < 4) return unknown;
-            const int64_t f = timecodeFromBytes(m.data.data(), base_);
+            // (In and Out by their labels, counted as the Program counts; the pre-roll a length, counted straight)
+            const int64_t f = timecodeFromBytesAs(m.data.data(), base_, m.cmd != cmd::PrerollTimePreset && dropFrame_);
             if (f < 0) return unknown;
             (m.cmd == cmd::InDataPreset ? in_ : m.cmd == cmd::OutDataPreset ? out_ : preroll_) = f;
             return ack;
@@ -482,10 +595,12 @@ void DeckEmulator::run() {
     Parser parser;
     uint8_t buf[256];
     while (!stop_) {
-        const int n = port_.read(buf, sizeof buf, 50);
+        // (sooner while a message is short, so one left so by a stray byte is passed over in time)
+        const int n = port_.read(buf, sizeof buf, parser.pending() ? 10 : 50);
         if (n < 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+            // The port gone (an adapter pulled out): no longer a deck.
+            failed_ = true;
+            break;
         }
         parser.feed(buf, size_t(n));
         Message m;

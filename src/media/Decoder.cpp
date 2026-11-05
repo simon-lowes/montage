@@ -2088,7 +2088,7 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         if (n != rawFrame_ || exrRgba_.empty()) {
             std::string err;
             bool premultiplied = false;
-            exrRgba_.clear();
+            std::vector<float>().swap(exrRgba_);  // (freed, not kept beside the frame being decoded)
             bool ok = false;
             if (jxlAnimation_) {
                 premultiplied = jxlAnimation_->info().alphaPremultiplied;

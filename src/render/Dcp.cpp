@@ -395,6 +395,18 @@ std::string dcpName(const DcpSettings& settings, int channels, const std::string
     return parts.join('_').toStdString();
 }
 
+std::string dcpFolderName(const Sequence& s, const DcpSettings& requested) {
+    DcpSettings settings = requested;
+    if (settings.subtitles && settings.subtitleLanguage.empty()) {
+        settings.subtitleLanguage = "en";
+        for (const CaptionTrack& t : s.captionTracks)
+            if (t.id == settings.subtitles && !t.language.empty()) settings.subtitleLanguage = t.language;
+    }
+    // Immersive mixes fold their heights down; an ambisonic field is heard through two virtual cardioids (stereo).
+    const int seqChannels = ambisonicLayout(s.audioLayout) ? 2 : layoutChannels(earLevelLayout(s.audioLayout));
+    return dcpName(settings, seqChannels == 8 ? 8 : 6, QDate::currentDate().toString(QStringLiteral("yyyyMMdd")).toStdString());
+}
+
 bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested, const std::string& parent, DcpResult* result,
                const std::function<bool(double)>& progress, std::string* error) {
     auto fail = [&](const std::string& why) {
@@ -480,6 +492,15 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         return codes;
     };
     const bool coded = !settings.codestreams.empty();
+    auto inProfile = [&](const std::vector<uint8_t>& cs) {
+        dcp::J2kHeader h;
+        return dcp::parseJ2kHeader(cs.data(), cs.size(), h) && h.rsiz == (fourK ? 4 : 3);
+    };
+    auto notInProfile = [&](const std::string& whose) {
+        return "A render farm's DCP is coded in the DCI " + std::string(fourK ? "4K" : "2K") + " profile, and " + whose +
+               (whose == "this node's" ? " JPEG 2000 encoder (FFmpeg's own, without OpenJPEG) does not code in it"
+                                       : " is not in it (coded without OpenJPEG)");
+    };
     // A render farm's segment: DCP frames [codeFrom, codeTo) coded alone into the folder of codestreams, and nothing
     // else.
     if (settings.codeTo > settings.codeFrom) {
@@ -487,14 +508,32 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         const int64_t from = std::max<int64_t>(0, settings.codeFrom), to = std::min<int64_t>(frames, settings.codeTo);
         if (to <= from) return fail("The segment holds none of the package's frames");
         if (!QDir().mkpath(QString::fromStdString(settings.codestreams))) return fail("Cannot write in " + settings.codestreams);
+        // (an encrypted package's codestreams sealed before they are written: never in the clear in the farm's folder)
+        dcp::Sealer sealer;
+        if (settings.encrypt) {
+            std::string why;
+            if (settings.codestreamCertificate.empty()) return fail("An encrypted DCP's segment needs the certificate its codestreams are sealed for");
+            if (!dcp::makeSealer(settings.codestreamCertificate, sealer, &why)) return fail(why);
+        }
         EncoderPool pool(cw, ch, fps, stereo, threads);
         int64_t taken = from * eyes;
         std::string err;
-        std::vector<uint8_t> cs;
+        std::vector<uint8_t> cs, sealed;
         auto writeReady = [&](bool wait) {
             while (taken < to * eyes && (wait || pool.ready(taken)) && pool.take(taken, cs, true)) {
+                // (every codestream in the DCI profile: one node's, coded with FFmpeg's own encoder, would mix pictures
+                // cinema servers refuse into the package)
+                if (!inProfile(cs)) {
+                    err = notInProfile(pool.openjpeg() ? "the codestream of frame " + std::to_string(taken / eyes) : std::string("this node's"));
+                    return false;
+                }
+                if (settings.encrypt && !dcp::seal(sealer, cs.data(), cs.size(), sealed, dcp::codestreamSealContext(taken / eyes, taken % eyes == 1))) {
+                    err = "Cannot seal a codestream";
+                    return false;
+                }
+                const std::vector<uint8_t>& out = settings.encrypt ? sealed : cs;
                 QSaveFile f(QString::fromStdString(codestreamFile(settings.codestreams, taken / eyes, taken % eyes == 1)));
-                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(cs.data()), qint64(cs.size())) != qint64(cs.size()) ||
+                if (!f.open(QIODevice::WriteOnly) || f.write(reinterpret_cast<const char*>(out.data()), qint64(out.size())) != qint64(out.size()) ||
                     !f.commit()) {
                     err = "Cannot write the codestreams in " + settings.codestreams;
                     return false;
@@ -525,14 +564,13 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             result->fps = fps;
             result->width = cw, result->height = ch;
             result->stereo = stereo;
-            result->cinemaProfile = pool.openjpeg();
+            result->cinemaProfile = true;
         }
         return true;
     }
 
     // The folder.
-    const std::string date = QDate::currentDate().toString(QStringLiteral("yyyyMMdd")).toStdString();
-    const std::string name = dcpName(settings, channels, date);
+    const std::string name = dcpFolderName(s, settings);
     const QString folder = QDir(QString::fromStdString(parent)).filePath(QString::fromStdString(name));
     if (QFileInfo::exists(folder)) return fail("There is already a folder called " + name + " there");
     if (!QDir().mkpath(folder)) return fail("Cannot make the folder " + folder.toStdString());
@@ -691,20 +729,32 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         if (!picture.open(QDir(folder).filePath(pictureFile).toStdString(), pictureId, fps, stereo, &err)) return fail(err);
         EncoderPool pool(cw, ch, fps, stereo, coded ? 0 : threads);
         int64_t written = 0;
-        std::vector<uint8_t> cs, right;
+        std::vector<uint8_t> cs, right, sealed;
+        // (an encrypted package's codestreams come sealed for the signer's leaf, opened here with its key)
+        dcp::Unsealer unsealer{chain.privateKey, {}};
+        std::string unsealError;
         auto readCoded = [&](int64_t k, bool eye, std::vector<uint8_t>& out) {
             QFile f(QString::fromStdString(codestreamFile(settings.codestreams, k, eye)));
             if (!f.open(QIODevice::ReadOnly)) return false;
             const QByteArray b = f.readAll();
-            out.assign(b.begin(), b.end());
-            return !out.empty();
+            if (!settings.encrypt) {
+                out.assign(b.begin(), b.end());
+                return !out.empty();
+            }
+            sealed.assign(b.begin(), b.end());
+            if (!dcp::isSealed(sealed.data(), sealed.size())) {
+                unsealError = "The codestream of frame " + std::to_string(k) + " in " + settings.codestreams + " was not sealed";
+                return false;
+            }
+            return dcp::unseal(unsealer, sealed, out, &unsealError, dcp::codestreamSealContext(k, eye)) && !out.empty();
         };
         auto writeReady = [&](bool wait) {
             while (written < frames) {
                 const int64_t job = written * eyes;
                 if (coded) {
                     if (!readCoded(written, false, cs) || (stereo && !readCoded(written, true, right))) {
-                        err = "The codestream of frame " + std::to_string(written) + " is missing from " + settings.codestreams;
+                        err = !unsealError.empty() ? unsealError
+                                                   : "The codestream of frame " + std::to_string(written) + " is missing from " + settings.codestreams;
                         return false;
                     }
                     if (progress && written % 16 == 0 && !progress(0.05 + 0.9 * double(written) / double(frames))) {
@@ -715,10 +765,14 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
                     if (!wait && !(pool.ready(job) && (!stereo || pool.ready(job + 1)))) break;
                     if (!pool.take(job, cs, true) || (stereo && !pool.take(job + 1, right, true))) break;
                 }
-                if (written == 0) {
-                    dcp::J2kHeader h;
-                    if (dcp::parseJ2kHeader(cs.data(), cs.size(), h)) cinema = h.rsiz == (fourK ? 4 : 3) && pool.openjpeg();
+                // (Every codestream's profile: a farm's segments, each coded on its own node, are refused when one is
+                // not in the DCI profile.)
+                const bool profiled = inProfile(cs) && (!stereo || inProfile(right));
+                if (coded && !profiled) {
+                    err = notInProfile("the codestream of frame " + std::to_string(written) + " in " + settings.codestreams);
+                    return false;
                 }
+                cinema = cinema && profiled && pool.openjpeg();
                 if (stereo ? !picture.writeStereo(cs.data(), cs.size(), right.data(), right.size(), &err) : !picture.write(cs.data(), cs.size(), &err))
                     return false;
                 ++written;

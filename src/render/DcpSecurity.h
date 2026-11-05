@@ -111,4 +111,28 @@ bool hmacSha1(const uint8_t* key, size_t keySize, const uint8_t* data, size_t si
 bool sha1(const uint8_t* data, size_t size, uint8_t out[20]);
 bool randomBytes(uint8_t* out, size_t size);
 
+// A render farm's codestreams of an encrypted DCP, sealed while they wait for the join, so the package's pictures are
+// never left in the clear in the farm's folder: AES-256-GCM under a key each segment makes, that key under RSA-OAEP
+// to a certificate (the signer's leaf), so only the holder of its private key opens them. A sealed file: "MSEAL1", the
+// wrapped key's length (2 bytes, big-endian), the wrapped key, a 12-byte IV, the ciphertext and a 16-byte tag.
+struct Sealer {
+    std::array<uint8_t, 32> key{};
+    std::string wrapped;  // the key under RSA-OAEP to the certificate
+};
+bool makeSealer(const std::string& certificatePem, Sealer& out, std::string* error = nullptr);
+// `context` (a codestream's frame and eye) is authenticated with it, so a sealed file moved to another frame fails to open.
+bool seal(const Sealer& sealer, const uint8_t* data, size_t size, std::vector<uint8_t>& out, const std::string& context = {});
+bool isSealed(const uint8_t* data, size_t size);
+// The context a farm's codestream is sealed with: its frame and eye.
+std::string codestreamSealContext(int64_t frame, bool right);
+// Opens a sealed file with the certificate's private key (PEM); `keys` keeps the keys already unwrapped, by their
+// wrapped form (a segment's frames share one). False (and `out` empty) when it was sealed for another key, for another
+// context, or has been changed.
+struct Unsealer {
+    std::string privateKey;
+    std::vector<std::pair<std::string, std::array<uint8_t, 32>>> keys;
+};
+bool unseal(Unsealer& unsealer, const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* error = nullptr,
+            const std::string& context = {});
+
 }  // namespace montage::dcp

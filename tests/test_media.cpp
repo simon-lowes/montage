@@ -26,6 +26,7 @@
 #include <array>
 #include <mutex>
 #include <optional>
+#include <deque>
 #include <set>
 #include <QImage>
 #include <QMatrix4x4>
@@ -260,6 +261,7 @@
 #include "render/DcpMxf.h"
 #include "render/Imf.h"
 #include "render/SegmentedExport.h"
+#include "render/DcpSecurity.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -1534,14 +1536,19 @@ ModelCamera lookAt(std::array<double, 3> C, std::array<double, 3> at, double f, 
 namespace {
 
 #ifndef _WIN32
-// A deck for the tests, at the far end of a pseudo-terminal pair: a tape whose timecode runs at 25 fps, answering Sony
-// 9-pin as the manuals describe (cue, play, stop, status, timecode, an edit's settings and auto edit), and, given an
-// Open Media Transport sender, sending its picture while it plays, each frame's blue its frame number (mod 25) and,
-// when `stamp` is set, its timecode with it, as SDI capture gives it.
+// A deck for the tests, at the far end of a pseudo-terminal pair: a tape whose timecode runs at 25 fps (or `base` and
+// `drop` at 29.97), answering Sony 9-pin as the manuals describe (cue, play, stop, status, timecode, an edit's
+// settings and auto edit), and, given an Open Media Transport sender, sending its picture while it plays, each frame's
+// colours its frame number (in its second, and the second's mod 5) and, when `stamp` is set, its timecode with it, as
+// SDI capture gives it. As a real line and deck can, it can answer late, lose answers, let a late answer to an earlier
+// command come first, and take a moment to search back from where it was playing when told to edit.
 class SimulatedDeck {
 public:
     using Clock = std::chrono::steady_clock;
-    explicit SimulatedDeck(const std::string& port) {
+    explicit SimulatedDeck(const std::string& port, int base = 25, bool drop = false) : base_(base), drop_(drop && base == 30) {
+        fps = base == 25 ? 25.0 : base * 1000.0 / 1001;  // (29.97 at 30, drop frame or not)
+        pos = 36000.0 * base;  // (10:00:00:00 counted without drop frame)
+        if (drop_) pos = double(parseTimecode("10:00:00;00", 30));
         ok = port_.open(port, 38400, 'O');
         thread_ = std::thread([this] { run(); });
     }
@@ -1552,22 +1559,35 @@ public:
     }
     bool ok = false;
     std::mutex m;
-    double pos = 36000.0 * 25;  // (10:00:00:00)
+    double fps = 25;
+    double pos = 0;
     double speed = 0;
-    Clock::time_point at = Clock::now(), cuedAt = Clock::now();
+    Clock::time_point at = Clock::now(), cuedAt = Clock::now(), rolledAt = Clock::now(), searchUntil{};
     int64_t in = -1, out = -1, preroll = -1;
     std::vector<uint8_t> channels;
     bool autoEdit = false, recording = false, editDone = false;
     int64_t recordedFrom = -1, recordedTo = -1;
     int commands = 0;
+    // The line's and the deck's ways: the answers to these commands (counted from 1) lost or held back 150 ms, every
+    // answer lost while recording, a STATUS answer come late in front of the next timecode's, and how long play takes
+    // to lock its servo (-1: the deck does not say).
+    std::set<int> lose, late;
+    bool loseWhileRecording = false, staleStatus = false;
+    double servoLockAfter = 0.2;
 
-    double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * 25.0 * std::chrono::duration<double>(now - at).count(); }
+    double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
         const auto now = Clock::now();
+        if (sp == 1 && (speed != 1 || std::fabs(frame - frameNow(now)) > 1)) rolledAt = now;
         pos = frame;
         speed = sp;
         at = now;
     }
+    bool servoLocked(Clock::time_point now = Clock::now()) const {
+        return servoLockAfter >= 0 && speed == 1 && std::chrono::duration<double>(now - rolledAt).count() >= servoLockAfter;
+    }
+    // A frame number on its tape from a label sent to it (read its own way, whatever the flag).
+    int64_t label(const std::vector<uint8_t>& d) const { return ninepin::timecodeFromBytesAs(d.data(), base_, drop_); }
 
 #ifdef MONTAGE_WITH_OMT
     // Its picture out over Open Media Transport while it plays.
@@ -1575,14 +1595,17 @@ public:
         pictures_ = std::thread([this, tx, stamp] {
             const int W = 320, H = 180;
             std::vector<std::vector<uint8_t>> pics;
-            for (int t = 0; t < 25; ++t) {
+            for (int t = 0; t < 125; ++t) {
                 Image img(W, H);
+                const int k = t % 25, second = t / 25;
                 for (int y = 0; y < H; ++y)
                     for (int x = 0; x < W; ++x) {
                         float* p = img.at(x, y);
-                        // (the frame's number in its second as two base-5 digits, red and blue, steps far apart enough
-                        // for any codec's error)
-                        p[0] = 0.2f + 0.15f * float(t % 5), p[1] = 0.4f, p[2] = 0.2f + 0.15f * float(t / 5), p[3] = 1;
+                        // (the frame's number in its second as two base-5 digits and its second mod 5, in three grey
+                        // bands left to right: grey whatever matrix a decoder reads it by, steps far apart enough for
+                        // any codec's error)
+                        const int digit = x < W / 3 ? k % 5 : x < 2 * W / 3 ? k / 5 : second;
+                        p[0] = p[1] = p[2] = 0.2f + 0.15f * float(digit), p[3] = 1;
                     }
                 std::vector<uint8_t> o(size_t(W) * H * 4);
                 video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), o.data(), size_t(W) * 2);
@@ -1597,7 +1620,7 @@ public:
                 }
                 if (f >= 0 && f != sent) {
                     omt::VideoOut v;
-                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(f % 25)].data(), v.rateN = 25, v.rateD = 1;
+                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(f % 125)].data(), v.rateN = 25, v.rateD = 1;
                     v.timestamp = f * 400000;
                     v.metadata = "<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>";
                     if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(f, 25, false) + "\"/>";
@@ -1612,8 +1635,14 @@ public:
 
 private:
     void tick() {
-        // An edit: rolling from In less the pre-roll, recording In to Out, stopping there.
+        // An edit: (searching back from where it was playing first) rolling from In less the pre-roll, recording In to
+        // Out, stopping there.
         if (!autoEdit) return;
+        if (searchUntil != Clock::time_point{}) {
+            if (Clock::now() < searchUntil) return;
+            searchUntil = {};
+            move(double(in - preroll), 1);
+        }
         const double f = frameNow();
         if (!recording && f >= double(in) && recordedFrom < 0) recording = true, recordedFrom = in;
         if (recording && f >= double(out)) {
@@ -1624,26 +1653,29 @@ private:
     ninepin::Message answer(const ninepin::Message& q) {
         using namespace ninepin;
         const Message ack{1, cmd::Ack, {}};
-        std::lock_guard lock(m);
-        ++commands;
         const int64_t here = int64_t(std::floor(frameNow() + 1e-9));
         auto timecode = [&](uint8_t c, int64_t f) {
-            const auto b = timecodeBytes(f, 25, false);
+            const auto b = timecodeBytes(f, base_, drop_);
             return Message{7, c, {b.begin(), b.end()}};
         };
         if (q.is(0, cmd::DeviceTypeRequest)) return Message{1, cmd::DeviceType, {0x21, 0x00}};
         if (q.group == 2) {
             switch (q.cmd) {
             case cmd::Play: move(here, 1); return ack;
-            case cmd::Stop: move(here, 0); return ack;
+            case cmd::Stop:
+                move(here, 0);
+                autoEdit = recording = false, searchUntil = {};
+                return ack;
             case cmd::CueUpWithData:
-                move(double(timecodeFromBytes(q.data.data(), 25)), 0);
+                move(double(label(q.data)), 0);
                 cuedAt = Clock::now() + std::chrono::milliseconds(150);  // (the tape takes a moment to get there)
                 return ack;
             case cmd::AutoEdit:
                 if (in < 0 || out <= in || preroll < 0) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
                 autoEdit = true, recording = false, recordedFrom = recordedTo = -1, editDone = false;
-                move(double(in - preroll), 1);
+                // (playing already: it plays on a moment before it searches back to the pre-roll)
+                if (speed == 1) searchUntil = Clock::now() + std::chrono::milliseconds(300);
+                else move(double(in - preroll), 1);
                 return ack;
             case cmd::ShuttleForward: move(here, speedFromData(q.data)); return ack;
             default: return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
@@ -1652,42 +1684,62 @@ private:
         if (q.group == 4) {
             if (q.data.size() < 1) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             switch (q.cmd) {
-            case cmd::InDataPreset: in = timecodeFromBytes(q.data.data(), 25); return ack;
-            case cmd::OutDataPreset: out = timecodeFromBytes(q.data.data(), 25); return ack;
-            case cmd::PrerollTimePreset: preroll = timecodeFromBytes(q.data.data(), 25); return ack;
+            case cmd::InDataPreset: in = label(q.data); return ack;
+            case cmd::OutDataPreset: out = label(q.data); return ack;
+            case cmd::PrerollTimePreset: preroll = timecodeFromBytes(q.data.data(), base_); return ack;
             case cmd::EditPreset: channels = q.data; return ack;
             default: return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             }
         }
         if (q.is(6, cmd::CurrentTimeSense)) return timecode(cmd::LtcTimeData, here);
-        if (q.is(6, cmd::StatusSense)) {
-            Status s;
-            s.play = speed == 1 && !recording;
-            s.record = recording;
-            s.stop = speed == 0;
-            s.shuttle = speed != 0 && speed != 1;
-            s.cueComplete = speed == 0 && Clock::now() >= cuedAt;
-            s.autoEdit = autoEdit;
-            s.edit = recording;
-            s.inSet = in >= 0, s.outSet = out >= 0;
-            const auto b = s.bytes();
-            return Message{7, cmd::StatusData, {b.begin(), b.end()}};
-        }
+        if (q.is(6, cmd::StatusSense)) return status();
         return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
+    }
+    ninepin::Message status() {
+        ninepin::Status s;
+        s.play = speed == 1 && !recording;
+        s.record = recording;
+        s.stop = speed == 0;
+        s.shuttle = speed != 0 && speed != 1;
+        s.cueComplete = speed == 0 && Clock::now() >= cuedAt;
+        s.servoLock = servoLocked();
+        s.autoEdit = autoEdit;
+        s.edit = recording;
+        s.inSet = in >= 0, s.outSet = out >= 0;
+        const auto b = s.bytes();
+        return ninepin::Message{7, ninepin::cmd::StatusData, {b.begin(), b.end()}};
     }
     void run() {
         ninepin::Parser parser;
         uint8_t buf[256];
+        std::deque<std::pair<Clock::time_point, std::vector<uint8_t>>> held;  // (answers held back, and when they go)
         while (!stop_) {
             const int n = port_.read(buf, sizeof buf, 2);
             if (n > 0) parser.feed(buf, size_t(n));
             ninepin::Message q;
-            for (ninepin::Parser::Result r; (r = parser.next(q)) != ninepin::Parser::None;)
-                port_.write(ninepin::encode(r == ninepin::Parser::Ok ? answer(q) : ninepin::Message{1, ninepin::cmd::Nak, {ninepin::cmd::NakChecksum}}));
+            for (ninepin::Parser::Result r; (r = parser.next(q)) != ninepin::Parser::None;) {
+                std::lock_guard lock(m);
+                ++commands;
+                const bool lost = lose.count(commands) || (loseWhileRecording && recording);
+                const ninepin::Message a = r == ninepin::Parser::Ok ? answer(q) : ninepin::Message{1, ninepin::cmd::Nak, {ninepin::cmd::NakChecksum}};
+                if (lost) continue;
+                if (staleStatus && q.is(6, ninepin::cmd::CurrentTimeSense)) {
+                    staleStatus = false;
+                    port_.write(ninepin::encode(status()));
+                }
+                if (late.count(commands)) held.emplace_back(Clock::now() + std::chrono::milliseconds(150), ninepin::encode(a));
+                else port_.write(ninepin::encode(a));
+            }
+            while (!held.empty() && Clock::now() >= held.front().first) {
+                port_.write(held.front().second);
+                held.pop_front();
+            }
             std::lock_guard lock(m);
             tick();
         }
     }
+    int base_ = 25;
+    bool drop_ = false;
     SerialPort port_;
     std::atomic<bool> stop_{false};
     std::thread thread_, pictures_;
@@ -2138,6 +2190,29 @@ private slots:
         QVERIFY(m.is(2, cmd::Play));
         QCOMPARE(p.next(m), Parser::BadChecksum);
         QCOMPARE(p.next(m), Parser::None);
+        // Back in step after a stray byte: one in front of a command (claiming three bytes of data) is passed over and
+        // the command taken, and so is one claiming more than ever comes, once the line has been quiet a while; a
+        // message cut short is given up the same way, so the next command is not read into it.
+        const auto t0 = Parser::Clock::now();
+        std::vector<uint8_t> stray = {0x63};
+        stray.insert(stray.end(), play.begin(), play.end());
+        stray.insert(stray.end(), play.begin(), play.end());
+        p.feed(stray.data(), stray.size(), t0);
+        QCOMPARE(p.next(m, t0), Parser::Ok);
+        QVERIFY(m.is(2, cmd::Play));
+        QCOMPARE(p.next(m, t0), Parser::Ok);
+        QCOMPARE(p.next(m, t0), Parser::None);
+        std::vector<uint8_t> greedy = {0x7F};
+        greedy.insert(greedy.end(), cue.begin(), cue.end());
+        p.feed(greedy.data(), greedy.size(), t0);
+        QCOMPARE(p.next(m, t0), Parser::None);
+        QCOMPARE(p.next(m, t0 + Parser::kByteGap + std::chrono::milliseconds(5)), Parser::Ok);
+        QVERIFY(m.is(2, cmd::CueUpWithData) && m.data.size() == 4);
+        p.feed(cue.data(), 4, t0);
+        p.feed(play.data(), play.size(), t0 + std::chrono::milliseconds(100));
+        QCOMPARE(p.next(m, t0 + std::chrono::milliseconds(100)), Parser::Ok);
+        QVERIFY(m.is(2, cmd::Play));
+        QCOMPARE(p.next(m, t0 + std::chrono::milliseconds(100)), Parser::None);
         // Timecode in BCD, frames first: 10:03:04:05 at 25, and drop frame at 29.97 (01:00:00;02, the first label of
         // the hour's first minute after the drop... none dropped at minute 0).
         const int64_t f25 = ((10 * 60 + 3) * 60 + 4) * 25 + 5;
@@ -2192,6 +2267,19 @@ private slots:
         QCOMPARE(fromAle[0].reel, std::string("R7"));
         QCOMPARE(fromAle[0].out - fromAle[0].in, int64_t(30));
         QCOMPARE(fromAle[0].in, parseTimecode("01:00:00;00", 30));
+        // A line whose Out is its In: no frames, not a day's worth over midnight.
+        writeTextFile(csv, "Name,Start,End\nEmpty,10:00:01:00,10:00:01:00\nLate,23:59:59:00,00:00:01:00\n");
+        const std::vector<LogEntry> edge = readCaptureLog(csv, 25, false, &err);
+        QCOMPARE(int(edge.size()), 1);
+        QCOMPARE(edge[0].out - edge[0].in, int64_t(50));
+        QVERIFY2(QString::fromStdString(err).contains("Out is its In"), err.c_str());
+        // Labels the other way at 29.97: a drop frame label is the same one without, and one drop frame skips is the
+        // next there is.
+        const int64_t df = parseTimecode("10:00:00;00", 30);
+        QCOMPARE(sameLabel(df, 30, true, false), int64_t(36000 * 30));
+        QCOMPARE(sameLabel(int64_t(36000 * 30), 30, false, true), df);
+        QCOMPARE(sameLabel(parseTimecode("00:01:00:00", 30), 30, false, true), parseTimecode("00:01:00;02", 30));
+        QCOMPARE(sameLabel(df + ltcFramesPerDay(30, true), 30, true, false), int64_t(36000 * 30) + ltcFramesPerDay(30, false));
     }
 
     void deckControlOverTheCable() {
@@ -2236,7 +2324,7 @@ private slots:
         e.out = e.in + 50;
         e.preroll = 1;
         int64_t rolledAt = -1;
-        QVERIFY2(editToTape(deck, e, [&](int64_t tapeFrame, double) { rolledAt = tapeFrame; }, nullptr, &err), err.c_str());
+        QVERIFY2(editToTape(deck, e, [&](int64_t framesToIn, double) { rolledAt = e.in - framesToIn; }, nullptr, &err), err.c_str());
         {
             std::lock_guard lock(sim.m);
             QCOMPARE(sim.in, e.in);
@@ -2248,6 +2336,109 @@ private slots:
             QCOMPARE(sim.recordedTo, e.out);
         }
         QVERIFY2(rolledAt >= e.in - 25 && rolledAt < e.in, std::to_string(rolledAt - e.in).c_str());
+
+        // A late answer to an earlier command, come first, is not taken for the timecode asked for; an answer lost or
+        // late is asked for again.
+        {
+            std::lock_guard lock(sim.m);
+            sim.staleStatus = true;
+        }
+        QCOMPARE(deck.timecode(), e.out);
+        for (std::set<int>* way : {&sim.lose, &sim.late}) {
+            {
+                std::lock_guard lock(sim.m);
+                way->insert(sim.commands + 1);
+            }
+            const auto again = deck.status();
+            QVERIFY2(again && again->stop, deck.lastError().c_str());
+            QCOMPARE(deck.timecode(), e.out);
+        }
+
+        // Told to edit while playing three seconds before In: it plays on a moment before it searches back, and the
+        // Program is started only once the deck runs up from its pre-roll at play speed, its servo locked, from where
+        // it really was then.
+        TapeEdit e2 = e;
+        e2.in = e.in + 500, e2.out = e2.in + 50;
+        {
+            std::lock_guard lock(sim.m);
+            sim.move(double(e2.in - 75), 1);
+        }
+        int rolls = 0;
+        int64_t toIn = -1;
+        double off = 99;
+        bool lockedThen = false;
+        QVERIFY2(editToTape(deck, e2,
+                            [&](int64_t framesToIn, double) {
+                                std::lock_guard lock(sim.m);
+                                ++rolls;
+                                toIn = framesToIn;
+                                off = sim.frameNow() - double(e2.in - framesToIn);
+                                lockedThen = sim.servoLocked();
+                            },
+                            nullptr, &err),
+                 err.c_str());
+        QCOMPARE(rolls, 1);
+        QVERIFY2(toIn > 0 && toIn <= 25, std::to_string(toIn).c_str());
+        QVERIFY2(off >= 0 && off < 3, std::to_string(off).c_str());
+        QVERIFY(lockedThen);
+        {
+            std::lock_guard lock(sim.m);
+            QCOMPARE(sim.recordedFrom, e2.in);
+            QCOMPARE(sim.recordedTo, e2.out);
+        }
+
+        // The deck stops answering once it records: the edit fails, and the deck is stopped there rather than left
+        // recording the Program's last picture to Out.
+        TapeEdit e3 = e;
+        e3.in = e2.in + 500, e3.out = e3.in + 75;
+        {
+            std::lock_guard lock(sim.m);
+            sim.loseWhileRecording = true;
+        }
+        QVERIFY(!editToTape(deck, e3, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("stopped answering"), err.c_str());
+        {
+            std::lock_guard lock(sim.m);
+            sim.loseWhileRecording = false;
+            QCOMPARE(sim.speed, 0.0);
+            QVERIFY(!sim.recording && !sim.autoEdit);
+            QCOMPARE(sim.recordedFrom, e3.in);
+            QCOMPARE(sim.recordedTo, int64_t(-1));
+            QVERIFY2(sim.frameNow() < double(e3.out), std::to_string(sim.frameNow() - double(e3.in)).c_str());
+        }
+
+        // A deck at 29.97 counting without drop frame, the timecodes typed for it in drop frame (as 29.97 is here):
+        // cued, edited and read by their labels, not three and a half seconds an hour away.
+        {
+            PseudoCable cable3;
+            QVERIFY(cable3.ok());
+            SimulatedDeck ndf(cable3.endB(), 30, false);
+            QVERIFY(ndf.ok);
+            Deck deck3;
+            deck3.setBase(30, true);
+            QVERIFY2(deck3.open(cable3.endA(), &err), err.c_str());
+            QVERIFY2(deck3.timecode() >= 0, deck3.lastError().c_str());
+            QVERIFY(!deck3.deckDropFrame() && deck3.dropFrame());
+            const int64_t typed = parseTimecode("10:30:00:00", 30, nullptr, true);
+            QVERIFY(deck3.cue(deck3.toDeck(typed)));
+            QVERIFY(deck3.waitForCue(deck3.toDeck(typed), 5));
+            QCOMPARE(formatTimecode(deck3.timecode(), 30, deck3.deckDropFrame()), std::string("10:30:00:00"));
+            {
+                std::lock_guard lock(ndf.m);
+                QCOMPARE(int64_t(ndf.frameNow()), int64_t((10 * 60 + 30) * 60 * 30));
+            }
+            TapeEdit n;
+            n.in = parseTimecode("10:31:00:10", 30, nullptr, true);
+            n.out = n.in + 60;
+            n.preroll = 1;
+            QVERIFY2(editToTape(deck3, n, {}, nullptr, &err), err.c_str());
+            std::lock_guard lock(ndf.m);
+            QCOMPARE(ndf.in, int64_t((10 * 60 + 31) * 60 * 30 + 10));
+            QCOMPARE(ndf.out, ndf.in + 60);
+            QCOMPARE(ndf.preroll, int64_t(30));
+            QCOMPARE(ndf.recordedFrom, ndf.in);
+            QCOMPARE(ndf.recordedTo, ndf.out);
+        }
 
 #ifdef MONTAGE_WITH_OMT
         if (!omt::vmxAvailable(&err)) QSKIP(err.c_str());
@@ -2279,10 +2470,10 @@ private slots:
         bs.preroll = 1;
         const std::vector<BatchClip> clips = batchCapture(deck, log, bs);
         QCOMPARE(int(clips.size()), 5);
-        // Which frame of its second a picture is (as the simulated deck draws it).
+        // Which frame a picture is, of five seconds' (as the simulated deck draws it: a whole second's slip shows).
         auto frameIn = [](const Image& img) {
-            const float* p = img.at(160, 90);
-            return int(std::lround((p[0] - 0.2f) / 0.15f)) + 5 * int(std::lround((p[2] - 0.2f) / 0.15f));
+            auto digit = [&img](int x) { return int(std::lround((img.at(x, 90)[1] - 0.2f) / 0.15f)); };
+            return digit(53) + 5 * digit(160) + 25 * digit(266);
         };
         for (const BatchClip& c : clips) {
             QVERIFY2(c.ok, (c.entry.name + ": " + c.error).c_str());
@@ -2299,18 +2490,24 @@ private slots:
             for (int64_t k : {int64_t(0), int64_t(1), int64_t(50), to - from - 1}) {
                 const Frame16Ptr f = dec.frameAt((double(k) + 0.5) / 25.0);
                 QVERIFY(f);
-                const int got = frameIn(toImage(*f)), want = int((from + k) % 25);
+                const int got = frameIn(toImage(*f)), want = int((from + k) % 125);
                 // The first frame must be the logged one; later, a picture the loaded test machine dropped on its way
                 // is held from the one before (as captureFromOmt allows).
-                QVERIFY2(got == want || (k > 0 && got == (want + 24) % 25),
-                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of its second, not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
+                QVERIFY2(got == want || (k > 0 && got == (want + 124) % 125),
+                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of five seconds', not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
             }
             // (the tape's name kept with the timecode)
             AVFormatContext* fc = nullptr;
             QVERIFY(avformat_open_input(&fc, c.path.c_str(), nullptr, nullptr) == 0);
             bool reel = false;
-            for (unsigned s = 0; s < fc->nb_streams; ++s)
+            for (unsigned s = 0; s < fc->nb_streams; ++s) {
                 if (const AVDictionaryEntry* t = av_dict_get(fc->streams[s]->metadata, "reel_name", nullptr, 0)) reel = reel || std::string(t->value) == "TAPE07";
+                // (how the file says its colour is coded: the feed's BT.709, which a decoder otherwise guesses as BT.601 at
+                // this size)
+                const AVCodecParameters* cp = fc->streams[s]->codecpar;
+                if (cp->codec_type == AVMEDIA_TYPE_VIDEO && cp->color_space != AVCOL_SPC_BT709)
+                    qInfo("%s is tagged %s, not bt709", c.entry.name.c_str(), av_color_space_name(cp->color_space));
+            }
             avformat_close_input(&fc);
             QVERIFY(reel);
         }
@@ -2337,10 +2534,10 @@ private slots:
             QVERIFY(dec.open(plain[0].path));
             const Frame16Ptr f = dec.frameAt(0.5 / 25.0);
             QVERIFY(f);
-            const int got = frameIn(toImage(*f)), want = int(from % 25);
+            const int got = frameIn(toImage(*f)), want = int(from % 125);
             bool near = false;
-            for (int d = -1; d <= 1; ++d) near = near || got == (want + d + 25) % 25;
-            QVERIFY2(near, qPrintable(QStringLiteral("first frame is frame %1 of its second, not %2").arg(got).arg(want)));
+            for (int d = -1; d <= 1; ++d) near = near || got == (want + d + 125) % 125;
+            QVERIFY2(near, qPrintable(QStringLiteral("first frame is frame %1 of five seconds', not %2").arg(got).arg(want)));
         }
         tx2.stop();
 #endif
@@ -2448,8 +2645,52 @@ private slots:
         QVERIFY(nak.is(1, cmd::Nak) && nak.data.size() == 1 && (nak.data[0] & cmd::NakChecksum));
         a = ask(2, cmd::Record);
         QVERIFY(a && a->is(1, cmd::Nak));
+        // A stray byte on the line, claiming more data than ever comes: passed over once the line is quiet, and the
+        // next command answered.
+        controller.write(std::vector<uint8_t>{0x7F});
+        QCOMPARE(timecodeNow(), stopped - 1);
         QVERIFY(montage.commandsAnswered() > 10);
         montage.stop();
+
+        // At 29.97 in drop frame: a controller's cue, In and Out, sent without the drop frame flag, are read by their
+        // labels as the Program counts them; a pre-roll from before 00:00:00:00 goes to it, not to 23:59.
+        {
+            DeckEmulator df;
+            df.setBase(30, true);
+            TransportState t;
+            t.fps = 30000.0 / 1001;
+            df.publish(t);
+            int64_t located = -2;
+            df.onRequest = [&](const TransportRequest& r) {
+                if (r.kind == TransportRequest::Locate) located = r.frame;
+            };
+            const int64_t ndf = (10 * 60 + 10) * 60 * 30;  // (10:10:00:00 counted without drop frame)
+            const auto nb = timecodeBytes(ndf, 30, false);
+            QVERIFY(df.answer(Message{2, cmd::CueUpWithData, {nb.begin(), nb.end()}}).is(1, cmd::Ack));
+            QCOMPARE(located, parseTimecode("10:10:00;00", 30));
+            QVERIFY(df.answer(Message{4, cmd::InDataPreset, {nb.begin(), nb.end()}}).is(1, cmd::Ack));
+            Message inData = df.answer(Message{6, cmd::InDataSense, {}});
+            QCOMPARE(timecodeFromBytes(inData.data.data(), 30), parseTimecode("10:10:00;00", 30));
+            const auto early = timecodeBytes(60, 30, false);  // (00:00:02:00, five seconds' pre-roll)
+            QVERIFY(df.answer(Message{4, cmd::InDataPreset, {early.begin(), early.end()}}).is(1, cmd::Ack));
+            QVERIFY(df.answer(Message{2, cmd::Preroll, {}}).is(1, cmd::Ack));
+            QCOMPARE(located, int64_t(0));
+            const Message now = df.answer(Message{6, cmd::CurrentTimeSense, {cmd::SenseLtc}});
+            QCOMPARE(timecodeFromBytes(now.data.data(), 30), int64_t(0));
+        }
+
+        // The adapter pulled out: the emulator stops, rather than spinning on a port that has gone.
+        {
+            DeckEmulator pulled;
+            {
+                PseudoCable gone;
+                QVERIFY(gone.ok());
+                QVERIFY2(pulled.start(gone.endB(), &err), err.c_str());
+                QVERIFY(pulled.running());
+            }
+            for (int i = 0; i < 100 && pulled.running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            QVERIFY(!pulled.running());
+        }
 #endif
     }
 
@@ -2500,6 +2741,40 @@ private slots:
             const LtcChase::Position end = chase.now();
             QVERIFY(end.state == LtcChase::State::Locked);
             QVERIFY(std::fabs(end.frame - (double(start) + double(ltc.size()) / perFrame + 3)) < 1.0);
+        }
+        // Followed either way and as a deck shuttles, past a fifth of play speed and five times it: LTC played backwards
+        // at play speed and three times it, and forwards at under a fifth and at six times (from a 192 kHz input),
+        // locked within a frame of the master and at its speed.
+        struct Shuttle {
+            double speed;
+            int rate;
+        };
+        for (const Shuttle sh : {Shuttle{-1, 48000}, Shuttle{-3, 48000}, Shuttle{0.18, 48000}, Shuttle{6, 192000}}) {
+            const double fast = std::fabs(sh.speed);
+            const int64_t start = parseTimecode("10:00:00:00", 25);
+            // (made at a rate that, read at the input's, runs at the speed)
+            const int made = int(std::lround(sh.rate / fast));
+            std::vector<float> ltc = encodeLtc(start, int64_t(std::ceil(25 * 4 * fast)), Rational{25, 1}, false, made);
+            if (sh.speed < 0) std::reverse(ltc.begin(), ltc.end());
+            const double perFrame = made / 25.0, total = double(ltc.size());
+            LtcChase chase(sh.rate, 25, false);
+            int locked = 0;
+            double worst = 0;
+            for (size_t at = 0; at < ltc.size(); at += size_t(sh.rate / 100)) {
+                const size_t n = std::min<size_t>(size_t(sh.rate / 100), ltc.size() - at);
+                chase.write(ltc.data() + at, n);
+                const double y = double(at + n), t = y / sh.rate;
+                const LtcChase::Position p = chase.now();
+                const double truth = double(start) + (sh.speed < 0 ? total - y : y) / perFrame;
+                if (t > 1.5 && y < total - perFrame) {
+                    QVERIFY2(p.state == LtcChase::State::Locked, qPrintable(QStringLiteral("%1x at %2 s").arg(sh.speed).arg(t)));
+                    QVERIFY2(std::fabs(p.speed - sh.speed) < 0.01 * fast, qPrintable(QStringLiteral("%1x read as %2x").arg(sh.speed).arg(p.speed)));
+                    worst = std::max(worst, std::fabs(p.frame - truth));
+                    ++locked;
+                }
+            }
+            QVERIFY2(locked > 50, qPrintable(QStringLiteral("%1x").arg(sh.speed)));
+            QVERIFY2(worst < 1.0, qPrintable(QStringLiteral("%1x: %2 frames out").arg(sh.speed).arg(worst)));
         }
     }
 
@@ -19961,6 +20236,31 @@ if __name__ == '__main__':
             QCOMPARE(QJsonDocument::fromJson(lines[0]).object().value("id").toInt(), 5);
             QCOMPARE(QJsonDocument::fromJson(lines[1]).object().value("result").toObject().value("structuredContent").toObject().value("status").toString(), QString("done"));
         }
+        // A call that stops with an exception of any kind (here one that is no std::exception, thrown by the
+        // notification sink while the call reports its progress) is answered with an error and ends its turn: the
+        // next call runs.
+        {
+            McpServer thrown;
+            thrown.setNotificationSink([](const std::string&) { throw 7; });
+            QVERIFY(QDir().mkpath(dir.path() + "/card/DCIM"));
+            {
+                QFile f(dir.path() + "/card/DCIM/A001.MOV");
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                f.write(QByteArray(4096, 'x'));
+            }
+            const auto send = [&](int id, const QString& name, const QJsonObject& args, const QJsonObject& meta) {
+                QJsonObject params{{"name", name}, {"arguments", args}};
+                if (!meta.isEmpty()) params["_meta"] = meta;
+                const auto lines = thrown.handle(
+                    QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"method", "tools/call"}, {"params", params}}).toJson(QJsonDocument::Compact).toStdString());
+                return lines.empty() ? QJsonObject() : QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            const QJsonObject failed = send(1, "montage_offload", {{"source", dir.path() + "/card"}, {"destinations", QJsonArray{dir.path() + "/copy"}}},
+                                            {{"progressToken", "offload-1"}});
+            QVERIFY2(failed.value("isError").toBool(), qPrintable(QJsonDocument(failed).toJson()));
+            const QJsonObject next = send(2, "montage_probe_media", {{"path", out}}, {});
+            QVERIFY2(!next.value("isError").toBool(), qPrintable(QJsonDocument(next).toJson()));
+        }
         // A second one cancelled while it runs, a third while it waits behind it: both end "cancelled" (the third never
         // started: no file), and the list has all three.
         const QString out2 = dir.path() + "/cancelled.mp4", out3 = dir.path() + "/queued.mp4";
@@ -21026,6 +21326,272 @@ if ui["pressed"] == "add":
                 QVERIFY(result.value("content").toArray().at(0).toObject().value("text").toString().contains("copied from the source as coded"));
                 QFile::remove(QString::fromStdString(path("lg-mcp.mxf")));
             }
+        }
+    }
+
+    void smartRenderingLimits() {
+        // Footage made here (a turning gradient with light grain, in GOPs of 12), each file's frames placed one after
+        // another in a cut, and what an export of the cut copies.
+        auto footage = [&](const std::string& file, int w, int h, int frames, const std::function<void(ExportSettings&)>& set) {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = w, gs.height = h, gs.fps = Rational{25, 1};
+            Clip grad = makeGeneratorClip(gen, "gradient", frames);
+            grad.generator.params["angle"].addKey(0, 0.0);
+            grad.generator.params["angle"].addKey(frames - 1, 140.0);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = 0.05;
+            grad.effects.push_back(grain);
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, grad);
+            ExportSettings st;
+            st.audioCodec = "none";
+            st.gop = 12;
+            set(st);
+            st.path = path(file.c_str());
+            std::string err;
+            const bool made = exportSequence(gen, gs, st, nullptr, nullptr, &err);
+            if (!made) qWarning("%s: %s", file.c_str(), err.c_str());
+            return made ? st.path : std::string();
+        };
+        auto cutOf = [&](Project& p, int w, int h, const std::vector<std::pair<std::string, int>>& files) {
+            Sequence& s = *p.active();
+            s.width = w, s.height = h, s.fps = Rational{25, 1};
+            FrameTime at = 0;
+            for (const auto& [file, frames] : files) {
+                MediaItem m = probeOrFail(p, file);
+                p.media.push_back(m);
+                if (!edit::placeMedia(p, s, m.id, at, 0, frames, {TrackKind::Video, 0}, {}, false).ok) return false;
+                at += frames;
+            }
+            return true;
+        };
+        auto copiedBy = [&](const Project& p, ExportSettings ex, const std::string& file, const ExportProgress& progress = nullptr) {
+            ex.path = path(file.c_str());
+            std::string err;
+            int copied = -1;
+            if (!exportSequence(p, *p.active(), ex, progress, nullptr, &err, nullptr, &copied)) {
+                qWarning("%s: %s", file.c_str(), err.c_str());
+                return -1;
+            }
+            return copied;
+        };
+        // The pictures a file decodes to, and those it decoded with errors.
+        auto decoded = [](const std::string& file, int& errors) {
+            int frames = 0;
+            errors = 0;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return -1;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            const AVCodec* codec = v >= 0 ? avcodec_find_decoder(fmt->streams[v]->codecpar->codec_id) : nullptr;
+            AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+            if (ctx) {
+                avcodec_parameters_to_context(ctx, fmt->streams[v]->codecpar);
+                ctx->err_recognition = AV_EF_CRCCHECK | AV_EF_EXPLODE;
+            }
+            if (ctx && avcodec_open2(ctx, codec, nullptr) >= 0) {
+                AVPacket* pkt = av_packet_alloc();
+                AVFrame* fr = av_frame_alloc();
+                auto take = [&] {
+                    while (avcodec_receive_frame(ctx, fr) >= 0) {
+                        if (fr->decode_error_flags || (fr->flags & AV_FRAME_FLAG_CORRUPT)) ++errors;
+                        ++frames;
+                        av_frame_unref(fr);
+                    }
+                };
+                while (av_read_frame(fmt, pkt) >= 0) {
+                    if (pkt->stream_index == v && avcodec_send_packet(ctx, pkt) < 0) ++errors;
+                    av_packet_unref(pkt);
+                    take();
+                }
+                avcodec_send_packet(ctx, nullptr);
+                take();
+                av_frame_free(&fr);
+                av_packet_free(&pkt);
+            }
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            return frames;
+        };
+        // A file's video decoder configuration (avcC, hvcC) and sample entry.
+        auto configOf = [](const std::string& file, uint32_t* tag = nullptr) {
+            QByteArray config;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return config;
+            avformat_find_stream_info(fmt, nullptr);
+            const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            if (v >= 0) {
+                const AVCodecParameters* par = fmt->streams[v]->codecpar;
+                config = QByteArray(reinterpret_cast<const char*>(par->extradata), par->extradata_size);
+                if (tag) *tag = par->codec_tag;
+            }
+            avformat_close_input(&fmt);
+            return config;
+        };
+        int errors = -1;
+
+        // ---- Coded at well over what the export would spend at its quality: encoded, not copied. A fifth of a bit a
+        // pixel (as a phone's 4K at 50 Mb/s is) is copied into an export at CRF 16, not into a draft at CRF 28; HEVC at
+        // three twentieths (as a phone's is) likewise.
+        {
+            const std::string rich = footage("lim-rich.mp4", 960, 540, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx264", st.preset = "veryfast", st.videoBitrate = int64_t(0.2 * 960 * 540 * 25);
+            });
+            QVERIFY(!rich.empty());
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 960, 540, {{rich, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx264", ex.audioCodec = "none", ex.preset = "veryfast";
+            ex.crf = 16;
+            QCOMPARE(copiedBy(p, ex, "lim-rich-16.mp4"), 48);
+            ex.crf = 28;
+            QCOMPARE(copiedBy(p, ex, "lim-rich-28.mp4"), 0);
+            // And at a profile above the export's: x264's fastest preset codes Constrained Baseline, so High footage
+            // is encoded (where the copy would have made the file High).
+            ex.crf = 16;
+            ex.preset = "ultrafast";
+            QCOMPARE(copiedBy(p, ex, "lim-rich-baseline.mp4"), 0);
+            const QByteArray baseline = configOf(path("lim-rich-baseline.mp4"));
+            QVERIFY(baseline.size() > 4 && uchar(baseline[1]) == 66);
+
+            const std::string phone = footage("lim-phone.mp4", 960, 540, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx265", st.preset = "veryfast", st.videoBitrate = int64_t(0.15 * 960 * 540 * 25);
+            });
+            QVERIFY(!phone.empty());
+            Project q = makeDefaultProject();
+            QVERIFY(cutOf(q, 960, 540, {{phone, 48}}));
+            ex.videoCodec = "libx265", ex.preset = "veryfast";
+            ex.crf = 16;
+            QCOMPARE(copiedBy(q, ex, "lim-phone-16.mp4"), 48);
+            ex.crf = 28;
+            QCOMPARE(copiedBy(q, ex, "lim-phone-28.mp4"), 0);
+            for (const char* f : {"lim-rich-16.mp4", "lim-rich-28.mp4", "lim-rich-baseline.mp4", "lim-phone-16.mp4", "lim-phone-28.mp4"})
+                QFile::remove(QString::fromStdString(path(f)));
+        }
+
+        // ---- At a level above the export's (x264's slowest presets keep sixteen pictures to refer to, which takes a
+        // higher level than one does): encoded; at the export's own, copied.
+        const std::string deep = footage("lim-deep.mp4", 320, 180, 48, [](ExportSettings& st) {
+            st.videoCodec = "libx264", st.preset = "veryslow", st.crf = 23;
+        });
+        const std::string fast = footage("lim-fast.mp4", 320, 180, 48, [](ExportSettings& st) {
+            st.videoCodec = "libx264", st.preset = "veryfast", st.crf = 23, st.parameterSetId = 1;
+        });
+        QVERIFY(!deep.empty() && !fast.empty());
+        {
+            const QByteArray d = configOf(deep), f = configOf(fast);
+            QVERIFY2(d.size() > 4 && f.size() > 4 && uchar(d[3]) > uchar(f[3]), qPrintable(QString("levels %1 and %2").arg(uchar(d[3])).arg(uchar(f[3]))));
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{deep, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx264", ex.audioCodec = "none", ex.crf = 16;
+            ex.preset = "veryfast";
+            QCOMPARE(copiedBy(p, ex, "lim-deep-fast.mp4"), 0);
+            ex.preset = "veryslow";
+            QCOMPARE(copiedBy(p, ex, "lim-deep-slow.mp4"), 48);
+            QFile::remove(QString::fromStdString(path("lim-deep-fast.mp4")));
+            QFile::remove(QString::fromStdString(path("lim-deep-slow.mp4")));
+        }
+
+        // ---- Constrained Baseline footage, then High: the file's avcC is High, so it carries the High profiles'
+        // extension (ISO/IEC 14496-15: 4:2:0, 8 bits, no SPS extensions), which the first footage's had not.
+        {
+            const std::string plain = footage("lim-plain.mp4", 320, 180, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx264", st.preset = "ultrafast", st.crf = 30;
+            });
+            QVERIFY(!plain.empty());
+            const QByteArray first = configOf(plain);
+            QVERIFY(first.size() > 4 && uchar(first[1]) == 66);
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{plain, 48}, {fast, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx264", ex.audioCodec = "none", ex.crf = 23, ex.preset = "veryfast";
+            QCOMPARE(copiedBy(p, ex, "lim-mixed.mp4"), 96);
+            const QByteArray avcc = configOf(path("lim-mixed.mp4"));
+            QVERIFY(avcc.size() > 7 && uchar(avcc[1]) == 100);
+            // (past the parameter sets: the extension's four bytes)
+            int i = 6;
+            for (int k = 0, n = uchar(avcc[5]) & 31; k < n; ++k) i += 2 + (int(uchar(avcc[i])) << 8 | uchar(avcc[i + 1]));
+            for (int k = 0, n = uchar(avcc[i++]); k < n; ++k) i += 2 + (int(uchar(avcc[i])) << 8 | uchar(avcc[i + 1]));
+            QCOMPARE(avcc.mid(i).toHex(), QByteArray("fdf8f800"));
+            QCOMPARE(decoded(path("lim-mixed.mp4"), errors), 96);
+            QCOMPARE(errors, 0);
+            QFile::remove(QString::fromStdString(path("lim-mixed.mp4")));
+        }
+
+        // ---- A GOP coded in more bytes than the copier holds while it reads one is encoded, not copied.
+        {
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{fast, 48}}));
+            const Sequence& s = *p.active();
+            const AVCodec* x264 = avcodec_find_encoder_by_name("libx264");
+            QVERIFY(x264);
+            AVCodecContext* m = avcodec_alloc_context3(x264);
+            m->width = 320, m->height = 180, m->pix_fmt = AV_PIX_FMT_YUV420P;
+            m->time_base = AVRational{1, 25}, m->framerate = AVRational{25, 1};
+            m->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            AVDictionary* opts = nullptr;
+            av_dict_set(&opts, "preset", "veryfast", 0);
+            av_dict_set(&opts, "crf", "23", 0);
+            QVERIFY(avcodec_open2(m, x264, &opts) >= 0);
+            av_dict_free(&opts);
+            AVFormatContext* oc = nullptr;
+            QVERIFY(avformat_alloc_output_context2(&oc, nullptr, "mp4", nullptr) >= 0);
+            AVStream* vst = avformat_new_stream(oc, nullptr);
+            LongGopEncoder lge;
+            lge.preset = "veryfast";
+            lge.crf = 23;
+            lge.main = m;
+            std::string why;
+            QVERIFY2(LongGopCopier::plan(p, s, 0, 48, sequenceColorSpace(s), lge, oc, vst, &why) != nullptr, why.c_str());
+            lge.maxGopBytes = 1000;
+            QVERIFY(LongGopCopier::plan(p, s, 0, 48, sequenceColorSpace(s), lge, oc, vst, &why) == nullptr);
+            QVERIFY2(why.find("GOP") != std::string::npos, why.c_str());
+            avformat_free_context(oc);
+            avcodec_free_context(&m);
+        }
+
+        // ---- HEVC copied whole, its parameter sets out of band (hvc1): when its footage is not found as planned while
+        // the copy runs (the file it was planned from emptied, the same footage at its name again), the export is made
+        // again, encoded, rather than given up.
+        {
+            // (coded finely, so a GOP takes more than the reader holds)
+            const std::string hevc = footage("lim-hevc.mp4", 320, 180, 48, [](ExportSettings& st) {
+                st.videoCodec = "libx265", st.preset = "ultrafast", st.crf = 4;
+            });
+            QVERIFY(!hevc.empty());
+            QVERIFY(QFileInfo(QString::fromStdString(hevc)).size() > 200000);
+            Project p = makeDefaultProject();
+            QVERIFY(cutOf(p, 320, 180, {{hevc, 48}}));
+            ExportSettings ex;
+            ex.videoCodec = "libx265", ex.audioCodec = "none", ex.crf = 4, ex.preset = "ultrafast";
+            uint32_t tag = 0;
+            QCOMPARE(copiedBy(p, ex, "lim-hevc-copy.mp4"), 48);
+            configOf(path("lim-hevc-copy.mp4"), &tag);
+            QCOMPARE(tag, uint32_t(MKTAG('h', 'v', 'c', '1')));
+            const QString src = QString::fromStdString(hevc), planned = src + ".planned";
+            bool swapped = false, emptied = false;
+            const ExportProgress swap = [&](double, FrameTime) {
+                if (swapped) return;
+                swapped = true;
+                if (!QFile::rename(src, planned)) return;  // (a file open cannot be renamed on Windows)
+                QFile::copy(planned, src);
+                QFile f(planned);
+                emptied = f.resize(0);
+                MediaPool::instance().forget(hevc);
+            };
+            const int copied = copiedBy(p, ex, "lim-hevc-lost.mp4", swap);
+            QVERIFY(swapped);
+            if (emptied) {
+                QCOMPARE(copied, 0);
+                QCOMPARE(decoded(path("lim-hevc-lost.mp4"), errors), 48);
+                QCOMPARE(errors, 0);
+            } else {
+                qInfo("The footage could not be moved while it was open: not checked here");
+            }
+            QFile::remove(planned);
+            QFile::remove(QString::fromStdString(path("lim-hevc-copy.mp4")));
+            QFile::remove(QString::fromStdString(path("lim-hevc-lost.mp4")));
         }
     }
 
@@ -23961,6 +24527,37 @@ if ui["pressed"] == "add":
         ranged.in = 140;
         ranged.out = 143;
         QCOMPARE(planExportSegments(seq, ranged, 6).size(), size_t(3));  // (no fewer than a frame each)
+        // MPEG-2's cuts fall on its GOPs (XDCAM's 12 frames, 15 at 30 frames a second): every segment but the last a whole
+        // number of them, the range still covered.
+        ExportSettings m2 = st;
+        m2.videoCodec = "mpeg2video";
+        m2.path = (dir.path() + "/out/xdcam.mxf").toStdString();
+        const int gop = exportMpeg2Gop(m2, seq.fps);
+        QVERIFY(gop == 12 || gop == 15);
+        parts = planExportSegments(seq, m2, 6);
+        QVERIFY(parts.size() >= 2);
+        QCOMPARE(parts.front().in, FrameTime(0));
+        QCOMPARE(parts.back().out, FrameTime(150));
+        for (size_t k = 0; k + 1 < parts.size(); ++k) {
+            QCOMPARE(parts[k].out, parts[k + 1].in);
+            QVERIFY2((parts[k].out - parts[k].in) % gop == 0, qPrintable(QString("%1 to %2").arg(parts[k].in).arg(parts[k].out)));
+        }
+        // A package segment's hash has its codestreams' lengths in it: bytes moved from one frame's file to the next
+        // change it.
+        {
+            const std::string codes = (dir.path() + "/framing").toStdString();
+            QVERIFY(QDir().mkpath(QString::fromStdString(codes)));
+            auto put = [&](int64_t k, const QByteArray& b) {
+                QFile f(QString::fromStdString(codestreamFile(codes, k)));
+                return f.open(QIODevice::WriteOnly) && f.write(b) == b.size();
+            };
+            SegmentCheck a, b;
+            QVERIFY(put(0, "ab") && put(1, "c") && checkCodestreams(codes, 0, 2, false, a));
+            QVERIFY(put(0, "a") && put(1, "bc") && checkCodestreams(codes, 0, 2, false, b));
+            QCOMPARE(a.frames, int64_t(2));
+            QCOMPARE(a.bytes, b.bytes);
+            QVERIFY(a.sha256 != b.sha256);
+        }
         // What is made in one go is refused.
         auto refused = [&](const std::function<void(ExportSettings&)>& change, const char* why) {
             ExportSettings x = st;
@@ -24300,10 +24897,11 @@ if ui["pressed"] == "add":
         QStringList log;
         std::mutex logLock;
         auto onFarm = [&](const ExportSettings& st, int segments, std::string* id = nullptr,
-                          const std::function<void(FarmNodeOptions&)>& setUp = {}) {
+                          const std::function<void(FarmNodeOptions&)>& setUp = {}, const std::function<void(const std::string&)>& prepare = {}) {
             std::string job, e;
             if (!submitFarmJob(farm, "Master", p, seq.id, st, 0, &job, &e, segments)) return qWarning("%s", e.c_str()), false;
             if (id) *id = job;
+            if (prepare) prepare(job);
             auto ended = [&] {
                 for (const FarmJob& j : farmJobs(farm))
                     if (j.id == job) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
@@ -24509,6 +25107,41 @@ if ui["pressed"] == "add":
         };
         QVERIFY2(std::fabs(lead(ts.path) - lead(single.path)) < 1e-4, qPrintable(QString("%1 s, whole %2 s").arg(lead(ts.path)).arg(lead(single.path))));
 
+        // ---- A segment coded differently is refused by the join in Annex B (MPEG-TS, MXF) as in an avcC: here the
+        // second's parameter sets have the same ids but come from another preset (fewer reference frames). Coded alike,
+        // the two join.
+        for (const QString ext : {QStringLiteral("ts"), QStringLiteral("mxf")}) {
+            ExportSettings base;
+            base.videoCodec = "libx264";
+            base.audioCodec = "none";
+            base.path = (dir.path() + "/out/odd." + ext).toStdString();
+            QVERIFY2(exportSplits(base, &err), err.c_str());
+            const std::vector<ExportSegment> halves{{0, 24}, {24, 48}};
+            ExportSettings whole = base;
+            whole.in = 0, whole.out = 48;
+            std::vector<std::string> files;
+            for (const char* second : {"veryfast", "medium"}) {
+                files.clear();
+                for (int k = 0; k < 2; ++k) {
+                    const std::string file = (dir.path() + QString("/whole/odd-%1.").arg(k) + ext).toStdString();
+                    ExportSettings x = segmentExportSettings(base, halves[size_t(k)], file, seq.fps);
+                    if (k == 1) x.preset = second;
+                    QVERIFY2(exportSequence(p, seq, x, {}, nullptr, &err), err.c_str());
+                    files.push_back(file);
+                }
+                const bool joined = joinExportSegments(p, seq, whole, 0, files, halves, {}, nullptr, &err);
+                if (std::string(second) == "veryfast") {
+                    QVERIFY2(!joined, qPrintable(ext));
+                    QVERIFY2(QString::fromStdString(err).contains("Segment 2 was coded differently"), err.c_str());
+                } else {
+                    QVERIFY2(joined, err.c_str());
+                    QCOMPARE(frames(whole.path), 48);
+                }
+            }
+            for (const std::string& f : files) QFile::remove(QString::fromStdString(f));
+            QFile::remove(QString::fromStdString(whole.path));
+        }
+
         // ---- Hardware-encoded segments go only to nodes coding with the same encoder: node A says it has one, node B
         // has none, and whichever takes a segment first decides; the other node renders none of them.
         ExportSettings hw;
@@ -24534,6 +25167,38 @@ if ui["pressed"] == "add":
         QVERIFY(reported);
         // Nodes of the same kind share them.
         QVERIFY2(onFarm(hw, 4, &hwId, [](FarmNodeOptions& o) { o.encoders["h264"] = "h264_test"; }), qPrintable(log.join('\n')));
+        // The node holding the pin gone (stopped), with none of the segments coded yet: the pin passes to the nodes that
+        // answer, which code them all. With one coded by it already, the others cannot match it: they fail, and so the
+        // join, saying why.
+        auto gone = [&](bool oneCoded) {
+            return [&, oneCoded](const std::string& job) {
+                const QString jobs = QString::fromStdString(farm) + "/jobs/";
+                QFile pin(jobs + QString::fromStdString(job) + "/encoder");
+                QVERIFY(pin.open(QIODevice::WriteOnly) && pin.write("h264_gone") == 9);
+                pin.close();
+                QFile node(QString::fromStdString(farm) + "/nodes/Gone.json");
+                QVERIFY(node.open(QIODevice::WriteOnly));
+                node.write(QJsonDocument(QJsonObject{{"name", "Gone"}, {"state", "stopped"}, {"beat", 7}, {"encoders", QJsonObject{{"h264", "h264_gone"}}}})
+                               .toJson());
+                node.close();
+                if (oneCoded)
+                    for (const FarmJob& j : farmJobs(farm))
+                        if (j.group == job && j.segment == 1) {
+                            QFile done(jobs + QString::fromStdString(j.id) + "/status.json");
+                            QVERIFY(done.open(QIODevice::WriteOnly) && done.write(QJsonDocument(QJsonObject{{"state", "done"}, {"node", "Gone"}}).toJson()) > 0);
+                        }
+            };
+        };
+        const auto sameKind = [](FarmNodeOptions& o) { o.encoders["h264"] = "h264_test"; };
+        log.clear();
+        QVERIFY2(onFarm(hw, 4, &hwId, sameKind, gone(false)), qPrintable(log.join('\n')));
+        QVERIFY2(log.join('\n').contains("No node coding with h264_gone answers"), qPrintable(log.join('\n')));
+        QCOMPARE(frames(hw.path), 150);
+        QVERIFY(!onFarm(hw, 4, &hwId, sameKind, gone(true)));
+        for (const FarmJob& j : farmJobs(farm))
+            if (j.id == hwId) QVERIFY2(QString::fromStdString(j.error).contains("coded with h264_gone, and no node coding with it is answering"), j.error.c_str());
+        QVERIFY(removeFarmJob(farm, hwId, &err));
+        QFile::remove(QString::fromStdString(farm) + "/nodes/Gone.json");
 
         // ---- Two passes: the bits shared out by what each first pass measured (here three times as much a frame in the
         // first half, bounded at four times the average), the whole's average kept.
@@ -24681,6 +25346,46 @@ if ui["pressed"] == "add":
         QVERIFY(!submitFarmImf(farm, "IMF", p, seq.id, archival, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
         QVERIFY(QString::fromStdString(err).contains("Application #2E"));
 
+        // ---- At 29.97 a master's composition is padded to a whole number of sound samples a frame (37 frames to 40):
+        // made in three segments, its pictures are the one-go master's, the padding's too, and it checks out.
+        {
+            const FrameTime inWas = seq.inPoint, outWas = seq.outPoint;
+            seq.fps = {30000, 1001};
+            seq.inPoint = 0, seq.outPoint = 36;
+            ImfSettings ntsc = imf;
+            ntsc.title = "Farm NTSC";
+            ntsc.inOut = true;
+            QCOMPARE(imfCompositionFrames(seq, ntsc), int64_t(40));
+            ImfResult one;
+            QVERIFY2(exportImf(p, seq, ntsc, (dir.path() + "/whole").toStdString(), &one, {}, &err), err.c_str());
+            QCOMPARE(one.frames, int64_t(40));
+            QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
+                         return submitFarmImf(farm, "IMF", p, seq.id, ntsc, (dir.path() + "/out").toStdString(), 3, id, e);
+                     }),
+                     qPrintable(log.join('\n')));
+            const QString made = onlyFolder(dir.path() + "/out", "Farm_NTSC_IMF_*");
+            QVERIFY(!made.isEmpty());
+            const std::vector<std::string> issues = verifyImf(made.toStdString());
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            auto picture = [](const QString& folder) {
+                for (const QString& f : QDir(folder).entryList({"VIDEO_*.mxf"})) return QDir(folder).filePath(f).toStdString();
+                return std::string();
+            };
+            dcp::ImfTrackReader a, b;
+            QVERIFY2(a.open(picture(QString::fromStdString(one.folder)), &err), err.c_str());
+            QVERIFY2(b.open(picture(made), &err), err.c_str());
+            QCOMPARE(a.frames(), int64_t(40));
+            QCOMPARE(b.frames(), a.frames());
+            std::vector<uint8_t> x, y;
+            for (int64_t k = 0; k < a.frames(); ++k) {
+                QVERIFY(a.frame(k, x) && b.frame(k, y));
+                QVERIFY2(x == y, qPrintable(QString("picture %1 differs").arg(k)));
+            }
+            QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+            seq.fps = {25, 1};
+            seq.inPoint = inWas, seq.outPoint = outWas;
+        }
+
         // ---- A DCP in four segments: the same pictures as one made in one go, and it passes the DCP checks.
         seq.inPoint = 0, seq.outPoint = 59;
         DcpSettings cinema;
@@ -24719,9 +25424,81 @@ if ui["pressed"] == "add":
             }
         }
         QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        // Its folder's name taken already: refused when sent, not once every segment is coded.
+        QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("There is already a folder called FarmTrailer_"), err.c_str());
+        // A codestream not in the DCI profile (as FFmpeg's own encoder codes them, on a node without OpenJPEG) stops the
+        // join, which says which frame; no package is left.
+        {
+            seq.outPoint = 24;  // (a second)
+            DcpSettings seg = cinema;
+            seg.title = "Farm Profile";
+            seg.codestreams = (dir.path() + "/profile").toStdString();
+            seg.codeFrom = 0, seg.codeTo = 25;
+            DcpResult coded;
+            QVERIFY2(exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), &coded, {}, &err), err.c_str());
+            QVERIFY(coded.cinemaProfile);
+            QFile f(QString::fromStdString(codestreamFile(seg.codestreams, 7)));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QByteArray b = f.readAll();
+            QCOMPARE(int(uint8_t(b[6])) << 8 | int(uint8_t(b[7])), 3);  // (its SIZ marker's Rsiz: the DCI 2K profile)
+            b[7] = 0;
+            QVERIFY(f.seek(0) && f.write(b) == b.size());
+            f.close();
+            seg.codeFrom = seg.codeTo = 0;
+            QVERIFY(!exportDcp(p, seq, seg, (dir.path() + "/whole").toStdString(), nullptr, {}, &err));
+            QVERIFY2(QString::fromStdString(err).contains("frame 7") && QString::fromStdString(err).contains("DCI 2K profile"), err.c_str());
+            QVERIFY(QDir(dir.path() + "/whole").entryList({"FarmProfile_*"}, QDir::Dirs).isEmpty());
+            seq.outPoint = 59;
+        }
         cinema.encrypt = true;
         QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
         QVERIFY(QString::fromStdString(err).contains("DKDM"));
+        if (dcp::securityAvailable()) {
+            // ---- Encrypted: a segment's codestreams are sealed for the signer's leaf, never in the clear in the farm's
+            // folder; only that leaf's key opens them.
+            cinema.title = "Farm Sealed";
+            cinema.dkdms = (dir.path() + "/dkdm").toStdString();
+            dcp::CertificateChain chain;
+            QVERIFY2(dcp::signerCertificateChain(chain, &err, cinema.certificates), err.c_str());
+            DcpSettings seg = cinema;
+            seg.codestreams = (dir.path() + "/codes").toStdString();
+            seg.codeFrom = 0, seg.codeTo = 12;
+            QVERIFY(!exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err));
+            QVERIFY2(QString::fromStdString(err).contains("certificate"), err.c_str());
+            seg.codestreamCertificate = chain.certificates.back();
+            QVERIFY2(exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err), err.c_str());
+            QFile coded(QString::fromStdString(codestreamFile(seg.codestreams, 5)));
+            QVERIFY(coded.open(QIODevice::ReadOnly));
+            const QByteArray bytes = coded.readAll();
+            const std::vector<uint8_t> sealed(bytes.begin(), bytes.end());
+            QVERIFY(dcp::isSealed(sealed.data(), sealed.size()));
+            std::vector<uint8_t> open;
+            dcp::Unsealer mine{chain.privateKey, {}};
+            QVERIFY2(dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext(5, false)), err.c_str());
+            QVERIFY(open.size() > 64 && open[0] == 0xff && open[1] == 0x4f && open[2] == 0xff && open[3] == 0x51);
+            QVERIFY(!bytes.contains(QByteArray(reinterpret_cast<const char*>(open.data()), 64)));  // (none of it in the clear)
+            dcp::CertificateChain other;
+            QVERIFY2(dcp::makeCertificateChain("Elsewhere", other, &err), err.c_str());
+            dcp::Unsealer theirs{other.privateKey, {}};
+            QVERIFY(!dcp::unseal(theirs, sealed, open, &err, dcp::codestreamSealContext(5, false)));
+            QVERIFY2(QString::fromStdString(err).contains("another certificate"), err.c_str());
+            std::vector<uint8_t> changed = sealed;
+            changed[changed.size() / 2] ^= 1;
+            QVERIFY(!dcp::unseal(mine, changed, open, &err, dcp::codestreamSealContext(5, false)) && open.empty());
+            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext(6, false)));  // (moved to another frame)
+            // The whole package made on the farm: it passes the checks, with its DKDM, and no codestream is left.
+            QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
+                         return submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, id, e);
+                     }),
+                     qPrintable(log.join('\n')));
+            const QString farmSealed = onlyFolder(dir.path() + "/out", "FarmSealed_*");
+            QVERIFY(!farmSealed.isEmpty());
+            const std::vector<std::string> issues = verifyDcp(farmSealed.toStdString());
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QCOMPARE(QDir(dir.path() + "/dkdm").entryList(QDir::Files).size(), 1);
+            QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+        }
     }
 
     void mcpBuildsACutFromAScript() {
@@ -34630,6 +35407,16 @@ if ui["pressed"] == "add":
             s.videoTracks[1].clips = {right};
             const float onAnother = darkest(renderSequenceFrame(p, s, 3, o));
             QVERIFY2(std::fabs(onAnother - oneGround) < 0.01f, qPrintable(QString("a shadow on another card's ground: %1").arg(onAnother)));
+            // Beside two such cards, their grounds at the same height, it lands on one ground (the card's on the
+            // nearest track to its own), not on both, which would darken it twice.
+            Clip third = right;
+            third.id = p.newId();
+            third.effects[0].params["pos_y"] = 70.0;
+            while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+            s.videoTracks[2].clips = {third};
+            const float onOne = darkest(renderSequenceFrame(p, s, 3, o));
+            QVERIFY2(std::fabs(onOne - oneGround) < 0.01f, qPrintable(QString("a shadow by two grounds: %1, by one %2").arg(onOne).arg(oneGround)));
+            s.videoTracks[2].clips.clear();
             s.videoTracks[1].clips.clear();
         }
 

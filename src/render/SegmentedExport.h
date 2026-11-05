@@ -39,7 +39,8 @@ bool exportSegmentsLongGop(const ExportSettings& s);
 bool exportIsImageSequence(const ExportSettings& s);
 
 // The export's range in `n` segments (fewer when it is shorter), each boundary on the cut nearest an equal share when
-// one is within an eighth of a segment's length, else on that share's frame.
+// one is within an eighth of a segment's length, else on that share's frame; MPEG-2's then on the nearest of its GOPs
+// (exportMpeg2Gop), so every GOP but the last is as long as a single render's.
 std::vector<ExportSegment> planExportSegments(const Sequence& seq, const ExportSettings& s, int n);
 // The settings a segment renders with: only its frames, without what the join makes for the whole (sound, embedded
 // captions, chapters, timecode, reports); a video file at `path`, an image sequence's frames where the whole one's go,

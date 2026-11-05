@@ -82,6 +82,7 @@ private:
     QCheckBox* nmos_;
     QLabel* nmosStatus_;
     nmos::Node* node_ = nullptr;
+    QString nmosFeed_;  // the feed (SDP text) an NMOS controller last set ("" none)
     QComboBox* codec_;
     QComboBox* wrapper_;
     QLineEdit* folder_;

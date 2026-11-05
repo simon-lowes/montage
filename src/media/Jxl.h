@@ -15,6 +15,7 @@ struct ColorSpace;
 
 bool jxlAvailable();  // built with libjxl
 bool jxlWritesPremultiplied();  // its libjxl (0.9 or later) writes premultiplied alpha
+bool jxlConvertsProfiles();     // built with Little CMS: colour that is none of Montage's spaces is converted, not refused
 bool isJxlPath(const std::string& file);
 
 struct JxlInfo {
@@ -25,7 +26,10 @@ struct JxlInfo {
     bool alpha = false;
     bool alphaPremultiplied = false;
     int orientation = 1;     // EXIF's 1 to 8
-    std::string colorSpace;  // the Montage space (render/ColorSpace.h id) its samples are in; "" = none of them
+    // The Montage space (render/ColorSpace.h id) its samples are read in: its own, or linear Rec.709 display light
+    // ("linear-rec709+display") for colour that is none of them, converted from its ICC profile (with Little CMS; a
+    // file it cannot convert, CMYK say, is refused).
+    std::string colorSpace;
     bool icc = false;        // its colour stated by an ICC profile
     double intensityTarget = 0;  // nits (the libjxl default, 255, for SDR)
     bool jpeg = false;           // holds a JPEG, rebuilt byte for byte by jxlToJpeg
@@ -69,6 +73,7 @@ struct JxlWriteOptions {
     bool premultiplied = false;        // written premultiplied (else straight)
     bool sourcePremultiplied = false;  // the pixels given are premultiplied (as program frames are)
     std::string colorSpace;            // the Montage space the pixels are in ("" = sRGB): its encoding is stated
+    std::vector<uint8_t> iccProfile;   // else an ICC profile stated as the pixels' colour (its bytes)
     double intensityTarget = 0;        // nits; 0 = the default
     int orientation = 1;
 };

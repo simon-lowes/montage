@@ -1,7 +1,7 @@
 // Montage — chasing linear timecode: a sound input carrying LTC from a DAW, a sync box or a tape machine (read by
 // audio/Ltc) followed as a position on the Program, so the picture follows another system's transport. It locks
-// after a few words in sequence, follows the master's speed, freewheels through drop-outs (for a set time, at the
-// last speed), and adds an offset.
+// after a few words in sequence, follows the master's speed either way (as far as the words can be read: a fifth of
+// play speed to five times it), freewheels through drop-outs (for a set time, at the last speed), and adds an offset.
 #pragma once
 
 #include <cstdint>
@@ -28,7 +28,7 @@ public:
     struct Position {
         State state = State::Stopped;
         double frame = 0;  // where the master is (plus the offset), in frames on its timecode; 0 when stopped
-        double speed = 0;  // times play
+        double speed = 0;  // times play (negative: backwards)
     };
     // Where the master is at input sample `sample` (as written so far; later ones are extrapolated).
     Position at(int64_t sample) const;
@@ -37,8 +37,8 @@ public:
 
 private:
     struct Word {
-        int64_t frame;  // its label's frame number (with the day wrapped out against the last)
-        double start;   // where it began, in samples
+        int64_t frame;     // its label's frame number (with the day wrapped out against the last)
+        double start, end;  // where its frame began and the next would (LtcFrame's), in samples
     };
     void take(const LtcFrame& f);
 

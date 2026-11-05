@@ -274,14 +274,23 @@ void CaptureDialog::nmosConnected() {
     QString why;
     const std::vector<st2110::SdpStream> streams = node_->receiverStreams(&why);
     std::string text;
-    for (const st2110::SdpStream& s : streams) text += st2110::sdpText(s);
-    if (!streams.empty()) {
+    bool video = false;
+    for (const st2110::SdpStream& s : streams) text += st2110::sdpText(s), video = video || s.encoding == "raw";
+    if (video) {
         setSource(QStringLiteral("st2110"), QString::fromStdString(text));
-        const nmos::ReceiverConnection c = node_->receiverConnection(0);
+        nmosFeed_ = url_->text();
+        // (each path's own: with the second leg alone, it is the first path)
+        const QStringList interfaces = node_->receiverInterfaces();
         QStringList options;
-        if (c.leg[0].enabled) options << QStringLiteral("interface=") + c.leg[0].interfaceIp;
-        if (c.leg[1].enabled && c.leg[0].enabled) options << QStringLiteral("interface2=") + c.leg[1].interfaceIp;
+        if (interfaces.size() > 0) options << QStringLiteral("interface=") + interfaces[0];
+        if (interfaces.size() > 1) options << QStringLiteral("interface2=") + interfaces[1];
         setOptions(options.join(QLatin1Char(' ')));
+    } else if (!nmosFeed_.isEmpty() && url_->text() == nmosFeed_) {
+        // (disconnected, its picture at least: what it connected is no longer the feed, unless someone has typed
+        // another since)
+        url_->clear();
+        setOptions(QString());
+        nmosFeed_.clear();
     }
     nmosStatus_->setText(why.isEmpty() ? nmosStatus() : tr("NMOS: %1").arg(why));
     nmosStatus_->setVisible(nmos_->isVisible());

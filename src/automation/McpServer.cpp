@@ -866,6 +866,8 @@ struct McpServer::Impl {
                 r = fail(e.message);
             } catch (const std::exception& e) {
                 r = fail(QString::fromUtf8(e.what()));
+            } catch (...) {
+                r = fail(QStringLiteral("%1 stopped with an error of unknown kind").arg(job->tool));
             }
             tCurrentJob = nullptr;
             tCancel = nullptr;
@@ -14329,13 +14331,31 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
                                        QJsonObject{{"job", job->id}, {"tool", name}, {"status", "queued"}})));
         }
         args.remove("async");
-        // montage_job is answered at once, while a job runs; other tools one at a time.
-        std::unique_lock<std::mutex> running(d_->toolMutex, std::defer_lock);
-        bool turn = false;
+        // montage_job is answered at once, while a job runs; other tools one at a time. The call's turn ends however
+        // it does (an answer, or any exception at all): later calls never wait on a turn that never ends.
+        struct Turn {
+            Impl* d;
+            std::unique_lock<std::mutex> running;
+            bool taken = false;
+            ~Turn() { end(); }
+            void end() {
+                if (running.owns_lock()) {
+                    d->notify = nullptr;
+                    tCancel = nullptr;
+                    {
+                        std::lock_guard l(d->cancelMutex);
+                        d->runningRequest.clear();
+                    }
+                    running.unlock();
+                }
+                if (taken) d->endTurn();
+                taken = false;
+            }
+        } turn{d_, std::unique_lock<std::mutex>(d_->toolMutex, std::defer_lock)};
         if (name != QLatin1String("montage_job")) {
             d_->waitTurn(d_->takeTurn());
-            turn = true;
-            running.lock();
+            turn.taken = true;
+            turn.running.lock();
             std::lock_guard l(d_->cancelMutex);
             d_->runningRequest = Impl::requestKey(id);
             d_->callCancel = d_->cancelledRequests.erase(d_->runningRequest) > 0;
@@ -14356,15 +14376,10 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
             r = fail(e.message);
         } catch (const std::exception& e) {
             r = fail(QString::fromUtf8(e.what()));
+        } catch (...) {
+            r = fail(QStringLiteral("%1 stopped with an error of unknown kind").arg(name));
         }
-        if (running.owns_lock()) {
-            d_->notify = nullptr;
-            tCancel = nullptr;
-            std::lock_guard l(d_->cancelMutex);
-            d_->runningRequest.clear();
-        }
-        if (running.owns_lock()) running.unlock();
-        if (turn) d_->endTurn();
+        turn.end();
         return reply(resultJson(r));
     }
     return error(-32601, QStringLiteral("Method not found: %1").arg(method));

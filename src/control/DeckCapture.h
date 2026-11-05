@@ -16,7 +16,9 @@
 
 namespace montage {
 
-// A clip logged on a tape: its frames [in, out) as frame numbers on the tape's timecode (audio/Ltc counts them).
+// A clip logged on a tape: its frames [in, out) as frame numbers on the tape's timecode (audio/Ltc counts them, drop
+// frame or not as the log's rate says; batch capture finds the frames with those labels on a deck that counts the
+// other way).
 struct LogEntry {
     std::string name, reel;
     int64_t in = 0, out = 0;
@@ -57,24 +59,29 @@ struct BatchClip {
 
 // Captures each entry in turn: the deck cued to its pre-roll, the recording started, the deck played, and the
 // pictures from the entry's In less its handle to its Out plus its handle kept, each placed by its timecode: the
-// picture's own when the feed carries it (SDI, Open Media Transport), else the deck's, read as it plays.
+// picture's own when the feed carries it (SDI, Open Media Transport), else the deck's, read as it plays. The entries'
+// timecodes are counted as the deck was set (Deck::setBase); a deck that counts the other way at 29.97 is sent the
+// same labels, and the clips keep its own.
 // `progress` says which clip and what is happening; `cancel` stops after the clip being captured.
 std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEntry>& log, const BatchCaptureSettings& s,
                                     const std::function<void(int index, const std::string& what)>& progress = {},
                                     const std::atomic<bool>* cancel = nullptr);
 
-// An edit onto tape: [in, out) on the tape's timecode, the channels, and the deck's pre-roll.
+// An edit onto tape: In on the tape's timecode (counted as the deck was set), out - in frames long, the channels, and
+// the deck's pre-roll.
 struct TapeEdit {
     int64_t in = 0, out = 0;
     ninepin::EditChannels channels;
-    double preroll = 5;  // seconds
+    double preroll = 5;  // seconds (less when In is nearer 00:00:00:00)
 };
 
 // Sets the edit on the deck (channels, In, Out, pre-roll) and runs it (AUTO EDIT): the deck pre-rolls and records In
-// to Out. `roll` is told once, as soon as the deck is seen running up towards In, the tape frame it was at and when
-// (captureClock()), so the Program can be started to reach the edit's first frame as the deck reaches In. Waits for
-// the edit to finish; false with the reason if the deck refused it or never got there.
-bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void(int64_t tapeFrame, double clock)>& roll,
+// to Out. `roll` is told as soon as the deck is seen running up towards In (moving forward at play speed within its
+// pre-roll, its servo locked when it says so), how many frames before In it was and when (captureClock()), so the
+// Program can be started to reach the edit's first frame as the deck reaches In; told again should the deck then jump
+// (one that was playing when told, searching back to its pre-roll). Waits for the edit to finish; false with the reason
+// if the deck refused it, stopped answering or never got there, the deck stopped once it had been told to record.
+bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void(int64_t framesToIn, double clock)>& roll,
                 const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
 }  // namespace montage

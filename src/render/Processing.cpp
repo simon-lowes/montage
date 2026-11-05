@@ -2956,7 +2956,10 @@ inline float blendChannel(int mode, float cb, float cs) {
         case 10: return cs >= 1 ? 1.0f : std::min(1.0f, cb / (1 - cs));         // colour dodge
         case 11: return cs <= 0 ? 0.0f : 1 - std::min(1.0f, (1 - cb) / cs);     // colour burn
         case 12: return std::max(0.0f, cb - cs);                               // subtract
-        case 13: return cb + cs >= 1 - 1e-5f ? 1.0f : 0.0f;  // hard mix: 1 where the two reach 1 (rounding aside), else 0
+        // hard mix: 1 where the two reach 1, else 0. The line is half an 8-bit step short of 1, as far as it can be from
+        // any two 8-bit values' sum, so a picture's codes land the same side however each path rounds them (the GPU's
+        // half floats too).
+        case 13: return cb + cs >= 1 - 0.5f / 255 ? 1.0f : 0.0f;
         default: return cs;
     }
 }
