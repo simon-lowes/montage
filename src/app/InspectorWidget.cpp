@@ -44,6 +44,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "EqPanel.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "render/Expressions.h"
@@ -165,7 +166,11 @@ QString InspectorWidget::signature() const {
                                          : nullptr;
         if (!chain) return {};
         QString sig = QString("X%1").arg(state_->inspectedChain()) + (sceneReferredWorking(*s) ? QStringLiteral(":scene") : QString());
-        for (const auto& e : *chain) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+        for (const auto& e : *chain) {
+            sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+            if (e.type == "parametric_eq")  // (its bands' settings are listed: rebuild when one is added or removed)
+                for (const std::string& b : eqBands(e)) sig += QString::fromStdString("q" + b);
+        }
         return sig;
     }
     QString sig = QString("C%1:%2:%3").arg(c->id).arg(QString::fromStdString(c->generator.type)).arg(c->mediaId);
@@ -200,6 +205,9 @@ QString InspectorWidget::signature() const {
         if (e.type == "mesh_warp")
             for (int k : meshPins(e)) sig += QString("p%1k%2").arg(k).arg(meshPinKind(e, k));
         if (e.type == "grid_warp") sig += QString("g%1x%2").arg(std::lround(e.p("rows", 0, 3))).arg(std::lround(e.p("cols", 0, 3)));
+        // A Parametric EQ's bands: rebuild when one is added or removed.
+        if (e.type == "parametric_eq")
+            for (const std::string& b : eqBands(e)) sig += QString::fromStdString("q" + b);
         // A Surface Tracker's status line: rebuild when it is tracked.
         if (e.type == "surface_track")
             if (const auto tk = e.strings.find("track"); tk != e.strings.end())
@@ -985,6 +993,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         if (e.type == "color_correct") addColorWheels(f, target(eid));
         if (e.type == "hdr_palette") addHdrPalette(f, *info, target(eid));
         else if (e.type == "color_slice") addColorSlice(f, *info, target(eid));
+        else if (e.type == "parametric_eq") addParametricEq(f, *info, target(eid));
         else addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
         if ((e.type == "perf_lock" || e.type == "film_negative") && onClip) {
@@ -2227,6 +2236,40 @@ void InspectorWidget::addColorSlice(QFormLayout* form, const EffectInfo& info, c
     for (const std::string& n : names)
         for (const ParamInfo& pi : info.params)
             if (pi.name == n) addParamRow(form, pi, target);
+}
+
+void InspectorWidget::addParametricEq(QFormLayout* form, const EffectInfo& info, const Target& target) {
+    // The display and its band strip (app/EqPanel.h), the output, then each band's settings with their keyframes,
+    // folded away until asked for.
+    form->addRow(new EqPanel(state_, target.owner, target.effect, target.time, false, content_));
+    for (const ParamInfo& pi : info.params)
+        if (pi.name == "output_db") addParamRow(form, pi, target);
+    if (info.params.size() < 2) return;
+    auto* toggle = new QToolButton(content_);
+    toggle->setObjectName(QStringLiteral("eqBandSettings"));
+    toggle->setText(tr("Band Settings and Keyframes"));
+    toggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    toggle->setAutoRaise(true);
+    auto* body = new QWidget(content_);
+    auto* sub = new QFormLayout(body);
+    sub->setContentsMargins(0, 0, 0, 0);
+    sub->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    sub->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    sub->setVerticalSpacing(3);
+    for (const ParamInfo& pi : info.params)
+        if (pi.name != "output_db") addParamRow(sub, pi, target);
+    const Id effect = target.effect;
+    const bool open = eqSettingsOpen_.count(effect) > 0;
+    body->setVisible(open);
+    toggle->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
+    connect(toggle, &QToolButton::clicked, this, [this, toggle, body, effect] {
+        body->setVisible(!body->isVisible());
+        toggle->setArrowType(body->isVisible() ? Qt::DownArrow : Qt::RightArrow);
+        if (body->isVisible()) eqSettingsOpen_.insert(effect);
+        else eqSettingsOpen_.erase(effect);
+    });
+    form->addRow(toggle);
+    form->addRow(body);
 }
 
 bool InspectorWidget::ownSetting(const Target& target) const {

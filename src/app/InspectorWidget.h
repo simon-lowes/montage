@@ -6,6 +6,7 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,8 @@ private:
     // The HDR Palette: a zone picker, the zone's wheel and its sliders.
     void addHdrPalette(QFormLayout* form, const EffectInfo& info, const Target& target);
     void addColorSlice(QFormLayout* form, const EffectInfo& info, const Target& target);
+    // The Parametric EQ: its display and band strip, its output, and every band's settings folded away.
+    void addParametricEq(QFormLayout* form, const EffectInfo& info, const Target& target);
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
     // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.
@@ -143,6 +146,7 @@ private:
     int sliceVector_ = 0;  // the Hue Vectors vector shown (0 Global, then Red to Magenta, then Skin)
     int hdrZone_ = 0;  // the HDR Palette zone shown (0 Global, then Black to Specular)
     std::map<Id, std::string> shapeSelection_;  // each shape layer's picked item
+    std::set<Id> eqSettingsOpen_;  // the Parametric EQs whose band settings are unfolded
 };
 
 }  // namespace montage

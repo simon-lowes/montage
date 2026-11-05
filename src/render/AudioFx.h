@@ -1,5 +1,5 @@
 // Montage — built-in audio effects past EQ3, compressor, limiter and delay:
-// a five-band parametric EQ, a de-esser, a noise gate, a reverb (Freeverb's
+// a parametric EQ of up to sixteen bands, a de-esser, a noise gate, a reverb (Freeverb's
 // design), channel tools (fill left or right, mono, swap, polarity), a
 // de-hummer, chorus and flanger, a phaser, tremolo and auto-pan, saturation
 // and stereo width. All work in place on interleaved stereo and keep their
@@ -7,7 +7,12 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <vector>
+
+namespace montage {
+struct Effect;
+}
 
 namespace montage::fx {
 
@@ -15,10 +20,13 @@ struct Biquad {
     double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
     double z1[2] = {0, 0}, z2[2] = {0, 0};
     void peaking(double fs, double f0, double q, double db);
-    void lowShelf(double fs, double f0, double db);
-    void highShelf(double fs, double f0, double db);
+    // Shelves: Q 0.707 rises without overshoot (the cookbook's slope S = 1); more makes a bump either side.
+    void lowShelf(double fs, double f0, double db, double q = 0.70710678118654752);
+    void highShelf(double fs, double f0, double db, double q = 0.70710678118654752);
     void highPass(double fs, double f0, double q = 0.70710678);
     void lowPass(double fs, double f0, double q = 0.70710678);
+    void notch(double fs, double f0, double q);
+    void bandPass(double fs, double f0, double q);  // 0 dB at f0
     // The filter's gain at `hz`, in dB.
     double responseDb(double fs, double hz) const;
     float process(int ch, float x) {
@@ -32,22 +40,55 @@ private:
     void set(double nb0, double nb1, double nb2, double a0, double na1, double na2);
 };
 
-// Low shelf, three bells and a high shelf, then an output gain.
+// A parametric EQ: up to sixteen bands in turn, then an output gain. Each band is one of the RBJ Audio EQ Cookbook's
+// biquads (bell, shelves, notch, band-pass), a Butterworth high- or low-pass of 12 to 48 dB an octave (a cut), or a
+// tilt: a low shelf and a high shelf about the same frequency, cutting one side by half the gain and lifting the other
+// by half, so it is flat at the frequency. Frequency, gain and Q are independent: Q never follows the gain.
+enum class EqShape { Bell, LowShelf, HighShelf, LowCut, HighCut, Notch, BandPass, Tilt };  // as core/Effects.h EqBandType
 struct EqBand {
     double hz = 1000, db = 0, q = 1;
+    EqShape shape = EqShape::Bell;
+    int slope = 24;  // a cut's, dB an octave: 12, 24, 36 or 48
+    bool on = true;
 };
 class ParametricEq {
 public:
+    static constexpr int kMaxBands = 16;
+    // The five bands an EQ had before bands could be added: a low shelf, three bells and a high shelf (the shelves'
+    // Q is the cookbook's 0.707 whatever they are given).
     void set(double sr, const EqBand& low, const EqBand& b1, const EqBand& b2, const EqBand& b3, const EqBand& high, double outputDb);
+    // Up to kMaxBands bands (more are left out). `solo`, a band's index: only the part of the sound that band works on
+    // is heard (soloFilter), the other bands and the output gain left out; -1 none. The filters keep their state, so
+    // moving a band as it plays does not click.
+    void set(double sr, const std::vector<EqBand>& bands, double outputDb, int solo = -1);
     void process(float* buf, int frames);
-    // The whole EQ's gain at `hz`, in dB (output gain included).
+    // The whole EQ's gain at `hz`, in dB, as it is heard (output gain included; the solo filter while soloing).
     double responseDb(double hz) const;
+    // One band's own gain at `hz`, in dB (on or off).
+    double bandResponseDb(int band, double hz) const;
+    int bandCount() const { return int(stages_.size()); }
 
 private:
-    std::array<Biquad, 5> bands_;
+    struct Stage {
+        std::array<Biquad, 4> sections;
+        int count = 0;
+        bool on = true;
+    };
+    static void design(Stage& st, double sr, const EqBand& b);
+    // The part of the sound a band works on: a band-pass at a bell's, notch's or band-pass's frequency and Q; below a
+    // low shelf's frequency or a high cut's (low-pass), above a high shelf's or a low cut's (high-pass); a tilt as it is.
+    static void soloFilter(Stage& st, double sr, const EqBand& b);
+    static double stageDb(const Stage& st, double sr, double hz);
+    std::vector<Stage> stages_;
+    Stage solo_;
+    bool soloing_ = false;
     double sr_ = 48000;
     float output_ = 1;
 };
+
+// The Parametric EQ effect's bands at frame `t` (core/Effects.h eqBands), and which is soloed: its "audition" string
+// names the band only on the copy of the project playback hears while Solo is held (-1 when none).
+std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo = nullptr);
 
 // Turns down the sibilant band (above `hz`) when it is louder than the
 // threshold. The band is split off with a Linkwitz-Riley crossover, whose two

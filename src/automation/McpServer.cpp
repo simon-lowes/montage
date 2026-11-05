@@ -291,6 +291,37 @@ QString need(const QJsonObject& a, const char* key) {
     return v;
 }
 
+// A Parametric EQ's `bands` argument: each {type, hz, db, q, slope, on} added to `e` as a band of its own.
+const char* const kEqTypeNames[] = {"bell", "low_shelf", "high_shelf", "low_cut", "high_cut", "notch", "band_pass", "tilt"};
+#define MONTAGE_EQ_BANDS_SCHEMA \
+    R"json({"type":"array","maxItems":16,"description":"parametric_eq: bands to add, each its own (up to 16 in all)","items":{"type":"object","properties":{"type":{"type":"string","enum":["bell","low_shelf","high_shelf","low_cut","high_cut","notch","band_pass","tilt"],"default":"bell"},"hz":{"type":"number","minimum":20,"maximum":20000},"db":{"type":"number","minimum":-30,"maximum":30,"description":"bell, shelves and tilt only"},"q":{"type":"number","minimum":0.1,"maximum":30},"slope":{"type":"integer","enum":[12,24,36,48],"description":"dB per octave, cuts only"},"on":{"type":"boolean","default":true}},"required":["hz"]}})json"
+void addEqBandsArg(Effect& e, const QJsonValue& v) {
+    if (!v.isArray()) throw ArgError{"bands is a list of {type, hz, db, q, slope, on}"};
+    for (const QJsonValue& item : v.toArray()) {
+        const QJsonObject b = item.toObject();
+        if (!item.isObject()) throw ArgError{"Each band is {type, hz, db, q, slope, on}"};
+        for (auto it = b.begin(); it != b.end(); ++it)
+            if (!QStringList{"type", "hz", "db", "q", "slope", "on"}.contains(it.key()))
+                throw ArgError{QStringLiteral("A band has no \"%1\" (type, hz, db, q, slope, on)").arg(it.key())};
+        const QString typeName = b.value("type").toString(QStringLiteral("bell"));
+        const auto type = std::find(std::begin(kEqTypeNames), std::end(kEqTypeNames), typeName.toStdString());
+        if (type == std::end(kEqTypeNames))
+            throw ArgError{"A band's type is bell, low_shelf, high_shelf, low_cut, high_cut, notch, band_pass or tilt"};
+        const int t = int(type - std::begin(kEqTypeNames));
+        const double hz = b.value("hz").toDouble(-1), db = b.value("db").toDouble(0), q = b.value("q").toDouble(0);
+        if (!(hz >= 20 && hz <= 20000)) throw ArgError{"A band's hz is from 20 to 20000"};
+        if (!(db >= -30 && db <= 30)) throw ArgError{"A band's db is from -30 to 30"};
+        if (b.contains("db") && db != 0 && !eqTypeHasGain(t)) throw ArgError{QStringLiteral("A %1 band has no gain (db)").arg(typeName)};
+        if (b.contains("q") && !(q >= 0.1 && q <= 30)) throw ArgError{"A band's q is from 0.1 to 30"};
+        const int slope = b.value("slope").toInt(24);
+        if (slope != 12 && slope != 24 && slope != 36 && slope != 48) throw ArgError{"A cut's slope is 12, 24, 36 or 48 (dB an octave)"};
+        const std::string band = addEqBand(e, t, hz, db, q);
+        if (band.empty()) throw ArgError{QStringLiteral("An EQ has at most %1 bands").arg(kEqMaxBands)};
+        e.params[band + "_slope"] = Param(double(slope / 12 - 1));
+        if (b.contains("on")) e.params[band + "_on"] = Param(b.value("on").toBool(true) ? 1.0 : 0.0);
+    }
+}
+
 // Seconds (a number) or a timecode / frame count / "N s" string, in the sequence's frames.
 FrameTime timeArg(const QJsonValue& v, const Sequence& s, const char* name) {
     if (v.isDouble()) return FrameTime(std::llround(v.toDouble() * s.fpsValue()));
@@ -3570,8 +3601,24 @@ void McpServer::Impl::addTools() {
                     }
                     params.append(po);
                 }
-                list.append(QJsonObject{{"type", QString::fromStdString(e.type)}, {"name", QString::fromStdString(e.displayName)},
-                                        {"group", QString::fromStdString(e.group)}, {"params", params}});
+                QJsonObject entry{{"type", QString::fromStdString(e.type)}, {"name", QString::fromStdString(e.displayName)},
+                                  {"group", QString::fromStdString(e.group)}, {"params", params}};
+                if (e.type == "parametric_eq") {
+                    // Its bands' params, the same for each band k from 1 to 16 (montage_add_effect's `bands` adds them).
+                    QJsonArray band;
+                    for (const ParamInfo& pi : eqBandParams("b1")) {
+                        QJsonObject po{{"name", QString::fromStdString("b<k>" + pi.name.substr(2))}, {"min", pi.min}, {"max", pi.max}, {"default", pi.def}};
+                        if (!pi.choices.empty()) {
+                            QJsonArray ch;
+                            for (const auto& c : pi.choices) ch.append(QString::fromStdString(c));
+                            po["choices"] = ch;
+                        }
+                        band.append(po);
+                    }
+                    entry["band_params"] = band;
+                    entry["max_bands"] = kEqMaxBands;
+                }
+                list.append(entry);
             }
             // OpenFX video plugins installed on this computer: clip effects, transitions and generators by their kind.
             if (kind == "video" || kind == "transition" || kind == "generator") {
@@ -3684,6 +3731,12 @@ void McpServer::Impl::addTools() {
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
         "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores). "
+        "parametric_eq (audio) starts flat with no bands: `bands` adds up to 16, each {type (bell, low_shelf, high_shelf, "
+        "low_cut, high_cut, notch, band_pass, tilt), hz, db (bell, shelves, tilt), q, slope (cuts: 12, 24, 36 or 48 dB an "
+        "octave), on}; frequency, gain and Q are independent. A band is also params b<k>_hz, b<k>_db, b<k>_q, b<k>_type "
+        "(0 bell, 1 low shelf, 2 high shelf, 3 low cut, 4 high cut, 5 notch, 6 band-pass, 7 tilt), b<k>_slope (0-3: 12-48 "
+        "dB an octave) and b<k>_on (k 1-16), with low_* and high_* the shelves of an EQ from before bands could be added; "
+        "output_db after them. "
         "mesh_warp bends the picture by `pins` as rigidly as it can (a mesh over its alpha, or the whole frame with mesh_from 1; "
         "density vertices): each pin sits at x, y on the picture (fractions of the frame); a position pin is moved to to_x, "
         "to_y, or keyed along path [{frame, x, y}]; a stiff pin keeps the area within radius (sequence pixels) in shape "
@@ -3723,6 +3776,7 @@ void McpServer::Impl::addTools() {
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
             "mask_smooth":{"type":"boolean","default":false},
+            "bands":)json" MONTAGE_EQ_BANDS_SCHEMA R"json(,
             "pins":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["position","stiff","bend","overlap"]},"x":{"type":"number"},"y":{"type":"number"},"to_x":{"type":"number"},"to_y":{"type":"number"},"path":{"type":"array","items":{"type":"object"}},"radius":{"type":"number"},"amount":{"type":"number"},"angle":{"type":"number"},"scale":{"type":"number"},"depth":{"type":"number"}},"required":["x","y"]},"description":"mesh_warp's pins"},
             "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
             "group":{"type":["number","string"],"description":"group_stage: which of the clip's groups (its id or name, such as the scene group round its angle group); default the clip's own"},
@@ -3801,9 +3855,14 @@ void McpServer::Impl::addTools() {
                 static const QRegularExpression gridPoint(QStringLiteral("^g([0-9]|1[0-2])_([0-9]|1[0-2])\\.d[xy]$"));
                 const bool known = (pluginParams ? e.params.count(name) > 0
                                            : std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; })) ||
-                                   (name.rfind("mask.", 0) == 0 && supportsMask(type)) || (type == "grid_warp" && gridPoint.match(it.key()).hasMatch());
+                                   (name.rfind("mask.", 0) == 0 && supportsMask(type)) || (type == "grid_warp" && gridPoint.match(it.key()).hasMatch()) ||
+                                   (type == "parametric_eq" && isEqBandParam(name));
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
+            }
+            if (a.contains("bands")) {
+                if (type != "parametric_eq") throw ArgError{"bands are a parametric_eq's"};
+                addEqBandsArg(e, a.value("bands"));
             }
             if (a.contains("pins")) {
                 // A Mesh Warp's pins: each placed at x, y on the picture (fractions of the frame), a Position pin moved
@@ -4135,9 +4194,11 @@ void McpServer::Impl::addTools() {
         "kick; key_hpf_hz high-passes what it listens to. In a surround or ambisonic sequence, upmix spreads the track's "
         "stereo (after its other inserts) over the speakers so that the stereo fold-down gives it back: centred sound "
         "to the centre, what differs between the sides behind and above (params centre_width, surround_depth and height "
-        "0-100, delay_ms, lfe 1 for the lows in the LFE, dialogue_centre 0 to upmix Dialogue-role clips too).",
+        "0-100, delay_ms, lfe 1 for the lows in the LFE, dialogue_centre 0 to upmix Dialogue-role clips too). A "
+        "parametric_eq starts with no bands: `bands` adds them, as montage_add_effect's.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","description":"A1, A2..."},
             "effect":{"type":"string"},"params":{"type":"object","additionalProperties":{"type":"number"}},
+            "bands":)json" MONTAGE_EQ_BANDS_SCHEMA R"json(,
             "strings":{"type":"object","additionalProperties":{"type":"string"}},
             "remove":{"type":"number","description":"An effect id to take off instead"}},"required":["project","track"]})json",
         false, [](const QJsonObject& a) {
@@ -4163,9 +4224,14 @@ void McpServer::Impl::addTools() {
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
                 const std::string name = it.key().toStdString();
-                if (std::none_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; }))
+                if (std::none_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; }) &&
+                    !(type == "parametric_eq" && isEqBandParam(name)))
                     throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
+            }
+            if (a.contains("bands")) {
+                if (type != "parametric_eq") throw ArgError{"bands are a parametric_eq's"};
+                addEqBandsArg(e, a.value("bands"));
             }
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {

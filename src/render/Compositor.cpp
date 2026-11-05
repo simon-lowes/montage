@@ -3554,6 +3554,7 @@ std::shared_ptr<const RoomKernels> roomKernels(const RoomKey& key, const RoomSha
 struct AudioMixer::State {
     Biquad bq[3];
     fx::ParametricEq eq;
+    std::string eqShape;  // its param names and soloed band, as last set
     fx::DeEsser deesser;
     fx::NoiseGate gate;
     fx::Reverb reverb;
@@ -3870,13 +3871,13 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
                 }
             }
         } else if (e.type == "parametric_eq") {
-            if (changed) {
-                auto band = [&](const char* n, double hz, bool q) {
-                    const std::string b(n);
-                    return fx::EqBand{e.p(b + "_hz", lt, hz), e.p(b + "_db", lt, 0), q ? e.p(b + "_q", lt, 1) : 1.0};
-                };
-                st->eq.set(sr, band("low", 100, false), band("b1", 250, true), band("b2", 1000, true), band("b3", 4000, true),
-                           band("high", 10000, false), e.p("output_db", lt, 0));
+            // (a band soloed or let go is a change, and so is one added or removed with the values as they were)
+            std::string shape = e.s("audition") + '#' + std::to_string(e.params.size());
+            if (changed || shape != st->eqShape) {
+                int solo = -1;
+                const std::vector<fx::EqBand> bands = fx::eqBandsOf(e, lt, &solo);
+                st->eq.set(sr, bands, e.p("output_db", lt, 0), solo);
+                st->eqShape = std::move(shape);
             }
             st->eq.process(buf, frames);
         } else if (e.type == "deesser") {

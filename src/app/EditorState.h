@@ -15,6 +15,7 @@
 #include "core/EditOps.h"
 #include "core/History.h"
 #include "media/Psd.h"
+#include "media/StereoAnalysis.h"
 #include "core/Model.h"
 
 class QFileSystemWatcher;
@@ -81,6 +82,12 @@ public:
     std::optional<double> liveParameter(Id owner, Id effect, const std::string& param) const {
         return liveParameter_ ? liveParameter_(owner, effect, param) : std::nullopt;
     }
+    // Momentary listening from a panel (the EQ display's Solo band, while it is held): laid over what the Program
+    // monitor plays, the project untouched and no undo step made; empty: none. The window passes it on to playback.
+    void setAudition(const std::function<void(Sequence&)>& fn) { emit auditionChanged(fn); }
+    // What the Program monitor plays, analysed ten times a second while it plays (its spectrum, for the EQ display):
+    // the window passes it on from playback.
+    void noteHeardAnalysis(montage::AudioAnalysisPtr analysis) { emit heardAnalysis(analysis); }
     // Counts projects opened, reloaded or made new: what was taken from one project can tell it is gone.
     uint64_t projectGeneration() const { return projectGeneration_; }
     // The active sequence as it was when the current gesture began (or the
@@ -301,6 +308,8 @@ signals:
     void statusMessage(const QString& text, int timeoutMs);
     void fileStateChanged();          // path or modified flag changed
     void lockStateChanged();          // read-only, who holds the lock, or whether it is free changed
+    void auditionChanged(const std::function<void(montage::Sequence&)>& apply);  // (setAudition)
+    void heardAnalysis(montage::AudioAnalysisPtr analysis);                      // (noteHeardAnalysis)
 
 private:
     std::function<bool(const ParameterMove&)> parameterCapture_;
