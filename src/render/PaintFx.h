@@ -17,6 +17,8 @@
 #include "core/Model.h"
 #include "media/Image.h"
 
+#include <atomic>
+
 namespace montage {
 
 enum class DisplaceChannel { Luma, Red, Green, Blue, Alpha, Off };
@@ -28,6 +30,9 @@ struct DisplaceSettings {
     DisplaceEdge edge = DisplaceEdge::Clamp;
     bool bicubic = false;  // else bilinear
     double mapBlur = 0;    // the map blurred first (a Gaussian's radius in pixels)
+    // Where the picture's own pixels are in the frame, [left, right) x [top, bottom) (a scaled or letterboxed clip's
+    // layer): only they move, and the edges are theirs. Empty: the whole frame.
+    int left = 0, top = 0, right = 0, bottom = 0;
 };
 // `img` displaced by `map` (the same size; straight values read from its premultiplied ones). A pixel moved by
 // (dx, dy) takes the colour from (x + dx, y + dy).
@@ -40,14 +45,15 @@ struct KuwaharaSettings {
     double anisotropy = 1;  // alpha: how far the ellipse stretches along the structure (smaller stretches more)
     double tensorBlur = 2;  // the structure tensor's smoothing (Gaussian sigma, pixels)
 };
-void anisotropicKuwahara(Image& img, const KuwaharaSettings& settings);
+// False, the picture as it was, when `cancel` stopped it part way.
+bool anisotropicKuwahara(Image& img, const KuwaharaSettings& settings, const std::atomic<bool>* cancel = nullptr);
 
 struct SmearSettings {
     double length = 12;     // pixels each way along the flow
     int levels = 8;         // colour levels after (0: none)
     double tensorBlur = 3;  // the structure tensor's smoothing (Gaussian sigma, pixels)
 };
-void contourSmear(Image& img, const SmearSettings& settings);
+bool contourSmear(Image& img, const SmearSettings& settings, const std::atomic<bool>* cancel = nullptr);
 
 // The Painterly effect.
 void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale);

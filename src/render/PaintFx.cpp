@@ -1,6 +1,10 @@
 #include "PaintFx.h"
 
+#include "render/Compositor.h"
+#include "render/Processing.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -8,9 +12,73 @@ namespace montage {
 
 namespace {
 
-// A Gaussian blur of `n`-channel rows (in place), edges held: separable, each output from the input alone.
+// The most samples a Kuwahara brush takes along its radius (past it, its ellipse is sampled every few pixels).
+constexpr double kKuwaharaSamples = 8;
+
+// A box of 2r + 1 across `n`-channel rows (along x) or down columns (along y), edges held, `in` to `out`: a running
+// sum, so its cost does not grow with r. Each row (or column) on its own, so any number of threads gives the same.
+void boxPass(const std::vector<float>& in, std::vector<float>& out, int w, int h, int n, int r, bool alongY) {
+    const double scale = 1.0 / (2 * r + 1);
+    if (!alongY) {
+        parallelRows(h, [&](int y0, int y1) {
+            std::vector<double> acc(static_cast<size_t>(n), 0.0);
+            for (int y = y0; y < y1; ++y) {
+                const float* row = &in[size_t(y) * size_t(w) * size_t(n)];
+                float* o = &out[size_t(y) * size_t(w) * size_t(n)];
+                auto at = [&](int x, int c) { return double(row[size_t(std::clamp(x, 0, w - 1)) * size_t(n) + size_t(c)]); };
+                for (int c = 0; c < n; ++c) {
+                    acc[size_t(c)] = 0;
+                    for (int i = -r; i <= r; ++i) acc[size_t(c)] += at(i, c);
+                }
+                for (int x = 0; x < w; ++x)
+                    for (int c = 0; c < n; ++c) {
+                        o[size_t(x) * size_t(n) + size_t(c)] = float(acc[size_t(c)] * scale);
+                        acc[size_t(c)] += at(x + r + 1, c) - at(x - r, c);
+                    }
+            }
+        });
+        return;
+    }
+    // (columns in bands, each band walked down row by row)
+    parallelRows(w, [&](int x0, int x1) {
+        const size_t span = size_t(x1 - x0) * size_t(n);
+        std::vector<double> acc(span, 0.0);
+        auto row = [&](int y) { return &in[(size_t(std::clamp(y, 0, h - 1)) * size_t(w) + size_t(x0)) * size_t(n)]; };
+        for (int i = -r; i <= r; ++i) {
+            const float* q = row(i);
+            for (size_t k = 0; k < span; ++k) acc[k] += q[k];
+        }
+        for (int y = 0; y < h; ++y) {
+            float* o = &out[(size_t(y) * size_t(w) + size_t(x0)) * size_t(n)];
+            const float* add = row(y + r + 1);
+            const float* drop = row(y - r);
+            for (size_t k = 0; k < span; ++k) {
+                o[k] = float(acc[k] * scale);
+                acc[k] += double(add[k]) - double(drop[k]);
+            }
+        }
+    });
+}
+
+// A Gaussian blur of `n`-channel rows (in place), edges held: separable, each output from the input alone. Wide ones
+// (past a sigma of 3) as three boxes each way (Kovesi's widths, "Fast Almost-Gaussian Filtering", 2010), whose cost
+// does not grow with the radius.
 void gaussian(std::vector<float>& v, int w, int h, int n, double sigma) {
     if (sigma <= 0 || w <= 0 || h <= 0) return;
+    if (sigma > 3) {
+        const double ideal = std::sqrt(4 * sigma * sigma + 1);  // (12 sigma^2 / 3 boxes, + 1)
+        int lo = int(std::floor(ideal));
+        if (lo % 2 == 0) --lo;
+        const int m = int(std::lround((12 * sigma * sigma - 3.0 * lo * lo - 12.0 * lo - 9) / (-4.0 * lo - 4)));
+        std::vector<float> tmp(v.size());
+        for (bool alongY : {false, true})
+            for (int pass = 0; pass < 3; ++pass) {
+                const int r = (pass < m ? lo : lo + 2) / 2;
+                boxPass(v, tmp, w, h, n, r, alongY);
+                v.swap(tmp);
+            }
+        return;
+    }
     const int r = std::max(1, int(std::ceil(3 * sigma)));
     std::vector<float> k(size_t(2 * r + 1));
     double sum = 0;
@@ -37,28 +105,37 @@ void gaussian(std::vector<float>& v, int w, int h, int n, double sigma) {
     });
 }
 
-int edgeIndex(int i, int n, DisplaceEdge edge) {
+// Index `i` within [lo, hi) as `edge` says (-1: transparent).
+int edgeIndex(int i, int lo, int hi, DisplaceEdge edge) {
+    const int n = hi - lo;
     switch (edge) {
-        case DisplaceEdge::Wrap: return ((i % n) + n) % n;
-        case DisplaceEdge::Clamp: return std::clamp(i, 0, n - 1);
-        case DisplaceEdge::Transparent: return i < 0 || i >= n ? -1 : i;
+        case DisplaceEdge::Wrap: return lo + (((i - lo) % n) + n) % n;
+        case DisplaceEdge::Clamp: return std::clamp(i, lo, hi - 1);
+        case DisplaceEdge::Transparent: return i < lo || i >= hi ? -1 : i;
     }
     return -1;
 }
 
-// The picture at (x, y) (pixel centres at +0.5), bilinear or bicubic (Catmull-Rom), outside as `edge` says.
-void sampleAt(const Image& img, double x, double y, DisplaceEdge edge, bool bicubic, float out[4]) {
+// Where a picture's own pixels are within its frame: [x0, x1) x [y0, y1).
+struct Bounds {
+    int x0, y0, x1, y1;
+};
+
+// The picture at (x, y) (pixel centres at +0.5), bilinear or bicubic (Catmull-Rom), outside `b` as `edge` says.
+void sampleAt(const Image& img, const Bounds& b, double x, double y, DisplaceEdge edge, bool bicubic, float out[4]) {
     x -= 0.5;
     y -= 0.5;
     const int x0 = int(std::floor(x)), y0 = int(std::floor(y));
     const double fx = x - x0, fy = y - y0;
     double acc[4] = {0, 0, 0, 0};
+    auto pixel = [&](int xi, int yi) -> const float* {
+        const int X = edgeIndex(xi, b.x0, b.x1, edge), Y = edgeIndex(yi, b.y0, b.y1, edge);
+        return X < 0 || Y < 0 ? nullptr : img.at(X, Y);
+    };
     auto add = [&](int xi, int yi, double w) {
         if (w == 0) return;
-        const int X = edgeIndex(xi, img.width, edge), Y = edgeIndex(yi, img.height, edge);
-        if (X < 0 || Y < 0) return;
-        const float* p = img.at(X, Y);
-        for (int c = 0; c < 4; ++c) acc[c] += w * p[c];
+        if (const float* p = pixel(xi, yi))
+            for (int c = 0; c < 4; ++c) acc[c] += w * p[c];
     };
     if (bicubic) {
         auto cr = [](double t, double ws[4]) {
@@ -79,23 +156,44 @@ void sampleAt(const Image& img, double x, double y, DisplaceEdge edge, bool bicu
         add(x0, y0 + 1, (1 - fx) * fy);
         add(x0 + 1, y0 + 1, fx * fy);
     }
-    // (Catmull-Rom overshoots at hard edges: coverage kept within 0 and 1)
-    if (bicubic) acc[3] = std::clamp(acc[3], 0.0, 1.0);
+    if (bicubic) {
+        // (Catmull-Rom overshoots at hard edges: every channel kept within the four nearest pixels' values, as bilinear
+        // would be, and coverage within 0 and 1)
+        static const float zero[4] = {0, 0, 0, 0};
+        double lo[4], hi[4];
+        for (int j = 0; j < 2; ++j)
+            for (int i = 0; i < 2; ++i) {
+                const float* p = pixel(x0 + i, y0 + j);
+                if (!p) p = zero;
+                for (int c = 0; c < 4; ++c) {
+                    lo[c] = i + j == 0 ? p[c] : std::min(lo[c], double(p[c]));
+                    hi[c] = i + j == 0 ? p[c] : std::max(hi[c], double(p[c]));
+                }
+            }
+        for (int c = 0; c < 4; ++c) acc[c] = std::clamp(acc[c], lo[c], hi[c]);
+        acc[3] = std::clamp(acc[3], 0.0, 1.0);
+    }
     for (int c = 0; c < 4; ++c) out[c] = float(acc[c]);
 }
 
-// A map's channel as a straight value (0.5, no move, where the map is transparent and the channel is a colour).
+// A map's channel as a straight value, within 0 and 1 (0.5, no move, where the map is transparent and the channel is a
+// colour, or where it is not a number).
 float channelOf(const float* p, DisplaceChannel ch) {
-    if (ch == DisplaceChannel::Alpha) return p[3];
-    if (p[3] <= 0) return 0.5f;
-    const float inv = 1.0f / p[3];
-    switch (ch) {
-        case DisplaceChannel::Luma: return (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) * inv;
-        case DisplaceChannel::Red: return p[0] * inv;
-        case DisplaceChannel::Green: return p[1] * inv;
-        case DisplaceChannel::Blue: return p[2] * inv;
-        default: return 0.5f;
+    float v = 0.5f;
+    if (ch == DisplaceChannel::Alpha) {
+        v = p[3];
+    } else if (p[3] > 0) {
+        const float inv = 1.0f / p[3];
+        switch (ch) {
+            case DisplaceChannel::Luma: v = (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) * inv; break;
+            case DisplaceChannel::Red: v = p[0] * inv; break;
+            case DisplaceChannel::Green: v = p[1] * inv; break;
+            case DisplaceChannel::Blue: v = p[2] * inv; break;
+            default: break;
+        }
     }
+    // (an HDR map's light past 1 moves no further than white; NaN moves nothing)
+    return std::isnan(v) ? 0.5f : std::clamp(v, 0.0f, 1.0f);
 }
 
 // The flow of a picture's structure: at each pixel the unit tangent (along its edges and contours, across its
@@ -166,15 +264,21 @@ void displaceByMap(Image& img, const Image& map, const DisplaceSettings& s) {
         std::copy(data.begin(), data.end(), blurred.px.begin());
         m = &blurred;
     }
+    // (the picture's own pixels, where it is smaller than the frame: its edges wrap, hold or end there)
+    Bounds b{0, 0, img.width, img.height};
+    if (s.right > s.left && s.bottom > s.top)
+        b = Bounds{std::clamp(s.left, 0, img.width), std::clamp(s.top, 0, img.height), std::clamp(s.right, 0, img.width),
+                   std::clamp(s.bottom, 0, img.height)};
+    if (b.x1 <= b.x0 || b.y1 <= b.y0) return;
     const Image src = img;
-    parallelRows(img.height, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y)
-            for (int x = 0; x < img.width; ++x) {
+    parallelRows(b.y1 - b.y0, [&](int r0, int r1) {
+        for (int y = b.y0 + r0; y < b.y0 + r1; ++y)
+            for (int x = b.x0; x < b.x1; ++x) {
                 const float* mp = m->at(x, y);
                 const double dx = h ? s.horizontalAmount * (2.0 * channelOf(mp, s.horizontal) - 1) : 0;
                 const double dy = v ? s.verticalAmount * (2.0 * channelOf(mp, s.vertical) - 1) : 0;
                 if (dx == 0 && dy == 0) continue;  // (left exactly as it was)
-                sampleAt(src, x + 0.5 + dx, y + 0.5 + dy, s.edge, s.bicubic, img.at(x, y));
+                sampleAt(src, b, x + 0.5 + dx, y + 0.5 + dy, s.edge, s.bicubic, img.at(x, y));
             }
     });
 }
@@ -193,30 +297,57 @@ DisplaceSettings displaceSettings(const Effect& e, FrameTime t, double pixelScal
     return s;
 }
 
-void anisotropicKuwahara(Image& img, const KuwaharaSettings& s) {
-    if (img.empty() || s.radius <= 0) return;
+bool anisotropicKuwahara(Image& img, const KuwaharaSettings& s, const std::atomic<bool>* cancel) {
+    if (img.empty() || s.radius <= 0) return true;
     const int W = img.width, H = img.height;
     const Flow flow = structureFlow(img, s.tensorBlur);
     const Image src = img;
     const double alpha = std::max(0.01, s.anisotropy), q = std::max(0.0, s.sharpness);
+    // A wide brush samples its ellipse every `step` pixels, from the picture and its squares averaged over a box of about
+    // that size (so each sample stands for the pixels about it, and the sectors' means and variances hold): at most
+    // about 200 samples a pixel whatever the radius.
+    const int step = std::max(1, int(std::ceil(s.radius / kKuwaharaSamples)));
+    std::vector<float> boxMean, boxSq;
+    if (step > 1) {
+        boxMean.assign(src.px.begin(), src.px.end());
+        boxSq.resize(size_t(W) * size_t(H) * 3);
+        for (size_t i = 0, n = size_t(W) * size_t(H); i < n; ++i)
+            for (int ch = 0; ch < 3; ++ch) boxSq[i * 3 + size_t(ch)] = boxMean[i * 4 + size_t(ch)] * boxMean[i * 4 + size_t(ch)];
+        std::vector<float> tmp;
+        for (bool alongY : {false, true}) {
+            tmp.resize(boxMean.size());
+            boxPass(boxMean, tmp, W, H, 4, step / 2, alongY);
+            boxMean.swap(tmp);
+            tmp.resize(boxSq.size());
+            boxPass(boxSq, tmp, W, H, 3, step / 2, alongY);
+            boxSq.swap(tmp);
+        }
+    }
+    const float* P = step > 1 ? boxMean.data() : src.px.data();
+    std::atomic<bool> stopped{false};
     parallelRows(H, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y)
+        for (int y = y0; y < y1; ++y) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) {
+                stopped = true;
+                return;
+            }
             for (int x = 0; x < W; ++x) {
                 const size_t i = size_t(y) * size_t(W) + size_t(x);
                 const double A = flow.anisotropy[i];
                 const double a = s.radius * std::clamp((alpha + A) / alpha, 0.1, 2.0);
                 const double b = s.radius * std::clamp(alpha / (alpha + A), 0.1, 2.0);
                 const double c = flow.tx[i], sn = flow.ty[i];
-                const int maxX = int(std::sqrt(a * a * c * c + b * b * sn * sn));
-                const int maxY = int(std::sqrt(a * a * sn * sn + b * b * c * c));
+                const int maxX = int(std::sqrt(a * a * c * c + b * b * sn * sn)) / step * step;
+                const int maxY = int(std::sqrt(a * a * sn * sn + b * b * c * c)) / step * step;
                 double m[8][5] = {}, sq[8][3] = {};
-                for (int j = -maxY; j <= maxY; ++j)
-                    for (int k = -maxX; k <= maxX; ++k) {
+                for (int j = -maxY; j <= maxY; j += step)
+                    for (int k = -maxX; k <= maxX; k += step) {
                         // The offset in the ellipse's frame, scaled to the disc of radius 1/2.
                         double vx = (c * k + sn * j) * 0.5 / a, vy = (-sn * k + c * j) * 0.5 / b;
                         const double d2 = vx * vx + vy * vy;
                         if (d2 > 0.25) continue;
-                        const float* p = src.at(std::clamp(x + k, 0, W - 1), std::clamp(y + j, 0, H - 1));
+                        const size_t at = size_t(std::clamp(y + j, 0, H - 1)) * size_t(W) + size_t(std::clamp(x + k, 0, W - 1));
+                        const float* p = P + at * 4;
                         // Polynomial sector weights: four sectors on the axes, four between them.
                         double w[8], n = 0;
                         for (int half = 0; half < 2; ++half) {
@@ -237,7 +368,10 @@ void anisotropicKuwahara(Image& img, const KuwaharaSettings& s) {
                             const double ws = w[sct] * g;
                             if (ws == 0) continue;
                             for (int ch = 0; ch < 4; ++ch) m[sct][ch] += ws * p[ch];
-                            for (int ch = 0; ch < 3; ++ch) sq[sct][ch] += ws * double(p[ch]) * p[ch];
+                            if (step > 1)
+                                for (int ch = 0; ch < 3; ++ch) sq[sct][ch] += ws * boxSq[at * 3 + size_t(ch)];
+                            else
+                                for (int ch = 0; ch < 3; ++ch) sq[sct][ch] += ws * double(p[ch]) * p[ch];
                             m[sct][4] += ws;
                         }
                     }
@@ -258,23 +392,33 @@ void anisotropicKuwahara(Image& img, const KuwaharaSettings& s) {
                 float* d = img.at(x, y);
                 for (int ch = 0; ch < 4; ++ch) d[ch] = float(out[ch] / total);
             }
+        }
     });
+    if (!stopped) return true;
+    img = src;
+    return false;
 }
 
-void contourSmear(Image& img, const SmearSettings& s) {
-    if (img.empty() || s.length <= 0) return;
+bool contourSmear(Image& img, const SmearSettings& s, const std::atomic<bool>* cancel) {
+    if (img.empty() || s.length <= 0) return true;
     const int W = img.width, H = img.height;
     const Flow flow = structureFlow(img, s.tensorBlur);
     const Image src = img;
     const int steps = std::max(1, int(std::lround(s.length)));
     const double sigma = std::max(0.5, s.length / 2);
+    const Bounds whole{0, 0, W, H};
     auto tangent = [&](double x, double y, double& tx, double& ty) {
         const int X = std::clamp(int(std::floor(x)), 0, W - 1), Y = std::clamp(int(std::floor(y)), 0, H - 1);
         const size_t i = size_t(Y) * size_t(W) + size_t(X);
         tx = flow.tx[i], ty = flow.ty[i];
     };
+    std::atomic<bool> stopped{false};
     parallelRows(H, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y)
+        for (int y = y0; y < y1; ++y) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) {
+                stopped = true;
+                return;
+            }
             for (int x = 0; x < W; ++x) {
                 double acc[4] = {0, 0, 0, 0}, total = 0;
                 {
@@ -297,7 +441,7 @@ void contourSmear(Image& img, const SmearSettings& s) {
                         if (px < 0 || py < 0 || px >= W || py >= H) break;
                         const double w = std::exp(-0.5 * k * k / (sigma * sigma));
                         float c[4];
-                        sampleAt(src, px, py, DisplaceEdge::Clamp, false, c);
+                        sampleAt(src, whole, px, py, DisplaceEdge::Clamp, false, c);
                         for (int ch = 0; ch < 4; ++ch) acc[ch] += w * c[ch];
                         total += w;
                     }
@@ -312,7 +456,11 @@ void contourSmear(Image& img, const SmearSettings& s) {
                     }
                 }
             }
+        }
     });
+    if (!stopped) return true;
+    img = src;
+    return false;
 }
 
 void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
@@ -321,19 +469,27 @@ void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const Image before = mix < 1 ? img : Image();
     // (within the ranges the effect offers, whatever was stored; brush and smear capped in pixels on big sources)
     const double detail = std::clamp(e.p("detail", t, 2), 0.5, 20.0) * pixelScale;
+    // (it runs for seconds a frame on big pictures: stopped with the render)
+    const SlowEffects& slow = currentSlowEffects();
+    bool finished = true;
     if (std::lround(e.p("style", t, 0)) == 1) {
         SmearSettings s;
         s.length = std::clamp(std::clamp(e.p("length", t, 12), 1.0, 100.0) * pixelScale, 1.0, 200.0);
         s.levels = int(std::lround(std::clamp(e.p("levels", t, 8), 0.0, 64.0)));
         s.tensorBlur = detail;
-        contourSmear(img, s);
+        finished = contourSmear(img, s, slow.cancel);
     } else {
         KuwaharaSettings s;
         s.radius = std::clamp(std::clamp(e.p("radius", t, 6), 1.0, 40.0) * pixelScale, 1.0, 80.0);
         s.sharpness = std::clamp(e.p("sharpness", t, 8), 1.0, 18.0);
         s.anisotropy = std::clamp(e.p("roundness", t, 1), 0.1, 10.0);
         s.tensorBlur = detail;
-        anisotropicKuwahara(img, s);
+        finished = anisotropicKuwahara(img, s, slow.cancel);
+    }
+    if (!finished) {
+        // (the render was stopped part way: the picture as it came, and the frame not final)
+        if (slow.issues) slow.issues->note("Painterly was stopped before it finished");
+        return;
     }
     if (mix < 1)
         for (size_t i = 0; i < img.px.size(); ++i) img.px[i] = float(before.px[i] + (img.px[i] - before.px[i]) * mix);

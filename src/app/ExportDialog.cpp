@@ -392,6 +392,27 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     jxlQuality_->setToolTip(tr("How JPEG XL frames are coded: lossless keeps every value; a distance trades a little for much smaller files"));
     if (jxlAvailable()) form->addRow(tr("JPEG XL:"), jxlQuality_);
     else jxlQuality_->hide();
+    jxlDepth_ = new QComboBox(form_);
+    jxlDepth_->setObjectName(QStringLiteral("exportJxlDepth"));
+    jxlDepth_->addItem(tr("The preset's (16-bit, or half floats in linear light)"), QString());
+    jxlDepth_->addItem(tr("8-bit"), QStringLiteral("8"));
+    jxlDepth_->addItem(tr("16-bit"), QStringLiteral("16"));
+    jxlDepth_->addItem(tr("Half float"), QStringLiteral("half"));
+    jxlDepth_->addItem(tr("Float"), QStringLiteral("float"));
+    jxlDepth_->setCurrentIndex(std::max(0, jxlDepth_->findData(appSettings().value("export/jxlDepth", QString()).toString())));
+    jxlDepth_->setToolTip(tr("JPEG XL frames' samples: integers, or half floats and floats that keep light past white"));
+    jxlPremultiplied_ = new QCheckBox(tr("JPEG XL alpha premultiplied"), form_);
+    jxlPremultiplied_->setObjectName(QStringLiteral("exportJxlPremultiplied"));
+    jxlPremultiplied_->setChecked(appSettings().value("export/jxlPremultiplied", false).toBool());
+    jxlPremultiplied_->setToolTip(jxlWritesPremultiplied() ? tr("Colour written multiplied by alpha, as compositing programs keep it; else straight")
+                                                           : tr("Needs libjxl 0.9 or later: alpha is written straight"));
+    if (jxlAvailable()) {
+        form->addRow(tr("JPEG XL depth:"), jxlDepth_);
+        form->addRow(QString(), jxlPremultiplied_);
+    } else {
+        jxlDepth_->hide();
+        jxlPremultiplied_->hide();
+    }
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
     stereo_ = new QComboBox(form_);
     stereo_->setObjectName(QStringLiteral("exportStereo"));
@@ -841,6 +862,8 @@ void ExportDialog::updateControls() {
         adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif" && vc != "jxl");
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
         jxlQuality_->setEnabled(video && vc == "jxl" && jxlAvailable());
+        jxlDepth_->setEnabled(jxlQuality_->isEnabled());
+        jxlPremultiplied_->setEnabled(jxlQuality_->isEnabled() && p->settings.alpha && jxlWritesPremultiplied());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
     loudnessReport_->setEnabled(p && hasAudio(p->settings));
@@ -1098,6 +1121,12 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     if (jxlQuality_->isEnabled()) {
         s.jxlDistance = jxlQuality_->currentData().toDouble();
         settings.setValue("export/jxlDistance", s.jxlDistance);
+        s.jxlDepth = jxlDepth_->currentData().toString().toStdString();
+        settings.setValue("export/jxlDepth", jxlDepth_->currentData());
+    }
+    if (jxlPremultiplied_->isEnabled()) {
+        s.jxlPremultiplied = jxlPremultiplied_->isChecked();
+        settings.setValue("export/jxlPremultiplied", s.jxlPremultiplied);
     }
     if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
         const int index = streams_->currentIndex();
