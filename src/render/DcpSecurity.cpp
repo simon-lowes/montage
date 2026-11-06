@@ -426,7 +426,7 @@ bool makeCertificateChain(const std::string& organisation, CertificateChain& out
     return true;
 }
 
-bool signerCertificateChain(CertificateChain& out, std::string* error, const std::string& folderPath) {
+bool signerCertificateChain(CertificateChain& out, std::string* error, const std::string& folderPath, bool make) {
     // One chain for good: the DKDMs (the only copies of encrypted packages' keys) are encrypted to its leaf, so a chain
     // with a file missing is reported, never replaced; and two exports at once make it once.
     static std::mutex making;
@@ -443,6 +443,7 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
         return n;
     };
     int present = count();
+    if (!make && present == 0) return fail("There is no DCP signing chain in " + dir.path().toStdString());
     // (and two programs at once, the app and the command-line tool sharing the folder: a lock file in it while one
     // is made, and another look once it is held)
     std::optional<QLockFile> others;
@@ -467,7 +468,7 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
         out = std::move(chain);
         return true;
     }
-    if (present > 0)
+    if (present > 0 || !make)
         return fail("The DCP signing chain in " + dir.path().toStdString() +
                     " is incomplete: restore its missing files from a backup (DKDMs need this chain; a new one cannot open them)");
     CertificateChain chain;
@@ -935,7 +936,7 @@ bool seal(const Sealer& sealer, const uint8_t* data, size_t size, std::vector<ui
 }
 
 bool isSealed(const uint8_t* data, size_t size) { return size >= kSealMagicSize && std::memcmp(data, kSealMagic, kSealMagicSize) == 0; }
-std::string codestreamSealContext(int64_t frame, bool right) { return "codestream " + std::to_string(frame) + (right ? " right" : " left"); }
+void cleanse(void* data, size_t size) { OPENSSL_cleanse(data, size); }
 
 bool unseal(Unsealer& u, const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* error, const std::string& context) {
     auto fail = [&](const std::string& why) {
@@ -984,7 +985,7 @@ bool unseal(Unsealer& u, const std::vector<uint8_t>& in, std::vector<uint8_t>& o
         (!context.empty() && EVP_DecryptUpdate(ctx.get(), nullptr, &a, reinterpret_cast<const uint8_t*>(context.data()), int(context.size())) != 1) ||
         EVP_DecryptUpdate(ctx.get(), out.data(), &n, iv + kSealIv, int(size)) != 1 ||
         EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, int(kSealTag), tag.data()) != 1 || EVP_DecryptFinal_ex(ctx.get(), spare, &m) != 1)
-        return fail("A sealed codestream has been changed");
+        return fail("A sealed codestream has been changed, or was sealed for another job, segment, frame or eye");
     return true;
 }
 
@@ -999,7 +1000,7 @@ bool none(std::string* error) {
 
 bool securityAvailable() { return false; }
 bool makeCertificateChain(const std::string&, CertificateChain&, std::string* error) { return none(error); }
-bool signerCertificateChain(CertificateChain&, std::string* error, const std::string&) { return none(error); }
+bool signerCertificateChain(CertificateChain&, std::string* error, const std::string&, bool) { return none(error); }
 bool readCertificate(const std::string&, CertificateInfo&, std::string* error) { return none(error); }
 bool signXml(std::string&, const CertificateChain&, std::string* error) { return none(error); }
 bool verifyXmlSignature(const std::string&, std::string* error, SignatureCheck*) { return none(error); }
@@ -1020,9 +1021,28 @@ bool randomBytes(uint8_t*, size_t) { return false; }
 bool makeSealer(const std::string&, Sealer&, std::string* error) { return none(error); }
 bool seal(const Sealer&, const uint8_t*, size_t, std::vector<uint8_t>&, const std::string&) { return false; }
 bool isSealed(const uint8_t* data, size_t size) { return size >= 6 && std::memcmp(data, "MSEAL1", 6) == 0; }
-std::string codestreamSealContext(int64_t frame, bool right) { return "codestream " + std::to_string(frame) + (right ? " right" : " left"); }
+void cleanse(void* data, size_t size) {
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(data);
+    while (size--) *p++ = 0;
+}
 bool unseal(Unsealer&, const std::vector<uint8_t>&, std::vector<uint8_t>&, std::string* error, const std::string&) { return none(error); }
 
 #endif
+
+// (Both builds alike.)
+std::string codestreamSealContext(const std::string& job, int segment, int segments, int64_t frame, bool right) {
+    return "farm codestream; job " + job + "; segment " + std::to_string(segment + 1) + " of " + std::to_string(segments) + "; frame " +
+           std::to_string(frame) + (right ? "; right eye" : "; left eye");
+}
+int codestreamSegment(int64_t frames, int segments, int64_t frame) {
+    if (frames <= 0 || segments <= 1 || frame < 0) return 0;
+    // (the largest k with frames * k / segments <= frame)
+    return int(std::min<int64_t>(segments - 1, ((frame + 1) * segments - 1) / frames));
+}
+Sealer::~Sealer() { cleanse(key.data(), key.size()); }
+Unsealer::~Unsealer() {
+    for (auto& [wrapped, k] : keys) cleanse(k.data(), k.size());
+    if (!privateKey.empty()) cleanse(privateKey.data(), privateKey.size());
+}
 
 }  // namespace montage::dcp

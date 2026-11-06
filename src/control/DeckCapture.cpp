@@ -291,6 +291,7 @@ std::vector<BatchClip> batchCapture(ninepin::Deck& deck, const std::vector<LogEn
         deck.stop();
         const CaptureStatus st = rec.status();
         clip.frames = st.frames;
+        clip.repeated = st.repeated;
         clip.timecode = st.timecode;
         const int64_t first = parseTimecode(st.timecode, base, nullptr, drop);
         if (stopped) clip.error = "Stopped";
@@ -328,13 +329,23 @@ bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void
     told = true;
     if (!deck.autoEdit()) return fail("The deck refused the edit: " + deck.lastError());
     // Watched as it runs: rolling up to In (the Program started then), recording, and stopping after Out. A run of
-    // readings moving forward at play speed, each where the first and the time since put it, is the deck rolling.
+    // readings moving forward at play speed, each where the run puts it, is the deck rolling. Where the deck is comes
+    // from its run (the median of its last readings less play speed's frames since), so a reading or two a few frames
+    // off (a jittery time source) neither breaks the run nor moves the Program's start: only three in a row elsewhere
+    // are the deck somewhere else.
     const double limit = captureClock() + double(preroll + (e.out - e.in)) / fps + 60;
     bool rolled = false, recorded = false, finished = false;
     struct Run {
-        int64_t frame = -1;  // its first reading
-        double at = 0, began = 0;
-    } run, rolledOn;
+        double at = -1, began = 0;    // its first reading's time (-1: no run), and when it began (the reading's middle)
+        std::vector<double> offsets;  // its last readings, each less play speed's frames since `at`
+        int misses = 0;               // readings in a row elsewhere
+        double offset() const {
+            std::vector<double> o = offsets;
+            std::nth_element(o.begin(), o.begin() + ptrdiff_t(o.size() / 2), o.end());
+            return o[o.size() / 2];
+        }
+    } run;
+    double rolledOn = -1;  // (when the run the Program was started from began)
     while (captureClock() < limit) {
         if (cancel && *cancel) return fail("Stopped");
         const auto st = deck.status();
@@ -343,20 +354,37 @@ bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void
         const double after = captureClock(), mid = (before + after) / 2;
         if (!st || f < 0) return fail("The deck stopped answering: " + deck.lastError());
         const bool forward = st->play && !st->reverse && !st->shuttle && !st->jog && !st->var && !st->still;
-        if (!forward) run = {};
-        else if (run.frame < 0 || std::fabs(double(f - run.frame) - (mid - run.at) * fps) > 2 + (after - before) * fps) run = {f, mid, mid};
+        auto startRun = [&] {
+            run = {};
+            run.at = before, run.began = mid, run.offsets = {double(f)};
+        };
+        if (!forward) {
+            run = {};
+        } else if (run.at < 0) {
+            startRun();
+        } else if (const double o = double(f) - (before - run.at) * fps; std::fabs(o - run.offset()) <= 2 + (after - before) * fps) {
+            run.misses = 0;
+            run.offsets.push_back(o);
+            if (run.offsets.size() > 5) run.offsets.erase(run.offsets.begin());
+        } else if (++run.misses >= 3) {
+            startRun();
+        }
+        // (where the deck is: its run's, else the reading's)
+        const double here = run.at >= 0 ? run.offset() + (before - run.at) * fps : double(f);
         recorded = recorded || st->record;
         // (a deck that jumped after the Program was started, before In: the Program started again once it runs up)
-        if (rolled && !recorded && f < in && run.began != rolledOn.began) rolled = false;
-        const bool steady = run.frame >= 0 && f - run.frame >= 2;
-        const bool near = f < in && f >= in - preroll - int64_t(std::lround(fps));
+        if (rolled && !recorded && here < double(in) && run.began != rolledOn) rolled = false;
+        // (recording with the Program not started from where the deck ran up: the paused Program would go to tape)
+        if (recorded && !rolled) return fail("The deck recorded without being seen running up to the edit's In");
+        const bool steady = run.at >= 0 && run.misses == 0 && run.offsets.size() >= 3 && (before - run.at) * fps >= 2;
+        const bool near = here < double(in) && here >= double(in - preroll - int64_t(std::lround(fps)));
         // (servo lock, when the deck reports it; one that never does is taken as locked after a second's play, or
         // with half a second to go)
-        const bool locked = st->servoLock || mid - run.began > 1.0 || double(in - f) < fps / 2;
+        const bool locked = st->servoLock || mid - run.began > 1.0 || double(in) - here < fps / 2;
         if (!rolled && !recorded && steady && near && locked) {
             rolled = true;
-            rolledOn = run;
-            if (roll) roll(in - f, before);
+            rolledOn = run.began;
+            if (roll) roll(in - int64_t(std::llround(here)), before);
         }
         if ((rolled || recorded) && !st->autoEdit && !st->edit && !st->record && (st->stop || st->still || f >= out)) {
             finished = true;

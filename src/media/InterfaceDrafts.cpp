@@ -205,7 +205,9 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
                 d.replace(at, hit.capturedLength(), (joined ? QStringLiteral(" %") : QStringLiteral("%")) + hit.captured(1));
             }
         }
-        if (d.isEmpty() || placeholders(d) != placeholders(src)) {
+        // A model that met a word or sign it has no piece for writes "<unk>" in its place: that draft is garbled, so the
+        // text stays in English.
+        if (d.isEmpty() || d.contains(QStringLiteral("<unk>")) || placeholders(d) != placeholders(src)) {
             ++st.skipped;
             continue;
         }
@@ -264,9 +266,12 @@ std::vector<std::string> engineInterfaceTexts() {
             if (sp.kind == StringKind::Track && !sp.choices.empty()) add(sp.choices.front());
         }
     }
-    // (a Parametric EQ's band types and slopes, shown in its bands' settings)
+    // (a Parametric EQ's band types and slopes, shown in its bands' settings; and the settings' names, the numbered
+    // bands' as patterns, "Band %1 (Hz)", which app/Language.h engine() fills in)
     for (const std::string& t : eqBandTypes()) add(t);
     for (const std::string& t : eqSlopes()) add(t);
+    for (const char* band : {"low", "high", "b%1"})
+        for (const ParamInfo& p : eqBandParams(band)) add(p.label);
     for (const ShapeItemKind& k : shapeItemKinds()) {
         add(k.label);
         for (const ParamInfo& p : k.params) {

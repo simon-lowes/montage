@@ -55,6 +55,7 @@
 #include <QTableWidget>
 #include <QSpinBox>
 #include <QTimer>
+#include <QTranslator>
 #include <QTextEdit>
 #include <QToolButton>
 #include <QRandomGenerator>
@@ -96,6 +97,7 @@
 #include "CurveEditor.h"
 #include "EqDisplay.h"
 #include "EqPanel.h"
+#include "DeckControl.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -14679,6 +14681,42 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void editToTapeFollowsTheLatestRoll() {
+        // Edit to tape starts the Program to reach the edit's first frame as the deck reaches In. A deck that rolls,
+        // then searches back and rolls again has the Program follow its latest run up alone: the start still waiting
+        // from the first roll is not made.
+        state()->newProject();
+        state()->apply("Clip", [](Project& p, Sequence& s) {
+            s.videoTracks[0].clips.push_back(makeGeneratorClip(p, "color", 400));
+            return edit::Result{};
+        });
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        program->pause();
+        DeckController deck(state(), program);
+        // (the edit 5 frames into the Program, the deck 50 frames (two seconds at 25) before In: the Program waits on
+        // its first frame for 45 of them, 1.8 s)
+        QElapsedTimer clock;
+        clock.start();
+        deck.rollProgram(5, 50, captureClock());
+        QVERIFY(deck.rollPending() && !program->isPlaying());
+        QCOMPARE(state()->playhead(), FrameTime(0));
+        QTest::qWait(800);
+        deck.rollProgram(5, 50, captureClock());  // (rolled again: 1.8 s from now)
+        while (clock.elapsed() < 2400) {
+            QVERIFY2(!program->isPlaying(), qPrintable(QStringLiteral("playing at %1 ms").arg(clock.elapsed())));
+            QTest::qWait(20);
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(program->isPlaying(), 3000);
+        program->pause();
+        // A roll from where the Program can start now plays it at once from there, nothing left waiting.
+        deck.rollProgram(60, 10, captureClock());
+        QVERIFY(program->isPlaying() && !deck.rollPending());
+        QVERIFY2(state()->playhead() >= 50 && state()->playhead() < 60, qPrintable(QString::number(state()->playhead())));
+        program->pause();
+        state()->newProject();
+    }
+
     void loopedPlaybackKeepsTime() {
         // Played round In to Out, the picture keeps to the loop on one clock: within it, wrapping back to In, each pass as
         // long as the loop.
@@ -14698,7 +14736,7 @@ const auto seq = [this] { return state()->sequence(); };
         const auto c = connect(program, &PlaybackController::positionChanged, this, [&](FrameTime t) { seen.emplace_back(clock.elapsed(), t); });
         program->seek(10);
         program->play();
-        QTest::qWait(2500);
+        QTest::qWait(3000);
         disconnect(c);
         // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
         const FrameTime at = program->position();
@@ -14718,9 +14756,14 @@ const auto seq = [this] { return state()->sequence(); };
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
-        // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
+        // Counted from the first frame played, not from the seek before it, and from a second on: starting to play is
+        // not the pace. (The picture follows the sound device's own count, which starts late by however long the device
+        // takes to start, up to a quarter of a second; on a slow macOS runner that alone read as 26 frames a second.)
         size_t first = 1;
         while (first < seen.size() && seen[first].second == seen[0].second) ++first;
+        QVERIFY(first < seen.size());
+        const qint64 played = seen[first].first;
+        while (first < seen.size() && seen[first].first < played + 1000) ++first;
         QVERIFY(first + 10 < seen.size());
         const qint64 start = seen[first].first;
         const double wrapsAfter = double(std::count_if(wraps.begin(), wraps.end(), [start](qint64 w) { return w > start; }));
@@ -19588,6 +19631,68 @@ print("added " + ui["name"])
         QCOMPARE(eq()->p("b1_db", 0), -4.5);
         QCOMPARE(display()->bands()[size_t(display()->bandIndex("b1"))].db, -4.5);
 
+        // A keyframed band: its dot clicked and let go where it was writes nothing and makes no undo step (a key added
+        // between two would change their curve); the wheel writes only its Q, and an arrow only what it moves.
+        const QString beforeKeys = state()->undoText();
+        QVERIFY(state()->edit("Key the bell", [&](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, clip, eqId);
+            Param hz(800.0), db(2.0);
+            hz.addKey(0, 800), hz.addKey(60, 1600);
+            db.addKey(0, 2), db.addKey(60, 5);
+            hz.keys[0].interp = db.keys[0].interp = Interp::Bezier;
+            e->params["b1_hz"] = hz, e->params["b1_db"] = db;
+            return true;
+        }));
+        state()->setPlayhead(30);
+        QApplication::processEvents();
+        const Effect keyed = *eq();
+        from = display()->nodePos(display()->bandIndex("b1"));
+        mouse(display(), QEvent::MouseButtonPress, from, Qt::LeftButton, Qt::LeftButton);
+        mouse(display(), QEvent::MouseButtonRelease, from, Qt::LeftButton, Qt::NoButton);
+        QApplication::processEvents();
+        QVERIFY(*eq() == keyed);
+        QCOMPARE(state()->undoText(), QString("Key the bell"));
+        QWheelEvent turn(from, display()->mapToGlobal(from), QPoint(), QPoint(0, 120), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(display(), &turn);
+        QApplication::processEvents();
+        QVERIFY(eq()->params.at("b1_hz") == keyed.params.at("b1_hz") && eq()->params.at("b1_db") == keyed.params.at("b1_db"));
+        QVERIFY(eq()->p("b1_q", 30) > keyed.p("b1_q", 30));
+        display()->setFocus();
+        QTest::keyClick(display(), Qt::Key_Up);
+        QVERIFY(eq()->params.at("b1_hz") == keyed.params.at("b1_hz"));
+        QCOMPARE(eq()->params.at("b1_db").keys.size(), size_t(3));
+        for (int k = 0; k < 4 && state()->undoText() != beforeKeys; ++k) state()->undo();
+        QCOMPARE(state()->undoText(), beforeKeys);
+        state()->setPlayhead(0);
+        QApplication::processEvents();
+
+        // The curve is drawn at the rate the EQ runs at, the sequence's: a 15 kHz cut of 24 dB an octave is much deeper
+        // at 20 kHz at 44.1 kHz than at 96 kHz.
+        QCOMPARE(display()->sampleRate(), 48000.0);
+        EqDisplay drawn;
+        EqDisplay::Band cut;
+        cut.name = "b9", cut.type = kEqHighCut, cut.hz = 15000, cut.q = M_SQRT1_2, cut.slope = 1;
+        drawn.setBands({cut}, 0);
+        for (double rate : {44100.0, 48000.0, 96000.0}) {
+            drawn.setSampleRate(rate);
+            fx::ParametricEq played;
+            played.set(rate, std::vector<fx::EqBand>{{15000, 0, M_SQRT1_2, fx::EqShape::HighCut, 24, true}}, 0);
+            QVERIFY(std::fabs(drawn.responseDb(20000) - played.responseDb(20000)) < 1e-9);
+        }
+        drawn.setSampleRate(44100);
+        const double deep = drawn.responseDb(20000);
+        drawn.setSampleRate(96000);
+        QVERIFY2(deep < -40 && drawn.responseDb(20000) > -20, qPrintable(QString("%1 and %2").arg(deep).arg(drawn.responseDb(20000))));
+        QVERIFY(state()->edit("44.1 kHz", [](Project&, Sequence& s) {
+            s.sampleRate = 44100;
+            return true;
+        }));
+        QApplication::processEvents();
+        QCOMPARE(display()->sampleRate(), 44100.0);
+        state()->undo();
+        QApplication::processEvents();
+        QCOMPARE(display()->sampleRate(), 48000.0);
+
         // Solo: held, playback hears only the bell's part (a band-pass at 3 kHz: the 200 Hz tone all but gone); let go,
         // both again. The project is untouched and no undo step is made.
         QVERIFY(state()->edit("Bell at 3 kHz", [&](Project&, Sequence& s) {
@@ -19661,21 +19766,31 @@ print("added " + ui["name"])
         QVERIFY(panelIn(win_.get())->tipsShown());
         QVERIFY(!appSettings().value(EqPanel::tipsHiddenKey()).toBool());
 
-        // An EQ from before bands could be added shows its five as dots: shelves at the ends, bells between.
+        // An EQ from a project saved before bands could be added shows its five as dots, shelves at the ends and
+        // bells between, drawn as it plays; its keyframed gain is named in the keyframes, not by its id.
+        Project then;
+        QVERIFY(loadProject(std::string(MONTAGE_TEST_DATA_DIR) + "/projects/five-band-eq.montage", then));
+        QVERIFY(then.active() && !then.active()->audioTracks.empty() && then.active()->audioTracks[0].effects.size() == 1);
+        const Effect five = then.active()->audioTracks[0].effects[0];
         QVERIFY(state()->edit("Old EQ", [&](Project&, Sequence& s) {
-            Effect* e = edit::ownedEffect(s, clip, eqId);
-            e->params.clear();
-            for (const auto& [n, v] : std::initializer_list<std::pair<const char*, double>>{
-                     {"low_hz", 100}, {"low_db", -3}, {"b1_hz", 250}, {"b1_db", 0}, {"b1_q", 1}, {"b2_hz", 1000}, {"b2_db", 2}, {"b2_q", 1},
-                     {"b3_hz", 4000}, {"b3_db", 0}, {"b3_q", 1}, {"high_hz", 10000}, {"high_db", 4}, {"output_db", 0}})
-                e->params[n] = Param(v);
+            edit::ownedEffect(s, clip, eqId)->params = five.params;
             return true;
         }));
         QApplication::processEvents();
         QCOMPARE(display()->bands().size(), size_t(5));
         QCOMPARE(display()->bands().front().type, int(kEqLowShelf));
         QCOMPARE(display()->bands().back().type, int(kEqHighShelf));
-        QVERIFY(std::fabs(display()->responseDb(20000) - 4) < 0.5 && std::fabs(display()->responseDb(20) + 3) < 0.3);
+        fx::ParametricEq oldEq;
+        oldEq.set(48000, fx::eqBandsOf(five, 0), five.p("output_db", 0));
+        for (double hz : {20.0, 120.0, 1200.0, 9000.0, 20000.0})
+            QVERIFY2(std::fabs(display()->responseDb(hz) - oldEq.responseDb(hz)) < 1e-6, qPrintable(QString::number(hz)));
+        win_->raisePanel("keyframes");
+        auto* keyframes = win_->findChild<KeyframePanel*>();
+        QVERIFY(keyframes);
+        QTRY_VERIFY(keyframes->clip() == clip && !keyframes->rows().empty());
+        QStringList rows;
+        for (const KeyframePanel::Row& row : keyframes->rows()) rows << row.label;
+        QVERIFY2(rows.contains(QStringLiteral("Parametric EQ · Band 2 (dB)")), qPrintable(rows.join(", ")));
 
         // Over MCP: an EQ added with bands of its own, by type.
         QVERIFY(state()->save(dir_.filePath("eq.montage")));
@@ -19717,8 +19832,33 @@ print("added " + ui["name"])
         for (int k = 0; k < 17; ++k) many.append(QJsonObject{{"hz", 100 + 50 * k}});
         QVERIFY(call("montage_add_effect", {{"project", dir_.filePath("eq.montage")}, {"clip", double(clip)}, {"effect", "parametric_eq"}, {"bands", many}})
                     .value("isError").toBool());
+        // A band's settings by name are checked as its `bands` are: refused out of range (b4_type 9 is no tilt), and
+        // so are a slope of 24.5, a shelf's Q over 2, and more than 16 bands in all (an old EQ's low and high count).
+        auto refused = [&](const QJsonObject& params, const QJsonArray& add = {}) {
+            QJsonObject args{{"project", dir_.filePath("eq.montage")}, {"track", "A1"}, {"effect", "parametric_eq"}, {"params", params}};
+            if (!add.isEmpty()) args["bands"] = add;
+            return call("montage_track_effect", args).value("isError").toBool();
+        };
+        QVERIFY(refused({{"b4_type", 9}}));
+        QVERIFY(refused({{"b4_type", 2.5}}));
+        QVERIFY(refused({{"b4_slope", 4}}));
+        QVERIFY(refused({{"b4_on", 0.5}}));
+        QVERIFY(refused({{"b4_hz", 30000}}));
+        QVERIFY(refused({{"b4_type", 1}, {"b4_q", 3}}));
+        QVERIFY(refused({{"b4_type", 3}, {"b4_db", 6}}));
+        QVERIFY(refused({}, QJsonArray{QJsonObject{{"type", "low_cut"}, {"hz", 80}, {"slope", 24.5}}}));
+        QVERIFY(refused({}, QJsonArray{QJsonObject{{"type", 3}, {"hz", 80}}}));
+        QVERIFY(refused({}, QJsonArray{QJsonObject{{"type", "low_shelf"}, {"hz", 80}, {"q", 3}}}));
+        QJsonArray sixteen;
+        for (int k = 0; k < 16; ++k) sixteen.append(QJsonObject{{"hz", 100 + 50 * k}});
+        QVERIFY(refused({{"low_db", 2}, {"high_db", -2}}, sixteen));
+        sixteen.removeLast(), sixteen.removeLast();
+        QVERIFY(!refused({{"low_db", 2}, {"high_db", -2}}, sixteen));
         QVERIFY(loadProject(dir_.filePath("eq.montage").toStdString(), loaded));
-        const Effect& onTrack = loaded.active()->audioTracks[0].effects.back();
+        QCOMPARE(eqBands(loaded.active()->audioTracks[0].effects.back()).size(), size_t(16));
+        // (and none of those refused was added)
+        QCOMPARE(loaded.active()->audioTracks[0].effects.size(), size_t(2));
+        const Effect& onTrack = loaded.active()->audioTracks[0].effects[0];
         QCOMPARE(eqBands(onTrack), std::vector<std::string>{"b4"});
         QCOMPARE(eqBandType(onTrack, "b4"), int(kEqNotch));
         // The effect list says how bands are made.
@@ -19727,6 +19867,23 @@ print("added " + ui["name"])
         for (const QJsonValue& v : list)
             if (v.toObject().value("type").toString() == "parametric_eq") listed = v.toObject().value("band_params").toArray().size() == 6;
         QVERIFY(listed);
+
+        // Band settings' names are listed for translators, the numbered bands' as patterns, and shown translated with
+        // their number in.
+        const std::vector<std::string> texts = language::listedEngineTexts();
+        for (const char* t : {"Band %1 (Hz)", "Band %1 (dB)", "Band %1 Q", "Band %1 Slope", "Low Band (dB)", "High Band Type"})
+            QVERIFY2(std::find(texts.begin(), texts.end(), t) != texts.end(), t);
+        struct Translated : QTranslator {
+            QString translate(const char* context, const char* source, const char*, int) const override {
+                return QByteArray(context) == "Engine" && QByteArray(source) == "Band %1 (Hz)" ? QStringLiteral("Bande %1 (Hz)") : QString();
+            }
+            bool isEmpty() const override { return false; }
+        } translated;
+        QCoreApplication::installTranslator(&translated);
+        auto untranslate = qScopeGuard([&] { QCoreApplication::removeTranslator(&translated); });
+        QCOMPARE(language::engine("Band 12 (Hz)"), QString("Bande 12 (Hz)"));
+        QCOMPARE(language::engine("Band 12 Q"), QString("Band 12 Q"));
+        QCOMPARE(language::engine("105mm Prime"), QString("105mm Prime"));
     }
 
     void inspectorEditsAreUndoable() {

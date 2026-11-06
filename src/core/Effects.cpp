@@ -1782,6 +1782,13 @@ const std::vector<std::string>& eqSlopes() {
 bool eqTypeHasGain(int type) { return type == kEqBell || type == kEqLowShelf || type == kEqHighShelf || type == kEqTilt; }
 bool eqTypeHasSlope(int type) { return type == kEqLowCut || type == kEqHighCut; }
 double eqDefaultQ(int type) { return type == kEqBell || type == kEqNotch || type == kEqBandPass ? 1.0 : 0.70710678118654752; }
+double eqMaxQ(int type) { return type == kEqLowShelf || type == kEqHighShelf || type == kEqTilt ? 2.0 : 30.0; }
+
+int eqBandSlot(const std::string& band) {
+    const auto& names = eqBandNames();
+    const auto it = std::find(names.begin(), names.end(), band);
+    return it == names.end() ? -1 : int(it - names.begin());
+}
 
 bool isEqBandParam(const std::string& name, std::string* band, std::string* field) {
     const size_t us = name.rfind('_');
@@ -1819,13 +1826,14 @@ std::string eqBandLabel(const std::string& band) {
     return "Band " + band.substr(1);
 }
 
-std::vector<ParamInfo> eqBandParams(const std::string& band) {
+std::vector<ParamInfo> eqBandParams(const std::string& band, int bandType) {
     const std::string l = eqBandLabel(band);
     ParamInfo on = boolean(band + "_on", l + " On", true), type = choice(band + "_type", l + " Type", eqBandTypes(), eqDefaultType(band)),
               slope = choice(band + "_slope", l + " Slope", eqSlopes(), 1);
     on.keyframeable = type.keyframeable = slope.keyframeable = false;
+    if (bandType < 0) bandType = eqDefaultType(band);
     return {on, type, num(band + "_hz", l + " (Hz)", 20, 20000, eqDefaultHz(band), 1), num(band + "_db", l + " (dB)", -30, 30, 0, 0.1),
-            num(band + "_q", l + " Q", 0.1, 30, eqDefaultQ(eqDefaultType(band))), slope};
+            num(band + "_q", l + " Q", 0.1, eqMaxQ(bandType), eqDefaultQ(bandType)), slope};
 }
 
 std::string addEqBand(Effect& e, int type, double hz, double db, double q) {
@@ -1839,7 +1847,7 @@ std::string addEqBand(Effect& e, int type, double hz, double db, double q) {
     e.params[band + "_type"] = Param(double(type));
     e.params[band + "_hz"] = Param(std::clamp(hz, 20.0, 20000.0));
     e.params[band + "_db"] = Param(eqTypeHasGain(type) ? std::clamp(db, -30.0, 30.0) : 0.0);
-    e.params[band + "_q"] = Param(q > 0 ? std::clamp(q, 0.1, 30.0) : eqDefaultQ(type));
+    e.params[band + "_q"] = Param(q > 0 ? std::clamp(q, 0.1, eqMaxQ(type)) : eqDefaultQ(type));
     e.params[band + "_slope"] = Param(1.0);
     return band;
 }
@@ -1859,6 +1867,9 @@ void setEqBandType(Effect& e, const std::string& band, int type) {
     const auto q = e.params.find(band + "_q");
     if (q == e.params.end() || (!q->second.animated() && std::fabs(q->second.value - eqDefaultQ(was)) < 1e-6))
         e.params[band + "_q"] = Param(eqDefaultQ(type));
+    // (and one set by hand keeps within the new type's range: a bell's Q of 8 is a shelf's 2)
+    else if (!q->second.animated() && q->second.value > eqMaxQ(type))
+        e.params[band + "_q"] = Param(eqMaxQ(type));
     e.params[band + "_type"] = Param(double(type));
 }
 
@@ -1890,7 +1901,7 @@ std::vector<ParamInfo> effectParams(const Effect& e) {
             for (ParamInfo& pi : gridWarpParams(e)) out.push_back(std::move(pi));
         if (e.type == "parametric_eq")
             for (const std::string& band : eqBands(e))
-                for (ParamInfo& pi : eqBandParams(band)) out.push_back(std::move(pi));
+                for (ParamInfo& pi : eqBandParams(band, eqBandType(e, band))) out.push_back(std::move(pi));
         return out;
     }
     std::vector<ParamInfo> out;

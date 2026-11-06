@@ -22,16 +22,15 @@ namespace montage {
 namespace {
 constexpr double kLowHz = 20, kHighHz = 20000;
 constexpr double kGrab = 9;          // px from a dot's centre that takes it
-constexpr double kRate = 48000;      // the rate the curves are drawn at
 constexpr double kFloorDb = -90;     // the spectrum's bottom
 constexpr int kSpectrumMs = 400;     // a spectrum older than this is not drawn (playback stopped)
 
-fx::ParametricEq eqOf(const std::vector<EqDisplay::Band>& bands, double outputDb) {
+fx::ParametricEq eqOf(const std::vector<EqDisplay::Band>& bands, double outputDb, double rate) {
     std::vector<fx::EqBand> fb;
     for (const EqDisplay::Band& b : bands)
         fb.push_back({b.hz, eqTypeHasGain(b.type) ? b.db : 0.0, b.q, fx::EqShape(b.type), 12 * (b.slope + 1), b.on});
     fx::ParametricEq eq;
-    eq.set(kRate, fb, outputDb);
+    eq.set(rate, fb, outputDb);
     return eq;
 }
 
@@ -114,6 +113,13 @@ void EqDisplay::announce() {
     QAccessible::updateAccessibility(&ev);
 }
 
+void EqDisplay::setSampleRate(double rate) {
+    rate = rate > 0 ? rate : 48000;
+    if (rate == rate_) return;
+    rate_ = rate;
+    update();
+}
+
 void EqDisplay::setRange(double db) {
     range_ = std::clamp(db, 3.0, 48.0);
     update();
@@ -141,7 +147,7 @@ bool EqDisplay::spectrumShown() const {
     return showSpectrum_ && spectrum_ && !spectrum_->bins.empty() && spectrumAge_.isValid() && spectrumAge_.elapsed() < kSpectrumMs;
 }
 
-double EqDisplay::responseDb(double hz) const { return eqOf(bands_, output_).responseDb(hz); }
+double EqDisplay::responseDb(double hz) const { return eqOf(bands_, output_, rate_).responseDb(hz); }
 
 QRectF EqDisplay::plot() const {
     const QFontMetricsF fm(font());
@@ -241,7 +247,7 @@ void EqDisplay::paintEvent(QPaintEvent*) {
         fill.setAlpha(55);
         p.fillPath(area, fill);
     }
-    const fx::ParametricEq eq = eqOf(bands_, output_);
+    const fx::ParametricEq eq = eqOf(bands_, output_, rate_);
     const int columns = std::max(2, int(r.width()));
     auto curve = [&](auto&& db) {
         QPainterPath path;
@@ -347,7 +353,6 @@ void EqDisplay::mousePressEvent(QMouseEvent* e) {
     if (i < 0) return;
     select(i);
     drag_ = i;
-    moved_ = false;
     pressAt_ = anchorAt_ = e->position();
     anchorHz_ = pressHz_ = bands_[size_t(i)].hz;
     anchorDb_ = pressDb_ = bands_[size_t(i)].db;
@@ -382,7 +387,6 @@ void EqDisplay::mouseMoveEvent(QMouseEvent* e) {
         else hz = pressHz_;
     }
     if (!eqTypeHasGain(b.type)) db = b.db;
-    moved_ = moved_ || hz != b.hz || db != b.db;
     b.hz = hz, b.db = db;
     update();
     updateReadout(e->position());
@@ -429,12 +433,12 @@ void EqDisplay::wheelEvent(QWheelEvent* e) {
     // (Shift turns a wheel sideways on some systems: either way counts)
     const QPoint d = e->angleDelta();
     const double steps = (d.y() != 0 ? d.y() : d.x()) / 120.0;
-    const double q = std::clamp(b.q * std::pow(2.0, steps / ((e->modifiers() & Qt::ShiftModifier) ? 40.0 : 8.0)), 0.1, 30.0);
+    const double q = std::clamp(b.q * std::pow(2.0, steps / ((e->modifiers() & Qt::ShiftModifier) ? 40.0 : 8.0)), 0.1, eqMaxQ(b.type));
     if (q != b.q) {
         b.q = q;
         update();
         updateReadout(e->position());
-        emit bandStepped(b.name, b.hz, b.db, q);
+        emit bandStepped(b.name, "_q", q);
     }
     e->accept();
 }
@@ -509,26 +513,37 @@ void EqDisplay::keyPressEvent(QKeyEvent* e) {
     if (i < 0) return QWidget::keyPressEvent(e);
     Band& b = bands_[size_t(i)];
     const bool fine = e->modifiers() & Qt::ShiftModifier;
-    double hz = b.hz, db = b.db, q = b.q;
+    // (only what the key moves is written: a key on the others would change their curves)
+    std::string field;
+    double value = 0;
     switch (e->key()) {
-        case Qt::Key_Left: hz /= std::pow(2.0, fine ? 1.0 / 96 : 1.0 / 12); break;
-        case Qt::Key_Right: hz *= std::pow(2.0, fine ? 1.0 / 96 : 1.0 / 12); break;
-        case Qt::Key_Up: db += fine ? 0.1 : 0.5; break;
-        case Qt::Key_Down: db -= fine ? 0.1 : 0.5; break;
-        case Qt::Key_PageUp: q *= std::pow(2.0, fine ? 1.0 / 16 : 0.25); break;
-        case Qt::Key_PageDown: q /= std::pow(2.0, fine ? 1.0 / 16 : 0.25); break;
+        case Qt::Key_Left:
+        case Qt::Key_Right:
+            field = "_hz";
+            value = std::clamp(b.hz * std::pow(2.0, (e->key() == Qt::Key_Left ? -1 : 1) * (fine ? 1.0 / 96 : 1.0 / 12)), kLowHz, kHighHz);
+            break;
+        case Qt::Key_Up:
+        case Qt::Key_Down:
+            if (!eqTypeHasGain(b.type)) return;
+            field = "_db";
+            value = std::clamp(std::round((b.db + (e->key() == Qt::Key_Down ? -1 : 1) * (fine ? 0.1 : 0.5)) * 10) / 10, -30.0, 30.0);
+            break;
+        case Qt::Key_PageUp:
+        case Qt::Key_PageDown:
+            field = "_q";
+            value = std::clamp(b.q * std::pow(2.0, (e->key() == Qt::Key_PageDown ? -1 : 1) * (fine ? 1.0 / 16 : 0.25)), 0.1, eqMaxQ(b.type));
+            break;
         case Qt::Key_Delete:
         case Qt::Key_Backspace: emit removeRequested(b.name); return;
         case Qt::Key_Space: emit onRequested(b.name, !b.on); return;
         default: return QWidget::keyPressEvent(e);
     }
-    hz = std::clamp(hz, kLowHz, kHighHz);
-    db = eqTypeHasGain(b.type) ? std::clamp(std::round(db * 10) / 10, -30.0, 30.0) : b.db;
-    q = std::clamp(q, 0.1, 30.0);
-    b.hz = hz, b.db = db, b.q = q;
+    double& now = field == "_hz" ? b.hz : field == "_db" ? b.db : b.q;
+    if (value == now) return;  // (at the end of its range)
+    now = value;
     update();
     announce();
-    emit bandStepped(b.name, hz, db, q);
+    emit bandStepped(b.name, field, value);
 }
 
 }  // namespace montage

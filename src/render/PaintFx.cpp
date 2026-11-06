@@ -250,6 +250,64 @@ Flow structureFlow(const Image& img, double sigma) {
 
 }  // namespace
 
+namespace {
+// Displace within a picture turned at an angle (DisplaceSettings::turned): each pixel whose centre lies in it takes its
+// colour from where it is moved to, that place wrapped, held or ended at the picture's own edges, found in the
+// picture's own axes (and, to wrap or hold, kept clear of its edges by the sampling's reach, so no pixel from outside it
+// comes in).
+void displaceTurned(Image& img, const Image& m, const DisplaceSettings& s, bool h, bool v) {
+    const double* o = s.origin;
+    const double* A = s.across;
+    const double* D = s.down;
+    const double det = A[0] * D[1] - A[1] * D[0];
+    if (!(std::fabs(det) > 1e-9)) return;
+    // (a frame point in the picture's own axes: 0 to 1 across and down it)
+    auto local = [&](double x, double y, double& a, double& b) {
+        const double rx = x - o[0], ry = y - o[1];
+        a = (rx * D[1] - ry * D[0]) / det;
+        b = (A[0] * ry - A[1] * rx) / det;
+    };
+    const double reach = s.bicubic ? 3.0 : 1.5;  // (frame pixels a sample reads about it, turned)
+    const double ia = std::min(0.5, reach / std::max(1e-9, std::hypot(A[0], A[1])));
+    const double ib = std::min(0.5, reach / std::max(1e-9, std::hypot(D[0], D[1])));
+    double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+    for (double a : {0.0, 1.0})
+        for (double b : {0.0, 1.0}) {
+            const double X = o[0] + a * A[0] + b * D[0], Y = o[1] + a * A[1] + b * D[1];
+            x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
+        }
+    const int c0 = int(std::clamp(std::floor(x0), 0.0, double(img.width))), c1 = int(std::clamp(std::ceil(x1), 0.0, double(img.width)));
+    const int r0 = int(std::clamp(std::floor(y0), 0.0, double(img.height))), r1 = int(std::clamp(std::ceil(y1), 0.0, double(img.height)));
+    if (c1 <= c0 || r1 <= r0) return;
+    const Bounds whole{0, 0, img.width, img.height};
+    const Image src = img;
+    parallelRows(r1 - r0, [&](int q0, int q1) {
+        for (int y = r0 + q0; y < r0 + q1; ++y)
+            for (int x = c0; x < c1; ++x) {
+                double a, b;
+                local(x + 0.5, y + 0.5, a, b);
+                if (a < 0 || a >= 1 || b < 0 || b >= 1) continue;  // (not the picture's: left as it is)
+                const float* mp = m.at(x, y);
+                const double dx = h ? s.horizontalAmount * (2.0 * channelOf(mp, s.horizontal) - 1) : 0;
+                const double dy = v ? s.verticalAmount * (2.0 * channelOf(mp, s.vertical) - 1) : 0;
+                if (dx == 0 && dy == 0) continue;
+                local(x + 0.5 + dx, y + 0.5 + dy, a, b);
+                float* out = img.at(x, y);
+                if (s.edge == DisplaceEdge::Transparent) {
+                    if (a < 0 || a >= 1 || b < 0 || b >= 1) {
+                        out[0] = out[1] = out[2] = out[3] = 0;
+                        continue;
+                    }
+                } else {
+                    if (s.edge == DisplaceEdge::Wrap) a -= std::floor(a), b -= std::floor(b);
+                    a = std::clamp(a, ia, 1 - ia), b = std::clamp(b, ib, 1 - ib);
+                }
+                sampleAt(src, whole, o[0] + a * A[0] + b * D[0], o[1] + a * A[1] + b * D[1], DisplaceEdge::Clamp, s.bicubic, out);
+            }
+    });
+}
+}  // namespace
+
 void displaceByMap(Image& img, const Image& map, const DisplaceSettings& s) {
     if (img.empty() || map.width != img.width || map.height != img.height) return;
     const bool h = s.horizontal != DisplaceChannel::Off && s.horizontalAmount != 0;
@@ -263,6 +321,10 @@ void displaceByMap(Image& img, const Image& map, const DisplaceSettings& s) {
         gaussian(data, map.width, map.height, 4, s.mapBlur / 2);  // (a radius of about two sigmas)
         std::copy(data.begin(), data.end(), blurred.px.begin());
         m = &blurred;
+    }
+    if (s.turned) {
+        displaceTurned(img, *m, s, h, v);
+        return;
     }
     // (the picture's own pixels, where it is smaller than the frame: its edges wrap, hold or end there)
     Bounds b{0, 0, img.width, img.height};

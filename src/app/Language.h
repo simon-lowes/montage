@@ -48,7 +48,8 @@ QString installed();
 bool rightToLeft(const QString& code);
 
 // A text the engine gives the interface (an effect's or a setting's name, a preset's, a colour space's), in the
-// interface's language: translated under the name "Engine".
+// interface's language: translated under the name "Engine". One made with a number in it and not translated as it is
+// ("Band 4 (Hz)", a Parametric EQ's) is translated as its pattern, "%1" in place of the number ("Band %1 (Hz)").
 QString engine(const std::string& text);
 // The engine's texts listed for lupdate (app/EngineTexts.cpp, written by `montage-cli interface-texts`).
 std::vector<std::string> listedEngineTexts();

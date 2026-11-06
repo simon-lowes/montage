@@ -76,6 +76,9 @@ struct FarmJob {
     bool join = false;
     // Two passes across segments: 1 = a segment's first pass (measuring), 2 = its second (waiting for every first).
     int pass = 0;
+    // An encrypted DCP's segments and join: the thumbprint of the leaf certificate its codestreams are sealed for (the
+    // signer's), which only a node holding that chain joins.
+    std::string signer;
 };
 struct FarmNodeInfo {
     std::string name, host, state;  // state: idle, rendering, stopped
@@ -84,6 +87,7 @@ struct FarmNodeInfo {
     int64_t beat = 0;
     // The encoder it codes each hardware family with ("h264" -> "h264_nvenc"; "libx264" when it has none for it).
     std::map<std::string, std::string> encoders;
+    std::string signer;  // the thumbprint of the DCP signing chain's leaf it joins encrypted DCPs with ("" none)
 };
 
 // The farm's folders made when missing; false with `error` when it cannot be used.
@@ -100,7 +104,11 @@ bool submitFarmJob(const std::string& farm, const std::string& name, const Proje
 // share of the pictures as JPEG 2000 codestreams into a hidden folder beside `parent` (where the package's folder is
 // made, before the nodes' mapping), and the join's checks them, makes the sound and everything else and wraps them as
 // they are (the picture track file as one node would have made it). `id` gets the join's. Refused for what cannot be
-// made in segments (Application #5, supplemental packages, an encrypted DCP without a folder for its DKDM).
+// made in segments (Application #5, supplemental packages, an encrypted DCP without a folder for its DKDM). An
+// encrypted DCP's codestreams are sealed for the sender's signing leaf (DcpSettings::certificates), and only a node
+// holding that chain in its own certificates folder joins it (FarmNodeOptions::certificates): its segments are coded
+// only while such a node answers, so none is coded for a join no node can make. A chain on the farm's share or in
+// `parent` is refused, as every node could read its key.
 bool submitFarmImf(const std::string& farm, const std::string& name, const Project& project, Id sequence, const ImfSettings& settings,
                    const std::string& parent, int segments, std::string* id = nullptr, std::string* error = nullptr);
 bool submitFarmDcp(const std::string& farm, const std::string& name, const Project& project, Id sequence, const DcpSettings& settings,
@@ -149,6 +157,9 @@ struct FarmNodeOptions {
     // exports pick (exportHwEncoder), the same choice its routing makes (render nodes compare them: one export's
     // hardware-encoded segments all go to nodes of the same kind). A family given here is only what it says (tests).
     std::map<std::string, std::string> encoders;
+    // The DCP signing chain this node joins encrypted DCPs with, never made by the node ("" = its own data folder's,
+    // dcp::signerFolder()): it takes such a join only when that chain's leaf is the one the codestreams were sealed for.
+    std::string certificates;
 };
 // Runs a render node until stopped (or, `once`, out of work): the oldest waiting job claimed (a segment coded by a
 // hardware encoder only when the first of its export's segments to be taken went to a node with the same encoder), its project read with

@@ -48,7 +48,7 @@ std::vector<EqDisplay::Band> bandsOf(const Effect& e, FrameTime t) {
         b.type = eqBandType(e, name);
         b.hz = std::clamp(e.p(name + "_hz", t, eqDefaultHz(name)), 20.0, 20000.0);
         b.db = e.p(name + "_db", t, 0);
-        b.q = e.p(name + "_q", t, eqDefaultQ(b.type));
+        b.q = std::min(e.p(name + "_q", t, eqDefaultQ(b.type)), eqMaxQ(b.type));  // (as playback takes it)
         b.slope = std::clamp(int(std::lround(e.p(name + "_slope", t, 1))), 0, 3);
         b.on = e.p(name + "_on", t, 1) > 0.5;
         out.push_back(b);
@@ -165,27 +165,33 @@ void EqPanel::build() {
     display_->setShowSpectrum(spectrum_->isChecked());
     v->addWidget(display_, 1);
     connect(display_, &EqDisplay::selectionChanged, this, [this](const std::string& band) { pick(band); });
-    connect(display_, &EqDisplay::dragStarted, this, [this](const std::string&) {
+    connect(display_, &EqDisplay::dragStarted, this, [this](const std::string& band) {
         state_->beginGesture(tr("Move EQ Band"));
         dragging_ = state_->inGesture();
+        const int i = display_->bandIndex(band);
+        pressHz_ = i < 0 ? 0 : display_->bands()[size_t(i)].hz;
+        pressDb_ = i < 0 ? 0 : display_->bands()[size_t(i)].db;
     });
     connect(display_, &EqDisplay::bandMoved, this, [this](const std::string& band, double hz, double db, bool final) {
         if (!dragging_) return;
         const FrameTime t = time_();
         const Id owner = owner_, effect = effect_;
+        // Only what the dot moved is written (a dot taken and let go where it was writes nothing, and makes no undo
+        // step): on a keyframed band, a key on the other would change its curve.
+        const bool moveHz = hz != pressHz_, moveDb = db != pressDb_;
         state_->updateGesture([=](Project&, Sequence& s) {
             Effect* e = edit::ownedEffect(s, owner, effect);
             if (!e) return;
-            e->params[band + "_hz"].set(t, hz);
-            if (eqTypeHasGain(eqBandType(*e, band))) e->params[band + "_db"].set(t, db);
+            if (moveHz) e->params[band + "_hz"].set(t, hz);
+            if (moveDb && eqTypeHasGain(eqBandType(*e, band))) e->params[band + "_db"].set(t, db);
         });
         if (final) {
             dragging_ = false;
             state_->endGesture(true);
         }
     });
-    connect(display_, &EqDisplay::bandStepped, this, [this](const std::string& band, double hz, double db, double q) {
-        write(band, {{"_hz", hz}, {"_db", db}, {"_q", q}}, tr("Change EQ Band"), QStringLiteral("step"));
+    connect(display_, &EqDisplay::bandStepped, this, [this](const std::string& band, const std::string& field, double value) {
+        write(band, {{field, value}}, tr("Change EQ Band"), QStringLiteral("step"));
     });
     connect(display_, &EqDisplay::addRequested, this, [this](double hz, double db, int type) {
         reshape(tr("Add EQ Band"), [=](Effect& e) { return addEqBand(e, type, hz, db); });
@@ -353,6 +359,7 @@ void EqPanel::refresh() {
         return;
     }
     setEnabled(true);
+    display_->setSampleRate(s->sampleRate);  // (the rate the EQ runs at)
     const FrameTime t = time_();
     display_->setBands(bandsOf(*e, t), e->p("output_db", t, 0));
     std::string band = picked()[effect_];
@@ -375,6 +382,7 @@ void EqPanel::refresh() {
     hz_->setValue(b.hz);
     db_->setValue(b.db);
     db_->setEnabled(eqTypeHasGain(b.type));
+    q_->setMaximum(eqMaxQ(b.type));
     q_->setValue(b.q);
     on_->setChecked(b.on);
 }

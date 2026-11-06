@@ -59,6 +59,11 @@ public:
     bool startBatchCapture(const std::vector<LogEntry>& log, const BatchCaptureSettings& s, QString* error = nullptr);
     // Edit to tape: the Program from `programIn` laid onto the tape at e.in to e.out, played out as the deck records.
     bool startEditToTape(const TapeEdit& e, FrameTime programIn, QString* error = nullptr);
+    // The deck seen running up to the edit's In, `framesToIn` before it at `clock` (captureClock()): the Program put
+    // where it reaches `programIn` as the deck reaches In, and started (now, or on its first frame at its time). A
+    // later roll replaces it, a start still to come included.
+    void rollProgram(FrameTime programIn, int64_t framesToIn, double clock);
+    bool rollPending() const;
     bool working() const { return worker_.joinable() && !workDone_; }
     void cancelWork();
     QString lastWork() const { return lastWork_; }
@@ -113,6 +118,7 @@ private:
     QIODevice* chaseIo_ = nullptr;
     int chaseChannel_ = 0, chaseChannels_ = 1;
     QTimer* chaseTimer_ = nullptr;
+    QTimer* rollTimer_ = nullptr;  // (the Program's start, when it comes after the deck's roll)
     bool chaseRolling_ = false;
     QByteArray chasePending_;  // a sample frame split between reads
     double chaseRate_ = 48000;

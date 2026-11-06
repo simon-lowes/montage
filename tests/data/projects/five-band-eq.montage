@@ -1,0 +1,110 @@
+{
+    "activeSequence": 1,
+    "format": "montage-project",
+    "media": [
+    ],
+    "mediaStereo": 2,
+    "name": "Untitled",
+    "nextId": 9,
+    "sequences": [
+        {
+            "audio": [
+                {
+                    "clips": [
+                    ],
+                    "effects": [
+                        {
+                            "id": 8,
+                            "params": {
+                                "b1_db": 2.5,
+                                "b1_hz": 300,
+                                "b1_q": 0.9,
+                                "b2_db": {
+                                    "keys": [
+                                        [
+                                            0,
+                                            -3,
+                                            "linear"
+                                        ],
+                                        [
+                                            50,
+                                            6,
+                                            "linear"
+                                        ]
+                                    ],
+                                    "value": -3
+                                },
+                                "b2_hz": 1200,
+                                "b2_q": 2,
+                                "b3_db": 5,
+                                "b3_hz": 4000,
+                                "b3_q": 0.7,
+                                "high_db": 3,
+                                "high_hz": 9000,
+                                "low_db": -4,
+                                "low_hz": 120,
+                                "output_db": -1.5
+                            },
+                            "type": "parametric_eq"
+                        }
+                    ],
+                    "id": 5,
+                    "name": "A1",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 6,
+                    "name": "A2",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 7,
+                    "name": "A3",
+                    "surround": null
+                }
+            ],
+            "fps": [
+                30,
+                1
+            ],
+            "height": 1080,
+            "id": 1,
+            "in": -1,
+            "markers": [
+            ],
+            "name": "Sequence 1",
+            "out": -1,
+            "playhead": 0,
+            "sampleRate": 48000,
+            "video": [
+                {
+                    "clips": [
+                    ],
+                    "id": 2,
+                    "name": "V1",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 3,
+                    "name": "V2",
+                    "surround": null
+                },
+                {
+                    "clips": [
+                    ],
+                    "id": 4,
+                    "name": "V3",
+                    "surround": null
+                }
+            ],
+            "width": 1920
+        }
+    ],
+    "version": 1
+}

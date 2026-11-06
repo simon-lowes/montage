@@ -1116,7 +1116,7 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
     };
     // The frame's slot: the next one, or (starting, or behind by more than a fifth of a second) the next to start from
     // now. A moment's hold-up (a busy machine) loses nothing: late frames go out straight away in their own slots, paced
-    // at up to twice the rate (below), the receiver placing them by their timestamps, until the sender has caught up.
+    // as on time (below), the receiver placing them by their timestamps, the sender catching up in the gaps it leaves.
     const int64_t now = ptpNowNs();
     const int64_t catchUp = std::max<int64_t>(1, num / (5 * den));
     if (nextFrame_ == 0 || frameStart(nextFrame_ + catchUp) < now) {
@@ -1167,15 +1167,13 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
             });
         // From ST 2110-21's default offset (43 lines of 1125 into a progressive frame, 22 into a field), spread over
         // most of what is left (a wide sender's pacing), in bursts of what is due. Late (catching up after a hold-up),
-        // from now over what is left of its time but at least half of it: the frames behind go out at up to twice the
-        // pace until the sender is on time again, never at once at line rate.
+        // from now at the same pace, never faster: the sender catches up by the offset and the tenth it leaves each
+        // frame (some 13 % of its time: a fifth of a second's hold-up made up in about a second and a half).
         const int64_t troffset = (end - start) * (video_.interlaced ? 22 : 43) / 1125;
-        int64_t vStart = fStart + troffset, span = (fEnd - vStart) * 9 / 10;
+        int64_t vStart = fStart + troffset;
+        const int64_t span = (fEnd - vStart) * 9 / 10;
         if (!waitUntil(vStart)) return false;
-        if (const int64_t late = ptpNowNs() - vStart; late > 0) {
-            vStart += late;
-            span = std::max((fEnd - vStart) * 9 / 10, (fEnd - fStart) * 9 / 20);
-        }
+        if (const int64_t late = ptpNowNs() - vStart; late > 0) vStart += late;
         size_t i = 0;
         while (ok && i < packets.size()) {
             const int64_t t = ptpNowNs();

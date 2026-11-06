@@ -163,13 +163,21 @@ const std::vector<std::string>& eqSlopes();     // a cut's slope: 12, 24, 36 or 
 bool eqTypeHasGain(int type);                   // a bell, a shelf or a tilt (not a cut, notch or band-pass)
 bool eqTypeHasSlope(int type);                  // a cut
 double eqDefaultQ(int type);                    // 1 for a bell, notch or band-pass; 0.707 (no overshoot) otherwise
+// The most Q a type takes: 2 for a shelf or tilt (a +6 dB shelf then bumps to under +9 dB beside its corner), 30 otherwise.
+double eqMaxQ(int type);
 // Whether `name` is a band's param ("b4_hz"), and which band and field.
 bool isEqBandParam(const std::string& name, std::string* band = nullptr, std::string* field = nullptr);
 std::vector<std::string> eqBands(const Effect& e);  // the bands it has, in the order they run
 int eqBandType(const Effect& e, const std::string& band);
+// A band's place among all the names, low 0, b1 to b16 1 to 16, high 17 (-1: not a band's): it stays the same band's
+// as others are added and removed, so playback keeps each band's filter to itself.
+int eqBandSlot(const std::string& band);
 std::string eqBandLabel(const std::string& band);  // "Band 4", "Low Band"
 double eqDefaultHz(const std::string& band);       // a band's frequency when it has none (as the five-band EQ had)
-std::vector<ParamInfo> eqBandParams(const std::string& band);
+// A band's settings, its Q's range that of `type` (-1: the band's own when it has none). Their names are made from
+// eqBandLabel; for translators they are listed with "%1" in place of the band's number ("Band %1 (Hz)", which
+// app/Language.h engine() fills in).
+std::vector<ParamInfo> eqBandParams(const std::string& band, int type = -1);
 // Adds a band named for the first free "b<k>", its params set (q 0: the type's own); "" when it has kEqMaxBands.
 std::string addEqBand(Effect& e, int type, double hz, double db = 0, double q = 0);
 void removeEqBand(Effect& e, const std::string& band);

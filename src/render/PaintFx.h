@@ -33,6 +33,11 @@ struct DisplaceSettings {
     // Where the picture's own pixels are in the frame, [left, right) x [top, bottom) (a scaled or letterboxed clip's
     // layer): only they move, and the edges are theirs. Empty: the whole frame.
     int left = 0, top = 0, right = 0, bottom = 0;
+    // Or, `turned`: a picture turned at another angle, its own pixels those whose centres lie in the parallelogram
+    // from `origin` along `across` and `down` (in the frame's pixels; its top left corner, top edge and left edge),
+    // its edges there.
+    bool turned = false;
+    double origin[2] = {0, 0}, across[2] = {0, 0}, down[2] = {0, 0};
 };
 // `img` displaced by `map` (the same size; straight values read from its premultiplied ones). A pixel moved by
 // (dx, dy) takes the colour from (x + dx, y + dy).

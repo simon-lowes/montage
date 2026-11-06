@@ -1192,9 +1192,10 @@ std::vector<st2110::SdpStream> Node::receiverStreams(QString* why) const {
             if (!c.leg[i].enabled) continue;
             s.path[n] = {(c.leg[i].multicastIp.isEmpty() ? c.leg[i].interfaceIp : c.leg[i].multicastIp).toStdString(), c.leg[i].port};
             s.source[n] = c.leg[i].sourceIp.toStdString();
+            s.interfaceAddress[n] = c.leg[i].interfaceIp.toStdString();  // (each receiver's own legs')
             ++n;
         }
-        if (n < 2) s.path[1] = {}, s.source[1].clear();
+        if (n < 2) s.path[1] = {}, s.source[1].clear(), s.interfaceAddress[1].clear();
         out.push_back(s);
     }
     return out;

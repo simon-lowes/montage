@@ -34,6 +34,7 @@ struct SdpStream {
     VideoFormat video;      // raw (all of it) and smpte291 (its frame rate)
     AudioFormat audio;      // L24 and L16
     bool fullRange = false; // the video's RANGE=FULL (its codes from 0, not 16 at 8 bits)
+    std::string interfaceAddress[2];  // where this stream joins on each path ("" as InputOptions say; not in its SDP)
     bool redundant() const { return path[1].port > 0; }
 };
 // The streams in an SDP (one or several; two media descriptions of a "DUP" group are one stream's two paths).
@@ -48,9 +49,11 @@ bool frameTimecode(const std::vector<AncPacket>& anc, Rational fps, output::Time
 // ST 2022-7: the packets of one stream from one or two paths, each taken once, out in the order of their RTP sequence
 // numbers (RFC 4175's extended ones for video, with `extended`). A gap is waited on while `window` later packets
 // arrive (and no more than `maxBytes` of them are held), for the other path to fill it.
-// Only RTP packets of the stream's payload type (`setPayloadType`, -1 any) and of one sender (the SSRC first heard)
-// take a place: another sender's are passed over until a window's worth of them has come with none of the first's
-// between (the sender started again with a new SSRC).
+// Only RTP packets of the stream's payload type (`setPayloadType`, -1 any) and of one sender on each path (its SSRC:
+// the two paths' may differ) take a place. Another sender's are passed over until a window's worth of them has come
+// with fewer than a quarter as many of the one taken between: then it is taken instead, so a real stream is not kept
+// out by a stray sender heard first and trickling on (an any-source join), and a sender that starts again with a new
+// SSRC is followed.
 class PathMerger {
 public:
     explicit PathMerger(bool extended, size_t window = 512, size_t maxBytes = size_t(256) << 20)
@@ -69,11 +72,18 @@ private:
     bool extended_;
     size_t window_, maxBytes_;
     int payloadType_ = -1;
-    bool started_ = false, haveSsrc_ = false;
-    uint32_t ssrc_ = 0;
+    bool started_ = false;
+    // Each path's sender: its SSRC, its packets since the others' were last counted from, and theirs (by SSRC, a few).
+    struct Sender {
+        bool have = false;
+        uint32_t ssrc = 0;
+        int64_t own = 0;
+        std::map<uint32_t, int64_t> others;
+    } sender_[2];
     int64_t next_ = 0;
-    int64_t lateRun_ = 0;      // packets in a row from before the window (a sender restarted, or one jumped ahead of)
-    int64_t strangerRun_ = 0;  // another sender's packets since the last of the one taken
+    int64_t lateRun_ = 0;     // packets in a row from before the window (a sender restarted, or one jumped ahead of)
+    int restartedBy_ = -1;    // the path whose new sender last started the count again
+    int64_t sinceRestart_ = 0;  // packets taken since
     size_t heldBytes_ = 0;     // what the packets held take (their buffers, and a little for each)
     std::map<int64_t, std::vector<uint8_t>> held_;
     void release(std::vector<std::vector<uint8_t>>& out);
@@ -94,7 +104,8 @@ struct InputFrame {
 };
 
 struct InputOptions {
-    std::string interfaceAddress[2];  // where to join multicast groups on each path ("" as routing chooses)
+    std::string interfaceAddress[2];  // where to join multicast groups on each path ("" as routing chooses), for the
+                                      // streams that name none of their own
     int waitMs = 200;                 // how long a frame waits for its sound and ancillary data before going without
 };
 

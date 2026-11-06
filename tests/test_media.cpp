@@ -33,6 +33,7 @@
 #include <QTextStream>
 #include <QVector3D>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QDateTime>
 #include <QFile>
@@ -1574,6 +1575,12 @@ public:
     std::set<int> lose, late;
     bool loseWhileRecording = false, staleStatus = false;
     double servoLockAfter = 0.2;
+    // A deck's own ways: stopped, its LTC answered as corrected LTC (74.14); every so many timecodes one this many
+    // frames out (a jittery reader); recording from In at once when told to edit, with no run up.
+    bool correctedLtcWhenStopped = false;
+    int jitterEvery = 0, jitterFrames = 0, timecodeReads = 0;
+    bool recordWithoutRoll = false;
+    int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
 
     double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
@@ -1618,15 +1625,23 @@ public:
                     std::lock_guard lock(m);
                     f = speed == 1 ? int64_t(std::floor(frameNow() + 1e-9)) : -1;
                 }
-                if (f >= 0 && f != sent) {
+                // (every frame played sent, as a deck's output never skips one: those this thread was held up past
+                // go at once, each with its own time)
+                for (int64_t g = sent >= 0 && f > sent && f - sent <= 5 ? sent + 1 : f; f >= 0 && f != sent && g <= f; ++g) {
+                    bool hold = false;
+                    {
+                        std::lock_guard lock(m);
+                        hold = g == heldUp;
+                    }
+                    if (hold) std::this_thread::sleep_for(std::chrono::milliseconds(60));
                     omt::VideoOut v;
-                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(f % 125)].data(), v.rateN = 25, v.rateD = 1;
-                    v.timestamp = f * 400000;
+                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(g % 125)].data(), v.rateN = 25, v.rateD = 1;
+                    v.timestamp = g * 400000;
                     v.metadata = "<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>";
-                    if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(f, 25, false) + "\"/>";
+                    if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(g, 25, false) + "\"/>";
                     tx->sendVideo(v);
-                    sent = f;
                 }
+                if (f >= 0) sent = f;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         });
@@ -1674,7 +1689,8 @@ private:
                 if (in < 0 || out <= in || preroll < 0) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
                 autoEdit = true, recording = false, recordedFrom = recordedTo = -1, editDone = false;
                 // (playing already: it plays on a moment before it searches back to the pre-roll)
-                if (speed == 1) searchUntil = Clock::now() + std::chrono::milliseconds(300);
+                if (recordWithoutRoll) move(double(in), 1), recording = true, recordedFrom = in;
+                else if (speed == 1) searchUntil = Clock::now() + std::chrono::milliseconds(300);
                 else move(double(in - preroll), 1);
                 return ack;
             case cmd::ShuttleForward: move(here, speedFromData(q.data)); return ack;
@@ -1691,7 +1707,11 @@ private:
             default: return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             }
         }
-        if (q.is(6, cmd::CurrentTimeSense)) return timecode(cmd::LtcTimeData, here);
+        if (q.is(6, cmd::CurrentTimeSense)) {
+            ++timecodeReads;
+            const int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
+            return timecode(correctedLtcWhenStopped && speed == 0 ? cmd::CorrectedLtcTimeData : cmd::LtcTimeData, here + off);
+        }
         if (q.is(6, cmd::StatusSense)) return status();
         return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
     }
@@ -2303,6 +2323,18 @@ private slots:
         QVERIFY(deck.cue(ten));
         QVERIFY(deck.waitForCue(ten, 5));
         QCOMPARE(deck.timecode(), ten);
+        // A deck that answers stopped with its corrected LTC (74.14): still its timecode, at once.
+        {
+            std::lock_guard lock(sim.m);
+            sim.correctedLtcWhenStopped = true;
+        }
+        const auto askedAt = std::chrono::steady_clock::now();
+        QCOMPARE(deck.timecode(), ten);
+        QVERIFY(std::chrono::steady_clock::now() - askedAt < std::chrono::milliseconds(250));
+        {
+            std::lock_guard lock(sim.m);
+            sim.correctedLtcWhenStopped = false;
+        }
         QVERIFY(deck.play());
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
         auto st = deck.status();
@@ -2387,10 +2419,63 @@ private slots:
             QCOMPARE(sim.recordedTo, e2.out);
         }
 
+        // A jittery reader (every fourth timecode five frames out): the run up is still seen once, the Program told
+        // from where the deck really was, and the edit made.
+        TapeEdit ej = e;
+        ej.in = e2.in + 250, ej.out = ej.in + 50;
+        {
+            std::lock_guard lock(sim.m);
+            sim.jitterEvery = 4, sim.jitterFrames = 5;
+        }
+        rolls = 0;
+        off = 99;
+        const bool jittered = editToTape(deck, ej,
+                                         [&](int64_t framesToIn, double) {
+                                             std::lock_guard lock(sim.m);
+                                             ++rolls;
+                                             off = sim.frameNow() - double(ej.in - framesToIn);
+                                         },
+                                         nullptr, &err);
+        {
+            std::lock_guard lock(sim.m);
+            sim.jitterEvery = 0;
+        }
+        QVERIFY2(jittered, err.c_str());
+        QCOMPARE(rolls, 1);
+        QVERIFY2(off >= 0 && off < 3, std::to_string(off).c_str());
+        {
+            std::lock_guard lock(sim.m);
+            QCOMPARE(sim.recordedFrom, ej.in);
+            QCOMPARE(sim.recordedTo, ej.out);
+        }
+
+        // A deck that records from In at once, never seen running up: the edit fails there and then, the deck stopped,
+        // rather than recording the paused Program to Out.
+        TapeEdit en = e;
+        en.in = ej.in + 250, en.out = en.in + 250;
+        {
+            std::lock_guard lock(sim.m);
+            sim.recordWithoutRoll = true;
+        }
+        rolls = 0;
+        const auto told = std::chrono::steady_clock::now();
+        QVERIFY(!editToTape(deck, en, [&](int64_t, double) { ++rolls; }, nullptr, &err));
+        QVERIFY(std::chrono::steady_clock::now() - told < std::chrono::seconds(3));
+        QVERIFY2(QString::fromStdString(err).contains("without being seen running up"), err.c_str());
+        QCOMPARE(rolls, 0);
+        {
+            std::lock_guard lock(sim.m);
+            sim.recordWithoutRoll = false;
+            QCOMPARE(sim.speed, 0.0);
+            QVERIFY(!sim.recording && !sim.autoEdit);
+            QCOMPARE(sim.recordedTo, int64_t(-1));
+            QVERIFY2(sim.frameNow() < double(en.in + 50), std::to_string(sim.frameNow() - double(en.in)).c_str());
+        }
+
         // The deck stops answering once it records: the edit fails, and the deck is stopped there rather than left
         // recording the Program's last picture to Out.
         TapeEdit e3 = e;
-        e3.in = e2.in + 500, e3.out = e3.in + 75;
+        e3.in = en.in + 500, e3.out = e3.in + 75;
         {
             std::lock_guard lock(sim.m);
             sim.loseWhileRecording = true;
@@ -2491,10 +2576,11 @@ private slots:
                 const Frame16Ptr f = dec.frameAt((double(k) + 0.5) / 25.0);
                 QVERIFY(f);
                 const int got = frameIn(toImage(*f)), want = int((from + k) % 125);
-                // The first frame must be the logged one; later, a picture the loaded test machine dropped on its way
-                // is held from the one before (as captureFromOmt allows).
-                QVERIFY2(got == want || (k > 0 && got == (want + 124) % 125),
-                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of five seconds', not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
+                // Each frame is the one its timecode says. Only where the recording says a picture was lost on its way
+                // (the loaded test machine's) and the one before held for it may a later frame show the one before.
+                QVERIFY2(got == want || (k > 0 && c.repeated > 0 && got == (want + 124) % 125),
+                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of five seconds', not %4 (%5 held)")
+                                        .arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want).arg(c.repeated)));
             }
             // (the tape's name kept with the timecode)
             AVFormatContext* fc = nullptr;
@@ -2503,10 +2589,17 @@ private slots:
             for (unsigned s = 0; s < fc->nb_streams; ++s) {
                 if (const AVDictionaryEntry* t = av_dict_get(fc->streams[s]->metadata, "reel_name", nullptr, 0)) reel = reel || std::string(t->value) == "TAPE07";
                 // (how the file says its colour is coded: the feed's BT.709, which a decoder otherwise guesses as BT.601 at
-                // this size)
+                // this size. Checked on Linux and Windows; on macOS, where such a capture was read by BT.601 though
+                // tagged BT.709, said rather than checked until a run there shows how it is tagged)
                 const AVCodecParameters* cp = fc->streams[s]->codecpar;
-                if (cp->codec_type == AVMEDIA_TYPE_VIDEO && cp->color_space != AVCOL_SPC_BT709)
+                if (cp->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+#ifdef __APPLE__
+                if (cp->color_space != AVCOL_SPC_BT709)
                     qInfo("%s is tagged %s, not bt709", c.entry.name.c_str(), av_color_space_name(cp->color_space));
+#else
+                const char* tag = av_color_space_name(cp->color_space);
+                QVERIFY2(cp->color_space == AVCOL_SPC_BT709, (c.entry.name + " is tagged " + (tag ? tag : "?") + ", not bt709").c_str());
+#endif
             }
             avformat_close_input(&fc);
             QVERIFY(reel);
@@ -2526,10 +2619,16 @@ private slots:
             bs.capture.video.url = "omt://127.0.0.1:" + std::to_string(tx2.port());
             std::vector<LogEntry> one = {log[0]};
             one[0].name = "Unstamped";
+            const int64_t from = one[0].in - 50;
+            // (the range's first picture held up on its way, as a loaded machine may: placed by the feed's own
+            // timestamps, not taken for the frame after)
+            {
+                std::lock_guard lock(sim2.m);
+                sim2.heldUp = from;
+            }
             const std::vector<BatchClip> plain = batchCapture(deck2, one, bs);
             QCOMPARE(int(plain.size()), 1);
             QVERIFY2(plain[0].ok, plain[0].error.c_str());
-            const int64_t from = one[0].in - 50;
             VideoDecoder dec;
             QVERIFY(dec.open(plain[0].path));
             const Frame16Ptr f = dec.frameAt(0.5 / 25.0);
@@ -25198,6 +25297,53 @@ if ui["pressed"] == "add":
         for (const FarmJob& j : farmJobs(farm))
             if (j.id == hwId) QVERIFY2(QString::fromStdString(j.error).contains("coded with h264_gone, and no node coding with it is answering"), j.error.c_str());
         QVERIFY(removeFarmJob(farm, hwId, &err));
+        // The pin is taken over by one node at a time, under a lock, and a node checks the lock and the pin again once it
+        // has claimed a segment. While another node holds the lock (here one that stopped holding it), no node takes the
+        // pin over, and a node that claimed a segment gives it back rather than code it with a kind being changed. The
+        // lock goes once seen unchanged for a silent node's time, and then every segment is coded with the one kind.
+        log.clear();
+        const auto locked = [&](const std::string& job) {
+            gone(false)(job);
+            const QString group = QString::fromStdString(farm) + "/jobs/" + QString::fromStdString(job);
+            QFile lock(group + "/encoder.lock");
+            QVERIFY(lock.open(QIODevice::WriteOnly) && lock.write("Gone-1") == 6);
+            lock.close();
+            const auto once = [&] {
+                FarmNodeOptions o;
+                o.farm = farm;
+                o.name = "Node C";
+                o.once = true;
+                o.encoders["h264"] = "h264_test";
+                o.log = [&](const std::string& l) {
+                    std::lock_guard<std::mutex> g(logLock);
+                    log << QString::fromStdString(l);
+                };
+                int rendered = -1;
+                QVERIFY(runFarmNode(o, &rendered, &err));
+                QCOMPARE(rendered, 0);
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.group == job) QVERIFY2(j.state == FarmState::Waiting && j.claim.empty(), j.name.c_str());
+            };
+            once();
+            QFile pin(group + "/encoder");
+            QVERIFY(pin.open(QIODevice::ReadOnly));
+            QCOMPARE(pin.readAll(), QByteArray("h264_gone"));
+            pin.close();
+            QVERIFY(!log.join('\n').contains("No node coding with h264_gone answers"));
+            // The pin already this node's kind but the lock not gone yet: the segment claimed is given back.
+            QVERIFY(pin.open(QIODevice::WriteOnly | QIODevice::Truncate) && pin.write("h264_test") == 9);
+            pin.close();
+            once();
+            QVERIFY2(log.join('\n').contains("Gave back"), qPrintable(log.join('\n')));
+        };
+        QVERIFY2(onFarm(hw, 4, &hwId, [](FarmNodeOptions& o) {
+                     o.encoders["h264"] = "h264_test";
+                     o.staleMs = 3000;
+                 }, locked),
+                 qPrintable(log.join('\n')));
+        QVERIFY2(log.join('\n').contains("Removed the encoder lock of " + QString::fromStdString(hwId)), qPrintable(log.join('\n')));
+        QCOMPARE(frames(hw.path), 150);
+        QVERIFY(removeFarmJob(farm, hwId, &err));
         QFile::remove(QString::fromStdString(farm) + "/nodes/Gone.json");
 
         // ---- Two passes: the bits shared out by what each first pass measured (here three times as much a frame in the
@@ -25456,7 +25602,7 @@ if ui["pressed"] == "add":
         QVERIFY(QString::fromStdString(err).contains("DKDM"));
         if (dcp::securityAvailable()) {
             // ---- Encrypted: a segment's codestreams are sealed for the signer's leaf, never in the clear in the farm's
-            // folder; only that leaf's key opens them.
+            // folder; only that leaf's key opens them, and each is bound to its job, segment, frame and eye.
             cinema.title = "Farm Sealed";
             cinema.dkdms = (dir.path() + "/dkdm").toStdString();
             dcp::CertificateChain chain;
@@ -25467,37 +25613,178 @@ if ui["pressed"] == "add":
             QVERIFY(!exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err));
             QVERIFY2(QString::fromStdString(err).contains("certificate"), err.c_str());
             seg.codestreamCertificate = chain.certificates.back();
+            QVERIFY(!exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err));
+            QVERIFY2(QString::fromStdString(err).contains("farm job"), err.c_str());
+            seg.codestreamJob = "job-one";
+            seg.codestreamSegments = 5;  // (12 frames each)
             QVERIFY2(exportDcp(p, seq, seg, (dir.path() + "/seg").toStdString(), nullptr, {}, &err), err.c_str());
             QFile coded(QString::fromStdString(codestreamFile(seg.codestreams, 5)));
             QVERIFY(coded.open(QIODevice::ReadOnly));
             const QByteArray bytes = coded.readAll();
+            coded.close();
             const std::vector<uint8_t> sealed(bytes.begin(), bytes.end());
             QVERIFY(dcp::isSealed(sealed.data(), sealed.size()));
             std::vector<uint8_t> open;
+            const std::string five = dcp::codestreamSealContext("job-one", 0, 5, 5, false);
             dcp::Unsealer mine{chain.privateKey, {}};
-            QVERIFY2(dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext(5, false)), err.c_str());
+            QVERIFY2(dcp::unseal(mine, sealed, open, &err, five), err.c_str());
             QVERIFY(open.size() > 64 && open[0] == 0xff && open[1] == 0x4f && open[2] == 0xff && open[3] == 0x51);
             QVERIFY(!bytes.contains(QByteArray(reinterpret_cast<const char*>(open.data()), 64)));  // (none of it in the clear)
             dcp::CertificateChain other;
             QVERIFY2(dcp::makeCertificateChain("Elsewhere", other, &err), err.c_str());
             dcp::Unsealer theirs{other.privateKey, {}};
-            QVERIFY(!dcp::unseal(theirs, sealed, open, &err, dcp::codestreamSealContext(5, false)));
+            QVERIFY(!dcp::unseal(theirs, sealed, open, &err, five));
             QVERIFY2(QString::fromStdString(err).contains("another certificate"), err.c_str());
             std::vector<uint8_t> changed = sealed;
             changed[changed.size() / 2] ^= 1;
-            QVERIFY(!dcp::unseal(mine, changed, open, &err, dcp::codestreamSealContext(5, false)) && open.empty());
-            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext(6, false)));  // (moved to another frame)
-            // The whole package made on the farm: it passes the checks, with its DKDM, and no codestream is left.
-            QVERIFY2(packageOnFarm([&](std::string* id, std::string* e) {
-                         return submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, id, e);
-                     }),
-                     qPrintable(log.join('\n')));
+            QVERIFY(!dcp::unseal(mine, changed, open, &err, five) && open.empty());
+            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext("job-one", 0, 5, 6, false)));  // (another frame)
+            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext("job-one", 0, 5, 5, true)));   // (the other eye)
+            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext("job-one", 1, 5, 5, false)));  // (another segment)
+            QVERIFY(!dcp::unseal(mine, sealed, open, &err, dcp::codestreamSealContext("job-two", 0, 5, 5, false)));  // (another job)
+            QCOMPARE(dcp::codestreamSegment(60, 5, 11), 0);
+            QCOMPARE(dcp::codestreamSegment(60, 5, 12), 1);
+            QCOMPARE(dcp::codestreamSegment(60, 4, 59), 3);
+            QCOMPARE(dcp::codestreamSegment(7, 3, 1), 0);  // (frames 0-1, 2-3, 4-6)
+            QCOMPARE(dcp::codestreamSegment(7, 3, 2), 1);
+            QCOMPARE(dcp::codestreamSegment(7, 3, 4), 2);
+            const QString elsewhere = dir.path() + "/elsewhere-certificates";
+            // A frame sealed for another job, put in this one's folder, stops the join at that frame (with it back, the
+            // join goes past it); no package is left.
+            {
+                DcpSettings two = seg;
+                two.codestreamJob = "job-two";
+                two.codestreams = (dir.path() + "/codes-two").toStdString();
+                QVERIFY2(exportDcp(p, seq, two, (dir.path() + "/seg").toStdString(), nullptr, {}, &err), err.c_str());
+                const QString five1 = QString::fromStdString(codestreamFile(seg.codestreams, 5));
+                QVERIFY(QFile::rename(five1, five1 + ".kept") && QFile::copy(QString::fromStdString(codestreamFile(two.codestreams, 5)), five1));
+                DcpSettings join = seg;
+                join.codeFrom = join.codeTo = 0;
+                QVERIFY(!exportDcp(p, seq, join, (dir.path() + "/whole").toStdString(), nullptr, {}, &err));
+                QVERIFY2(QString::fromStdString(err).contains("frame 5") && QString::fromStdString(err).contains("another job"), err.c_str());
+                QVERIFY(QFile::remove(five1) && QFile::rename(five1 + ".kept", five1));
+                QVERIFY(!exportDcp(p, seq, join, (dir.path() + "/whole").toStdString(), nullptr, {}, &err));
+                QVERIFY2(QString::fromStdString(err).contains("frame 12") && QString::fromStdString(err).contains("missing"), err.c_str());
+                // Opened only with the leaf's chain: a node whose chain is another refuses before any work.
+                dcp::CertificateChain made;
+                QVERIFY2(dcp::signerCertificateChain(made, &err, elsewhere.toStdString()), err.c_str());
+                join.certificates = elsewhere.toStdString();
+                QVERIFY(!exportDcp(p, seq, join, (dir.path() + "/whole").toStdString(), nullptr, {}, &err));
+                QVERIFY2(QString::fromStdString(err).contains("sealed for another certificate"), err.c_str());
+                QVERIFY(QDir(dir.path() + "/whole").entryList({"FarmSealed_*"}, QDir::Dirs).isEmpty());
+                QDir(QString::fromStdString(two.codestreams)).removeRecursively();
+            }
+            // The signing chain on the farm's share, or where the package goes, is refused when sent: every node could
+            // read its key, which opens the codestreams and every DKDM made with it.
+            {
+                DcpSettings shared = cinema;
+                shared.certificates = farm + "/certificates";
+                QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, shared, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+                QVERIFY2(QString::fromStdString(err).contains("every render node can read their key"), err.c_str());
+                shared.certificates = (dir.path() + "/out/keys").toStdString();
+                QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, shared, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+                QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/certificates") && !QFileInfo::exists(dir.path() + "/out/keys"));
+#ifndef _WIN32
+                // (also when the share is reached through a link, as macOS's /tmp is /private/tmp, the folder not there yet)
+                QVERIFY(QFile::link(QString::fromStdString(farm), dir.path() + "/farm-link"));
+                shared.certificates = (dir.path() + "/farm-link/keys/new").toStdString();
+                QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, shared, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+                QVERIFY2(QString::fromStdString(err).contains("every render node can read their key"), err.c_str());
+                QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/keys"));
+                QFile::remove(dir.path() + "/farm-link");
+#endif
+            }
+            // A node holding another chain (or none) codes no segment while no node holding the signer's answers: none
+            // is coded for a join it could not make.
+            QStringList sealedLog;
+            const auto node = [&](const QString& name, const std::string& certificates, bool once, const std::function<bool()>& stop) {
+                FarmNodeOptions o;
+                o.farm = farm;
+                o.name = name.toStdString();
+                o.pollMs = 100;
+                o.once = once;
+                o.stopped = stop;
+                o.certificates = certificates;
+                o.log = [&](const std::string& l) {
+                    std::lock_guard<std::mutex> g(logLock);
+                    sealedLog << name + ": " + QString::fromStdString(l);
+                };
+                std::string x;
+                runFarmNode(o, nullptr, &x);
+            };
+            std::string sealedId;
+            QVERIFY2(submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, &sealedId, &err), err.c_str());
+            node("Stranger", elsewhere.toStdString(), true, {});
+            for (const FarmJob& j : farmJobs(farm))
+                if (j.group == sealedId || j.id == sealedId) {
+                    QVERIFY2(j.state == FarmState::Waiting && j.claim.empty(), j.name.c_str());
+                    QVERIFY(!j.signer.empty());
+                }
+            QVERIFY2(sealedLog.join('\n').contains("Stranger: The segments of " + QString::fromStdString(sealedId) + " wait"), qPrintable(sealedLog.join('\n')));
+            QVERIFY(QDir(dir.path() + "/out").entryList({".montage-segments-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+            // With a node holding it answering, both code segments; the join is left by the other, and made by that node.
+            const auto segmentsEnded = [&] {
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.group == sealedId && j.state != FarmState::Done && j.state != FarmState::Failed && j.state != FarmState::Cancelled) return false;
+                return true;
+            };
+            {
+                std::thread holder([&] { node("Holder", {}, false, segmentsEnded); });
+                std::thread stranger([&] { node("Stranger", elsewhere.toStdString(), false, segmentsEnded); });
+                holder.join();
+                stranger.join();
+            }
+            const std::vector<FarmJob> afterSegments = farmJobs(farm);
+            const auto sealedEnded = [&] {
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.id == sealedId) return j.state == FarmState::Done || j.state == FarmState::Failed || j.state == FarmState::Cancelled;
+                return true;
+            };
+            // (Unless the holder took the join as the last segment ended.)
+            if (std::any_of(afterSegments.begin(), afterSegments.end(), [&](const FarmJob& j) { return j.id == sealedId && j.state == FarmState::Waiting; })) {
+                node("Stranger", elsewhere.toStdString(), true, {});
+                QVERIFY2(sealedLog.join('\n').contains("Stranger: Left the join of " + QString::fromStdString(sealedId)), qPrintable(sealedLog.join('\n')));
+                // A join that cannot put its package in place (a folder of its name made meanwhile) fails, and leaves no
+                // DKDM for a package that is not there; tried again, it is made.
+                const QString inTheWay = QDir(dir.path() + "/out").filePath(QString::fromStdString(dcpFolderName(seq, cinema)));
+                QVERIFY(QDir().mkpath(inTheWay));
+                node("Holder", {}, false, sealedEnded);
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.id == sealedId) QVERIFY2(j.state == FarmState::Failed && QString::fromStdString(j.error).contains("already a folder"), j.error.c_str());
+                QVERIFY(QDir(dir.path() + "/dkdm").entryList(QDir::Files).isEmpty());
+                QVERIFY(QDir(inTheWay).removeRecursively());
+                QVERIFY2(retryFarmJob(farm, sealedId, &err), err.c_str());
+            }
+            node("Holder", {}, false, sealedEnded);
+            for (const FarmJob& j : farmJobs(farm))
+                if (j.group == sealedId || j.id == sealedId) {
+                    QVERIFY2(j.state == FarmState::Done, qPrintable(QString::fromStdString(j.name + ": " + j.error) + "\n" + sealedLog.join('\n')));
+                    if (j.join) QCOMPARE(j.node, std::string("Holder"));
+                }
             const QString farmSealed = onlyFolder(dir.path() + "/out", "FarmSealed_*");
             QVERIFY(!farmSealed.isEmpty());
             const std::vector<std::string> issues = verifyDcp(farmSealed.toStdString());
             QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
             QCOMPARE(QDir(dir.path() + "/dkdm").entryList(QDir::Files).size(), 1);
             QVERIFY(QDir(dir.path() + "/out").entryList({".montage-*"}, QDir::Dirs | QDir::Files | QDir::Hidden).isEmpty());
+            // No key on the share: no file in the farm's folder or beside the package holds the signer's private key (nor
+            // any private key), and the jobs name the signer only by its leaf's thumbprint.
+            dcp::CertificateInfo leaf;
+            QVERIFY(dcp::readCertificate(chain.certificates.back(), leaf));
+            const QByteArray keyBody = QByteArray::fromStdString(chain.privateKey).split('\n').value(1);
+            QVERIFY(keyBody.size() > 32);
+            bool named = false;
+            for (const QString& root : {QString::fromStdString(farm), dir.path() + "/out"}) {
+                QDirIterator it(root, QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+                while (it.hasNext()) {
+                    QFile f(it.next());
+                    QVERIFY(f.open(QIODevice::ReadOnly));
+                    const QByteArray b = f.readAll();
+                    QVERIFY2(!b.contains(keyBody) && !b.contains("PRIVATE KEY"), qPrintable(f.fileName()));
+                    named |= f.fileName().endsWith("job.json") && b.contains(QByteArray::fromStdString(leaf.thumbprint));
+                }
+            }
+            QVERIFY(named);
         }
     }
 
@@ -32615,6 +32902,23 @@ if ui["pressed"] == "add":
         }, again, &st));
         QCOMPARE(again.find("x %1") != std::string::npos, true);  // (only "Lost %1" is still open)
         QCOMPARE(st.drafted, 1);
+        // A draft where the model wrote "<unk>" for a word or sign it did not know is garbled, so it is not kept.
+        std::string garbled;
+        QVERIFY(draftInterfaceTranslation(out, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
+            o.assign(in.size(), "Verl<unk>ren %1");
+            return true;
+        }, garbled, &st));
+        QCOMPARE(st.drafted, 0);
+        QVERIFY(garbled.find("unk") == std::string::npos);
+        // And none of the languages Montage ships holds such a draft.
+        const QDir shipped(QStringLiteral(MONTAGE_TEST_DATA_DIR "/../../translations"));
+        const QStringList files = shipped.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
+        QVERIFY(!files.isEmpty());
+        for (const QString& name : files) {
+            QFile f(shipped.filePath(name));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY2(!f.readAll().contains("&lt;unk&gt;"), qPrintable(name));
+        }
     }
 
     void translation() {

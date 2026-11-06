@@ -80,6 +80,12 @@ DeckController::DeckController(EditorState* state, PlaybackController* program, 
         connect(program_, &PlaybackController::positionChanged, this, [this] { publish(); });
         connect(program_, &PlaybackController::playingChanged, this, [this] { publish(); });
     }
+    rollTimer_ = new QTimer(this);
+    rollTimer_->setSingleShot(true);
+    rollTimer_->setTimerType(Qt::PreciseTimer);
+    connect(rollTimer_, &QTimer::timeout, this, [this] {
+        if (program_) program_->play();
+    });
     chaseTimer_ = new QTimer(this);
     chaseTimer_->setInterval(10);
     connect(chaseTimer_, &QTimer::timeout, this, &DeckController::chaseTick);
@@ -255,27 +261,15 @@ bool DeckController::startEditToTape(const TapeEdit& e, FrameTime programIn, QSt
     cancel_ = false;
     workDone_ = false;
     lastWork_ = tr("Edit to tape: setting up");
-    const double fps = deckRate_.toDouble();
     QPointer<DeckController> self(this);
-    worker_ = std::thread([this, self, e, programIn, fps] {
+    worker_ = std::thread([this, self, e, programIn] {
         std::string err;
         const bool ok = editToTape(
             deck_, e,
-            [self, programIn, fps](int64_t framesToIn, double clock) {
-                // The Program started so its first frame of the edit goes out as the deck reaches In.
-                QMetaObject::invokeMethod(self, [self, programIn, fps, framesToIn, clock] {
-                    if (!self || !self->program_) return;
-                    const double late = (captureClock() - clock) * fps;
-                    const FrameTime from = programIn - FrameTime(framesToIn) + FrameTime(std::lround(late));
-                    self->state_->setPlayhead(std::max<FrameTime>(0, from));
-                    if (from >= 0) {
-                        self->program_->play();
-                    } else {
-                        // (the Program's start nearer than the pre-roll: it waits on its first frame until its time)
-                        QTimer::singleShot(int(std::lround(double(-from) * 1000 / fps)), self, [self] {
-                            if (self && self->program_ && !self->workDone_) self->program_->play();
-                        });
-                    }
+            [self, programIn](int64_t framesToIn, double clock) {
+                QMetaObject::invokeMethod(self, [self, programIn, framesToIn, clock] {
+                    if (!self) return;
+                    self->rollProgram(programIn, framesToIn, clock);
                     self->lastWork_ = tr("Edit to tape: rolling");
                     emit self->workProgress(self->lastWork_);
                 }, Qt::QueuedConnection);
@@ -283,6 +277,7 @@ bool DeckController::startEditToTape(const TapeEdit& e, FrameTime programIn, QSt
             &cancel_, &err);
         QMetaObject::invokeMethod(self, [self, ok, err] {
             if (!self) return;
+            self->rollTimer_->stop();  // (a start still to come, for a roll before the deck stopped: not made)
             if (self->program_) self->program_->pause();
             self->workDone_ = true;
             self->lastWork_ = ok ? tr("Edit to tape: done") : tr("Edit to tape: %1").arg(QString::fromStdString(err));
@@ -291,6 +286,28 @@ bool DeckController::startEditToTape(const TapeEdit& e, FrameTime programIn, QSt
     });
     return true;
 }
+
+void DeckController::rollProgram(FrameTime programIn, int64_t framesToIn, double clock) {
+    // The Program started so its first frame of the edit goes out as the deck reaches In. Each roll replaces the one
+    // before: a start still waiting from an earlier one (a deck that rolled, then searched back and rolled again) is
+    // not made, so the Program follows the deck's latest run up alone.
+    rollTimer_->stop();
+    if (!program_) return;
+    const double fps = deckRate_.toDouble();
+    const double late = (captureClock() - clock) * fps;
+    const FrameTime from = programIn - FrameTime(framesToIn) + FrameTime(std::lround(late));
+    if (from >= 0) {
+        state_->setPlayhead(from);
+        program_->play();
+    } else {
+        // (the Program's start nearer than the pre-roll: it waits on its first frame until its time)
+        program_->pause();
+        state_->setPlayhead(0);
+        rollTimer_->start(int(std::lround(double(-from) * 1000 / fps)));
+    }
+}
+
+bool DeckController::rollPending() const { return rollTimer_->isActive(); }
 
 // ---- Montage as a deck
 

@@ -59,11 +59,15 @@ struct DcpSettings {
     // "-R"), and nothing else is written; with `codestreams` alone, the package is made with the pictures coded there.
     // An encrypted package's codestreams are sealed (dcp::seal) for `codestreamCertificate`, the PEM certificate of the
     // signer's leaf as the sender has it, and opened by the joining node with that leaf's private key: they are never in
-    // the clear in the farm's folder. Every codestream must be in the DCI profile: a segment coded by FFmpeg's own
-    // encoder (no OpenJPEG) fails, and so does a package made from a codestream that is not.
+    // the clear in the farm's folder. Each is bound to the farm job `codestreamJob` (the join's id), its segment of
+    // `codestreamSegments` (the frames split evenly), its frame and eye, so none can be swapped for another's. Every
+    // codestream must be in the DCI profile: a segment coded by FFmpeg's own encoder (no OpenJPEG) fails, and so does a
+    // package made from a codestream that is not.
     std::string codestreams;
     int64_t codeFrom = 0, codeTo = 0;
     std::string codestreamCertificate;
+    std::string codestreamJob;
+    int codestreamSegments = 0;
 };
 
 struct DcpResult {

@@ -384,6 +384,13 @@ bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bo
     };
     o.interfaceAddress[0] = option("interface");
     o.interfaceAddress[1] = option("interface2");
+    // (a sound or data stream joined on interfaces of its own: audio_interface, data_interface and their 2s)
+    for (st2110::SdpStream& x : streams) {
+        const std::string kind = x.media == "audio" ? "audio_" : x.encoding == "smpte291" ? "data_" : "";
+        if (kind.empty()) continue;
+        x.interfaceAddress[0] = option((kind + "interface").c_str());
+        x.interfaceAddress[1] = option((kind + "interface2").c_str());
+    }
     if (const std::string w = option("wait"); !w.empty()) o.waitMs = std::clamp(std::atoi(w.c_str()), 0, 2000);
     in.st2110 = std::make_unique<st2110::Input>();
     if (!in.st2110->open(streams, o, error)) {
@@ -626,6 +633,7 @@ void Recorder::run() {
     // When the video packets arrived, by their timestamp: a decoder that holds pictures back (frame threads, reordering)
     // gives a picture out with a later packet, so it is placed by when its own packet came.
     std::deque<std::pair<int64_t, double>> arrivals;
+    std::deque<std::pair<double, double>> delays;  // (a range placed by the clock: recent pictures' arrival and delay)
     int64_t soundEnd = INT64_MAX;  // (once stopped: the pictures' end)
     int width = 0, height = 0;
     int colorSpace = AVCOL_SPC_BT709;
@@ -696,6 +704,20 @@ void Recorder::run() {
         double came = arrival;
         for (const auto& [pts, when] : arrivals)
             if (pts == f->pts) came = when;
+        // A picture held up on its way (a busy sender, network or machine) arrives late, never early, so taken by when
+        // it came alone it can be labelled a frame on and the range's first frame passed over (the one before labelled
+        // short of it). Placed instead by its own timestamp and the least delay the last two seconds' pictures came
+        // with, the pictures' labels run on one by one as their timestamps do.
+        if (const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts; ts != AV_NOPTS_VALUE) {
+            const double t = double(ts) * av_q2d(in.videoTb), delay = came - t;
+            // (a jump in the feed's clock: what was learnt no longer holds)
+            if (!delays.empty() && std::fabs(delay - delays.back().second) > 1) delays.clear();
+            delays.emplace_back(came, delay);
+            while (delays.front().first < came - 2) delays.pop_front();
+            double least = delay;
+            for (const auto& d : delays) least = std::min(least, d.second);
+            came = t + least;
+        }
         return cs.label(came);
     };
 

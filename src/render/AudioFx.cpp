@@ -6,12 +6,39 @@
 
 #include "core/Effects.h"
 
+#if defined(__SSE__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
+#include <xmmintrin.h>
+#define MONTAGE_DENORMALS_MXCSR 1
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#define MONTAGE_DENORMALS_FPCR 1
+#endif
+
 namespace montage::fx {
 
 namespace {
 float dbToLin(double db) { return float(std::pow(10.0, db / 20.0)); }
 double clampHz(double f, double fs) { return std::clamp(f, 10.0, fs * 0.49); }
 }  // namespace
+
+DenormalsOff::DenormalsOff() {
+#if defined(MONTAGE_DENORMALS_MXCSR)
+    was_ = _mm_getcsr();
+    _mm_setcsr(unsigned(was_) | 0x8040u);  // flush to zero (bit 15), denormals are zero (bit 6)
+#elif defined(MONTAGE_DENORMALS_FPCR)
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    was_ = fpcr;
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr | (uint64_t(1) << 24)));  // FZ: flush to zero, in and out
+#endif
+}
+
+DenormalsOff::~DenormalsOff() {
+#if defined(MONTAGE_DENORMALS_MXCSR)
+    _mm_setcsr(unsigned(was_));
+#elif defined(MONTAGE_DENORMALS_FPCR)
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(was_));
+#endif
+}
 
 // RBJ cookbook biquads.
 void Biquad::set(double nb0, double nb1, double nb2, double a0, double na1, double na2) {
@@ -104,9 +131,9 @@ void ParametricEq::soloFilter(Stage& st, double sr, const EqBand& b) {
     st.on = true;
     switch (b.shape) {
         case EqShape::LowShelf:
-        case EqShape::HighCut: st.count = 1, st.sections[0].lowPass(sr, b.hz); break;
+        case EqShape::LowCut: st.count = 1, st.sections[0].lowPass(sr, b.hz); break;
         case EqShape::HighShelf:
-        case EqShape::LowCut: st.count = 1, st.sections[0].highPass(sr, b.hz); break;
+        case EqShape::HighCut: st.count = 1, st.sections[0].highPass(sr, b.hz); break;
         case EqShape::Tilt: design(st, sr, b), st.on = true; break;
         default: st.count = 1, st.sections[0].bandPass(sr, b.hz, b.q); break;
     }
@@ -118,8 +145,9 @@ void ParametricEq::set(double sr, const EqBand& low, const EqBand& b1, const EqB
     l.shape = EqShape::LowShelf, h.shape = EqShape::HighShelf;
     l.q = h.q = M_SQRT1_2;
     l.on = h.on = true;
+    l.slot = eqBandSlot("low"), h.slot = eqBandSlot("high");
     EqBand bells[3] = {b1, b2, b3};
-    for (EqBand& b : bells) b.shape = EqShape::Bell, b.on = true;
+    for (int k = 0; k < 3; ++k) bells[k].shape = EqShape::Bell, bells[k].on = true, bells[k].slot = eqBandSlot("b" + std::to_string(k + 1));
     set(sr, {l, bells[0], bells[1], bells[2], h}, outputDb);
 }
 
@@ -128,12 +156,32 @@ void ParametricEq::set(double sr, const std::vector<EqBand>& bands, double outpu
     if (sr != sr_) {
         stages_.clear();
         solo_ = Stage{};
+        soloMix_ = 0;
+        primed_ = false;
     }
-    // (a band whose filter changes shape keeps its sections' state: it may click once, as any switch does)
-    stages_.resize(n);
-    for (size_t i = 0; i < n; ++i) design(stages_[i], sr, bands[i]);
-    soloing_ = solo >= 0 && size_t(solo) < n;
-    if (soloing_) soloFilter(solo_, sr, bands[size_t(solo)]);
+    // Each band takes its own filter back (a band whose filter changes shape keeps its sections' state: it may click
+    // once, as any switch does).
+    std::vector<Stage> next(n);
+    for (size_t i = 0; i < n; ++i) {
+        const int id = bands[i].slot >= 0 ? bands[i].slot : int(i);
+        Stage& st = next[i];
+        const auto was = std::find_if(stages_.begin(), stages_.end(), [&](const Stage& x) { return x.id == id; });
+        if (was != stages_.end()) st = *was;
+        st.id = id;
+        design(st, sr, bands[i]);
+        if (!primed_) st.mix = st.on ? 1 : 0;
+        else if (st.on && st.mix <= 0) st.clear();  // (switched back on, or new: from rest, as it fades in)
+    }
+    stages_ = std::move(next);
+    const bool soloNow = solo >= 0 && size_t(solo) < n;
+    if (soloNow) {
+        const int id = stages_[size_t(solo)].id;
+        if (soloMix_ <= 0 || id != solo_.id) solo_.clear();
+        soloFilter(solo_, sr, bands[size_t(solo)]);
+        solo_.id = id;
+    }
+    soloing_ = soloNow;
+    if (!primed_) soloMix_ = soloing_ ? 1 : 0;
     output_ = dbToLin(outputDb);
     sr_ = sr;
 }
@@ -157,23 +205,45 @@ double ParametricEq::bandResponseDb(int band, double hz) const {
 }
 
 void ParametricEq::process(float* buf, int frames) {
-    if (soloing_) {
-        for (int i = 0; i < frames; ++i)
-            for (int ch = 0; ch < 2; ++ch) {
-                float v = buf[i * 2 + ch];
-                for (int k = 0; k < solo_.count; ++k) v = solo_.sections[size_t(k)].process(ch, v);
-                buf[i * 2 + ch] = v;
+    const float step = float(1 / (kFadeSeconds * sr_));
+    for (int i = 0; i < frames; ++i) {
+        float* f = buf + size_t(i) * 2;
+        float v[2] = {f[0], f[1]};
+        for (Stage& st : stages_) {
+            if (!st.on && st.mix <= 0) continue;
+            float w[2] = {v[0], v[1]};
+            st.run(w);
+            if (st.on && st.mix >= 1) {
+                v[0] = w[0], v[1] = w[1];
+                continue;
             }
-        return;
-    }
-    for (int i = 0; i < frames; ++i)
-        for (int ch = 0; ch < 2; ++ch) {
-            float v = buf[i * 2 + ch];
-            for (Stage& st : stages_)
-                if (st.on)
-                    for (int k = 0; k < st.count; ++k) v = st.sections[size_t(k)].process(ch, v);
-            buf[i * 2 + ch] = v * output_;
+            for (int ch = 0; ch < 2; ++ch) v[ch] += (w[ch] - v[ch]) * st.mix;
+            st.mix = st.on ? std::min(1.0f, st.mix + step) : std::max(0.0f, st.mix - step);
         }
+        v[0] *= output_, v[1] *= output_;
+        if (soloing_ || soloMix_ > 0) {
+            float w[2] = {f[0], f[1]};
+            solo_.run(w);
+            if (soloing_ && soloMix_ >= 1) v[0] = w[0], v[1] = w[1];
+            else {
+                for (int ch = 0; ch < 2; ++ch) v[ch] += (w[ch] - v[ch]) * soloMix_;
+                soloMix_ = soloing_ ? std::min(1.0f, soloMix_ + step) : std::max(0.0f, soloMix_ - step);
+            }
+        }
+        f[0] = v[0], f[1] = v[1];
+    }
+    for (Stage& st : stages_)
+        for (int k = 0; k < st.count; ++k) st.sections[size_t(k)].flushTiny();
+    for (int k = 0; k < solo_.count; ++k) solo_.sections[size_t(k)].flushTiny();
+    primed_ = primed_ || frames > 0;
+}
+
+bool ParametricEq::atRest() const {
+    auto still = [](const Stage& st) {
+        return std::all_of(st.sections.begin(), st.sections.begin() + st.count,
+                           [](const Biquad& b) { return !b.z1[0] && !b.z1[1] && !b.z2[0] && !b.z2[1]; });
+    };
+    return still(solo_) && std::all_of(stages_.begin(), stages_.end(), still);
 }
 
 std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo) {
@@ -187,8 +257,9 @@ std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo) {
         b.on = e.p(band + "_on", t, 1) > 0.5;
         b.hz = std::clamp(e.p(band + "_hz", t, eqDefaultHz(band)), 10.0, 24000.0);
         b.db = eqTypeHasGain(type) ? e.p(band + "_db", t, 0) : 0;
-        b.q = std::clamp(e.p(band + "_q", t, eqDefaultQ(type)), 0.05, 50.0);
+        b.q = std::clamp(e.p(band + "_q", t, eqDefaultQ(type)), 0.05, eqMaxQ(type));
         b.slope = 12 * (1 + std::clamp(int(std::lround(e.p(band + "_slope", t, 1))), 0, 3));
+        b.slot = eqBandSlot(band);
         if (solo && band == audition) *solo = int(out.size());
         out.push_back(b);
         if (int(out.size()) == ParametricEq::kMaxBands) break;

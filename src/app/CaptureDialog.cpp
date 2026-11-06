@@ -284,6 +284,13 @@ void CaptureDialog::nmosConnected() {
         QStringList options;
         if (interfaces.size() > 0) options << QStringLiteral("interface=") + interfaces[0];
         if (interfaces.size() > 1) options << QStringLiteral("interface2=") + interfaces[1];
+        // (the sound's and the data's receivers, where a controller joins them elsewhere)
+        for (int stream : {1, 2}) {
+            const QStringList own = node_->receiverInterfaces(stream);
+            const QString kind = stream == 1 ? QStringLiteral("audio_") : QStringLiteral("data_");
+            for (int i = 0; i < 2 && i < own.size(); ++i)
+                if (own[i] != interfaces.value(i)) options << kind + (i ? QStringLiteral("interface2=") : QStringLiteral("interface=")) + own[i];
+        }
         setOptions(options.join(QLatin1Char(' ')));
     } else if (!nmosFeed_.isEmpty() && url_->text() == nmosFeed_) {
         // (disconnected, its picture at least: what it connected is no longer the feed, unless someone has typed
@@ -439,7 +446,7 @@ QString CaptureDialog::statusText() const { return status_->text(); }
 
 QByteArray CaptureDialog::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_capture","title":"Capture (record a live feed)",
-"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url.",
+"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url.",
 "inputSchema":{"type":"object","properties":{
 "action":{"type":"string","enum":["kinds","record","stop","status","nmos"]},"offer":{"type":"boolean"},
 "kind":{"type":"string"},"url":{"type":"string"},"options":{"type":"string"},"sound":{"type":"string"},
