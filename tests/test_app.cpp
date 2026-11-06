@@ -14736,7 +14736,7 @@ const auto seq = [this] { return state()->sequence(); };
         const auto c = connect(program, &PlaybackController::positionChanged, this, [&](FrameTime t) { seen.emplace_back(clock.elapsed(), t); });
         program->seek(10);
         program->play();
-        QTest::qWait(2500);
+        QTest::qWait(3000);
         disconnect(c);
         // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
         const FrameTime at = program->position();
@@ -14756,9 +14756,14 @@ const auto seq = [this] { return state()->sequence(); };
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
-        // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
+        // Counted from the first frame played, not from the seek before it, and from a second on: starting to play is
+        // not the pace. (The picture follows the sound device's own count, which starts late by however long the device
+        // takes to start, up to a quarter of a second; on a slow macOS runner that alone read as 26 frames a second.)
         size_t first = 1;
         while (first < seen.size() && seen[first].second == seen[0].second) ++first;
+        QVERIFY(first < seen.size());
+        const qint64 played = seen[first].first;
+        while (first < seen.size() && seen[first].first < played + 1000) ++first;
         QVERIFY(first + 10 < seen.size());
         const qint64 start = seen[first].first;
         const double wrapsAfter = double(std::count_if(wraps.begin(), wraps.end(), [start](qint64 w) { return w > start; }));
