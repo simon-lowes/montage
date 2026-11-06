@@ -832,10 +832,28 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
         dcp::CertificateInfo leaf;
         std::string err;
         if (!dcp::securityAvailable()) return fail(error, "This build cannot encrypt (it has no OpenSSL)");
-        const QString certificates = QDir::cleanPath(QFileInfo(qs(settings.certificates.empty() ? dcp::signerFolder() : settings.certificates)).absoluteFilePath());
+        // (folders compared as the file system does: through links (macOS's /tmp is /private/tmp), from the nearest
+        // folder that is there, and on Windows and macOS whatever their case)
+        auto where = [](const std::string& path) {
+            QString at = QDir::cleanPath(QFileInfo(qs(path)).absoluteFilePath()), rest;
+            while (!QFileInfo::exists(at)) {
+                const QString up = QFileInfo(at).path();
+                if (up == at) break;
+                rest = QFileInfo(at).fileName() + (rest.isEmpty() ? QString() : QStringLiteral("/") + rest);
+                at = up;
+            }
+            const QString real = QFileInfo(at).canonicalFilePath();
+            return QDir::cleanPath((real.isEmpty() ? at : real) + (rest.isEmpty() ? QString() : QStringLiteral("/") + rest));
+        };
+#if defined(_WIN32) || defined(__APPLE__)
+        const Qt::CaseSensitivity cs = Qt::CaseInsensitive;
+#else
+        const Qt::CaseSensitivity cs = Qt::CaseSensitive;
+#endif
+        const QString certificates = where(settings.certificates.empty() ? dcp::signerFolder() : settings.certificates);
         for (const std::string& shared : {farm, parent}) {
-            const QString s = QDir::cleanPath(QFileInfo(qs(shared)).absoluteFilePath());
-            if (!shared.empty() && (certificates == s || certificates.startsWith(s + '/')))
+            const QString s = where(shared);
+            if (!shared.empty() && (certificates.compare(s, cs) == 0 || certificates.startsWith(s + '/', cs)))
                 return fail(error, "The certificates the package is signed with are in " + ss(certificates) +
                                        ", where every render node can read their key: keep them on the computers that join encrypted DCPs only");
         }
@@ -1167,7 +1185,9 @@ struct Node {
             QFile r(lock);
             const bool ours = r.open(QIODevice::ReadOnly) && r.readAll() == me;
             r.close();
-            if (ours) QFile::remove(lock);
+            // (on Windows a file another node is reading cannot go for that moment: tried again)
+            for (int tries = 0; ours && tries < 20 && !QFile::remove(lock) && QFileInfo::exists(lock); ++tries)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
         };
         // (Read again under the lock: another node may have taken it over just before.)
         if (readPin() != kind) return unlock(), false;

@@ -1580,6 +1580,7 @@ public:
     bool correctedLtcWhenStopped = false;
     int jitterEvery = 0, jitterFrames = 0, timecodeReads = 0;
     bool recordWithoutRoll = false;
+    int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
 
     double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
@@ -1624,15 +1625,23 @@ public:
                     std::lock_guard lock(m);
                     f = speed == 1 ? int64_t(std::floor(frameNow() + 1e-9)) : -1;
                 }
-                if (f >= 0 && f != sent) {
+                // (every frame played sent, as a deck's output never skips one: those this thread was held up past
+                // go at once, each with its own time)
+                for (int64_t g = sent >= 0 && f > sent && f - sent <= 5 ? sent + 1 : f; f >= 0 && f != sent && g <= f; ++g) {
+                    bool hold = false;
+                    {
+                        std::lock_guard lock(m);
+                        hold = g == heldUp;
+                    }
+                    if (hold) std::this_thread::sleep_for(std::chrono::milliseconds(60));
                     omt::VideoOut v;
-                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(f % 125)].data(), v.rateN = 25, v.rateD = 1;
-                    v.timestamp = f * 400000;
+                    v.width = W, v.height = H, v.stride = W * 2, v.data = pics[size_t(g % 125)].data(), v.rateN = 25, v.rateD = 1;
+                    v.timestamp = g * 400000;
                     v.metadata = "<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/>";
-                    if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(f, 25, false) + "\"/>";
+                    if (stamp) v.metadata += "<montage_timecode value=\"" + formatTimecode(g, 25, false) + "\"/>";
                     tx->sendVideo(v);
-                    sent = f;
                 }
+                if (f >= 0) sent = f;
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         });
@@ -2610,10 +2619,16 @@ private slots:
             bs.capture.video.url = "omt://127.0.0.1:" + std::to_string(tx2.port());
             std::vector<LogEntry> one = {log[0]};
             one[0].name = "Unstamped";
+            const int64_t from = one[0].in - 50;
+            // (the range's first picture held up on its way, as a loaded machine may: placed by the feed's own
+            // timestamps, not taken for the frame after)
+            {
+                std::lock_guard lock(sim2.m);
+                sim2.heldUp = from;
+            }
             const std::vector<BatchClip> plain = batchCapture(deck2, one, bs);
             QCOMPARE(int(plain.size()), 1);
             QVERIFY2(plain[0].ok, plain[0].error.c_str());
-            const int64_t from = one[0].in - 50;
             VideoDecoder dec;
             QVERIFY(dec.open(plain[0].path));
             const Frame16Ptr f = dec.frameAt(0.5 / 25.0);
@@ -25669,6 +25684,15 @@ if ui["pressed"] == "add":
                 shared.certificates = (dir.path() + "/out/keys").toStdString();
                 QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, shared, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
                 QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/certificates") && !QFileInfo::exists(dir.path() + "/out/keys"));
+#ifndef _WIN32
+                // (also when the share is reached through a link, as macOS's /tmp is /private/tmp, the folder not there yet)
+                QVERIFY(QFile::link(QString::fromStdString(farm), dir.path() + "/farm-link"));
+                shared.certificates = (dir.path() + "/farm-link/keys/new").toStdString();
+                QVERIFY(!submitFarmDcp(farm, "DCP", p, seq.id, shared, (dir.path() + "/out").toStdString(), 4, nullptr, &err));
+                QVERIFY2(QString::fromStdString(err).contains("every render node can read their key"), err.c_str());
+                QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/keys"));
+                QFile::remove(dir.path() + "/farm-link");
+#endif
             }
             // A node holding another chain (or none) codes no segment while no node holding the signer's answers: none
             // is coded for a join it could not make.

@@ -633,6 +633,7 @@ void Recorder::run() {
     // When the video packets arrived, by their timestamp: a decoder that holds pictures back (frame threads, reordering)
     // gives a picture out with a later packet, so it is placed by when its own packet came.
     std::deque<std::pair<int64_t, double>> arrivals;
+    std::deque<std::pair<double, double>> delays;  // (a range placed by the clock: recent pictures' arrival and delay)
     int64_t soundEnd = INT64_MAX;  // (once stopped: the pictures' end)
     int width = 0, height = 0;
     int colorSpace = AVCOL_SPC_BT709;
@@ -703,6 +704,20 @@ void Recorder::run() {
         double came = arrival;
         for (const auto& [pts, when] : arrivals)
             if (pts == f->pts) came = when;
+        // A picture held up on its way (a busy sender, network or machine) arrives late, never early, so taken by when
+        // it came alone it can be labelled a frame on and the range's first frame passed over (the one before labelled
+        // short of it). Placed instead by its own timestamp and the least delay the last two seconds' pictures came
+        // with, the pictures' labels run on one by one as their timestamps do.
+        if (const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts; ts != AV_NOPTS_VALUE) {
+            const double t = double(ts) * av_q2d(in.videoTb), delay = came - t;
+            // (a jump in the feed's clock: what was learnt no longer holds)
+            if (!delays.empty() && std::fabs(delay - delays.back().second) > 1) delays.clear();
+            delays.emplace_back(came, delay);
+            while (delays.front().first < came - 2) delays.pop_front();
+            double least = delay;
+            for (const auto& d : delays) least = std::min(least, d.second);
+            came = t + least;
+        }
         return cs.label(came);
     };
 
