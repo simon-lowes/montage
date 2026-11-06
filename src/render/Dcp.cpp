@@ -501,6 +501,11 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
                (whose == "this node's" ? " JPEG 2000 encoder (FFmpeg's own, without OpenJPEG) does not code in it"
                                        : " is not in it (coded without OpenJPEG)");
     };
+    // (an encrypted farm package's codestream: bound to its job, segment, frame and eye)
+    auto sealContext = [&](int64_t k, bool right) {
+        return dcp::codestreamSealContext(settings.codestreamJob, dcp::codestreamSegment(frames, settings.codestreamSegments, k),
+                                          std::max(1, settings.codestreamSegments), k, right);
+    };
     // A render farm's segment: DCP frames [codeFrom, codeTo) coded alone into the folder of codestreams, and nothing
     // else.
     if (settings.codeTo > settings.codeFrom) {
@@ -513,6 +518,8 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         if (settings.encrypt) {
             std::string why;
             if (settings.codestreamCertificate.empty()) return fail("An encrypted DCP's segment needs the certificate its codestreams are sealed for");
+            if (settings.codestreamJob.empty() || settings.codestreamSegments < 1)
+                return fail("An encrypted DCP's segment needs the farm job and segments its codestreams are sealed for");
             if (!dcp::makeSealer(settings.codestreamCertificate, sealer, &why)) return fail(why);
         }
         EncoderPool pool(cw, ch, fps, stereo, threads);
@@ -527,7 +534,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
                     err = notInProfile(pool.openjpeg() ? "the codestream of frame " + std::to_string(taken / eyes) : std::string("this node's"));
                     return false;
                 }
-                if (settings.encrypt && !dcp::seal(sealer, cs.data(), cs.size(), sealed, dcp::codestreamSealContext(taken / eyes, taken % eyes == 1))) {
+                if (settings.encrypt && !dcp::seal(sealer, cs.data(), cs.size(), sealed, sealContext(taken / eyes, taken % eyes == 1))) {
                     err = "Cannot seal a codestream";
                     return false;
                 }
@@ -588,6 +595,16 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
     if (settings.sign) {
         std::string err;
         if (!dcp::signerCertificateChain(chain, &err, settings.certificates)) return fail("Cannot sign the package: " + err);
+    }
+    // (a farm's sealed codestreams: opened only with the key of the leaf they were sealed for, checked before any work)
+    if (settings.encrypt && coded) {
+        dcp::CertificateInfo mine, sealedFor;
+        if (settings.codestreamJob.empty() || settings.codestreamSegments < 1)
+            return fail("An encrypted DCP's codestreams need the farm job and segments they were sealed for");
+        if (!dcp::readCertificate(settings.codestreamCertificate, sealedFor) || chain.empty() || !dcp::readCertificate(chain.certificates.back(), mine) ||
+            mine.thumbprint != sealedFor.thumbprint)
+            return fail("The codestreams were sealed for another certificate than this node's signing chain (in " +
+                        (settings.certificates.empty() ? dcp::signerFolder() : settings.certificates) + ")");
     }
     dcp::ContentKey pictureKey, soundKey, subtitleKey, iabKey;
     if (settings.encrypt) {
@@ -746,7 +763,11 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
                 unsealError = "The codestream of frame " + std::to_string(k) + " in " + settings.codestreams + " was not sealed";
                 return false;
             }
-            return dcp::unseal(unsealer, sealed, out, &unsealError, dcp::codestreamSealContext(k, eye)) && !out.empty();
+            if (!dcp::unseal(unsealer, sealed, out, &unsealError, sealContext(k, eye)) || out.empty()) {
+                unsealError = "The codestream of frame " + std::to_string(k) + (eye ? " (right eye)" : "") + " in " + settings.codestreams + ": " + unsealError;
+                return false;
+            }
+            return true;
         };
         auto writeReady = [&](bool wait) {
             while (written < frames) {

@@ -120,9 +120,10 @@ int usage() {
                  "  montage-cli farm <folder> jobs|nodes [--json]\n"
                  "  montage-cli farm <folder> cancel|retry|remove <job>\n"
                  "                     (a render farm: a folder every computer reaches; jobs wait there for render nodes)\n"
-                 "  montage-cli node <folder> [--name NAME] [--map FROM=TO]... [--once] [--poll SECONDS]\n"
+                 "  montage-cli node <folder> [--name NAME] [--map FROM=TO]... [--once] [--poll SECONDS] [--certificates FOLDER]\n"
                  "                     (a render node: renders the farm's waiting jobs one at a time, FROM paths read as TO;\n"
-                 "                      Ctrl+C gives its job back for another node)\n"
+                 "                      Ctrl+C gives its job back for another node; --certificates: the DCP signing chain it\n"
+                 "                      joins encrypted DCPs with, never on the farm's share)\n"
                  "  montage-cli st2110 [--mode 1080p25] [--depth 10|8] [--video ADDR:PORT] [--audio ADDR:PORT] [--data ADDR:PORT]\n"
                  "                     [--interface ADDR] [--ttl N] [--channels 2|8] [--seconds N] [--no-nmos] [--nmos-port N]\n"
                  "                     [--label NAME] [--registry URL | --domain DOMAIN [--dns-server ADDR]]\n"
@@ -669,6 +670,7 @@ int cmdNode(const std::vector<std::string>& args) {
         if (a == "--name") o.name = next();
         else if (a == "--once") o.once = true;
         else if (a == "--poll") o.pollMs = std::max(100, int(std::atof(next().c_str()) * 1000));
+        else if (a == "--certificates") o.certificates = next();
         else if (a == "--map") {
             FarmPathMap m;
             if (!parseFarmPathMap(next(), m)) {

@@ -11,6 +11,7 @@
 #include <QSaveFile>
 #include <QSysInfo>
 #include <chrono>
+#include <set>
 #include <thread>
 
 #include "core/ProjectIO.h"
@@ -282,6 +283,8 @@ void visitDcp(S& s, V& v) {
     v("codeFrom", s.codeFrom);
     v("codeTo", s.codeTo);
     v("codestreamCertificate", s.codestreamCertificate);
+    v("codestreamJob", s.codestreamJob);
+    v("codestreamSegments", s.codestreamSegments);
 }
 
 QJsonObject imfToJson(const ImfSettings& s) {
@@ -396,6 +399,7 @@ FarmJob readJob(const std::string& farm, const std::string& id) {
     job.segments = j.value("segments").toInt();
     job.join = j.value("join").toBool();
     job.pass = j.value("pass").toInt();
+    job.signer = ss(j.value("signer").toString());
     QFile claim(d.filePath(QStringLiteral("claim")));
     const bool claimed = claim.open(QIODevice::ReadOnly);
     if (claimed) job.claim = ss(QString::fromUtf8(claim.readAll()));
@@ -725,10 +729,12 @@ bool submitFarmJob(const std::string& farm, const std::string& name, const Proje
 
 namespace {
 
-// A package's segments (each coding its share of the pictures) and the join that wraps them.
+// A package's segments (each coding its share of the pictures) and the join that wraps them. `settingsFor` is given the
+// codestreams' folder, the frames, the join's id and the number of segments; `extra` goes in every job.
 bool submitPackage(const std::string& farm, const std::string& name, const Project& project, Id sequence, const char* kind,
-                   const std::function<QJsonObject(const std::string&, int64_t, int64_t)>& settingsFor, int64_t frames,
-                   const std::string& parent, const std::string& folderName, int segments, std::string* id, std::string* error) {
+                   const std::function<QJsonObject(const std::string&, int64_t, int64_t, const std::string&, int)>& settingsFor,
+                   int64_t frames, const std::string& parent, const std::string& folderName, int segments, std::string* id,
+                   std::string* error, const QJsonObject& extra = {}) {
     if (parent.empty()) return fail(error, "The job has no folder for the package");
     // (Its name taken already: refused now, not once every segment is coded.)
     if (QFileInfo::exists(QDir(qs(parent)).filePath(qs(folderName)))) return fail(error, "There is already a folder called " + folderName + " in " + parent);
@@ -736,7 +742,7 @@ bool submitPackage(const std::string& farm, const std::string& name, const Proje
     const QByteArray proj = QByteArray::fromStdString(projectToJson(project));
     ExportSettings where;
     where.path = parent;  // (what the queue shows as its output)
-    const QJsonObject job{{"name", qs(name)},
+    QJsonObject job{{"name", qs(name)},
                           {"sequence", QString::number(sequence)},
                           {"stems", 0},
                           {"package", kind},
@@ -744,6 +750,7 @@ bool submitPackage(const std::string& farm, const std::string& name, const Proje
                           {"submittedBy", QSysInfo::machineHostName()},
                           {"submitted", qs(nowIso())},
                           {"version", 1}};
+    for (auto it = extra.begin(); it != extra.end(); ++it) job[it.key()] = it.value();
     const std::string jobId = newJobId();
     const char sep = parent.find('/') == std::string::npos && parent.find('\\') != std::string::npos ? '\\' : '/';
     const std::string folder = (parent.back() == sep ? parent : parent + sep) + ".montage-segments-" + jobId;
@@ -754,7 +761,7 @@ bool submitPackage(const std::string& farm, const std::string& name, const Proje
         const std::string segId = newJobId();
         QJsonObject sj = job;
         sj["name"] = qs(name) + QStringLiteral(" - segment %1 of %2").arg(k + 1).arg(n);
-        sj["packageSettings"] = settingsFor(folder, from, to);
+        sj["packageSettings"] = settingsFor(folder, from, to, jobId, n);
         sj["group"] = qs(jobId);
         sj["segment"] = k + 1;
         sj["segments"] = n;
@@ -768,7 +775,7 @@ bool submitPackage(const std::string& farm, const std::string& name, const Proje
         ranges.append(QJsonArray{double(from), double(to)});
     }
     QJsonObject jj = job;
-    jj["packageSettings"] = settingsFor(folder, 0, 0);
+    jj["packageSettings"] = settingsFor(folder, 0, 0, jobId, n);
     jj["join"] = true;
     jj["segments"] = n;
     jj["after"] = after;
@@ -794,7 +801,7 @@ bool submitFarmImf(const std::string& farm, const std::string& name, const Proje
     std::string why;
     const int64_t frames = imfCompositionFrames(*seq, settings, &why);
     if (frames <= 0) return fail(error, why);
-    auto settingsFor = [&](const std::string& folder, int64_t from, int64_t to) {
+    auto settingsFor = [&](const std::string& folder, int64_t from, int64_t to, const std::string&, int) {
         ImfSettings x = settings;
         x.codestreams = folder;
         x.codeFrom = from, x.codeTo = to;
@@ -813,25 +820,41 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
     if (settings.encrypt && settings.dkdms.empty()) return fail(error, "An encrypted DCP made on a render farm needs a folder for its DKDM");
     const int64_t frames = dcpPackageFrames(*seq, settings);
     if (frames < dcpFrameRate(*seq, settings.fps)) return fail(error, "A DCP must last at least a second (cinema servers refuse shorter reels)");
-    // (an encrypted package's codestreams are sealed for the signer's leaf, so they are never in the clear in the farm's
-    // folder: the joining node opens them with that leaf's key, so it needs the same certificates folder)
+    // An encrypted package's codestreams are sealed for the signer's leaf, so they are never in the clear in the farm's
+    // folder. A coding node needs only that certificate; the join is made only by a node holding the chain itself (in
+    // its own certificates folder, FarmNodeOptions::certificates), named in the jobs by the leaf's thumbprint. The chain
+    // is never to be on the farm's share, where every node (and anyone reading it) would hold the key that opens the
+    // codestreams and every DKDM made with it.
     std::string sealFor;
+    QJsonObject extra;
     if (settings.encrypt) {
         dcp::CertificateChain chain;
+        dcp::CertificateInfo leaf;
         std::string err;
         if (!dcp::securityAvailable()) return fail(error, "This build cannot encrypt (it has no OpenSSL)");
-        if (!dcp::signerCertificateChain(chain, &err, settings.certificates) || chain.empty())
+        const QString certificates = QDir::cleanPath(QFileInfo(qs(settings.certificates.empty() ? dcp::signerFolder() : settings.certificates)).absoluteFilePath());
+        for (const std::string& shared : {farm, parent}) {
+            const QString s = QDir::cleanPath(QFileInfo(qs(shared)).absoluteFilePath());
+            if (!shared.empty() && (certificates == s || certificates.startsWith(s + '/')))
+                return fail(error, "The certificates the package is signed with are in " + ss(certificates) +
+                                       ", where every render node can read their key: keep them on the computers that join encrypted DCPs only");
+        }
+        if (!dcp::signerCertificateChain(chain, &err, settings.certificates) || chain.empty() || !dcp::readCertificate(chain.certificates.back(), leaf, &err))
             return fail(error, "Cannot read the certificates the package is signed with: " + err);
         sealFor = chain.certificates.back();
+        extra["signer"] = qs(leaf.thumbprint);
     }
-    auto settingsFor = [&](const std::string& folder, int64_t from, int64_t to) {
+    auto settingsFor = [&](const std::string& folder, int64_t from, int64_t to, const std::string& job, int n) {
         DcpSettings x = settings;
         x.codestreamCertificate = sealFor;
+        x.codestreamJob = settings.encrypt ? job : std::string();
+        x.codestreamSegments = settings.encrypt ? n : 0;
         x.codestreams = folder;
         x.codeFrom = from, x.codeTo = to;
         return dcpToJson(x);
     };
-    return submitPackage(farm, name, project, sequence, "dcp", settingsFor, frames, parent, dcpFolderName(*seq, settings), segments, id, error);
+    return submitPackage(farm, name, project, sequence, "dcp", settingsFor, frames, parent, dcpFolderName(*seq, settings), segments, id, error,
+                         extra);
 }
 
 std::vector<FarmJob> farmJobs(const std::string& farm) {
@@ -859,6 +882,7 @@ std::vector<FarmNodeInfo> farmNodes(const std::string& farm) {
         n.beat = int64_t(o.value("beat").toDouble());
         const QJsonObject enc = o.value("encoders").toObject();
         for (auto it = enc.begin(); it != enc.end(); ++it) n.encoders[ss(it.key())] = ss(it.value().toString());
+        n.signer = ss(o.value("signer").toString());
         out.push_back(std::move(n));
     }
     return out;
@@ -989,6 +1013,9 @@ struct Node {
     FarmHeartbeats watched;
     std::map<std::string, int64_t> leftFor;  // segments this node failed, left for other nodes until then (its clock)
     std::map<std::string, std::string> found;  // the hardware encoders found, by family and size
+    std::string signer;             // the leaf thumbprint of the DCP signing chain this node joins with (ownSigner)
+    int64_t signerRead = -1;        // when it was read (this node's clock)
+    std::set<std::string> told;     // what was said once (a job left for other nodes)
 
     explicit Node(const FarmNodeOptions& options) : o(options), watched(options.staleMs) {
         name = o.name.empty() ? ss(QSysInfo::machineHostName()) : o.name;
@@ -1020,7 +1047,44 @@ struct Node {
                                           {"job", qs(job)},
                                           {"updated", qs(nowIso())},
                                           {"beat", double(++beat)},
-                                          {"encoders", enc}});
+                                          {"encoders", enc},
+                                          {"signer", qs(ownSigner())}});
+    }
+    void tellOnce(const std::string& key, const std::string& line) {
+        if (told.insert(key).second) log(line);
+    }
+    // The leaf thumbprint of the signing chain in this node's certificates folder, "" with none there (never made here:
+    // a chain made on the spot could open nothing sealed for the sender's). Read again every ten seconds.
+    std::string ownSigner() {
+        if (signerRead >= 0 && nowMs() - signerRead < 10000) return signer;
+        signerRead = nowMs();
+        signer.clear();
+        const QDir dir(qs(o.certificates.empty() ? dcp::signerFolder() : o.certificates));
+        QFile leaf(dir.filePath(QStringLiteral("leaf.pem")));
+        dcp::CertificateInfo info;
+        if (dcp::securityAvailable() && QFileInfo::exists(dir.filePath(QStringLiteral("leaf.key"))) && leaf.open(QIODevice::ReadOnly) &&
+            dcp::readCertificate(leaf.readAll().toStdString(), info))
+            signer = info.thumbprint;
+        return signer;
+    }
+    // An encrypted DCP's join is taken only by a node holding the chain its codestreams were sealed for, and its
+    // segments are coded only while such a node answers (this one or another), so none is coded for a join no node can
+    // make. Those left wait, said once in the node's log.
+    bool maySeal(const FarmJob& j) {
+        const std::string mine = ownSigner();
+        if (mine == j.signer) return true;
+        if (j.join) {
+            tellOnce(j.id, "Left the join of " + j.id + " for a node holding the certificates it is signed with (this node's --certificates holds others or none)");
+            return false;
+        }
+        for (const FarmNodeInfo& n : farmNodes(o.farm)) {
+            if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat)) continue;
+            if (n.signer == j.signer) return true;
+        }
+        tellOnce(j.group, "The segments of " + j.group +
+                              " wait: no node holding the certificates the package is signed with is answering, and only such a node can join it "
+                              "(start one with them in its --certificates folder)");
+        return false;
     }
     // The encoder this node codes a hardware export of `seq` with: the export's own choice (exportHwEncoder), asked
     // once for each picture.
@@ -1037,8 +1101,9 @@ struct Node {
     // Whether this node may take a segment of a hardware-encoded export: its kind pinned to the export's join by the
     // first node that takes one (a file only one creation of succeeds), the others taking them only with that kind.
     // When no node coding with the pinned kind answers any more, the pin passes to this node if none of the segments
-    // was coded with it yet; else the segment cannot be coded to match the others, and `stranded` says why.
-    bool mayCodeSegment(const FarmJob& j, std::string* stranded) {
+    // was coded with it yet; else the segment cannot be coded to match the others, and `stranded` says why. `pinned`
+    // gets the kind the segment is to be coded with, checked again once it is claimed (pinHolds).
+    bool mayCodeSegment(const FarmJob& j, std::string* stranded, std::string* pinned) {
         if (j.segment <= 0 || j.group.empty()) return true;
         ExportSettings st;
         const QJsonObject job = readJson(QDir(jobDir(o.farm, j.id)).filePath(QStringLiteral("job.json")));
@@ -1052,6 +1117,7 @@ struct Node {
         seq.stereo3d = pic.size() >= 5 && pic.at(4).toBool();
         const std::string family = st.videoCodec.substr(3);
         const std::string mine = encoderFor(st, seq);
+        if (pinned) *pinned = mine;
         const QString pin = QDir(jobDir(o.farm, j.group)).filePath(QStringLiteral("encoder"));
         auto pinIt = [&] {
             QFile f(pin);
@@ -1062,46 +1128,91 @@ struct Node {
             return true;
         };
         if (pinIt()) return true;
-        QByteArray kind;
-        QFile r(pin);
-        for (int tries = 0; tries < 20 && kind.isEmpty(); ++tries) {  // (another node's, being written)
-            if (r.open(QIODevice::ReadOnly)) {
-                kind = r.readAll();
-                r.close();
+        auto readPin = [&] {
+            QByteArray kind;
+            QFile r(pin);
+            for (int tries = 0; tries < 20 && kind.isEmpty(); ++tries) {  // (another node's, being written)
+                if (r.open(QIODevice::ReadOnly)) {
+                    kind = r.readAll();
+                    r.close();
+                }
+                if (kind.isEmpty()) std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
-            if (kind.isEmpty()) std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        }
+            return kind;
+        };
+        const QByteArray kind = readPin();
         if (kind.isEmpty()) return false;
         if (kind == QByteArray::fromStdString(mine)) return true;
         // Another kind's: left to the nodes with it while one answers.
-        const std::string pinned = ss(QString::fromUtf8(kind));
+        const std::string was = ss(QString::fromUtf8(kind));
         for (const FarmNodeInfo& n : farmNodes(o.farm)) {
             if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat)) continue;
-            if (const auto e = n.encoders.find(family); e != n.encoders.end() && e->second == pinned) return false;
+            if (const auto e = n.encoders.find(family); e != n.encoders.end() && e->second == was) return false;
         }
-        // None does: its segments being coded are waited for (a silent node's are taken back), and with none coded yet
-        // the pin is this node's (put aside first, so only one node takes it over).
+        // None does: taken over under a lock only one node makes. A node coding a segment claims it first and only then
+        // looks for the lock and the pin (pinHolds), and this looks for claims only once it holds the lock, so either this
+        // sees that claim and leaves the pin, or that node sees the lock or the new pin and gives its segment back: two
+        // kinds never code one export. A lock left by a node that stopped holding it goes once seen unchanged that long.
+        const QString lock = pin + QStringLiteral(".lock");
+        const QByteArray me = QByteArray::fromStdString(token);
+        {
+            QFile l(lock);
+            if (!l.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+                pinLocked(j.group);  // (another node's, or one left)
+                return false;
+            }
+            l.write(me);
+        }
+        auto unlock = [&] {
+            QFile r(lock);
+            const bool ours = r.open(QIODevice::ReadOnly) && r.readAll() == me;
+            r.close();
+            if (ours) QFile::remove(lock);
+        };
+        // (Read again under the lock: another node may have taken it over just before.)
+        if (readPin() != kind) return unlock(), false;
+        // Its segments being coded are waited for (a silent node's are taken back); with one coded already, none can
+        // match it.
         bool coded = false;
         for (const std::string& seg : segmentIds(o.farm, j.group)) {
             if (!jobExists(o.farm, seg)) continue;
-            const FarmState state = readJob(o.farm, seg).state;
-            if (state == FarmState::Rendering) return false;
+            const FarmState state = readJob(o.farm, seg).state;  // (claimed with no status yet counts as rendering)
+            if (state == FarmState::Rendering) return unlock(), false;
             coded |= state == FarmState::Done;
         }
         if (coded) {
+            unlock();
             if (stranded)
-                *stranded = "The export's other segments were coded with " + pinned + ", and no node coding with it is answering: start one, then retry the job";
+                *stranded = "The export's other segments were coded with " + was + ", and no node coding with it is answering: start one, then retry the job";
             return false;
         }
-        const QString aside = pin + QStringLiteral("-") + QString::number(QRandomGenerator::global()->generate64(), 16);
-        if (!QFile::rename(pin, aside)) return false;
-        QFile a(aside);
-        const QByteArray held = a.open(QIODevice::ReadOnly) ? a.readAll() : QByteArray();
-        a.close();
-        QFile::remove(aside);
-        if (held != kind) return false;  // (another node took it over meanwhile)
-        log("No node coding with " + pinned + " answers");
-        return pinIt();
+        QSaveFile f(pin);
+        const bool taken = f.open(QIODevice::WriteOnly) && f.write(QByteArray::fromStdString(mine)) == qint64(mine.size()) && f.commit();
+        unlock();
+        if (taken) log("No node coding with " + was + " answers: segments of " + j.group + " are coded with " + mine);
+        return taken;
+    }
+    // Whether a node is taking the pin of `group` over (its lock). A lock left by a node that stopped while holding it
+    // goes once seen unchanged for as long as a silent node's job is (still locked this time).
+    bool pinLocked(const std::string& group) {
+        const QString lock = QDir(jobDir(o.farm, group)).filePath(QStringLiteral("encoder.lock"));
+        QFile r(lock);
+        if (!r.open(QIODevice::ReadOnly)) return QFileInfo::exists(lock);
+        const std::string key = "lock|" + group + "|" + ss(QString::fromUtf8(r.readAll()));
+        r.close();
+        if (watched.stale(key, 0)) {
+            QFile::remove(lock);
+            watched.forget(key);
+            log("Removed the encoder lock of " + group + ", left by a node that stopped");
+        }
+        return true;
+    }
+    // Whether a hardware-encoded segment just claimed is still to be coded with `kind`: no node taking the pin over
+    // (its lock) and the pin still `kind`, looked for in that order (mayCodeSegment).
+    bool pinHolds(const std::string& group, const std::string& kind) {
+        if (pinLocked(group)) return false;
+        QFile f(QDir(jobDir(o.farm, group)).filePath(QStringLiteral("encoder")));
+        return f.open(QIODevice::ReadOnly) && f.readAll() == QByteArray::fromStdString(kind);
     }
     // Whether this node still holds the job's claim (another may have taken it back while this one was silent). Its
     // claim counts while another node has it aside for a moment, checking whether it was the stale one.
@@ -1145,13 +1256,21 @@ struct Node {
                 if (std::any_of(segs.begin(), segs.end(), [&](const std::string& seg) { return jobExists(o.farm, seg) && !ended(readJob(o.farm, seg).state); }))
                     continue;
             }
-            std::string stranded;
-            if (!mayCodeSegment(j, &stranded) && stranded.empty()) continue;
+            // (An encrypted DCP's: its join only on a node holding the signer's chain, its segments only while one answers.)
+            if (!j.signer.empty() && !maySeal(j)) continue;
+            std::string stranded, pinned;
+            if (!mayCodeSegment(j, &stranded, &pinned) && stranded.empty()) continue;
             const QDir d(jobDir(o.farm, j.id));
             QFile c(d.filePath(QStringLiteral("claim")));
             if (!c.open(QIODevice::WriteOnly | QIODevice::NewOnly)) continue;  // (another node's)
             c.write(QByteArray::fromStdString(token));
             c.close();
+            // (A hardware-encoded segment, claimed: given back when the pin was taken over meanwhile.)
+            if (stranded.empty() && !pinned.empty() && !pinHolds(j.group, pinned)) {
+                releaseClaim(d, token);
+                tellOnce("gave back|" + j.group, "Gave back " + j.id + ": the encoder its export is coded with was being changed");
+                continue;
+            }
             // (A segment no node can code to match the others: it fails, and so its join, saying why.)
             if (!stranded.empty()) {
                 writeJson(d.filePath(QStringLiteral("status.json")),
@@ -1253,6 +1372,15 @@ struct Node {
             dcp.certificates = mapFarmPath(dcp.certificates, o.maps);
             dcp.dkdms = mapFarmPath(dcp.dkdms, o.maps);
         }
+        // An encrypted DCP's: a segment seals for the leaf its job names, and the join opens them with this node's own
+        // chain (claim made sure it is that leaf's), never one at a path the sender named.
+        if (package == "dcp" && dcp.encrypt) {
+            dcp::CertificateInfo sealFor;
+            if (job.value("signer").toString().isEmpty() || !dcp::readCertificate(dcp.codestreamCertificate, sealFor) ||
+                sealFor.thumbprint != ss(job.value("signer").toString()))
+                return failJob("The certificate the package's codestreams are sealed for is not its signer's");
+            if (join) dcp.certificates = o.certificates;
+        }
         const std::string codestreams = package == "imf" ? imf.codestreams : dcp.codestreams;
         Project p;
         if (!projectFromJson(ss(QString::fromUtf8(doc.toJson(QJsonDocument::Compact))), p, &err)) return failJob("Cannot read the job's project: " + err);
@@ -1327,6 +1455,8 @@ struct Node {
         err.clear();
         std::vector<size_t> bad;  // a join's segments that did not check out
         SegmentCheck made;        // a segment's
+        std::string dkdm;         // an encrypted DCP join's, removed unless its package is put in place
+        bool placed = false;
         std::thread worker([&] {
             const ExportProgress report = [&progress](double f, FrameTime) { progress = f; };
             const Sequence* sequence = p.findSequence(seq);
@@ -1363,7 +1493,9 @@ struct Node {
                     } else {
                         DcpSettings x = dcp;
                         x.codeFrom = x.codeTo = 0;
-                        ok = exportDcp(p, *sequence, x, into, nullptr, wrapping, &err);
+                        DcpResult result;
+                        ok = exportDcp(p, *sequence, x, into, &result, wrapping, &err);
+                        dkdm = result.dkdm;
                     }
                 }
             } else if (!package.empty()) {
@@ -1474,6 +1606,8 @@ struct Node {
                 } else if (!QDir().rename(f.filePath(), to)) {
                     ok = false;
                     err = "Cannot move the package into place as " + ss(to);
+                } else {
+                    placed = true;
                 }
             }
             for (const QFileInfo& f : QDir(scratch).entryInfoList(QDir::Files)) {
@@ -1501,6 +1635,8 @@ struct Node {
                 }
         }
         QDir(scratch).removeRecursively();
+        // (The keys of a package that was not put in place: no DKDM is left for it.)
+        if (!dkdm.empty() && !placed) QFile::remove(qs(dkdm));
         if (ok && pass == 1 && holds(d) && !writeJson(d.filePath(QStringLiteral("pass.json")), QJsonObject{{"bytes", double(made.bytes)}})) {
             ok = false;
             err = "Cannot write the first pass's measure in the render farm folder";
