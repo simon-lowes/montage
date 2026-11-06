@@ -39,6 +39,10 @@ public:
     // The band picked (the strip below sets it, the keys move it); "" none. Does not emit.
     void setSelected(const std::string& band);
     const std::string& selected() const { return selected_; }
+    // The sample rate the EQ runs at (the sequence's), which its curves are drawn at: a cut near the top of the range
+    // falls off more steeply at 44.1 kHz than at 96 kHz.
+    void setSampleRate(double rate);
+    double sampleRate() const { return rate_; }
     // The gain shown either side of 0 dB: 6, 12, 24 or 30.
     void setRange(double db);
     double range() const { return range_; }
@@ -67,11 +71,13 @@ public:
 
 signals:
     void selectionChanged(const std::string& band);
-    // A dot taken (`started`), dragged and let go (`final`): the band's new frequency and gain.
+    // A dot taken (`started`), dragged and let go (`final`): the band's new frequency and gain. A dot taken and let go
+    // where it was moves nothing.
     void dragStarted(const std::string& band);
     void bandMoved(const std::string& band, double hz, double db, bool final);
-    // The band moved, or its Q changed, from the keyboard or the wheel (each a step).
-    void bandStepped(const std::string& band, double hz, double db, double q);
+    // One of the band's settings stepped from the keyboard or the wheel: `field` "_hz", "_db" or "_q" (only the one that
+    // changed, so a keyframed band gains no keys on the others).
+    void bandStepped(const std::string& band, const std::string& field, double value);
     void addRequested(double hz, double db, int type);
     void removeRequested(const std::string& band);
     void typeRequested(const std::string& band, int type);
@@ -104,6 +110,7 @@ private:
 
     std::vector<Band> bands_;
     double output_ = 0;
+    double rate_ = 48000;
     std::string selected_;
     double range_ = 12;
     AudioAnalysisPtr spectrum_;
@@ -116,7 +123,6 @@ private:
     double anchorHz_ = 0, anchorDb_ = 0, pressHz_ = 0, pressDb_ = 0;
     Qt::KeyboardModifiers anchorMods_;
     bool soloing_ = false;
-    bool moved_ = false;
 };
 
 }  // namespace montage

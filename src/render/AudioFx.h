@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -15,6 +16,21 @@ struct Effect;
 }
 
 namespace montage::fx {
+
+// While one lives, this thread's arithmetic takes subnormal numbers as zero (flush to zero and denormals are zero),
+// where the processor has the switch (x86 with SSE, 64-bit ARM): what audio wants, since a filter ringing down after a
+// sound otherwise works on them for minutes, many times slower. What was set before is put back when it goes. (Each
+// filter here also zeroes its own tiny state, for the processors without the switch: Biquad::flushTiny.)
+class DenormalsOff {
+public:
+    DenormalsOff();
+    ~DenormalsOff();
+    DenormalsOff(const DenormalsOff&) = delete;
+    DenormalsOff& operator=(const DenormalsOff&) = delete;
+
+private:
+    uint64_t was_ = 0;
+};
 
 struct Biquad {
     double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
@@ -35,6 +51,13 @@ struct Biquad {
         z2[ch] = b2 * x - a2 * y;
         return float(y);
     }
+    void clear() { z1[0] = z1[1] = z2[0] = z2[1] = 0; }
+    // Zeroes state below -400 dB. After a sound, a filter's state only tends towards zero, through subnormal numbers
+    // that most processors work on many times slower; called after each block, silence leaves it at zero instead.
+    void flushTiny() {
+        for (double* z : {z1, z1 + 1, z2, z2 + 1})
+            if (std::fabs(*z) < 1e-20) *z = 0;
+    }
 
 private:
     void set(double nb0, double nb1, double nb2, double a0, double na1, double na2);
@@ -50,6 +73,7 @@ struct EqBand {
     EqShape shape = EqShape::Bell;
     int slope = 24;  // a cut's, dB an octave: 12, 24, 36 or 48
     bool on = true;
+    int slot = -1;   // which band it is (core/Effects.h eqBandSlot), whatever others come and go; -1: known by its place
 };
 class ParametricEq {
 public:
@@ -58,30 +82,50 @@ public:
     // Q is the cookbook's 0.707 whatever they are given).
     void set(double sr, const EqBand& low, const EqBand& b1, const EqBand& b2, const EqBand& b3, const EqBand& high, double outputDb);
     // Up to kMaxBands bands (more are left out). `solo`, a band's index: only the part of the sound that band works on
-    // is heard (soloFilter), the other bands and the output gain left out; -1 none. The filters keep their state, so
-    // moving a band as it plays does not click.
+    // is heard (soloFilter), the other bands and the output gain left out; -1 none.
+    // As it plays, each band keeps its own filter's state (by its slot), so moving a band does not click, nor does
+    // adding or removing another. A band switched on (or added) starts from rest and fades in over kFadeSeconds, one
+    // switched off fades out, and Solo pressed or let go crosses over as quickly: the bands keep running while it is
+    // held, so none comes back on a state from before. Set before anything is heard, it is all there at once.
     void set(double sr, const std::vector<EqBand>& bands, double outputDb, int solo = -1);
+    static constexpr double kFadeSeconds = 0.01;
     void process(float* buf, int frames);
     // The whole EQ's gain at `hz`, in dB, as it is heard (output gain included; the solo filter while soloing).
     double responseDb(double hz) const;
     // One band's own gain at `hz`, in dB (on or off).
     double bandResponseDb(int band, double hz) const;
     int bandCount() const { return int(stages_.size()); }
+    // Whether every filter is at rest (its state zero): where silence brings them, as process zeroes state too small to
+    // hear rather than leave it ringing down through subnormal numbers.
+    bool atRest() const;
 
 private:
     struct Stage {
         std::array<Biquad, 4> sections;
         int count = 0;
         bool on = true;
+        int id = -1;     // its band's slot (or place)
+        float mix = 0;   // how much of it is heard, as it fades in (to 1) or out (to 0)
+        void clear() {
+            for (Biquad& b : sections) b.clear();
+        }
+        // Runs the sections on one frame (both channels).
+        void run(float v[2]) {
+            for (int ch = 0; ch < 2; ++ch)
+                for (int k = 0; k < count; ++k) v[ch] = sections[size_t(k)].process(ch, v[ch]);
+        }
     };
     static void design(Stage& st, double sr, const EqBand& b);
     // The part of the sound a band works on: a band-pass at a bell's, notch's or band-pass's frequency and Q; below a
-    // low shelf's frequency or a high cut's (low-pass), above a high shelf's or a low cut's (high-pass); a tilt as it is.
+    // low shelf's or a low cut's frequency (low-pass), above a high shelf's or a high cut's (high-pass): for a cut, what
+    // it takes away; a tilt as it is.
     static void soloFilter(Stage& st, double sr, const EqBand& b);
     static double stageDb(const Stage& st, double sr, double hz);
     std::vector<Stage> stages_;
     Stage solo_;
     bool soloing_ = false;
+    float soloMix_ = 0;   // how much of the solo is heard, as it crosses over
+    bool primed_ = false; // something has been heard since the rate was set
     double sr_ = 48000;
     float output_ = 1;
 };

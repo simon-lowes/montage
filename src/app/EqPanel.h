@@ -84,6 +84,7 @@ private:
     QToolButton* tipsToggle_ = nullptr;
     std::string soloing_;  // the band held soloed ("" none)
     bool dragging_ = false;
+    double pressHz_ = 0, pressDb_ = 0;  // the dot dragged, where it was taken
 };
 
 }  // namespace montage

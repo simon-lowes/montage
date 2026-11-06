@@ -102,12 +102,14 @@ void KeyframePanel::rebuild() {
         for (const auto& [addr, effect] : owners(*c)) {
             if (!effect || effect->empty()) continue;
             const EffectInfo* info = findEffectInfo(effect->type);
+            // (the effect's own list: a Parametric EQ's bands and a Mesh Warp's pins are not in the catalogue's)
+            const bool builtIn = effect->type != "plugin" && effect->type != "ofx";
+            const std::vector<ParamInfo> infos = !info ? std::vector<ParamInfo>{} : builtIn ? effectParams(*effect) : info->params;
             for (const auto& [name, param] : effect->params) {
                 if (!param.varies() || (isMaskPathParam(name) && name != kMaskPathParam)) continue;
                 QString label = QString::fromStdString(name);
-                if (info)
-                    for (const ParamInfo& pi : info->params)
-                        if (pi.name == name) label = language::engine(pi.label);
+                for (const ParamInfo& pi : infos)
+                    if (pi.name == name) label = language::engine(pi.label);
                 if (name == kMaskPathParam) label = tr("Mask Path");
                 if (!param.expr.empty()) label += QStringLiteral(" =");  // (driven by an expression: its curve in the graph)
                 ParamAddress a = addr;

@@ -19217,6 +19217,171 @@ colorspaces:
         QVERIFY(!decode(bytes, c, &err));
         QVERIFY(fromHex("0xFZ").empty());
     }
+    void parametricEqAsItPlays() {
+        // The EQ as playback runs it, block by block, while its bands change (its responses: parametricEqBands).
+        const double sr = 48000;
+        const int block = 256;
+        auto tone = [&](int from, int frames, double hz) {
+            std::vector<float> buf(size_t(frames) * 2);
+            for (int i = 0; i < frames; ++i)
+                buf[size_t(i) * 2] = buf[size_t(i) * 2 + 1] = float(0.4 * std::sin(2 * M_PI * hz * double(from + i) / sr));
+            return buf;
+        };
+        auto bands = [](std::initializer_list<int> which) {
+            // b1 a bell lifting 300 Hz, b2 a bell of no gain (it changes nothing), b3 a bell cutting 2 kHz.
+            std::vector<fx::EqBand> out;
+            for (int k : which) {
+                fx::EqBand b{k == 1 ? 300.0 : k == 2 ? 900.0 : 2000.0, k == 1 ? 6.0 : k == 2 ? 0.0 : -8.0, 1.5};
+                b.slot = eqBandSlot("b" + std::to_string(k));
+                out.push_back(b);
+            }
+            return out;
+        };
+        auto worst = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double w = 0;
+            for (size_t i = 0; i < a.size(); ++i) w = std::max(w, double(std::fabs(a[i] - b[i])));
+            return w;
+        };
+        // Removing b2 as it plays leaves b1 and b3 each on its own filter: what follows is what b1 and b3 alone make,
+        // sample for sample (b2 changed nothing). Adding it back changes nothing either.
+        fx::ParametricEq three, two;
+        three.set(sr, bands({1, 2, 3}), 0);
+        two.set(sr, bands({1, 3}), 0);
+        int at = 0;
+        for (const std::vector<fx::EqBand>& now : {bands({1, 2, 3}), bands({1, 3}), bands({1, 2, 3})}) {
+            three.set(sr, now, 0);
+            for (int k = 0; k < 20; ++k, at += block) {
+                std::vector<float> a = tone(at, block, 700), b = a;
+                three.process(a.data(), block);
+                two.process(b.data(), block);
+                QVERIFY2(worst(a, b) < 1e-5, qPrintable(QString("%1 bands, at %2: %3").arg(now.size()).arg(at).arg(worst(a, b))));
+            }
+        }
+
+        // The largest step from one sample to the next (from the last of `before`, when given): after a change, no
+        // click, only the tone's own steps.
+        auto steps = [](const std::vector<float>& buf, const std::vector<float>& before = {}) {
+            std::vector<float> all(before.end() - std::min<ptrdiff_t>(2, ptrdiff_t(before.size())), before.end());
+            all.insert(all.end(), buf.begin(), buf.end());
+            double w = 0;
+            for (size_t i = 2; i < all.size(); ++i) w = std::max(w, double(std::fabs(all[i] - all[i - 2])));
+            return w;
+        };
+        auto run = [&](fx::ParametricEq& eq, int from, int blocks) {
+            std::vector<float> out;
+            for (int k = 0; k < blocks; ++k) {
+                std::vector<float> buf = tone(from + k * block, block, 200);
+                eq.process(buf.data(), block);
+                out.insert(out.end(), buf.begin(), buf.end());
+            }
+            return out;
+        };
+        // A loud, narrow bell at the tone, switched off a while and back on, starts afresh and fades in, rather than
+        // going on from where it was left.
+        std::vector<fx::EqBand> loud{{200, 18, 8}};
+        fx::ParametricEq eq;
+        eq.set(sr, loud, 0);
+        at = 0;
+        const double steady = steps(run(eq, at, 40));
+        at += 40 * block;
+        loud[0].on = false;
+        eq.set(sr, loud, 0);
+        const std::vector<float> off = run(eq, at, 37);
+        at += 37 * block;
+        loud[0].on = true;
+        eq.set(sr, loud, 0);
+        const std::vector<float> back = run(eq, at, 4);
+        at += 4 * block;
+        QVERIFY2(steps(back, off) <= steady * 1.05, qPrintable(QString("%1 against %2").arg(steps(back, off)).arg(steady)));
+        // Solo pressed and let go crosses over, from and back to bands that kept running: no step larger than the
+        // sound makes on either side.
+        loud.push_back({3000, 0, 2, fx::EqShape::BandPass});
+        auto settled = [&](int solo) {
+            fx::ParametricEq x;
+            x.set(sr, loud, 0, solo);
+            run(x, 0, 40);
+            return steps(run(x, 40 * block, 10));
+        };
+        eq.set(sr, loud, 0);
+        std::vector<float> before = run(eq, at, 40);
+        at += 40 * block;
+        int was = -1;
+        for (int solo : {1, -1, 0, -1}) {
+            eq.set(sr, loud, 0, solo);
+            const std::vector<float> crossed = run(eq, at, 8);
+            at += 8 * block;
+            const double bound = 1.1 * std::max(settled(was), settled(solo)) + 2e-3;
+            QVERIFY2(steps(crossed, before) <= bound,
+                     qPrintable(QString("solo %1 after %2: %3 against %4").arg(solo).arg(was).arg(steps(crossed, before)).arg(bound)));
+            was = solo;
+            before = crossed;
+        }
+        // (set before anything is heard, it is all there at once: no fade)
+        fx::ParametricEq fresh;
+        fresh.set(sr, loud, 0, 1);
+        std::vector<float> f = tone(0, block, 3000), w = f;
+        fresh.process(f.data(), block);
+        fx::Biquad bp;
+        bp.bandPass(sr, 3000, 2);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = bp.process(int(i % 2), w[i]);
+        QVERIFY(worst(f, w) < 1e-6);
+
+        // Silence after a sound: the filters come to rest, their state zero (rather than ringing down for minutes
+        // through subnormal numbers, which most processors work on many times slower).
+        std::vector<fx::EqBand> many;
+        for (int k = 0; k < 16; ++k)
+            many.push_back({40 * std::pow(1.5, k), k % 2 ? 6.0 : -6.0, 2, k == 0 ? fx::EqShape::LowCut : k == 15 ? fx::EqShape::HighCut : fx::EqShape::Bell, 48});
+        fx::ParametricEq quiet;
+        quiet.set(sr, many, 0);
+        std::vector<float> burst = tone(0, block, 440);
+        quiet.process(burst.data(), block);
+        QVERIFY(!quiet.atRest());
+        std::vector<float> silence(size_t(block) * 2);
+        int blocks = 0;
+        for (; blocks < int(5 * sr) / block && !quiet.atRest(); ++blocks) {
+            std::fill(silence.begin(), silence.end(), 0.0f);
+            quiet.process(silence.data(), block);
+        }
+        QVERIFY2(quiet.atRest(), "still ringing after 5 s");
+        qInfo("at rest after %.2f s", blocks * block / sr);
+        // Playback runs its effects with subnormal numbers taken as zero where the processor can, and puts the mode
+        // back after.
+        volatile float tiny = 1e-39f, half = 0.5f;
+        {
+            const fx::DenormalsOff off;
+#if defined(__SSE__) || defined(_M_X64) || defined(__aarch64__)
+            QVERIFY(tiny * half == 0.0f);
+#endif
+        }
+        QVERIFY(tiny * half != 0.0f);
+
+        // A shelf or tilt has a Q of up to 2 only, where a +6 dB shelf bumps to under +9 dB: a Q of 30 set on one
+        // plays as 2, and is listed so.
+        Effect steep = makeEffect("parametric_eq", 4);
+        const std::string shelf = addEqBand(steep, kEqHighShelf, 2000, 6, 30);
+        QCOMPARE(steep.p(shelf + "_q", 0), 2.0);
+        steep.params[shelf + "_q"] = Param(30.0);
+        QCOMPARE(fx::eqBandsOf(steep, 0)[0].q, 2.0);
+        fx::ParametricEq shelved;
+        shelved.set(sr, fx::eqBandsOf(steep, 0), 0);
+        double peak = -100;
+        for (double hz = 20; hz < 20000; hz *= 1.02) peak = std::max(peak, shelved.responseDb(hz));
+        QVERIFY2(peak < 9, qPrintable(QString::number(peak)));
+        for (const ParamInfo& pi : effectParams(steep))
+            if (pi.name == shelf + "_q") QCOMPARE(pi.max, 2.0);
+        // (a bell with a Q of 8 made a shelf takes the most a shelf has)
+        const std::string bell = addEqBand(steep, kEqBell, 500, 3, 8);
+        setEqBandType(steep, bell, kEqLowShelf);
+        QCOMPARE(steep.p(bell + "_q", 0), 2.0);
+        // A cut soloed is heard as what it takes away: below a low cut, above a high cut.
+        const std::vector<fx::EqBand> cuts{{100, 0, M_SQRT1_2, fx::EqShape::LowCut, 24, true}, {8000, 0, M_SQRT1_2, fx::EqShape::HighCut, 24, true}};
+        fx::ParametricEq soloed;
+        soloed.set(sr, cuts, 0, 0);
+        QVERIFY2(std::fabs(soloed.responseDb(20)) < 0.5 && soloed.responseDb(2000) < -25, qPrintable(QString::number(soloed.responseDb(2000))));
+        soloed.set(sr, cuts, 0, 1);
+        QVERIFY2(std::fabs(soloed.responseDb(20000)) < 0.5 && soloed.responseDb(500) < -25, qPrintable(QString::number(soloed.responseDb(500))));
+    }
+
     void streamingPackage() {
         // A twelve-second sequence (a cut at 4 s), captions in two languages, two chapters and a two-second ad break
         // at 5 s, packaged as a ladder of three renditions in two-second segments, with the mix and a French stream.
@@ -20703,13 +20868,15 @@ colorspaces:
         setEqBandType(t, b, kEqBell);
         QCOMPARE(t.p(b + "_q", 0), 2.0);
 
-        // An EQ saved before bands could be added (low shelf, three bells, high shelf, output) sounds as it did, in
-        // its response and sample for sample: the old filters, worked out here as they were.
-        Effect old = makeEffect("parametric_eq", 3);
-        const std::pair<const char*, double> values[] = {{"low_hz", 120},  {"low_db", -4},  {"b1_hz", 300},  {"b1_db", 2.5}, {"b1_q", 0.9},
-                                                         {"b2_hz", 1200}, {"b2_db", -3},  {"b2_q", 2},     {"b3_hz", 4000}, {"b3_db", 5},
-                                                         {"b3_q", 0.7},   {"high_hz", 9000}, {"high_db", 3}, {"output_db", -1.5}};
-        for (const auto& [name, v] : values) old.params[name] = Param(v);
+        // An EQ saved before bands could be added (low shelf, three bells, high shelf, output), read from a project
+        // saved then, sounds as it did, in its response and sample for sample: the old filters, worked out here as
+        // they were.
+        Project then;
+        QVERIFY(loadProject(std::string(MONTAGE_TEST_DATA_DIR) + "/projects/five-band-eq.montage", then));
+        QVERIFY(then.active() && !then.active()->audioTracks.empty() && then.active()->audioTracks[0].effects.size() == 1);
+        Effect old = then.active()->audioTracks[0].effects[0];
+        QCOMPARE(old.type, std::string("parametric_eq"));
+        QCOMPARE(old.params.size(), size_t(14));
         QCOMPARE(eqBands(old), (std::vector<std::string>{"low", "b1", "b2", "b3", "high"}));
         QCOMPARE(eqBandType(old, "low"), int(kEqLowShelf));
         QCOMPARE(eqBandType(old, "high"), int(kEqHighShelf));
@@ -20761,9 +20928,7 @@ colorspaces:
         double worst = 0;
         for (size_t i = 0; i < buf.size(); ++i) worst = std::max(worst, double(std::fabs(buf[i] - ref[i])));
         QVERIFY2(worst < 1e-5, say(worst));
-        // Keys on a band's gain change it over time, as before.
-        old.params["b2_db"].addKey(0, -3);
-        old.params["b2_db"].addKey(50, 6);
+        // Its keys on a band's gain change it over time, as before.
         QVERIFY(near(fx::eqBandsOf(old, 50)[2].db, 6, 1e-9) && near(fx::eqBandsOf(old, 0)[2].db, -3, 1e-9));
 
         // Soloed (only on the copy playback hears, while Solo is held): a bell, notch or band-pass is heard as a

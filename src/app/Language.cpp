@@ -130,7 +130,16 @@ bool rightToLeft(const QString& code) {
 
 QString engine(const std::string& text) {
     if (text.empty()) return {};
-    return QCoreApplication::translate("Engine", text.c_str());
+    const QString t = QCoreApplication::translate("Engine", text.c_str());
+    if (t != QString::fromUtf8(text)) return t;
+    // (one number only: "Band 12 Q" is "Band %1 Q" with 12)
+    const size_t at = text.find_first_of("0123456789");
+    if (at == std::string::npos) return t;
+    const size_t end = text.find_first_not_of("0123456789", at);
+    if (end != std::string::npos && text.find_first_of("0123456789", end) != std::string::npos) return t;
+    const std::string pattern = text.substr(0, at) + "%1" + (end == std::string::npos ? std::string() : text.substr(end));
+    const QString p = QCoreApplication::translate("Engine", pattern.c_str());
+    return p == QString::fromStdString(pattern) ? t : p.arg(QString::fromStdString(text.substr(at, end - at)));
 }
 
 void keepUntranslated(QObject* o) {

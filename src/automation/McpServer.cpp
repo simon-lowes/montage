@@ -294,7 +294,7 @@ QString need(const QJsonObject& a, const char* key) {
 // A Parametric EQ's `bands` argument: each {type, hz, db, q, slope, on} added to `e` as a band of its own.
 const char* const kEqTypeNames[] = {"bell", "low_shelf", "high_shelf", "low_cut", "high_cut", "notch", "band_pass", "tilt"};
 #define MONTAGE_EQ_BANDS_SCHEMA \
-    R"json({"type":"array","maxItems":16,"description":"parametric_eq: bands to add, each its own (up to 16 in all)","items":{"type":"object","properties":{"type":{"type":"string","enum":["bell","low_shelf","high_shelf","low_cut","high_cut","notch","band_pass","tilt"],"default":"bell"},"hz":{"type":"number","minimum":20,"maximum":20000},"db":{"type":"number","minimum":-30,"maximum":30,"description":"bell, shelves and tilt only"},"q":{"type":"number","minimum":0.1,"maximum":30},"slope":{"type":"integer","enum":[12,24,36,48],"description":"dB per octave, cuts only"},"on":{"type":"boolean","default":true}},"required":["hz"]}})json"
+    R"json({"type":"array","maxItems":16,"description":"parametric_eq: bands to add, each its own (up to 16 in all)","items":{"type":"object","properties":{"type":{"type":"string","enum":["bell","low_shelf","high_shelf","low_cut","high_cut","notch","band_pass","tilt"],"default":"bell"},"hz":{"type":"number","minimum":20,"maximum":20000},"db":{"type":"number","minimum":-30,"maximum":30,"description":"bell, shelves and tilt only"},"q":{"type":"number","minimum":0.1,"maximum":30,"description":"up to 2 for shelves and tilt"},"slope":{"type":"integer","enum":[12,24,36,48],"description":"dB per octave, cuts only"},"on":{"type":"boolean","default":true}},"required":["hz"]}})json"
 void addEqBandsArg(Effect& e, const QJsonValue& v) {
     if (!v.isArray()) throw ArgError{"bands is a list of {type, hz, db, q, slope, on}"};
     for (const QJsonValue& item : v.toArray()) {
@@ -303,6 +303,12 @@ void addEqBandsArg(Effect& e, const QJsonValue& v) {
         for (auto it = b.begin(); it != b.end(); ++it)
             if (!QStringList{"type", "hz", "db", "q", "slope", "on"}.contains(it.key()))
                 throw ArgError{QStringLiteral("A band has no \"%1\" (type, hz, db, q, slope, on)").arg(it.key())};
+        // (each as given or refused: a type that is not a name, or a slope of 24.5, is not taken for another)
+        for (const char* key : {"hz", "db", "q", "slope"})
+            if (b.contains(key) && !b.value(key).isDouble()) throw ArgError{QStringLiteral("A band's %1 is a number").arg(QLatin1String(key))};
+        if (b.contains("type") && !b.value("type").isString())
+            throw ArgError{"A band's type is a name: bell, low_shelf, high_shelf, low_cut, high_cut, notch, band_pass or tilt"};
+        if (b.contains("on") && !b.value("on").isBool()) throw ArgError{"A band's on is true or false"};
         const QString typeName = b.value("type").toString(QStringLiteral("bell"));
         const auto type = std::find(std::begin(kEqTypeNames), std::end(kEqTypeNames), typeName.toStdString());
         if (type == std::end(kEqTypeNames))
@@ -312,13 +318,45 @@ void addEqBandsArg(Effect& e, const QJsonValue& v) {
         if (!(hz >= 20 && hz <= 20000)) throw ArgError{"A band's hz is from 20 to 20000"};
         if (!(db >= -30 && db <= 30)) throw ArgError{"A band's db is from -30 to 30"};
         if (b.contains("db") && db != 0 && !eqTypeHasGain(t)) throw ArgError{QStringLiteral("A %1 band has no gain (db)").arg(typeName)};
-        if (b.contains("q") && !(q >= 0.1 && q <= 30)) throw ArgError{"A band's q is from 0.1 to 30"};
-        const int slope = b.value("slope").toInt(24);
+        if (b.contains("q") && !(q >= 0.1 && q <= eqMaxQ(t)))
+            throw ArgError{QStringLiteral("A %1 band's q is from 0.1 to %2").arg(typeName).arg(eqMaxQ(t))};
+        const double slope = b.value("slope").toDouble(24);
         if (slope != 12 && slope != 24 && slope != 36 && slope != 48) throw ArgError{"A cut's slope is 12, 24, 36 or 48 (dB an octave)"};
         const std::string band = addEqBand(e, t, hz, db, q);
         if (band.empty()) throw ArgError{QStringLiteral("An EQ has at most %1 bands").arg(kEqMaxBands)};
-        e.params[band + "_slope"] = Param(double(slope / 12 - 1));
+        e.params[band + "_slope"] = Param(double(int(slope) / 12 - 1));
         if (b.contains("on")) e.params[band + "_on"] = Param(b.value("on").toBool(true) ? 1.0 : 0.0);
+    }
+}
+
+// A Parametric EQ's bands once its params and `bands` are in: at most kEqMaxBands in all (an old EQ's low and high
+// among them, so playback and the display agree), and each band's setting given by name within its range. A value out
+// of range is refused, not changed into another (b4_type 9 is not a tilt).
+void checkEqBands(const Effect& e) {
+    if (int(eqBands(e).size()) > kEqMaxBands)
+        throw ArgError{QStringLiteral("An EQ has at most %1 bands (low and high count among them)").arg(kEqMaxBands)};
+    for (const auto& [name, param] : e.params) {
+        std::string band, field;
+        if (!isEqBandParam(name, &band, &field)) continue;
+        const double v = param.value;
+        const QString n = QString::fromStdString(name);
+        const int type = eqBandType(e, band);
+        const bool whole = v == std::floor(v);
+        if (field == "type" && !(whole && v >= 0 && v < double(eqBandTypes().size())))
+            throw ArgError{QStringLiteral("%1 is 0 (bell), 1 (low shelf), 2 (high shelf), 3 (low cut), 4 (high cut), 5 (notch), "
+                                          "6 (band-pass) or 7 (tilt)").arg(n)};
+        if (field == "slope" && !(whole && v >= 0 && v < double(eqSlopes().size())))
+            throw ArgError{QStringLiteral("%1 is 0, 1, 2 or 3 (12, 24, 36 or 48 dB an octave)").arg(n)};
+        if (field == "on" && v != 0 && v != 1) throw ArgError{QStringLiteral("%1 is 0 or 1").arg(n)};
+        if (field == "hz" && !(v >= 20 && v <= 20000)) throw ArgError{QStringLiteral("%1 is from 20 to 20000").arg(n)};
+        if (field == "db" && !(v >= -30 && v <= 30)) throw ArgError{QStringLiteral("%1 is from -30 to 30").arg(n)};
+        if (field == "db" && v != 0 && !eqTypeHasGain(type))
+            throw ArgError{QStringLiteral("%1: a %2 band has no gain").arg(n, QString::fromStdString(eqBandTypes()[size_t(type)]).toLower())};
+        if (field == "q" && !(v >= 0.1 && v <= eqMaxQ(type)))
+            throw ArgError{QStringLiteral("%1 is from 0.1 to %2 for a %3 band")
+                               .arg(n)
+                               .arg(eqMaxQ(type))
+                               .arg(QString::fromStdString(eqBandTypes()[size_t(type)]).toLower())};
     }
 }
 
@@ -3864,6 +3902,7 @@ void McpServer::Impl::addTools() {
                 if (type != "parametric_eq") throw ArgError{"bands are a parametric_eq's"};
                 addEqBandsArg(e, a.value("bands"));
             }
+            if (type == "parametric_eq") checkEqBands(e);
             if (a.contains("pins")) {
                 // A Mesh Warp's pins: each placed at x, y on the picture (fractions of the frame), a Position pin moved
                 // to to_x, to_y or keyed along `path`.
@@ -4233,6 +4272,7 @@ void McpServer::Impl::addTools() {
                 if (type != "parametric_eq") throw ArgError{"bands are a parametric_eq's"};
                 addEqBandsArg(e, a.value("bands"));
             }
+            if (type == "parametric_eq") checkEqBands(e);
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {
                 const std::string name = it.key().toStdString();

@@ -3749,6 +3749,7 @@ void AudioMixer::resetLocked() {
 }
 
 void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames) {
+    const fx::DenormalsOff denormals;  // (filters ringing down in silence would otherwise run on subnormal numbers)
     // Where the signal reaching the next effect comes from: the chain's input, less the latency of the plugins passed.
     int64_t keyAt = key_.at;
     // What a compressor or gate listens to: its sidechain track (not its own) or the signal, high-passed when asked.
