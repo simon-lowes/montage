@@ -32,8 +32,17 @@ failed=0
 run() {
     local suite=$1
     shift
-    (cd "$work/nmos-testing" && timeout 900 "$work/venv/bin/python" nmos-test.py suite "$suite" "$@" --output "$work/$suite.xml" \
-        > "$work/$suite.log" 2>&1) || true
+    local attempt
+    for attempt in 1 2; do
+        rm -f "$work/$suite.xml"
+        (cd "$work/nmos-testing" && timeout 900 "$work/venv/bin/python" nmos-test.py suite "$suite" "$@" --output "$work/$suite.xml" \
+            > "$work/$suite.log" 2>&1) || true
+        # (the tool fetches AMWA's specification repositories from GitHub as it starts: a runner that briefly cannot reach
+        # GitHub stops it before any test, so that alone is tried once more)
+        [ -s "$work/$suite.xml" ] && break
+        grep -q "Could not resolve host\|unable to access 'https://github.com" "$work/$suite.log" || break
+        [ "$attempt" = 1 ] && { echo "$suite: GitHub could not be reached for the specifications; trying again"; sleep 15; }
+    done
     if [ ! -s "$work/$suite.xml" ]; then
         # (the tool stopped before writing its report: its own output says why)
         echo "$suite: no report; the test tool's output ends:"
