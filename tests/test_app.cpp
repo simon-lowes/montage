@@ -97,6 +97,7 @@
 #include "CurveEditor.h"
 #include "EqDisplay.h"
 #include "EqPanel.h"
+#include "DeckControl.h"
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
@@ -14677,6 +14678,42 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY2(std::fabs(px.redF() - grey[0]) < 0.02, qPrintable(QString("%1 vs %2").arg(px.redF()).arg(grey[0])));
         read->setCurrentIndex(0);
         QTRY_COMPARE_WITH_TIMEOUT(lastSpace(), QString("rec709"), 20000);
+        state()->newProject();
+    }
+
+    void editToTapeFollowsTheLatestRoll() {
+        // Edit to tape starts the Program to reach the edit's first frame as the deck reaches In. A deck that rolls,
+        // then searches back and rolls again has the Program follow its latest run up alone: the start still waiting
+        // from the first roll is not made.
+        state()->newProject();
+        state()->apply("Clip", [](Project& p, Sequence& s) {
+            s.videoTracks[0].clips.push_back(makeGeneratorClip(p, "color", 400));
+            return edit::Result{};
+        });
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        program->pause();
+        DeckController deck(state(), program);
+        // (the edit 5 frames into the Program, the deck 50 frames (two seconds at 25) before In: the Program waits on
+        // its first frame for 45 of them, 1.8 s)
+        QElapsedTimer clock;
+        clock.start();
+        deck.rollProgram(5, 50, captureClock());
+        QVERIFY(deck.rollPending() && !program->isPlaying());
+        QCOMPARE(state()->playhead(), FrameTime(0));
+        QTest::qWait(800);
+        deck.rollProgram(5, 50, captureClock());  // (rolled again: 1.8 s from now)
+        while (clock.elapsed() < 2400) {
+            QVERIFY2(!program->isPlaying(), qPrintable(QStringLiteral("playing at %1 ms").arg(clock.elapsed())));
+            QTest::qWait(20);
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(program->isPlaying(), 3000);
+        program->pause();
+        // A roll from where the Program can start now plays it at once from there, nothing left waiting.
+        deck.rollProgram(60, 10, captureClock());
+        QVERIFY(program->isPlaying() && !deck.rollPending());
+        QVERIFY2(state()->playhead() >= 50 && state()->playhead() < 60, qPrintable(QString::number(state()->playhead())));
+        program->pause();
         state()->newProject();
     }
 

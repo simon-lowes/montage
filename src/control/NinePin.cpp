@@ -242,8 +242,10 @@ bool answers(const Message& q, const Message& a) {
     if (q.cmd != cmd::CurrentTimeSense) return a.cmd == q.cmd;  // (STATUS SENSE to STATUS DATA, IN DATA SENSE to IN DATA...)
     const uint8_t ask = q.data.empty() ? cmd::SenseLtc : q.data[0];
     switch (a.cmd) {
-    case cmd::LtcTimeData: return (ask & cmd::SenseLtc) != 0;
-    case cmd::VitcTimeData: return (ask & cmd::SenseVitc) != 0;
+    case cmd::LtcTimeData:
+    case cmd::CorrectedLtcTimeData: return (ask & cmd::SenseLtc) != 0;
+    case cmd::VitcTimeData:
+    case cmd::HoldVitcTimeData: return (ask & cmd::SenseVitc) != 0;
     case cmd::Timer1Data: return (ask & cmd::SenseTimer1) != 0;
     case cmd::Timer2Data: return (ask & cmd::SenseTimer2) != 0;
     case cmd::LtcUserBitsData: return (ask & cmd::SenseLtcUserBits) != 0;

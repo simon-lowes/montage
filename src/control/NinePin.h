@@ -77,9 +77,12 @@ constexpr uint8_t CurrentTimeSense = 0x0C, InDataSense = 0x10, OutDataSense = 0x
 // CURRENT TIME SENSE's request byte, and the answers' CMD-2 (group 7).
 constexpr uint8_t SenseLtc = 0x01, SenseVitc = 0x02, SenseTimer1 = 0x04, SenseTimer2 = 0x08, SenseLtcUserBits = 0x10,
                   SenseVitcUserBits = 0x20;
+// (a deck that cannot read LTC or VITC just then, stopped or still, answers with the LTC its timer carries on from,
+// 74.14, or the VITC it last read, 74.16)
 constexpr uint8_t Timer1Data = 0x00, Timer2Data = 0x01, LtcTimeData = 0x04, LtcUserBitsData = 0x05, VitcTimeData = 0x06,
-                  VitcUserBitsData = 0x07, InData = 0x10, OutData = 0x11, StatusData = 0x20, SpeedData = 0x2E,
-                  EditPresetData = 0x30, PrerollTimeData = 0x31;
+                  VitcUserBitsData = 0x07, InData = 0x10, OutData = 0x11, CorrectedLtcTimeData = 0x14,
+                  HoldVitcTimeData = 0x16, StatusData = 0x20, SpeedData = 0x2E, EditPresetData = 0x30,
+                  PrerollTimeData = 0x31;
 // NAK's reasons.
 constexpr uint8_t NakUnknownCommand = 0x01, NakChecksum = 0x04, NakParity = 0x10, NakOverrun = 0x20, NakFraming = 0x40,
                   NakTimeout = 0x80;

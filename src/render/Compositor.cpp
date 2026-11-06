@@ -1943,22 +1943,38 @@ void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip&
     const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
     const Image before = mask.empty() ? Image() : layer;
     DisplaceSettings ds = displaceSettings(*e, lt, o.scale);
-    // The edges are the clip's picture's, where it lies square on the canvas (scaled, moved, letterboxed, cropped or
-    // turned by quarter turns): the pixels whose centres it covers. Turned at any other angle, the canvas's.
+    // The edges are the clip's picture's (scaled, moved, letterboxed, cropped, turned): where it lies square on the
+    // canvas (at quarter turns), the pixels whose centres it covers; turned at any other angle, the parallelogram its
+    // corners make.
     if (Geometry g; clipGeometry(p, seq, c, t, g) && g.sx != 0 && g.sy != 0) {
         const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+        if (u1 <= u0 || v1 <= v0) return;  // (cropped away)
+        // (a point of the picture, on the canvas in the layer's pixels)
+        auto canvas = [&](double u, double v, double& X, double& Y) {
+            const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
+            X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
+        };
         if (std::min(std::fabs(cr), std::fabs(sn)) < 1e-9) {
             double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
-            for (double u : {g.mw * g.cl, g.mw * (1 - g.cr)})
-                for (double v : {g.mh * g.ct, g.mh * (1 - g.cb)}) {
-                    const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
-                    const double X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
+            for (double u : {u0, u1})
+                for (double v : {v0, v1}) {
+                    double X, Y;
+                    canvas(u, v, X, Y);
                     x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
                 }
             auto edge = [](double at, int n) { return int(std::clamp(std::ceil(at - 0.5 - 1e-6), 0.0, double(n))); };
             ds.left = edge(x0, layer.width), ds.right = edge(x1, layer.width);
             ds.top = edge(y0, layer.height), ds.bottom = edge(y1, layer.height);
             if (ds.right <= ds.left || ds.bottom <= ds.top) return;  // (none of its picture on the canvas)
+        } else {
+            double X, Y;
+            ds.turned = true;
+            canvas(u0, v0, ds.origin[0], ds.origin[1]);
+            canvas(u1, v0, X, Y);
+            ds.across[0] = X - ds.origin[0], ds.across[1] = Y - ds.origin[1];
+            canvas(u0, v1, X, Y);
+            ds.down[0] = X - ds.origin[0], ds.down[1] = Y - ds.origin[1];
         }
     }
     displaceByMap(layer, map, ds);

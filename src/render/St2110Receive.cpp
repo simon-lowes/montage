@@ -241,28 +241,54 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
         ++rejected;
         return;
     }
-    if (haveSsrc_ && p.ssrc != ssrc_) {
-        if (++strangerRun_ <= int64_t(window_)) {
-            ++rejected;
-            return;
-        }
-        // (nothing but the new sender's for a window: taken from here)
-        flush(out);
-        started_ = haveSsrc_ = false;
-        lateRun_ = 0;
-    }
-    if (!haveSsrc_) haveSsrc_ = true, ssrc_ = p.ssrc;
-    strangerRun_ = 0;
-    ++received[path & 1];
     // (RFC 4175's extended sequence number: the payload's first two bytes, after any header extension, above the
-    // header's)
+    // header's; placed by the count so far)
     const uint32_t low = p.sequence;
     const uint32_t seq = extended_ && p.size >= 2 ? get16(p.payload) << 16 | low : low;
+    auto place = [&] { return extended_ ? next_ + int32_t(seq - uint32_t(next_)) : next_ + int16_t(uint16_t(seq - uint16_t(next_))); };
+    Sender& who = sender_[path & 1];
+    const Sender& other = sender_[(path & 1) ^ 1];
+    if (!who.have && started_ && other.have && p.ssrc != other.ssrc && std::llabs(place() - next_) > int64_t(window_)) {
+        // (a path's first sender: the other path's, or one of its own (ST 2022-7's legs may have SSRCs of their own)
+        // numbered as the stream is, not a stray far off)
+        ++rejected;
+        return;
+    }
+    if (who.have && p.ssrc != who.ssrc) {
+        // (the one taken's packets counted from the first stranger's; all counted again once it has sent a window)
+        if (who.others.empty()) who.own = 0;
+        const int64_t theirs = ++who.others[p.ssrc];
+        if (theirs <= int64_t(window_) || who.own * 4 >= theirs) {
+            ++rejected;
+            if (who.others.size() > 8) {
+                // (a few strangers counted at a time: the one heard least let go)
+                auto least = who.others.begin();
+                for (auto it = who.others.begin(); it != who.others.end(); ++it)
+                    if (it->second < least->second) least = it;
+                who.others.erase(least);
+            }
+            return;
+        }
+        // A window of another sender's, with few of the one taken between: that one now. The count starts again from
+        // its numbers, unless the other path's new sender has just started it (both legs' senders started again).
+        who.have = false;
+        if (restartedBy_ != ((path & 1) ^ 1) || sinceRestart_ > 4 * int64_t(window_)) {
+            flush(out);
+            started_ = false;
+            lateRun_ = 0;
+            restartedBy_ = path & 1;
+            sinceRestart_ = 0;
+        }
+    }
+    if (!who.have) who = Sender{true, p.ssrc, 0, {}};
+    if (++who.own >= int64_t(window_)) who.own = 0, who.others.clear();
+    ++sinceRestart_;
+    ++received[path & 1];
     if (!started_) {
         started_ = true;
         next_ = seq;
     }
-    const int64_t n = extended_ ? next_ + int32_t(seq - uint32_t(next_)) : next_ + int16_t(uint16_t(seq - uint16_t(next_)));
+    const int64_t n = place();
     if (n < next_) {
         // (the other path's copy of what was given out, or one too late to place)
         if (n >= next_ - int64_t(window_)) {
@@ -369,7 +395,8 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
         }
         for (int p = 0; p < (s.redundant() ? 2 : 1); ++p) {
             std::string why;
-            if (!st->socket[p].open(s.path[p], o.interfaceAddress[p], &why, s.source[p])) return fail(why);
+            const std::string& at = s.interfaceAddress[p].empty() ? o.interfaceAddress[p] : s.interfaceAddress[p];
+            if (!st->socket[p].open(s.path[p], at, &why, s.source[p])) return fail(why);
         }
         streams_.push_back(std::move(st));
     }

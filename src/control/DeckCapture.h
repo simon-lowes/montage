@@ -53,6 +53,7 @@ struct BatchClip {
     LogEntry entry;
     std::string path, timecode;  // the file, and its first frame's timecode (the clip's In less its handle)
     int64_t frames = 0;
+    int64_t repeated = 0;  // pictures the feed lost on its way, the one before held for each
     bool ok = false;
     std::string error;
 };
@@ -79,8 +80,10 @@ struct TapeEdit {
 // to Out. `roll` is told as soon as the deck is seen running up towards In (moving forward at play speed within its
 // pre-roll, its servo locked when it says so), how many frames before In it was and when (captureClock()), so the
 // Program can be started to reach the edit's first frame as the deck reaches In; told again should the deck then jump
-// (one that was playing when told, searching back to its pre-roll). Waits for the edit to finish; false with the reason
-// if the deck refused it, stopped answering or never got there, the deck stopped once it had been told to record.
+// (one that was playing when told, searching back to its pre-roll). Where the deck is comes from a steady run of its
+// readings, a stray one a few frames off passed over. Waits for the edit to finish; false with the reason if the deck
+// refused it, stopped answering, never got there or recorded without being seen running up to In (failing at once),
+// the deck stopped once it had been told to record.
 bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void(int64_t framesToIn, double clock)>& roll,
                 const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 

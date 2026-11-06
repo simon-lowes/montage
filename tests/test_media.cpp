@@ -1575,6 +1575,11 @@ public:
     std::set<int> lose, late;
     bool loseWhileRecording = false, staleStatus = false;
     double servoLockAfter = 0.2;
+    // A deck's own ways: stopped, its LTC answered as corrected LTC (74.14); every so many timecodes one this many
+    // frames out (a jittery reader); recording from In at once when told to edit, with no run up.
+    bool correctedLtcWhenStopped = false;
+    int jitterEvery = 0, jitterFrames = 0, timecodeReads = 0;
+    bool recordWithoutRoll = false;
 
     double frameNow(Clock::time_point now = Clock::now()) const { return pos + speed * fps * std::chrono::duration<double>(now - at).count(); }
     void move(double frame, double sp) {
@@ -1675,7 +1680,8 @@ private:
                 if (in < 0 || out <= in || preroll < 0) return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
                 autoEdit = true, recording = false, recordedFrom = recordedTo = -1, editDone = false;
                 // (playing already: it plays on a moment before it searches back to the pre-roll)
-                if (speed == 1) searchUntil = Clock::now() + std::chrono::milliseconds(300);
+                if (recordWithoutRoll) move(double(in), 1), recording = true, recordedFrom = in;
+                else if (speed == 1) searchUntil = Clock::now() + std::chrono::milliseconds(300);
                 else move(double(in - preroll), 1);
                 return ack;
             case cmd::ShuttleForward: move(here, speedFromData(q.data)); return ack;
@@ -1692,7 +1698,11 @@ private:
             default: return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
             }
         }
-        if (q.is(6, cmd::CurrentTimeSense)) return timecode(cmd::LtcTimeData, here);
+        if (q.is(6, cmd::CurrentTimeSense)) {
+            ++timecodeReads;
+            const int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
+            return timecode(correctedLtcWhenStopped && speed == 0 ? cmd::CorrectedLtcTimeData : cmd::LtcTimeData, here + off);
+        }
         if (q.is(6, cmd::StatusSense)) return status();
         return Message{1, cmd::Nak, {cmd::NakUnknownCommand}};
     }
@@ -2304,6 +2314,18 @@ private slots:
         QVERIFY(deck.cue(ten));
         QVERIFY(deck.waitForCue(ten, 5));
         QCOMPARE(deck.timecode(), ten);
+        // A deck that answers stopped with its corrected LTC (74.14): still its timecode, at once.
+        {
+            std::lock_guard lock(sim.m);
+            sim.correctedLtcWhenStopped = true;
+        }
+        const auto askedAt = std::chrono::steady_clock::now();
+        QCOMPARE(deck.timecode(), ten);
+        QVERIFY(std::chrono::steady_clock::now() - askedAt < std::chrono::milliseconds(250));
+        {
+            std::lock_guard lock(sim.m);
+            sim.correctedLtcWhenStopped = false;
+        }
         QVERIFY(deck.play());
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
         auto st = deck.status();
@@ -2388,10 +2410,63 @@ private slots:
             QCOMPARE(sim.recordedTo, e2.out);
         }
 
+        // A jittery reader (every fourth timecode five frames out): the run up is still seen once, the Program told
+        // from where the deck really was, and the edit made.
+        TapeEdit ej = e;
+        ej.in = e2.in + 250, ej.out = ej.in + 50;
+        {
+            std::lock_guard lock(sim.m);
+            sim.jitterEvery = 4, sim.jitterFrames = 5;
+        }
+        rolls = 0;
+        off = 99;
+        const bool jittered = editToTape(deck, ej,
+                                         [&](int64_t framesToIn, double) {
+                                             std::lock_guard lock(sim.m);
+                                             ++rolls;
+                                             off = sim.frameNow() - double(ej.in - framesToIn);
+                                         },
+                                         nullptr, &err);
+        {
+            std::lock_guard lock(sim.m);
+            sim.jitterEvery = 0;
+        }
+        QVERIFY2(jittered, err.c_str());
+        QCOMPARE(rolls, 1);
+        QVERIFY2(off >= 0 && off < 3, std::to_string(off).c_str());
+        {
+            std::lock_guard lock(sim.m);
+            QCOMPARE(sim.recordedFrom, ej.in);
+            QCOMPARE(sim.recordedTo, ej.out);
+        }
+
+        // A deck that records from In at once, never seen running up: the edit fails there and then, the deck stopped,
+        // rather than recording the paused Program to Out.
+        TapeEdit en = e;
+        en.in = ej.in + 250, en.out = en.in + 250;
+        {
+            std::lock_guard lock(sim.m);
+            sim.recordWithoutRoll = true;
+        }
+        rolls = 0;
+        const auto told = std::chrono::steady_clock::now();
+        QVERIFY(!editToTape(deck, en, [&](int64_t, double) { ++rolls; }, nullptr, &err));
+        QVERIFY(std::chrono::steady_clock::now() - told < std::chrono::seconds(3));
+        QVERIFY2(QString::fromStdString(err).contains("without being seen running up"), err.c_str());
+        QCOMPARE(rolls, 0);
+        {
+            std::lock_guard lock(sim.m);
+            sim.recordWithoutRoll = false;
+            QCOMPARE(sim.speed, 0.0);
+            QVERIFY(!sim.recording && !sim.autoEdit);
+            QCOMPARE(sim.recordedTo, int64_t(-1));
+            QVERIFY2(sim.frameNow() < double(en.in + 50), std::to_string(sim.frameNow() - double(en.in)).c_str());
+        }
+
         // The deck stops answering once it records: the edit fails, and the deck is stopped there rather than left
         // recording the Program's last picture to Out.
         TapeEdit e3 = e;
-        e3.in = e2.in + 500, e3.out = e3.in + 75;
+        e3.in = en.in + 500, e3.out = e3.in + 75;
         {
             std::lock_guard lock(sim.m);
             sim.loseWhileRecording = true;
@@ -2492,10 +2567,11 @@ private slots:
                 const Frame16Ptr f = dec.frameAt((double(k) + 0.5) / 25.0);
                 QVERIFY(f);
                 const int got = frameIn(toImage(*f)), want = int((from + k) % 125);
-                // The first frame must be the logged one; later, a picture the loaded test machine dropped on its way
-                // is held from the one before (as captureFromOmt allows).
-                QVERIFY2(got == want || (k > 0 && got == (want + 124) % 125),
-                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of five seconds', not %4").arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want)));
+                // Each frame is the one its timecode says. Only where the recording says a picture was lost on its way
+                // (the loaded test machine's) and the one before held for it may a later frame show the one before.
+                QVERIFY2(got == want || (k > 0 && c.repeated > 0 && got == (want + 124) % 125),
+                         qPrintable(QStringLiteral("%1 frame %2: frame %3 of five seconds', not %4 (%5 held)")
+                                        .arg(QString::fromStdString(c.entry.name)).arg(k).arg(got).arg(want).arg(c.repeated)));
             }
             // (the tape's name kept with the timecode)
             AVFormatContext* fc = nullptr;
@@ -2504,10 +2580,17 @@ private slots:
             for (unsigned s = 0; s < fc->nb_streams; ++s) {
                 if (const AVDictionaryEntry* t = av_dict_get(fc->streams[s]->metadata, "reel_name", nullptr, 0)) reel = reel || std::string(t->value) == "TAPE07";
                 // (how the file says its colour is coded: the feed's BT.709, which a decoder otherwise guesses as BT.601 at
-                // this size)
+                // this size. Checked on Linux and Windows; on macOS, where such a capture was read by BT.601 though
+                // tagged BT.709, said rather than checked until a run there shows how it is tagged)
                 const AVCodecParameters* cp = fc->streams[s]->codecpar;
-                if (cp->codec_type == AVMEDIA_TYPE_VIDEO && cp->color_space != AVCOL_SPC_BT709)
+                if (cp->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+#ifdef __APPLE__
+                if (cp->color_space != AVCOL_SPC_BT709)
                     qInfo("%s is tagged %s, not bt709", c.entry.name.c_str(), av_color_space_name(cp->color_space));
+#else
+                const char* tag = av_color_space_name(cp->color_space);
+                QVERIFY2(cp->color_space == AVCOL_SPC_BT709, (c.entry.name + " is tagged " + (tag ? tag : "?") + ", not bt709").c_str());
+#endif
             }
             avformat_close_input(&fc);
             QVERIFY(reel);

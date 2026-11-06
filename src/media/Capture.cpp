@@ -384,6 +384,13 @@ bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bo
     };
     o.interfaceAddress[0] = option("interface");
     o.interfaceAddress[1] = option("interface2");
+    // (a sound or data stream joined on interfaces of its own: audio_interface, data_interface and their 2s)
+    for (st2110::SdpStream& x : streams) {
+        const std::string kind = x.media == "audio" ? "audio_" : x.encoding == "smpte291" ? "data_" : "";
+        if (kind.empty()) continue;
+        x.interfaceAddress[0] = option((kind + "interface").c_str());
+        x.interfaceAddress[1] = option((kind + "interface2").c_str());
+    }
     if (const std::string w = option("wait"); !w.empty()) o.waitMs = std::clamp(std::atoi(w.c_str()), 0, 2000);
     in.st2110 = std::make_unique<st2110::Input>();
     if (!in.st2110->open(streams, o, error)) {

@@ -4609,6 +4609,36 @@ colorspaces:
                     for (int k = 0; k < 3; ++k) apart = std::max(apart, std::fabs(wrapped.at(x, y)[k] - want[k]));
                 }
             QVERIFY2(apart < 1e-3f, qPrintable(QString::number(apart)));
+            // Turned 30 degrees, the edges are still the picture's own: ending there, nothing about it is moved onto
+            // the black; held there, its pixels near the edge it is moved past keep its colour rather than the black's.
+            c.motion.params["rotation"] = 30.0;
+            c.effects.back().params["h_amount"] = 0.0;
+            const Image turned = renderProgramFrame(pr, s, 2, RenderOptions());
+            c.effects.back().params["h_amount"] = 8.0;
+            c.effects.back().params["edges"] = 2.0;  // (transparent)
+            const Image ended = renderProgramFrame(pr, s, 2, RenderOptions());
+            c.effects.back().params["edges"] = 1.0;  // (clamp)
+            const Image held = renderProgramFrame(pr, s, 2, RenderOptions());
+            const double cr = std::cos(M_PI / 6), sn = std::sin(M_PI / 6);
+            float outsideMoved = 0, insideDark = 1;
+            int inside = 0;
+            for (int y = 0; y < 36; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    // (how far the pixel's centre is inside the turned picture, 32 x 18 about the middle; less than 0 out)
+                    const double dx = x + 0.5 - 32, dy = y + 0.5 - 18;
+                    const double u = dx * cr + dy * sn, v = -dx * sn + dy * cr;
+                    const double in = std::min(16 - std::fabs(u), 9 - std::fabs(v));
+                    if (in < -1.5)
+                        for (int k = 0; k < 3; ++k) outsideMoved = std::max(outsideMoved, std::fabs(ended.at(x, y)[k] - turned.at(x, y)[k]));
+                    if (in > 2) {
+                        const float* q = held.at(x, y);
+                        insideDark = std::min(insideDark, std::max({q[0], q[1], q[2]}));
+                        ++inside;
+                    }
+                }
+            QVERIFY(inside > 200);
+            QVERIFY2(outsideMoved < 1e-6f, qPrintable(QString::number(outsideMoved)));
+            QVERIFY2(insideDark > 0.2f, qPrintable(QString::number(insideDark)));
         }
     }
 
@@ -14785,13 +14815,15 @@ colorspaces:
             QVERIFY(!lone.send(picA.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
             QVERIFY(lone.sendErrors(0) > 0);
 #endif
-            // Late by a few frames (a hold-up shorter than a fifth of a second), a frame still goes in its own slot but
-            // spread over at least half a frame's time (here 9 ms), not all at once at line rate.
+            // Late by a few frames (a hold-up shorter than a fifth of a second), each frame still goes in its own slot,
+            // spread over as long as on time (here 17 ms of the 20), never faster than ST 2110-21's pacing lets it.
             std::this_thread::sleep_for(std::chrono::milliseconds(70));
-            const auto from = std::chrono::steady_clock::now();
-            QVERIFY(pair.send(picB.data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
-            const auto took = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - from).count();
-            QVERIFY2(took >= 7000, qPrintable(QString::number(took)));
+            for (int k = 0; k < 3; ++k) {
+                const auto from = std::chrono::steady_clock::now();
+                QVERIFY(pair.send((k % 2 ? picA : picB).data(), stride, PixelFormat::V210, nullptr, 0, nullptr, {}, &halt));
+                const auto took = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - from).count();
+                QVERIFY2(took >= 16000, qPrintable(QStringLiteral("frame %1: %2 us").arg(k).arg(took)));
+            }
             // Stopped while catching up, it stops.
             std::this_thread::sleep_for(std::chrono::milliseconds(70));
             halt = true;
@@ -14966,6 +14998,41 @@ colorspaces:
             QVERIFY(out.size() == 3 && merger.rejected == 4 && merger.duplicates == 0 && merger.late == 0 && merger.lost == 0);
             for (uint32_t i = 0; i < 20; ++i) merger.push(rtp(500 + i, 96, 9, false), 0, out);
             QVERIFY(out.size() == 7 && merger.rejected == 4 + 16);
+        }
+        // (a packet numbered `seq` from sender `ssrc`)
+        auto sent = [](uint32_t seq, uint32_t ssrc) {
+            std::vector<uint8_t> p(16, 0);
+            p[0] = 0x80, p[2] = uint8_t(seq >> 8), p[3] = uint8_t(seq);
+            p[8] = uint8_t(ssrc >> 24), p[9] = uint8_t(ssrc >> 16), p[10] = uint8_t(ssrc >> 8), p[11] = uint8_t(ssrc);
+            return p;
+        };
+        // Joined from any source: a stray sender heard first and trickling a packet in every window does not keep the
+        // real stream out (it is taken once a window of it has come), and once taken the stray stays out.
+        {
+            st::PathMerger merger(false, 16);
+            std::vector<std::vector<uint8_t>> out;
+            merger.push(sent(9000, 5), 0, out);
+            for (uint32_t i = 0; i < 200; ++i) {
+                if (i % 16 == 0) merger.push(sent(9001 + i / 16, 5), 0, out);
+                merger.push(sent(100 + i, 6), 0, out);
+            }
+            // (the stray's three while it was the one taken, then the real stream's from its seventeenth)
+            QCOMPARE(int(out.size()), 3 + 200 - 16);
+            for (size_t k = 3; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(100 + 16 + k - 3));
+        }
+        // ST 2022-7 legs from senders with SSRCs of their own: merged by number, each leg's losses filled by the other;
+        // and when both legs' senders start again with new SSRCs, the count starts again once, nothing given out twice.
+        {
+            st::PathMerger merger(false, 16);
+            std::vector<std::vector<uint8_t>> out;
+            for (uint32_t i = 0; i < 40; ++i) merger.push(sent(i, 7), 0, out), merger.push(sent(i, 70), 1, out);
+            for (uint32_t i = 40; i < 100; ++i) merger.push(sent(i, i % 2 ? 7 : 70), i % 2 ? 0 : 1, out);
+            QVERIFY(out.size() == 100 && merger.lost == 0 && merger.duplicates == 40);
+            out.clear();
+            for (uint32_t i = 0; i < 100; ++i) merger.push(sent(3000 + i, 9), 0, out), merger.push(sent(3000 + i, 90), 1, out);
+            merger.flush(out);
+            QCOMPARE(int(out.size()), 100 - 16);
+            for (size_t k = 0; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(3016 + k));
         }
         // What is held for a gap is bounded by memory as well as by count: datagrams as large as one can be, the gap
         // given up on rather than held past the limit.
@@ -15292,12 +15359,28 @@ colorspaces:
         const st::InputStats s = in.stats();
         QVERIFY(s.duplicates > 0 && s.packets[0][1] > 0);
         in.close();
+        // Each receiver joins on its own legs' interfaces: the sound's first leg put on another of this computer's
+        // (where it has one), the picture's left where it was.
+        {
+            const QString audioSingle = QStringLiteral("/x-nmos/connection/v1.1/single/receivers/%1/").arg(audioId);
+            const QJsonArray choices = json("GET", audioSingle + "constraints").second.array()[0].toObject()["interface_ip"].toObject()["enum"].toArray();
+            QVERIFY(!choices.isEmpty());
+            const QString elsewhere = choices.last().toString();
+            QCOMPARE(json("PATCH", audioSingle + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"interface_ip", elsewhere}}, QJsonObject{}}},
+                                                                       {"activation", QJsonObject{{"mode", "activate_immediate"}}}}).first, 200);
+            const std::vector<st::SdpStream> moved = node.receiverStreams();
+            QVERIFY(moved.size() == 2 && moved[1].media == "audio");
+            QCOMPARE(QString::fromStdString(moved[1].interfaceAddress[0]), elsewhere);
+            QCOMPARE(QString::fromStdString(moved[0].interfaceAddress[0]), QStringLiteral("127.0.0.1"));
+            QCOMPARE(QString::fromStdString(moved[0].interfaceAddress[1]), node.receiverConnection(0).leg[1].interfaceIp);
+        }
         // With the second leg alone, its port and interface are the first path's.
         QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"rtp_enabled", false}}, QJsonObject{}}},
                                                               {"activation", QJsonObject{{"mode", "activate_immediate"}}}}).first, 200);
         const std::vector<st::SdpStream> second = node.receiverStreams();
         QVERIFY(!second.empty() && !second[0].redundant() && second[0].path[0].port == ports[3]);
         QCOMPARE(node.receiverInterfaces(), QStringList{node.receiverConnection(0).leg[1].interfaceIp});
+        QCOMPARE(QString::fromStdString(second[0].interfaceAddress[0]), node.receiverConnection(0).leg[1].interfaceIp);
 
         // IS-04's target: an empty one disconnects, and nothing is taken.
         QCOMPARE(json("PUT", nodeApi + "receivers/" + videoId + "/target", QJsonObject{}).first, 202);
