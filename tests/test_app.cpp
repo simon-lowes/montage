@@ -14747,29 +14747,30 @@ const auto seq = [this] { return state()->sequence(); };
         program->setLoop(was);
         QVERIFY2(after >= at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
         QVERIFY(seen.size() > 10);
-        std::vector<qint64> wraps;
+        const double fps = state()->sequence()->fpsValue();
+        int wraps = 0;
         for (size_t i = 0; i < seen.size(); ++i) {
             QVERIFY2(seen[i].second >= 10 && seen[i].second <= 19, qPrintable(QString::number(seen[i].second)));
-            if (i > 0 && seen[i].second + 5 < seen[i - 1].second) wraps.push_back(seen[i].first);  // (back to In, not a frame)
+            if (i > 0 && seen[i].second < seen[i - 1].second) ++wraps;  // (back to In)
         }
-        QVERIFY2(wraps.size() >= 2, qPrintable(QString::number(wraps.size())));
+        QVERIFY2(wraps >= 2, qPrintable(QString::number(wraps)));
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
-        // Counted from the first frame played, not from the seek before it, and from a second on: starting to play is
-        // not the pace. (The picture follows the sound device's own count, which starts late by however long the device
-        // takes to start, up to a quarter of a second; on a slow macOS runner that alone read as 26 frames a second.)
+        // Between two ticks the picture moves on by the difference of the two frames round the 10-frame loop: a tick that
+        // comes late and lands just past a wrap (14, then 11: 7 frames on) is not a step back. Only ticks more than a
+        // whole pass apart would hide passes, and those are counted from the time between them.
+        // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
         size_t first = 1;
         while (first < seen.size() && seen[first].second == seen[0].second) ++first;
-        QVERIFY(first < seen.size());
-        const qint64 played = seen[first].first;
-        while (first < seen.size() && seen[first].first < played + 1000) ++first;
         QVERIFY(first + 10 < seen.size());
-        const qint64 start = seen[first].first;
-        const double wrapsAfter = double(std::count_if(wraps.begin(), wraps.end(), [start](qint64 w) { return w > start; }));
-        const double fps = state()->sequence()->fpsValue();
-        const double frames = double(seen.back().second - seen[first].second) + 10.0 * wrapsAfter;
-        const double rate = frames / (double(seen.back().first - start) / 1000.0);
+        double frames = 0;
+        for (size_t i = first + 1; i < seen.size(); ++i) {
+            const int on = int(((seen[i].second - seen[i - 1].second) % 10 + 10) % 10);
+            const double expected = double(seen[i].first - seen[i - 1].first) / 1000.0 * fps;
+            frames += on + 10.0 * std::max(0.0, std::round((expected - on) / 10.0));
+        }
+        const double rate = frames / (double(seen.back().first - seen[first].first) / 1000.0);
         QVERIFY2(std::fabs(rate - fps) < fps * 0.1, qPrintable(QStringLiteral("%1 frames a second, not %2").arg(rate).arg(fps)));
         state()->newProject();
     }
