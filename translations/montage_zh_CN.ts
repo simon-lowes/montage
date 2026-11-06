@@ -134,7 +134,7 @@
     </message>
     <message>
         <source>3-Band EQ</source>
-        <translation type="unfinished">3 条E&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>35mm</source>
@@ -302,7 +302,7 @@
     </message>
     <message>
         <source>Amount (Bulge + / Pinch -)</source>
-        <translation type="unfinished">数量 (Bulge &lt;unk&gt; / Pinch -)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Amount (px)</source>
@@ -458,7 +458,7 @@
     </message>
     <message>
         <source>Audio Track (0 = all)</source>
-        <translation type="unfinished">音轨( 0 &lt;unk&gt; 全部)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Audio Visualiser</source>
@@ -642,7 +642,7 @@
     </message>
     <message>
         <source>Blue Hue (°)</source>
-        <translation type="unfinished">蓝色色调 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Blue Offset</source>
@@ -682,7 +682,7 @@
     </message>
     <message>
         <source>Blur &amp; Sharpen</source>
-        <translation type="unfinished">模糊 &lt;unk&gt; 锐化</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Blur (px)</source>
@@ -822,11 +822,11 @@
     </message>
     <message>
         <source>Camera Tilt (°, 3D)</source>
-        <translation type="unfinished">相机倾斜( &lt;unk&gt;, 3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Camera Turn (°, 3D)</source>
-        <translation type="unfinished">相机转身( &lt;unk&gt;, 3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Canon Log 3 / Cinema Gamut</source>
@@ -958,7 +958,7 @@
     </message>
     <message>
         <source>Clip Level (dBFS, 0 = auto)</source>
-        <translation type="unfinished">剪切级别( dBFS, 0 &lt;unk&gt; 自动)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Clip Result Values</source>
@@ -1130,7 +1130,7 @@
     </message>
     <message>
         <source>Crop Box Back (Z)</source>
-        <translation type="unfinished">后方裁剪框 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Crop Box Bottom (Y)</source>
@@ -1138,7 +1138,7 @@
     </message>
     <message>
         <source>Crop Box Front (Z)</source>
-        <translation type="unfinished">裁剪框前端 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Crop Box Left (X, the file&apos;s units)</source>
@@ -1202,7 +1202,7 @@
     </message>
     <message>
         <source>Cut-off (Hz, 0 = auto)</source>
-        <translation type="unfinished">终止( Hz, 0 &lt;unk&gt; 自动)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cutoff (Hz)</source>
@@ -1218,7 +1218,7 @@
     </message>
     <message>
         <source>Cyan Hue (°)</source>
-        <translation type="unfinished">青色色( &lt;unk&gt; )</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cyan Saturation</source>
@@ -1234,7 +1234,7 @@
     </message>
     <message>
         <source>DNxHR HQ</source>
-        <translation type="unfinished">人权处 H&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>DNxHR HQ (MXF)</source>
@@ -1242,7 +1242,7 @@
     </message>
     <message>
         <source>DNxHR HQ in MXF OP1a, each channel a mono track (Avid&apos;s layout)</source>
-        <translation type="unfinished">用于MXF OP1a的 DNXHR H&lt;unk&gt;,每个频道都有单轨( Avid 的布局)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>DNxHR HQX (10-bit)</source>
@@ -1410,7 +1410,7 @@
     </message>
     <message>
         <source>Depth (% of width)</source>
-        <translation type="unfinished">深度( &lt;unk&gt;宽度)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Depth (ms)</source>
@@ -1562,7 +1562,7 @@
     </message>
     <message>
         <source>EBU R103 (-5 to 105 %)</source>
-        <translation type="unfinished">EBU R103 (5至105 &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>EQ</source>
@@ -1634,7 +1634,7 @@
     </message>
     <message>
         <source>Emitter Z (3D)</source>
-        <translation type="unfinished">爱心 &lt;unk&gt; (3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>End Card</source>
@@ -1670,7 +1670,7 @@
     </message>
     <message>
         <source>Evolution (°)</source>
-        <translation type="unfinished">演变 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Evolution Speed (° per frame)</source>
@@ -1686,7 +1686,7 @@
     </message>
     <message>
         <source>Extra Zoom</source>
-        <translation type="unfinished">额外 &lt;unk&gt; 缩放</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Extrusion (px)</source>
@@ -1762,7 +1762,7 @@
     </message>
     <message>
         <source>Fast export on the GPU / media engine (VideoToolbox, NVENC, Quick Sync, AMF); x264 if there is none</source>
-        <translation type="unfinished">GPU/ 媒体引擎快速导出( VideoToolbox, NVENC, &lt;unk&gt;Quick Sync, AMF); 如果没有, x264 )</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Feather</source>
@@ -1778,7 +1778,7 @@
     </message>
     <message>
         <source>Field of View (°)</source>
-        <translation type="unfinished">视图字段 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Fill</source>
@@ -1970,7 +1970,7 @@
     </message>
     <message>
         <source>Follow the 360° View</source>
-        <translation type="unfinished">跟随 360 &lt;unk&gt; 视图</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Font</source>
@@ -2190,7 +2190,7 @@
     </message>
     <message>
         <source>Green Hue (°)</source>
-        <translation type="unfinished">绿色色( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Green Offset</source>
@@ -2306,7 +2306,7 @@
     </message>
     <message>
         <source>Hardware HEVC (VideoToolbox, NVENC, Quick Sync, AMF); x265 if there is none</source>
-        <translation type="unfinished">硬件 HEVC (VideoToolbox, NVENC, &lt;unk&gt;Quick Sync, AMF); 如果没有的话, x265</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Harmonics</source>
@@ -2482,7 +2482,7 @@
     </message>
     <message>
         <source>Hue Variation (°)</source>
-        <translation type="unfinished">色调变化 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Hue Vectors</source>
@@ -2502,7 +2502,7 @@
     </message>
     <message>
         <source>Image Light Rotation (°)</source>
-        <translation type="unfinished">图像光旋转 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Image Light Strength</source>
@@ -2602,7 +2602,7 @@
     </message>
     <message>
         <source>Jaw</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Keep</source>
@@ -2666,7 +2666,7 @@
     </message>
     <message>
         <source>Largest Spot (% of face)</source>
-        <translation type="unfinished">最大点( &lt;unk&gt;脸)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Learned Effect</source>
@@ -2782,7 +2782,7 @@
     </message>
     <message>
         <source>Light Direction (°)</source>
-        <translation type="unfinished">光线方向 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Light Distance (model sizes)</source>
@@ -2810,7 +2810,7 @@
     </message>
     <message>
         <source>Light Height (°)</source>
-        <translation type="unfinished">光高 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Light Leak</source>
@@ -3006,7 +3006,7 @@
     </message>
     <message>
         <source>Magenta Hue (°)</source>
-        <translation type="unfinished">紫色色( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Magenta Saturation</source>
@@ -3274,7 +3274,7 @@
     </message>
     <message>
         <source>Noise Level % (0 = auto)</source>
-        <translation type="unfinished">噪音级别 &lt;unk&gt; (0 &lt;unk&gt; 自动)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Noise Reduction</source>
@@ -3282,7 +3282,7 @@
     </message>
     <message>
         <source>Noise Threshold (%)</source>
-        <translation type="unfinished">噪音阈值 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>None</source>
@@ -3362,7 +3362,7 @@
     </message>
     <message>
         <source>One numbered PNG a frame, with transparency (name_000000.png...)</source>
-        <translation type="unfinished">以透明方式( name&lt;unk&gt;000. png...) 编号为 PNG 的框架</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>One numbered half-float OpenEXR a frame in scene-linear light, values above white kept: for compositing</source>
@@ -3454,7 +3454,7 @@
     </message>
     <message>
         <source>Pan (°)</source>
-        <translation type="unfinished">潘(&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Panasonic V-Log / V-Gamut</source>
@@ -3462,7 +3462,7 @@
     </message>
     <message>
         <source>Parametric EQ</source>
-        <translation type="unfinished">参数 E&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Particles</source>
@@ -3566,7 +3566,7 @@
     </message>
     <message>
         <source>Position &amp; Scale</source>
-        <translation type="unfinished">位置 &lt;unk&gt; 比例</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Position X</source>
@@ -3582,7 +3582,7 @@
     </message>
     <message>
         <source>Position Z (towards the camera)</source>
-        <translation type="unfinished">位置 &lt;unk&gt; (向相机前)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Position and Scale</source>
@@ -3590,7 +3590,7 @@
     </message>
     <message>
         <source>Position, Scale &amp; Rotation</source>
-        <translation type="unfinished">位置, 缩放 &lt;unk&gt; 旋转</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Position, Scale and Rotation</source>
@@ -3654,7 +3654,7 @@
     </message>
     <message>
         <source>ProRes 422 HQ</source>
-        <translation type="unfinished">预 算 422 H&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>ProRes 422 LT</source>
@@ -3670,7 +3670,7 @@
     </message>
     <message>
         <source>ProRes 4444 XQ (alpha)</source>
-        <translation type="unfinished">ProRes 4444 X&lt;unk&gt;(阿尔法)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Projection</source>
@@ -3738,7 +3738,7 @@
     </message>
     <message>
         <source>Readout (% of a frame)</source>
-        <translation type="unfinished">读出( 框中的 &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rebate Width</source>
@@ -3754,7 +3754,7 @@
     </message>
     <message>
         <source>Rec.2100 PQ (HDR10)</source>
-        <translation type="unfinished">参考文件2100 P &lt;unk&gt; (人类发展报告10)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rec.709 (SDR video)</source>
@@ -3786,7 +3786,7 @@
     </message>
     <message>
         <source>Red Hue (°)</source>
-        <translation type="unfinished">红色色( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Red Offset</source>
@@ -3842,7 +3842,7 @@
     </message>
     <message>
         <source>Reframe 360°</source>
-        <translation type="unfinished">重写 360 &lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Release (ms)</source>
@@ -3922,7 +3922,7 @@
     </message>
     <message>
         <source>Roll (Z°)</source>
-        <translation type="unfinished">滚动 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Roll (degrees clockwise)</source>
@@ -3930,7 +3930,7 @@
     </message>
     <message>
         <source>Roll (°)</source>
-        <translation type="unfinished">滚动 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Roll / Crawl</source>
@@ -3970,11 +3970,11 @@
     </message>
     <message>
         <source>Rotation (°)</source>
-        <translation type="unfinished">旋转 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rotation Variation (°)</source>
-        <translation type="unfinished">旋转变化 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Round</source>
@@ -4206,7 +4206,7 @@
     </message>
     <message>
         <source>Shutter Angle (°)</source>
-        <translation type="unfinished">开关角 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sidechain</source>
@@ -4266,7 +4266,7 @@
     </message>
     <message>
         <source>Skin Hue (°)</source>
-        <translation type="unfinished">皮肤色( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Skin Saturation</source>
@@ -4274,7 +4274,7 @@
     </message>
     <message>
         <source>Skin Width (°)</source>
-        <translation type="unfinished">皮肤( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sky</source>
@@ -4510,7 +4510,7 @@
     </message>
     <message>
         <source>Spin (°/s)</source>
-        <translation type="unfinished">旋转 (&lt;unk&gt;/s)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Spin Variation</source>
@@ -4526,11 +4526,11 @@
     </message>
     <message>
         <source>Spot Angle (°)</source>
-        <translation type="unfinished">点角 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Spread (°)</source>
-        <translation type="unfinished">展开( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sprite (Picture or Clip)</source>
@@ -4866,7 +4866,7 @@
     </message>
     <message>
         <source>Tilt (°)</source>
-        <translation type="unfinished">倾斜 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Tilt-Shift Blur</source>
@@ -5042,7 +5042,7 @@
     </message>
     <message>
         <source>Turn (Y°)</source>
-        <translation type="unfinished">转过( Y&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Turn (degrees right)</source>
@@ -5222,7 +5222,7 @@
     </message>
     <message>
         <source>Wind Z (px/s², 3D)</source>
-        <translation type="unfinished">风 &lt;unk&gt; (px/s2, 3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Wipe</source>
@@ -5254,7 +5254,7 @@
     </message>
     <message>
         <source>Yellow Hue (°)</source>
-        <translation type="unfinished">黄色色( &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Yellow Saturation</source>
@@ -5262,7 +5262,7 @@
     </message>
     <message>
         <source>ZIP (1 line)</source>
-        <translation type="unfinished">&lt;unk&gt;IP(1行)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>ZIP (16 lines)</source>
@@ -6450,7 +6450,7 @@
     </message>
     <message>
         <source>Video + Audio</source>
-        <translation type="unfinished">视频 &lt;unk&gt; 音频</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Video</source>
@@ -6924,7 +6924,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Labelling speakers uses pyannote&apos;s segmentation model (MIT) and the CAM++ voice model (Apache-2.0), which run on this computer.</source>
-        <translation type="unfinished">标签用的是Pyannote的分解模型(MIT)和CAM&lt;unk&gt;(Apache-2.0)的语音模型,该模型运行在计算机上。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Nothing to transcribe: choose clips with sound</source>
@@ -6944,19 +6944,19 @@ Download it now?</source>
     </message>
     <message>
         <source>SubRip captions (*.srt)</source>
-        <translation type="unfinished">子Rip 标题 (&lt;unk&gt;. strt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>WebVTT captions (*.vtt)</source>
-        <translation type="unfinished">WebVTT 说明 (&lt;unk&gt;.vtt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Plain text (*.txt)</source>
-        <translation type="unfinished">纯文本 (&lt;unk&gt;. txt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Transcript with word timings (*.json)</source>
-        <translation type="unfinished">带有字数计时的文字缩写 (&lt;unk&gt;.json)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Transcript</source>
@@ -7208,7 +7208,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Cue sheets (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">Cue 工作表 (&lt;unk&gt;. csv &lt;unk&gt;. tsv &lt;unk&gt;. txt); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export…</source>
@@ -7232,7 +7232,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Cue sheet (*.csv)</source>
-        <translation type="unfinished">Cue 工作表 (&lt;unk&gt;. csv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Remove</source>
@@ -7336,7 +7336,7 @@ Download it now?</source>
     </message>
     <message>
         <source>How long the streamer takes to cross the picture, reaching the edge on the line (0 = none)</source>
-        <translation type="unfinished">流线器经过图片多久, 到达线上的边缘( 0 &lt;unk&gt; 零)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Beeps a second apart before the line, which starts where the next would be</source>
@@ -7622,7 +7622,7 @@ Download it now?</source>
     </message>
     <message>
         <source>OPENAI_API_KEY, or none for a local server</source>
-        <translation type="unfinished">openAI&lt;unk&gt;API&lt;unk&gt;KEY, 或没有本地服务器</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>ANTHROPIC_API_KEY</source>
@@ -8719,55 +8719,55 @@ Download it now?</source>
     </message>
     <message>
         <source>Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Subtitle pictures, read by OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;All files (*)</source>
-        <translation type="unfinished">标题 (&lt;unk&gt;.srt &lt;unk&gt;.vtt &lt;unk&gt;.mcc &lt;unk&gt;.mcc &lt;unk&gt;.tml &lt;unk&gt;.tml &lt;unk&gt;.dfxp &lt;unk&gt;.stl &lt;unk&gt;.ass &lt;unk&gt;.ssa); 标题图片,由OCR (&lt;unk&gt;.sup &lt;unk&gt;.idx &lt;unk&gt;.mks &lt;unk&gt;.mkv &lt;unk&gt;.m2ts &lt;unk&gt;.m2ts &lt;unk&gt;.tml); 所有文件 (&lt;unk&gt;) ;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>SubRip (*.srt)</source>
-        <translation type="unfinished">子Rip (&lt;unk&gt;.strt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>WebVTT (*.vtt)</source>
-        <translation type="unfinished">WebVTT (&lt;unk&gt;.vtt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Scenarist SCC, CEA-608 (*.scc)</source>
-        <translation type="unfinished">Scenarist SCC, CEA-608 (&lt;unk&gt;.scc)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>MCC captions, CEA-608 and CTA-708 (*.mcc)</source>
-        <translation type="unfinished">CCC说明,CEA-608和CTA-708 (&lt;unk&gt;.mcc)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)</source>
-        <translation type="unfinished">IMSC 1. 1 TTML (&lt;unk&gt;.tml &lt;unk&gt;.xml &lt;unk&gt;.dfxp)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>EBU STL (*.stl)</source>
-        <translation type="unfinished">EBU STL (&lt;unk&gt;.stl)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Advanced SubStation Alpha (*.ass *.ssa)</source>
-        <translation type="unfinished">高级子系统 Alpha (&lt;unk&gt;.ass &lt;unk&gt;.ssa)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Blu-ray subtitle pictures, PGS (*.sup)</source>
-        <translation type="unfinished">蓝光字幕图片, PGS (&lt;unk&gt;.sup)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Blu-ray subtitle pictures in Matroska (*.mks)</source>
-        <translation type="unfinished">蓝光字幕图片( &lt;unk&gt;. mks)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>DVB subtitle pictures in MPEG-TS (*.ts)</source>
-        <translation type="unfinished">MPEG-TS (&lt;unk&gt;. ts) 中的 DVB 字幕图片</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>DVD subtitle pictures, VobSub (*.idx *.sub)</source>
-        <translation type="unfinished">DVD 字幕图片, VobSub (&lt;unk&gt;.idx &lt;unk&gt;.sub)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>IMSC 1.1 Image, TTML with PNGs (*.ttml)</source>
-        <translation type="unfinished">IMSC 1. 1 图像, 与 PNGs 的 TTML (&lt;unk&gt;. tml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Captions</source>
@@ -9605,7 +9605,7 @@ Download it now?</source>
     </message>
     <message>
         <source>#</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Shot</source>
@@ -9697,7 +9697,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Change EDL (*.edl);;Change list (*.csv)</source>
-        <translation type="unfinished">更改 EDL (&lt;unk&gt;.edl); 更改列表 (&lt;unk&gt;. csv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Re-conform Sequence</source>
@@ -10933,7 +10933,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Montage presets (*.montagepreset)</source>
-        <translation type="unfinished">蒙太奇预设( &lt;unk&gt;. 蒙太奇预设)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Show Presets Folder</source>
@@ -10957,7 +10957,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Generators &amp; Titles</source>
-        <translation type="unfinished">发电机 &lt;unk&gt; 标题</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Other</source>
@@ -11365,7 +11365,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Parametric EQ</source>
-        <translation type="unfinished">参数 E&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -11512,7 +11512,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Pulldown for 29.97 interlaced or 59.94 deliveries of a 23.976 cut; a speed change (PAL&apos;s 25 from 24, 4 % shorter, the sound sped with it); or a standards conversion, each new frame made from the two nearest by optical flow, never across a cut</source>
-        <translation type="unfinished">29.97 交错或59.94 交付23.976的切线; 速度变化(PAL25, 24, 4 &lt;unk&gt; 音速随它而加速); 或标准转换, 由光学流最接近的两个框架所制作, 从未跨越切口</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Keep pitch</source>
@@ -11713,7 +11713,7 @@ HDR output is 10-bit and tagged; PQ carries HDR10 metadata.</source>
     </message>
     <message>
         <source>°</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>How wide the cameras see, across the picture</source>
@@ -11896,7 +11896,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Images (*.png *.jpg *.jpeg *.webp *.bmp)</source>
-        <translation type="unfinished">图像 (&lt;unk&gt;. png &lt;unk&gt;.jpg &lt;unk&gt;.jpeg &lt;unk&gt;.webp &lt;unk&gt;. bmp)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sign with Content Credentials</source>
@@ -11932,7 +11932,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>All Files (*)</source>
-        <translation type="unfinished">全部文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 Files (*.%2);;All Files (*)</source>
@@ -11948,7 +11948,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All Files (*)</source>
-        <translation type="unfinished">证书 (&lt;unk&gt;. pem &lt;unk&gt;. crt &lt;unk&gt;. cer); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Its Private Key</source>
@@ -11956,7 +11956,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Private Keys (*.pem *.key);;All Files (*)</source>
-        <translation type="unfinished">私钥 (&lt;unk&gt;. pem &lt;unk&gt;. keys); 全部文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Signing Certificate</source>
@@ -12320,7 +12320,7 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>Text (*.txt *.md)</source>
-        <translation type="unfinished">文本 (&lt;unk&gt;. txt &lt;unk&gt;. md)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Could not write %1</source>
@@ -12558,7 +12558,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node after the picked one (Alt+S)</source>
-        <translation type="unfinished">选择后添加一个节点( Alt&lt;unk&gt;S)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Parallel</source>
@@ -12566,7 +12566,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node beside the picked one, joined by a parallel mixer (Alt+P)</source>
-        <translation type="unfinished">在所选的节点旁边添加一个节点, 并配有平行的混音器( Alt&lt;unk&gt;P)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Layer</source>
@@ -12574,7 +12574,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node over the picked one, joined by a layer mixer (Alt+L)</source>
-        <translation type="unfinished">在所选的节点上添加一个节点, 并配有层混音器 (Alt&lt;unk&gt;L)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Outside</source>
@@ -12582,7 +12582,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node grading what the picked node&apos;s window leaves out (Alt+O)</source>
-        <translation type="unfinished">添加一个节点排序, 选择节点的窗口会留下什么( Alt&lt;unk&gt;O)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Remove</source>
@@ -12998,7 +12998,7 @@ Projects it was inserted into play its pictures from there, so they would need r
     </message>
     <message>
         <source>◀ Follow</source>
-        <translation type="unfinished">&lt;unk&gt; 跟随</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Move this clip with the footage beneath it, backwards from the playhead</source>
@@ -13019,11 +13019,11 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Position &amp; Scale</source>
-        <translation type="unfinished">位置 &lt;unk&gt; 比例</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Position, Scale &amp; Rotation</source>
-        <translation type="unfinished">位置, 缩放 &lt;unk&gt; 旋转</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>How much around the point to follow</source>
@@ -13587,7 +13587,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda)</source>
-        <translation type="unfinished">核子相机(&lt;unk&gt;.chan); 与已安装模型的场景(&lt;unk&gt;.usda)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Wrote %1</source>
@@ -13623,7 +13623,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Track ▶</source>
-        <translation type="unfinished">音轨 &lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track the surface under the corners from the playhead on.
@@ -13792,7 +13792,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>+</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Add another object to the mask</source>
@@ -13800,7 +13800,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>−</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Add an object to cut out of the mask</source>
@@ -13992,7 +13992,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Zone</source>
-        <translation type="unfinished">&lt;unk&gt; &lt;unk&gt; &lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Skin</source>
@@ -14096,7 +14096,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Set by its expression (=)</source>
-        <translation type="unfinished">根据其表达式设置 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Toggle animation (keyframes)</source>
@@ -14236,7 +14236,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>All files (*)</source>
-        <translation type="unfinished">全部文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> stops</source>
@@ -15404,7 +15404,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>This copy of Montage was not packaged: it uses the Qt, FFmpeg and other libraries installed on this computer, under their own licences.</source>
-        <translation type="unfinished">这份蒙塔奇的复印件没有包装:它使用由他们自己许可安装的&lt;unk&gt;t、FFmpeg和其他图书馆。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Bundled Libraries</source>
@@ -15479,7 +15479,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Screenplays (*.fountain *.spmd *.fdx *.txt);;All files (*)</source>
-        <translation type="unfinished">屏幕剧 (&lt;unk&gt;.fountain &lt;unk&gt;.spmd &lt;unk&gt;.fdx &lt;unk&gt;.txt); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Lined Script</source>
@@ -15491,7 +15491,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>PDF (*.pdf)</source>
-        <translation type="unfinished">PDF (&lt;unk&gt;.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1: %2 of %3 lines read by a take, %4 in the cut</source>
@@ -15980,7 +15980,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)</source>
-        <translation type="unfinished">审评说明(&lt;unk&gt;.json); 马克尔清单 (&lt;unk&gt;.csv &lt;unk&gt;.txt &lt;unk&gt;.tsv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Project &amp;Manager…</source>
@@ -15996,7 +15996,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">蒙太奇项目(&lt;unk&gt;.蒙太奇)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Mer&amp;ge Project…</source>
@@ -16108,7 +16108,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Avid Log Exchange (*.ale *.ALE);;All files (*)</source>
-        <translation type="unfinished">Avid 日志交换 (&lt;unk&gt;. ale &lt;unk&gt;. ALE) ; 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export ALE…</source>
@@ -16168,7 +16168,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Text (*.txt);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">文本 (&lt;unk&gt;. txt);; CSV (&lt;unk&gt;. csv); ; PDF (&lt;unk&gt;.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Pape&amp;rwork</source>
@@ -16376,7 +16376,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>LUT files (*.cube)</source>
-        <translation type="unfinished">LUT 文件 (&lt;unk&gt;. cube)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rebuild LUT as &amp;Grade…</source>
@@ -16404,7 +16404,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ASC CDL (*.cdl *.cc *.ccc);;All files (*)</source>
-        <translation type="unfinished">ASC CDL (&lt;unk&gt;. cdl &lt;unk&gt;.cc cc &lt;unk&gt;.ccc); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export CDL…</source>
@@ -16416,7 +16416,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)</source>
-        <translation type="unfinished">颜色决定列表 (&lt;unk&gt;. cdl);; 颜色校正 (&lt;unk&gt;.cc); 颜色校正 收藏 (&lt;unk&gt;.ccc)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import ACES Metadata (AMF)…</source>
@@ -16428,7 +16428,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ACES Metadata File (*.amf);;All files (*)</source>
-        <translation type="unfinished">ACES 元数据文件 (&lt;unk&gt;. amf); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export ACES Metadata (AMF)…</source>
@@ -16794,7 +16794,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>2 × 2 Grid</source>
-        <translation type="unfinished">2 &lt;unk&gt; 2 格</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Full Frame (Reset)</source>
@@ -17058,7 +17058,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Tables (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">表格 (&lt;unk&gt;. csv &lt;unk&gt;. tsv &lt;unk&gt;. txt); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>New &amp;Colour Matte</source>
@@ -17362,7 +17362,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl);;PDF with pictures (*.pdf)</source>
-        <translation type="unfinished">标记列表 (&lt;unk&gt;. csv);; 访问定位器 (&lt;unk&gt;. txt); 解析标记 EDL (&lt;unk&gt;. edl); 带有图片的 PDF (&lt;unk&gt;. pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Markers…</source>
@@ -17374,7 +17374,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Marker lists and review notes (*.csv *.txt *.tsv *.json)</source>
-        <translation type="unfinished">标记列表和回顾注释 (&lt;unk&gt;. csv &lt;unk&gt;. txt &lt;unk&gt;. tsv &lt;unk&gt;.json)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>&amp;Quality Check…</source>
@@ -17438,7 +17438,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>PDF (*.pdf)</source>
-        <translation type="unfinished">PDF (&lt;unk&gt;.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Analyse HDR &amp;Light Levels…</source>
@@ -17674,7 +17674,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>SOFA files (*.sofa *.zip)</source>
-        <translation type="unfinished">空间局文件 (&lt;unk&gt;.sofa &lt;unk&gt;.zip)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot read SOFA files (libmysofa)</source>
@@ -17874,7 +17874,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)</source>
-        <translation type="unfinished">脚本 (&lt;unk&gt;.lua &lt;unk&gt;.py);; 卢阿 脚本 (&lt;unk&gt;.lua); 皮顿脚本 (&lt;unk&gt;.py); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open Scripts Folder</source>
@@ -18036,7 +18036,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>About &amp;Qt</source>
-        <translation type="unfinished">&amp;关于 &lt;unk&gt; t</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>&amp;About Montage</source>
@@ -18134,7 +18134,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage);;All files (*)</source>
-        <translation type="unfinished">蒙太奇项目(&lt;unk&gt;.montage); 所有文件(&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>a while</source>
@@ -18258,15 +18258,15 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>PNG for SDR screens (*.png)</source>
-        <translation type="unfinished">特别提款权屏幕( &lt;unk&gt;. png) 的 PNG</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>HDR PNG, 16-bit (*.png)</source>
-        <translation type="unfinished">人类发展报告,16位元(&lt;unk&gt;.png)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>AVIF for SDR screens (*.avif)</source>
-        <translation type="unfinished">特别提款权屏幕的 AVIF (&lt;unk&gt;.avif)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>HDR AVIF, 10-bit (*.avif)</source>
@@ -18274,19 +18274,19 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>HDR JPEG with gain map (*.jpg)</source>
-        <translation type="unfinished">具有增益图的JPEG(&lt;unk&gt;.jpg)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>HDR AVIF with gain map (*.avif)</source>
-        <translation type="unfinished">具有收益图的《人类发展报告》AVIF (&lt;unk&gt;.avif)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>HEIF for SDR screens (*.heic)</source>
-        <translation type="unfinished">特别提款权屏幕的 HEIF (&lt;unk&gt;.heic)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>HDR HEIF, 10-bit (*.heic)</source>
-        <translation type="unfinished">人类发展报告 HEIF, 10 位 (&lt;unk&gt;. Heic)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>HDR HEIF with gain map (*.heic)</source>
@@ -18294,15 +18294,15 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>JPEG for SDR screens (*.jpg)</source>
-        <translation type="unfinished">特别提款权屏幕的JPEG( &lt;unk&gt;. jpg)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>TIFF for SDR screens (*.tif)</source>
-        <translation type="unfinished">特别提款权屏幕的TIFF( &lt;unk&gt;.tif)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Images (*.png *.jpg *.tif *.avif *.heic)</source>
-        <translation type="unfinished">图像 (&lt;unk&gt;. png &lt;unk&gt;.jpg &lt;unk&gt;.tif &lt;unk&gt;.avif &lt;unk&gt;.heic)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Frame</source>
@@ -19128,7 +19128,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Excel workbook (*.xlsx);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">Excel 工作手册(&lt;unk&gt;.xlsx); CSV (&lt;unk&gt;.csv); PDF (&lt;unk&gt;.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
@@ -19448,7 +19448,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Tone: its EQ</source>
-        <translation type="unfinished">音调:它的E&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Follow its tone over time</source>
@@ -20148,7 +20148,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>IAMF in MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)</source>
-        <translation type="unfinished">MP4中的IAMF(&lt;unk&gt;.mp4 &lt;unk&gt;.m4a);IAMF流(&lt;unk&gt;.iamf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR</source>
@@ -20596,7 +20596,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>KDMs (*.xml)</source>
-        <translation type="unfinished">KDMs (&lt;unk&gt;. xml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>the servers&apos; certificates (.pem, .crt), separated by ;</source>
@@ -20612,7 +20612,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All files (*)</source>
-        <translation type="unfinished">证书 (&lt;unk&gt;. pem &lt;unk&gt;. crt &lt;unk&gt;. cer); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Valid from:</source>
@@ -20706,7 +20706,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>OSC (Stream Deck, Loupedeck, X-keys through Bitfocus Companion; TouchOSC; QLab)</source>
-        <translation type="unfinished">OSC (Stream Deck, Loupedeck, 透过 Bitpoint 伴奏的 X 键; TouchOSC; &lt;unk&gt;Lab)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Listen for OSC messages</source>
@@ -20874,7 +20874,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Trims are worked out from an HDR master (PQ or HLG); see Sequence Settings</source>
-        <translation type="unfinished">字符串由主机( P&lt;unk&gt; 或 HLG) 制定; 见序列设置</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Add a trim target first (the Trims panel&apos;s +)</source>
@@ -20904,7 +20904,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Light levels are measured on HDR sequences (PQ or HLG); see Sequence Settings</source>
-        <translation type="unfinished">光度水平在《人类发展报告》序列(P&lt;unk&gt;或HLG)上测量;见序列设置</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Measuring light levels...</source>
@@ -21381,7 +21381,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>CMX 3600 EDL (*.edl)</source>
-        <translation type="unfinished">CMX 3600 EDL (&lt;unk&gt;.edl)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export OpenTimelineIO</source>
@@ -21397,7 +21397,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Final Cut Pro 7 XML (*.xml)</source>
-        <translation type="unfinished">最终切除 7 XML (&lt;unk&gt;. xml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export FCPXML</source>
@@ -21405,7 +21405,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>FCPXML (*.fcpxml)</source>
-        <translation type="unfinished">FCPXML (&lt;unk&gt;. fcpxml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Exported %1</source>
@@ -21487,7 +21487,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">时间线 (&lt;unk&gt;. xml &lt;unk&gt;.fcpxml &lt;unk&gt;.otio &lt;unk&gt;. aaf &lt;unk&gt;. aaf &lt;unk&gt;.avb); 最终切除 7 XML (&lt;unk&gt;.xml); FCPXML (&lt;unk&gt;.fcpxml); 开放时间线 IO (&lt;unk&gt;.otio); 3600 EDL (&lt;unk&gt;.edl); AAAF (Mdia 作曲家, Pro 工具) (&lt;unk&gt;.aaf); Media 作曲家 宾 &lt;unk&gt;.avb); 货币基金的组成 (CPL &lt;unk&gt;. xml ASSETMAP.xml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import IMF Package</source>
@@ -21525,7 +21525,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>OGraf graphics (*.ograf.json)</source>
-        <translation type="unfinished">OGraf 图形 (&lt;unk&gt;.ograf.json)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>OGraf graphics are drawn by a web browser: install Chrome, Chromium or Edge (or set MONTAGE_CHROMIUM to one) to see this one.</source>
@@ -22356,7 +22356,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Bin</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>New bin (the arrow: a new smart bin)</source>
@@ -22418,7 +22418,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)</source>
-        <translation type="unfinished">媒体 (&lt;unk&gt;. mv &lt;unk&gt;.mkv &lt;unk&gt;.m4v &lt;unk&gt;.mxf &lt;unk&gt;.m4v &lt;unk&gt;.mpv &lt;unk&gt;.mts &lt;unk&gt;.m2ts &lt;unk&gt;.m2ts &lt;unk&gt;.mg &lt;unk&gt;.wv &lt;unk&gt;.mv &lt;unk&gt;.gfv &lt;unk&gt;.m3 &lt;unk&gt;.a3 &lt;unk&gt;.m4a &lt;unk&gt;.m4a &lt;unk&gt;.m4a &lt;unk&gt;.mcr2 &lt;unk&gt;.cr3 &lt;unk&gt;.og &lt;unk&gt;.opus &lt;unk&gt;.aif &lt;unk&gt;.aiff &lt;unk&gt;.png &lt;unk&gt;.jpg &lt;unk&gt;.jpg &lt;unk&gt;.jpg &lt;unk&gt;.tiff &lt;unk&gt;.bp &lt;unk&gt;.exp &lt;unk&gt;.svg &lt;unk&gt;.mlvv &lt;unk&gt;.psb &lt;unk&gt;.dng.dg.cr2 &lt;unk&gt;.cr3 &lt;unk&gt;nf &lt;unk&gt; arw.r2 &lt;unk&gt; &lt;unk&gt; &lt;unk&gt;f } &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt; &lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Image Sequence</source>
@@ -22426,7 +22426,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Frames (*.exr *.dpx *.png *.tif *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;All files (*)</source>
-        <translation type="unfinished">框架 (&lt;unk&gt;.exr &lt;unk&gt;.dpx &lt;unk&gt;.png &lt;unk&gt;.tif &lt;unk&gt;.tiff &lt;unk&gt;.tga &lt;unk&gt;.bmp &lt;unk&gt;.jpg &lt;unk&gt;.jpeg &lt;unk&gt;.webp); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Frames per second:</source>
@@ -22538,7 +22538,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Smart Bin</source>
-        <translation type="unfinished">智能&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Change Smart Bin</source>
@@ -22606,7 +22606,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>360° Footage</source>
-        <translation type="unfinished">360 &lt;unk&gt; 脚注</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Audio Channels</source>
@@ -23135,7 +23135,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">蒙太奇项目(&lt;unk&gt;.蒙太奇)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Choose Base…</source>
@@ -24066,7 +24066,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Calibration LUTs (*.cube *.3dl *.clf *.ctf);;All files (*)</source>
-        <translation type="unfinished">校准 LUT (&lt;unk&gt;. cube &lt;unk&gt; 3dl &lt;unk&gt;. clf &lt;unk&gt;. ctf); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Screen %1: %2 (%3 × %4)</source>
@@ -24090,7 +24090,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>The signal sent to this device (in its own colour: BT.709, BT.2020, PQ or HLG)</source>
-        <translation type="unfinished">发送到该设备的信号(以其自己的颜色: BT709、 BT.2020、 P&lt;unk&gt;或 HLG)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Start the reference output to choose its LUT.</source>
@@ -24149,7 +24149,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Go to In (Shift+I)</source>
-        <translation type="unfinished">转到( Shift&lt;unk&gt;I)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Step Back (Left)</source>
@@ -24165,7 +24165,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Go to Out (Shift+O)</source>
-        <translation type="unfinished">转到外( Shift&lt;unk&gt;O)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Insert</source>
@@ -24261,11 +24261,11 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Zebras 100 %</source>
-        <translation type="unfinished">&lt;unk&gt;100&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Zebras 70 %</source>
-        <translation type="unfinished">&lt;unk&gt;70&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>False Colour</source>
@@ -24281,7 +24281,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Zebra stripes over clipping (or skin-tone exposure), or false colour by brightness: purple crushed, blue near black, green 18 % grey, pink a stop over, yellow near clipping, red clipped; or magenta stripes over colours a Rec.709 or P3 delivery cannot show</source>
-        <translation type="unfinished">&lt;unk&gt;Bra条纹超过剪切(或皮肤色素暴露),或亮度为假色:紫色压碎,蓝色接近黑色,绿色18 &lt;unk&gt;灰色,粉红色一站过,黄色接近剪切,红色剪切;或Rec.709或P3交付的颜色上的紫色条纹无法显示。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Showing HDR: this display goes to %1 times SDR white</source>
@@ -24388,7 +24388,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Both front speakers play (L + R) / 2 (F2)</source>
-        <translation type="unfinished">两位前台演讲者都玩(L &lt;unk&gt; R) / 2 (F2)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Mute</source>
@@ -25084,7 +25084,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>100%: the picture&apos;s edges are hard left and right (the front left and right speakers in surround). A 360° sequence&apos;s picture is always the whole circle.</source>
-        <translation type="unfinished">100&lt;unk&gt;:图片的边缘是硬的左右(右前方和右侧的扬声器) 。360&lt;unk&gt;的顺序总是整个圆圈。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track and Pan</source>
@@ -25571,7 +25571,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>ProRes 422 HQ (.mov)</source>
-        <translation type="unfinished">ProRes 422 H&lt;unk&gt;(.mov)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>H.264 (.mp4)</source>
@@ -25670,7 +25670,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Netflix: -27 ±2 LKFS dialogue, -2 dBTP</source>
-        <translation type="unfinished">Netflix: -27 &lt;unk&gt;2 LKFS 对话框, - 2 dBTP</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cinema trailer: 85 Leq(M)</source>
@@ -26529,7 +26529,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Your project is replaced by the colourist&apos;s while you follow (your media files are kept). Alt+click the Program monitor to point at something.</source>
-        <translation type="unfinished">您的工程被颜色主义者的替换, 您跟踪( 您的媒体文件被保存) 。 Alt&lt;unk&gt; 点击程序监视器来指向某处 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Join</source>
@@ -26727,7 +26727,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>the stream&apos;s + 1</source>
-        <translation type="unfinished">流体是 &lt;unk&gt; 1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> ms</source>
@@ -27053,7 +27053,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Recordings (*.mp4 *.mov *.m4v *.mxf *.wav *.bwf);;All Files (*)</source>
-        <translation type="unfinished">记录 (&lt;unk&gt;.mp4 &lt;unk&gt;. mov &lt;unk&gt;.m4v &lt;unk&gt;.mxf &lt;unk&gt;.wav &lt;unk&gt;.bwf); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Recording:</source>
@@ -27544,7 +27544,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Run the script on the open project (Ctrl+Return); one undo step</source>
-        <translation type="unfinished">在打开的工程( Ctrl&lt;unk&gt;return) 上运行脚本; 一次撤消步骤</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Stop</source>
@@ -27576,7 +27576,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)</source>
-        <translation type="unfinished">脚本 (&lt;unk&gt;.lua &lt;unk&gt;.py);; 卢阿 脚本 (&lt;unk&gt;.lua); 皮顿脚本 (&lt;unk&gt;.py); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot read %1</source>
@@ -27588,11 +27588,11 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Python scripts (*.py)</source>
-        <translation type="unfinished">Python 脚本 (&lt;unk&gt;. py)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Lua scripts (*.lua)</source>
-        <translation type="unfinished">卢阿文稿 (&lt;unk&gt;. lua)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot write %1</source>
@@ -27685,7 +27685,7 @@ Neither did I.</source>
     </message>
     <message>
         <source> % of the line</source>
-        <translation type="unfinished"> &lt;unk&gt;线</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>How much of a line a reading must say to count</source>
@@ -27733,7 +27733,7 @@ Neither did I.</source>
     </message>
     <message>
         <source>Scripts (*.txt *.fountain *.md *.fdx);;All files (*)</source>
-        <translation type="unfinished">脚本 (&lt;unk&gt;. txt &lt;unk&gt;.fountain &lt;unk&gt;. md &lt;unk&gt;. fdx); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Could not open %1</source>
@@ -27883,11 +27883,11 @@ Neither did I.</source>
     </message>
     <message>
         <source>2560 × 1440  QHD</source>
-        <translation type="unfinished">2560 &lt;unk&gt; 1440 &lt;unk&gt; HD</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1920 × 1080  HD</source>
-        <translation type="unfinished">1920 &lt;unk&gt; 1080 氢氯氟烃</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1280 × 720  HD</source>
@@ -27995,7 +27995,7 @@ ACES 2.0 through OpenColorIO (2.5 and later)</source>
     </message>
     <message>
         <source>Ambisonics (first order AmbiX, for 360° video)</source>
-        <translation type="unfinished">阿姆比索尼奇(AmbiX第一顺序,360&lt;unk&gt;View)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Ambisonics (second order, 9 channels)</source>
@@ -28048,7 +28048,7 @@ and each track and bus gets a surround panner in the mixer.</source>
     </message>
     <message>
         <source>360° video (equirectangular)</source>
-        <translation type="unfinished">360&lt;unk&gt;( 方形)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Exports say they are 360° to players and YouTube; 360° footage comes in whole, not as a view.
@@ -28087,7 +28087,7 @@ View › Stereo 3D chooses what the viewer shows; exports are side by side unles
     <message>
         <source>For a cut that goes back to film: the gauge its feet and frames, key numbers and film lists
 (File › Export Film Lists) are counted in.</source>
-        <translation type="unfinished">片中可以追溯到电影:测量其脚和框架,关键数字和电影列表(File &lt;unk&gt; Export film Lists)被计算在内。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Film:</source>
@@ -28267,7 +28267,7 @@ View › Stereo 3D chooses what the viewer shows; exports are side by side unles
     </message>
     <message>
         <source>Smart Bin</source>
-        <translation type="unfinished">智能&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Name:</source>
@@ -28735,7 +28735,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">音响或视频 (&lt;unk&gt;.wav &lt;unk&gt;.mp3 &lt;unk&gt;.m4a &lt;unk&gt;.aac &lt;unk&gt;.flac &lt;unk&gt;.ogg &lt;unk&gt;.opus &lt;unk&gt;.aif &lt;unk&gt;.aiff &lt;unk&gt;.mov &lt;unk&gt;.mkv &lt;unk&gt;.mxf); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No recording picked</source>
@@ -30449,7 +30449,7 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">音响或视频 (&lt;unk&gt;.wav &lt;unk&gt;.mp3 &lt;unk&gt;.m4a &lt;unk&gt;.aac &lt;unk&gt;.flac &lt;unk&gt;.ogg &lt;unk&gt;.opus &lt;unk&gt;.aif &lt;unk&gt;.aiff &lt;unk&gt;.mov &lt;unk&gt;.mkv &lt;unk&gt;.mxf); 所有文件 (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot convert voices (no ONNX Runtime).</source>
@@ -30650,7 +30650,7 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>Keyboard layouts (*.json)</source>
-        <translation type="unfinished">键盘布局 (&lt;unk&gt;.json)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Could not write %1</source>

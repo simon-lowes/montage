@@ -32615,6 +32615,23 @@ if ui["pressed"] == "add":
         }, again, &st));
         QCOMPARE(again.find("x %1") != std::string::npos, true);  // (only "Lost %1" is still open)
         QCOMPARE(st.drafted, 1);
+        // A draft where the model wrote "<unk>" for a word or sign it did not know is garbled, so it is not kept.
+        std::string garbled;
+        QVERIFY(draftInterfaceTranslation(out, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
+            o.assign(in.size(), "Verl<unk>ren %1");
+            return true;
+        }, garbled, &st));
+        QCOMPARE(st.drafted, 0);
+        QVERIFY(garbled.find("unk") == std::string::npos);
+        // And none of the languages Montage ships holds such a draft.
+        const QDir shipped(QStringLiteral(MONTAGE_TEST_DATA_DIR "/../../translations"));
+        const QStringList files = shipped.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
+        QVERIFY(!files.isEmpty());
+        for (const QString& name : files) {
+            QFile f(shipped.filePath(name));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY2(!f.readAll().contains("&lt;unk&gt;"), qPrintable(name));
+        }
     }
 
     void translation() {

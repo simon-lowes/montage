@@ -310,7 +310,7 @@
     </message>
     <message>
         <source>Amount (Bulge + / Pinch -)</source>
-        <translation type="unfinished">Cantidad (Bulge &lt;unk&gt; / Pinch -)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Amount (px)</source>
@@ -650,7 +650,7 @@
     </message>
     <message>
         <source>Blue Hue (°)</source>
-        <translation type="unfinished">Blue Hue (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Blue Offset</source>
@@ -830,11 +830,11 @@
     </message>
     <message>
         <source>Camera Tilt (°, 3D)</source>
-        <translation type="unfinished">Cámara Tilt (&lt;unk&gt;, 3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Camera Turn (°, 3D)</source>
-        <translation type="unfinished">Gira de la cámara (&lt;unk&gt;, 3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Canon Log 3 / Cinema Gamut</source>
@@ -1234,7 +1234,7 @@
     </message>
     <message>
         <source>Cyan Hue (°)</source>
-        <translation type="unfinished">Cyan Hue (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cyan Saturation</source>
@@ -1694,11 +1694,11 @@
     </message>
     <message>
         <source>Evolution (°)</source>
-        <translation type="unfinished">Evolución (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Evolution Speed (° per frame)</source>
-        <translation type="unfinished">Velocidad de evolución (&lt;unk&gt; por marco)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Expand</source>
@@ -1802,7 +1802,7 @@
     </message>
     <message>
         <source>Field of View (°)</source>
-        <translation type="unfinished">Campo de visión (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Fill</source>
@@ -1994,7 +1994,7 @@
     </message>
     <message>
         <source>Follow the 360° View</source>
-        <translation type="unfinished">Siga la vista 360&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Font</source>
@@ -2214,7 +2214,7 @@
     </message>
     <message>
         <source>Green Hue (°)</source>
-        <translation type="unfinished">Green Hue (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Green Offset</source>
@@ -2510,7 +2510,7 @@
     </message>
     <message>
         <source>Hue Variation (°)</source>
-        <translation type="unfinished">Variación del tono (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Hue Vectors</source>
@@ -2530,7 +2530,7 @@
     </message>
     <message>
         <source>Image Light Rotation (°)</source>
-        <translation type="unfinished">Rotación de luz de imagen (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Image Light Strength</source>
@@ -2730,11 +2730,11 @@
     </message>
     <message>
         <source>Lens (field of view °)</source>
-        <translation type="unfinished">Lente (campo de visión &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Lens (field of view °, 3D)</source>
-        <translation type="unfinished">Lente (campo de visión &lt;unk&gt;, 3D)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Lens Blur (Depth)</source>
@@ -2810,7 +2810,7 @@
     </message>
     <message>
         <source>Light Direction (°)</source>
-        <translation type="unfinished">Dirección de luz (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Light Distance (model sizes)</source>
@@ -2838,7 +2838,7 @@
     </message>
     <message>
         <source>Light Height (°)</source>
-        <translation type="unfinished">Altura de la luz (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Light Leak</source>
@@ -3038,7 +3038,7 @@
     </message>
     <message>
         <source>Magenta Hue (°)</source>
-        <translation type="unfinished">Magenta Hue (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Magenta Saturation</source>
@@ -3494,7 +3494,7 @@
     </message>
     <message>
         <source>Pan (°)</source>
-        <translation type="unfinished">Pan (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Panasonic V-Log / V-Gamut</source>
@@ -3826,7 +3826,7 @@
     </message>
     <message>
         <source>Red Hue (°)</source>
-        <translation type="unfinished">Rojo Hue (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Red Offset</source>
@@ -3882,7 +3882,7 @@
     </message>
     <message>
         <source>Reframe 360°</source>
-        <translation type="unfinished">Reframe 360&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Release (ms)</source>
@@ -3962,7 +3962,7 @@
     </message>
     <message>
         <source>Roll (Z°)</source>
-        <translation type="unfinished">Rodamiento (Z&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Roll (degrees clockwise)</source>
@@ -3970,7 +3970,7 @@
     </message>
     <message>
         <source>Roll (°)</source>
-        <translation type="unfinished">Rollo (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Roll / Crawl</source>
@@ -4010,11 +4010,11 @@
     </message>
     <message>
         <source>Rotation (°)</source>
-        <translation type="unfinished">Rotación (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rotation Variation (°)</source>
-        <translation type="unfinished">Variación de rotación (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Round</source>
@@ -4250,7 +4250,7 @@
     </message>
     <message>
         <source>Shutter Angle (°)</source>
-        <translation type="unfinished">Ángulo de obturación (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sidechain</source>
@@ -4302,7 +4302,7 @@
     </message>
     <message>
         <source>Skin Centre (°)</source>
-        <translation type="unfinished">Centro de la piel (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Skin Density</source>
@@ -4310,7 +4310,7 @@
     </message>
     <message>
         <source>Skin Hue (°)</source>
-        <translation type="unfinished">Piel Hue (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Skin Saturation</source>
@@ -4318,7 +4318,7 @@
     </message>
     <message>
         <source>Skin Width (°)</source>
-        <translation type="unfinished">Ancho de la piel (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sky</source>
@@ -4534,7 +4534,7 @@
     </message>
     <message>
         <source>Speed (° per frame)</source>
-        <translation type="unfinished">Velocidad (&lt;unk&gt; por marco)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Speed Variation</source>
@@ -4558,7 +4558,7 @@
     </message>
     <message>
         <source>Spin (°/s)</source>
-        <translation type="unfinished">Espines (&lt;unk&gt;/s)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Spin Variation</source>
@@ -4574,11 +4574,11 @@
     </message>
     <message>
         <source>Spot Angle (°)</source>
-        <translation type="unfinished">Ángulo de la mancha (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Spread (°)</source>
-        <translation type="unfinished">Separar (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sprite (Picture or Clip)</source>
@@ -4910,7 +4910,7 @@
     </message>
     <message>
         <source>Tilt (X°)</source>
-        <translation type="unfinished">Inclinación (X&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Tilt (degrees up)</source>
@@ -4918,7 +4918,7 @@
     </message>
     <message>
         <source>Tilt (°)</source>
-        <translation type="unfinished">Inclinación (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Tilt-Shift Blur</source>
@@ -5094,7 +5094,7 @@
     </message>
     <message>
         <source>Turn (Y°)</source>
-        <translation type="unfinished">Gira (Y&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Turn (degrees right)</source>
@@ -5306,7 +5306,7 @@
     </message>
     <message>
         <source>Yellow Hue (°)</source>
-        <translation type="unfinished">Hue amarillo (&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Yellow Saturation</source>
@@ -6359,7 +6359,7 @@
     </message>
     <message>
         <source>Saved &quot;%1&quot; (it has no published fields yet: right-click a setting › Publish to Graphic)</source>
-        <translation type="unfinished">Guardado « %1 » (no tiene campos publicados todavía: haga clic con el botón derecho en una configuración &lt;unk&gt; Publicar a Gráfico)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Publish %1</source>
@@ -6459,7 +6459,7 @@
     </message>
     <message>
         <source>Video + Audio</source>
-        <translation type="unfinished">Video &lt;unk&gt; Audio</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Video</source>
@@ -6545,7 +6545,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Lip Sync redraws the speaker&apos;s mouth to say another track&apos;s sound (a dub) with MuseTalk 1.5 (MIT), whisper-tiny (Apache-2.0) and sd-vae-ft-mse (MIT), which run on this computer. Signed exports&apos; Content Credentials name it as AI-generated. It takes about 4 s a frame on four cores, so the monitors show it once the frames are rendered (Sequence › Render In to Out); exports always include it.</source>
-        <translation type="unfinished">Lip Sync redibuja la boca del orador para decir el sonido de otra pista (un dub) con MuseTalk 1.5 (MIT), susurro-tinto (Apache-2.0) y sd-vae-ft-mse (MIT), que se ejecutan en este equipo. Firmado las exportaciones&apos; Contenido Credenciales nombrarlo como IA-generado. Se necesita aproximadamente 4 s un marco en cuatro núcleos, por lo que los monitores lo muestran una vez que los marcos se traducen (Secuencia &lt;unk&gt; Render In to Out); las exportaciones siempre lo incluyen.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Lens Correction</source>
@@ -6577,7 +6577,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Motion Deblur uses NAFNet (MIT, trained on the GoPro dataset, CC BY 4.0), an image model that runs on this computer. It takes seconds a frame, so the monitors show it once the frames are rendered (Sequence › Render In to Out); exports always include it.</source>
-        <translation type="unfinished">Motion Deblur utiliza NAFNet (MIT, entrenado en el conjunto de datos GoPro, CC BY 4.0), un modelo de imagen que se ejecuta en este equipo. Se tarda segundos en un marco, por lo que los monitores lo muestran una vez que se muestran los marcos (Secuencia &lt;unk&gt; Render In to Out); las exportaciones siempre lo incluyen.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Depth</source>
@@ -6938,7 +6938,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Labelling speakers uses pyannote&apos;s segmentation model (MIT) and the CAM++ voice model (Apache-2.0), which run on this computer.</source>
-        <translation type="unfinished">Los altavoces de etiquetado utilizan el modelo de segmentación de pyannote (MIT) y el modelo de voz CAM&lt;unk&gt; (Apache-2.0), que se ejecutan en este ordenador.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Nothing to transcribe: choose clips with sound</source>
@@ -7701,7 +7701,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Phase correlation of left and right over the last 300 ms: +1 the same (mono), 0 unrelated, under 0 out of phase (lost when folded down to mono)</source>
-        <translation type="unfinished">Correlación de fase izquierda y derecha en los últimos 300 ms: &lt;unk&gt;1 el mismo (mono), 0 no relacionado, bajo 0 fuera de fase (perdido cuando se dobla hacia abajo a mono)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>MONO</source>
@@ -7855,7 +7855,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Fits a little faster (%1×)</source>
-        <translation type="unfinished">Se ajusta un poco más rápido (%1&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
         <source>Too long: cut %n word(s)</source>
@@ -8307,7 +8307,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Captions that break the reading limits (More › Reading Limits)</source>
-        <translation type="unfinished">Las letras que rompen los límites de lectura (Más &lt;unk&gt; Límites de lectura)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Where a caption sits when not at the bottom in the middle (Place)</source>
@@ -8710,7 +8710,7 @@ Download it now?</source>
     </message>
     <message>
         <source>One sound a line, as its caption reads (&quot;Door slams&quot;), optionally followed by | and what it sounds like (&quot;Door slams|a door slamming shut&quot;). The project keeps its own list.</source>
-        <translation type="unfinished">Un sonido una línea, como su título dice (&quot;Puerta golpea&quot;), opcionalmente seguido por &lt;unk&gt; y lo que suena (&quot;Puerta golpea&quot; una puerta cierra&quot;).El proyecto mantiene su propia lista.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot read %1</source>
@@ -9299,7 +9299,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1×%2 at %3 fps</source>
-        <translation type="unfinished">%1&lt;unk&gt;%2 a %3 fps</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
         <source>%n sound channel(s)</source>
@@ -9641,7 +9641,7 @@ Download it now?</source>
     </message>
     <message>
         <source>#</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Shot</source>
@@ -9709,7 +9709,7 @@ Download it now?</source>
     </message>
     <message>
         <source> (+%1 more)</source>
-        <translation type="unfinished"> (&lt;unk&gt;%1 más)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rebuild a sequence cut to %1 (a mix, a grade, effects and titles) to play against %2</source>
@@ -10738,7 +10738,7 @@ Download it now?</source>
     <name>montage::EditorState</name>
     <message>
         <source>This project is open read-only (File › Edit Project to make changes)</source>
-        <translation type="unfinished">Este proyecto es abierto sólo lectura (Archivo &lt;unk&gt; Editar proyecto para hacer cambios)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Read-only: %1 is editing this project</source>
@@ -10940,7 +10940,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 is free to edit: File › Edit Project</source>
-        <translation type="unfinished">%1 es libre de editar: Archivo &lt;unk&gt; Editar proyecto</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>New VFX versions: %1</source>
@@ -11439,7 +11439,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Match sequence resolution (%1 × %2)</source>
-        <translation type="unfinished">Resolución de secuencia de coincidencia (%1 &lt;unk&gt; %2)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Constant rate factor: lower values give higher quality and larger files</source>
@@ -11760,7 +11760,7 @@ HDR output is 10-bit and tagged; PQ carries HDR10 metadata.</source>
     </message>
     <message>
         <source>°</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>How wide the cameras see, across the picture</source>
@@ -12102,7 +12102,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     </message>
     <message>
         <source>Add chapter markers (Sequence &gt; Add Chapter Marker) to export chapters</source>
-        <translation type="unfinished">Añadir marcadores de capítulos (Secuencia &lt;unk&gt; Añadir marcador de capítulos) a los capítulos de exportación</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No sequence is open.</source>
@@ -12110,7 +12110,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     </message>
     <message>
         <source>Video: %1 (%2), %3 × %4, %5 fps</source>
-        <translation type="unfinished">Vídeo: %1 (%2), %3 &lt;unk&gt; %4, %5 fps</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>, QP %1</source>
@@ -12134,7 +12134,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     </message>
     <message>
         <source>MOV keeps no 3D or 360° metadata: choose MP4 or MKV for players and YouTube to recognise it</source>
-        <translation type="unfinished">MOV no guarda metadatos 3D o 360&lt;unk&gt;: elegir MP4 o MKV para los reproductores y YouTube para reconocerlo</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Video: none</source>
@@ -12146,7 +12146,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     </message>
     <message>
         <source> (%1 cannot carry %2: the mix folds down; WAV, MOV with PCM, or File › Export Immersive Master keep every channel)</source>
-        <translation type="unfinished"> (%1 no puede llevar %2: la mezcla se pliega; WAV, MOV con PCM, o Archivo &lt;unk&gt; Exportar Maestro Inmersivo mantener cada canal)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Audio: none</source>
@@ -12207,15 +12207,15 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>Frame %1 of %2  ·  Elapsed %3</source>
-        <translation type="unfinished">Marco %1 de %2 &lt;unk&gt; Elapsed %3</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>  ·  About %1 remaining</source>
-        <translation type="unfinished">  &lt;unk&gt; Acerca de %1 restante</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>  ·  %1 fps</source>
-        <translation type="unfinished">  &lt;unk&gt; %1 fps</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Exported %1</source>
@@ -12609,7 +12609,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node after the picked one (Alt+S)</source>
-        <translation type="unfinished">Añadir un nodo después del elegido (Alt&lt;unk&gt;S)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Parallel</source>
@@ -12617,7 +12617,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node beside the picked one, joined by a parallel mixer (Alt+P)</source>
-        <translation type="unfinished">Añadir un nodo junto al elegido, unido por un mezclador paralelo (Alt&lt;unk&gt;P)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Layer</source>
@@ -12625,7 +12625,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node over the picked one, joined by a layer mixer (Alt+L)</source>
-        <translation type="unfinished">Añadir un nodo sobre el elegido, unido por un mezclador de capas (Alt&lt;unk&gt;L)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Outside</source>
@@ -12633,7 +12633,7 @@ Grabbed %4
     </message>
     <message>
         <source>Add a node grading what the picked node&apos;s window leaves out (Alt+O)</source>
-        <translation type="unfinished">Añadir un nodo de clasificación lo que la ventana del nodo elegido deja fuera (Alt&lt;unk&gt;O)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Remove</source>
@@ -12819,7 +12819,7 @@ Grabbed %4
     </message>
     <message>
         <source>Save a sequence as a template with Sequence › Save as Graphics Template; the settings you publish (right-click one in the Inspector) are what each copy can change.</source>
-        <translation type="unfinished">Guardar una secuencia como plantilla con Secuencia &lt;unk&gt; Guardar como plantilla gráfica; la configuración que publica (clic derecho en uno en el Inspector) es lo que cada copia puede cambiar.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 x %2, %3 s. Fields: %4</source>
@@ -13038,7 +13038,7 @@ Projects it was inserted into play its pictures from there, so they would need r
     </message>
     <message>
         <source>%1 → %2  (%3)</source>
-        <translation type="unfinished">%1 &lt;unk&gt; %2 (%3)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Reset Transform</source>
@@ -13050,7 +13050,7 @@ Projects it was inserted into play its pictures from there, so they would need r
     </message>
     <message>
         <source>◀ Follow</source>
-        <translation type="unfinished">&lt;unk&gt; Seguir</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Move this clip with the footage beneath it, backwards from the playhead</source>
@@ -13058,7 +13058,7 @@ Projects it was inserted into play its pictures from there, so they would need r
     </message>
     <message>
         <source>Follow ▶</source>
-        <translation type="unfinished">Siga &lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Move this clip with the footage beneath it, from the playhead on.
@@ -13382,7 +13382,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>; camera motion data: %1, %2° lens</source>
-        <translation type="unfinished">; datos de movimiento de cámara: %1, %2&lt;unk&gt; lente</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Turn each frame by the camera&apos;s own motion data</source>
@@ -13679,7 +13679,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>◀ Track</source>
-        <translation type="unfinished">&lt;unk&gt; Pista</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track the surface under the corners backwards from the playhead</source>
@@ -13687,7 +13687,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Track ▶</source>
-        <translation type="unfinished">Pista &lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track the surface under the corners from the playhead on.
@@ -13858,7 +13858,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>+</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Add another object to the mask</source>
@@ -13866,7 +13866,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>−</source>
-        <translation type="unfinished">&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Add an object to cut out of the mask</source>
@@ -15009,7 +15009,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>No keyframes on %1 yet. Animate a parameter with ◷ in the Inspector, or drag its line on the timeline.</source>
-        <translation type="unfinished">No hay fotogramas clave en %1 todavía. Animar un parámetro con &lt;unk&gt; en el Inspector, o arrastrar su línea en la línea de tiempo.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Move Keyframe</source>
@@ -15760,7 +15760,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Dialogue intelligibility at the playhead (0 to 1; under about 0.45 hard to follow), from the last Sequence › Dialogue Intelligibility… analysis</source>
-        <translation type="unfinished">Diálogo inteligibilidad en el cabezal (0 a 1; bajo aproximadamente 0.45 difícil de seguir), de la última secuencia &lt;unk&gt; Diálogo Intelligibilidad... análisis</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>-23 (EBU R128)</source>
@@ -15799,11 +15799,11 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     <name>montage::MainWindow</name>
     <message>
         <source>%1 · %2×%3 · %4 fps · cache %5 MB</source>
-        <translation type="unfinished">%1 &lt;unk&gt; %2&lt;unk&gt;%3 &lt;unk&gt; %4 fps &lt;unk&gt; caché %5 MB</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Welcome to Montage — import media with Ctrl+I or drag files onto the Media bin</source>
-        <translation type="unfinished">Bienvenido a Montage — importar medios con Ctrl&lt;unk&gt;I o arrastrar archivos en el contenedor de medios</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open sequences: click to switch, drag to reorder, close to put away (double-click a sequence in the bin to open it)</source>
@@ -16878,7 +16878,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>2 × 2 Grid</source>
-        <translation type="unfinished">2 &lt;unk&gt; 2 Rejilla</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Full Frame (Reset)</source>
@@ -17690,7 +17690,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Screen %1: %2 (%3 × %4)</source>
-        <translation type="unfinished">Pantalla %1: %2 (%3 &lt;unk&gt; %4)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Reference Output…</source>
@@ -18105,7 +18105,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Workspaces: the panels laid out for a task (Alt+Shift+1 to 6)</source>
-        <translation type="unfinished">Espacios de trabajo: los paneles establecidos para una tarea (Alt&lt;unk&gt;Shift&lt;unk&gt;1 a 6)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>&amp;Help</source>
@@ -18234,7 +18234,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
         <source>%1 is editing “%2” (since %3).
 
 Open it read-only? You can watch, play and export it; it follows their saves, and once they close it File › Edit Project lets you edit it.</source>
-        <translation type="unfinished">%1 está editando « %2 » (desde %3). ¿Ábrelo sólo de lectura? Puede ver, reproducir y exportarlo; sigue sus guardares, y una vez que lo cierran Archivo &lt;unk&gt; Editar proyecto le permite editarlo.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open Read-Only</source>
@@ -18672,11 +18672,11 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>1 clip selected · %1</source>
-        <translation type="unfinished">1 clip seleccionado &lt;unk&gt; %1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 clips selected · %2</source>
-        <translation type="unfinished">%1 clips seleccionados &lt;unk&gt; %2</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open a clip in the Source monitor first</source>
@@ -18708,7 +18708,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Select an edit to trim first (Shift+T)</source>
-        <translation type="unfinished">Seleccione una edición para recortar primero (Shift&lt;unk&gt;T)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Trim</source>
@@ -18748,7 +18748,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Trimming %1: Ctrl+Left/Right a frame, with Shift five; Alt+T changes side; Esc ends</source>
-        <translation type="unfinished">Recortando %1: Ctrl&lt;unk&gt;Izquierda/Derecha de un marco, con Shift cinco; Alt&lt;unk&gt;T cambia de lado; Esc termina</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Select a clip under the playhead to mark it</source>
@@ -19122,7 +19122,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Park on the look to compare with and choose Clip › Set Colour Reference first</source>
-        <translation type="unfinished">Estaciona en el look para comparar y elige Clip &lt;unk&gt; Establecer Color Referencia primero</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Reference: %1</source>
@@ -19181,7 +19181,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Park on the look to match and choose Clip › Set Colour Reference first</source>
-        <translation type="unfinished">Estaciona en el look para que coincida y elige Clip &lt;unk&gt; Establecer Color Referencia primero</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Match Colour</source>
@@ -19523,7 +19523,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Select the clip whose voice is right and choose Clip › Set Voice Reference first</source>
-        <translation type="unfinished">Seleccione el clip cuya voz es correcta y seleccione Clip &lt;unk&gt; Establecer la referencia de voz primero</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Select the audio clips to match</source>
@@ -19539,7 +19539,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Select the production take and choose Clip › Set Voice Reference first</source>
-        <translation type="unfinished">Seleccione la toma de producción y seleccione Clip &lt;unk&gt; Establecer la referencia de voz primero</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Matching dialogue...</source>
@@ -20047,7 +20047,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Review copy queued; send it with %1%2. The notes saved from the page come back with File › Import Review Notes.</source>
-        <translation type="unfinished">Revisar copia en cola; enviarla con %1%2. Las notas guardadas de la página vuelven con File &lt;unk&gt; Importar notas de revisión.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export for Review</source>
@@ -20151,7 +20151,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source> It is encrypted: make KDMs for the cinemas&apos; servers with File › Make KDMs (its keys are kept in %1).</source>
-        <translation type="unfinished"> Está encriptado: hacer KDMs para los servidores de los cines con el archivo &lt;unk&gt; Hacer KDMs (sus claves se guardan en %1).</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> Advice: %1</source>
@@ -20298,7 +20298,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>An IMF (Interoperable Master Format) package of %1: a delivery master (Application #2E) as streaming services and broadcasters ask for, JPEG 2000 pictures (lossless by default), or an archival master (Application #5), the pictures in ACES; 24-bit sound with channel labels, checked when it is done.</source>
-        <translation type="unfinished">Un paquete del FMI (Interoperable Master Format) de %1: un maestro de entrega (Aplicación &lt;unk&gt;2E) como servicios de transmisión y las emisoras piden, imágenes JPEG 2000 (sin pérdida por defecto), o un maestro de archivo (Aplicación &lt;unk&gt;5), las imágenes en ACES; sonido de 24 bits con etiquetas de canal, comprobado cuando se hace.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Title:</source>
@@ -20342,11 +20342,11 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Delivery master (Application #2E, JPEG 2000)</source>
-        <translation type="unfinished">Maestro de entrega (Aplicación &lt;unk&gt;2E, JPEG 2000)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Archival master (Application #5, ACES OpenEXR)</source>
-        <translation type="unfinished">Maestro de archivo (Aplicación &lt;unk&gt;5, ACES OpenEXR)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Master:</source>
@@ -20654,7 +20654,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Encrypt (cinemas need a KDM to play it: File › Make KDMs…)</source>
-        <translation type="unfinished">Cifrar (cines necesitan un KDM para reproducirlo: Archivo &lt;unk&gt; Hacer KDMs...)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build has no OpenSSL</source>
@@ -21017,7 +21017,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Add a trim target first (the Trims panel&apos;s +)</source>
-        <translation type="unfinished">Añadir un objetivo de recorte primero (el panel de los recortes &lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Measuring each shot&apos;s light...</source>
@@ -22502,7 +22502,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Import media files (Ctrl+I)</source>
-        <translation type="unfinished">Importar archivos multimedia (Ctrl&lt;unk&gt;I)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Title</source>
@@ -22777,7 +22777,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>360° Footage</source>
-        <translation type="unfinished">360&lt;unk&gt; Footage</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Audio Channels</source>
@@ -23867,7 +23867,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>+ Bus</source>
-        <translation type="unfinished">&lt;unk&gt; Bus</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Add a bus: route tracks to it to process them together</source>
@@ -24252,7 +24252,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Screen %1: %2 (%3 × %4)</source>
-        <translation type="unfinished">Pantalla %1: %2 (%3 &lt;unk&gt; %4)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>The viewers and full-screen output on this display (their Rec. 709 pictures)</source>
@@ -24319,7 +24319,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Current time — type a timecode, +frames or seconds (e.g. 2.5s) and press Enter</source>
-        <translation type="unfinished">Tiempo actual — escribir un código de tiempo, &lt;unk&gt;frames o segundos (p. ej. 2.5s) y presionar Enter</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Mark In (I)</source>
@@ -24331,7 +24331,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Go to In (Shift+I)</source>
-        <translation type="unfinished">Ir a (Shift&lt;unk&gt;I)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Step Back (Left)</source>
@@ -24347,7 +24347,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Go to Out (Shift+O)</source>
-        <translation type="unfinished">Ir a cabo (Shift&lt;unk&gt;O)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Insert</source>
@@ -24570,7 +24570,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Both front speakers play (L + R) / 2 (F2)</source>
-        <translation type="unfinished">Ambos altavoces frontales juegan (L &lt;unk&gt; R) / 2 (F2)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Mute</source>
@@ -24773,7 +24773,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Put a multicam clip under the playhead (Media › Create Multicam Clip) to switch angles here.</source>
-        <translation type="unfinished">Ponga un clip multicam bajo el cabezal de juego (Media &lt;unk&gt; Crear Multicam Clip) para cambiar ángulos aquí.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Live: click an angle or press 1–%1 to cut to it.</source>
@@ -25119,7 +25119,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>agent tools over OSC are off (Edit › Control Surface… › OSC › Allow agent tools)</source>
-        <translation type="unfinished">herramientas de agente sobre OSC están apagados (Editar &lt;unk&gt; Control de la superficie... &lt;unk&gt; OSC &lt;unk&gt; Permitir herramientas de agente)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>use /montage/undo</source>
@@ -25127,7 +25127,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>a tool&apos;s argument is a JSON object, like {&quot;text&quot;: &quot;Hi&quot;}</source>
-        <translation type="unfinished">un argumento de herramienta es un objeto JSON, como &lt;unk&gt;&quot;texto&quot;: &quot;Hola&quot;&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>over OSC, tools work on the open project: leave out &quot;project&quot;</source>
@@ -25273,7 +25273,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>100%: the picture&apos;s edges are hard left and right (the front left and right speakers in surround). A 360° sequence&apos;s picture is always the whole circle.</source>
-        <translation type="unfinished">100%: los bordes de la imagen son duros izquierda y derecha (los altavoces delanteros izquierda y derecha en el entorno). Una secuencia de 360&lt;unk&gt; es siempre el círculo entero.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track and Pan</source>
@@ -25332,7 +25332,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <name>montage::PatchGenerator</name>
     <message>
         <source>Start the reference output first (Playback › Video Output › Reference Output…)</source>
-        <translation type="unfinished">Iniciar la salida de referencia primero (Reproducción &lt;unk&gt; Salida de vídeo &lt;unk&gt; Salida de referencia...)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>The reference output stopped</source>
@@ -25640,7 +25640,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <name>montage::ProductionPanel</name>
     <message>
         <source>No production open (File › Production › Open Production)</source>
-        <translation type="unfinished">No hay producción abierta (File &lt;unk&gt; Producción &lt;unk&gt; Producción abierta)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Project</source>
@@ -25862,7 +25862,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Netflix: -27 ±2 LKFS dialogue, -2 dBTP</source>
-        <translation type="unfinished">Netflix: -27 &lt;unk&gt;2 Diálogo LKFS, -2 dBTP</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cinema trailer: 85 Leq(M)</source>
@@ -26153,7 +26153,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>The face models are not installed yet: download them in Settings &gt; Models (People search).</source>
-        <translation type="unfinished">Los modelos faciales no están instalados todavía: descárgalos en Ajustes &lt;unk&gt; Modelos (Buscar personas).</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Stop</source>
@@ -26733,7 +26733,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Your project is replaced by the colourist&apos;s while you follow (your media files are kept). Alt+click the Program monitor to point at something.</source>
-        <translation type="unfinished">Su proyecto es reemplazado por el colorista mientras usted sigue (sus archivos de medios se mantienen). Alt&lt;unk&gt;click el monitor del programa para apuntar algo.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Join</source>
@@ -26768,7 +26768,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>%1 %2 × %3 (%4)</source>
-        <translation type="unfinished">%1 %2 &lt;unk&gt; %3 (%4)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Streaming to a viewer: %1, %2 Mb/s</source>
@@ -26935,7 +26935,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>the stream&apos;s + 1</source>
-        <translation type="unfinished">la corriente &lt;unk&gt; 1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> ms</source>
@@ -26975,7 +26975,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>. In Montage: File › Watch Remote Review…</source>
-        <translation type="unfinished">En Montaje: Archivo &lt;unk&gt; Ver revisión remota…</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>; with FFmpeg: ffplay -fflags nobuffer &quot;%1?passphrase=%2&quot;</source>
@@ -27396,7 +27396,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Markers to: the stream&apos;s host, port + 1</source>
-        <translation type="unfinished">Marcadores a: host de la corriente, puerto &lt;unk&gt; 1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Where the editor&apos;s Montage takes markers (host:port), when the stream comes through a server or over UDP</source>
@@ -27653,7 +27653,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>CIE 1976 u′v′</source>
-        <translation type="unfinished">CIE 1976 u&lt;unk&gt;v&lt;unk&gt;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>The chromaticity diagram: 1931 xy, or 1976 u&apos;v&apos; (its distances closer to how different colours look)</source>
@@ -27661,7 +27661,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Peak %1 · Avg %2 nits</source>
-        <translation type="unfinished">Picos %1 &lt;unk&gt; Avg %2 lits</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Brighter than the %1-nit mastering peak</source>
@@ -27737,7 +27737,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Outside Rec.709 %1 % · P3 %2 %</source>
-        <translation type="unfinished">Fuera de Rec.709 %1 % &lt;unk&gt; P3 %2 %</translation>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -27756,7 +27756,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Run the script on the open project (Ctrl+Return); one undo step</source>
-        <translation type="unfinished">Ejecutar el script en el proyecto abierto (Ctrl&lt;unk&gt;Return); un paso de deshacer</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Stop</source>
@@ -27965,7 +27965,7 @@ Neither did I.</source>
     </message>
     <message>
         <source>Nothing is transcribed yet: transcribe the takes first (Clip › Transcribe).</source>
-        <translation type="unfinished">Nada se transcribe todavía: transcribir las tomas primero (Clip &lt;unk&gt; Transcribir).</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No lines yet.</source>
@@ -28094,27 +28094,27 @@ Neither did I.</source>
     <name>montage::SequenceSettingsDialog</name>
     <message>
         <source>3840 × 2160  UHD</source>
-        <translation type="unfinished">3840 &lt;unk&gt; 2160 UHD</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>2560 × 1440  QHD</source>
-        <translation type="unfinished">2560 &lt;unk&gt; 1440 QHD</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1920 × 1080  HD</source>
-        <translation type="unfinished">1920 &lt;unk&gt; 1080 HD</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1280 × 720  HD</source>
-        <translation type="unfinished">1280 &lt;unk&gt; 720 HD</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1080 × 1920  Vertical</source>
-        <translation type="unfinished">1080 &lt;unk&gt; 1920 Vertical</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1080 × 1080  Square</source>
-        <translation type="unfinished">1080 &lt;unk&gt; 1080 Square</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sequence Settings</source>
@@ -28210,7 +28210,7 @@ ACES 2.0 through OpenColorIO (2.5 and later)</source>
     </message>
     <message>
         <source>Ambisonics (first order AmbiX, for 360° video)</source>
-        <translation type="unfinished">Ambisónica (primer orden AmbiX, para vídeo 360&lt;unk&gt;)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Ambisonics (second order, 9 channels)</source>
@@ -28263,12 +28263,12 @@ and each track and bus gets a surround panner in the mixer.</source>
     </message>
     <message>
         <source>360° video (equirectangular)</source>
-        <translation type="unfinished">Vídeo de 360 &lt;unk&gt; (equirectangular)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Exports say they are 360° to players and YouTube; 360° footage comes in whole, not as a view.
 Use a 2:1 frame size such as 3840 x 1920 or 5760 x 2880.</source>
-        <translation type="unfinished">Las exportaciones dicen que son 360&lt;unk&gt; a los reproductores y YouTube; 360&lt;unk&gt; imágenes viene en su totalidad, no como una vista. Utilice un tamaño de marco de 2:1 como 3840 x 1920 o 5760 x 2880.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Projection:</source>
@@ -28289,7 +28289,7 @@ Use a 2:1 frame size such as 3840 x 1920 or 5760 x 2880.</source>
     <message>
         <source>Stereo footage gives each eye its own picture and the Stereo 3D effect sets a clip&apos;s depth.
 View › Stereo 3D chooses what the viewer shows; exports are side by side unless chosen otherwise.</source>
-        <translation type="unfinished">El material estéreo da a cada ojo su propia imagen y el efecto Stereo 3D establece la profundidad de un clip. Ver &lt;unk&gt; Stereo 3D elige lo que el espectador muestra; las exportaciones son lado a lado a menos que se elija lo contrario.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Stereo:</source>
@@ -28302,7 +28302,7 @@ View › Stereo 3D chooses what the viewer shows; exports are side by side unles
     <message>
         <source>For a cut that goes back to film: the gauge its feet and frames, key numbers and film lists
 (File › Export Film Lists) are counted in.</source>
-        <translation type="unfinished">Para un corte que se remonta a la película: el medidor sus pies y marcos, números clave y listas de películas (File &lt;unk&gt; Export Film Lists) se cuentan en.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Film:</source>
@@ -28680,7 +28680,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>No folders yet: Folders › Add Folder… to bring in a library of sounds</source>
-        <translation type="unfinished">No hay carpetas todavía: Carpetas &lt;unk&gt; Añadir carpeta... para traer una biblioteca de sonidos</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
         <source>%n sound(s)</source>
@@ -28698,11 +28698,11 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source> · reading the folders…</source>
-        <translation type="unfinished"> &lt;unk&gt; leer las carpetas…</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> · listening %1 of %2</source>
-        <translation type="unfinished"> &lt;unk&gt; escuchar %1 de %2</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot search sound by what it sounds like (no ONNX Runtime)</source>
@@ -29196,7 +29196,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
         <source>Surround: drag to place the track among the speakers (nearer the middle spreads it out).
 Wheel: narrower or wider; Alt+wheel: higher or lower (immersive layouts). Double-click: front, as in stereo.
 Right-click: width, LFE, height and audio object.</source>
-        <translation type="unfinished">Alrededor: arrastrar para colocar la pista entre los altavoces (cerca del medio lo separa). Rueda: más estrecha o más ancha; Rueda Alt&lt;unk&gt;: más alta o más baja (diseños inmersivos). Doble clic: delantero, como en estéreo. Clic derecho: ancho, LFE, altura y objeto de audio.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Width</source>
@@ -29406,11 +29406,11 @@ Right-click: width, LFE, height and audio object.</source>
     </message>
     <message>
         <source>Volume · %1 · trimmed</source>
-        <translation type="unfinished">Volumen &lt;unk&gt; %1 &lt;unk&gt; recortado</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Volume · %1</source>
-        <translation type="unfinished">Volumen &lt;unk&gt; %1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Delete Automation Point</source>

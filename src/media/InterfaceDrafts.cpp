@@ -205,7 +205,9 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
                 d.replace(at, hit.capturedLength(), (joined ? QStringLiteral(" %") : QStringLiteral("%")) + hit.captured(1));
             }
         }
-        if (d.isEmpty() || placeholders(d) != placeholders(src)) {
+        // A model that met a word or sign it has no piece for writes "<unk>" in its place: that draft is garbled, so the
+        // text stays in English.
+        if (d.isEmpty() || d.contains(QStringLiteral("<unk>")) || placeholders(d) != placeholders(src)) {
             ++st.skipped;
             continue;
         }
