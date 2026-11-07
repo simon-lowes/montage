@@ -116,6 +116,7 @@ target_compile_definitions(montage_test_hang PRIVATE MONTAGE_TEST_HANG)
 montage_test_clap(montage_test_crash MontageTestCrash crash plugins/test_clap_misbehaving.c)
 target_compile_definitions(montage_test_crash PRIVATE MONTAGE_TEST_CRASH)
 montage_test_clap(montage_test_latency MontageTestLatency latency plugins/test_clap_latency.c)
+montage_test_clap(montage_test_convolver MontageTestConvolver convolver plugins/test_clap_convolver.c)
 montage_test_clap(montage_test_sidechain MontageTestSidechain sidechain plugins/test_clap_sidechain.c)
 if(NOT WIN32 AND NOT APPLE)
   target_link_libraries(montage_test_sidechain PRIVATE m)
@@ -153,12 +154,13 @@ target_compile_definitions(test_render PRIVATE MONTAGE_TEST_OFX_DIR="${CMAKE_CUR
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
 
 montage_test(test_plugins)
-add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage_test_sidechain montage-plugin-probe
-  montage_test_ofx montage_test_ofx_crash)
+add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage_test_sidechain
+  montage_test_convolver montage-plugin-probe montage-pluginhost montage_test_ofx montage_test_ofx_crash)
 target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
   MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
-  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
+  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
+  MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>")
 
 if(TARGET PkgConfig::LILV)
   # An LV2 gain with latency, as a bundle (shared module + Turtle files).

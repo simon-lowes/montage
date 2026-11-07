@@ -165,7 +165,7 @@ add_library(montage_engine STATIC
   media/Translator.h media/Translator.cpp
   media/InterfaceDrafts.h media/InterfaceDrafts.cpp
   render/Processing.h render/Processing.cpp render/TransferTables.h
-  render/Ofx.h render/Ofx.cpp render/OfxGl.h render/OfxGl.cpp
+  render/Ofx.h render/Ofx.cpp render/OfxGl.h render/OfxGl.cpp render/OfxRemote.h render/OfxRemote.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
@@ -299,6 +299,7 @@ add_library(montage_engine STATIC
   render/MonitorCalibration.h render/MonitorCalibration.cpp
   render/MonitorSection.h render/MonitorSection.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
+  audio/PluginHost.h audio/PluginHost.cpp audio/PluginHostInternal.h audio/PluginIpc.h audio/PluginIpc.cpp audio/PluginWire.h
   audio/AraHost.h audio/AraHost.cpp ${PROJECT_SOURCE_DIR}/third_party/ara/ARA_Library/Dispatch/ARAHostDispatch.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
@@ -804,3 +805,11 @@ montage_copy_runtime(montage-plugin-probe)
 set_target_properties(montage-plugin-probe PROPERTIES AUTOMOC OFF
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/app)
 install(TARGETS montage-plugin-probe RUNTIME DESTINATION bin)
+
+# Runs plug-ins in processes of their own while Montage uses them (audio/PluginHost.h), beside the editor as the probe is.
+add_executable(montage-pluginhost tools/plugin_host.cpp)
+target_link_libraries(montage-pluginhost PRIVATE montage_engine)
+montage_copy_runtime(montage-pluginhost)
+set_target_properties(montage-pluginhost PROPERTIES AUTOMOC OFF
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/app)
+install(TARGETS montage-pluginhost RUNTIME DESTINATION bin)

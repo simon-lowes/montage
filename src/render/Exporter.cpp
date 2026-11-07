@@ -20,6 +20,7 @@
 #include "core/Surround.h"
 #include "render/RateConversion.h"
 #include "render/Retime.h"
+#include "audio/PluginHost.h"
 #include "audio/TimeStretch.h"
 #include "media/Rife.h"
 
@@ -860,6 +861,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (error) *error = msg;
         return false;
     };
+    // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h).
+    const uint64_t pluginFailures = plugins::offlineFailureSerial();
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());  // nothing past the end of the cut
@@ -2090,6 +2093,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     } freeSecond{secondField};
     for (FrameTime f = din; f < dout; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
+        if (plugins::offlineFailureSerial() != pluginFailures)
+            return fail("Export stopped because the plug-in " + plugins::lastOfflineFailure());
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         int longGopCopied = 0;
         std::string longGopError;
@@ -2825,9 +2830,15 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
                            containerCarriesStreams(s.path);
     // Smart rendering that cannot go on as planned (HEVC copied as hvc1 whose footage is not found where it was): made
     // again, encoded whole.
+    const uint64_t pluginFailures = plugins::offlineFailureSerial();
     auto exportOnce = [&](const Sequence& q, const ExportSettings& st) {
         bool again = false;
-        if (exportImpl(p, q, st, progress, cancel, error, opened, encoderUsed, smartRendered, light, &again)) return true;
+        if (exportImpl(p, q, st, progress, cancel, error, opened, encoderUsed, smartRendered, light, &again)) {
+            // (the last blocks, after the last check)
+            if (plugins::offlineFailureSerial() == pluginFailures) return true;
+            if (error) *error = "Export stopped because the plug-in " + plugins::lastOfflineFailure();
+            return false;
+        }
         if (!again || (cancel && cancel->load())) return false;
         ExportSettings whole = st;
         whole.smartRender = false;

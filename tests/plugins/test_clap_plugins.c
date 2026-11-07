@@ -3,10 +3,12 @@
 //                            an "editor" that, when shown, asks to be 400x250 and turns the gain to 0.25
 //                            (as if the user dragged its knob) so hosts can test the editor protocol
 //   org.montage.test.invert  polarity inversion, no parameters
-// Built as MontageTestPlugins.clap.
+// Both misbehave on request (test_fault.h). Built as MontageTestPlugins.clap.
 #include <clap/clap.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "test_fault.h"
 
 typedef struct {
     clap_plugin_t plugin;
@@ -109,10 +111,12 @@ static const clap_plugin_params_t kParams = {params_count, params_info, params_v
 
 // ---- state: the gain as 8 bytes ----
 static bool state_save(const clap_plugin_t* p, const clap_ostream_t* s) {
+    montage_test_fault("save", NULL, 0);
     double g = ((TestPlugin*)p->plugin_data)->gain;
     return s->write(s, &g, sizeof g) == (int64_t)sizeof g;
 }
 static bool state_load(const clap_plugin_t* p, const clap_istream_t* s) {
+    montage_test_fault("load", NULL, 0);
     double g = 0;
     if (s->read(s, &g, sizeof g) != (int64_t)sizeof g) return false;
     ((TestPlugin*)p->plugin_data)->gain = g;
@@ -157,9 +161,17 @@ static const clap_plugin_gui_t kGui = {gui_supported, gui_preferred, gui_create,
                                        gui_set_parent, gui_set_transient, gui_suggest_title, gui_show, gui_hide};
 
 // ---- plugin ----
-static bool plugin_init(const clap_plugin_t* p) { (void)p; return true; }
+static bool plugin_init(const clap_plugin_t* p) {
+    (void)p;
+    montage_test_fault("init", NULL, 0);
+    return true;
+}
 static void plugin_destroy(const clap_plugin_t* p) { free(p->plugin_data); }
-static bool plugin_activate(const clap_plugin_t* p, double sr, uint32_t minf, uint32_t maxf) { (void)p; (void)sr; (void)minf; (void)maxf; return true; }
+static bool plugin_activate(const clap_plugin_t* p, double sr, uint32_t minf, uint32_t maxf) {
+    (void)p; (void)sr; (void)minf; (void)maxf;
+    montage_test_fault("activate", NULL, 0);
+    return true;
+}
 static void plugin_deactivate(const clap_plugin_t* p) { (void)p; }
 static bool plugin_start(const clap_plugin_t* p) { (void)p; return true; }
 static void plugin_stop(const clap_plugin_t* p) { (void)p; }
@@ -173,6 +185,7 @@ static clap_process_status plugin_process(const clap_plugin_t* p, const clap_pro
         float* out = proc->audio_outputs[0].data32[c];
         for (uint32_t i = 0; i < proc->frames_count; ++i) out[i] = in[i] * factor;
     }
+    montage_test_fault("process", proc->audio_outputs[0].data32[1], proc->frames_count);
     return CLAP_PROCESS_CONTINUE;
 }
 static const void* plugin_extension(const clap_plugin_t* p, const char* id) {

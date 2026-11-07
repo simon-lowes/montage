@@ -34,6 +34,7 @@
 #include "media/SuperScale.h"
 #include "render/ColorSpace.h"
 #include "render/OfxGl.h"
+#include "render/OfxRemote.h"
 #include "ofxColour.h"
 #include "ofxCore.h"
 #include "ofxDrawSuite.h"
@@ -2104,6 +2105,31 @@ std::string Registry::guardPath() const {
         .toStdString();
 }
 
+void Registry::adopt(const PluginDesc& d) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    scanned_ = true;  // (never scans by itself)
+    for (PluginDesc& have : plugins_)
+        if (have.id == d.id) {
+            have = d;
+            return;
+        }
+    plugins_.push_back(d);
+}
+
+bool Registry::lookUp(const Effect& e, PluginDesc& d, std::string* error) {
+    // Only a plug-in this computer's scan found and did not block runs: never a binary named by the project file, which
+    // could be anything, or one that crashed the probe (or crashed while showing its controls).
+    ensureScanned();
+    if (find(e.s("ofx_id"), d)) return true;
+    const std::vector<PluginDesc> saved = descriptionsFromJson(e.s("ofx_description"));
+    const std::string name = effectName(e);
+    if (error) *error = name + " is not installed";
+    if (!saved.empty())
+        for (const auto& [binary, why] : blocked())
+            if (binary == saved.front().binary && error) *error = name + " is blocked: " + why;
+    return false;
+}
+
 bool Registry::find(const std::string& id, PluginDesc& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const PluginDesc& d : plugins_)
@@ -2193,19 +2219,7 @@ ColourPlan planColour(Instance& inst, const ColorSpace& working) {
 
 // The plug-in for effect `e`, loaded, and an instance of it checked out (given back by the caller).
 Instance* acquire(const Effect& e, PluginDesc& d, Loaded*& l, std::string* error) {
-    // Only a plug-in this computer's scan found and did not block runs: never a binary named by the project file, which
-    // could be anything, or one that crashed the probe (or crashed while showing its controls).
-    Registry& registry = Registry::instance();
-    registry.ensureScanned();
-    if (!registry.find(e.s("ofx_id"), d)) {
-        const std::vector<PluginDesc> saved = descriptionsFromJson(e.s("ofx_description"));
-        const std::string name = effectName(e);
-        if (error) *error = name + " is not installed";
-        if (!saved.empty())
-            for (const auto& [binary, why] : registry.blocked())
-                if (binary == saved.front().binary && error) *error = name + " is blocked: " + why;
-        return nullptr;
-    }
+    if (!Registry::instance().lookUp(e, d, error)) return nullptr;
     l = loadPlugin(d, error);
     if (!l) return nullptr;
     return checkOut(l, e.id, error);
@@ -2587,6 +2601,20 @@ std::string effectName(const Effect& e) {
 
 bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch, std::string* error, const ColorSpace* working) {
     if (img.empty()) return true;
+    if (remote::isolated()) {
+        // In a plug-in host (render/OfxRemote.h).
+        PluginDesc d;
+        if (!Registry::instance().lookUp(e, d, error)) return false;
+        if (d.transition() || d.generator()) {
+            if (error) *error = d.label + (d.transition() ? " is a transition" : " is a generator") + ", not a clip effect";
+            return false;
+        }
+        Image out;
+        if (!remote::render(remote::Kind::Effect, e, d, t, 0, scale, img.width, img.height, &img, nullptr, out, &fetch, error, working))
+            return false;
+        img = std::move(out);
+        return true;
+    }
     PluginDesc d;
     Loaded* l = nullptr;
     GiveBack inst{acquire(e, d, l, error)};
@@ -2619,6 +2647,15 @@ bool applyTransition(const Effect& e, double t, double progress, const Image& fr
     // (a side with nothing is transparent; the other is fitted to the first)
     Image a = from.empty() ? Image(w, h) : from;
     Image b = to.empty() ? Image(w, h) : to.width == w && to.height == h ? to : resizeImage(to, w, h);
+    if (remote::isolated()) {
+        PluginDesc d;
+        if (!Registry::instance().lookUp(e, d, error)) return false;
+        if (!d.transition()) {
+            if (error) *error = d.label + " is not a transition";
+            return false;
+        }
+        return remote::render(remote::Kind::Transition, e, d, t, std::clamp(progress, 0.0, 1.0), scale, w, h, &a, &b, out, nullptr, error, working);
+    }
     PluginDesc d;
     Loaded* l = nullptr;
     GiveBack inst{acquire(e, d, l, error)};
@@ -2639,6 +2676,15 @@ bool applyTransition(const Effect& e, double t, double progress, const Image& fr
 
 bool renderGenerator(const Effect& e, double t, int w, int h, double scale, Image& out, std::string* error, const ColorSpace* working) {
     if (w <= 0 || h <= 0) return false;
+    if (remote::isolated()) {
+        PluginDesc d;
+        if (!Registry::instance().lookUp(e, d, error)) return false;
+        if (!d.generator()) {
+            if (error) *error = d.label + " is not a generator";
+            return false;
+        }
+        return remote::render(remote::Kind::Generator, e, d, t, 0, scale, w, h, nullptr, nullptr, out, nullptr, error, working);
+    }
     PluginDesc d;
     Loaded* l = nullptr;
     GiveBack inst{acquire(e, d, l, error)};
@@ -2675,6 +2721,7 @@ const InputResolver& currentInputs() {
     return tInputs ? *tInputs : none;
 }
 OwnMaskScope::OwnMaskScope(const std::vector<float>* matte) : previous_(tOwnMask) { tOwnMask = matte; }
+const std::vector<float>* currentOwnMask() { return tOwnMask; }
 OwnMaskScope::~OwnMaskScope() { tOwnMask = previous_; }
 
 bool initializeGpu(std::string* why) { return gl::initialize(why); }

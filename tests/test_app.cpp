@@ -180,6 +180,8 @@
 #include "audio/ElasticAudio.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
+#include "audio/PluginHost.h"
+#include "audio/PluginHostInternal.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "media/Beats.h"
@@ -207,6 +209,8 @@
 #include "control/MackieControl.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
+#include "PluginFailureBar.h"
+#include "PluginManagerDialog.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
 #include "Accessibility.h"
@@ -4487,6 +4491,57 @@ private slots:
         QVERIFY(!PluginEditorWindow::find(clip, eid));
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void pluginFailureBarAndHostingSettings() {
+        // A plug-in that failed in its host is named in the bar above the timeline, which never blocks; Disable keeps
+        // it bypassed and turns it off. Tools › Plug-in Hosting… sets how plug-ins run, saved for the next start.
+        auto* bar = win_->findChild<PluginFailureBar*>("pluginFailureBar");
+        QVERIFY(bar);
+        plugins::clearHostFailures();
+        QTRY_VERIFY(!bar->isVisible());
+        const std::string id = "clap:org.example.broken";
+        plugins::remote::recordFailure(id, "Broken Reverb", "Example", "crash", "crashed (signal 11); bypassed", false);
+        QTRY_VERIFY(bar->isVisible());
+        auto* text = bar->findChild<QLabel*>("pluginFailureText");
+        QVERIFY(text);
+        QVERIFY2(text->text().contains("Broken Reverb crashed in its plug-in host"), qPrintable(text->text()));
+        QVERIFY(bar->findChild<QPushButton*>("pluginFailureDisable")->isVisible());
+        plugins::remote::recordFailure(id, "Broken Reverb", "Example", "hang", "stopped responding; bypassed", false);
+        QTRY_VERIFY2(text->text().contains("Broken Reverb stopped responding") && text->text().contains("(2 time"), qPrintable(text->text()));
+        bar->findChild<QPushButton*>("pluginFailureDisable")->click();
+        QVERIFY(!bar->isVisible());
+        QVERIFY(plugins::Registry::instance().isPluginDisabled(id));
+        plugins::Registry::instance().setPluginDisabled(id, false);
+        plugins::clearHostFailures();
+        // A new failure shows it again; Close puts it away.
+        plugins::remote::recordFailure(id, "Broken Reverb", "Example", "memory", "used more memory than the limit (4096 MB); bypassed", false);
+        QTRY_VERIFY(bar->isVisible());
+        QVERIFY2(text->text().contains("used more memory than the limit"), qPrintable(text->text()));
+        bar->findChild<QPushButton*>("pluginFailureClose")->click();
+        QVERIFY(!bar->isVisible());
+        plugins::clearHostFailures();
+
+        const plugins::HostingSettings before = plugins::hosting();
+        whenModal<QDialog>(this, [](QDialog* d) {
+            QCOMPARE(d->objectName(), QString("pluginHostingDialog"));
+            auto* isolation = d->findChild<QComboBox*>("hostingIsolation");
+            QVERIFY(isolation && isolation->count() == 4);
+            isolation->setCurrentIndex(isolation->findData(int(plugins::Isolation::PerVendor)));
+            d->findChild<QSpinBox*>("hostingMissedBlocks")->setValue(40);
+            d->findChild<QComboBox*>("hostingBypass")->setCurrentIndex(1);
+            d->accept();
+        });
+        PluginManagerDialog::editHosting(win_.get());
+        QVERIFY(plugins::hosting().isolation == plugins::Isolation::PerVendor);
+        QCOMPARE(plugins::hosting().missedBlocks, 40);
+        QVERIFY(plugins::hosting().bypassWithSilence);
+        QCOMPARE(appSettings().value("plugins/hosting/isolation").toString(), QString("vendor"));
+        plugins::setHosting(plugins::HostingSettings{});
+        PluginManagerDialog::applySavedHosting();
+        QVERIFY(plugins::hosting().isolation == plugins::Isolation::PerVendor && plugins::hosting().missedBlocks == 40);
+        plugins::setHostingAndSave(before);
+        QCOMPARE(appSettings().value("plugins/hosting/isolation").toString(), QString::fromLatin1(plugins::isolationName(before.isolation)));
     }
 
     void araPlugInDocument() {

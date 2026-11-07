@@ -38,6 +38,7 @@
 #include <tuple>
 
 #include "AudioFx.h"
+#include "audio/PluginHost.h"
 #include "audio/Upmix.h"
 #include "ColorSpace.h"
 #include "CompositeRender.h"
@@ -4014,6 +4015,8 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                      std::vector<MeterLevels>* trackLevels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    // Plug-ins in host processes: in playback a block one cannot give back in time is bypassed; offline it is waited for.
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
     const int n = layoutChannels(seq.audioLayout);
     if (n == 2) {
         std::lock_guard lock(m_);
@@ -4060,6 +4063,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
 void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                            std::vector<MeterLevels>* trackLevels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
     const int n = layoutChannels(seq.audioLayout);
     std::lock_guard lock(m_);
     if (start != nextStart_) {
@@ -4498,6 +4502,7 @@ int AudioMixer::maxLatency(const Sequence& seq, double sr) {
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                          std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack, int channels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
     const double sr = rate > 0 ? rate : seq.sampleRate;
     // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders. Nested
     // sequences mix as stereo, except an ambisonic one wanted as its field.

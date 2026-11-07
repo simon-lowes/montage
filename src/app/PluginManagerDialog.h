@@ -22,6 +22,11 @@ public:
 
     // Applies the extra plugin folders saved in the settings to the registry.
     static void applySavedFolders();
+    // Applies the saved plug-in hosting settings (audio/PluginHost.h), and keeps them saved when they change (here or
+    // over the agent link).
+    static void applySavedHosting();
+    // The hosting settings: how plug-ins are grouped into host processes and what happens when one fails.
+    static void editHosting(QWidget* parent);
 
 signals:
     // The set of offered plugins may have changed (scan, enable/disable).
@@ -41,6 +46,7 @@ private:
     QPushButton* rescanSelected_ = nullptr;
     QPushButton* retry_ = nullptr;
     QPushButton* folders_ = nullptr;
+    QPushButton* hosting_ = nullptr;
     bool scanning_ = false;
     bool refreshing_ = false;
 };

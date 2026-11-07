@@ -68,6 +68,7 @@
 #include "audio/ElasticAudio.h"
 #include "audio/TapeRepair.h"
 #include "audio/PluginEffect.h"
+#include "audio/PluginHost.h"
 #include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
@@ -3704,6 +3705,84 @@ void McpServer::Impl::addTools() {
             }
             const QJsonObject o{{"effects", list}};
             return ok(json(o), o);
+        });
+
+    add("montage_plugins", "Plug-in hosting",
+        "How plug-ins are hosted, and how they have failed. Audio plug-ins (CLAP, VST3, LV2, Audio Units) and OpenFX video "
+        "plug-ins run in plug-in host processes of their own, so one that crashes, hangs or uses too much memory is bypassed "
+        "(playback carries on; an export stops, naming it) and started again with its last settings. `isolation` reads or "
+        "sets the grouping: \"plugin\" (each plug-in in a host of its own, the default), \"vendor\" (one host for each maker), "
+        "\"shared\" (all plug-ins in one host) or \"off\" (in Montage's own process). ARA plug-ins always run in Montage's "
+        "process. Also sets missed_blocks (audio blocks a host may be late with in a row before it counts as hung), bypass "
+        "(\"input\" or \"silence\"), memory_limit_mb (0: none), export_timeout_s and auto_restarts (a session, for each "
+        "plug-in). The result lists the running hosts and every failure this session (which plug-in, its kind: crash, hang, "
+        "memory or load; when first and last, how many times, restarts, whether it is bypassed now). `restart` starts a "
+        "failed plug-in again; `disable` keeps it bypassed and turns it off in the plug-in list; `clear_failures` empties "
+        "the list.",
+        R"json({"type":"object","properties":{"isolation":{"type":"string","enum":["plugin","vendor","shared","off"]},"missed_blocks":{"type":"integer","minimum":1,"maximum":1000},"bypass":{"type":"string","enum":["input","silence"]},"memory_limit_mb":{"type":"integer","minimum":0},"export_timeout_s":{"type":"number","minimum":1},"auto_restarts":{"type":"integer","minimum":0,"maximum":100},"restart":{"type":"string","description":"the plug-in id of a failure to start again"},"disable":{"type":"string","description":"the plug-in id of a failure to keep bypassed"},"clear_failures":{"type":"boolean"}}})json",
+        false, [](const QJsonObject& a) {
+            plugins::HostingSettings h = plugins::hosting();
+            bool changed = false;
+            if (a.contains("isolation")) {
+                const auto i = plugins::isolationFromName(str(a, "isolation").toStdString());
+                if (!i) return fail("isolation is plugin, vendor, shared or off");
+                h.isolation = *i;
+                changed = true;
+            }
+            if (a.contains("missed_blocks")) h.missedBlocks = std::clamp(a.value("missed_blocks").toInt(16), 1, 1000), changed = true;
+            if (a.contains("bypass")) {
+                const QString b = str(a, "bypass");
+                if (b != "input" && b != "silence") return fail("bypass is input or silence");
+                h.bypassWithSilence = b == "silence";
+                changed = true;
+            }
+            if (a.contains("memory_limit_mb")) h.memoryLimitMb = std::max(0, a.value("memory_limit_mb").toInt()), changed = true;
+            if (a.contains("export_timeout_s")) h.exportTimeoutMs = int(std::lround(std::max(1.0, a.value("export_timeout_s").toDouble()) * 1000)), changed = true;
+            if (a.contains("auto_restarts")) h.autoRestarts = std::clamp(a.value("auto_restarts").toInt(), 0, 100), changed = true;
+            if (changed) plugins::setHostingAndSave(h);
+            QStringList did;
+            if (a.contains("restart")) {
+                const std::string id = str(a, "restart").toStdString();
+                did << (plugins::restartPlugin(id) ? QStringLiteral("Starting %1 again.").arg(QString::fromStdString(id))
+                                                   : QStringLiteral("%1 was not bypassed.").arg(QString::fromStdString(id)));
+            }
+            if (a.contains("disable")) {
+                plugins::disablePluginAfterFailure(str(a, "disable").toStdString());
+                did << QStringLiteral("%1 is kept bypassed and turned off.").arg(str(a, "disable"));
+            }
+            if (a.value("clear_failures").toBool()) {
+                plugins::clearHostFailures();
+                did << QStringLiteral("Failures cleared.");
+            }
+            h = plugins::hosting();
+            auto iso = [](int64_t ms) { return QDateTime::fromMSecsSinceEpoch(ms).toUTC().toString(Qt::ISODateWithMs); };
+            QJsonArray failures;
+            for (const plugins::HostFailure& f : plugins::hostFailures())
+                failures.append(QJsonObject{{"plugin", QString::fromStdString(f.pluginId)}, {"name", QString::fromStdString(f.name)},
+                                            {"vendor", QString::fromStdString(f.vendor)}, {"kind", QString::fromStdString(f.kind)},
+                                            {"reason", QString::fromStdString(f.reason)}, {"first", iso(f.firstMs)}, {"last", iso(f.lastMs)},
+                                            {"count", f.count}, {"restarts", f.restarts}, {"bypassed", f.bypassedNow},
+                                            {"offline", f.offline}, {"disabled", f.disabled}});
+            QJsonArray hosts;
+            for (const plugins::HostInfo& hi : plugins::runningHosts())
+                hosts.append(QJsonObject{{"key", QString::fromStdString(hi.key)}, {"pid", double(hi.pid)}, {"instances", hi.instances}});
+            const QJsonObject o{{"isolation", plugins::isolationName(h.isolation)},
+                                {"host_available", plugins::hostAvailable()},
+                                {"missed_blocks", h.missedBlocks},
+                                {"bypass", h.bypassWithSilence ? "silence" : "input"},
+                                {"memory_limit_mb", h.memoryLimitMb},
+                                {"export_timeout_s", h.exportTimeoutMs / 1000.0},
+                                {"auto_restarts", h.autoRestarts},
+                                {"hosts", hosts},
+                                {"failures", failures}};
+            QString text = QStringLiteral("Plug-ins: %1").arg(h.isolation == plugins::Isolation::PerPlugin  ? "each in a host of its own"
+                                                              : h.isolation == plugins::Isolation::PerVendor ? "one host for each maker"
+                                                              : h.isolation == plugins::Isolation::Shared    ? "all in one host"
+                                                                                                             : "in Montage's own process");
+            if (h.isolation != plugins::Isolation::InProcess && !plugins::hostAvailable()) text += " (the host program is missing: in Montage's own process)";
+            text += QStringLiteral("; %1 failure(s) this session.").arg(failures.size());
+            if (!did.isEmpty()) text += " " + did.join(' ');
+            return ok(text, o);
         });
 
     add("montage_add_effect", "Add an effect",

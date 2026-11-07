@@ -329,7 +329,7 @@ std::unique_ptr<Session> Session::open(const plugins::Descriptor& desc, const st
     impl->roles = roles;
     impl->describeTimeline();
     std::string err;
-    impl->inst = plugins::instantiate(desc, &err);
+    impl->inst = plugins::instantiateHere(desc, &err);  // (ARA shares the document: always in this process)
     if (!impl->inst) return fail("the plug-in could not be loaded: " + err);
     impl->library = impl->inst->library();
     impl->factory = static_cast<const ARAFactory*>(impl->inst->araFactory());

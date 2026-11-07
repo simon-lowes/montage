@@ -8,7 +8,8 @@
 // file changes or the user retries them.
 //
 // Hosting runs a plugin on stereo audio as a clip effect (type "plugin"), with another track as its key input when
-// it has one (a sidechain).
+// it has one (a sidechain). Plug-ins run in host processes of their own (audio/PluginHost.h), so one that crashes or
+// hangs while running is bypassed instead of ending the session.
 #pragma once
 
 #include <cstdint>
@@ -63,6 +64,8 @@ public:
     virtual void editorGesture(uint32_t id, bool begin) {}
     // The editor wants a new size (pixels).
     virtual void editorResize(int width, int height) = 0;
+    // The editor went away by itself (its window was closed, or the host process it ran in failed).
+    virtual void editorClosed() {}
 };
 
 // A loaded, running plugin. Not thread safe: use from one thread at a time.
@@ -116,14 +119,21 @@ public:
     virtual bool openEditor(void* parent, EditorListener* listener, int& width, int& height) { return false; }
     virtual void closeEditor() {}
     virtual bool editorResizable() { return false; }
+    // Whether the open editor is in a window of its own rather than in the parent given (a plug-in in a host process
+    // on macOS, where another process's view cannot hold it).
+    virtual bool editorInOwnWindow() { return false; }
     virtual void setEditorSize(int width, int height) {}
     virtual void idle() {}
 };
 
+// Runs in a plug-in host process (audio/PluginHost.h) unless isolation is off or the plug-in offers ARA.
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error = nullptr);
+// Always in this process.
+std::unique_ptr<Instance> instantiateHere(const Descriptor& d, std::string* error = nullptr);
 // Whether a plugin (by descriptor id) has turned out to have a key input, once any instance of it was made here.
 bool knownSidechain(const std::string& id);
-// Plugins loaded by this process so far (crash reports note whether plugins were in use).
+// Plugins loaded by this process so far (crash reports note whether plugins were in use; those in host processes are
+// not counted).
 int instancesCreated();
 
 // Standard folders for a format on this OS, after the format's environment
@@ -191,6 +201,8 @@ public:
     std::optional<Descriptor> find(const std::string& id) const;
     std::vector<Blocked> blocklist() const;
     void unblock(const std::string& path);
+    // Blocks a plugin file that crashed its host process while loading, as a crash while scanning does.
+    void blockAfterCrash(Format f, const std::string& path, const std::string& reason);
     // Disabled plugins stay installed and keep working in existing projects,
     // but are not offered in effect lists. Saved with the cache.
     void setPluginDisabled(const std::string& id, bool disabled);

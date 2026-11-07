@@ -224,6 +224,7 @@ extern "C" {
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
+#include "PluginFailureBar.h"
 #include "PluginManagerDialog.h"
 #include "ScopesWidget.h"
 #include "SpellUi.h"
@@ -278,6 +279,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildMenus();
     applyHdrViewer();
     keymap::load(this);
+
+    // How plug-ins run in host processes of their own (Tools › Audio Plugins › Hosting…).
+    PluginManagerDialog::applySavedHosting();
 
     // Crash safety: find sessions that did not exit cleanly before starting ours.
     recovery_ = new RecoveryManager(state_, QString(), this);
@@ -426,6 +430,10 @@ void MainWindow::buildPanels() {
         sequenceTabs_->setExpanding(false);
         sequenceTabs_->setDocumentMode(true);
         sequenceTabs_->setToolTip(tr("Open sequences: click to switch, drag to reorder, close to put away (double-click a sequence in the bin to open it)"));
+        // A plug-in that failed in its host, named, with Restart and Disable (it never stops playback).
+        auto* pluginFailures = new PluginFailureBar(centre);
+        connect(pluginFailures, &PluginFailureBar::pluginsChanged, this, [this] { effects_->reload(); });
+        v->addWidget(pluginFailures);
         v->addWidget(sequenceTabs_);
         v->addWidget(timeline_, 1);
         setCentralWidget(centre);
@@ -3056,6 +3064,7 @@ void MainWindow::buildMenus() {
         connect(dlg, &PluginManagerDialog::pluginsChanged, effects_, &EffectsBrowser::reload);
         dlg->show();
     });
+    add(toolsM, QT_TR_NOOP("Plug-in &Hosting…"), QKeySequence(), [this] { PluginManagerDialog::editHosting(this); });
     {
         // Where the AI models run (media/Inference.h): the GPU or NPU when there is one, or the processor only.
         // Provider libraries beside the program or in Montage's data folder are registered first.

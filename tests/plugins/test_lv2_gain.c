@@ -1,10 +1,12 @@
 /* A test LV2 plugin for Montage: stereo gain (dB) delayed by 16 samples,
    reporting that latency on a lv2:reportsLatency output, and turned down by
-   what arrives on its key (side chain) inputs: (1 - min(1, |key|)). */
+   what arrives on its key (side chain) inputs: (1 - min(1, |key|)). It misbehaves on request (test_fault.h). */
 #include <lv2/core/lv2.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "test_fault.h"
 
 #define DELAY 16
 
@@ -23,6 +25,7 @@ static LV2_Handle instantiate(const LV2_Descriptor* d, double rate, const char* 
     (void)rate;
     (void)path;
     (void)f;
+    montage_test_fault("init", NULL, 0);
     return calloc(1, sizeof(Gain));
 }
 
@@ -59,6 +62,7 @@ static void run(LV2_Handle h, uint32_t n) {
         }
         g->pos = (g->pos + 1) % DELAY;
     }
+    montage_test_fault("process", g->out[1], n);
 }
 
 static void cleanup(LV2_Handle h) { free(h); }

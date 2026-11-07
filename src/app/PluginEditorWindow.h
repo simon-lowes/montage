@@ -39,6 +39,8 @@ public:
     void editorParameter(uint32_t id, double value) override;
     void editorGesture(uint32_t id, bool begin) override;
     void editorResize(int width, int height) override;
+    // The editor went (its plug-in host failed, or the user closed its own window): this window closes too.
+    void editorClosed() override;
 
 protected:
     void closeEvent(QCloseEvent* e) override;

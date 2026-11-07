@@ -27,6 +27,7 @@
 #include "core/Surround.h"
 #include "render/AdaptiveHdr.h"
 #include "render/ColorSpace.h"
+#include "audio/PluginHost.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
 #include "render/MonitorCalibration.h"
@@ -111,6 +112,7 @@ private:
 
     // The frame as delivered alone (a preview from the render cache has only its SDR picture).
     QImage renderSignal(const Request& r, FrameTime t) {
+        plugins::RenderModeScope live(true);  // (a plug-in failing in its host here is playback's, not an export's)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s || !ownSpace(*s, r.trim)) return {};
         RenderOptions o;
@@ -125,6 +127,7 @@ private:
 
     // The frame in a scene-referred sequence's working space alone, for the scopes.
     QImage renderWorkingSignal(const Request& r, FrameTime t) {
+        plugins::RenderModeScope live(true);  // (a plug-in failing in its host here is playback's, not an export's)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s || !sceneReferredWorking(*s)) return {};
         RenderOptions o;
@@ -174,6 +177,7 @@ private:
     }
 
     Rendered render(const Request& r, FrameTime t) {
+        plugins::RenderModeScope live(true);  // (a plug-in failing in its host here is playback's, not an export's)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return {};
         RenderOptions o;
