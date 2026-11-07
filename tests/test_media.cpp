@@ -1576,9 +1576,12 @@ public:
     bool loseWhileRecording = false, staleStatus = false;
     double servoLockAfter = 0.2;
     // A deck's own ways: stopped, its LTC answered as corrected LTC (74.14); every so many timecodes one this many
-    // frames out (a jittery reader); recording from In at once when told to edit, with no run up.
+    // frames out (a jittery reader), or so many in a row that far out once it passes a frame in an edit; recording
+    // from In at once when told to edit, with no run up.
     bool correctedLtcWhenStopped = false;
     int jitterEvery = 0, jitterFrames = 0, timecodeReads = 0;
+    int64_t burstFrom = -1;
+    int burstReads = 0;
     bool recordWithoutRoll = false;
     int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
 
@@ -1709,7 +1712,8 @@ private:
         }
         if (q.is(6, cmd::CurrentTimeSense)) {
             ++timecodeReads;
-            const int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
+            int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
+            if (burstReads > 0 && autoEdit && here >= burstFrom) off = jitterFrames, --burstReads;
             return timecode(correctedLtcWhenStopped && speed == 0 ? cmd::CorrectedLtcTimeData : cmd::LtcTimeData, here + off);
         }
         if (q.is(6, cmd::StatusSense)) return status();
@@ -2449,10 +2453,31 @@ private slots:
             QCOMPARE(sim.recordedTo, ej.out);
         }
 
+        // The reader slipping five frames for a moment just as the deck runs up to In: four readings in a row, and six
+        // (more than half of its last nine, so the deck seems somewhere else until it is seen where it was going). The
+        // edit is made all the same, the Program started once and standing, rather than the run up taken as lost and
+        // the edit failed when the deck records before it is seen running up again.
+        TapeEdit eb = ej;
+        for (int burst : {4, 6}) {
+            eb.in += 250, eb.out = eb.in + 50;
+            {
+                std::lock_guard lock(sim.m);
+                sim.jitterFrames = 5, sim.burstFrom = eb.in - 2, sim.burstReads = burst;
+            }
+            rolls = 0;
+            const bool made = editToTape(deck, eb, [&](int64_t, double) { ++rolls; }, nullptr, &err);
+            std::lock_guard lock(sim.m);
+            sim.burstReads = 0;
+            QVERIFY2(made, qPrintable(QString("%1 in a row: %2").arg(burst).arg(err.c_str())));
+            QCOMPARE(rolls, 1);
+            QCOMPARE(sim.recordedFrom, eb.in);
+            QCOMPARE(sim.recordedTo, eb.out);
+        }
+
         // A deck that records from In at once, never seen running up: the edit fails there and then, the deck stopped,
         // rather than recording the paused Program to Out.
         TapeEdit en = e;
-        en.in = ej.in + 250, en.out = en.in + 250;
+        en.in = eb.in + 250, en.out = en.in + 250;
         {
             std::lock_guard lock(sim.m);
             sim.recordWithoutRoll = true;
@@ -24522,6 +24547,16 @@ if ui["pressed"] == "add":
         QVERIFY(!beats.stale(id, 6));  // (it moved: watched afresh)
         QTest::qWait(250);
         QVERIFY(beats.stale(id, 6));
+        // A beat seen for the first time is as old as its file (how long before the watcher's own heartbeat it was
+        // written): one written longer ago than that is silent at once, so a node that has only just started (one run
+        // now and then with --once) never waits on a node long gone; one written a little before is silent after the
+        // rest of that time, and one that moves is watched afresh.
+        QVERIFY(beats.stale("long gone", 3, 250));
+        QVERIFY(!beats.stale("long gone", 4, 250));
+        QVERIFY(!beats.stale("just now", 3, 100));
+        QTest::qWait(150);
+        QVERIFY(beats.stale("just now", 3, 100));
+        QVERIFY(!beats.stale("long gone", 4, 250));
         // A node with a short patience takes it back and renders it.
         stop = false;
         o.staleMs = 300;
@@ -25335,13 +25370,40 @@ if ui["pressed"] == "add":
             pin.close();
             once();
             QVERIFY2(log.join('\n').contains("Gave back"), qPrintable(log.join('\n')));
+            // A lock written long before (older than the node's own heartbeat by a silent node's time) goes at once, even
+            // for a node that has only just started, as one run now and then with --once has; then made again, for the
+            // nodes below to watch.
+            const QString removed = "Removed the encoder lock of " + QString::fromStdString(job);
+            QVERIFY(!log.join('\n').contains(removed));
+            QVERIFY(lock.open(QIODevice::ReadWrite) && lock.setFileTime(QDateTime::currentDateTime().addSecs(-120), QFileDevice::FileModificationTime));
+            lock.close();
+            {
+                FarmNodeOptions o;
+                o.farm = farm;
+                o.name = "Node D";
+                o.once = true;
+                o.encoders["h264"] = "h264_test";
+                o.log = [&](const std::string& l) {
+                    std::lock_guard<std::mutex> g(logLock);
+                    log << QString::fromStdString(l);
+                };
+                o.stopped = [&] {
+                    std::lock_guard<std::mutex> g(logLock);
+                    return log.join('\n').contains(removed);
+                };
+                QVERIFY(runFarmNode(o, nullptr, &err));
+            }
+            QVERIFY2(log.join('\n').count(removed) == 1, qPrintable(log.join('\n')));
+            QVERIFY(!QFileInfo::exists(group + "/encoder.lock"));
+            QVERIFY(lock.open(QIODevice::WriteOnly | QIODevice::NewOnly) && lock.write("Gone-1") == 6);
+            lock.close();
         };
         QVERIFY2(onFarm(hw, 4, &hwId, [](FarmNodeOptions& o) {
                      o.encoders["h264"] = "h264_test";
                      o.staleMs = 3000;
                  }, locked),
                  qPrintable(log.join('\n')));
-        QVERIFY2(log.join('\n').contains("Removed the encoder lock of " + QString::fromStdString(hwId)), qPrintable(log.join('\n')));
+        QVERIFY2(log.join('\n').count("Removed the encoder lock of " + QString::fromStdString(hwId)) == 2, qPrintable(log.join('\n')));
         QCOMPARE(frames(hw.path), 150);
         QVERIFY(removeFarmJob(farm, hwId, &err));
         QFile::remove(QString::fromStdString(farm) + "/nodes/Gone.json");
@@ -25693,6 +25755,25 @@ if ui["pressed"] == "add":
                 QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/keys"));
                 QFile::remove(dir.path() + "/farm-link");
 #endif
+                // A node's own chain there is refused likewise, when it starts and before any work.
+                FarmNodeOptions o;
+                o.farm = farm;
+                o.name = "Shared Keys";
+                o.once = true;
+                o.certificates = farm + "/certificates";
+                std::string why;
+                QVERIFY(!runFarmNode(o, nullptr, &why));
+                QVERIFY2(QString::fromStdString(why).contains("every render node can read their key"), why.c_str());
+#ifndef _WIN32
+                QVERIFY(QFile::link(QString::fromStdString(farm), dir.path() + "/farm-link"));
+                o.certificates = (dir.path() + "/farm-link/certificates").toStdString();
+                why.clear();
+                QVERIFY(!runFarmNode(o, nullptr, &why));
+                QVERIFY2(QString::fromStdString(why).contains("every render node can read their key"), why.c_str());
+                QFile::remove(dir.path() + "/farm-link");
+#endif
+                QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/nodes/Shared Keys.json") &&
+                        !QFileInfo::exists(QString::fromStdString(farm) + "/nodes/Shared_Keys.json"));
             }
             // A node holding another chain (or none) codes no segment while no node holding the signer's answers: none
             // is coded for a join it could not make.
@@ -25714,6 +25795,18 @@ if ui["pressed"] == "add":
             };
             std::string sealedId;
             QVERIFY2(submitFarmDcp(farm, "DCP", p, seq.id, cinema, (dir.path() + "/out").toStdString(), 4, &sealedId, &err), err.c_str());
+            // (Nor while the only one that held it is long gone: its heartbeat two minutes older than the node's own,
+            // which has only just started, as one run now and then with --once has.)
+            dcp::CertificateInfo signerLeaf;
+            QVERIFY(dcp::readCertificate(chain.certificates.back(), signerLeaf));
+            const QString crashed = QString::fromStdString(farm) + "/nodes/Crashed.json";
+            {
+                QFile f(crashed);
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                f.write(QJsonDocument(QJsonObject{{"name", "Crashed"}, {"state", "idle"}, {"beat", 9}, {"signer", QString::fromStdString(signerLeaf.thumbprint)}})
+                            .toJson());
+                QVERIFY(f.flush() && f.setFileTime(QDateTime::currentDateTime().addSecs(-120), QFileDevice::FileModificationTime));
+            }
             node("Stranger", elsewhere.toStdString(), true, {});
             for (const FarmJob& j : farmJobs(farm))
                 if (j.group == sealedId || j.id == sealedId) {
@@ -25721,6 +25814,25 @@ if ui["pressed"] == "add":
                     QVERIFY(!j.signer.empty());
                 }
             QVERIFY2(sealedLog.join('\n').contains("Stranger: The segments of " + QString::fromStdString(sealedId) + " wait"), qPrintable(sealedLog.join('\n')));
+            // A node whose folder has the signer's certificates but another key says it holds no chain (it could open
+            // nothing sealed for the leaf), says why once, and codes nothing either.
+            const QString mismatched = dir.path() + "/mismatched-certificates";
+            QVERIFY(QDir().mkpath(mismatched));
+            for (const char* name : {"root.pem", "intermediate.pem", "leaf.pem"})
+                QVERIFY(QFile::copy(QDir(QString::fromStdString(dcp::signerFolder())).filePath(name), mismatched + "/" + name));
+            QVERIFY(dcp::writeWholeFile((mismatched + "/leaf.key").toStdString(), other.privateKey, true));
+            dcp::CertificateChain wrong;
+            QVERIFY(dcp::signerCertificateChain(wrong, &err, mismatched.toStdString(), false));
+            QVERIFY(!dcp::chainKeyMatches(wrong, &err));
+            QVERIFY2(QString::fromStdString(err).contains("not the leaf certificate's"), err.c_str());
+            QVERIFY(dcp::chainKeyMatches(chain, &err));
+            node("Mismatched", mismatched.toStdString(), true, {});
+            for (const FarmJob& j : farmJobs(farm))
+                if (j.group == sealedId || j.id == sealedId) QVERIFY2(j.state == FarmState::Waiting && j.claim.empty(), j.name.c_str());
+            for (const FarmNodeInfo& n : farmNodes(farm))
+                if (n.name == "Mismatched") QVERIFY(n.signer.empty());
+            QVERIFY2(sealedLog.join('\n').contains("Mismatched: The DCP signing chain in " + mismatched + " cannot be used"), qPrintable(sealedLog.join('\n')));
+            QVERIFY(QFile::remove(crashed));
             QVERIFY(QDir(dir.path() + "/out").entryList({".montage-segments-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
             // With a node holding it answering, both code segments; the join is left by the other, and made by that node.
             const auto segmentsEnded = [&] {
@@ -25744,6 +25856,19 @@ if ui["pressed"] == "add":
             if (std::any_of(afterSegments.begin(), afterSegments.end(), [&](const FarmJob& j) { return j.id == sealedId && j.state == FarmState::Waiting; })) {
                 node("Stranger", elsewhere.toStdString(), true, {});
                 QVERIFY2(sealedLog.join('\n').contains("Stranger: Left the join of " + QString::fromStdString(sealedId)), qPrintable(sealedLog.join('\n')));
+                // A node holding the chain in the folder the package goes in fails the join before any work, saying why:
+                // anyone given the package there could read the key.
+                const QString inOut = dir.path() + "/out/keys";
+                QVERIFY(QDir().mkpath(inOut));
+                for (const char* name : {"root.pem", "intermediate.pem", "leaf.pem", "leaf.key"})
+                    QVERIFY(QFile::copy(QDir(QString::fromStdString(dcp::signerFolder())).filePath(name), inOut + "/" + name));
+                node("Holder", inOut.toStdString(), false, sealedEnded);
+                for (const FarmJob& j : farmJobs(farm))
+                    if (j.id == sealedId) QVERIFY2(j.state == FarmState::Failed && QString::fromStdString(j.error).contains("where the package goes"), j.error.c_str());
+                QVERIFY(QDir(dir.path() + "/dkdm").entryList(QDir::Files).isEmpty());
+                QVERIFY(QDir(dir.path() + "/out").entryList({"FarmSealed_*"}, QDir::Dirs).isEmpty());
+                QVERIFY(QDir(inOut).removeRecursively());
+                QVERIFY2(retryFarmJob(farm, sealedId, &err), err.c_str());
                 // A join that cannot put its package in place (a folder of its name made meanwhile) fails, and leaves no
                 // DKDM for a package that is not there; tried again, it is made.
                 const QString inTheWay = QDir(dir.path() + "/out").filePath(QString::fromStdString(dcpFolderName(seq, cinema)));
@@ -32910,14 +33035,63 @@ if ui["pressed"] == "add":
         }, garbled, &st));
         QCOMPARE(st.drafted, 0);
         QVERIFY(garbled.find("unk") == std::string::npos);
-        // And none of the languages Montage ships holds such a draft.
+        // A file dialog's filters keep the source's patterns: the model's "(*.Montage)" becomes "(*.montage)" again, and a
+        // draft that lost a filter, or wrote a run of backslashes for words it could not place, is not kept.
+        const std::string filters = R"(<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
+<TS version="2.1" language="de">
+<context>
+    <name>montage::MainWindow</name>
+    <message>
+        <source>Montage projects (*.montage);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EDL (*.edl);;Change list (*.csv)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Film list</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+</TS>
+)";
+        std::string filtered;
+        QVERIFY(draftInterfaceTranslation(filters, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
+            o = {"Montageprojekte (*.Montage);;Alle Dateien (*)", "EDL ändern (*.edl); Liste ändern (*.csv)", "\\\\ \\\\"};
+            return in.size() == 3;
+        }, filtered, &st));
+        QCOMPARE(st.drafted, 1);
+        QVERIFY2(filtered.find("<translation type=\"unfinished\">Montageprojekte (*.montage);;Alle Dateien (*)</translation>") !=
+                     std::string::npos, filtered.c_str());
+        QVERIFY(filtered.find("Liste") == std::string::npos && filtered.find('\\') == std::string::npos);
+        // And none of the languages Montage ships holds such a draft: no "<unk>", no run of backslashes, and each file
+        // filter with the source's own patterns.
         const QDir shipped(QStringLiteral(MONTAGE_TEST_DATA_DIR "/../../translations"));
         const QStringList files = shipped.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
         QVERIFY(!files.isEmpty());
+        static const QRegularExpression message(QStringLiteral("<source>([^<]*)</source>\\s*<translation[^>]*>([^<]*)</translation>"));
+        static const QRegularExpression pattern(QStringLiteral("\\(([^()]*\\*[^()]*)\\)"));
+        auto patternsOf = [](const QString& text) {
+            QStringList out;
+            for (auto it = pattern.globalMatch(text); it.hasNext();) out << it.next().captured(1);
+            return out;
+        };
         for (const QString& name : files) {
             QFile f(shipped.filePath(name));
             QVERIFY(f.open(QIODevice::ReadOnly));
-            QVERIFY2(!f.readAll().contains("&lt;unk&gt;"), qPrintable(name));
+            const QString text = QString::fromUtf8(f.readAll());
+            QVERIFY2(!text.contains(QStringLiteral("&lt;unk&gt;")), qPrintable(name));
+            for (auto it = message.globalMatch(text); it.hasNext();) {
+                const auto m = it.next();
+                const QString source = m.captured(1), translation = m.captured(2);
+                if (translation.isEmpty()) continue;
+                QVERIFY2(!translation.contains(QStringLiteral("\\\\")) || source.contains(QStringLiteral("\\\\")),
+                         qPrintable(name + ": " + translation));
+                if (source.contains(QStringLiteral("(*")))
+                    QVERIFY2(patternsOf(translation) == patternsOf(source), qPrintable(name + ": " + source + " -> " + translation));
+            }
         }
     }
 

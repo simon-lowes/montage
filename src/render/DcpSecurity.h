@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,9 @@ struct CertificateInfo {
     int bits = 0;
 };
 bool readCertificate(const std::string& pem, CertificateInfo& out, std::string* error = nullptr);
+// Whether `chain`'s private key is its leaf's (both read, and the key the one the leaf's public key goes with): what is
+// sealed or encrypted for the leaf opens with it, and what it signs checks out against the leaf.
+bool chainKeyMatches(const CertificateChain& chain, std::string* error = nullptr);
 // The certificates in a PEM file or a cinema's chain (several, in file order).
 std::vector<std::string> splitCertificates(const std::string& text);
 
@@ -139,10 +143,10 @@ std::string codestreamSealContext(const std::string& job, int segment, int segme
 int codestreamSegment(int64_t frames, int segments, int64_t frame);
 // Opens a sealed file with the certificate's private key (PEM); `keys` keeps the keys already unwrapped, by their
 // wrapped form (a segment's frames share one). False (and `out` empty) when it was sealed for another key, for another
-// context, or has been changed.
+// context, or has been changed. (A deque: keys added never move the ones there, so no copy is left unwiped.)
 struct Unsealer {
     std::string privateKey;
-    std::vector<std::pair<std::string, std::array<uint8_t, 32>>> keys;
+    std::deque<std::pair<std::string, std::array<uint8_t, 32>>> keys;
     ~Unsealer();
 };
 bool unseal(Unsealer& unsealer, const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* error = nullptr,

@@ -6252,6 +6252,78 @@
         <source>Tilt</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Band %1 (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -6972,7 +7044,7 @@ Download it now?</source>
     </message>
     <message>
         <source>SubRip captions (*.srt)</source>
-        <translation type="unfinished">субRip субрип (*. srt)</translation>
+        <translation type="unfinished">субRip субрип (*.srt)</translation>
     </message>
     <message>
         <source>WebVTT captions (*.vtt)</source>
@@ -7238,7 +7310,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Cue sheets (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">b) все файлы (*.csv *.tsv *.txt);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export…</source>
@@ -8785,11 +8857,11 @@ Download it now?</source>
     </message>
     <message>
         <source>Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Subtitle pictures, read by OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;All files (*)</source>
-        <translation type="unfinished">* stt *.vt *.scc *.mcc *.mcc *.mccml *.xml *.dfxp *.stl *.ssa* / subll* subcl* subt(*.up *.idx *.mks *.mkv *.mkv *.ts *.m2ts *.tml);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>SubRip (*.srt)</source>
-        <translation type="unfinished">СубRip (*. srt)</translation>
+        <translation type="unfinished">СубRip (*.srt)</translation>
     </message>
     <message>
         <source>WebVTT (*.vtt)</source>
@@ -8797,7 +8869,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Scenarist SCC, CEA-608 (*.scc)</source>
-        <translation type="unfinished">Сценарист, СЕА-608 (*.scx)</translation>
+        <translation type="unfinished">Сценарист, СЕА-608 (*.scc)</translation>
     </message>
     <message>
         <source>MCC captions, CEA-608 and CTA-708 (*.mcc)</source>
@@ -8813,11 +8885,11 @@ Download it now?</source>
     </message>
     <message>
         <source>Advanced SubStation Alpha (*.ass *.ssa)</source>
-        <translation type="unfinished">Усовершенствованный субстинационный Альфа (*.асс *.ssa)</translation>
+        <translation type="unfinished">Усовершенствованный субстинационный Альфа (*.ass *.ssa)</translation>
     </message>
     <message>
         <source>Blu-ray subtitle pictures, PGS (*.sup)</source>
-        <translation type="unfinished">Снимки с субтитров Blu-ray, PGS (*.up)</translation>
+        <translation type="unfinished">Снимки с субтитров Blu-ray, PGS (*.sup)</translation>
     </message>
     <message>
         <source>Blu-ray subtitle pictures in Matroska (*.mks)</source>
@@ -9769,7 +9841,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Change EDL (*.edl);;Change list (*.csv)</source>
-        <translation type="unfinished">Изменение EDL (*.edl);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Re-conform Sequence</source>
@@ -11025,7 +11097,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Montage presets (*.montagepreset)</source>
-        <translation type="unfinished">Подгонные предсети (*.монтажные презентации)</translation>
+        <translation type="unfinished">Подгонные предсети (*.montagepreset)</translation>
     </message>
     <message>
         <source>Show Presets Folder</source>
@@ -12032,7 +12104,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>%1 Files (*.%2);;All Files (*)</source>
-        <translation type="unfinished">Файлы %1 (*. %2); все файлы (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export To</source>
@@ -12044,7 +12116,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All Files (*)</source>
-        <translation type="unfinished">- все файлы (*.pem *.crt *.cer);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Its Private Key</source>
@@ -12052,7 +12124,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Private Keys (*.pem *.key);;All Files (*)</source>
-        <translation type="unfinished">Частные ключи (*.pem *.key); все файлы (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Signing Certificate</source>
@@ -13715,7 +13787,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda)</source>
-        <translation type="unfinished">Камера ночного питания (*.chan); сцена в долларах США с установленными моделями (*.usda)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Wrote %1</source>
@@ -15641,7 +15713,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Screenplays (*.fountain *.spmd *.fdx *.txt);;All files (*)</source>
-        <translation type="unfinished">Скринплей (*. фонтан *.spmd *.fdx *.txt);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Lined Script</source>
@@ -15752,7 +15824,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1;;All files (*)</source>
-        <translation type="unfinished">%1;; все файлы (*)</translation>
+        <translation type="unfinished">%1;;все файлы (*)</translation>
     </message>
     <message>
         <source>Search Folder for Media</source>
@@ -16146,7 +16218,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)</source>
-        <translation type="unfinished">Обзорные записки (*.json); списки Маркеров (*.csv *.txt *.tsv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Project &amp;Manager…</source>
@@ -16162,7 +16234,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">Проекты в Монтаже (*.монтаж)</translation>
+        <translation type="unfinished">Проекты в Монтаже (*.montage)</translation>
     </message>
     <message>
         <source>Mer&amp;ge Project…</source>
@@ -16274,7 +16346,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Avid Log Exchange (*.ale *.ALE);;All files (*)</source>
-        <translation type="unfinished">Avid Log Exchange (*.ale *.ALE); все файлы (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export ALE…</source>
@@ -16334,7 +16406,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Text (*.txt);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">Текст (*.txt); CSV (*.csv); PDF (*.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Pape&amp;rwork</source>
@@ -16542,7 +16614,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>LUT files (*.cube)</source>
-        <translation type="unfinished">Файлы LUT (*. куб)</translation>
+        <translation type="unfinished">Файлы LUT (*.cube)</translation>
     </message>
     <message>
         <source>Rebuild LUT as &amp;Grade…</source>
@@ -16570,7 +16642,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ASC CDL (*.cdl *.cc *.ccc);;All files (*)</source>
-        <translation type="unfinished">ASC CDL (*.cdl *.cc *.ccc); все файлы (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export CDL…</source>
@@ -16582,7 +16654,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)</source>
-        <translation type="unfinished">Список решений по цвету (*.cdl); исправление в колоре (*.cc); коллекция по вопросам Колорной коррекции (*.ccc)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import ACES Metadata (AMF)…</source>
@@ -16594,7 +16666,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ACES Metadata File (*.amf);;All files (*)</source>
-        <translation type="unfinished">Файл метаданных ACES (*.amf); все файлы (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export ACES Metadata (AMF)…</source>
@@ -17226,7 +17298,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Tables (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">Таблица (*.csv *.tsv *.txt);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>New &amp;Colour Matte</source>
@@ -18042,7 +18114,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)</source>
-        <translation type="unfinished">Скрипты (*.lua *.py); Lua syprips (*.lua); Python spectives (*.py); All data (*.ll data) (*.lua); Python spectives (*.py);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open Scripts Folder</source>
@@ -18306,7 +18378,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage);;All files (*)</source>
-        <translation type="unfinished">Проекты Монтаж (*.монтаж);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>a while</source>
@@ -19350,7 +19422,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Excel workbook (*.xlsx);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">Справочник Excel (*.xlsx); CSV (*.csv); PDF (*.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
@@ -20424,7 +20496,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>IAMF in MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)</source>
-        <translation type="unfinished">IAMF в MP4 (*.mp4 *.m4a); поток IAMF (*.iamf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR</source>
@@ -20888,7 +20960,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All files (*)</source>
-        <translation type="unfinished">- все файлы (*.pem *.crt *.cer);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Valid from:</source>
@@ -21793,7 +21865,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">- FCPXML (*.fcpxml *.otio*.edl *.aaf *.avb);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import IMF Package</source>
@@ -22750,7 +22822,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)</source>
-        <translation type="unfinished">* mkv *.webm *.mxf *.mv *.mv *.mv *.m2ts *.ts *.mpg *.mg *.mg *.mg *.mv *.mv *.mv *.flv *.gv *. . mav *. mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aif *. .png *.jpg *.jpeg *.tif *.bmp * webp *.exr *.svg *.json *.mlv *.mlv *.ps#.psb*.dng *.cr2 *.cr3 *.nef * arw *raf.rw2 * orf.pf.pf.pf. /.fr.iiq) * Все файлы********* все файлы****************************************************************************************************************************************************************************************************</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Image Sequence</source>
@@ -22758,7 +22830,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Frames (*.exr *.dpx *.png *.tif *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;All files (*)</source>
-        <translation type="unfinished">(*.exr *.dpx *.png *.tiff *.tiff *.tga *.bmp *.jpg *.jpeg *.webp)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Frames per second:</source>
@@ -23485,7 +23557,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">Проекты в Монтаже (*.монтаж)</translation>
+        <translation type="unfinished">Проекты в Монтаже (*.montage)</translation>
     </message>
     <message>
         <source>Choose Base…</source>
@@ -24428,7 +24500,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Calibration LUTs (*.cube *.3dl *.clf *.ctf);;All files (*)</source>
-        <translation type="unfinished">Калибровочные КЛАССы (*.cube * 3dl *.clf *.ctf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Screen %1: %2 (%3 × %4)</source>
@@ -27469,7 +27541,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Recordings (*.mp4 *.mov *.m4v *.mxf *.wav *.bwf);;All Files (*)</source>
-        <translation type="unfinished">Записи (*.mp4 *.mov *.m4v *.mxf *.wav *.bwf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Recording:</source>
@@ -27998,7 +28070,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)</source>
-        <translation type="unfinished">Скрипты (*.lua *.py); Lua syprips (*.lua); Python spectives (*.py); All data (*.ll data) (*.lua); Python spectives (*.py);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot read %1</source>
@@ -28157,7 +28229,7 @@ Neither did I.</source>
     </message>
     <message>
         <source>Scripts (*.txt *.fountain *.md *.fdx);;All files (*)</source>
-        <translation type="unfinished">* txt *.funtain * md *.fdx);</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Could not open %1</source>
@@ -29177,7 +29249,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">Звуковой или видео (*.wav *.mp3 *.m4a *.aac *.flac *.og *.opus *.aif *.aif *.aiff *.mov *.mp4 *.mkv *.mxf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No recording picked</source>
@@ -30927,7 +30999,7 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">Звуковой или видео (*.wav *.mp3 *.m4a *.aac *.flac *.og *.opus *.aif *.aif *.aiff *.mov *.mp4 *.mkv *.mxf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot convert voices (no ONNX Runtime).</source>

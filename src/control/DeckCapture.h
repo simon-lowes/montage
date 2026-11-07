@@ -81,7 +81,8 @@ struct TapeEdit {
 // pre-roll, its servo locked when it says so), how many frames before In it was and when (captureClock()), so the
 // Program can be started to reach the edit's first frame as the deck reaches In; told again should the deck then jump
 // (one that was playing when told, searching back to its pre-roll). Where the deck is comes from a steady run of its
-// readings, a stray one a few frames off passed over. Waits for the edit to finish; false with the reason if the deck
+// readings, readings a few frames off passed over: it is somewhere else only when most of its last nine say so, and a
+// Program already started stands until a steady run shows the deck somewhere else. Waits for the edit to finish; false with the reason if the deck
 // refused it, stopped answering, never got there or recorded without being seen running up to In (failing at once),
 // the deck stopped once it had been told to record.
 bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void(int64_t framesToIn, double clock)>& roll,

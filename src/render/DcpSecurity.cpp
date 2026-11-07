@@ -516,6 +516,20 @@ bool readCertificate(const std::string& pem, CertificateInfo& out, std::string* 
     return true;
 }
 
+bool chainKeyMatches(const CertificateChain& chain, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = opensslError(why);
+        return false;
+    };
+    if (chain.empty()) return fail("The chain has no certificates");
+    Ptr<X509> leaf = certificateFrom(chain.certificates.back());
+    if (!leaf) return fail("The leaf certificate cannot be read");
+    Ptr<EVP_PKEY> key = privateKeyFrom(chain.privateKey);
+    if (!key) return fail("The private key cannot be read");
+    if (X509_check_private_key(leaf.get(), key.get()) != 1) return fail("The private key is not the leaf certificate's");
+    return true;
+}
+
 bool signXml(std::string& xml, const CertificateChain& chain, std::string* error) {
     auto fail = [&](const std::string& why) {
         if (error) *error = opensslError(why);
@@ -1002,6 +1016,7 @@ bool securityAvailable() { return false; }
 bool makeCertificateChain(const std::string&, CertificateChain&, std::string* error) { return none(error); }
 bool signerCertificateChain(CertificateChain&, std::string* error, const std::string&, bool) { return none(error); }
 bool readCertificate(const std::string&, CertificateInfo&, std::string* error) { return none(error); }
+bool chainKeyMatches(const CertificateChain&, std::string* error) { return none(error); }
 bool signXml(std::string&, const CertificateChain&, std::string* error) { return none(error); }
 bool verifyXmlSignature(const std::string&, std::string* error, SignatureCheck*) { return none(error); }
 ContentKey newContentKey(const std::string& type, bool* ok) {

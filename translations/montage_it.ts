@@ -6248,6 +6248,78 @@
         <source>Tilt</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Band %1 (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -11996,7 +12068,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All Files (*)</source>
-        <translation type="unfinished">Certificati (*.pm *.crt *.cer);;Tutti i file (*)</translation>
+        <translation type="unfinished">Certificati (*.pem *.crt *.cer);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>Its Private Key</source>
@@ -15560,7 +15632,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Screenplays (*.fountain *.spmd *.fdx *.txt);;All files (*)</source>
-        <translation type="unfinished">Sceneggiature (*.fontania *.spmd *.fdx *.txt);;Tutti i file (*)</translation>
+        <translation type="unfinished">Sceneggiature (*.fountain *.spmd *.fdx *.txt);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>Export Lined Script</source>
@@ -16079,7 +16151,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">Progetti di montaggio (*.montaggio)</translation>
+        <translation type="unfinished">Progetti di montaggio (*.montage)</translation>
     </message>
     <message>
         <source>Mer&amp;ge Project…</source>
@@ -16499,7 +16571,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)</source>
-        <translation type="unfinished">Lista delle decisioni di colore (*.cdl); Correzione di colore (*.cc); Raccolta delle correzioni di colore (*.ccc)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import ACES Metadata (AMF)…</source>
@@ -18220,7 +18292,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage);;All files (*)</source>
-        <translation type="unfinished">Progetti di montaggio (*.montaggio);;Tutti i file (*)</translation>
+        <translation type="unfinished">Progetti di montaggio (*.montage);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>a while</source>
@@ -20286,7 +20358,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>IAMF in MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)</source>
-        <translation type="unfinished">IAMF in MP4 (*.mp4 *.m4a); flusso IAMF (*.iamf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR</source>
@@ -20750,7 +20822,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All files (*)</source>
-        <translation type="unfinished">Certificati (*.pm *.crt *.cer);;Tutti i file (*)</translation>
+        <translation type="unfinished">Certificati (*.pem *.crt *.cer);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>Valid from:</source>
@@ -22585,7 +22657,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)</source>
-        <translation type="unfinished">Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.opus *.aif *.pg *.jpg *.tif *.bmp *.webp *.exr *.svg *.json *.mlv *.psdd *.pg *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3f *.iiq);Tutti i file (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Image Sequence</source>
@@ -22593,7 +22665,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Frames (*.exr *.dpx *.png *.tif *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;All files (*)</source>
-        <translation type="unfinished">Frame (*.exr *.dpx *.png *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;Tutti i file (*)</translation>
+        <translation type="unfinished">Frame (*.exr *.dpx *.png *.tif *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>Frames per second:</source>
@@ -23311,7 +23383,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">Progetti di montaggio (*.montaggio)</translation>
+        <translation type="unfinished">Progetti di montaggio (*.montage)</translation>
     </message>
     <message>
         <source>Choose Base…</source>
@@ -24248,7 +24320,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Calibration LUTs (*.cube *.3dl *.clf *.ctf);;All files (*)</source>
-        <translation type="unfinished">LUT di taratura (*.cubo *.3dl *.clf *.ctf);;Tutti i file (*)</translation>
+        <translation type="unfinished">LUT di taratura (*.cube *.3dl *.clf *.ctf);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>Screen %1: %2 (%3 × %4)</source>
@@ -27946,7 +28018,7 @@ Neither did I.</source>
     </message>
     <message>
         <source>Scripts (*.txt *.fountain *.md *.fdx);;All files (*)</source>
-        <translation type="unfinished">Scripts (*.txt *.fontain *.md *.fdx);;Tutti i file (*)</translation>
+        <translation type="unfinished">Scripts (*.txt *.fountain *.md *.fdx);;Tutti i file (*)</translation>
     </message>
     <message>
         <source>Could not open %1</source>

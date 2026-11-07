@@ -8,7 +8,10 @@
 // paths absolute); a node claims a job by creating jobs/<id>/claim (only one creation can succeed) and writes
 // status.json (state, progress, a heartbeat count) as it renders; a cancel file asks it to stop. nodes/<name>.json is
 // each node's heartbeat. Nothing relies on the computers' clocks agreeing: a node that stops answering is noticed by
-// its heartbeat count not changing for a minute of the watcher's own time, and its job is taken back for another.
+// its heartbeat count not changing for a minute of the watcher's own time, and its job is taken back for another. (A
+// heartbeat seen for the first time is judged by how long before the watcher's own its file was written, both
+// stamped by the share; only where the share keeps each writer's own times do the clocks need to agree within that
+// minute.)
 // (Jobs are taken oldest first by the sending computer's clock, which only orders them.)
 //
 // A job sent in segments (render/SegmentedExport.h) is a job for each segment, rendered by whichever nodes are free,
@@ -88,6 +91,9 @@ struct FarmNodeInfo {
     // The encoder it codes each hardware family with ("h264" -> "h264_nvenc"; "libx264" when it has none for it).
     std::map<std::string, std::string> encoders;
     std::string signer;  // the thumbprint of the DCP signing chain's leaf it joins encrypted DCPs with ("" none)
+    // When its file was last written, ms since 1970 by the clock that stamps the share's files (the file server's, or
+    // the writer's where the share keeps theirs); compared only with another file's on the share (FarmHeartbeats).
+    int64_t written = 0;
 };
 
 // The farm's folders made when missing; false with `error` when it cannot be used.
@@ -124,11 +130,14 @@ bool retryFarmJob(const std::string& farm, const std::string& id, std::string* e
 // may be rendering), and their files when the folder is reachable from here.
 bool removeFarmJob(const std::string& farm, const std::string& id, std::string* error = nullptr);
 
-// Notices heartbeats that stop: `stale` is true once the same beat has been seen for `ms` of this computer's time.
+// Notices heartbeats that stop: `stale` is true once the same beat has been seen for `ms` of this computer's time. A
+// beat seen for the first time counts from `age` ms before (how long before this node's own heartbeat its file was
+// written, by the share's clock: FarmNodeInfo::written), so a node that has only just started (`once`, run now and
+// then) sees one that stopped long ago as stopped, not as answering until it has watched it a minute itself.
 class FarmHeartbeats {
 public:
     explicit FarmHeartbeats(int64_t ms = 60000) : ms_(ms) {}
-    bool stale(const std::string& key, int64_t beat);
+    bool stale(const std::string& key, int64_t beat, int64_t age = 0);
     void forget(const std::string& key) { seen_.erase(key); }
 
 private:
@@ -158,7 +167,10 @@ struct FarmNodeOptions {
     // hardware-encoded segments all go to nodes of the same kind). A family given here is only what it says (tests).
     std::map<std::string, std::string> encoders;
     // The DCP signing chain this node joins encrypted DCPs with, never made by the node ("" = its own data folder's,
-    // dcp::signerFolder()): it takes such a join only when that chain's leaf is the one the codestreams were sealed for.
+    // dcp::signerFolder()): it takes such a join only when that chain's leaf is the one the codestreams were sealed for
+    // (and the chain whole, its key the leaf's: a chain that cannot be used is said once in the log). A folder in the
+    // farm's (however it is reached: through links, or the same folder by another path) is refused when the node
+    // starts, and one where the package goes fails its join, as anyone reading it there would hold the key.
     std::string certificates;
 };
 // Runs a render node until stopped (or, `once`, out of work): the oldest waiting job claimed (a segment coded by a

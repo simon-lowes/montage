@@ -73,12 +73,15 @@ private:
     size_t window_, maxBytes_;
     int payloadType_ = -1;
     bool started_ = false;
-    // Each path's sender: its SSRC, its packets since the others' were last counted from, and theirs (by SSRC, a few).
+    // Each path's sender: its SSRC, its packets since the others' were last counted from, and theirs (by SSRC, a few);
+    // with none yet, those that would be its first but are numbered far from the stream, and the other path's count
+    // when the first of them came.
     struct Sender {
         bool have = false;
         uint32_t ssrc = 0;
         int64_t own = 0;
         std::map<uint32_t, int64_t> others;
+        int64_t otherAt = 0;
     } sender_[2];
     int64_t next_ = 0;
     int64_t lateRun_ = 0;     // packets in a row from before the window (a sender restarted, or one jumped ahead of)
