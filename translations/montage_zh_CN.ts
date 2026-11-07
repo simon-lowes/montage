@@ -7669,7 +7669,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Stopped after %1 steps; ask again to carry on</source>
-        <translation type="unfinished">\\ %1 步骤后停止; 请求继续</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>The agent link is gone</source>
@@ -9146,7 +9146,7 @@ Download it now?</source>
     </message>
     <message>
         <source>FFmpeg&apos;s input options, e.g. video_size=1920x1080 framerate=25</source>
-        <translation type="unfinished">FFmpeg 的输入选项, 例如视频“ 大小” \\\\\\\ x1080 框架范围 \ 25</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Options:</source>
@@ -10730,7 +10730,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 is not part of a numbered sequence</source>
-        <translation type="unfinished">\\ { %1 不是编号序列的一部分</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import %1</source>
@@ -10766,7 +10766,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Remove %1</source>
-        <translation type="unfinished">删除 \\\ %1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Make Subclip</source>
@@ -10854,7 +10854,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 took over this project: Save As to keep your changes</source>
-        <translation type="unfinished">\\ %1 接管此工程: 保存为保留您的更改</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 is editing %2</source>
@@ -10862,7 +10862,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 is editing this project</source>
-        <translation type="unfinished">\\ %1 正在编辑此工程</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Your changes here are not saved: Save As to keep them, or discard them to edit the saved project</source>
@@ -10882,7 +10882,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 took over this project: it is read-only now (Save As keeps your changes)</source>
-        <translation type="unfinished">\\ %1 接管了这个项目: 现在只读( 保存为您保留更改)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 was saved by %2: showing the latest</source>
@@ -10894,7 +10894,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 is free to edit: File › Edit Project</source>
-        <translation type="unfinished">\\ %1 是可自由编辑的 : 文件 \\\ 编辑工程</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>New VFX versions: %1</source>
@@ -12118,7 +12118,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     </message>
     <message>
         <source>%1 is a folder. Choose a file name.</source>
-        <translation type="unfinished">\\ %1 是文件夹。 选择文件名 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>The folder %1 does not exist.</source>
@@ -12127,7 +12127,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     <message>
         <source>%1 already exists.
 Do you want to replace it?</source>
-        <translation type="unfinished">\\ %1 已经存在。 您想要替换它吗 ?</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>The start timecode should look like 10:00:00:00.</source>
@@ -12737,7 +12737,7 @@ Grabbed %4
     </message>
     <message>
         <source> — no longer in the graphic</source>
-        <translation type="unfinished"> \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Remove Field</source>
@@ -14972,7 +14972,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1, no keyframes</source>
-        <translation type="unfinished">\\ %1, 没有键盘</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Paste Keyframes at Playhead</source>
@@ -15588,7 +15588,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1;;All files (*)</source>
-        <translation type="unfinished">\\ %1;; 所有文件 (% )</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Search Folder for Media</source>
@@ -15720,7 +15720,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Welcome to Montage — import media with Ctrl+I or drag files onto the Media bin</source>
-        <translation type="unfinished">欢迎使用 Ctrl\\I 导入媒体或将文件拖放到媒体文件夹</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open sequences: click to switch, drag to reorder, close to put away (double-click a sequence in the bin to open it)</source>
@@ -16096,7 +16096,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Media Composer bins (*.avb)</source>
-        <translation type="unfinished">媒体撰写器文件夹 (\\. avb)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import A&amp;LE (Avid Log Exchange)…</source>
@@ -16120,7 +16120,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Avid Log Exchange (*.ale)</source>
-        <translation type="unfinished">Avid 日志交换( Q. ale)</translation>
+        <translation type="unfinished">Avid 日志交换 (*.ale)</translation>
     </message>
     <message>
         <source>Export Final Cut Pro &amp;7 XML (Premiere, Resolve)…</source>
@@ -16444,7 +16444,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ACES Metadata File (*.amf)</source>
-        <translation type="unfinished">ACES元数据文件( Q. amf)</translation>
+        <translation type="unfinished">ACES元数据文件 (*.amf)</translation>
     </message>
     <message>
         <source>Folder for the ACES Metadata Files</source>
@@ -18270,7 +18270,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>HDR AVIF, 10-bit (*.avif)</source>
-        <translation type="unfinished">人类发展报告AVIF,10位(+.avif)</translation>
+        <translation type="unfinished">人类发展报告AVIF,10位 (*.avif)</translation>
     </message>
     <message>
         <source>HDR JPEG with gain map (*.jpg)</source>
@@ -18290,7 +18290,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>HDR HEIF with gain map (*.heic)</source>
-        <translation type="unfinished">人类发展报告 获得图(ZZ.heic)</translation>
+        <translation type="unfinished">人类发展报告 获得图 (*.heic)</translation>
     </message>
     <message>
         <source>JPEG for SDR screens (*.jpg)</source>
@@ -18618,7 +18618,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Select an edit to trim first (Shift+T)</source>
-        <translation type="unfinished">选择要先剪切的编辑( Shift\\ t)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Trim</source>
@@ -19132,7 +19132,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
-        <translation type="unfinished">;;文本 (\\ txt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Select the video clips to arrange, or put the playhead over them</source>
@@ -19920,7 +19920,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>A review copy of %1 and a page that plays it in any browser, offline. Reviewers pause on a frame or mark a range, type notes and save them as a file; import that file and each note becomes a marker.</source>
-        <translation type="unfinished">\\\ { %1 的复本和在任何浏览器中播放它的页面, 下线 。 评论员在框架或标记范围、 键入笔记并保存为文件; 导入该文件和每个便笺成为标记 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export for Review To</source>
@@ -20094,7 +20094,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>ADM BWF (*.wav)</source>
-        <translation type="unfinished">阿拉伯妇女发展组织(ADM BWF) (Z.wav)</translation>
+        <translation type="unfinished">阿拉伯妇女发展组织(ADM BWF) (*.wav)</translation>
     </message>
     <message>
         <source>Writing the immersive audio of %1...</source>
@@ -21389,7 +21389,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>OpenTimelineIO (*.otio)</source>
-        <translation type="unfinished">开放时间线IO( Q. otio)</translation>
+        <translation type="unfinished">开放时间线IO (*.otio)</translation>
     </message>
     <message>
         <source>Export Final Cut Pro 7 XML</source>
@@ -21455,7 +21455,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>AAF (*.aaf)</source>
-        <translation type="unfinished">阿拉伯农业联合会(*.aaf)</translation>
+        <translation type="unfinished">阿拉伯农业联合会 (*.aaf)</translation>
     </message>
     <message>
         <source>Export AAF with Media</source>
@@ -22686,7 +22686,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Assemble %1 at Playhead</source>
-        <translation type="unfinished">游戏头头组集合 \\\ %1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Assemble %1 at Playhead (Insert)</source>
@@ -23078,7 +23078,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Proxy media ready — toggle &quot;Proxy&quot; in the Program monitor to use it</source>
-        <translation type="unfinished">代理媒体已就绪 \\\\ 切换到程序监视器中的“ Proxy ” 来使用它</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Could not put %1 in place (%2)</source>
@@ -24994,7 +24994,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>%1 takes -1 (left) to 1 (right)</source>
-        <translation type="unfinished">\\ %1 将 - 1 (左) 到 1 (右)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track %1 pans in two dimensions</source>
@@ -25504,7 +25504,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source> — open here read-only</source>
-        <translation type="unfinished"> \\ 在这里打开只读</translation>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -27101,7 +27101,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>%1 already exists: choose another name, or choose it with Choose… to replace it.</source>
-        <translation type="unfinished">\\ %1 已经存在: 选择另一个名称, 或者选择它来替换它 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Repairing %1…</source>
@@ -27186,7 +27186,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Markers to: the stream&apos;s host, port + 1</source>
-        <translation type="unfinished">标记给: 流体主机, 端口 \\\ 1</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Where the editor&apos;s Montage takes markers (host:port), when the stream comes through a server or over UDP</source>

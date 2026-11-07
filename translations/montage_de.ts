@@ -7223,7 +7223,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Cue sheets (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">Die Tabellen sind in den Tabellen (*.csv *.tsv *.txt);;alle Dateien (*) zu finden</translation>
+        <translation type="unfinished">Die Tabellen sind in den Tabellen (*.csv *.tsv *.txt);;alle Dateien (*)</translation>
     </message>
     <message>
         <source>Export…</source>
@@ -8752,7 +8752,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Subtitle pictures, read by OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;All files (*)</source>
-        <translation type="unfinished">Bildunterschriften (*.srt *.vtt *.scc *.ttml *.xml *.dfxp *.stl *.ssa);;Untertitelbilder, gelesen von OCR (*.sup *.idx *.mkv *.ts *.m2ts *.ttml);;Alle Dateien (*)</translation>
+        <translation type="unfinished">Bildunterschriften (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Untertitelbilder, gelesen von OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;Alle Dateien (*)</translation>
     </message>
     <message>
         <source>SubRip (*.srt)</source>
@@ -9733,7 +9733,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Change EDL (*.edl);;Change list (*.csv)</source>
-        <translation type="unfinished">EDL ändern (*.edl); Liste ändern (*.csv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Re-conform Sequence</source>
@@ -10979,7 +10979,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Montage presets (*.montagepreset)</source>
-        <translation type="unfinished">Montagevoreinstellungen (*.Montagevoreinstellung)</translation>
+        <translation type="unfinished">Montagevoreinstellungen (*.montagepreset)</translation>
     </message>
     <message>
         <source>Show Presets Folder</source>
@@ -11984,7 +11984,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>%1 Files (*.%2);;All Files (*)</source>
-        <translation type="unfinished">%1 Dateien (*.%2);Alle Dateien (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export To</source>
@@ -16063,7 +16063,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">Montageprojekte (*.Montage)</translation>
+        <translation type="unfinished">Montageprojekte (*.montage)</translation>
     </message>
     <message>
         <source>Mer&amp;ge Project…</source>
@@ -16235,7 +16235,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Text (*.txt);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">(b) Die Veröffentlichungen der Europäischen Gemeinschaften sind in den folgenden Abschnitten enthalten:</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Pape&amp;rwork</source>
@@ -18204,7 +18204,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage);;All files (*)</source>
-        <translation type="unfinished">Montageprojekte (*.Montage);;Alle Dateien (*)</translation>
+        <translation type="unfinished">Montageprojekte (*.montage);;Alle Dateien (*)</translation>
     </message>
     <message>
         <source>a while</source>
@@ -19231,7 +19231,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
-        <translation type="unfinished">;;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *</translation>
+        <translation type="unfinished">;;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * (*.txt)</translation>
     </message>
     <message>
         <source>Select the video clips to arrange, or put the playhead over them</source>
@@ -21629,7 +21629,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">*.fcpxml *.otio *.edl *.aaf *.avb;;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF Komposition (CPL*.xml ASSETMAP.xml)</translation>
+        <translation type="unfinished">*.fcpxml *.otio *.edl *.aaf *.avb (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF Komposition (CPL*.xml ASSETMAP.xml)</translation>
     </message>
     <message>
         <source>Import IMF Package</source>
@@ -22585,7 +22585,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)</source>
-        <translation type="unfinished">Medien (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.pv *.mv *.m2ts *.mg *.mpg *.meg *.wmv *.fv *.gif *.wav *.mp3 *.aac *.m4a *.flc *.ogg *.opus *.aif *.png *.jpg *.jpg *.jpeg *.tif *.ffff *.pmp *.pppp *.pg *.pg *.psd *.pb *.pbg *.pg *.pg *.pg *.pg *.pg *.pg *.pg *.pg *.pg *.pg *.pg *.f *.fff *.rw2 *.pf *.pf *.ff *.f.pg *.f.pg *.f.;;;;; alle Dateien (*); alle Dateien (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Image Sequence</source>
@@ -23311,7 +23311,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Montage projects (*.montage)</source>
-        <translation type="unfinished">Montageprojekte (*.Montage)</translation>
+        <translation type="unfinished">Montageprojekte (*.montage)</translation>
     </message>
     <message>
         <source>Choose Base…</source>
@@ -27262,7 +27262,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Recordings (*.mp4 *.mov *.m4v *.mxf *.wav *.bwf);;All Files (*)</source>
-        <translation type="unfinished">Aufzeichnungen (*.mp4 *.mov *.m4v *.mxf *.wav *.bwf);Alle Dateien (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Recording:</source>
@@ -28957,7 +28957,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">Ton oder Video (*.wav *.mp3 *.m4a *.aac *.fac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);alle Dateien (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No recording picked</source>
@@ -30689,7 +30689,7 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">Ton oder Video (*.wav *.mp3 *.m4a *.aac *.fac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);alle Dateien (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot convert voices (no ONNX Runtime).</source>

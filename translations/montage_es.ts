@@ -8752,7 +8752,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Subtitle pictures, read by OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;All files (*)</source>
-        <translation type="unfinished">Títulos (*.srt *.vtt *.sc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Fotografías de subtítulos, leídas por OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.tml);;Todos los archivos (*)</translation>
+        <translation type="unfinished">Títulos (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Fotografías de subtítulos, leídas por OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;Todos los archivos (*)</translation>
     </message>
     <message>
         <source>SubRip (*.srt)</source>
@@ -16499,7 +16499,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)</source>
-        <translation type="unfinished">Lista de decisiones de color (*.cdl);; Corrección de color (*.cc);; Colección de correcciones de color (*.ccc)</translation>
+        <translation type="unfinished">Lista de decisiones de color (*.cdl);;Corrección de color (*.cc);;Colección de correcciones de color (*.ccc)</translation>
     </message>
     <message>
         <source>Import ACES Metadata (AMF)…</source>
@@ -17446,7 +17446,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl);;PDF with pictures (*.pdf)</source>
-        <translation type="unfinished">Lista de marcadores (*.csv);; localizadores ávidos (*.txt);;Resolver marcador EDL (*.edl);;PDF con imágenes (*.pdf)</translation>
+        <translation type="unfinished">Lista de marcadores (*.csv);;localizadores ávidos (*.txt);;Resolver marcador EDL (*.edl);;PDF con imágenes (*.pdf)</translation>
     </message>
     <message>
         <source>Import Markers…</source>
@@ -19239,7 +19239,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Excel workbook (*.xlsx);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">Manual de Excel (*.xlsx);; CSV (*.csv); PDF (*.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
@@ -21641,7 +21641,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">*.otio *.edl *.aaf *.avb);;; Final Cut Pro 7 XML (*.xml);; FCPXML (*.fcpxml);; OpenTimelineIO (*.otio);; CMX 3600 EDL (*.edl);; AAF (Media Composer, Pro Tools) (*.aaf);;; Media Composer bin (*.avb);; composición del FMI (CPL*.xml ASSETMAP.xml)</translation>
+        <translation type="unfinished">*.otio *.edl *.aaf *.avb) (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;; Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;; Media Composer bin (*.avb);;composición del FMI (CPL*.xml ASSETMAP.xml)</translation>
     </message>
     <message>
         <source>Import IMF Package</source>
@@ -22585,7 +22585,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)</source>
-        <translation type="unfinished">*.m4v *.mv *.m2ts *.mv *.mmpg *.mmpg *.mv *.mv *.mv *.m4a *.m4a *.flac *.ogg *.opus *.aif *.aif *.png *.jp *.jpg *.tif *.tiff *.bmp *.bmp *.bp.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw*.raf *.rw2 *.orf *.pef *.srw *.iq;Todos los archivos (*).nef *.rw2 *.orf *.p.p.f *.srw *.iq;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Image Sequence</source>

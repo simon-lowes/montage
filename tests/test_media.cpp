@@ -32910,14 +32910,63 @@ if ui["pressed"] == "add":
         }, garbled, &st));
         QCOMPARE(st.drafted, 0);
         QVERIFY(garbled.find("unk") == std::string::npos);
-        // And none of the languages Montage ships holds such a draft.
+        // A file dialog's filters keep the source's patterns: the model's "(*.Montage)" becomes "(*.montage)" again, and a
+        // draft that lost a filter, or wrote a run of backslashes for words it could not place, is not kept.
+        const std::string filters = R"(<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
+<TS version="2.1" language="de">
+<context>
+    <name>montage::MainWindow</name>
+    <message>
+        <source>Montage projects (*.montage);;All files (*)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Change EDL (*.edl);;Change list (*.csv)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Film list</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+</TS>
+)";
+        std::string filtered;
+        QVERIFY(draftInterfaceTranslation(filters, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
+            o = {"Montageprojekte (*.Montage);;Alle Dateien (*)", "EDL ändern (*.edl); Liste ändern (*.csv)", "\\\\ \\\\"};
+            return in.size() == 3;
+        }, filtered, &st));
+        QCOMPARE(st.drafted, 1);
+        QVERIFY2(filtered.find("<translation type=\"unfinished\">Montageprojekte (*.montage);;Alle Dateien (*)</translation>") !=
+                     std::string::npos, filtered.c_str());
+        QVERIFY(filtered.find("Liste") == std::string::npos && filtered.find('\\') == std::string::npos);
+        // And none of the languages Montage ships holds such a draft: no "<unk>", no run of backslashes, and each file
+        // filter with the source's own patterns.
         const QDir shipped(QStringLiteral(MONTAGE_TEST_DATA_DIR "/../../translations"));
         const QStringList files = shipped.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
         QVERIFY(!files.isEmpty());
+        static const QRegularExpression message(QStringLiteral("<source>([^<]*)</source>\\s*<translation[^>]*>([^<]*)</translation>"));
+        static const QRegularExpression pattern(QStringLiteral("\\(([^()]*\\*[^()]*)\\)"));
+        auto patternsOf = [](const QString& text) {
+            QStringList out;
+            for (auto it = pattern.globalMatch(text); it.hasNext();) out << it.next().captured(1);
+            return out;
+        };
         for (const QString& name : files) {
             QFile f(shipped.filePath(name));
             QVERIFY(f.open(QIODevice::ReadOnly));
-            QVERIFY2(!f.readAll().contains("&lt;unk&gt;"), qPrintable(name));
+            const QString text = QString::fromUtf8(f.readAll());
+            QVERIFY2(!text.contains(QStringLiteral("&lt;unk&gt;")), qPrintable(name));
+            for (auto it = message.globalMatch(text); it.hasNext();) {
+                const auto m = it.next();
+                const QString source = m.captured(1), translation = m.captured(2);
+                if (translation.isEmpty()) continue;
+                QVERIFY2(!translation.contains(QStringLiteral("\\\\")) || source.contains(QStringLiteral("\\\\")),
+                         qPrintable(name + ": " + translation));
+                if (source.contains(QStringLiteral("(*")))
+                    QVERIFY2(patternsOf(translation) == patternsOf(source), qPrintable(name + ": " + source + " -> " + translation));
+            }
         }
     }
 

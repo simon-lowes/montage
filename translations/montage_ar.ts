@@ -7018,7 +7018,7 @@ Download it now?</source>
     </message>
     <message>
         <source>WebVTT captions (*.vtt)</source>
-        <translation type="unfinished">مقتطفات WebVTT (*.vt)</translation>
+        <translation type="unfinished">مقتطفات WebVTT (*.vtt)</translation>
     </message>
     <message>
         <source>Plain text (*.txt)</source>
@@ -7283,7 +7283,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Cue sheets (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">صحائف كُو (*.csv*.tsv*.txt)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export…</source>
@@ -8884,15 +8884,15 @@ Download it now?</source>
     </message>
     <message>
         <source>Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;Subtitle pictures, read by OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;All files (*)</source>
-        <translation type="unfinished">لقطات (*.srt*.vt*.sc*.mc*.mkml*.xml*.dfxp*.sl*.ass*.ssa;; Subtitle phors, at oCR (*.sup*.idx*.mks*.mkv*.ts*.m2ts*.tml; all fiils (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>SubRip (*.srt)</source>
-        <translation type="unfinished">(*.rrt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>WebVTT (*.vtt)</source>
-        <translation type="unfinished">WebVTT*.vtt</translation>
+        <translation type="unfinished">WebVTT*.vtt (*.vtt)</translation>
     </message>
     <message>
         <source>Scenarist SCC, CEA-608 (*.scc)</source>
@@ -8904,15 +8904,15 @@ Download it now?</source>
     </message>
     <message>
         <source>TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)</source>
-        <translation type="unfinished">TTML، IMSC 1.1 (*.tml*.xml*.dfxp)</translation>
+        <translation type="unfinished">TTML، IMSC 1.1 (*.ttml *.xml *.dfxp)</translation>
     </message>
     <message>
         <source>EBU STL (*.stl)</source>
-        <translation type="unfinished">EBU STL (*stl)</translation>
+        <translation type="unfinished">EBU STL (*.stl)</translation>
     </message>
     <message>
         <source>Advanced SubStation Alpha (*.ass *.ssa)</source>
-        <translation type="unfinished">المرحلة المتقدمة ألفا (*.ass*.sa)</translation>
+        <translation type="unfinished">المرحلة المتقدمة ألفا (*.ass *.ssa)</translation>
     </message>
     <message>
         <source>Blu-ray subtitle pictures, PGS (*.sup)</source>
@@ -8928,11 +8928,11 @@ Download it now?</source>
     </message>
     <message>
         <source>DVD subtitle pictures, VobSub (*.idx *.sub)</source>
-        <translation type="unfinished">صور DVD مترجمة، VobSub (*.idx*.sub)</translation>
+        <translation type="unfinished">صور DVD مترجمة، VobSub (*.idx *.sub)</translation>
     </message>
     <message>
         <source>IMSC 1.1 Image, TTML with PNGs (*.ttml)</source>
-        <translation type="unfinished">IMSC 1-1 صورة، TTML مع PNGs (*.tml)</translation>
+        <translation type="unfinished">IMSC 1-1 صورة، TTML مع PNGs (*.ttml)</translation>
     </message>
     <message>
         <source>Export Captions</source>
@@ -9877,7 +9877,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Change EDL (*.edl);;Change list (*.csv)</source>
-        <translation type="unfinished">غيّر DEL (*.edl)؛ غيّر قائمة (*.csv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Re-conform Sequence</source>
@@ -11163,7 +11163,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Montage presets (*.montagepreset)</source>
-        <translation type="unfinished">مونتاج:</translation>
+        <translation type="unfinished">مونتاج: (*.montagepreset)</translation>
     </message>
     <message>
         <source>Show Presets Folder</source>
@@ -12136,7 +12136,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Images (*.png *.jpg *.jpeg *.webp *.bmp)</source>
-        <translation type="unfinished">الصور (*.png*.jpg*.jpeg*.webp*.bmp)</translation>
+        <translation type="unfinished">الصور (*.png *.jpg *.jpeg *.webp *.bmp)</translation>
     </message>
     <message>
         <source>Sign with Content Credentials</source>
@@ -12176,7 +12176,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>%1 Files (*.%2);;All Files (*)</source>
-        <translation type="unfinished">%1 الملفات (*. %2)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export To</source>
@@ -12188,7 +12188,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All Files (*)</source>
-        <translation type="unfinished">شهادات (*.pem*.crt*.cer)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Its Private Key</source>
@@ -12196,7 +12196,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Private Keys (*.pem *.key);;All Files (*)</source>
-        <translation type="unfinished">مفاتيح خاصة (*.pem*. key)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Signing Certificate</source>
@@ -12560,7 +12560,7 @@ Do you want to replace it?</source>
     </message>
     <message>
         <source>Text (*.txt *.md)</source>
-        <translation type="unfinished">نص (*.txt*.md)</translation>
+        <translation type="unfinished">نص (*.txt *.md)</translation>
     </message>
     <message>
         <source>Could not write %1</source>
@@ -13907,7 +13907,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda)</source>
-        <translation type="unfinished">آلة تصوير نوكي (*.chan)؛ مشهد بدولارات الولايات المتحدة مع النماذج التي وضعت (*.usda)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Wrote %1</source>
@@ -15884,7 +15884,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Screenplays (*.fountain *.spmd *.fdx *.txt);;All files (*)</source>
-        <translation type="unfinished">الشاشات (*.fontain*.spmd*.fdx*.txt)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Lined Script</source>
@@ -15998,7 +15998,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1;;All files (*)</source>
-        <translation type="unfinished">%1; كل الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Search Folder for Media</source>
@@ -16395,7 +16395,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)</source>
-        <translation type="unfinished">مذكرات استعراض (*.json)؛ قوائم ماركر (*.csv*.txt*.tsv)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Project &amp;Manager…</source>
@@ -16523,7 +16523,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Avid Log Exchange (*.ale *.ALE);;All files (*)</source>
-        <translation type="unfinished">Avid Log Barch (*.al*.ALE)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export ALE…</source>
@@ -16535,7 +16535,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Avid Log Exchange (*.ale)</source>
-        <translation type="unfinished">بورصة أفيد للسجل (*.al)</translation>
+        <translation type="unfinished">بورصة أفيد للسجل (*.ale)</translation>
     </message>
     <message>
         <source>Export Final Cut Pro &amp;7 XML (Premiere, Resolve)…</source>
@@ -16583,7 +16583,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Text (*.txt);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">نص (*.txt)؛ CSV (*.csv)؛ PDF (*.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export Pape&amp;rwork</source>
@@ -16791,7 +16791,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>LUT files (*.cube)</source>
-        <translation type="unfinished">ملفات LUT (*.cub)</translation>
+        <translation type="unfinished">ملفات LUT (*.cube)</translation>
     </message>
     <message>
         <source>Rebuild LUT as &amp;Grade…</source>
@@ -16819,7 +16819,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ASC CDL (*.cdl *.cc *.ccc);;All files (*)</source>
-        <translation type="unfinished">ASC CDL (*.cdl*.cc*ccc)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export CDL…</source>
@@ -16831,7 +16831,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Color Decision List (*.cdl);;Color Correction (*.cc);;Color Correction Collection (*.ccc)</source>
-        <translation type="unfinished">قائمة القرارات الملونة (*.cdl)؛ تصحيح الكلور (*.cc)؛ مجموعة تصحيحات الكلور (*.cc)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import ACES Metadata (AMF)…</source>
@@ -16843,7 +16843,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ACES Metadata File (*.amf);;All files (*)</source>
-        <translation type="unfinished">ACES بيانات ملفّ (*.amf)؛ جميع ملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Export ACES Metadata (AMF)…</source>
@@ -16859,7 +16859,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>ACES Metadata File (*.amf)</source>
-        <translation type="unfinished">ACES بيانات ملف</translation>
+        <translation type="unfinished">ACES بيانات ملف (*.amf)</translation>
     </message>
     <message>
         <source>Folder for the ACES Metadata Files</source>
@@ -17478,7 +17478,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Tables (*.csv *.tsv *.txt);;All files (*)</source>
-        <translation type="unfinished">الجداول (*.csv*.tsv*.txt)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>New &amp;Colour Matte</source>
@@ -17782,7 +17782,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Marker list (*.csv);;Avid locators (*.txt);;Resolve marker EDL (*.edl);;PDF with pictures (*.pdf)</source>
-        <translation type="unfinished">قائمة العلامات (*.csv)؛ أجهزة تحديد المواقع المأخوذة من أجهزة الطيران (*.txt)؛ ومؤشر التعادل EDL (*.edl)؛ وجهاز تحديد المواقع المجهز بالصور (*.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Markers…</source>
@@ -17794,7 +17794,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Marker lists and review notes (*.csv *.txt *.tsv *.json)</source>
-        <translation type="unfinished">قوائم العلامات ومذكرات المراجعة (*.csv*.txt*.tsv*.json)</translation>
+        <translation type="unfinished">قوائم العلامات ومذكرات المراجعة (*.csv *.txt *.tsv *.json)</translation>
     </message>
     <message>
         <source>&amp;Quality Check…</source>
@@ -18094,7 +18094,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>SOFA files (*.sofa *.zip)</source>
-        <translation type="unfinished">ملفات SOFA (*.sofa*.zip)</translation>
+        <translation type="unfinished">ملفات SOFA (*.sofa *.zip)</translation>
     </message>
     <message>
         <source>This build of Montage cannot read SOFA files (libmysofa)</source>
@@ -18294,7 +18294,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)</source>
-        <translation type="unfinished">سكربتات (*.lua*.py)؛ Lua نصوص (*.lua)؛ Python brexts (*.py)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Open Scripts Folder</source>
@@ -18564,7 +18564,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Montage projects (*.montage);;All files (*)</source>
-        <translation type="unfinished">مشاريع مونتاج (*.montage)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>a while</source>
@@ -18706,11 +18706,11 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>AVIF for SDR screens (*.avif)</source>
-        <translation type="unfinished">AVIF لشاشات حقوق السحب الخاصة (*.avef)</translation>
+        <translation type="unfinished">AVIF لشاشات حقوق السحب الخاصة (*.avif)</translation>
     </message>
     <message>
         <source>HDR AVIF, 10-bit (*.avif)</source>
-        <translation type="unfinished">AVIF، 10 بت (*.avef)</translation>
+        <translation type="unfinished">AVIF، 10 بت (*.avif)</translation>
     </message>
     <message>
         <source>HDR JPEG with gain map (*.jpg)</source>
@@ -18718,19 +18718,19 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>HDR AVIF with gain map (*.avif)</source>
-        <translation type="unfinished">خريطة المكاسب (*.avef)</translation>
+        <translation type="unfinished">خريطة المكاسب (*.avif)</translation>
     </message>
     <message>
         <source>HEIF for SDR screens (*.heic)</source>
-        <translation type="unfinished">HEF لشاشات حقوق السحب الخاصة (*.hic)</translation>
+        <translation type="unfinished">HEF لشاشات حقوق السحب الخاصة (*.heic)</translation>
     </message>
     <message>
         <source>HDR HEIF, 10-bit (*.heic)</source>
-        <translation type="unfinished">جدول أعمال التنمية البشرية،</translation>
+        <translation type="unfinished">جدول أعمال التنمية البشرية، (*.heic)</translation>
     </message>
     <message>
         <source>HDR HEIF with gain map (*.heic)</source>
-        <translation type="unfinished">خريطة المكاسب (*.hic)</translation>
+        <translation type="unfinished">خريطة المكاسب (*.heic)</translation>
     </message>
     <message>
         <source>JPEG for SDR screens (*.jpg)</source>
@@ -18742,7 +18742,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Images (*.png *.jpg *.tif *.avif *.heic)</source>
-        <translation type="unfinished">الصور (*.png*.jpg*.tif*.vif*.hic)</translation>
+        <translation type="unfinished">الصور (*.png *.jpg *.tif *.avif *.heic)</translation>
     </message>
     <message>
         <source>Export Frame</source>
@@ -19683,7 +19683,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Excel workbook (*.xlsx);;CSV (*.csv);;PDF (*.pdf)</source>
-        <translation type="unfinished">كتاب عمل إكسل (*.xlsx)؛ CSV (*.csv)؛ PDF (*.pdf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
@@ -20838,7 +20838,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>IAMF in MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)</source>
-        <translation type="unfinished">IAMF في MP4 (*.mp4 *.m4a)؛ ؛ جدول IAMF (*.iamf)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR</source>
@@ -21302,7 +21302,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Certificates (*.pem *.crt *.cer);;All files (*)</source>
-        <translation type="unfinished">الشهادات (*.pem*.crt*.cer)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Valid from:</source>
@@ -22249,7 +22249,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">الخط الزمني (*.xml*.fcpxml*.otio*.adl*.aaff*.avb)؛ Final Cut Pro 7 XML (*.xml)؛ FCPXML (*.fcpxml)؛ Opentimelineio (*.otio)؛ CMX 3000 EDL (*.edl)؛ AAF (Media Comoper, Pro Totes) (*.aaf)؛ Media Comporser Ben (*.avb)؛ FAFFD (CPL*.xml ASSTMAP.xml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import IMF Package</source>
@@ -23245,7 +23245,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif *.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json *.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)</source>
-        <translation type="unfinished">وسائط الإعلام (*.mp4*.mmv*.mkv*.avi*.m4v*.m4v*.mxf*.apv*.m2ts*.mpg*.mpg*.mpg*.pg.wipp.exr*sv*.mp3*.mlv*.psd*.psb*.dng*.cr2*.cr3*.nef*arw.raf*rw2*.orgworf*</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import Image Sequence</source>
@@ -23253,7 +23253,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Frames (*.exr *.dpx *.png *.tif *.tiff *.tga *.bmp *.jpg *.jpeg *.webp);;All files (*)</source>
-        <translation type="unfinished">الإطارات (*.exr*.dpx*.png*.tif*.tga*.bmp*.jpg*.jpg*.webp; جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Frames per second:</source>
@@ -24968,7 +24968,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Calibration LUTs (*.cube *.3dl *.clf *.ctf);;All files (*)</source>
-        <translation type="unfinished">المعايرة LUTs (*.cube*.3dl*.clf*.ctf)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Screen %1: %2 (%3 × %4)</source>
@@ -28090,7 +28090,7 @@ with rate control per segment, and image sequences. The sound is rendered once, 
     </message>
     <message>
         <source>Recordings (*.mp4 *.mov *.m4v *.mxf *.wav *.bwf);;All Files (*)</source>
-        <translation type="unfinished">التسجيلات (*.mp4*.m4v*.mxf*.wav*.bwf)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Recording:</source>
@@ -28628,7 +28628,7 @@ works on, in its working space; read when the playhead stops</source>
     </message>
     <message>
         <source>Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)</source>
-        <translation type="unfinished">سكربتات (*.lua*.py)؛ Lua نصوص (*.lua)؛ Python brexts (*.py)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot read %1</source>
@@ -28790,7 +28790,7 @@ Neither did I.</source>
     </message>
     <message>
         <source>Scripts (*.txt *.fountain *.md *.fdx);;All files (*)</source>
-        <translation type="unfinished">سكربتات (*.txt*.fonstin*.md*.fdx)؛ جميع الملفات (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Could not open %1</source>
@@ -29837,7 +29837,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">صوت أو فيديو (*.mp3 *.m4a*.aac*.gg*.og_.opus*.aif*.aif*.mov*.mp4*.mkv*.mxf; all fiils (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No recording picked</source>
@@ -31641,7 +31641,7 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>Sound or video (*.wav *.mp3 *.m4a *.aac *.flac *.ogg *.opus *.aif *.aiff *.mov *.mp4 *.mkv *.mxf);;All files (*)</source>
-        <translation type="unfinished">صوت أو فيديو (*.mp3 *.m4a*.aac*.gg*.og_.opus*.aif*.aif*.mov*.mp4*.mkv*.mxf; all fiils (*)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build of Montage cannot convert voices (no ONNX Runtime).</source>
