@@ -6252,6 +6252,78 @@
         <source>Tilt</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Band %1 (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Band %1 Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>High Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band (Hz)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band (dB)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band On</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Q</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Slope</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Low Band Type</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>

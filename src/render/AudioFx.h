@@ -18,7 +18,7 @@ struct Effect;
 namespace montage::fx {
 
 // While one lives, this thread's arithmetic takes subnormal numbers as zero (flush to zero and denormals are zero),
-// where the processor has the switch (x86 with SSE, 64-bit ARM): what audio wants, since a filter ringing down after a
+// where the processor has the switch (x86 with SSE, ARM with a floating-point unit): what audio wants, since a filter ringing down after a
 // sound otherwise works on them for minutes, many times slower. What was set before is put back when it goes. (Each
 // filter here also zeroes its own tiny state, for the processors without the switch: Biquad::flushTiny.)
 class DenormalsOff {
@@ -85,16 +85,19 @@ public:
     // is heard (soloFilter), the other bands and the output gain left out; -1 none.
     // As it plays, each band keeps its own filter's state (by its slot), so moving a band does not click, nor does
     // adding or removing another. A band switched on (or added) starts from rest and fades in over kFadeSeconds, one
-    // switched off fades out, and Solo pressed or let go crosses over as quickly: the bands keep running while it is
-    // held, so none comes back on a state from before. Set before anything is heard, it is all there at once.
+    // switched off (or removed) fades out, and Solo pressed, let go or moved to another band crosses over as quickly:
+    // the bands keep running while it is held, so none comes back on a state from before, and a filter section a band
+    // stops using (a shallower cut, a tilt made a bell) is cleared, so none comes back on one either. Set before
+    // anything is heard, it is all there at once. Nothing is allocated once it has been set (it may be every block).
     void set(double sr, const std::vector<EqBand>& bands, double outputDb, int solo = -1);
     static constexpr double kFadeSeconds = 0.01;
+    static constexpr int kMaxStages = 2 * kMaxBands;  // (the bands, and as many removed still fading out)
     void process(float* buf, int frames);
     // The whole EQ's gain at `hz`, in dB, as it is heard (output gain included; the solo filter while soloing).
     double responseDb(double hz) const;
     // One band's own gain at `hz`, in dB (on or off).
     double bandResponseDb(int band, double hz) const;
-    int bandCount() const { return int(stages_.size()); }
+    int bandCount() const;
     // Whether every filter is at rest (its state zero): where silence brings them, as process zeroes state too small to
     // hear rather than leave it ringing down through subnormal numbers.
     bool atRest() const;
@@ -106,8 +109,13 @@ private:
         bool on = true;
         int id = -1;     // its band's slot (or place)
         float mix = 0;   // how much of it is heard, as it fades in (to 1) or out (to 0)
+        bool gone = false;  // its band removed: fading out where it was, then dropped
         void clear() {
             for (Biquad& b : sections) b.clear();
+        }
+        // The sections past `count` at rest, for when they are next used.
+        void clearSpare() {
+            for (size_t k = size_t(count); k < sections.size(); ++k) sections[k].clear();
         }
         // Runs the sections on one frame (both channels).
         void run(float v[2]) {
@@ -121,10 +129,10 @@ private:
     // it takes away; a tilt as it is.
     static void soloFilter(Stage& st, double sr, const EqBand& b);
     static double stageDb(const Stage& st, double sr, double hz);
-    std::vector<Stage> stages_;
-    Stage solo_;
+    std::vector<Stage> stages_, scratch_;  // (scratch_: where set makes the next stages_, kept for its room)
+    Stage solo_, soloOut_;  // the solo filter, and the one Solo was on before it moved to another band
     bool soloing_ = false;
-    float soloMix_ = 0;   // how much of the solo is heard, as it crosses over
+    float soloMix_ = 0, soloOutMix_ = 0;  // how much of each is heard, as they cross over
     bool primed_ = false; // something has been heard since the rate was set
     double sr_ = 48000;
     float output_ = 1;

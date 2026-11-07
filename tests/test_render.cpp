@@ -19410,7 +19410,8 @@ colorspaces:
         std::vector<float> before = run(eq, at, 40);
         at += 40 * block;
         int was = -1;
-        for (int solo : {1, -1, 0, -1}) {
+        // (and moved from one band to the other and back while held)
+        for (int solo : {1, -1, 0, 1, 0, -1}) {
             eq.set(sr, loud, 0, solo);
             const std::vector<float> crossed = run(eq, at, 8);
             at += 8 * block;
@@ -19420,6 +19421,60 @@ colorspaces:
             was = solo;
             before = crossed;
         }
+        // A band with gain removed as it plays fades out as one switched off does, where it was among the others: no
+        // step larger than the sound makes with it or without it; then it is gone.
+        {
+            std::vector<fx::EqBand> pair{{200, 18, 8}, {3000, -6, 2}};
+            pair[0].slot = eqBandSlot("b1"), pair[1].slot = eqBandSlot("b2");
+            auto settledAs = [&](const std::vector<fx::EqBand>& with) {
+                fx::ParametricEq x;
+                x.set(sr, with, 0);
+                run(x, 0, 40);
+                return steps(run(x, 40 * block, 10));
+            };
+            fx::ParametricEq removing;
+            removing.set(sr, pair, 0);
+            const std::vector<float> was2 = run(removing, 0, 40);
+            removing.set(sr, {pair[1]}, 0);
+            QCOMPARE(removing.bandCount(), 1);
+            const std::vector<float> removed = run(removing, 40 * block, 8);
+            const double bound = 1.1 * std::max(settledAs(pair), settledAs({pair[1]})) + 2e-3;
+            QVERIFY2(steps(removed, was2) <= bound, qPrintable(QString("%1 against %2").arg(steps(removed, was2)).arg(bound)));
+            // (faded out: what is heard is the band left alone, sample for sample)
+            fx::ParametricEq alone;
+            alone.set(sr, {pair[1]}, 0);
+            run(alone, 0, 48);
+            removing.set(sr, {pair[1]}, 0);
+            std::vector<float> a = tone(48 * block, block, 200), b = a;
+            removing.process(a.data(), block);
+            alone.process(b.data(), block);
+            QVERIFY2(worst(a, b) < 1e-5, qPrintable(QString::number(worst(a, b))));
+        }
+        // Filter sections a band stops using (a 48 dB an octave cut made 12, a tilt made a bell) are cleared, so on
+        // going back they start from rest, as they would have had they never run, not from the sound of a while ago.
+        for (const auto& [from, to] : {std::pair{fx::EqBand{150, 0, M_SQRT1_2, fx::EqShape::LowCut, 48}, fx::EqBand{150, 0, M_SQRT1_2, fx::EqShape::LowCut, 12}},
+                                       std::pair{fx::EqBand{400, 9, 1, fx::EqShape::Tilt}, fx::EqBand{400, 9, 1, fx::EqShape::Bell}}}) {
+            fx::ParametricEq went, stayed;
+            went.set(sr, {from}, 0);
+            stayed.set(sr, {to}, 0);
+            auto both = [&](int from0, int blocks) {
+                double w = 0;
+                for (int k = 0; k < blocks; ++k) {
+                    std::vector<float> a = tone(from0 + k * block, block, 150), b = a;
+                    went.process(a.data(), block);
+                    stayed.process(b.data(), block);
+                    w = std::max(w, worst(a, b));
+                }
+                return w;
+            };
+            both(0, 20);
+            went.set(sr, {to}, 0);
+            both(20 * block, 40);  // (long enough for what the sections it keeps were doing before to have died away)
+            went.set(sr, {from}, 0), stayed.set(sr, {from}, 0);
+            const double after = both(60 * block, 4);
+            QVERIFY2(after < 1e-5, qPrintable(QString("%1: %2").arg(int(from.shape)).arg(after)));
+        }
+
         // (set before anything is heard, it is all there at once: no fade)
         fx::ParametricEq fresh;
         fresh.set(sr, loud, 0, 1);
@@ -19453,7 +19508,7 @@ colorspaces:
         volatile float tiny = 1e-39f, half = 0.5f;
         {
             const fx::DenormalsOff off;
-#if defined(__SSE__) || defined(_M_X64) || defined(__aarch64__)
+#if defined(__SSE__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM) || (defined(__arm__) && defined(__ARM_FP))
             QVERIFY(tiny * half == 0.0f);
 #endif
         }

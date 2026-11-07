@@ -11,6 +11,11 @@
 #define MONTAGE_DENORMALS_MXCSR 1
 #elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 #define MONTAGE_DENORMALS_FPCR 1
+#elif defined(__arm__) && defined(__ARM_FP) && (defined(__GNUC__) || defined(__clang__))
+#define MONTAGE_DENORMALS_FPSCR 1
+#elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM))
+#include <float.h>
+#define MONTAGE_DENORMALS_CONTROLFP 1
 #endif
 
 namespace montage::fx {
@@ -29,6 +34,16 @@ DenormalsOff::DenormalsOff() {
     __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
     was_ = fpcr;
     __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr | (uint64_t(1) << 24)));  // FZ: flush to zero, in and out
+#elif defined(MONTAGE_DENORMALS_FPSCR)
+    uint32_t fpscr = 0;
+    __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+    was_ = fpscr;
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr | (uint32_t(1) << 24)));  // FZ, as on 64-bit ARM
+#elif defined(MONTAGE_DENORMALS_CONTROLFP)
+    unsigned int cw = 0;
+    _controlfp_s(&cw, 0, 0);
+    was_ = cw;
+    _controlfp_s(&cw, _DN_FLUSH, _MCW_DN);  // (the FPCR's or FPSCR's FZ bit, there)
 #endif
 }
 
@@ -37,6 +52,11 @@ DenormalsOff::~DenormalsOff() {
     _mm_setcsr(unsigned(was_));
 #elif defined(MONTAGE_DENORMALS_FPCR)
     __asm__ __volatile__("msr fpcr, %0" : : "r"(was_));
+#elif defined(MONTAGE_DENORMALS_FPSCR)
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(uint32_t(was_)));
+#elif defined(MONTAGE_DENORMALS_CONTROLFP)
+    unsigned int cw = 0;
+    _controlfp_s(&cw, unsigned(was_) & _MCW_DN, _MCW_DN);
 #endif
 }
 
@@ -125,6 +145,7 @@ void ParametricEq::design(Stage& st, double sr, const EqBand& b) {
             break;
         }
     }
+    st.clearSpare();
 }
 
 void ParametricEq::soloFilter(Stage& st, double sr, const EqBand& b) {
@@ -137,6 +158,7 @@ void ParametricEq::soloFilter(Stage& st, double sr, const EqBand& b) {
         case EqShape::Tilt: design(st, sr, b), st.on = true; break;
         default: st.count = 1, st.sections[0].bandPass(sr, b.hz, b.q); break;
     }
+    st.clearSpare();
 }
 
 void ParametricEq::set(double sr, const EqBand& low, const EqBand& b1, const EqBand& b2, const EqBand& b3, const EqBand& high,
@@ -155,33 +177,64 @@ void ParametricEq::set(double sr, const std::vector<EqBand>& bands, double outpu
     const size_t n = std::min(bands.size(), size_t(kMaxBands));
     if (sr != sr_) {
         stages_.clear();
-        solo_ = Stage{};
-        soloMix_ = 0;
+        solo_ = soloOut_ = Stage{};
+        soloMix_ = soloOutMix_ = 0;
         primed_ = false;
     }
+    // (room for every stage there can be, kept from then on: set is called every block while a setting is keyframed)
+    if (stages_.capacity() < size_t(kMaxStages)) stages_.reserve(size_t(kMaxStages));
+    if (scratch_.capacity() < size_t(kMaxStages)) scratch_.reserve(size_t(kMaxStages));
+    auto idOf = [&](size_t i) { return bands[i].slot >= 0 ? bands[i].slot : int(i); };
+    auto byId = [](std::vector<Stage>& in, int id) { return std::find_if(in.begin(), in.end(), [&](const Stage& x) { return x.id == id; }); };
     // Each band takes its own filter back (a band whose filter changes shape keeps its sections' state: it may click
     // once, as any switch does).
-    std::vector<Stage> next(n);
+    std::vector<Stage>& next = scratch_;
+    next.clear();
     for (size_t i = 0; i < n; ++i) {
-        const int id = bands[i].slot >= 0 ? bands[i].slot : int(i);
-        Stage& st = next[i];
-        const auto was = std::find_if(stages_.begin(), stages_.end(), [&](const Stage& x) { return x.id == id; });
-        if (was != stages_.end()) st = *was;
-        st.id = id;
+        const int id = idOf(i);
+        const auto was = byId(stages_, id);
+        next.push_back(was != stages_.end() ? *was : Stage{});
+        Stage& st = next.back();
+        st.id = id, st.gone = false;
         design(st, sr, bands[i]);
         if (!primed_) st.mix = st.on ? 1 : 0;
         else if (st.on && st.mix <= 0) st.clear();  // (switched back on, or new: from rest, as it fades in)
     }
-    stages_ = std::move(next);
+    // A band removed as it plays fades out where it was in the chain, as one switched off does, then goes.
+    if (primed_) {
+        size_t at = 0;  // (where the next removed one goes: after the last band before it that is kept)
+        for (const Stage& old : stages_) {
+            if (const auto kept = byId(next, old.id); kept != next.end()) {
+                at = size_t(kept - next.begin()) + 1;
+            } else if (old.mix > 0 && next.size() < size_t(kMaxStages)) {
+                Stage& st = *next.insert(next.begin() + ptrdiff_t(at++), old);
+                st.on = false, st.gone = true;
+            }
+        }
+    }
+    std::swap(stages_, scratch_);
     const bool soloNow = solo >= 0 && size_t(solo) < n;
     if (soloNow) {
-        const int id = stages_[size_t(solo)].id;
-        if (soloMix_ <= 0 || id != solo_.id) solo_.clear();
+        const int id = idOf(size_t(solo));
+        if (soloMix_ <= 0) {
+            solo_.clear();
+        } else if (id != solo_.id) {
+            // Moved to another band while held: the one it was on fades out as the new one fades in (back to the one
+            // still fading out, the two change places; a third so soon, the fainter of the two let go).
+            if (soloOutMix_ > 0 && id == soloOut_.id) {
+                std::swap(solo_, soloOut_);
+                std::swap(soloMix_, soloOutMix_);
+            } else {
+                if (soloMix_ >= soloOutMix_) soloOut_ = solo_, soloOutMix_ = soloMix_;
+                solo_.clear();
+                soloMix_ = 0;
+            }
+        }
         soloFilter(solo_, sr, bands[size_t(solo)]);
         solo_.id = id;
     }
     soloing_ = soloNow;
-    if (!primed_) soloMix_ = soloing_ ? 1 : 0;
+    if (!primed_) soloMix_ = soloing_ ? 1 : 0, soloOutMix_ = 0;
     output_ = dbToLin(outputDb);
     sr_ = sr;
 }
@@ -200,8 +253,14 @@ double ParametricEq::responseDb(double hz) const {
     return db;
 }
 
+int ParametricEq::bandCount() const {
+    return int(std::count_if(stages_.begin(), stages_.end(), [](const Stage& st) { return !st.gone; }));
+}
+
 double ParametricEq::bandResponseDb(int band, double hz) const {
-    return band >= 0 && band < int(stages_.size()) ? stageDb(stages_[size_t(band)], sr_, hz) : 0.0;
+    for (const Stage& st : stages_)
+        if (!st.gone && band-- == 0) return stageDb(st, sr_, hz);
+    return 0.0;
 }
 
 void ParametricEq::process(float* buf, int frames) {
@@ -221,29 +280,38 @@ void ParametricEq::process(float* buf, int frames) {
             st.mix = st.on ? std::min(1.0f, st.mix + step) : std::max(0.0f, st.mix - step);
         }
         v[0] *= output_, v[1] *= output_;
-        if (soloing_ || soloMix_ > 0) {
+        if (soloing_ || soloMix_ > 0 || soloOutMix_ > 0) {
             float w[2] = {f[0], f[1]};
             solo_.run(w);
-            if (soloing_ && soloMix_ >= 1) v[0] = w[0], v[1] = w[1];
-            else {
-                for (int ch = 0; ch < 2; ++ch) v[ch] += (w[ch] - v[ch]) * soloMix_;
+            if (soloing_ && soloMix_ >= 1 && soloOutMix_ <= 0) {
+                v[0] = w[0], v[1] = w[1];
+            } else {
+                float u[2] = {f[0], f[1]};
+                if (soloOutMix_ > 0) soloOut_.run(u);
+                for (int ch = 0; ch < 2; ++ch) v[ch] += (w[ch] - v[ch]) * soloMix_ + (u[ch] - v[ch]) * soloOutMix_;
                 soloMix_ = soloing_ ? std::min(1.0f, soloMix_ + step) : std::max(0.0f, soloMix_ - step);
+                soloOutMix_ = std::max(0.0f, soloOutMix_ - step);
             }
         }
         f[0] = v[0], f[1] = v[1];
     }
+    // (a filter no longer heard put at rest, as it would be made when next heard)
+    if (!soloing_ && soloMix_ <= 0) solo_.clear();
+    if (soloOutMix_ <= 0) soloOut_.clear();
     for (Stage& st : stages_)
-        for (int k = 0; k < st.count; ++k) st.sections[size_t(k)].flushTiny();
-    for (int k = 0; k < solo_.count; ++k) solo_.sections[size_t(k)].flushTiny();
+        if (!st.on && st.mix <= 0) st.clear();
+    for (Stage* st : {&solo_, &soloOut_})
+        for (Biquad& b : st->sections) b.flushTiny();
+    for (Stage& st : stages_)
+        for (Biquad& b : st.sections) b.flushTiny();
     primed_ = primed_ || frames > 0;
 }
 
 bool ParametricEq::atRest() const {
     auto still = [](const Stage& st) {
-        return std::all_of(st.sections.begin(), st.sections.begin() + st.count,
-                           [](const Biquad& b) { return !b.z1[0] && !b.z1[1] && !b.z2[0] && !b.z2[1]; });
+        return std::all_of(st.sections.begin(), st.sections.end(), [](const Biquad& b) { return !b.z1[0] && !b.z1[1] && !b.z2[0] && !b.z2[1]; });
     };
-    return still(solo_) && std::all_of(stages_.begin(), stages_.end(), still);
+    return still(solo_) && still(soloOut_) && std::all_of(stages_.begin(), stages_.end(), still);
 }
 
 std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo) {
