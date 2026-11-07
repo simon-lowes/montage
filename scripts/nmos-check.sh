@@ -41,7 +41,8 @@ run() {
         # GitHub stops it before any test, so that alone is tried once more)
         [ -s "$work/$suite.xml" ] && break
         grep -q "Could not resolve host\|unable to access 'https://github.com" "$work/$suite.log" || break
-        [ "$attempt" = 1 ] && { echo "$suite: GitHub could not be reached for the specifications; trying again"; sleep 15; }
+        # (a clone cut off part way may be left in the tool's cache: it starts again from none)
+        [ "$attempt" = 1 ] && { echo "$suite: GitHub could not be reached for the specifications; trying again"; rm -rf "$work/nmos-testing/cache"; sleep 15; }
     done
     if [ ! -s "$work/$suite.xml" ]; then
         # (the tool stopped before writing its report: its own output says why)
