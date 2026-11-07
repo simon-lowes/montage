@@ -11,6 +11,7 @@
 #include <QSaveFile>
 #include <QSysInfo>
 #include <chrono>
+#include <filesystem>
 #include <set>
 #include <thread>
 
@@ -360,6 +361,55 @@ bool writeJson(const QString& path, const QJsonObject& o) {
 
 bool fail(std::string* error, const std::string& e) {
     if (error) *error = e;
+    return false;
+}
+
+// Whether folder `inner` is `outer` or lies inside it, as the file system sees them: compared through links (from the
+// nearest folder that is there, so one not made yet is caught too; macOS's /tmp is /private/tmp), on Windows and macOS
+// whatever their case, and by the folders themselves (device and file number, or Windows's file id), so one share
+// reached two ways (a UNC path and a mapped drive, two mounts of it) is caught where the system can tell.
+bool folderWithin(const std::string& inner, const std::string& outer) {
+    if (inner.empty() || outer.empty()) return false;
+    auto nearest = [](const std::string& path, QString* rest) {
+        QString at = QDir::cleanPath(QFileInfo(qs(path)).absoluteFilePath());
+        while (!QFileInfo::exists(at)) {
+            const QString up = QFileInfo(at).path();
+            if (up == at) break;
+            *rest = QFileInfo(at).fileName() + (rest->isEmpty() ? QString() : QStringLiteral("/") + *rest);
+            at = up;
+        }
+        return at;
+    };
+    auto where = [&](const std::string& path) {
+        QString rest;
+        const QString at = nearest(path, &rest);
+        const QString real = QFileInfo(at).canonicalFilePath();
+        return QDir::cleanPath((real.isEmpty() ? at : real) + (rest.isEmpty() ? QString() : QStringLiteral("/") + rest));
+    };
+#if defined(_WIN32) || defined(__APPLE__)
+    const Qt::CaseSensitivity cs = Qt::CaseInsensitive;
+#else
+    const Qt::CaseSensitivity cs = Qt::CaseSensitive;
+#endif
+    const QString in = where(inner), out = where(outer);
+    if (in.compare(out, cs) == 0 || in.startsWith(out + '/', cs)) return true;
+    // (the same folder by another path: each folder `inner` is in, as named and through its links, against `outer`)
+    const QFileInfo outerInfo(qs(outer));
+    if (!outerInfo.isDir()) return false;
+    const std::filesystem::path target = outerInfo.filesystemAbsoluteFilePath();
+    QString rest;
+    const QString there = nearest(inner, &rest);
+    for (const QString& start : {there, QFileInfo(there).canonicalFilePath()}) {
+        if (start.isEmpty()) continue;
+        std::filesystem::path at = QFileInfo(start).filesystemAbsoluteFilePath();
+        for (;;) {
+            std::error_code ec;
+            if (std::filesystem::equivalent(at, target, ec) && !ec) return true;
+            const std::filesystem::path up = at.parent_path();
+            if (up == at || up.empty()) break;
+            at = up;
+        }
+    }
     return false;
 }
 
@@ -832,31 +882,11 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
         dcp::CertificateInfo leaf;
         std::string err;
         if (!dcp::securityAvailable()) return fail(error, "This build cannot encrypt (it has no OpenSSL)");
-        // (folders compared as the file system does: through links (macOS's /tmp is /private/tmp), from the nearest
-        // folder that is there, and on Windows and macOS whatever their case)
-        auto where = [](const std::string& path) {
-            QString at = QDir::cleanPath(QFileInfo(qs(path)).absoluteFilePath()), rest;
-            while (!QFileInfo::exists(at)) {
-                const QString up = QFileInfo(at).path();
-                if (up == at) break;
-                rest = QFileInfo(at).fileName() + (rest.isEmpty() ? QString() : QStringLiteral("/") + rest);
-                at = up;
-            }
-            const QString real = QFileInfo(at).canonicalFilePath();
-            return QDir::cleanPath((real.isEmpty() ? at : real) + (rest.isEmpty() ? QString() : QStringLiteral("/") + rest));
-        };
-#if defined(_WIN32) || defined(__APPLE__)
-        const Qt::CaseSensitivity cs = Qt::CaseInsensitive;
-#else
-        const Qt::CaseSensitivity cs = Qt::CaseSensitive;
-#endif
-        const QString certificates = where(settings.certificates.empty() ? dcp::signerFolder() : settings.certificates);
-        for (const std::string& shared : {farm, parent}) {
-            const QString s = where(shared);
-            if (!shared.empty() && (certificates.compare(s, cs) == 0 || certificates.startsWith(s + '/', cs)))
-                return fail(error, "The certificates the package is signed with are in " + ss(certificates) +
+        const std::string certificates = settings.certificates.empty() ? dcp::signerFolder() : settings.certificates;
+        for (const std::string& shared : {farm, parent})
+            if (folderWithin(certificates, shared))
+                return fail(error, "The certificates the package is signed with are in " + certificates +
                                        ", where every render node can read their key: keep them on the computers that join encrypted DCPs only");
-        }
         if (!dcp::signerCertificateChain(chain, &err, settings.certificates) || chain.empty() || !dcp::readCertificate(chain.certificates.back(), leaf, &err))
             return fail(error, "Cannot read the certificates the package is signed with: " + err);
         sealFor = chain.certificates.back();
@@ -901,6 +931,7 @@ std::vector<FarmNodeInfo> farmNodes(const std::string& farm) {
         const QJsonObject enc = o.value("encoders").toObject();
         for (auto it = enc.begin(); it != enc.end(); ++it) n.encoders[ss(it.key())] = ss(it.value().toString());
         n.signer = ss(o.value("signer").toString());
+        n.written = QFileInfo(d.filePath(f)).lastModified().toMSecsSinceEpoch();
         out.push_back(std::move(n));
     }
     return out;
@@ -976,13 +1007,14 @@ bool removeFarmJob(const std::string& farm, const std::string& id, std::string* 
     return true;
 }
 
-bool FarmHeartbeats::stale(const std::string& key, int64_t beat) {
+bool FarmHeartbeats::stale(const std::string& key, int64_t beat, int64_t age) {
     const int64_t now = nowMs();
-    Seen& s = seen_[key];
-    if (s.beat != beat) {
+    const auto [it, first] = seen_.try_emplace(key);
+    Seen& s = it->second;
+    if (first || s.beat != beat) {
+        // (a beat that moved while watched is fresh; one never seen before is as old as its file)
         s.beat = beat;
-        s.since = now;
-        return false;
+        s.since = first ? now - std::max<int64_t>(0, age) : now;
     }
     return now - s.since >= ms_;
 }
@@ -1071,20 +1103,39 @@ struct Node {
     void tellOnce(const std::string& key, const std::string& line) {
         if (told.insert(key).second) log(line);
     }
+    // How long before this node's own heartbeat (written each time it looks for work, and while it renders) a file on
+    // the share was written, both by the clock that stamps the share's files: how old a heartbeat or lock seen for the
+    // first time is (FarmHeartbeats). 0 when either time cannot be read.
+    int64_t ageOf(int64_t written) const {
+        const QDateTime own = QFileInfo(nodeFile()).lastModified();
+        if (!own.isValid() || written <= 0) return 0;
+        return std::max<int64_t>(0, own.toMSecsSinceEpoch() - written);
+    }
+    int64_t ageOf(const QString& file) const {
+        const QDateTime at = QFileInfo(file).lastModified();
+        return at.isValid() ? ageOf(at.toMSecsSinceEpoch()) : 0;
+    }
     // The leaf thumbprint of the signing chain in this node's certificates folder, "" with none there (never made here:
-    // a chain made on the spot could open nothing sealed for the sender's). Read again every ten seconds.
+    // a chain made on the spot could open nothing sealed for the sender's), or with one that cannot open what is sealed
+    // for its leaf (a file missing or unreadable, or a key that is not the leaf's). Read again every ten seconds.
     std::string ownSigner() {
         if (signerRead >= 0 && nowMs() - signerRead < 10000) return signer;
         signerRead = nowMs();
         signer.clear();
-        const QDir dir(qs(o.certificates.empty() ? dcp::signerFolder() : o.certificates));
-        QFile leaf(dir.filePath(QStringLiteral("leaf.pem")));
+        if (!dcp::securityAvailable()) return signer;
+        dcp::CertificateChain chain;
         dcp::CertificateInfo info;
-        if (dcp::securityAvailable() && QFileInfo::exists(dir.filePath(QStringLiteral("leaf.key"))) && leaf.open(QIODevice::ReadOnly) &&
-            dcp::readCertificate(leaf.readAll().toStdString(), info))
+        std::string why;
+        if (!QFileInfo::exists(QDir(qs(certificatesFolder())).filePath(QStringLiteral("leaf.pem")))) return signer;  // (none: nothing to say)
+        if (dcp::signerCertificateChain(chain, &why, certificatesFolder(), false) && dcp::chainKeyMatches(chain, &why) &&
+            dcp::readCertificate(chain.certificates.back(), info, &why))
             signer = info.thumbprint;
+        else
+            tellOnce("chain|" + why, "The DCP signing chain in " + certificatesFolder() + " cannot be used, so this node joins no encrypted DCP: " + why);
+        dcp::cleanse(chain.privateKey.data(), chain.privateKey.size());
         return signer;
     }
+    std::string certificatesFolder() const { return o.certificates.empty() ? dcp::signerFolder() : o.certificates; }
     // An encrypted DCP's join is taken only by a node holding the chain its codestreams were sealed for, and its
     // segments are coded only while such a node answers (this one or another), so none is coded for a join no node can
     // make. Those left wait, said once in the node's log.
@@ -1096,7 +1147,7 @@ struct Node {
             return false;
         }
         for (const FarmNodeInfo& n : farmNodes(o.farm)) {
-            if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat)) continue;
+            if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat, ageOf(n.written))) continue;
             if (n.signer == j.signer) return true;
         }
         tellOnce(j.group, "The segments of " + j.group +
@@ -1164,15 +1215,16 @@ struct Node {
         // Another kind's: left to the nodes with it while one answers.
         const std::string was = ss(QString::fromUtf8(kind));
         for (const FarmNodeInfo& n : farmNodes(o.farm)) {
-            if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat)) continue;
+            if (n.name == name || n.state == "stopped" || watched.stale("node|" + n.name, n.beat, ageOf(n.written))) continue;
             if (const auto e = n.encoders.find(family); e != n.encoders.end() && e->second == was) return false;
         }
         // None does: taken over under a lock only one node makes. A node coding a segment claims it first and only then
         // looks for the lock and the pin (pinHolds), and this looks for claims only once it holds the lock, so either this
         // sees that claim and leaves the pin, or that node sees the lock or the new pin and gives its segment back: two
         // kinds never code one export. A lock left by a node that stopped holding it goes once seen unchanged that long.
+        // (Each lock its own: this node's token and a number of its own, so one this node makes again is watched afresh.)
         const QString lock = pin + QStringLiteral(".lock");
-        const QByteArray me = QByteArray::fromStdString(token);
+        const QByteArray me = QByteArray::fromStdString(token + "-" + std::to_string(QRandomGenerator::global()->generate64()));
         {
             QFile l(lock);
             if (!l.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
@@ -1206,6 +1258,11 @@ struct Node {
                 *stranded = "The export's other segments were coded with " + was + ", and no node coding with it is answering: start one, then retry the job";
             return false;
         }
+        // (Still this node's lock: one judged left by a stopped node, wrongly, and replaced meanwhile is not.)
+        {
+            QFile r(lock);
+            if (!r.open(QIODevice::ReadOnly) || r.readAll() != me) return unlock(), false;
+        }
         QSaveFile f(pin);
         const bool taken = f.open(QIODevice::WriteOnly) && f.write(QByteArray::fromStdString(mine)) == qint64(mine.size()) && f.commit();
         unlock();
@@ -1213,17 +1270,32 @@ struct Node {
         return taken;
     }
     // Whether a node is taking the pin of `group` over (its lock). A lock left by a node that stopped while holding it
-    // goes once seen unchanged for as long as a silent node's job is (still locked this time).
+    // goes once it is as old as a silent node's job is taken back at (still locked this time): that one lock, by what
+    // it holds and when it was written, watched here or older than this node's heartbeat by that much. It is renamed
+    // aside first (only one rename succeeds) and goes only when that is the lock judged left; another (made meanwhile,
+    // after another node took the old one away) is put back, or, when yet another was made meanwhile, its node finds it
+    // gone before it changes the pin.
     bool pinLocked(const std::string& group) {
-        const QString lock = QDir(jobDir(o.farm, group)).filePath(QStringLiteral("encoder.lock"));
+        const QDir d(jobDir(o.farm, group));
+        const QString lock = d.filePath(QStringLiteral("encoder.lock"));
         QFile r(lock);
         if (!r.open(QIODevice::ReadOnly)) return QFileInfo::exists(lock);
-        const std::string key = "lock|" + group + "|" + ss(QString::fromUtf8(r.readAll()));
+        const QByteArray held = r.readAll();
         r.close();
-        if (watched.stale(key, 0)) {
-            QFile::remove(lock);
-            watched.forget(key);
+        const QDateTime at = QFileInfo(lock).lastModified();
+        const std::string key = "lock|" + group + "|" + held.toStdString() + "|" + std::to_string(at.isValid() ? at.toMSecsSinceEpoch() : 0);
+        if (!watched.stale(key, 0, at.isValid() ? ageOf(at.toMSecsSinceEpoch()) : 0)) return true;
+        watched.forget(key);
+        const QString aside = d.filePath(QStringLiteral(".encoder.lock-") + QString::number(QRandomGenerator::global()->generate64(), 16));
+        if (!QFile::rename(lock, aside)) return true;  // (gone meanwhile, or open on Windows: looked at again next time)
+        QFile a(aside);
+        const QByteArray was = a.open(QIODevice::ReadOnly) ? a.readAll() : QByteArray();
+        a.close();
+        if (was == held && QFileInfo(aside).lastModified() == at) {
+            QFile::remove(aside);
             log("Removed the encoder lock of " + group + ", left by a node that stopped");
+        } else if (!QFile::rename(aside, lock)) {
+            QFile::remove(aside);
         }
         return true;
     }
@@ -1256,8 +1328,11 @@ struct Node {
         for (const FarmJob& j : farmJobs(o.farm)) {
             if (j.state != FarmState::Rendering) continue;
             // (Watched per claim: a job taken by another node is watched afresh.)
+            // (A job first seen is as old as its status, or its claim when it has none yet.)
+            const QDir d(jobDir(o.farm, j.id));
+            const QString status = d.filePath(QStringLiteral("status.json"));
             const std::string key = j.id + "|" + j.claim;
-            if (watched.stale(key, j.beat)) {
+            if (watched.stale(key, j.beat, ageOf(QFileInfo::exists(status) ? status : d.filePath(QStringLiteral("claim"))))) {
                 if (reclaimFarmJob(o.farm, j.id, j.claim)) log("Took back " + j.id + " from " + (j.node.empty() ? std::string("a node") : j.node) + ", which stopped answering");
                 watched.forget(key);
             }
@@ -1400,6 +1475,11 @@ struct Node {
                 sealFor.thumbprint != ss(job.value("signer").toString()))
                 return failJob("The certificate the package's codestreams are sealed for is not its signer's");
             if (join) dcp.certificates = o.certificates;
+            // (and never one where the package goes, beside the codestreams, for whoever is given it to read)
+            if (join && folderWithin(certificatesFolder(), st.path))
+                return failJob("This node's DCP certificates are in " + certificatesFolder() + ", inside " + st.path +
+                               " where the package goes: anyone given it could read their key, which opens its codestreams and every DKDM "
+                               "made with them. Keep them elsewhere on this computer (--certificates) and retry the job");
         }
         const std::string codestreams = package == "imf" ? imf.codestreams : dcp.codestreams;
         Project p;
@@ -1714,6 +1794,12 @@ struct Node {
 bool runFarmNode(const FarmNodeOptions& options, int* rendered, std::string* error) {
     if (rendered) *rendered = 0;
     if (!openFarm(options.farm, error)) return false;
+    // The DCP signing chain this node joins with is never on the farm's share, where every node (and anyone reading it)
+    // would hold the key that opens every encrypted DCP's codestreams and DKDMs (submitFarmDcp refuses the sender's).
+    const std::string certificates = options.certificates.empty() ? dcp::signerFolder() : options.certificates;
+    if (folderWithin(certificates, options.farm))
+        return fail(error, "This node's DCP certificates folder " + certificates + " is in the render farm's folder " + options.farm +
+                               ", where every render node can read their key: keep them on the computers that join encrypted DCPs only (--certificates)");
     Node n(options);
     n.log("Node " + n.name + " on " + options.farm);
     while (!n.stopped()) {
