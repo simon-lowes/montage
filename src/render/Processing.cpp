@@ -1,4 +1,5 @@
 #include "Processing.h"
+#include <set>
 #include "SurfaceTrack.h"
 #include "ColorChart.h"
 #include "Ofx.h"
@@ -891,8 +892,11 @@ void transpose(const Image& src, Image& dst) {
 
 }  // namespace
 
-void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
-    if (radius < 0.5 || img.empty()) return;
+namespace {
+// The radii of gaussianBlur's box passes (each direction), none below half a pixel.
+std::vector<int> gaussianBoxRadii(double radius) {
+    std::vector<int> radii;
+    if (radius < 0.5) return radii;
     // Three box passes approximate a Gaussian with sigma ~ radius / 2.
     double sigma = radius / 2.0;
     int n = 3;
@@ -902,12 +906,19 @@ void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
     int wu = wl + 2;
     double mIdeal = (12.0 * sigma * sigma - n * wl * wl - 4.0 * n * wl - 3.0 * n) / (-4.0 * wl - 4.0);
     int m = int(std::lround(mIdeal));
+    for (int i = 0; i < n; ++i)
+        if (const int r = ((i < m ? wl : wu) - 1) / 2; r > 0) radii.push_back(r);
+    return radii;
+}
+}  // namespace
+
+void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
+    if (radius < 0.5 || img.empty()) return;
+    const std::vector<int> radii = gaussianBoxRadii(radius);
     Image tmp(img.width, img.height);
     auto passes = [&](Image& a) {
         Image t2(a.width, a.height);
-        for (int i = 0; i < n; ++i) {
-            int r = ((i < m ? wl : wu) - 1) / 2;
-            if (r <= 0) continue;
+        for (int r : radii) {
             boxBlurH(a, t2, r);
             std::swap(a.px, t2.px);
         }
@@ -3093,6 +3104,71 @@ Face projectFace(const double corners[4][3], double f, int w, int h) {
     return face;
 }
 
+
+// How far out Shape Wipe's shape must grow to cover a cell's corners (its edge walked all round: a shape's farthest
+// point need not be a corner).
+float shapeReach(int shape, int count, float cell, float rc, float rs, int w, int h) {
+    float reach = 0;
+    const float hx = count == 1 ? w / (2 * cell) : 1.0f, hy = count == 1 ? h / (2 * cell) : 1.0f;
+    for (int i = 0; i <= 64; ++i)
+        for (int side = 0; side < 4; ++side) {
+            const float t = float(i) / 64 * 2 - 1;
+            const float ex = side < 2 ? (side ? hx : -hx) : t * hx, ey = side < 2 ? t * hy : (side == 3 ? hy : -hy);
+            reach = std::max(reach, shapeDistance(shape, ex * rc + ey * rs, -ex * rs + ey * rc));
+        }
+    return reach;
+}
+
+// 3D Cube's and Flip's faces at uf (0 < uf < 1): A's face, then B's.
+void transitionFaces(const std::string& type, int dir, float uf, int w, int h, Face faces[2]) {
+    const float pi = float(M_PI);
+    const float bell = std::sin(pi * uf);
+    const double f = 2.0 * std::max(w, h), W2 = w / 2.0, H2 = h / 2.0;
+    const bool vertical = type == "cube" ? dir >= 2 : dir == 1;
+    // Turn about the vertical axis (or the horizontal one), then push back a little mid-way.
+    auto place = [&](double pts[4][3], double angle, double centreZ) {
+        const double c = std::cos(angle), s = std::sin(angle);
+        for (int i = 0; i < 4; ++i) {
+            double& p = vertical ? pts[i][1] : pts[i][0];
+            const double z = pts[i][2];
+            const double np = p * c + z * s, nz = -p * s + z * c;
+            p = np;
+            pts[i][2] = nz + centreZ;
+        }
+    };
+    if (type == "cube") {
+        const double D2 = vertical ? H2 : W2;  // half the cube's depth
+        const double sign = dir == 1 || dir == 3 ? -1 : 1;
+        const double angle = sign * uf * pi / 2, back = D2 + 0.6 * D2 * bell;
+        double front[4][3] = {{-W2, -H2, -D2}, {W2, -H2, -D2}, {W2, H2, -D2}, {-W2, H2, -D2}};
+        double side[4][3];
+        if (!vertical && sign > 0) {  // B on the right face
+            const double s[4][3] = {{W2, -H2, -D2}, {W2, -H2, D2}, {W2, H2, D2}, {W2, H2, -D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        } else if (!vertical) {  // on the left
+            const double s[4][3] = {{-W2, -H2, D2}, {-W2, -H2, -D2}, {-W2, H2, -D2}, {-W2, H2, D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        } else if (sign > 0) {  // below
+            const double s[4][3] = {{-W2, H2, -D2}, {W2, H2, -D2}, {W2, H2, D2}, {-W2, H2, D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        } else {  // above
+            const double s[4][3] = {{-W2, -H2, D2}, {W2, -H2, D2}, {W2, -H2, -D2}, {-W2, -H2, -D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        }
+        place(front, angle, back);
+        place(side, angle, back);
+        faces[0] = projectFace(front, f, w, h);
+        faces[1] = projectFace(side, f, w, h);
+    } else {
+        // A card: A on its front for the first half, B on its back for the second.
+        const bool second = uf >= 0.5f;
+        const double angle = second ? (uf - 1) * pi : uf * pi, back = 0.5 * std::max(W2, H2) * bell;
+        double card[4][3] = {{-W2, -H2, 0}, {W2, -H2, 0}, {W2, H2, 0}, {-W2, H2, 0}};
+        place(card, angle, back);
+        faces[second ? 1 : 0] = projectFace(card, f, w, h);
+    }
+}
+
 }  // namespace
 
 Image transitionMix(const std::string& type, const Effect& params, const Image& aIn, const Image& bIn, double u, int w,
@@ -3116,11 +3192,14 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
         const float* p = img.at(x, y);
         std::copy(p, p + 4, o);
     };
-    const float uf = float(std::clamp(u, 0.0, 1.0));
-    const float soft = float(params.p("softness", 0, 0.05));
-    const int dir = int(params.p("direction", 0, 0));
-    const float ang = float(params.p("angle", 0, 0)) * float(M_PI) / 180.0f;
-    const float strength = float(params.p("strength", 0, 1));
+    // The settings as the GPU takes them too (gpuTransitionParams), so the two read them alike.
+    float q[44];
+    gpuTransitionParams(type, params, u, w, h, q);
+    const float uf = q[1];
+    const float soft = q[2];
+    const int dir = int(q[3]);
+    const float ang = q[4];
+    const float strength = q[5];
     const float pi = float(M_PI);
     const float bell = std::sin(pi * uf);  // 0 at the ends, 1 halfway
     auto zero = [](float o[4]) { o[0] = o[1] = o[2] = o[3] = 0; };
@@ -3133,77 +3212,20 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
         x ^= x >> 16, x *= 0x7feb352dU, x ^= x >> 15, x *= 0x846ca68bU, x ^= x >> 16;
         return float(x & 0xffffff) / float(0xffffff);
     };
-    const float turn = float(params.p("turn", 0, 180)) * pi / 180;
-    const float leak[3] = {float(params.p("color.r", 0, 1.0)), float(params.p("color.g", 0, 0.55)), float(params.p("color.b", 0, 0.2))};
-    const bool brightsFirst = params.p("invert", 0) > 0.5;
-    const uint32_t glitchSeed = uint32_t(uf * 40);  // the pattern jumps a few times through the transition
-    // Shape Wipe: square cells of the shape (one over the whole frame for a count of 1), and how far
-    // out the shape must grow to cover a cell's corners.
-    const int shape = int(std::lround(params.p("shape", 0, 0)));
-    const int count = std::clamp(int(std::lround(params.p("count", 0, 1))), 1, 64);
-    const float cell = count == 1 ? float(std::max(w, h)) : float(w) / count;
-    const float rot = float(params.p("angle", 0, 0)) * pi / 180, rc = std::cos(rot), rs = std::sin(rot);
-    float reach = 0;
-    if (type == "shape_wipe") {
-        const float hx = count == 1 ? w / (2 * cell) : 1.0f, hy = count == 1 ? h / (2 * cell) : 1.0f;
-        for (int i = 0; i <= 64; ++i)
-            for (int side = 0; side < 4; ++side) {
-                // The cell's edge, walked all round (a shape's farthest point need not be a corner).
-                const float t = float(i) / 64 * 2 - 1;
-                const float ex = side < 2 ? (side ? hx : -hx) : t * hx, ey = side < 2 ? t * hy : (side == 3 ? hy : -hy);
-                reach = std::max(reach, shapeDistance(shape, ex * rc + ey * rs, -ex * rs + ey * rc));
-            }
-    }
+    const float turn = q[6];
+    const float leak[3] = {q[8], q[9], q[10]};
+    const bool brightsFirst = q[7] > 0.5f;
+    const uint32_t glitchSeed = uint32_t(q[11]);  // the pattern jumps a few times through the transition
+    // Shape Wipe: square cells of the shape (one over the whole frame for a count of 1), and how far out the shape
+    // must grow to cover a cell's corners.
+    const int shape = int(q[12]);
+    const int count = int(q[13]);
+    const float cell = q[14], reach = q[15], rc = q[16], rs = q[17];
     // 3D Cube and Flip: the faces' projections for this moment.
     Face faces[2];
     const Image* faceImg[2] = {&a, &b};
     const bool threeD = type == "cube" || type == "flip";
-    if (threeD && uf > 0 && uf < 1) {
-        const double f = 2.0 * std::max(w, h), W2 = w / 2.0, H2 = h / 2.0;
-        const bool vertical = type == "cube" ? dir >= 2 : dir == 1;
-        // Turn about the vertical axis (or the horizontal one), then push back a little mid-way.
-        auto place = [&](double pts[4][3], double angle, double centreZ) {
-            const double c = std::cos(angle), s = std::sin(angle);
-            for (int i = 0; i < 4; ++i) {
-                double& p = vertical ? pts[i][1] : pts[i][0];
-                const double z = pts[i][2];
-                const double np = p * c + z * s, nz = -p * s + z * c;
-                p = np;
-                pts[i][2] = nz + centreZ;
-            }
-        };
-        if (type == "cube") {
-            const double D2 = vertical ? H2 : W2;  // half the cube's depth
-            const double sign = dir == 1 || dir == 3 ? -1 : 1;
-            const double angle = sign * uf * pi / 2, back = D2 + 0.6 * D2 * bell;
-            double front[4][3] = {{-W2, -H2, -D2}, {W2, -H2, -D2}, {W2, H2, -D2}, {-W2, H2, -D2}};
-            double side[4][3];
-            if (!vertical && sign > 0) {  // B on the right face
-                const double s[4][3] = {{W2, -H2, -D2}, {W2, -H2, D2}, {W2, H2, D2}, {W2, H2, -D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            } else if (!vertical) {  // on the left
-                const double s[4][3] = {{-W2, -H2, D2}, {-W2, -H2, -D2}, {-W2, H2, -D2}, {-W2, H2, D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            } else if (sign > 0) {  // below
-                const double s[4][3] = {{-W2, H2, -D2}, {W2, H2, -D2}, {W2, H2, D2}, {-W2, H2, D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            } else {  // above
-                const double s[4][3] = {{-W2, -H2, D2}, {W2, -H2, D2}, {W2, -H2, -D2}, {-W2, -H2, -D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            }
-            place(front, angle, back);
-            place(side, angle, back);
-            faces[0] = projectFace(front, f, w, h);
-            faces[1] = projectFace(side, f, w, h);
-        } else {
-            // A card: A on its front for the first half, B on its back for the second.
-            const bool second = uf >= 0.5f;
-            const double angle = second ? (uf - 1) * pi : uf * pi, back = 0.5 * std::max(W2, H2) * bell;
-            double card[4][3] = {{-W2, -H2, 0}, {W2, -H2, 0}, {W2, H2, 0}, {-W2, H2, 0}};
-            place(card, angle, back);
-            faces[second ? 1 : 0] = projectFace(card, f, w, h);
-        }
-    }
+    if (threeD && uf > 0 && uf < 1) transitionFaces(type, dir, uf, w, h, faces);
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -3409,6 +3431,40 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
     return out;
 }
 
+int gpuTransitionParams(const std::string& type, const Effect& params, double u, int w, int h, float q[44]) {
+    static const char* const kinds[] = {"cross_dissolve", "dip_to_black", "dip_to_white", "wipe", "iris", "push", "slide", "zoom", "whip_pan",
+                                        "zoom_blur", "spin", "glitch", "light_leak", "luma_wipe", "shape_wipe", "cube", "flip", "clock_wipe"};
+    int kind = 0;  // (any other: a cross dissolve, as transitionMix mixes it)
+    for (int i = 0; i < int(std::size(kinds)); ++i)
+        if (type == kinds[i]) kind = i;
+    // As transitionMix works them out, in gpumix.frag's order.
+    std::fill(q, q + 44, 0.0f);
+    const float pi = float(M_PI);
+    const float uf = float(std::clamp(u, 0.0, 1.0));
+    const int dir = int(params.p("direction", 0, 0));
+    q[0] = float(kind), q[1] = uf, q[2] = float(params.p("softness", 0, 0.05)), q[3] = float(dir);
+    q[4] = float(params.p("angle", 0, 0)) * float(M_PI) / 180.0f, q[5] = float(params.p("strength", 0, 1));
+    q[6] = float(params.p("turn", 0, 180)) * pi / 180, q[7] = params.p("invert", 0) > 0.5 ? 1 : 0;
+    q[8] = float(params.p("color.r", 0, 1.0)), q[9] = float(params.p("color.g", 0, 0.55)), q[10] = float(params.p("color.b", 0, 0.2));
+    q[11] = float(uint32_t(uf * 40));
+    const int shape = int(std::lround(params.p("shape", 0, 0)));
+    const int count = std::clamp(int(std::lround(params.p("count", 0, 1))), 1, 64);
+    const float cell = count == 1 ? float(std::max(w, h)) : float(w) / count;
+    const float rot = float(params.p("angle", 0, 0)) * pi / 180, rc = std::cos(rot), rs = std::sin(rot);
+    q[12] = float(shape), q[13] = float(count), q[14] = cell, q[15] = type == "shape_wipe" ? shapeReach(shape, count, cell, rc, rs, w, h) : 0.0f;
+    q[16] = rc, q[17] = rs;
+    if ((type == "cube" || type == "flip") && uf > 0 && uf < 1) {
+        q[18] = 1;
+        Face faces[2] = {};
+        transitionFaces(type, dir, uf, w, h, faces);
+        for (int k = 0; k < 2; ++k) {
+            for (int i = 0; i < 9; ++i) q[20 + k * 12 + i] = float(faces[k].inv[i]);
+            q[20 + k * 12 + 9] = faces[k].facing ? 1 : 0;
+        }
+    }
+    return type == "ofx" || type == "smooth_cut" ? -1 : kind;
+}
+
 const ColorSpace* sourceLookSpace(const Effect& e) {
     if (e.type != "cdl" && e.type != "lut") return nullptr;
     for (const auto& cs : colorSpaces())
@@ -3462,6 +3518,15 @@ void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& spac
         r = v[0], g = v[1], b = v[2];
     });
 }
+
+namespace {
+// The effects the GPU draws through gpufilter.frag.
+bool isGpuFilter(const std::string& type) {
+    static const std::set<std::string> filters = {"gaussian_blur", "sharpen", "glow", "channel_blur", "directional_blur", "vignette",
+                                                  "posterize", "letterbox", "mirror", "mosaic", "chromatic_aberration", "noise"};
+    return filters.count(type) > 0;
+}
+}  // namespace
 
 bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing) {
     const int shape = int(std::lround(e.p("mask.shape", t)));
@@ -3635,6 +3700,93 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[6] = float(e.p("despill", t, 100) / 100), op.params[7] = float(e.p("restore", t, 50) / 100);
         op.params[8] = float(e.p("edge_desat", t, 0) / 100), op.params[9] = float(std::lround(e.p("view", t, 0)));
         op.params[10] = float(std::lround(shrink)), op.params[11] = float(std::lround(soften / 2));
+    } else if (e.type == "track_matte") {
+        return true;  // (the compositor applies it, render/Compositor)
+    } else if (isGpuFilter(e.type)) {
+        // gpufilter.frag's passes, as the effect runs on the CPU; through its mask, marked before and mixed after.
+        gpu::ColorOp f;
+        f.kind = gpu::ColorOp::Filter;
+        auto add = [&](int mode, std::initializer_list<float> params) {
+            gpu::ColorOp::FilterPass fp;
+            fp.mode = mode;
+            std::copy(params.begin(), params.end(), fp.params);
+            f.passes.push_back(fp);
+        };
+        // gaussianBlur's box passes along rows, then columns, in the channels given.
+        auto blur = [&](double radius, bool rows, bool columns, const float (&channels)[4]) {
+            const std::vector<int> radii = gaussianBoxRadii(radius);
+            for (int dim = 0; dim < 2; ++dim)
+                if (dim ? columns : rows)
+                    for (int r : radii) add(1, {float(r), float(dim), 0, 0, channels[0], channels[1], channels[2], channels[3]});
+        };
+        const float all[4] = {1, 1, 1, 1};
+        const std::string& ty = e.type;
+        if (ty == "gaussian_blur") {
+            const int dir = int(e.p("direction", t));
+            blur(e.p("radius", t, 10) * pixelScale, dir != 2, dir != 1, all);
+        } else if (ty == "sharpen") {
+            blur(e.p("radius", t, 1.5) * pixelScale, true, true, all);
+            add(3, {float(e.p("amount", t, 1))});
+        } else if (ty == "glow") {
+            const double radius = e.p("radius", t, 20) * pixelScale;
+            add(4, {float(e.p("threshold", t, 0.7))});
+            if (radius > 0.5) blur(radius, true, true, all);
+            add(5, {float(e.p("intensity", t, 1))});
+        } else if (ty == "channel_blur") {
+            const char* names[4] = {"red", "green", "blue", "alpha"};
+            const int dims = int(std::lround(e.p("dimensions", t, 0)));
+            for (int c = 0; c < 4; ++c) {
+                const double r = std::max(0.0, e.p(names[c], t, 0)) * pixelScale;
+                if (r < 0.05) continue;
+                float only[4] = {0, 0, 0, 0};
+                only[c] = 1;
+                blur(r, dims != 2, dims != 1, only);
+            }
+        } else if (ty == "directional_blur") {
+            const double length = e.p("length", t, 20) * pixelScale;
+            if (length >= 0.5) {
+                const double ang = e.p("angle", t, 0) * M_PI / 180;
+                add(2, {float(length), float(std::clamp(int(std::ceil(length)), 2, 96)), float(std::cos(ang)), float(std::sin(ang))});
+            }
+        } else if (ty == "vignette") {
+            add(6, {float(e.p("amount", t, 0.5)), float(e.p("size", t, 0.75)), float(e.p("softness", t, 0.5))});
+        } else if (ty == "posterize") {
+            add(7, {float(std::clamp(e.p("levels", t, 6), 2.0, 64.0)) - 1});
+        } else if (ty == "letterbox") {
+            static const double ratios[] = {2.39, 2.0, 1.85, 4.0 / 3.0, 1.0, 9.0 / 16.0};
+            const int choice = std::clamp(int(e.p("aspect", t, 0)), 0, int(std::size(ratios)) - 1);
+            add(8, {float(ratios[choice]), float(std::clamp(e.p("opacity", t, 100) / 100.0, 0.0, 1.0))});
+        } else if (ty == "mirror") {
+            add(9, {float(int(e.p("mode", t)))});
+        } else if (ty == "mosaic") {
+            if (const int size = std::max(1, int(std::lround(e.p("size", t, 16) * pixelScale))); size > 1) {
+                add(10, {float(size), 0});
+                add(10, {float(size), 1});
+            }
+        } else if (ty == "chromatic_aberration") {
+            if (const double amount = e.p("amount", t, 3) * pixelScale; std::fabs(amount) >= 0.01) add(11, {float(amount)});
+        } else if (ty == "noise") {
+            const float amount = float(std::clamp(e.p("amount", t, 20) / 100.0, 0.0, 1.0));
+            const uint32_t frame = uint32_t(t);
+            if (amount > 0)
+                add(12, {amount, e.p("color", t, 1) >= 0.5 ? 1.0f : 0.0f, e.p("clip", t, 1) >= 0.5 ? 1.0f : 0.0f, 0, float(frame & 0xffffu),
+                         float(frame >> 16)});
+        } else {
+            return false;  // (a filter without its passes here: the CPU draws it)
+        }
+        if (f.passes.empty()) return true;  // (nothing changes)
+        if (!op.masked) {
+            out.push_back(std::move(f));
+            return true;
+        }
+        gpu::ColorOp mark;
+        mark.kind = gpu::ColorOp::Mark;
+        out.push_back(std::move(mark));
+        out.push_back(std::move(f));
+        op.kind = gpu::ColorOp::Mix;
+        gpuMask(e, t, op, width, height, pixelScale);
+        out.push_back(std::move(op));
+        return true;
     } else if (e.type == "levels") {
         op.kind = gpu::ColorOp::Levels;
         const float inB = float(e.p("in_black", t, 0)), inW = float(e.p("in_white", t, 1));

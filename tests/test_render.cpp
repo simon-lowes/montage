@@ -19124,13 +19124,227 @@ colorspaces:
         const std::string layer = gpu::stats().lastCpuLayer;
         QVERIFY2(layer.find("\"" + masked.name + "\"") == 0 && layer.find("Color Correct") != std::string::npos, layer.c_str());
         QVERIFY(edit::clipById(s, maskedId));
+        // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
-        adj.effects.push_back(makeEffect(p, "invert"));
+        adj.effects.push_back(makeEffect(p, "emboss"));
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
         gpu::resetStats();
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
-        QVERIFY(!gpu::stats().lastFallback.empty());
+        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Emboss") == 0, gpu::stats().lastFallback.c_str());
+    }
+
+    // The filters, transitions, adjustment layers and track mattes the GPU draws, each at three settings, against the
+    // CPU: within 1/1023, with nothing made on the CPU. Then a project of 24 common effects, an adjustment layer and a
+    // track matte, drawn with no fallback at all.
+    void gpuEffectsMatchCpu() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        auto addPicture = [&](const char* name, int w, int h, bool alpha, float phase) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.21f + phase), float(y) / h,
+                                                           0.5f + 0.4f * std::sin(x * 0.07f - y * 0.13f + phase),
+                                                           alpha ? std::min(1.0f, 0.1f + 0.9f * float((x * 3 + y) % 61) / 60) : 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 160, 90, false, 0), other = addPicture("other.png", 160, 90, false, 1.7f),
+                 small = addPicture("small.png", 97, 71, true, 0.6f);
+        QVERIFY(wide && other && small);
+        auto compare = [&](FrameTime t, const QString& what) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+            QVERIFY2(worst <= 1.0 / 1023,
+                     qPrintable(QString("%1: off by %2 at %3,%4 (cpu %5 %6 %7 %8, gpu %9 %10 %11 %12)").arg(what).arg(worst).arg(wx).arg(wy)
+                                    .arg(cpu.at(wx, wy)[0]).arg(cpu.at(wx, wy)[1]).arg(cpu.at(wx, wy)[2]).arg(cpu.at(wx, wy)[3])
+                                    .arg(onGpu.at(wx, wy)[0]).arg(onGpu.at(wx, wy)[1]).arg(onGpu.at(wx, wy)[2]).arg(onGpu.at(wx, wy)[3])));
+        };
+        // V1 the full-frame picture; V2 the small one with transparency, scaled and turned, carrying the effect.
+        auto r1 = edit::placeMedia(p, s, wide, 0, 0, 40, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r1.ok);
+        auto r2 = edit::placeMedia(p, s, small, 0, 0, 40, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        const Id topId = r2.created[0];
+        {
+            Clip* top = edit::clipById(s, topId);
+            top->motion.params["scale"] = 130.0;
+            top->motion.params["rotation"] = 11.0;
+            top->motion.params["pos_x"] = 9.0;
+        }
+        using Settings = std::vector<std::pair<const char*, double>>;
+        const std::vector<std::pair<const char*, std::vector<Settings>>> filters = {
+            {"gaussian_blur", {{{"radius", 3}}, {{"radius", 14}, {"direction", 1}}, {{"radius", 40}, {"direction", 2}}}},
+            {"directional_blur", {{{"length", 6}, {"angle", 30}}, {{"length", 25}, {"angle", 120}}, {{"length", 70}, {"angle", 0}}}},
+            {"channel_blur", {{{"red", 4}, {"blue", 10}}, {{"alpha", 6}, {"dimensions", 1}}, {{"green", 20}, {"red", 0.3}, {"dimensions", 2}}}},
+            {"sharpen", {{{"amount", 1}, {"radius", 1.5}}, {{"amount", 2.5}, {"radius", 4}}, {{"amount", 0.5}, {"radius", 0.6}}}},
+            {"glow", {{{"threshold", 0.5}, {"radius", 10}}, {{"threshold", 0.3}, {"radius", 30}, {"intensity", 2}}, {{"threshold", 0.8}, {"radius", 3}, {"intensity", 0.5}}}},
+            {"vignette", {{}, {{"amount", 0.8}, {"size", 0.5}, {"softness", 0.2}}, {{"amount", 0.3}, {"size", 1}, {"softness", 1}}}},
+            {"posterize", {{{"levels", 2}}, {{"levels", 6}}, {{"levels", 20}}}},
+            {"letterbox", {{{"aspect", 0}}, {{"aspect", 3}, {"opacity", 50}}, {{"aspect", 5}}}},
+            {"mirror", {{{"mode", 0}}, {{"mode", 1}}, {{"mode", 3}}}},
+            {"mosaic", {{{"size", 4}}, {{"size", 9}}, {{"size", 25}}}},
+            {"chromatic_aberration", {{{"amount", 3}}, {{"amount", -8}}, {{"amount", 15}}}},
+            {"noise", {{{"amount", 20}}, {{"amount", 60}, {"color", 0}, {"clip", 0}}, {{"amount", 5}}}},
+        };
+        for (const auto& [type, settings] : filters)
+            for (size_t k = 0; k < settings.size(); ++k) {
+                Effect e = makeEffect(p, type);
+                for (const auto& [name, value] : settings[k]) e.params[name] = value;
+                if (k == 2) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.6, e.params["mask.h"] = 0.5, e.params["mask.feather"] = 10.0;
+                edit::clipById(s, topId)->effects = {e};
+                const long passes = gpu::stats().filterPasses;
+                compare(7 + FrameTime(k), QString("%1 #%2").arg(type).arg(k + 1));
+                QVERIFY2(gpu::stats().filterPasses > passes, type);
+            }
+        edit::clipById(s, topId)->effects.clear();
+
+        // Every transition (but Smooth Cut's flow and OpenFX's), at three places, between two pictures on V1.
+        QVERIFY(edit::placeMedia(p, s, other, 40, 0, 40, {TrackKind::Video, 0}, {}, false).ok);
+        edit::clipById(s, topId)->motion.params["opacity"] = 0.0;  // (V2 out of the way)
+        QVERIFY(edit::addTransition(p, s, r1.created[0], edit::Edge::Out, "cross_dissolve", 20).ok);
+        Transition& tr = s.videoTracks[0].transitions.at(0);
+        const std::vector<std::pair<const char*, std::vector<Settings>>> transitions = {
+            {"dip_to_black", {{}}}, {"dip_to_white", {{}}}, {"wipe", {{{"angle", 30}, {"softness", 0.1}}, {{"angle", 200}, {"softness", 0}}}},
+            {"iris", {{}}}, {"push", {{{"direction", 0}}, {{"direction", 3}}}}, {"slide", {{{"direction", 1}}, {{"direction", 2}}}},
+            {"zoom", {{{"strength", 1.5}}}}, {"whip_pan", {{{"direction", 0}}, {{"direction", 3}, {"strength", 2}}}}, {"zoom_blur", {{}}},
+            {"spin", {{{"turn", 90}}}}, {"glitch", {{{"strength", 1}}}}, {"light_leak", {{}}}, {"luma_wipe", {{}, {{"invert", 1}}}},
+            {"shape_wipe", {{{"shape", 0}}, {{"shape", 3}, {"count", 3}, {"angle", 20}}, {{"shape", 4}}, {{"shape", 5}, {"count", 2}}, {{"shape", 1}}}},
+            {"cube", {{{"direction", 0}}, {{"direction", 1}}, {{"direction", 2}}, {{"direction", 3}}}},
+            {"flip", {{{"direction", 0}}, {{"direction", 1}}}}, {"clock_wipe", {{}}}};
+        FrameTime from = 0, to = 0;
+        QVERIFY(edit::transitionRange(s.videoTracks[0], tr, from, to));
+        for (const auto& [type, settings] : transitions)
+            for (size_t k = 0; k < settings.size(); ++k) {
+                tr.type = type;
+                tr.params = makeEffect(p, type);
+                for (const auto& [name, value] : settings[k]) tr.params.params[name] = value;
+                const long mixes = gpu::stats().mixPasses;
+                for (FrameTime at : {from + 2, from + 9, to - 3}) compare(at, QString("%1 #%2 at %3").arg(type).arg(k + 1).arg(at - from));
+                QVERIFY2(gpu::stats().mixPasses >= mixes + 3, type);
+            }
+        tr.type = "cross_dissolve";
+        tr.params = makeEffect(p, "cross_dissolve");
+
+        // An adjustment layer (V3) over both, its effects on the canvas beneath: three settings, one through a mask and
+        // faded, one scaled.
+        Clip adj = makeGeneratorClip(p, "adjustment", 80);
+        const Id adjId = adj.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
+        edit::clipById(s, topId)->motion.params["opacity"] = 100.0;
+        for (int k = 0; k < 3; ++k) {
+            Clip* a = edit::clipById(s, adjId);
+            a->effects.clear();
+            a->motion.params = {};
+            Effect blur = makeEffect(p, "gaussian_blur");
+            blur.params["radius"] = 4.0 + 8 * k;
+            Effect cc = makeEffect(p, "color_correct");
+            cc.params["saturation"] = 0.4 + 0.5 * k;
+            cc.params["exposure"] = 0.3;
+            if (k == 1) cc.params["mask.shape"] = 2.0, cc.params["mask.w"] = 0.5, cc.params["mask.h"] = 0.7;
+            a->effects = {blur, cc};
+            if (k == 1) a->motion.params["opacity"] = 60.0, a->blendMode = "multiply";
+            if (k == 2) a->motion.params["scale"] = 70.0, a->motion.params["rotation"] = -8.0;
+            compare(12 + k, QString("adjustment layer #%1").arg(k + 1));
+            compare(from + 9, QString("adjustment layer #%1 over a dissolve").arg(k + 1));
+        }
+
+        // A track matte: V2 through V4's picture (hidden), by its alpha, by its luma, and the reverse.
+        while (s.videoTracks.size() < 4) edit::addTrack(p, s, TrackKind::Video);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 3}, colorClip(p, 0.9f, 0.6f, 0.2f, 0, 80)).ok);
+        {
+            Clip* matteClip = &s.videoTracks[3].clips.at(0);
+            matteClip->motion.params["scale"] = 55.0;
+            matteClip->motion.params["rotation"] = 30.0;
+            matteClip->motion.params["opacity"] = 70.0;
+        }
+        edit::clipById(s, adjId)->effects.clear();
+        for (int k = 0; k < 3; ++k) {
+            Effect key = makeEffect(p, "track_matte");
+            key.params["track"] = 4.0;
+            key.params["composite"] = k == 1 ? 1.0 : 0.0;
+            key.params["reverse"] = k == 2 ? 1.0 : 0.0;
+            edit::clipById(s, topId)->effects = {key};
+            const long mixes = gpu::stats().mixPasses;
+            compare(15 + k, QString("track matte #%1").arg(k + 1));
+            QVERIFY(gpu::stats().mixPasses > mixes);
+        }
+
+        // 24 common effects (12 on V2, 12 on the adjustment layer), an adjustment layer and a track matte, all on the GPU.
+        {
+            Clip* top = edit::clipById(s, topId);
+            Effect key = top->effects.at(0);
+            key.params["reverse"] = 0.0;
+            top->effects = {key};
+            auto add = [&](Clip* c, const char* type, Settings settings) {
+                Effect e = makeEffect(p, type);
+                for (const auto& [name, value] : settings) e.params[name] = value;
+                c->effects.push_back(e);
+            };
+            add(top, "color_correct", {{"exposure", 0.2}, {"saturation", 1.2}});
+            add(top, "curves", {});
+            top->effects.back().strings["master"] = "0,0 0.4,0.3 1,1";
+            add(top, "hue_curves", {});
+            top->effects.back().strings["hue_sat"] = "0,0.5 0.5,0.7 1,0.5";
+            add(top, "cdl", {{"slope.r", 1.1}, {"offset.b", 0.02}});
+            add(top, "hue_sat", {{"hue", 12}, {"saturation", 0.9}});
+            add(top, "levels", {{"in_black", 0.05}, {"gamma", 1.1}});
+            add(top, "black_white", {{"amount", 30}});
+            add(top, "invert", {{"amount", 10}});
+            add(top, "luma_key", {{"threshold", 0.05}});
+            add(top, "chroma_key", {{"tolerance", 0.1}});
+            add(top, "gaussian_blur", {{"radius", 3}});
+            add(top, "sharpen", {{"amount", 0.8}});
+            Clip* a = edit::clipById(s, adjId);
+            add(a, "glow", {{"threshold", 0.6}, {"radius", 8}});
+            add(a, "directional_blur", {{"length", 5}, {"angle", 45}});
+            add(a, "channel_blur", {{"blue", 3}});
+            add(a, "vignette", {});
+            add(a, "posterize", {{"levels", 24}});
+            add(a, "letterbox", {{"aspect", 1}, {"opacity", 80}});
+            add(a, "mosaic", {{"size", 2}});
+            add(a, "chromatic_aberration", {{"amount", 2}});
+            add(a, "noise", {{"amount", 4}});
+            add(a, "mirror", {{"mode", 2}});
+            add(a, "screen_key", {{"clip_black", 0.9}});
+            add(a, "lut", {});
+            const std::string cube = (dir.path() + "/soft.cube").toStdString();
+            {
+                std::ofstream f(cube);
+                f << "LUT_3D_SIZE 2\n0 0 0.05\n1 0 0\n0 0.95 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n0.98 1 1\n";
+            }
+            a->effects.back().strings["path"] = cube;
+            QCOMPARE(int(top->effects.size() + a->effects.size()), 25);  // (the matte key, and 24 effects)
+            const long frames = gpu::stats().cpuFrames, layers = gpu::stats().cpuLayers;
+            compare(20, "24 effects, an adjustment layer and a track matte");
+            QCOMPARE(gpu::stats().cpuFrames, frames);
+            QCOMPARE(gpu::stats().cpuLayers, layers);
+        }
     }
     void gpuYcbcrPlanes() {
         // Decoded Y′CbCr converted on the GPU from its planes, as decoded, rather than the decoder converting it to
@@ -20139,8 +20353,9 @@ colorspaces:
                     }
     }
     void gpuExportMatchesCpu() {
-        // An export drawn on the GPU (one read-back a frame) against the same export on the CPU: Y′CbCr footage graded,
-        // a picture over it scaled, turned, faded and screened, 16-bit PNGs out.
+        // An export drawn on the GPU (one read-back a frame) against the same export on the CPU: Y′CbCr footage graded
+        // and blurred, a picture over it scaled, turned, faded and screened, an adjustment layer sharpening both, 16-bit
+        // PNGs out.
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
         QTemporaryDir dir;
@@ -20170,6 +20385,13 @@ colorspaces:
         cc.params["exposure"] = 0.3;
         cc.params["saturation"] = 1.2;
         edit::clipById(s, r1.created[0])->effects.push_back(cc);
+        Effect blur = makeEffect(p, "gaussian_blur");
+        blur.params["radius"] = 5.0;
+        edit::clipById(s, r1.created[0])->effects.push_back(blur);
+        // An adjustment layer over both (V3): Sharpen and a vignette on the canvas.
+        Clip adj = makeGeneratorClip(p, "adjustment", 3);
+        adj.effects = {makeEffect(p, "sharpen"), makeEffect(p, "vignette")};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
         auto r2 = edit::placeMedia(p, s, ids[1], 0, 0, 3, {TrackKind::Video, 1}, {}, false);
         QVERIFY(r2.ok);
         Clip* top = edit::clipById(s, r2.created[0]);

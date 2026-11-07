@@ -2707,7 +2707,8 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         return GpuLayerResult::Unsupported;
     };
     if (compositeShown(c)) return cpu("a compositing graph");
-    if (c.isGenerator() && c.generator.type == "adjustment") return cpu("an adjustment layer");
+    // An adjustment layer: the canvas beneath it, as drawn on the GPU so far, through its effects.
+    const bool adjustment = c.isGenerator() && c.generator.type == "adjustment";
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
     const FrameTime lt = t - c.start;
@@ -2716,10 +2717,17 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         if (!gpuChainOps(seq, c, lt, [](const Effect& e) { return runOnSource(e) || e.type == "aces_gamut_compress"; }, unused, 0, 0, 1))
             return cpu(cpuEffectReason(c, lt));
     }
+    const int SW = seq.width, SH = seq.height;
+    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
     ClipSource cs;
-    if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
+    Image canvasSize;  // (an adjustment layer's source: the canvas's size alone, its picture is the GPU's)
+    canvasSize.width = W, canvasSize.height = H;
+    if (!clipSource(p, seq, c, t, o, adjustment ? &canvasSize : nullptr, true, cs)) return GpuLayerResult::Nothing;
     int w = 0, h = 0;
-    if (cs.frame) {
+    if (adjustment) {
+        out.canvas = true;
+        w = W, h = H;
+    } else if (cs.frame) {
         out.frame = cs.frame;
         out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
                                 : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
@@ -2742,7 +2750,9 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     if ((planes ? std::max(planes->width, w) : cs.frame ? w * 2 : w) > maxSize || std::max(planes ? planes->height : 0, h) > maxSize)
         return cpu("a picture larger than the GPU takes");
     if (why) {
-        if (planes)
+        if (adjustment)
+            *why = "an adjustment layer, on the canvas drawn so far";
+        else if (planes)
             *why = "Y′CbCr " + std::string(planes->log2ChromaH ? "4:2:0" : planes->log2ChromaW ? "4:2:2" : "4:4:4") + " " +
                    std::to_string(planes->bits) + "-bit, converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
@@ -2750,9 +2760,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     }
     // Placed as transformLayer places it (worked out here in double).
     const Geometry& g = cs.g;
-    const int SW = seq.width, SH = seq.height;
     gpu::Placement& pl = out.place;
-    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
     Image probe;  // (identityLayer reads the size alone)
     probe.width = w, probe.height = h;
     if (identityLayer(probe, g, SW, SH, o.scale)) {
@@ -2761,6 +2769,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     }
     const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
     if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
+        out.canvas = false;
         out.frame.reset();
         out.image = Image();
         out.ops.clear();
@@ -2776,6 +2785,15 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
     pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
     return GpuLayerResult::Drawn;
+}
+
+// Whether the GPU mixes a transition itself: not Smooth Cut's flow or an OpenFX one, nor one with a clip turned as a
+// 3D Layer as it mixes (those are the CPU's).
+bool gpuMixesTransition(const Sequence& seq, const Track& track, const Transition& tr) {
+    if (tr.type == "smooth_cut" || tr.type == "ofx") return false;
+    for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)})
+        if (c && c->enabled && !(c->isGenerator() && c->generator.type == "model3d") && enabledEffect(seq, *c, "layer_3d")) return false;
+    return true;
 }
 
 // A layer made on the CPU, the canvas's size, for the GPU to blend.
@@ -2808,29 +2826,42 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     frame.height = std::max(1, int(std::lround(seq.height * o.scale)));
     const int W = frame.width, H = frame.height;
     if (W > gpu::maxTextureSize() || H > gpu::maxTextureSize()) return fallback("a frame larger than the GPU takes");
+    // (Tracks that are another clip's matte or map are not drawn themselves, as on the CPU.)
     const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
-    if (std::find(hiddenMatte.begin(), hiddenMatte.end(), true) != hiddenMatte.end()) return fallback("a track matte");
-    // The clips on screen that need the canvas beneath them, or another track, go to the CPU whole.
+    // The clips on screen that need the canvas beneath them, or another track, made on the CPU, go to the CPU whole.
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        if (solo < 0 && hiddenMatte[ti]) continue;
         FrameTime from = 0, to = 0;
         std::vector<const Clip*> shown;
-        if (const Transition* tr = activeTransition(track, t, from, to)) shown = {findClip(track, tr->clipA), findClip(track, tr->clipB)};
+        const Transition* tr = activeTransition(track, t, from, to);
+        if (tr) shown = {findClip(track, tr->clipA), findClip(track, tr->clipB)};
         else shown = {clipAt(track, t)};
         for (const Clip* c : shown)
             if (c && c->enabled) {
-                if (c->isGenerator() && c->generator.type == "adjustment") return fallback("an adjustment layer");
-                if (trackMatteOf(*c)) return fallback("a track matte");
+                if (c->isGenerator() && c->generator.type == "adjustment") {
+                    // (its effects all the GPU's, or the canvas beneath it would have to come back to the CPU; so too
+                    // a transition mixed there)
+                    std::vector<gpu::ColorOp> unused;
+                    if (compositeShown(*c) || !gpuChainOps(seq, *c, t - c->start, runOnSource, unused, 0, 0, 1))
+                        return fallback("an adjustment layer with " + cpuEffectReason(*c, t - c->start));
+                    if (tr && !gpuMixesTransition(seq, track, *tr)) return fallback("an adjustment layer in a " + tr->type + " transition");
+                }
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
                 if (enabledEffect(seq, *c, "displace_by_layer")) return fallback("Displace by Layer");
                 if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }
+    std::string adjustmentOnCpu;  // (an adjustment layer the GPU turned down after all: the frame is the CPU's)
     auto layerOf = [&](const Clip& c, gpu::Layer& l) {
         std::string how;
         const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l, &how);
+        if (r == GpuLayerResult::Unsupported && c.isGenerator() && c.generator.type == "adjustment") {
+            adjustmentOnCpu = how;
+            return false;
+        }
         if (r == GpuLayerResult::Unsupported) {
             l = {};
             Image img = clipLayer(p, seq, c, t, o, nullptr);
@@ -2843,6 +2874,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        if (solo < 0 && hiddenMatte[ti]) continue;
         FrameTime from = 0, to = 0;
         if (const Transition* active = activeTransition(track, t, from, to)) {
             const Clip* A = findClip(track, active->clipA);
@@ -2850,11 +2882,14 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             const Clip* top = B ? B : A;
             gpu::Item item;
             item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
-            if (active->type == "cross_dissolve") {
+            const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+            const int kind = active->type == "cross_dissolve" ? 0 : gpuTransitionParams(active->type, active->params, u, W, H, item.transitionParams);
+            if (gpuMixesTransition(seq, track, *active)) {
                 item.b.emplace();
                 if (A && A->enabled) layerOf(*A, item.a);
                 if (B && B->enabled) layerOf(*B, *item.b);
-                item.dissolve = float(std::clamp((double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from)), 0.0, 1.0));
+                item.dissolve = float(std::clamp(u, 0.0, 1.0));
+                if (active->type != "cross_dissolve") item.transition = kind;
             } else {
                 item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
                 gpu::countLayer(false, "a " + active->type + " transition");
@@ -2865,9 +2900,21 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
         if (const Clip* c = clipAt(track, t)) {
             gpu::Item item;
             item.blendMode = blendModeIndex(c->blendMode);
-            if (layerOf(*c, item.a)) frame.items.push_back(std::move(item));
+            if (!layerOf(*c, item.a)) continue;
+            if (const Effect* e = trackMatteOf(*c)) {
+                // Seen through the matte track's picture (none there now: an empty matte; no track: no matte).
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {
+                    const FrameTime lt = t - c->start;
+                    item.matte.emplace();
+                    item.matteLuma = e->p("composite", lt, 0) > 0.5, item.matteReverse = e->p("reverse", lt, 0) > 0.5;
+                    if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t); mc && !(mc->isGenerator() && mc->generator.type == "adjustment"))
+                        layerOf(*mc, *item.matte);
+                }
+            }
+            frame.items.push_back(std::move(item));
         }
     }
+    if (!adjustmentOnCpu.empty()) return fallback("an adjustment layer: " + adjustmentOnCpu);
     // Captions are drawn on the CPU, before the display transform.
     const CaptionTrack* captions = opts.captions ? captionTrackFor(seq) : nullptr;
     if (captions && !captionAt(*captions, t)) captions = nullptr;

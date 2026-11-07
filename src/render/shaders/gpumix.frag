@@ -1,0 +1,254 @@
+#version 440
+// Two pictures at the canvas's size mixed into one, as render/Processing's transitionMix and render/Compositor's
+// applyTrackMatte do it on the CPU (premultiplied):
+//   0 to 17: a transition, outgoing `aTex` into incoming `bTex` (p[0].x: 0 Cross Dissolve, 1 Dip to Black, 2 Dip to
+//   White, 3 Wipe, 4 Iris, 5 Push, 6 Slide, 7 Zoom, 8 Whip Pan, 9 Zoom Blur, 10 Spin, 11 Glitch, 12 Light Leak,
+//   13 Luma Wipe, 14 Shape Wipe, 15 Cube, 16 Flip, 17 Clock Wipe), with what render/Processing's gpuTransitionParams
+//   works out for it: p[0] y position, z softness, w direction; p[1] angle, strength, turn, brights first; p[2] the
+//   leak's colour and the glitch's seed; p[3] shape, count, cell, reach; p[4] the shape's cos and sin, 3D under way;
+//   p[5..7] and p[8..10] the 3D faces' inverse projections (nine each) and whether each faces the camera
+//   30: a track matte, `aTex` through `bTex`'s alpha (or luma, p[0].y), or the reverse (p[0].z)
+layout(location = 0) out vec4 fragColor;
+layout(std140, binding = 0) uniform Params { vec4 p[16]; };
+layout(binding = 1) uniform sampler2D aTex;  // RGBA32F, premultiplied
+layout(binding = 4) uniform sampler2D bTex;
+
+const float PI = 3.14159265358979;
+
+float clamp01(float v) { return v > 0.0 ? min(v, 1.0) : 0.0; }
+float smoothstepCpu(float e0, float e1, float x) {
+    if (e1 == e0) return x < e0 ? 0.0 : 1.0;
+    float t = clamp01((x - e0) / (e1 - e0));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+vec4 pix(sampler2D t, ivec2 size, int x, int y) { return x < 0 || y < 0 || x >= size.x || y >= size.y ? vec4(0.0) : texelFetch(t, ivec2(x, y), 0); }
+// Bilinear, transparent outside (transitionMix's sample).
+vec4 bilinear(sampler2D t, ivec2 size, float x, float y) {
+    x -= 0.5;
+    y -= 0.5;
+    const int x0 = int(floor(x)), y0 = int(floor(y));
+    const float fx = x - float(x0), fy = y - float(y0);
+    return pix(t, size, x0, y0) * ((1.0 - fx) * (1.0 - fy)) + pix(t, size, x0 + 1, y0) * (fx * (1.0 - fy)) +
+           pix(t, size, x0, y0 + 1) * ((1.0 - fx) * fy) + pix(t, size, x0 + 1, y0 + 1) * (fx * fy);
+}
+vec4 pixA(ivec2 size, int x, int y) { return pix(aTex, size, x, y); }
+vec4 pixB(ivec2 size, int x, int y) { return pix(bTex, size, x, y); }
+vec4 sampleA(ivec2 size, float x, float y) { return bilinear(aTex, size, x, y); }
+vec4 sampleB(ivec2 size, float x, float y) { return bilinear(bTex, size, x, y); }
+vec4 sampleOf(bool b, ivec2 size, float x, float y) { return b ? bilinear(bTex, size, x, y) : bilinear(aTex, size, x, y); }
+
+float hashf(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return float(x & 0xffffffu) / float(0xffffff);
+}
+
+float shapeDistance(int shape, float qx, float qy) {
+    const float ax = abs(qx), ay = abs(qy), r = sqrt(qx * qx + qy * qy);
+    if (shape == 1) return ax + ay;
+    if (shape == 2) return max(ax, ay);
+    if ((shape == 3 || shape == 4) && r == 0.0) return 0.0;  // (atan(0, 0) is undefined here; the CPU's is 0, and r / anything 0)
+    if (shape == 3) {
+        const float t = atan(-qy, qx) - PI / 2.0;
+        return r / (0.62 + 0.38 * cos(5.0 * t));
+    }
+    if (shape == 4) {
+        const float t = atan(-qy + 0.35 * r, qx), s = sin(t), c = cos(t);
+        const float rho = (2.0 - 2.0 * s + s * sqrt(abs(c)) / (s + 1.4)) / 2.4;
+        return r / max(0.05, rho);
+    }
+    if (shape == 5) return min(max(ax / 0.35, ay), max(ax, ay / 0.35));
+    return r;
+}
+
+// Zoom Blur and Spin: a picture moved by k (0 at rest, 1 at the cut) and smeared along that motion.
+vec4 moved(bool b, ivec2 size, float fxp, float fyp, float k, bool zoom) {
+    const float strength = p[1].y, turn = p[1].z, cx = float(size.x) * 0.5, cy = float(size.y) * 0.5;
+    const float smear = strength * k;
+    const float d = sqrt(fxp * fxp + fyp * fyp);
+    const float reach = zoom ? 0.25 * smear * d : 0.075 * smear * abs(turn) * k * d;
+    const int taps = clamp(int(reach / 1.5) + 1, 1, 48);
+    vec4 o = vec4(0.0);
+    for (int t = 0; t < taps; ++t) {
+        const float f = taps > 1 ? float(t) / float(taps - 1) : 0.0;
+        float sx, sy;
+        if (zoom) {
+            const float sc = 1.0 + k * (1.0 + strength) * (1.0 + 0.25 * smear * f);
+            sx = cx + fxp / sc, sy = cy + fyp / sc;
+        } else {
+            const float ang = k * 0.5 * turn * (1.0 + 0.15 * smear * f);
+            const float sc = 1.0 - 0.15 * k;
+            const float cs = cos(-ang), sn = sin(-ang);
+            sx = cx + (fxp * cs - fyp * sn) / sc, sy = cy + (fxp * sn + fyp * cs) / sc;
+        }
+        o += sampleOf(b, size, sx, sy) / float(taps);
+    }
+    return o;
+}
+
+vec4 transition(int type, ivec2 xy, ivec2 size) {
+    const int x = xy.x, y = xy.y, w = size.x, h = size.y;
+    const float uf = p[0].y, soft = p[0].z, strength = p[1].y;
+    const int dir = int(p[0].w);
+    const float bell = sin(PI * uf);
+    const vec4 pa = pixA(size, x, y), pb = pixB(size, x, y);
+    if (type == 1 || type == 2) {
+        const float col = type == 2 ? 1.0 : 0.0;
+        if (uf < 0.5) {
+            const float k = uf * 2.0;
+            return vec4(pa.rgb * (1.0 - k) + col * k, pa.a * (1.0 - k) + k);
+        }
+        const float k = (uf - 0.5) * 2.0;
+        return vec4(col * (1.0 - k) + pb.rgb * k, (1.0 - k) + pb.a * k);
+    }
+    if (type == 3) {
+        const float ang = p[1].x;
+        const float nx = (float(x) + 0.5) / float(w) - 0.5, ny = (float(y) + 0.5) / float(h) - 0.5;
+        const float proj = nx * cos(ang) + ny * sin(ang);
+        const float ext = 0.5 * (abs(cos(ang)) + abs(sin(ang))) + soft;
+        const float edge = -ext + 2.0 * ext * uf;
+        const float mb = 1.0 - smoothstepCpu(edge - soft, edge + soft, proj);
+        return pa * (1.0 - mb) + pb * mb;
+    }
+    if (type == 4) {
+        const float nx = (float(x) + 0.5) - float(w) * 0.5, ny = (float(y) + 0.5) - float(h) * 0.5;
+        const float maxR = sqrt(float(w) * float(w) * 0.25 + float(h) * float(h) * 0.25);
+        const float d = sqrt(nx * nx + ny * ny) / maxR;
+        const float r = uf * (1.0 + soft);
+        const float mb = 1.0 - smoothstepCpu(r - soft, r, d);
+        return pa * (1.0 - mb) + pb * mb;
+    }
+    if (type == 5 || type == 6) {
+        int ox = 0, oy = 0, shiftB = 0;
+        if (dir == 0) ox = -int(floor(uf * float(w) + 0.5)), shiftB = w;
+        else if (dir == 1) ox = int(floor(uf * float(w) + 0.5)), shiftB = -w;
+        else if (dir == 2) oy = -int(floor(uf * float(h) + 0.5)), shiftB = h;
+        else oy = int(floor(uf * float(h) + 0.5)), shiftB = -h;
+        const bool horiz = dir <= 1;
+        const vec4 a = type == 5 ? pixA(size, x - ox, y - oy) : pa;
+        const vec4 b = pixB(size, x - ox - (horiz ? shiftB : 0), y - oy - (horiz ? 0 : shiftB));
+        return b + a * (1.0 - b.a);
+    }
+    if (type == 7) {
+        const float sa = 1.0 + uf * strength, sb = 1.0 + (1.0 - uf) * strength;
+        const float cx = float(w) * 0.5, cy = float(h) * 0.5, fxp = float(x) + 0.5, fyp = float(y) + 0.5;
+        const vec4 a = sampleA(size, cx + (fxp - cx) / sa, cy + (fyp - cy) / sa);
+        const vec4 b = sampleB(size, cx + (fxp - cx) / sb, cy + (fyp - cy) / sb);
+        return a * (1.0 - uf) + b * uf;
+    }
+    if (type == 8) {
+        const bool horiz = dir <= 1;
+        const float sign = (dir == 0 || dir == 2) ? -1.0 : 1.0;
+        const float span = horiz ? float(w) : float(h);
+        const float e = uf * uf * (3.0 - 2.0 * uf);
+        const float travel = sign * e * span, blur = strength * 0.25 * span * bell;
+        const int taps = clamp(int(blur / 1.5) + 1, 1, 48);
+        vec4 sa = vec4(0.0), sb = vec4(0.0);
+        for (int k = 0; k < taps; ++k) {
+            const float s = taps > 1 ? (float(k) / float(taps - 1) - 0.5) * blur : 0.0;
+            const float ax = horiz ? float(x) + 0.5 - travel - s : float(x) + 0.5;
+            const float ay = horiz ? float(y) + 0.5 : float(y) + 0.5 - travel - s;
+            const float bx = horiz ? ax + sign * span : ax, by = horiz ? ay : ay + sign * span;
+            sa += sampleA(size, ax, ay) / float(taps);
+            sb += sampleB(size, bx, by) / float(taps);
+        }
+        return sb + sa * (1.0 - sb.a);
+    }
+    if (type == 9 || type == 10) {
+        const float fxp = float(x) + 0.5 - float(w) * 0.5, fyp = float(y) + 0.5 - float(h) * 0.5;
+        const vec4 qa = moved(false, size, fxp, fyp, min(1.0, uf * 2.0), type == 9);
+        const vec4 qb = moved(true, size, fxp, fyp, min(1.0, (1.0 - uf) * 2.0), type == 9);
+        const float m = smoothstepCpu(0.45, 0.55, uf);
+        return qa * (1.0 - m) + qb * m;
+    }
+    if (type == 11) {
+        const uint seed = uint(p[2].w);
+        const float amount = strength * (1.0 - abs(2.0 * uf - 1.0));
+        const int band = y / max(2, h / 24);
+        const float r1 = hashf(uint(band) * 2654435761u ^ seed * 40503u);
+        const float r2 = hashf(uint(band) * 97u ^ seed * 2246822519u);
+        const float shift = (r1 < amount * 0.6) ? (r2 - 0.5) * 0.25 * float(w) * amount : 0.0;
+        const bool flip = hashf(uint(band) * 31u ^ seed * 3266489917u) < amount * 0.35;
+        const bool fromB = (uf >= 0.5) != flip;
+        const float split = 0.02 * float(w) * amount;
+        const vec4 qr = sampleOf(fromB, size, float(x) + 0.5 - shift + split, float(y) + 0.5);
+        const vec4 qg = sampleOf(fromB, size, float(x) + 0.5 - shift, float(y) + 0.5);
+        const vec4 qb = sampleOf(fromB, size, float(x) + 0.5 - shift - split, float(y) + 0.5);
+        return vec4(qr.r, qg.g, qb.b, max(qr.a, max(qg.a, qb.a)));
+    }
+    if (type == 12) {
+        const float m = smoothstepCpu(0.3, 0.7, uf);
+        vec4 o = pa * (1.0 - m) + pb * m;
+        const float nx = (float(x) + 0.5) / float(w), ny = (float(y) + 0.5) / float(h);
+        const float c1 = -0.3 + 1.6 * uf, c2 = 1.2 - 1.4 * uf;
+        const float l = strength * bell *
+                        (exp(-((nx - c1) * (nx - c1) / 0.08 + (ny - 0.35) * (ny - 0.35) / 0.3)) +
+                         0.6 * exp(-((nx - c2) * (nx - c2) / 0.05 + (ny - 0.8) * (ny - 0.8) / 0.15)));
+        o.rgb += l * p[2].xyz;
+        o.a = min(1.0, o.a + l);
+        return o;
+    }
+    if (type == 13) {
+        float la = pa.a > 1e-6 ? (0.2126 * pa.r + 0.7152 * pa.g + 0.0722 * pa.b) / pa.a : 0.0;
+        if (p[1].w > 0.5) la = 1.0 - la;
+        const float s = max(1e-3, soft), tt = uf * (1.0 + 2.0 * s) - s;
+        const float mb = 1.0 - smoothstepCpu(tt, tt + s, la);
+        return pa * (1.0 - mb) + pb * mb;
+    }
+    if (type == 14) {
+        const int shape = int(p[3].x), count = int(p[3].y);
+        const float cell = p[3].z, reach = p[3].w, rc = p[4].x, rs = p[4].y;
+        float qx, qy;
+        if (count == 1) {
+            qx = (float(x) + 0.5 - float(w) * 0.5) / cell, qy = (float(y) + 0.5 - float(h) * 0.5) / cell;
+        } else {
+            const float cx = (floor((float(x) + 0.5) / cell) + 0.5) * cell, cy = (floor((float(y) + 0.5) / cell) + 0.5) * cell;
+            qx = (float(x) + 0.5 - cx) / (cell / 2.0), qy = (float(y) + 0.5 - cy) / (cell / 2.0);
+        }
+        const float d = shapeDistance(shape, qx * rc + qy * rs, -qx * rs + qy * rc);
+        const float s = max(1e-3, soft) * reach, tt = uf * (reach + s);
+        const float mb = 1.0 - smoothstepCpu(tt - s, tt, d);
+        return pa * (1.0 - mb) + pb * mb;
+    }
+    if (type == 15 || type == 16) {
+        if (p[4].z < 0.5) return uf <= 0.0 ? pa : pb;
+        for (int k = 0; k < 2; ++k) {
+            const int b = k == 0 ? 5 : 8;
+            if (p[b + 2].y < 0.5) continue;
+            const float sx = float(x) + 0.5, sy = float(y) + 0.5;
+            const float tw = p[b + 1].z * sx + p[b + 1].w * sy + p[b + 2].x;
+            const float tu = (p[b].x * sx + p[b].y * sy + p[b].z) / tw, tv = (p[b].w * sx + p[b + 1].x * sy + p[b + 1].y) / tw;
+            if (tu < 0.0 || tu > 1.0 || tv < 0.0 || tv > 1.0) continue;
+            return sampleOf(k == 1, size, tu * float(w), tv * float(h));
+        }
+        return vec4(0.0);
+    }
+    if (type == 17) {
+        const float dx = float(x) + 0.5 - float(w) * 0.5, dy = float(y) + 0.5 - float(h) * 0.5;
+        // (atan(0, -0) is undefined here; the CPU's atan2 gives a half turn)
+        float ang = dx == 0.0 && dy == 0.0 ? 0.5 : atan(dx, -dy) / (2.0 * PI);
+        if (ang < 0.0) ang += 1.0;
+        const float s = max(1e-3, soft), tt = uf * (1.0 + s);
+        const float mb = 1.0 - smoothstepCpu(tt - s, tt, ang);
+        return pa * (1.0 - mb) + pb * mb;
+    }
+    return pa * (1.0 - uf) + pb * uf;
+}
+
+void main() {
+    const ivec2 xy = ivec2(gl_FragCoord.xy);
+    const ivec2 size = textureSize(aTex, 0);
+    const int mode = int(p[0].x);
+    if (mode == 30) {
+        const vec4 q = texelFetch(bTex, xy, 0);
+        float m = p[0].y > 0.5 ? clamp(0.2126 * q.r + 0.7152 * q.g + 0.0722 * q.b, 0.0, 1.0) : q.a;
+        if (p[0].z > 0.5) m = 1.0 - m;
+        fragColor = texelFetch(aTex, xy, 0) * m;
+        return;
+    }
+    fragColor = transition(mode, xy, size);
+}

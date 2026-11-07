@@ -58,7 +58,15 @@ struct ColorOp {
     // (ChromaKey, LumaKey and ScreenKey change the alpha too: render/Processing's keyers, gpucolor.frag's 18 to 20;
     // a ScreenKey whose params[10] or [11] are set has its matte shrunk or grown and blurred by passes of its own.)
     // (Shader runs `shader` on the picture, without a mask.)
-    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey, Shader } kind = Lut;
+    // (Filter runs gpufilter.frag's `passes` in turn, each on the picture the one before made, with the picture the
+    // filter began with beside it: the blurs, Sharpen, Glow and the other effects that read beyond their own pixel. A
+    // filter with a mask is marked before and mixed after, as a grade node is.)
+    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey, Shader, Filter } kind = Lut;
+    struct FilterPass {
+        int mode = 0;          // gpufilter.frag's
+        float params[16] = {};  // its p[1..4]
+    };
+    std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader
     int slot = 0;                // Store, Load
     int passMode = 0;            // Pass
@@ -89,7 +97,8 @@ struct Placement {
 };
 
 struct Layer {
-    Frame16Ptr frame;                    // a decoded frame, RGBA or Y′CbCr planes (premultiplied on the GPU) ...
+    bool canvas = false;                 // an adjustment layer's: the canvas as drawn so far, at the canvas's size ...
+    Frame16Ptr frame;                    // or a decoded frame, RGBA or Y′CbCr planes (premultiplied on the GPU) ...
     std::shared_ptr<const Lut3D> input;  // ... and its input transform, if any
     Image image;                         // or a picture made on the CPU (premultiplied, working space)
     std::vector<ColorOp> ops;
@@ -98,8 +107,16 @@ struct Layer {
 
 struct Item {
     Layer a;
-    std::optional<Layer> b;  // a cross dissolve's second clip
+    std::optional<Layer> b;  // a transition's second clip
     float dissolve = -1;     // its position 0..1 (negative: one layer)
+    // A transition other than a cross dissolve: gpumix.frag's kind and its settings (render/Processing's
+    // gpuTransitionParams), both clips placed on the canvas first. (-1: a cross dissolve, mixed as they are placed.)
+    int transition = -1;
+    float transitionParams[44] = {};
+    // A track matte: the clip seen through another track's picture (placed at the canvas's size), by its alpha or
+    // luma, or the reverse (render/Compositor's applyTrackMatte).
+    std::optional<Layer> matte;
+    bool matteLuma = false, matteReverse = false;
     int blendMode = 0;       // render/Processing's blendModeIndex
 };
 
@@ -117,6 +134,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8 = nullptr);
 struct Stats {
     long gpuFrames = 0, cpuFrames = 0;  // frames asked of the GPU path: drawn there, or fallen back
     long gpuLayers = 0, cpuLayers = 0;  // their layers: drawn from the source, or made on the CPU and uploaded
+    long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
 };

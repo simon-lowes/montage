@@ -144,6 +144,7 @@ public:
     }
 
     bool draw(const Frame& frame, Image* out, QImage* out8);
+    long filterPasses = 0, mixPasses = 0;  // (the last frame's)
 
 private:
     void loop();
@@ -174,7 +175,7 @@ private:
     };
     Program* program(const ShaderStep& step, QRhiResourceUpdateBatch* u);
     void dropProgram(Program& prog, bool later = false);
-    QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u);
+    QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas = nullptr);
     void endFrame();
 
     std::thread thread_;
@@ -207,6 +208,7 @@ private:
     QRhiTexture *dummy2d_ = nullptr, *dummy3d_ = nullptr, *dummy16_ = nullptr, *dummyR_ = nullptr;
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
+    QRhiGraphicsPipeline *filterPs_ = nullptr, *mixPs_ = nullptr;
     QRhiRenderPassDescriptor *rpFloat_ = nullptr, *rp8_ = nullptr;
     QRhiTexture *rpFloatTex_ = nullptr, *rp8Tex_ = nullptr;  // (the small targets they were made from)
     // Textures kept between frames (by format and size), lent out within one. Only let go between frames: a pass
@@ -475,7 +477,9 @@ bool Device::create() {
     compositePs_ = pipeline(kCompositeFragQsb, sizeof kCompositeFragQsb, rpFloat_);
     outputPs_ = pipeline(kOutputFragQsb, sizeof kOutputFragQsb, rpFloat_);
     output8Ps_ = pipeline(kOutputFragQsb, sizeof kOutputFragQsb, rp8_);
-    if (!colorPs_ || !compositePs_ || !outputPs_ || !output8Ps_) {
+    filterPs_ = pipeline(kFilterFragQsb, sizeof kFilterFragQsb, rpFloat_);
+    mixPs_ = pipeline(kMixFragQsb, sizeof kMixFragQsb, rpFloat_);
+    if (!colorPs_ || !compositePs_ || !outputPs_ || !output8Ps_ || !filterPs_ || !mixPs_) {
         problem_ = "the graphics device cannot build the compositor's shaders";
         return false;
     }
@@ -495,8 +499,8 @@ void Device::destroy() {
     pool_.clear();
     for (QRhiBuffer* b : ubufs_) delete b;
     ubufs_.clear();
-    delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_;
-    colorPs_ = compositePs_ = outputPs_ = output8Ps_ = nullptr;
+    delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_, delete filterPs_, delete mixPs_;
+    colorPs_ = compositePs_ = outputPs_ = output8Ps_ = filterPs_ = mixPs_ = nullptr;
     rpFloat_ = rp8_ = nullptr;  // (the targets' own)
     delete layout_, layout_ = nullptr;
     delete dummy2d_, delete dummy3d_, delete dummy16_, delete dummyR_, delete rpFloatTex_, delete rp8Tex_;
@@ -749,10 +753,12 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
 #endif
 }
 
-// A layer's picture at its source size, through its colour steps (null when it could not be made).
-QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
+// A layer's picture at its source size, through its colour steps (null when it could not be made). An adjustment
+// layer's starts from `canvas`, which is never let go here.
+QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas) {
     using T = QRhiTexture;
     QRhiTexture* cur = nullptr;
+    QRhiTexture* const pinned = l.canvas ? canvas : nullptr;
     float p[64] = {};
     // The input transform's LUT, for the steps that take a decoded frame in (gpucolor.frag's 0, 24 and 26).
     auto inputLut = [&](float* q, std::vector<std::pair<int, QRhiTexture*>>& textures) {
@@ -768,7 +774,10 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         if (l.input && l.input->is1D) textures.push_back({4, table});
         return true;
     };
-    if (l.frame && l.frame->planes) {
+    if (l.canvas) {
+        if (!canvas) return nullptr;
+        cur = canvas;
+    } else if (l.frame && l.frame->planes) {
         // Y′CbCr as decoded: each plane uploaded as it is, converted (24), resampled to the frame's size where that
         // differs (25 along rows, then columns) and taken in as a decoded frame (24 itself, or 26).
         const YcbcrPlanes& yc = *l.frame->planes;
@@ -873,7 +882,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         }
     }
     auto keep = [&](QRhiTexture* t) {
-        return std::find(marked.begin(), marked.end(), t) != marked.end() || std::find(kept.begin(), kept.end(), t) != kept.end();
+        return t == pinned || std::find(marked.begin(), marked.end(), t) != marked.end() ||
+               std::find(kept.begin(), kept.end(), t) != kept.end();
     };
     auto sweep = [&](size_t i) {
         for (size_t k = 0; k < kept.size(); ++k)
@@ -936,6 +946,27 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
             continue;
         }
         const QSize size = cur->pixelSize();
+        if (op.kind == ColorOp::Filter) {
+            // Each pass on what the one before made, beside the picture the filter began with.
+            QRhiTexture* at = cur;
+            for (const ColorOp::FilterPass& fp : op.passes) {
+                QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
+                if (!made) return nullptr;
+                std::fill(p, p + 64, 0.0f);
+                p[0] = float(fp.mode);
+                std::copy(fp.params, fp.params + 16, p + 4);
+                pass(filterPs_, made, u, {{1, at}, {4, cur}}, uniforms(u, p));
+                u = rhi_->nextResourceUpdateBatch();
+                ++filterPasses;
+                if (at != cur) release(at);
+                at = made;
+            }
+            if (at != cur) {
+                if (!keep(cur)) release(cur);
+                cur = at;
+            }
+            continue;
+        }
         QRhiTexture* next = texture(T::RGBA32F, size.width(), size.height(), true);
         if (!next) return nullptr;
         if (op.kind == ColorOp::Shader) {
@@ -1040,7 +1071,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         cur = next;
     }
     for (QRhiTexture* t : kept)
-        if (t && t != cur) release(t);
+        if (t && t != cur && t != pinned) release(t);
     return cur;
 }
 
@@ -1081,6 +1112,7 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
+    filterPasses = mixPasses = 0;
     const int W = frame.width, H = frame.height;
     const int maxSize = maxTexture_;
     if (W <= 0 || H <= 0 || W > maxSize || H > maxSize) return false;
@@ -1103,12 +1135,68 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         q[12] = g.u0, q[13] = g.u1, q[14] = g.v0, q[15] = g.v1;
         q[16] = g.kx, q[17] = g.ky, q[18] = g.px, q[19] = g.py;
     };
+    // A layer placed alone on a transparent canvas (a transition's or a matte's, before they are mixed).
+    auto placed = [&](const Layer* l, QRhiTexture* tex) -> QRhiTexture* {
+        QRhiTexture* to = texture(T::RGBA32F, W, H, true);
+        if (!to) return nullptr;
+        float q[64] = {};
+        q[1] = 1, q[3] = -1;
+        place(q + 4, l, tex);
+        pass(compositePs_, to, u, {{1, dummy2d_}, {2, tex ? tex : dummy2d_}, {3, dummy2d_}}, uniforms(u, q));
+        u = rhi_->nextResourceUpdateBatch();
+        return to;
+    };
+    auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n) -> QRhiTexture* {
+        QRhiTexture* to = a && b ? texture(T::RGBA32F, W, H, true) : nullptr;
+        if (!to) return nullptr;
+        float q[64] = {};
+        std::copy(params, params + n, q);
+        pass(mixPs_, to, u, {{1, a}, {4, b}}, uniforms(u, q));
+        u = rhi_->nextResourceUpdateBatch();
+        ++mixPasses;
+        release(a), release(b);
+        return to;
+    };
+    // (Nothing to draw, transparent: no picture, or an adjustment layer over nothing.)
+    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty(); };
+    Layer full;  // (a picture the canvas's size already)
+    full.place.full = true;
     for (const Item& it : frame.items) {
-        QRhiTexture* a = layer(it.a, u);
-        QRhiTexture* b = it.b ? layer(*it.b, u) : nullptr;
-        if ((!a && (it.a.frame || !it.a.image.empty())) || (it.b && !b && (it.b->frame || !it.b->image.empty()))) {
+        if (!it.b && it.a.canvas && !canvas) continue;  // (an adjustment layer over nothing shows nothing)
+        QRhiTexture* a = layer(it.a, u, canvas);
+        QRhiTexture* b = it.b ? layer(*it.b, u, canvas) : nullptr;
+        if ((!a && !absent(it.a)) || (it.b && !b && !absent(*it.b))) {
             ok = false;
             break;
+        }
+        const Layer* la = &it.a;
+        if ((it.b && it.transition >= 0) || it.matte) {
+            // Placed on the canvas, then mixed: a transition, then a track matte.
+            QRhiTexture* m = placed(&it.a, a);
+            if (a && a != canvas) release(a);
+            if (m && it.b && it.transition >= 0) {
+                QRhiTexture* mb = placed(&*it.b, b);
+                if (b && b != canvas) release(b);
+                b = nullptr;
+                m = mixed(m, mb, it.transitionParams, 44);
+            }
+            if (m && it.matte) {
+                QRhiTexture* matte = layer(*it.matte, u);
+                if (!matte && !absent(*it.matte)) {
+                    ok = false;
+                    break;
+                }
+                QRhiTexture* mm = placed(&*it.matte, matte);
+                if (matte) release(matte);
+                const float q[3] = {30, it.matteLuma ? 1.0f : 0.0f, it.matteReverse ? 1.0f : 0.0f};
+                m = mixed(m, mm, q, 3);
+            }
+            if (!m) {
+                ok = false;
+                break;
+            }
+            a = m;
+            la = &full;
         }
         QRhiTexture* next = texture(T::RGBA32F, W, H, true);
         if (!next) {
@@ -1119,9 +1207,9 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         p[0] = canvas ? 1 : 0;
         p[1] = !canvas && it.blendMode == 0 ? 1 : 0;  // the first normal layer is the canvas (as the CPU moves it in)
         p[2] = float(it.blendMode);
-        p[3] = it.b ? it.dissolve : -1;
-        place(p + 4, &it.a, a);
-        if (it.b) place(p + 24, &*it.b, b);
+        p[3] = it.b && la == &it.a ? it.dissolve : -1;  // (a cross dissolve, mixed as the two are placed)
+        place(p + 4, la, a);
+        if (la == &it.a && it.b) place(p + 24, &*it.b, b);
         QRhiBuffer* ub = uniforms(u, p);
         pass(compositePs_, next, u, {{1, canvas ? canvas : dummy2d_}, {2, a ? a : dummy2d_}, {3, b ? b : dummy2d_}}, ub);
         u = rhi_->nextResourceUpdateBatch();
@@ -1233,10 +1321,17 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     std::shared_lock lock(gDeviceMutex);
     if (!gDevice || !gDevice->ready()) return false;
     Device* d = gDevice.get();
-    const bool ok = d->run([&] { return d->draw(frame, out, out8); });
+    long filters = 0, mixes = 0;
+    const bool ok = d->run([&] {
+        const bool drawn = d->draw(frame, out, out8);
+        filters = d->filterPasses, mixes = d->mixPasses;
+        return drawn;
+    });
     if (ok) {
         std::lock_guard statsLock(gStatsMutex);
         ++gStats.gpuFrames;
+        gStats.filterPasses += filters;
+        gStats.mixPasses += mixes;
     }
     return ok;
 }
