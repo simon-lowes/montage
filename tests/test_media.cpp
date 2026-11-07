@@ -1576,9 +1576,12 @@ public:
     bool loseWhileRecording = false, staleStatus = false;
     double servoLockAfter = 0.2;
     // A deck's own ways: stopped, its LTC answered as corrected LTC (74.14); every so many timecodes one this many
-    // frames out (a jittery reader); recording from In at once when told to edit, with no run up.
+    // frames out (a jittery reader), or so many in a row that far out once it passes a frame in an edit; recording
+    // from In at once when told to edit, with no run up.
     bool correctedLtcWhenStopped = false;
     int jitterEvery = 0, jitterFrames = 0, timecodeReads = 0;
+    int64_t burstFrom = -1;
+    int burstReads = 0;
     bool recordWithoutRoll = false;
     int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
 
@@ -1709,7 +1712,8 @@ private:
         }
         if (q.is(6, cmd::CurrentTimeSense)) {
             ++timecodeReads;
-            const int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
+            int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
+            if (burstReads > 0 && autoEdit && here >= burstFrom) off = jitterFrames, --burstReads;
             return timecode(correctedLtcWhenStopped && speed == 0 ? cmd::CorrectedLtcTimeData : cmd::LtcTimeData, here + off);
         }
         if (q.is(6, cmd::StatusSense)) return status();
@@ -2449,10 +2453,31 @@ private slots:
             QCOMPARE(sim.recordedTo, ej.out);
         }
 
+        // The reader slipping five frames for a moment just as the deck runs up to In: four readings in a row, and six
+        // (more than half of its last nine, so the deck seems somewhere else until it is seen where it was going). The
+        // edit is made all the same, the Program started once and standing, rather than the run up taken as lost and
+        // the edit failed when the deck records before it is seen running up again.
+        TapeEdit eb = ej;
+        for (int burst : {4, 6}) {
+            eb.in += 250, eb.out = eb.in + 50;
+            {
+                std::lock_guard lock(sim.m);
+                sim.jitterFrames = 5, sim.burstFrom = eb.in - 2, sim.burstReads = burst;
+            }
+            rolls = 0;
+            const bool made = editToTape(deck, eb, [&](int64_t, double) { ++rolls; }, nullptr, &err);
+            std::lock_guard lock(sim.m);
+            sim.burstReads = 0;
+            QVERIFY2(made, qPrintable(QString("%1 in a row: %2").arg(burst).arg(err.c_str())));
+            QCOMPARE(rolls, 1);
+            QCOMPARE(sim.recordedFrom, eb.in);
+            QCOMPARE(sim.recordedTo, eb.out);
+        }
+
         // A deck that records from In at once, never seen running up: the edit fails there and then, the deck stopped,
         // rather than recording the paused Program to Out.
         TapeEdit en = e;
-        en.in = ej.in + 250, en.out = en.in + 250;
+        en.in = eb.in + 250, en.out = en.in + 250;
         {
             std::lock_guard lock(sim.m);
             sim.recordWithoutRoll = true;

@@ -15020,6 +15020,27 @@ colorspaces:
             QCOMPARE(int(out.size()), 3 + 200 - 16);
             for (size_t k = 3; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(100 + 16 + k - 3));
         }
+        // The same on the other leg: joined from any source with ST 2022-7, leg B dead but for a stray heard first
+        // there, trickling. Leg A's real sender is taken once a window of it has come (rather than turned away for
+        // good as numbered far from the stray's), the stray stays out from then, and leg B, let go, takes the real
+        // stream's other leg when it comes, filling what leg A misses.
+        {
+            st::PathMerger merger(false, 16);
+            std::vector<std::vector<uint8_t>> out;
+            merger.push(sent(9000, 5), 1, out);
+            for (uint32_t i = 0; i < 200; ++i) {
+                if (i % 16 == 0) merger.push(sent(9001 + i / 16, 5), 1, out);
+                merger.push(sent(100 + i, 6), 0, out);
+            }
+            for (uint32_t i = 200; i < 260; ++i) {
+                if (i % 16 == 0) merger.push(sent(9100 + i, 5), 1, out);
+                if (i % 7 != 3) merger.push(sent(100 + i, 6), 0, out);
+                merger.push(sent(100 + i, 60), 1, out);
+            }
+            QCOMPARE(int(out.size()), 3 + 260 - 16);
+            for (size_t k = 3; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(100 + 16 + k - 3));
+            QCOMPARE(merger.lost, int64_t(0));
+        }
         // ST 2022-7 legs from senders with SSRCs of their own: merged by number, each leg's losses filled by the other;
         // and when both legs' senders start again with new SSRCs, the count starts again once, nothing given out twice.
         {

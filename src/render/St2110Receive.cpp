@@ -246,41 +246,51 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     const uint32_t low = p.sequence;
     const uint32_t seq = extended_ && p.size >= 2 ? get16(p.payload) << 16 | low : low;
     auto place = [&] { return extended_ ? next_ + int32_t(seq - uint32_t(next_)) : next_ + int16_t(uint16_t(seq - uint16_t(next_))); };
-    Sender& who = sender_[path & 1];
-    const Sender& other = sender_[(path & 1) ^ 1];
-    if (!who.have && started_ && other.have && p.ssrc != other.ssrc && std::llabs(place() - next_) > int64_t(window_)) {
-        // (a path's first sender: the other path's, or one of its own (ST 2022-7's legs may have SSRCs of their own)
-        // numbered as the stream is, not a stray far off)
+    const int side = path & 1, otherSide = side ^ 1;
+    Sender& who = sender_[side];
+    Sender& other = sender_[otherSide];
+    auto turnAway = [&] {
         ++rejected;
-        return;
+        if (who.others.size() > 8) {
+            // (a few strangers counted at a time: the one heard least let go)
+            auto least = who.others.begin();
+            for (auto it = who.others.begin(); it != who.others.end(); ++it)
+                if (it->second < least->second) least = it;
+            who.others.erase(least);
+        }
+    };
+    if (!who.have && started_ && other.have && p.ssrc != other.ssrc && std::llabs(place() - next_) > int64_t(window_)) {
+        // A path's first sender is the other path's, or one of its own (ST 2022-7's legs may have SSRCs of their own)
+        // numbered as the stream is, not a stray far off; unless the stray is the other path's (heard first on a leg
+        // that is otherwise dead): this one is taken once it has sent a window with fewer than a quarter as many of
+        // that one's between, the count started again from its numbers and the other path let go to find its own.
+        if (who.others.empty()) who.otherAt = received[otherSide];
+        const int64_t theirs = ++who.others[p.ssrc];
+        if (theirs <= int64_t(window_) || (received[otherSide] - who.otherAt) * 4 >= theirs) return turnAway();
+        other = Sender{};
+        flush(out);
+        started_ = false;
+        lateRun_ = 0;
+        restartedBy_ = side;
+        sinceRestart_ = 0;
     }
     if (who.have && p.ssrc != who.ssrc) {
         // (the one taken's packets counted from the first stranger's; all counted again once it has sent a window)
         if (who.others.empty()) who.own = 0;
         const int64_t theirs = ++who.others[p.ssrc];
-        if (theirs <= int64_t(window_) || who.own * 4 >= theirs) {
-            ++rejected;
-            if (who.others.size() > 8) {
-                // (a few strangers counted at a time: the one heard least let go)
-                auto least = who.others.begin();
-                for (auto it = who.others.begin(); it != who.others.end(); ++it)
-                    if (it->second < least->second) least = it;
-                who.others.erase(least);
-            }
-            return;
-        }
+        if (theirs <= int64_t(window_) || who.own * 4 >= theirs) return turnAway();
         // A window of another sender's, with few of the one taken between: that one now. The count starts again from
         // its numbers, unless the other path's new sender has just started it (both legs' senders started again).
         who.have = false;
-        if (restartedBy_ != ((path & 1) ^ 1) || sinceRestart_ > 4 * int64_t(window_)) {
+        if (restartedBy_ != otherSide || sinceRestart_ > 4 * int64_t(window_)) {
             flush(out);
             started_ = false;
             lateRun_ = 0;
-            restartedBy_ = path & 1;
+            restartedBy_ = side;
             sinceRestart_ = 0;
         }
     }
-    if (!who.have) who = Sender{true, p.ssrc, 0, {}};
+    if (!who.have) who = Sender{true, p.ssrc, 0, {}, 0};
     if (++who.own >= int64_t(window_)) who.own = 0, who.others.clear();
     ++sinceRestart_;
     ++received[path & 1];
