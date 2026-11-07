@@ -39,6 +39,8 @@ public:
     bool alive();
     // How it ended ("crashed (signal 11)", "used more than 4096 MB"...); "" while it runs.
     std::string howItEnded();
+    // What the host said as it crashed (signal or exception code; 0: it did not), told before the process ends.
+    uint32_t crashCode() const;
     void kill();
     std::atomic<int> instances{0};
     // Set by the first to report this host's end (renders on several threads see it end together; one failure).

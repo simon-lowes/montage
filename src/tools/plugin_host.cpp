@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,7 +39,11 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #endif
 
 using namespace montage;
@@ -50,6 +55,99 @@ int64_t gMemoryLimit = 0;  // bytes, 0: none
 
 void checkMemory() {
     if (gMemoryLimit > 0 && ipc::ownResidentBytes() > gMemoryLimit) std::_Exit(wire::kExitTooMuchMemory);
+}
+
+// The channels Montage waits on, for a crash to be told at once: a crashed process can take seconds to end (a core
+// dump being written, a crash reporter), and Montage would count those as late blocks. Written from a signal handler,
+// so fixed slots of atomics.
+struct CrashSlot {
+    std::atomic<wire::Header*> h{nullptr};
+    std::atomic<ipc::Bell*> bell{nullptr};
+};
+CrashSlot gCrashSlots[512];
+
+void watchForCrash(wire::Header* h, ipc::Bell* bell) {
+    for (CrashSlot& s : gCrashSlots) {
+        wire::Header* none = nullptr;
+        if (s.h.compare_exchange_strong(none, h)) {
+            s.bell.store(bell);
+            return;
+        }
+    }
+}
+
+void unwatchForCrash(wire::Header* h) {
+    for (CrashSlot& s : gCrashSlots)
+        if (s.h.load() == h) {
+            s.bell.store(nullptr);
+            s.h.store(nullptr);
+        }
+}
+
+// (async-signal-safe: atomics, and a futex wake, sem_post or SetEvent)
+void tellMontageOfCrash(uint32_t code) {
+    for (CrashSlot& s : gCrashSlots) {
+        wire::Header* h = s.h.load();
+        if (!h) continue;
+        h->crashed.store(code ? code : 1, std::memory_order_release);
+        h->toClient.fetch_add(1, std::memory_order_acq_rel);
+        if (ipc::Bell* b = s.bell.load()) b->ring(&h->toClient);
+    }
+}
+
+#ifdef _WIN32
+LONG WINAPI onUnhandledException(EXCEPTION_POINTERS* e) {
+    tellMontageOfCrash(e && e->ExceptionRecord ? uint32_t(e->ExceptionRecord->ExceptionCode) : 1);
+    return EXCEPTION_EXECUTE_HANDLER;  // (ends the process; no error box, see SetErrorMode)
+}
+void onAbort(int) {
+    tellMontageOfCrash(3);  // (abort's exit code)
+    std::_Exit(3);
+}
+#else
+void onFatalSignal(int sig) {
+    tellMontageOfCrash(uint32_t(sig));
+    std::signal(sig, SIG_DFL);
+    raise(sig);  // (ends it as the signal would have)
+}
+
+// A thread's own stack for the handler, so a stack overflow reaches it too.
+struct AltStack {
+    std::unique_ptr<char[]> mem;
+    AltStack() {
+        const size_t size = 64 * 1024;
+        mem.reset(new char[size]);
+        stack_t st{};
+        st.ss_sp = mem.get();
+        st.ss_size = size;
+        if (sigaltstack(&st, nullptr) != 0) mem.reset();
+    }
+    ~AltStack() {
+        if (!mem) return;
+        stack_t st{};
+        st.ss_flags = SS_DISABLE;
+        sigaltstack(&st, nullptr);
+    }
+};
+#endif
+
+void catchCrashes() {
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(onUnhandledException);
+    std::signal(SIGABRT, onAbort);
+#else
+    // No core dumps: the plug-in's crash is reported by Montage, and a dump only keeps the process from ending.
+    rlimit none{0, 0};
+    setrlimit(RLIMIT_CORE, &none);
+#if defined(__linux__)
+    prctl(PR_SET_DUMPABLE, 0);  // (a core_pattern piped to a collector does not heed RLIMIT_CORE)
+#endif
+    struct sigaction sa {};
+    sa.sa_handler = onFatalSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_ONSTACK | SA_NODEFER;
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS}) sigaction(sig, &sa, nullptr);
+#endif
 }
 
 // The host's end of a channel.
@@ -72,7 +170,14 @@ struct Channel {
         // (a channel is new when opened here: a message Montage sent before then is still to be read)
         seen = 0;
         bumps = h->toClient.load(std::memory_order_acquire);
+        watchForCrash(h, toClient.get());
         return true;
+    }
+    Channel() = default;
+    Channel(const Channel&) = delete;
+    Channel& operator=(const Channel&) = delete;
+    ~Channel() {
+        if (h) unwatchForCrash(h);
     }
     void* base() const { return mem->data(); }
     char* payload() const { return wire::payload(mem->data()); }
@@ -273,6 +378,9 @@ void process(AudioInstance& a) {
 }
 
 void serveAudio(std::shared_ptr<AudioInstance> a) {
+#ifndef _WIN32
+    AltStack alt;
+#endif
     Channel& c = a->chan;
     wire::Header* h = c.h;
     for (;;) {
@@ -456,6 +564,9 @@ bool ask(OfxChannel& o, int32_t kind, double t, const std::string& connection, I
 }
 
 void serveOfx(std::shared_ptr<OfxChannel> o) {
+#ifndef _WIN32
+    AltStack alt;
+#endif
     Channel& c = o->chan;
     wire::Header* h = c.h;
     for (;;) {
@@ -552,6 +663,9 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
 
 // The control channel: Montage asks for instances here.
 void serveControl(std::string name) {
+#ifndef _WIN32
+    AltStack alt;
+#endif
     Channel c;
     std::string err;
     if (!c.open(name, &err)) {
@@ -640,6 +754,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);  // (a crash ends it quietly; Montage reports it)
 #endif
+    catchCrashes();
     if (!ipc::processRunning(parent)) return wire::kExitLostMontage;
     setRunningInHost(true);
     QGuiApplication app(argc, argv);

@@ -4533,6 +4533,10 @@ private slots:
             d->accept();
         });
         PluginManagerDialog::editHosting(win_.get());
+        // (the offscreen platform gives the focus to no window when a dialog closes; a desktop gives it back to the main
+        // window, as the tests after this one expect)
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
         QVERIFY(plugins::hosting().isolation == plugins::Isolation::PerVendor);
         QCOMPARE(plugins::hosting().missedBlocks, 40);
         QVERIFY(plugins::hosting().bypassWithSilence);

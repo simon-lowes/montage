@@ -142,8 +142,11 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     Result r = Result::Ok;
     if (sendPayload(c, *link->host, msg, timeout, &r)) {
         const InputResolver& inputs = currentInputs();
-        hd->flags = (hd->flags & wire::kPayloadInBlob) | (fetch && *fetch ? wire::kHasFetch : 0) | (inputs ? wire::kHasInputs : 0) |
-                    (withMask ? wire::kHasMask : 0);
+        uint32_t flags = hd->flags & wire::kPayloadInBlob;
+        if (fetch && *fetch) flags |= wire::kHasFetch;
+        if (inputs) flags |= wire::kHasInputs;
+        if (withMask) flags |= wire::kHasMask;
+        hd->flags = flags;
         hd->argI = int64_t(kind);
         hd->argI2 = w;
         hd->argI3 = h;

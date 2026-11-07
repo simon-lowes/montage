@@ -16,7 +16,7 @@
 namespace montage::plugins::wire {
 
 constexpr uint32_t kMagic = 0x3148504d;  // "MPH1"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr int kMaxChannels = 32;
 constexpr int kMaxFrames = 8192;
 constexpr int kMaxParamChanges = 1024;
@@ -80,6 +80,9 @@ struct ParamChange {
 struct Header {
     uint32_t magic;
     uint32_t version;
+    // Set by the host as it crashes (the signal, or on Windows the exception code), before the process has ended:
+    // a core dump or a crash reporter can keep a crashed process from ending for seconds.
+    std::atomic<uint32_t> crashed;
     alignas(64) std::atomic<uint32_t> toHost;
     alignas(64) std::atomic<uint32_t> toClient;
     alignas(64) uint32_t command;

@@ -165,6 +165,7 @@ bool Channel::create(std::string* error) {
     h = wire::header(mem->data());
     h->magic = wire::kMagic;
     h->version = wire::kVersion;
+    h->crashed.store(0, std::memory_order_relaxed);
     return true;
 }
 
@@ -174,15 +175,27 @@ void Channel::unlinkNames() {
     if (toClient) toClient->unlinkName();
 }
 
+uint32_t Host::crashCode() const { return control.h ? control.h->crashed.load(std::memory_order_acquire) : 0; }
+
 bool Host::alive() {
     if (dead_.load(std::memory_order_acquire)) return false;
-    if (proc && proc->alive()) return true;
+    if (proc && proc->alive() && !crashCode()) return true;
     dead_.store(true, std::memory_order_release);
     return false;
 }
 
 std::string Host::howItEnded() {
     if (alive()) return {};
+    // (told by the host as it crashed, which is so whether or not the process has ended yet)
+    if (const uint32_t crash = crashCode()) {
+#ifdef _WIN32
+        char code[16];
+        std::snprintf(code, sizeof code, "0x%08X", unsigned(crash));
+        return std::string("crashed (exception ") + code + ")";
+#else
+        return "crashed (signal " + std::to_string(crash) + ")";
+#endif
+    }
     const int code = proc ? proc->exitCode() : -1;
     if (code == wire::kExitTooMuchMemory) return "used more memory than the limit (" + std::to_string(gMemoryLimitMb.load()) + " MB)";
     if (code == wire::kExitLostMontage) return "lost touch with Montage";
@@ -258,6 +271,7 @@ Result call(Channel& c, Host& host, int64_t timeoutUs, const std::function<void(
     const int64_t end = ipc::nowUs() + timeoutUs;
     // A reply still out from a message not waited for: the host takes the next one only after it.
     while (c.pending && !collectPending(c)) {
+        if (h->crashed.load(std::memory_order_acquire)) return Result::Dead;
         const int64_t left = end - ipc::nowUs();
         if (left <= 0) return Result::Timeout;
         if (!c.toClient->wait(&h->toClient, h->toClient.load(std::memory_order_acquire), std::min<int64_t>(left, 2000)) && !host.alive())
@@ -282,6 +296,7 @@ Result call(Channel& c, Host& host, int64_t timeoutUs, const std::function<void(
             }
             return Result::Ok;
         }
+        if (h->crashed.load(std::memory_order_acquire)) return Result::Dead;  // (it may not have ended yet)
         const int64_t left = end - ipc::nowUs();
         if (left <= 0) {
             c.pending = c.seq;
@@ -676,6 +691,7 @@ void reportFailure(Core& core, bool same) {
                          : "stopped responding (" + std::to_string(core.missed.load()) + " audio blocks late in a row) and was stopped";
         if (host) host->kill();
     } else {
+        if (host && host->crashCode()) host->kill();  // (crashed but not yet ended: a core dump, a crash reporter)
         const std::string how = host ? host->howItEnded() : std::string("ended");
         if (how.rfind("used more memory", 0) == 0) kind = "memory";
         reason = how.empty() ? "stopped answering" : how;
