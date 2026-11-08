@@ -11,8 +11,12 @@
 #include <QString>
 #include <QStringList>
 #include <QTimer>
+#include <atomic>
+#include <mutex>
 #include <optional>
+#include <vector>
 
+#include "audio/AudioDevice.h"
 #include "core/Model.h"
 
 class QAudioSource;
@@ -53,8 +57,12 @@ public:
     explicit VoiceoverRecorder(EditorState* state, QObject* parent = nullptr);
     ~VoiceoverRecorder() override;
 
-    // The audio inputs (descriptions), the system default first.
+    // The audio inputs (descriptions), the system default first; with a device chosen in Monitoring
+    // (audio/AudioDevice.h), its inputs by their port names.
     static QStringList inputs();
+    // The playback a take follows through that device (the program monitor's): each take then starts exactly where
+    // the picture was when what the talent heard was played, the device's round trip taken off.
+    void setClock(const QObject* playback) { clock_ = playback; }
     // Where takes go: a "Voiceover" folder beside the project (or in Music when it is unsaved).
     QString takeFolder() const;
     // Takes named otherwise: into folder `folder` (on disk beside the project, and in the bin), files `stem` 1, 2...
@@ -97,12 +105,24 @@ signals:
 
 private:
     void readDevice();
+    void drainDevice();  // what the device's input has brought, into the take (on this thread)
+    void closeDevice();
     Id stopLoop();
 
     EditorState* state_;
     WavWriter writer_;
     QAudioSource* source_ = nullptr;
     QPointer<QIODevice> io_;
+    // Through the device chosen in Monitoring: its input from channel firstInput_, placed by aligner_ on the audio
+    // thread and queued in pending_ for drain_ to write. A take that follows a clock is armed only once its caller has
+    // moved the playback to it (the next turn of the event loop), so a block of where it played before is not taken.
+    const void* clock_ = nullptr;
+    int tap_ = -1, firstInput_ = 0, takeNumber_ = 0;
+    std::atomic<bool> armed_{false};
+    audiodev::TakeAligner aligner_;
+    std::mutex pendingM_;
+    std::vector<float> pending_;
+    QTimer drain_;
     int rate_ = 48000, channels_ = 1, sampleBytes_ = 4;
     int format_ = 0;  // 0 float, 1 int16, 2 int32
     FrameTime at_ = 0, stopAt_ = -1;

@@ -54,6 +54,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [RNNoise](https://github.com/xiph/rnnoise) and its model | BSD-3-Clause | the source's `COPYING` (copied into the packages) |
 | [SQLite](https://www.sqlite.org) 3.50 (with FTS5), for the sound library's index | Public domain | none needed ([sqlite.org/copyright.html](https://www.sqlite.org/copyright.html)) |
 | [Lua](https://www.lua.org) 5.4 | MIT | [LICENSES/MIT-Lua.txt](LICENSES/MIT-Lua.txt) |
+| [PortAudio](https://www.portaudio.com) 19.7.0 (its ALSA, Core Audio and WASAPI host APIs), for the audio devices | MIT (with non-binding requests) | the source's `LICENSE.txt` (copied into the packages) |
 | [libvmx](https://github.com/openmediatransport/libvmx) (commit 31724bb), Open Media Transport's VMX codec, with [sse2neon](https://github.com/DLTcollab/sse2neon) on ARM | MIT, MIT | the source's `LICENSE.txt` (copied into the packages); [LICENSES/MIT-sse2neon.txt](LICENSES/MIT-sse2neon.txt) |
 | [x265](https://www.x265.org) 4.2, built with its multiview encoder for spatial video (MV-HEVC) export | GPL-2.0-or-later | the source's `COPYING` (copied into the packages; the release sources carry its tarball) |
 | [ThorVG](https://github.com/thorvg/thorvg), with RapidJSON (MIT) and JerryScript (Apache-2.0) | MIT, MIT, Apache-2.0 | the source's licence files (copied into the packages) |

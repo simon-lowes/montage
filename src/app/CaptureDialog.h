@@ -99,6 +99,7 @@ private:
     QLineEdit* url_;
     QPushButton* find_;
     QLineEdit* sound_;
+    QDoubleSpinBox* soundLatency_;
     QLineEdit* options_;
     QCheckBox* nmos_;
     QLabel* nmosStatus_;

@@ -2870,6 +2870,10 @@ void MainWindow::buildMenus() {
             return monitoring_->runTool(args, structured, isError);
         });
     if (liveLink_)
+        liveLink_->addAppTool(MonitoringPanel::deviceToolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return monitoring_->runDeviceTool(args, structured, isError);
+        });
+    if (liveLink_)
         liveLink_->addAppTool(RemoteReviewController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return remoteReview_->runTool(args, structured, isError);
         });

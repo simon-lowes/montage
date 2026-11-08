@@ -27,6 +27,7 @@
 #include "EditorState.h"
 #include "ReferenceOutputPanel.h"
 #include "Settings.h"
+#include "audio/AudioDevice.h"
 #include "media/ImageSequence.h"
 #include "render/Nmos.h"
 #include "render/St2110Receive.h"
@@ -109,6 +110,19 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     sound_->setObjectName(QStringLiteral("captureSound"));
     sound_->setPlaceholderText(tr("The feed's own sound"));
     form->addRow(tr("Sound device:"), sound_);
+    // The sound's latency, taken off so it lines up with the pictures: the device's input latency as Monitoring's audio
+    // device reports it (a measured loopback's half where one was run), or set by hand.
+    soundLatency_ = new QDoubleSpinBox(this);
+    soundLatency_->setObjectName(QStringLiteral("captureSoundLatency"));
+    soundLatency_->setRange(0, 2000);
+    soundLatency_->setDecimals(1);
+    soundLatency_->setSuffix(tr(" ms"));
+    soundLatency_->setToolTip(tr("How late a sound device's sound arrives (its input latency): taken off, so it lines up with the pictures (a feed's own sound keeps its times)"));
+    if (const audiodev::Engine& engine = audiodev::Engine::shared(); engine.active()) {
+        const audiodev::EngineStatus st = engine.status();
+        if (st.rate > 0) soundLatency_->setValue(1000.0 * (st.measured ? st.roundTrip / 2 : st.latency.input) / st.rate);
+    }
+    form->addRow(tr("Sound latency:"), soundLatency_);
     options_ = new QLineEdit(settings.value(QStringLiteral("capture/options")).toString(), this);
     options_->setObjectName(QStringLiteral("captureOptions"));
     options_->setPlaceholderText(tr("FFmpeg's input options, e.g. video_size=1920x1080 framerate=25"));
@@ -536,6 +550,7 @@ bool CaptureDialog::record() {
     cs.path = path_.toStdString();
     cs.timecode = tc.toStdString();
     cs.seconds = seconds_->value();
+    cs.soundLatency = soundLatency_->value() / 1000.0;
     if (recorder_) recorder_->stop();
     if (!startLive(cs)) {
         refresh();
@@ -621,12 +636,12 @@ QString CaptureDialog::statusText() const { return status_->text(); }
 
 QByteArray CaptureDialog::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_capture","title":"Capture (record a live feed)",
-"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url. \"live\" with record: a live package of the feed as it records (HLS and DASH with a sliding window of window segments of 2 s, into folder; low_latency: in parts sent as they are made; segments ts: HLS in MPEG-TS; sound aac, libopus, ac3, eac3 or none; serve: from here over HTTP on port, network for other computers too).",
+"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped), sound_latency_ms (how late the sound arrives, taken off; default Monitoring's audio device's input latency). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url. \"live\" with record: a live package of the feed as it records (HLS and DASH with a sliding window of window segments of 2 s, into folder; low_latency: in parts sent as they are made; segments ts: HLS in MPEG-TS; sound aac, libopus, ac3, eac3 or none; serve: from here over HTTP on port, network for other computers too).",
 "inputSchema":{"type":"object","properties":{
 "action":{"type":"string","enum":["kinds","record","stop","status","nmos"]},"offer":{"type":"boolean"},
 "kind":{"type":"string"},"url":{"type":"string"},"options":{"type":"string"},"sound":{"type":"string"},
 "codec":{"type":"string"},"wrapper":{"type":"string","enum":["mov","mxf"]},"folder":{"type":"string"},"name":{"type":"string"},
-"timecode":{"type":"string"},"seconds":{"type":"number","minimum":0},
+"timecode":{"type":"string"},"seconds":{"type":"number","minimum":0},"sound_latency_ms":{"type":"number","minimum":0,"maximum":2000},
 "live":{"type":"object","properties":{"folder":{"type":"string"},"hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
 "low_latency":{"type":"boolean","default":false},"window":{"type":"integer","minimum":3,"maximum":100,"default":6},
 "segments":{"type":"string","enum":["cmaf","ts"],"default":"cmaf"},"sound":{"type":"string","enum":["aac","libopus","ac3","eac3","none"],"default":"aac"},
@@ -665,6 +680,7 @@ QString CaptureDialog::runTool(const QJsonObject& args, QJsonObject& structured,
         if (args.contains("name")) setClipName(args.value("name").toString());
         setTimecode(args.value("timecode").toString());
         setSeconds(args.value("seconds").toDouble(0));
+        if (args.contains("sound_latency_ms")) soundLatency_->setValue(args.value("sound_latency_ms").toDouble());
         LiveOptions lo;  // (none unless asked)
         if (args.value("live").isObject()) {
             const QJsonObject l = args.value("live").toObject();

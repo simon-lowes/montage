@@ -5,6 +5,8 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QThread>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonObject>
@@ -18,8 +20,10 @@
 #include <cstring>
 #include <cstdio>
 #include <functional>
+#include <mutex>
 
 #include "audio/AraHost.h"
+#include "audio/AudioDevice.h"
 #include "audio/PluginEffect.h"
 #include "audio/PluginHost.h"
 #include "audio/PluginIpc.h"
@@ -219,6 +223,54 @@ std::vector<float> testNoise(size_t n, uint32_t seed) {
         x = float(int32_t(seed >> 8) % 20000) / 20000.0f * 0.8f;
     }
     return v;
+}
+
+// A device test's playback: a click at timeline sample `clickAt` on its first channel, its blocks numbered from 0.
+struct Clicker {
+    std::atomic<int64_t> pos{0};
+    int64_t clickAt = 4800;
+    int64_t render(float* out, int channels, int frames) {
+        const int64_t p = pos.fetch_add(frames);
+        std::fill(out, out + size_t(frames) * size_t(channels), 0.0f);
+        if (clickAt >= p && clickAt < p + frames) out[size_t(clickAt - p) * size_t(channels)] = 0.8f;
+        return p;
+    }
+};
+
+// A device test's recording of the first input, placed as a take starting at timeline sample 0.
+struct Take {
+    std::mutex m;
+    std::vector<float> got;
+    audiodev::TakeAligner aligner{0, true};
+    void add(const float* in, int channels, int frames, int64_t sample) {
+        const audiodev::TakeAligner::Step st = aligner.next(sample, frames);
+        std::lock_guard<std::mutex> lock(m);
+        got.resize(got.size() + size_t(st.silence), 0.0f);
+        for (int i = st.skip; i < frames; ++i) got.push_back(in[size_t(i) * size_t(channels)]);
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m);
+        return got.size();
+    }
+    int64_t click() {
+        std::lock_guard<std::mutex> lock(m);
+        return audiodev::findClick(got.data(), int64_t(got.size()));
+    }
+};
+
+// Records a click through `e` (open): where it lands in the take.
+int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
+    Clicker clicker;
+    Take take;
+    const int out = e.addOutput(&clicker, rate, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+    const int in = e.addInput(&clicker, rate, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+    if (out < 0 || in < 0) return -2;
+    QElapsedTimer t;
+    t.start();
+    while (take.size() < size_t(clicker.clickAt + rate / 10) && t.elapsed() < 10000) QThread::msleep(10);
+    e.removeInput(in);
+    e.removeOutput(out);
+    return take.click();
 }
 
 // Each test runs twice: in Montage's own process and in plug-in hosts.
@@ -2409,6 +2461,232 @@ private slots:
         o = call({{"clear_failures", true}}).value("structuredContent").toObject();
         QCOMPARE(o.value("failures").toArray().size(), 0);
         QVERIFY(!o.value("hosts").toArray().isEmpty());
+    }
+
+    void audioDeviceSettings() {
+        // The device's settings round-trip, buffers are powers of two from 32 to 2048, and a measured loopback is used
+        // only at the rate and buffer it was measured at.
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Jack;
+        s.output = "system";
+        s.sampleRate = 96000;
+        s.bufferFrames = 128;
+        s.clock = "Word clock";
+        s.inputs = 4;
+        s.inputNames = {"Dialogue", "", "Room"};
+        s.loopbackFrames = 700, s.loopbackRate = 96000, s.loopbackBuffer = 128;
+        QCOMPARE(audiodev::DeviceSettings::fromJson(s.toJson()), s);
+        QCOMPARE(audiodev::clampBuffer(1), 32);
+        QCOMPARE(audiodev::clampBuffer(100), 128);
+        QCOMPARE(audiodev::clampBuffer(256), 256);
+        QCOMPARE(audiodev::clampBuffer(9000), 2048);
+        QCOMPARE(audiodev::inputName(s, 0), std::string("Dialogue"));
+        QCOMPARE(audiodev::inputName(s, 1), std::string("In 2"));
+        QCOMPARE(audiodev::inputName(s, 3), std::string("In 4"));
+        bool measured = false;
+        QCOMPARE(audiodev::roundTrip(s, 96000, 128, {200, 300}, &measured), 700);
+        QVERIFY(measured);
+        QCOMPARE(audiodev::roundTrip(s, 48000, 128, {200, 300}, &measured), 500);
+        QVERIFY(!measured);
+        QCOMPARE(audiodev::hostFromId("wasapi_exclusive").value(), audiodev::Host::WasapiExclusive);
+        QVERIFY(!audiodev::hostFromId("nothing"));
+        QVERIFY(!audiodev::hostBuilt(audiodev::Host::Asio));  // (its SDK is not built)
+        QCOMPARE(audiodev::availableHosts().front(), audiodev::Host::Qt);
+
+        // A click is found at its first sample of half its peak; quiet recordings have none.
+        std::vector<float> r(1000, 0.001f);
+        r[400] = 0.3f, r[401] = 0.9f, r[402] = 0.5f;
+        QCOMPARE(audiodev::findClick(r.data(), 1000), int64_t(401));
+        QCOMPARE(audiodev::findClick(r.data(), 400), int64_t(-1));
+
+        // Takes: clocked, blocks wait for the playback; a later block starts after silence, an earlier one is cut.
+        audiodev::TakeAligner wait(1000, true);
+        QCOMPARE(wait.next(-1, 256).skip, 256);
+        QVERIFY(!wait.started());
+        audiodev::TakeAligner::Step st = wait.next(1100, 256);
+        QCOMPARE(st.silence, int64_t(100));
+        QCOMPARE(st.skip, 0);
+        audiodev::TakeAligner early(1000, true);
+        st = early.next(700, 256);
+        QCOMPARE(st.skip, 256);
+        st = early.next(956, 256);
+        QCOMPARE(st.skip, 44);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(early.next(1212, 256).skip, 0);
+        // Unclocked, the input's latency is taken off its start.
+        audiodev::TakeAligner loose(0, false, 300);
+        QCOMPARE(loose.next(-1, 256).skip, 256);
+        QCOMPARE(loose.next(-1, 256).skip, 44);
+        QCOMPARE(loose.next(-1, 256).skip, 0);
+    }
+
+    void loopbackRecordingLandsAtZero_data() {
+        QTest::addColumn<int>("buffer");
+        QTest::newRow("64") << 64;
+        QTest::newRow("256") << 256;
+        QTest::newRow("1024") << 1024;
+    }
+    void loopbackRecordingLandsAtZero() {
+        // A click played out through a loopback (the outputs back on the inputs, as by a cable) is recorded and, the
+        // device's reported latencies taken off, lands where it was played.
+        QFETCH(int, buffer);
+        audiodev::setLoopbackOptions({buffer, 2 * buffer, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = buffer;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        const audiodev::EngineStatus st = e.status();
+        QCOMPARE(st.buffer, buffer);
+        QCOMPARE(st.latency.input, buffer);
+        QCOMPARE(st.latency.output, 2 * buffer);
+        QCOMPARE(st.roundTrip, 3 * buffer);
+        QVERIFY(!st.measured);
+        QCOMPARE(recordClick(e), int64_t(4800));
+
+        // A round trip longer than the device says (converters it does not report): measured, and taken off instead.
+        audiodev::setLoopbackOptions({buffer, 2 * buffer, 300});
+        s.host = audiodev::Host::Qt;
+        e.setSettings(s);
+        QVERIFY(!e.isOpen());
+        s.host = audiodev::Host::Loopback;
+        e.setSettings(s);
+        QCOMPARE(recordClick(e), int64_t(4800 + 300));
+        std::string why;
+        QCOMPARE(e.measureLoopback(0, 0, 0.5, &why), 3 * buffer + 300);
+        QVERIFY(e.status().measured);
+        QCOMPARE(e.settings().loopbackFrames, 3 * buffer + 300);
+        QCOMPARE(recordClick(e), int64_t(4800));
+        // Nothing joined from that output to that input: nothing measured, and the last measurement kept.
+        QCOMPARE(e.measureLoopback(1, 0, 0.2, &why), -1);
+        QVERIFY(!why.empty());
+        QCOMPARE(e.settings().loopbackFrames, 3 * buffer + 300);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void loopbackFollowsRateChanges() {
+        // The device's rate changed mid-session (as a server's is): Montage follows it, resampling its 48 kHz both ways,
+        // and recordings still land where they were played.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QCOMPARE(recordClick(e), int64_t(4800));
+        audiodev::loopbackChangeRate(96000);
+        QTRY_COMPARE(e.status().rate, 96000);
+        QCOMPARE(e.status().rateChanges, 1);
+        QCOMPARE(e.roundTripAt(48000), 256);  // (512 frames at 96 kHz)
+        const int64_t at = recordClick(e);
+        QVERIFY2(std::llabs(at - 4800) <= 16, qPrintable(QString::number(at)));
+        // The playback still runs in real time at its own rate: about 48000 of its samples a second.
+        Clicker clicker;
+        const int id = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+        QVERIFY(id >= 0);
+        QTest::qWait(1000);
+        const int64_t played = clicker.pos.load();
+        e.removeOutput(id);
+        QVERIFY2(played > 40000 && played < 58000, qPrintable(QString::number(played)));
+        audiodev::setLoopbackOptions({});
+    }
+
+    void overloadedCallbackIsAnXrun() {
+        // A callback held past its period (an overloaded computer) is counted as an xrun, and the count can be reset.
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 128;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QTest::qWait(200);
+        e.resetXruns();
+        const int64_t before = e.status().xruns;
+        QVERIFY(before < 3);
+        audiodev::loopbackStall(60);
+        QTRY_VERIFY(e.status().xruns > before);
+        e.resetXruns();
+        QVERIFY(e.status().xruns < 3);
+    }
+
+    void jackPortsAndLoopback() {
+        // Under JACK's dummy driver (a test tool), or a PipeWire server with its JACK library: Montage's ports appear with
+        // the monitoring section's names, a click looped from an output port back into an input port is recorded and,
+        // the loop measured, lands where it was played at buffers of 64, 256 and 1024, and an overloaded callback is an
+        // xrun.
+        QProcess jackd;
+        const QString server = QStringLiteral("montage-test-%1").arg(QCoreApplication::applicationPid());
+        const QString exe = QStandardPaths::findExecutable(QStringLiteral("jackd"));
+        if (!exe.isEmpty()) {
+            qputenv("JACK_DEFAULT_SERVER", server.toUtf8());
+            qputenv("JACK_NO_AUDIO_RESERVATION", "1");
+            jackd.start(exe, {"--no-realtime", "-n", server, "-d", "dummy", "-r", "48000", "-p", "256"});
+            QVERIFY(jackd.waitForStarted(5000));
+        }
+        if (audiodev::jackLibrary().empty()) QSKIP("No JACK library (PipeWire's or a system libjack) loads here");
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Jack;
+        s.bufferFrames = 256;
+        s.inputs = 2;
+        s.inputNames = {"Dialogue", "Room"};
+        s.autoConnect = false;
+        e.setOutputNames({"L", "R", "C"});
+        e.setOutputChannels(3);
+        QElapsedTimer t;
+        t.start();
+        do {
+            e.setSettings(audiodev::DeviceSettings{});
+            e.setSettings(s);
+            if (!e.isOpen()) QThread::msleep(200);
+        } while (!e.isOpen() && t.elapsed() < 10000);
+        if (!e.isOpen()) {
+            if (exe.isEmpty()) QSKIP("No jackd here, and no JACK or PipeWire server answers");
+            QFAIL(e.status().error.c_str());
+        }
+        const audiodev::EngineStatus st = e.status();
+        for (const char* port : {":L", ":R", ":C", ":Dialogue", ":Room"})
+            QVERIFY2(std::any_of(st.ports.begin(), st.ports.end(), [&](const std::string& p) { return p.size() > strlen(port) && p.compare(p.size() - strlen(port), strlen(port), port) == 0; }),
+                     port);
+        const std::string client = st.ports.front().substr(0, st.ports.front().find(':'));
+        // The speakers renamed (another set): the ports follow.
+        e.setOutputNames({"Lw", "Rw", "Cw"});
+        const auto renamed = e.status().ports;
+        QVERIFY(std::find(renamed.begin(), renamed.end(), client + ":Lw") != renamed.end());
+        for (int buffer : {64, 256, 1024}) {
+            s.bufferFrames = buffer;
+            s.loopbackFrames = 0;
+            e.setSettings(audiodev::DeviceSettings{});
+            e.setSettings(s);
+            QVERIFY2(e.isOpen(), e.status().error.c_str());
+            QVERIFY(e.connect(client + ":Lw", client + ":Dialogue"));
+            std::string why;
+            const int trip = e.measureLoopback(0, 0, 0.5, &why);
+            QVERIFY2(trip > 0, why.c_str());
+            QCOMPARE(recordClick(e, e.status().rate), int64_t(4800));
+        }
+        // A callback that overruns its period.
+        e.resetXruns();
+        const int64_t before = e.status().xruns;
+        std::atomic<int> slow{1};
+        const int id = e.addOutput(&slow, 48000, 2, [&](float* o, int ch, int n) {
+            std::fill(o, o + size_t(n) * size_t(ch), 0.0f);
+            if (slow.exchange(0)) QThread::msleep(100);
+            return int64_t(-1);
+        });
+        QVERIFY(id >= 0);
+        QTRY_VERIFY_WITH_TIMEOUT(e.status().xruns > before, 5000);
+        e.removeOutput(id);
+        e.setSettings(audiodev::DeviceSettings{});
+        if (jackd.state() != QProcess::NotRunning) {
+            jackd.terminate();
+            jackd.waitForFinished(5000);
+        }
     }
 
     void araPlugIns() {

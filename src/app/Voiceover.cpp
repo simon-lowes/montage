@@ -97,7 +97,10 @@ bool WavWriter::close() {
 // ---------------------------------------------------------------------------
 // VoiceoverRecorder
 
-VoiceoverRecorder::VoiceoverRecorder(EditorState* state, QObject* parent) : QObject(parent), state_(state) {}
+VoiceoverRecorder::VoiceoverRecorder(EditorState* state, QObject* parent) : QObject(parent), state_(state) {
+    drain_.setInterval(20);
+    connect(&drain_, &QTimer::timeout, this, &VoiceoverRecorder::drainDevice);
+}
 
 VoiceoverRecorder::~VoiceoverRecorder() {
     if (isRecording()) cancel();
@@ -105,6 +108,11 @@ VoiceoverRecorder::~VoiceoverRecorder() {
 
 QStringList VoiceoverRecorder::inputs() {
     QStringList out;
+    if (const audiodev::Engine& engine = audiodev::Engine::shared(); engine.active()) {
+        const audiodev::DeviceSettings ds = engine.settings();
+        for (int k = 0; k < ds.inputs; ++k) out << QString::fromStdString(audiodev::inputName(ds, k));
+        return out;
+    }
     const QAudioDevice def = QMediaDevices::defaultAudioInput();
     if (!def.isNull()) out << def.description();
     for (const QAudioDevice& d : QMediaDevices::audioInputs())
@@ -136,7 +144,14 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
     channels_ = std::max(1, channels);
     format_ = 0;
     sampleBytes_ = 4;
-    if (openDevice) {
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    const bool onDevice = openDevice && engine.active();
+    if (onDevice) {
+        // The device's inputs from the one named (its first, else), at the sequence's rate.
+        const QStringList names = inputs();
+        firstInput_ = std::max(0, int(names.indexOf(input)));
+        rate_ = s->sampleRate;
+    } else if (openDevice) {
         QAudioDevice device = QMediaDevices::defaultAudioInput();
         for (const QAudioDevice& d : QMediaDevices::audioInputs())
             if (!input.isEmpty() && d.description() == input) device = d;
@@ -169,6 +184,42 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         return false;
     }
     stopping_ = false;
+    if (onDevice) {
+        // Placed by the playback it follows (the round trip taken off), else the input's latency taken off its start.
+        const int64_t first = std::llround(double(at_) / s->fpsValue() * rate_);
+        const audiodev::EngineStatus st = engine.status();
+        const int64_t fallback = st.rate > 0 ? std::llround(double(st.measured ? st.roundTrip / 2 : st.latency.input) * rate_ / st.rate) : 0;
+        aligner_ = audiodev::TakeAligner(first, clock_ != nullptr, fallback);
+        {
+            std::lock_guard<std::mutex> lock(pendingM_);
+            pending_.clear();
+        }
+        std::string error;
+        armed_ = clock_ == nullptr;
+        tap_ = engine.addInput(clock_, rate_, [this](const float* in, int channels, int frames, int64_t sample) {
+            if (!armed_.load()) return;
+            const audiodev::TakeAligner::Step step = aligner_.next(sample, frames);
+            if (step.silence == 0 && step.skip >= frames) return;
+            std::lock_guard<std::mutex> lock(pendingM_);
+            if (pending_.size() > size_t(rate_) * size_t(channels_) * 120) return;  // (no one is draining: a stuck main thread)
+            pending_.resize(pending_.size() + size_t(step.silence) * size_t(channels_), 0.0f);
+            for (int i = step.skip; i < frames; ++i)
+                for (int c = 0; c < channels_; ++c) {
+                    const int from = firstInput_ + c;
+                    pending_.push_back(from < channels ? in[size_t(i) * size_t(channels) + size_t(from)] : 0.0f);
+                }
+        }, &error);
+        if (tap_ < 0) {
+            cancel();
+            state_->message(tr("The audio input could not be opened: %1").arg(QString::fromStdString(error)), 5000);
+            return false;
+        }
+        drain_.start();
+        if (clock_)
+            QMetaObject::invokeMethod(this, [this, take = ++takeNumber_] {
+                if (take == takeNumber_ && tap_ >= 0) armed_ = true;
+            }, Qt::QueuedConnection);
+    }
     if (source_) {
         io_ = source_->start();
         if (!io_) {
@@ -226,6 +277,22 @@ void VoiceoverRecorder::readDevice() {
     feed(buf.data(), frames);
 }
 
+void VoiceoverRecorder::drainDevice() {
+    std::vector<float> got;
+    {
+        std::lock_guard<std::mutex> lock(pendingM_);
+        got.swap(pending_);
+    }
+    if (!got.empty()) feed(got.data(), qint64(got.size() / size_t(channels_)));
+}
+
+void VoiceoverRecorder::closeDevice() {
+    if (tap_ < 0) return;
+    audiodev::Engine::shared().removeInput(tap_);
+    tap_ = -1;
+    drain_.stop();
+}
+
 void VoiceoverRecorder::feed(const float* interleaved, qint64 frames) {
     if (!isRecording() || stopping_) return;
     const Sequence* s = state_->sequence();
@@ -246,6 +313,10 @@ void VoiceoverRecorder::feed(const float* interleaved, qint64 frames) {
 
 Id VoiceoverRecorder::stop() {
     if (!isRecording()) return 0;
+    if (tap_ >= 0) {
+        closeDevice();
+        drainDevice();  // (what came before the stop)
+    }
     stopping_ = true;
     if (source_) {
         source_->stop();
@@ -407,6 +478,11 @@ Id VoiceoverRecorder::stopLoop() {
 void VoiceoverRecorder::cancel() {
     loopIn_ = loopOut_ = preroll_ = 0;
     groupTracks_.clear();
+    closeDevice();
+    {
+        std::lock_guard<std::mutex> lock(pendingM_);
+        pending_.clear();
+    }
     if (source_) {
         source_->stop();
         source_->deleteLater();
@@ -423,6 +499,7 @@ void VoiceoverRecorder::cancel() {
 
 VoiceoverDialog::VoiceoverDialog(EditorState* state, PlaybackController* program, QWidget* parent)
     : QDialog(parent), state_(state), program_(program), recorder_(new VoiceoverRecorder(state, this)) {
+    recorder_->setClock(program);
     setWindowTitle(tr("Record Voiceover"));
     setObjectName(QStringLiteral("voiceoverDialog"));
     auto* form = new QFormLayout(this);

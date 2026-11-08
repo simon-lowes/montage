@@ -315,6 +315,7 @@ add_library(montage_engine STATIC
   audio/DialogueAlign.h audio/DialogueAlign.cpp
   audio/ElasticAudio.h audio/ElasticAudio.cpp
   audio/Sampler.h audio/Sampler.cpp
+  audio/AudioDevice.h audio/AudioDevice.cpp audio/AudioDeviceInternal.h audio/JackDevice.cpp audio/PortAudioDevice.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/LtcChase.h audio/LtcChase.cpp
@@ -685,6 +686,11 @@ endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_THORVG)
+endif()
+
+if(MONTAGE_WITH_PORTAUDIO)
+  target_link_libraries(montage_engine PRIVATE montage_portaudio)
+  target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_PORTAUDIO)
 endif()
 
 if(MONTAGE_WITH_LUA)

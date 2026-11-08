@@ -178,6 +178,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/AudioDevice.h"
 #include "audio/ElasticAudio.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
@@ -12554,6 +12555,156 @@ const auto seq = [this] { return state()->sequence(); };
         // A rating on one track's take rates that pass on the others.
         QVERIFY(state()->apply("Rate", [&](Project&, Sequence& s) { return edit::rateGroupLane(s, {TrackKind::Audio, 2}, s.audioTracks[2].lanes[0].id, 4); }));
         for (int t = 0; t < 3; ++t) QCOMPARE(track(t).lanes[0].rating, 4);
+        state()->newProject();
+    }
+
+    void recordingThroughTheAudioDevice() {
+        // Through Monitoring's audio device (the loopback here: its outputs come back on its inputs, late by the
+        // latencies it reports, as an interface with a cable from output to input would), a voiceover take and an ADR
+        // take land where what was heard was played, the round trip taken off; the picture (and the sampler's notes)
+        // follow what is heard, the output latency taken off; MCP reads and sets it; Capture offers its input latency.
+        const int rate = 48000;
+        // (in a folder of its own: its takes are not counted by the other recording tests)
+        QVERIFY(QDir().mkpath(dir_.path() + "/device"));
+        const QString click = dir_.path() + "/device/click.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(click, rate, 1));
+            std::vector<float> x(size_t(rate) * 9, 0.0f);
+            x[size_t(rate)] = 0.8f;      // at 1 s
+            x[size_t(rate) * 6] = 0.8f;  // at 6 s (in the ADR line)
+            w.write(x.data(), qint64(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/device/device.montage"));
+        const auto ids = state()->importFiles({click});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Click", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids.front(), 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 1}, false);
+        }));
+        QCOMPARE(state()->sequence()->sampleRate, rate);
+        const double fps = state()->sequence()->fpsValue();
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        auto* monitoring = win_->findChild<MonitoringPanel*>();
+        QVERIFY(program && monitoring);
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_audio_device"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "get"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("hosts").toArray().first().toString(), QString("qt"));
+        QCOMPARE(r.value("structuredContent").toObject().value("status").toObject().value("open").toBool(), false);
+        audiodev::setLoopbackOptions({256, 512, 0});
+        r = call({{"action", "set"},
+                  {"settings", QJsonObject{{"host", "loopback"}, {"buffer", 256}, {"sample_rate", 0}, {"inputs", 2},
+                                           {"input_names", QJsonArray{"Talent", "Room"}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject st = r.value("structuredContent").toObject().value("status").toObject();
+        QVERIFY(st.value("open").toBool());
+        QCOMPARE(st.value("sample_rate").toInt(), rate);
+        QCOMPARE(st.value("buffer").toInt(), 256);
+        QCOMPARE(st.value("input_latency").toInt(), 256);
+        QCOMPARE(st.value("output_latency").toInt(), 512);
+        QCOMPARE(st.value("round_trip").toInt(), 768);
+        QCOMPARE(VoiceoverRecorder::inputs(), (QStringList{"Talent", "Room"}));
+        // The panel shows it (16 ms taken off recordings, as reported), with its driver chosen.
+        QTRY_VERIFY(monitoring->findChild<QLabel*>("monitorDeviceStatus")->text().contains("16.0 ms"));
+        QCOMPARE(monitoring->findChild<QComboBox*>("monitorDriver")->currentData().toString(), QString("loopback"));
+        QVERIFY(monitoring->findChild<QComboBox*>("monitorDeviceBuffer")->isEnabled());
+        // Capture offers the device's input latency for its sound (256 frames).
+        {
+            CaptureDialog capture(state());
+            QCOMPARE(capture.findChild<QDoubleSpinBox*>("captureSoundLatency")->value(), 5.3);
+        }
+
+        // A voiceover take: the click heard at 1 s is at 1 s in the take.
+        auto readTake = [&](const QString& path) {
+            QFile f(path);
+            std::vector<float> x;
+            if (!f.open(QIODevice::ReadOnly)) return x;
+            const QByteArray all = f.readAll();
+            x.resize(size_t(std::max<qsizetype>(0, all.size() - 44)) / 4);
+            std::memcpy(x.data(), all.constData() + 44, x.size() * 4);
+            return x;
+        };
+        {
+            VoiceoverRecorder rec(state());
+            rec.setClock(program);
+            rec.setPlacing(false);
+            QVERIFY(rec.start(0, 0, -1, "Talent"));
+            program->seek(0);
+            program->play();
+            QTRY_VERIFY(program->onDevice());
+            // The picture follows what is heard: the sample the program shows trails what was last sent by the output
+            // latency (512), within a block (a tap following it sees the block sent, less the round trip).
+            std::atomic<int64_t> sent{-1};
+            audiodev::Engine& engine = audiodev::Engine::shared();
+            const int tap = engine.addInput(program, rate, [&](const float*, int, int, int64_t at) {
+                if (at >= 0) sent = at + 768;
+            });
+            QVERIFY(tap >= 0);
+            std::vector<int64_t> gaps;
+            for (int i = 0; i < 20; ++i) {
+                QTest::qWait(40);
+                if (sent.load() >= 0) gaps.push_back(sent.load() - program->heardSample());
+            }
+            engine.removeInput(tap);
+            QVERIFY(gaps.size() > 10);
+            std::sort(gaps.begin(), gaps.end());
+            const int64_t gap = gaps[gaps.size() / 2];
+            QVERIFY2(gap > 512 - 300 && gap < 512 + 300, qPrintable(QString::number(gap)));
+            QTRY_VERIFY_WITH_TIMEOUT(rec.seconds() > 1.4, 5000);
+            rec.stop();
+            program->pause();
+            const std::vector<float> take = readTake(rec.lastTake());
+            QVERIFY(take.size() > size_t(rate));
+            const int64_t at = audiodev::findClick(take.data(), int64_t(take.size()));
+            QVERIFY2(std::llabs(at - rate) <= 1, qPrintable(QString::number(at)));
+        }
+
+        // An ADR take, through the ADR panel: the click on A2 at 6 s lands where the cycle had it.
+        state()->apply("Cue", [](Project& p, Sequence& s) {
+            CaptionTrack ct;
+            ct.id = p.newId();
+            Caption c;
+            c.start = 165, c.end = 200, c.text = "MAYA: We should go.";
+            ct.captions.push_back(c);
+            s.captionTracks.push_back(ct);
+            return edit::Result{};
+        });
+        auto* adr = win_->findChild<AdrPanel*>("adrPanel");
+        QVERIFY(adr);
+        auto* adrDock = qobject_cast<QDockWidget*>(adr->parentWidget());
+        const bool adrShown = adrDock && adrDock->isVisible();
+        win_->findChild<QAction*>("showAdr")->trigger();
+        adr->setUseInputDevice(true);
+        QCOMPARE(adr->addCuesFromCaptions(), 1);
+        adr->record();
+        QVERIFY(adr->isRecording());
+        const AdrCycle cyc = *program->adrCycle();
+        QTRY_VERIFY_WITH_TIMEOUT(!adr->isRunning(), 30000);
+        const Id clip = state()->sequence()->adrCues.empty() ? 0 : state()->sequence()->adrCues[0].clip;
+        QVERIFY(clip);
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c);
+        const std::vector<float> take = readTake(QString::fromStdString(state()->project().findMedia(c->mediaId)->path));
+        const int64_t want = 6 * rate - int64_t(std::llround(double(cyc.playFrom) / fps * rate));
+        const int64_t at = audiodev::findClick(take.data(), int64_t(take.size()));
+        QVERIFY2(std::llabs(at - want) <= 1, qPrintable(QString("%1, not %2").arg(at).arg(want)));
+
+        // Back to the system's devices.
+        r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!audiodev::Engine::shared().isOpen() && !program->onDevice());
+        QCOMPARE(monitoring->findChild<QComboBox*>("monitorDriver")->currentData().toString(), QString("qt"));
+        audiodev::setLoopbackOptions({});
+        if (adrDock && !adrShown) adrDock->hide();
         state()->newProject();
     }
 

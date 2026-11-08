@@ -61,6 +61,7 @@ public:
 
 AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget* viewer, QWidget* parent)
     : QWidget(parent), state_(state), program_(program), recorder_(new VoiceoverRecorder(state, this)) {
+    recorder_->setClock(program);
     setObjectName(QStringLiteral("adrPanel"));
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(4, 4, 4, 4);

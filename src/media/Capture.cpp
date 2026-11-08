@@ -1035,6 +1035,9 @@ void Recorder::run() {
             audioBaseSample = int64_t(std::llround(double(nextFrame) / av_q2d(fps) * 48000));
         }
         if (!std::isnan(t)) expected = sameInput ? int64_t(std::llround((t - t0) * 48000)) : audioBaseSample + int64_t(std::llround((t - audioBase) * 48000));
+        // (a sound device's sound, arriving late by its latency, belongs that much earlier; the feed's own sound keeps
+        // its times, and sound without times is moved once, at its start)
+        if (!sameInput && (!std::isnan(t) || !audioStarted)) expected -= int64_t(std::llround(std::clamp(cs.soundLatency, 0.0, 2.0) * 48000));
         const int64_t diff = expected - nextSample;
         if (!audioStarted || (std::llabs(diff) > 4800 && std::llabs(diff) < 96000)) {
             // (exactly at the start; after it, gaps and overlaps of more than a tenth of a second, so jitter is left be;

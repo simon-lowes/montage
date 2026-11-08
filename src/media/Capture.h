@@ -43,6 +43,7 @@ struct CaptureSettings {
     double seconds = 0;                  // stop after this long (0: when stopped)
     double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)
     std::string reel;                    // the tape's name, kept with the timecode (QuickTime's reel name)
+    double soundLatency = 0;             // seconds a sound device's sound arrives late by (its input latency): taken off (not the feed's own)
     // A range of the feed's frames by their timecode (batch capture from a deck): pictures labelled before `fromFrame`
     // are passed over; the file starts on the first labelled `fromFrame` or later, with that label as its timecode, and
     // holds the pictures up to `fromFrame + frames`, each placed by its label. Labels are frame numbers at the feed's
