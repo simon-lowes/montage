@@ -1478,11 +1478,26 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             std::vector<uint16_t> mine = pictureAt(k);
             if (proresApp) {
                 // (decoded to 16-bit R'G'B', compared at the master's 10 bits)
-                checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, fullRange, mine = std::move(mine), cs = std::move(cs)] {
+                checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, fullRange, fields, proresProfile, colourId, mine = std::move(mine),
+                                                                   cs = std::move(cs)] {
                     try {
+                        if (cs.empty()) return false;
+                        {
+                            // Coded again as the writer codes it: the same bytes are the same picture, with no decoder in
+                            // the comparison (its rounding differs between FFmpeg builds, by more than the check allows on
+                            // macOS's). A master coded by another encoder build falls through to the decoded comparison.
+                            prores::Encoder encoder;
+                            prores::Coding coding;
+                            coding.fields = fields;
+                            coding.fullRange = fullRange;
+                            std::vector<uint16_t> rgb = mine;
+                            for (uint16_t& v : rgb) v = uint16_t(v << 6 | v >> 4);  // (10 bits to 16)
+                            std::vector<uint8_t> again;
+                            if (encoder.open(W, H, proresProfile, colourId, coding) && encoder.encode(rgb.data(), again) && again == cs) return true;
+                        }
                         std::vector<uint16_t> theirs;
                         int w = 0, h = 0;
-                        if (cs.empty() || !prores::decode(cs.data(), cs.size(), fullRange, theirs, nullptr, w, h) || w != W || h != H) return false;
+                        if (!prores::decode(cs.data(), cs.size(), fullRange, theirs, nullptr, w, h) || w != W || h != H) return false;
                         for (uint16_t& v : theirs) v = uint16_t(v >> 6);
                         return alikeTo(mine, theirs);
                     } catch (...) {
