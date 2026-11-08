@@ -954,9 +954,19 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 if (!made) return nullptr;
                 std::fill(p, p + 64, 0.0f);
                 p[0] = float(fp.mode);
-                std::copy(fp.params, fp.params + 16, p + 4);
-                pass(filterPs_, made, u, {{1, at}, {4, cur}}, uniforms(u, p));
+                std::copy(fp.params, fp.params + 60, p + 4);
+                QRhiTexture* table = nullptr;
+                if (fp.tableWidth > 0 && !fp.table.empty()) {
+                    const int rows = int(fp.table.size() / (size_t(fp.tableWidth) * 4));
+                    table = texture(T::RGBA32F, fp.tableWidth, std::max(1, rows), false);
+                    if (!table) return nullptr;
+                    QRhiTextureSubresourceUploadDescription d(fp.table.data(), quint32(fp.table.size() * sizeof(float)));
+                    u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
+                }
+                if (table) pass(filterPs_, made, u, {{1, at}, {4, cur}, {5, table}}, uniforms(u, p));
+                else pass(filterPs_, made, u, {{1, at}, {4, cur}}, uniforms(u, p));
                 u = rhi_->nextResourceUpdateBatch();
+                if (table) release(table);
                 ++filterPasses;
                 if (at != cur) release(at);
                 at = made;

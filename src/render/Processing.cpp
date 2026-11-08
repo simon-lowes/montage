@@ -266,12 +266,18 @@ void colorWarper(const Effect& e, FrameTime t, Image& img);  // below, as hue cu
 // shows: SDR white and HDR's 203 nits are both 1.0), moved by the global exposure and each zone's exposure as far as the
 // pixel is in it (the curve kept rising), then the contrast round its pivot; the channels shifted by the zones' colour
 // balance (stops per channel), the saturation scaled, the black offset added, and the result coded back.
-void hdrPalette(const Effect& e, FrameTime t, Image& img) {
-    const ColorSpace& space = currentWorkingSpace();
-    const TransferTables tables(space.transfer);
-    float kr = 0.2126f, kg = 0.7152f, kb = 0.0722f;
-    if (space.primaries == Primaries::Bt2020) kr = 0.2627f, kg = 0.6780f, kb = 0.0593f;
-    else if (space.primaries == Primaries::P3D65) kr = 0.2290f, kg = 0.6917f, kb = 0.0793f;
+// Its settings at a time, as the pixels need them (gpufilter.frag takes the same): per stop of brightness, from -16 to
+// +12 in 1/32 steps, the brightness out, the saturation and the balance.
+struct HdrPaletteSetup {
+    static constexpr float kEvMin = -16, kEvMax = 12;
+    static constexpr int kSteps = int((kEvMax - kEvMin) * 32);
+    float kr = 0.2126f, kg = 0.7152f, kb = 0.0722f, toWhite = 1, blackOffset = 0, mix = 1;
+    std::vector<float> evOut, sat, bal[3];
+};
+HdrPaletteSetup hdrPaletteSetup(const Effect& e, FrameTime t, const ColorSpace& space) {
+    HdrPaletteSetup h;
+    if (space.primaries == Primaries::Bt2020) h.kr = 0.2627f, h.kg = 0.6780f, h.kb = 0.0593f;
+    else if (space.primaries == Primaries::P3D65) h.kr = 0.2290f, h.kg = 0.6917f, h.kb = 0.0793f;
     struct ZoneValues {
         float exposure, saturation, balance[3], range, falloff;
         bool dark;
@@ -289,11 +295,11 @@ void hdrPalette(const Effect& e, FrameTime t, Image& img) {
     const float exposure = float(e.p("exposure", t)), saturation = float(e.p("saturation", t, 1));
     const float global[3] = {float(e.p("global_r", t)), float(e.p("global_g", t)), float(e.p("global_b", t))};
     const float contrast = float(e.p("contrast", t, 1)), pivot = float(e.p("pivot", t));
-    const float blackOffset = float(e.p("black_offset", t)), mix = float(e.p("mix", t, 100)) / 100;
-    // Per stop of brightness, from -16 to +12 in 1/32 steps: the brightness out, the balance and the saturation.
-    constexpr float kEvMin = -16, kEvMax = 12;
-    constexpr int kSteps = int((kEvMax - kEvMin) * 32);
-    std::vector<float> evOut(kSteps + 1), sat(kSteps + 1), bal[3];
+    h.blackOffset = float(e.p("black_offset", t)), h.mix = float(e.p("mix", t, 100)) / 100;
+    constexpr int kSteps = HdrPaletteSetup::kSteps;
+    constexpr float kEvMin = HdrPaletteSetup::kEvMin, kEvMax = HdrPaletteSetup::kEvMax;
+    std::vector<float>&evOut = h.evOut, &sat = h.sat, (&bal)[3] = h.bal;
+    evOut.resize(kSteps + 1), sat.resize(kSteps + 1);
     for (auto& b : bal) b.assign(kSteps + 1, 0.0f);
     for (int i = 0; i <= kSteps; ++i) {
         const float ev = kEvMin + (kEvMax - kEvMin) * float(i) / kSteps;
@@ -317,14 +323,25 @@ void hdrPalette(const Effect& e, FrameTime t, Image& img) {
     for (int k = 0; k < 3; ++k)
         for (int i = 1; i <= kSteps; ++i)
             bal[k][size_t(i)] = std::max(bal[k][size_t(i)], evOut[size_t(i - 1)] + bal[k][size_t(i - 1)] - evOut[size_t(i)]);
+    // HLG decodes to scene light with its peak at 1; its reference white (75%) is brought to 1 like SDR white and PQ's
+    // 203 nits.
+    h.toWhite = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+    return h;
+}
+
+void hdrPalette(const Effect& e, FrameTime t, Image& img) {
+    const ColorSpace& space = currentWorkingSpace();
+    const TransferTables tables(space.transfer);
+    const HdrPaletteSetup h = hdrPaletteSetup(e, t, space);
+    constexpr int kSteps = HdrPaletteSetup::kSteps;
+    constexpr float kEvMin = HdrPaletteSetup::kEvMin, kEvMax = HdrPaletteSetup::kEvMax;
+    const float kr = h.kr, kg = h.kg, kb = h.kb, toWhite = h.toWhite, blackOffset = h.blackOffset, mix = h.mix;
     auto lookup = [&](const std::vector<float>& table, float x) {
         const int i = std::min(kSteps - 1, int(x));
         return table[size_t(i)] + (table[size_t(i + 1)] - table[size_t(i)]) * (x - float(i));
     };
     constexpr float kGrey = 0.18f;
-    // HLG decodes to scene light with its peak at 1; its reference white (75%) is brought to 1 like SDR white and PQ's
-    // 203 nits.
-    const float toWhite = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+    const std::vector<float>&evOut = h.evOut, &sat = h.sat, (&bal)[3] = h.bal;
     // perPixel hands over straight (unpremultiplied) colour and premultiplies after.
     perPixel(img, [&](float& r, float& g, float& b, float&) {
         const float code[3] = {r, g, b};
@@ -3523,8 +3540,33 @@ namespace {
 // The effects the GPU draws through gpufilter.frag.
 bool isGpuFilter(const std::string& type) {
     static const std::set<std::string> filters = {"gaussian_blur", "sharpen", "glow", "channel_blur", "directional_blur", "vignette",
-                                                  "posterize", "letterbox", "mirror", "mosaic", "chromatic_aberration", "noise"};
+                                                  "posterize", "letterbox", "mirror", "mosaic", "chromatic_aberration", "noise",
+                                                  "crosstalk", "colour_correlation", "hdr_palette", "color_warper", "color_slice",
+                                                  "film_grain", "rgb_mixer", "grain_match"};
     return filters.count(type) > 0;
+}
+
+// The working space's transfer function as gpufilter.frag knows it (the display curves the GPU composites in), or -1.
+int gpuTransfer(const ColorSpace& space) {
+    switch (space.transfer) {
+        case Transfer::Bt1886:
+        case Transfer::Srgb:
+        case Transfer::Linear:
+        case Transfer::Pq:
+        case Transfer::Hlg:
+        case Transfer::Gamma22: return int(space.transfer);
+        default: return -1;
+    }
+}
+
+// A filter pass's table with the working space's transfer tables in its row 0 (decoding in x, encoding in y), `rows`
+// rows in all.
+void transferTableRows(gpu::ColorOp::FilterPass& fp, const ColorSpace& space, int rows) {
+    const TransferTables tables(space.transfer);
+    fp.tableWidth = TransferTables::kDecode + 1;
+    fp.table.assign(size_t(fp.tableWidth) * 4 * size_t(rows), 0.0f);
+    for (size_t i = 0; i < tables.dec.size(); ++i) fp.table[i * 4] = tables.dec[i];
+    for (size_t i = 0; i < tables.enc.size(); ++i) fp.table[i * 4 + 1] = tables.enc[i];
 }
 }  // namespace
 
@@ -3771,8 +3813,122 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             if (amount > 0)
                 add(12, {amount, e.p("color", t, 1) >= 0.5 ? 1.0f : 0.0f, e.p("clip", t, 1) >= 0.5 ? 1.0f : 0.0f, 0, float(frame & 0xffffu),
                          float(frame >> 16)});
+        } else if (ty == "film_grain") {
+            // (its noise grid at the grain's size, new every frame, made in the shader by the CPU's hash)
+            const double size = std::max(0.5, e.p("size", t, 1.5) * pixelScale);
+            const int gw = std::max(1, int(std::ceil(width / size))), gh = std::max(1, int(std::ceil(height / size)));
+            const uint32_t seed = vfx::grainSeed(t);
+            add(18, {float(e.p("amount", t, 0.15)), e.p("color", t) > 0.5 ? 1.0f : 0.0f, float(gw), float(gh),
+                     float(double(gw) / std::max(1, width)), float(double(gh) / std::max(1, height)), float(seed & 0xffffu), float(seed >> 16)});
+        } else if (ty == "rgb_mixer") {
+            float m[12] = {};
+            bool identity = true;
+            for (int o = 0; o < 3; ++o)
+                for (int i = 0; i < 3; ++i) {
+                    const std::string name = std::string(1, "rgb"[o]) + "." + "rgb"[i];
+                    m[o * 4 + i] = float(e.p(name, t, o == i ? 1 : 0));
+                    identity = identity && m[o * 4 + i] == (o == i ? 1.0f : 0.0f);
+                }
+            if (!identity) add(19, {0, 0, 0, 0, m[0], m[1], m[2], 0, m[4], m[5], m[6], 0, m[8], m[9], m[10]});
+        } else if (ty == "color_warper") {
+            ColorWarp w;
+            if (parseColorWarp(e.s("mesh"), w) && !w.empty()) {
+                const WarpField field(w);
+                add(16, {float(std::clamp(e.p("mix", t, 100) / 100.0, 0.0, 1.0)), e.p("preserve_luma", t) > 0.5 ? 1.0f : 0.0f});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = kWarpSpokes * (kWarpRings + 1);
+                fp.table.assign(size_t(fp.tableWidth) * 4, 0.0f);
+                for (int i = 0; i < kWarpSpokes; ++i)
+                    for (int j = 0; j <= kWarpRings; ++j) {
+                        float* d = &fp.table[size_t(i * (kWarpRings + 1) + j) * 4];
+                        d[0] = float(field.dh[i][j]), d[1] = float(field.ds[i][j]), d[2] = float(field.dl[i][j]);
+                    }
+            }
         } else {
-            return false;  // (a filter without its passes here: the CPU draws it)
+            // The colour tools on the working space's light, through its transfer function.
+            const ColorSpace& space = currentWorkingSpace();
+            const int tf = gpuTransfer(space);
+            if (tf < 0) return false;  // (a curve the shader does not have)
+            gpu::ColorOp::FilterPass fp;
+            auto rows3 = [&](int at, const double m[9]) {
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c) fp.params[(at - 1) * 4 + r * 4 + c] = float(m[r * 3 + c]);
+            };
+            fp.params[0] = float(tf);
+            if (ty == "crosstalk") {
+                double m[9];
+                if (crosstalkMatrix(e, t, space, m)) {
+                    fp.mode = 13;
+                    rows3(2, m);
+                }
+            } else if (ty == "colour_correlation") {
+                const CorrelationSettings cs = correlationSettings(e, t, space);
+                fp.mode = 14;
+                fp.params[1] = float(cs.saturation), fp.params[2] = float(cs.start);
+                fp.params[4] = float(cs.low), fp.params[5] = float(cs.high), fp.params[6] = float(cs.soft);
+                rows3(3, cs.toBoundary);
+                rows3(6, cs.fromBoundary);
+                for (int k = 0; k < 3; ++k) fp.params[32 + k] = float(cs.luma[k]);
+            } else if (ty == "hdr_palette") {
+                const HdrPaletteSetup h = hdrPaletteSetup(e, t, space);
+                fp.mode = 15;
+                fp.params[1] = h.toWhite, fp.params[2] = h.blackOffset, fp.params[3] = h.mix;
+                fp.params[4] = h.kr, fp.params[5] = h.kg, fp.params[6] = h.kb;
+                transferTableRows(fp, space, 3);
+                const size_t row = size_t(fp.tableWidth) * 4;
+                for (int i = 0; i <= HdrPaletteSetup::kSteps; ++i) {
+                    float* d = &fp.table[row + size_t(i) * 4];
+                    d[0] = h.evOut[size_t(i)], d[1] = h.sat[size_t(i)], d[2] = h.bal[0][size_t(i)], d[3] = h.bal[1][size_t(i)];
+                    fp.table[2 * row + size_t(i) * 4] = h.bal[2][size_t(i)];
+                }
+            } else if (ty == "color_slice") {
+                const ColorSliceSetup cs = colorSliceSetup(e, t);
+                if (cs.any) {
+                    fp.mode = 17;
+                    fp.params[1] = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+                    fp.params[2] = float(cs.vecs.size()), fp.params[3] = cs.mix;
+                    fp.params[4] = cs.globalSat, fp.params[5] = cs.globalDensity, fp.params[6] = cs.depth, fp.params[7] = cs.protect;
+                    fp.params[8] = cs.subtractive ? 1.0f : 0.0f, fp.params[9] = space.primaries != Primaries::Bt709 ? 1.0f : 0.0f;
+                    double toRef[9], fromRef[9];
+                    primariesMatrix(space.primaries, Primaries::Bt709, toRef);
+                    primariesMatrix(Primaries::Bt709, space.primaries, fromRef);
+                    rows3(4, toRef);
+                    rows3(7, fromRef);
+                    const float skin[5] = {cs.skin.centre, cs.skin.width, cs.skin.hue, cs.skin.sat, cs.skin.density};
+                    std::copy(skin, skin + 5, fp.params + 36);
+                    transferTableRows(fp, space, 3);
+                    const size_t row = size_t(fp.tableWidth) * 4;
+                    for (size_t i = 0; i < cs.vecs.size(); ++i) {
+                        const ColorSliceSetup::Vec& v = cs.vecs[i];
+                        const float d[4] = {v.centre, v.width, v.hue, v.sat};
+                        std::copy(d, d + 4, &fp.table[row + i * 4]);
+                        fp.table[2 * row + i * 4] = v.density;
+                    }
+                }
+            } else if (ty == "grain_match") {
+                // (its grain's fields made, and kept, on the CPU as addGrain makes them; added to the light here)
+                const GrainProfile g = effectGrainProfile(e);
+                GrainFields gf;
+                if (grainFields(width, height, g, grainMatchSettings(e, t), t, gf)) {
+                    fp.mode = 20;
+                    fp.params[1] = float(gf.amount), fp.params[2] = float(gf.power), fp.params[3] = float(gf.shapeScale);
+                    rows3(2, &gf.L[0][0]);
+                    int model = 0;  // (by channel: the amplitudes a model's, following the light)
+                    for (int c = 0; c < 3; ++c)
+                        if (g.response > 0 && std::all_of(g.amplitude[c], g.amplitude[c] + GrainProfile::kBands, [](double a) { return a > 0; }))
+                            model |= 1 << c;
+                    const double pqTop = toLinear(Transfer::Pq, 1), pqSlope = (pqTop - toLinear(Transfer::Pq, 1 - 1e-4)) / 1e-4;
+                    fp.params[16] = float(g.response), fp.params[17] = float(model);
+                    fp.params[18] = float(pqTop), fp.params[19] = float(pqSlope);
+                    for (int c = 0; c < 3; ++c)
+                        for (int b = 0; b < GrainProfile::kBands; ++b) fp.params[20 + c * 8 + b] = float(g.amplitude[c][b]);
+                    fp.table = std::move(gf.z);
+                    fp.tableWidth = width;
+                }
+            } else {
+                return false;  // (a filter without its passes here: the CPU draws it)
+            }
+            if (fp.mode) f.passes.push_back(std::move(fp));
         }
         if (f.passes.empty()) return true;  // (nothing changes)
         if (!op.masked) {

@@ -14,6 +14,8 @@ namespace montage::vfx {
 void levels(const Effect& e, FrameTime t, Image& img);
 void glow(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void filmGrain(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// The seed of Film Grain's noise grid at `t` (render/shaders/gpufilter.frag makes the same grid from it).
+uint32_t grainSeed(FrameTime t);
 void directionalBlur(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void chromaticAberration(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void lensDistortion(const Effect& e, FrameTime t, Image& img);

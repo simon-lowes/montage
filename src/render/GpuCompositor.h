@@ -63,8 +63,10 @@ struct ColorOp {
     // filter with a mask is marked before and mixed after, as a grade node is.)
     enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey, Shader, Filter } kind = Lut;
     struct FilterPass {
-        int mode = 0;          // gpufilter.frag's
-        float params[16] = {};  // its p[1..4]
+        int mode = 0;           // gpufilter.frag's
+        float params[60] = {};  // its p[1..15]
+        std::vector<float> table;  // RGBA rows of tableWidth (its `table`, as the mode says), or none
+        int tableWidth = 0;
     };
     std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader

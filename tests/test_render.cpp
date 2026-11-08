@@ -19224,6 +19224,52 @@ colorspaces:
             }
         edit::clipById(s, topId)->effects.clear();
 
+        // The colour tools that work on the working space's light (and two that do not) and the grain, three settings each: in Rec.709,
+        // in Rec.2100 PQ, HLG or Adobe RGB, and through a mask in Display P3.
+        struct Tool {
+            const char* type;
+            std::vector<Settings> settings;
+            const char* mesh;
+        };
+        const std::vector<Tool> tools = {
+            {"crosstalk", {{{"red_hue", 20}, {"green_strength", 70}}, {{"blue_hue", -30}, {"green_strength", 85}}, {{"green_hue", 50}, {"red_strength", 130}, {"invert", 1}}}, nullptr},
+            {"colour_correlation",
+             {{{"saturation", 140}}, {{"saturation", 60}, {"boundary", 2}, {"exposure_low", -1}, {"exposure_soft", 2}},
+              {{"saturation", 180}, {"compress_start", 60}, {"boundary", 0}}},
+             nullptr},
+            {"hdr_palette",
+             {{{"exposure", 0.5}, {"dark_exposure", 1}, {"saturation", 1.3}},
+              {{"contrast", 1.4}, {"pivot", -1}, {"light_r", 0.2}, {"black_offset", 0.01}},
+              {{"black_exposure", -1}, {"global_b", 0.1}, {"highlight_saturation", 0.5}, {"mix", 70}}},
+             nullptr},
+            {"color_warper", {{}, {{"preserve_luma", 1}}, {{"mix", 60}}}, "0,2,20,0.1,0.3;4,3,-30,-0.2,-0.5;8,4,45,0.15,0;2,1,10,0.3,0.2"},
+            {"color_slice",
+             {{{"red_hue", 15}, {"blue_saturation", 1.5}}, {{"skin_hue", -10}, {"green_density", 0.6}, {"subtractive", 0}},
+              {{"saturation", 1.4}, {"density", 0.3}, {"cyan_hue", -25}, {"protect_highlights", 90}}},
+             nullptr},
+            {"film_grain", {{{"amount", 0.2}}, {{"amount", 0.4}, {"size", 3}, {"color", 1}}, {{"amount", 0.1}, {"size", 0.7}}}, nullptr},
+            {"rgb_mixer", {{{"r.g", 0.2}, {"r.r", 0.8}}, {{"b.r", -0.1}, {"g.b", 0.3}}, {{"g.g", 1.2}}}, nullptr},
+            {"grain_match",
+             {{{"source", 5}, {"model_strength", 6}}, {{"source", 2}, {"amount", 150}, {"saturation", 50}},
+              {{"source", 5}, {"temporal", 30}, {"kurtosis", 5}, {"response", 1}, {"seed", 7}}},
+             nullptr},
+        };
+        const char* spaces[] = {"rec2100pq", "rec2100hlg", "adobergb"};
+        for (size_t n = 0; n < tools.size(); ++n)
+            for (size_t k = 0; k < 3; ++k) {
+                s.colorSpace = k == 0 ? "rec709" : k == 1 ? spaces[n % 3] : "p3d65";
+                Effect e = makeEffect(p, tools[n].type);
+                for (const auto& [name, value] : tools[n].settings[k]) e.params[name] = value;
+                if (tools[n].mesh) e.strings["mesh"] = tools[n].mesh;
+                if (k == 2) e.params["mask.shape"] = 1.0, e.params["mask.w"] = 0.6, e.params["mask.h"] = 0.5, e.params["mask.feather"] = 10.0;
+                edit::clipById(s, topId)->effects = {e};
+                const long passes = gpu::stats().filterPasses;
+                compare(7 + FrameTime(k), QString("%1 #%2 in %3").arg(tools[n].type).arg(k + 1).arg(QString::fromStdString(s.colorSpace)));
+                QVERIFY2(gpu::stats().filterPasses > passes, tools[n].type);
+            }
+        s.colorSpace = "rec709";
+        edit::clipById(s, topId)->effects.clear();
+
         // Every transition (but Smooth Cut's flow and OpenFX's), at three places, between two pictures on V1.
         QVERIFY(edit::placeMedia(p, s, other, 40, 0, 40, {TrackKind::Video, 0}, {}, false).ok);
         edit::clipById(s, topId)->motion.params["opacity"] = 0.0;  // (V2 out of the way)

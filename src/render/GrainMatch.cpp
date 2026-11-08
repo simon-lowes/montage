@@ -797,20 +797,39 @@ bool measureClipGrain(const Project& p, const Sequence& s, const Clip& c, const 
     return true;
 }
 
-void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const GrainSettings& s, int64_t t) {
-    if (img.empty() || s.amount <= 0 || !g.valid()) return;
+namespace {
+// addGrain's setup: the fields now and a frame before, carried over by alpha and beta.
+struct GrainSetup {
+    std::shared_ptr<const Fields> now, before;
+    double alpha = 1, beta = 0, power = 1, shapeScale = 1;
+    float amount = 0;
+    double L[3][3] = {};
+};
+GrainSetup grainSetup(int w, int h, const GrainProfile& g, const GrainSettings& s, int64_t t) {
+    GrainSetup u;
     // Our pixels per pixel of the frame measured, the grain's size aside: the grain scales with the picture.
-    const double scale = double(g.width) / img.width / std::clamp(s.size, 0.05, 20.0);
-    const float amount = float(s.amount * resolutionGain(g, double(g.width) / img.width, std::clamp(s.size, 0.05, 20.0)));
-    const auto now = shapedFields(g, scale, s.seed, t, img.width, img.height);
-    const double power = powerForKurtosis(g.kurtosis), shapeScale = 1 / std::sqrt(absMoment(2 * power));
+    const double scale = double(g.width) / w / std::clamp(s.size, 0.05, 20.0);
+    u.amount = float(s.amount * resolutionGain(g, double(g.width) / w, std::clamp(s.size, 0.05, 20.0)));
+    u.now = shapedFields(g, scale, s.seed, t, w, h);
+    u.power = powerForKurtosis(g.kurtosis), u.shapeScale = 1 / std::sqrt(absMoment(2 * u.power));
     // Carried over as a moving average of this frame's fields and the last's: a ρ correlation from frame to frame (the
     // Gaussian's that gives the one measured once shaped).
-    const double rho = std::clamp(gaussianCorrelationFor(power, std::clamp(g.temporal, 0.0, 0.45)), 0.0, 0.49);
-    const double alpha = std::sqrt((1 + std::sqrt(1 - 4 * rho * rho)) / 2), beta = rho / alpha;
-    const auto before = beta > 1e-4 ? shapedFields(g, scale, s.seed, t - 1, img.width, img.height) : nullptr;
-    double L[3][3];
-    cholesky(g, s.saturation, L, power);
+    const double rho = std::clamp(gaussianCorrelationFor(u.power, std::clamp(g.temporal, 0.0, 0.45)), 0.0, 0.49);
+    u.alpha = std::sqrt((1 + std::sqrt(1 - 4 * rho * rho)) / 2), u.beta = rho / u.alpha;
+    if (u.beta > 1e-4) u.before = shapedFields(g, scale, s.seed, t - 1, w, h);
+    cholesky(g, s.saturation, u.L, u.power);
+    return u;
+}
+}  // namespace
+
+void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const GrainSettings& s, int64_t t) {
+    if (img.empty() || s.amount <= 0 || !g.valid()) return;
+    const GrainSetup u = grainSetup(img.width, img.height, g, s, t);
+    const auto& now = u.now;
+    const auto& before = u.before;
+    const double alpha = u.alpha, beta = u.beta, power = u.power, shapeScale = u.shapeScale;
+    const float amount = u.amount;
+    const double(&L)[3][3] = u.L;
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             float* p = img.row(y);
@@ -831,6 +850,17 @@ void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const 
             }
         }
     });
+}
+
+bool grainFields(int w, int h, const GrainProfile& g, const GrainSettings& s, int64_t t, GrainFields& out) {
+    if (w <= 0 || h <= 0 || s.amount <= 0 || !g.valid()) return false;
+    const GrainSetup u = grainSetup(w, h, g, s, t);
+    out.z.assign(size_t(w) * size_t(h) * 4, 0.0f);
+    for (size_t i = 0; i < size_t(w) * size_t(h); ++i)
+        for (int k = 0; k < 3; ++k) out.z[i * 4 + size_t(k)] = float(u.alpha * u.now->z[k][i] + (u.before ? u.beta * u.before->z[k][i] : 0.0));
+    std::copy(&u.L[0][0], &u.L[0][0] + 9, &out.L[0][0]);
+    out.power = u.power, out.shapeScale = u.shapeScale, out.amount = u.amount;
+    return true;
 }
 
 namespace {
@@ -1099,7 +1129,7 @@ GrainProfile effectGrainProfile(const Effect& e) {
     return stockGrain(gauge < 0 || gauge > 3 ? 1 : gauge);
 }
 
-void grainMatch(const Effect& e, FrameTime t, Image& img) {
+GrainSettings grainMatchSettings(const Effect& e, FrameTime t) {
     // (Replace Grain's taking the plate's grain out first is done on the source frames, with their neighbours; the grain
     // put back allows for what that leaves.)
     GrainSettings s;
@@ -1108,6 +1138,11 @@ void grainMatch(const Effect& e, FrameTime t, Image& img) {
     s.size = e.p("size", t, 100) / 100;
     s.saturation = e.p("saturation", t, 100) / 100;
     s.seed = uint32_t(std::max(0.0, e.p("seed", t, 0)));
+    return s;
+}
+
+void grainMatch(const Effect& e, FrameTime t, Image& img) {
+    const GrainSettings s = grainMatchSettings(e, t);
     const ColorSpace& working = currentWorkingSpace();
     // (Graded scene-referred, the picture is in the working space and the profile in the sequence's, where the plate's
     // grain was measured: the grain is added there, its strength in each light and colour as measured, and the picture
