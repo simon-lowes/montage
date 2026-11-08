@@ -869,14 +869,15 @@ private slots:
         cbr.preset = "veryfast";
         cbr.videoBitrate = 300000;
         cbr.hrd = "cbr";
-        QVERIFY2(exportSequence(state()->project(), seq, cbr, nullptr, nullptr, &err), err.c_str());
+        // (the sequence as it is now: the undo above replaced it)
+        QVERIFY2(exportSequence(state()->project(), *state()->sequence(), cbr, nullptr, nullptr, &err), err.c_str());
         compare.findChild<QLineEdit*>("qcCompareFile")->clear();
         QVERIFY(compare.findChild<QLineEdit*>("qcHrdFile"));
         QVERIFY(compare.findChild<QPushButton*>("qcHrdBrowse"));
         compare.findChild<QLineEdit*>("qcHrdFile")->setText(QString::fromStdString(cbr.path));
         QVERIFY(compare.runCheck());
         const QString summary = compare.findChild<QLabel*>("qcSummary")->text();
-        QVERIFY2(summary.contains("Buffer model: NAL HRD, CBR") && summary.contains("conforms"), qPrintable(summary));
+        QVERIFY2(summary.contains("Buffer model: H.264 NAL HRD, CBR") && summary.contains("conforms"), qPrintable(summary));
         QVERIFY(std::none_of(compare.issues().begin(), compare.issues().end(), [](const QcIssue& i) { return i.kind == QcKind::Hrd; }));
     }
 
