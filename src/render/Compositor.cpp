@@ -55,6 +55,7 @@
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
+#include "ShapeLayers.h"
 #include "Titles.h"
 #include "Layer3D.h"
 #include "ModelClip.h"
@@ -73,6 +74,8 @@
 #include "render/Spherical.h"
 #include "render/AudioReactive.h"
 #include "core/EditOps.h"
+#include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/Surround.h"
@@ -868,6 +871,103 @@ int ofxInputTrack(const Sequence& seq, const std::string& connection) {
     return -1;
 }
 
+}  // namespace
+
+TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h) {
+    const int shape = int(std::lround(c.generator.p("path_shape", 0)));
+    const auto ps = c.generator.params.find("path_shape");
+    if (shape != 4 && shape != 5 && (ps == c.generator.params.end() || ps->second.keys.empty())) return {};
+    return [&p, &seq, &c, w, h](double t) -> std::optional<TitlePathCurve> {
+        const FrameTime lt = FrameTime(std::floor(t + 1e-9));
+        const int kind = int(std::lround(c.generator.pAt("path_shape", t)));
+        using Seg = TitlePathCurve::Segment;
+        TitlePathCurve out;
+        auto cubic = [&](QPointF a, QPointF b, QPointF cc, QPointF d) {
+            Seg g;
+            g.kind = (a == b && cc == d) ? 0 : 1;
+            if (g.kind == 0) g.p[0] = a, g.p[1] = d;
+            else g.p[0] = a, g.p[1] = b, g.p[2] = cc, g.p[3] = d;
+            out.segments.push_back(g);
+        };
+        // A path's points (anchors and handles) mapped through `to`, as its segments.
+        auto pathSegments = [&](const std::vector<PathPoint>& pts, bool closed, const std::function<QPointF(double, double)>& to) {
+            const size_t n = pts.size();
+            for (size_t i = 0; i + 1 < n + (closed ? 1 : 0); ++i) {
+                const PathPoint &a = pts[i], &b = pts[(i + 1) % n];
+                cubic(to(a.x, a.y), to(a.x + a.ox, a.y + a.oy), to(b.x + b.ix, b.y + b.iy), to(b.x, b.y));
+            }
+            out.closed = closed;
+        };
+        if (kind == 4) {
+            // The clip's effects' masks drawn as shapes (ellipses, rectangles, Bézier paths), the Mask Number-th.
+            const int want = std::max(1, int(std::lround(c.generator.pAt("path_mask", t, 1))));
+            int k = 0;
+            for (const Effect& e : c.effects) {
+                const int ms = int(std::lround(e.p("mask.shape", lt)));
+                if ((ms != 1 && ms != 2 && ms != 5) || ++k != want) continue;
+                const MaskBox b = maskBox(e, lt);
+                if (ms == 1) {
+                    // From the top, clockwise on screen (as the Circle path runs).
+                    Seg g;
+                    g.kind = 2;
+                    g.p[0] = QPointF(b.x * w, b.y * h);
+                    g.p[1] = QPointF(b.w * w / 2, b.h * h / 2);
+                    g.rotation = b.rotation * M_PI / 180;
+                    g.from = -M_PI / 2, g.to = 1.5 * M_PI;
+                    out.segments.push_back(g);
+                    out.closed = true;
+                    return out;
+                }
+                auto to = [&](double bx, double by) {
+                    double u = 0, v = 0;
+                    boxToFrame(b, w, h, bx, by, u, v);
+                    return QPointF(u * w, v * h);
+                };
+                if (ms == 2) pathSegments({{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}}, true, to);
+                else if (maskPathCount(e) >= 2) pathSegments(maskPath(e, lt), e.p("mask.open", lt) <= 0.5, to);
+                if (out.segments.empty()) return std::nullopt;
+                return out;
+            }
+            return std::nullopt;
+        }
+        if (kind != 5) return std::nullopt;
+        // A shape layer under the title (on Shape Track, or the nearest below it) at this time, and its path.
+        const auto loc = edit::locate(seq, c.id);
+        if (!loc || loc->track.kind != TrackKind::Video) return std::nullopt;
+        const FrameTime st = c.start + lt;
+        const int track = int(std::lround(c.generator.pAt("path_track", t)));
+        const Clip* layer = nullptr;
+        for (int i = track > 0 ? track - 1 : loc->track.index - 1; i >= 0 && i < int(seq.videoTracks.size()) && !layer; i = track > 0 ? -1 : i - 1)
+            for (const Clip& k : seq.videoTracks[size_t(i)].clips)
+                if (k.isGenerator() && k.generator.type == "shape" && k.contains(st) && k.id != c.id) {
+                    layer = &k;
+                    break;
+                }
+        if (!layer) return std::nullopt;
+        const std::string id = shapePathItem(layer->generator, c.generator.s("path_item"));
+        const FrameTime slt = st - layer->start;
+        QTransform toFrame;
+        if (id.empty() || !shapePathToFrame(layer->generator, id, slt, seq.width, seq.height, toFrame)) return std::nullopt;
+        const std::vector<PathPoint> pts = shapePathPoints(layer->generator, id, slt);
+        if (pts.size() < 2) return std::nullopt;
+        const ShapeItem* item = findShapeItem(shapeContents(layer->generator), id);
+        const bool closed = !item || item->closed;
+        // Its frame to the sequence through the layer's clip, then to the title's frame through the title's.
+        bool ok = true;
+        pathSegments(pts, closed, [&](double x, double y) {
+            const QPointF f = toFrame.map(QPointF(x, y));
+            double sx = 0, sy = 0, u = 0, v = 0;
+            ok = ok && clipFrameToSequence(p, seq, *layer, st, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+                 sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
+            return QPointF(u * w, v * h);
+        });
+        if (!ok || out.segments.empty()) return std::nullopt;
+        return out;
+    };
+}
+
+namespace {
+
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
                 bool deferFrame, ClipSource& out) {
@@ -924,6 +1024,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
+              : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h))
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back

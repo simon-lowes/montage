@@ -375,6 +375,18 @@ void EditorState::setMaskObject(Id effect, int which) {
     emit maskObjectChanged();
 }
 
+std::string EditorState::shapeItem(Id clip) const {
+    auto it = shapeItems_.find(clip);
+    return it == shapeItems_.end() ? std::string() : it->second;
+}
+
+void EditorState::setShapeItem(Id clip, const std::string& item) {
+    auto [it, added] = shapeItems_.try_emplace(clip, item);
+    if (!added && it->second == item) return;
+    it->second = item;
+    emit maskObjectChanged();
+}
+
 void EditorState::setPaintEffect(Id effect) {
     if (paintEffect_ == effect) return;
     paintEffect_ = effect;

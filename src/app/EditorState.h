@@ -121,6 +121,10 @@ public:
     // choice of what to work on, not a change to the project: it makes no undo step and works in a read-only project.
     int maskObject(const Effect& e) const;
     void setMaskObject(Id effect, int which);
+    // The item picked in a shape layer's contents (the Inspector's Contents list; a path of it is edited on the
+    // Program monitor with the mask tools), "" none. Not an edit either.
+    std::string shapeItem(Id clip) const;
+    void setShapeItem(Id clip, const std::string& item);
     // The Paint or Dust Spot Removal effect whose strokes or spots are being marked on the Program monitor (0: none). Also a
     // choice of what to work on, not an edit.
     Id paintEffect() const { return paintEffect_; }
@@ -368,6 +372,7 @@ private:
     Id selectedTransition_ = 0;
     Id inspectedChain_ = 0;
     std::map<Id, int> maskObjects_;  // effect -> object being picked
+    std::map<Id, std::string> shapeItems_;  // shape layer clip -> item picked
     Id paintEffect_ = 0;
     int meshPinKind_ = 0;
     Id gradeNodeClip_ = 0;           // the clip whose colour node is picked, and the node

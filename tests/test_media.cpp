@@ -21,6 +21,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <QFontMetricsF>
 #include <functional>
 #include <limits>
 #include <array>
@@ -16268,6 +16269,62 @@ private slots:
         double ink = 0;
         for (float v : drawn.px) ink += v;
         QVERIFY(ink > 100);
+
+        // On the path of a shape layer below (its "outline" item), spread over it, the offset keyed, a variable font
+        // axis for the whole title, its letters motion blurred; a 3D title's letters extruded deeper by an animation;
+        // a gradient's stops keyed. Bad ones are refused.
+        r = call("montage_add_title",
+                 {{"project", project}, {"text", "Round"}, {"at", 0}, {"duration", 2}, {"axes", QJsonObject{{"wdth", 80}}},
+                  {"motion_blur", true}, {"shutter", 90}, {"samples", 8},
+                  {"path", QJsonObject{{"shape", "shape"}, {"track", 2}, {"item", "outline"}, {"align", "spread"}, {"perpendicular", false},
+                                       {"offset_keys", QJsonArray{QJsonObject{{"frame", 0}, {"offset", 0}}, QJsonObject{{"frame", 30}, {"offset", 50}}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_add_title", {{"project", project}, {"text", "Deep"}, {"at", 0}, {"template", "3d"}, {"depth", 20},
+                                       {"animations", QJsonArray{QJsonObject{{"start", 50}, {"depth", 60}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}, {"animations", QJsonArray{QJsonObject{{"x", 5}}}}})
+                    .value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"animations", QJsonArray{QJsonObject{{"depth", 5}}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"path", QJsonObject{{"shape", "mask"}, {"align", "sideways"}}}})
+                    .value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"axes", QJsonObject{{"toolong", 1}}}}).value("isError").toBool());
+        r = call("montage_add_shape", {{"project", project}, {"at", 0},
+                                       {"items", QJsonArray{QJsonObject{{"type", "rect"}},
+                                                            QJsonObject{{"type", "fill"}, {"settings", QJsonObject{{"gradient", 1}}},
+                                                                        {"stops", QJsonArray{QJsonArray{0, "#ff0000", 1}, QJsonArray{1, "#ff0000", 1}}},
+                                                                        {"gradient_keys", QJsonArray{QJsonObject{{"frame", 0}, {"stops", QJsonArray{QJsonArray{0, "#ff0000", 1}, QJsonArray{1, "#ff0000", 1}}}},
+                                                                                                     QJsonObject{{"frame", 10}, {"stops", QJsonArray{QJsonArray{0, "#0000ff", 1}, QJsonArray{1, "#0000ff", 0.5}}}}}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_shape", {{"project", project}, {"at", 0},
+                                           {"items", QJsonArray{QJsonObject{{"type", "rect"}},
+                                                                QJsonObject{{"type", "fill"}, {"gradient_keys", QJsonArray{QJsonObject{{"frame", 0}, {"stops", QJsonArray{QJsonArray{0, "#ff0000"}}}}}}}}}})
+                    .value("isError").toBool());
+        Project withMore;
+        QVERIFY(loadProject(project.toStdString(), withMore));
+        const Clip *round = nullptr, *deep = nullptr, *grad = nullptr;
+        for (const Track& tr : withMore.active()->videoTracks)
+            for (const Clip& c : tr.clips) {
+                if (c.generator.type == "title" && c.generator.s("text") == "Round") round = &c;
+                if (c.generator.type == "title3d" && c.generator.s("text") == "Deep") deep = &c;
+                if (c.generator.type == "shape" && c.generator.params.count("fill1.s1.opacity")) grad = &c;
+            }
+        QVERIFY(round && deep && grad);
+        QCOMPARE(round->generator.p("path_shape", 0), 5.0);
+        QCOMPARE(round->generator.p("path_track", 0), 2.0);
+        QCOMPARE(round->generator.s("path_item"), std::string("outline"));
+        QCOMPARE(round->generator.p("path_align", 0), 4.0);
+        QCOMPARE(round->generator.p("path_upright", 0), 1.0);
+        QCOMPARE(round->generator.p("path_offset", 15), 25.0);
+        QCOMPARE(round->generator.p("axis.wdth", 0), 80.0);
+        QCOMPARE(round->generator.p("letter_blur", 0), 1.0);
+        QCOMPARE(round->generator.p("letter_shutter", 0), 90.0);
+        QCOMPARE(round->generator.p("letter_samples", 0), 8.0);
+        QCOMPARE(deep->generator.p("ta1.depth", 0), 60.0);
+        QCOMPARE(deep->generator.p("ta1.start", 0), 50.0);
+        const std::vector<ShapeItem> gi = shapeContents(grad->generator);
+        const std::vector<std::array<double, 5>> at5 = gradientStops(grad->generator, gi.at(1), 5);
+        QCOMPARE(int(at5.size()), 2);
+        QVERIFY(std::abs(at5[1][1] - 0.5) < 1e-9 && std::abs(at5[1][3] - 0.5) < 1e-9 && std::abs(at5[1][4] - 0.75) < 1e-9);
     }
 
     void bleepInTheMix() {
@@ -37320,7 +37377,8 @@ if ui["pressed"] == "add":
                     .value("isError").toBool());
         r = call("montage_add_shape", {{"project", project}, {"at", 0}, {"svg", QString::fromStdString(MONTAGE_TEST_DATA_DIR "/svg/paths.svg")}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
-        QVERIFY(QJsonDocument(r).toJson().contains("Text"));
+        // (Its text made a title over the layer.)
+        QVERIFY2(QJsonDocument(r).toJson().contains("titles"), QJsonDocument(r).toJson().constData());
         Project back;
         QVERIFY(loadProject(project.toStdString(), back));
         std::vector<const Clip*> shapes;
@@ -37348,6 +37406,236 @@ if ui["pressed"] == "add":
         QVERIFY(replaced);
         QCOMPARE(int(shapeContents(replaced->generator).size()), 2);
         QVERIFY(!replaced->generator.params.count(pathId + ".p0.x"));
+    }
+
+    void shapeGradientStopKeys() {
+        // A linear gradient across a 200 x 100 rectangle with two listed stops, both keyed from red (frame 0) to blue
+        // (frame 10): at frame 5 every stop is the even mix, and the rectangle draws as a fill of that colour does.
+        const int W = 400, H = 300;
+        Project p = makeDefaultProject();
+        ShapeItem rect, fill;
+        rect.type = "rect", rect.id = "r";
+        fill.type = "fill", fill.id = "f";
+        fill.stops = {{0, 1, 0, 0, 1}, {1, 1, 0, 0, 1}};
+        Effect g = makeEffect(p, "shape");
+        g.params["r.width"] = Param(200.0), g.params["r.height"] = Param(100.0);
+        g.params["f.gradient"] = Param(1.0);
+        keyGradientStops(g, fill, 0, {{0, 1, 0, 0, 1}, {1, 1, 0, 0, 1}});
+        keyGradientStops(g, fill, 10, {{0, 0, 0, 1, 1}, {1, 0, 0, 1, 1}});
+        setShapeContents(g, {rect, fill});
+        const std::vector<ShapeItem> its = shapeContents(g);
+        const std::vector<std::array<double, 5>> mid = gradientStops(g, its[1], 5);
+        QCOMPARE(int(mid.size()), 2);
+        for (int i = 0; i < 2; ++i) {
+            const std::array<double, 5> want{double(i), 0.5, 0, 0.5, 1};
+            for (int c = 0; c < 5; ++c) QVERIFY2(std::abs(mid[size_t(i)][size_t(c)] - want[size_t(c)]) < 1e-12, qPrintable(QString("stop %1 [%2] %3").arg(i).arg(c).arg(mid[size_t(i)][size_t(c)])));
+        }
+        Effect flat = makeEffect(p, "shape");
+        setShapeContents(flat, {rect, ShapeItem{"fill", "f"}});
+        flat.params["r.width"] = Param(200.0), flat.params["r.height"] = Param(100.0);
+        flat.params["f.color.r"] = Param(0.5), flat.params["f.color.g"] = Param(0.0), flat.params["f.color.b"] = Param(0.5);
+        const Image a = renderShape(g, 5, W, H, 1), b = renderShape(flat, 5, W, H, 1);
+        float worst = 0;
+        for (size_t i = 0; i < a.px.size(); ++i) worst = std::max(worst, std::fabs(a.px[i] - b.px[i]));
+        QVERIFY2(worst <= 1.0f / 255 + 1e-6f, qPrintable(QString("%1 of 255").arg(worst * 255)));
+        // Only the end stop keyed: halfway along at frame 5, the gradient is halfway from red to the end's even mix.
+        Effect one = makeEffect(p, "shape");
+        ShapeItem f2 = fill;
+        f2.stops = {{0, 1, 0, 0, 1}, {1, 1, 0, 0, 1}};
+        one.params["r.width"] = Param(200.0), one.params["r.height"] = Param(100.0);
+        one.params["f.gradient"] = Param(1.0);
+        for (const std::string& c : {"r", "g", "b"}) {
+            Param col;
+            col.addKey(0, c == "r" ? 1.0 : 0.0);
+            col.addKey(10, c == "b" ? 1.0 : 0.0);
+            one.params["f.s1.color." + c] = col;
+        }
+        setShapeContents(one, {rect, f2});
+        const float* px = renderShape(one, 5, W, H, 1).at(W / 2, H / 2);
+        QVERIFY2(std::fabs(px[0] - 0.75f) <= 2.0f / 255 && px[1] == 0.0f && std::fabs(px[2] - 0.25f) <= 2.0f / 255 && px[3] == 1.0f,
+                 qPrintable(QString("%1 %2 %3 %4").arg(px[0]).arg(px[1]).arg(px[2]).arg(px[3])));
+        // A stop's place keyed too: its params are listed for the Inspector, labelled by stop.
+        const std::vector<ParamInfo> sp = gradientStopParams(its[1]);
+        QVERIFY(std::any_of(sp.begin(), sp.end(), [](const ParamInfo& pi) { return pi.name == "s1.pos" && pi.label == "Stop 2 Place"; }));
+    }
+
+    void svgImportOpacityDashesCssText() {
+        // SVG files the test writes, each drawn as its reference (painted here with QPainter, as the SVG says it
+        // looks) within 1/255: nested group opacity, every dash pair, inline CSS. Its text becomes titles.
+        Project p = makeDefaultProject();
+        auto toImage = [](const QImage& q) {
+            Image img(q.width(), q.height());
+            for (int y = 0; y < q.height(); ++y) {
+                const uchar* s = q.constScanLine(y);
+                for (int x = 0; x < q.width() * 4; ++x) img.row(y)[x] = s[x] / 255.0f;
+            }
+            return img;
+        };
+        auto canvas = [] {
+            QImage q(100, 100, QImage::Format_RGBA8888_Premultiplied);
+            q.fill(Qt::transparent);
+            return q;
+        };
+        auto imported = [&](const char* name, const std::string& body, std::vector<SvgText>* texts = nullptr) {
+            const std::string file = path(name);
+            {
+                std::ofstream f(file);
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << body << "</svg>";
+            }
+            Effect g = makeEffect(p, "shape");
+            double w = 0, h = 0;
+            std::vector<std::string> notes;
+            std::string err;
+            if (!importSvgShapes(file, g, w, h, &notes, &err, texts)) qWarning("%s", err.c_str());
+            return g;
+        };
+        auto compare = [&](const char* name, const Effect& g, const QImage& ref) {
+            const Image ours = renderShape(g, 0, 100, 100, 1), want = toImage(ref);
+            float worst = 0;
+            int at = -1;
+            for (size_t i = 0; i < ours.px.size(); ++i)
+                if (const float d = std::fabs(ours.px[i] - want.px[i]); d > worst) worst = d, at = int(i);
+            if (worst > 1.0f / 255 + 1e-6f)
+                qWarning("%s: pixel %d,%d channel %d is %g, wants %g", name, (at / 4) % 100, (at / 4) / 100, at % 4, ours.px[size_t(at)], want.px[size_t(at)]);
+            return worst <= 1.0f / 255 + 1e-6f;
+        };
+
+        // Nested opacity: a group at 50 % holding one at 80 % (two overlapping squares, red under blue) and a green
+        // square at 50 %. Each group is seen through as a whole, its opacity applied once: no red through the blue.
+        {
+            const Effect g = imported("opacity.svg", "<g opacity=\"0.5\"><g opacity=\"0.8\">"
+                                                     "<rect x=\"10\" y=\"10\" width=\"50\" height=\"50\" fill=\"#ff0000\"/>"
+                                                     "<rect x=\"30\" y=\"30\" width=\"50\" height=\"50\" fill=\"#0000ff\"/></g>"
+                                                     "<rect x=\"60\" y=\"5\" width=\"30\" height=\"30\" fill=\"#00ff00\" opacity=\"0.5\"/></g>");
+            QImage inner = canvas(), outer = canvas(), ref = canvas();
+            {
+                QPainter pa(&inner);
+                pa.fillRect(QRect(10, 10, 50, 50), QColor(255, 0, 0));
+                pa.fillRect(QRect(30, 30, 50, 50), QColor(0, 0, 255));
+            }
+            {
+                QPainter pa(&outer);
+                pa.setOpacity(0.8);
+                pa.drawImage(0, 0, inner);
+                pa.setOpacity(0.5);
+                pa.fillRect(QRect(60, 5, 30, 30), QColor(0, 255, 0));
+            }
+            {
+                QPainter pa(&ref);
+                pa.setOpacity(0.5);
+                pa.drawImage(0, 0, outer);
+            }
+            QVERIFY(compare("opacity.svg", g, ref));
+        }
+        // Dash arrays: four numbers (two pairs), and an odd list (taken twice over), on 10 px wide lines.
+        {
+            const Effect g = imported("dashes.svg", "<line x1=\"0\" y1=\"20\" x2=\"100\" y2=\"20\" stroke=\"#ffffff\" stroke-width=\"10\" stroke-dasharray=\"10 5 20 5\"/>"
+                                                    "<line x1=\"0\" y1=\"60\" x2=\"100\" y2=\"60\" stroke=\"#ffffff\" stroke-width=\"10\" stroke-dasharray=\"10,4,6\"/>");
+            QImage ref = canvas();
+            {
+                QPainter pa(&ref);
+                for (const auto& [a, b] : std::vector<std::pair<int, int>>{{0, 10}, {15, 35}, {40, 50}, {55, 75}, {80, 90}, {95, 100}})
+                    pa.fillRect(QRect(a, 15, b - a, 10), Qt::white);
+                for (const auto& [a, b] : std::vector<std::pair<int, int>>{{0, 10}, {14, 20}, {30, 34}, {40, 50}, {54, 60}, {70, 74}, {80, 90}, {94, 100}})
+                    pa.fillRect(QRect(a, 55, b - a, 10), Qt::white);
+            }
+            QVERIFY(compare("dashes.svg", g, ref));
+        }
+        // Inline CSS: type, class, id and child selectors by specificity, a comment and an @-rule skipped, over the
+        // presentation attribute and under style=.
+        {
+            const Effect g = imported("css.svg", "<style>rect { fill: #808080 } .a { fill: #ff0000 } #b { fill: #0000ff; opacity: 0.5 }"
+                                                 " /* g rect { fill: #000 } */ g.box > rect { fill: #00ff00 } @media print { rect { fill: #000 } }</style>"
+                                                 "<rect x=\"0\" y=\"0\" width=\"20\" height=\"20\"/>"
+                                                 "<rect class=\"a\" x=\"20\" y=\"0\" width=\"20\" height=\"20\"/>"
+                                                 "<rect id=\"b\" class=\"a\" x=\"40\" y=\"0\" width=\"20\" height=\"20\"/>"
+                                                 "<rect fill=\"#ff00ff\" x=\"60\" y=\"0\" width=\"20\" height=\"20\"/>"
+                                                 "<g class=\"box\"><rect x=\"0\" y=\"40\" width=\"20\" height=\"20\"/>"
+                                                 "<rect class=\"a\" x=\"20\" y=\"40\" width=\"20\" height=\"20\"/>"
+                                                 "<rect class=\"a\" style=\"fill:#ffff00\" x=\"40\" y=\"40\" width=\"20\" height=\"20\"/>"
+                                                 "<g><rect x=\"60\" y=\"40\" width=\"20\" height=\"20\"/></g></g>");
+            QImage ref = canvas();
+            {
+                QPainter pa(&ref);
+                pa.fillRect(QRect(0, 0, 20, 20), QColor(0x80, 0x80, 0x80));
+                pa.fillRect(QRect(20, 0, 20, 20), QColor(255, 0, 0));
+                pa.fillRect(QRect(60, 0, 20, 20), QColor(0x80, 0x80, 0x80));
+                pa.fillRect(QRect(0, 40, 20, 20), QColor(0, 255, 0));
+                pa.fillRect(QRect(20, 40, 20, 20), QColor(0, 255, 0));
+                pa.fillRect(QRect(40, 40, 20, 20), QColor(255, 255, 0));
+                pa.fillRect(QRect(60, 40, 20, 20), QColor(0x80, 0x80, 0x80));  // a grandchild, not a child
+                pa.setOpacity(0.5);
+                pa.fillRect(QRect(40, 0, 20, 20), QColor(0, 0, 255));
+            }
+            QVERIFY(compare("css.svg", g, ref));
+        }
+        // Text: read out (where it is, its font, size and colour) to be made titles, which a layer imported into a
+        // sequence gets on the track above it, drawn where the SVG has it.
+        {
+            std::vector<SvgText> texts;
+            const Effect g = imported("text.svg", "<rect width=\"100\" height=\"100\" fill=\"#000000\"/>"
+                                                  "<text x=\"10\" y=\"80\" font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\" opacity=\"0.5\">Hi</text>"
+                                                  "<text x=\"90\" y=\"30\" text-anchor=\"end\" font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ff0000\" font-weight=\"bold\">Up</text>",
+                                      &texts);
+            QCOMPARE(int(texts.size()), 2);
+            QCOMPARE(texts[0].text, std::string("Hi"));
+            QCOMPARE(texts[0].font, std::string("DejaVu Sans"));
+            QVERIFY(std::abs(texts[0].size - 20) < 1e-9 && std::abs(texts[0].opacity - 0.5) < 1e-9 && texts[0].anchor == 0 && !texts[0].bold);
+            QVERIFY(texts[1].anchor == 2 && texts[1].bold && std::abs(texts[1].fill[0] - 1) < 1e-9 && texts[1].fill[1] == 0);
+            // (Positions from the drawing's middle, which is the layer's.)
+            QVERIFY(std::abs(texts[0].x - -40) < 1e-9 && std::abs(texts[0].y - 30) < 1e-9);
+            Sequence& s = *p.active();
+            s.width = 100, s.height = 100;
+            for (Track& tr : s.videoTracks) tr.clips.clear();
+            Clip layer = makeGeneratorClip(p, "shape", 30);
+            layer.generator = g;
+            s.videoTracks[0].clips.push_back(layer);
+            std::vector<std::string> notes;
+            QCOMPARE(placeSvgTexts(p, s, layer.id, texts, &notes), 2);
+            QCOMPARE(int(s.videoTracks[1].clips.size()), 1);
+            QCOMPARE(int(s.videoTracks[2].clips.size()), 1);
+            const Clip& hi = s.videoTracks[1].clips[0];
+            QVERIFY(hi.isGenerator() && hi.generator.type == "title" && hi.generator.s("text") == "Hi");
+            QCOMPARE(hi.start, layer.start);
+            QCOMPARE(hi.duration, layer.duration);
+            // Drawn where the SVG has it: its ink where QPainter draws the same text there (within a pixel or so).
+            auto inkBox = [](const Image& img) {
+                QRect r;
+                for (int y = 0; y < img.height; ++y)
+                    for (int x = 0; x < img.width; ++x)
+                        if (img.at(x, y)[3] > 0.2f) r = r.united(QRect(x, y, 1, 1));
+                return r;
+            };
+            for (int k = 0; k < 2; ++k) {
+                const Clip& title = s.videoTracks[size_t(1 + k)].clips[0];
+                const QRect got = inkBox(renderGenerator(title.generator, 0, 100, 100, 1.0, 30, 30));
+                QImage q = canvas();
+                {
+                    QPainter pa(&q);
+                    pa.setRenderHint(QPainter::Antialiasing);
+                    QFont f(QStringLiteral("DejaVu Sans"));
+                    f.setPixelSize(20);
+                    f.setBold(k == 1);
+                    f.setHintingPreference(QFont::PreferNoHinting);
+                    pa.setFont(f);
+                    pa.setPen(Qt::white);
+                    const QString text = k == 0 ? QStringLiteral("Hi") : QStringLiteral("Up");
+                    const double x = k == 0 ? 10 : 90 - QFontMetricsF(f).horizontalAdvance(text);
+                    pa.drawText(QPointF(x, k == 0 ? 80 : 30), text);
+                }
+                const QRect want = inkBox(toImage(q));
+                QVERIFY2(std::abs(got.left() - want.left()) <= 2 && std::abs(got.right() - want.right()) <= 2 && std::abs(got.top() - want.top()) <= 2 &&
+                             std::abs(got.bottom() - want.bottom()) <= 2,
+                         qPrintable(QString("text %1: %2,%3 %4x%5, wants %6,%7 %8x%9").arg(k).arg(got.x()).arg(got.y()).arg(got.width()).arg(got.height())
+                                        .arg(want.x()).arg(want.y()).arg(want.width()).arg(want.height())));
+            }
+            // Without a list for it, text is noted as not made into shapes (as before).
+            Effect plain = makeEffect(p, "shape");
+            double w = 0, h = 0;
+            std::string err;
+            QVERIFY(importSvgShapes(path("text.svg"), plain, w, h, &notes, &err));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Text") != std::string::npos; }));
+        }
     }
 
     void usdCameraAndSolveExport() {

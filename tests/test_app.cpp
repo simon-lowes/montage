@@ -17759,6 +17759,113 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setSelection({}, false);
     }
 
+    void shapePathInProgramMonitor() {
+        // A shape layer's path, keyed at frame 0, picked in its contents: its points are edited on the Program monitor
+        // with the mask tools. Dragging one at frame 20 writes a key there that one undo takes away again.
+        state()->newProject();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        emit browser->applyRequested("shape", EffectCategory::Generator);
+        const Id id = state()->primaryClip()->id;
+        QVERIFY(state()->edit("Path", [id](Project&, Sequence& s) {
+            Effect& g = edit::clipById(s, id)->generator;
+            ShapeItem path, fill;
+            path.type = "path", path.id = "path1", path.closed = true;
+            fill.type = "fill", fill.id = "fill1";
+            setShapeContents(g, {path, fill});
+            setShapePathPoints(g, "path1", 0, {{-200, -150}, {200, -150}, {200, 150}, {-200, 150}}, true);
+            return true;
+        }));
+        state()->setShapeItem(id, "path1");
+        state()->setSelection({id}, false);
+        state()->setPlayhead(20);
+        QApplication::processEvents();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        auto pathShape = [&]() -> std::optional<MaskOverlay::Shape> {
+            for (const MaskOverlay::Shape& sh : overlay->shapes())
+                if (sh.clip == id && sh.item == "path1") return sh;
+            return std::nullopt;
+        };
+        QTRY_VERIFY(pathShape().has_value());
+        QVERIFY(!pathShape()->drawing());
+        auto gen = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), id)->generator; };
+        QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0}));
+        const std::vector<PathPoint> before = pathPoints(gen(), 20, "path1.");
+        // Point 1 (top right) on the widget, dragged 30 px left and 20 px down.
+        QPointF from;
+        QVERIFY(overlay->boxToWidget(*pathShape(), before[1].x, before[1].y, from));
+        const QPoint a = from.toPoint(), b = a + QPoint(-30, 20);
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, a);
+        QMouseEvent move(QEvent::MouseMove, QPointF(b), viewer->mapToGlobal(QPointF(b)), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move);
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, b);
+        QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0, 20}));
+        const std::vector<PathPoint> after = pathPoints(gen(), 20, "path1.");
+        QPointF to;
+        QVERIFY(overlay->boxToWidget(*pathShape(), after[1].x, after[1].y, to));
+        QVERIFY2(QLineF(to, QPointF(b)).length() < 1.5, qPrintable(QString("%1,%2 for %3,%4").arg(to.x()).arg(to.y()).arg(b.x()).arg(b.y())));
+        QVERIFY(after[0] == before[0] && after[2] == before[2] && after[3] == before[3]);
+        // Frame 0 keeps its shape; the drag was one undo step.
+        QVERIFY(pathPoints(gen(), 0, "path1.") == before);
+        QVERIFY(state()->canUndo());
+        state()->undo();
+        QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0}));
+        QVERIFY(pathPoints(gen(), 20, "path1.") == before);
+        // Dragging inside moves the whole path (a key at the playhead), one undo step.
+        QPointF inside;
+        QVERIFY(overlay->boxToWidget(*pathShape(), 0, 0, inside));
+        {
+            const QPoint c = inside.toPoint(), d = c + QPoint(25, 0);
+            QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, c);
+            QMouseEvent mv(QEvent::MouseMove, QPointF(d), viewer->mapToGlobal(QPointF(d)), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(viewer, &mv);
+            QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, d);
+        }
+        const std::vector<PathPoint> moved = pathPoints(gen(), 20, "path1.");
+        QVERIFY2(moved[0].x > before[0].x + 5 && std::abs((moved[0].x - before[0].x) - (moved[2].x - before[2].x)) < 1e-9 && std::abs(moved[0].y - before[0].y) < 1e-9,
+                 qPrintable(QString("%1 -> %2").arg(before[0].x).arg(moved[0].x)));
+        state()->undo();
+        QVERIFY(pathPoints(gen(), 20, "path1.") == before);
+        // Clicking the outline adds a point at every key; Ctrl-click removes it again.
+        QPointF top;
+        QVERIFY(overlay->boxToWidget(*pathShape(), 0, -150, top));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, top.toPoint());
+        QCOMPARE(pathPointCount(gen(), "path1."), 5);
+        QVERIFY(std::abs(pathPoints(gen(), 0, "path1.")[1].x) < 3);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, top.toPoint());
+        QCOMPARE(pathPointCount(gen(), "path1."), 4);
+        // The fill picked in the Inspector: Add Gradient Stop makes its two colours a list of stops and adds one
+        // between them, each stop's place, colour and opacity a setting of its own.
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QComboBox* list = nullptr;
+        QTRY_VERIFY((list = inspector->findChild<QComboBox*>("shapeItems")) != nullptr);
+        const int fillRow = list->findData(QStringLiteral("fill1"));
+        QVERIFY(fillRow >= 0);
+        list->setCurrentIndex(fillRow);
+        emit list->activated(fillRow);
+        QTRY_VERIFY(inspector->findChild<QPushButton*>("addGradientStop") != nullptr);
+        QCOMPARE(state()->shapeItem(id), std::string("fill1"));
+        QVERIFY(!pathShape().has_value());  // (no path picked: nothing to edit on the monitor)
+        inspector->findChild<QPushButton*>("addGradientStop")->click();
+        QTRY_COMPARE(int(shapeContents(gen())[1].stops.size()), 3);
+        QCOMPARE(gen().p("fill1.gradient", 0), 1.0);
+        const std::vector<std::array<double, 5>> stops = gradientStops(gen(), shapeContents(gen())[1], 20);
+        QVERIFY(std::abs(stops[1][0] - 0.5) < 1e-9 || std::abs(stops[2][0] - 0.5) < 1e-9);
+        auto placeRow = [&] {
+            for (auto* l : inspector->findChildren<QLabel*>())
+                if (l->text().startsWith("Stop 3 Place")) return true;
+            return false;
+        };
+        QTRY_VERIFY(placeRow());
+        state()->setSelection({}, false);
+    }
+
     void globalMute() {
         // A tone on A1: heard, then silent under Global Mute, with the clip and track untouched.
         state()->newProject();

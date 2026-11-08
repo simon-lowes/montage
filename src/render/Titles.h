@@ -15,6 +15,7 @@
 #include <QPointF>
 #include <QString>
 #include <array>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -66,8 +67,31 @@ void applyTitleStyleSpans(Effect& g, const std::vector<std::pair<QString, std::o
 // Amount: its range's shape over the units, eased, spread by its random amount.
 double textSelection(const Effect& g, int k, FrameTime t, double fps, FrameTime duration, int i, int n);
 
-// Whether the title needs the styled path: it has runs that change something, a path, or text animations.
+// Whether the title needs the styled path: it has runs that change something, a path, text animations or font axes
+// of its own.
 bool titleIsStyled(const Effect& g, FrameTime t);
+
+// A path the title does not hold itself, to set its text on (path_shape 4, a mask of an effect on its clip, or 5, a
+// path of a shape layer under it; render/Compositor finds them): in output pixels, as lines, cubic Béziers and
+// elliptic arcs, in the order the text runs along them.
+struct TitlePathCurve {
+    struct Segment {
+        int kind = 0;    // 0 a line p[0] to p[1], 1 a cubic p[0] p[1] p[2] p[3], 2 an elliptic arc
+        QPointF p[4];    // (an arc: its centre in p[0], its radii in p[1])
+        double rotation = 0, from = 0, to = 0;  // an arc's: its axes turned (radians), and its angles
+    };
+    std::vector<Segment> segments;
+    bool closed = false;
+};
+// The path at a time (clip frames, fractional within a frame for motion blur); nothing when there is none.
+using TitlePathFn = std::function<std::optional<TitlePathCurve>(double t)>;
+// The path a title clip `c` in `seq` sets its text on when it is not its own (render/Compositor.cpp): one of its
+// effects' masks (path_shape 4, the Mask Number-th ellipse, rectangle or Bézier mask) or a shape layer's path under it
+// (5), in pixels of the title's w x h picture, at a clip time. Empty for a title on any other path. It refers to `p`,
+// `seq` and `c`, which must outlive it.
+TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h);
+// The title's font axes of its own (params "axis.<tag>", for every character; runs' axes override them).
+std::vector<std::string> titleAxes(const Effect& g);
 
 // One glyph cluster of a styled title as drawn at frame t.
 struct TitleGlyph {
@@ -75,18 +99,32 @@ struct TitleGlyph {
     int line = 0;
     QPainterPath path;          // in output pixels, placed and animated
     QPointF baselineMid;        // the middle of its baseline in output pixels, placed (before animation)
+    double angle = 0;           // how far its baseline is turned (degrees, clockwise on screen) where it is placed
     std::vector<std::pair<quint32, QPointF>> glyphs;  // glyph ids and their pen positions in the line's layout
     QColor fill, outlineColor;
     double outline = 0, opacity = 1, blur = 0;
 };
 // The glyphs a styled title draws at frame t on a w x h frame (empty for a plain one).
-std::vector<TitleGlyph> titleGlyphs(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps);
+std::vector<TitleGlyph> titleGlyphs(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps,
+                                    const TitlePathFn& path = {});
 
-// The "title" generator at frame t of a clip `duration` frames long.
-Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps);
+// The "title" generator at frame t of a clip `duration` frames long. With Motion Blur (letter_blur), the average of
+// letter_samples renders spread evenly over the shutter (letter_shutter degrees of a frame) centred on the frame.
+Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {});
+// One render at a time between frames, without motion blur.
+Image renderTitleAt(const Effect& g, double t, int w, int h, double scale, FrameTime duration, double fps, const TitlePathFn& path = {});
 
 // A styled title's text as one outline, laid out with its runs (no path or animation), lines `lineHeight` apart, for
 // the 3D titles: px output pixels per sequence pixel. Empty when it has no runs.
 QPainterPath styledTextOutline(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing);
+// The same text a glyph cluster at a time, for depths set letter by letter: each cluster's outline and its place
+// among the letters, letters not spaces, words and lines (-1 for a space), in reading order. `defaultText` is the
+// title's text when it has none set.
+struct TitleCharOutline {
+    QPainterPath path;
+    int letter = 0, solid = -1, word = -1, line = 0;
+};
+std::vector<TitleCharOutline> titleCharOutlines(const Effect& g, FrameTime t, double px, double defaultSize, double lineSpacing,
+                                                const QString& defaultText, int& letters, int& solids, int& words, int& lines);
 
 }  // namespace montage

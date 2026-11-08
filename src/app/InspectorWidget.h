@@ -92,6 +92,8 @@ private:
     void addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target);
     // A title's styled runs (Style Selected Text, Clear Styles) and its text animations, a section each.
     void addTitleTextTools(QFormLayout* form, const Clip& clip, const Target& target);
+    // A title's (or a 3D title's) font axes of its own and text animations.
+    void addTextAnimations(const Clip& clip, const Target& target);
     // A shape layer's contents (core/ShapeContents.h): listed, added to, removed, reordered, imported from an SVG or a
     // drawn mask, and the picked item's settings.
     void addShapeContents(QFormLayout* form, const Clip& clip, const Target& target);

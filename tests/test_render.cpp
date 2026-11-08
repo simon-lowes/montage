@@ -42,6 +42,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "render/MeshWarp.h"
 #include "render/SurfaceTrack.h"
 #include "render/ColorChart.h"
@@ -13912,6 +13913,178 @@ colorspaces:
         QVERIFY(renderGenerator(t, 0, 800, 600, 1.0, 30, 30).px != renderGenerator(flat, 0, 800, 600, 1.0, 30, 30).px);
     }
 
+    void textOnMasksAndShapePaths() {
+        // A title set on one of its clip's masks: an ellipse mask drawn as a circle of radius 200 round the middle of
+        // an 800 x 600 frame. Every letter's baseline middle on the circle (0.1 px) and its baseline along the circle's
+        // tangent there (0.1 degrees).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 800, s.height = 600;
+        Clip c = makeGeneratorClip(p, "title", 60);
+        Effect& t = c.generator;
+        t.strings["text"] = "AROUND THE WORLD AND BACK AGAIN";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 36.0;
+        t.params["path_shape"] = 4.0;
+        Effect m = makeEffect(p, "invert");
+        m.params["mask.shape"] = 1.0;
+        m.params["mask.x"] = 0.5, m.params["mask.y"] = 0.5, m.params["mask.w"] = 400.0 / 800, m.params["mask.h"] = 400.0 / 600;
+        c.effects.push_back(m);
+        const QPointF mid(400, 300);
+        const double R = 200;
+        auto glyphs = [&](FrameTime f) { return titleGlyphs(t, f, 800, 600, 1.0, 60, 30, titlePathSource(p, s, c, 800, 600)); };
+        auto wrap = [](double deg) { return std::remainder(deg, 360.0); };
+        std::vector<TitleGlyph> gl = glyphs(0);
+        QCOMPARE(int(gl.size()), 31);
+        for (const TitleGlyph& g : gl) {
+            const double r = QLineF(mid, g.baselineMid).length();
+            QVERIFY2(std::abs(r - R) < 0.1, qPrintable(QString("radius %1").arg(r, 0, 'f', 4)));
+            // Clockwise on screen (y down), the tangent at angle phi points at phi + 90 degrees.
+            const double phi = std::atan2(g.baselineMid.y() - mid.y(), g.baselineMid.x() - mid.x()) * 180 / M_PI;
+            QVERIFY2(std::abs(wrap(g.angle - (phi + 90))) < 0.1, qPrintable(QString("baseline at %1, tangent %2").arg(g.angle).arg(phi + 90)));
+            if (!g.path.isEmpty()) QVERIFY(QLineF(mid, g.path.boundingRect().center()).length() > R);  // standing on it, outside
+        }
+        // Centred at the top as the text is centred, reading clockwise.
+        QVERIFY(gl.front().baselineMid.x() < mid.x() && gl.back().baselineMid.x() > mid.x());
+        // Upright (perpendicular off): not turned.
+        t.params["path_upright"] = 1.0;
+        for (const TitleGlyph& g : glyphs(0)) QVERIFY(std::abs(g.angle) < 1e-9);
+        t.params["path_upright"] = 0.0;
+
+        // From the start, the offset keyed from 0 to 100 % over 30 frames: the first letter goes round the circle at
+        // 360 degrees in 30 frames, from where it starts (half its advance past the top).
+        t.params["path_align"] = 1.0;
+        Param off;
+        off.addKey(0, 0.0);
+        off.addKey(30, 100.0);
+        t.params["path_offset"] = off;
+        auto firstAt = [&](FrameTime f) {
+            const TitleGlyph g = glyphs(f).front();
+            return std::atan2(g.baselineMid.y() - mid.y(), g.baselineMid.x() - mid.x());
+        };
+        const double start = firstAt(0);
+        // (How far along a straight path from the title's position the first letter's middle is set.)
+        Effect straight = t;
+        straight.params["path_shape"] = 3.0;
+        straight.params["path_offset"] = Param(0.0);
+        straight.strings["path_data"] = "M 0 0 L 2000 0";
+        const double half = titleGlyphs(straight, 0, 800, 600, 1.0, 60, 30).front().baselineMid.x() - mid.x();
+        QVERIFY2(half > 5 && std::abs((start + M_PI / 2) * R - half) < 0.1, qPrintable(QString("%1 px along, %2 on a line").arg((start + M_PI / 2) * R).arg(half)));
+        for (FrameTime f : {3, 7, 12, 15, 22, 29}) {
+            const double want = start + 2 * M_PI * double(f) / 30, got = firstAt(f);
+            const double along = std::remainder(got - want, 2 * M_PI) * R;
+            QVERIFY2(std::abs(along) < 0.1, qPrintable(QString("frame %1: %2 px off along the arc").arg(f).arg(along)));
+            const TitleGlyph g = glyphs(f).front();
+            QVERIFY(std::abs(QLineF(mid, g.baselineMid).length() - R) < 0.1);
+        }
+
+        // On a rectangle mask 720 x 300 px: the path runs clockwise from its top left corner, so centred (In the Middle)
+        // a sixth of its 2040 px round (360 px), the letters sit along the top edge's middle, level, on it.
+        t.params["path_offset"] = Param(360.0 / 2040 * 100);
+        t.params["path_align"] = 2.0;
+        c.effects[0].params["mask.shape"] = 2.0;
+        c.effects[0].params["mask.w"] = 0.9, c.effects[0].params["mask.h"] = 0.5;
+        t.strings["text"] = "TOP";
+        gl = glyphs(0);
+        QCOMPARE(int(gl.size()), 3);
+        for (const TitleGlyph& g : gl)
+            QVERIFY2(std::abs(g.baselineMid.y() - 150) < 1e-6 && std::abs(g.angle) < 1e-6, qPrintable(QString("%1 %2").arg(g.baselineMid.y()).arg(g.angle)));
+        QVERIFY2(std::abs((gl[0].baselineMid.x() + gl[2].baselineMid.x()) / 2 - 400) < 2, qPrintable(QString::number(gl[1].baselineMid.x())));
+
+        // On a shape layer's path below it: a closed square path 300 px across round the layer's middle (an outline
+        // only, nothing drawn), the layer moved 50 px right. An eighth of the way round (the top edge's middle), the
+        // text runs along that edge, 150 px above the frame's middle, centred on the moved layer.
+        Clip layer = makeGeneratorClip(p, "shape", 60);
+        {
+            ShapeItem path;
+            path.type = "path", path.id = "path1", path.closed = true;
+            setShapeContents(layer.generator, {path});
+            setShapePathPoints(layer.generator, "path1", 0, {{-150, -150}, {150, -150}, {150, 150}, {-150, 150}});
+            layer.generator.params["pos_x"] = 50.0;
+        }
+        QVERIFY(s.videoTracks.size() >= 2);
+        for (Track& tr : s.videoTracks) tr.clips.clear();
+        layer.start = 0, c.start = 0;
+        s.videoTracks[0].clips = {layer};
+        c.effects.clear();
+        t.params["path_shape"] = 5.0;
+        t.params["path_offset"] = Param(12.5);
+        s.videoTracks[1].clips = {c};
+        const Clip& placed = s.videoTracks[1].clips[0];
+        const TitlePathFn fromShape = titlePathSource(p, s, placed, 800, 600);
+        QVERIFY(fromShape && fromShape(0));
+        const std::vector<TitleGlyph> sg = titleGlyphs(placed.generator, 0, 800, 600, 1.0, 60, 30, fromShape);
+        QCOMPARE(int(sg.size()), 3);
+        for (const TitleGlyph& g : sg) QVERIFY2(std::abs(g.baselineMid.y() - 150) < 1e-6 && std::abs(g.angle) < 1e-6, qPrintable(QString::number(g.baselineMid.y())));
+        QVERIFY2(std::abs((sg[0].baselineMid.x() + sg[2].baselineMid.x()) / 2 - 450) < 2, qPrintable(QString::number(sg[1].baselineMid.x())));
+        // Rendered in the sequence, the title draws there: ink just above the top edge, none below the middle.
+        RenderOptions o;
+        const Image frame = renderSequenceFrame(p, s, 0, o);
+        QCOMPARE(frame.width, 800);
+        float above = 0, below = 0;
+        for (int y = 0; y < 600; ++y)
+            for (int xx = 0; xx < 800; ++xx) {
+                if (y >= 100 && y <= 152) above = std::max(above, frame.at(xx, y)[0]);
+                if (y > 300) below = std::max(below, frame.at(xx, y)[0]);
+            }
+        QVERIFY2(above > 0.5f && below == 0.0f, qPrintable(QString("%1 %2").arg(above).arg(below)));
+        // With no shape layer below, there is no path to set it on.
+        s.videoTracks[0].clips.clear();
+        QVERIFY(!titlePathSource(p, s, s.videoTracks[1].clips[0], 800, 600)(0));
+    }
+
+    void titleLetterMotionBlur() {
+        // A letter moving 40 px a frame (a text animator's Position X keyed 0 to 400 over 10 frames), blurred with a
+        // 360 degree shutter and 16 samples: the frame is the average of the 16 renders at the subframes, within 1/255.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "I";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 80.0;
+        t.params["shadow"] = 0.0;
+        const int k = addTextAnimator(t);
+        const std::string x = "ta" + std::to_string(k) + ".x";
+        Param move;
+        move.addKey(0, -200.0);
+        move.addKey(10, 200.0);
+        t.params[x] = move;
+        t.params["letter_blur"] = 1.0;
+        t.params["letter_shutter"] = 360.0;
+        t.params["letter_samples"] = 16.0;
+        const int w = 640, h = 240;
+        const Image blurred = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        std::vector<double> sum(blurred.px.size(), 0.0);
+        for (int i = 0; i < 16; ++i) {
+            const double at = 5 + ((i + 0.5) / 16 - 0.5);
+            Effect still = t;
+            still.params["letter_blur"] = 0.0;
+            still.params[x] = Param(-200.0 + 40 * at);
+            const Image one = renderTitle(still, 5, w, h, 1.0, 30, 30);
+            QCOMPARE(one.px.size(), sum.size());
+            for (size_t j = 0; j < sum.size(); ++j) sum[j] += one.px[j];
+        }
+        double worst = 0;
+        for (size_t j = 0; j < sum.size(); ++j) worst = std::max(worst, std::abs(sum[j] / 16 - blurred.px[j]));
+        QVERIFY2(worst <= 1.0 / 255, qPrintable(QString("%1 of 255 off").arg(worst * 255)));
+        // Blurred indeed: smeared over about 40 px more than the sharp letter.
+        t.params["letter_blur"] = 0.0;
+        const Image sharp = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        auto spread = [&](const Image& img) {
+            int x0 = w, x1 = -1;
+            for (int y = 0; y < h; ++y)
+                for (int xx = 0; xx < w; ++xx)
+                    if (img.at(xx, y)[3] > 0.01f) x0 = std::min(x0, xx), x1 = std::max(x1, xx);
+            return x1 - x0;
+        };
+        QVERIFY2(std::abs(spread(blurred) - spread(sharp) - 37.5) < 4, qPrintable(QString("%1 %2").arg(spread(blurred)).arg(spread(sharp))));
+        // Still, a blurred title renders once: the same as unblurred.
+        t.params[x] = Param(0.0);
+        t.params["letter_blur"] = 1.0;
+        const Image stillBlur = renderTitle(t, 5, w, h, 1.0, 30, 30);
+        t.params["letter_blur"] = 0.0;
+        QVERIFY(stillBlur.px == renderTitle(t, 5, w, h, 1.0, 30, 30).px);
+    }
+
     void variableFontAxes() {
         // Oswald's weight axis: at 400 it draws as its default (Regular) instance does, heavier as it rises, and at 700
         // as its Bold instance where the font database offers that.
@@ -19638,6 +19811,67 @@ colorspaces:
                     q.save(QString::fromLocal8Bit(dir) + "/" + pre.id + "_" + QString::number(t) + ".png");
                 }
         }
+    }
+
+    void titles3DLetterDepths() {
+        // Two lines of one letter each, extruded 40 px, a text animation adding 80 px to the second half of the text
+        // (its second line): seen from the side (turned 90 degrees about Y through a long lens, so nearly without
+        // perspective), each letter's silhouette runs back as far as it is deep, 40 and 120 px, from the same face.
+        Effect g = makeEffect("title3d", 1);
+        g.strings["text"] = "I\nI";
+        g.strings["font"] = "DejaVu Sans";
+        g.params["size"] = Param(120.0);
+        g.params["depth"] = Param(40.0);
+        g.params["rot_x"] = Param(0.0);
+        g.params["rot_y"] = Param(90.0);
+        g.params["fov"] = Param(5.0);
+        g.params["ambient"] = Param(100.0);
+        g.params["specular"] = Param(0.0);
+        const int k = addTextAnimator(g);
+        const std::string pre = "ta" + std::to_string(k) + ".";
+        QVERIFY(g.params.count(pre + "depth") && !g.params.count(pre + "x"));
+        g.params[pre + "by"] = Param(3.0);  // lines
+        g.params[pre + "start"] = Param(50.0);
+        g.params[pre + "depth"] = Param(80.0);
+        const int w = 640, h = 360;
+        // The letters' silhouettes, top to bottom: their rows and columns.
+        struct Run {
+            int y0, y1, x0 = 1 << 30, x1 = -1;
+        };
+        auto runs = [&](const Image& img) {
+            std::vector<Run> out;
+            bool in = false;
+            for (int y = 0; y < h; ++y) {
+                bool any = false;
+                for (int x = 0; x < w && !any; ++x) any = img.at(x, y)[3] >= 0.5f;
+                if (any && !in) out.push_back({y, y});
+                if (any) out.back().y1 = y;
+                in = any;
+            }
+            for (Run& r : out)
+                for (int y = r.y0; y <= r.y1; ++y)
+                    for (int x = 0; x < w; ++x)
+                        if (img.at(x, y)[3] >= 0.5f) r.x0 = std::min(r.x0, x), r.x1 = std::max(r.x1, x);
+            return out;
+        };
+        auto deep = [](const Run& r) { return double(r.x1 - r.x0 + 1); };
+        const std::vector<Run> r = runs(renderGenerator(g, 0, w, h, 1.0, 90, 30));
+        QCOMPARE(int(r.size()), 2);
+        QVERIFY2(std::abs(deep(r[0]) - 40) <= 0.05 * 40 + 2 && std::abs(deep(r[1]) - 120) <= 0.05 * 120 + 2, qPrintable(QString("%1 %2").arg(deep(r[0])).arg(deep(r[1]))));
+        // The faces line up: the deep letter goes back from the same front.
+        QVERIFY2(std::abs(r[0].x0 - r[1].x0) <= 3 || std::abs(r[0].x1 - r[1].x1) <= 3,
+                 qPrintable(QString("%1-%2 %3-%4").arg(r[0].x0).arg(r[0].x1).arg(r[1].x0).arg(r[1].x1)));
+        // A negative depth takes away from the base.
+        g.params[pre + "depth"] = Param(-30.0);
+        const std::vector<Run> thin = runs(renderGenerator(g, 0, w, h, 1.0, 90, 30));
+        QCOMPARE(int(thin.size()), 2);
+        QVERIFY2(std::abs(deep(thin[1]) - 10) <= 3 && std::abs(deep(thin[0]) - 40) <= 4, qPrintable(QString("%1 %2").arg(deep(thin[0])).arg(deep(thin[1]))));
+        // Without the animation both lines are 40 deep.
+        Effect plain = g;
+        for (auto it = plain.params.begin(); it != plain.params.end();) it = it->first.rfind("ta", 0) == 0 ? plain.params.erase(it) : std::next(it);
+        const std::vector<Run> same = runs(renderGenerator(plain, 0, w, h, 1.0, 90, 30));
+        QCOMPARE(int(same.size()), 2);
+        QVERIFY(std::abs(deep(same[1]) - deep(same[0])) <= 1 && std::abs(deep(same[0]) - 40) <= 4);
     }
 
     void titles3D() {

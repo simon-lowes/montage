@@ -11,7 +11,8 @@ namespace {
 
 const char* const kComponents[6] = {"x", "y", "ix", "iy", "ox", "oy"};
 
-std::string paramName(int i, int component) { return "mask.p" + std::to_string(i) + "." + kComponents[component]; }
+const std::string kMask = "mask.";
+std::string paramName(const std::string& prefix, int i, int component) { return prefix + "p" + std::to_string(i) + "." + kComponents[component]; }
 
 double& component(PathPoint& p, int c) {
     double* f[6] = {&p.x, &p.y, &p.ix, &p.iy, &p.ox, &p.oy};
@@ -19,9 +20,20 @@ double& component(PathPoint& p, int c) {
 }
 double component(const PathPoint& p, int c) { return component(const_cast<PathPoint&>(p), c); }
 
-void erasePathParams(Effect& e) {
+// Whether `name` is prefix + "p<i>.<component>".
+bool isPathParam(const std::string& name, const std::string& prefix) {
+    if (name.rfind(prefix + "p", 0) != 0) return false;
+    size_t i = prefix.size() + 1;
+    const size_t digits = i;
+    while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i]))) ++i;
+    if (i == digits || i >= name.size() || name[i] != '.') return false;
+    const std::string c = name.substr(i + 1);
+    return std::any_of(std::begin(kComponents), std::end(kComponents), [&c](const char* k) { return c == k; });
+}
+
+void erasePathParams(Effect& e, const std::string& prefix) {
     for (auto it = e.params.begin(); it != e.params.end();)
-        it = isMaskPathParam(it->first) ? e.params.erase(it) : std::next(it);
+        it = isPathParam(it->first, prefix) ? e.params.erase(it) : std::next(it);
 }
 
 double cubic(double p0, double p1, double p2, double p3, double s) {
@@ -37,61 +49,58 @@ MaskBox maskBox(const Effect& e, FrameTime t) {
     return {e.p("mask.x", t, 0.5), e.p("mask.y", t, 0.5), e.p("mask.w", t, 0.4), e.p("mask.h", t, 0.4), e.p("mask.rotation", t)};
 }
 
-bool isMaskPathParam(const std::string& name) {
-    if (name.rfind("mask.p", 0) != 0) return false;
-    size_t i = 6;
-    const size_t digits = i;
-    while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i]))) ++i;
-    if (i == digits || i >= name.size() || name[i] != '.') return false;
-    const std::string c = name.substr(i + 1);
-    return std::any_of(std::begin(kComponents), std::end(kComponents), [&c](const char* k) { return c == k; });
-}
+bool isMaskPathParam(const std::string& name) { return isPathParam(name, kMask); }
 
-int maskPathCount(const Effect& e) {
+int pathPointCount(const Effect& e, const std::string& prefix) {
     int n = 0;
-    while (e.params.count(paramName(n, 0))) ++n;
+    while (e.params.count(paramName(prefix, n, 0))) ++n;
     return n;
 }
+int maskPathCount(const Effect& e) { return pathPointCount(e, kMask); }
 
 std::vector<std::string> maskPathParams(const Effect& e) {
     std::vector<std::string> out;
     const int n = maskPathCount(e);
     for (int i = 0; i < n; ++i)
-        for (int c = 0; c < 6; ++c) out.push_back(paramName(i, c));
+        for (int c = 0; c < 6; ++c) out.push_back(paramName(kMask, i, c));
     return out;
 }
 
-std::vector<PathPoint> maskPath(const Effect& e, FrameTime t) {
-    std::vector<PathPoint> pts(size_t(maskPathCount(e)));
+std::vector<PathPoint> pathPoints(const Effect& e, FrameTime t, const std::string& prefix) {
+    std::vector<PathPoint> pts(size_t(pathPointCount(e, prefix)));
     for (size_t i = 0; i < pts.size(); ++i)
-        for (int c = 0; c < 6; ++c) component(pts[i], c) = e.p(paramName(int(i), c), t);
+        for (int c = 0; c < 6; ++c) component(pts[i], c) = e.p(paramName(prefix, int(i), c), t);
     return pts;
 }
+std::vector<PathPoint> maskPath(const Effect& e, FrameTime t) { return pathPoints(e, t, kMask); }
 
-bool maskPathAnimated(const Effect& e) {
-    auto it = e.params.find(kMaskPathParam);
+bool pathAnimated(const Effect& e, const std::string& prefix) {
+    auto it = e.params.find(paramName(prefix, 0, 0));
     return it != e.params.end() && it->second.animated();
 }
+bool maskPathAnimated(const Effect& e) { return pathAnimated(e, kMask); }
 
-std::vector<FrameTime> maskPathKeyTimes(const Effect& e) {
+std::vector<FrameTime> pathKeyTimes(const Effect& e, const std::string& prefix) {
     std::set<FrameTime> times;
     for (const auto& [name, p] : e.params)
-        if (isMaskPathParam(name))
+        if (isPathParam(name, prefix))
             for (const Keyframe& k : p.keys) times.insert(k.t);
     return {times.begin(), times.end()};
 }
+std::vector<FrameTime> maskPathKeyTimes(const Effect& e) { return pathKeyTimes(e, kMask); }
 
-void setMaskPath(Effect& e, FrameTime t, const std::vector<PathPoint>& pts) {
-    const bool animated = maskPathAnimated(e);
-    for (int i = int(pts.size()), n = maskPathCount(e); i < n; ++i)
-        for (int c = 0; c < 6; ++c) e.params.erase(paramName(i, c));
+void setPathPoints(Effect& e, FrameTime t, const std::vector<PathPoint>& pts, const std::string& prefix) {
+    const bool animated = pathAnimated(e, prefix);
+    for (int i = int(pts.size()), n = pathPointCount(e, prefix); i < n; ++i)
+        for (int c = 0; c < 6; ++c) e.params.erase(paramName(prefix, i, c));
     for (size_t i = 0; i < pts.size(); ++i)
         for (int c = 0; c < 6; ++c) {
-            Param& p = e.params[paramName(int(i), c)];
+            Param& p = e.params[paramName(prefix, int(i), c)];
             if (animated && !p.animated()) p.addKey(t, component(pts[i], c));
             else p.set(t, component(pts[i], c));
         }
 }
+void setMaskPath(Effect& e, FrameTime t, const std::vector<PathPoint>& pts) { setPathPoints(e, t, pts, kMask); }
 
 void setMaskPathAnimated(Effect& e, FrameTime t, bool on) {
     for (const std::string& name : maskPathParams(e)) {
@@ -106,12 +115,12 @@ void setMaskPathAnimated(Effect& e, FrameTime t, bool on) {
     }
 }
 
-void editMaskPath(Effect& e, FrameTime t, const std::function<void(std::vector<PathPoint>&)>& fn) {
-    if (!maskPathAnimated(e)) {
-        std::vector<PathPoint> pts = maskPath(e, t);
+void editPathPoints(Effect& e, FrameTime t, const std::function<void(std::vector<PathPoint>&)>& fn, const std::string& prefix) {
+    if (!pathAnimated(e, prefix)) {
+        std::vector<PathPoint> pts = pathPoints(e, t, prefix);
         fn(pts);
-        erasePathParams(e);
-        setMaskPath(e, t, pts);
+        erasePathParams(e, prefix);
+        setPathPoints(e, t, pts, prefix);
         return;
     }
     struct Snapshot {
@@ -120,27 +129,28 @@ void editMaskPath(Effect& e, FrameTime t, const std::function<void(std::vector<P
         std::vector<PathPoint> pts;
     };
     std::vector<Snapshot> keys;
-    const Param& rep = e.params.at(kMaskPathParam);
-    for (FrameTime k : maskPathKeyTimes(e)) {
+    const Param& rep = e.params.at(paramName(prefix, 0, 0));
+    for (FrameTime k : pathKeyTimes(e, prefix)) {
         const Keyframe* kf = rep.keyAt(k);
-        keys.push_back({k, kf ? kf->interp : Interp::Linear, maskPath(e, k)});
+        keys.push_back({k, kf ? kf->interp : Interp::Linear, pathPoints(e, k, prefix)});
         fn(keys.back().pts);
     }
-    erasePathParams(e);
+    erasePathParams(e, prefix);
     for (const Snapshot& s : keys)
         for (size_t i = 0; i < s.pts.size(); ++i)
-            for (int c = 0; c < 6; ++c) e.params[paramName(int(i), c)].addKey(s.t, component(s.pts[i], c), s.interp);
+            for (int c = 0; c < 6; ++c) e.params[paramName(prefix, int(i), c)].addKey(s.t, component(s.pts[i], c), s.interp);
 }
+void editMaskPath(Effect& e, FrameTime t, const std::function<void(std::vector<PathPoint>&)>& fn) { editPathPoints(e, t, fn, kMask); }
 
 std::pair<double, double> segmentPoint(const PathPoint& a, const PathPoint& b, double s) {
     return {cubic(a.x, a.x + a.ox, b.x + b.ix, b.x, s), cubic(a.y, a.y + a.oy, b.y + b.iy, b.y, s)};
 }
 
-int insertMaskPoint(Effect& e, FrameTime t, int seg, double s) {
-    const int n = maskPathCount(e);
-    if (n < 2 || seg < 0 || seg >= n) return -1;
+int insertPathPoint(Effect& e, FrameTime t, int seg, double s, const std::string& prefix, bool closed) {
+    const int n = pathPointCount(e, prefix);
+    if (n < 2 || seg < 0 || seg >= (closed ? n : n - 1)) return -1;
     s = std::clamp(s, 0.01, 0.99);
-    editMaskPath(e, t, [seg, s](std::vector<PathPoint>& pts) {
+    editPathPoints(e, t, [seg, s](std::vector<PathPoint>& pts) {
         if (seg >= int(pts.size())) return;
         PathPoint& a = pts[size_t(seg)];
         PathPoint& b = pts[size_t(seg + 1) % pts.size()];
@@ -171,27 +181,30 @@ int insertMaskPoint(Effect& e, FrameTime t, int seg, double s) {
             b.iy = cy - p3y;
         }
         pts.insert(pts.begin() + seg + 1, mid);
-    });
+    }, prefix);
     return seg + 1;
 }
+int insertMaskPoint(Effect& e, FrameTime t, int seg, double s) { return insertPathPoint(e, t, seg, s, kMask, true); }
 
-bool removeMaskPoint(Effect& e, FrameTime t, int index) {
-    if (index < 0 || index >= maskPathCount(e) || maskPathCount(e) <= 3) return false;
-    editMaskPath(e, t, [index](std::vector<PathPoint>& pts) {
+bool removePathPoint(Effect& e, FrameTime t, int index, const std::string& prefix, int fewest) {
+    if (index < 0 || index >= pathPointCount(e, prefix) || pathPointCount(e, prefix) <= fewest) return false;
+    editPathPoints(e, t, [index](std::vector<PathPoint>& pts) {
         if (index < int(pts.size())) pts.erase(pts.begin() + index);
-    });
+    }, prefix);
     return true;
 }
+bool removeMaskPoint(Effect& e, FrameTime t, int index) { return removePathPoint(e, t, index, kMask, 3); }
 
-void toggleMaskPointSmooth(Effect& e, FrameTime t, int index) {
-    if (index < 0 || index >= maskPathCount(e)) return;
-    const bool wasSmooth = maskPath(e, t)[size_t(index)].smooth();
-    editMaskPath(e, t, [index, wasSmooth](std::vector<PathPoint>& pts) {
+void togglePathPointSmooth(Effect& e, FrameTime t, int index, const std::string& prefix, bool closed) {
+    if (index < 0 || index >= pathPointCount(e, prefix)) return;
+    const bool wasSmooth = pathPoints(e, t, prefix)[size_t(index)].smooth();
+    editPathPoints(e, t, [index, wasSmooth, closed](std::vector<PathPoint>& pts) {
         PathPoint& p = pts[size_t(index)];
         if (wasSmooth) p.ix = p.iy = p.ox = p.oy = 0;
-        else p = smoothed(pts, index);
-    });
+        else p = smoothed(pts, index, closed);
+    }, prefix);
 }
+void toggleMaskPointSmooth(Effect& e, FrameTime t, int index) { togglePathPointSmooth(e, t, index, kMask, true); }
 
 PathPoint smoothed(const std::vector<PathPoint>& pts, int i, bool closed) {
     const int n = int(pts.size());
@@ -301,7 +314,7 @@ void setMaskPathFromFrame(Effect& e, std::vector<PathPoint> pts, double frameW, 
         for (size_t i = 0; i < pts.size(); ++i)
             if (!pts[i].smooth()) pts[i] = smoothed(pts, int(i));
     fitMaskBox(box, pts, frameW, frameH);
-    erasePathParams(e);
+    erasePathParams(e, kMask);
     e.params.erase("mask.open");
     e.params["mask.shape"] = Param(5);
     e.params["mask.x"] = Param(box.x);

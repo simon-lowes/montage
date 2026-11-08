@@ -59,6 +59,18 @@ bool removeMaskPoint(Effect& e, FrameTime t, int index);
 // Corner <-> smooth (automatic handles from the neighbours), at every key.
 void toggleMaskPointSmooth(Effect& e, FrameTime t, int index);
 
+// The same for any path kept as params prefix + "p<i>.x" ... (a shape layer's path item: prefix "<id>."), open or
+// closed; a path keeps at least `fewest` points.
+int pathPointCount(const Effect& e, const std::string& prefix);
+std::vector<PathPoint> pathPoints(const Effect& e, FrameTime t, const std::string& prefix);
+bool pathAnimated(const Effect& e, const std::string& prefix);
+std::vector<FrameTime> pathKeyTimes(const Effect& e, const std::string& prefix);
+void setPathPoints(Effect& e, FrameTime t, const std::vector<PathPoint>& pts, const std::string& prefix);
+void editPathPoints(Effect& e, FrameTime t, const std::function<void(std::vector<PathPoint>&)>& fn, const std::string& prefix);
+int insertPathPoint(Effect& e, FrameTime t, int seg, double s, const std::string& prefix, bool closed);
+bool removePathPoint(Effect& e, FrameTime t, int index, const std::string& prefix, int fewest);
+void togglePathPointSmooth(Effect& e, FrameTime t, int index, const std::string& prefix, bool closed);
+
 // The point at s along a segment, and the segment split there (de Casteljau).
 std::pair<double, double> segmentPoint(const PathPoint& a, const PathPoint& b, double s);
 // The handles a smooth point gets from its neighbours (Catmull-Rom).

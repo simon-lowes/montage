@@ -3211,7 +3211,11 @@ void McpServer::Impl::addTools() {
         "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`. runs style stretches of the text "
         "(from and len count UTF-16 characters, newlines included): font, size, bold, italic, color and outline_color as "
         "[r, g, b] in 0..1, outline width, tracking, baseline shift (pixels up) and a variable font's axes ({\"wght\": 650}). "
-        "path sets the text along a circle (radius), a wave or SVG path data from the title's position. animations move "
+        "path sets the text along a circle (radius), a wave, SVG path data from the title's position, one of the title "
+        "clip's masks (mask; add one with montage_add_effect) or a shape layer's path below it (shape: track, item), from "
+        "offset % along it (offset_keys animate it), aligned at its start, middle or end or spread over it, the letters "
+        "at right angles to it unless perpendicular is false. axes sets a variable font's axes for the whole title; "
+        "motion_blur blurs moving letters (shutter angle, samples). animations move "
         "the text a letter, word or line at a time: a range (start, end and offset in % of the text; shape) selects "
         "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour) "
         "goes as far as it selects them; sweep runs the range across the text from the start (in_across) or to the end "
@@ -3225,8 +3229,15 @@ void McpServer::Impl::addTools() {
                 "color":{"type":"array","items":{"type":"number"}},"outline":{"type":"number"},
                 "outline_color":{"type":"array","items":{"type":"number"}},"tracking":{"type":"number"},"baseline":{"type":"number"},
                 "axes":{"type":"object","additionalProperties":{"type":"number"}}},"required":["from","len"]}},
-            "path":{"type":"object","properties":{"shape":{"type":"string","enum":["circle","wave","custom"]},"radius":{"type":"number"},
+            "path":{"type":"object","properties":{"shape":{"type":"string","enum":["circle","wave","custom","mask","shape"]},"radius":{"type":"number"},
                 "wavelength":{"type":"number"},"offset":{"type":"number","description":"% of the path's length"},
+                "offset_keys":{"type":"array","items":{"type":"object","properties":{"frame":{"type":"number"},"offset":{"type":"number"}}},
+                    "description":"The offset keyed: frames from the title's start"},
+                "align":{"type":"string","enum":["as_text","start","middle","end","spread"],"default":"as_text"},
+                "mask":{"type":"integer","description":"mask: which of the title clip's masks (1 the first)"},
+                "track":{"type":"integer","description":"shape: the shape layer's video track (1 the bottom; 0 the nearest below)"},
+                "item":{"type":"string","description":"shape: the path item's name or id (the first path when not given)"},
+                "perpendicular":{"type":"boolean","default":true,"description":"letters stand at right angles to the path (false: upright)"},
                 "upright":{"type":"boolean"},"reverse":{"type":"boolean","description":"run the other way (inside a circle)"},
                 "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"}},"required":["shape"]},
             "animations":{"type":"array","items":{"type":"object","properties":{
@@ -3237,8 +3248,13 @@ void McpServer::Impl::addTools() {
                 "random":{"type":"number"},"random_order":{"type":"boolean"},"seed":{"type":"number"},
                 "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"rotation":{"type":"number"},"opacity":{"type":"number"},
                 "blur":{"type":"number"},"tracking":{"type":"number"},"fill":{"type":"array","items":{"type":"number"}},"fill_amount":{"type":"number"},
-                "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"}}}},
-            "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels)"},
+                "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"},
+                "depth":{"type":"number","description":"3d: extrusion added where it selects (pixels)"}}}},
+            "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels); an animation's depth adds to it letter by letter"},
+            "axes":{"type":"object","additionalProperties":{"type":"number"},"description":"A variable font's axes for the whole title ({\"wght\": 650})"},
+            "motion_blur":{"type":"boolean","description":"Blur letters as they move"},
+            "shutter":{"type":"number","default":180,"description":"Motion blur shutter angle (degrees)"},
+            "samples":{"type":"integer","default":16,"description":"Motion blur samples (2-64)"},
             "spin_in":{"type":"boolean","description":"3d: spin in at the start"},
             "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
             "animate_by":{"type":"string","enum":["letter","word","line"],"default":"letter"},
@@ -3284,8 +3300,21 @@ void McpServer::Impl::addTools() {
                 if (a.value("animation_seconds").isDouble()) c.generator.params["text_anim_dur"] = Param(std::clamp(a.value("animation_seconds").toDouble(), 0.1, 10.0));
                 c.generator.params["text_anim_out"] = Param(a.value("animate_out").toBool() ? 1.0 : 0.0);
             }
-            if (type == "title3d" && (a.contains("path") || a.contains("animations")))
-                throw ArgError{"path and animations are for flat titles"};
+            if (type == "title3d" && (a.contains("path") || a.contains("motion_blur")))
+                throw ArgError{"path and motion_blur are for flat titles"};
+            if (a.contains("axes")) {
+                const QJsonObject ax = a.value("axes").toObject();
+                for (auto it = ax.begin(); it != ax.end(); ++it) {
+                    const QString tag = it.key();
+                    if (tag.isEmpty() || tag.size() > 4 || !it.value().isDouble()) throw ArgError{"\"axes\" maps tags of 1-4 letters to numbers"};
+                    c.generator.params["axis." + tag.toStdString()] = Param(it.value().toDouble());
+                }
+            }
+            if (a.contains("motion_blur")) {
+                c.generator.params["letter_blur"] = Param(a.value("motion_blur").toBool() ? 1.0 : 0.0);
+                if (a.value("shutter").isDouble()) c.generator.params["letter_shutter"] = Param(std::clamp(a.value("shutter").toDouble(), 0.0, 720.0));
+                if (a.value("samples").isDouble()) c.generator.params["letter_samples"] = Param(double(std::clamp(a.value("samples").toInt(), 2, 64)));
+            }
             if (a.contains("runs")) {
                 if (!a.value("runs").isArray()) throw ArgError{"\"runs\" is a list of {from, len, ...}"};
                 const QJsonArray arr = a.value("runs").toArray();
@@ -3296,16 +3325,36 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("path")) {
                 const QJsonObject pa = a.value("path").toObject();
-                const QStringList shapes{"none", "circle", "wave", "custom"};
+                const QStringList shapes{"none", "circle", "wave", "custom", "mask", "shape"};
                 const int sh = int(shapes.indexOf(pa.value("shape").toString()));
-                if (sh <= 0) throw ArgError{"\"path\" shape is circle, wave or custom"};
+                if (sh <= 0) throw ArgError{"\"path\" shape is circle, wave, custom, mask or shape"};
+                if (pa.contains("mask")) c.generator.params["path_mask"] = Param(double(std::clamp(pa.value("mask").toInt(1), 1, 64)));
+                if (pa.contains("track")) c.generator.params["path_track"] = Param(double(std::clamp(pa.value("track").toInt(0), 0, 99)));
+                if (pa.contains("item")) c.generator.strings["path_item"] = pa.value("item").toString().toStdString();
+                if (pa.contains("align")) {
+                    const QStringList aligns{"as_text", "start", "middle", "end", "spread"};
+                    const int al = int(aligns.indexOf(pa.value("align").toString()));
+                    if (al < 0) throw ArgError{"\"align\" is as_text, start, middle, end or spread"};
+                    c.generator.params["path_align"] = Param(double(al));
+                }
+                if (pa.contains("perpendicular")) c.generator.params["path_upright"] = Param(pa.value("perpendicular").toBool(true) ? 0.0 : 1.0);
                 if (sh == 3 && pa.value("data").toString().trimmed().isEmpty()) throw ArgError{"A custom path needs its SVG path data (data)"};
                 c.generator.params["path_shape"] = Param(double(sh));
                 for (const auto& [key, param] : std::vector<std::pair<const char*, const char*>>{
                          {"radius", "path_radius"}, {"wavelength", "path_wavelength"}, {"offset", "path_offset"}})
                     if (pa.value(key).isDouble()) c.generator.params[param] = Param(pa.value(key).toDouble());
-                c.generator.params["path_upright"] = Param(pa.value("upright").toBool() ? 1.0 : 0.0);
+                if (!pa.contains("perpendicular")) c.generator.params["path_upright"] = Param(pa.value("upright").toBool() ? 1.0 : 0.0);
                 c.generator.params["path_reverse"] = Param(pa.value("reverse").toBool() ? 1.0 : 0.0);
+                if (pa.contains("offset_keys")) {
+                    Param off;
+                    for (const QJsonValue& kv : pa.value("offset_keys").toArray()) {
+                        const QJsonObject ko = kv.toObject();
+                        if (!ko.value("frame").isDouble() || !ko.value("offset").isDouble()) throw ArgError{"Each offset key is {frame, offset}"};
+                        off.addKey(FrameTime(std::llround(ko.value("frame").toDouble())), ko.value("offset").toDouble());
+                    }
+                    if (off.keys.empty()) throw ArgError{"\"offset_keys\" is empty"};
+                    c.generator.params["path_offset"] = off;
+                }
                 if (sh == 3) c.generator.strings["path_data"] = pa.value("data").toString().toStdString();
             }
             if (a.contains("animations")) {
@@ -3330,8 +3379,11 @@ void McpServer::Impl::addTools() {
                              {"start", "start"}, {"end", "end"}, {"offset", "offset"}, {"ease", "ease"}, {"amount", "amount"},
                              {"sweep_seconds", "sweep_dur"}, {"random", "random"}, {"seed", "seed"}, {"x", "x"}, {"y", "y"},
                              {"scale", "scale"}, {"rotation", "rotation"}, {"opacity", "opacity"}, {"blur", "blur"},
-                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}})
+                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}, {"depth", "depth"}})
                         if (o.contains(key)) {
+                            if (std::string(name) == "depth" && type != "title3d") throw ArgError{"An animation's depth is for the 3d template"};
+                            if (type == "title3d" && std::string(name) != "depth" && std::string(" start end offset ease amount sweep_dur random seed ").find(" " + std::string(name) + " ") == std::string::npos)
+                                throw ArgError{QStringLiteral("A 3D title's animations select letters and set depth; \"%1\" is for flat titles").arg(key)};
                             if (!o.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
                             set(name, o.value(key).toDouble());
                         }
@@ -3711,11 +3763,11 @@ void McpServer::Impl::addTools() {
         "draw_on animates the outline drawing itself on over that many seconds (Trim End keyframed 0 to 100 %). Lottie "
         "animations (.json) and SVG graphics are placed like other media, with montage_place_media; svg (a file) instead "
         "makes an SVG's paths, groups, fills, strokes and gradients into an editable shape layer its size (what it cannot "
-        "make into shapes is listed in notes). items builds a layer of several things, in order, the first on top: "
+        "make into shapes is listed in notes; its text becomes title clips over it, counted in titles). items builds a layer of several things, in order, the first on top: "
         "{type, settings?, name?} with type a shape (rect, ellipse, polygon, star, or path with points [[x, y] or {x, y, "
         "in: [dx, dy], out: [dx, dy]}], closed, and keys [{frame, points}] to morph it), a paint (fill, stroke: settings "
         "color \"#rrggbb\", width, gradient 1 linear or 2 radial from start_x/y to end_x/y with color2, or stops "
-        "[[offset, \"#rrggbb\", opacity]]), an operator changing the paths above it in its group (merge: mode 0 keep "
+        "[[offset, \"#rrggbb\", opacity]], and gradient_keys [{frame, stops}] to animate the stops), an operator changing the paths above it in its group (merge: mode 0 keep "
         "each, 1 union, 2 subtract, 3 intersect, 4 exclude; offset: amount, join; round: radius; pucker: amount -100..100; "
         "twist: angle; zigzag: size, ridges, points 1 smooth; wiggle: size, spacing, speed, correlation, seed; trim: "
         "start, end, offset; repeater: copies, offset, pos_x/y, anchor_x/y, scale, rotation, start_opacity, end_opacity) "
@@ -3740,12 +3792,13 @@ void McpServer::Impl::addTools() {
             Effect built;
             std::vector<std::string> notes;
             double svgW = 0, svgH = 0;
+            std::vector<SvgText> svgTexts;
             if (a.contains("svg") && a.contains("items")) throw ArgError{"Give \"svg\" or \"items\", not both"};
             if (a.contains("svg")) {
                 const QFileInfo fi(absolute(str(a, "svg")));
                 if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(str(a, "svg"))};
                 std::string err;
-                if (!importSvgShapes(fi.absoluteFilePath().toStdString(), built, svgW, svgH, &notes, &err)) return fail(QString::fromStdString(err));
+                if (!importSvgShapes(fi.absoluteFilePath().toStdString(), built, svgW, svgH, &notes, &err, &svgTexts)) return fail(QString::fromStdString(err));
                 contents = shapeContents(built);
             } else if (a.contains("items")) {
                 std::set<std::string> usedIds;
@@ -3788,6 +3841,20 @@ void McpServer::Impl::addTools() {
                             const QColor col(st.at(1).toString());
                             if (!col.isValid()) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
                             it.stops.push_back({std::clamp(st.at(0).toDouble(), 0.0, 1.0), col.redF(), col.greenF(), col.blueF(), st.at(2).toDouble(1)});
+                        }
+                        for (const QJsonValue& kv : o.value("gradient_keys").toArray()) {
+                            // A gradient's stops keyed: [{frame, stops: [[offset, "#rrggbb", opacity]]}].
+                            const QJsonObject ko = kv.toObject();
+                            std::vector<std::array<double, 5>> stops;
+                            for (const QJsonValue& sv : ko.value("stops").toArray()) {
+                                const QJsonArray st = sv.toArray();
+                                const QColor col(st.at(1).toString());
+                                if (st.size() < 2 || !col.isValid()) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
+                                stops.push_back({std::clamp(st.at(0).toDouble(), 0.0, 1.0), col.redF(), col.greenF(), col.blueF(), std::clamp(st.at(2).toDouble(1), 0.0, 1.0)});
+                            }
+                            if (stops.size() < 2) throw ArgError{"Each gradient key has two or more stops"};
+                            if (!it.stops.empty() && stops.size() != it.stops.size()) throw ArgError{"Each gradient key has as many stops as the gradient"};
+                            keyGradientStops(built, it, FrameTime(std::llround(ko.value("frame").toDouble())), stops);
                         }
                         if (it.type == "path") {
                             auto pointsOf = [](const QJsonArray& arr) {
@@ -3840,12 +3907,16 @@ void McpServer::Impl::addTools() {
                 for (const ShapeItem& it : shapeContents(sc->generator)) eraseShapeItemParams(sc->generator, it);
                 for (const auto& [k, v] : built.params) sc->generator.params[k] = v;
                 setShapeContents(sc->generator, contents);
+                const Id scId = sc->id;
+                const int titles = placeSvgTexts(l.project, s, scId, svgTexts, &notes);
                 save(l);
-                QJsonObject out = clipJson(l.project, s, *sc);
+                sc = edit::clipById(s, scId);
+                QJsonObject out = sc ? clipJson(l.project, s, *sc) : QJsonObject{};
+                if (titles) out["titles"] = titles;
                 QJsonArray ns;
                 for (const std::string& n : notes) ns.append(QString::fromStdString(n));
                 if (!ns.isEmpty()) out["notes"] = ns;
-                return ok(QStringLiteral("Replaced the shapes of %1").arg(QString::fromStdString(sc->name)), out);
+                return ok(QStringLiteral("Replaced the shapes of %1").arg(sc ? QString::fromStdString(sc->name) : QString()), out);
             }
             if (!a.contains("at")) throw ArgError{"\"at\" is needed"};
             TrackRef t{TrackKind::Video, 0};
@@ -3901,9 +3972,11 @@ void McpServer::Impl::addTools() {
             }
             const auto r = edit::overwrite(l.project, s, t, c);
             check(r);
+            const int titles = r.created.empty() ? 0 : placeSvgTexts(l.project, s, r.created[0], svgTexts, &notes);
             save(l);
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
             QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            if (titles) out["titles"] = titles;
             QJsonArray ns;
             for (const std::string& n : notes) ns.append(QString::fromStdString(n));
             if (!ns.isEmpty()) out["notes"] = ns;
