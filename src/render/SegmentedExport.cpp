@@ -351,6 +351,7 @@ ExportSettings segmentExportSettings(const ExportSettings& s, const ExportSegmen
     // (A segment's GOPs copied from the footage bring the footage's parameter sets, which the one decoder configuration
     // the join keeps would not hold for the others.)
     if (exportSegmentsLongGop(s)) x.smartRender = false;
+    x.hrdCheck = false;  // (the join checks the whole)
     // A stated buffer model (or MPEG-2's constant rate): segments after the first start with the buffer lower than an
     // encoder's own start, so the join, which can only fill it (with filler data), meets each where it stands.
     if ((s.hrd == "cbr" || s.hrd == "vbr" || s.videoCodec == "mpeg2video") && segment.in > rangeIn(s) && s.vbvInit <= 0) x.vbvInit = 0.5;

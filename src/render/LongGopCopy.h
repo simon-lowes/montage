@@ -81,13 +81,6 @@ public:
     bool finish(std::string* error);
     int copiedFrames() const { return copied_; }
     int encodedParts() const { return parts_; }
-    // The buffer model kept across the joins (footage whose stream states an HRD, MPEG-2 at a constant rate): false
-    // when there was none to keep.
-    bool keepsHrd() const { return hrdOn_; }
-    // Copies left to be encoded because the buffer before them stood too low for what they ask; filler bytes added.
-    int hrdDeclined() const { return hrdDeclined_; }
-    int64_t hrdFillerBytes() const { return hrd_.fillerBytes(); }
-    const std::vector<HrdIssue>& hrdIssues() const { return hrd_.issues(); }
 
     struct Packet;
     struct Gop;
@@ -150,7 +143,6 @@ private:
     // The buffer model (render/HrdCheck.h).
     bool hrdOn_ = false;
     double hrdRate_ = 0, hrdBuffer_ = 0;
-    bool hrdCbr_ = false;
     std::vector<uint8_t> hrdSps_;  // H.264 and HEVC: the footage's SPS whose HRD the encoded parts are given
     HrdSplicer hrd_;
     int heldFlags_ = 0;
@@ -158,8 +150,9 @@ private:
     // H.264 entered at a recovery point: what its I-picture's frame_num was (taken off those after it until an IDR
     // picture), and the idr_pic_id the next IDR picture made takes.
     int64_t frameNumShift_ = -1;  // (H.264, after an I-picture made an IDR one: its frame_num, taken off those after; -1 none)
-    int idrPicId_ = 1;
-    int hrdDeclined_ = 0;
+    uint64_t pocShift_ = 0, sinceIdr_ = 0;  // (and its pic_order_cnt_lsb; the latest frame_num since, not wrapped)
+    // (2 to 65535: never x264's 0 and 1, so a made IDR picture right after an encoded one has another idr_pic_id)
+    int idrPicId_ = 2;
 };
 
 }  // namespace montage

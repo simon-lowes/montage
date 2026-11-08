@@ -2939,7 +2939,7 @@ bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSetti
 
 bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
     const std::string& c = s.videoCodec;
-    if (c != "libx264" && c != "libx265" && c != "mpeg2video") return false;
+    if (!s.hrdCheck || (c != "libx264" && c != "libx265" && c != "mpeg2video")) return false;
     if (s.profile == "avci100" || s.path.find('%') != std::string::npos) return false;  // (intra only; image sequences)
     return copiedFrames > 0 || s.hrd == "cbr" || s.hrd == "vbr";
 }

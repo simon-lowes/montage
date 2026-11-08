@@ -282,8 +282,11 @@ bool h264RecoveryNow(const uint8_t* nal, size_t n) {
         size += rb[i++];
         if (i + size_t(size) > rb.size()) break;
         if (type == 6) {
+            // (recovery_frame_cnt 0 and exact_match_flag: the pictures from it on decode exactly as without what is before)
             nal::Reader r(rb.data() + i, size_t(size));
-            return r.ue() == 0 && r.ok;
+            const uint64_t count = r.ue();
+            const bool exact = r.flag();
+            return count == 0 && exact && r.ok;
         }
         i += size_t(size);
     }
@@ -308,6 +311,8 @@ struct H264Slice {
     size_t frameNumAt = 0;   // bit of frame_num
     uint64_t frameNum = 0;
     size_t afterFrame = 0;   // after frame_num and the field flags
+    size_t pocLsbAt = 0;     // pic_order_cnt_lsb (pic_order_cnt_type 0; else 0)
+    uint64_t pocLsb = 0;
     size_t markingAt = 0;    // dec_ref_pic_marking()
     size_t afterMarking = 0;
     bool adaptive = false;   // adaptive_ref_pic_marking_mode_flag, and its operations (op, then its one or two values)
@@ -335,15 +340,19 @@ bool readH264Slice(const uint8_t* d, size_t n, const std::map<int, hrd::Sps>& sp
         if (field) r.flag();
     }
     sl.afterFrame = r.pos;
-    if (!full) return r.ok;
     const bool idr = (d[0] & 31) == 5;
     if (idr) r.ue();
     if (s.pocType == 0) {
-        r.u(s.log2MaxPocLsb);
+        sl.pocLsbAt = r.pos;
+        sl.pocLsb = r.u(s.log2MaxPocLsb);
+        if (!full) return r.ok;
         if (sl.pps->bottomFieldPicOrder && !field) r.se();
-    } else if (s.pocType == 1 && !s.deltaPicOrderAlwaysZero) {
-        r.se();
-        if (sl.pps->bottomFieldPicOrder && !field) r.se();
+    } else {
+        if (!full) return r.ok;
+        if (s.pocType == 1 && !s.deltaPicOrderAlwaysZero) {
+            r.se();
+            if (sl.pps->bottomFieldPicOrder && !field) r.se();
+        }
     }
     if (sl.pps->redundantPicCnt) r.ue();
     const int st = int(sl.type % 5);  // (0 P, 1 B, 2 I, 3 SP, 4 SI)
@@ -416,7 +425,13 @@ std::vector<uint8_t> h264SliceAsIdr(const uint8_t* d, size_t n, const std::map<i
     w.u(0, sl.sps->log2MaxFrameNum);
     w.copy(sl.rb, sl.frameNumAt + size_t(sl.sps->log2MaxFrameNum), sl.afterFrame);
     w.ue(uint64_t(idrPicId & 0xffff));
-    w.copy(sl.rb, sl.afterFrame, sl.markingAt);
+    if (sl.sps->pocType == 0) {
+        // (an IDR picture's order count is 0, 8.2.1: the pictures after it have its lsb taken off theirs)
+        w.u(0, sl.sps->log2MaxPocLsb);
+        w.copy(sl.rb, sl.pocLsbAt + size_t(sl.sps->log2MaxPocLsb), sl.markingAt);
+    } else {
+        w.copy(sl.rb, sl.afterFrame, sl.markingAt);
+    }
     w.flag(false);  // no_output_of_prior_pics_flag
     w.flag(false);  // long_term_reference_flag
     if (sl.pps->cabac) {
@@ -434,30 +449,53 @@ std::vector<uint8_t> h264SliceAsIdr(const uint8_t* d, size_t n, const std::map<i
     return nal::escape(&header, 1, w.out);
 }
 
-// H.264: a slice with `shift` taken off its frame_num (modulo MaxFrameNum), as after an I-picture made an IDR one. A
-// reference picture's marking operations on pictures from before that IDR picture (gone from the decoder there) are
-// left out; with none left, the sliding window marks as they did (it removes nothing the operations kept). Empty when
-// it cannot be done.
-std::vector<uint8_t> h264SliceFrameNum(const uint8_t* d, size_t n, const std::map<int, hrd::Sps>& sps, const std::map<int, hrd::Pps>& pps,
-                                       uint64_t shift) {
+// H.264, after an I-picture made an IDR picture: what its pictures' numbers are taken from, until the next IDR picture.
+struct H264Renumber {
+    uint64_t frameNumShift = 0;  // the I-picture's frame_num
+    uint64_t pocShift = 0;       // its pic_order_cnt_lsb (pic_order_cnt_type 0)
+    uint64_t sinceIdr = 0;       // the latest picture's frame_num as rewritten, not wrapped (reference pictures since it)
+};
+
+// H.264: a slice with the frame_num and pic_order_cnt_lsb of `rn` taken off its own (modulo their maxima), as after
+// an I-picture made an IDR one. A reference picture's marking operations on pictures from before that IDR picture
+// (gone from the decoder there) are left out; with none left, the sliding window marks as they did (it removes
+// nothing the operations kept). Empty when it cannot be done. `rn.sinceIdr` follows the pictures.
+std::vector<uint8_t> h264SliceRenumbered(const uint8_t* d, size_t n, const std::map<int, hrd::Sps>& sps, const std::map<int, hrd::Pps>& pps,
+                                         H264Renumber& rn) {
     H264Slice sl;
     if (!readH264Slice(d, n, sps, pps, sl, false)) return {};
-    const uint64_t wrap = uint64_t(1) << sl.sps->log2MaxFrameNum;
-    const uint64_t frameNum = (sl.frameNum + wrap - shift % wrap) % wrap;
-    const int bits = sl.sps->log2MaxFrameNum;
+    const int bits = sl.sps->log2MaxFrameNum, pocBits = sl.sps->log2MaxPocLsb;
+    const uint64_t wrap = uint64_t(1) << bits, pocWrap = uint64_t(1) << pocBits;
+    const uint64_t frameNum = (sl.frameNum + wrap - rn.frameNumShift % wrap) % wrap;
+    // (frame_num rises by one after each reference picture: unwrapped, the first value at or past the one before)
+    uint64_t since = rn.sinceIdr - rn.sinceIdr % wrap + frameNum;
+    if (since < rn.sinceIdr) since += wrap;
+    rn.sinceIdr = since;
+    const bool poc = sl.sps->pocType == 0;
     nal::Writer w;
     w.copy(sl.rb, 8, sl.frameNumAt);
     w.u(frameNum, bits);
+    // Up to `to`: the rest of the header as it was, the new pic_order_cnt_lsb in its place.
+    auto header = [&](size_t to) {
+        if (!poc) {
+            w.copy(sl.rb, sl.frameNumAt + size_t(bits), to);
+            return;
+        }
+        w.copy(sl.rb, sl.frameNumAt + size_t(bits), sl.pocLsbAt);
+        w.u((sl.pocLsb + pocWrap - rn.pocShift % pocWrap) % pocWrap, pocBits);
+        w.copy(sl.rb, sl.pocLsbAt + size_t(pocBits), to);
+    };
     if ((d[0] & 0x60) && readH264Slice(d, n, sps, pps, sl, true) && sl.adaptive) {
         std::vector<std::array<uint64_t, 3>> kept;
         for (const auto& o : sl.ops) {
-            // (difference_of_pic_nums_minus1: the picture CurrPicNum - (it + 1); before the IDR picture when below 0)
-            const bool before = (o[0] == 1 || o[0] == 3) && o[1] + 1 > frameNum;
+            // (difference_of_pic_nums_minus1: the picture CurrPicNum - (it + 1); before the IDR picture when that is
+            // below 0, counted without wrapping)
+            const bool before = (o[0] == 1 || o[0] == 3) && o[1] + 1 > since;
             if (before && o[0] == 3) return {};  // (a long-term reference made of a picture that is not there)
             if (!before) kept.push_back(o);
         }
         if (kept.size() != sl.ops.size()) {
-            w.copy(sl.rb, sl.frameNumAt + size_t(bits), sl.markingAt);
+            header(sl.markingAt);
             w.flag(!kept.empty());
             if (!kept.empty()) {
                 for (const auto& o : kept) {
@@ -481,7 +519,7 @@ std::vector<uint8_t> h264SliceFrameNum(const uint8_t* d, size_t n, const std::ma
             return nal::escape(d, 1, w.out);
         }
     }
-    w.copy(sl.rb, sl.frameNumAt + size_t(bits), sl.rb.size() * 8);
+    header(sl.rb.size() * 8);
     return nal::escape(d, 1, w.out);
 }
 
@@ -1010,7 +1048,6 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
                         (exported.profile > 0 && (h264ProfileRank(s[1]) > h264ProfileRank(exported.profile) || s[3] > exported.level));
             if (above) continue;
             if (lg->firstSource_ >= 0 && src.avcc.lengthSize != lg->lengthSize_) continue;
-            if (!hrdFits(statedHrd(codec, src.avcc.sps))) continue;
             for (const auto& u : src.avcc.sps) {
                 const hrd::Sps sp = hrd::parseH264Sps(u.data(), u.size());
                 if (sp.valid) src.hsps[sp.id] = sp;
@@ -1029,6 +1066,8 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
                 if (id < 0 || id > 255 || (ppsById.count(id) && ppsById[id] != s)) clash = true;
             }
             if (clash) continue;
+            // (last: the first source taken sets the buffer model, so one turned away for another reason must not)
+            if (!hrdFits(statedHrd(codec, src.avcc.sps))) continue;
             for (const auto& s : src.avcc.sps) spsById[h264SpsId(s.data(), s.size())] = s;
             for (const auto& s : src.avcc.pps) ppsById[h264PpsId(s.data(), s.size())] = s;
             if (lg->firstSource_ < 0) lg->lengthSize_ = src.avcc.lengthSize;
@@ -1360,6 +1399,10 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         for (const auto& sp : lg->sources_)
             if (sp->usable) lg->level_ = std::max(lg->level_, sp->level);
         lg->profile_ = lg->sources_[size_t(lg->firstSource_)]->profile;
+        // (the encoded parts' SPS must be able to state the footage's HRD, or the stream would have two models: x265
+        // writes timing information with hrd=1, and one sub-layer, so footage stating more is not copied)
+        if (mode.has && hrd::parseHevcSps(mode.sps.data(), mode.sps.size()).maxSubLayersMinus1 != 0)
+            return none("the encoder's parameter sets cannot take the footage's HRD (it states sub-layers)");
     } else if (codec == kMpeg2) {
         lg->profile_ = lg->sources_[size_t(lg->firstSource_)]->profile;
         lg->level_ = lg->sources_[size_t(lg->firstSource_)]->level;
@@ -1381,7 +1424,7 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         if (stated) lg->hrdOn_ = lg->hrd_.start(codec, {}, 0, fps, lg->depth_, double(m->rc_max_rate), buffer);
     }
     if (lg->hrdOn_) {
-        lg->hrdRate_ = lg->hrd_.bitRate(), lg->hrdBuffer_ = lg->hrd_.bufferBits(), lg->hrdCbr_ = lg->hrd_.cbr();
+        lg->hrdRate_ = lg->hrd_.bitRate(), lg->hrdBuffer_ = lg->hrd_.bufferBits();
     }
     lg->pkt_ = av_packet_alloc();
     if (!lg->pkt_) return none("out of memory");
@@ -1752,7 +1795,6 @@ int LongGopCopier::copy(FrameTime rel, std::string* error) {
         }
         std::vector<AVPacket*> gop;
         const int got = declined ? 0 : readGop(copies_[cursor_], gop, error);
-        if (declined) ++hrdDeclined_;
         if (got < 0) return -1;
         if (got == 0 && hvc1_) {
             // (an encoded part's sets cannot go beside the source's out of band: the export is made again, encoded)
@@ -1860,20 +1902,25 @@ bool LongGopCopier::writeGop(const Copy& c, const std::vector<AVPacket*>& gop, s
                 if (type == 1 && makeIdr) {
                     if (!shiftSet) {
                         H264Slice sl;
-                        frameNumShift_ = readH264Slice(nal, len, src.hsps, src.hpps, sl, false) ? int64_t(sl.frameNum) : 0;
+                        const bool read = readH264Slice(nal, len, src.hsps, src.hpps, sl, false);
+                        frameNumShift_ = read ? int64_t(sl.frameNum) : 0;
+                        pocShift_ = read ? sl.pocLsb : 0;
+                        sinceIdr_ = 0;
                         shiftSet = true;
                     }
                     v = h264SliceAsIdr(nal, len, src.hsps, src.hpps, idrPicId_);
                     bad = bad || v.empty();
                 } else if (type == 1 && frameNumShift_ >= 0 && !idr) {
-                    v = h264SliceFrameNum(nal, len, src.hsps, src.hpps, uint64_t(frameNumShift_));
+                    H264Renumber rn{uint64_t(frameNumShift_), pocShift_, sinceIdr_};
+                    v = h264SliceRenumbered(nal, len, src.hsps, src.hpps, rn);
+                    sinceIdr_ = rn.sinceIdr;
                     bad = bad || v.empty();
                 }
                 if (v.empty()) putNal(renumbered, nal, len, lengthSize_);
                 else putNal(renumbered, v.data(), v.size(), lengthSize_);
             });
             if (bad) return fail(error, "Smart rendering: an H.264 slice from a recovery point could not be rewritten");
-            if (makeIdr) idrPicId_ = (idrPicId_ + 1) & 0xffff;
+            if (makeIdr) idrPicId_ = idrPicId_ >= 0xffff ? 2 : idrPicId_ + 1;
             if (idr && !makeIdr) frameNumShift_ = -1;
             trimmed.swap(renumbered);
             body = trimmed.data();

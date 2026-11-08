@@ -19,6 +19,7 @@
 // x264 and x265 count them), Annex B files (MPEG-TS, raw streams) as they are. Sub-picture HRD parameters are not modelled.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -183,7 +184,6 @@ public:
     bool cbr() const { return cbr_; }
     double bitRate() const { return rate_; }
     double bufferBits() const { return size_; }
-    int64_t written() const { return count_; }
     // A parameter set the output carries out of band (H.264's avcC) or will see in band.
     void addParameterSet(const uint8_t* nal, size_t n);
     // Seconds the next access unit's removal comes after the one held (or the first's initial delay) finished arriving,
@@ -198,19 +198,16 @@ public:
     // The access unit held, final.
     std::vector<uint8_t> finish(int64_t* prevDisplay);
     bool holding() const { return havePending_; }
-    // The initial delay (seconds) the first access unit gets when it is ours (default: 90 % of the buffer).
-    void setFirstDelay(double seconds) { firstDelay_ = seconds; }
     // The initial delay (seconds) an access unit (an IRAP picture copied from footage) asks for, from its own SEI or
     // vbv_delay: -1 when it says none.
     double askedDelay(const uint8_t* d, size_t n) const;
-    const std::vector<HrdIssue>& issues() const { return issues_; }
-    int64_t fillerBytes() const { return filler_; }
 
 private:
     struct Held {
         std::vector<uint8_t> au;
         int64_t display = 0;
         bool ours = false, mayPad = false;
+        bool bp = false;     // it carries a buffering period (its own, or one given it)
         double removal = 0;  // its nominal removal time
         double arrival = 0;  // when its first bit arrives (before padding)
     };
@@ -218,7 +215,8 @@ private:
     bool rewrite(Held& h, int64_t k);
     void pad(Held& h, int64_t bytes);
     int64_t bitsOf(const std::vector<uint8_t>& au) const;
-    void note(int64_t frame, int64_t shown, const char* kind, const std::string& text);
+    // The initial delay (seconds) the first access unit gets when it is ours: 90 % of the buffer.
+    double firstDelay() const { return 0.9 * size_ / std::max(1.0, rate_); }
 
     bool active_ = false;
     int codec_ = 0;
@@ -231,20 +229,15 @@ private:
     std::map<int, hrd::Sps> sps_;
     std::map<int, hrd::Pps> pps_;
     std::vector<uint8_t> hrdSps_;  // the SPS whose HRD parts are given
-    double firstDelay_ = -1;
     // The model.
     int64_t count_ = 0;        // access units final
     double t0_ = 0;            // the first access unit's removal
     double lastFinal_ = 0;     // when the last final one finished arriving
-    double bpRemoval_ = 0;     // the latest buffering period's first access unit's removal
     int64_t bpIndex_ = 0;
     int64_t init90_ = 0, offset90_ = 0;
-    int64_t dpbFrames_ = -1;   // output delay, in frames, after the removal less the display order (learned)
     double mpegBits_ = 0;      // MPEG-2: bits written
     Held pending_;
     bool havePending_ = false;
-    std::vector<HrdIssue> issues_;
-    int64_t filler_ = 0;
 };
 
 }  // namespace montage

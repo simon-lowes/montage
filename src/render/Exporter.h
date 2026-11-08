@@ -71,6 +71,9 @@ struct ExportSettings {
     // How full the buffer is (a fraction of it) before the first picture, with a stated HRD or MPEG-2 at a constant
     // rate; 0 = the encoder's own (90 %, MPEG-2 full). A farm's later segments start lower, so the join can meet them.
     double vbvInit = 0;
+    // Whether the file is checked against its buffer model once written (exportNeedsHrdCheck); off for a segmented
+    // export's segments, as the join checks the whole.
+    bool hrdCheck = true;
     std::string preset = "medium";       // encoder speed preset
     std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq", x264 "avci100" (AVC-Intra 100)
     std::string pixFmt;                  // empty = sensible default for the codec

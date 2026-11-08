@@ -1368,9 +1368,6 @@ int64_t HrdSplicer::bitsOf(const std::vector<uint8_t>& au) const {
     return lengthSize_ > 0 ? streamBits(splitNals(au.data(), au.size(), lengthSize_)) : int64_t(au.size()) * 8;
 }
 
-void HrdSplicer::note(int64_t frame, int64_t shown, const char* kind, const std::string& text) {
-    if (issues_.size() < kKeptIssues) issues_.push_back({frame, shown, kind, text});
-}
 
 double HrdSplicer::askedDelay(const uint8_t* d, size_t n) const {
     if (codec_ == kMpeg2) {
@@ -1400,7 +1397,7 @@ double mpeg2Lead(const std::vector<uint8_t>& au) {
 }  // namespace
 
 double HrdSplicer::nextDelay() const {
-    if (!havePending_) return firstDelay_ >= 0 ? firstDelay_ : 0.9 * size_ / std::max(1.0, rate_);
+    if (!havePending_) return firstDelay();
     const double nextRemoval = t0_ + double(count_ + 1) * frame_;
     const double end = pending_.arrival + double(bitsOf(pending_.au)) / rate_;
     return nextRemoval - end;
@@ -1410,7 +1407,6 @@ void HrdSplicer::pad(Held& h, int64_t bytes) {
     if (bytes <= 0) return;
     if (codec_ == kMpeg2) {
         h.au.insert(h.au.end(), size_t(bytes), 0);  // (zero bytes before the next start code)
-        filler_ += bytes;
         return;
     }
     // Filler data NAL units (H.264 type 12, HEVC type 38) after the picture's own: start code, header, 0xFF..., 0x80.
@@ -1433,7 +1429,6 @@ void HrdSplicer::pad(Held& h, int64_t bytes) {
         f.insert(f.end(), size_t(take), 0xff);
         f.push_back(0x80);
         nals.push_back(std::move(f));
-        filler_ += take + overhead;
         payload -= take;
         if (payload <= 0) break;
         payload -= overhead;
@@ -1442,7 +1437,6 @@ void HrdSplicer::pad(Held& h, int64_t bytes) {
 }
 
 void HrdSplicer::finalize(Held& h, double nextRemoval, double nextAsked) {
-    const int64_t k = count_;
     double bits = double(bitsOf(h.au));
     if (cbr_ && h.mayPad) {
         // Where the next access unit's removal finds the buffer (its bits there): no more than it holds, and no more than
@@ -1461,9 +1455,9 @@ void HrdSplicer::finalize(Held& h, double nextRemoval, double nextAsked) {
             bits = double(bitsOf(h.au));
         }
     }
-    const double end = h.arrival + bits / rate_;
-    if (end > h.removal + 1e-7) note(k, h.display, "underflow", format("the picture's last bits arrive %.2f ms late", (end - h.removal) * 1000));
-    lastFinal_ = end;
+    // (a picture too large to arrive by its removal underflows here: nothing can be done about it, and the written
+    // stream's check, checkHrd, reports it)
+    lastFinal_ = h.arrival + bits / rate_;
     if (codec_ == kMpeg2) mpegBits_ += bits;
     ++count_;
 }
@@ -1495,12 +1489,11 @@ std::vector<uint8_t> HrdSplicer::push(std::vector<uint8_t> au, int64_t display, 
     h.arrival = k == 0 ? 0 : lastFinal_;
     if (codec_ == kMpeg2 && k == 0) h.removal = t0_;
     if (!cbr_ && codec_ != kMpeg2 && k > 0) {
-        const bool bp = h.ours ? false : askedDelay(h.au.data(), h.au.size()) >= 0;
-        const double earliest = h.removal - double(bp ? init90_ : init90_ + offset90_) / 90000;
+        // (C.1.2: a buffering period's first access unit no earlier than its initial delay before its removal; the
+        // others no earlier than the delay and offset together)
+        const double earliest = h.removal - double(h.bp ? init90_ : init90_ + offset90_) / 90000;
         h.arrival = std::max(h.arrival, earliest);
     }
-    if (cbr_ && k > 0 && (h.removal - lastFinal_) * rate_ > size_ * (1 + 1e-9) + 8)
-        note(k, display, "overflow", format("the buffer would hold %.0f bits of its %.0f", (h.removal - lastFinal_) * rate_, size_));
     pending_ = std::move(h);
     havePending_ = true;
     return out;
@@ -1524,7 +1517,7 @@ bool HrdSplicer::rewrite(Held& h, int64_t k) {
         if (pics.empty()) return false;
         const double psc = (mpegBits_ + double(pics[0].psc) * 8) / rate_;
         if (k == 0) {
-            const double d = h.ours || pics[0].vbvDelay < 0 ? (firstDelay_ >= 0 ? firstDelay_ : 0.9 * size_ / rate_) : double(pics[0].vbvDelay) / 90000;
+            const double d = h.ours || pics[0].vbvDelay < 0 ? firstDelay() : double(pics[0].vbvDelay) / 90000;
             t0_ = psc + d;
             h.removal = t0_;
         }
@@ -1586,10 +1579,7 @@ bool HrdSplicer::rewrite(Held& h, int64_t k) {
         }
     }
     auto it = sps_.find(spsId);
-    if (it == sps_.end() || !it->second.active() || firstVcl < 0) {
-        note(k, h.display, "timing", "its parameter sets state no HRD: left as it is");
-        return false;
-    }
+    if (it == sps_.end() || !it->second.active() || firstVcl < 0) return false;  // (its parameter sets state no HRD: left as it is)
     const hrd::Sps& s = it->second;
     const double tc = s.tick();
     const int64_t perFrame = std::max<int64_t>(1, std::llround(frame_ / tc));
@@ -1651,7 +1641,7 @@ bool HrdSplicer::rewrite(Held& h, int64_t k) {
         const auto& oldOff = !bp.nalOffset.empty() ? bp.nalOffset : bp.vclOffset;
         const int64_t sum = had >= 0 ? had + (oldOff.empty() ? 0 : oldOff[0]) : sum90_;
         if (k == 0) {
-            delay = had >= 0 && !h.ours ? had : int64_t(std::llround((firstDelay_ >= 0 ? firstDelay_ : 0.9 * size_ / rate_) * 90000));
+            delay = had >= 0 && !h.ours ? had : int64_t(std::llround(firstDelay() * 90000));
             t0_ = double(delay) / 90000;
             h.removal = t0_;
         } else {
@@ -1679,15 +1669,15 @@ bool HrdSplicer::rewrite(Held& h, int64_t k) {
             nbp.nalAltDelay.clear(), nbp.nalAltOffset.clear(), nbp.vclAltDelay.clear(), nbp.vclAltOffset.clear();
         }
         init90_ = delay, offset90_ = offset;
+        h.bp = true;
     }
     // Picture timing: removal one frame after the one before; output as its timestamps place it.
     hrd::PictureTiming npt = pt;
     npt.present = true;
-    const int64_t fromBp = isBp ? (k - bpIndex_) : (k - bpIndex_);
-    npt.cpbRemovalDelay = k == 0 ? (codec_ == kHevc ? 1 : 0) : fromBp * perFrame;
-    if (dpbFrames_ < 0 && ptAt.nal >= 0 && !h.ours) dpbFrames_ = std::max<int64_t>(0, std::llround(double(pt.dpbOutputDelay) / double(perFrame)) - (h.display - k));
-    const int64_t dpbFrames = dpbFrames_ >= 0 ? dpbFrames_ : depth_;
-    npt.dpbOutputDelay = std::max<int64_t>(0, (h.display - k + dpbFrames) * perFrame);
+    npt.cpbRemovalDelay = k == 0 ? (codec_ == kHevc ? 1 : 0) : (k - bpIndex_) * perFrame;
+    // (one output delay for the whole stream, the most any picture of it is decoded ahead of where it is shown, so
+    // output times keep display order across every join)
+    npt.dpbOutputDelay = std::max<int64_t>(0, (h.display - k + depth_) * perFrame);
     if (isBp) bpIndex_ = k;
     // Written back only where something changed.
     bool changed = false;

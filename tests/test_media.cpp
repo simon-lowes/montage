@@ -21407,10 +21407,15 @@ if ui["pressed"] == "add":
             const auto source = packets(st.path), smart = packets(ex.path);
             std::map<int64_t, QByteArray> byFrame;
             for (const Coded& c : source) byFrame[c.frame] = c.data;
-            // (MPEG-2: a copied GOP's header given the time code of where it now sits)
+            // (MPEG-2: a copied GOP's header given the time code of where it now sits, and each picture's vbv_delay the
+            // one its place in the stream's buffer model gives it)
             auto withoutGopTimecode = [](QByteArray d) {
                 const int i = d.indexOf(QByteArray("\x00\x00\x01\xb8", 4));
                 if (i >= 0 && i + 8 <= d.size()) d[i + 4] = char(uchar(d[i + 4]) & 0x80), d[i + 5] = 0, d[i + 6] = 0, d[i + 7] = char(uchar(d[i + 7]) & 0x7f);
+                for (int p = d.indexOf(QByteArray("\x00\x00\x01\x00", 4)); p >= 0 && p + 8 <= d.size(); p = d.indexOf(QByteArray("\x00\x00\x01\x00", 4), p + 4)) {
+                    // (temporal_reference's 10 bits and the coding type's 3, then the delay's 16)
+                    d[p + 5] = char(uchar(d[p + 5]) & 0xf8), d[p + 6] = 0, d[p + 7] = char(uchar(d[p + 7]) & 0x07);
+                }
                 return d;
             };
             auto sameCoded = [&](const QByteArray& got, const QByteArray& want) {

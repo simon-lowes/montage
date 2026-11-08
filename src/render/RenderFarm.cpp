@@ -171,6 +171,7 @@ void visitSettings(S& s, V& v) {
     v("vbvMaxrate", s.vbvMaxrate);
     v("vbvBuffer", s.vbvBuffer);
     v("vbvInit", s.vbvInit);
+    v("hrdCheck", s.hrdCheck);
     v("pass", s.pass);
     v("parameterSetId", s.parameterSetId);
     v("passStats", s.passStats);
