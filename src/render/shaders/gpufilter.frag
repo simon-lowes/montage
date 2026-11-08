@@ -42,7 +42,8 @@
 //   27 Find Edges, 28 Emboss, 29 Halftone, 30 Duotone, 31 VHS (the table each row's shift, tearing and scanline), 32 Tilt-Shift's
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 //   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
-// and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth).
+// and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth); Light Rays
+// (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture) and 38 Lens Flare.
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -726,6 +727,71 @@ void main() {
         // the frame's depth
         const vec4 to = texelFetch(table, xy, 0);
         fragColor = vec4(px.rgb + (to.xyz * px.a - px.rgb) * to.w, px.a);
+        return;
+    }
+    if (mode == 35) {
+        // Light Rays' light: what is above the threshold (p[1].x), tinted (p[2].xyz), no coverage of its own
+        const float a = px.a;
+        const float l = a > 0.0 ? lumaOf(px) / a : 0.0;
+        const float k = !isinf(l) && !isnan(l) && l > p[1].x ? (l - p[1].x) / l : 0.0;
+        fragColor = vec4(k > 0.0 ? px.rgb * k * p[2].xyz : vec3(0.0), 0.0);
+        return;
+    }
+    if (mode == 36) {
+        // One of its passes: eight samples (weights p[2..3]) along the line to the centre (p[1].xy), p[1].z apart,
+        // bilinear, transparent outside
+        const float x = float(xy.x) + 0.5, y = float(xy.y) + 0.5;
+        vec3 acc = vec3(0.0);
+        for (int j = 0; j < 8; ++j) {
+            const float f = float(j) * p[1].z;
+            acc += p[2 + j / 4][j % 4] * bilinear(size, x + (p[1].x - x) * f, y + (p[1].y - y) * f).rgb;
+        }
+        fragColor = vec4(acc, 0.0);
+        return;
+    }
+    if (mode == 37) {
+        // The rays (srcTex) added to the picture (orig) by p[1].x; light shows on transparent areas too
+        const vec4 o = texelFetch(orig, xy, 0);
+        const vec3 add = px.rgb * p[1].x;
+        fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));
+        return;
+    }
+    if (mode == 38) {
+        // Lens Flare (render/StyleFx's lensFlare): p[1] the light's place, half the diagonal, the lens; p[2] the frame's
+        // centre, brightness, ghosts; p[3] the tint and the star's spokes; the table each ghost (where along the line, its
+        // radius and strength; its colour)
+        const int lens = int(p[1].w), spokes = int(p[3].w);
+        const float R = p[1].z, x = float(xy.x) + 0.5, y = float(xy.y) + 0.5;
+        const float dx = x - p[1].x, dy = y - p[1].y, d = sqrt(dx * dx + dy * dy) / R;
+        const vec3 tint = p[3].xyz;
+        vec3 light = vec3(0.0);
+        const float core = 1.6 * exp(-(d / 0.025) * (d / 0.025)) + 0.35 * exp(-d / 0.1);
+        for (int c = 0; c < 3; ++c) light[c] += core * (c == 0 ? 1.0 : 0.5 + 0.5 * tint[c] / max(0.01, tint[0]));
+        if (lens == 3) {
+            const float streak = exp(-(dy / (0.006 * R)) * (dy / (0.006 * R))) * exp(-abs(dx) / (0.8 * R));
+            light += vec3(0.25, 0.45, 0.9) * streak;
+        } else {
+            const float a = atan(dy, dx);
+            const float ray = pow(abs(cos(float(spokes) * 0.5 * a)), lens == 0 ? 60.0 : 120.0) * exp(-d / (lens == 0 ? 0.25 : 0.35));
+            light += 0.5 * ray;
+        }
+        if (lens == 0)
+            for (int c = 0; c < 3; ++c) {
+                const float ring = (d - (0.33 + 0.012 * float(c))) / 0.012;
+                light[c] += 0.07 * exp(-ring * ring);
+            }
+        const int n = textureSize(table, 0).x / 2;
+        for (int k = 0; k < n; ++k) {
+            const vec4 g = texelFetch(table, ivec2(2 * k, 0), 0), rgb = texelFetch(table, ivec2(2 * k + 1, 0), 0);
+            const float gx = p[1].x + (p[2].x - p[1].x) * g.x, gy = p[1].y + (p[2].y - p[1].y) * g.x;
+            const float ex = (x - gx) / (lens == 3 ? 1.6 : 1.0), ey = y - gy;
+            const float gd = sqrt(ex * ex + ey * ey) / R / g.y;
+            if (gd >= 1.15) continue;
+            const float disc = (1.0 - clamp((gd - 0.85) / 0.3, 0.0, 1.0)) * (0.7 + 0.3 * min(1.0, gd));
+            light += p[2].w * g.z * disc * rgb.rgb;
+        }
+        const vec3 add = p[2].z * light * tint;
+        fragColor = vec4(px.rgb + add, min(1.0, px.a + max(add.r, max(add.g, add.b))));
         return;
     }
     if (mode >= 13 && mode <= 20 && px.a <= 0.0) {

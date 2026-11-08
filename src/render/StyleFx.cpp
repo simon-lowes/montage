@@ -463,6 +463,25 @@ void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     });
 }
 
+bool lensFlareGhosts(int lens, FlareGhosts& out) {
+    struct Ghost {
+        double at, radius, strength;
+        float rgb[3];
+    };
+    static const Ghost kZoom[] = {{0.45, 0.035, 0.10, {0.6f, 1.0f, 0.6f}}, {0.75, 0.09, 0.06, {0.7f, 0.5f, 1.0f}}, {1.25, 0.025, 0.14, {1.0f, 0.8f, 0.4f}},
+                                  {1.55, 0.13, 0.05, {0.5f, 0.8f, 1.0f}}, {1.9, 0.06, 0.08, {1.0f, 0.5f, 0.6f}},  {2.3, 0.17, 0.04, {0.6f, 1.0f, 0.8f}}};
+    static const Ghost kPrime[] = {{0.6, 0.05, 0.08, {0.8f, 0.9f, 1.0f}}, {1.3, 0.08, 0.06, {1.0f, 0.85f, 0.6f}}, {2.0, 0.12, 0.05, {0.7f, 1.0f, 0.8f}}};
+    static const Ghost kAnamorphic[] = {{0.5, 0.05, 0.08, {0.4f, 0.6f, 1.0f}}, {1.4, 0.09, 0.06, {0.5f, 0.7f, 1.0f}}, {2.1, 0.14, 0.04, {0.4f, 0.5f, 1.0f}}};
+    lens = std::clamp(lens, 0, 3);
+    const Ghost* ghosts = lens == 0 ? kZoom : lens == 3 ? kAnamorphic : kPrime;
+    out.count = lens == 0 ? 6 : 3;
+    for (int k = 0; k < out.count; ++k) {
+        out.at[k] = ghosts[k].at, out.radius[k] = ghosts[k].radius, out.strength[k] = ghosts[k].strength;
+        std::copy(ghosts[k].rgb, ghosts[k].rgb + 3, out.rgb[k]);
+    }
+    return true;
+}
+
 void lensFlare(const Effect& e, FrameTime t, Image& img) {
     const int W = img.width, H = img.height;
     if (W <= 0 || H <= 0) return;
@@ -473,16 +492,8 @@ void lensFlare(const Effect& e, FrameTime t, Image& img) {
     if (bright <= 0) return;
     const double R = std::hypot(W, H) / 2, cx = W / 2.0, cy = H / 2.0;
     // Ghosts: discs along the line from the light through the centre, at these fractions of the way.
-    struct Ghost {
-        double at, radius, strength;
-        float rgb[3];
-    };
-    static const Ghost kZoom[] = {{0.45, 0.035, 0.10, {0.6f, 1.0f, 0.6f}}, {0.75, 0.09, 0.06, {0.7f, 0.5f, 1.0f}}, {1.25, 0.025, 0.14, {1.0f, 0.8f, 0.4f}},
-                                  {1.55, 0.13, 0.05, {0.5f, 0.8f, 1.0f}}, {1.9, 0.06, 0.08, {1.0f, 0.5f, 0.6f}},  {2.3, 0.17, 0.04, {0.6f, 1.0f, 0.8f}}};
-    static const Ghost kPrime[] = {{0.6, 0.05, 0.08, {0.8f, 0.9f, 1.0f}}, {1.3, 0.08, 0.06, {1.0f, 0.85f, 0.6f}}, {2.0, 0.12, 0.05, {0.7f, 1.0f, 0.8f}}};
-    static const Ghost kAnamorphic[] = {{0.5, 0.05, 0.08, {0.4f, 0.6f, 1.0f}}, {1.4, 0.09, 0.06, {0.5f, 0.7f, 1.0f}}, {2.1, 0.14, 0.04, {0.4f, 0.5f, 1.0f}}};
-    const Ghost* ghosts = lens == 0 ? kZoom : lens == 3 ? kAnamorphic : kPrime;
-    const int nGhosts = lens == 0 ? 6 : 3;
+    FlareGhosts ghosts;
+    lensFlareGhosts(lens, ghosts);
     const int spokes = lens == 1 ? 6 : lens == 2 ? 8 : 4;
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -510,14 +521,13 @@ void lensFlare(const Effect& e, FrameTime t, Image& img) {
                         light[c] += 0.07 * std::exp(-ring * ring);
                     }
                 }
-                for (int k = 0; k < nGhosts; ++k) {
-                    const Ghost& g = ghosts[k];
-                    const double gx = px + (cx - px) * g.at, gy = py + (cy - py) * g.at;  // 1 = the centre, 2 = opposite the light
-                    double gd = std::hypot((x + 0.5 - gx) / (lens == 3 ? 1.6 : 1.0), y + 0.5 - gy) / R / g.radius;
+                for (int k = 0; k < ghosts.count; ++k) {
+                    const double gx = px + (cx - px) * ghosts.at[k], gy = py + (cy - py) * ghosts.at[k];  // 1 = the centre, 2 = opposite the light
+                    double gd = std::hypot((x + 0.5 - gx) / (lens == 3 ? 1.6 : 1.0), y + 0.5 - gy) / R / ghosts.radius[k];
                     if (gd >= 1.15) continue;
                     // A soft-edged disc, a little brighter at its rim.
                     const double disc = (1 - std::clamp((gd - 0.85) / 0.3, 0.0, 1.0)) * (0.7 + 0.3 * std::min(1.0, gd));
-                    for (int c = 0; c < 3; ++c) light[c] += ghostAmt * g.strength * disc * g.rgb[c];
+                    for (int c = 0; c < 3; ++c) light[c] += ghostAmt * ghosts.strength[k] * disc * ghosts.rgb[k][c];
                 }
                 double lum = 0;
                 for (int c = 0; c < 3; ++c) {

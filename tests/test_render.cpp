@@ -18650,12 +18650,14 @@ colorspaces:
         compare(20, o, "color space transform");
         QVERIFY(gpu::stats().cpuLayers > 0);
         graded->effects.erase(graded->effects.begin() + 1);
-        // Light Rays and Aperture Glare are worked out on the CPU too, and the layer they make drawn there.
+        // Aperture Glare is worked out on the CPU too (Light Rays as well when shadows block its rays), and the layer they
+        // make drawn there.
         {
             Clip* generated = s.videoTracks[2].clips.empty() ? nullptr : &s.videoTracks[2].clips[0];
             QVERIFY(generated);
             Effect rays = makeEffect(p, "light_rays");
             rays.params["threshold"] = 0.5;
+            rays.params["block"] = 50.0;
             Effect glare = makeEffect(p, "aperture_glare");
             glare.params["threshold"] = 0.6;
             glare.params["size"] = 20.0;
@@ -19242,6 +19244,9 @@ colorspaces:
               {{"mesh_from", 1}, {"pin1.kind", 0}, {"pin1.x", 0.5}, {"pin1.y", 0.5}, {"pin1.to_x", 0.8}, {"pin1.to_y", 0.3}, {"pin2.kind", 1}, {"pin2.x", 0.2}, {"pin2.y", 0.7}}}},
             {"grid_warp", {{{"g1_1.dx", 0.05}, {"g1_1.dy", -0.04}}, {{"rows", 2}, {"cols", 4}, {"shape", 1}, {"g1_2.dx", -0.06}, {"g1_1.dy", 0.1}},
                            {{"g0_0.dx", 0.1}, {"g3_2.dy", -0.08}, {"g2_2.dx", 0.12}}}},
+            {"light_rays", {{{"threshold", 0.5}}, {{"threshold", 0.3}, {"length", 90}, {"decay", 20}, {"pos_x", 0.8}, {"pos_y", -0.3}, {"intensity", 2}},
+                            {{"threshold", 0.4}, {"follow", 1}, {"mask.shape", 1}, {"mask.x", 0.3}, {"mask.y", 0.6}, {"mask.w", 0.2}, {"mask.h", 0.2}}}},
+            {"lens_flare", {{}, {{"lens", 3}, {"pos_x", 0.7}, {"pos_y", 0.6}, {"brightness", 150}}, {{"lens", 2}, {"ghosts", 50}, {"pos_x", -0.2}, {"color.b", 1}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -19252,6 +19257,13 @@ colorspaces:
                 const long passes = gpu::stats().filterPasses;
                 compare(7 + FrameTime(k), QString("%1 #%2").arg(type).arg(k + 1));
                 QVERIFY2(gpu::stats().filterPasses > passes, type);
+                if (std::string(type) == "light_rays") {  // (the picture has light above each threshold: the rays are there)
+                    RenderOptions o;
+                    o.gpu = true;
+                    const Image lit = renderProgramFrame(p, s, 7 + FrameTime(k), o);
+                    edit::clipById(s, topId)->effects.clear();
+                    QVERIFY(renderProgramFrame(p, s, 7 + FrameTime(k), o).px != lit.px);
+                }
             }
         edit::clipById(s, topId)->effects.clear();
 

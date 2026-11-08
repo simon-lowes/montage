@@ -3547,7 +3547,7 @@ bool isGpuFilter(const std::string& type) {
                                                   "film_grain", "rgb_mixer", "grain_match", "edge_extend", "wave_warp", "twirl", "spherize",
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
-                                                  "grid_warp", "depth_map", "depth_fog"};
+                                                  "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare"};
     return filters.count(type) > 0;
 }
 
@@ -4102,6 +4102,51 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             if (blurred || std::fabs(sat - 1) > 1e-4f)
                 add(32, {float(width / 2.0), float(focus * height), float(-std::sin(angle)), float(std::cos(angle)), float(height),
                          float(bandWidth / 2), float(bandWidth / 2 + std::max(0.02, bandWidth)), sat, blurred ? 1.0f : 0.0f});
+        } else if (ty == "light_rays") {
+            // lightRays' light above the threshold, its three passes towards the centre and the sum (gpufilter.frag's
+            // modes 35 to 37); shadows blocking the rays stay on the CPU
+            if (std::clamp(e.p("block", t, 0) / 100, 0.0, 1.0) > 0) return false;
+            const double W = width, H = height;
+            double cx = e.p("pos_x", t, 0.5) * W, cy = e.p("pos_y", t, 0.25) * H;
+            if (e.p("follow", t, 0) > 0.5) {
+                const MaskBox box = maskBox(e, t);
+                cx = box.x * W, cy = box.y * H;
+            }
+            cx = std::clamp(std::isfinite(cx) ? cx : W / 2.0, -4.0 * W, 5.0 * W), cy = std::clamp(std::isfinite(cy) ? cy : H / 2.0, -4.0 * H, 5.0 * H);
+            const double threshold = std::max(0.0, e.p("threshold", t, 0.8)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
+            const double length = std::clamp(e.p("length", t, 60) / 100, 0.0, 1.0), decay = std::clamp(e.p("decay", t, 50) / 100, 0.0, 1.0);
+            if (intensity > 0 && length > 0) {
+                add(35, {float(threshold), 0, 0, 0, float(e.p("color.r", t, 1.0)), float(e.p("color.g", t, 0.95)), float(e.p("color.b", t, 0.85))});
+                constexpr int kSamples = 8, kPasses = 3;
+                const double first = length / (std::pow(double(kSamples), kPasses) - 1), rate = decay * 6 / length;
+                for (int pass = 0; pass < kPasses; ++pass) {
+                    const double step = first * std::pow(double(kSamples), pass);
+                    double w[kSamples], sum = 0;
+                    for (int j = 0; j < kSamples; ++j) sum += w[j] = std::exp(-rate * j * step);
+                    add(36, {float(cx), float(cy), float(step), 0, float(w[0] / sum), float(w[1] / sum), float(w[2] / sum), float(w[3] / sum),
+                             float(w[4] / sum), float(w[5] / sum), float(w[6] / sum), float(w[7] / sum)});
+                }
+                add(37, {float(intensity)});
+            }
+        } else if (ty == "lens_flare") {
+            // lensFlare's light, star, ring and ghosts at each pixel (gpufilter.frag's mode 38), the ghosts in the table
+            sfx::FlareGhosts g;
+            const int lens = std::clamp(int(e.p("lens", t, 0)), 0, 3);
+            const double bright = std::max(0.0, e.p("brightness", t, 100) / 100);
+            if (bright > 0 && sfx::lensFlareGhosts(lens, g)) {
+                add(38, {float(e.p("pos_x", t, 0.3) * width), float(e.p("pos_y", t, 0.3) * height), float(std::hypot(width, height) / 2),
+                         float(lens), float(width / 2.0), float(height / 2.0), float(bright),
+                         float(std::max(0.0, e.p("ghosts", t, 100) / 100)), float(e.p("color.r", t, 1.0)), float(e.p("color.g", t, 0.9)),
+                         float(e.p("color.b", t, 0.75)), float(lens == 1 ? 6 : lens == 2 ? 8 : 4)});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = 2 * g.count;
+                fp.table.assign(size_t(fp.tableWidth) * 4, 0.0f);
+                for (int k = 0; k < g.count; ++k) {
+                    float* q = &fp.table[size_t(k) * 8];
+                    q[0] = float(g.at[k]), q[1] = float(g.radius[k]), q[2] = float(g.strength[k]);
+                    std::copy(g.rgb[k], g.rgb[k] + 3, q + 4);
+                }
+            }
         } else if (ty == "rgb_mixer") {
             float m[12] = {};
             bool identity = true;
@@ -4213,7 +4258,8 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             if (fp.mode) f.passes.push_back(std::move(fp));
         }
         if (f.passes.empty()) return true;  // (nothing changes)
-        if (!op.masked) {
+        // (rays from the mask's track take it as where they come from, not as a limit, as applyVideoEffect does)
+        if (!op.masked || (ty == "light_rays" && e.p("follow", t, 0) > 0.5)) {
             out.push_back(std::move(f));
             return true;
         }

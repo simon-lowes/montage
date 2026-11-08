@@ -41,10 +41,19 @@ struct ShakeMove {
     double ox = 0, oy = 0, angle = 0, zoom = 1;
 };
 bool cameraShakeMove(const Effect& e, FrameTime t, int w, int h, double pixelScale, ShakeMove& out);
-// Lens Flare (Premiere's, Resolve's Lens Flare): light from a point (on or off the frame) as a lens would scatter
-// it: a hot core and halo, a star of rays (or an anamorphic streak), a ring, and ghosts strung along the line
-// through the frame's centre. Added to the picture.
+// Lens Flare: light from a point (on or off the frame) as a lens would scatter it: a hot core and halo, a star of
+// rays (or an anamorphic streak), a ring, and ghosts strung along the line through the frame's centre. Added to the
+// picture.
 void lensFlare(const Effect& e, FrameTime t, Image& img);
+// Its ghosts for a lens (0 the zoom, 1 and 2 the primes, 3 anamorphic): each one's place along the line from the light
+// through the centre (1 the centre), radius (a share of half the diagonal), strength and colour.
+struct FlareGhosts {
+    static constexpr int kMost = 6;
+    int count = 0;
+    double at[kMost], radius[kMost], strength[kMost];
+    float rgb[kMost][3];
+};
+bool lensFlareGhosts(int lens, FlareGhosts& out);
 
 // Light Rays: light above a threshold in the picture (scene light, the linear domain), tinted, streaming out from a
 // centre (Light X and Y, keyed, or the effect's mask as tracked when `follow` is on): blurred along the lines through
