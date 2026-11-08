@@ -200,6 +200,8 @@
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
 #include "render/StreamingPackage.h"
+#include "render/LivePackage.h"
+#include "media/Capture.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -993,6 +995,7 @@ struct McpServer::Impl {
     }
 
     void addTools();
+    ToolResult renderLive(const QJsonObject& a);
     struct SpeechLine {
         std::string text;
         FrameTime at = 0, fit = -1;  // fit: the room it has, in frames (-1: any)
@@ -1182,6 +1185,114 @@ McpServer::Impl::CloneVoice McpServer::Impl::cloneVoiceArg(const QJsonObject& a,
                  .arg(QString::fromUtf8(lang->name), QString::fromStdString(v.from), QDateTime::currentDateTime().toString(Qt::ISODate))
                  .toStdString();
     return v;
+}
+
+// montage_render's streaming.live: a live package from a recording as it is made (render/LivePackage.h).
+ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
+    const QJsonObject so = a.value("streaming").toObject();
+    if (!so.value("live").isObject()) throw ArgError{"\"live\" is an object: {url, seconds, ...}"};
+    if (a.contains("farm")) throw ArgError{"A live package is made here, not on a render farm"};
+    const QJsonObject lo = so.value("live").toObject();
+    LiveSettings ls;
+    ls.folder = absolute(need(a, "output")).toStdString();
+    ls.codec = str(so, "codec", "libx264").toStdString();
+    for (const QJsonValue& v : so.value("ladder").toArray()) {
+        const QJsonObject r = v.toObject();
+        StreamingRung rung;
+        rung.width = r.value("width").toInt(), rung.height = r.value("height").toInt();
+        rung.bitrate = r.value("bitrate").toInteger();
+        rung.codec = str(r, "codec", QString::fromStdString(ls.codec)).toStdString();
+        if (rung.width <= 0 || rung.bitrate <= 0) throw ArgError{"Each rung needs a width and a bitrate"};
+        ls.rungs.push_back(rung);
+    }
+    ls.segmentSeconds = so.value("segment_seconds").toDouble(2);
+    if (ls.segmentSeconds < 1 || ls.segmentSeconds > 6) throw ArgError{"A live package's \"segment_seconds\" is 1 to 6"};
+    ls.window = lo.value("window").toInt(6);
+    if (ls.window < 3 || ls.window > 100) throw ArgError{"\"window\" is 3 to 100 segments"};
+    ls.lowLatency = so.value("low_latency").toBool();
+    ls.partSeconds = lo.value("part_seconds").toDouble(0.5);
+    if (ls.partSeconds < 0.1 || ls.partSeconds > 1) throw ArgError{"\"part_seconds\" is 0.1 to 1"};
+    ls.hls = so.value("hls").toBool(true), ls.dash = so.value("dash").toBool(true);
+    ls.segmentFormat = str(so, "segments", "cmaf").toStdString();
+    if (ls.segmentFormat != "cmaf" && ls.segmentFormat != "ts") throw ArgError{"\"segments\" is cmaf or ts"};
+    ls.audioCodec = str(so, "audio_codec", "aac").toStdString();
+    if (ls.audioCodec != "aac" && ls.audioCodec != "libopus" && ls.audioCodec != "ac3" && ls.audioCodec != "eac3" && ls.audioCodec != "none")
+        throw ArgError{"\"audio_codec\" is aac, libopus, ac3, eac3 or none"};
+    ls.audioBitrate = so.value("audio_bitrate").toInteger(128000);
+    if (ls.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
+    if (a.contains("audio_name")) ls.audioName = str(a, "audio_name").toStdString();
+    if (a.contains("audio_language")) ls.audioLanguage = str(a, "audio_language").toStdString();
+
+    CaptureSettings cs;
+    cs.video.url = need(lo, "url").toStdString();
+    cs.video.device = str(lo, "device").toStdString();
+    const QJsonObject options = lo.value("options").toObject();
+    for (auto it = options.begin(); it != options.end(); ++it)
+        cs.video.options[it.key().toStdString()] = it.value().isString() ? it.value().toString().toStdString() : it.value().toVariant().toString().toStdString();
+    cs.seconds = lo.value("seconds").toDouble();
+    if (!(cs.seconds >= 1 && cs.seconds <= 86400)) throw ArgError{"\"seconds\" is how long to record, 1 to 86400"};
+    {
+        const QFileInfo fi(QString::fromStdString(ls.folder));
+        cs.path = lo.contains("record") ? absolute(str(lo, "record")).toStdString()
+                                        : fi.absoluteDir().filePath(fi.fileName() + ".mov").toStdString();
+    }
+    cs.codec = str(lo, "capture_codec", "prores_proxy").toStdString();
+    const bool serve = lo.value("serve").toBool();
+    const int port = lo.value("port").toInt(0);
+    if (port < 0 || port > 65535) throw ArgError{"\"port\" is 0 to 65535"};
+    const std::string address = str(lo, "address", "127.0.0.1").toStdString();
+    if (address != "127.0.0.1" && address != "0.0.0.0") throw ArgError{"\"address\" is 127.0.0.1 or 0.0.0.0"};
+
+    std::string why;
+    LivePackager packager;
+    if (!packager.start(ls, &why)) return fail(QString::fromStdString(why));
+    LiveOrigin origin;
+    if (serve && !origin.start(ls.folder, port, [&](const std::string& rel) { return packager.growing(rel); }, &why, address))
+        return fail(QString::fromStdString(why));
+    const int servedPort = serve ? origin.port() : 0;
+    cs.onPicture = [&](const AVFrame* f, int num, int den) { packager.picture(f, num, den); };
+    cs.onSound = [&](const AVFrame* f) { packager.sound(f); };
+    Recorder recorder;
+    if (!recorder.start(cs, &why)) return fail(QString::fromStdString(why));
+    const std::atomic<bool>* cancel = cancelFlag();
+    bool cancelled = false;
+    while (!recorder.wait(0.25)) {
+        const LiveStatus ps = packager.status();
+        progress(recorder.status().seconds / cs.seconds, QStringLiteral("Recording live: %1 segments").arg(ps.segments));
+        if ((cancel && cancel->load()) || !ps.error.empty()) {
+            cancelled = cancel && cancel->load();
+            break;
+        }
+    }
+    recorder.stop();
+    packager.finish();
+    origin.stop();
+    const CaptureStatus rs = recorder.status();
+    const LiveStatus ps = packager.status();
+    if (!rs.error.empty()) return fail(QString::fromStdString(rs.error));
+    if (!ps.error.empty()) return fail(QString::fromStdString(ps.error));
+    QJsonArray renditions;
+    for (const std::string& r : ps.renditions) renditions.append(QString::fromStdString(r));
+    QJsonObject o{{"folder", QString::fromStdString(ls.folder)}, {"renditions", renditions}, {"segments", double(ps.segments)},
+                  {"first_listed", double(ps.firstListed)}, {"frames", double(ps.frames)}, {"dropped", double(ps.dropped)},
+                  {"recording", QString::fromStdString(cs.path)}};
+    QString text = QStringLiteral("%1 a live package in %2: %3 renditions, %4 segments (the playlists hold the last %5)")
+                       .arg(cancelled ? "Stopped" : "Made", QString::fromStdString(ls.folder))
+                       .arg(ps.renditions.size())
+                       .arg(ps.segments)
+                       .arg(std::min<int64_t>(ps.segments, ls.window));
+    text += QStringLiteral("\nRecorded to %1").arg(QString::fromStdString(cs.path));
+    if (!ps.hls.empty()) o["hls"] = QString::fromStdString(ps.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(ps.hls));
+    if (!ps.dash.empty()) o["dash"] = QString::fromStdString(ps.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(ps.dash));
+    if (ls.audioCodec == "ac3" || ls.audioCodec == "eac3") o["dialnorm"] = ps.dialnorm;
+    if (ps.dropped) text += QStringLiteral("\n%1 picture(s) dropped while the encoders fell behind").arg(ps.dropped);
+    if (serve) {
+        const QString url = QStringLiteral("http://%1:%2/").arg(QString::fromStdString(address == "0.0.0.0" ? "127.0.0.1" : address)).arg(servedPort);
+        o["url"] = url;
+        text += QStringLiteral("\nServed at %1 while it recorded (now stopped)").arg(url);
+    }
+    if (!rs.warning.empty()) text += QStringLiteral("\n") + QString::fromStdString(rs.warning);
+    return ok(text, o);
 }
 
 void McpServer::Impl::addTools() {
@@ -12322,7 +12433,7 @@ void McpServer::Impl::addTools() {
         "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion. "
         "Smart rendering: where the preset codes video as the footage is (ProRes, DNxHR; H.264, HEVC and XDCAM HD422 a GOP "
         "at a time), untouched pictures are copied from the source; the result's copied_frames says how many.",
-        R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
+        R"json({"type":"object","properties":{"project":{"type":"string","description":"The project (not with streaming.live)"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
             "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
@@ -12388,17 +12499,33 @@ void McpServer::Impl::addTools() {
                 "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
                 "iframe_playlists":{"type":"boolean","default":true},
                 "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
-                "audio_codec":{"type":"string","enum":["aac","libopus","none"],"default":"aac"},
-                "audio_bitrate":{"type":"integer","default":128000},
-                "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
+                "audio_codec":{"type":"string","enum":["aac","libopus","ac3","eac3","none"],"default":"aac","description":"AAC, Opus, AC-3 (to 5.1) or E-AC-3 (to 7.1; the AC-3 family stating the mix's measured loudness as dialnorm)"},
+                "audio_bitrate":{"type":"integer","default":128000,"description":"A pair of channels' (more channels, more bits)"},
+                "segments":{"type":"string","enum":["cmaf","ts"],"default":"cmaf","description":"ts: HLS in MPEG-TS segments (H.264 or HEVC, AAC, AC-3 or E-AC-3; DASH stays CMAF)"},
+                "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"},
+                "low_latency":{"type":"boolean","default":false,"description":"With live: segments made of parts of part_seconds (LL-HLS parts and CMAF chunks), each sent as it is made"},
+                "live":{"type":"object","description":"A live package instead, from a recording as it is made (no project needed: output is the package's folder): a sliding window of HLS segments and a dynamic DASH MPD, fed by the feed for seconds. Waits until it ends","properties":{
+                    "url":{"type":"string","description":"The feed: a stream's URL (srt://, rist://, udp://, rtmp://...), omt://host:port, or a capture device's name"},
+                    "device":{"type":"string","description":"The input device for url (v4l2, alsa, avfoundation, dshow, lavfi, omt); left out for a URL"},
+                    "options":{"type":"object","description":"FFmpeg input options, as strings"},
+                    "seconds":{"type":"number","minimum":1,"maximum":86400,"description":"How long to record"},
+                    "record":{"type":"string","description":"The recording made alongside (.mov or .mxf; default the folder's name with .mov, beside it)"},
+                    "capture_codec":{"type":"string","default":"prores_proxy","description":"The recording's codec (prores_proxy ... dnxhr_hqx)"},
+                    "window":{"type":"integer","minimum":3,"maximum":100,"default":6,"description":"Segments the playlists and the MPD's time-shift buffer hold"},
+                    "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5},
+                    "serve":{"type":"boolean","default":false,"description":"Serve the package over HTTP while it records (blocking playlist reloads, growing segments sent as they grow)"},
+                    "port":{"type":"integer","minimum":0,"maximum":65535,"default":0,"description":"serve: the port (0 any free one)"},
+                    "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"}},
+                    "required":["url","seconds"]}}},
             "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
             "hrd":{"type":"string","enum":["","cbr","vbr"],"default":"","description":"H.264 and H.265 (x264, x265): state a hypothetical reference decoder, as broadcast ingest checks it: cbr (a constant rate at bitrate, else vbv_maxrate, filler where the pictures need less) or vbr (no more than vbv_maxrate). The file is checked against it after rendering (the result's hrd)"},
             "vbv_maxrate":{"type":"integer","minimum":0,"description":"The HRD's bit rate, bits/s (default: bitrate)"},
             "vbv_buffer":{"type":"integer","minimum":0,"description":"The HRD's buffer, bits (default: a second at its rate)"},
             "two_pass":{"type":"boolean","default":false,"description":"H.264 and H.265 with a bitrate: coded twice, the first pass measuring the pictures so the second spends the bits where they are needed (H.264 in segments: each segment's first pass measures and the bits are shared out across them; H.265 in two passes is made in one go)"},
             "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265, MPEG-2 and AV1 with rate control per segment unless two_pass (H.264); hardware H.264 and H.265 by nodes with the same encoder; MOV, MP4, MKV, MXF, broadcast MXF and MPEG-TS files; image sequences frame by frame; IMF and DCP packages through montage_export_imf and montage_export_dcp with farm). The sound is rendered once, by the joining node. The job's id is the join's"}},
-            "required":["project","output"]})json",
+            "required":["output"]})json",
         false, [this](const QJsonObject& a) {
+            if (a.value("streaming").toObject().contains("live")) return renderLive(a);
             Loaded l = open(a);
             Sequence& s = l.seq();
             const ExportPreset* pr = findExportPreset(str(a, "preset", "H.264 - High Quality").toStdString());
@@ -12634,7 +12761,11 @@ void McpServer::Impl::addTools() {
                 ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
                 if (ss.cueCommand != "splice_insert" && ss.cueCommand != "time_signal") throw ArgError{"\"cue\" is splice_insert or time_signal"};
                 ss.audioCodec = str(so, "audio_codec", "aac").toStdString();
-                if (ss.audioCodec != "aac" && ss.audioCodec != "libopus" && ss.audioCodec != "none") throw ArgError{"\"audio_codec\" is aac, libopus or none"};
+                if (ss.audioCodec != "aac" && ss.audioCodec != "libopus" && ss.audioCodec != "ac3" && ss.audioCodec != "eac3" && ss.audioCodec != "none")
+                    throw ArgError{"\"audio_codec\" is aac, libopus, ac3, eac3 or none"};
+                ss.segmentFormat = str(so, "segments", "cmaf").toStdString();
+                if (ss.segmentFormat != "cmaf" && ss.segmentFormat != "ts") throw ArgError{"\"segments\" is cmaf or ts"};
+                if (so.contains("low_latency")) throw ArgError{"\"low_latency\" is for a live package (live)"};
                 ss.audioBitrate = so.value("audio_bitrate").toInteger(128000);
                 if (ss.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
                 ss.startDate = str(so, "start_date").toStdString();

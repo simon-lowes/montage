@@ -2459,6 +2459,60 @@ private slots:
         dlg->hide();
     }
 
+    void captureLivePackage() {
+        // A live package made while recording (montage_capture's live): lavfi's test pattern and tone, packaged as HLS
+        // in MPEG-TS segments and DASH, served from here while it records; ended with the recording, and still served.
+        const std::vector<std::string> kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build has no capture devices");
+        state()->newProject();
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QTemporaryDir dir;
+        const QString folder = dir.filePath("live");
+        const QString feed = "testsrc2=size=320x180:rate=25,realtime[out0];sine=sample_rate=48000,arealtime[out1]";
+        const QString sound = "ac3";  // (FFmpeg's own encoder)
+        // (low latency with MPEG-TS segments refused)
+        QJsonObject r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Live 01"}, {"seconds", 5},
+                              {"live", QJsonObject{{"folder", folder}, {"segments", "ts"}, {"low_latency", true}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Live 01"}, {"seconds", 5}, {"codec", "prores_proxy"},
+                  {"live", QJsonObject{{"folder", folder}, {"segments", "ts"}, {"sound", sound}, {"window", 3}, {"serve", true}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QString url = r.value("structuredContent").toObject().value("live_url").toString();
+        QVERIFY2(url.startsWith("http://127.0.0.1:"), qPrintable(url));
+        CaptureDialog* dlg = win_->captureDialog();
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live: "), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
+        r = call({{"action", "status"}});
+        const QJsonObject live = r.value("structuredContent").toObject().value("live").toObject();
+        QVERIFY2(!live.value("running").toBool() && live.value("segments").toInt() >= 2 && live.value("error").toString().isEmpty(),
+                 QJsonDocument(r).toJson().constData());
+        QVERIFY(dlg->statusText().contains("Live package ended"));
+        // (served still: the playlists, ended)
+        QNetworkAccessManager net;
+        net.setProxy(QNetworkProxy::NoProxy);
+        std::unique_ptr<QNetworkReply> reply(net.get(QNetworkRequest(QUrl(url + "master.m3u8"))));
+        QTRY_VERIFY_WITH_TIMEOUT(reply->isFinished(), 10000);
+        QCOMPARE(reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(), 200);
+        const QString master = QString::fromUtf8(reply->readAll());
+        QVERIFY2(master.contains(sound == "ac3" ? "ac-3" : "mp4a."), qPrintable(master));
+        const QString video = master.split('\n').filter(QRegularExpression("^v\\d.*playlist\\.m3u8$")).value(0);
+        QVERIFY2(!video.isEmpty(), qPrintable(master));
+        QFile list(folder + "/" + video);
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(list.readAll());
+        QVERIFY2(text.contains(".ts") && text.contains("#EXT-X-ENDLIST"), qPrintable(text));
+        QVERIFY(QFileInfo::exists(folder + "/manifest.mpd"));
+        dlg->setLive({});
+        dlg->hide();
+    }
+
     // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the
     // streams' time code.
     void captureSt2110OverTheAgentLink() {

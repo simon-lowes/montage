@@ -10126,6 +10126,52 @@ private slots:
         QDir(folder).removeRecursively();
     }
 
+    void mcpLivePackage() {
+        // montage_render's streaming.live: FFmpeg's test source recorded for six seconds and packaged as it came, in
+        // MPEG-TS segments for HLS with a window of three, served while it recorded; the new options checked.
+        const QString folder = QString::fromStdString(path("live-mcp"));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject feed{{"url", "testsrc2=size=320x180:rate=25,realtime"}, {"device", "lavfi"}, {"seconds", 6}};
+        // Refused: low latency with TS segments or without live, a live segment over 6 s, an unknown sound or format.
+        QVERIFY(call({{"output", folder}, {"streaming", QJsonObject{{"live", feed}, {"segments", "ts"}, {"low_latency", true}}}}).value("isError").toBool());
+        QVERIFY(call({{"output", folder}, {"streaming", QJsonObject{{"live", feed}, {"segment_seconds", 8}}}}).value("isError").toBool());
+        QVERIFY(call({{"output", folder}, {"streaming", QJsonObject{{"live", feed}, {"audio_codec", "dts"}}}}).value("isError").toBool());
+        QVERIFY(call({{"output", folder}, {"streaming", QJsonObject{{"live", feed}, {"segments", "flv"}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", "x.montage"}, {"output", folder}, {"streaming", QJsonObject{{"low_latency", true}}}}).value("isError").toBool());
+        QVERIFY(QDir(folder).isEmpty() || !QDir(folder).exists());
+        const auto kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build reaches no FFmpeg input devices (libavdevice)");
+        QJsonObject live = feed;
+        live["window"] = 3;
+        live["serve"] = true;
+        const QJsonObject r = call({{"output", folder},
+                                    {"streaming", QJsonObject{{"live", live}, {"segments", "ts"}, {"segment_seconds", 1}, {"dash", false}, {"audio_codec", "none"},
+                                                              {"ladder", QJsonArray{QJsonObject{{"width", 320}, {"height", 180}, {"bitrate", 300000}}}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("hls").toString().endsWith("master.m3u8"));
+        QVERIFY(out.value("dash").toString().isEmpty());
+        QVERIFY(out.value("url").toString().startsWith("http://127.0.0.1:"));
+        QVERIFY2(out.value("segments").toInt() >= 4, qPrintable(QString::number(out.value("segments").toInt())));
+        QVERIFY(QFileInfo(out.value("recording").toString()).size() > 0);
+        QFile playlist(folder + "/" + out.value("renditions").toArray().at(0).toString() + "/playlist.m3u8");
+        QVERIFY(playlist.open(QIODevice::ReadOnly));
+        const QString m3u = QString::fromUtf8(playlist.readAll());
+        QCOMPARE(m3u.count("#EXTINF:"), 3);  // (the window)
+        QVERIFY(m3u.contains(".ts\n") && m3u.contains("#EXT-X-ENDLIST"));
+        QDir(folder).removeRecursively();
+        QFile::remove(out.value("recording").toString());
+    }
+
     void samplerPasses() {
         // A Foley sampler over MCP: steps on a key (two sounds taking turns), cloth on another, a recording of hits cut
         // onto keys; a pass played from notes lands on a take lane and in the comp, its mix the sampler's render sample for

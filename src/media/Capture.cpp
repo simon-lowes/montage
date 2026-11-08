@@ -640,6 +640,8 @@ void Recorder::run() {
     bool interlaced = false, topFirst = true;
 
     auto write = [&](AVCodecContext* enc, AVStream* st, AVFrame* f) -> bool {
+        if (f && enc == venc && cs.onPicture) cs.onPicture(f, fps.num, fps.den);
+        else if (f && enc == aenc && cs.onSound) cs.onSound(f);
         int err = avcodec_send_frame(enc, f);
         if (err < 0 && err != AVERROR_EOF) {
             fatal = "Cannot encode: " + avError(err);

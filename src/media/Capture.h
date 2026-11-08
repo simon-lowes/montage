@@ -23,6 +23,8 @@
 #include <thread>
 #include <vector>
 
+struct AVFrame;
+
 namespace montage {
 
 struct CaptureSource {
@@ -51,6 +53,11 @@ struct CaptureSettings {
     int64_t frames = 0;
     std::function<int64_t(double arrived)> label;
     bool labelDropFrame = false;  // `label`'s frames counted in drop frame (at 29.97)
+    // Each picture and each stretch of sound as it is recorded, on the recording thread (so kept brief: a live package
+    // copies them, render/LivePackage.h): the picture as coded into the file, its pts the frame's number there at
+    // fpsNum/fpsDen frames a second; the sound at 48 kHz, its pts the first sample's number.
+    std::function<void(const AVFrame* picture, int fpsNum, int fpsDen)> onPicture;
+    std::function<void(const AVFrame* sound)> onSound;
 };
 
 // The clock CaptureSettings::label is asked by (seconds, steady).

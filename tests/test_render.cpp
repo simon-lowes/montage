@@ -92,6 +92,12 @@
 #include "render/EncodeCompare.h"
 #include "render/Scte35.h"
 #include "render/StreamingPackage.h"
+#include "render/LivePackage.h"
+#include "media/Capture.h"
+#include "render/TsSegments.h"
+#include "render/Ac3.h"
+#include "media/Loudness.h"
+#include "core/Surround.h"
 #include "render/HdrStill.h"
 #include "media/GainMap.h"
 #include "render/Gallery.h"
@@ -118,6 +124,7 @@
 #include <QTcpSocket>
 #include <QNetworkProxy>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <array>
 #include <functional>
@@ -128,6 +135,10 @@
 #include <QRawFont>
 #include <QTextLayout>
 #include <QElapsedTimer>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QStandardPaths>
 #include <QRandomGenerator>
 #include "core/ScriptCut.h"
 #include "render/AutoTrims.h"
@@ -197,6 +208,153 @@ Image solid(int w, int h, float r, float g, float b, float a = 1) {
 }
 
 bool near(float a, float b, float tol = 0.02f) { return std::fabs(a - b) <= tol; }
+
+// A mono 16-bit WAV of a tone.
+bool writeToneWav(const QString& path, double hz, double seconds, double amplitude) {
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    const int n = int(48000 * seconds);
+    QByteArray d;
+    auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+    d.append("RIFF");
+    u32(uint32_t(36 + n * 2));
+    d.append("WAVEfmt ");
+    u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+    d.append("data");
+    u32(uint32_t(n * 2));
+    for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(amplitude * 32767 * std::sin(2 * M_PI * hz * i / 48000.0)))));
+    return f.write(d) == d.size();
+}
+
+// A file's first sound stream decoded (planar, in FFmpeg's channel order), with its coded packets.
+struct DecodedSound {
+    std::vector<std::vector<float>> channels;
+    int rate = 0;
+    uint64_t mask = 0;
+    std::vector<std::vector<uint8_t>> packets;
+    std::string codec;
+};
+DecodedSound decodeSound(const std::string& path) {
+    DecodedSound out;
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return out;
+    avformat_find_stream_info(fmt, nullptr);
+    const int si = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    const AVCodec* dec = si >= 0 ? avcodec_find_decoder(fmt->streams[si]->codecpar->codec_id) : nullptr;
+    AVCodecContext* ctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+    if (!ctx || avcodec_parameters_to_context(ctx, fmt->streams[si]->codecpar) < 0 || avcodec_open2(ctx, dec, nullptr) < 0) {
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return out;
+    }
+    out.codec = dec->name;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* fr = av_frame_alloc();
+    auto take = [&] {
+        while (avcodec_receive_frame(ctx, fr) >= 0) {
+            const int n = fr->ch_layout.nb_channels;
+            out.rate = fr->sample_rate;
+            if (fr->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) out.mask = fr->ch_layout.u.mask;
+            out.channels.resize(size_t(n));
+            for (int c = 0; c < n; ++c)
+                for (int i = 0; i < fr->nb_samples; ++i) {
+                    float v = 0;
+                    switch (fr->format) {
+                        case AV_SAMPLE_FMT_FLTP: v = reinterpret_cast<const float*>(fr->extended_data[c])[i]; break;
+                        case AV_SAMPLE_FMT_FLT: v = reinterpret_cast<const float*>(fr->extended_data[0])[i * n + c]; break;
+                        case AV_SAMPLE_FMT_S16P: v = reinterpret_cast<const int16_t*>(fr->extended_data[c])[i] / 32768.0f; break;
+                        case AV_SAMPLE_FMT_S16: v = reinterpret_cast<const int16_t*>(fr->extended_data[0])[i * n + c] / 32768.0f; break;
+                        default: break;
+                    }
+                    out.channels[size_t(c)].push_back(v);
+                }
+        }
+    };
+    while (av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == si) {
+            out.packets.emplace_back(pkt->data, pkt->data + pkt->size);
+            avcodec_send_packet(ctx, pkt);
+            take();
+        }
+        av_packet_unref(pkt);
+    }
+    avcodec_send_packet(ctx, nullptr);
+    take();
+    av_frame_free(&fr);
+    av_packet_free(&pkt);
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+    return out;
+}
+
+// An MPEG-TS file read: each PID's continuity counters in order, the PIDs the PMT gives each stream type, and the first
+// PES packet of each PID (its PTS, and its payload as far as it went in its first TS packet's run).
+struct TsRead {
+    bool synced = true;
+    std::vector<std::pair<int, int>> counters;  // (pid, cc) of packets with a payload
+    std::map<int, int> types;                   // pid -> stream_type
+    std::map<int, int64_t> firstPts;
+    std::map<int, std::vector<uint8_t>> firstPes;
+    int firstPid = -1;
+};
+TsRead readTs(const QByteArray& b) {
+    TsRead r;
+    std::map<int, bool> collecting;
+    int pmtPid = -1;
+    for (int at = 0; at + 188 <= b.size(); at += 188) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.constData() + at);
+        if (p[0] != 0x47) {
+            r.synced = false;
+            break;
+        }
+        const int pid = (p[1] & 0x1f) << 8 | p[2];
+        const bool start = p[1] & 0x40;
+        const int afc = (p[3] >> 4) & 3, cc = p[3] & 15;
+        if (r.firstPid < 0) r.firstPid = pid;
+        int off = 4;
+        if (afc & 2) off += 1 + p[4];
+        if (!(afc & 1) || off >= 188) continue;
+        r.counters.emplace_back(pid, cc);
+        const uint8_t* d = p + off;
+        const int n = 188 - off;
+        if (pid == 0 && start) {
+            const uint8_t* t = d + 1 + d[0];
+            pmtPid = (t[10] & 0x1f) << 8 | t[11];
+        } else if (pid == pmtPid && start) {
+            const uint8_t* t = d + 1 + d[0];
+            const int length = (t[1] & 0x0f) << 8 | t[2];
+            const int info = (t[10] & 0x0f) << 8 | t[11];
+            for (int i = 12 + info; i + 5 <= 3 + length - 4; ) {
+                const int type = t[i], es = (t[i + 1] & 0x1f) << 8 | t[i + 2], esInfo = (t[i + 3] & 0x0f) << 8 | t[i + 4];
+                r.types[es] = type;
+                i += 5 + esInfo;
+            }
+        } else if (r.types.count(pid)) {
+            if (start && !r.firstPts.count(pid) && n > 14 && d[0] == 0 && d[1] == 0 && d[2] == 1 && (d[7] & 0x80)) {
+                const int64_t pts = int64_t(d[9] & 0x0e) << 29 | int64_t(d[10]) << 22 | int64_t(d[11] & 0xfe) << 14 | int64_t(d[12]) << 7 | d[13] >> 1;
+                r.firstPts[pid] = pts;
+                collecting[pid] = true;
+                r.firstPes[pid].assign(d + 9 + d[8], d + n);
+            } else if (start) {
+                collecting[pid] = false;
+            } else if (collecting[pid]) {
+                r.firstPes[pid].insert(r.firstPes[pid].end(), d, d + n);
+            }
+        }
+    }
+    return r;
+}
+
+// The amplitude of a tone in samples [from, from + n).
+double toneLevel(const std::vector<float>& x, size_t from, size_t n, double hz, int rate) {
+    double re = 0, im = 0;
+    for (size_t i = from; i < from + n && i < x.size(); ++i) {
+        const double a = 2 * M_PI * hz * double(i) / rate;
+        re += x[i] * std::cos(a), im += x[i] * std::sin(a);
+    }
+    return 2 * std::hypot(re, im) / double(n);
+}
 
 // Netflix's Photon (the reference IMF checker) on a package: its errors, or {"skipped"} when MONTAGE_TEST_PHOTON (a
 // folder of Photon's jar and its dependencies) is not set.
@@ -20738,6 +20896,212 @@ colorspaces:
         QVERIFY(pkg.exists(".montage-package-old/" + videos[0] + "/seg00001.m4s"));
         QVERIFY(!pkg.exists(".montage-package-old-2"));
     }
+    void ac3AndEac3Exports() {
+        // AC-3 5.1 (in MPEG-TS) and E-AC-3 7.1 (in MP4, as two substreams) from their presets: a tone on each speaker,
+        // each decoded by FFmpeg on its speaker; the dialogue level the mix measured, rounded; the sequence's downmix
+        // levels and production information stated; and the stereo the decoder folds down from those levels as loud
+        // as Montage's own fold-down.
+        if (!avcodec_find_encoder_by_name("ac3") || !avcodec_find_encoder_by_name("eac3")) QSKIP("This FFmpeg has no AC-3 encoders");
+        QTemporaryDir dir;
+        for (const std::string layout : {"5.1", "7.1"}) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+            s.audioLayout = layout;
+            s.downmixCentreDb = -4.5, s.downmixSurroundDb = -6;
+            s.preferredDownmix = "loro";
+            s.mixingLevel = 85, s.roomType = "small";
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.5f, 0.5f, 0, 75));
+            const auto& speakers = layoutSpeakers(layout);
+            std::vector<double> hz;
+            s.audioTracks.clear();
+            for (size_t c = 0; c < speakers.size(); ++c) {
+                hz.push_back(speakers[c].lfe ? 60.0 : 250.0 + 125.0 * double(c));
+                const QString wav = dir.filePath(QStringLiteral("tone-%1-%2.wav").arg(QString::fromStdString(layout)).arg(c));
+                QVERIFY(writeToneWav(wav, hz.back(), 3.0, 0.2 + 0.03 * double(c)));
+                MediaItem m;
+                m.id = p.newId();
+                QVERIFY(probeMedia(wav.toStdString(), m));
+                p.media.push_back(m);
+                s.audioTracks.emplace_back();
+                Track& t = s.audioTracks.back();
+                Clip a = makeClip(p, m, TrackKind::Audio, s);
+                a.duration = 75;
+                t.clips.push_back(a);
+                // (each on its own speaker: panned to its angle, no width; the LFE's alone on the LFE)
+                if (speakers[c].lfe) {
+                    t.surround.lfeOnly = true, t.surround.lfeDb = 0;
+                } else {
+                    t.surround.x = std::sin(speakers[c].angle * M_PI / 180), t.surround.y = std::cos(speakers[c].angle * M_PI / 180);
+                    t.surround.width = 0;
+                }
+            }
+            const ExportPreset* preset = findExportPreset(layout == "5.1" ? "H.264 + AC-3 (MPEG-TS)" : "H.264 + E-AC-3 (MP4)");
+            QVERIFY(preset);
+            ExportSettings e = preset->settings;
+            e.path = dir.filePath(QString::fromStdString("sound-" + layout + "." + preset->extension)).toStdString();
+            std::string err;
+            QVERIFY2(exportSequence(p, s, e, nullptr, nullptr, &err), err.c_str());
+            const DecodedSound d = decodeSound(e.path);
+            QCOMPARE(d.codec, std::string(layout == "5.1" ? "ac3" : "eac3"));
+            QCOMPARE(d.channels.size(), speakers.size());
+            QCOMPARE(d.mask, uint64_t(layout == "5.1" ? AV_CH_LAYOUT_5POINT1 : AV_CH_LAYOUT_7POINT1));
+            // Every channel's tone on its speaker (FFmpeg's order is Montage's), and no other's.
+            const size_t from = 24000, n = 48000;
+            for (size_t c = 0; c < speakers.size(); ++c) {
+                const double own = toneLevel(d.channels[c], from, n, hz[c], 48000);
+                QVERIFY2(own > 0.1, qPrintable(QString("%1 %2: %3").arg(QString::fromStdString(layout)).arg(speakers[c].name).arg(own)));
+                for (size_t o = 0; o < speakers.size(); ++o)
+                    if (o != c) {
+                        const double other = toneLevel(d.channels[c], from, n, hz[o], 48000);
+                        QVERIFY2(other < own * 0.03, qPrintable(QString("%1 %2 hears %3: %4 / %5").arg(QString::fromStdString(layout)).arg(speakers[c].name)
+                                                                    .arg(speakers[o].name).arg(other).arg(own)));
+                    }
+            }
+            // The mix's loudness as Montage measures it.
+            AudioMixer mixer;
+            std::vector<float> block(size_t(4800) * speakers.size()), stereo(4800 * 2);
+            std::vector<double> weights;
+            for (const Speaker& sp : speakers) weights.push_back(sp.loudnessWeight);
+            LoudnessMeter whole(48000), folded(48000);
+            const int64_t end = int64_t(75) * 48000 / 25;
+            for (int64_t at = 0; at < end; at += 4800) {
+                mixer.mixLayout(p, s, at, 4800, block.data());
+                whole.addChannels(block.data(), 4800, int(speakers.size()), weights.data());
+                downmixToStereo(layout, block.data(), 4800, stereo.data(), s.downmixCentreDb, s.downmixSurroundDb);
+                folded.add(stereo.data(), 4800);
+            }
+            const LoudnessResult measured = whole.result();
+            QVERIFY(measured.valid);
+            // Each syncframe: the dialogue level, the downmix levels and the production information.
+            QVERIFY(!d.packets.empty());
+            for (const std::vector<uint8_t>& pk : d.packets) {
+                const std::vector<Ac3FrameInfo> info = parseAc3Frames(pk.data(), pk.size());
+                QCOMPARE(info.size(), size_t(layout == "5.1" ? 1 : 2));
+                for (const Ac3FrameInfo& f : info) {
+                    QVERIFY(f.crcOk);
+                    QCOMPARE(f.dialnorm, ac3Dialnorm(measured.integrated));
+                }
+                const Ac3FrameInfo& f = info.front();
+                QVERIFY2(std::fabs(f.centreMixDb + 4.5) < 0.01 && std::fabs(f.surroundMixDb + 6) < 0.01,
+                         qPrintable(QString("%1 %2").arg(f.centreMixDb).arg(f.surroundMixDb)));
+                QCOMPARE(f.preferredDownmix, 2);  // Lo/Ro
+                QCOMPARE(f.mixingLevel, 85);
+                QCOMPARE(f.roomType, 2);  // small
+                if (layout == "7.1") {
+                    QVERIFY(info[0].eac3 && info[0].streamType == 0 && info[0].acmod == 7 && info[0].lfe);
+                    QVERIFY(info[1].streamType == 1 && info[1].acmod == 6 && info[1].chanmap == 0x1A00);
+                }
+            }
+            if (layout == "5.1") {
+                // The decoder's fold-down from the levels the stream states (FFmpeg scales its own down, so it is made
+                // here as a decoder that keeps the levels makes it): as loud as Montage's, within half a unit.
+                LoudnessMeter decoded(48000);
+                const float cg = float(std::pow(10.0, -4.5 / 20)), sg = float(std::pow(10.0, -6.0 / 20));
+                const size_t len = d.channels[0].size();
+                std::vector<float> lr(len * 2);
+                for (size_t i = 0; i < len; ++i) {
+                    lr[i * 2] = d.channels[0][i] + cg * d.channels[2][i] + sg * d.channels[4][i];
+                    lr[i * 2 + 1] = d.channels[1][i] + cg * d.channels[2][i] + sg * d.channels[5][i];
+                }
+                decoded.add(lr.data(), int64_t(len));
+                const double ours = folded.result().integrated, theirs = decoded.result().integrated;
+                QVERIFY2(std::fabs(ours - theirs) < 0.5, qPrintable(QString("%1 %2").arg(ours).arg(theirs)));
+            }
+        }
+    }
+
+    void streamingTsSegments() {
+        // HLS in MPEG-TS segments (DASH in CMAF beside them), with AC-3 sound: every segment starts with the tables and
+        // a keyframe at its own time, the continuity counters run on across the segments, the I-frame playlist's
+        // ranges end on whole packets, and the CMAF has the AC-3 sample entry ("ac-3" in both).
+        if (!avcodec_find_encoder_by_name("ac3")) QSKIP("This FFmpeg has no AC-3 encoder");
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 80));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.1f, 0.3f, 0.9f, 80, 70));
+        const QString wav = dir.filePath("tone.wav");
+        QVERIFY(writeToneWav(wav, 440, 6, 0.3));
+        MediaItem m;
+        m.id = p.newId();
+        QVERIFY(probeMedia(wav.toStdString(), m));
+        p.media.push_back(m);
+        Clip a = makeClip(p, m, TrackKind::Audio, s);
+        a.duration = 150;
+        s.audioTracks[0].clips.push_back(a);
+        StreamingSettings st;
+        st.folder = (dir.path() + "/package").toStdString();
+        st.segmentSeconds = 2;
+        st.segmentFormat = "ts";
+        st.audioCodec = "ac3";
+        st.audioBitrate = 192000;
+        st.rungs = {{320, 180, 400000, "libx264"}};
+        std::string err;
+        StreamingResult res;
+        // (AV1 does not go in TS segments)
+        StreamingSettings av1 = st;
+        av1.rungs[0].codec = "libsvtav1";
+        QVERIFY(!exportStreamingPackage(p, s, av1, nullptr, nullptr, &err, &res) && err.find("AV1") != std::string::npos);
+        QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
+        QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50, 100}));
+        const QDir pkg(QString::fromStdString(st.folder));
+        auto text = [&](const QString& f) {
+            QFile file(pkg.filePath(f));
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
+        const QString master = text("master.m3u8");
+        QVERIFY2(master.contains("CODECS=\"avc1.") && master.contains(",ac-3\""), qPrintable(master));
+        const QString video = text("v1_180p_h264/playlist.m3u8"), sound = text("a1_en/playlist.m3u8");
+        QVERIFY2(video.contains("seg00001.ts") && video.contains("seg00003.ts") && !video.contains("EXT-X-MAP"), qPrintable(video));
+        QVERIFY2(sound.contains("seg00001.ts") && !sound.contains("EXT-X-MAP"), qPrintable(sound));
+        // (and DASH's CMAF: the AC-3 configuration in the sample entry)
+        const QString mpd = text("manifest.mpd");
+        QVERIFY2(mpd.contains("codecs=\"ac-3\""), qPrintable(mpd));
+        QFile init(pkg.filePath("a1_en/init.mp4"));
+        QVERIFY(init.open(QIODevice::ReadOnly) && init.readAll().contains("dac3"));
+        QVERIFY(pkg.exists("v1_180p_h264/seg00001.m4s"));
+        for (const char* rendition : {"v1_180p_h264", "a1_en"}) {
+            std::map<int, int> last;
+            for (int k = 1; k <= 3; ++k) {
+                QFile f(pkg.filePath(QString("%1/seg%2.ts").arg(rendition).arg(k, 5, 10, QChar('0'))));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                const QByteArray bytes = f.readAll();
+                QVERIFY(bytes.size() % 188 == 0);
+                const TsRead t = readTs(bytes);
+                QVERIFY(t.synced);
+                QCOMPARE(t.firstPid, 0);  // (the PAT first)
+                QCOMPARE(t.types.size(), size_t(1));
+                const int pid = t.types.begin()->first, type = t.types.begin()->second;
+                QCOMPARE(type, std::strcmp(rendition, "a1_en") == 0 ? 0x81 : 0x1b);  // AC-3 (ATSC), H.264
+                // At the segment's own time (from kTsOffset).
+                QVERIFY(t.firstPts.count(pid));
+                const int64_t want = kTsOffset + int64_t(res.segments[size_t(k - 1)]) * 3600;
+                QVERIFY2(std::llabs(t.firstPts.at(pid) - want) <= (type == 0x1b ? 0 : 1440 * 2),
+                         qPrintable(QString("%1 seg %2: %3, not %4").arg(rendition).arg(k).arg(t.firstPts.at(pid)).arg(want)));
+                if (type == 0x1b) {
+                    // A keyframe first: an IDR slice before any other.
+                    const std::vector<uint8_t>& pes = t.firstPes.at(pid);
+                    int first = -1;
+                    for (size_t i = 0; i + 3 < pes.size() && first < 0; ++i)
+                        if (pes[i] == 0 && pes[i + 1] == 0 && pes[i + 2] == 1 && ((pes[i + 3] & 0x1f) == 5 || (pes[i + 3] & 0x1f) == 1))
+                            first = pes[i + 3] & 0x1f;
+                    QCOMPARE(first, 5);
+                }
+                // The counters run on from the segment before.
+                for (const auto& [id, cc] : t.counters) {
+                    if (last.count(id)) QVERIFY2(cc == (last[id] + 1) % 16, qPrintable(QString("%1 seg %2 pid %3: %4 after %5").arg(rendition).arg(k).arg(id).arg(cc).arg(last[id])));
+                    last[id] = cc;
+                }
+            }
+        }
+        const QString iframes = text("v1_180p_h264/iframes.m3u8");
+        const QRegularExpressionMatch range = QRegularExpression("#EXT-X-BYTERANGE:(\\d+)@0").match(iframes);
+        QVERIFY2(range.hasMatch() && range.captured(1).toInt() % 188 == 0, qPrintable(iframes));
+        QVERIFY(iframes.contains("seg00001.ts"));
+    }
+
     void streamingPackagePlays() {
         // The package played in a browser: HLS through hls.js and DASH through dash.js (test tools, fetched when the
         // build is configured), switching between rungs, with the captions, the cues and the times they fall at.
@@ -20935,6 +21299,341 @@ colorspaces:
         QCOMPARE(js("r.error").toString(), QString());
 #endif
     }
+    void livePackagePlays() {
+        // A live package from a recording as it is made: FFmpeg's test source sent over SRT on loopback (each picture
+        // stamped with the wall clock, in milliseconds, as a row of black and white blocks), recorded by Capture, fed
+        // to the packager, served by its origin, and played while it records by hls.js (LL-HLS) and dash.js (low
+        // latency): the delay the stamps show under three seconds, and the window keeping its set number of segments.
+#ifndef MONTAGE_TEST_STREAMING_PLAYERS
+        QSKIP("hls.js and dash.js were not fetched when the build was configured");
+#else
+        const std::string exe = ografBrowser();
+        if (exe.empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        {
+            QProcess probe;
+            probe.start(ffmpeg, {"-hide_banner", "-protocols"});
+            probe.waitForFinished(20000);
+            if (!QString::fromLocal8Bit(probe.readAllStandardOutput()).contains(QRegularExpression("\\n\\s*srt\\s*\\n"))) QSKIP("This ffmpeg has no SRT");
+        }
+        QTemporaryDir dir;
+        const QString folder = dir.filePath("live");
+        QVERIFY(QDir().mkpath(folder));
+        // The page and the players, served from the package's folder.
+        const QDir players(QStringLiteral(MONTAGE_TEST_STREAMING_PLAYERS));
+        for (const char* f : {"hls.min.js", "dash.all.min.js"}) QVERIFY(QFile::copy(players.filePath(f), folder + "/" + f));
+        {
+            QFile page(folder + "/harness.html");
+            QVERIFY(page.open(QIODevice::WriteOnly));
+            page.write("<!doctype html><html><body><video width=\"640\" height=\"360\" muted playsinline></video>"
+                       "<canvas width=\"640\" height=\"360\"></canvas></body></html>");
+        }
+        bool sandbox = true;
+#ifndef _WIN32
+        sandbox = geteuid() != 0;
+#endif
+        HeadlessBrowser::Options options;
+        options.offline = false;  // (it reaches the origin on loopback, and nothing else is asked for)
+        options.extraArgs = {"--autoplay-policy=no-user-gesture-required", "--no-proxy-server"};
+        auto browser = std::make_unique<HeadlessBrowser>();
+        std::string err;
+        if (!browser->start(exe, 640, 360, sandbox, &err, options)) {
+            if (!sandbox) QFAIL(err.c_str());
+            browser = std::make_unique<HeadlessBrowser>();
+            QVERIFY2(browser->start(exe, 640, 360, false, &err, options), err.c_str());
+        }
+        HeadlessBrowser& b = *browser;
+        auto js = [&](const QString& expression) {
+            QJsonObject r;
+            std::string e;
+            if (!b.call("Runtime.evaluate", {{"expression", expression}, {"awaitPromise", true}, {"returnByValue", true}}, &r, &e, true, 30000)) {
+                qWarning("%s", e.c_str());
+                return QJsonValue();
+            }
+            if (r.contains("exceptionDetails")) qWarning("%s", QJsonDocument(r.value("exceptionDetails").toObject()).toJson().constData());
+            return r.value("result").toObject().value("value");
+        };
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (js(expression).toBool()) return true;
+                QThread::msleep(100);
+            }
+            return false;
+        };
+        // H.264 and AAC where the browser plays them, else AV1 and Opus.
+        QJsonObject nav;
+        QVERIFY2(b.call("Page.navigate", {{"url", "about:blank"}}, &nav, &err), err.c_str());
+        auto plays = [&](const QString& c) { return js(QString("MediaSource.isTypeSupported('video/mp4; codecs=\"%1\"')").arg(c)).toBool(); };
+        LiveSettings ls;
+        ls.folder = folder.toStdString();
+        ls.rungs = {{640, 360, 900000, "libx264"}};
+        ls.audioCodec = "aac";
+        if (!plays("avc1.640015,mp4a.40.2")) {
+            if (!plays("av01.0.04M.08,opus") || !avcodec_find_encoder_by_name("libsvtav1") || !avcodec_find_encoder_by_name("libopus"))
+                QSKIP("This browser plays neither H.264 and AAC nor AV1 and Opus");
+            ls.rungs[0].codec = "libsvtav1";
+            ls.audioCodec = "libopus";
+        }
+        ls.segmentSeconds = 2;
+        ls.window = 4;
+        ls.lowLatency = true;
+        ls.partSeconds = 0.32;
+        ls.preset = "ultrafast";
+        LivePackager packager;
+        QVERIFY2(packager.start(ls, &err), err.c_str());
+        LiveOrigin origin;
+        QVERIFY2(origin.start(ls.folder, 0, [&](const std::string& rel) { return packager.growing(rel); }, &err), err.c_str());
+        const QString base = QStringLiteral("http://127.0.0.1:%1/").arg(origin.port());
+
+        // The feed: recorded (ProRes, as Capture records) and packaged as it comes.
+        quint16 port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            const quint16 c = quint16(20000 + QRandomGenerator::global()->bounded(10000));
+            QUdpSocket u;
+            if (u.bind(QHostAddress::LocalHost, c)) port = c;
+        }
+        QVERIFY(port > 0);
+        CaptureSettings cs;
+        cs.video.url = QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port).toStdString();
+        cs.path = dir.filePath("live.mov").toStdString();
+        cs.codec = "prores_proxy";
+        cs.openTimeout = 20;
+        cs.onPicture = [&](const AVFrame* f, int num, int den) { packager.picture(f, num, den); };
+        cs.onSound = [&](const AVFrame* f) { packager.sound(f); };
+        Recorder recorder;
+        QVERIFY2(recorder.start(cs, &err), err.c_str());
+        QThread::msleep(300);
+        // (the stamp: bit i of the wall clock's milliseconds, mod 2^24, white or black in the 16-pixel block i of the
+        // top row)
+        // (drawn on the top strip alone and laid over the picture: the stamp's expression over every pixel is slow
+        // enough to keep the feed below its rate on a busy computer)
+        const QString stamp = "testsrc2=size=640x360:rate=25,realtime,format=yuv420p,setpts=RTCTIME/(TB*1000000),split[a][b];"
+                              "[b]crop=384:16:0:0,geq=lum='if(mod(floor(floor(T*1000)/pow(2\\,floor(X/16)))\\,2)\\,235\\,16)':cb=128:cr=128[s];"
+                              "[a][s]overlay=0:0,setpts=N/(25*TB)";
+        QProcess sender;
+        sender.setProcessChannelMode(QProcess::ForwardedErrorChannel);
+        sender.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", stamp, "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000,arealtime",
+                              "-t", "120", "-c:v", "mpeg2video", "-g", "12", "-b:v", "6M", "-c:a", "mp2", "-f", "mpegts",
+                              QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(port)});
+        QVERIFY(sender.waitForStarted(10000));
+        struct Stop {
+            QProcess& sender;
+            ~Stop() {
+                sender.kill();
+                sender.waitForFinished(5000);
+            }
+        } stopSender{sender};
+        QTRY_VERIFY2_WITH_TIMEOUT(packager.status().segments >= 2 || !packager.status().error.empty() || !recorder.status().error.empty(),
+                                  qPrintable(QString::fromStdString(packager.status().error + recorder.status().error)), 30000);
+        QCOMPARE(QString::fromStdString(recorder.status().error), QString());
+        QCOMPARE(QString::fromStdString(packager.status().error), QString());
+
+        // The delay: the stamp of the picture shown against the clock, the median of a few readings over two seconds.
+        const QString delay = R"js((async () => {
+            const v = document.querySelector('video'), c = document.querySelector('canvas'), g = c.getContext('2d', {willReadFrequently: true});
+            const got = [];
+            for (let n = 0; n < 10; ++n) {
+                await new Promise(ok => setTimeout(ok, 200));
+                g.drawImage(v, 0, 0, 640, 360);
+                const px = g.getImageData(0, 0, 640, 16).data;
+                let t = 0;
+                for (let i = 0; i < 24; ++i) if (px[(8 * 640 + 16 * i + 8) * 4] > 128) t += 2 ** i;
+                const now = Date.now() % 2 ** 24;
+                got.push((now - t + 2 ** 24) % 2 ** 24);
+            }
+            got.sort((a, b) => a - b);
+            return got[5]; })())js";
+        // HLS, low latency (parts, blocking reloads).
+        QVERIFY2(b.call("Page.navigate", {{"url", base + "harness.html"}}, &nav, &err), err.c_str());
+        QVERIFY(until("document.readyState === 'complete'", 20));
+        QVERIFY(js(R"js((async () => {
+            await new Promise((ok, bad) => { const s = document.createElement('script'); s.src = 'hls.min.js'; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+            window.r = {error: '', parts: 0};
+            const v = document.querySelector('video');
+            const h = new Hls({lowLatencyMode: true});
+            window.h = h;
+            h.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) r.error = d.type + ' ' + d.details; });
+            h.on(Hls.Events.LEVEL_UPDATED, (e, d) => { r.parts = d.details.partList ? d.details.partList.length : 0; r.live = d.details.live; });
+            h.loadSource('master.m3u8');
+            h.attachMedia(v);
+            v.muted = true;
+            v.play().catch(e => r.error = String(e));
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 3", 40), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QVERIFY(js("r.live").toBool());
+        QVERIFY2(js("r.parts").toInt() > 0, qPrintable(js("JSON.stringify(r)").toString()));
+        QThread::msleep(2000);
+        const int hlsDelay = js(delay).toInt();
+        qInfo("LL-HLS delay %d ms", hlsDelay);
+        QVERIFY2(hlsDelay > 0 && hlsDelay < 3000, qPrintable(QString::number(hlsDelay)));
+        QCOMPARE(js("r.error").toString(), QString());
+
+        // DASH, low latency (chunks as they are made), from another host name (its own connections).
+        const QString other = QStringLiteral("http://localhost:%1/").arg(origin.port());
+        QVERIFY2(b.call("Page.navigate", {{"url", other + "harness.html"}}, &nav, &err), err.c_str());
+        QVERIFY(until("document.readyState === 'complete'", 20));
+        QVERIFY(js(R"js((async () => {
+            await new Promise((ok, bad) => { const s = document.createElement('script'); s.src = 'dash.all.min.js'; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+            window.r = {error: ''};
+            const v = document.querySelector('video');
+            const p = dashjs.MediaPlayer().create();
+            window.p = p;
+            p.updateSettings({debug: {logLevel: 0}});
+            p.on(dashjs.MediaPlayer.events.ERROR, e => r.error = JSON.stringify(e.error && (e.error.message || e.error.code) || e));
+            v.muted = true;
+            p.initialize(v, 'manifest.mpd', true);
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 3", 40), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QVERIFY(js("p.isDynamic()").toBool());
+        QThread::msleep(3000);  // (its catch-up to the latency asked for)
+        const int dashDelay = js(delay).toInt();
+        qInfo("DASH delay %d ms (latency %f; the recording %lld pictures repeated, %lld dropped; the packager %lld dropped)", dashDelay,
+              js("p.getCurrentLiveLatency()").toDouble(), (long long)recorder.status().repeated, (long long)recorder.status().dropped,
+              (long long)packager.status().dropped);
+        QVERIFY2(dashDelay > 0 && dashDelay < 3000, qPrintable(QString::number(dashDelay)));
+
+        // The window: the playlists hold four segments, the MPD's buffer as long, and the files gone before them.
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments >= 9, 30000);
+        const LiveStatus st = packager.status();
+        QFile list(folder + "/" + QString::fromStdString(st.renditions.front()) + "/playlist.m3u8");
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(list.readAll());
+        QCOMPARE(text.count("#EXTINF:"), 4);
+        const int sequence = QRegularExpression("#EXT-X-MEDIA-SEQUENCE:(\\d+)").match(text).captured(1).toInt();
+        QVERIFY2(sequence >= 5, qPrintable(text));
+        QVERIFY(text.contains("#EXT-X-PART:") && text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART") && text.contains("CAN-BLOCK-RELOAD=YES"));
+        QVERIFY(!QFile::exists(folder + "/" + QString::fromStdString(st.renditions.front()) + "/seg00001.m4s"));
+        QFile mpd(folder + "/manifest.mpd");
+        QVERIFY(mpd.open(QIODevice::ReadOnly));
+        const QString x = QString::fromUtf8(mpd.readAll());
+        QVERIFY2(x.contains("type=\"dynamic\"") && x.contains("timeShiftBufferDepth=\"PT7.680S\"") && x.contains("availabilityTimeComplete=\"false\""), qPrintable(x));
+
+        // Stopped: the recording is a whole file, and the playlists end.
+        sender.kill();
+        recorder.stop();
+        packager.finish();
+        MediaItem rec;
+        QVERIFY2(probeMedia(cs.path, rec, &err), err.c_str());
+        QVERIFY(rec.hasVideo && rec.width == 640);
+        QFile ended(folder + "/" + QString::fromStdString(st.renditions.front()) + "/playlist.m3u8");
+        QVERIFY(ended.open(QIODevice::ReadOnly) && ended.readAll().contains("#EXT-X-ENDLIST"));
+        origin.stop();
+#endif
+    }
+
+    void livePackageWindowAndTs() {
+        // Without a browser: pictures and sound handed to the packager as a recording would, in real time, packaged
+        // as HLS in MPEG-TS segments (and DASH in CMAF): the window slides, its segments start on keyframes, and the
+        // origin holds a playlist request until the segment asked for is made, and a request for a part file until it
+        // is written.
+        QTemporaryDir dir;
+        LiveSettings ls;
+        ls.folder = dir.filePath("live").toStdString();
+        ls.rungs = {{320, 180, 300000, "libx264"}};
+        ls.segmentSeconds = 1;
+        ls.window = 3;
+        ls.segmentFormat = "ts";
+        ls.audioCodec = avcodec_find_encoder_by_name("ac3") ? "ac3" : "aac";
+        ls.preset = "ultrafast";
+        std::string err;
+        {
+            LiveSettings bad = ls;
+            bad.lowLatency = true;
+            LivePackager x;
+            QVERIFY(!x.start(bad, &err) && err.find("CMAF") != std::string::npos);
+        }
+        LivePackager packager;
+        QVERIFY2(packager.start(ls, &err), err.c_str());
+        LiveOrigin origin;
+        QVERIFY2(origin.start(ls.folder, 0, [&](const std::string& rel) { return packager.growing(rel); }, &err), err.c_str());
+        AVFrame* pic = av_frame_alloc();
+        pic->format = AV_PIX_FMT_YUV422P10LE, pic->width = 320, pic->height = 180;
+        QVERIFY(av_frame_get_buffer(pic, 0) >= 0);
+        AVFrame* snd = av_frame_alloc();
+        snd->format = AV_SAMPLE_FMT_S32, snd->sample_rate = 48000, snd->nb_samples = 1920;
+        av_channel_layout_default(&snd->ch_layout, 2);
+        QVERIFY(av_frame_get_buffer(snd, 0) >= 0);
+        // A request for the third segment, before it is made: answered once it is.
+        QNetworkAccessManager net;
+        const QString base = QStringLiteral("http://127.0.0.1:%1/").arg(origin.port());
+        std::unique_ptr<QNetworkReply> held;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int f = 0; f < 25 * 7; ++f) {
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) reinterpret_cast<uint16_t*>(pic->data[0] + y * pic->linesize[0])[x] = uint16_t(64 + ((x + f * 4) % 320) * 2);
+            for (int c = 1; c < 3; ++c)
+                for (int y = 0; y < 180; ++y)
+                    for (int x = 0; x < 160; ++x) reinterpret_cast<uint16_t*>(pic->data[c] + y * pic->linesize[c])[x] = 512;
+            pic->pts = f;
+            packager.picture(pic, 25, 1);
+            auto* d = reinterpret_cast<int32_t*>(snd->data[0]);
+            for (int i = 0; i < 1920; ++i) d[2 * i] = d[2 * i + 1] = int32_t(0.3 * 2147483647.0 * std::sin(2 * M_PI * 440 * (f * 1920 + i) / 48000.0));
+            snd->pts = int64_t(f) * 1920;
+            packager.sound(snd);
+            if (f == 5) {
+                QTRY_VERIFY_WITH_TIMEOUT(packager.status().renditions.size() == 2, 10000);
+                const QString v = QString::fromStdString(packager.status().renditions.front());
+                held.reset(net.get(QNetworkRequest(QUrl(base + v + "/playlist.m3u8?_HLS_msn=3"))));
+            }
+            std::this_thread::sleep_until(t0 + std::chrono::milliseconds(40 * (f + 1)));
+            QCoreApplication::processEvents();
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(held->isFinished(), 10000);
+        const QByteArray reply = held->readAll();
+        QCOMPARE(held->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(), 200);
+        QVERIFY2(reply.contains("seg00003.ts"), reply.constData());
+        QCOMPARE(held->rawHeader("Access-Control-Allow-Origin"), QByteArray("*"));
+        packager.finish();
+        av_frame_free(&pic);
+        av_frame_free(&snd);
+        const LiveStatus st = packager.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        QCOMPARE(st.segments, int64_t(7));
+        const QDir v(QString::fromStdString(ls.folder + "/" + st.renditions.front()));
+        QFile list(v.filePath("playlist.m3u8"));
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(list.readAll());
+        QCOMPARE(text.count("#EXTINF:"), 3);
+        QVERIFY2(text.contains("#EXT-X-MEDIA-SEQUENCE:5") && text.contains("seg00007.ts") && text.contains("#EXT-X-ENDLIST") && !text.contains("EXT-X-MAP"),
+                 qPrintable(text));
+        // Each listed segment: the tables, then a keyframe at its own time; the counters on from one to the next.
+        std::map<int, int> last;
+        for (int k = 5; k <= 7; ++k) {
+            QFile f(v.filePath(QString("seg%1.ts").arg(k, 5, 10, QChar('0'))));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const TsRead t = readTs(f.readAll());
+            QVERIFY(t.synced && t.firstPid == 0 && t.types.size() == 1);
+            const int pid = t.types.begin()->first;
+            QCOMPARE(t.firstPts.at(pid), kTsOffset + int64_t(k - 1) * 90000);
+            const std::vector<uint8_t>& pes = t.firstPes.at(pid);
+            int first = -1;
+            for (size_t i = 0; i + 3 < pes.size() && first < 0; ++i)
+                if (pes[i] == 0 && pes[i + 1] == 0 && pes[i + 2] == 1 && ((pes[i + 3] & 0x1f) == 5 || (pes[i + 3] & 0x1f) == 1)) first = pes[i + 3] & 0x1f;
+            QCOMPARE(first, 5);
+            for (const auto& [id, cc] : t.counters) {
+                if (last.count(id)) QVERIFY(cc == (last[id] + 1) % 16);
+                last[id] = cc;
+            }
+        }
+        QVERIFY(!v.exists("seg00001.ts"));
+        // (and the sound: AC-3 stating the loudness measured so far)
+        if (ls.audioCodec == "ac3") {
+            QFile f(QString::fromStdString(ls.folder + "/" + st.renditions.back() + "/seg00007.ts"));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY(st.dialnorm < -1 && st.dialnorm > -31);
+        }
+        QFile mpd(QString::fromStdString(ls.folder + "/manifest.mpd"));
+        QVERIFY(mpd.open(QIODevice::ReadOnly));
+        const QByteArray x = mpd.readAll();
+        QVERIFY2(x.contains("type=\"dynamic\"") && x.contains("mediaPresentationDuration") && x.contains("seg$Number%05d$.m4s"), x.constData());
+        origin.stop();
+    }
+
     void streamingSegmentsAndLadder() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
