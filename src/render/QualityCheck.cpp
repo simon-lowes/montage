@@ -73,6 +73,8 @@ const char* qcKindName(QcKind k) {
         case QcKind::CinemaLoudness: return "Leq(M)";
         case QcKind::EncodeQuality: return "Encode quality";
         case QcKind::Hrd: return "Buffer model";
+        case QcKind::SoftFocus: return "Soft focus";
+        case QcKind::MotionBlur: return "Motion blur";
     }
     return "";
 }
@@ -160,7 +162,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     std::vector<QcIssue> issues;
     // With an encode to compare, the other checks take the first half of the progress.
     const bool compare = !q.compareFile.empty();
-    const std::function<void(double)> progress =
+    const std::function<void(double)> scaled =
         !progressAll ? progressAll : compare ? std::function<void(double)>([&](double f) { progressAll(0.5 * f); }) : progressAll;
     if (out < 0) out = s.duration();
     in = std::max<FrameTime>(0, in);
@@ -170,6 +172,10 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     const bool picture = q.flashing || q.levels || q.blackSeconds > 0 || q.freezeSeconds > 0;
     const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0 || q.phase || q.dcOffsetDb != 0 ||
                        q.uncaptionedSeconds > 0 || q.leqmLimit > 0;
+    // Focus renders the picture again, larger: it takes the last half (all of it on its own).
+    const double focusShare = q.focus ? (picture || sound ? 0.5 : 1.0) : 0.0;
+    const std::function<void(double)> progress =
+        !scaled || focusShare == 0 ? scaled : std::function<void(double)>([&](double f) { scaled((1 - focusShare) * f); });
     const double pictureShare = picture ? (sound ? 0.8 : 1.0) : 0.0;
 
     if (picture) {
@@ -466,6 +472,15 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                                       n ? sum / n : 0.0, q.intelligibility)});
             }
         }
+    }
+    if (q.focus) {
+        if (cancel && cancel->load()) return {};
+        const std::vector<FocusIssue> soft = checkSequenceFocus(p, s, in, out, q.focusOptions, [&](double f) {
+            if (scaled) scaled(1 - focusShare + focusShare * f);
+        }, cancel);
+        if (cancel && cancel->load()) return {};
+        for (const FocusIssue& f : soft)
+            issues.push_back({f.kind == FocusFinding::MotionBlur ? QcKind::MotionBlur : QcKind::SoftFocus, f.start, f.end, f.text});
     }
     if (q.spelling) {
         // The misspelt words and the first suggestion for each: "'teh' (the?), 'knwon' (known?)".

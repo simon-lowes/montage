@@ -5970,7 +5970,11 @@ void McpServer::Impl::addTools() {
         "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
         "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
         "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
-        "(`uncaptioned_seconds`), and a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`). Lists each "
+        "(`uncaptioned_seconds`), a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`), and with "
+        "`focus`, soft shots and motion blur: each frame's sharpness (fine detail against the picture's own contrast, so dark "
+        "or flat shots are not called soft) measured at `focus_width`, stretches of a shot well under its own best, shots well "
+        "under the other angles of their scene (Group Shots' groups, else the media's scene and camera), and motion blur told "
+        "apart from focus by which way the detail was lost. Lists each "
         "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
         "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's). `compare` sets a delivered "
         "file against the sequence's own render (or against `reference`, another file), aligned over ±12 frames, frame by "
@@ -5999,6 +6003,8 @@ void McpServer::Impl::addTools() {
             "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
             "uncaptioned_seconds":{"type":"number","default":0,"description":"Sound louder than -40 dBFS outside speech with no caption over it for this long (SDH); 0 = not checked"},
             "markers":{"type":"boolean","default":false},
+            "focus":{"type":"boolean","default":false,"description":"Soft focus and motion blur, frame by frame (renders the picture again, larger)"},
+            "focus_width":{"type":"integer","default":960,"description":"The width focus is measured at (never above the sequence's)"},
             "compare":{"type":"string","description":"A delivered file to compare with the sequence's render (or with reference)"},
             "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
             "hrd":{"type":"string","description":"An H.264, HEVC or MPEG-2 file to check against its buffer model (H.264/H.265 Annex C HRD, MPEG-2 VBV; CBR and VBR): each underflow and overflow at the frame it falls on, and a summary line (taken as an export of the range)"},
@@ -6060,6 +6066,11 @@ void McpServer::Impl::addTools() {
             q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
+            q.focus = a.value("focus").toBool(false);
+            if (a.contains("focus_width")) {
+                q.focusOptions.width = a.value("focus_width").toInt();
+                if (q.focusOptions.width < 64 || q.focusOptions.width > 8192) throw ArgError{"\"focus_width\" must be between 64 and 8192"};
+            }
             if (a.contains("reference") && q.compareFile.empty()) throw ArgError{"\"reference\" is compared with the file named by \"compare\""};
             if (a.contains("hrd")) {
                 const QString file = absolute(need(a, "hrd"));

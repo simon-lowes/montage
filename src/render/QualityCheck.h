@@ -11,9 +11,11 @@
 //  - linked clips out of sync with their picture (core/EditOps.h syncOffsets);
 //  - dialogue the music and effects make hard to follow (render/Intelligibility.h);
 //  - stereo out of phase (a mono fold-down cancels it), a channel inverted, and DC offset (media/StereoAnalysis.h);
-//  - for captions for the deaf and hard of hearing, loud sound outside speech that no caption describes.
+//  - for captions for the deaf and hard of hearing, loud sound outside speech that no caption describes;
+//  - soft shots and motion blur (render/FocusCheck.h), with `focus`.
 #pragma once
 
+#include "render/FocusCheck.h"
 #include "render/HrdCheck.h"
 
 #include <atomic>
@@ -68,9 +70,13 @@ struct QcSettings {
     // overflow reported at the frame it falls on ("" = not checked). As with compareFile, the file is taken to be an export
     // of the range.
     std::string hrdFile;
+    // Focus (render/FocusCheck.h): stretches of a shot well under its own best, shots well under the other angles of
+    // their scene, and motion blur, each frame measured at focusOptions.width.
+    bool focus = false;
+    FocusOptions focusOptions;
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness, EncodeQuality, Hrd };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness, EncodeQuality, Hrd, SoftFocus, MotionBlur };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;

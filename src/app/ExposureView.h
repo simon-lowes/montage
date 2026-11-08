@@ -8,6 +8,8 @@
 #include <QColor>
 #include <QImage>
 #include <QString>
+#include <utility>
+#include <vector>
 
 #include "render/ColorSpace.h"
 
@@ -22,5 +24,13 @@ QImage exposureView(const QImage& img, ExposureView mode);
 // `picture` with the pixels whose colour in `signal` (the same frame as delivered: code values in `space`, any size)
 // is outside `target` striped.
 QImage gamutView(const QImage& picture, const QImage& signal, const QString& space, Primaries target);
+
+// Focus peaking (render/FocusCheck.h): the picture with the edges in focus (fine detail past the sensitivity's
+// threshold: 0 low, 1 medium, 2 high) painted in `colour`, over a picture dimmed a little so they stand out. The marks
+// are painted over `shown` instead when it is given at the picture's size (an exposure check's view of it, whose own
+// stripes and bands are not detail).
+QImage focusPeakingView(const QImage& picture, const QColor& colour, int sensitivity, const QImage& shown = QImage());
+// The colours offered for it, and their names.
+const std::vector<std::pair<QColor, const char*>>& peakingColours();
 
 }  // namespace montage

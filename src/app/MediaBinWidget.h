@@ -99,6 +99,10 @@ public:
     // Timecode from LTC: the LTC recorded on a sound channel of each file (media/LtcTimecode.h) becomes its timecode,
     // the LTC channel no longer played; one undo step. How many had LTC.
     int timecodeFromLtc(const std::vector<Id>& media);
+    // Check Focus (render/FocusCheck.h): the pictures checked frame by frame for soft focus and motion blur, each
+    // against the other angles of its scene (scene and camera metadata), and what was found put in their Focus column
+    // (shown) and so in the ALE written from them, as one undo step. Returns how many were checked.
+    int checkFocus(const std::vector<Id>& media);
 
     // Logging, each one undo step.
     bool setRating(const std::vector<Id>& ids, int rating);

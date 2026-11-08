@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "render/FocusCheck.h"
 #include "render/Gamut.h"
 
 namespace montage {
@@ -72,6 +73,39 @@ QImage gamutView(const QImage& picture, const QImage& signal, const QString& spa
             if (row[std::min(sw - 1, int(int64_t(x) * sw / w))]) line[x] = ((x - y + 4096) / 4) % 2 ? qRgb(20, 0, 20) : qRgb(255, 40, 220);
     }
     return img;
+}
+
+QImage focusPeakingView(const QImage& picture, const QColor& colour, int sensitivity, const QImage& shown) {
+    if (picture.isNull()) return picture;
+    const QImage source = picture.convertToFormat(QImage::Format_RGB32);
+    QImage img = shown.size() == picture.size() ? shown.convertToFormat(QImage::Format_RGB32) : source;
+    const int w = img.width(), h = img.height();
+    std::vector<float> luma(size_t(w) * size_t(h));
+    for (int y = 0; y < h; ++y) {
+        const auto* line = reinterpret_cast<const QRgb*>(source.constScanLine(y));
+        for (int x = 0; x < w; ++x)
+            luma[size_t(y) * size_t(w) + size_t(x)] = float((0.2126 * qRed(line[x]) + 0.7152 * qGreen(line[x]) + 0.0722 * qBlue(line[x])) / 255.0);
+    }
+    const std::vector<uint8_t> mask = focusPeaking(luma.data(), w, h, peakingThreshold(sensitivity));
+    const QRgb mark = colour.rgb();
+    for (int y = 0; y < h; ++y) {
+        auto* line = reinterpret_cast<QRgb*>(img.scanLine(y));
+        const uint8_t* row = mask.data() + size_t(y) * size_t(w);
+        for (int x = 0; x < w; ++x) {
+            if (row[x]) line[x] = mark;
+            else line[x] = qRgb(qRed(line[x]) * 3 / 4, qGreen(line[x]) * 3 / 4, qBlue(line[x]) * 3 / 4);
+        }
+    }
+    return img;
+}
+
+const std::vector<std::pair<QColor, const char*>>& peakingColours() {
+    static const std::vector<std::pair<QColor, const char*>> colours{{QColor(255, 40, 40), QT_TRANSLATE_NOOP("MonitorPanel", "Red")},
+                                                                     {QColor(60, 255, 60), QT_TRANSLATE_NOOP("MonitorPanel", "Green")},
+                                                                     {QColor(60, 140, 255), QT_TRANSLATE_NOOP("MonitorPanel", "Blue")},
+                                                                     {QColor(255, 235, 40), QT_TRANSLATE_NOOP("MonitorPanel", "Yellow")},
+                                                                     {QColor(255, 255, 255), QT_TRANSLATE_NOOP("MonitorPanel", "White")}};
+    return colours;
 }
 
 }  // namespace montage

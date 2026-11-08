@@ -116,6 +116,7 @@
 #include <unistd.h>
 #endif
 #include "core/History.h"
+#include "core/MediaLog.h"
 #include <QTcpServer>
 #include <QSslCertificate>
 #include <QSslKey>
@@ -586,6 +587,72 @@ std::vector<std::vector<std::string>> cookingAndFootball() {
              "A late goal from the captain won the match for us.", "The coach praised the whole team after the match."}};
 }
 
+
+// A focus chart: discs of many sizes and greys on mid grey, edges anti-aliased (4 x 4 samples a pixel), the same each run.
+std::vector<float> focusChart(int w, int h) {
+    std::vector<float> img(size_t(w) * size_t(h), 0.5f);
+    uint32_t seed = 12345;
+    auto rnd = [&] {
+        seed = seed * 1664525u + 1013904223u;
+        return double(seed >> 8) / double(1u << 24);
+    };
+    const int discs = w * h / 140;
+    for (int d = 0; d < discs; ++d) {
+        const double cx = rnd() * w, cy = rnd() * h, r = 1.5 + rnd() * 6, grey = 0.1 + 0.8 * rnd();
+        for (int y = std::max(0, int(cy - r - 1)); y <= std::min(h - 1, int(cy + r + 1)); ++y)
+            for (int x = std::max(0, int(cx - r - 1)); x <= std::min(w - 1, int(cx + r + 1)); ++x) {
+                int in = 0;
+                for (int sy = 0; sy < 4; ++sy)
+                    for (int sx = 0; sx < 4; ++sx) {
+                        const double dx = x + (sx + 0.5) / 4 - cx, dy = y + (sy + 0.5) / 4 - cy;
+                        in += dx * dx + dy * dy <= r * r;
+                    }
+                float& v = img[size_t(y) * size_t(w) + size_t(x)];
+                v = float(v + (grey - v) * in / 16.0);
+            }
+    }
+    return img;
+}
+
+// Through a Gaussian of `sigma` px (sampled to 4 sigma, edges repeated), or a box `box` px long one way (motion blur:
+// across the picture when `across`, else up and down).
+std::vector<float> blurred(const std::vector<float>& src, int w, int h, double sigma, int box = 0, bool across = true) {
+    std::vector<double> k;
+    if (box > 0) k.assign(size_t(box), 1.0 / box);
+    else {
+        const int r = std::max(1, int(std::ceil(4 * sigma)));
+        double sum = 0;
+        for (int i = -r; i <= r; ++i) sum += k.emplace_back(std::exp(-0.5 * i * i / (sigma * sigma)));
+        for (double& v : k) v /= sum;
+    }
+    const int r = int(k.size() / 2);
+    auto pass = [&](const std::vector<float>& in, bool horizontal) {
+        std::vector<float> out(in.size());
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                double acc = 0;
+                for (int i = 0; i < int(k.size()); ++i) {
+                    const int o = i - r;
+                    const int xx = horizontal ? std::clamp(x + o, 0, w - 1) : x, yy = horizontal ? y : std::clamp(y + o, 0, h - 1);
+                    acc += k[size_t(i)] * in[size_t(yy) * size_t(w) + size_t(xx)];
+                }
+                out[size_t(y) * size_t(w) + size_t(x)] = float(acc);
+            }
+        return out;
+    };
+    if (box > 0) return pass(src, across);
+    return pass(pass(src, true), false);
+}
+
+QImage greyImage(const std::vector<float>& v, int w, int h) {
+    QImage q(w, h, QImage::Format_RGB32);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const int g = std::clamp(int(std::lround(v[size_t(y) * size_t(w) + size_t(x)] * 255)), 0, 255);
+            q.setPixel(x, y, qRgb(g, g, g));
+        }
+    return q;
+}
 
 }  // namespace
 
@@ -8846,6 +8913,212 @@ colorspaces:
         // Cancelled: nothing.
         std::atomic<bool> cancel{true};
         QVERIFY(qualityCheck(p, s, 0, -1, q, {}, &cancel).empty());
+    }
+
+    void focusChecks() {
+        const int W = 320, H = 180;
+        const std::vector<float> chart = focusChart(W, H);
+        // Sharpness falls with every step of blur from σ 0.5 to 4 px, and defocus is the same every way.
+        double before = measureFocus(chart.data(), W, H).sharpness;
+        QString steps = QString::number(before, 'f', 4);
+        for (double sigma = 0.5; sigma <= 4.001; sigma += 0.5) {
+            const std::vector<float> b = blurred(chart, W, H, sigma);
+            const FocusMeasure m = measureFocus(b.data(), W, H);
+            steps += QStringLiteral(" σ%1: %2 (%3)").arg(sigma).arg(m.sharpness, 0, 'f', 4).arg(m.anisotropy, 0, 'f', 2);
+            QVERIFY2(m.textured && m.sharpness < before, qPrintable(steps));
+            QVERIFY2(m.anisotropy < 0.1, qPrintable(steps));
+            before = m.sharpness;
+        }
+        qInfo("%s", qPrintable(steps));
+        const FocusMeasure sharp = measureFocus(chart.data(), W, H);
+        QVERIFY2(sharp.anisotropy < 0.1, qPrintable(QString::number(sharp.anisotropy)));
+        // Dark and flat: a tenth of the light, the same sharpness; a grey frame has nothing to judge.
+        std::vector<float> dark = chart;
+        for (float& v : dark) v = 0.02f + 0.1f * v;
+        const FocusMeasure dim = measureFocus(dark.data(), W, H);
+        QVERIFY2(dim.textured && std::fabs(dim.sharpness - sharp.sharpness) < 0.01 * sharp.sharpness,
+                 qPrintable(QStringLiteral("%1 %2").arg(dim.sharpness).arg(sharp.sharpness)));
+        const std::vector<float> grey(size_t(W) * H, 0.4f);
+        QVERIFY(!measureFocus(grey.data(), W, H).textured);
+        // Motion blur: detail lost one way, and which way.
+        for (bool across : {true, false}) {
+            const std::vector<float> smear = blurred(chart, W, H, 0, 15, across);
+            const FocusMeasure m = measureFocus(smear.data(), W, H);
+            const double off = across ? std::min(m.blurAngle, 180 - m.blurAngle) : std::fabs(m.blurAngle - 90);
+            QVERIFY2(m.anisotropy > 0.25 && off < 10, qPrintable(QStringLiteral("%1 %2").arg(m.anisotropy).arg(m.blurAngle)));
+        }
+        // The same on one thread and on eight.
+        const std::vector<float> mid = blurred(chart, W, H, 1.2);
+        QVERIFY(measureFocus(mid.data(), W, H, 1) == measureFocus(mid.data(), W, H, 8));
+        QVERIFY(focusPeaking(mid.data(), W, H, 0.05, 1) == focusPeaking(mid.data(), W, H, 0.05, 8));
+        // Peaking marks the chart's edges at σ 0.5 and none at σ 3, at every sensitivity.
+        for (int sensitivity = 0; sensitivity < 3; ++sensitivity) {
+            const double t = peakingThreshold(sensitivity);
+            const std::vector<float> crisp = blurred(chart, W, H, 0.5), soft = blurred(chart, W, H, 3);
+            const std::vector<uint8_t> a = focusPeaking(crisp.data(), W, H, t), b = focusPeaking(soft.data(), W, H, t);
+            const double marked = double(std::count(a.begin(), a.end(), 1)) / a.size();
+            QVERIFY2(marked > 0.02, qPrintable(QString::number(marked)));
+            QVERIFY2(std::count(b.begin(), b.end(), 1) == 0, qPrintable(QString::number(std::count(b.begin(), b.end(), 1))));
+            // Only near edges: none on the chart's flat grey or inside the bigger discs.
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i]) {
+                    const int x = int(i % W), y = int(i / W);
+                    bool edge = false;
+                    for (int dy = -3; dy <= 3 && !edge; ++dy)
+                        for (int dx = -3; dx <= 3 && !edge; ++dx) {
+                            const int xx = std::clamp(x + dx, 0, W - 1), yy = std::clamp(y + dy, 0, H - 1);
+                            edge = std::fabs(chart[size_t(yy) * W + size_t(xx)] - chart[i]) > 0.05f;
+                        }
+                    QVERIFY2(edge, qPrintable(QStringLiteral("%1, %2").arg(x).arg(y)));
+                }
+        }
+
+        // Through Quality Check: a sequence of shots of the chart.
+        QTemporaryDir dir;
+        const QString sharpPng = dir.filePath("chart.png"), darkPng = dir.filePath("dark.png");
+        QVERIFY(greyImage(chart, W, H).save(sharpPng));
+        QVERIFY(greyImage(dark, W, H).save(darkPng));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        auto media = [&](const QString& path) {
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id(0);
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id chartId = media(sharpPng), darkId = media(darkPng);
+        QVERIFY(chartId && darkId);
+        auto place = [&](Id m, FrameTime start, FrameTime length) {
+            [&] { QVERIFY(edit::placeMedia(p, s, m, start, 0, length, {TrackKind::Video, 0}, {}, false).ok); }();
+            return &trackAt(s, {TrackKind::Video, 0})->clips.back();
+        };
+        // 0-125: sharp but for a second (50-75) out of focus.
+        Clip* a = place(chartId, 0, 125);
+        Effect fx = makeEffect(p, "gaussian_blur");
+        fx.params["radius"].addKey(0, 0, Interp::Hold);
+        fx.params["radius"].addKey(50, 4, Interp::Hold);  // (σ is half the radius)
+        fx.params["radius"].addKey(75, 0, Interp::Hold);
+        a->effects.push_back(fx);
+        // 125-175: the chart panned, with motion blur across the picture.
+        Clip* b = place(chartId, 125, 50);
+        b->motion.params["scale"] = 140.0;
+        b->motion.params["pos_x"].addKey(0, -50);
+        b->motion.params["pos_x"].addKey(49, 50);
+        Effect smear = makeEffect(p, "directional_blur");
+        smear.params["length"] = 16.0;
+        smear.params["angle"] = 0.0;
+        b->effects.push_back(smear);
+        // 175-325: three angles of one scene: the chart sharp, the chart dark (and sharp), the chart out of focus.
+        const Id c = place(chartId, 175, 50)->id, d = place(darkId, 225, 50)->id;
+        Clip* e = place(chartId, 275, 50);
+        Effect defocus = makeEffect(p, "gaussian_blur");
+        defocus.params["radius"] = 4.0;
+        e->effects.push_back(defocus);
+        const Id eId = e->id;
+        ShotGrouping grouping;
+        for (Id clip : {c, d, eId}) grouping.angles.push_back({{clip}, 0});
+        grouping.scenes = {"12A"};
+        grouping.sceneGroups = {0};
+        QVERIFY(edit::applyShotGrouping(p, s, grouping).ok);
+
+        QcSettings q;
+        q.flashing = q.levels = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        q.clipping = q.phase = q.spelling = q.sync = false;
+        q.dcOffsetDb = 0;
+        q.focus = true;
+        q.focusOptions.threads = 1;
+        int ticks = 0;
+        const std::vector<QcIssue> issues = qualityCheck(p, s, 0, -1, q, [&](double) { ++ticks; });
+        QString got;
+        for (const QcIssue& i : issues) got += QStringLiteral("%1 %2-%3: %4; ").arg(qcKindName(i.kind)).arg(i.start).arg(i.end).arg(QString::fromStdString(i.text));
+        qInfo("%s", qPrintable(got));
+        QVERIFY(ticks >= 325);
+        QCOMPARE(issues.size(), size_t(3));
+        QVERIFY2(issues[0].kind == QcKind::SoftFocus && issues[0].start == 50 && issues[0].end == 75, qPrintable(got));
+        QVERIFY2(issues[1].kind == QcKind::MotionBlur && issues[1].start == 125 && issues[1].end == 175, qPrintable(got));
+        QVERIFY2(QString::fromStdString(issues[1].text).contains("across the picture"), qPrintable(got));
+        QVERIFY2(issues[2].kind == QcKind::SoftFocus && issues[2].start == 275 && issues[2].end == 325, qPrintable(got));
+        QVERIFY2(QString::fromStdString(issues[2].text).contains("other angles of scene 12A"), qPrintable(got));
+        // The same on eight threads, frame by frame.
+        std::vector<FocusShot> one, eight;
+        FocusOptions o = q.focusOptions;
+        const std::vector<FocusIssue> f1 = checkSequenceFocus(p, s, 0, -1, o, {}, nullptr, &one);
+        o.threads = 8;
+        const std::vector<FocusIssue> f8 = checkSequenceFocus(p, s, 0, -1, o, {}, nullptr, &eight);
+        QCOMPARE(f1.size(), f8.size());
+        for (size_t i = 0; i < f1.size(); ++i) QVERIFY(f1[i].start == f8[i].start && f1[i].end == f8[i].end && f1[i].text == f8[i].text);
+        QCOMPARE(one.size(), eight.size());
+        QCOMPARE(one.size(), size_t(5));
+        for (size_t i = 0; i < one.size(); ++i) QVERIFY(one[i].frames == eight[i].frames);
+        // Markers.
+        QCOMPARE(addQcMarkers(s, issues), 3);
+        QVERIFY(std::any_of(s.markers.begin(), s.markers.end(), [](const Marker& m) { return m.name == "QC: Soft focus" && m.t == 50 && m.duration == 24; }));
+        QVERIFY(std::any_of(s.markers.begin(), s.markers.end(), [](const Marker& m) { return m.name == "QC: Motion blur"; }));
+        // Without the out-of-focus angle, the dark one is not called soft.
+        std::erase_if(trackAt(s, {TrackKind::Video, 0})->clips, [&](const Clip& k) { return k.id == eId; });
+        const std::vector<FocusIssue> left = checkSequenceFocus(p, s, 175, 275, o);
+        QVERIFY2(left.empty(), left.empty() ? "" : left[0].text.c_str());
+        // A title and an adjustment layer over part of a shot do not cut it: the shot is what lies under them.
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        Clip title = makeGeneratorClip(p, "title", 20), adjust = makeGeneratorClip(p, "adjustment", 30);
+        title.start = 185, adjust.start = 230;
+        s.videoTracks[1].clips.push_back(title);
+        s.videoTracks[2].clips.push_back(adjust);
+        std::vector<FocusShot> under;
+        checkSequenceFocus(p, s, 175, 275, o, {}, nullptr, &under);
+        QCOMPARE(under.size(), size_t(2));
+        QVERIFY(under[0].start == 175 && under[0].end == 225 && under[0].scene == under[1].scene && !under[0].scene.empty());
+
+        // Dailies: picture media checked as shots, each against the other angles of its scene.
+        const QString takes = dir.filePath("takes");
+        QDir().mkpath(takes);
+        auto writeTake = [&](const QString& name, const std::function<std::vector<float>(int)>& frameAt, int frames) {
+            QDir().mkpath(takes + "/" + name);
+            for (int f = 0; f < frames; ++f)
+                if (!greyImage(frameAt(f), W, H).save(QStringLiteral("%1/%2/%2_%3.png").arg(takes, name).arg(f, 4, 10, QChar('0')))) return Id(0);
+            ImageSequence run;
+            if (!detectImageSequence(QStringLiteral("%1/%2/%2_0000.png").arg(takes, name).toStdString(), run)) return Id(0);
+            MediaItem m;
+            if (!probeMedia(imageSequencePath(run), m)) return Id(0);
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const std::vector<float> soft2 = blurred(chart, W, H, 2);
+        const Id takeA = writeTake("A001", [&](int f) { return f >= 10 && f < 20 ? soft2 : chart; }, 30);
+        const Id takeB = writeTake("B001", [&](int) { return soft2; }, 10);
+        const Id takeC = writeTake("C001", [&](int) { return dark; }, 10);
+        QVERIFY(takeA && takeB && takeC);
+        for (auto [id, camera] : {std::pair{takeA, "A"}, std::pair{takeB, "B"}, std::pair{takeC, "C"}}) {
+            p.findMedia(id)->metadata["scene"] = "4";
+            p.findMedia(id)->metadata["camera"] = camera;
+        }
+        p.findMedia(takeA)->timecode = 3600;
+        const std::vector<MediaFocus> daily = checkMediaFocus(p, {takeA, takeB, takeC}, o);
+        QCOMPARE(daily.size(), size_t(3));
+        QVERIFY(daily[0].checked && daily[1].checked && daily[2].checked);
+        QVERIFY2(daily[0].summary == "Soft 01:00:00:10–01:00:00:20", daily[0].summary.c_str());
+        QVERIFY2(QString::fromStdString(daily[1].summary).startsWith("Soft against the other angles of its scene"), daily[1].summary.c_str());
+        QVERIFY2(daily[2].summary == "Sharp", daily[2].summary.c_str());
+        // A subclip is checked over its own part of the file (frames 5 to 25 here), at its own timecodes; a picture that
+        // cannot be read is said so, not judged.
+        const double rate = p.findMedia(takeA)->fps.toDouble();
+        std::optional<MediaItem> sub = makeSubclip(p, takeA, 5 / rate, 25 / rate);
+        QVERIFY(sub);
+        sub->id = p.newId();
+        sub->metadata.erase("scene");
+        p.media.push_back(*sub);
+        MediaItem gone = *p.findMedia(takeB);
+        gone.id = p.newId();
+        gone.path = dir.filePath("gone/gone_%04d.png").toStdString();
+        p.media.push_back(gone);
+        const std::vector<MediaFocus> more = checkMediaFocus(p, {sub->id, gone.id}, o);
+        QCOMPARE(more.size(), size_t(2));
+        QVERIFY2(more[0].checked && more[0].summary == "Soft 01:00:00:10–01:00:00:20", more[0].summary.c_str());
+        QVERIFY2(!more[1].checked && more[1].summary == "Not read", more[1].summary.c_str());
     }
 
     void exportsImfMaster() {

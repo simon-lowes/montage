@@ -104,6 +104,7 @@
 #include <QMessageBox>
 #include "media/ContentCredentials.h"
 #include "ExposureView.h"
+#include "core/Ale.h"
 #include "QualityCheckDialog.h"
 #include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
@@ -4109,6 +4110,199 @@ private slots:
         QTest::qWait(300);
         QCOMPARE(program->viewer()->shownImage(), program->viewer()->image().convertToFormat(QImage::Format_RGB32));
         combo->setCurrentIndex(0);
+    }
+
+    void focusPeakingAndSoftShots() {
+        // A chart of discs, sharp and through Gaussians.
+        const int W = 320, H = 180;
+        QImage chart(W, H, QImage::Format_RGB32);
+        chart.fill(qRgb(128, 128, 128));
+        {
+            QPainter painter(&chart);
+            painter.setRenderHint(QPainter::Antialiasing);
+            painter.setPen(Qt::NoPen);
+            QRandomGenerator rng(7);
+            for (int i = 0; i < W * H / 140; ++i) {
+                const int g = 25 + rng.bounded(205);
+                painter.setBrush(QColor(g, g, g));
+                const double r = 1.5 + rng.generateDouble() * 6;
+                painter.drawEllipse(QPointF(rng.generateDouble() * W, rng.generateDouble() * H), r, r);
+            }
+        }
+        auto blur = [&](const QImage& in, double sigma) {
+            const int r = int(std::ceil(4 * sigma));
+            std::vector<double> k;
+            double sum = 0;
+            for (int i = -r; i <= r; ++i) sum += k.emplace_back(std::exp(-0.5 * i * i / (sigma * sigma)));
+            std::vector<double> a(size_t(W) * H), b(a.size());
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) a[size_t(y) * W + size_t(x)] = qGray(in.pixel(x, y));
+            for (int pass = 0; pass < 2; ++pass) {
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        double acc = 0;
+                        for (int i = -r; i <= r; ++i)
+                            acc += k[size_t(i + r)] * (pass ? a[size_t(std::clamp(y + i, 0, H - 1)) * W + size_t(x)] : a[size_t(y) * W + size_t(std::clamp(x + i, 0, W - 1))]);
+                        b[size_t(y) * W + size_t(x)] = acc / sum;
+                    }
+                std::swap(a, b);
+            }
+            QImage out(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int g = std::clamp(int(std::lround(a[size_t(y) * W + size_t(x)])), 0, 255);
+                    out.setPixel(x, y, qRgb(g, g, g));
+                }
+            return out;
+        };
+        auto marked = [](const QImage& img, QRgb colour) {
+            int n = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) n += img.pixel(x, y) == colour;
+            return n;
+        };
+        const QColor red = peakingColours()[0].first, blue = peakingColours()[2].first;
+        // Peaking marks the chart's edges at σ 0.5 and none at σ 3, and dims the rest.
+        const QImage crisp = blur(chart, 0.5), soft = blur(chart, 3);
+        const QImage peakedCrisp = focusPeakingView(crisp, red, 1);
+        QVERIFY2(marked(peakedCrisp, red.rgb()) > W * H / 50, qPrintable(QString::number(marked(peakedCrisp, red.rgb()))));
+        QCOMPARE(marked(focusPeakingView(soft, red, 2), red.rgb()), 0);
+        QCOMPARE(qRed(focusPeakingView(soft, red, 1).pixel(5, 5)), qRed(soft.pixel(5, 5)) * 3 / 4);
+
+        // On a monitor: found at its size, or in the picture's own pixels; the picture itself is left as it is.
+        {
+            ViewerWidget v;
+            v.resize(660, 380);
+            v.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&v));
+            v.setImage(crisp, 0);
+            QCOMPARE(v.shownImage(), crisp);
+            v.setFocusPeaking(true);
+            const QSize at = (v.imageRect().size() * v.devicePixelRatioF()).toSize();
+            QVERIFY(at.width() > W);
+            const QImage shown = v.shownImage();
+            QCOMPARE(shown.size(), at);
+            QCOMPARE(shown, focusPeakingView(crisp.scaled(at, Qt::IgnoreAspectRatio, Qt::SmoothTransformation), red, 1));
+            v.setPeakingAtMonitorSize(false);
+            QCOMPARE(v.shownImage(), peakedCrisp);
+            v.setPeakingColour(blue);
+            QVERIFY(marked(v.shownImage(), blue.rgb()) > W * H / 50);
+            // Over an exposure check too: found in the picture, painted over the check's view of it.
+            v.setExposureView(int(ExposureView::FalseColor));
+            QCOMPARE(v.shownImage(), focusPeakingView(crisp, blue, 1, exposureView(crisp, ExposureView::FalseColor)));
+            QCOMPARE(v.image(), crisp);
+            // So zebra stripes over a flat white picture are not taken for detail.
+            QImage white(W, H, QImage::Format_RGB32);
+            white.fill(Qt::white);
+            v.setImage(white, 1);
+            v.setExposureView(int(ExposureView::Zebras100));
+            QVERIFY(exposureView(white, ExposureView::Zebras100) != white);
+            QCOMPARE(marked(v.shownImage(), blue.rgb()), 0);
+            v.setImage(crisp, 0);
+            v.setFocusPeaking(false);
+            v.setExposureView(0);
+            QCOMPARE(v.shownImage(), crisp);
+        }
+        // Both monitors have it, its menu setting the colour, sensitivity and size (remembered).
+        loadDemo();
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>()) {
+            auto* button = m->findChild<QToolButton*>("focusPeaking");
+            QVERIFY(button && button->menu());
+            button->setChecked(true);
+            QVERIFY(m->viewer()->focusPeaking());
+            button->menu()->findChild<QAction*>("peakingColour3")->trigger();
+            QCOMPARE(m->viewer()->peakingColour(), peakingColours()[3].first);
+            button->menu()->findChild<QAction*>("peakingSensitivity2")->trigger();
+            QCOMPARE(m->viewer()->peakingSensitivity(), 2);
+            button->menu()->findChild<QAction*>("peakingAtFullSize")->trigger();
+            QVERIFY(!m->viewer()->peakingAtMonitorSize());
+            QCOMPARE(appSettings().value("monitor/peakingColour").toInt(), 3);
+            // (put back)
+            button->menu()->findChild<QAction*>("peakingColour0")->trigger();
+            button->menu()->findChild<QAction*>("peakingSensitivity1")->trigger();
+            button->menu()->findChild<QAction*>("peakingAtMonitorSize")->trigger();
+            button->setChecked(false);
+            QVERIFY(!m->viewer()->focusPeaking());
+        }
+
+        // Quality Check: a second out of focus in a shot of the chart, found and marked.
+        const QString chartPng = dir_.path() + "/focus-chart.png";
+        QVERIFY(crisp.save(chartPng));
+        state()->newProject();
+        const auto ids = state()->importFiles({chartPng});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->edit("place", [&](Project& p, Sequence& s) {
+            s.width = W, s.height = H, s.fps = Rational{25, 1};
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 75, {TrackKind::Video, 0}, {}, false).ok) return false;
+            Effect fx = makeEffect(p, "gaussian_blur");
+            fx.params["radius"].addKey(0, 0, Interp::Hold);
+            fx.params["radius"].addKey(25, 4, Interp::Hold);
+            fx.params["radius"].addKey(50, 0, Interp::Hold);
+            s.videoTracks[0].clips[0].effects.push_back(fx);
+            return true;
+        });
+        QualityCheckDialog dlg(state(), win_.get());
+        for (const char* off : {"qcFlashing", "qcLevels", "qcBlack", "qcFreeze", "qcSilence", "qcClipping", "qcPhase", "qcDcOffset"})
+            if (auto* box = dlg.findChild<QCheckBox*>(off)) box->setChecked(false);
+        auto* focus = dlg.findChild<QCheckBox*>("qcFocus");
+        QVERIFY(focus && !focus->isChecked());
+        focus->setChecked(true);
+        QVERIFY(dlg.settings().focus);
+        QVERIFY(dlg.runCheck());
+        const auto& issues = dlg.issues();
+        const auto softAt = std::find_if(issues.begin(), issues.end(), [](const QcIssue& i) { return i.kind == QcKind::SoftFocus; });
+        QVERIFY(softAt != issues.end());
+        QVERIFY2(softAt->start == 25 && softAt->end == 50, softAt->text.c_str());
+        QVERIFY(dlg.addMarkers() >= 1);
+        const auto& marks = state()->sequence()->markers;
+        QVERIFY(std::any_of(marks.begin(), marks.end(), [](const Marker& m) { return m.name == "QC: Soft focus" && m.t == 25; }));
+
+        // Dailies: a take out of focus for its middle, checked in the media bin; the Focus column and the ALE say where.
+        const QString take = dir_.path() + "/focus-take.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = W, gs.height = H, gs.fps = Rational{25, 1};
+            MediaItem m;
+            QVERIFY(probeMedia(chartPng.toStdString(), m));
+            m.id = gen.newId();
+            gen.media.push_back(m);
+            QVERIFY(edit::placeMedia(gen, gs, m.id, 0, 0, 30, {TrackKind::Video, 0}, {}, false).ok);
+            Effect fx = makeEffect(gen, "gaussian_blur");
+            fx.params["radius"].addKey(0, 0, Interp::Hold);
+            fx.params["radius"].addKey(10, 4, Interp::Hold);
+            fx.params["radius"].addKey(20, 0, Interp::Hold);
+            gs.videoTracks[0].clips[0].effects.push_back(fx);
+            ExportSettings st;
+            st.path = take.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.crf = 12;
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto takes = state()->importFiles({take});
+        QCOMPARE(takes.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin);
+        QCOMPARE(bin->checkFocus(takes), 1);
+        const MediaItem* takeItem = state()->project().findMedia(takes[0]);
+        const std::string found = takeItem->metadata.at("focus");
+        // (at the take's own timecode, where the export gave it one)
+        const FrameTime origin = takeItem->timecode > 0 ? FrameTime(std::llround(takeItem->timecode * 25)) : 0;
+        const std::string expected = "Soft " + formatTimecode(origin + 10, Rational{25, 1}) + "–" + formatTimecode(origin + 20, Rational{25, 1});
+        QVERIFY2(found == expected, found.c_str());
+        QCOMPARE(QString::fromStdString(mediaFieldText(*state()->project().findMedia(takes[0]), "focus")), QString::fromStdString(found));
+        auto* list = bin->findChild<QTreeView*>("mediaList");
+        QVERIFY(list && !list->isColumnHidden(MediaBinModel::columnOf("focus")));
+        const AleTable ale = aleFromMedia(state()->project(), takes, Rational{25, 1});
+        const auto column = std::find(ale.columns.begin(), ale.columns.end(), "Focus");
+        QVERIFY(column != ale.columns.end());
+        QCOMPARE(ale.rows.at(0).at(size_t(column - ale.columns.begin())), found);
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(takes[0])->metadata.count("focus"));
+        state()->newProject();
     }
 
     void gamutScopeAndChecks() {

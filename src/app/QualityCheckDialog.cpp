@@ -83,6 +83,12 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     };
     form->addRow(QString(), row(black_, blackSeconds_, tr("Black for at least"), "qcBlack", 1.0, true));
     form->addRow(QString(), row(freeze_, freezeSeconds_, tr("Frozen for at least"), "qcFreeze", 5.0, true));
+    focus_ = new QCheckBox(tr("Soft focus and motion blur"), this);
+    focus_->setObjectName(QStringLiteral("qcFocus"));
+    focus_->setToolTip(tr("Stretches of a shot well under its own best, shots well under the other angles of their scene (from "
+                          "Group Shots, else the media's scene and camera), and blur that ran one way. Each frame is measured at up "
+                          "to 960 pixels wide, so this takes longer than the other picture checks."));
+    form->addRow(QString(), focus_);
     form->addRow(tr("Sound:"), row(silence_, silenceSeconds_, tr("Silent for at least"), "qcSilence", 2.0, true));
     clipping_ = new QCheckBox(tr("Clipping (sound at full scale)"), this);
     clipping_->setObjectName(QStringLiteral("qcClipping"));
@@ -289,6 +295,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.levels = levels_->isChecked();
     q.blackSeconds = black_->isChecked() ? blackSeconds_->value() : 0;
     q.freezeSeconds = freeze_->isChecked() ? freezeSeconds_->value() : 0;
+    q.focus = focus_->isChecked();
     q.silenceSeconds = silence_->isChecked() ? silenceSeconds_->value() : 0;
     q.clipping = clipping_->isChecked();
     q.phase = phase_->isChecked();

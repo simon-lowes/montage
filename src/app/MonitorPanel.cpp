@@ -5,12 +5,14 @@
 
 #include "ExposureView.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QComboBox>
 #include <QDrag>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
@@ -51,7 +53,7 @@ ViewerWidget::ViewerWidget(QWidget* parent) : QWidget(parent) {
 
 QImage ViewerWidget::drawnImage() {
     if (image_.isNull()) return {};
-    return calibrated_[0].get(exposure_ ? shownImage() : image_, DisplayCalibration::instance().screenLut(screen()));
+    return calibrated_[0].get(overlaid() ? shownImage() : image_, DisplayCalibration::instance().screenLut(screen()));
 }
 
 void ViewerWidget::setImage(const QImage& img, FrameTime t) {
@@ -60,7 +62,7 @@ void ViewerWidget::setImage(const QImage& img, FrameTime t) {
     imageTime_ = t;
     // Under the HDR surface the SDR picture is not seen: repainted (and the drawing over it sent again) only when its
     // place moved, or when the exposure check, drawn from it, is on.
-    if (!hdrShowing() || reshaped || exposure_ != 0) update();
+    if (!hdrShowing() || reshaped || overlaid()) update();
     // Overlays that move with playback (ADR streamers, handles on animated clips) repaint with each picture: theirs are
     // sent along with it, when they changed.
     else if (!overlays_.empty()) refreshOverlay(false);
@@ -82,6 +84,33 @@ void ViewerWidget::setExposureView(int mode) {
     update();
 }
 
+void ViewerWidget::setFocusPeaking(bool on) {
+    peaking_ = on;
+    update();
+}
+
+void ViewerWidget::setPeakingColour(const QColor& colour) {
+    peakingColour_ = colour;
+    update();
+}
+
+void ViewerWidget::setPeakingSensitivity(int sensitivity) {
+    peakingSensitivity_ = std::clamp(sensitivity, 0, 2);
+    update();
+}
+
+void ViewerWidget::setPeakingAtMonitorSize(bool on) {
+    peakingAtMonitorSize_ = on;
+    update();
+}
+
+QSize ViewerWidget::peakingSize() const {
+    if (!peakingAtMonitorSize_) return image_.size();
+    // The picture's area in device pixels, as it reaches the screen.
+    const QSizeF r = imageRect().size() * devicePixelRatioF();
+    return QSize(std::max(1, int(std::lround(r.width()))), std::max(1, int(std::lround(r.height()))));
+}
+
 void ViewerWidget::setSignal(const QImage& signal, FrameTime t, const QString& space) {
     signal_ = signal;
     signalTime_ = t;
@@ -90,7 +119,25 @@ void ViewerWidget::setSignal(const QImage& signal, FrameTime t, const QString& s
 }
 
 QImage ViewerWidget::shownImage() const {
-    if (exposure_ == 0 || image_.isNull()) return image_;
+    if (!overlaid() || image_.isNull()) return image_;
+    const QImage exposed = exposure_ ? exposedImage() : image_;
+    if (!peaking_) return exposed;
+    // Peaking over that, found in the picture itself (not in an exposure check's stripes and bands) at the monitor's size
+    // (scaled as it is drawn) or in its own pixels.
+    const QSize size = peakingSize();
+    const QString state = QStringLiteral("%1 %2 %3 %4x%5").arg(peakingColour_.name()).arg(peakingSensitivity_).arg(exposure_)
+                              .arg(size.width()).arg(size.height());
+    if (peakedKey_ != exposed.cacheKey() || peakedState_ != state || peaked_.isNull()) {
+        auto at = [&](const QImage& img) { return size == img.size() ? img : img.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation); };
+        const QImage picture = at(image_);
+        peaked_ = focusPeakingView(picture, peakingColour_, peakingSensitivity_, exposure_ ? at(exposed) : QImage());
+        peakedKey_ = exposed.cacheKey();
+        peakedState_ = state;
+    }
+    return peaked_;
+}
+
+QImage ViewerWidget::exposedImage() const {
     const bool gamut = exposure_ >= int(ExposureView::OutOfGamut709);
     // The gamut checks need the frame as delivered: none marked while the one at hand is another frame's.
     const QImage signal = gamut && !signal_.isNull() && signalTime_ == imageTime_ ? signal_ : QImage();
@@ -177,9 +224,9 @@ void ViewerWidget::paintContent(QPainter& p, bool picture) {
     }
     const QRectF r = imageRect();
     p.setRenderHint(QPainter::SmoothPixmapTransform);
-    if (picture || exposure_) {
-        // (the exposure check is an SDR picture, drawn over HDR too)
-        p.drawImage(r, calibrated_[0].get(exposure_ ? shownImage() : image_, lut));
+    if (picture || overlaid()) {
+        // (the exposure check and focus peaking are an SDR picture, drawn over HDR too)
+        p.drawImage(r, calibrated_[0].get(overlaid() ? shownImage() : image_, lut));
     } else {
         // Where the HDR surface's picture shows through.
         p.save();
@@ -685,6 +732,72 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
                              "magenta stripes over colours a Rec.709 or P3 delivery cannot show"));
     connect(exposure_, &QComboBox::currentIndexChanged, viewer_, &ViewerWidget::setExposureView);
     bar->addWidget(exposure_);
+    // Focus peaking on either monitor: on and off, and from its menu its colour, how sensitive, and where the edges
+    // are found (remembered for both monitors).
+    peaking_ = new QToolButton(this);
+    peaking_->setObjectName(QStringLiteral("focusPeaking"));
+    peaking_->setIcon(theme::icon("peaking"));
+    peaking_->setAutoRaise(true);
+    peaking_->setCheckable(true);
+    peaking_->setPopupMode(QToolButton::MenuButtonPopup);
+    peaking_->setAccessibleName(tr("Focus peaking"));
+    peaking_->setToolTip(tr("Focus peaking: the edges in focus marked in colour over the picture (its menu sets the colour, how "
+                            "sensitive it is, and whether edges are found at the monitor's size or in the picture's own pixels)"));
+    {
+        QSettings st = appSettings();
+        const auto& colours = peakingColours();
+        const int colour = std::clamp(st.value("monitor/peakingColour", 0).toInt(), 0, int(colours.size()) - 1);
+        viewer_->setPeakingColour(colours[size_t(colour)].first);
+        viewer_->setPeakingSensitivity(st.value("monitor/peakingSensitivity", 1).toInt());
+        viewer_->setPeakingAtMonitorSize(st.value("monitor/peakingAtMonitorSize", true).toBool());
+        auto* menu = new QMenu(peaking_);
+        menu->setObjectName(QStringLiteral("focusPeakingMenu"));
+        menu->addSection(tr("Colour"));
+        auto* colourGroup = new QActionGroup(menu);
+        for (int i = 0; i < int(colours.size()); ++i) {
+            QPixmap swatch(12, 12);
+            swatch.fill(colours[size_t(i)].first);
+            QAction* a = menu->addAction(QIcon(swatch), tr(colours[size_t(i)].second));
+            a->setObjectName(QStringLiteral("peakingColour%1").arg(i));
+            a->setCheckable(true);
+            a->setChecked(i == colour);
+            colourGroup->addAction(a);
+            connect(a, &QAction::triggered, this, [this, i] {
+                viewer_->setPeakingColour(peakingColours()[size_t(i)].first);
+                appSettings().setValue("monitor/peakingColour", i);
+            });
+        }
+        menu->addSection(tr("Sensitivity"));
+        auto* sensitivityGroup = new QActionGroup(menu);
+        const char* levels[] = {QT_TR_NOOP("Low (the crispest edges only)"), QT_TR_NOOP("Medium"), QT_TR_NOOP("High")};
+        for (int i = 0; i < 3; ++i) {
+            QAction* a = menu->addAction(tr(levels[i]));
+            a->setObjectName(QStringLiteral("peakingSensitivity%1").arg(i));
+            a->setCheckable(true);
+            a->setChecked(i == viewer_->peakingSensitivity());
+            sensitivityGroup->addAction(a);
+            connect(a, &QAction::triggered, this, [this, i] {
+                viewer_->setPeakingSensitivity(i);
+                appSettings().setValue("monitor/peakingSensitivity", i);
+            });
+        }
+        menu->addSection(tr("Found"));
+        auto* sizeGroup = new QActionGroup(menu);
+        for (bool monitorSize : {true, false}) {
+            QAction* a = menu->addAction(monitorSize ? tr("At the Monitor's Size") : tr("At 1:1 (the Picture's Own Pixels)"));
+            a->setObjectName(monitorSize ? QStringLiteral("peakingAtMonitorSize") : QStringLiteral("peakingAtFullSize"));
+            a->setCheckable(true);
+            a->setChecked(monitorSize == viewer_->peakingAtMonitorSize());
+            sizeGroup->addAction(a);
+            connect(a, &QAction::triggered, this, [this, monitorSize] {
+                viewer_->setPeakingAtMonitorSize(monitorSize);
+                appSettings().setValue("monitor/peakingAtMonitorSize", monitorSize);
+            });
+        }
+        peaking_->setMenu(menu);
+    }
+    connect(peaking_, &QToolButton::toggled, viewer_, &ViewerWidget::setFocusPeaking);
+    bar->addWidget(peaking_);
     bar->addStretch();
     durationLabel_ = new QLabel(this);
     durationLabel_->setFont(theme::monoFont(9));

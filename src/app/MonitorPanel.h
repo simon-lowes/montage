@@ -1,6 +1,7 @@
 // Montage — Source and Program monitors: viewer, scrub bar and transport.
 #pragma once
 
+#include <QColor>
 #include <QImage>
 #include <QPointer>
 #include <QWindow>
@@ -37,9 +38,20 @@ public:
     // An exposure check over the picture (ExposureView.h); 0 = off.
     void setExposureView(int mode);
     int exposureView() const { return exposure_; }
+    // Focus peaking over the picture (ExposureView.h focusPeakingView), over any exposure check: edges in focus in
+    // `colour`, at a sensitivity (0 low, 1 medium, 2 high), found in the picture as the monitor shows it (scaled to its
+    // size) or in the picture's own pixels (1:1).
+    void setFocusPeaking(bool on);
+    bool focusPeaking() const { return peaking_; }
+    void setPeakingColour(const QColor& colour);
+    QColor peakingColour() const { return peakingColour_; }
+    void setPeakingSensitivity(int sensitivity);
+    int peakingSensitivity() const { return peakingSensitivity_; }
+    void setPeakingAtMonitorSize(bool on);
+    bool peakingAtMonitorSize() const { return peakingAtMonitorSize_; }
     // The frame as delivered (code values in `space`), for the out-of-gamut checks: used while it is the picture's.
     void setSignal(const QImage& signal, montage::FrameTime t, const QString& space);
-    // The picture as drawn (with the exposure check), for testing.
+    // The picture as drawn (with the exposure check and focus peaking; at the monitor's size when peaking is), for testing.
     QImage shownImage() const;
     // That through the display's calibration LUT (app/DisplayCalibration.h), as it reaches the screen.
     QImage drawnImage();
@@ -128,6 +140,16 @@ private:
     QImage signal_;
     QString signalSpace_;
     mutable int exposedMode_ = 0;
+    bool overlaid() const { return exposure_ != 0 || peaking_; }  // the picture shown is not image_ as it is
+    QImage exposedImage() const;                                   // image_ with the exposure check
+    QSize peakingSize() const;                                     // the size peaking is found at
+    bool peaking_ = false;
+    QColor peakingColour_{255, 40, 40};
+    int peakingSensitivity_ = 1;
+    bool peakingAtMonitorSize_ = true;
+    mutable QImage peaked_;  // exposed_ (or image_) with focus peaking
+    mutable qint64 peakedKey_ = -1;
+    mutable QString peakedState_;
     bool dragSource_ = false;
     bool lookAround_ = false, looking_ = false;
     std::vector<std::function<void(QPainter&, const QRectF&)>> overlays_;
@@ -236,6 +258,7 @@ private:
     QToolButton* playButton_;
     QComboBox* resolution_ = nullptr;
     QComboBox* exposure_ = nullptr;  // exposure check (ExposureView.h)
+    QToolButton* peaking_ = nullptr;  // focus peaking, with its menu
     std::string waveformRequested_;  // the media whose audio decode this monitor started
 
     void renderTrimView();

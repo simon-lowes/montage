@@ -50,6 +50,7 @@ private:
     QDoubleSpinBox* blackSeconds_;
     QCheckBox* freeze_;
     QDoubleSpinBox* freezeSeconds_;
+    QCheckBox* focus_ = nullptr;
     QCheckBox* silence_;
     QDoubleSpinBox* silenceSeconds_;
     QCheckBox* clipping_;

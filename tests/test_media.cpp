@@ -5099,6 +5099,68 @@ private slots:
         QVERIFY2(!res.value("isError").toBool() && text.contains("Channel inverted") && text.contains("Out of phase"), qPrintable(text));
     }
 
+    // Phase 14 #8 over MCP: montage_quality_check's focus finds a second out of focus in a shot of a chart.
+    void mcpQualityCheckFocus() {
+        QImage chart(320, 180, QImage::Format_RGB32);
+        chart.fill(qRgb(128, 128, 128));
+        {
+            QPainter painter(&chart);
+            painter.setRenderHint(QPainter::Antialiasing);
+            painter.setPen(Qt::NoPen);
+            uint32_t seed = 3;
+            auto next = [&] { return double((seed = seed * 1664525u + 1013904223u) >> 8) / double(1u << 24); };
+            for (int i = 0; i < 320 * 180 / 140; ++i) {
+                const int g = int(25 + 205 * next());
+                painter.setBrush(QColor(g, g, g));
+                const double r = 1.5 + next() * 6, x = next() * 320, y = next() * 180;
+                painter.drawEllipse(QPointF(x, y), r, r);
+            }
+        }
+        QVERIFY(chart.save(QString::fromStdString(path("focus-chart.png"))));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, path("focus-chart.png"));
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 75, {TrackKind::Video, 0}, {}, false).ok);
+        Effect fx = makeEffect(p, "gaussian_blur");
+        fx.params["radius"].addKey(0, 0, Interp::Hold);
+        fx.params["radius"].addKey(25, 4, Interp::Hold);
+        fx.params["radius"].addKey(50, 0, Interp::Hold);
+        s.videoTracks[0].clips[0].effects.push_back(fx);
+        const QString project = QString::fromStdString(path("focus.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_quality_check"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject quiet{{"flashing", false}, {"levels", false}, {"black_seconds", 0}, {"freeze_seconds", 0}, {"silence_seconds", 0},
+                                {"clipping", false}, {"phase", false}, {"dc_offset_db", 0}, {"spelling", false}, {"sync", false}};
+        QJsonObject args = quiet;
+        QJsonObject res = call(args);
+        QString text = res.value("content").toArray().at(0).toObject().value("text").toString();
+        QVERIFY2(!res.value("isError").toBool() && !text.contains("Soft focus"), qPrintable(text));
+        args["focus"] = true;
+        args["markers"] = true;
+        res = call(args);
+        text = res.value("content").toArray().at(0).toObject().value("text").toString();
+        QVERIFY2(!res.value("isError").toBool() && text.contains(QStringLiteral("%1 - %2  Soft focus:")
+                                                                   .arg(QString::fromStdString(formatTimecode(25, s.fps)), QString::fromStdString(formatTimecode(50, s.fps)))),
+                 qPrintable(text));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& marks = back.active()->markers;
+        QVERIFY(std::any_of(marks.begin(), marks.end(), [](const Marker& k) { return k.name == "QC: Soft focus" && k.t == 25; }));
+        args["focus_width"] = 10;
+        QVERIFY(call(args).value("isError").toBool());
+    }
+
     void upmixStereoToSurround() {
         const int rate = 48000, lat = Upmixer::kLatency;
         std::mt19937 rng(11);

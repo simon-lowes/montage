@@ -238,6 +238,7 @@ add_library(montage_engine STATIC
   render/AudioReactive.h render/AudioReactive.cpp
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
+  render/FocusCheck.h render/FocusCheck.cpp
   render/EncodeCompare.h render/EncodeCompare.cpp
   render/LongGopCopy.h render/LongGopCopy.cpp
   render/HrdCheck.h render/HrdCheck.cpp render/NalBits.h
