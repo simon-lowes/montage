@@ -57,7 +57,8 @@ struct ColorOp;
 // Luma and Screen Key, its matte shrunk, grown or softened too), and the filters (Gaussian, Directional and Channel
 // Blur, Sharpen, Glow, Vignette, Posterize, Letterbox, Mirror, Mosaic, Chromatic Aberration and Noise), through a
 // drawn mask and an HSL qualifier if it has them, appended to `out` (nothing when the effect is off or changes nothing). False for
-// any other effect or mask (people, objects, depth, Refine Edges, Show Mask), which only the CPU draws. The mask's
+// any other effect or mask (people, Refine Edges, Show Mask), which only the CPU draws; object and depth masks from
+// what their models made (the object's segmentation at the SourceSecondsScope's time, currentDepth()). The mask's
 // shape is drawn for a picture `width` by `height` (0: whether it could be, alone).
 bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, int width = 0, int height = 0, double pixelScale = 1);
 // An effect's (or a grade node's) mask in that form, into `op`; false when only the CPU can make it. `showing`: Show
@@ -83,6 +84,18 @@ public:
 
 private:
     std::shared_ptr<const DepthMap> previous_;
+};
+// The media time of the frame worked on (-1: not footage), for the GPU's forms of what follows the footage (object
+// masks): set by the compositor for one clip's effects on this thread (applyVideoEffect sets its own).
+class SourceSecondsScope {
+public:
+    explicit SourceSecondsScope(double seconds);
+    ~SourceSecondsScope();
+    SourceSecondsScope(const SourceSecondsScope&) = delete;
+    SourceSecondsScope& operator=(const SourceSecondsScope&) = delete;
+
+private:
+    double previous_;
 };
 // The same for the people in the frame (media/Matting.h): Remove Background and People masks.
 const ValueMap* currentPersonMatte();

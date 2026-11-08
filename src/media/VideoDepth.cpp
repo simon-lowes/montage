@@ -626,6 +626,14 @@ std::shared_ptr<const DepthMap> frameDepth(const Image& img, const std::string& 
 
 bool analyzeVideoDepth(const std::string& path, double start, double end, int size, const std::function<bool(double)>& progress,
                        std::string* error) {
+    return analyzeVideoDepth(
+        path, start, end,
+        [&](int count, const std::function<bool(int, Image&)>& frameAt, const std::function<bool(int, const DepthMap&)>& sink, float& lo,
+            float& hi) { return estimateVideoDepth(count, frameAt, sink, lo, hi, size, progress, error); },
+        size, error);
+}
+
+bool analyzeVideoDepth(const std::string& path, double start, double end, const VideoDepthEstimate& estimate, int size, std::string* error) {
     int64_t mediaSize, modified;
     if (!mediaStamp(path, mediaSize, modified)) {
         if (error) *error = "The file is not there";
@@ -703,7 +711,7 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, int si
         return written;
     };
     float lo = 0, hi = 1;
-    if (!estimateVideoDepth(count, frameAt, sink, lo, hi, size, progress, error) || !written) {
+    if (!estimate(count, frameAt, sink, lo, hi) || !written) {
         out.close();
         out.remove();
         if (error && error->empty()) *error = "Cannot write " + out.fileName().toStdString();

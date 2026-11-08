@@ -2724,6 +2724,18 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     canvasSize.width = W, canvasSize.height = H;
     if (!clipSource(p, seq, c, t, o, adjustment ? &canvasSize : nullptr, true, cs)) return GpuLayerResult::Nothing;
     CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));  // (a Keyer's plate track, made here as clipLayer makes it)
+    // The clip's analysed depth, for the depth effects and masks (as clipLayer finds it; the still model's would need
+    // the picture here), and the media time, for object masks.
+    std::shared_ptr<const DepthMap> depth;
+    {
+        const std::vector<const Effect*> chain = gradeChain(seq, c);
+        if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, cs.lt); })) {
+            if (!cs.reframed && !cs.sourcePath.empty() && cs.sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, cs.sourceSeconds);
+            if (!depth && depthAvailable() && depthModel().installed()) return cpu("its depth, worked out from the picture");
+        }
+    }
+    DepthScope depthScope(depth);
+    SourceSecondsScope sourceTime(cs.sourceSeconds);
     int w = 0, h = 0;
     if (adjustment) {
         out.canvas = true;

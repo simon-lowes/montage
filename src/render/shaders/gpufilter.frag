@@ -42,6 +42,7 @@
 //   27 Find Edges, 28 Emboss, 29 Halftone, 30 Duotone, 31 VHS (the table each row's shift, tearing and scanline), 32 Tilt-Shift's
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 //   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
+// and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth).
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -718,6 +719,13 @@ void main() {
             o = s + o * (1.0 - s.a);
         }
         fragColor = o;
+        return;
+    }
+    if (mode == 34) {
+        // Depth Map and Depth Fog: towards the table's colour (xyz, straight) by its w, both worked out on the CPU from
+        // the frame's depth
+        const vec4 to = texelFetch(table, xy, 0);
+        fragColor = vec4(px.rgb + (to.xyz * px.a - px.rgb) * to.w, px.a);
         return;
     }
     if (mode >= 13 && mode <= 20 && px.a <= 0.0) {

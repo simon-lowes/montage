@@ -145,6 +145,7 @@
 #include "render/FaceRefine.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
 #include "render/RenderCache.h"
 #include "render/Shapes.h"
 #include "render/Shorts.h"
@@ -19437,6 +19438,134 @@ colorspaces:
             QCOMPARE(gpu::stats().cpuFrames, frames);
             QCOMPARE(gpu::stats().cpuLayers, layers);
         }
+    }
+    // The depth effects and masks and object masks on the GPU, once their models have run: a video clip with its depth
+    // analysed (made here from each frame's brightness, in the model's place) and an object segmented on every frame,
+    // within 1/1023 of the CPU with nothing made there.
+    void gpuDepthAndObjectMasks() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        qputenv("MONTAGE_DEPTH_CACHE", (dir.path() + "/depth").toUtf8());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160;
+        s.height = 90;
+        // The footage: a picture moving across the frame, exported as a video.
+        QImage q(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x)
+                q.setPixelColor(x, y, QColor::fromRgbF(0.5f + 0.45f * std::sin(x * 0.11f), float(y) / 90, 0.5f + 0.4f * std::sin(x * 0.05f - y * 0.09f), 1.0f));
+        QVERIFY(q.save(dir.filePath("still.png")));
+        MediaItem still;
+        QVERIFY(probeMedia(dir.filePath("still.png").toStdString(), still));
+        still.id = p.newId();
+        p.media.push_back(still);
+        auto placed = edit::placeMedia(p, s, still.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        edit::clipById(s, placed.created[0])->motion.params["pos_x"] = Param(0.0);
+        edit::clipById(s, placed.created[0])->motion.params["pos_x"].addKey(0, -20.0);
+        edit::clipById(s, placed.created[0])->motion.params["pos_x"].addKey(19, 20.0);
+        ExportSettings st;
+        st.path = (dir.path() + "/shot.mkv").toStdString();
+        st.videoCodec = "ffv1";  // (RGB, lossless: the footage the same on either side, Y'CbCr conversions not in question)
+        st.pixFmt = "gbrp16le";
+        st.audioCodec = "none";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        s.videoTracks[0].clips.clear();
+        MediaItem shot;
+        QVERIFY(probeMedia(st.path, shot));
+        shot.id = p.newId();
+        p.media.push_back(shot);
+        // Its depth: each frame's brightness, near where bright.
+        const VideoDepthEstimate fromBrightness = [](int count, const std::function<bool(int, Image&)>& frameAt,
+                                                     const std::function<bool(int, const DepthMap&)>& sink, float& lo, float& hi) {
+            for (int i = 0; i < count; ++i) {
+                Image img;
+                if (!frameAt(i, img)) return false;
+                DepthMap d;
+                d.width = img.width, d.height = img.height;
+                for (int y = 0; y < img.height; ++y)
+                    for (int x = 0; x < img.width; ++x) {
+                        const float* px = img.at(x, y);
+                        d.values.push_back(0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2]);
+                    }
+                if (!sink(i, d)) return false;
+            }
+            lo = 0.1f, hi = 0.9f;
+            return true;
+        };
+        QVERIFY2(analyzeVideoDepth(st.path, 0, 10, fromBrightness, 70, &err), err.c_str());
+        QVERIFY(analysedDepth(st.path, 0.2));
+        // An object on every frame: a disc moving right.
+        auto object = std::make_shared<ObjectMask>();
+        object->fps = shot.fps.valid() ? shot.fps.toDouble() : 25;
+        for (int n = 0; n < 20; ++n) {
+            std::vector<float> logits(size_t(kObjectGrid) * kObjectGrid);
+            for (int y = 0; y < kObjectGrid; ++y)
+                for (int x = 0; x < kObjectGrid; ++x)
+                    logits[size_t(y) * kObjectGrid + size_t(x)] = float(50 - std::hypot(x - 80 - 4 * n, y - 128));
+            object->frames[n] = packObjectLogits(logits.data());
+        }
+        auto r = edit::placeMedia(p, s, shot.id, 0, 0, 20, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r.ok);
+        const Id clipId = r.created[0];
+        edit::clipById(s, clipId)->motion.params["scale"] = 120.0;
+        edit::clipById(s, clipId)->motion.params["rotation"] = 7.0;
+        auto compare = [&](FrameTime t, const QString& what) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+        };
+        compare(2, "the footage alone");
+        RenderOptions plain;
+        plain.gpu = false;
+        const Image untouched = renderProgramFrame(p, s, 5, plain);
+        using Settings = std::vector<std::pair<const char*, double>>;
+        struct Case {
+            const char* type;
+            Settings settings;
+            bool object;
+        };
+        const std::vector<Case> cases = {
+            {"depth_map", {}, false},
+            {"depth_map", {{"invert", 1}, {"mix", 60}}, false},
+            {"depth_map", {{"mask.shape", 1}, {"mask.w", 0.6}, {"mask.h", 0.5}, {"mask.feather", 10}}, false},
+            {"depth_fog", {}, false},
+            {"depth_fog", {{"start", 80}, {"amount", 90}, {"curve", 0.7}, {"height", 40}, {"horizon", 70}}, false},
+            {"depth_fog", {{"start", 40}, {"mask.depth", 1}, {"mask.depth_low", 30}, {"mask.depth_high", 60}}, false},
+            {"invert", {{"mask.depth", 1}, {"mask.depth_low", 40}, {"mask.depth_high", 70}, {"mask.depth_soft", 15}}, false},
+            {"invert", {{"mask.depth", 1}, {"mask.depth_low", 20}, {"mask.qualify", 1}, {"mask.lum_low", 30}}, false},
+            {"invert", {{"mask.shape", 3}, {"mask.feather", 6}}, true},
+            {"gaussian_blur", {{"radius", 4}, {"mask.shape", 3}, {"mask.expansion", 5}, {"mask.invert", 1}}, true},
+            {"invert", {{"mask.shape", 3}, {"mask.depth", 1}, {"mask.depth_high", 60}}, true},
+        };
+        for (size_t k = 0; k < cases.size(); ++k) {
+            Effect e = makeEffect(p, cases[k].type);
+            for (const auto& [name, value] : cases[k].settings) e.params[name] = value;
+            if (cases[k].object) e.object = object;
+            edit::clipById(s, clipId)->effects = {e};
+            const QString what = QString("%1 #%2").arg(cases[k].type).arg(k + 1);
+            compare(3 + FrameTime(k), what);
+            // (it did something: the depth and the object were there)
+            if (k == 0 || k == 6 || k == 8) QVERIFY2(renderProgramFrame(p, s, 5, plain).px != untouched.px, qPrintable(what));
+        }
+        qunsetenv("MONTAGE_DEPTH_CACHE");
     }
     void gpuYcbcrPlanes() {
         // Decoded Y′CbCr converted on the GPU from its planes, as decoded, rather than the decoder converting it to

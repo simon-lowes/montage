@@ -1228,6 +1228,8 @@ FaceScope::~FaceScope() { tFaces = std::move(previous_); }
 const DepthMap* currentDepth() { return tDepth.get(); }
 DepthScope::DepthScope(std::shared_ptr<const DepthMap> depth) : previous_(std::move(tDepth)) { tDepth = std::move(depth); }
 DepthScope::~DepthScope() { tDepth = std::move(previous_); }
+SourceSecondsScope::SourceSecondsScope(double seconds) : previous_(tSourceSeconds) { tSourceSeconds = seconds; }
+SourceSecondsScope::~SourceSecondsScope() { tSourceSeconds = previous_; }
 const ValueMap* currentPersonMatte() { return tPerson.get(); }
 PersonScope::PersonScope(std::shared_ptr<const ValueMap> matte) : previous_(std::move(tPerson)) { tPerson = std::move(matte); }
 PersonScope::~PersonScope() { tPerson = std::move(previous_); }
@@ -3545,7 +3547,7 @@ bool isGpuFilter(const std::string& type) {
                                                   "film_grain", "rgb_mixer", "grain_match", "edge_extend", "wave_warp", "twirl", "spherize",
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
-                                                  "grid_warp"};
+                                                  "grid_warp", "depth_map", "depth_fog"};
     return filters.count(type) > 0;
 }
 
@@ -3575,19 +3577,43 @@ void transferTableRows(gpu::ColorOp::FilterPass& fp, const ColorSpace& space, in
 
 bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing) {
     const int shape = int(std::lround(e.p("mask.shape", t)));
-    if (shape == 3 || shape == 4 || shape > 6 || e.p("mask.depth", t) > 0.5 || (!showing && e.p("mask.show", t) > 0.5) ||
-        e.p("mask.surface", t) > 0.5 ||
+    if (shape == 4 || shape > 6 || (!showing && e.p("mask.show", t) > 0.5) || e.p("mask.surface", t) > 0.5 ||
         (shape > 0 && shape != 6 && e.p("mask.refine", t) > 0))
         return false;  // (what the picture holds, or the mask shown)
-    // As effectMatte makes it: the shape (and its holes closed) here, the qualifier, inverting and fading there.
+    // As effectMatte makes it: the shape (an object's from its segmentation) with its holes closed and the range of
+    // depths here, the qualifier, inverting and fading there.
     op.masked = true;
-    if (shape > 0 && width > 0 && height > 0) {
+    const bool depthRange = e.p("mask.depth", t) > 0.5;
+    if ((shape > 0 || depthRange) && width > 0 && height > 0) {
         op.mask.assign(size_t(width) * size_t(height), 1.0f);
-        drawMaskShape(e, t, shape, op.mask, width, height, pixelScale);
-        if (shape != 6) consolidateMatte(op.mask, width, height, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
+        if (shape == 3) {
+            std::vector<float> logits;
+            if (e.object && tSourceSeconds >= 0 && e.object->maskLogitsAt(tSourceSeconds, logits))
+                op.mask = objectMatte(logits, width, height, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
+            else
+                std::fill(op.mask.begin(), op.mask.end(), 0.f);
+        }
+        if (shape > 0) drawMaskShape(e, t, shape, op.mask, width, height, pixelScale);
+        if (shape > 0 && shape != 6) consolidateMatte(op.mask, width, height, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
+        if (depthRange) {
+            const DepthMap* depth = currentDepth();
+            const double lo = e.p("mask.depth_low", t, 50) / 100, hi = e.p("mask.depth_high", t, 100) / 100;
+            const double ramp = std::max(1e-4, e.p("mask.depth_soft", t, 10) / 100);
+            if (!depth) {
+                std::fill(op.mask.begin(), op.mask.end(), 0.f);
+            } else {
+                const std::vector<float> d = depth->resized(width, height);
+                for (size_t i = 0; i < op.mask.size(); ++i) {
+                    const double v = d[i];
+                    const double out = v < lo ? lo - v : v > hi ? v - hi : 0.0;
+                    const double k = std::clamp(1.0 - out / ramp, 0.0, 1.0);
+                    op.mask[i] *= float(k * k * (3 - 2 * k));
+                }
+            }
+        }
     }
     const bool qualify = e.p("mask.qualify", t) > 0.5;
-    const float m[12] = {shape > 0 ? 1.0f : 0.0f,
+    const float m[12] = {shape > 0 || depthRange ? 1.0f : 0.0f,
                          qualify ? 1.0f : 0.0f,
                          e.p("mask.invert", t) > 0.5 ? 1.0f : 0.0f,
                          float(std::clamp(e.p("mask.opacity", t, 100) / 100.0, 0.0, 1.0)),
@@ -3999,6 +4025,36 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     q[15] = float((d.own[0] ? 1 : 0) | (d.own[1] ? 2 : 0) | (d.own[2] ? 4 : 0));
                     q[16] = float(d.r[0][0]), q[17] = float(d.r[0][1]), q[18] = float(d.r[1][0]), q[19] = float(d.r[1][1]);
                     q[20] = float(d.r[2][0]), q[21] = float(d.r[2][1]);
+                }
+            }
+        } else if (ty == "depth_map" || ty == "depth_fog") {
+            // depthEffect's colour and amount at each pixel, from the frame's depth (currentDepth(): nothing without one)
+            const DepthMap* depth = currentDepth();
+            if (width > 0 && height > 0 && depth && !depth->empty()) {
+                const std::vector<float> d = depth->resized(width, height);
+                add(34, {});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = width;
+                fp.table.assign(d.size() * 4, 0.0f);
+                if (ty == "depth_map") {
+                    const bool farWhite = e.p("invert", t) > 0.5;
+                    const float mix = float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0));
+                    for (size_t i = 0; i < d.size(); ++i) {
+                        const float g = farWhite ? 1 - d[i] : d[i];
+                        fp.table[i * 4] = fp.table[i * 4 + 1] = fp.table[i * 4 + 2] = g;
+                        fp.table[i * 4 + 3] = mix;
+                    }
+                } else {
+                    const double start = std::max(0.01, e.p("start", t, 60) / 100), amount = std::clamp(e.p("amount", t, 70) / 100, 0.0, 1.0);
+                    const double curve = std::max(0.05, e.p("curve", t, 1.5));
+                    const float col[3] = {float(e.p("color.r", t, 0.78)), float(e.p("color.g", t, 0.82)), float(e.p("color.b", t, 0.88))};
+                    const double horizon = std::clamp(e.p("horizon", t, 50) / 100, 0.0, 1.0), lift = std::clamp(e.p("height", t, 0) / 100, 0.0, 1.0) * 8;
+                    for (size_t i = 0; i < d.size(); ++i) {
+                        const double far = std::clamp((start - d[i]) / start, 0.0, 1.0);
+                        const double above = std::max(0.0, horizon - (double(i / size_t(width)) + 0.5) / height);
+                        std::copy(col, col + 3, &fp.table[i * 4]);
+                        fp.table[i * 4 + 3] = float(amount * std::pow(far, curve) * std::exp(-lift * above));
+                    }
                 }
             }
         } else if (ty == "find_edges") {
