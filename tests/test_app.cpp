@@ -303,6 +303,10 @@
 #include "render/Ocio.h"
 #include "render/SurfaceTrack.h"
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
 using namespace montage;
 
 namespace {
@@ -2476,7 +2480,8 @@ private slots:
         QTemporaryDir dir;
         const QString folder = dir.filePath("live");
         const QString feed = "testsrc2=size=320x180:rate=25,realtime[out0];sine=sample_rate=48000,arealtime[out1]";
-        const QString sound = "ac3";  // (FFmpeg's own encoder)
+        // (FFmpeg's own AC-3 encoder; the packaged FFmpeg has none, and the live package then has AAC sound)
+        const QString sound = avcodec_find_encoder_by_name("ac3") ? "ac3" : "aac";
         // (low latency with MPEG-TS segments refused)
         QJsonObject r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Live 01"}, {"seconds", 5},
                               {"live", QJsonObject{{"folder", folder}, {"segments", "ts"}, {"low_latency", true}}}});
