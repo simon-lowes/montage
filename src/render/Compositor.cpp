@@ -951,7 +951,8 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
         if (id.empty() || !shapePathToFrame(layer->generator, id, slt, seq.width, seq.height, toFrame)) return std::nullopt;
         const std::vector<PathPoint> pts = shapePathPoints(layer->generator, id, slt);
         if (pts.size() < 2) return std::nullopt;
-        const ShapeItem* item = findShapeItem(shapeContents(layer->generator), id);
+        const std::vector<ShapeItem> contents = shapeContents(layer->generator);  // (kept: the item points into it)
+        const ShapeItem* item = findShapeItem(contents, id);
         const bool closed = !item || item->closed;
         // Its frame to the sequence through the layer's clip, then to the title's frame through the title's.
         bool ok = true;
