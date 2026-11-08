@@ -37545,7 +37545,7 @@ if ui["pressed"] == "add":
         // presentation attribute and under style=.
         {
             const Effect g = imported("css.svg", "<style>rect { fill: #808080 } .a { fill: #ff0000 } #b { fill: #0000ff; opacity: 0.5 }"
-                                                 " /* g rect { fill: #000 } */ g.box > rect { fill: #00ff00 } @media print { rect { fill: #000 } }</style>"
+                                                 " /* g rect { fill: #000 } */ @media print { rect { fill: #000 } } g.box > rect { fill: #00ff00 }</style>"
                                                  "<rect x=\"0\" y=\"0\" width=\"20\" height=\"20\"/>"
                                                  "<rect class=\"a\" x=\"20\" y=\"0\" width=\"20\" height=\"20\"/>"
                                                  "<rect id=\"b\" class=\"a\" x=\"40\" y=\"0\" width=\"20\" height=\"20\"/>"
@@ -37574,11 +37574,11 @@ if ui["pressed"] == "add":
         {
             std::vector<SvgText> texts;
             const Effect g = imported("text.svg", "<rect width=\"100\" height=\"100\" fill=\"#000000\"/>"
-                                                  "<text x=\"10\" y=\"80\" font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\" opacity=\"0.5\">Hi</text>"
+                                                  "<text x=\"10\" y=\"80\" font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\" opacity=\"0.5\">H<tspan>i</tspan></text>"
                                                   "<text x=\"90\" y=\"30\" text-anchor=\"end\" font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ff0000\" font-weight=\"bold\">Up</text>",
                                       &texts);
             QCOMPARE(int(texts.size()), 2);
-            QCOMPARE(texts[0].text, std::string("Hi"));
+            QCOMPARE(texts[0].text, std::string("Hi"));  // (its tspan's text in its place, no space put in)
             QCOMPARE(texts[0].font, std::string("DejaVu Sans"));
             QVERIFY(std::abs(texts[0].size - 20) < 1e-9 && std::abs(texts[0].opacity - 0.5) < 1e-9 && texts[0].anchor == 0 && !texts[0].bold);
             QVERIFY(texts[1].anchor == 2 && texts[1].bold && std::abs(texts[1].fill[0] - 1) < 1e-9 && texts[1].fill[1] == 0);

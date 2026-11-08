@@ -212,7 +212,7 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     for (const QString& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
     const int align = int(std::lround(g.p("align", t, 1)));
     // Letter by letter when text animations set the letters' depths or the title has font axes of its own (each glyph
-    // cluster its own outline and depth); else the text as one outline, its styled runs (render/Titles.h) each in its
+    // cluster its own depth, those as deep as each other one outline); else the text as one outline, its styled runs (render/Titles.h) each in its
     // own font, size, weight and tracking.
     const std::vector<int> anims = textAnimators(g);
     const bool perLetter = !anims.empty() || !titleAxes(g).empty();
@@ -243,8 +243,13 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
                 if (i < 0) continue;
                 d += g.p(pre + "depth", t) * textSelection(g, k, t, fps, duration, i, n);
             }
-            outlines.emplace_back(c.path, std::max(0.0, d) * px);
+            // (letters as deep as each other one outline, so where they overlap they merge, as a whole title does)
+            const double depth = std::max(0.0, d) * px;
+            auto same = std::find_if(outlines.begin(), outlines.end(), [&](const auto& o) { return std::abs(o.second - depth) < 1e-9; });
+            if (same == outlines.end()) outlines.emplace_back(c.path, depth);
+            else same->first.addPath(c.path);
         }
+        for (auto& o : outlines) o.first.setFillRule(Qt::WindingFill);
     } else {
         QPainterPath path = styledTextOutline(g, t, px, 120, lineSpacing);
         path.setFillRule(Qt::WindingFill);

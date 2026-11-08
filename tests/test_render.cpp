@@ -14035,6 +14035,22 @@ colorspaces:
                 if (y > 300) below = std::max(below, frame.at(xx, y)[0]);
             }
         QVERIFY2(above > 0.5f && below == 0.0f, qPrintable(QString("%1 %2").arg(above).arg(below)));
+        // Motion blurred on its first and last frames, the shutter's samples outside the clip still find the path:
+        // no straight copy of the text where the title would sit without one.
+        for (const FrameTime f : {FrameTime(0), FrameTime(59)}) {
+            Effect blurred = placed.generator;
+            blurred.params["letter_blur"] = 1.0;
+            blurred.params["path_offset"] = Param(0.0);
+            blurred.params["path_offset"].addKey(0, 12.0), blurred.params["path_offset"].addKey(59, 13.0);
+            const Image img = renderTitle(blurred, f, 800, 600, 1.0, 60, 30, fromShape);
+            float ghost = 0, on = 0;
+            for (int y = 0; y < 600; ++y)
+                for (int xx = 0; xx < 800; ++xx) {
+                    float& m = y > 200 ? ghost : on;
+                    m = std::max(m, img.at(xx, y)[3]);
+                }
+            QVERIFY2(ghost == 0.0f && on > 0.5f, qPrintable(QString("frame %1: %2 %3").arg(f).arg(ghost).arg(on)));
+        }
         // With no shape layer below, there is no path to set it on.
         s.videoTracks[0].clips.clear();
         QVERIFY(!titlePathSource(p, s, s.videoTracks[1].clips[0], 800, 600)(0));

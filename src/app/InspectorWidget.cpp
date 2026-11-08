@@ -3289,7 +3289,14 @@ void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, cons
                 ShapeItem* it = findShapeItem(its, id);
                 if (!it) return false;
                 std::vector<std::array<double, 5>> now = gradientStops(e, *it, t);
-                if (it->stops.empty()) it->stops = now;
+                if (it->stops.empty()) {
+                    // Its two colours become the list's ends, keys and all.
+                    it->stops = now;
+                    for (const char* ch : {"r", "g", "b"})
+                        for (const auto& [from, stop] : {std::pair{".color.", ".s0.color."}, std::pair{".color2.", ".s1.color."}})
+                            if (auto p = e.params.find(id + from + ch); p != e.params.end() && !p->second.keys.empty())
+                                e.params[id + stop + ch] = p->second;
+                }
                 if (now.size() < 2 || it->stops.size() >= 64) return false;
                 const auto& a = now[now.size() - 2];
                 const auto& b = now.back();

@@ -904,6 +904,7 @@ struct SvgNode {
     std::map<QString, QString> attrs;
     std::vector<SvgNode> children;
     QString text;
+    std::vector<int> childAt;  // where in `text` each child came (for text with tspans in it)
 };
 
 bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
@@ -919,6 +920,7 @@ bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
             c.name = xr.name().toString();
             if (!readSvgTree(xr, c, depth + 1)) return false;
             node.children.push_back(std::move(c));
+            node.childAt.push_back(int(node.text.size()));
         } else if (xr.isCharacters()) {
             node.text += xr.text();
         } else if (xr.isEndElement()) {
@@ -966,8 +968,13 @@ std::vector<CssRule> parseCss(QString text, int& order) {
     while (at < text.size()) {
         const qsizetype open = text.indexOf('{', at);
         if (open < 0) break;
-        const qsizetype close = text.indexOf('}', open);
-        if (close < 0) break;
+        // (to its matching brace: an @media or @supports block holds rules of its own)
+        qsizetype close = open;
+        for (int depth = 0; ++close < text.size();) {
+            if (text[close] == '{') ++depth;
+            else if (text[close] == '}' && depth-- == 0) break;
+        }
+        if (close >= text.size()) break;
         const QString selectors = text.mid(at, open - at).trimmed();
         Style decls;
         declarations(text.mid(open + 1, close - open - 1), decls);
@@ -1064,11 +1071,19 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
     return s;
 }
 
-// All the character data in an element and the elements in it (tspans), its runs of white space made single spaces.
+// All the character data in an element and the elements in it (tspans), in order, its runs of white space made
+// single spaces.
 QString textIn(const SvgNode& n) {
-    QString t = n.text;
-    for (const SvgNode& c : n.children)
-        if (c.name == "tspan" || c.name == "textPath" || c.name == "a") t += ' ' + textIn(c);
+    QString t;
+    int from = 0;
+    for (size_t i = 0; i < n.children.size(); ++i) {
+        const int at = std::clamp(i < n.childAt.size() ? n.childAt[i] : int(n.text.size()), from, int(n.text.size()));
+        t += n.text.mid(from, at - from);
+        from = at;
+        const SvgNode& c = n.children[i];
+        if (c.name == "tspan" || c.name == "textPath" || c.name == "a") t += textIn(c);
+    }
+    t += n.text.mid(from);
     return t.simplified();
 }
 
@@ -1291,9 +1306,10 @@ public:
         if (n.attrs.count("spreadMethod")) out.spread = n.attrs.at("spreadMethod") == "reflect" ? 1 : n.attrs.at("spreadMethod") == "repeat" ? 2 : 0;
         std::vector<std::array<double, 5>> stops;
         double last = 0;
+        const std::vector<const SvgNode*> inGradient{&n};  // (so "#g stop" and "linearGradient > stop" match)
         for (const SvgNode& s : n.children) {
             if (s.name != "stop") continue;
-            const Style st = styleOf(s, &sheet_);
+            const Style st = styleOf(s, &sheet_, &inGradient);
             const QString off = s.attrs.count("offset") ? s.attrs.at("offset") : QString("0");
             double o = numbersIn(off).empty() ? 0 : numbersIn(off)[0];
             if (off.contains('%')) o /= 100;

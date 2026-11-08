@@ -877,8 +877,9 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
     const int shape = int(std::lround(c.generator.p("path_shape", 0)));
     const auto ps = c.generator.params.find("path_shape");
     if (shape != 4 && shape != 5 && (ps == c.generator.params.end() || ps->second.keys.empty())) return {};
-    return [&p, &seq, &c, w, h](double t) -> std::optional<TitlePathCurve> {
-        const FrameTime lt = FrameTime(std::floor(t + 1e-9));
+    // The path at a frame of the clip.
+    auto atFrame = [&p, &seq, &c, w, h](FrameTime lt) -> std::optional<TitlePathCurve> {
+        const double t = double(lt);
         const int kind = int(std::lround(c.generator.pAt("path_shape", t)));
         using Seg = TitlePathCurve::Segment;
         TitlePathCurve out;
@@ -904,7 +905,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
             int k = 0;
             for (const Effect& e : c.effects) {
                 const int ms = int(std::lround(e.p("mask.shape", lt)));
-                if ((ms != 1 && ms != 2 && ms != 5) || ++k != want) continue;
+                if (!e.enabled || (ms != 1 && ms != 2 && ms != 5) || ++k != want) continue;  // (as the monitor shows them)
                 const MaskBox b = maskBox(e, lt);
                 if (ms == 1) {
                     // From the top, clockwise on screen (as the Circle path runs).
@@ -963,6 +964,27 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
         });
         if (!ok || out.segments.empty()) return std::nullopt;
         return out;
+    };
+    // Between frames (motion blur's samples), the paths of the frames either side mixed, as their keys run straight
+    // between them; before the clip's first frame or after its last, the path there.
+    return [atFrame, last = std::max<FrameTime>(0, c.duration - 1)](double t) -> std::optional<TitlePathCurve> {
+        const double ct = std::clamp(t, 0.0, double(last));
+        const FrameTime lt = FrameTime(std::floor(ct + 1e-9));
+        std::optional<TitlePathCurve> a = atFrame(lt);
+        const double f = ct - double(lt);
+        if (!a || f < 1e-9 || lt >= last) return a;
+        const std::optional<TitlePathCurve> b = atFrame(lt + 1);
+        if (!b || b->segments.size() != a->segments.size() || b->closed != a->closed) return a;
+        for (size_t i = 0; i < a->segments.size(); ++i) {
+            TitlePathCurve::Segment& sa = a->segments[i];
+            const TitlePathCurve::Segment& sb = b->segments[i];
+            if (sa.kind != sb.kind) return atFrame(lt);
+            for (int k = 0; k < 4; ++k) sa.p[k] += (sb.p[k] - sa.p[k]) * f;
+            sa.rotation += (sb.rotation - sa.rotation) * f;
+            sa.from += (sb.from - sa.from) * f;
+            sa.to += (sb.to - sa.to) * f;
+        }
+        return a;
     };
 }
 
