@@ -12230,9 +12230,16 @@ void McpServer::Impl::addTools() {
         "delivered, as reference stills, with an ACES Metadata File. `application` \"prores\" makes a ProRes master instead "
         "(Application ProRes, SMPTE RDD 45): the pictures in `prores_profile` (422 LT, 422 or 422 HQ as Y'CbCr 4:2:2, to "
         "3840 x 2160 and 60 fps, not P3-D65; 4444 or 4444 XQ as R'G'B' 4:4:4, to 4096 x 3112), 10 bits, in MXF as RDD 44 "
-        "maps them; sound, timed text and supplementals as for #2E.",
+        "maps them; sound, timed text and supplementals as for #2E. With it, `fields` \"tff\" or \"bff\" codes each picture as "
+        "two fields, the top or the bottom first (4:2:2 to 1920 x 1080 at 25, 29.97 or 30, Rec.709), `ycbcr444` describes "
+        "4444 as Y'CbCr 4:4:4 (to 1920 x 1080, Rec.709) and `full_range` codes 4:4:4 R'G'B' over the full range (QE.2). "
+        "`application` \"dpp_prores\" makes a broadcaster's master (Application DPP (ProRes), SMPTE RDD 59-1, as UK and "
+        "North American broadcasters ask for it): 422 HQ at 1920 x 1080 or 3840 x 2160 (`size` hd or uhd), progressive, Rec.709, Rec.2020 PQ or "
+        "HLG, with the DPP's identification and content kind (`kind` programme by default: programme, commercial, "
+        "sponsorship, infomercial, presentation_event, promotion or music_video). Its 4:4:4 is 12 bits, which FFmpeg's "
+        "ProRes encoder does not make, and RDD 45 takes no alpha, so neither is offered.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
-            "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
+            "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test","programme","commercial","sponsorship","infomercial","presentation_event","music_video"],"description":"Default feature (dpp_prores: programme; the last six are Application DPP's only)"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
             "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
@@ -12249,8 +12256,11 @@ void McpServer::Impl::addTools() {
                 "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
-            "application":{"enum":[2,5,"prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45)"},
-            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's)"},
+            "application":{"enum":[2,5,"prores","dpp_prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45); \"dpp_prores\": Application DPP (ProRes, RDD 59-1)"},
+            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's; DPP: hq)"},
+            "fields":{"type":"string","enum":["progressive","tff","bff"],"default":"progressive","description":"Application ProRes: two fields a picture, the top (tff) or the bottom (bff) first"},
+            "ycbcr444":{"type":"boolean","default":false,"description":"Application ProRes: 4444 described as Y'CbCr 4:4:4, not R'G'B'"},
+            "full_range":{"type":"boolean","default":false,"description":"Application ProRes: 4:4:4 R'G'B' over the full range (QE.2)"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
             "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
@@ -12265,7 +12275,7 @@ void McpServer::Impl::addTools() {
             if (s.duration() == 0) return fail("The sequence is empty");
             ImfSettings st;
             st.title = str(a, "title", QFileInfo(need(a, "project")).completeBaseName()).toStdString();
-            st.kind = str(a, "kind", "feature").toStdString();
+            st.kind = str(a, "kind", a.value("application").toString() == "dpp_prores" ? "programme" : "feature").toStdString();
             st.colour = str(a, "colour").toStdString();
             st.size = str(a, "size", "sequence").toStdString();
             st.bits = a.value("bits").toInt(0);
@@ -12304,13 +12314,19 @@ void McpServer::Impl::addTools() {
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
             if (a.value("application").isString()) {
-                if (a.value("application").toString() != "prores") throw ArgError{"\"application\" is 2, 5 or \"prores\""};
-                st.application = 45;
+                const QString app = a.value("application").toString();
+                if (app != "prores" && app != "dpp_prores") throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
+                st.application = app == "prores" ? 45 : 59;
             } else {
                 st.application = a.value("application").toInt(2);
-                if (st.application != 2 && st.application != 5) throw ArgError{"\"application\" is 2, 5 or \"prores\""};
+                if (st.application != 2 && st.application != 5) throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
             }
             st.prores = str(a, "prores_profile", "hq").toStdString();
+            const QString fields = str(a, "fields", "progressive");
+            if (fields != "progressive" && fields != "tff" && fields != "bff") throw ArgError{"\"fields\" is progressive, tff or bff"};
+            st.fields = fields == "progressive" ? std::string() : fields.toStdString();
+            st.ycbcr444 = a.value("ycbcr444").toBool();
+            st.fullRange = a.value("full_range").toBool();
             st.graded = a.value("graded").toBool(true);
             st.immersive = a.value("iab").toBool();
             st.sadm = a.value("sadm").toBool();
@@ -12346,9 +12362,12 @@ void McpServer::Impl::addTools() {
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
-            if (r.application == 45) {
-                out["application"] = "prores";
+            if (r.application == 45 || r.application == 59) {
+                out["application"] = r.application == 45 ? "prores" : "dpp_prores";
                 out["prores_profile"] = QString::fromStdString(r.prores);
+                out["fields"] = r.fields.empty() ? QStringLiteral("progressive") : QString::fromStdString(r.fields);
+                out["ycbcr444"] = r.ycbcr444;
+                out["full_range"] = r.fullRange;
             }
             if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             if (r.sadm || r.adm)

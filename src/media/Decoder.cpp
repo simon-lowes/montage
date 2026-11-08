@@ -99,7 +99,7 @@ Rational jxlRate(const JxlInfo& i) {
     return Rational{q.num, q.den};
 }
 
-std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h);
+std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h, bool* proresFullRange = nullptr);
 bool immersiveSound(const std::string& file, ImmersiveTrackInfo* info = nullptr);
 
 // Keep FFmpeg quiet unless something is actually wrong.
@@ -1040,6 +1040,7 @@ void VideoDecoder::close() {
     exrRgba_.clear();
     rawFrame_ = -1;
     proResRaw_ = false;
+    imfFullRange_ = false;
     viewId_ = -1;
 }
 
@@ -1076,12 +1077,15 @@ bool immersiveSound(const std::string& file, ImmersiveTrackInfo* info) {
 }
 
 // An IMF picture track file, read once per file (decoders open it again and again: the media pool, thumbnails), with
-// its picture size; nullptr for any other MXF.
-std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h) {
+// its picture size; nullptr for any other MXF. (ProRes track files, which FFmpeg decodes, give nullptr too, and whether
+// their descriptor says full range (QE.2), which their frames cannot say.)
+std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h, bool* proresFullRange) {
     struct Known {
         std::shared_ptr<const dcp::ImfTrackReader> reader;
         int w = 0, h = 0;
+        bool proresFull = false;
     };
+    if (proresFullRange) *proresFullRange = false;
     static std::mutex lock;
     static std::map<std::string, Known> known;
     std::error_code ec;
@@ -1096,12 +1100,19 @@ std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, i
         std::lock_guard<std::mutex> g(lock);
         if (auto it = known.find(key); it != known.end()) {
             w = it->second.w, h = it->second.h;
+            if (proresFullRange) *proresFullRange = it->second.proresFull;
             return it->second.reader;
         }
     }
     Known k;
     auto reader = std::make_shared<dcp::ImfTrackReader>();
-    if (reader->open(file, nullptr, true) && (reader->imfRgbJpeg2000() ? openJpegAvailable() : reader->imfAces() && exrAvailable())) {
+    const bool opened = reader->open(file, nullptr, true);
+    if (!opened) {
+        // (the header alone: FFmpeg reads the frames)
+        dcp::ImfTrackReader head;
+        k.proresFull = head.openHeader(file) && head.imfProRes() && head.fullRange();
+    }
+    if (opened && (reader->imfRgbJpeg2000() ? openJpegAvailable() : reader->imfAces() && exrAvailable())) {
         k.w = reader->width(), k.h = reader->height();
         std::vector<uint8_t> cs;
         std::vector<uint16_t> rgb;
@@ -1116,6 +1127,7 @@ std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, i
     if (known.size() > 256) known.clear();
     known[key] = k;
     w = k.w, h = k.h;
+    if (proresFullRange) *proresFullRange = k.proresFull;
     return k.reader;
 }
 
@@ -1274,9 +1286,9 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     const std::string file = uninterpretedPath(path);
     std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : std::string();
     for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-    if (ext == ".mxf" && (openJpegAvailable() || exrAvailable())) {
+    if (ext == ".mxf") {
         int w = 0, h = 0;
-        if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h)) {
+        if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h, &imfFullRange_)) {
             imf_ = std::move(reader);
             rawFrame_ = -1;
             dispW_ = std::max(1, int(std::lround(w * (par_ > 0 ? par_ : 1.0))));
@@ -1509,6 +1521,8 @@ bool VideoDecoder::decodeNext(AVFrame* into) {
             av_frame_unref(into);
             av_frame_move_ref(into, hwTransfer_);
         }
+        // (IMF ProRes in full range, QE.2: its descriptor says so, the frames cannot)
+        if (rc == 0 && imfFullRange_) into->color_range = AVCOL_RANGE_JPEG;
         if (rc == 0) return true;
         if (rc == AVERROR_EOF) return false;
         if (rc != AVERROR(EAGAIN)) return false;

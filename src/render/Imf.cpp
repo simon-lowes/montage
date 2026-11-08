@@ -106,6 +106,14 @@ bool validKind(const std::string& k) {
     return std::any_of(std::begin(kinds), std::end(kinds), [&](const char* x) { return k == x; });
 }
 
+// Application DPP's content kinds (RDD 59-1 Table 6), written in its own scope.
+bool dppKind(const std::string& k) {
+    static const char* kinds[] = {"programme", "commercial", "sponsorship", "infomercial", "presentation_event", "promotion", "music_video"};
+    return std::any_of(std::begin(kinds), std::end(kinds), [&](const char* x) { return k == x; });
+}
+constexpr const char* kDppKindScope = "http://schema.thedpp.com/imf/RDD59-1/2021#content-kind";
+constexpr const char* kKindScope = "http://www.smpte-ra.org/schemas/2067-3/2013#content-kind";
+
 // Frames encoded several at a time, taken back in order (as the DCP's pool: the earliest not taken back is always
 // being encoded or next in line, so waiting for it ends).
 class ImfEncoderPool {
@@ -214,13 +222,14 @@ constexpr const char* kIabNs = "http://www.smpte-ra.org/ns/2067-201/2019";
 constexpr const char* kSadmNs = "http://www.smpte-ra.org/ns/2067-203/2022";
 constexpr const char* kAdmNs = "http://www.smpte-ra.org/ns/2067-204/2022";
 
-void rgbaComponents(QXmlStreamWriter& x, const QString& element, int bits) {
+void rgbaComponents(QXmlStreamWriter& x, const QString& element, int bits, int alphaBits = 0) {
     x.writeStartElement("r1:" + element);
-    const char* codes[] = {"CompRed", "CompGreen", "CompBlue"};
+    const char* codes[] = {"CompRed", "CompGreen", "CompBlue", "CompAlpha"};
+    const int count = alphaBits ? 4 : 3;
     for (int i = 0; i < 8; ++i) {
         x.writeStartElement("r2:RGBAComponent");
-        x.writeTextElement("r2:Code", i < 3 ? codes[i] : "CompNull");
-        x.writeTextElement("r2:ComponentSize", QString::number(i < 3 ? bits : 0));
+        x.writeTextElement("r2:Code", i < count ? codes[i] : "CompNull");
+        x.writeTextElement("r2:ComponentSize", QString::number(i < 3 ? bits : i < count ? alphaBits : 0));
         x.writeEndElement();
     }
     x.writeEndElement();
@@ -313,12 +322,13 @@ void pictureDescriptor(QXmlStreamWriter& x, const dcp::ImfPictureWriter& w, int6
     x.writeEndElement();  // RGBADescriptor
 }
 
-// Application ProRes's: a CDCI descriptor for Y'CbCr (4:2:2) or an RGBA one for R'G'B' (4:4:4), narrow range, with
-// coding equations always and a container constraints sub-descriptor.
+// Application ProRes's: a CDCI descriptor for Y'CbCr (4:2:2, or 4:4:4) or an RGBA one for R'G'B' (4:4:4), narrow range
+// or full (QE.2), progressive or separate fields, with coding equations always and a container constraints
+// sub-descriptor (as the track file's, render/DcpMxf).
 void proresDescriptor(QXmlStreamWriter& x, const dcp::ImfProResWriter& w, int64_t duration) {
     const dcp::ProResFormat& f = w.format();
     const dcp::ImfColour& c = f.colour;
-    const int scale = 1 << (f.bits - 10);  // (narrow range: 64 to 940 in ten bits)
+    const int low = f.low(), high = f.high();
     x.writeStartElement(f.rgb ? "r0:RGBADescriptor" : "r0:CDCIDescriptor");
     x.writeNamespace(kGroups, "r0");
     x.writeNamespace(kElements, "r1");
@@ -334,9 +344,10 @@ void proresDescriptor(QXmlStreamWriter& x, const dcp::ImfProResWriter& w, int64_
     x.writeTextElement("r1:SampleRate", QStringLiteral("%1/%2").arg(r.num).arg(r.den));
     x.writeTextElement("r1:EssenceLength", QString::number(duration));
     x.writeTextElement("r1:ContainerFormat", ulUrn(std::string(dcp::ImfProResWriter::kContainer)));
-    x.writeTextElement("r1:FrameLayout", "FullFrame");
+    x.writeTextElement("r1:FrameLayout", f.fields ? "SeparateFields" : "FullFrame");
     x.writeTextElement("r1:StoredWidth", QString::number(f.width));
-    x.writeTextElement("r1:StoredHeight", QString::number(f.height));
+    x.writeTextElement("r1:StoredHeight", QString::number(f.storedHeight()));
+    if (f.fields) x.writeTextElement("r1:DisplayF2Offset", f.fields == 2 ? "-1" : "0");
     x.writeTextElement("r1:ImageAspectRatio", QStringLiteral("%1/%2").arg(f.aspectNum).arg(f.aspectDen));
     x.writeTextElement("r1:TransferCharacteristic", ulUrn(c.transfer));
     x.writeTextElement("r1:PictureCompression", ulUrn(w.coding()));
@@ -364,17 +375,18 @@ void proresDescriptor(QXmlStreamWriter& x, const dcp::ImfProResWriter& w, int64_
         x.writeTextElement("r1:MasteringDisplayMinimumLuminance", QString::number(std::llround(c.minLuminance * 10000)));
     }
     if (f.rgb) {
-        x.writeTextElement("r1:ComponentMaxRef", QString::number(940 * scale));
-        x.writeTextElement("r1:ComponentMinRef", QString::number(64 * scale));
+        x.writeTextElement("r1:ComponentMaxRef", QString::number(high));
+        x.writeTextElement("r1:ComponentMinRef", QString::number(low));
         x.writeTextElement("r1:ScanningDirection", "ScanningDirection_LeftToRightTopToBottom");
-        rgbaComponents(x, "PixelLayout", f.bits);
+        rgbaComponents(x, "PixelLayout", f.bits, f.alphaBits);
     } else {
         x.writeTextElement("r1:ComponentDepth", QString::number(f.bits));
         x.writeTextElement("r1:HorizontalSubsampling", QString::number(f.horizontalSubsampling()));
         x.writeTextElement("r1:VerticalSubsampling", "1");
-        x.writeTextElement("r1:BlackRefLevel", QString::number(64 * scale));
-        x.writeTextElement("r1:WhiteRefLevel", QString::number(940 * scale));
-        x.writeTextElement("r1:ColorRange", QString::number(897 * scale - (scale - 1)));
+        if (f.alphaBits) x.writeTextElement("r1:AlphaSampleDepth", QString::number(f.alphaBits));
+        x.writeTextElement("r1:BlackRefLevel", QString::number(low));
+        x.writeTextElement("r1:WhiteRefLevel", QString::number(high));
+        x.writeTextElement("r1:ColorRange", QString::number(f.colorRange()));
     }
     x.writeEndElement();
 }
@@ -542,6 +554,9 @@ bool decodeTiff16(const std::vector<uint8_t>& tiff, std::vector<uint16_t>& rgb, 
 
 constexpr const char* kApp5 = "http://www.smpte-ra.org/ns/2067-50/2017";
 constexpr const char* kAppProRes = "tag:apple.com,2017:imf:rdd45:2022";  // (RDD 45 Table 6)
+// RDD 59-1 Table 5: writers use the second; readers take either (the first is TSP 2121-1's, which RDD 59-1 replaced).
+constexpr const char* kAppDpp = "http://schema.thedpp.com/imf/RDD59-1/2021";
+constexpr const char* kAppDppBefore = "http://www.digitalproductionpartnership.co.uk/schema/imf/TSP2121-1/2018";
 
 // The display an Application #5 master is made for: the sequence's delivery colour (its frames are taken back to
 // ACES through it), the space alone when it is tone mapped; Rec.709 for one that is not a display's.
@@ -1066,14 +1081,16 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (error) *error = why;
         return false;
     };
-    if (settings.application != 2 && settings.application != 5 && settings.application != 45)
-        return fail("The IMF application is 2 (#2E), 5 (#5) or 45 (Application ProRes)");
+    if (settings.application != 2 && settings.application != 5 && settings.application != 45 && settings.application != 59)
+        return fail("The IMF application is 2 (#2E), 5 (#5), 45 (Application ProRes) or 59 (Application DPP)");
     const bool aces = settings.application == 5;
-    const bool proresApp = settings.application == 45;
+    // (Application DPP is Application ProRes constrained: RDD 59-1 4)
+    const bool dpp = settings.application == 59;
+    const bool proresApp = settings.application == 45 || dpp;
     if (settings.application == 2 && !openJpegAvailable()) return fail("This build of Montage has no OpenJPEG, which IMF masters are coded with");
     if (proresApp && !prores::encoderAvailable()) return fail("This build of FFmpeg has no ProRes encoder");
     if (aces && !exrAvailable()) return fail("This build of Montage has no OpenEXR library, which archival masters are written with");
-    if (!validKind(settings.kind)) return fail("Unknown content kind " + settings.kind);
+    if (!validKind(settings.kind) && !(dpp && dppKind(settings.kind))) return fail("Unknown content kind " + settings.kind);
     std::string err;
     // A supplemental package keeps the earlier composition's picture: its size, colour, depth and coding.
     const bool supplemental = !settings.supplementOf.empty();
@@ -1085,13 +1102,19 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (cpl.empty()) return fail("There is no IMF package in " + settings.supplementOf);
         if (!readImfComposition(cpl, old, &err)) return fail(err);
         oldPicture = old.picture();
-        auto appName = [](int a) { return a == 5 ? std::string("IMF Application #5") : a == 45 ? std::string("IMF Application ProRes") : a == 2 ? std::string("IMF Application #2E") : std::string("another IMF application"); };
+        auto appName = [](int a) {
+            return a == 5    ? std::string("IMF Application #5")
+                   : a == 45 ? std::string("IMF Application ProRes")
+                   : a == 59 ? std::string("IMF Application DPP (ProRes)")
+                   : a == 2  ? std::string("IMF Application #2E")
+                             : std::string("another IMF application");
+        };
         // (an earlier package of another edition of ST 2067-21 reads as application 0: #2E's family)
         if ((old.application ? old.application : 2) != settings.application)
             return fail("The earlier package is " + appName(old.application) + "; a supplemental keeps its application");
         if (!oldPicture || old.width <= 0 || old.height <= 0 ||
             (aces        ? old.colour != "aces2065-1"
-             : proresApp ? old.bits != 10 || prores::profileOf(old.prores) < 2 || old.colour.empty()
+             : proresApp ? old.bits != 10 || prores::profileOf(old.prores) < 2 || old.colour.empty()  // (12 bits: no encoder makes them)
                          : (old.bits != 10 && old.bits != 12) || !old.rsiz || old.colour.empty()))
             return fail("The earlier package's picture is not one Montage makes supplementals of");
         oldPaths = imfTrackFiles(settings.supplementOf);
@@ -1131,17 +1154,56 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (htj2k && !lossless) return fail("HTJ2K masters here are lossless");
         if (htj2k && !htj2kAvailable()) return fail("This build of Montage has no HTJ2K encoder");
     }
-    // Application ProRes (RDD 45 Table 1): 4:2:2 Y'CbCr to 3840 x 2160 (no P3-D65, no 120 fps), 4:4:4 R'G'B' to 4096 x 3112.
-    int proresProfile = 0;
+    // Application ProRes (RDD 45 Table 1): 4:2:2 Y'CbCr to 3840 x 2160 (no P3-D65, no 120 fps; interlaced to 1920 x 1080
+    // at 25, 29.97 or 30 in Rec.709), 4:4:4 R'G'B' to 4096 x 3112 (QE.1 or QE.2), 4:4:4 Y'CbCr to 1920 x 1080 (progressive,
+    // Rec.709, QE.1). Application DPP (RDD 59-1 Table 2 and 4): 422 HQ or 4444 / 4444 XQ at 1920 x 1080 or 3840 x 2160,
+    // progressive, at up to 60 fps, Rec.709, Rec.2020 PQ or HLG; 4:4:4 at 12 bits.
+    int proresProfile = 0, fields = 0;
+    bool ycbcr444 = false, fullRange = false;
     if (proresApp) {
+        const std::string fieldName = supplemental ? old.fields : settings.fields;
+        if (fieldName != "" && fieldName != "tff" && fieldName != "bff") return fail("Fields are \"\" (progressive), \"tff\" or \"bff\"");
+        fields = fieldName == "tff" ? 1 : fieldName == "bff" ? 2 : 0;
+        ycbcr444 = supplemental ? old.ycbcr444 : settings.ycbcr444;
+        fullRange = supplemental ? old.fullRange : settings.fullRange;
         proresProfile = prores::profileOf(supplemental ? old.prores : settings.prores);
-        if (proresProfile < 2) return fail("Application ProRes takes ProRes 422 LT, 422, 422 HQ, 4444 or 4444 XQ (lt, 422, hq, 4444 or 4444xq)");
         const bool full = prores::fourFourFour(proresProfile);
+        const double rateValue = double(canonical.num) / double(canonical.den);
+        if (dpp) {
+            if (proresProfile != 4 && !full) return fail("Application DPP takes ProRes 422 HQ, 4444 or 4444 XQ (RDD 59-1 Table 4)");
+            if (full)
+                return fail("Application DPP's 4:4:4 pictures are 12 bits (RDD 59-1 Table 2) and FFmpeg's ProRes encoder codes 10: DPP masters here are "
+                            "422 HQ");
+            if (!((W == 1920 && H == 1080) || (W == 3840 && H == 2160)))
+                return fail("Application DPP pictures are 1920 x 1080 or 3840 x 2160 (choose HD or UHD)");
+            if (colourId == "p3d65-pq") return fail("Application DPP has Rec.709, Rec.2020 PQ and HLG, not P3-D65 PQ");
+            if (fields) return fail("Application DPP pictures are progressive");
+            if (ycbcr444 || fullRange) return fail("Application DPP's 422 HQ is Y'CbCr 4:2:2 in narrow range (QE.1)");
+            if (rateValue > 61) return fail("Application DPP masters run at up to 60 fps");
+        }
+        if (proresProfile < 2) return fail("Application ProRes takes ProRes 422 LT, 422, 422 HQ, 4444 or 4444 XQ (lt, 422, hq, 4444 or 4444xq)");
         if (W % 2) return fail("ProRes masters here have an even width");
         if (!full && (W > 3840 || H > 2160)) return fail("ProRes 4:2:2 masters are at most 3840 x 2160 (4444 goes to 4096 x 3112)");
         if (full && (W > 4096 || H > 3112)) return fail("ProRes masters are at most 4096 x 3112");
         if (!full && colourId == "p3d65-pq") return fail("Application ProRes has P3-D65 PQ only in 4:4:4 (4444 or 4444 XQ)");
-        if (!full && double(canonical.num) / double(canonical.den) > 61) return fail("ProRes 4:2:2 masters run at up to 60 fps (4444 at 120)");
+        if (!full && rateValue > 61) return fail("ProRes 4:2:2 masters run at up to 60 fps (4444 at 120)");
+        if (fields) {
+            if (full) return fail("Interlaced ProRes masters are 4:2:2 (422 LT, 422 or 422 HQ)");
+            if (W > 1920 || H > 1080) return fail("Interlaced ProRes masters are at most 1920 x 1080");
+            if (H % 2) return fail("Interlaced ProRes masters have an even height");
+            if (canonical != Rational{25, 1} && canonical != Rational{30, 1} && canonical != Rational{30000, 1001})
+                return fail("Interlaced ProRes masters run at 25, 29.97 or 30 fps");
+            if (colourId != "rec709") return fail("Interlaced ProRes masters are Rec.709");
+        }
+        if (ycbcr444) {
+            if (!full) return fail("Y'CbCr 4:4:4 is ProRes 4444 or 4444 XQ");
+            if (W > 1920 || H > 1080) return fail("ProRes Y'CbCr 4:4:4 masters are at most 1920 x 1080 (R'G'B' goes to 4096 x 3112)");
+            if (colourId != "rec709") return fail("ProRes Y'CbCr 4:4:4 masters are Rec.709");
+            if (rateValue > 61) return fail("ProRes Y'CbCr 4:4:4 masters run at up to 60 fps");
+        }
+        if (fullRange && (!full || ycbcr444)) return fail("Full range (QE.2) is for 4:4:4 R'G'B' (4444 or 4444 XQ)");
+    } else if (!settings.fields.empty() || settings.ycbcr444 || settings.fullRange) {
+        return fail("Fields, Y'CbCr 4:4:4 and full range are for ProRes masters");
     }
     const dcp::EditRate rate{uint32_t(canonical.num), uint32_t(canonical.den)};  // as written, not as the sequence stores it
     const double fps = rate.value();
@@ -1416,11 +1478,11 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             std::vector<uint16_t> mine = pictureAt(k);
             if (proresApp) {
                 // (decoded to 16-bit R'G'B', compared at the master's 10 bits)
-                checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, mine = std::move(mine), cs = std::move(cs)] {
+                checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, fullRange, mine = std::move(mine), cs = std::move(cs)] {
                     try {
                         std::vector<uint16_t> theirs;
                         int w = 0, h = 0;
-                        if (cs.empty() || !prores::decode(cs.data(), cs.size(), theirs, w, h) || w != W || h != H) return false;
+                        if (cs.empty() || !prores::decode(cs.data(), cs.size(), fullRange, theirs, nullptr, w, h) || w != W || h != H) return false;
                         for (uint16_t& v : theirs) v = uint16_t(v >> 6);
                         return alikeTo(mine, theirs);
                     } catch (...) {
@@ -1974,15 +2036,20 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         pf.width = W;
         pf.height = H;
         pf.profile = proresProfile;
-        pf.rgb = prores::fourFourFour(proresProfile);
+        pf.rgb = prores::fourFourFour(proresProfile) && !ycbcr444;
         pf.bits = 10;
+        pf.fields = fields;
+        pf.fullRange = fullRange;
         pf.colour = colour;
         const int g = std::gcd(W, H);
         pf.aspectNum = uint32_t(W / g);
         pf.aspectDen = uint32_t(H / g);
         dcp::ImfProResWriter writer;
         prores::Encoder encoder;
-        if (!encoder.open(W, H, proresProfile, colourId, &err) ||
+        prores::Coding coding;
+        coding.fields = fields;
+        coding.fullRange = fullRange;
+        if (!encoder.open(W, H, proresProfile, colourId, coding, &err) ||
             !writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, pf, &err))
             return fail(err);
         const int64_t count = int64_t(toCode.size());
@@ -2165,8 +2232,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         text(x, "Creator", "Montage");
         text(x, "ContentOriginator", issuer);
         text(x, "ContentTitle", title);
+        // (Application DPP: RDD 59-1 9.1 asks for it, in the DPP's scope for its own kinds)
         x.writeStartElement("ContentKind");
-        x.writeAttribute("scope", "http://www.smpte-ra.org/schemas/2067-3/2013#content-kind");
+        x.writeAttribute("scope", dpp && dppKind(settings.kind) ? kDppKindScope : kKindScope);
         x.writeCharacters(QString::fromStdString(settings.kind));
         x.writeEndElement();
         x.writeStartElement("ContentVersionList");
@@ -2188,6 +2256,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeStartElement("ExtensionProperties");
         // (HTJ2K pictures came with the 2023 edition)
         x.writeTextElement("cc:ApplicationIdentification", aces        ? kApp5
+                                                           : dpp       ? kAppDpp
                                                            : proresApp ? kAppProRes
                                                            : htj2k     ? "http://www.smpte-ra.org/ns/2067-21/2023"
                                                                    : "http://www.smpte-ra.org/ns/2067-21/2021");
@@ -2327,6 +2396,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         for (const Own& f : own) result->trackFiles.push_back(QDir(folder).filePath(f.file).toStdString());
         result->application = settings.application;
         result->prores = proresApp ? prores::profileName(proresProfile) : std::string();
+        result->fields = fields == 1 ? "tff" : fields == 2 ? "bff" : "";
+        result->ycbcr444 = ycbcr444;
+        result->fullRange = fullRange;
         result->outputTransform = outputName;
         result->targetFrames = targetsWritten;
         result->amf = amfFile.empty() ? std::string() : QDir(folder).filePath(QString::fromStdString(amfFile)).toStdString();
@@ -2389,34 +2461,83 @@ ImfTrack probeImfTrack(const std::string& path, const std::function<bool(qint64)
 namespace {
 
 // What RDD 45 asks of an Application ProRes picture track file, as read: its profile, descriptor, size and rate
-// (Table 1), RDD 44's five-byte lengths and body partitions of no more than 10.01 seconds, all but the last as long,
-// and every frame's header as the descriptor and Table 3 have it.
+// (Table 1: sampling, components, frame structure, quantization, colour and depth together), RDD 44's five-byte lengths
+// and body partitions of no more than 10.01 seconds, all but the last as long, separate fields as Table 6 has them, no
+// alpha (5.2.1), and every frame's header as the descriptor and Table 3 have it. Application DPP (RDD 59-1) narrows
+// that: 422 HQ, 4444 or 4444 XQ (Table 4) at 1920 x 1080 or 3840 x 2160, progressive, at up to 60 fps, 4:2:2 at 10 bits
+// and 4:4:4 R'G'B' at 12 (Table 2), not P3-D65, HLG in narrow range only (5.2.2).
 std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const ImfComposition& comp, const std::function<bool(int64_t bytes)>& read,
                                           bool& stopped) {
     std::vector<std::string> out;
+    const bool dpp = comp.application == 59;
     const int profile = r.proresProfile();
     if (profile == 0) return {"its picture coding label is not a ProRes profile"};
     if (profile == 1) out.push_back("it is ProRes 422 Proxy, which Application ProRes does not take");
+    if (dpp && profile != 4 && profile != 5 && profile != 6)
+        out.push_back("it is " + prores::profileTitle(profile) + "; Application DPP takes 422 HQ, 4444 and 4444 XQ (RDD 59-1 Table 4)");
     if (!comp.prores.empty() && prores::profileName(profile) != comp.prores)
         out.push_back("it is " + prores::profileTitle(profile) + " and the composition's first picture " + prores::profileTitle(prores::profileOf(comp.prores)) +
                       " (a main image virtual track keeps one profile)");
     const bool full = prores::fourFourFour(profile), rgb = r.rgba();
     const int W = r.width(), H = r.height();
+    const int layout = r.frameLayout();
+    const bool interlaced = layout == 1;
+    if (layout != 0 && layout != 1)
+        out.push_back("its frame layout (" + std::to_string(layout) + ") is neither full frames nor separate fields (segmented frames are not taken)");
     if (!full && rgb) out.push_back("4:2:2 ProRes is Y'CbCr, described by a CDCI descriptor, not RGBA");
     if (full && !rgb && (W > 1920 || H > 1080)) out.push_back("4:4:4 Y'CbCr is only up to 1920 x 1080");
+    if (full && !rgb && dpp) out.push_back("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 2), described by an RGBA descriptor");
     if (!full && (W > 3840 || H > 2160)) out.push_back("4:2:2 pictures are at most 3840 x 2160");
     if (W > 4096 || H > 3112 || W <= 0 || H <= 0) out.push_back("pictures are 1 to 4096 x 1 to 3112");
+    if (dpp && !((W == 1920 && H == 1080) || (W == 3840 && H == 2160))) out.push_back("Application DPP pictures are 1920 x 1080 or 3840 x 2160");
+    if (full && rgb && r.horizontalSubsampling() > 1) out.push_back("an RGBA descriptor does not subsample");
+    if (!rgb && r.horizontalSubsampling() != (full ? 1 : 2))
+        out.push_back("its horizontal subsampling (" + std::to_string(r.horizontalSubsampling()) + ") is not the profile's (RDD 44 Table 7)");
     const dcp::EditRate e = r.rate();
     const uint64_t g = std::gcd(uint64_t(e.num), uint64_t(e.den));
     const uint64_t num = g ? e.num / g : 0, den = g ? e.den / g : 0;
     static const std::pair<uint64_t, uint64_t> rates[] = {{24, 1}, {24000, 1001}, {25, 1}, {30, 1}, {30000, 1001}, {50, 1}, {60, 1}, {60000, 1001}};
     const bool rateOk = std::any_of(std::begin(rates), std::end(rates), [&](auto x) { return x.first == num && x.second == den; }) ||
-                        (full && rgb && num == 120 && den == 1);
-    if (!rateOk) out.push_back("its edit rate " + std::to_string(e.num) + "/" + std::to_string(e.den) + " is not one Application ProRes takes");
+                        (full && rgb && !dpp && num == 120 && den == 1);
+    if (!rateOk) out.push_back("its edit rate " + std::to_string(e.num) + "/" + std::to_string(e.den) + " is not one " +
+                               (dpp ? "Application DPP" : "Application ProRes") + " takes");
     prores::ColourCodes want;
     const bool known = prores::colourCodes(comp.colour, want);
     if (!known) out.push_back("its colour is not one of RDD 45's");
     if (comp.colour == "p3d65-pq" && !(full && rgb)) out.push_back("P3-D65 PQ (COLOR.6) is 4:4:4 R'G'B' only");
+    if (comp.colour == "p3d65-pq" && dpp) out.push_back("Application DPP has no P3-D65 PQ (COLOR.6)");
+    if (full && !rgb && comp.colour != "rec709") out.push_back("4:4:4 Y'CbCr is Rec.709 (COLOR.1 to COLOR.3) only");
+    if (full && !rgb && double(num) > 61.0 * double(den)) out.push_back("4:4:4 Y'CbCr runs at up to 60 fps");
+    // Interlaced (Table 1's second column): 4:2:2 Y'CbCr to 1920 x 1080, monoscopic, at 25, 29.97 or 30, Rec.709;
+    // separate fields (the stored height a field's: each frame's header, which gives the frame's, is held to twice it
+    // below), DisplayF2Offset as the frames' interlace_mode (RDD 44 Table 6).
+    if (interlaced) {
+        if (dpp) out.push_back("Application DPP pictures are progressive (RDD 59-1 Table 2)");
+        if (full) out.push_back("interlaced pictures are 4:2:2");
+        if (W > 1920 || H > 1080) out.push_back("interlaced pictures are at most 1920 x 1080");
+        if (!((num == 25 && den == 1) || (num == 30 && den == 1) || (num == 30000 && den == 1001)))
+            out.push_back("interlaced pictures run at 25, 29.97 or 30 fps");
+        if (comp.colour != "rec709") out.push_back("interlaced pictures are Rec.709 (COLOR.1 to COLOR.3)");
+        if (r.displayF2Offset() != 0 && r.displayF2Offset() != -1) out.push_back("its DisplayF2Offset is neither 0 nor -1 (RDD 44 Table 6)");
+    }
+    // Depth and range: QE.1 (64 to 940 in ten bits, scaled) or QE.2 (0 to the top code, 4:4:4 R'G'B' only); 10 or 12 bits
+    // (8 in Rec.709 too). Application DPP: 4:2:2 at 10, 4:4:4 at 12, HLG at QE.1 only.
+    const int bits = r.componentBits();
+    if (bits != 8 && bits != 10 && bits != 12) out.push_back("its component depth (" + std::to_string(bits) + ") is not 8, 10 or 12 bits");
+    else if (bits == 8 && comp.colour != "rec709") out.push_back("8-bit pictures are Rec.709 (COLOR.1 to COLOR.3) only");
+    if (dpp && !full && bits != 10) out.push_back("Application DPP's 4:2:2 is 10 bits (RDD 59-1 Table 2)");
+    if (dpp && full && bits != 12) out.push_back("Application DPP's 4:4:4 is 12 bits (RDD 59-1 Table 2)");
+    if (bits >= 8 && bits <= 12) {
+        const int scale = 1 << (bits - 8);  // (QE.1: 16 to 235 in eight bits)
+        const bool qe1 = r.componentLow() == 16 * scale && r.componentHigh() == 235 * scale;
+        const bool qe2 = r.componentLow() == 0 && r.componentHigh() == (1 << bits) - 1;
+        if (!qe1 && !qe2)
+            out.push_back("its component range (" + std::to_string(r.componentLow()) + " to " + std::to_string(r.componentHigh()) +
+                          ") is neither QE.1 nor QE.2");
+        if (qe2 && !(full && rgb)) out.push_back("full range (QE.2) is for 4:4:4 R'G'B' only");
+        if (qe2 && dpp && comp.colour == "rec2020-hlg") out.push_back("Application DPP's HLG (COLOR.8) is QE.1 only (RDD 59-1 5.2.2)");
+    }
+    if (r.alphaBits()) out.push_back("its descriptor gives alpha, which RDD 45 does not take (5.2.1: no encoded alpha)");
     if (r.elementLengthBytes() != 5) out.push_back("its frames' KLV lengths are not all five bytes (RDD 44 6.2.2)");
     const std::vector<int64_t>& parts = r.bodyPartitionFrames();
     if (parts.empty()) out.push_back("its essence is in no body partition");
@@ -2430,6 +2551,8 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
             break;
         }
     }
+    // (separate fields: the first coded first, the top (interlace_mode 1) when DisplayF2Offset is 0, else the bottom)
+    const int wantInterlace = interlaced ? (r.displayF2Offset() == -1 ? 2 : 1) : 0;
     std::vector<uint8_t> bytes;
     std::string err;
     for (int64_t k = 0; k < r.frames(); ++k) {
@@ -2446,8 +2569,11 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
         if (h.frameSize != bytes.size()) why = "its frame_size is not the element's";
         else if (h.width != W || h.height != H) why = "it is " + std::to_string(h.width) + " x " + std::to_string(h.height) + " in a track of " + std::to_string(W) + " x " + std::to_string(H);
         else if (h.chroma != (full ? 3 : 2)) why = "its chroma format is not the profile's";
-        else if (h.interlace != 0) why = "it is interlaced in a track of progressive frames";
-        else if (h.alpha != 0) why = "it carries alpha";
+        else if (h.interlace != wantInterlace)
+            why = wantInterlace == 0 ? "it is interlaced in a track of progressive frames"
+                  : h.interlace == 0 ? "it is progressive in a track of separate fields"
+                                     : "its first field is not the one the descriptor's DisplayF2Offset says (RDD 44 Table 6)";
+        else if (h.alpha != 0) why = "it carries alpha (RDD 45 5.2.1)";
         else if (known && (h.primaries != want.primaries || h.transfer != want.transfer || h.matrix != want.matrix))
             why = "its colour codes (" + std::to_string(h.primaries) + ", " + std::to_string(h.transfer) + ", " + std::to_string(h.matrix) +
                   ") are not RDD 45 Table 3's for " + comp.colour;
@@ -2555,9 +2681,10 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         for (const auto& [path, text] : cplItems)
             if (path.endsWith("ExtensionProperties/ApplicationIdentification") &&
                 (text.contains("http://www.smpte-ra.org/ns/2067-21/") || text.contains("http://www.smpte-ra.org/ns/2067-50/") ||
-                 text.contains("tag:apple.com,2017:imf:rdd45:")))
+                 text.contains("tag:apple.com,2017:imf:rdd45:") || text.contains("http://schema.thedpp.com/imf/RDD59-1/") ||
+                 text.contains(QLatin1String(kAppDppBefore))))
                 application = true;
-        if (!application) issue(c.path + " does not identify IMF Application #2E, #5 or ProRes");
+        if (!application) issue(c.path + " does not identify IMF Application #2E, #5, ProRes or DPP");
         ImfComposition comp;
         std::string err;
         if (!readImfComposition(dir.filePath(c.path).toStdString(), comp, &err)) {
@@ -2566,6 +2693,17 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         }
         const ImfVirtualTrack* picture = comp.picture();
         if (!picture) issue(c.path + " has no picture");
+        // Application DPP (RDD 59-1 7 and 9.1): one identification, Table 5's, and a content kind, in the DPP's scope
+        // when it is one of Table 6's.
+        if (comp.application == 59) {
+            int ids = 0;
+            for (const auto& [path, text] : cplItems)
+                if (path.endsWith("ExtensionProperties/ApplicationIdentification")) ids += int(text.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts).size());
+            if (ids > 1) issue(c.path + " identifies more than one application; Application DPP's identification is alone (RDD 59-1 7)");
+            if (comp.contentKind.empty()) issue(c.path + " has no ContentKind, which Application DPP asks for (RDD 59-1 9.1)");
+            else if (dppKind(comp.contentKind) && comp.contentKindScope != kDppKindScope)
+                issue(c.path + " gives the content kind " + QString::fromStdString(comp.contentKind) + " outside the DPP's scope (RDD 59-1 9.1)");
+        }
         std::set<std::string> seen;
         for (const ImfVirtualTrack& t : comp.tracks) {
             const QString kind = QString::fromStdString(t.kind);
@@ -2606,7 +2744,7 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     }
                 }
                 const bool acesPicture = image && comp.application == 5;
-                const bool proresPicture = image && comp.application == 45;
+                const bool proresPicture = image && (comp.application == 45 || comp.application == 59);
                 if (text || !inside || acesPicture || proresPicture || iab || mga || admSound) {
                     // Read as Montage reads track files (those of other packages without reading all their essence).
                     dcp::ImfTrackReader reader;
@@ -2749,6 +2887,18 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
 }
 
 bool readImfFrame(const std::string& mxf, int index, std::vector<uint16_t>& rgb, int& width, int& height, int& bits, std::string* error) {
+    // ProRes (RDD 44): decoded by the descriptor's range, given at its depth.
+    {
+        dcp::ImfTrackReader head, reader;
+        if (head.openHeader(mxf) && head.imfProRes() && reader.open(mxf) && reader.imfProRes()) {
+            std::vector<uint8_t> frame;
+            if (!reader.frame(index, frame, error)) return false;
+            if (!prores::decode(frame.data(), frame.size(), reader.fullRange(), rgb, nullptr, width, height, error)) return false;
+            bits = reader.componentBits() >= 8 && reader.componentBits() <= 16 ? reader.componentBits() : 10;
+            for (uint16_t& v : rgb) v = uint16_t(v >> (16 - bits));
+            return true;
+        }
+    }
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, mxf.c_str(), nullptr, nullptr) < 0) {
         if (error) *error = "Cannot open " + mxf;
@@ -2842,6 +2992,10 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
         uint16_t rsiz = 0;
         QString transfer, primaries, language, contentKind, container, authoring, compression;
         double peak = 0;
+        // (pictures: the descriptor's kind, frame layout, field offset and the low and high codes, CDCI's or RGBA's)
+        bool cdci = false;
+        QString layout;
+        int f2Offset = 0, low = -1, high = -1;
     };
     std::map<std::string, Info> info;
     QString descriptorId, inject;
@@ -2867,8 +3021,13 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                 take();
                 if (value.contains("http://www.smpte-ra.org/ns/2067-50/")) out.application = 5;
                 else if (value.contains("http://www.smpte-ra.org/ns/2067-21/")) out.application = 2;
+                else if (value.contains("http://schema.thedpp.com/imf/RDD59-1/") || value.contains(QLatin1String(kAppDppBefore))) out.application = 59;
                 else if (value.contains("tag:apple.com,2017:imf:rdd45:")) out.application = 45;
                 else out.application = 0;
+            } else if (d == 2 && name == "ContentKind") {
+                out.contentKindScope = r.attributes().value("scope").toString().toStdString();
+                take();
+                out.contentKind = value.toStdString();
             } else if (d == 2 && (name == "Id" || name == "ContentTitle" || name == "EditRate" || name == "IssueDate")) {
                 take();
                 if (name == "Id") out.id = packageBareId(value).toStdString();
@@ -2883,6 +3042,7 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                     take();
                     descriptorId = packageBareId(value);
                 } else if (descriptorStart < 0 && !descriptorId.isEmpty()) {
+                    info[descriptorId.toStdString()].cdci = name == "CDCIDescriptor";
                     // The descriptor as written, with the namespaces declared above it added to its own element.
                     descriptorStart = all.lastIndexOf(QLatin1Char('<'), r.characterOffset() - 1);
                     std::map<QString, QString> inScope;
@@ -2899,7 +3059,8 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                                                    "MasteringDisplayMaximumLuminance", "ChannelCount", "RFC5646SpokenLanguage",
                                                    "MCAAudioContentKind", "RFC5646LanguageTagList", "ContainerFormat",
                                                    "ACESAuthoringInformation", "ACESMasteringDisplayMaximumLuminance", "ComponentDepth",
-                                                   "PictureCompression"};
+                                                   "PictureCompression", "FrameLayout", "DisplayF2Offset", "BlackRefLevel",
+                                                   "WhiteRefLevel", "ComponentMinRef", "ComponentMaxRef"};
                 if (fields.contains(name)) {
                     take();
                     Info& x = info[descriptorId.toStdString()];
@@ -2918,6 +3079,10 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                     if (name == "ContainerFormat") x.container = value.toLower();
                     if (name == "ACESAuthoringInformation") x.authoring = value;
                     if (name == "ACESMasteringDisplayMaximumLuminance") x.peak = value.toDouble() / 10000.0;
+                    if (name == "FrameLayout") x.layout = value;
+                    if (name == "DisplayF2Offset") x.f2Offset = value.toInt();
+                    if (name == "BlackRefLevel" || name == "ComponentMinRef") x.low = value.toInt();
+                    if (name == "WhiteRefLevel" || name == "ComponentMaxRef") x.high = value.toInt();
                 }
             } else if (d >= 5 && path[1] == "SegmentList" && path[2] == "Segment" && path[3] == "SequenceList") {
                 // CompositionPlaylist/SegmentList/Segment/SequenceList/<kind>/TrackId, .../ResourceList/Resource/<field>
@@ -3025,8 +3190,16 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
             QString coding = x.compression;
             coding.remove('.');
             if (x.container == ulUrn(std::string(dcp::ImfProResWriter::kContainer)) && coding.size() == 45 && coding.mid(13, 14) == "060e2b34040101" &&
-                coding.mid(29, 12) == "040102020306")
+                coding.mid(29, 12) == "040102020306") {
                 out.prores = prores::profileName(coding.mid(41, 2).toInt(nullptr, 16));
+                // Separate fields: the stored height is a field's, DisplayF2Offset -1 the bottom field first (RDD 44 Table 6).
+                if (x.layout == "SeparateFields") {
+                    out.fields = x.f2Offset == -1 ? "bff" : "tff";
+                    out.height *= 2;
+                }
+                out.ycbcr444 = x.cdci && prores::fourFourFour(prores::profileOf(out.prores));
+                out.fullRange = x.bits > 0 && x.bits <= 16 && x.low == 0 && x.high == (1 << x.bits) - 1;
+            }
         }
     }
     return true;

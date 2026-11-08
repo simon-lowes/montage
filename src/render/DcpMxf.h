@@ -412,13 +412,24 @@ private:
 
 // A ProRes picture (SMPTE RDD 36) as IMF Application ProRes (RDD 45) describes it.
 struct ProResFormat {
-    int width = 0, height = 0;
+    int width = 0, height = 0;  // the frame's (interlaced: both fields)
     int profile = 4;  // RDD 44's coding label byte 15: 1 422 Proxy, 2 422 LT, 3 422, 4 422 HQ, 5 4444, 6 4444 XQ
-    bool rgb = false;  // decoded as R'G'B' (an RGBA descriptor), else as Y'CbCr (CDCI)
+    bool rgb = false;  // decoded as R'G'B' (an RGBA descriptor), else as Y'CbCr (CDCI; 4:4:4 too, with 4444 and 4444 XQ)
     int bits = 10;
+    // 0 progressive (FullFrame); 1 or 2 interlaced (SeparateFields, the stored height a field's), the top or the bottom
+    // field first: DisplayF2Offset 0 or -1, as RDD 44 Table 6 ties it to the frames' interlace_mode.
+    int fields = 0;
+    bool fullRange = false;  // QE.2: components from 0 to the top code, else QE.1 (64 to 940 in ten bits)
+    int alphaBits = 0;       // 4444 and 4444 XQ with alpha: 8 or 16 (an RGBA layout's A, a CDCI's AlphaSampleDepth)
     ImfColour colour;  // (the coding equations always given: RDD 44 asks for them even with RGBA)
     uint32_t aspectNum = 16, aspectDen = 9;
     int horizontalSubsampling() const { return profile >= 5 ? 1 : 2; }
+    int storedHeight() const { return fields ? height / 2 : height; }
+    // Black and white (QE.1: 64 and 940 in ten bits, scaled to the depth; QE.2: 0 and the top code), and a CDCI
+    // descriptor's ColorRange (QE.1: the colour differences' 64 to 960, scaled).
+    int low() const { return fullRange ? 0 : 64 << (bits - 10); }
+    int high() const { return fullRange ? (1 << bits) - 1 : 940 << (bits - 10); }
+    int colorRange() const { return fullRange ? 1 << bits : (960 << (bits - 10)) - low() + 1; }
 };
 
 // SMPTE RDD 44: one ProRes frame a KLV (five-byte lengths), frame-wrapped in OP1a, in body partitions of about ten
@@ -653,7 +664,12 @@ public:
     enum class Kind { Unknown, Picture, Sound, TimedText, Iab, Mga };
     // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000 or imfAces), without walking
     // the rest of a file that is not; `immersiveOnly` the same unless it is immersive sound (IAB, MGA, or sound with ADM).
-    bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false, bool immersiveOnly = false);
+    bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false, bool immersiveOnly = false) {
+        return open(path, error, imfPictureOnly, immersiveOnly, false);
+    }
+    // The header alone: what its descriptors and labels say (imfProRes, the sizes, depth, range, fields), without
+    // walking the essence; frames() is 0, and kind() Picture for a picture descriptor.
+    bool openHeader(const std::string& path, std::string* error = nullptr);
     Kind kind() const { return kind_; }
     const Uuid& asset() const { return asset_; }
     int64_t frames() const { return int64_t(elements_.size()); }  // picture, IAB (each an IABitstream frame) or MGA frames
@@ -673,6 +689,19 @@ public:
     bool imfProRes() const { return kind_ == Kind::Picture && op1a_ && prores_ && (rgba_ || cdci_); }
     bool rgba() const { return rgba_; }
     int proresProfile() const { return proresProfile_; }
+    // What a ProRes picture's descriptor says beyond that (as ProResFormat has it): its frame layout (0 FullFrame, 1
+    // SeparateFields, ...), the stored height (height() is the frame's: twice a field's), DisplayF2Offset (0 when not
+    // given), the component depth, horizontal subsampling, range (QE.2: from 0 to the top code) and alpha's depth (0:
+    // none).
+    int frameLayout() const { return frameLayout_; }
+    int storedHeight() const { return storedHeight_; }
+    int displayF2Offset() const { return displayF2Offset_; }
+    int componentBits() const { return componentBits_; }
+    int horizontalSubsampling() const { return horizontalSubsampling_; }
+    bool fullRange() const { return fullRange_; }
+    int componentLow() const { return componentLow_; }  // (CDCI's black and white levels, RGBA's component limits; -1 not given)
+    int componentHigh() const { return componentHigh_; }
+    int alphaBits() const { return alphaBits_; }
     const std::vector<int64_t>& bodyPartitionFrames() const { return bodyFrames_; }
     int elementLengthBytes() const { return lengthBytes_; }  // (0: they differ)
     // Its ACES picture sub-descriptor's output transform, and its target frames, each found in its stream or not.
@@ -710,6 +739,7 @@ public:
     bool resource(const Uuid& id, std::vector<uint8_t>& out, std::string* error = nullptr) const;
 
 private:
+    bool open(const std::string& path, std::string* error, bool imfPictureOnly, bool immersiveOnly, bool headerOnly);
     std::string path_;
     std::vector<Resource> resources_;
     Kind kind_ = Kind::Unknown;
@@ -718,6 +748,9 @@ private:
     EditRate rate_;
     bool op1a_ = false, rgba_ = false, j2k_ = false, aces_ = false, adm_ = false, prores_ = false, cdci_ = false;
     int proresProfile_ = 0, lengthBytes_ = -1;
+    int frameLayout_ = 0, storedHeight_ = 0, displayF2Offset_ = 0, componentBits_ = 0, horizontalSubsampling_ = 0, alphaBits_ = 0;
+    bool fullRange_ = false;
+    int componentLow_ = -1, componentHigh_ = -1;
     std::vector<int64_t> bodyFrames_;
     int sampleRate_ = 48000;
     std::vector<AdmChannelMapping> chna_;

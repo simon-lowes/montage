@@ -372,6 +372,44 @@ QStringList photonErrors(const QString& folder) {
     return errors;
 }
 
+// Every picture of an MXF file's first stream as FFmpeg's demuxer and decoder give them (the decoder told the stream's
+// tag, as a player is): `each` sees the decoded frame and its packet; the frames decoded, or -1.
+int64_t decodeMxfPictures(const std::string& mxf, const std::function<bool(const AVFrame*, const AVPacket*)>& each) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, mxf.c_str(), nullptr, nullptr) < 0) return -1;
+    int64_t n = -1;
+    const AVCodec* codec = avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->nb_streams >= 1 ? avcodec_find_decoder(fmt->streams[0]->codecpar->codec_id) : nullptr;
+    AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+    if (ctx) ctx->thread_count = 1;
+    if (ctx && avcodec_parameters_to_context(ctx, fmt->streams[0]->codecpar) >= 0 && avcodec_open2(ctx, codec, nullptr) >= 0) {
+        n = 0;
+        AVPacket* pkt = av_packet_alloc();
+        AVFrame* frame = av_frame_alloc();
+        bool going = true;
+        while (going && av_read_frame(fmt, pkt) >= 0) {
+            if (pkt->stream_index == 0 && avcodec_send_packet(ctx, pkt) >= 0) {
+                while (going && avcodec_receive_frame(ctx, frame) >= 0) {
+                    ++n;
+                    going = each(frame, pkt);
+                }
+            }
+            av_packet_unref(pkt);
+        }
+        if (!going) n = -1;
+        av_frame_free(&frame);
+        av_packet_free(&pkt);
+    }
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+    return n;
+}
+
+// The first file in `folder` whose name matches `pattern`, as a path.
+std::string firstFileIn(const std::string& folder, const QString& pattern) {
+    const QDir d(QString::fromStdString(folder));
+    return d.filePath(d.entryList({pattern}).value(0)).toStdString();
+}
+
 // Unpremultiplied colour at a pixel.
 void rgb(const Image& img, int x, int y, float out[4]) {
     const float* p = img.at(x, y);
@@ -9745,6 +9783,489 @@ colorspaces:
         bad = sup;
         bad.application = 2;
         QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("supplemental keeps") != std::string::npos);
+    }
+
+    void exportsImfProResCompleted() {
+        if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder");
+        QTemporaryDir dir;
+        std::string err;
+        auto photonFindings = [](const std::string& folder) {
+            QStringList found = photonErrors(QString::fromStdString(folder));
+            found.removeIf([](const QString& e) { return e.contains("has both index table and essence"); });  // (RDD 44's layout, as exportsImfProRes)
+            return found;
+        };
+        auto headOf = [](const std::string& mxf) {
+            QFile f(QString::fromStdString(mxf));
+            return f.open(QIODevice::ReadOnly) ? f.read(65536) : QByteArray();
+        };
+        RenderOptions ro;
+        ro.highQuality = true;
+
+        // Interlaced (RDD 45 Table 1's second column): 320 x 180 at 25 fps, the first three frames lines of two greys
+        // (light on the top field's lines, dark on the bottom's), then a matte.
+        Project p = makeDefaultProject();
+        {
+            Sequence& s = *p.active();
+            s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+            QImage lines(320, 180, QImage::Format_RGBA64);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) lines.setPixelColor(x, y, y % 2 ? QColor::fromRgbF(0.2f, 0.2f, 0.2f) : QColor::fromRgbF(0.8f, 0.8f, 0.8f));
+            QVERIFY(lines.save(dir.filePath("lines.png")));
+            MediaItem m;
+            QVERIFY(probeMedia(dir.filePath("lines.png").toStdString(), m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 3, {TrackKind::Video, 0}, {}, false).ok);
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.7f, 0.4f, 0.2f, 3, 3)).ok);
+        }
+        Sequence& seq = *p.active();
+        for (const std::string order : {"tff", "bff"}) {
+            const bool top = order == "tff";
+            ImfSettings st;
+            st.title = "Fields " + order;
+            st.captions = false;
+            st.application = 45;
+            st.prores = "422";
+            st.fields = order;
+            ImfResult r;
+            QVERIFY2(exportImf(p, seq, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+            QVERIFY(r.fields == order && r.frames == 6 && r.prores == "422" && r.height == 180);
+            std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QStringList photon = photonFindings(r.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            ImfComposition comp;
+            QVERIFY2(readImfComposition(r.cpl, comp, &err), err.c_str());
+            QVERIFY(comp.fields == order && comp.height == 180 && comp.width == 320 && comp.prores == "422");
+            {
+                QFile cpl(QString::fromStdString(r.cpl));
+                QVERIFY(cpl.open(QIODevice::ReadOnly));
+                const QByteArray x = cpl.readAll();
+                QVERIFY(x.contains("<r1:FrameLayout>SeparateFields</r1:FrameLayout>") && x.contains("<r1:StoredHeight>90</r1:StoredHeight>") &&
+                        x.contains(top ? "<r1:DisplayF2Offset>0</r1:DisplayF2Offset>" : "<r1:DisplayF2Offset>-1</r1:DisplayF2Offset>"));
+            }
+            // The track file: separate fields (FrameLayout 1), a field's stored height, DisplayF2Offset 0 for the top
+            // field first and -1 for the bottom (RDD 44 Table 6), and every frame's interlace_mode 1 or 2 to match.
+            const std::string video = firstFileIn(r.folder, "VIDEO_*.mxf");
+            dcp::ImfTrackReader reader;
+            QVERIFY2(reader.open(video, &err), err.c_str());
+            QVERIFY(reader.imfProRes() && reader.frameLayout() == 1 && reader.storedHeight() == 90 && reader.height() == 180 &&
+                    reader.displayF2Offset() == (top ? 0 : -1) && reader.componentBits() == 10 && !reader.fullRange());
+            const QByteArray head = headOf(video);
+            QVERIFY(head.contains(QByteArray::fromHex("320c000101")) && head.contains(QByteArray::fromHex("320200040000005a")) &&
+                    head.contains(QByteArray::fromHex(top ? "3217000400000000" : "32170004ffffffff")));
+            // FFmpeg decodes every frame as it was rendered, flagged interlaced with the field order written, the
+            // light lines on the top field and the dark on the bottom.
+            int64_t k = 0;
+            const int64_t decoded = decodeMxfPictures(video, [&](const AVFrame* f, const AVPacket* pkt) {
+                prores::FrameHeader h;
+                if (!prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) || h.interlace != (top ? 1 : 2) || h.height != 180) return false;
+                if (!(f->flags & AV_FRAME_FLAG_INTERLACED) || bool(f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != top || f->width != 320 || f->height != 180)
+                    return false;
+                std::vector<uint16_t> rgb;
+                int w = 0, hh = 0;
+                if (!prores::decode(pkt->data, size_t(pkt->size), rgb, w, hh, &err)) return false;
+                const Image want = renderProgramFrame(p, seq, k, ro);
+                for (int y : {10, 11, 90, 91})
+                    for (int c = 0; c < 3; ++c) {
+                        const double got = rgb[(size_t(y) * 320 + 160) * 3 + size_t(c)] / 65535.0;
+                        if (std::fabs(got - want.at(160, y)[c]) > 2.0 / 255) {
+                            qWarning("frame %d line %d channel %d: %f, rendered %f", int(k), y, c, got, double(want.at(160, y)[c]));
+                            return false;
+                        }
+                    }
+                ++k;
+                return true;
+            });
+            QCOMPARE(decoded, int64_t(6));
+            // Opened again, the frames come in interlaced with that order: Montage keeps the first field and rebuilds
+            // the other where it combs, so the lines show the top field's light grey, or the bottom's dark one.
+            Project q = makeDefaultProject();
+            const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+            QVERIFY2(in.error.empty(), in.error.c_str());
+            const Sequence* back = q.findSequence(in.sequence);
+            QVERIFY(back && back->width == 320 && back->height == 180 && back->fps == (Rational{25, 1}));
+            const Image again = renderProgramFrame(q, *back, 1, ro);
+            for (int y : {10, 11}) {
+                const float want = top ? 0.8f : 0.2f;
+                QVERIFY2(std::fabs(again.at(160, y)[1] - want) < 3.0 / 255,
+                         qPrintable(QStringLiteral("%1, line %2: %3").arg(QString::fromStdString(order)).arg(y).arg(again.at(160, y)[1])));
+            }
+            const Image matte = renderProgramFrame(q, *back, 4, ro);
+            QVERIFY(std::fabs(matte.at(160, 90)[0] - 0.7f) < 3.0 / 255 && std::fabs(matte.at(160, 90)[2] - 0.2f) < 3.0 / 255);
+        }
+        // Interlaced is 4:2:2 to 1920 x 1080 at 25, 29.97 or 30 in Rec.709 only.
+        {
+            ImfSettings bad;
+            bad.captions = false;
+            bad.application = 45;
+            bad.fields = "tff";
+            bad.prores = "4444";
+            QVERIFY(!exportImf(p, seq, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("4:2:2") != std::string::npos);
+            bad.prores = "hq";
+            bad.colour = "rec2020-hlg";
+            QVERIFY(!exportImf(p, seq, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("Rec.709") != std::string::npos);
+            bad.colour.clear();
+            bad.fields = "upper";
+            QVERIFY(!exportImf(p, seq, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("tff") != std::string::npos);
+            bad.fields = "bff";
+            Sequence film = seq;
+            film.fps = Rational{24, 1};
+            QVERIFY(!exportImf(p, film, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("25, 29.97 or 30") != std::string::npos);
+            bad.application = 2;
+            QVERIFY(!exportImf(p, seq, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("ProRes masters") != std::string::npos);
+        }
+
+        // 4:4:4 Y'CbCr (Table 1's first column): 4444 in a CDCI descriptor, no subsampling.
+        Project p2 = makeDefaultProject();
+        Sequence& s2 = *p2.active();
+        s2.width = 320, s2.height = 180, s2.fps = Rational{24, 1};
+        s2.videoTracks[0].clips = {colorClip(p2, 0.0f, 1.0f, 0.5f, 0, 3), colorClip(p2, 0.9f, 0.1f, 0.3f, 3, 3)};
+        Sequence first = s2;
+        first.id = p2.newId();
+        first.name = "First";
+        p2.sequences.push_back(first);
+        Sequence& now = *p2.active();
+        {
+            ImfSettings st;
+            st.title = "YCbCr 444";
+            st.captions = false;
+            st.application = 45;
+            st.prores = "4444";
+            st.ycbcr444 = true;
+            ImfResult r;
+            QVERIFY2(exportImf(p2, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+            QVERIFY(r.ycbcr444 && !r.fullRange && r.prores == "4444");
+            std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QStringList photon = photonFindings(r.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            ImfComposition comp;
+            QVERIFY(readImfComposition(r.cpl, comp, &err) && comp.ycbcr444 && !comp.fullRange && comp.fields.empty());
+            const std::string video = firstFileIn(r.folder, "VIDEO_*.mxf");
+            dcp::ImfTrackReader reader;
+            QVERIFY(reader.open(video, &err) && reader.imfProRes() && !reader.rgba() && reader.horizontalSubsampling() == 1 && reader.proresProfile() == 5);
+            const QByteArray head = headOf(video);
+            QVERIFY(head.contains(QByteArray::fromHex("3302000400000001")) && head.contains(QByteArray::fromHex("3304000400000040")));
+            int64_t k = 0;
+            QCOMPARE(decodeMxfPictures(video, [&](const AVFrame* f, const AVPacket* pkt) {
+                         prores::FrameHeader h;
+                         if (!prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) || h.chroma != 3 || h.interlace != 0) return false;
+                         if (f->format != AV_PIX_FMT_YUV444P12 && f->format != AV_PIX_FMT_YUV444P10) return false;
+                         std::vector<uint16_t> rgb;
+                         int w = 0, hh = 0;
+                         if (!prores::decode(pkt->data, size_t(pkt->size), rgb, w, hh, &err)) return false;
+                         const Image want = renderProgramFrame(p2, now, k++, ro);
+                         for (int c = 0; c < 3; ++c)
+                             if (std::fabs(rgb[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0 - want.at(160, 90)[c]) > 2.0 / 255) return false;
+                         return true;
+                     }),
+                     int64_t(6));
+            ImfSettings bad = st;
+            bad.colour = "p3d65-pq";
+            QVERIFY(!exportImf(p2, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("Rec.709") != std::string::npos);
+            bad = st;
+            bad.prores = "hq";
+            QVERIFY(!exportImf(p2, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("4444") != std::string::npos);
+            bad = st;
+            bad.fullRange = true;
+            QVERIFY(!exportImf(p2, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("QE.2") != std::string::npos);
+            bad = st;
+            bad.size = "uhd";
+            QVERIFY(!exportImf(p2, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("1920 x 1080") != std::string::npos);
+        }
+
+        // Full range (QE.2), 4:4:4 R'G'B': black at 0 and white at 1023 in the descriptor, Y'CbCr over the whole range in
+        // the frames, and the code values back as they went in (0, 1023 and 512 for 0, 1 and 0.5).
+        ImfResult full;
+        {
+            ImfSettings st;
+            st.title = "Full range";
+            st.captions = false;
+            st.application = 45;
+            st.prores = "4444xq";
+            st.fullRange = true;
+            QVERIFY2(exportImf(p2, now, st, dir.path().toStdString(), &full, {}, &err), err.c_str());
+            QVERIFY(full.fullRange && !full.ycbcr444 && full.prores == "4444xq");
+            std::vector<std::string> issues = verifyImf(full.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QStringList photon = photonFindings(full.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            ImfComposition comp;
+            QVERIFY(readImfComposition(full.cpl, comp, &err) && comp.fullRange && !comp.ycbcr444);
+            {
+                QFile cpl(QString::fromStdString(full.cpl));
+                QVERIFY(cpl.open(QIODevice::ReadOnly));
+                const QByteArray x = cpl.readAll();
+                QVERIFY(x.contains("<r1:ComponentMaxRef>1023</r1:ComponentMaxRef>") && x.contains("<r1:ComponentMinRef>0</r1:ComponentMinRef>"));
+            }
+            const std::string video = firstFileIn(full.folder, "VIDEO_*.mxf");
+            dcp::ImfTrackReader reader;
+            QVERIFY(reader.open(video, &err) && reader.rgba() && reader.fullRange() && reader.componentLow() == 0 && reader.componentHigh() == 1023);
+            const QByteArray head = headOf(video);
+            QVERIFY(head.contains(QByteArray::fromHex("34060004000003ff")) && head.contains(QByteArray::fromHex("3407000400000000")));
+            // (R'G'B' 0, 1, 0.5 in Rec.709: Y' 0.7152 + 0.0722 x 0.5 of the whole range, codes from 0 at twelve bits as
+            // FFmpeg decodes 4:4:4)
+            int64_t k = 0;
+            QCOMPARE(decodeMxfPictures(video, [&](const AVFrame* f, const AVPacket*) {
+                         if (k++ != 0) return true;
+                         if (f->format != AV_PIX_FMT_YUV444P12) return false;
+                         const int y = reinterpret_cast<const uint16_t*>(f->data[0] + 90 * f->linesize[0])[160];
+                         const int wantY = int(std::lround((0.7152 + 0.0722 * 0.5) * 4095));
+                         if (std::abs(y - wantY) > 12) {
+                             qWarning("Y' %d, expected about %d", y, wantY);
+                             return false;
+                         }
+                         return true;
+                     }),
+                     int64_t(6));
+            std::vector<uint16_t> codes;
+            int w = 0, h = 0, bits = 0;
+            QVERIFY2(readImfFrame(video, 1, codes, w, h, bits, &err), err.c_str());
+            QVERIFY(w == 320 && h == 180 && bits == 10);
+            const uint16_t* px = codes.data() + (size_t(90) * 320 + 160) * 3;
+            QVERIFY2(px[0] <= 2 && px[1] >= 1021 && std::abs(int(px[2]) - 512) <= 2, qPrintable(QStringLiteral("%1 %2 %3").arg(px[0]).arg(px[1]).arg(px[2])));
+            // Opened again, at full range: the colours as they were made.
+            Project q = makeDefaultProject();
+            const ImportResult in = importImf(q, full.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+            QVERIFY2(in.error.empty(), in.error.c_str());
+            const Image again = renderProgramFrame(q, *q.findSequence(in.sequence), 1, ro);
+            QVERIFY2(again.at(160, 90)[0] < 2.0 / 255 && again.at(160, 90)[1] > 253.0 / 255 && std::fabs(again.at(160, 90)[2] - 0.5f) < 2.0 / 255,
+                     qPrintable(QStringLiteral("%1 %2 %3").arg(again.at(160, 90)[0]).arg(again.at(160, 90)[1]).arg(again.at(160, 90)[2])));
+        }
+        // A supplemental keeps the full range and the profile.
+        {
+            now.videoTracks[0].clips[1].generator.params["color.g"] = 0.6;
+            ImfSettings sup;
+            sup.captions = false;
+            sup.application = 45;
+            sup.prores = "hq";
+            sup.supplementOf = full.folder;
+            sup.originalSequence = first.id;
+            ImfResult r2;
+            QVERIFY2(exportImf(p2, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+            QVERIFY2(r2.supplemental && r2.codedFrames == 3 && r2.fullRange && r2.prores == "4444xq", qPrintable(QString::number(r2.codedFrames)));
+            std::vector<std::string> issues = verifyImf(r2.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        }
+
+        // Alpha and 12 bits, which Montage does not make in a package (RDD 45 5.2.1 takes no alpha; FFmpeg's encoder codes
+        // 10 bits), read from track files made here: 4444 with a 16-bit alpha ramp FFmpeg decodes exactly, and a 12-bit
+        // descriptor read at 12 bits. Put in a package in place of its own picture, Montage's check names alpha.
+        {
+            const std::string video = firstFileIn(full.folder, "VIDEO_*.mxf");
+            dcp::ImfTrackReader was;
+            QVERIFY(was.open(video, &err));
+            prores::Coding coding;
+            coding.alpha = true;
+            prores::Encoder enc;
+            QVERIFY2(enc.open(320, 180, 5, "rec709", coding, &err), err.c_str());
+            std::vector<uint16_t> rgb(size_t(320) * 180 * 3, 30000), alpha(size_t(320) * 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) alpha[size_t(y) * 320 + size_t(x)] = uint16_t(x * 65535 / 319);
+            for (int bits : {16, 12}) {
+                dcp::ProResFormat pf;
+                pf.width = 320, pf.height = 180, pf.profile = 5, pf.rgb = true;
+                pf.bits = bits == 12 ? 12 : 10;
+                pf.alphaBits = bits == 16 ? 16 : 0;
+                pf.colour.primaries = "060e2b34040101060401010103030000";
+                pf.colour.transfer = "060e2b34040101010401010101020000";
+                pf.colour.codingEquations = "060e2b34040101010401010102020000";
+                const std::string path = dir.filePath(QStringLiteral("made%1.mxf").arg(bits)).toStdString();
+                dcp::ImfProResWriter wr;
+                QVERIFY2(wr.open(path, was.asset(), was.rate(), pf, &err), err.c_str());
+                std::vector<uint8_t> frame;
+                prores::Encoder opaque;
+                QVERIFY(opaque.open(320, 180, 5, "rec709", &err));
+                for (int64_t i = 0; i < was.frames(); ++i) {
+                    QVERIFY2(bits == 16 ? enc.encode(rgb.data(), alpha.data(), frame, &err) : opaque.encode(rgb.data(), frame, &err), err.c_str());
+                    QVERIFY2(wr.write(frame.data(), frame.size(), &err), err.c_str());
+                }
+                QVERIFY2(wr.close(&err), err.c_str());
+                dcp::ImfTrackReader made;
+                QVERIFY2(made.open(path, &err), err.c_str());
+                QVERIFY(made.imfProRes() && made.alphaBits() == pf.alphaBits && made.componentBits() == pf.bits && made.componentHigh() == (pf.bits == 12 ? 3760 : 940));
+                if (bits == 16) {
+                    QCOMPARE(decodeMxfPictures(path, [&](const AVFrame* f, const AVPacket* pkt) {
+                                 if (f->format != AV_PIX_FMT_YUVA444P12) return false;
+                                 for (int x = 0; x < 320; ++x) {
+                                     const int a12 = reinterpret_cast<const uint16_t*>(f->data[3] + 7 * f->linesize[3])[x];
+                                     const int a10 = int((uint32_t(alpha[size_t(x)]) * 1023 + 32767) / 65535);
+                                     if (a12 >> 2 != a10) return false;
+                                 }
+                                 std::vector<uint16_t> back, a;
+                                 int w = 0, h = 0;
+                                 return prores::decode(pkt->data, size_t(pkt->size), false, back, &a, w, h, &err) && a.size() == alpha.size() &&
+                                        std::abs(int(a[319]) - 65535) <= 64 && a[0] == 0;
+                             }),
+                             was.frames());
+                } else {
+                    std::vector<uint16_t> codes;
+                    int w = 0, h = 0, depth = 0;
+                    QVERIFY2(readImfFrame(path, 0, codes, w, h, depth, &err), err.c_str());
+                    QVERIFY2(depth == 12 && std::abs(int(codes[0]) - int(std::lround(30000 / 65535.0 * 4095))) <= 8, qPrintable(QString::number(codes[0])));
+                }
+                // In the package: the check names what it finds (the packing list's hash aside).
+                QFile::remove(QString::fromStdString(video));
+                QVERIFY(QFile::copy(QString::fromStdString(path), QString::fromStdString(video)));
+                const std::vector<std::string> issues = verifyImf(full.folder);
+                const bool alphaNamed = std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("5.2.1") != std::string::npos; });
+                const bool rangeNamed = std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("QE.1") != std::string::npos; });
+                QVERIFY(bits == 16 ? alphaNamed : !alphaNamed);
+                QVERIFY(!rangeNamed);
+            }
+        }
+    }
+
+    void exportsImfDpp() {
+        if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder");
+        QTemporaryDir dir;
+        std::string err;
+        auto photonFindings = [](const std::string& folder) {
+            QStringList found = photonErrors(QString::fromStdString(folder));
+            found.removeIf([](const QString& e) { return e.contains("has both index table and essence"); });  // (RDD 44's layout, as exportsImfProRes)
+            return found;
+        };
+        RenderOptions ro;
+        ro.highQuality = true;
+        // HD at 25 fps: a light grey matte, then a dark one (greys: the frames are told apart by lightness alone).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920, s.height = 1080, s.fps = Rational{25, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0.75f, 0.75f, 0.75f, 0, 3), colorClip(p, 0.25f, 0.25f, 0.25f, 3, 3)};
+        Sequence cut1 = s;
+        cut1.id = p.newId();
+        cut1.name = "Cut 1";
+        p.sequences.push_back(cut1);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "DPP";
+        st.captions = false;
+        st.application = 59;
+        st.prores = "hq";
+        st.kind = "programme";
+        ImfResult r;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.application == 59 && r.frames == 6 && r.prores == "hq" && r.bits == 10 && r.colour == "rec709" && r.fields.empty());
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonFindings(r.folder);
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        // The CPL: Application DPP's identification alone (RDD 59-1 Table 5), and the content kind in the DPP's scope.
+        QByteArray cplText;
+        {
+            QFile cpl(QString::fromStdString(r.cpl));
+            QVERIFY(cpl.open(QIODevice::ReadOnly));
+            cplText = cpl.readAll();
+        }
+        QVERIFY(cplText.count("http://schema.thedpp.com/imf/RDD59-1/2021<") == 1 && !cplText.contains("rdd45"));
+        QVERIFY(cplText.contains("<ContentKind scope=\"http://schema.thedpp.com/imf/RDD59-1/2021#content-kind\">programme</ContentKind>"));
+        ImfComposition comp;
+        QVERIFY2(readImfComposition(r.cpl, comp, &err), err.c_str());
+        QVERIFY(comp.application == 59 && comp.prores == "hq" && comp.width == 1920 && comp.height == 1080 && comp.contentKind == "programme");
+        // The track file: 422 HQ at ten bits, narrow range; every frame FFmpeg decodes is the one rendered.
+        const QDir out(QString::fromStdString(r.folder));
+        const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+        dcp::ImfTrackReader reader;
+        QVERIFY2(reader.open(video, &err), err.c_str());
+        QVERIFY(reader.imfProRes() && !reader.rgba() && reader.proresProfile() == 4 && reader.componentBits() == 10 && reader.componentLow() == 64 &&
+                reader.componentHigh() == 940 && reader.horizontalSubsampling() == 2 && reader.frameLayout() == 0);
+        int64_t k = 0;
+        QCOMPARE(decodeMxfPictures(video, [&](const AVFrame* f, const AVPacket* pkt) {
+                     prores::FrameHeader h;
+                     if (!prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) || h.chroma != 2 || h.interlace != 0 || h.alpha != 0) return false;
+                     if (f->width != 1920 || f->height != 1080 || f->format != AV_PIX_FMT_YUV422P10) return false;
+                     std::vector<uint16_t> rgb;
+                     int w = 0, hh = 0;
+                     if (!prores::decode(pkt->data, size_t(pkt->size), rgb, w, hh, &err)) return false;
+                     const Image want = renderProgramFrame(p, now, k++, ro);
+                     for (int c = 0; c < 3; ++c)
+                         if (std::fabs(rgb[(size_t(540) * 1920 + 960) * 3 + size_t(c)] / 65535.0 - want.at(960, 540)[c]) > 2.0 / 255) return false;
+                     return true;
+                 }),
+                 int64_t(6));
+        // Opened again: the light shot, then the dark.
+        {
+            Project q = makeDefaultProject();
+            const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+            QVERIFY2(in.error.empty(), in.error.c_str());
+            const Sequence* back = q.findSequence(in.sequence);
+            QVERIFY(back && back->width == 1920 && back->height == 1080 && back->fps == (Rational{25, 1}));
+            QVERIFY(std::fabs(renderProgramFrame(q, *back, 1, ro).at(960, 540)[1] - 0.75f) < 3.0 / 255);
+            QVERIFY(std::fabs(renderProgramFrame(q, *back, 4, ro).at(960, 540)[1] - 0.25f) < 3.0 / 255);
+        }
+
+        // A supplemental: the dark shot changed, its three frames new, Application DPP still.
+        now.videoTracks[0].clips[1].generator.params["color.r"] = 0.35;
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.35;
+        now.videoTracks[0].clips[1].generator.params["color.b"] = 0.35;
+        ImfSettings sup = st;
+        sup.supplementOf = r.folder;
+        sup.originalSequence = cut1.id;
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY2(r2.supplemental && r2.application == 59 && r2.codedFrames == 3 && r2.prores == "hq", qPrintable(QString::number(r2.codedFrames)));
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        photon = photonFindings(r2.folder);
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        ImfSettings other = sup;
+        other.application = 45;
+        other.kind = "feature";
+        QVERIFY(!exportImf(p, now, other, dir.path().toStdString(), nullptr, {}, &err) && err.find("supplemental keeps") != std::string::npos);
+
+        // HLG (COLOR.8), a commercial.
+        {
+            ImfSettings hlg = st;
+            hlg.title = "DPP HLG";
+            hlg.colour = "rec2020-hlg";
+            hlg.kind = "commercial";
+            ImfResult rh;
+            QVERIFY2(exportImf(p, cut1, hlg, dir.path().toStdString(), &rh, {}, &err), err.c_str());
+            QVERIFY(rh.application == 59 && rh.colour == "rec2020-hlg");
+            issues = verifyImf(rh.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            photon = photonFindings(rh.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            ImfComposition hc;
+            QVERIFY(readImfComposition(rh.cpl, hc, &err) && hc.application == 59 && hc.colour == "rec2020-hlg" && hc.contentKind == "commercial");
+        }
+
+        // Refused: 4444 (12 bits, which FFmpeg's encoder does not code), 422 LT, a picture neither HD nor UHD, P3-D65 PQ,
+        // fields, a DPP kind outside Application DPP.
+        ImfSettings bad = st;
+        bad.prores = "4444";
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("12 bits") != std::string::npos);
+        bad.prores = "lt";
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("422 HQ") != std::string::npos);
+        bad = st;
+        Sequence small = cut1;
+        small.width = 320, small.height = 180;
+        QVERIFY(!exportImf(p, small, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("1920 x 1080 or 3840 x 2160") != std::string::npos);
+        bad.colour = "p3d65-pq";
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("P3-D65") != std::string::npos);
+        bad = st;
+        bad.fields = "tff";
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("progressive") != std::string::npos);
+        bad = st;
+        bad.application = 45;
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("content kind") != std::string::npos);
+
+        // Montage's check: a DPP composition with no content kind, or a second application identification, is named.
+        {
+            QString x = QString::fromUtf8(cplText);
+            x.remove(QRegularExpression("<ContentKind[^>]*>[^<]*</ContentKind>"));
+            x.replace("http://schema.thedpp.com/imf/RDD59-1/2021</", "http://schema.thedpp.com/imf/RDD59-1/2021 tag:apple.com,2017:imf:rdd45:2022</");
+            QFile cpl(QString::fromStdString(r.cpl));
+            QVERIFY(cpl.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            cpl.write(x.toUtf8());
+            cpl.close();
+            issues = verifyImf(r.folder);
+            auto named = [&](const char* what) {
+                return std::any_of(issues.begin(), issues.end(), [&](const std::string& i) { return i.find(what) != std::string::npos; });
+            };
+            QVERIFY(named("has no ContentKind") && named("more than one application"));
+        }
     }
 
     void exportsImfSupplementalAt2997() {

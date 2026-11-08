@@ -29,6 +29,7 @@
 #include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 
+#include <QStandardItemModel>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QAction>
@@ -8316,11 +8317,19 @@ void MainWindow::exportImfDialog() {
     form->addRow(tr("Title:"), title);
     auto* kind = new QComboBox(&dlg);
     kind->setObjectName(QStringLiteral("imfKind"));
-    for (const auto& [label, value] : std::vector<std::pair<QString, QString>>{{tr("Feature"), "feature"}, {tr("Episode"), "episode"},
-                                                                             {tr("Short"), "short"}, {tr("Trailer"), "trailer"},
-                                                                             {tr("Teaser"), "teaser"}, {tr("Advertisement"), "advertisement"},
-                                                                             {tr("Promotion"), "promotion"}, {tr("Test"), "test"}})
-        kind->addItem(label, value);
+    // (ST 2067-3's kinds; Application DPP's own, RDD 59-1 Table 6, when that is the master)
+    const std::vector<std::pair<QString, QString>> kinds{{tr("Feature"), "feature"},     {tr("Episode"), "episode"},
+                                                         {tr("Short"), "short"},         {tr("Trailer"), "trailer"},
+                                                         {tr("Teaser"), "teaser"},       {tr("Advertisement"), "advertisement"},
+                                                         {tr("Promotion"), "promotion"}, {tr("Test"), "test"}};
+    const std::vector<std::pair<QString, QString>> dppKinds{{tr("Programme"), "programme"},
+                                                            {tr("Commercial"), "commercial"},
+                                                            {tr("Sponsorship"), "sponsorship"},
+                                                            {tr("Infomercial"), "infomercial"},
+                                                            {tr("Presentation (continuity, announcements)"), "presentation_event"},
+                                                            {tr("Promotion"), "promotion"},
+                                                            {tr("Music video"), "music_video"}};
+    for (const auto& [label, value] : kinds) kind->addItem(label, value);
     form->addRow(tr("Kind:"), kind);
     // Application #2E for delivery, or #5 for the archive: the pictures in ACES, with the output transform named.
     auto* application = new QComboBox(&dlg);
@@ -8328,6 +8337,13 @@ void MainWindow::exportImfDialog() {
     if (openJpegAvailable()) application->addItem(tr("Delivery master (Application #2E, JPEG 2000)"), 2);
     if (exrAvailable()) application->addItem(tr("Archival master (Application #5, ACES OpenEXR)"), 5);
     if (prores::encoderAvailable()) application->addItem(tr("ProRes master (Application ProRes, RDD 45)"), 45);
+    if (prores::encoderAvailable()) {
+        application->addItem(tr("Broadcast master (Application DPP (ProRes), RDD 59-1)"), 59);
+        application->setItemData(application->count() - 1,
+                                 tr("ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG, as UK and "
+                                    "North American broadcasters' IMF delivery specifications ask"),
+                                 Qt::ToolTipRole);
+    }
     form->addRow(tr("Master:"), application);
     // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
     auto* proresProfile = new QComboBox(&dlg);
@@ -8339,6 +8355,20 @@ void MainWindow::exportImfDialog() {
     proresProfile->addItem(tr("4444 XQ (4:4:4 RGB)"), "4444xq");
     proresProfile->setToolTip(tr("4:2:2 goes to 3840 x 2160 and 60 fps, in Rec.709, Rec.2020 PQ or HLG; 4:4:4 to 4096 x 3112 in any of the colours"));
     form->addRow(tr("ProRes:"), proresProfile);
+    // Application ProRes: fields, 4:4:4's components and range.
+    auto* fields = new QComboBox(&dlg);
+    fields->setObjectName(QStringLiteral("imfFields"));
+    fields->addItem(tr("Progressive"), QString());
+    fields->addItem(tr("Interlaced, top field first"), "tff");
+    fields->addItem(tr("Interlaced, bottom field first"), "bff");
+    fields->setToolTip(tr("Each picture coded as two fields (4:2:2, to 1920 x 1080 at 25, 29.97 or 30 fps, Rec.709), as 1080i deliveries ask"));
+    form->addRow(tr("Fields:"), fields);
+    auto* ycbcr444 = new QCheckBox(tr("4:4:4 as Y'CbCr (to 1920 x 1080, Rec.709), not RGB"), &dlg);
+    ycbcr444->setObjectName(QStringLiteral("imfYcbcr444"));
+    form->addRow(QString(), ycbcr444);
+    auto* fullRange = new QCheckBox(tr("Full range (QE.2: 0 to 1023, 4:4:4 RGB)"), &dlg);
+    fullRange->setObjectName(QStringLiteral("imfFullRange"));
+    form->addRow(QString(), fullRange);
     auto* graded = new QComboBox(&dlg);
     graded->setObjectName(QStringLiteral("imfGraded"));
     graded->addItem(tr("Graded"), true);
@@ -8480,21 +8510,69 @@ void MainWindow::exportImfDialog() {
     original->setToolTip(tr("The sequence the earlier package was mastered from, kept as it was: its cut is compared with this one "
                             "to find the pictures that changed"));
     form->addRow(tr("Mastered from:"), original);
+    // (the ProRes choices made before Application DPP was chosen, given back when another master is)
+    struct BeforeDpp {
+        bool kept = false;
+        int profile = 0, fields = 0;
+        bool ycbcr444 = false, fullRange = false;
+    };
+    auto beforeDpp = std::make_shared<BeforeDpp>();
     auto syncSupplemental = [=] {
         for (QWidget* w : {static_cast<QWidget*>(earlier), static_cast<QWidget*>(browseEarlier), static_cast<QWidget*>(original)}) w->setEnabled(supplemental->isChecked());
         // (a supplemental keeps the earlier picture's size, colour, depth and coding; an archival master's pictures are
         // ACES, uncoded)
         const bool aces = application->currentData().toInt() == 5;
-        const bool proresApp = application->currentData().toInt() == 45;
+        const bool dpp = application->currentData().toInt() == 59;
+        const bool proresApp = application->currentData().toInt() == 45 || dpp;
         size->setEnabled(!supplemental->isChecked());
         colour->setEnabled(!supplemental->isChecked() && !aces);
         for (QWidget* w : {static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)}) w->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
-        proresProfile->setEnabled(!supplemental->isChecked() && proresApp);
+        // (Application DPP: 422 HQ here, progressive, narrow range; its 4:4:4 is 12 bits, which no encoder here makes)
+        // Application DPP takes HD or UHD and no P3-D65 PQ: the others greyed out while it is chosen.
+        auto offer = [](QComboBox* box, const char* value, bool on) {
+            if (auto* m = qobject_cast<QStandardItemModel*>(box->model()))
+                if (QStandardItem* i = m->item(box->findData(QString::fromLatin1(value)))) i->setEnabled(on);
+        };
+        for (const char* v : {"sequence", "4k"}) offer(size, v, !dpp);
+        offer(colour, "p3d65-pq", !dpp);
+        if (dpp && !beforeDpp->kept) *beforeDpp = {true, proresProfile->currentIndex(), fields->currentIndex(), ycbcr444->isChecked(), fullRange->isChecked()};
+        if (!dpp && beforeDpp->kept) {
+            const BeforeDpp was = *beforeDpp;
+            beforeDpp->kept = false;
+            proresProfile->setCurrentIndex(was.profile);
+            fields->setCurrentIndex(was.fields);
+            ycbcr444->setChecked(was.ycbcr444);
+            fullRange->setChecked(was.fullRange);
+        }
+        if (dpp) {
+            if (colour->currentData().toString() == "p3d65-pq") colour->setCurrentIndex(colour->findData("rec2020-pq"));
+            proresProfile->setCurrentIndex(proresProfile->findData("hq"));
+            fields->setCurrentIndex(0);
+            ycbcr444->setChecked(false);
+            fullRange->setChecked(false);
+            if (size->currentData().toString() != "hd" && size->currentData().toString() != "uhd")
+                size->setCurrentIndex(size->findData(s->width > 1920 || s->height > 1080 ? "uhd" : "hd"));
+        }
+        proresProfile->setEnabled(!supplemental->isChecked() && proresApp && !dpp);
+        const bool fourFourFour = prores::fourFourFour(prores::profileOf(proresProfile->currentData().toString().toStdString()));
+        fields->setEnabled(!supplemental->isChecked() && proresApp && !dpp && !fourFourFour);
+        ycbcr444->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour);
+        fullRange->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour && !ycbcr444->isChecked());
+        // The kinds the master takes, the one chosen kept where it is one of them.
+        const QString was = kind->currentData().toString();
+        const bool showingDpp = kind->findData("programme") >= 0;
+        if (dpp != showingDpp) {
+            kind->clear();
+            for (const auto& [label, value] : dpp ? dppKinds : kinds) kind->addItem(label, value);
+            kind->setCurrentIndex(std::max(0, kind->findData(was)));
+        }
         graded->setEnabled(aces);
         target->setEnabled(aces);
     };
     connect(supplemental, &QCheckBox::toggled, &dlg, syncSupplemental);
     connect(application, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
+    connect(proresProfile, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
+    connect(ycbcr444, &QCheckBox::toggled, &dlg, syncSupplemental);
     syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
@@ -8535,14 +8613,19 @@ void MainWindow::exportImfDialog() {
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
     st.application = application->currentData().toInt();
-    if (st.application == 45) st.prores = proresProfile->currentData().toString().toStdString();
+    if (st.application == 45 || st.application == 59) {
+        st.prores = proresProfile->currentData().toString().toStdString();
+        if (fields->isEnabled()) st.fields = fields->currentData().toString().toStdString();
+        st.ycbcr444 = ycbcr444->isEnabled() && ycbcr444->isChecked();
+        st.fullRange = fullRange->isEnabled() && fullRange->isChecked();
+    }
     if (st.application == 5) {
         st.graded = graded->currentData().toBool();
         if (target->isChecked()) st.targetFrames = {state_->playhead()};
     }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
-    st.bits = st.application == 45 ? 10 : bits->currentData().toInt();
+    st.bits = st.application == 45 || st.application == 59 ? 10 : bits->currentData().toInt();
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();

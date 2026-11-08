@@ -8595,6 +8595,36 @@ private slots:
             QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
                                                 {"prores_profile", "proxy"}})
                         .value("isError").toBool());
+            // Interlaced, Y'CbCr 4:4:4 and full range, each checked.
+            for (const QJsonObject& extra : {QJsonObject{{"fields", "tff"}}, QJsonObject{{"prores_profile", "4444"}, {"ycbcr444", true}},
+                                             QJsonObject{{"prores_profile", "4444xq"}, {"full_range", true}}}) {
+                QJsonObject args{{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
+                                 {"title", extra.keys().join(" ")}};
+                for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+                r = call("montage_export_imf", args);
+                QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                const QJsonObject m = r.value("structuredContent").toObject();
+                QVERIFY2(m.value("problems").toArray().isEmpty() && m.value("fields").toString() == extra.value("fields").toString("progressive") &&
+                             m.value("ycbcr444").toBool() == extra.value("ycbcr444").toBool() && m.value("full_range").toBool() == extra.value("full_range").toBool(),
+                         QJsonDocument(m).toJson().constData());
+            }
+            QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
+                                                {"prores_profile", "4444"}, {"fields", "bff"}})
+                        .value("isError").toBool());
+            // Application DPP: 422 HQ in HD, a programme unless asked; its 4:4:4 (12 bits) refused.
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"title", "DPP"},
+                                            {"application", "dpp_prores"}, {"size", "hd"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject dpp = r.value("structuredContent").toObject();
+            QVERIFY2(dpp.value("problems").toArray().isEmpty() && dpp.value("application").toString() == "dpp_prores" &&
+                         dpp.value("prores_profile").toString() == "hq" && dpp.value("width").toInt() == 1920,
+                     QJsonDocument(dpp).toJson().constData());
+            ImfComposition dc;
+            std::string why;
+            QVERIFY(readImfComposition(dpp.value("cpl").toString().toStdString(), dc, &why) && dc.application == 59 && dc.contentKind == "programme");
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"application", "dpp_prores"},
+                                            {"size", "hd"}, {"prores_profile", "4444"}});
+            QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("12 bits"));
         }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});
@@ -8654,6 +8684,39 @@ private slots:
                 offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
                           !dlg->findChild<QComboBox*>("imfColour")->isEnabled();
                 application->setCurrentIndex(application->findData(2));
+            }
+            // Application ProRes: fields for 4:2:2, Y'CbCr and full range for 4:4:4. Application DPP: 422 HQ, progressive, HD
+            // or UHD, its own content kinds, the ProRes choices fixed.
+            if (offered && prores::encoderAvailable()) {
+                auto* profile = dlg->findChild<QComboBox*>("imfProResProfile");
+                auto* fieldsBox = dlg->findChild<QComboBox*>("imfFields");
+                auto* ycbcr = dlg->findChild<QCheckBox*>("imfYcbcr444");
+                auto* full = dlg->findChild<QCheckBox*>("imfFullRange");
+                auto* kindBox = dlg->findChild<QComboBox*>("imfKind");
+                auto* sizeBox = dlg->findChild<QComboBox*>("imfSize");
+                application->setCurrentIndex(application->findData(45));
+                profile->setCurrentIndex(profile->findData("hq"));
+                offered = fieldsBox->isEnabled() && !ycbcr->isEnabled() && !full->isEnabled();
+                profile->setCurrentIndex(profile->findData("4444"));
+                offered = offered && !fieldsBox->isEnabled() && ycbcr->isEnabled() && full->isEnabled();
+                ycbcr->setChecked(true);
+                offered = offered && !full->isEnabled();
+                application->setCurrentIndex(application->findData(59));
+                offered = offered && profile->currentData().toString() == "hq" && !profile->isEnabled() && !fieldsBox->isEnabled() &&
+                          !ycbcr->isChecked() && kindBox->findData("programme") >= 0 && kindBox->findData("feature") < 0 &&
+                          (sizeBox->currentData().toString() == "hd" || sizeBox->currentData().toString() == "uhd");
+                // (4K and P3-D65 PQ not offered; the ProRes choices given back on leaving)
+                auto* colourBox = dlg->findChild<QComboBox*>("imfColour");
+                auto enabled = [](QComboBox* box, const char* value) {
+                    auto* m = qobject_cast<QStandardItemModel*>(box->model());
+                    return m && m->item(box->findData(QString::fromLatin1(value)))->isEnabled();
+                };
+                offered = offered && !enabled(sizeBox, "4k") && enabled(sizeBox, "uhd") && !enabled(colourBox, "p3d65-pq") && enabled(colourBox, "rec2020-hlg");
+                application->setCurrentIndex(application->findData(45));
+                offered = offered && profile->currentData().toString() == "4444" && ycbcr->isChecked() && enabled(sizeBox, "4k");
+                ycbcr->setChecked(false);
+                application->setCurrentIndex(application->findData(2));
+                offered = offered && kindBox->findData("feature") >= 0;
             }
             if (supplemental) supplemental->setChecked(true);
             offered = offered && earlier->isEnabled() && !dlg->findChild<QComboBox*>("imfSize")->isEnabled();
