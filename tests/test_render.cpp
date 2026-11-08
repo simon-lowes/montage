@@ -10328,8 +10328,15 @@ colorspaces:
         // descriptor read at 12 bits. Put in a package in place of its own picture, Montage's check names alpha.
         {
             const std::string video = firstFileIn(full.folder, "VIDEO_*.mxf");
-            dcp::ImfTrackReader was;
-            QVERIFY(was.open(video, &err));
+            // (read, then closed: on Windows a file held open cannot be replaced, as the package's picture is below)
+            dcp::Uuid wasAsset{};
+            dcp::EditRate wasRate{};
+            int64_t wasFrames = 0;
+            {
+                dcp::ImfTrackReader was;
+                QVERIFY(was.open(video, &err));
+                wasAsset = was.asset(), wasRate = was.rate(), wasFrames = was.frames();
+            }
             prores::Coding coding;
             coding.alpha = true;
             prores::Encoder enc;
@@ -10347,11 +10354,11 @@ colorspaces:
                 pf.colour.codingEquations = "060e2b34040101010401010102020000";
                 const std::string path = dir.filePath(QStringLiteral("made%1.mxf").arg(bits)).toStdString();
                 dcp::ImfProResWriter wr;
-                QVERIFY2(wr.open(path, was.asset(), was.rate(), pf, &err), err.c_str());
+                QVERIFY2(wr.open(path, wasAsset, wasRate, pf, &err), err.c_str());
                 std::vector<uint8_t> frame;
                 prores::Encoder opaque;
                 QVERIFY(opaque.open(320, 180, 5, "rec709", &err));
-                for (int64_t i = 0; i < was.frames(); ++i) {
+                for (int64_t i = 0; i < wasFrames; ++i) {
                     QVERIFY2(bits == 16 ? enc.encode(rgb.data(), alpha.data(), frame, &err) : opaque.encode(rgb.data(), frame, &err), err.c_str());
                     QVERIFY2(wr.write(frame.data(), frame.size(), &err), err.c_str());
                 }
@@ -10372,7 +10379,7 @@ colorspaces:
                                  return prores::decode(pkt->data, size_t(pkt->size), false, back, &a, w, h, &err) && a.size() == alpha.size() &&
                                         std::abs(int(a[319]) - 65535) <= 64 && a[0] == 0;
                              }),
-                             was.frames());
+                             wasFrames);
                 } else {
                     std::vector<uint16_t> codes;
                     int w = 0, h = 0, depth = 0;
