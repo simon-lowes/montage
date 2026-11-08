@@ -17930,11 +17930,6 @@ colorspaces:
         QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("UDP"));
         bad.relayOnly = false;
         QVERIFY(checkStreamSettings(bad).empty());
-        // (a TURN server among the ICE servers will do for relay only too)
-        bad = rig.settings;
-        bad.turnServer.clear(), bad.turnUser.clear(), bad.turnPassword.clear();
-        bad.iceServers = {"turn:reviewer:relay-password-1@127.0.0.1:3478"};
-        QVERIFY2(checkStreamSettings(bad).empty(), checkStreamSettings(bad).c_str());
 #endif
     }
 

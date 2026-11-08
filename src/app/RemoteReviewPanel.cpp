@@ -342,7 +342,7 @@ QString RemoteReviewController::status() const {
                     const int w = std::max(2, (m.width >> i) & ~1), h = std::max(2, (m.height >> i) & ~1);
                     sizes << tr("%1 at %2 × %3").arg(st.rungViewers[i]).arg(w).arg(h);
                 }
-            text += tr(" (%1)").arg(sizes.join(tr(", ")));
+            if (!sizes.isEmpty()) text += tr(" (%1)").arg(sizes.join(tr(", ")));
         }
         if (st.hdrViewers > 0) text += tr(", %n in HDR", "", st.hdrViewers);
         if (st.skipped > 0) text += tr(", %n frame(s) skipped (encoding fell behind)", "", int(std::min<int64_t>(st.skipped, 1 << 30)));
@@ -431,7 +431,11 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
         }
         if (has("turn")) {
             const QJsonObject t = args.value("turn").toObject();
-            if (t.contains("url")) c.turnServer = t.value("url").toString().trimmed().toStdString();
+            if (t.contains("url")) {
+                const std::string url = t.value("url").toString().trimmed().toStdString();
+                if (url != c.turnServer) c.turnUser.clear(), c.turnPassword.clear();  // (one relay's login never goes to another)
+                c.turnServer = url;
+            }
             if (t.contains("username")) c.turnUser = t.value("username").toString().toStdString();
             if (t.contains("password")) c.turnPassword = t.value("password").toString().toStdString();
             if (t.contains("relay_only")) c.relayOnly = t.value("relay_only").toBool();

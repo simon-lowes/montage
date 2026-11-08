@@ -145,8 +145,7 @@ std::string checkStreamSettings(const StreamSettings& s) {
             if (s.turnServer.find('@') != std::string::npos) return "The TURN relay's user name and password go in their own fields";
             if (s.turnUser.empty() || s.turnPassword.empty()) return "A TURN relay needs its user name and password";
         }
-        const bool turnInIce = std::any_of(s.iceServers.begin(), s.iceServers.end(), [](const std::string& i) { return i.rfind("turn:", 0) == 0; });
-        if (s.relayOnly && s.turnServer.empty() && !turnInIce) return "Only through a relay needs a TURN relay";
+        if (s.relayOnly && s.turnServer.empty()) return "Only through a relay needs a TURN relay";
         if (s.relayOnly && !s.turnServer.empty() &&
             (s.turnServer.rfind("turns:", 0) == 0 || QString::fromStdString(s.turnServer).toLower().contains(QLatin1String("transport=tcp"))))
             return "Only through a relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)";

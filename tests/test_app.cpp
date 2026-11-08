@@ -21066,7 +21066,10 @@ print("added " + ui["name"])
         QVERIFY(st.value("turn").toObject().value("relay_only").toBool());
         QVERIFY(!QJsonDocument(r).toJson().contains("another-secret"));  // (never the relay's password)
         call({{"action", "stop"}});
-        // Refused: more sizes than three, and only through a relay with none.
+        // Refused: another relay without its own login (the last one's is not sent to it), more sizes than three, and
+        // only through a relay with none.
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"url", "turn:other.example.com:3478"}}}});
+        QVERIFY(r.value("isError").toBool());
         r = call({{"action", "start"}, {"simulcast", 5}});
         QVERIFY(r.value("isError").toBool());
         r = call({{"action", "start"}, {"simulcast", 2}, {"turn", QJsonObject{{"url", ""}, {"relay_only", true}}}});

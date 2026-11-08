@@ -1070,7 +1070,9 @@ struct BrowserReviewBackend::Impl {
             conf.enableIceUdpMux = true;
             conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
         }
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4)
+        // (bound to the review's own address, unless that is this computer's loopback and a relay elsewhere must be
+        // reached)
+        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4 && (!relayInUse || !host.isLoopback()))
             conf.bindAddress = host.toString().toStdString();
         v->pc = std::make_shared<rtc::PeerConnection>(conf);
         // Only codecs this FFmpeg can encode are offered back: a browser picked one it cannot would see no picture.
