@@ -57,10 +57,10 @@ struct SurroundGains {
 };
 SurroundGains surroundGains(const std::string& layout, const SurroundPan& p);
 
-// ITU-R BS.775 fold-down to stereo: the centre and the surrounds at -3 dB
-// into their side, the LFE left out (an ambisonic mix is heard through two
-// virtual cardioids, from its first order). `in` has the layout's channels; `out` is stereo. In
-// place is not allowed.
-void downmixToStereo(const std::string& layout, const float* in, int frames, float* out);
+// ITU-R BS.775 fold-down to stereo: the centre and the surrounds at -3 dB (or the levels given, in dB, -99 leaving
+// them out) into their side, the LFE left out (an ambisonic mix is heard through two virtual cardioids, from its
+// first order). `in` has the layout's channels; `out` is stereo. In place is not allowed.
+void downmixToStereo(const std::string& layout, const float* in, int frames, float* out, double centreDb = -3,
+                     double surroundDb = -3);
 
 }  // namespace montage

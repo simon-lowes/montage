@@ -61,6 +61,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "render/DialogueLoudness.h"
+#include "render/Ac3.h"
 #include "render/LoudnessReport.h"
 #include "media/SuperScale.h"
 #include "media/ThreadScheduling.h"
@@ -239,6 +240,8 @@ struct Output {
     // Spatial video: the video "encoder" gives raw pictures (the eyes side by side), which this codes as MV-HEVC.
     std::unique_ptr<SpatialVideoEncoder> spatial;
     std::string spatialError;  // (what x265 said, when it failed)
+    // E-AC-3 above 5.1: the audio "encoder" is a description, the sound coded by two encoders as two substreams.
+    std::map<AVCodecContext*, std::unique_ptr<Eac3Extended>> extended;
     bool headerWritten = false;
     ~Output() {
         sws_freeContext(sws);
@@ -280,9 +283,21 @@ int writeSpatial(Output& o, std::vector<SpatialVideoEncoder::Packet>& coded) {
 // Why writing video failed: x265's own words for spatial video.
 std::string videoError(const Output& o, int rc) { return o.spatialError.empty() ? averr(rc) : o.spatialError; }
 
+Eac3Extended* extendedFor(Output& o, AVCodecContext* ctx) {
+    auto it = o.extended.find(ctx);
+    return it == o.extended.end() ? nullptr : it->second.get();
+}
+
+// avcodec_send_frame, or to the E-AC-3 substreams' encoders when `ctx` describes them.
+int sendFrame(Output& o, AVCodecContext* ctx, const AVFrame* f) {
+    if (Eac3Extended* x = extendedFor(o, ctx)) return x->send(f);
+    return avcodec_send_frame(ctx, f);
+}
+
 int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
+    Eac3Extended* extended = extendedFor(o, ctx);
     for (;;) {
-        int rc = avcodec_receive_packet(ctx, o.pkt);
+        int rc = extended ? extended->receive(o.pkt) : avcodec_receive_packet(ctx, o.pkt);
         if (rc == AVERROR_EOF && o.spatial && st == o.vst) {
             std::vector<SpatialVideoEncoder::Packet> coded;
             return o.spatial->flush(coded, &o.spatialError) ? writeSpatial(o, coded) : AVERROR_EXTERNAL;
@@ -387,6 +402,19 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
             v.push_back(dnx);
         }
         v.push_back(preset("VP9 (WebM)", "webm", "Open web format, Opus audio", "libvpx-vp9", "libopus", 32, "good"));
+        {
+            // Broadcast and streaming sound: AC-3 to 5.1, E-AC-3 to 7.1, each stating its dialogue level (the mix as
+            // measured) and the sequence's downmix levels.
+            ExportPreset ts = preset("H.264 + AC-3 (MPEG-TS)", "ts",
+                                     "Transport stream for broadcast: H.264 with AC-3 sound to 5.1, its dialogue level measured",
+                                     "libx264", "ac3", 18, "medium");
+            ts.settings.audioBitrate = 192000;  // a pair of channels' (5.1: 576 kb/s)
+            v.push_back(ts);
+            ExportPreset ec3 = preset("H.264 + E-AC-3 (MP4)", "mp4", "H.264 with E-AC-3 sound to 7.1, its dialogue level measured",
+                                      "libx264", "eac3", 18, "slow");
+            ec3.settings.audioBitrate = 192000;  // (7.1: 768 kb/s)
+            v.push_back(ec3);
+        }
         v.push_back(preset("AV1 (SVT-AV1)", "mp4", "Next-generation efficiency", "libsvtav1", "aac", 32, "8"));
         {
             // Short-form social video: the platforms' -14 LUFS loudness, kept under -1 dBTP.
@@ -1307,6 +1335,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
 
     int audioFrameSize = 1024;
+    // AC-3 and E-AC-3: the downmix levels and production information the sequence states (the dialogue level is
+    // set once the mix is measured).
+    const bool ac3Family = s.audioCodec == "ac3" || s.audioCodec == "eac3";
+    Ac3Metadata ac3Meta;
+    ac3Meta.centreMixDb = seq.downmixCentreDb;
+    ac3Meta.surroundMixDb = seq.downmixSurroundDb;
+    ac3Meta.preferredDownmix = seq.preferredDownmix;
+    ac3Meta.mixingLevel = seq.mixingLevel;
+    ac3Meta.roomType = seq.roomType;
     // An audio encoder and its stream, in the sequence's layout (or stereo); "" or why not.
     auto openAudio = [&](AVCodecContext*& actx, AVStream*& ast, bool mono = false) -> std::string {
         const AVCodec* codec = avcodec_find_encoder_by_name(s.audioCodec.c_str());
@@ -1332,6 +1369,21 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             return "This FFmpeg cannot describe the " + seq.audioLayout + " channel layout";
         }
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
+        if (s.audioCodec == "eac3" && layout.nb_channels > 6) {
+            // 7.1 as two substreams (render/Ac3.h); `actx` describes the stream for the muxer.
+            auto x = std::make_unique<Eac3Extended>();
+            std::string why;
+            const int64_t rate = std::clamp<int64_t>(int64_t(s.audioBitrate) * layout.nb_channels / 2, 256000, 2048000);
+            if (!x->open(sr, rate, ac3Meta, &why)) return why;
+            avcodec_free_context(&actx);
+            actx = x->describe();
+            if (!actx) return "Out of memory";
+            o.extended[actx] = std::move(x);
+            avcodec_parameters_from_context(ast->codecpar, actx);
+            ast->time_base = actx->time_base;
+            audioFrameSize = actx->frame_size;
+            return {};
+        }
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
         if (s.audioCodec == "libopus" && sr != 48000) actx->sample_rate = 48000;
@@ -1357,6 +1409,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         const bool field = !mono && !s.downmixStereo && ambisonicLayout(seq.audioLayout);
         if (s.audioCodec == "aac" || s.audioCodec == "libopus")
             actx->bit_rate = s.audioBitrate * (field ? layoutChannels(seq.audioLayout) / 2 : 1);  // per pair of channels
+        else if (ac3Family)  // (per pair of channels too, to the most a frame holds: 640 kb/s for AC-3)
+            actx->bit_rate = std::clamp<int64_t>(int64_t(s.audioBitrate) * std::max(2, layout.nb_channels) / 2, 96000,
+                                                 s.audioCodec == "ac3" ? 640000 : 1024000);
         actx->time_base = AVRational{1, actx->sample_rate};
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
@@ -1366,6 +1421,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             av_dict_set(&opts, "aac_ms", "0", 0);
             av_dict_set(&opts, "aac_is", "0", 0);
             av_dict_set(&opts, "aac_pns", "0", 0);
+        }
+        if (ac3Family) {
+            const bool centre = av_channel_layout_index_from_channel(&layout, AV_CHAN_FRONT_CENTER) >= 0 && layout.nb_channels > 2;
+            bool surround = false;
+            for (AVChannel ch : {AV_CHAN_SIDE_LEFT, AV_CHAN_BACK_LEFT, AV_CHAN_BACK_CENTER})
+                surround |= av_channel_layout_index_from_channel(&layout, ch) >= 0;
+            ac3EncoderOptions(ac3Meta, s.audioCodec == "eac3", centre, surround, &opts);
         }
         rc = avcodec_open2(actx, codec, &opts);
         av_dict_free(&opts);
@@ -1755,6 +1817,56 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
 
+    // AC-3 and E-AC-3 state the programme's loudness (dialnorm): the target it was normalised to, or the mix measured.
+    if (wantAudio && ac3Family) {
+        const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
+        std::vector<float> chunk(size_t(8192) * size_t(nch));
+        auto measure = [&](const std::function<void(int64_t, int, float*)>& mixAt, int64_t from) -> std::optional<int> {
+            LoudnessMeter meter(mixRate);
+            for (int64_t pos = from; pos < end;) {
+                if (cancel && cancel->load()) return std::nullopt;
+                const int n = int(std::min<int64_t>(8192, end - pos));
+                mixAt(pos, n, chunk.data());
+                meter.addChannels(chunk.data(), n, nch, weights.data());
+                pos += n;
+            }
+            const LoudnessResult r = meter.result();
+            return ac3Dialnorm(r.valid ? r.integrated : -31.0);
+        };
+        auto setDialnorm = [&](AVCodecContext* ctx, int dialnorm) {
+            if (Eac3Extended* x = extendedFor(o, ctx)) x->setDialnorm(dialnorm);
+            else if (ctx) ac3SetDialnorm(ctx, dialnorm);
+        };
+        if (o.actx) {
+            std::optional<int> d;
+            if (s.loudnessTarget < 0) {
+                d = ac3Dialnorm(s.loudnessTarget);
+            } else {
+                AudioMixer meterMixer;
+                meterMixer.setTrackMask(s.audioTracks);
+                d = measure([&](int64_t pos, int n, float* dst) { mixBlock(meterMixer, pos, n, dst); }, audioCursor);
+            }
+            if (!d) return fail("Cancelled");
+            setDialnorm(o.actx, *d);
+        }
+        for (auto& e : extras) {
+            if (!e->ctx) continue;
+            std::optional<int> d;
+            if (s.loudnessTarget < 0 && e->normalise) {
+                d = ac3Dialnorm(s.loudnessTarget);
+            } else {
+                AudioMixer m;
+                m.setTrackMask(e->tracks);
+                d = measure([&](int64_t pos, int n, float* dst) {
+                    if (nch > 2) m.mixLayout(p, e->seq, pos, n, dst);
+                    else m.mix(p, e->seq, pos, n, dst);
+                }, e->cursor);
+            }
+            if (!d) return fail("Cancelled");
+            setDialnorm(e->ctx, *d);
+        }
+    }
+
     auto encodeFifo = [&](AVCodecContext* actx, AVStream* ast, AVFrame* aframe, std::vector<float>& fifo, int64_t& audioPts,
                           bool final) -> bool {
         const size_t nc = size_t(actx->ch_layout.nb_channels);
@@ -1799,7 +1911,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             aframe->pts = audioPts;
             audioPts += n;
             fifo.erase(fifo.begin(), fifo.begin() + long(size_t(n) * nc));
-            if (avcodec_send_frame(actx, aframe) < 0) return false;
+            if (sendFrame(o, actx, aframe) < 0) return false;
             if (drain(o, actx, ast) < 0) return false;
         }
         return true;
@@ -2347,8 +2459,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (wantAudio) {
         if (o.actx) {
             if (!encodeAudio(true)) return fail("Audio encoding failed");
-            if ((rc = avcodec_send_frame(o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0)
-                return fail("Finishing audio failed: " + averr(rc));
+            if ((rc = sendFrame(o, o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0) {
+                const Eac3Extended* x = extendedFor(o, o.actx);
+                return fail("Finishing audio failed: " + (x && !x->error.empty() ? x->error : averr(rc)));
+            }
         }
         for (auto& mo : monos) {
             if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, true)) return fail("Audio encoding failed");
@@ -2358,7 +2472,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         for (auto& e : extras) {
             if (!e->ctx) continue;
             if (!encodeFifo(e->ctx, e->st, e->frame, e->fifo, e->pts, true)) return fail("Audio encoding failed");
-            if ((rc = avcodec_send_frame(e->ctx, nullptr)) < 0 || (rc = drain(o, e->ctx, e->st)) < 0)
+            if ((rc = sendFrame(o, e->ctx, nullptr)) < 0 || (rc = drain(o, e->ctx, e->st)) < 0)
                 return fail("Finishing audio failed: " + averr(rc));
         }
     }
@@ -2507,6 +2621,7 @@ std::string exportAudioLayout(const std::string& layout, const std::string& code
     }
     if (exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
+    if (codec == "eac3" && (layout == "7.1" || ear == "7.1")) return "7.1";  // (in two substreams, render/Ac3.h)
     if (ear != layout && exportCodecCarries(codec, ear)) return ear;
     if (layoutChannels(layout) > 6 && exportCodecCarries(codec, "5.1")) return "5.1";
     return "stereo";

@@ -1038,6 +1038,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (s.vr180) o["vr180"] = true;
     if (s.stereo3d) o["stereo3d"] = true;
     if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
+    if (s.downmixCentreDb != -3) o["downmixCentreDb"] = s.downmixCentreDb;
+    if (s.downmixSurroundDb != -3) o["downmixSurroundDb"] = s.downmixSurroundDb;
+    if (!s.preferredDownmix.empty()) o["preferredDownmix"] = qs(s.preferredDownmix);
+    if (s.mixingLevel) o["mixingLevel"] = s.mixingLevel;
+    if (!s.roomType.empty()) o["roomType"] = qs(s.roomType);
     if (!s.filmGauge.empty()) o["filmGauge"] = qs(s.filmGauge);
     return o;
 }
@@ -1121,6 +1126,14 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.stereo3d = o.value("stereo3d").toBool(false);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
     if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) == audioLayouts().end()) s.audioLayout = "stereo";
+    s.downmixCentreDb = std::clamp(o.value("downmixCentreDb").toDouble(-3), -99.0, 3.0);
+    s.downmixSurroundDb = std::clamp(o.value("downmixSurroundDb").toDouble(-3), -99.0, 0.0);
+    s.preferredDownmix = ss(o.value("preferredDownmix"));
+    if (s.preferredDownmix != "loro" && s.preferredDownmix != "ltrt") s.preferredDownmix.clear();
+    s.mixingLevel = o.value("mixingLevel").toInt(0);
+    if (s.mixingLevel < 80 || s.mixingLevel > 111) s.mixingLevel = 0;
+    s.roomType = ss(o.value("roomType"));
+    if (s.roomType != "large" && s.roomType != "small") s.roomType.clear();
     s.filmGauge = ss(o.value("filmGauge"));
     if (!s.filmGauge.empty()) s.filmGauge = filmGauge(s.filmGauge).id;
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));

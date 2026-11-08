@@ -749,6 +749,15 @@ struct Sequence {
     Rational fps{30, 1};
     int sampleRate = 48000;
     std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1" (core/Surround.h)
+    // The stereo fold-down of a surround mix: the centre's and the surrounds' levels into their side (dB; -99 = left
+    // out), as the sequence is heard in stereo and as AC-3 and E-AC-3 exports tell decoders to fold it.
+    double downmixCentreDb = -3, downmixSurroundDb = -3;
+    // What AC-3 and E-AC-3 exports state about the production: the stereo downmix a decoder should prefer ("",
+    // "loro" or "ltrt"), the mixing room's peak level (dB SPL, 80 to 111; 0 = not stated) and its type ("", "large"
+    // or "small"; stated with a mixing level).
+    std::string preferredDownmix;
+    int mixingLevel = 0;
+    std::string roomType;
     std::string filmGauge;  // "" (none: timecode), or a gauge cut on film is counted in (core/FilmCount.h)
     std::vector<Track> videoTracks;   // [0] = V1 (bottom-most)
     std::vector<Track> audioTracks;   // [0] = A1

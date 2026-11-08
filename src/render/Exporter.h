@@ -43,7 +43,7 @@ struct ExportSettings {
     // path gets a frame number, name_000000.png, unless it already has a printf pattern).
     std::string videoCodec = "libx264";  // also exr (half float, scene-linear) and dpx (10-bit) image sequences
     int startNumber = 0;                 // an image sequence's first frame number
-    std::string audioCodec = "aac";      // aac, pcm_s16le, pcm_s24le, libopus, flac, none
+    std::string audioCodec = "aac";      // aac, pcm_s16le, pcm_s24le, libopus, flac, ac3 (to 5.1), eac3 (to 7.1), none
     int width = 0;                       // 0 = sequence size (a GIF: at most 480 wide)
     int height = 0;                      // 0 = in proportion to the width
     double fps = 0;                      // GIF frame rate; 0 = 15 (or the sequence's, if lower)

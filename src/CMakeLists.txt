@@ -287,6 +287,7 @@ add_library(montage_engine STATIC
   render/RenderFarm.h render/RenderFarm.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
   render/StreamingPackage.h render/StreamingPackage.cpp
+  render/Ac3.h render/Ac3.cpp
   render/Scte35.h render/Scte35.cpp
   render/GradeGraph.h render/GradeGraph.cpp
   render/CompositeRender.h render/CompositeRender.cpp

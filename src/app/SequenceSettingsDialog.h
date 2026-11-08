@@ -34,6 +34,11 @@ struct NewSequenceSpec {
     std::string filmGauge;               // cut on film: the gauge it is counted in (Sequence::filmGauge)
     std::string workingSpace;            // graded scene-referred in this space (Sequence::workingSpace); "" = as delivered
     std::string outputTransform;         // (Sequence::outputTransform)
+    // The stereo fold-down's levels and what AC-3 and E-AC-3 exports state about the production (Sequence's).
+    double downmixCentreDb = -3, downmixSurroundDb = -3;
+    std::string preferredDownmix;
+    int mixingLevel = 0;
+    std::string roomType;
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -81,6 +86,11 @@ private:
     QComboBox* workingSpace_ = nullptr;
     QComboBox* outputTransform_ = nullptr;
     QComboBox* audioLayout_ = nullptr;
+    QComboBox* downmixCentre_ = nullptr;
+    QComboBox* downmixSurround_ = nullptr;
+    QComboBox* preferredDownmix_ = nullptr;
+    QSpinBox* mixingLevel_ = nullptr;
+    QComboBox* roomType_ = nullptr;
     QComboBox* filmGauge_ = nullptr;
     QCheckBox* spherical_ = nullptr;
     QCheckBox* vr180_ = nullptr;

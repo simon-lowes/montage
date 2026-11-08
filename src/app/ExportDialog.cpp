@@ -95,6 +95,8 @@ QString audioCodecName(const ExportSettings& s) {
     const QString kbps = QString::number(s.audioBitrate / 1000);
     if (c == "aac") return QStringLiteral("AAC %1 kb/s").arg(kbps);
     if (c == "libopus") return QStringLiteral("Opus %1 kb/s").arg(kbps);
+    if (c == "ac3") return QStringLiteral("AC-3");
+    if (c == "eac3") return QStringLiteral("E-AC-3");
     if (c == "pcm_s16le") return QStringLiteral("PCM 16-bit");
     if (c == "pcm_s24le") return QStringLiteral("PCM 24-bit");
     if (c == "flac") return QStringLiteral("FLAC (lossless)");

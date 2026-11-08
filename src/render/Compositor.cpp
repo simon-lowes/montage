@@ -4120,7 +4120,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
             return;
         }
     }
-    downmixToStereo(seq.audioLayout, full.data(), frames, out);
+    downmixToStereo(seq.audioLayout, full.data(), frames, out, seq.downmixCentreDb, seq.downmixSurroundDb);
 }
 
 void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
