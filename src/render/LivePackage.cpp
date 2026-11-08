@@ -27,6 +27,15 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "core/Surround.h"
 #include "media/Loudness.h"
@@ -86,12 +95,18 @@ bool writeAtomically(const std::string& path, const void* data, size_t n) {
         if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
         if (f.write(static_cast<const char*>(data), qint64(n)) != qint64(n)) return false;
     }
-    // (rename replaces at once where it can; where it cannot (Windows), the old one goes first)
-#ifndef _WIN32
-    if (std::rename(tmp.c_str(), path.c_str()) == 0) return true;
+#ifdef _WIN32
+    // (replaced in one step; refused while another program has the old one open without sharing its deletion, as the
+    // origin's own reads and a virus scanner's do for a moment, so tried again for up to two seconds)
+    const std::wstring from = QString::fromStdString(tmp).toStdWString(), to = QString::fromStdString(path).toStdWString();
+    for (int i = 0; i < 400; ++i) {
+        if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
+        Sleep(5);
+    }
+    return false;
+#else
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
 #endif
-    QFile::remove(QString::fromStdString(path));
-    return QFile::rename(QString::fromStdString(tmp), QString::fromStdString(path));
 }
 bool writeAtomically(const std::string& path, const std::string& text) { return writeAtomically(path, text.data(), text.size()); }
 
