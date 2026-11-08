@@ -516,7 +516,8 @@ struct Core {
     Isolation grouping = Isolation::PerPlugin;
     std::atomic<Link*> next{nullptr};
     std::atomic<Link*> retired{nullptr};
-    std::atomic<int> state{0};  // 0 running, 1 bypassed, 2 a restart being made
+    // 0 running, 1 bypassed, 2 a restart being made, 3 failing (bypassed, its failure not yet handed to the supervisor)
+    std::atomic<int> state{0};
     std::atomic<int> failure{NoFailure};
     std::atomic<bool> failedOffline{false};
     std::atomic<bool> lastRenderOffline{false};  // (whether its last block was an export's: a host found ended between blocks)
@@ -717,8 +718,11 @@ void Supervisor::pass() {
                 core->attention = true;
             }
         }
+        // (the state before the failure: one seen bypassed has its failure to report already set, so the failure is
+        // recorded, against the host that failed, before a new host is started)
+        const int st = core->state.load(std::memory_order_acquire);
         if (core->attention.exchange(false)) reportFailure(*core, restartedNow.count(core->d.id) > 0);
-        if (core->state.load() != 1) continue;
+        if (st != 1) continue;
         const bool asked = core->restartAsked.exchange(false);
         if (pluginHeldBypassed(core->d.id) && !asked) continue;
         if (!asked && !restartedNow.count(core->d.id)) {
@@ -987,7 +991,7 @@ private:
     bool restartComing() const {
         const int st = core_->state.load();
         if (st == 2 || core_->next.load() != nullptr) return true;
-        if (st != 1) return false;
+        if (st != 1 && st != 3) return false;
         if (core_->restartAsked.load()) return true;
         return !pluginHeldBypassed(core_->d.id) && autoRestartsLeft(core_->d.id) > 0;
     }
@@ -1025,8 +1029,9 @@ private:
 
     // (`rendering`: in the middle of processing; a failure on a control call, from the UI thread, is no export's)
     void fail(Failure f, bool rendering = false) {
+        // (failing until all is set: the supervisor restarts it only once it can see what to report)
         int expected = 0;
-        if (!core_->state.compare_exchange_strong(expected, 1)) return;
+        if (!core_->state.compare_exchange_strong(expected, 3)) return;
         core_->failure = f;
         core_->failedOffline = rendering && !tRealtime;
         if (rendering && !tRealtime) {
@@ -1037,6 +1042,7 @@ private:
             noteOfflineFailure(core_->d.name.empty() ? core_->d.id : core_->d.name, how.empty() ? "stopped answering" : how);
         }
         core_->attention = true;
+        core_->state.store(1, std::memory_order_release);
     }
 
     void noteResult(Result r) {
@@ -1341,7 +1347,7 @@ bool restartPlugin(const std::string& id) {
     // (disabled from the failure bar: Restart is the user taking it back, so it is offered for new effects again)
     if (wasHeld) Registry::instance().setPluginDisabled(id, false);
     for (const auto& c : supervisor().live())
-        if (c->d.id == id && c->state.load() == 1) {
+        if (c->d.id == id && (c->state.load() == 1 || c->state.load() == 3)) {
             c->restartAsked = true;
             any = true;
         }
