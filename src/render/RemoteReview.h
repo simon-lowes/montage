@@ -115,7 +115,7 @@ struct ReviewStats {
     int viewers = 0;           // watching now
     int64_t encoded = 0;       // pictures sent since the viewer connected
     int64_t skipped = 0;       // ticks with no picture sent because encoding fell behind
-    double kbps = 0;           // the last few seconds' rate (to each viewer)
+    double kbps = 0;           // the last few seconds' rate to each viewer (a browser review: the most any one is sent)
     std::string encoder;       // "libx265", "hevc_nvenc" (a browser review: those in use, "libx264, libsvtav1")
     std::string error;         // the last connection's ("" none)
     int markersPort = -1;      // listening for markers on it (-1 none)

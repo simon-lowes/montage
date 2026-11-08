@@ -173,7 +173,8 @@ QString network(const QHostAddress& a) {
 
 QString lower(QString s) { return s.toLower(); }
 
-// "turn:host:3478" or "turns:host" as host, port and whether over TLS (false when it is not one).
+// "turn:host:3478" or "turns:host" as host, port and whether over TLS or TCP (`tls`: one Montage cannot reach; false
+// when it is not one).
 bool parseRelay(const std::string& url, std::string& host, uint16_t& port, bool& tls) {
     const size_t colon = url.find(':');
     if (colon == std::string::npos) return false;
@@ -181,8 +182,12 @@ bool parseRelay(const std::string& url, std::string& host, uint16_t& port, bool&
     if (scheme != "turn" && scheme != "turns") return false;
     tls = scheme == "turns";
     std::string rest = url.substr(colon + 1);
-    rest = rest.substr(0, rest.find('?'));
-    port = tls ? 5349 : 3478;
+    if (const size_t q = rest.find('?'); q != std::string::npos) {
+        // (RFC 7065's ?transport=: over TCP, like TLS, a relay only browsers reach; Montage's ICE takes UDP alone)
+        if (QString::fromStdString(rest.substr(q + 1)).toLower().contains(QLatin1String("transport=tcp"))) tls = true;
+        rest = rest.substr(0, q);
+    }
+    port = scheme == "turns" ? 5349 : 3478;
     if (!rest.empty() && rest[0] == '[') {
         const size_t end = rest.find(']');
         if (end == std::string::npos) return false;
@@ -485,7 +490,7 @@ public:
     FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc) : viewer_(std::move(viewer)), ssrc_(ssrc) {}
     void incoming(rtc::message_vector& messages, const rtc::message_callback&) override {
         for (const auto& message : messages) {
-            if (!message) continue;
+            if (!message || message->type != rtc::Message::Control) continue;  // (RTCP only)
             const auto* d = reinterpret_cast<const uint8_t*>(message->data());
             const size_t size = message->size();
             for (size_t at = 0; at + 8 <= size;) {
@@ -771,13 +776,18 @@ struct BrowserReviewBackend::Impl {
                         break;  // (children are listed oldest first)
                     }
             } else {
+                // (of the addresses with a connection that could go: one waiting to be answered)
                 std::map<QString, int> held;
+                std::set<QString> waiting;
                 for (QSslSocket* o : open)
-                    if (o != c) ++held[guesser(o->peerAddress())];
+                    if (o != c) {
+                        ++held[guesser(o->peerAddress())];
+                        if (!o->property("answered").toBool()) waiting.insert(guesser(o->peerAddress()));
+                    }
                 QString most;
                 int mostHeld = 0;
                 for (const auto& [who, n] : held)
-                    if (n > mostHeld && !trusted.count(who)) most = who, mostHeld = n;
+                    if (n > mostHeld && waiting.count(who) && !trusted.count(who)) most = who, mostHeld = n;
                 if (mostHeld > held[from] + 1)
                     for (QSslSocket* o : open)
                         if (o != c && !o->property("answered").toBool() && guesser(o->peerAddress()) == most) {
@@ -867,7 +877,9 @@ struct BrowserReviewBackend::Impl {
         // budget of their own, so that guessing from a few networks never shuts them out)
         const QString around = network(c->peerAddress());
         forget(guessingNetworks, [&](Clock::time_point t) { return now - t > kFailureMemory; });
-        const bool suspect = failures.count(peer) > 0 || guessingNetworks.count(around) > 0;
+        // (with the list of networks full, every network not in it counts as one that guessed: guessing from more
+        // networks than it holds never empties the newcomers' budget)
+        const bool suspect = failures.count(peer) > 0 || guessingNetworks.count(around) > 0 || guessingNetworks.size() >= 4096;
         // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
         auto blocked = failures.find(peer);
         if (blocked != failures.end() && blocked->second.count >= (known ? 100 : 10)) {
@@ -1058,7 +1070,7 @@ struct BrowserReviewBackend::Impl {
             conf.enableIceUdpMux = true;
             conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
         }
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4 && !relayInUse)
+        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4)
             conf.bindAddress = host.toString().toStdString();
         v->pc = std::make_shared<rtc::PeerConnection>(conf);
         // Only codecs this FFmpeg can encode are offered back: a browser picked one it cannot would see no picture.
@@ -1599,7 +1611,7 @@ struct BrowserReviewBackend::Impl {
                     v->video->sendFrame(c.data.data(), c.data.size(), rtc::FrameInfo(rtp));
                     v->lastPts = c.pts;
                     sentTo(*v, c.data.size(), now);
-                    total = std::max(total, c.data.size());
+                    total = std::max(total, c.data.size());  // (the rate is the most any one viewer is sent)
                 } catch (const std::exception&) {
                 }
             };
@@ -1614,6 +1626,9 @@ struct BrowserReviewBackend::Impl {
             if (moved) {
                 v->rung = want;
                 v->needKey = false;
+                // (reports and tries count from the switch, not from when it was asked for)
+                v->movedAt = now;
+                v->nextTry = std::max(v->nextTry, now + v->hold);
                 rungMessage(*v);
                 continue;
             }
@@ -1943,7 +1958,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
             d.iceServers.emplace_back(relayHost, relayPort, d.settings.turnUser, d.settings.turnPassword, rtc::IceServer::RelayType::TurnUdp);
             d.relayInUse = true;
         } else if (d.settings.relayOnly) {
-            return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns:)");
+            return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)");
         }
     }
     d.mode = mode;
