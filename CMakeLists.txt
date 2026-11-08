@@ -254,9 +254,10 @@ endif()
 
 if(MONTAGE_WITH_LUA)
   include(FetchContent)
-  # Lua's own release; its library sources (not the lua and luac programs) compiled here.
+  # Lua's own release; its library sources (not the lua and luac programs) compiled here. (Debian's copy of the same
+  # tarball, the same bytes, is tried when lua.org cannot be reached.)
   FetchContent_Declare(lua
-    URL https://www.lua.org/ftp/lua-5.4.7.tar.gz
+    URL https://www.lua.org/ftp/lua-5.4.7.tar.gz https://deb.debian.org/debian/pool/main/l/lua5.4/lua5.4_5.4.7.orig.tar.gz
     URL_HASH SHA256=9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
     SOURCE_SUBDIR no-cmake)
   FetchContent_MakeAvailable(lua)
