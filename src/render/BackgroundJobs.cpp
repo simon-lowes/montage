@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QSaveFile>
+#include <QThread>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QFileInfo>
@@ -127,10 +128,16 @@ bool save(Record r, const QString& folder) {
     const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     if (r.created.isEmpty()) r.created = now;
     r.updated = now;
-    QSaveFile f(dir + QStringLiteral("/job.json"));
-    if (!f.open(QIODevice::WriteOnly)) return false;
-    f.write(QJsonDocument(toJson(r)).toJson(QJsonDocument::Indented));
-    return f.commit();
+    const QByteArray text = QJsonDocument(toJson(r)).toJson(QJsonDocument::Indented);
+    // (tried again for up to two seconds: on Windows a record cannot be replaced while another reader has it open, as
+    // a job list or a second Montage reading the store does for a moment)
+    for (int attempt = 0; attempt < 400; ++attempt) {
+        QSaveFile f(dir + QStringLiteral("/job.json"));
+        if (!f.open(QIODevice::WriteOnly)) return false;
+        if (f.write(text) == text.size() && f.commit()) return true;
+        QThread::msleep(5);
+    }
+    return false;
 }
 
 bool load(const QString& id, Record& r, const QString& folder) {
