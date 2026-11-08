@@ -1259,6 +1259,7 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
         const QDateTime certStart = QDateTime::fromString(QString::fromStdString(t.leaf.notBefore), Qt::ISODate);
         const QDateTime certEnd = QDateTime::fromString(QString::fromStdString(t.leaf.notAfter), Qt::ISODate);
         if (!certStart.isValid() || !certEnd.isValid()) return fail("The certificate of " + what + " has no validity dates");
+        if (t.leaf.bits != 2048) return fail("The key of " + what + " is not RSA 2048 (as cinema servers' are)");
         if (r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after the certificate of " + what + " does (" + t.leaf.notAfter + ")");
         if (r.notBefore < certStart.toSecsSinceEpoch()) return fail("The window starts before the certificate of " + what + " does (" + t.leaf.notBefore + ")");
         if (screen && !screen->timeZone.empty() && !QTimeZone(QByteArray::fromStdString(screen->timeZone)).isValid())

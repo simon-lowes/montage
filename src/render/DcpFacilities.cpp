@@ -93,6 +93,8 @@ bool takeChain(FacilityDevice& d, const std::vector<std::string>& certificates, 
     return true;
 }
 
+bool sameName(const std::string& a, const std::string& b) { return QString::fromStdString(a).compare(QString::fromStdString(b), Qt::CaseInsensitive) == 0; }
+
 bool fail(std::string* error, const std::string& why) {
     if (error) *error = why;
     return false;
@@ -111,7 +113,15 @@ bool readDevice16(const QDomElement& e, FacilityDevice& d, const std::string& wh
     const std::string identifier = id.text().simplified().toStdString();
     const std::string what = where + ", " + (d.type.empty() ? std::string("a device") : d.type) + (d.serial.empty() ? "" : " " + d.serial);
     d.name = d.model.empty() ? d.type : d.model;
-    const std::vector<std::string> certs = certificatesIn(child(e, "KeyInfoList"));
+    // Each KeyInfo a whole chain, every one checked; the device is known by the first.
+    std::vector<std::string> certs;
+    for (const QDomElement& keys : children(child(e, "KeyInfoList"), "KeyInfo")) {
+        const std::vector<std::string> chain = certificatesIn(keys);
+        if (chain.empty()) continue;
+        FacilityDevice other = d;
+        if (!takeChain(other, chain, false, what, error)) return false;
+        if (certs.empty()) certs = chain;
+    }
     if (!certs.empty()) {
         if (!takeChain(d, certs, false, what, error)) return false;
         if (byThumbprint && identifier != d.thumbprint) {
@@ -147,6 +157,9 @@ bool readExtended(const QDomElement& root, Facility& f, std::string* error) {
         for (const QDomElement& suite : suites) {
             FacilityScreen screen;
             screen.name = ++n == 1 ? auditorium : auditorium + " #" + std::to_string(n);
+            // (names are unique in an FLM; one that repeats a name is told apart all the same)
+            for (int k = 2; std::any_of(f.screens.begin(), f.screens.end(), [&](const FacilityScreen& o) { return sameName(o.name, screen.name); }); ++k)
+                screen.name = auditorium + " (" + std::to_string(k) + ")";
             bool server = false;
             for (const QDomElement& e : children(suite, "Device")) {
                 FacilityDevice d;
@@ -154,6 +167,7 @@ bool readExtended(const QDomElement& root, Facility& f, std::string* error) {
                 if (d.type == "SM") {
                     if (server) return fail(error, where + ": a suite with two security managers");
                     if (d.certificates.empty()) return fail(error, where + ": its security manager has no certificate");
+                    if (!d.active) f.notes.push_back(where + ": its server is marked inactive (no KDMs are made for it)");
                     screen.server = std::move(d);
                     server = true;
                 } else {
@@ -188,7 +202,7 @@ bool readEtm(const std::string& xml, const QDomElement& root, Facility& f, std::
     if (f.id.empty()) return fail(error, "The FLM has no FacilityID");
     if (f.name.empty()) f.name = f.id;
     if (const std::string offset = text(child(info, "UTCOffset"), "Offset"); !offset.empty())
-        f.timeZone = "UTC" + std::string(offset[0] == '-' ? "" : "+") + offset;
+        f.timeZone = "UTC" + std::string(offset[0] == '-' || offset[0] == '+' ? "" : "+") + offset;
     if (const std::string email = text(child(info, "ContactInfo"), "Email"); !email.empty()) f.kdmEmails.push_back(email);
     if (text(ext, "FLMPartial") == "true") f.notes.push_back("A partial FLM: " + text(pub, "AnnotationText"));
     std::vector<FacilityDevice> servers, others;
@@ -261,8 +275,6 @@ std::string readText(const std::string& textOrFile, std::string* error) {
     return f.readAll().toStdString();
 }
 
-bool sameName(const std::string& a, const std::string& b) { return QString::fromStdString(a).compare(QString::fromStdString(b), Qt::CaseInsensitive) == 0; }
-
 }  // namespace
 
 bool readFlm(const std::string& xml, Facility& out, std::string* error) {
@@ -321,6 +333,7 @@ bool loadFacilities(std::vector<Facility>& out, std::string* error, const std::s
             screen.name = so.value("name").toString().toStdString();
             screen.server = deviceFrom(so.value("server").toObject());
             for (const QJsonValue& d : so.value("devices").toArray()) screen.devices.push_back(deviceFrom(d.toObject()));
+            screen.byHand = so.value("by_hand").toBool();
             c.screens.push_back(std::move(screen));
         }
         for (const QJsonValue& d : o.value("other_devices").toArray()) c.otherDevices.push_back(deviceFrom(d.toObject()));
@@ -337,7 +350,7 @@ bool saveFacilities(const std::vector<Facility>& list, std::string* error, const
         for (const FacilityScreen& s : c.screens) {
             QJsonArray devices;
             for (const FacilityDevice& d : s.devices) devices.append(toJson(d));
-            screens.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"server", toJson(s.server)}, {"devices", devices}});
+            screens.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"server", toJson(s.server)}, {"devices", devices}, {"by_hand", s.byHand}});
         }
         for (const FacilityDevice& d : c.otherDevices) others.append(toJson(d));
         for (const std::string& e : c.kdmEmails) emails.append(QString::fromStdString(e));
@@ -362,6 +375,9 @@ bool saveFacilities(const std::vector<Facility>& list, std::string* error, const
 size_t mergeFacility(std::vector<Facility>& list, Facility f) {
     for (size_t i = 0; i < list.size(); ++i)
         if (!f.id.empty() && list[i].id == f.id) {
+            for (FacilityScreen& s : list[i].screens)
+                if (s.byHand && std::none_of(f.screens.begin(), f.screens.end(), [&](const FacilityScreen& o) { return sameName(o.name, s.name); }))
+                    f.screens.push_back(std::move(s));
             list[i] = std::move(f);
             return i;
         }
@@ -377,6 +393,7 @@ bool addScreenByHand(std::vector<Facility>& list, const std::string& cinema, con
     if (cinemaName.empty() || screenName.empty()) return fail(error, "A screen needs a cinema and a name");
     FacilityScreen s;
     s.name = screenName;
+    s.byHand = true;
     std::string err;
     const std::string serverText = readText(server, &err);
     if (serverText.empty()) return fail(error, err.empty() ? "No server certificate" : err);
@@ -415,6 +432,8 @@ KdmScreen kdmScreen(const Facility& cinema, const FacilityScreen& screen) {
     for (const FacilityDevice& d : screen.devices)
         if (d.active && !d.thumbprint.empty() && std::find(k.trustedDevices.begin(), k.trustedDevices.end(), d.thumbprint) == k.trustedDevices.end())
             k.trustedDevices.push_back(d.thumbprint);
+    // A suite that lists devices none of which can be named: its server alone, not any device.
+    if (k.trustedDevices.empty() && !screen.devices.empty() && !screen.server.thumbprint.empty()) k.trustedDevices.push_back(screen.server.thumbprint);
     return k;
 }
 
@@ -431,7 +450,8 @@ bool pickScreens(const std::vector<Facility>& list, const std::vector<std::strin
     };
     for (const std::string& name : names) {
         if (const Facility* f = cinemaNamed(name)) {
-            for (const FacilityScreen& s : f->screens) take(*f, s);
+            for (const FacilityScreen& s : f->screens)
+                if (s.server.active) take(*f, s);
             continue;
         }
         // "Cinema/Screen", the cinema's name itself possibly with a "/" in it.
@@ -439,8 +459,12 @@ bool pickScreens(const std::vector<Facility>& list, const std::vector<std::strin
         for (size_t at = name.find('/'); at != std::string::npos && !found; at = name.find('/', at + 1)) {
             const Facility* f = cinemaNamed(name.substr(0, at));
             if (!f) continue;
-            for (const FacilityScreen& s : f->screens)
-                if (sameName(s.name, name.substr(at + 1))) take(*f, s), found = true;
+            for (const FacilityScreen& s : f->screens) {
+                if (!sameName(s.name, name.substr(at + 1))) continue;
+                if (!s.server.active) return fail(error, "The server of " + name + " is marked inactive in its FLM");
+                take(*f, s);
+                found = true;
+            }
         }
         if (!found) return fail(error, "No screen or cinema named " + name + " in the facility list");
     }

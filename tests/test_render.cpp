@@ -11228,6 +11228,17 @@ colorspaces:
         std::vector<KdmScreen> picked;
         QVERIFY(pickScreens(back, {"riverside cinema/2"}, picked, &err) && picked.size() == 1 && picked[0].screen == "2");
         QVERIFY(!pickScreens(back, {"Riverside Cinema/9"}, picked, &err) && err.find("Riverside Cinema/9") != std::string::npos);
+        {
+            // A server its FLM marks inactive: left out of its cinema's screens, refused when named.
+            std::vector<Facility> retired = back;
+            retired[0].screens[2].server.active = false;
+            QVERIFY(pickScreens(retired, {"Riverside Cinema"}, picked, &err) && picked.size() == 2);
+            QVERIFY(!pickScreens(retired, {"Riverside Cinema/3"}, picked, &err) && err.find("inactive") != std::string::npos);
+            // A suite whose devices are all inactive authorises its server alone, not any device.
+            FacilityScreen idle = back[2].screens[1];
+            for (FacilityDevice& d : idle.devices) d.active = false;
+            QVERIFY(kdmScreen(back[2], idle).trustedDevices == std::vector<std::string>{idle.server.thumbprint});
+        }
         QVERIFY2(pickScreens(back, {"Riverside Cinema", "Hilltop Pictures", "urn:x-facilityID:test:harbour", "Harbour Hall/1"}, picked, &err), err.c_str());
         QCOMPARE(picked.size(), size_t(7));
         // The booking: one KDM per screen, a folder and a zip for each cinema.
@@ -11322,6 +11333,16 @@ colorspaces:
         flip(tampered, tampered.find("-----END CERTIFICATE-----", tampered.rfind("-----BEGIN")) - 12);
         QVERIFY(!addScreenByHand(hand, "Village Hall", "Two", tampered, {}, &err));
         QVERIFY(pickScreens(hand, {"Village Hall"}, picked, &err) && picked.size() == 1 && picked[0].trustedDevices.size() == 1);
+        // A screen added by hand to a cinema from an FLM stays when a newer FLM of it is read.
+        QVERIFY(addScreenByHand(back, "Riverside Cinema", "Pop-up", chainText, {}, &err));
+        QCOMPARE(back[0].screens.size(), size_t(4));
+        {
+            Facility newer;
+            QVERIFY(readFlmFile(flms[0].toStdString(), newer, &err));
+            QCOMPARE(mergeFacility(back, newer), size_t(0));
+            QVERIFY(back[0].screens.size() == 4 && back[0].screens[3].name == "Pop-up" && back[0].screens[3].byHand);
+            QVERIFY(saveFacilities(back, &err, listFile) && loadFacilities(back, &err, listFile) && back[0].screens[3].byHand && !back[0].screens[0].byHand);
+        }
         // An ST 430-7 FLM: a signed ETM of security devices, its signature checked. One security manager: its screen
         // takes the other devices; two: they are kept apart (the FLM does not say whose they are).
         dcp::CertificateChain facility, extraServer;
@@ -11337,13 +11358,13 @@ colorspaces:
             return "<DeviceDescription><DeviceIdentifier idtype=\"DeviceUID\">urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</DeviceIdentifier><DeviceTypeID>" +
                    type + "</DeviceTypeID><DeviceSerial>1</DeviceSerial><DeviceName>" + name + "</DeviceName><VersionInfo><Name>a</Name><Value>1</Value></VersionInfo></DeviceDescription>";
         };
-        auto etm = [&](bool twoServers) {
+        auto etm = [&](bool twoServers, const char* offset = "-05:00") {
             std::string x = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DCinemaSecurityMessage xmlns=\"http://www.smpte-ra.org/schemas/430-3/2006/ETM\" "
                             "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n<AuthenticatedPublic Id=\"ID_AuthenticatedPublic\">\n";
             x += "<MessageId>urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</MessageId><MessageType>http://www.smpte-ra.org/schemas/430-7/2008/FLM</MessageType>"
                  "<IssueDate>2026-11-01T10:00:00+00:00</IssueDate><RequiredExtensions><FLMRequiredExtensions xmlns=\"http://www.smpte-ra.org/schemas/430-7/2008/FLM\">"
-                 "<FacilityInfo><FacilityID>urn:x-facilityID:test:lakeside</FacilityID><FacilityName>Lakeside Screens</FacilityName><UTCOffset><Offset>-05:00</Offset>"
-                 "</UTCOffset></FacilityInfo><SecurityDeviceList>";
+                 "<FacilityInfo><FacilityID>urn:x-facilityID:test:lakeside</FacilityID><FacilityName>Lakeside Screens</FacilityName><UTCOffset><Offset>" +
+                 std::string(offset) + "</Offset></UTCOffset></FacilityInfo><SecurityDeviceList>";
             x += "<SecurityDevice>" + etmKeyInfo(cinemas[0].screens[0].server) + description("SM", "Screen One") + "</SecurityDevice>";
             if (twoServers) x += "<SecurityDevice>" + etmKeyInfo(extraServer) + description("SM", "Screen Two") + "</SecurityDevice>";
             x += "<SecurityDevice>" + etmKeyInfo(cinemas[0].screens[0].projector) + description("PR", "Projector") + "</SecurityDevice>";
@@ -11368,6 +11389,13 @@ colorspaces:
         QVERIFY(dcp::signXml(two, facility, &err));
         QVERIFY2(readFlm(two, lake, &err), err.c_str());
         QVERIFY(lake.screens.size() == 2 && lake.screens[0].devices.empty() && lake.otherDevices.size() == 1 && lake.notes.size() == 1);
+        // An offset written with its sign, or without one.
+        for (const char* offset : {"+01:00", "01:00"}) {
+            std::string east = etm(false, offset);
+            QVERIFY(dcp::signXml(east, facility, &err));
+            QVERIFY2(readFlm(east, lake, &err), err.c_str());
+            QVERIFY2(lake.timeZone == "UTC+01:00" && QTimeZone(QByteArray::fromStdString(lake.timeZone)).isValid(), lake.timeZone.c_str());
+        }
         // Neither kind of FLM: refused.
         QVERIFY(!readFlm("<?xml version=\"1.0\"?><Other/>", lake, &err) && err.find("Not a Facility List Message") != std::string::npos);
     }

@@ -32,6 +32,7 @@ struct FacilityScreen {
     std::string name;                     // the auditorium's number or name (a second suite in it: "<name> #2")
     FacilityDevice server;                // the security manager the screen's KDMs are encrypted to
     std::vector<FacilityDevice> devices;  // the rest of its suite, listed in its KDMs
+    bool byHand = false;                  // added by hand (kept when a newer FLM of its cinema is read)
 };
 
 struct Facility {
@@ -59,7 +60,8 @@ bool readFlmFile(const std::string& path, Facility& out, std::string* error = nu
 std::string facilitiesFile();
 bool loadFacilities(std::vector<Facility>& out, std::string* error = nullptr, const std::string& file = {});
 bool saveFacilities(const std::vector<Facility>& list, std::string* error = nullptr, const std::string& file = {});
-// Puts `f` in the list: in place of the one with its id (a newer FLM of a cinema), or at the end. Its index.
+// Puts `f` in the list: in place of the one with its id (a newer FLM of a cinema; screens added to it by hand stay,
+// unless the FLM now lists one of that name), or at the end. Its index.
 size_t mergeFacility(std::vector<Facility>& list, Facility f);
 // A screen added by hand to the cinema of that name (made when there is none): the server's certificate (PEM text or
 // a file of it; a chain is checked to its root, a leaf alone is taken as it is) and other devices' certificates
@@ -67,10 +69,13 @@ size_t mergeFacility(std::vector<Facility>& list, Facility f);
 bool addScreenByHand(std::vector<Facility>& list, const std::string& cinema, const std::string& screen, const std::string& server,
                      const std::vector<std::string>& devices, std::string* error = nullptr);
 
-// What a booking needs of a screen: its server's leaf and its active devices' thumbprints.
+// What a booking needs of a screen: its server's leaf and its active devices' thumbprints. A screen whose suite lists
+// devices of which none can be named (all inactive, or without certificates or thumbprints) authorises its server
+// alone rather than any device; one that lists none, any device.
 KdmScreen kdmScreen(const Facility& cinema, const FacilityScreen& screen);
-// Screens named "Cinema/Screen", or "Cinema" for all its screens (the cinema by name or id, names without regard to
-// case); false (and which) when a name matches none.
+// Screens named "Cinema/Screen", or "Cinema" for all its screens whose servers are active (the cinema by name or id,
+// names without regard to case); false (and which) when a name matches none, or names a screen whose server its FLM
+// marks inactive.
 bool pickScreens(const std::vector<Facility>& list, const std::vector<std::string>& names, std::vector<KdmScreen>& out,
                  std::string* error = nullptr);
 

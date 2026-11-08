@@ -8861,16 +8861,26 @@ void MainWindow::makeKdmsDialog() {
     // The facility list: cinemas and their screens, ticked for this booking.
     std::vector<Facility> facilities;
     std::string loadError;
-    if (!loadFacilities(facilities, &loadError)) state_->message(tr("The facility list cannot be read: %1").arg(QString::fromStdString(loadError)), 10000);
+    // (a list that cannot be read is not written over: it is shown empty and left as it is)
+    const bool listRead = loadFacilities(facilities, &loadError);
+    if (!listRead) state_->message(tr("The facility list cannot be read: %1").arg(QString::fromStdString(loadError)), 10000);
     auto* tree = new QTreeWidget(&dlg);
     tree->setObjectName(QStringLiteral("kdmScreens"));
     tree->setHeaderLabels({tr("Cinema and screen"), tr("Server"), tr("Devices in its KDMs"), tr("Certificate ends")});
     tree->setMinimumHeight(180);
     tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    auto deviceText = [](const FacilityScreen& sc) {
+    // (what its KDMs will list: kdmScreen's choice, named by type)
+    auto deviceText = [](const Facility& f, const FacilityScreen& sc) {
+        const KdmScreen k = kdmScreen(f, sc);
         QStringList parts;
-        for (const FacilityDevice& d : sc.devices)
-            if (d.active && !d.thumbprint.empty()) parts << QString::fromStdString(d.type.empty() ? d.name : d.type);
+        for (const std::string& t : k.trustedDevices) {
+            if (t == sc.server.thumbprint) parts << tr("its server only");
+            for (const FacilityDevice& d : sc.devices)
+                if (d.thumbprint == t) {
+                    parts << QString::fromStdString(d.type.empty() ? d.name : d.type);
+                    break;
+                }
+        }
         return parts.isEmpty() ? tr("any device") : parts.join(QStringLiteral(", "));
     };
     auto refresh = [&, tree] {
@@ -8892,9 +8902,11 @@ void MainWindow::makeKdmsDialog() {
             for (size_t j = 0; j < f.screens.size(); ++j) {
                 const FacilityScreen& sc = f.screens[j];
                 const QString key = QString::fromStdString(f.id + "\n" + sc.name);
-                auto* screen = new QTreeWidgetItem(cinema, {tr("Screen %1").arg(QString::fromStdString(sc.name)), QString::fromStdString(sc.server.commonName),
-                                                            deviceText(sc), QString::fromStdString(sc.server.notAfter).left(10)});
-                screen->setFlags(screen->flags() | Qt::ItemIsUserCheckable);
+                auto* screen = new QTreeWidgetItem(cinema, {tr("Screen %1").arg(QString::fromStdString(sc.name)),
+                                                            sc.server.active ? QString::fromStdString(sc.server.commonName)
+                                                                             : tr("%1 (inactive)").arg(QString::fromStdString(sc.server.commonName)),
+                                                            deviceText(f, sc), QString::fromStdString(sc.server.notAfter).left(10)});
+                screen->setFlags(sc.server.active ? screen->flags() | Qt::ItemIsUserCheckable : screen->flags() & ~Qt::ItemIsEnabled);
                 screen->setData(0, Qt::UserRole, key);
                 screen->setData(0, Qt::UserRole + 1, int(i));
                 screen->setData(0, Qt::UserRole + 2, int(j));
@@ -8906,6 +8918,10 @@ void MainWindow::makeKdmsDialog() {
     };
     refresh();
     auto store = [&] {
+        if (!listRead) {
+            refresh();
+            return;
+        }
         std::string err;
         if (!saveFacilities(facilities, &err)) state_->message(tr("The facility list cannot be saved: %1").arg(QString::fromStdString(err)), 10000);
         refresh();
@@ -8988,6 +9004,7 @@ void MainWindow::makeKdmsDialog() {
         }
         store();
     });
+    for (QPushButton* b : {readFlms, addScreen, remove}) b->setEnabled(listRead);
     auto* list = new QVBoxLayout;
     list->addWidget(tree, 1);
     auto* listButtons = new QHBoxLayout;
@@ -9037,7 +9054,7 @@ void MainWindow::makeKdmsDialog() {
         for (int j = 0; j < tree->topLevelItem(i)->childCount(); ++j) {
             const QTreeWidgetItem* screen = tree->topLevelItem(i)->child(j);
             const size_t c = size_t(screen->data(0, Qt::UserRole + 1).toInt()), k = size_t(screen->data(0, Qt::UserRole + 2).toInt());
-            if (screen->checkState(0) == Qt::Checked && c < facilities.size() && k < facilities[c].screens.size())
+            if (screen->checkState(0) == Qt::Checked && c < facilities.size() && k < facilities[c].screens.size() && facilities[c].screens[k].server.active)
                 r.screens.push_back(kdmScreen(facilities[c], facilities[c].screens[k]));
         }
     r.notBefore = from->dateTime().toSecsSinceEpoch();
