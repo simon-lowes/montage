@@ -22303,6 +22303,8 @@ colorspaces:
         QFile list(folder + "/" + QString::fromStdString(st.renditions.front()) + "/playlist.m3u8");
         QVERIFY(list.open(QIODevice::ReadOnly));
         const QString text = QString::fromUtf8(list.readAll());
+        // (closed at once: on Windows a file held open cannot be replaced, and the packager rewrites it each part)
+        list.close();
         QCOMPARE(text.count("#EXTINF:"), 4);
         const int sequence = QRegularExpression("#EXT-X-MEDIA-SEQUENCE:(\\d+)").match(text).captured(1).toInt();
         QVERIFY2(sequence >= 5, qPrintable(text));
@@ -22311,6 +22313,7 @@ colorspaces:
         QFile mpd(folder + "/manifest.mpd");
         QVERIFY(mpd.open(QIODevice::ReadOnly));
         const QString x = QString::fromUtf8(mpd.readAll());
+        mpd.close();
         QVERIFY2(x.contains("type=\"dynamic\"") && x.contains("timeShiftBufferDepth=\"PT7.680S\"") && x.contains("availabilityTimeComplete=\"false\""), qPrintable(x));
 
         // Stopped: the recording is a whole file, and the playlists end.
@@ -22321,6 +22324,7 @@ colorspaces:
         QVERIFY2(probeMedia(cs.path, rec, &err), err.c_str());
         QVERIFY(rec.hasVideo && rec.width == 640);
         QFile ended(folder + "/" + QString::fromStdString(st.renditions.front()) + "/playlist.m3u8");
+        QVERIFY2(packager.status().error.empty(), packager.status().error.c_str());
         QVERIFY(ended.open(QIODevice::ReadOnly) && ended.readAll().contains("#EXT-X-ENDLIST"));
         origin.stop();
 #endif
