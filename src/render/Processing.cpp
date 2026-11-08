@@ -3542,7 +3542,9 @@ bool isGpuFilter(const std::string& type) {
     static const std::set<std::string> filters = {"gaussian_blur", "sharpen", "glow", "channel_blur", "directional_blur", "vignette",
                                                   "posterize", "letterbox", "mirror", "mosaic", "chromatic_aberration", "noise",
                                                   "crosstalk", "colour_correlation", "hdr_palette", "color_warper", "color_slice",
-                                                  "film_grain", "rgb_mixer", "grain_match", "edge_extend"};
+                                                  "film_grain", "rgb_mixer", "grain_match", "edge_extend", "wave_warp", "twirl", "spherize",
+                                                  "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
+                                                  "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift"};
     return filters.count(type) > 0;
 }
 
@@ -3869,6 +3871,137 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 add(25, {solid, amount});
                 f.passes.back().tableSlot = top;
             }
+        } else if (ty == "wave_warp" || ty == "twirl" || ty == "spherize" || ty == "ripple" || ty == "turbulent_displace" ||
+                   ty == "motion_tile" || ty == "camera_shake" || ty == "corner_pin") {
+            // render/StyleFx's and render/VideoFx's warps: each pixel from where the warp says (gpufilter.frag's mode 26),
+            // what is the same for the whole frame worked out here (as the CPU does, before any pixel)
+            constexpr double kDeg = M_PI / 180;
+            const double W = width, H = height;
+            auto centre = [&](double& cx, double& cy) {
+                cx = W / 2.0 + e.p("center_x", t) * pixelScale;
+                cy = H / 2.0 + e.p("center_y", t) * pixelScale;
+            };
+            if (width <= 0 || height <= 0) {
+                // (the sizes are not known yet: only whether it can be drawn here)
+            } else if (ty == "wave_warp") {
+                const double waveHeight = e.p("height", t, 10) * pixelScale, waveWidth = std::max(1.0, e.p("width", t, 40) * pixelScale);
+                if (std::fabs(waveHeight) >= 1e-3) {
+                    const double dir = e.p("direction", t, 0) * kDeg;
+                    const double phase = std::fmod(e.p("phase", t, 0) * kDeg + double(t) * e.p("speed", t, 0) * kDeg, 2 * M_PI);
+                    add(26, {0, float(std::cos(dir)), float(std::sin(dir)), float(waveHeight), float(waveWidth), float(phase),
+                             float(std::lround(e.p("shape", t, 0)))});
+                }
+            } else if (ty == "twirl") {
+                const double angle = e.p("angle", t, 90) * kDeg;
+                if (std::fabs(angle) >= 1e-6) {
+                    double cx, cy;
+                    centre(cx, cy);
+                    const double R = std::max(1.0, e.p("radius", t, 50) / 100 * std::hypot(W, H) / 2);
+                    add(26, {1, 0, 0, 0, float(cx), float(cy), float(R), float(angle)});
+                }
+            } else if (ty == "spherize") {
+                const double amount = std::clamp(e.p("amount", t, 50) / 100, -1.0, 1.0);
+                if (std::fabs(amount) >= 1e-4) {
+                    double cx, cy;
+                    centre(cx, cy);
+                    const double R = std::max(1.0, e.p("radius", t, 50) / 100 * std::min(W, H) / 2.0);
+                    const double power = amount > 0 ? 1 + amount * 0.9 : 1 / (1 - amount * 0.9);
+                    add(26, {2, 0, 0, 0, float(cx), float(cy), float(R), float(power)});
+                }
+            } else if (ty == "ripple") {
+                const double amp = e.p("amplitude", t, 8) * pixelScale, lambda = std::max(1.0, e.p("wavelength", t, 40) * pixelScale);
+                if (std::fabs(amp) >= 1e-3) {
+                    double cx, cy;
+                    centre(cx, cy);
+                    const double R = std::max(1.0, e.p("radius", t, 100) / 100 * std::hypot(W, H) / 2);
+                    const double phase = std::fmod(double(t) * e.p("speed", t, 20) * kDeg, 2 * M_PI);
+                    add(26, {3, 0, 0, 0, float(cx), float(cy), float(R), float(amp), float(lambda), float(phase)});
+                }
+            } else if (ty == "turbulent_displace") {
+                const double amount = e.p("amount", t, 20) * pixelScale, size = std::max(1.0, e.p("size", t, 100) * pixelScale);
+                if (std::fabs(amount) >= 1e-3) {
+                    const int octaves = std::clamp(int(std::lround(e.p("complexity", t, 3))), 1, 8);
+                    const double z = (e.p("evolution", t, 0) + double(t) * e.p("speed", t, 0)) / 360;
+                    const uint32_t seed = uint32_t(std::lround(e.p("seed", t, 0)));
+                    const uint32_t sx = seed * 2 + 1, sy = seed * 2 + 2;
+                    add(26, {4, 0, 0, 0, float(size), float(amount), float(z), float(octaves), float(sx & 0xffffu), float(sx >> 16),
+                             float(sy & 0xffffu), float(sy >> 16)});
+                }
+            } else if (ty == "motion_tile") {
+                const double tw = std::clamp(e.p("tile_width", t, 100), 1.0, 100.0) / 100, th = std::clamp(e.p("tile_height", t, 100), 1.0, 100.0) / 100;
+                const double ox = e.p("offset_x", t) * pixelScale, oy = e.p("offset_y", t) * pixelScale;
+                if (!(tw == 1 && th == 1 && ox == 0 && oy == 0))
+                    add(26, {5, 0, 0, 0, float(ox), float(oy), float(W * tw), float(H * th), e.p("mirror", t) > 0.5 ? 1.0f : 0.0f});
+            } else if (ty == "camera_shake") {
+                sfx::ShakeMove m;
+                if (sfx::cameraShakeMove(e, t, width, height, pixelScale, m))
+                    add(26, {6, 0, 0, 0, float(W / 2), float(H / 2), float(m.ox), float(m.oy), float(m.zoom), float(std::cos(-m.angle)),
+                             float(std::sin(-m.angle))});
+            } else {
+                double q[4][2] = {{e.p("tl_x", t, 0) * W, e.p("tl_y", t, 0) * H},
+                                  {e.p("tr_x", t, 1) * W, e.p("tr_y", t, 0) * H},
+                                  {e.p("br_x", t, 1) * W, e.p("br_y", t, 1) * H},
+                                  {e.p("bl_x", t, 0) * W, e.p("bl_y", t, 1) * H}};
+                double m[9];
+                if (vfx::squareToQuad(q, m)) {
+                    const double inv[9] = {m[4] * m[8] - m[5] * m[7], m[2] * m[7] - m[1] * m[8], m[1] * m[5] - m[2] * m[4],
+                                           m[5] * m[6] - m[3] * m[8], m[0] * m[8] - m[2] * m[6], m[2] * m[3] - m[0] * m[5],
+                                           m[3] * m[7] - m[4] * m[6], m[1] * m[6] - m[0] * m[7], m[0] * m[4] - m[1] * m[3]};
+                    // (scaled so the largest is 1: the same map, within a float's range)
+                    double big = 0;
+                    for (double v : inv) big = std::max(big, std::fabs(v));
+                    if (big > 0) {
+                        add(26, {7});
+                        for (int r = 0; r < 3; ++r)
+                            for (int c = 0; c < 3; ++c) f.passes.back().params[4 + r * 4 + c] = float(inv[r * 3 + c] / big);
+                    }
+                }
+            }
+        } else if (ty == "find_edges") {
+            add(27, {e.p("invert", t, 1) > 0.5 ? 1.0f : 0.0f, float(std::clamp(e.p("blend", t, 0) / 100, 0.0, 1.0))});
+        } else if (ty == "emboss") {
+            const double dir = e.p("direction", t, 135) * M_PI / 180, relief = std::max(0.25, e.p("relief", t, 2) * pixelScale);
+            add(28, {float(std::cos(dir) * relief), float(-std::sin(dir) * relief), float(e.p("contrast", t, 100) / 100) * 2,
+                     float(std::clamp(e.p("blend", t, 0) / 100, 0.0, 1.0))});
+        } else if (ty == "halftone") {
+            constexpr double kDeg = M_PI / 180;
+            const double angle = e.p("angle", t, 45) * kDeg;
+            const double a0 = angle + 15 * kDeg, a1 = angle + 75 * kDeg;
+            add(29, {float(std::max(2.0, e.p("dot_size", t, 8) * pixelScale)), e.p("mode", t, 0) > 0.5 ? 1.0f : 0.0f, 0, 0,
+                     float(std::cos(a0)), float(std::sin(a0)), float(std::cos(a1)), float(std::sin(a1)), float(std::cos(angle)),
+                     float(std::sin(angle)), float(std::cos(angle)), float(std::sin(angle))});
+        } else if (ty == "duotone") {
+            add(30, {float(e.p("shadows.r", t, 0.08)), float(e.p("shadows.g", t, 0.1)), float(e.p("shadows.b", t, 0.35)),
+                     float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0)), float(e.p("highlights.r", t, 1)), float(e.p("highlights.g", t, 0.85)),
+                     float(e.p("highlights.b", t, 0.6))});
+        } else if (ty == "vhs") {
+            sfx::VhsSetup vs;
+            if (width > 0 && height > 0 && sfx::vhsSetup(e, t, width, height, pixelScale, vs)) {
+                const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+                const double bleed = e.p("bleed", t, 4) * pixelScale * amount;
+                add(31, {amount, float(bleed), float(e.p("noise", t, 30) / 100) * amount, 0, float(1.2 * pixelScale * amount),
+                         float(vs.seed & 0xffffu), float(vs.seed >> 16), float(std::max(1, int(std::ceil(bleed)))),
+                         float(std::max(1, int(3 * pixelScale)))});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = height;
+                fp.table.assign(size_t(height) * 4, 0.0f);
+                for (int y = 0; y < height; ++y) {
+                    fp.table[size_t(y) * 4] = float(vs.shift[size_t(y)]);
+                    fp.table[size_t(y) * 4 + 1] = vs.torn[size_t(y)];
+                    fp.table[size_t(y) * 4 + 2] = vs.line[size_t(y)];
+                }
+            }
+        } else if (ty == "tilt_shift") {
+            // (the Gaussian of the whole picture, then the band kept sharp and the colour pushed, as tiltShift does)
+            const double radius = e.p("blur", t, 12) * pixelScale;
+            const double focus = e.p("focus", t, 50) / 100, bandWidth = std::max(0.0, e.p("width", t, 20) / 100);
+            const double angle = e.p("angle", t, 0) * M_PI / 180;
+            const float sat = float(e.p("saturation", t, 120) / 100);
+            const bool blurred = radius >= 0.5;
+            if (blurred) blur(radius, true, true, all);
+            if (blurred || std::fabs(sat - 1) > 1e-4f)
+                add(32, {float(width / 2.0), float(focus * height), float(-std::sin(angle)), float(std::cos(angle)), float(height),
+                         float(bandWidth / 2), float(bandWidth / 2 + std::max(0.02, bandWidth)), sat, blurred ? 1.0f : 0.0f});
         } else if (ty == "rgb_mixer") {
             float m[12] = {};
             bool identity = true;

@@ -320,28 +320,42 @@ void duotone(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
-void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+bool vhsSetup(const Effect& e, FrameTime t, int W, int H, double pixelScale, VhsSetup& out) {
     const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
-    if (amount <= 0) return;
-    const double bleed = e.p("bleed", t, 4) * pixelScale * amount;
-    const float noise = float(e.p("noise", t, 30) / 100) * amount, lines = float(e.p("scanlines", t, 30) / 100) * amount;
+    if (amount <= 0 || W <= 0 || H <= 0) return false;
+    const float lines = float(e.p("scanlines", t, 30) / 100) * amount;
     const double tracking = e.p("tracking", t, 30) / 100 * amount;
-    const int W = img.width, H = img.height;
-    const Image src = img;
-    const uint32_t seed = hash(uint32_t(t) * 2654435761U + 12345U);
+    out.seed = hash(uint32_t(t) * 2654435761U + 12345U);
+    const uint32_t seed = out.seed;
     // Each line wobbles a little; a band of bad tracking rolls up the frame; and the bottom
     // few lines tear sideways, where the heads switch.
     const double bandY = std::fmod(double(t) * 3.7 * pixelScale + double(seed % 997), double(H) * 1.5) - double(H) * 0.25;
     const double bandH = std::max(4.0, 0.06 * H), switchY = H * (1 - 0.025);
-    std::vector<double> shift(static_cast<size_t>(H));
-    std::vector<float> torn(static_cast<size_t>(H), 0.0f);
+    out.shift.assign(size_t(H), 0.0);
+    out.torn.assign(size_t(H), 0.0f);
+    out.line.assign(size_t(H), 1.0f);
     for (int y = 0; y < H; ++y) {
         const double wobble = (double(hash(seed ^ uint32_t(y / std::max(1, int(2 * pixelScale)))) & 0xffff) / 65535.0 - 0.5) * 1.5 * pixelScale;
         const double inBand = std::max(0.0, 1 - std::fabs(y - bandY) / bandH);
         const double inSwitch = y >= switchY ? (y - switchY) / (H - switchY) : 0;
-        shift[size_t(y)] = (wobble + inBand * inBand * 25 * pixelScale + inSwitch * 18 * pixelScale) * tracking;
-        torn[size_t(y)] = float(std::max(inBand * inBand, inSwitch) * tracking);
+        out.shift[size_t(y)] = (wobble + inBand * inBand * 25 * pixelScale + inSwitch * 18 * pixelScale) * tracking;
+        out.torn[size_t(y)] = float(std::max(inBand * inBand, inSwitch) * tracking);
+        out.line[size_t(y)] = (int(y / std::max(1.0, pixelScale)) & 1) ? 1 - lines * 0.5f : 1.0f;
     }
+    return true;
+}
+
+void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    VhsSetup setup;
+    if (!vhsSetup(e, t, img.width, img.height, pixelScale, setup)) return;
+    const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+    const double bleed = e.p("bleed", t, 4) * pixelScale * amount;
+    const float noise = float(e.p("noise", t, 30) / 100) * amount;
+    const int W = img.width, H = img.height;
+    const Image src = img;
+    const uint32_t seed = setup.seed;
+    const std::vector<double>& shift = setup.shift;
+    const std::vector<float>& torn = setup.torn;
     // Tape's narrow bandwidth: soft brightness, and colour smeared and lagging behind it.
     const double soft = 1.2 * pixelScale * amount;
     parallelRows(H, [&](int y0, int y1) {
@@ -375,7 +389,7 @@ void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale) {
                 if (torn[size_t(y)] > 0.3f && (h >> 16) % 7 == 0) l = std::max(l, 0.85f);  // dropouts
                 // Lifted blacks, a little less contrast and colour.
                 l = 0.04f * amount + l * (1 - 0.1f * amount);
-                const float row = (int(y / std::max(1.0, pixelScale)) & 1) ? 1 - lines * 0.5f : 1.0f;
+                const float row = setup.line[size_t(y)];
                 const float sat = 1 - 0.2f * amount;
                 const float r = l + cr * sat, b = l + cb * sat;
                 const float g = (l - 0.2126f * r - 0.0722f * b) / 0.7152f;
@@ -420,19 +434,27 @@ void tiltShift(const Effect& e, FrameTime t, Image& img, double pixelScale) {
         });
 }
 
-void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+bool cameraShakeMove(const Effect& e, FrameTime t, int w, int h, double pixelScale, ShakeMove& out) {
     const double amp = e.p("amplitude", t, 10) * pixelScale, rot = e.p("rotation", t, 1) * kDeg;
-    if (std::fabs(amp) < 1e-3 && std::fabs(rot) < 1e-6) return;
+    if (std::fabs(amp) < 1e-3 && std::fabs(rot) < 1e-6) return false;
     const double speed = std::max(0.0, e.p("speed", t, 50)) / 100 * 0.35;  // noise cycles per frame
     const uint32_t seed = uint32_t(std::lround(e.p("seed", t, 0)));
     const double s = double(t) * speed;
-    const double ox = amp * fbm(s, 0.5, 0, 3, seed * 3 + 1), oy = amp * fbm(s, 1.5, 0, 3, seed * 3 + 2);
-    const double a = rot * fbm(s, 2.5, 0, 3, seed * 3 + 3);
-    const double W = img.width, H = img.height, cx = W / 2, cy = H / 2;
+    out.ox = amp * fbm(s, 0.5, 0, 3, seed * 3 + 1), out.oy = amp * fbm(s, 1.5, 0, 3, seed * 3 + 2);
+    out.angle = rot * fbm(s, 2.5, 0, 3, seed * 3 + 3);
+    const double W = w, H = h;
     // Zoomed in just enough that the frame's edges never show.
-    double zoom = 1;
-    if (e.p("zoom", t, 1) > 0.5) zoom = 1 + 2 * std::fabs(amp) / std::min(W, H) + std::sin(std::fabs(rot)) * (W + H) / std::min(W, H);
-    const double c = std::cos(-a), sn = std::sin(-a);
+    out.zoom = 1;
+    if (e.p("zoom", t, 1) > 0.5) out.zoom = 1 + 2 * std::fabs(amp) / std::min(W, H) + std::sin(std::fabs(rot)) * (W + H) / std::min(W, H);
+    return true;
+}
+
+void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    ShakeMove m;
+    if (!cameraShakeMove(e, t, img.width, img.height, pixelScale, m)) return;
+    const double ox = m.ox, oy = m.oy, zoom = m.zoom;
+    const double W = img.width, H = img.height, cx = W / 2, cy = H / 2;
+    const double c = std::cos(-m.angle), sn = std::sin(-m.angle);
     remap(img, Edge::Clamp, [&](double x, double y, double& sx, double& sy) {
         const double rx = (x - cx - ox) / zoom, ry = (y - cy - oy) / zoom;
         sx = cx + rx * c - ry * sn;

@@ -35,6 +35,12 @@
 //   23 a level pushed back from the one above (srcTex) into what it was pulled as (extra); 24 a level's cells of colour
 //   p[1].x relaxed towards their neighbours; 25 the picture (orig) took the colours pushed out (srcTex) by p[1].y, where
 //   it is neither solid nor clear, when anything was known (the top level, `table`)
+// and the warps and stylizers of render/StyleFx and render/VideoFx, what is the same over the frame worked out on the CPU:
+//   26 a warp, each pixel bilinear from where it says (p[1].x): 0 Wave Warp, 1 Twirl, 2 Spherize, 3 Ripple, 4 Turbulent
+//      Displace (its noise made here by the CPU's hash), 5 Motion Tile (wrapped), 6 Camera Shake, 7 Corner Pin (p[2..4] the
+//      inverse map's rows, transparent outside)
+//   27 Find Edges, 28 Emboss, 29 Halftone, 30 Duotone, 31 VHS (the table each row's shift, tearing and scanline), 32 Tilt-Shift's
+//      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -228,6 +234,83 @@ float grainAmplitude(int c, float light) {
     return grainBand(c, i) + (grainBand(c, i + 1) - grainBand(c, i)) * (x - float(i));
 }
 
+// ---- render/StyleFx's and render/VideoFx's warps and stylizers ----
+// The texel at (x, y) with an edge rule: 0 transparent outside, 1 clamped to the picture, 2 wrapped round it.
+vec4 texelEdge(ivec2 size, int x, int y, int edge) {
+    if (edge == 1) {
+        x = clamp(x, 0, size.x - 1);
+        y = clamp(y, 0, size.y - 1);
+    } else if (edge == 2) {
+        x -= size.x * int(floor(float(x) / float(size.x)));
+        y -= size.y * int(floor(float(y) / float(size.y)));
+    } else if (x < 0 || y < 0 || x >= size.x || y >= size.y) {
+        return vec4(0.0);
+    }
+    return texelFetch(srcTex, ivec2(x, y), 0);
+}
+// Bilinear at (x, y) (pixel centres at +0.5) with an edge rule.
+vec4 sampleEdge(ivec2 size, float x, float y, int edge) {
+    x -= 0.5;
+    y -= 0.5;
+    const int x0 = int(floor(x)), y0 = int(floor(y));
+    const float fx = x - float(x0), fy = y - float(y0);
+    const vec4 p00 = texelEdge(size, x0, y0, edge), p10 = texelEdge(size, x0 + 1, y0, edge);
+    const vec4 p01 = texelEdge(size, x0, y0 + 1, edge), p11 = texelEdge(size, x0 + 1, y0 + 1, edge);
+    const vec4 top = p00 + (p10 - p00) * fx, bottom = p01 + (p11 - p01) * fx;
+    return top + (bottom - top) * fy;
+}
+float lumaOf(vec4 c) { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
+uint hashOne32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+// render/StyleFx's valueNoise and fbm.
+float valueCorner(int a, int b, int c, uint seed) {
+    const uint h = hashOne32(uint(a) * 73856093u ^ hashOne32(uint(b) * 19349663u ^ hashOne32(uint(c) * 83492791u ^ seed)));
+    return float(h & 0xffffffu) / 8388607.0 - 1.0;
+}
+float valueNoise(float x, float y, float z, uint seed) {
+    const float fx = floor(x), fy = floor(y), fz = floor(z);
+    const int ix = int(fx), iy = int(fy), iz = int(fz);
+    vec3 u = vec3(x - fx, y - fy, z - fz);
+    u = u * u * u * (u * (u * 6.0 - 15.0) + 10.0);
+    const float x00 = mix(valueCorner(ix, iy, iz, seed), valueCorner(ix + 1, iy, iz, seed), u.x);
+    const float x10 = mix(valueCorner(ix, iy + 1, iz, seed), valueCorner(ix + 1, iy + 1, iz, seed), u.x);
+    const float x01 = mix(valueCorner(ix, iy, iz + 1, seed), valueCorner(ix + 1, iy, iz + 1, seed), u.x);
+    const float x11 = mix(valueCorner(ix, iy + 1, iz + 1, seed), valueCorner(ix + 1, iy + 1, iz + 1, seed), u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+float fbm(float x, float y, float z, int octaves, uint seed) {
+    float sum = 0.0, amp = 1.0, norm = 0.0, f = 1.0;
+    for (int o = 0; o < octaves; ++o) {
+        sum += amp * valueNoise(x * f, y * f, z * f + float(o) * 17.31, seed + uint(o) * 101u);
+        norm += amp;
+        amp *= 0.5;
+        f *= 2.0;
+    }
+    return sum / norm;
+}
+float smoothstepFx(float a, float b, float x) {
+    const float u = clamp((x - a) / (b - a), 0.0, 1.0);
+    return u * u * (3.0 - 2.0 * u);
+}
+// Halftone's dot: 1 inside it, for the cell round (x, y) on the grid turned by (c, s).
+float halftoneDot(ivec2 size, float x, float y, float c, float s, int channel) {
+    const float cell = p[1].x;
+    const float u = (x * c + y * s) / cell, v = (-x * s + y * c) / cell;
+    const float cu = floor(u) + 0.5, cv = floor(v) + 0.5;
+    const vec4 at = sampleEdge(size, (cu * c - cv * s) * cell, (cu * s + cv * c) * cell, 1);
+    const float a = at.a > 0.0 ? at.a : 1.0;
+    const float tone = clamp((channel < 0 ? lumaOf(at) : at[channel]) / a, 0.0, 1.0);
+    const float r = cell * sqrt((1.0 - tone) / 3.14159265358979);
+    const float d = length(vec2(u - cu, v - cv)) * cell;
+    return smoothstepFx(r + 0.5, r - 0.5, d);
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const ivec2 size = textureSize(srcTex, 0);
@@ -414,6 +497,177 @@ void main() {
             return;
         }
         fragColor = vec4(o.rgb + (px.rgb * o.a - o.rgb) * p[1].y, o.a);
+        return;
+    }
+    if (mode == 26) {
+        // Each pixel from where the warp says, bilinear (or left as it was where the warp does not reach)
+        const int kind = int(p[1].x);
+        const float x = float(xy.x) + 0.5, y = float(xy.y) + 0.5;
+        float sx = x, sy = y;
+        int edge = 1;
+        if (kind == 0) {
+            const float dx = p[1].y, dy = p[1].z, height = p[1].w;
+            const float s = 6.283185307179586 * (x * dx + y * dy) / p[2].x + p[2].y;
+            float w = sin(s);
+            if (int(p[2].z) == 1) w = asin(clamp(w, -1.0, 1.0)) * 2.0 / 3.14159265358979;
+            else if (int(p[2].z) == 2) w = tanh(6.0 * w) / tanh(6.0);
+            sx = x + dy * height * w;
+            sy = y - dx * height * w;
+        } else if (kind >= 1 && kind <= 3) {
+            const float cx = p[2].x, cy = p[2].y, R = p[2].z, rx = x - cx, ry = y - cy, r = sqrt(rx * rx + ry * ry);
+            if (r >= R || (kind != 1 && r < 1e-9)) {
+                fragColor = px;
+                return;
+            }
+            if (kind == 1) {
+                const float a = -p[2].w * (1.0 - r / R) * (1.0 - r / R), c = cos(a), s = sin(a);
+                sx = cx + rx * c - ry * s;
+                sy = cy + rx * s + ry * c;
+            } else if (kind == 2) {
+                const float k = pow(r / R, p[2].w) * R / r;
+                sx = cx + rx * k;
+                sy = cy + ry * k;
+            } else {
+                const float d = p[2].w * sin(6.283185307179586 * r / p[3].x - p[3].y) * (1.0 - r / R);
+                sx = cx + rx / r * (r + d);
+                sy = cy + ry / r * (r + d);
+            }
+        } else if (kind == 4) {
+            const float u = x / p[2].x, v = y / p[2].x;
+            const int octaves = int(p[2].w);
+            sx = x + p[2].y * fbm(u, v, p[2].z, octaves, uint(p[3].x) + uint(p[3].y) * 65536u);
+            sy = y + p[2].y * fbm(u, v, p[2].z, octaves, uint(p[3].z) + uint(p[3].w) * 65536u);
+        } else if (kind == 5) {
+            const float W = float(size.x), H = float(size.y), cw = p[2].z, ch = p[2].w;
+            const float u = (x - p[2].x - (W - cw) / 2.0) / cw, v = (y - p[2].y - (H - ch) / 2.0) / ch;
+            float fu = u - floor(u), fv = v - floor(v);
+            if (p[3].x > 0.5 && mod(floor(u), 2.0) > 0.5) fu = 1.0 - fu;
+            if (p[3].x > 0.5 && mod(floor(v), 2.0) > 0.5) fv = 1.0 - fv;
+            sx = fu * W;
+            sy = fv * H;
+            edge = 2;
+        } else if (kind == 6) {
+            const float rx = (x - p[2].x - p[2].z) / p[3].x, ry = (y - p[2].y - p[2].w) / p[3].x;
+            sx = p[2].x + rx * p[3].y - ry * p[3].z;
+            sy = p[2].y + rx * p[3].z + ry * p[3].y;
+        } else if (kind == 7) {
+            // (render/VideoFx's Corner Pin: transparent outside the quadrilateral)
+            const float w = dot(p[4].xyz, vec3(x, y, 1.0));
+            if (abs(w) < 1e-12) {
+                fragColor = vec4(0.0);
+                return;
+            }
+            const float u = dot(p[2].xyz, vec3(x, y, 1.0)) / w, v = dot(p[3].xyz, vec3(x, y, 1.0)) / w;
+            if (u < 0.0 || v < 0.0 || u > 1.0 || v > 1.0) {
+                fragColor = vec4(0.0);
+                return;
+            }
+            sx = u * float(size.x);
+            sy = v * float(size.y);
+            edge = 0;
+        }
+        fragColor = sampleEdge(size, sx, sy, edge);
+        return;
+    }
+    if (mode >= 27 && mode <= 30 && px.a <= 0.0) {
+        fragColor = px;  // (nothing there to style)
+        return;
+    }
+    if (mode == 27) {
+        // Find Edges: Sobel, each colour on its own, on straight colour, edges clamped
+        const float a = px.a;
+        vec3 o;
+        float n[9 * 3];
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
+                const vec4 q = texelFetch(srcTex, clamp(xy + ivec2(i, j), ivec2(0), size - 1), 0);
+                for (int c = 0; c < 3; ++c) n[((j + 1) * 3 + i + 1) * 3 + c] = q.a > 0.0 ? q[c] / q.a : 0.0;
+            }
+        for (int c = 0; c < 3; ++c) {
+            const float gx = n[2 * 3 + c] + 2.0 * n[5 * 3 + c] + n[8 * 3 + c] - n[0 * 3 + c] - 2.0 * n[3 * 3 + c] - n[6 * 3 + c];
+            const float gy = n[6 * 3 + c] + 2.0 * n[7 * 3 + c] + n[8 * 3 + c] - n[0 * 3 + c] - 2.0 * n[1 * 3 + c] - n[2 * 3 + c];
+            float e = min(1.0, sqrt(gx * gx + gy * gy) / 4.0);
+            if (p[1].x > 0.5) e = 1.0 - e;
+            o[c] = (e + (px[c] / a - e) * p[1].y) * a;
+        }
+        fragColor = vec4(o, a);
+        return;
+    }
+    if (mode == 28) {
+        // Emboss: grey, raised where the picture brightens towards the light (p[1] the light's offset, contrast, blend)
+        const float a = px.a, x = float(xy.x) + 0.5, y = float(xy.y) + 0.5;
+        const vec4 lit = sampleEdge(size, x + p[1].x, y + p[1].y, 1), shade = sampleEdge(size, x - p[1].x, y - p[1].y, 1);
+        const float v = clamp(0.5 + p[1].z * (lumaOf(lit) - lumaOf(shade)), 0.0, 1.0);
+        fragColor = vec4((v + (px.rgb / a - v) * p[1].w) * a, a);
+        return;
+    }
+    if (mode == 29) {
+        // Halftone: p[1] the cell, colour; p[2] the cos and sin of the cyan and magenta screens, p[3] the yellow's and black's
+        const float a = px.a, x = float(xy.x) + 0.5, y = float(xy.y) + 0.5;
+        if (p[1].y > 0.5) {
+            fragColor = vec4((1.0 - halftoneDot(size, x, y, p[2].x, p[2].y, 0)) * a, (1.0 - halftoneDot(size, x, y, p[2].z, p[2].w, 1)) * a,
+                             (1.0 - halftoneDot(size, x, y, p[3].x, p[3].y, 2)) * a, a);
+        } else {
+            const float v = 1.0 - halftoneDot(size, x, y, p[3].z, p[3].w, -1);
+            fragColor = vec4(vec3(v * a), a);
+        }
+        return;
+    }
+    if (mode == 30) {
+        // Duotone: p[1].xyz the shadows' colour, p[2].xyz the highlights', p[1].w the mix
+        const float a = px.a, l = clamp(lumaOf(px) / a, 0.0, 1.0);
+        const vec3 v = p[1].xyz + (p[2].xyz - p[1].xyz) * l;
+        fragColor = vec4(px.rgb + (v * a - px.rgb) * p[1].w, a);
+        return;
+    }
+    if (mode == 31) {
+        // VHS: p[1] amount, bleed, noise; p[2] softness, the seed's low and high 16 bits, the bleed's taps; p[3].x the
+        // noise's streak length; the table each row's shift (x), tearing (y) and scanline's brightness (z)
+        const vec3 row = texelFetch(table, ivec2(xy.y, 0), 0).xyz;
+        const float sx = float(xy.x) + 0.5 - row.x, y = float(xy.y) + 0.5;
+        const vec4 here = sampleEdge(size, sx, y, 1);
+        const float a = here.a;
+        if (a <= 0.0) {
+            fragColor = here;
+            return;
+        }
+        const float amount = p[1].x, bleed = p[1].y, soft = p[2].x;
+        const vec4 l0 = sampleEdge(size, sx - soft, y, 1), l1 = sampleEdge(size, sx + soft, y, 1);
+        float l = (lumaOf(here) * 2.0 + lumaOf(l0) + lumaOf(l1)) / 4.0 / a;
+        float cb = 0.0, cr = 0.0, wsum = 0.0;
+        const int taps = int(p[2].w);
+        for (int k = 0; k <= 2 * taps; ++k) {
+            const vec4 q = sampleEdge(size, sx - bleed * float(k) / float(taps), y, 1);
+            const float qa = q.a > 0.0 ? q.a : 1.0, ql = lumaOf(q) / qa;
+            cb += q.b / qa - ql, cr += q.r / qa - ql, wsum += 1.0;
+        }
+        cb /= wsum, cr /= wsum;
+        const uint seed = uint(p[2].y) + uint(p[2].z) * 65536u;
+        const uint h = hashOne32(seed ^ (uint(xy.y) * 2246822519u + uint(xy.x / int(p[3].x))));
+        const float n = float(h & 0xffffu) / 65535.0 - 0.5;
+        l += n * p[1].z * (0.35 + row.y * 1.5);
+        if (row.y > 0.3 && (h >> 16) % 7u == 0u) l = max(l, 0.85);
+        l = 0.04 * amount + l * (1.0 - 0.1 * amount);
+        const float sat = 1.0 - 0.2 * amount;
+        const float r = l + cr * sat, b = l + cb * sat, g = (l - 0.2126 * r - 0.0722 * b) / 0.7152;
+        fragColor = vec4(max(0.0, r * row.z) * a, max(0.0, g * row.z) * a, max(0.0, b * row.z) * a, a);
+        return;
+    }
+    if (mode == 32) {
+        // Tilt-Shift's last step: the picture (orig) towards its blur (srcTex, when p[3].x) away from the band (p[1] its
+        // centre and normal, p[2] the frame's height, where it starts and finishes going soft, the saturation)
+        vec4 o = px;
+        if (p[3].x > 0.5) {
+            const float d = abs((float(xy.x) + 0.5 - p[1].x) * p[1].z + (float(xy.y) + 0.5 - p[1].y) * p[1].w) / p[2].x;
+            const float k = smoothstepFx(p[2].y, p[2].z, d);
+            const vec4 sharp = texelFetch(orig, xy, 0);
+            o = sharp + (px - sharp) * k;
+        }
+        if (abs(p[2].w - 1.0) > 1e-4) {
+            const float l = lumaOf(o);
+            o.rgb = max(vec3(0.0), l + (o.rgb - l) * p[2].w);
+        }
+        fragColor = o;
         return;
     }
     if (mode >= 13 && mode <= 20 && px.a <= 0.0) {

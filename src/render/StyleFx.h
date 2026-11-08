@@ -7,6 +7,9 @@
 // given in pixels look the same in previews at lower resolution.
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include "core/Model.h"
 #include "media/Image.h"
 
@@ -25,6 +28,19 @@ void duotone(const Effect& e, FrameTime t, Image& img);
 void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void tiltShift(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// What VHS and Camera Shake work out for the whole frame, w x h, before they touch a pixel (for render/Processing's
+// GPU passes too). VHS: each row's shift, tearing and scanline brightness, and the frame's seed (false when it is off).
+struct VhsSetup {
+    std::vector<double> shift;
+    std::vector<float> torn, line;
+    uint32_t seed = 0;
+};
+bool vhsSetup(const Effect& e, FrameTime t, int w, int h, double pixelScale, VhsSetup& out);
+// Camera Shake's move: its offset (pixels), turn (radians) and zoom (false when it leaves the frame as it is).
+struct ShakeMove {
+    double ox = 0, oy = 0, angle = 0, zoom = 1;
+};
+bool cameraShakeMove(const Effect& e, FrameTime t, int w, int h, double pixelScale, ShakeMove& out);
 // Lens Flare (Premiere's, Resolve's Lens Flare): light from a point (on or off the frame) as a lens would scatter
 // it: a hot core and halo, a star of rays (or an anamorphic streak), a ring, and ghosts strung along the line
 // through the frame's centre. Added to the picture.

@@ -19126,12 +19126,12 @@ colorspaces:
         QVERIFY(edit::clipById(s, maskedId));
         // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
-        adj.effects.push_back(makeEffect(p, "emboss"));
+        adj.effects.push_back(makeEffect(p, "painterly"));
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
         gpu::resetStats();
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
-        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Emboss") == 0, gpu::stats().lastFallback.c_str());
+        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Painterly") == 0, gpu::stats().lastFallback.c_str());
     }
 
     // The filters, transitions, adjustment layers and track mattes the GPU draws, each at three settings, against the
@@ -19212,6 +19212,21 @@ colorspaces:
             {"chromatic_aberration", {{{"amount", 3}}, {{"amount", -8}}, {{"amount", 15}}}},
             {"noise", {{{"amount", 20}}, {{"amount", 60}, {"color", 0}, {"clip", 0}}, {{"amount", 5}}}},
             {"edge_extend", {{}, {{"amount", 60}, {"solid", 50}}, {{"solid", 99}}}},
+            {"wave_warp", {{{"height", 6}, {"width", 30}}, {{"height", 12}, {"direction", 40}, {"shape", 1}, {"speed", 20}}, {{"height", -8}, {"shape", 2}, {"phase", 90}}}},
+            {"twirl", {{}, {{"angle", -200}, {"radius", 80}, {"center_x", 10}}, {{"angle", 45}, {"radius", 30}}}},
+            {"spherize", {{}, {{"amount", -70}, {"radius", 90}}, {{"amount", 100}, {"center_y", -8}}}},
+            {"ripple", {{}, {{"amplitude", 14}, {"wavelength", 18}, {"speed", 50}}, {{"amplitude", -5}, {"radius", 50}}}},
+            {"turbulent_displace", {{}, {{"amount", 35}, {"size", 40}, {"complexity", 6}, {"seed", 3}}, {{"amount", 10}, {"evolution", 120}, {"speed", 10}}}},
+            {"motion_tile", {{{"tile_width", 50}, {"tile_height", 50}}, {{"tile_width", 33}, {"tile_height", 70}, {"mirror", 1}, {"offset_x", 7}},
+                             {{"offset_x", -12}, {"offset_y", 9}, {"mirror", 1}}}},
+            {"camera_shake", {{}, {{"amplitude", 20}, {"rotation", 3}, {"zoom", 0}, {"seed", 5}}, {{"amplitude", 4}, {"speed", 90}}}},
+            {"corner_pin", {{{"tl_x", 0.1}, {"tl_y", 0.07}, {"br_x", 0.93}}, {{"tr_x", 0.8}, {"tr_y", 0.15}, {"bl_x", -0.2}, {"bl_y", 1.1}}, {{"tl_x", 0.23}, {"br_y", 0.83}}}},
+            {"find_edges", {{}, {{"invert", 0}, {"blend", 30}}, {{"blend", 60}}}},
+            {"emboss", {{}, {{"direction", 30}, {"relief", 4}, {"contrast", 200}}, {{"blend", 40}, {"relief", 0.7}}}},
+            {"halftone", {{}, {{"dot_size", 5}, {"angle", 20}, {"mode", 1}}, {{"dot_size", 12}, {"mode", 1}}}},
+            {"duotone", {{}, {{"mix", 60}, {"shadows.r", 0.3}}, {{"highlights.g", 0.2}}}},
+            {"vhs", {{}, {{"amount", 60}, {"bleed", 7}, {"tracking", 80}}, {{"noise", 80}, {"scanlines", 70}}}},
+            {"tilt_shift", {{}, {{"blur", 5}, {"angle", 30}, {"focus", 30}, {"saturation", 100}}, {{"blur", 0.2}, {"saturation", 150}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
