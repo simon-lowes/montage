@@ -16978,15 +16978,22 @@ colorspaces:
         // (each end shows whole frames: the client's frame against the colourist's exact place, at most a frame behind or
         // ahead of it beyond the frame it rounds down to)
         double worst = 0;
+        int samples = 0;
         while (playing.elapsed() < 1500) {
-            view.playhead = 31 + FrameTime(double(playing.elapsed()) * 24 / 1000);
+            const qint64 sent = playing.elapsed();
+            view.playhead = 31 + FrameTime(double(sent) * 24 / 1000);
             host.setView(view);
             QThread::msleep(5);
+            // (a sample after this loop itself stalled for more than a frame, as a busy machine's sleep can, measures
+            // the machine, not the following: left out)
+            if (playing.elapsed() - sent > 5 + 1000 / 24) continue;
             if (playing.elapsed() > 300 && client.view(seen, &age)) {
                 const double hostNow = 31 + double(playing.elapsed()) * 24 / 1000;
                 worst = std::max(worst, std::abs(double(followPlayhead(seen, {24, 1}, age)) - hostNow));
+                ++samples;
             }
         }
+        QVERIFY2(samples >= 20, QByteArray::number(samples).constData());
         QVERIFY2(worst < 2, QByteArray::number(worst).constData());
         QVERIFY(seen.compare.empty() && seen.playing);
 

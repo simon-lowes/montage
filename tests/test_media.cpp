@@ -24552,11 +24552,16 @@ if ui["pressed"] == "add":
         // now and then with --once) never waits on a node long gone; one written a little before is silent after the
         // rest of that time, and one that moves is watched afresh.
         QVERIFY(beats.stale("long gone", 3, 250));
+        QElapsedTimer moved;  // (started before beat 4 is first seen: it is never younger than this says)
+        moved.start();
         QVERIFY(!beats.stale("long gone", 4, 250));
         QVERIFY(!beats.stale("just now", 3, 100));
         QTest::qWait(150);
         QVERIFY(beats.stale("just now", 3, 100));
-        QVERIFY(!beats.stale("long gone", 4, 250));
+        // Still within the patience since it moved, as long as this side has kept up (a slow machine may have let
+        // the whole patience pass, when silent is right too).
+        const bool goneStale = beats.stale("long gone", 4, 250);
+        if (moved.elapsed() < 195) QVERIFY(!goneStale);
         // A node with a short patience takes it back and renders it.
         stop = false;
         o.staleMs = 300;

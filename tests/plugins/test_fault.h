@@ -63,8 +63,12 @@ static void montage_test_fault(const char* call, float* buf, size_t n) {
             p = (float*)malloc(16);
             n = 4;
         }
-        /* Past the end, a page at a time, until the memory beyond is not there to write. */
-        for (size_t i = n; i < ((size_t)1 << 32); i += 1024) ((volatile float*)p)[i] = 1.0f;
+        /* Past the end: the next pages one by one, then a megabyte at a time until the memory beyond is not there to
+         * write. (A page at a time all the way can take seconds when a large writable mapping lies beyond the buffer,
+         * as it seems to on the macOS runner, and a crash that late reads as a hang.) */
+        size_t i = n;
+        for (; i < n + 64 * 1024; i += 1024) ((volatile float*)p)[i] = 1.0f;
+        for (; i < ((size_t)1 << 32); i += (size_t)1 << 18) ((volatile float*)p)[i] = 1.0f;
         abort();
     } else if (!strcmp(kind, "leak")) {
         const size_t bytes = (size_t)64 << 20;

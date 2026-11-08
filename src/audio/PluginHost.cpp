@@ -778,6 +778,7 @@ public:
     void process(float* const* channels, int numChannels, int frames) override {
         takeNext();
         if (frames <= 0) return;
+        if (!usable() && !tRealtime && !offlineNoted_) awaitRestart();  // (noted: this render is stopping at it anyway)
         for (int off = 0; off < frames; off += wire::kMaxFrames) processChunk(channels, numChannels, off, std::min(wire::kMaxFrames, frames - off));
         key_ = nullptr;
     }
@@ -981,6 +982,27 @@ public:
 
 private:
     bool usable() const { return link_ && core_->state.load(std::memory_order_acquire) == 0; }
+
+    // Whether the supervisor is starting it again, or will at its next look.
+    bool restartComing() const {
+        const int st = core_->state.load();
+        if (st == 2 || core_->next.load() != nullptr) return true;
+        if (st != 1) return false;
+        if (core_->restartAsked.load()) return true;
+        return !pluginHeldBypassed(core_->d.id) && autoRestartsLeft(core_->d.id) > 0;
+    }
+
+    // Offline (an export, which may wait), a plug-in being started again is waited for, up to the export's limit, so
+    // an export that starts just after a failure (its host perhaps still ending: a crash reporter, a core dump) has it
+    // back rather than stopping at it.
+    void awaitRestart() {
+        const int64_t end = ipc::nowUs() + int64_t(gExportTimeoutMs.load()) * 1000;
+        while (!usable() && restartComing() && ipc::nowUs() < end) {
+            supervisor().wake();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            takeNext();
+        }
+    }
 
     // A restarted link from the supervisor, taken up here (the thread using the instance).
     void takeNext() {

@@ -2064,8 +2064,40 @@ private slots:
         QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in Montage Test Gain"), err.c_str());
         QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
         QVERIFY(failureOf(d->id)->offline);
+        // (a host started again while the fault was set has it too: the next export is to get a host without it)
+        QVERIFY(eventually([] { return runningHosts().empty(); }, 20000));
         err.clear();
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+    }
+
+    void offlineRenderWaitsForARestart() {
+        // A render that may wait (an export) and finds its plug-in being started again after a failure waits for it,
+        // within the export's limit, instead of stopping at it: it is heard, and no export is told of a failure.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) { s.autoRestarts = 2; });
+        auto inst = instantiate(*d);
+        QVERIFY(inst && inst->activate(48000, 256));
+        inst->setParameter(7, 0.7);
+        std::vector<float> l(256), r(256);
+        float* ch[2] = {l.data(), r.data()};
+        RenderModeScope offline(false);
+        auto level = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst->process(ch, 2, 256);
+            return l[255];
+        };
+        QCOMPARE(level(), 0.35f);
+        // Ended between blocks, and found so by the supervisor: bypassed, a new host on its way (being started: the
+        // instance still names the old one).
+        const int64_t pid = hostProcessOf(inst.get());
+        QVERIFY(ipc::killProcess(pid));
+        QVERIFY(eventually([&] { return bypassed(inst.get()) && hostProcessOf(inst.get()) == pid; }, 20000));
+        const uint64_t offlineBefore = offlineFailureSerial();
+        QCOMPARE(level(), 0.35f);  // (waited for, not bypassed)
+        QVERIFY(!bypassed(inst.get()) && hostProcessOf(inst.get()) != pid);
+        QCOMPARE(offlineFailureSerial(), offlineBefore);
     }
 
     void stateSurvivesAHostRestart() {
