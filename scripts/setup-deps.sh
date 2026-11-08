@@ -42,9 +42,18 @@ esac
 if [ -n "$ORT_ARCH" ] && [ ! -f /opt/onnxruntime/include/onnxruntime_cxx_api.h ]; then
   tmp=$(mktemp -d)
   echo "$(date -u +%T) ONNX Runtime $ORT_VERSION"
-  # (A download slower than 50 KB/s for a minute is given up and retried.)
-  curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 600 -o "$tmp/ort.tgz" \
-    "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-$ORT_ARCH-$ORT_VERSION.tgz"
+  # (A download slower than 50 KB/s for a minute is given up and retried. GitHub's release downloads can answer 504
+  # for minutes at a time, so a failed round is tried again after a pause, for up to about five minutes in all.)
+  ort_url="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-$ORT_ARCH-$ORT_VERSION.tgz"
+  for round in 1 2 3 4 5 6; do
+    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --speed-limit 51200 --speed-time 60 --max-time 600 \
+         -o "$tmp/ort.tgz" "$ort_url"; then
+      break
+    fi
+    [ "$round" -eq 6 ] && { echo "ONNX Runtime could not be downloaded from $ort_url" >&2; exit 22; }
+    echo "$(date -u +%T) ONNX Runtime download failed; trying again in 45 s"
+    sleep 45
+  done
   $SUDO mkdir -p /opt/onnxruntime
   $SUDO tar -xzf "$tmp/ort.tgz" -C /opt/onnxruntime --strip-components=1
   rm -rf "$tmp"
