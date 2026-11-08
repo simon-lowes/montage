@@ -273,7 +273,13 @@ void halftone(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     // Dots on a grid turned by `angle`; each dot's area is the ink the cell's tone needs.
     auto dot = [&](double x, double y, double ang, int channel) {
         const double c = std::cos(ang), s = std::sin(ang);
-        const double u = (x * c + y * s) / cell, v = (-x * s + y * c) / cell;
+        // (a place within 1/1000 of a cell of the screen's lines is taken as on them, so a GPU's rounding cannot move a
+        // pixel on one, such as the diagonal at 45 degrees, into the next cell: render/shaders/gpufilter.frag)
+        auto onLine = [](double w) {
+            const double k = std::floor(w + 0.5);
+            return std::fabs(w - k) < 1e-3 ? k : w;
+        };
+        const double u = onLine((x * c + y * s) / cell), v = onLine((-x * s + y * c) / cell);
         const double cu = std::floor(u) + 0.5, cv = std::floor(v) + 0.5;
         const double px = (cu * c - cv * s) * cell, py = (cu * s + cv * c) * cell;
         float at[4];

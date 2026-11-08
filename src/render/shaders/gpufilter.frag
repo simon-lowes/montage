@@ -302,9 +302,15 @@ float smoothstepFx(float a, float b, float x) {
     return u * u * (3.0 - 2.0 * u);
 }
 // Halftone's dot: 1 inside it, for the cell round (x, y) on the grid turned by (c, s).
+// (a place within 1/1000 of a cell of the screen's lines is taken as on them, as on the CPU: at 45 degrees -x * s + y * c is
+// exactly 0 on the diagonal, which fused multiply-adds turn into a tiny value either side of it, and with it the cell)
+float onScreenLine(float u) {
+    const float k = floor(u + 0.5);
+    return abs(u - k) < 1e-3 ? k : u;
+}
 float halftoneDot(ivec2 size, float x, float y, float c, float s, int channel) {
     const float cell = p[1].x;
-    const float u = (x * c + y * s) / cell, v = (-x * s + y * c) / cell;
+    const float u = onScreenLine((x * c + y * s) / cell), v = onScreenLine((-x * s + y * c) / cell);
     const float cu = floor(u) + 0.5, cv = floor(v) + 0.5;
     const vec4 at = sampleEdge(size, (cu * c - cv * s) * cell, (cu * s + cv * c) * cell, 1);
     const float a = at.a > 0.0 ? at.a : 1.0;
