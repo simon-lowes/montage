@@ -46,6 +46,7 @@ class QTabBar;
 namespace montage {
 
 class QualityCheckDialog;
+class TrackGroupsDialog;
 
 class SpectralRepairDialog;
 class PanFollowDialog;
@@ -243,6 +244,7 @@ public:
     // Clip › Remove Letterbox: black bars baked into the selected video clips' pictures found, cropped off and the rest
     // scaled to fill the frame (render/Letterbox.h), one undo step. How many clips changed.
     int removeLetterbox();
+    void trackGroupsDialog();   // Sequence › Track Groups… (core/TrackGroups.h), kept open beside the work
     void watchFoldersDialog();  // File › Watch Folders… (EditorState::addWatchFolder)
     // Sequence › Analyse HDR Light Levels: an HDR sequence's MaxCLL and MaxFALL measured over In to Out (or all of it)
     // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
@@ -681,6 +683,7 @@ private:
     bool takeEditInteractive();  // File › Edit Project: asks before discarding changes not saved
     void newProjectInProduction(const QString& folder);
     AudioDescriptionDialog* audioDescription_ = nullptr;
+    TrackGroupsDialog* trackGroups_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;

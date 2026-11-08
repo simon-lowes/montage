@@ -26,6 +26,7 @@
 #include "PlaybackController.h"
 #include "core/EditOps.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 
 namespace montage {
 
@@ -185,8 +186,17 @@ bool VoiceoverRecorder::startLoop(FrameTime in, FrameTime out, FrameTime preroll
     if (isRecording() || out <= in) return false;
     preroll = std::clamp<FrameTime>(preroll, 0, in);
     loopIn_ = in, loopOut_ = out, preroll_ = preroll;
+    // Record arming through a track group (core/TrackGroups.h): every track of the group records, one input channel
+    // each (the target's first, then the others in order), and their passes share pass ids and take numbers.
+    groupTracks_.clear();
+    if (const Sequence* s = state_->sequence(); s && track >= 0 && track < int(s->audioTracks.size()))
+        for (TrackRef r : groupTracks(*s, {TrackKind::Audio, track}, GroupSwitch::Record))
+            if (r.kind == TrackKind::Audio) groupTracks_.push_back(r.index);
+    if (groupTracks_.size() > 1) channels = std::max(channels, int(groupTracks_.size()));
+    else groupTracks_.clear();
     if (start(in - preroll, track, -1, input, openDevice, sampleRate, channels)) return true;
     loopIn_ = loopOut_ = preroll_ = 0;
+    groupTracks_.clear();
     return false;
 }
 
@@ -306,20 +316,44 @@ Id VoiceoverRecorder::stopLoop() {
     QStringList files;
     bool written = true;
     const QString stem = QFileInfo(path_).completeBaseName() + QStringLiteral(" pass ");
-    for (size_t k = 0; k < passes.size(); ++k) {
-        const QString file = takeFolder() + '/' + stem + QString::number(k + 1) + QStringLiteral(".wav");
-        WavWriter w;
-        if (!w.open(file, rate_, channels_)) {
-            written = false;
-            break;
+    const std::vector<int> grouped = groupTracks_;
+    groupTracks_.clear();
+    if (grouped.size() > 1) {
+        // A grouped recording: each track's channel of each pass, a mono file of its own (track by track).
+        std::vector<float> mono;
+        for (size_t t = 0; t < grouped.size() && written; ++t) {
+            const int ch = int(t) % channels_;
+            const QString name = grouped[t] < int(s->audioTracks.size()) ? QString::fromStdString(s->audioTracks[size_t(grouped[t])].name) : QString();
+            for (size_t k = 0; k < passes.size(); ++k) {
+                const QString file = takeFolder() + '/' + stem + QString::number(k + 1) + ' ' + (name.isEmpty() ? QString::number(t + 1) : name) +
+                                     QStringLiteral(".wav");
+                mono.resize(size_t(passes[k].count));
+                for (qint64 i = 0; i < passes[k].count; ++i) mono[size_t(i)] = samples[(passes[k].first + i) * channels_ + ch];
+                WavWriter w;
+                if (!w.open(file, rate_, 1) || (w.write(mono.data(), passes[k].count), !w.close())) {
+                    QFile::remove(file);
+                    written = false;
+                    break;
+                }
+                files << file;
+            }
         }
-        w.write(samples + passes[k].first * channels_, passes[k].count);
-        if (!w.close()) {
-            QFile::remove(file);
-            written = false;
-            break;
+    } else {
+        for (size_t k = 0; k < passes.size(); ++k) {
+            const QString file = takeFolder() + '/' + stem + QString::number(k + 1) + QStringLiteral(".wav");
+            WavWriter w;
+            if (!w.open(file, rate_, channels_)) {
+                written = false;
+                break;
+            }
+            w.write(samples + passes[k].first * channels_, passes[k].count);
+            if (!w.close()) {
+                QFile::remove(file);
+                written = false;
+                break;
+            }
+            files << file;
         }
-        files << file;
     }
     // The whole recording goes only once every pass is safely written; else it is kept, and the passes written so far
     // removed (nothing is lost, and nothing goes on the timeline half done).
@@ -347,6 +381,20 @@ Id VoiceoverRecorder::stopLoop() {
     Id clip = 0;
     state_->apply(tr("Loop Record"), [&](Project& p, Sequence& sq) {
         if (sq.audioTracks.empty()) return edit::Result::fail("No audio track");
+        if (grouped.size() > 1) {
+            // The passes on every grouped track, recorded together (one pass id and take number per pass).
+            std::vector<TrackRef> tracks;
+            std::vector<std::vector<Id>> media;
+            for (size_t t = 0; t < grouped.size(); ++t) {
+                if (grouped[t] >= int(sq.audioTracks.size())) return edit::Result::fail("A grouped track has gone");
+                tracks.push_back({TrackKind::Audio, grouped[t]});
+                media.emplace_back(ids.begin() + long(t * passes.size()), ids.begin() + long((t + 1) * passes.size()));
+            }
+            edit::Result r = edit::addGroupLoopTakes(p, sq, tracks, media, complete, in, out);
+            const size_t lanes = ids.size();
+            if (r.ok && r.created.size() > lanes) clip = r.created[lanes];  // the target track's comp
+            return r;
+        }
         const TrackRef a{TrackKind::Audio, std::min(track, int(sq.audioTracks.size()) - 1)};
         edit::Result r = edit::addLoopTakes(p, sq, a, ids, complete, in, out);
         if (r.ok && r.created.size() > ids.size()) clip = r.created.back();
@@ -358,6 +406,7 @@ Id VoiceoverRecorder::stopLoop() {
 
 void VoiceoverRecorder::cancel() {
     loopIn_ = loopOut_ = preroll_ = 0;
+    groupTracks_.clear();
     if (source_) {
         source_->stop();
         source_->deleteLater();

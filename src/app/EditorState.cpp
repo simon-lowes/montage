@@ -1,5 +1,6 @@
 #include "EditorState.h"
 
+#include "core/TrackGroups.h"
 #include "core/Expression.h"
 #include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
@@ -327,7 +328,8 @@ bool EditorState::isSelected(Id clip) const {
 
 void EditorState::setSelection(std::vector<Id> clips, bool expandLinked) {
     primary_ = clips.empty() ? 0 : clips.front();
-    if (expandLinked && sequence()) clips = edit::expandLinks(*sequence(), clips);
+    // With the clips linked to them and, through a track group's editing switch, those over the same time on its tracks.
+    if (expandLinked && sequence()) clips = edit::expandGroups(*sequence(), clips);
     if (clips == selection_ && selectedTransition_ == 0 && (clips.empty() || !inspectedChain_)) return;
     selection_ = std::move(clips);
     selectedTransition_ = 0;

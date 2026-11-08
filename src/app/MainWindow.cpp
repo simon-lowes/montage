@@ -142,6 +142,8 @@ extern "C" {
 #include "InspectorWidget.h"
 #include "AutoDuckDialog.h"
 #include "AutoMixDialog.h"
+#include "TrackGroupsDialog.h"
+#include "core/TrackGroups.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "SoundSamplesDialog.h"
@@ -495,6 +497,7 @@ void MainWindow::buildPanels() {
                 programPanel_->showTrimView(left, right, leftLabel, rightLabel);
             });
     connect(timeline_, &TimelineWidget::trimViewEnded, programPanel_, &MonitorPanel::endTrimView);
+    connect(timeline_, &TimelineWidget::trackGroupsRequested, this, &MainWindow::trackGroupsDialog);
     bin_ = new MediaBinWidget(state_, this);
     connect(bin_, &MediaBinWidget::openInSource, this, &MainWindow::openInSource);
     connect(bin_, &MediaBinWidget::newTitleRequested, this, &MainWindow::addTitle);
@@ -2274,6 +2277,25 @@ void MainWindow::buildMenus() {
         audioDescription_->show();
         audioDescription_->raise();
     })->setObjectName(QStringLiteral("audioDescription"));
+    // Track groups (core/TrackGroups.h): the dialog, and every group suspended at once (and back) with a key.
+    add(seqM, QT_TR_NOOP("Track &Groups…"), QKeySequence(), [this] { trackGroupsDialog(); })->setObjectName(QStringLiteral("trackGroups"));
+    {
+        QAction* suspend = add(seqM, QT_TR_NOOP("Suspend Track Groups"), QKeySequence("Ctrl+Shift+G"), [this] {
+            if (!state_->sequence()) return;
+            const bool on = !state_->sequence()->groupsSuspended;
+            state_->edit(on ? tr("Suspend Track Groups") : tr("Resume Track Groups"), [on](Project&, Sequence& s) {
+                s.groupsSuspended = on;
+                return true;
+            });
+            state_->message(on ? tr("Track groups suspended: each track acts alone (Ctrl+Shift+G again resumes them)") : tr("Track groups resumed"), 4000);
+        });
+        suspend->setObjectName(QStringLiteral("suspendTrackGroups"));
+        suspend->setCheckable(true);
+        connect(state_, &EditorState::projectChanged, suspend, [this, suspend] {
+            const QSignalBlocker block(suspend);
+            suspend->setChecked(state_->sequence() && state_->sequence()->groupsSuspended);
+        });
+    }
     add(seqM, QT_TR_NOOP("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
         if (!state_->sequence()) return;
         SpeechDialog dlg(state_, this);
@@ -3905,14 +3927,8 @@ void MainWindow::addEdit(bool allTracks) {
             if (c.contains(t)) tracks.push_back(loc->track);
         }
     if (tracks.empty()) tracks = {{TrackKind::Video, state_->targetVideoTrack()}, {TrackKind::Audio, state_->targetAudioTrack()}};
-    state_->apply(tr("Add Edit"), [t, tracks](Project& p, Sequence& sq) {
-        edit::Result last = edit::Result::fail("No clip under the playhead");
-        for (TrackRef r : tracks) {
-            auto res = edit::razor(p, sq, r, t);
-            if (res.ok) last = res;
-        }
-        return last;
-    });
+    // (With the tracks grouped with them: core/TrackGroups.h razorTogether.)
+    state_->apply(tr("Add Edit"), [t, tracks](Project& p, Sequence& sq) { return edit::razorTogether(p, sq, tracks, t); });
 }
 
 void MainWindow::addTransitionsToSelection(std::optional<TrackKind> only) {
@@ -6366,7 +6382,7 @@ bool MainWindow::cycleTake(int step) {
     }
     const Id clip = c->id;
     return state_->apply(step > 0 ? tr("Next Take") : tr("Previous Take"),
-                         [clip, step](Project& p, Sequence& s) { return edit::cycleTake(p, s, clip, step); });
+                         [clip, step](Project& p, Sequence& s) { return edit::cycleGroupTake(p, s, clip, step); });
 }
 
 bool MainWindow::stepVfxVersion(int step) {
@@ -9373,6 +9389,14 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     box.exec();
     if (box.clickedButton() == go) state_->setPlayhead(l.maxCllFrame);
     return true;
+}
+
+void MainWindow::trackGroupsDialog() {
+    if (!state_->sequence()) return;
+    if (!trackGroups_) trackGroups_ = new TrackGroupsDialog(state_, this);
+    trackGroups_->show();
+    trackGroups_->raise();
+    trackGroups_->activateWindow();
 }
 
 void MainWindow::watchFoldersDialog() {

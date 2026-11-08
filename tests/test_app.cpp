@@ -226,6 +226,7 @@
 #include "LoudnessReadout.h"
 #include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
+#include "TrackGroupsDialog.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "FootageNotesDialog.h"
@@ -287,6 +288,7 @@
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 #include "media/Decoder.h"
 #include "media/LtcTimecode.h"
 #include "audio/Ltc.h"
@@ -11814,6 +11816,297 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->removeMedia(firstTake));
         QCOMPARE(track().lanes.size(), size_t(3));
         QVERIFY(std::none_of(track().lanes.begin(), track().lanes.end(), [&](const TakeLane& l) { return l.mediaId == firstTake; }));
+        state()->newProject();
+    }
+
+    void trackGroupsInTheApp() {
+        state()->newProject();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        // Three audio tracks, each with a clip of its own microphone over the same time.
+        std::vector<Id> clips;
+        QVERIFY(state()->apply("Clips", [&](Project& p, Sequence& s) {
+            for (int k = 0; k < 3; ++k) {
+                MediaItem m;
+                m.id = p.newId();
+                m.kind = MediaKind::Audio;
+                m.name = "mic" + std::to_string(k) + ".wav";
+                m.path = "/nonexistent/mic" + std::to_string(k) + ".wav";
+                m.duration = 10.0;
+                m.hasAudio = true;
+                p.media.push_back(m);
+                Clip c = makeClip(p, p.media.back(), TrackKind::Audio, s);
+                c.start = 30;
+                c.duration = 120;
+                clips.push_back(c.id);
+                edit::Result r = edit::overwrite(p, s, {TrackKind::Audio, k}, c);
+                if (!r.ok) return r;
+            }
+            s.audioTracks[1].volumeDb = -3;
+            s.audioTracks[2].volumeDb = 2;
+            return edit::Result{};
+        }));
+        auto track = [&](int k) -> const Track& { return state()->sequence()->audioTracks.at(size_t(k)); };
+
+        // Sequence › Track Groups… opens the dialog; nothing to switch until there is a group.
+        auto* open = win_->findChild<QAction*>("trackGroups");
+        QVERIFY(open);
+        open->trigger();
+        auto* dlg = win_->findChild<TrackGroupsDialog*>();
+        QVERIFY(dlg && dlg->isVisible());
+        QCOMPARE(dlg->groups()->count(), 0);
+        QVERIFY(!dlg->switchBox("groupEditing")->isEnabled());
+        QVERIFY(!dlg->groups()->accessibleName().isEmpty() && !dlg->tracks()->accessibleName().isEmpty());
+        auto rowOf = [&](int audio) {
+            for (int i = 0; i < dlg->tracks()->count(); ++i)
+                if (dlg->tracks()->item(i)->data(Qt::UserRole).toInt() == 100000 + audio) return i;
+            return -1;
+        };
+        // A group of the highlighted track (A1), then A2 and A3 ticked into it: one undo step each.
+        dlg->tracks()->setCurrentRow(rowOf(0));
+        QVERIFY(dlg->newGroup("Dialogue"));
+        QCOMPARE(state()->sequence()->trackGroups.size(), size_t(1));
+        const Id group = state()->sequence()->trackGroups[0].id;
+        QCOMPARE(track(0).group, group);
+        QCOMPARE(dlg->groups()->count(), 1);
+        QVERIFY(dlg->switchBox("groupEditing")->isEnabled() && dlg->switchBox("groupEditing")->isChecked());
+        QVERIFY(!dlg->newGroup("dialogue"));  // the name is taken
+        for (int k : {1, 2}) {
+            QListWidgetItem* it = dlg->tracks()->item(rowOf(k));
+            QVERIFY(it->flags() & Qt::ItemIsUserCheckable);
+            it->setCheckState(Qt::Checked);
+            QCOMPARE(track(k).group, group);
+        }
+        state()->undo();
+        QCOMPARE(track(2).group, Id(0));
+        state()->redo();
+        QCOMPARE(track(2).group, group);
+        // A switch turned off and on again in the dialog.
+        dlg->switchBox("groupPan")->click();
+        QVERIFY(!state()->sequence()->trackGroups[0].pan);
+        dlg->switchBox("groupPan")->click();
+        QVERIFY(state()->sequence()->trackGroups[0].pan);
+        // A2's colour chosen from the keyboard, and its clips drawn in it.
+        dlg->tracks()->setCurrentRow(rowOf(1));
+        QComboBox* color = dlg->colorBox();
+        QCOMPARE(color->currentIndex(), 0);  // None
+        // (Its list opened and the next colour picked with the keys.)
+        color->showPopup();
+        QTRY_VERIFY(color->view()->isVisible());
+        QTest::keyClick(color->view(), Qt::Key_Down);
+        QTest::keyClick(color->view(), Qt::Key_Return);
+        QCOMPARE(color->currentIndex(), 1);
+        const QString chosen = theme::labelColor(1).name();
+        QCOMPARE(QString::fromStdString(track(1).color), chosen);
+        dlg->colorClipsBox()->click();
+        QVERIFY(track(1).colorClips);
+        dlg->close();
+
+        // The header shows the colour, in a bar at its left edge.
+        TimelineWidget* tl = timeline();
+        tl->zoomToFit();
+        const int y = tl->spanBounds({TrackKind::Audio, 1}, 30, 40).center().y();
+        QVERIFY(y > 0);
+        QTRY_COMPARE(tl->viewport()->grab().toImage().pixelColor(4, y).name(), chosen);
+
+        // A click on one clip selects all three; Delete removes all three; one undo brings them back.
+        win_->activateWindow();
+        QTRY_COMPARE(QApplication::activeWindow(), static_cast<QWidget*>(win_.get()));  // (not the colour list's popup)
+        const QRect b = tl->clipBounds(clips[1]);
+        QVERIFY(!b.isEmpty() && tl->viewport()->rect().contains(b.center()));
+        // (Above its volume line, which a click in the middle would take hold of.)
+        const QPoint onClip(b.center().x(), b.top() + 6);
+        state()->setSelection({});
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, onClip);
+        QCOMPARE(state()->selectedClips().size(), size_t(3));
+        tl->setFocus();
+        QTest::keyClick(win_.get(), Qt::Key_Delete);
+        for (int k = 0; k < 3; ++k) QVERIFY(track(k).clips.empty());
+        state()->undo();
+        for (int k = 0; k < 3; ++k) QCOMPARE(track(k).clips.size(), size_t(1));
+
+        // Ctrl+Shift+G suspends every group: a click then selects the one clip; again resumes them.
+        auto* suspend = win_->findChild<QAction*>("suspendTrackGroups");
+        QVERIFY(suspend);
+        QTest::keyClick(win_.get(), Qt::Key_G, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(state()->sequence()->groupsSuspended);
+        QVERIFY(suspend->isChecked());
+        state()->setSelection({});
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, onClip);
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{clips[1]});
+        QTest::keyClick(win_.get(), Qt::Key_G, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(!state()->sequence()->groupsSuspended);
+        QVERIFY(!suspend->isChecked());
+
+        // A fader move on A1 moves A2 and A3 by as many decibels (their offsets stay); one undo puts all three back.
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(2));
+        mixer->trackFader(0)->setValue(-60);
+        QCOMPARE(track(0).volumeDb, -6.0);
+        QCOMPARE(track(1).volumeDb, -9.0);
+        QCOMPARE(track(2).volumeDb, -4.0);
+        state()->undo();
+        QCOMPARE(track(0).volumeDb, 0.0);
+        QCOMPARE(track(1).volumeDb, -3.0);
+        QCOMPARE(track(2).volumeDb, 2.0);
+        // Mute on one mutes the group.
+        mixer->trackMute(2)->click();
+        QVERIFY(track(0).muted && track(1).muted && track(2).muted);
+        state()->undo();
+        QVERIFY(!track(0).muted && !track(1).muted && !track(2).muted);
+
+        // Touch set on A1 is set on all three; a pass with A1's fader held writes the others' lanes by as much.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
+        for (int k = 0; k < 3; ++k) QCOMPARE(track(k).automation, int(AutomationMode::Touch));
+        QSlider* fader = mixer->trackFader(0);
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-30);
+            }
+            if (f == 15) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(60);
+        const double before[] = {0.0, -3.0, 2.0};
+        for (int k = 0; k < 3; ++k) {
+            QVERIFY(track(k).volumeAuto.animated());
+            QCOMPARE(track(k).volumeAuto.at(10), before[k] - 3.0);
+            QCOMPARE(track(k).volumeAuto.at(2), before[k]);
+            QCOMPARE(track(k).volumeAuto.at(50), before[k]);
+        }
+        state()->undo();
+        for (int k = 0; k < 3; ++k) QVERIFY(!track(k).volumeAuto.animated());
+
+        // With the group's automation switch off, the pass writes A1 alone.
+        QVERIFY(state()->apply("Switch", [&](Project&, Sequence& s) {
+            TrackGroup g = s.trackGroups[0];
+            g.automation = false;
+            return edit::setTrackGroupSwitches(s, group, g);
+        }));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 30; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-60);
+            }
+            if (f == 15) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(30);
+        QCOMPARE(track(0).volumeAuto.at(10), -6.0);
+        QVERIFY(!track(1).volumeAuto.animated() && !track(2).volumeAuto.animated());
+        state()->newProject();
+    }
+
+    void groupLoopRecordingComp() {
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/grouploop.montage"));
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime in = 30, out = in + FrameTime(std::llround(8 * fps)), pre = 15;
+        QVERIFY(state()->apply("Group", [](Project& p, Sequence& s) {
+            return edit::createTrackGroup(p, s, "Band", {{TrackKind::Audio, 0}, {TrackKind::Audio, 1}, {TrackKind::Audio, 2}});
+        }));
+        // A loop recording onto A1 records A1-A3 (one input channel each): three passes, each sample saying which
+        // channel and where in the recording it is.
+        VoiceoverRecorder rec(state());
+        QVERIFY(rec.startLoop(in, out, pre, 0, {}, false, 48000, 1));
+        const double length = double(out - in) / fps * 48000;
+        const qint64 preroll = std::llround(double(pre) / fps * 48000);
+        auto passStart = [&](int k) { return preroll + qint64(std::llround(k * length)); };
+        auto value = [](qint64 i, int ch) { return float(i % 7919) / 7919.0f * 0.25f + 0.1f * float(ch); };
+        const qint64 total = passStart(3) + 4800;
+        std::vector<float> block(4800 * 3);
+        for (qint64 at = 0; at < total; at += 4800) {
+            const qint64 n = std::min<qint64>(4800, total - at);
+            for (qint64 i = 0; i < n; ++i)
+                for (int ch = 0; ch < 3; ++ch) block[size_t(i * 3 + ch)] = value(at + i, ch);
+            rec.feed(block.data(), n);
+        }
+        QCOMPARE(rec.passes(), 3);
+        QVERIFY(rec.stop());
+        auto track = [&](int k) -> const Track& { return state()->sequence()->audioTracks.at(size_t(k)); };
+        // Three lanes on each track; pass k has one pass id, one take number and one colour on all three, and each
+        // track's lane holds its own channel.
+        for (int t = 0; t < 3; ++t) {
+            QCOMPARE(track(t).lanes.size(), size_t(3));
+            QCOMPARE(track(t).clips.size(), size_t(1));  // the last pass comped
+        }
+        for (size_t k = 0; k < 3; ++k) {
+            const TakeLane& l0 = track(0).lanes[k];
+            QVERIFY(l0.pass != 0);
+            QCOMPARE(takeNumber(l0), int(k) + 1);
+            for (int t = 1; t < 3; ++t) {
+                const TakeLane& l = track(t).lanes[k];
+                QCOMPARE(l.pass, l0.pass);
+                QCOMPARE(takeNumber(l), takeNumber(l0));
+                QCOMPARE(takeColor(l), takeColor(l0));
+                QVERIFY(l.mediaId != l0.mediaId);
+            }
+            for (int t = 0; t < 3; ++t) {
+                QFile f(QString::fromStdString(state()->project().findMedia(track(t).lanes[k].mediaId)->path));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                f.seek(44);
+                const QByteArray data = f.readAll();
+                QCOMPARE(qint64(data.size() / 4), passStart(int(k) + 1) - passStart(int(k)));
+                QCOMPARE(reinterpret_cast<const float*>(data.constData())[0], value(passStart(int(k)), t));
+            }
+        }
+        QVERIFY(track(0).lanes[0].pass != track(0).lanes[1].pass);
+        // Take 2 comped from 4 s to 7 s on A2 alone; a copy comped track by track for comparison.
+        Project byHand = state()->project();
+        const FrameTime from = FrameTime(std::llround(4 * fps)), to = FrameTime(std::llround(7 * fps));
+        const Id take2 = track(1).lanes[1].id;
+        for (int t = 0; t < 3; ++t) {
+            Sequence& s = *byHand.active();
+            QVERIFY(edit::compTake(byHand, s, {TrackKind::Audio, t}, s.audioTracks[size_t(t)].lanes[1].id, from, to).ok);
+        }
+        QVERIFY(state()->apply("Comp", [&](Project& p, Sequence& s) { return edit::compGroup(p, s, {TrackKind::Audio, 1}, take2, from, to); }));
+        // All three switch at the same frames, with their crossfades at the same samples (the same joins and lengths).
+        auto joins = [&](int t) {
+            std::vector<std::tuple<FrameTime, FrameTime, std::string>> out;
+            for (const Transition& x : track(t).transitions) {
+                const Clip* a = edit::clipById(*state()->sequence(), x.clipA);
+                out.push_back({a ? a->end() : -1, x.duration, x.type});
+            }
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        for (int t = 0; t < 3; ++t) {
+            QCOMPARE(track(t).clips.size(), size_t(3));
+            QCOMPARE(compLaneOf(track(t), track(t).clips[1]), track(t).lanes[1].id);
+            QCOMPARE(track(t).transitions.size(), size_t(2));
+            for (size_t k = 0; k < 3; ++k) {
+                QCOMPARE(track(t).clips[k].start, track(0).clips[k].start);
+                QCOMPARE(track(t).clips[k].sourceIn, track(0).clips[k].sourceIn);
+            }
+            QCOMPARE(joins(t), joins(0));
+        }
+        // The mix from 3 s to 8 s equals the mix of the copy comped track by track, sample for sample.
+        const int64_t start = 3 * 48000;
+        const int frames = 5 * 48000;
+        std::vector<float> grouped(size_t(frames) * 2), single(size_t(frames) * 2);
+        {
+            AudioMixer m;
+            m.mix(state()->project(), *state()->sequence(), start, frames, grouped.data());
+        }
+        {
+            AudioMixer m;
+            m.mix(byHand, *byHand.active(), start, frames, single.data());
+        }
+        float peak = 0;
+        for (float v : grouped) peak = std::max(peak, std::fabs(v));
+        QVERIFY(peak > 0.05f);
+        QVERIFY(grouped == single);
+        // One undo takes the comp back off all three.
+        state()->undo();
+        for (int t = 0; t < 3; ++t) QCOMPARE(track(t).clips.size(), size_t(1));
+        // A rating on one track's take rates that pass on the others.
+        QVERIFY(state()->apply("Rate", [&](Project&, Sequence& s) { return edit::rateGroupLane(s, {TrackKind::Audio, 2}, s.audioTracks[2].lanes[0].id, 4); }));
+        for (int t = 0; t < 3; ++t) QCOMPARE(track(t).lanes[0].rating, 4);
         state()->newProject();
     }
 

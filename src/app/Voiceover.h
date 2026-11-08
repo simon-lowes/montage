@@ -112,6 +112,7 @@ private:
     bool stopping_ = false;
     bool placing_ = true;
     FrameTime loopIn_ = 0, loopOut_ = 0, preroll_ = 0;
+    std::vector<int> groupTracks_;  // a loop recording onto a track group's tracks (by index; the target first)
 };
 
 // Sequence › Record Voiceover: input, level, countdown and punch-in.

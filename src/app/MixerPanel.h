@@ -14,6 +14,7 @@
 #include "EditorState.h"
 #include "core/Automation.h"
 #include "core/Model.h"
+#include "core/TrackGroups.h"
 
 class QAction;
 class QDial;
@@ -186,6 +187,10 @@ private:
     void addBus();
     void makeAutomationMenu(QWidget* parent);
 
+    // The other strips of a track's group that a pass writes with it (core/TrackGroups.h: `sw` and the automation
+    // switch), and whether one of their faders (or pans) is held.
+    std::vector<int> groupedStrips(int index, GroupSwitch sw) const;
+    bool groupHeld(int index, GroupSwitch sw, bool pan) const;
     void setVolume(int index, double db);
     void setPan(int index, double pan);
     void setSurround(int index, const SurroundPan& pan, bool final);
