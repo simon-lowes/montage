@@ -1,4 +1,5 @@
 #include "ProjectIO.h"
+#include "TrackGroups.h"
 #include "Automation.h"
 #include "ColorGroups.h"
 #include "AdaptiveHdrMetadata.h"
@@ -602,11 +603,16 @@ QJsonObject trackToJson(const Track& t) {
         for (const TakeLane& l : t.lanes) {
             QJsonObject lo{{"id", double(l.id)}, {"name", qs(l.name)}, {"media", double(l.mediaId)}, {"start", double(l.start)}};
             if (l.rating) lo["rating"] = l.rating;
+            if (l.pass) lo["pass"] = double(l.pass);
+            if (l.number) lo["number"] = l.number;
             lanes.append(lo);
         }
         o["lanes"] = lanes;
     }
     if (!t.lanesShown) o["lanesShown"] = false;
+    if (t.group) o["group"] = double(t.group);
+    if (!t.color.empty()) o["color"] = qs(t.color);
+    if (t.colorClips) o["colorClips"] = true;
     if (!t.sampler.empty()) {
         QJsonArray pads, passes;
         for (const SamplerSlot& sl : t.sampler.pads) {
@@ -704,9 +710,14 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
         l.mediaId = Id(i64(lo.value("media")));
         l.start = i64(lo.value("start"));
         l.rating = std::clamp(lo.value("rating").toInt(0), 0, 5);
+        l.pass = Id(i64(lo.value("pass")));
+        l.number = std::max(0, lo.value("number").toInt(0));
         if (l.mediaId) t.lanes.push_back(std::move(l));
     }
     t.lanesShown = o.value("lanesShown").toBool(true);
+    t.group = Id(i64(o.value("group")));
+    t.color = normalizeTrackColor(ss(o.value("color")));
+    t.colorClips = o.value("colorClips").toBool(false);
     {
         const QJsonObject so = o.value("sampler").toObject();
         for (const auto& v : so.value("slots").toArray()) {
@@ -960,6 +971,25 @@ QJsonObject sequenceToJson(const Sequence& s) {
         for (const auto& [k, db] : s.folderGains) gains[qs(k)] = db;
         o["folderGains"] = gains;
     }
+    if (!s.trackGroups.empty()) {
+        QJsonArray groups;
+        for (const TrackGroup& g : s.trackGroups) {
+            QJsonObject go{{"id", double(g.id)}, {"name", qs(g.name)}};
+            // The switches as they differ from a new group's (all on), and its suspension.
+            const TrackGroup fresh;
+            if (g.editing != fresh.editing) go["editing"] = g.editing;
+            if (g.mute != fresh.mute) go["mute"] = g.mute;
+            if (g.volume != fresh.volume) go["volume"] = g.volume;
+            if (g.pan != fresh.pan) go["pan"] = g.pan;
+            if (g.automation != fresh.automation) go["automation"] = g.automation;
+            if (g.record != fresh.record) go["record"] = g.record;
+            if (g.comp != fresh.comp) go["comp"] = g.comp;
+            if (g.suspended) go["suspended"] = true;
+            groups.append(go);
+        }
+        o["trackGroups"] = groups;
+    }
+    if (s.groupsSuspended) o["groupsSuspended"] = true;
     if (!s.mutedRoles.empty()) {
         QJsonArray roles;
         for (const std::string& r : s.mutedRoles) roles.append(qs(r));
@@ -1030,6 +1060,22 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     for (const auto& r : o.value("mutedRoles").toArray()) s.mutedRoles.push_back(r.toString().toStdString());
     const QJsonObject gains = o.value("folderGains").toObject();
     for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
+    for (const auto& v : o.value("trackGroups").toArray()) {
+        const QJsonObject go = v.toObject();
+        TrackGroup g;
+        g.id = Id(i64(go.value("id")));
+        g.name = ss(go.value("name"));
+        g.editing = go.value("editing").toBool(true);
+        g.mute = go.value("mute").toBool(true);
+        g.volume = go.value("volume").toBool(true);
+        g.pan = go.value("pan").toBool(true);
+        g.automation = go.value("automation").toBool(true);
+        g.record = go.value("record").toBool(true);
+        g.comp = go.value("comp").toBool(true);
+        g.suspended = go.value("suspended").toBool(false);
+        if (g.id) s.trackGroups.push_back(std::move(g));
+    }
+    s.groupsSuspended = o.value("groupsSuspended").toBool(false);
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.workingSpace = ss(o.value("workingSpace"));
     s.outputTransform = ss(o.value("outputTransform"));

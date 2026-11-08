@@ -17,6 +17,7 @@
 #include "CompositeGraph.h"
 #include "Effects.h"
 #include "GradeGraph.h"
+#include "TrackGroups.h"
 #include "render/Ofx.h"
 
 namespace montage::edit {
@@ -947,6 +948,14 @@ Result trim(Project& p, Sequence& s, Id clipId, Edge edge, FrameTime delta, Trim
             if (pos == edgePos) group.push_back(l);
         }
     }
+    // The clips of grouped tracks (core/TrackGroups.h) with their edge there, and theirs linked to them.
+    if (includeLinked)
+        for (Id m : groupEdgeMates(s, clipId, edge))
+            for (Id l : linkedClips(s, m)) {
+                const Clip* lc = clipById(s, l);
+                if (lc && (edge == Edge::In ? lc->start : lc->end()) == edgePos && std::find(group.begin(), group.end(), l) == group.end())
+                    group.push_back(l);
+            }
     // Clamp the delta across the group.
     for (Id id : group) {
         auto l = locate(s, id);
@@ -1605,7 +1614,57 @@ Result duplicateClips(Project& p, Sequence& s, const std::vector<Id>& ids, Frame
 // ---------------------------------------------------------------------------
 // Transitions
 
+namespace {
+
+Result addTransitionHere(Project& p, Sequence& s, Id clipId, Edge edge, const std::string& type, FrameTime duration);
+
+// The transitions on the grouped tracks (core/TrackGroups.h, editing switch) of the one with id `id` that join clips
+// at the same frame in the same way (a dissolve, a fade in or a fade out).
+std::vector<Id> transitionMates(const Sequence& s, Id id) {
+    std::vector<Id> out;
+    TrackRef where;
+    const Transition* tr = transitionById(const_cast<Sequence&>(s), id, &where);
+    if (!tr) return out;
+    const Track* t = trackAt(s, where);
+    FrameTime from = 0, to = 0;
+    if (!transitionRange(*t, *tr, from, to)) return out;
+    const std::vector<TrackRef> tracks = groupTracks(s, where, GroupSwitch::Editing);
+    for (size_t k = 1; k < tracks.size(); ++k) {
+        if (tracks[k].kind != where.kind) continue;
+        const Track* o = trackAt(s, tracks[k]);
+        for (const Transition& m : o->transitions) {
+            FrameTime a = 0, b = 0;
+            if ((m.clipA != 0) == (tr->clipA != 0) && (m.clipB != 0) == (tr->clipB != 0) && transitionRange(*o, m, a, b) &&
+                (tr->clipA ? (tr->clipB ? a + m.duration / 2 == from + tr->duration / 2 : b == to) : a == from))
+                out.push_back(m.id);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
 Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::string& type, FrameTime duration) {
+    // The clips of grouped tracks of the same kind (a picture transition is not a sound's) with their edge there get
+    // one too.
+    std::vector<Id> mates = groupEdgeMates(s, clipId, edge);
+    const auto here = locate(s, clipId);
+    std::erase_if(mates, [&](Id m) {
+        const auto at = locate(s, m);
+        return !here || !at || at->track.kind != here->track.kind;
+    });
+    Result r = addTransitionHere(p, s, clipId, edge, type, duration);
+    if (r.ok)
+        for (Id m : mates) {
+            Result o = addTransitionHere(p, s, m, edge, type, duration);
+            if (o.ok) r.created.insert(r.created.end(), o.created.begin(), o.created.end());
+        }
+    return r;
+}
+
+namespace {
+
+Result addTransitionHere(Project& p, Sequence& s, Id clipId, Edge edge, const std::string& type, FrameTime duration) {
     auto loc = locate(s, clipId);
     if (!loc) return Result::fail("Unknown clip");
     Track* t = trackAt(s, loc->track);
@@ -1650,6 +1709,8 @@ Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::s
     return r;
 }
 
+}  // namespace
+
 Result addTransitionsToClips(Project& p, Sequence& s, const std::vector<Id>& clips, const std::string& videoType,
                              const std::string& audioType, FrameTime duration) {
     Result res;
@@ -1675,7 +1736,8 @@ Result addTransitionsToClips(Project& p, Sequence& s, const std::vector<Id>& cli
             }
             if (!done.insert(point).second) continue;
             const bool audio = loc->track.kind == TrackKind::Audio;
-            const Result r = addTransition(p, s, id, edge, audio ? audioType : videoType, duration);
+            // (A grouped track's clips are among `clips` when they are meant to get one: a selection holds them.)
+            const Result r = addTransitionHere(p, s, id, edge, audio ? audioType : videoType, duration);
             if (r.ok) res.created.insert(res.created.end(), r.created.begin(), r.created.end());
             else why = r.error;
         }
@@ -2218,7 +2280,30 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     return out;
 }
 
+namespace {
+Result removeTransitionHere(Sequence& s, Id transitionId);
+Result setTransitionDurationHere(Sequence& s, Id transitionId, FrameTime duration);
+}  // namespace
+
 Result removeTransition(Sequence& s, Id transitionId) {
+    const std::vector<Id> mates = transitionMates(s, transitionId);
+    Result r = removeTransitionHere(s, transitionId);
+    if (r.ok)
+        for (Id m : mates) removeTransitionHere(s, m);
+    return r;
+}
+
+Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration) {
+    const std::vector<Id> mates = transitionMates(s, transitionId);
+    Result r = setTransitionDurationHere(s, transitionId, duration);
+    if (r.ok)
+        for (Id m : mates) setTransitionDurationHere(s, m, r.applied);
+    return r;
+}
+
+namespace {
+
+Result removeTransitionHere(Sequence& s, Id transitionId) {
     for (TrackRef r : allTracks(s)) {
         Track* t = trackAt(s, r);
         auto it = std::find_if(t->transitions.begin(), t->transitions.end(),
@@ -2232,6 +2317,8 @@ Result removeTransition(Sequence& s, Id transitionId) {
     return Result::fail("Unknown transition");
 }
 
+}  // namespace
+
 Transition* transitionById(Sequence& s, Id id, TrackRef* where) {
     for (TrackRef r : allTracks(s)) {
         Track* t = trackAt(s, r);
@@ -2244,7 +2331,9 @@ Transition* transitionById(Sequence& s, Id id, TrackRef* where) {
     return nullptr;
 }
 
-Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration) {
+namespace {
+
+Result setTransitionDurationHere(Sequence& s, Id transitionId, FrameTime duration) {
     TrackRef where;
     Transition* tr = transitionById(s, transitionId, &where);
     if (!tr) return Result::fail("Unknown transition");
@@ -2263,6 +2352,8 @@ Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration) {
     r.applied = tr->duration;
     return r;
 }
+
+}  // namespace
 
 bool transitionRange(const Track& t, const Transition& tr, FrameTime& from, FrameTime& to) {
     FrameTime cut = -1;

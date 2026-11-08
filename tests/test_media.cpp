@@ -269,6 +269,7 @@
 #include "core/MidiMaps.h"
 #include "audio/Sampler.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 #include "core/OnScreenText.h"
 #include "render/Processing.h"
 #include "media/CameraRaw.h"
@@ -14437,6 +14438,107 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
         QVERIFY(loadProject(project.toStdString(), back));
         QVERIFY(back.active()->audioTracks[0].effects.empty());
+    }
+
+    void mcpTrackGroupsAndColours() {
+        // Three audio tracks with two passes recorded together on each (silent files; only the edit is checked).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        std::vector<std::vector<Id>> media(3);
+        for (int t = 0; t < 3; ++t)
+            for (int k = 0; k < 2; ++k) {
+                const std::string file = path(("group pass " + std::to_string(k + 1) + " A" + std::to_string(t + 1) + ".wav").c_str());
+                QVERIFY(writeMonoWav(file, std::vector<float>(size_t(48000) * 6, 0.0f), 48000));
+                MediaItem m;
+                m.id = p.newId();
+                m.kind = MediaKind::Audio;
+                m.name = file;
+                m.path = file;
+                m.duration = 6.0;
+                m.hasAudio = true;
+                m.sampleRate = 48000;
+                m.channels = 1;
+                p.media.push_back(m);
+                media[size_t(t)].push_back(m.id);
+            }
+        const std::vector<TrackRef> abc{{TrackKind::Audio, 0}, {TrackKind::Audio, 1}, {TrackKind::Audio, 2}};
+        QVERIFY(edit::addGroupLoopTakes(p, s, abc, media, {true, true}, 30, 210).ok);
+        const QString project = QString::fromStdString(path("groups.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        // A group made of the three tracks, a switch turned off, and A2 coloured with its clips.
+        QJsonObject r = call("montage_track", {{"project", project}, {"tracks", QJsonArray{"A1", "A2", "A3"}}, {"group", "Band"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_track", {{"project", project}, {"track", "A3"}, {"switches", QJsonObject{{"pan", false}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_track", {{"project", project}, {"track", "A2"}, {"color", "#3A7"}, {"color_clips", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(call("montage_track", {{"project", project}, {"track", "A2"}, {"color", "teal"}}).value("isError").toBool());
+        QVERIFY(call("montage_track", {{"project", project}, {"group", "Band"}}).value("isError").toBool());  // no track named
+        // The listing.
+        r = call("montage_track", {{"project", project}});
+        const QJsonObject sc = r.value("structuredContent").toObject();
+        const QJsonArray groups = sc.value("groups").toArray();
+        QCOMPARE(groups.size(), qsizetype(1));
+        QCOMPARE(groups[0].toObject().value("name").toString(), QString("Band"));
+        QCOMPARE(groups[0].toObject().value("tracks").toArray().size(), qsizetype(3));
+        QVERIFY(!groups[0].toObject().value("pan").toBool() && groups[0].toObject().value("volume").toBool());
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        QCOMPARE(q.active()->audioTracks[1].color, std::string("#33aa77"));
+        QVERIFY(q.active()->audioTracks[1].colorClips);
+        QVERIFY(q.active()->audioTracks[0].group && q.active()->audioTracks[0].group == q.active()->audioTracks[2].group);
+        // montage_takes lists each lane's pass, number and colour (the same on every track of the group).
+        r = call("montage_takes", {{"project", project}, {"track", "A3"}, {"action", "list"}});
+        const QJsonArray lanes3 = r.value("structuredContent").toObject().value("lanes").toArray();
+        r = call("montage_takes", {{"project", project}, {"track", "A1"}, {"action", "list"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("group").toString(), QString("Band"));
+        const QJsonArray lanes1 = r.value("structuredContent").toObject().value("lanes").toArray();
+        QCOMPARE(lanes1.size(), qsizetype(2));
+        for (qsizetype k = 0; k < 2; ++k) {
+            QCOMPARE(lanes1[k].toObject().value("pass"), lanes3[k].toObject().value("pass"));
+            QCOMPARE(lanes1[k].toObject().value("number").toInt(), int(k) + 1);
+            QCOMPARE(lanes1[k].toObject().value("color"), lanes3[k].toObject().value("color"));
+        }
+        // A comp of Take 1 from 2 s to 4 s on A1 is made on all three; with group false, on A1 alone.
+        r = call("montage_takes", {{"project", project}, {"track", "A1"}, {"action", "comp"}, {"lane", "Take 1"}, {"from", 2}, {"to", 4}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        for (int t = 0; t < 3; ++t) {
+            const Track& tr = q.active()->audioTracks[size_t(t)];
+            QCOMPARE(tr.clips.size(), size_t(3));
+            QCOMPARE(compLaneOf(tr, tr.clips[1]), tr.lanes[0].id);
+        }
+        r = call("montage_takes", {{"project", project}, {"track", "A1"}, {"action", "comp"}, {"lane", "Take 1"}, {"from", 4.5}, {"to", 5.5}, {"group", false}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        QCOMPARE(q.active()->audioTracks[0].clips.size(), size_t(5));
+        QCOMPARE(q.active()->audioTracks[1].clips.size(), size_t(3));
+        // A rating goes to the pass on every track; suspending every group makes the next one act alone.
+        r = call("montage_takes", {{"project", project}, {"track", "A2"}, {"action", "rate"}, {"lane", "Take 2"}, {"rating", 5}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_track", {{"project", project}, {"suspend_all", true}});
+        QVERIFY(r.value("structuredContent").toObject().value("groups_suspended").toBool());
+        r = call("montage_takes", {{"project", project}, {"track", "A2"}, {"action", "rate"}, {"lane", "Take 1"}, {"rating", 2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        for (int t = 0; t < 3; ++t) QCOMPARE(q.active()->audioTracks[size_t(t)].lanes[1].rating, 5);
+        QCOMPARE(q.active()->audioTracks[1].lanes[0].rating, 2);
+        QCOMPARE(q.active()->audioTracks[0].lanes[0].rating, 0);
+        // The group deleted: its tracks stay, in no group.
+        r = call("montage_track", {{"project", project}, {"delete_group", "band"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        QVERIFY(q.active()->trackGroups.empty() && q.active()->audioTracks[0].group == 0);
     }
 
     void takesOnLanes() {

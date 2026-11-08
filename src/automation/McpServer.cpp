@@ -36,6 +36,7 @@
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
@@ -5507,6 +5508,105 @@ void McpServer::Impl::addTools() {
             return fail(QStringLiteral("Unknown action %1").arg(action));
         });
 
+    add("montage_track", "A track's group and colour",
+        "Track groups and colours. A group holds tracks edited, mixed and comped together; its switches say what a "
+        "change on one of them does to the others: editing (selecting, cutting, trimming, moving, deleting and fading "
+        "clips over the same time), mute (mute and solo), volume and pan (moves by the same amount, keeping offsets), "
+        "automation (modes, and lanes written in a pass), record (recording onto one records onto all) and comp (passes "
+        "recorded together share a pass id and take number; comping, ratings, auditions and Best Take act on the "
+        "group: see montage_takes). group puts the track (or tracks) in a group by name, made if new (\"\" takes "
+        "them out); switches sets the group's switches and suspended; suspend_all suspends (or resumes) every group. "
+        "color is the track's label colour (#rrggbb, \"\" none), drawn on its header and, with color_clips, its clips; "
+        "it is saved and carried in OpenTimelineIO. Without changes, lists the tracks and groups.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "track":{"type":"string","description":"V1, V2... or A1, A2..."},
+            "tracks":{"type":"array","items":{"type":"string"},"description":"Several tracks at once (instead of track)"},
+            "group":{"type":"string","description":"The group to put the track(s) in (made if new); \"\" takes them out"},
+            "switches":{"type":"object","description":"For the track's group (or `group`'s)","properties":{
+                "editing":{"type":"boolean"},"mute":{"type":"boolean"},"volume":{"type":"boolean"},"pan":{"type":"boolean"},
+                "automation":{"type":"boolean"},"record":{"type":"boolean"},"comp":{"type":"boolean"},"suspended":{"type":"boolean"}}},
+            "delete_group":{"type":"string","description":"A group to delete (its tracks stay)"},
+            "color":{"type":"string","description":"#rrggbb, or \"\" for none"},
+            "color_clips":{"type":"boolean","description":"Draw the colour on the track's clips that have no label of their own"},
+            "suspend_all":{"type":"boolean"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<TrackRef> tracks;
+            if (a.contains("tracks"))
+                for (const QJsonValue& v : a.value("tracks").toArray()) tracks.push_back(trackArg(v.toString(), s, false));
+            else if (a.contains("track"))
+                tracks.push_back(trackArg(str(a, "track"), s, false));
+            auto apply = [](const edit::Result& r) {
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                return r.ok;
+            };
+            bool changed = false;
+            const bool wantsTracks = a.contains("group") || a.contains("color") || a.contains("color_clips");
+            if (wantsTracks && tracks.empty()) return fail(QStringLiteral("Name the track (track or tracks)"));
+            if (a.contains("delete_group")) {
+                const TrackGroup* g = findTrackGroup(s, str(a, "delete_group").toStdString());
+                if (!g) return fail(QStringLiteral("No group called %1").arg(str(a, "delete_group")));
+                changed |= apply(edit::removeTrackGroup(s, g->id));
+            }
+            if (a.contains("group")) {
+                const std::string name = str(a, "group").trimmed().toStdString();
+                if (name.empty()) changed |= apply(edit::setTrackGroup(s, tracks, 0));
+                else if (const TrackGroup* g = findTrackGroup(s, name)) changed |= apply(edit::setTrackGroup(s, tracks, g->id));
+                else changed |= apply(edit::createTrackGroup(l.project, s, name, tracks));
+            }
+            if (a.contains("switches")) {
+                const TrackGroup* g = a.contains("group") && !str(a, "group").trimmed().isEmpty() ? findTrackGroup(s, str(a, "group").trimmed().toStdString())
+                                      : !tracks.empty()                                            ? findTrackGroup(s, trackAt(s, tracks.front())->group)
+                                                                                                   : nullptr;
+                if (!g) return fail(QStringLiteral("switches need a grouped track or a group"));
+                TrackGroup next = *g;
+                const QJsonObject sw = a.value("switches").toObject();
+                next.editing = sw.value("editing").toBool(next.editing), next.mute = sw.value("mute").toBool(next.mute);
+                next.volume = sw.value("volume").toBool(next.volume), next.pan = sw.value("pan").toBool(next.pan);
+                next.automation = sw.value("automation").toBool(next.automation), next.record = sw.value("record").toBool(next.record);
+                next.comp = sw.value("comp").toBool(next.comp), next.suspended = sw.value("suspended").toBool(next.suspended);
+                changed |= apply(edit::setTrackGroupSwitches(s, g->id, next));
+            }
+            if (a.contains("color")) changed |= apply(edit::setTrackColor(s, tracks, str(a, "color").trimmed().toStdString()));
+            if (a.contains("color_clips")) changed |= apply(edit::setTrackColorClips(s, tracks, a.value("color_clips").toBool()));
+            if (a.contains("suspend_all") && s.groupsSuspended != a.value("suspend_all").toBool()) {
+                s.groupsSuspended = a.value("suspend_all").toBool();
+                changed = true;
+            }
+            if (changed) save(l);
+            QJsonArray list, groups;
+            QStringList lines;
+            for (TrackRef r : allTracks(s)) {
+                const Track& t = *trackAt(s, r);
+                const QString ref = (r.kind == TrackKind::Video ? QStringLiteral("V") : QStringLiteral("A")) + QString::number(r.index + 1);
+                QJsonObject o{{"track", ref}, {"name", QString::fromStdString(t.name)}};
+                QString line = ref + QStringLiteral(" ") + QString::fromStdString(t.name);
+                if (const TrackGroup* g = findTrackGroup(s, t.group)) {
+                    o["group"] = QString::fromStdString(g->name);
+                    line += QStringLiteral(", group ") + QString::fromStdString(g->name);
+                }
+                if (!t.color.empty()) {
+                    o["color"] = QString::fromStdString(t.color);
+                    line += QStringLiteral(", colour ") + QString::fromStdString(t.color);
+                }
+                if (t.colorClips) o["color_clips"] = true;
+                list.append(o);
+                lines << line;
+            }
+            for (const TrackGroup& g : s.trackGroups) {
+                QJsonArray members;
+                for (TrackRef r : groupMembers(s, g.id))
+                    members.append((r.kind == TrackKind::Video ? QStringLiteral("V") : QStringLiteral("A")) + QString::number(r.index + 1));
+                groups.append(QJsonObject{{"name", QString::fromStdString(g.name)}, {"tracks", members}, {"editing", g.editing}, {"mute", g.mute},
+                                          {"volume", g.volume}, {"pan", g.pan}, {"automation", g.automation}, {"record", g.record},
+                                          {"comp", g.comp}, {"suspended", g.suspended}});
+                lines << QStringLiteral("Group %1%2: %3 track(s)").arg(QString::fromStdString(g.name), g.suspended ? QStringLiteral(" (suspended)") : QString()).arg(members.size());
+            }
+            if (s.groupsSuspended) lines << QStringLiteral("Every group is suspended");
+            return ok(lines.join('\n'), {{"tracks", list}, {"groups", groups}, {"groups_suspended", s.groupsSuspended}});
+        });
+
     add("montage_takes", "Take lanes, comps and track versions on an audio track",
         "Takes on lanes (Pro Tools' loop record, playlists and comping): an audio track keeps takes as lanes under it and "
         "plays a comp of them, its own clips cut from the lanes with short equal-power crossfades at the joins. list gives "
@@ -5528,12 +5628,15 @@ void McpServer::Impl::addTools() {
             "crossfade":{"type":"number","description":"Seconds (comp, join; default 0.01)"},
             "rating":{"type":"integer"},"name":{"type":"string"},"shown":{"type":"boolean"},
             "version":{"type":"string","enum":["new","switch","rename","delete"]},"index":{"type":"integer"},"empty":{"type":"boolean"},
-            "line":{"type":"string","description":"suggest: the words the take should say"}},"required":["project","action"]})json",
+            "line":{"type":"string","description":"suggest: the words the take should say"},
+            "group":{"type":"boolean","default":true,"description":"comp, rate and suggest act on the track's group (montage_track) when its comp switch is on; false for this track alone"},
+            "apply":{"type":"boolean","default":false,"description":"suggest: give the suggested take's from..to to the comp (on the group)"}},"required":["project","action"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
             if (track.kind != TrackKind::Audio) return fail(QStringLiteral("Take lanes are on audio tracks"));
+            const bool grouped = a.value("group").toBool(true);
             const QString action = need(a, "action");
             const double fps = s.fpsValue();
             auto laneArg = [&]() -> Id {
@@ -5550,8 +5653,16 @@ void McpServer::Impl::addTools() {
                 QString text;
                 for (const LaneView& v : laneViews(l.project, s, track)) {
                     QJsonObject o{{"name", QString::fromStdString(v.name)}, {"start", secs(v.start, s)}, {"end", secs(v.end, s)}, {"rating", v.rating}};
-                    if (v.lane) o["lane"] = double(v.lane);
-                    else o["clip"] = double(v.clip), o["take"] = v.take + 1;
+                    if (v.lane) {
+                        o["lane"] = double(v.lane);
+                        // Its pass (shared by the grouped tracks' lanes recorded with it), take number and colour.
+                        if (const TakeLane* ln = edit::findTakeLane(t, v.lane)) {
+                            if (ln->pass) o["pass"] = double(ln->pass);
+                            if (takeNumber(*ln)) o["number"] = takeNumber(*ln), o["color"] = QString::fromStdString(takeColor(*ln));
+                        }
+                    } else {
+                        o["clip"] = double(v.clip), o["take"] = v.take + 1;
+                    }
                     lanes.append(o);
                     text += QStringLiteral("%1%2 (%3 to %4)%5\n").arg(v.lane ? QStringLiteral("Lane ") : QStringLiteral("Audition take: "),
                                                                     QString::fromStdString(v.name), tc(v.start, s), tc(v.end, s),
@@ -5566,7 +5677,9 @@ void McpServer::Impl::addTools() {
                 for (size_t k = 0; k < t.versions.size(); ++k)
                     versions.append(QJsonObject{{"index", int(k) + 1}, {"name", QString::fromStdString(t.versions[k].name)}, {"shown", int(k) == t.version}});
                 text += QStringLiteral("%1 comp clip(s); %2 version(s)").arg(comp.size()).arg(std::max<qsizetype>(1, versions.size()));
-                return ok(text, {{"lanes", lanes}, {"comp", comp}, {"versions", versions}, {"lanes_shown", t.lanesShown}});
+                QJsonObject out{{"lanes", lanes}, {"comp", comp}, {"versions", versions}, {"lanes_shown", t.lanesShown}};
+                if (const TrackGroup* g = findTrackGroup(s, t.group)) out["group"] = QString::fromStdString(g->name);
+                return ok(text, out);
             };
             if (action == "list") return listing();
             if (action == "suggest") {
@@ -5581,9 +5694,16 @@ void McpServer::Impl::addTools() {
                 if (a.contains("from")) from = timeArg(a.value("from"), s, "from");
                 if (a.contains("to")) to = timeArg(a.value("to"), s, "to");
                 if (from < 0 || to <= from) return fail(QStringLiteral("suggest needs from and to"));
-                const TakeChoice choice = chooseTake(l.project, s, track, from, to, a.value("line").toString().toStdString());
+                // (Over the group: each pass judged by every grouped track's recording of it.)
+                const std::string line = a.value("line").toString().toStdString();
+                const TakeChoice choice = grouped ? chooseGroupTake(l.project, s, track, from, to, line) : chooseTake(l.project, s, track, from, to, line);
                 if (choice.best < 0) return fail(QStringLiteral("No takes cover that range"));
                 const TakeCandidate& b = choice.takes[size_t(choice.best)];
+                if (a.value("apply").toBool()) {
+                    if (!b.lane) return fail(QStringLiteral("The suggested take is an audition's: pick it with montage_audition"));
+                    check(grouped ? edit::compGroup(l.project, s, track, b.lane, from, to) : edit::compTake(l.project, s, track, b.lane, from, to));
+                    save(l);
+                }
                 QJsonArray all;
                 for (const TakeCandidate& t : choice.takes)
                     all.append(QJsonObject{{"name", QString::fromStdString(t.name)}, {"said", QString::fromStdString(t.said)},
@@ -5611,8 +5731,10 @@ void McpServer::Impl::addTools() {
                 for (const std::string& f : passes) media.push_back(mediaFor(l.project, QString::fromStdString(f)));
                 r = edit::addLoopTakes(l.project, s, track, media, complete, in, out);
             } else if (action == "comp") {
-                r = edit::compTake(l.project, s, track, laneArg(), timeArg(a.value("from"), s, "from"), timeArg(a.value("to"), s, "to"),
-                                   a.value("crossfade").toDouble(kCompCrossfadeSeconds));
+                // On the grouped tracks too (their lanes of the same pass, over the same frames).
+                const FrameTime from = timeArg(a.value("from"), s, "from"), to = timeArg(a.value("to"), s, "to");
+                const double xf = a.value("crossfade").toDouble(kCompCrossfadeSeconds);
+                r = grouped ? edit::compGroup(l.project, s, track, laneArg(), from, to, xf) : edit::compTake(l.project, s, track, laneArg(), from, to, xf);
             } else if (action == "join") {
                 const FrameTime at = timeArg(a.value("at"), s, "at");
                 if (a.contains("move")) r = edit::moveCompJoin(l.project, s, track, at, FrameTime(std::llround(a.value("move").toDouble() * fps)));
@@ -5620,7 +5742,7 @@ void McpServer::Impl::addTools() {
                 else return fail(QStringLiteral("join needs move or crossfade"));
             } else if (action == "rate") {
                 if (!a.value("rating").isDouble()) return fail(QStringLiteral("rate needs rating (0 to 5)"));
-                r = edit::rateTakeLane(s, track, laneArg(), a.value("rating").toInt());
+                r = grouped ? edit::rateGroupLane(s, track, laneArg(), a.value("rating").toInt()) : edit::rateTakeLane(s, track, laneArg(), a.value("rating").toInt());
             } else if (action == "rename") {
                 r = edit::renameTakeLane(s, track, laneArg(), need(a, "name").toStdString());
             } else if (action == "show") {
@@ -5669,9 +5791,9 @@ void McpServer::Impl::addTools() {
             if (a.contains("pick")) {
                 const QJsonValue pv = a.value("pick");
                 if (pv.isString() && (pv.toString() == "next" || pv.toString() == "previous"))
-                    check(edit::cycleTake(l.project, s, clip, pv.toString() == "next" ? 1 : -1));
+                    check(edit::cycleGroupTake(l.project, s, clip, pv.toString() == "next" ? 1 : -1));  // (with its track group)
                 else
-                    check(edit::pickTake(l.project, s, clip, (pv.isString() ? pv.toString().toInt() : pv.toInt()) - 1));
+                    check(edit::pickGroupTake(l.project, s, clip, (pv.isString() ? pv.toString().toInt() : pv.toInt()) - 1));
                 changed = true;
             }
             if (a.value("finalize").toBool()) {
@@ -7796,7 +7918,7 @@ void McpServer::Impl::addTools() {
             if (action == "pick_take") {
                 const AdrCue& q = cueNamed(need(a, "cue"));
                 if (!q.clip || !edit::clipById(s, q.clip)) return fail("That cue has no takes");
-                const edit::Result r = edit::pickTake(l.project, s, q.clip, a.value("take").toInt(0) - 1);
+                const edit::Result r = edit::pickGroupTake(l.project, s, q.clip, a.value("take").toInt(0) - 1);
                 if (!r.ok) return fail(QString::fromStdString(r.error));
                 save(l);
                 return ok("Picked the take", listing());

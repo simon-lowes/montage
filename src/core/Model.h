@@ -602,6 +602,10 @@ struct TakeLane {
     Id mediaId = 0;
     FrameTime start = 0;  // where its first sample plays
     int rating = 0;       // 0 none, 1..5
+    // The pass it was recorded in (core/TrackGroups.h): passes recorded together on grouped tracks share one, so a
+    // range of a take comped on one of them goes to the others too. 0 = none.
+    Id pass = 0;
+    int number = 0;  // its take number, the same on every grouped track (0: read from a "Take N" name)
     bool operator==(const TakeLane&) const = default;
 };
 
@@ -695,6 +699,11 @@ struct Track {
     std::vector<TrackVersion> versions;
     int version = 0;
     SamplerSettings sampler;  // audio: a sound-effect sampler (audio/Sampler.h)
+    // Track groups (core/TrackGroups.h): the group it is in (TrackGroup::id; 0 = none), and its label colour
+    // ("#rrggbb", "" = none), drawn on its header and, with colorClips, on its clips that have no label of their own.
+    Id group = 0;
+    std::string color;
+    bool colorClips = false;
     bool operator==(const Track&) const = default;
 };
 
@@ -713,6 +722,23 @@ struct Bus {
     Param volumeTrim;  // its fader's trim, as a track's
     int automation = 1;
     bool operator==(const Bus&) const = default;
+};
+
+// A track group (core/TrackGroups.h): tracks edited, mixed and comped together. Each switch says what a change on
+// one of its tracks does to the others; a suspended group (or every group, with Sequence::groupsSuspended) leaves
+// each track on its own.
+struct TrackGroup {
+    Id id = 0;
+    std::string name;
+    bool editing = true;     // selection and editing: cut, trim, move, delete, fades
+    bool mute = true;        // mute and solo
+    bool volume = true;      // fader moves, keeping the tracks' offsets
+    bool pan = true;         // pan moves, by the same amount
+    bool automation = true;  // automation modes and the lanes written in a pass
+    bool record = true;      // record arming: recording onto one records onto all
+    bool comp = true;        // comping, auditions, ratings and Best Take
+    bool suspended = false;
+    bool operator==(const TrackGroup&) const = default;
 };
 
 struct Sequence {
@@ -734,6 +760,8 @@ struct Sequence {
     bool multicam = false;              // a multicam clip's sequence: video tracks are angles (Multicam.h)
     std::vector<std::string> collapsedFolders;  // track folders shown collapsed: "V/name" or "A/name"
     std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
+    std::vector<TrackGroup> trackGroups;  // core/TrackGroups.h
+    bool groupsSuspended = false;         // every group suspended at once (Suspend Track Groups)
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::vector<ColorGroup> colorGroups;   // clips graded together (core/ColorGroups.h)
     std::vector<SharedNode> sharedNodes;   // grade nodes shared by its clips (core/GradeGraph.h)

@@ -54,6 +54,7 @@ add_library(montage_engine STATIC
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
   core/TakeLanes.h core/TakeLanes.cpp
+  core/TrackGroups.h core/TrackGroups.cpp
   core/Provenance.h core/Provenance.cpp
   core/LensProfile.h core/LensProfile.cpp
   core/AudioDescription.h core/AudioDescription.cpp

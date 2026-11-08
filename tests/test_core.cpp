@@ -66,6 +66,7 @@
 #include "core/LensProfile.h"
 #include "core/AudioDescription.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 #include <QProcess>
 #include <QDir>
 #include <QTemporaryFile>
@@ -12335,6 +12336,258 @@ private slots:
         a3 = clipById(fx3.s(), r3.created[1]);
         a3->start += 4;
         QCOMPARE(syncOffset(fx3.s(), a3->id), 4.0);
+    }
+
+    void trackGroupsEditTogether() {
+        // Three audio tracks, each with a 10 s clip of its own microphone at the same place, grouped.
+        Project p = makeDefaultProject();
+        Sequence& s0 = *p.active();
+        const TrackRef a1{TrackKind::Audio, 0}, a2{TrackKind::Audio, 1}, a3{TrackKind::Audio, 2};
+        for (int k = 0; k < 3; ++k) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Audio;
+            m.name = "mic" + std::to_string(k) + ".wav";
+            m.path = "/nonexistent/mic" + std::to_string(k) + ".wav";
+            m.duration = 10.0;
+            m.hasAudio = true;
+            p.media.push_back(m);
+            Clip c = makeClip(p, p.media.back(), TrackKind::Audio, s0);
+            c.start = 30;
+            c.duration = 240;
+            QVERIFY(edit::overwrite(p, s0, {TrackKind::Audio, k}, c).ok);
+        }
+        const edit::Result made = edit::createTrackGroup(p, s0, "Dialogue", {a1, a2, a3});
+        QVERIFY2(made.ok, made.error.c_str());
+        const Id group = made.created.front();
+        QVERIFY(!edit::createTrackGroup(p, s0, "dialogue", {a1}).ok);  // the name is taken
+        QCOMPARE(groupTracks(s0, a2, GroupSwitch::Editing), (std::vector<TrackRef>{a2, a1, a3}));
+        // What each track holds: its clips' place and source, and its fades.
+        auto shape = [&](int k) {
+            std::vector<std::tuple<FrameTime, FrameTime, double>> out;
+            for (const Clip& c : p.active()->audioTracks[size_t(k)].clips) out.push_back({c.start, c.duration, c.sourceIn});
+            return out;
+        };
+        auto same = [&] { return shape(0) == shape(1) && shape(1) == shape(2); };
+        auto clipOn = [&](int k, size_t i) { return p.active()->audioTracks[size_t(k)].clips.at(i).id; };
+        History h;
+        // A cut on one track cuts all three at the same frame; one undo puts all three back.
+        h.push("Add Edit", p);
+        QVERIFY(edit::razorTogether(p, *p.active(), {a1}, 120).ok);
+        QCOMPARE(p.active()->audioTracks[2].clips.size(), size_t(2));
+        QVERIFY(same());
+        QVERIFY(h.undo(p));
+        QCOMPARE(p.active()->audioTracks[1].clips.size(), size_t(1));
+        QVERIFY(edit::razorTogether(p, *p.active(), {a2}, 120).ok);
+        QVERIFY(same());
+        // A trim of the out edge of A2's second clip trims the others' (their edges are at the same frame).
+        h.push("Trim", p);
+        QCOMPARE(edit::trim(p, *p.active(), clipOn(1, 1), edit::Edge::Out, -30, edit::TrimMode::Normal).applied, FrameTime(-30));
+        QVERIFY(same());
+        QCOMPARE(p.active()->audioTracks[0].clips[1].end(), FrameTime(240));
+        QVERIFY(h.undo(p));
+        QCOMPARE(p.active()->audioTracks[2].clips[1].end(), FrameTime(270));
+        QVERIFY(edit::trim(p, *p.active(), clipOn(1, 1), edit::Edge::Out, -30, edit::TrimMode::Normal).ok);
+        // Selecting a clip selects its group mates; moving the selection moves all three.
+        const std::vector<Id> picked = edit::expandGroups(*p.active(), {clipOn(2, 1)});
+        QCOMPARE(picked.size(), size_t(3));
+        h.push("Move", p);
+        QVERIFY(edit::moveClips(p, *p.active(), picked, 15, 0, 0).ok);
+        QVERIFY(same());
+        QCOMPARE(p.active()->audioTracks[1].clips[1].start, FrameTime(135));
+        // A fade on one gets the same fade on the others.
+        QVERIFY(edit::addTransition(p, *p.active(), clipOn(0, 1), edit::Edge::Out, "crossfade", 12).ok);
+        for (int k = 0; k < 3; ++k) QCOMPARE(p.active()->audioTracks[size_t(k)].transitions.size(), size_t(1));
+        QVERIFY(edit::setTransitionDuration(*p.active(), p.active()->audioTracks[2].transitions[0].id, 20).ok);
+        for (int k = 0; k < 3; ++k) QCOMPARE(p.active()->audioTracks[size_t(k)].transitions[0].duration, FrameTime(20));
+        QVERIFY(edit::removeTransition(*p.active(), p.active()->audioTracks[1].transitions[0].id).ok);
+        for (int k = 0; k < 3; ++k) QVERIFY(p.active()->audioTracks[size_t(k)].transitions.empty());
+        // A delete of the first clip on one takes the first on all three.
+        h.push("Delete", p);
+        QVERIFY(edit::removeClips(p, *p.active(), edit::expandGroups(*p.active(), {clipOn(0, 0)}), false).ok);
+        QVERIFY(same());
+        QCOMPARE(p.active()->audioTracks[1].clips.size(), size_t(1));
+        // Undone step by step: each of the move and the delete was one step for all three tracks.
+        QVERIFY(h.undo(p));
+        QCOMPARE(p.active()->audioTracks[2].clips.size(), size_t(2));
+        QVERIFY(same());
+        QVERIFY(h.undo(p));
+        QCOMPARE(p.active()->audioTracks[0].clips[1].start, FrameTime(120));
+        QVERIFY(same());
+        // Mute and solo go to the group; with the mute switch off, to the one track.
+        Sequence& s = *p.active();
+        QVERIFY(edit::setTrackMuted(s, a3, true).ok);
+        QVERIFY(s.audioTracks[0].muted && s.audioTracks[1].muted);
+        QVERIFY(edit::setTrackSoloed(s, a1, true).ok);
+        QVERIFY(s.audioTracks[2].solo);
+        TrackGroup sw = *findTrackGroup(s, group);
+        sw.mute = false;
+        QVERIFY(edit::setTrackGroupSwitches(s, group, sw).ok);
+        QVERIFY(edit::setTrackMuted(s, a3, false).ok);
+        QVERIFY(!s.audioTracks[2].muted && s.audioTracks[0].muted);
+        QVERIFY(edit::setTrackAutomationMode(s, a2, int(AutomationMode::Touch)).ok);
+        for (int k = 0; k < 3; ++k) QCOMPARE(s.audioTracks[size_t(k)].automation, int(AutomationMode::Touch));
+        // Suspended (the group, or every group at once), each track acts alone.
+        s.groupsSuspended = true;
+        QVERIFY(edit::razorTogether(p, s, {a1}, 200).ok);
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(3));
+        QCOMPARE(s.audioTracks[1].clips.size(), size_t(2));
+        QCOMPARE(edit::expandGroups(s, {s.audioTracks[1].clips[1].id}).size(), size_t(1));
+        s.groupsSuspended = false;
+        QVERIFY(edit::suspendTrackGroup(s, group, true).ok);
+        QCOMPARE(groupTracks(s, a1, GroupSwitch::Editing), (std::vector<TrackRef>{a1}));
+        QVERIFY(edit::suspendTrackGroup(s, group, false).ok);
+        // The group goes; its tracks stay.
+        QVERIFY(edit::removeTrackGroup(s, group).ok);
+        QVERIFY(s.trackGroups.empty() && s.audioTracks[1].group == 0);
+    }
+
+    void groupCompingAcrossTracks() {
+        // A loop recording of three passes onto three grouped tracks (a boom and two radio mics): 6 s from 1 s at 30 fps.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const std::vector<TrackRef> tracks{{TrackKind::Audio, 0}, {TrackKind::Audio, 1}, {TrackKind::Audio, 2}};
+        QVERIFY(edit::createTrackGroup(p, s, "Scene 4", tracks).ok);
+        std::vector<std::vector<Id>> media(3);
+        for (int t = 0; t < 3; ++t)
+            for (int k = 0; k < 3; ++k) {
+                MediaItem m;
+                m.id = p.newId();
+                m.kind = MediaKind::Audio;
+                m.name = "mic" + std::to_string(t) + " pass " + std::to_string(k + 1) + ".wav";
+                m.path = "/nonexistent/" + m.name;
+                m.duration = 6.0;
+                m.hasAudio = true;
+                p.media.push_back(m);
+                media[size_t(t)].push_back(m.id);
+            }
+        // A take already on A2 alone: the new passes are numbered after it on every track.
+        QVERIFY(edit::addTakeLane(p, s, tracks[1], media[1][0], 30, "Take 1").ok);
+        const edit::Result r = edit::addGroupLoopTakes(p, s, tracks, media, {true, true, true}, 30, 210);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(9 + 3));
+        // Pass k shares a pass id, a take number and a colour on all three tracks.
+        auto lane = [&](int t, int k) -> const TakeLane& {
+            const auto& lanes = s.audioTracks[size_t(t)].lanes;
+            return lanes[lanes.size() - 3 + size_t(k)];
+        };
+        for (int k = 0; k < 3; ++k) {
+            QVERIFY(lane(0, k).pass != 0);
+            QCOMPARE(lane(1, k).pass, lane(0, k).pass);
+            QCOMPARE(lane(2, k).pass, lane(0, k).pass);
+            QCOMPARE(takeNumber(lane(0, k)), k + 2);
+            QCOMPARE(takeNumber(lane(2, k)), k + 2);
+            QCOMPARE(lane(1, k).name, "Take " + std::to_string(k + 2));
+            QCOMPARE(takeColor(lane(0, k)), takeColor(lane(2, k)));
+            QVERIFY(!takeColor(lane(0, k)).empty());
+            if (k) QVERIFY(lane(0, k).pass != lane(0, k - 1).pass && takeColor(lane(0, k)) != takeColor(lane(0, k - 1)));
+        }
+        QCOMPARE(edit::passLanes(s, tracks[2], lane(2, 0).id).size(), size_t(3));
+        // Comping take 3 (the second pass) from 4 s to 7 s on A2 comps it on all three at the same frames, with its
+        // joins' crossfades where they fall on the others.
+        const edit::Result c = edit::compGroup(p, s, tracks[1], lane(1, 1).id, 120, 210);
+        QVERIFY2(c.ok, c.error.c_str());
+        QCOMPARE(c.created.size(), size_t(3));
+        for (int t = 0; t < 3; ++t) {
+            const Track& tr = s.audioTracks[size_t(t)];
+            QCOMPARE(tr.clips.size(), size_t(2));
+            QCOMPARE(tr.clips[1].start, FrameTime(120));
+            QCOMPARE(tr.clips[1].end(), FrameTime(210));
+            QCOMPARE(compLaneOf(tr, tr.clips[1]), lane(t, 1).id);
+            QCOMPARE(tr.transitions.size(), size_t(1));
+            QCOMPARE(edit::clipById(s, tr.transitions[0].clipB)->start, FrameTime(120));
+        }
+        // Rated on one, rated on all; with the comp switch off, one track at a time.
+        QVERIFY(edit::rateGroupLane(s, tracks[0], lane(0, 2).id, 5).ok);
+        QCOMPARE(lane(2, 2).rating, 5);
+        TrackGroup g = s.trackGroups[0];
+        g.comp = false;
+        QVERIFY(edit::setTrackGroupSwitches(s, g.id, g).ok);
+        QVERIFY(edit::compGroup(p, s, tracks[0], lane(0, 0).id, 60, 90).ok);
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(4));
+        QCOMPARE(s.audioTracks[1].clips.size(), size_t(2));
+        // Pass ids and take numbers are saved and read back.
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/groups.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.active()->audioTracks, p.active()->audioTracks);
+        QCOMPARE(back.active()->trackGroups, p.active()->trackGroups);
+    }
+
+    void trackColoursInInterchange() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const TrackRef v1{TrackKind::Video, 0}, a1{TrackKind::Audio, 0}, a2{TrackKind::Audio, 1};
+        QVERIFY(edit::setTrackColor(s, {a1, a2}, "#C84646").ok);
+        QCOMPARE(s.audioTracks[1].color, std::string("#c84646"));
+        QVERIFY(edit::setTrackColor(s, {v1}, "3d8aff").ok);
+        QVERIFY(!edit::setTrackColor(s, {v1}, "blue-ish").ok);
+        QVERIFY(edit::setTrackColorClips(s, {a2}, true).ok);
+        QVERIFY(edit::createTrackGroup(p, s, "Boom and radios", {a1, a2}).ok);
+        TrackGroup g = s.trackGroups[0];
+        g.pan = false;
+        QVERIFY(edit::setTrackGroupSwitches(s, g.id, g).ok);
+        double r = 0, gr = 0, b = 0;
+        QVERIFY(trackColorRgb("#c84646", r, gr, b) && std::fabs(r - 200 / 255.0) < 1e-12);
+        QCOMPARE(trackColorFromRgb(r, gr, b), std::string("#c84646"));
+        // Saved and reopened.
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/colours.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.active()->videoTracks[0].color, std::string("#3d8aff"));
+        QCOMPARE(back.active()->audioTracks, s.audioTracks);
+        QCOMPARE(back.active()->trackGroups, s.trackGroups);
+        // A project from before groups and colours (none of their keys) reads as it did: no groups, no colours.
+        {
+            Project plain = makeDefaultProject();
+            const std::string old = (dir.path() + "/plain.montage").toStdString();
+            QVERIFY(saveProject(plain, old));
+            QFile f(QString::fromStdString(old));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray text = f.readAll();
+            QVERIFY(!text.contains("trackGroups") && !text.contains("\"color\"") && !text.contains("\"group\""));
+            Project read;
+            QVERIFY(loadProject(old, read));
+            QVERIFY(read.active()->trackGroups.empty() && read.active()->audioTracks[0].color.empty() && !read.active()->audioTracks[0].group);
+        }
+        // OpenTimelineIO 0.18: each track's Color (red, green, blue, alpha), and the group in Montage's metadata.
+        const std::string otio = exportOtio(p, s);
+        const QJsonObject root = QJsonDocument::fromJson(QByteArray::fromStdString(otio)).object();
+        const QJsonArray tracks = root.value("tracks").toObject().value("children").toArray();
+        const QJsonObject a1Json = tracks.at(int(s.videoTracks.size())).toObject();
+        const QJsonObject color = a1Json.value("color").toObject();
+        QCOMPARE(color.value("OTIO_SCHEMA").toString(), QString("Color.1"));
+        QVERIFY(std::fabs(color.value("r").toDouble() - 200 / 255.0) < 1e-9 && std::fabs(color.value("g").toDouble() - 70 / 255.0) < 1e-9);
+        QCOMPARE(color.value("a").toDouble(), 1.0);
+        QVERIFY(!tracks.at(1).toObject().contains("color"));  // V2 has none
+        Project q;
+        const ImportResult in = importOtio(q, otio);
+        QVERIFY2(in.ok, in.error.c_str());
+        const Sequence& qs = *q.findSequence(in.sequence);
+        QCOMPARE(qs.videoTracks[0].color, std::string("#3d8aff"));
+        QCOMPARE(qs.audioTracks[0].color, std::string("#c84646"));
+        QVERIFY(qs.audioTracks[1].colorClips && !qs.audioTracks[0].colorClips);
+        QCOMPARE(qs.trackGroups.size(), size_t(1));
+        QCOMPARE(qs.trackGroups[0].name, std::string("Boom and radios"));
+        QVERIFY(!qs.trackGroups[0].pan && qs.trackGroups[0].volume);
+        QVERIFY(qs.audioTracks[0].group == qs.trackGroups[0].id && qs.audioTracks[1].group == qs.trackGroups[0].id && !qs.audioTracks[2].group);
+        // A colour another tool wrote as a string reads too.
+        QJsonObject other = root;
+        QJsonObject stack = other.value("tracks").toObject();
+        QJsonArray children = stack.value("children").toArray();
+        QJsonObject v2 = children.at(1).toObject();
+        v2["color"] = "#00FF80";
+        children[1] = v2;
+        stack["children"] = children;
+        other["tracks"] = stack;
+        Project q2;
+        const ImportResult in2 = importOtio(q2, QJsonDocument(other).toJson().toStdString());
+        QVERIFY(in2.ok);
+        QCOMPARE(q2.findSequence(in2.sequence)->videoTracks[1].color, std::string("#00ff80"));
     }
 
     void projectFileRelinksRelativePaths() {
