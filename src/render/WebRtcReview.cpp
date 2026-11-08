@@ -1410,7 +1410,16 @@ struct BrowserReviewBackend::Impl {
             const AVCodec* c = n.empty() ? nullptr : avcodec_find_encoder_by_name(n.c_str());
             if (!c || (n.find("_nvenc") != std::string::npos && !hardwareOpens(n.c_str()))) continue;
             if (!tenBit) return true;
-            for (const AVPixelFormat* f = c->pix_fmts; f && *f != AV_PIX_FMT_NONE; ++f)
+            const AVPixelFormat* formats = nullptr;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+            // FFmpeg 8 drops AVCodec::pix_fmts; without a context this asks the encoder itself.
+            const void* cfg = nullptr;
+            if (avcodec_get_supported_config(nullptr, c, AV_CODEC_CONFIG_PIX_FORMAT, 0, &cfg, nullptr) >= 0)
+                formats = static_cast<const AVPixelFormat*>(cfg);
+#else
+            formats = c->pix_fmts;
+#endif
+            for (const AVPixelFormat* f = formats; f && *f != AV_PIX_FMT_NONE; ++f)
                 if (*f == AV_PIX_FMT_YUV420P10) return true;
         }
         return false;
