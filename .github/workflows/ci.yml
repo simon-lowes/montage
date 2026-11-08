@@ -236,6 +236,8 @@ jobs:
           (python3 -m venv ~/pyavb && ~/pyavb/bin/pip install -q pyavb==1.4.0 pyaaf2==1.7.1) && echo "MONTAGE_TEST_PYAVB=$HOME/pyavb/bin/python" >> "$GITHUB_ENV" \
             || echo "::warning::Could not install pyavb; the Avid bin tests' comparisons with pyavb will be skipped"
       - name: Test
+        env:
+          MONTAGE_REQUIRE_FIREFOX: "1"  # (the runner's Firefox and geckodriver: the browser review test fails rather than skips without them)
         run: ctest --test-dir build --output-on-failure
       - name: The window read over AT-SPI, as a screen reader on Linux reads it
         run: |

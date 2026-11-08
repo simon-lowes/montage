@@ -20941,8 +20941,28 @@ print("added " + ui["name"])
         QVERIFY(address->text().startsWith("https://"));
         auto* codec = dlg->findChild<QComboBox*>("reviewStreamCodec");
         QVERIFY(codec->findData(QStringLiteral("av1")) >= 0);
+        QVERIFY(codec->findData(QStringLiteral("vp9")) >= 0);
         QVERIFY(dlg->findChild<QLineEdit*>("reviewStreamIce")->isVisibleTo(dlg));
         QVERIFY(!dlg->findChild<QWidget*>("reviewStreamMarkersRow")->isVisibleTo(dlg));
+        // A TURN relay of the user's own (its password not shown), the sizes sent at once and HDR: a browser's settings.
+        auto* turn = dlg->findChild<QLineEdit*>("reviewStreamTurn");
+        auto* relayOnly = dlg->findChild<QCheckBox*>("reviewStreamRelayOnly");
+        auto* rungs = dlg->findChild<QComboBox*>("reviewStreamRungs");
+        auto* hdr = dlg->findChild<QCheckBox*>("reviewStreamHdr");
+        QVERIFY(turn && relayOnly && rungs && hdr);
+        QVERIFY(turn->isVisibleTo(dlg) && rungs->isVisibleTo(dlg) && hdr->isVisibleTo(dlg));
+        QCOMPARE(dlg->findChild<QLineEdit*>("reviewStreamTurnPassword")->echoMode(), QLineEdit::Password);
+        turn->clear();
+        QVERIFY(!relayOnly->isEnabled());  // (only with a relay)
+        turn->setText(QStringLiteral("turn:relay.example.com:3478"));
+        QVERIFY(relayOnly->isEnabled());
+        dlg->findChild<QLineEdit*>("reviewStreamTurnUser")->setText(QStringLiteral("ana"));
+        dlg->findChild<QLineEdit*>("reviewStreamTurnPassword")->setText(QStringLiteral("relay-secret"));
+        rungs->setCurrentIndex(rungs->findData(2));
+        hdr->setChecked(true);
+        viewers->setCurrentIndex(viewers->findData(false));
+        QVERIFY(!turn->isVisibleTo(dlg) && !rungs->isVisibleTo(dlg) && !hdr->isVisibleTo(dlg));
+        viewers->setCurrentIndex(viewers->findData(true));
         address->setText(QStringLiteral("https://127.0.0.1:%1").arg(port));
         codec->setCurrentIndex(codec->findData(QStringLiteral("h264")));
         dlg->findChild<QCheckBox*>("reviewStreamHardware")->setChecked(false);
@@ -20954,6 +20974,12 @@ print("added " + ui["name"])
         QVERIFY(controller->status().contains(tr("Waiting for viewers")));
         const QString howTo = dlg->findChild<QLabel*>("reviewStreamHowTo")->text();
         QVERIFY2(howTo.contains(QStringLiteral("https://127.0.0.1:%1/").arg(port)) && howTo.contains(pass), qPrintable(howTo));
+        QVERIFY2(howTo.contains(QStringLiteral("turn:relay.example.com:3478")) && !howTo.contains(QStringLiteral("relay-secret")), qPrintable(howTo));
+        QCOMPARE(controller->settings().turnServer, std::string("turn:relay.example.com:3478"));
+        QCOMPARE(controller->settings().turnUser, std::string("ana"));
+        QCOMPARE(controller->settings().rungs, 2);
+        QVERIFY(!controller->settings().relayOnly);
+        QVERIFY(!turn->isEnabled() && !rungs->isEnabled());  // (while it runs)
         // Montage's own certificate for this computer, kept for next time, its key this user's alone.
         QString cert, key;
         QVERIFY(RemoteReviewController::ownCertificate(cert, key));
@@ -20989,6 +21015,14 @@ print("added " + ui["name"])
         const auto config = get("/config", pass.toUtf8());
         QCOMPARE(config.first, 200);
         QCOMPARE(QJsonDocument::fromJson(config.second).object().value("sequence").toInteger(), qint64(state()->sequence()->id));
+        // (the page is given the relay, with its login, and the sizes)
+        const QJsonObject pageConfig = QJsonDocument::fromJson(config.second).object();
+        QCOMPARE(pageConfig.value("rungs").toArray().size(), 2);
+        bool relayGiven = false;
+        for (const QJsonValue& ice : pageConfig.value("iceServers").toArray())
+            relayGiven = relayGiven || (ice.toObject().value("urls").toVariant().toStringList().contains("turn:relay.example.com:3478") &&
+                                        ice.toObject().value("username").toString() == "ana" && ice.toObject().value("credential").toString() == "relay-secret");
+        QVERIFY2(relayGiven, config.second.constData());
 
         // An agent sees it, and can start it again for browsers by asking for WebRTC.
         auto call = [&](const QJsonObject& args) {
@@ -21011,6 +21045,37 @@ print("added " + ui["name"])
         QCOMPARE(r.value("structuredContent").toObject().value("passphrase").toString().size(), 20);
         QVERIFY(controller->running() && controller->browser());
         QCOMPARE(controller->settings().iceServers, std::vector<std::string>{"stun:stun.example.com:3478"});
+        // Simulcast, a TURN relay and HDR from an agent: the sizes and the viewers in HDR in its status.
+        call({{"action", "stop"}});
+        r = call({{"action", "start"}, {"simulcast", true}, {"hdr", false}, {"codec", "vp9"},
+                  {"turn", QJsonObject{{"url", "turn:relay.example.com:3478"}, {"username", "bo"}, {"password", "another-secret"}, {"relay_only", true}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(controller->settings().rungs, 3);
+        QVERIFY(!controller->settings().hdr);
+        QVERIFY(controller->settings().relayOnly);
+        QCOMPARE(controller->settings().codec, std::string("vp9"));
+        QCOMPARE(controller->settings().turnUser, std::string("bo"));
+        r = call({{"action", "status"}});
+        const QJsonObject st = r.value("structuredContent").toObject();
+        // (up to three sizes: none under 64 pixels each way)
+        QVERIFY(st.value("sizes").toArray().size() >= 2 && st.value("sizes").toArray().size() <= 3);
+        QCOMPARE(size_t(st.value("sizes").toArray().size()), controller->backend()->stats().rungViewers.size());
+        QCOMPARE(st.value("sizes").toArray().first().toObject().value("viewers").toInt(), 0);
+        QCOMPARE(st.value("hdr_viewers").toInt(), 0);
+        QCOMPARE(st.value("turn").toObject().value("url").toString(), QStringLiteral("turn:relay.example.com:3478"));
+        QVERIFY(st.value("turn").toObject().value("relay_only").toBool());
+        QVERIFY(!QJsonDocument(r).toJson().contains("another-secret"));  // (never the relay's password)
+        call({{"action", "stop"}});
+        // Refused: more sizes than three, and only through a relay with none.
+        r = call({{"action", "start"}, {"simulcast", 5}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"simulcast", 2}, {"turn", QJsonObject{{"url", ""}, {"relay_only", true}}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(!controller->running());
+        r = call({{"action", "start"}, {"simulcast", false}, {"turn", QJsonObject{{"url", ""}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(controller->settings().rungs, 1);
+        QVERIFY(controller->settings().turnServer.empty() && controller->settings().turnPassword.empty() && !controller->settings().relayOnly);
         call({{"action", "stop"}});
         dlg->close();
         // (the round trip over SRT reads its settings back on the next run)
@@ -21018,6 +21083,10 @@ print("added " + ui["name"])
         back.address = "srt://0.0.0.0:9000";
         back.codec = "hevc";
         back.iceServers.clear();
+        back.turnServer.clear(), back.turnUser.clear(), back.turnPassword.clear();
+        back.relayOnly = false;
+        back.rungs = 3;
+        back.hdr = true;
         RemoteReviewController::saveSettings(back, RemoteReviewController::loadOptions());
     }
 
