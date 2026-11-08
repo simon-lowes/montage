@@ -29,12 +29,19 @@
 //   20 Grain Match (render/GrainMatch's addGrain): p[1].yzw the amount, the power shaping the grain and its scale, p[2..4]
 //      the Cholesky factor, p[5] the response, the channels following it (a model's, by bit), PQ's light at 1 and its slope there, p[6..11] each
 //      channel's amplitude in the eight bands; the table the grain's fields, a texel to a pixel
+// and Edge Extend (render/CleanPlate's fillHoles, its pyramid one level a pass, each texel's colour and how much of it is
+// known in alpha):
+//   21 the picture's solid colours (alpha at least p[1].x), known; 22 a level pulled from the one below (srcTex);
+//   23 a level pushed back from the one above (srcTex) into what it was pulled as (extra); 24 a level's cells of colour
+//   p[1].x relaxed towards their neighbours; 25 the picture (orig) took the colours pushed out (srcTex) by p[1].y, where
+//   it is neither solid nor clear, when anything was known (the top level, `table`)
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D srcTex;  // RGBA32F, premultiplied: what the pass before made
 layout(binding = 4) uniform sampler2D orig;    // RGBA32F: the picture as the effect began
+layout(binding = 2) uniform sampler2D extra;   // RGBA32F: what an earlier pass kept, where the mode reads one
 layout(binding = 5) uniform sampler2D table;   // RGBA32F: the pass's table, rows as its mode says
 
 float clamp01(float v) { return v > 0.0 ? min(v, 1.0) : 0.0; }
@@ -348,6 +355,65 @@ void main() {
             o[c] = v * a;
         }
         fragColor = vec4(o, a);
+        return;
+    }
+    if (mode == 21) {
+        fragColor = px.a >= p[1].x ? vec4(px.rgb / px.a, 1.0) : vec4(0.0);
+        return;
+    }
+    if (mode == 22) {
+        float sw = 0.0;
+        vec3 acc = vec3(0.0);
+        int n = 0;
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                const ivec2 f = ivec2(2 * xy.x + dx, 2 * xy.y + dy);
+                if (f.x >= size.x || f.y >= size.y) continue;
+                ++n;
+                const vec4 v = texelFetch(srcTex, f, 0);
+                if (v.a <= 0.0) continue;
+                sw += v.a;
+                acc += v.a * v.rgb;
+            }
+        fragColor = vec4(sw > 0.0 ? acc / sw : vec3(0.0), sw / float(max(1, n)));
+        return;
+    }
+    if (mode == 23) {
+        const vec4 f = texelFetch(extra, xy, 0);
+        if (f.a >= 1.0) {
+            fragColor = f;
+            return;
+        }
+        const float cy = clamp((float(xy.y) + 0.5) / 2.0 - 0.5, 0.0, float(size.y - 1));
+        const float cx = clamp((float(xy.x) + 0.5) / 2.0 - 0.5, 0.0, float(size.x - 1));
+        const int j0 = int(cy), j1 = min(j0 + 1, size.y - 1), i0 = int(cx), i1 = min(i0 + 1, size.x - 1);
+        const float b = cy - float(j0), a = cx - float(i0);
+        const vec3 up = (texelFetch(srcTex, ivec2(i0, j0), 0).rgb * (1.0 - a) + texelFetch(srcTex, ivec2(i1, j0), 0).rgb * a) * (1.0 - b) +
+                        (texelFetch(srcTex, ivec2(i0, j1), 0).rgb * (1.0 - a) + texelFetch(srcTex, ivec2(i1, j1), 0).rgb * a) * b;
+        fragColor = vec4(f.a * f.rgb + (1.0 - f.a) * up, f.a);
+        return;
+    }
+    if (mode == 24) {
+        if (((xy.x + xy.y) & 1) != int(p[1].x) || px.a >= 1.0) {
+            fragColor = px;
+            return;
+        }
+        vec3 sum = vec3(0.0);
+        int n = 0;
+        if (xy.x > 0) sum += texelFetch(srcTex, xy - ivec2(1, 0), 0).rgb, ++n;
+        if (xy.x + 1 < size.x) sum += texelFetch(srcTex, xy + ivec2(1, 0), 0).rgb, ++n;
+        if (xy.y > 0) sum += texelFetch(srcTex, xy - ivec2(0, 1), 0).rgb, ++n;
+        if (xy.y + 1 < size.y) sum += texelFetch(srcTex, xy + ivec2(0, 1), 0).rgb, ++n;
+        fragColor = n == 0 ? px : vec4(sum / float(n), px.a);
+        return;
+    }
+    if (mode == 25) {
+        const vec4 o = texelFetch(orig, xy, 0);
+        if (o.a >= p[1].x || o.a <= 0.0 || texelFetch(table, ivec2(0, 0), 0).a <= 0.0) {
+            fragColor = o;
+            return;
+        }
+        fragColor = vec4(o.rgb + (px.rgb * o.a - o.rgb) * p[1].y, o.a);
         return;
     }
     if (mode >= 13 && mode <= 20 && px.a <= 0.0) {

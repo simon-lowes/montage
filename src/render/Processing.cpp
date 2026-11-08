@@ -3542,7 +3542,7 @@ bool isGpuFilter(const std::string& type) {
     static const std::set<std::string> filters = {"gaussian_blur", "sharpen", "glow", "channel_blur", "directional_blur", "vignette",
                                                   "posterize", "letterbox", "mirror", "mosaic", "chromatic_aberration", "noise",
                                                   "crosstalk", "colour_correlation", "hdr_palette", "color_warper", "color_slice",
-                                                  "film_grain", "rgb_mixer", "grain_match"};
+                                                  "film_grain", "rgb_mixer", "grain_match", "edge_extend"};
     return filters.count(type) > 0;
 }
 
@@ -3727,7 +3727,8 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[0] = float(e.p("threshold", t, 0.1)), op.params[1] = float(e.p("softness", t, 0.05));
         op.params[2] = e.p("invert", t) > 0.5 ? 1 : 0;
     } else if (e.type == "screen_key") {
-        if (std::lround(e.p("clean_plate", t, 0)) != 0) return false;  // (a clean plate is made and read on the CPU)
+        const int plateMode = int(std::lround(e.p("clean_plate", t, 0)));
+        if (plateMode == 1) return false;  // (a clean plate made from the picture itself: on the CPU, which has it)
         // (as screenKey, the matte shrunk or grown and softened by passes of its own when asked)
         const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
         op.kind = gpu::ColorOp::ScreenKey;
@@ -3742,6 +3743,19 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[6] = float(e.p("despill", t, 100) / 100), op.params[7] = float(e.p("restore", t, 50) / 100);
         op.params[8] = float(e.p("edge_desat", t, 0) / 100), op.params[9] = float(std::lround(e.p("view", t, 0)));
         op.params[10] = float(std::lround(shrink)), op.params[11] = float(std::lround(soften / 2));
+        // A plate track's picture as keyerPlate makes it (resized, in the effect's colours, blurred), on the CPU while the
+        // clip's layer is set up (render/Compositor's cleanPlateFor), where each pixel's screen colour is read.
+        if (plateMode == 2 && width > 0 && height > 0) {
+            Image size;
+            size.width = width, size.height = height;
+            Image plate = keyerPlate(e, t, size, pixelScale);
+            if (!plate.empty() && plate.width == width && plate.height == height) {
+                op.plate.assign(plate.px.begin(), plate.px.end());
+                op.params[12] = 1;
+                op.params[13] = std::max(1e-3f, float(std::clamp(e.p("plate_threshold", t, 50), 1.0, 100.0) / 100) * op.params[3]);
+            }
+        }
+        for (int k = 0; k < 3; ++k) op.params[16 + k] = sk[k];
     } else if (e.type == "track_matte") {
         return true;  // (the compositor applies it, render/Compositor)
     } else if (isGpuFilter(e.type)) {
@@ -3820,6 +3834,41 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             const uint32_t seed = vfx::grainSeed(t);
             add(18, {float(e.p("amount", t, 0.15)), e.p("color", t) > 0.5 ? 1.0f : 0.0f, float(gw), float(gh),
                      float(double(gw) / std::max(1, width)), float(double(gh) / std::max(1, height)), float(seed & 0xffffu), float(seed >> 16)});
+        } else if (ty == "edge_extend") {
+            // fillHoles's pyramid (render/CleanPlate): the solid colours known, pulled up a level at a time (each kept),
+            // pushed back down and relaxed on each level (red then black), then mixed into the edges.
+            const float amount = float(std::clamp(e.p("amount", t, 100), 0.0, 100.0) / 100);
+            const float solid = float(std::clamp(e.p("solid", t, 95), 1.0, 100.0) / 100);
+            if (amount > 0 && width > 0 && height > 0) {
+                std::vector<std::pair<int, int>> levels{{width, height}};
+                while (levels.back().first > 1 || levels.back().second > 1)
+                    levels.push_back({(levels.back().first + 1) / 2, (levels.back().second + 1) / 2});
+                const int top = int(levels.size()) - 1;
+                auto sized = [&](int level) {
+                    f.passes.back().width = levels[size_t(level)].first, f.passes.back().height = levels[size_t(level)].second;
+                };
+                add(21, {solid});
+                f.passes.back().save = 0;
+                for (int l = 1; l <= top; ++l) {
+                    add(22, {});
+                    sized(l);
+                    f.passes.back().save = l;
+                }
+                constexpr int kSweeps = 2;  // (as edgeExtend asks fillHoles for)
+                for (int l = top - 1; l >= 0; --l) {
+                    add(23, {});
+                    sized(l);
+                    f.passes.back().extra = l;
+                    const int sweeps = l == 0 ? std::max(1, kSweeps / 8) : l == 1 ? std::max(1, kSweeps / 4) : kSweeps;
+                    for (int k = 0; k < sweeps; ++k)
+                        for (int colour = 0; colour < 2; ++colour) {
+                            add(24, {float(colour)});
+                            sized(l);
+                        }
+                }
+                add(25, {solid, amount});
+                f.passes.back().tableSlot = top;
+            }
         } else if (ty == "rgb_mixer") {
             float m[12] = {};
             bool identity = true;

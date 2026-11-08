@@ -947,11 +947,22 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         }
         const QSize size = cur->pixelSize();
         if (op.kind == ColorOp::Filter) {
-            // Each pass on what the one before made, beside the picture the filter began with.
+            // Each pass on what the one before made, beside the picture the filter began with (and what earlier passes
+            // kept in the filter's slots).
             QRhiTexture* at = cur;
+            std::vector<QRhiTexture*> saved;
+            auto slotted = [&](QRhiTexture* t) { return std::find(saved.begin(), saved.end(), t) != saved.end(); };
+            auto letGo = [&](QRhiTexture* t) {
+                if (t && t != cur && !slotted(t)) release(t);
+            };
+            auto slotAt = [&](int i) { return i >= 0 && size_t(i) < saved.size() ? saved[size_t(i)] : nullptr; };
+            bool failed = false;
             for (const ColorOp::FilterPass& fp : op.passes) {
-                QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
-                if (!made) return nullptr;
+                QRhiTexture* made = texture(T::RGBA32F, fp.width > 0 ? fp.width : size.width(), fp.height > 0 ? fp.height : size.height(), true);
+                if (!made) {
+                    failed = true;
+                    break;
+                }
                 std::fill(p, p + 64, 0.0f);
                 p[0] = float(fp.mode);
                 std::copy(fp.params, fp.params + 60, p + 4);
@@ -959,17 +970,39 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 if (fp.tableWidth > 0 && !fp.table.empty()) {
                     const int rows = int(fp.table.size() / (size_t(fp.tableWidth) * 4));
                     table = texture(T::RGBA32F, fp.tableWidth, std::max(1, rows), false);
-                    if (!table) return nullptr;
+                    if (!table) {
+                        release(made);
+                        failed = true;
+                        break;
+                    }
                     QRhiTextureSubresourceUploadDescription d(fp.table.data(), quint32(fp.table.size() * sizeof(float)));
                     u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
                 }
-                if (table) pass(filterPs_, made, u, {{1, at}, {4, cur}, {5, table}}, uniforms(u, p));
-                else pass(filterPs_, made, u, {{1, at}, {4, cur}}, uniforms(u, p));
+                std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};
+                if (QRhiTexture* t = slotAt(fp.extra)) bound.push_back({2, t});
+                if (QRhiTexture* t = table ? table : slotAt(fp.tableSlot)) bound.push_back({5, t});
+                pass(filterPs_, made, u, bound, uniforms(u, p));
                 u = rhi_->nextResourceUpdateBatch();
                 if (table) release(table);
                 ++filterPasses;
-                if (at != cur) release(at);
+                if (fp.save >= 0) {
+                    if (saved.size() <= size_t(fp.save)) saved.resize(size_t(fp.save) + 1, nullptr);
+                    QRhiTexture* old = saved[size_t(fp.save)];
+                    saved[size_t(fp.save)] = made;
+                    if (old != at) letGo(old);
+                }
+                letGo(at);
                 at = made;
+            }
+            for (QRhiTexture*& t : saved)
+                if (t != at) {
+                    QRhiTexture* s = t;
+                    t = nullptr;
+                    letGo(s);
+                }
+            if (failed) {
+                letGo(at);
+                return nullptr;
             }
             if (at != cur) {
                 if (!keep(cur)) release(cur);
@@ -1028,6 +1061,15 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 textures.push_back({4, table});
             }
         }
+        QRhiTexture* plate = nullptr;  // (a ScreenKey's clean plate, read as src16)
+        if (op.kind == ColorOp::ScreenKey && !op.plate.empty()) {
+            if (op.plate.size() != size_t(size.width()) * size_t(size.height()) * 4) return nullptr;
+            plate = texture(T::RGBA32F, size.width(), size.height(), false);
+            if (!plate) return nullptr;
+            QRhiTextureSubresourceUploadDescription d(op.plate.data(), quint32(op.plate.size() * sizeof(float)));
+            u->uploadTexture(plate, QRhiTextureUploadEntry(0, 0, d));
+            textures.push_back({2, plate});
+        }
         if (op.kind == ColorOp::ScreenKey && (op.params[10] != 0 || op.params[11] != 0)) {
             // Its matte first, shrunk or grown and softened as render/Processing's screenKey does (gpucolor.frag's
             // 21 to 23), then read from the table.
@@ -1036,7 +1078,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             float q[64] = {};
             std::copy(p, p + 64, q);
             q[0] = 21;
-            pass(colorPs_, matte, u, {{1, cur}}, uniforms(u, q));
+            if (plate) pass(colorPs_, matte, u, {{1, cur}, {2, plate}}, uniforms(u, q));
+            else pass(colorPs_, matte, u, {{1, cur}}, uniforms(u, q));
             u = rhi_->nextResourceUpdateBatch();
             auto step = [&](int mode, int radius, bool maximum, bool column) {
                 QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
@@ -1077,7 +1120,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         if (!keep(cur)) release(cur);
         if (input && !keep(input)) release(input);
         for (const auto& [binding, tex] : textures)
-            if ((binding == 4 && op.kind != ColorOp::Lut && op.kind != ColorOp::Mix) || binding == 5) release(tex);
+            if ((binding == 4 && op.kind != ColorOp::Lut && op.kind != ColorOp::Mix) || binding == 5 || tex == plate) release(tex);
         cur = next;
     }
     for (QRhiTexture* t : kept)

@@ -19211,6 +19211,7 @@ colorspaces:
             {"mosaic", {{{"size", 4}}, {{"size", 9}}, {{"size", 25}}}},
             {"chromatic_aberration", {{{"amount", 3}}, {{"amount", -8}}, {{"amount", 15}}}},
             {"noise", {{{"amount", 20}}, {{"amount", 60}, {"color", 0}, {"clip", 0}}, {{"amount", 5}}}},
+            {"edge_extend", {{}, {{"amount", 60}, {"solid", 50}}, {{"solid", 99}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -19268,6 +19269,29 @@ colorspaces:
                 QVERIFY2(gpu::stats().filterPasses > passes, tools[n].type);
             }
         s.colorSpace = "rec709";
+
+        // The Keyer with a clean plate from the (hidden) track above, three settings: keyed with its matte shrunk and
+        // softened, the plate shown, and the screen evened out by it.
+        QVERIFY(edit::placeMedia(p, s, other, 0, 0, 40, {TrackKind::Video, 2}, {}, false).ok);
+        for (int k = 0; k < 3; ++k) {
+            Effect key = makeEffect(p, "screen_key");
+            key.params["clean_plate"] = 2.0;
+            key.params["plate_blur"] = 2.0;
+            key.params["key.r"] = 0.4, key.params["key.g"] = 0.6, key.params["key.b"] = 0.3;
+            if (k == 0) key.params["shrink"] = 2.0, key.params["soften"] = 3.0;
+            key.params["view"] = k == 0 ? 0.0 : k + 2.0;
+            edit::clipById(s, topId)->effects = {key};
+            compare(10 + k, QString("Keyer with a clean plate #%1").arg(k + 1));
+            if (k == 1) {  // (the plate is there: shown, it is not the picture keyed)
+                RenderOptions o;
+                o.gpu = true;
+                const Image shown = renderProgramFrame(p, s, 11, o);
+                key.params["clean_plate"] = 0.0;
+                edit::clipById(s, topId)->effects = {key};
+                QVERIFY(renderProgramFrame(p, s, 11, o).px != shown.px);
+            }
+        }
+        s.videoTracks[2].clips.clear();
         edit::clipById(s, topId)->effects.clear();
 
         // Every transition (but Smooth Cut's flow and OpenFX's), at three places, between two pictures on V1.

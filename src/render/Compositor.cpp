@@ -2723,6 +2723,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     Image canvasSize;  // (an adjustment layer's source: the canvas's size alone, its picture is the GPU's)
     canvasSize.width = W, canvasSize.height = H;
     if (!clipSource(p, seq, c, t, o, adjustment ? &canvasSize : nullptr, true, cs)) return GpuLayerResult::Nothing;
+    CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));  // (a Keyer's plate track, made here as clipLayer makes it)
     int w = 0, h = 0;
     if (adjustment) {
         out.canvas = true;

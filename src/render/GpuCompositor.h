@@ -56,7 +56,8 @@ struct ColorOp {
     // the picture in `slot`, Load takes it up again, and Pass draws gpucolor.frag's `passMode` from the slots `in`
     // (its source, table and mask; -1 for none) into the slot `out`, leaving the picture as it is.)
     // (ChromaKey, LumaKey and ScreenKey change the alpha too: render/Processing's keyers, gpucolor.frag's 18 to 20;
-    // a ScreenKey whose params[10] or [11] are set has its matte shrunk or grown and blurred by passes of its own.)
+    // a ScreenKey whose params[10] or [11] are set has its matte shrunk or grown and blurred by passes of its own, and
+    // one with a clean plate, made on the CPU, reads it from `plate`.)
     // (Shader runs `shader` on the picture, without a mask.)
     // (Filter runs gpufilter.frag's `passes` in turn, each on the picture the one before made, with the picture the
     // filter began with beside it: the blurs, Sharpen, Glow and the other effects that read beyond their own pixel. A
@@ -67,6 +68,9 @@ struct ColorOp {
         float params[60] = {};  // its p[1..15]
         std::vector<float> table;  // RGBA rows of tableWidth (its `table`, as the mode says), or none
         int tableWidth = 0;
+        int width = 0, height = 0;  // what it makes (0: the layer's size)
+        int save = -1;              // the filter's slot it keeps what it makes in, for a later pass
+        int extra = -1, tableSlot = -1;  // slots read as gpufilter.frag's `extra`, and as its `table` instead of `table` above
     };
     std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader
@@ -85,6 +89,7 @@ struct ColorOp {
     bool masked = false;
     std::vector<float> mask;
     float maskParams[12] = {};
+    std::vector<float> plate;  // ScreenKey: its clean plate (RGBA, the layer's size), or none
 };
 
 // Where a layer goes on the canvas (render/Compositor's Geometry, worked out on the CPU).
