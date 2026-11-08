@@ -33,6 +33,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 
 #ifdef Q_OS_WIN
 #include <winsock2.h>
@@ -49,7 +50,9 @@
 #include <rtc/rtc.hpp>
 
 #include "core/ReviewPage.h"
+#include "media/Image.h"
 #include "media/ThreadScheduling.h"
+#include "render/ColorSpace.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -157,7 +160,49 @@ QString guesser(const QHostAddress& a) {
     return QHostAddress(ip).toString() + "/64";
 }
 
+// The network around it: an IPv4 address's /24, an IPv6 address's /48 (a site's, which holds many /64s).
+QString network(const QHostAddress& a) {
+    bool v4 = false;
+    const quint32 ip4 = a.toIPv4Address(&v4);
+    if (v4) return QHostAddress(ip4 & 0xffffff00u).toString() + "/24";
+    if (a.protocol() != QAbstractSocket::IPv6Protocol) return a.toString();
+    Q_IPV6ADDR ip = a.toIPv6Address();
+    for (int i = 6; i < 16; ++i) ip[i] = 0;
+    return QHostAddress(ip).toString() + "/48";
+}
+
 QString lower(QString s) { return s.toLower(); }
+
+// "turn:host:3478" or "turns:host" as host, port and whether over TLS (false when it is not one).
+bool parseRelay(const std::string& url, std::string& host, uint16_t& port, bool& tls) {
+    const size_t colon = url.find(':');
+    if (colon == std::string::npos) return false;
+    const std::string scheme = url.substr(0, colon);
+    if (scheme != "turn" && scheme != "turns") return false;
+    tls = scheme == "turns";
+    std::string rest = url.substr(colon + 1);
+    rest = rest.substr(0, rest.find('?'));
+    port = tls ? 5349 : 3478;
+    if (!rest.empty() && rest[0] == '[') {
+        const size_t end = rest.find(']');
+        if (end == std::string::npos) return false;
+        host = rest.substr(1, end - 1);
+        rest = rest.substr(end + 1);
+        if (!rest.empty() && rest[0] != ':') return false;
+        if (!rest.empty()) rest = rest.substr(1);
+    } else {
+        const size_t c = rest.rfind(':');
+        host = rest.substr(0, c);
+        rest = c == std::string::npos ? std::string() : rest.substr(c + 1);
+    }
+    if (!rest.empty()) {
+        bool ok = false;
+        const int p = QString::fromStdString(rest).toInt(&ok);
+        if (!ok || p < 1 || p > 65535) return false;
+        port = uint16_t(p);
+    }
+    return !host.empty();
+}
 
 // An ICE server as the settings name it ("turn:user:password@host:3478") and as a browser takes it.
 QJsonObject browserIceServer(const std::string& url) {
@@ -226,11 +271,12 @@ protected:
 // The offer's choice for a medium: the payload type of the first codec in `order` it takes, and its format line.
 struct Choice {
     int pt = -1;
-    std::string codec;  // "h264", "av1", "hevc", "opus"
+    std::string codec;  // "h264", "av1", "vp9", "hevc", "opus"
     std::string fmtp;
 };
 
-Choice choose(const rtc::Description::Media& m, const std::vector<std::string>& order) {
+// (`tenBit`: one that carries 10-bit pictures: VP9's profile 2, HEVC's Main 10)
+Choice choose(const rtc::Description::Media& m, const std::vector<std::string>& order, bool tenBit = false) {
     for (const std::string& want : order) {
         Choice best;
         int bestScore = 0;
@@ -242,6 +288,7 @@ Choice choose(const rtc::Description::Media& m, const std::vector<std::string>& 
             for (const std::string& f : map->fmtps) fmtp += (fmtp.empty() ? "" : ";") + f;
             const QString f = lower(QString::fromStdString(fmtp));
             int score = 0;
+            if (tenBit && want != "vp9" && want != "hevc") continue;
             if (want == "h264" && format == "h264") {
                 // Packetised in fragments (mode 1); constrained baseline best, as x264 makes it, then baseline.
                 if (!f.contains("packetization-mode=1")) continue;
@@ -249,8 +296,13 @@ Choice choose(const rtc::Description::Media& m, const std::vector<std::string>& 
             } else if (want == "av1" && format == "av1") {
                 if (f.contains("profile=") && !f.contains("profile=0")) continue;  // (8-bit 4:2:0 is profile 0)
                 score = 1;
+            } else if (want == "vp9" && format == "vp9") {
+                // (profile 0: 8-bit 4:2:0; profile 2: 10-bit)
+                if (tenBit ? !f.contains("profile-id=2") : f.contains("profile-id=") && !f.contains("profile-id=0")) continue;
+                score = 1;
             } else if (want == "hevc" && format == "h265") {
-                if (f.contains("profile-id=") && !f.contains("profile-id=1")) continue;  // (Main)
+                // (Main, or for 10-bit Main 10)
+                if (tenBit ? !f.contains("profile-id=2") : f.contains("profile-id=") && !f.contains("profile-id=1")) continue;
                 score = 1;
             } else if (want == "opus" && format == "opus" && map->clockRate == 48000) {
                 score = 1;
@@ -346,20 +398,135 @@ struct Viewer {
     std::shared_ptr<rtc::Track> video, audio;
     std::shared_ptr<rtc::RtpPacketizationConfig> vcfg, acfg;
     std::string codec;  // the picture's ("" none)
+    bool hdr = false;   // sent 10-bit HDR (else SDR)
+    std::shared_ptr<class Vp9Packetizer> vp9;  // VP9's, told each picture's size
     std::atomic<bool> needKey{true};  // nothing but a key frame goes to them next
     std::atomic<int64_t> lastKeyAsk{0};  // when they last asked for one (ms on the steady clock)
     std::atomic<bool> connected{false}, gone{false};
+    // The rung they are sent, and the one they are moving to (sent from its next key frame on).
+    std::atomic<int> rung{0}, wantRung{0};
     Clock::time_point created = Clock::now();
     std::mutex m;  // the members below
     std::shared_ptr<rtc::DataChannel> channel;
     std::string author = "Reviewer", color = kPalette[0];
     double markerBudget = kMarkerBurst, drawingBudget = double(kDrawingBurst), pointerBudget = kPointerRate;
     Clock::time_point budgetAt = Clock::now();
+    // Their receiver reports on the picture: how many, and the share of packets lost in the last.
+    uint64_t reports = 0;
+    double loss = 0;
+    Clock::time_point reportAt;
+    // (send's thread) How the ladder steers them: reports read, when they last moved, when they may next try the rung
+    // above, how long they wait between tries (doubled each time one fails), and what was sent them lately.
+    uint64_t seenReports = 0;
+    Clock::time_point movedAt = Clock::now(), nextTry = Clock::now() + std::chrono::seconds(3);
+    std::chrono::milliseconds hold{8000};
+    bool trying = false;  // moved up a rung lately, to see whether it fits
+    int64_t lastPts = -1;
+    std::deque<std::pair<Clock::time_point, size_t>> sent;
+};
+
+// VP9 over RTP (RFC 9628) in flexible mode: one spatial and temporal layer, a 15-bit picture ID, each inter picture
+// referring to the one before, and the scalability structure (the picture's size) on key frames.
+class Vp9Packetizer final : public rtc::RtpPacketizer {
+public:
+    explicit Vp9Packetizer(std::shared_ptr<rtc::RtpPacketizationConfig> config)
+        : rtc::RtpPacketizer(std::move(config)), picture_(uint16_t(QRandomGenerator::system()->bounded(0x8000))) {}
+    std::atomic<int> width{0}, height{0};
+
+protected:
+    std::vector<rtc::binary> fragment(rtc::binary data) override {
+        if (data.empty()) return {};
+        const bool key = keyFrame(data);
+        picture_ = uint16_t((picture_ + 1) & 0x7fff);
+        const size_t room = DefaultMaxFragmentSize - 12;  // (its RTP header and the descriptor's own bytes below)
+        std::vector<rtc::binary> out;
+        for (size_t at = 0; at < data.size();) {
+            const bool first = at == 0;
+            rtc::binary p;
+            // I P L F B E V Z: a picture ID; inter-predicted unless a key frame; no layer indices; flexible mode;
+            // beginning and end of the picture; the scalability structure on a key frame's first packet.
+            p.push_back(std::byte((1 << 7) | (key ? 0 : 1 << 6) | (1 << 4) | (first ? 1 << 3 : 0) | (key && first ? 1 << 1 : 0)));
+            p.push_back(std::byte(0x80 | (picture_ >> 8)));  // (M: the 15-bit form)
+            p.push_back(std::byte(picture_ & 0xff));
+            if (!key) p.push_back(std::byte(1 << 1));  // P_DIFF 1 (the picture before), N 0 (no more)
+            if (key && first) {
+                p.push_back(std::byte(1 << 4));  // N_S 0 (one spatial layer), Y (its size), G 0 (no group description)
+                for (int v : {width.load(), height.load()}) {
+                    p.push_back(std::byte((v >> 8) & 0xff));
+                    p.push_back(std::byte(v & 0xff));
+                }
+            }
+            const size_t n = std::min(room, data.size() - at);
+            p.insert(p.end(), data.begin() + ptrdiff_t(at), data.begin() + ptrdiff_t(at + n));
+            at += n;
+            if (at == data.size()) p[0] |= std::byte(1 << 2);  // E
+            out.push_back(std::move(p));
+        }
+        return out;
+    }
+
+private:
+    // A key frame's uncompressed header: frame marker, profile (a reserved bit for profile 3), not an existing frame
+    // shown, frame type 0.
+    static bool keyFrame(const rtc::binary& d) {
+        const unsigned b = unsigned(d[0]);
+        if ((b >> 6) != 2) return false;
+        const int profile = int(((b >> 5) & 1) | (((b >> 4) & 1) << 1));
+        int bit = profile == 3 ? 2 : 3;
+        if ((b >> bit) & 1) return false;  // show_existing_frame
+        return ((b >> (bit - 1)) & 1) == 0;
+    }
+    uint16_t picture_;
+};
+
+// A viewer's receiver reports on their picture (in RTCP sender and receiver reports): the share of packets lost.
+class FeedbackReader final : public rtc::MediaHandler {
+public:
+    FeedbackReader(std::weak_ptr<Viewer> viewer, uint32_t ssrc) : viewer_(std::move(viewer)), ssrc_(ssrc) {}
+    void incoming(rtc::message_vector& messages, const rtc::message_callback&) override {
+        for (const auto& message : messages) {
+            if (!message) continue;
+            const auto* d = reinterpret_cast<const uint8_t*>(message->data());
+            const size_t size = message->size();
+            for (size_t at = 0; at + 8 <= size;) {
+                if ((d[at] >> 6) != 2) break;
+                const int count = d[at] & 31, type = d[at + 1];
+                const size_t length = (size_t((d[at + 2] << 8) | d[at + 3]) + 1) * 4;
+                if (at + length > size) break;
+                if (type == 200 || type == 201) {
+                    for (size_t b = at + (type == 200 ? 28 : 8), i = 0; i < size_t(count) && b + 24 <= at + length; ++i, b += 24) {
+                        const uint32_t ssrc = (uint32_t(d[b]) << 24) | (uint32_t(d[b + 1]) << 16) | (uint32_t(d[b + 2]) << 8) | d[b + 3];
+                        if (ssrc != ssrc_) continue;
+                        if (auto v = viewer_.lock()) {
+                            std::lock_guard lock(v->m);
+                            v->loss = d[b + 4] / 256.0;
+                            v->reportAt = Clock::now();
+                            ++v->reports;
+                        }
+                    }
+                }
+                at += length;
+            }
+        }
+    }
+
+private:
+    std::weak_ptr<Viewer> viewer_;
+    uint32_t ssrc_;
+};
+
+// An encoder for one codec, rung and depth.
+struct EncoderKey {
+    std::string codec;
+    int rung = 0;
+    bool hdr = false;
+    bool operator<(const EncoderKey& o) const { return std::tie(codec, rung, hdr) < std::tie(o.codec, o.rung, o.hdr); }
 };
 
 struct VideoEncoder {
     AVCodecContext* ctx = nullptr;
     AVPacket* pkt = nullptr;
+    AVFrame* picture = nullptr;
     std::string name;
     std::map<int64_t, StreamTag> tags;  // by picture, until its packet comes out
     ~VideoEncoder() {
@@ -368,8 +535,115 @@ struct VideoEncoder {
             while (avcodec_receive_packet(ctx, pkt) >= 0) av_packet_unref(pkt);
         avcodec_free_context(&ctx);
         av_packet_free(&pkt);
+        av_frame_free(&picture);
     }
 };
+
+// One rung of the ladder: its size and bit rate.
+struct Rung {
+    int width = 0, height = 0;
+    int64_t bitrate = 0;
+};
+
+// A picture coded from one encoder this tick.
+struct Coded {
+    EncoderKey key;
+    std::vector<std::byte> data;
+    int64_t pts = 0;
+    bool keyFrame = false;
+    StreamTag tag;
+    int width = 0, height = 0;
+};
+
+// Y′CbCr codes (10-bit) of one colour space to those of BT.709 SDR, as the Program monitor shows them: a 33³ table,
+// looked up trilinearly.
+struct ToSdr {
+    static constexpr int N = 33;
+    std::vector<float> table;  // N³ × 3, Y′ Cb Cr codes
+    void build(const ColorSpace& from, bool bt2020, double peakNits) {
+        table.resize(size_t(N) * N * N * 3);
+        const double kr = bt2020 ? 0.2627 : 0.2126, kb = bt2020 ? 0.0593 : 0.0722;
+        const double kr7 = 0.2126, kb7 = 0.0722;
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j)
+                for (int k = 0; k < N; ++k) {
+                    const double y = (i * 1023.0 / (N - 1) - 64) / 876, cb = (j * 1023.0 / (N - 1) - 512) / 896, cr = (k * 1023.0 / (N - 1) - 512) / 896;
+                    const double r = y + 2 * (1 - kr) * cr, b = y + 2 * (1 - kb) * cb, g = (y - kr * r - kb * b) / (1 - kr - kb);
+                    float rgb[3] = {float(std::clamp(r, 0.0, 1.0)), float(std::clamp(g, 0.0, 1.0)), float(std::clamp(b, 0.0, 1.0))};
+                    convertPixel(rgb, from, rec709Space(), peakNits);
+                    const double R = std::clamp<double>(rgb[0], 0, 1), G = std::clamp<double>(rgb[1], 0, 1), B = std::clamp<double>(rgb[2], 0, 1);
+                    const double Y = kr7 * R + (1 - kr7 - kb7) * G + kb7 * B;
+                    float* o = &table[((size_t(i) * N + size_t(j)) * N + size_t(k)) * 3];
+                    o[0] = float(64 + 876 * Y);
+                    o[1] = float(512 + 896 * (B - Y) / (2 * (1 - kb7)));
+                    o[2] = float(512 + 896 * (R - Y) / (2 * (1 - kr7)));
+                }
+    }
+    void at(int y, int u, int v, float out[3]) const {
+        const float s = float(N - 1) / 1023.0f;
+        const float fy = std::clamp(float(y) * s, 0.0f, float(N - 1)), fu = std::clamp(float(u) * s, 0.0f, float(N - 1)),
+                    fv = std::clamp(float(v) * s, 0.0f, float(N - 1));
+        const int i = std::min(N - 2, int(fy)), j = std::min(N - 2, int(fu)), k = std::min(N - 2, int(fv));
+        const float a = fy - float(i), b = fu - float(j), c = fv - float(k);
+        for (int ch = 0; ch < 3; ++ch) {
+            auto t = [&](int di, int dj, int dk) { return table[((size_t(i + di) * N + size_t(j + dj)) * N + size_t(k + dk)) * 3 + size_t(ch)]; };
+            const float c00 = t(0, 0, 0) + (t(0, 0, 1) - t(0, 0, 0)) * c, c01 = t(0, 1, 0) + (t(0, 1, 1) - t(0, 1, 0)) * c;
+            const float c10 = t(1, 0, 0) + (t(1, 0, 1) - t(1, 0, 0)) * c, c11 = t(1, 1, 0) + (t(1, 1, 1) - t(1, 1, 0)) * c;
+            const float c0 = c00 + (c01 - c00) * b, c1 = c10 + (c11 - c10) * b;
+            out[ch] = c0 + (c1 - c0) * a;
+        }
+    }
+    // A whole picture (each chroma sample the mean of the four pixels it serves).
+    void apply(Planes420& p) const {
+        const int w = p.width, h = p.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+        parallelRows(ch, [&](int y0, int y1) {
+            for (int cy = y0; cy < y1; ++cy)
+                for (int cx = 0; cx < cw; ++cx) {
+                    const size_t ci = size_t(cy) * size_t(cw) + size_t(cx);
+                    const int u = p.u[ci], v = p.v[ci];
+                    float su = 0, sv = 0;
+                    int n = 0;
+                    for (int dy = 0; dy < 2; ++dy)
+                        for (int dx = 0; dx < 2; ++dx) {
+                            const int x = 2 * cx + dx, y = 2 * cy + dy;
+                            if (x >= w || y >= h) continue;
+                            uint16_t& Y = p.y[size_t(y) * size_t(w) + size_t(x)];
+                            float o[3];
+                            at(Y, u, v, o);
+                            Y = uint16_t(std::clamp(std::lround(o[0]), 0L, 1023L));
+                            su += o[1], sv += o[2], ++n;
+                        }
+                    p.u[ci] = uint16_t(std::clamp(std::lround(su / float(n)), 0L, 1023L));
+                    p.v[ci] = uint16_t(std::clamp(std::lround(sv / float(n)), 0L, 1023L));
+                }
+        });
+    }
+};
+
+// A picture at a smaller size, each sample the mean of the box it covers.
+Planes420 shrink(const Planes420& p, int w, int h) {
+    if (w == p.width && h == p.height) return p;
+    Planes420 out(w, h);
+    auto plane = [](const std::vector<uint16_t>& in, int iw, int ih, std::vector<uint16_t>& o, int ow, int oh) {
+        parallelRows(oh, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                const int sy0 = int(int64_t(y) * ih / oh), sy1 = std::max(sy0 + 1, int(int64_t(y + 1) * ih / oh));
+                for (int x = 0; x < ow; ++x) {
+                    const int sx0 = int(int64_t(x) * iw / ow), sx1 = std::max(sx0 + 1, int(int64_t(x + 1) * iw / ow));
+                    uint32_t sum = 0;
+                    for (int sy = sy0; sy < sy1; ++sy)
+                        for (int sx = sx0; sx < sx1; ++sx) sum += in[size_t(sy) * size_t(iw) + size_t(sx)];
+                    const uint32_t n = uint32_t((sy1 - sy0) * (sx1 - sx0));
+                    o[size_t(y) * size_t(ow) + size_t(x)] = uint16_t((sum + n / 2) / n);
+                }
+            }
+        });
+    };
+    plane(p.y, p.width, p.height, out.y, w, h);
+    plane(p.u, (p.width + 1) / 2, (p.height + 1) / 2, out.u, (w + 1) / 2, (h + 1) / 2);
+    plane(p.v, (p.width + 1) / 2, (p.height + 1) / 2, out.v, (w + 1) / 2, (h + 1) / 2);
+    return out;
+}
 
 }  // namespace
 
@@ -387,6 +661,7 @@ struct BrowserReviewBackend::Impl {
     QSslCertificate certificate;
     QSslKey key;
     std::vector<rtc::IceServer> iceServers;
+    bool relayInUse = false;  // a TURN relay among them, which Montage reaches too
 
     // The web server's thread, its loop and the object queued work runs on.
     std::thread http;
@@ -395,8 +670,10 @@ struct BrowserReviewBackend::Impl {
     std::map<QString, Failures> failures;  // (that thread's)
     std::map<QString, PeerBucket> peerBuckets;          // (that thread's) by guesser()
     std::map<QString, Clock::time_point> trusted;       // (that thread's) addresses that gave the right passphrase lately
-    double guesses = kGuessBurst;  // passphrases that may be tried now
-    Clock::time_point guessesAt = Clock::now();
+    std::map<QString, Clock::time_point> guessingNetworks;  // (that thread's) by network(): when one there last guessed wrong
+    // Passphrases that may be tried now: from addresses and networks that have guessed wrong lately, and from the rest.
+    double guesses = kGuessBurst, freshGuesses = kGuessBurst;
+    Clock::time_point guessesAt = Clock::now(), freshGuessesAt = Clock::now();
 
     std::map<std::string, std::shared_ptr<Viewer>> viewers;
     // Viewers let go, kept a few seconds more: a callback of theirs still running is never the last to hold one (a
@@ -413,10 +690,14 @@ struct BrowserReviewBackend::Impl {
     std::string lastError;
 
     // Encoding (send's thread; the encoders map is changed under m, as stats() reads it).
-    std::map<std::string, std::unique_ptr<VideoEncoder>> encoders;
-    std::map<std::string, std::string> encoderErrors;
-    std::map<std::string, Clock::time_point> forcedKey;  // when each codec's encoder was last made to start a key frame
-    AVFrame* picture = nullptr;
+    std::map<EncoderKey, std::unique_ptr<VideoEncoder>> encoders;
+    std::map<EncoderKey, std::string> encoderErrors;
+    std::map<EncoderKey, Clock::time_point> forcedKey;  // when each encoder was last made to start a key frame
+    std::vector<Rung> ladder;  // full size first
+    bool hdrSignal = false;    // the frames are PQ or HLG (BT.2020)
+    Eotf eotf = Eotf::Sdr;
+    std::unique_ptr<ToSdr> toSdr;  // for frames that are not BT.709 SDR
+    uint16_t hdrWhite = 940;       // burnt-in text in HDR pictures: at HDR reference white
     AVCodecContext* aenc = nullptr;
     AVAudioFifo* fifo = nullptr;
     AVFrame* aframe = nullptr;
@@ -477,16 +758,33 @@ struct BrowserReviewBackend::Impl {
         }
         if (open.size() > kMaxConnections) {
             // Full. A reviewer who gave the passphrase lately still gets in, in the place of the oldest connection
-            // still waiting to be answered from anyone else; no one else does.
+            // still waiting to be answered from anyone else. Anyone else gets in by their share: in the place of the
+            // oldest connection waiting from the address (IPv6 /64) holding the most, when that holds more than
+            // theirs, so that a few addresses holding every place cannot keep a newcomer out.
             QSslSocket* oldest = nullptr;
             const auto now = Clock::now();  // (trust that has run out counts for nothing here either)
             for (auto it = trusted.begin(); it != trusted.end();) it = now - it->second > kTrustedMemory ? trusted.erase(it) : std::next(it);
-            if (trusted.count(from))
+            if (trusted.count(from)) {
                 for (QSslSocket* o : open)
                     if (o != c && !o->property("answered").toBool() && !trusted.count(guesser(o->peerAddress()))) {
                         oldest = o;
                         break;  // (children are listed oldest first)
                     }
+            } else {
+                std::map<QString, int> held;
+                for (QSslSocket* o : open)
+                    if (o != c) ++held[guesser(o->peerAddress())];
+                QString most;
+                int mostHeld = 0;
+                for (const auto& [who, n] : held)
+                    if (n > mostHeld && !trusted.count(who)) most = who, mostHeld = n;
+                if (mostHeld > held[from] + 1)
+                    for (QSslSocket* o : open)
+                        if (o != c && !o->property("answered").toBool() && guesser(o->peerAddress()) == most) {
+                            oldest = o;
+                            break;
+                        }
+            }
             if (!oldest) {
                 c->abort();
                 c->deleteLater();
@@ -549,7 +847,10 @@ struct BrowserReviewBackend::Impl {
     // The passphrase as a bearer token. An address that has guessed wrong too often lately is refused at once; each
     // address (IPv6 /64) may try only so many a second, and all of them together only so many more (the rest refused
     // untried), except addresses that gave the right one lately, so that guessing elsewhere never shuts reviewers
-    // already in out. Wrong ones are told a second after the one before from the same address.
+    // already in out. Addresses whose network (IPv4 /24, IPv6 /48) has guessed wrong lately share that budget; the
+    // rest share one of their own, so that guessing from a few networks never shuts a newcomer out either (one who
+    // would must bring a fresh network for each wrong guess). Wrong ones are told a second after the one before from
+    // the same address.
     bool authorised(QSslSocket* c, const Request& r) {
         const QString peer = guesser(c->peerAddress());
         const auto now = Clock::now();
@@ -562,6 +863,11 @@ struct BrowserReviewBackend::Impl {
         while (failures.size() > 4096)
             failures.erase(std::min_element(failures.begin(), failures.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
         const bool known = trusted.count(peer) > 0;
+        // (an address, or a network around it, that has guessed wrong lately; newcomers from elsewhere have a
+        // budget of their own, so that guessing from a few networks never shuts them out)
+        const QString around = network(c->peerAddress());
+        forget(guessingNetworks, [&](Clock::time_point t) { return now - t > kFailureMemory; });
+        const bool suspect = failures.count(peer) > 0 || guessingNetworks.count(around) > 0;
         // (an address a reviewer is in lately, as a shared network's, is blocked only after many more)
         auto blocked = failures.find(peer);
         if (blocked != failures.end() && blocked->second.count >= (known ? 100 : 10)) {
@@ -578,13 +884,15 @@ struct BrowserReviewBackend::Impl {
                 return false;
             }
             mine.tokens -= 1;
-            guesses = std::min(kGuessBurst, guesses + std::chrono::duration<double>(now - guessesAt).count() * kGuessRate);
-            guessesAt = now;
-            if (guesses < 1) {
+            double& pool = suspect ? guesses : freshGuesses;
+            Clock::time_point& poolAt = suspect ? guessesAt : freshGuessesAt;
+            pool = std::min(kGuessBurst, pool + std::chrono::duration<double>(now - poolAt).count() * kGuessRate);
+            poolAt = now;
+            if (pool < 1) {
                 respond(c, "429 Too Many Requests", {{"Retry-After", "5"}}, "Too many passphrases tried: try again shortly");
                 return false;
             }
-            guesses -= 1;
+            pool -= 1;
         }
         QByteArray given = r.header("authorization");
         if (given.toLower().startsWith("bearer ")) given = given.mid(7).trimmed();
@@ -596,6 +904,7 @@ struct BrowserReviewBackend::Impl {
         Failures& f = failures[peer];
         ++f.count;
         f.last = now;
+        if (guessingNetworks.size() < 4096 || guessingNetworks.count(around)) guessingNetworks[around] = now;
         // (per address: wrong guesses from elsewhere never hold back anyone's answer, the shared bucket above bounds
         // how fast all of them together may guess)
         f.nextRefusal = std::max(now, f.nextRefusal) + std::chrono::seconds(1);
@@ -624,17 +933,25 @@ struct BrowserReviewBackend::Impl {
         if (path == "/config" && r.method == "GET") {
             if (!authorised(c, r)) return;
             QJsonArray ice;
-            for (const std::string& s : settings.iceServers) ice.append(browserIceServer(s));
+            for (const QJsonObject& s : browserIceServers()) ice.append(s);
+            QJsonArray rungs;
+            for (const Rung& g : ladder) rungs.append(QJsonArray{g.width, g.height});
             std::lock_guard lock(m);
-            const QJsonObject o{{"iceServers", ice}, {"fps", QJsonArray{mode.fps.num, mode.fps.den}}, {"width", mode.width}, {"height", mode.height},
-                                {"sequence", double(sequence)}};
+            const QJsonObject o{{"iceServers", ice}, {"iceTransportPolicy", settings.relayOnly ? "relay" : "all"},
+                                {"fps", QJsonArray{mode.fps.num, mode.fps.den}}, {"width", mode.width}, {"height", mode.height},
+                                {"sequence", double(sequence)}, {"rungs", rungs},
+                                {"hdr", !settings.hdr || !hdrSignal ? "" : eotf == Eotf::Pq ? "pq" : "hlg"}};
             return respond(c, "200 OK", {}, QJsonDocument(o).toJson(QJsonDocument::Compact), "application/json");
         }
         if (path == "/whep") {
             if (r.method != "POST") return respond(c, "405 Method Not Allowed", {{"Allow", "POST, OPTIONS"}}, {});
             if (!authorised(c, r)) return;
             if (!r.header("content-type").toLower().startsWith("application/sdp")) return respond(c, "415 Unsupported Media Type", {}, "An SDP offer, please");
-            return offer(c, r.body);
+            // (?hdr=1: the player decodes 10-bit HDR and wants it)
+            const QByteArray query = r.path.mid(path.size() + 1);
+            bool hdr = false;
+            for (const QByteArray& kv : query.split('&')) hdr = hdr || kv == "hdr=1" || kv == "hdr=true";
+            return offer(c, r.body, hdr);
         }
         if (path.startsWith("/whep/")) {
             if (r.method == "PATCH") return respond(c, "405 Method Not Allowed", {{"Allow", "DELETE"}}, {});  // (no trickle ICE)
@@ -657,8 +974,19 @@ struct BrowserReviewBackend::Impl {
         respond(c, "404 Not Found", {}, "Not found");
     }
 
+    // The STUN and TURN servers as browsers are given them: the settings' own, then the TURN relay.
+    std::vector<QJsonObject> browserIceServers() const {
+        std::vector<QJsonObject> out;
+        for (const std::string& s : settings.iceServers) out.push_back(browserIceServer(s));
+        if (!settings.turnServer.empty())
+            out.push_back({{"urls", QString::fromStdString(settings.turnServer)},
+                           {"username", QString::fromStdString(settings.turnUser)},
+                           {"credential", QString::fromStdString(settings.turnPassword)}});
+        return out;
+    }
+
     // A viewer's offer: their connection made, answered once its candidates are gathered.
-    void offer(QSslSocket* c, const QByteArray& sdp) {
+    void offer(QSslSocket* c, const QByteArray& sdp, bool hdr) {
         {
             std::lock_guard lock(m);
             if (int(viewers.size()) >= settings.maxViewers) return respond(c, "503 Service Unavailable", {}, "As many viewers as allowed are watching");
@@ -666,7 +994,7 @@ struct BrowserReviewBackend::Impl {
         std::shared_ptr<Viewer> v;
         std::string why;
         try {
-            v = makeViewer(sdp.toStdString(), c->peerAddress().toString(), why);
+            v = makeViewer(sdp.toStdString(), c->peerAddress().toString(), hdr, why);
         } catch (const std::exception& e) {
             why = std::string("The offer is not one Montage can answer: ") + e.what();
         }
@@ -680,8 +1008,7 @@ struct BrowserReviewBackend::Impl {
             std::optional<rtc::Description> local = v ? v->pc->localDescription() : std::nullopt;
             if (!local) return respond(sock, "500 Internal Server Error", {}, "No answer");
             std::vector<std::pair<QByteArray, QByteArray>> headers{{"Location", "/whep/" + QByteArray::fromStdString(v->id)}};
-            for (const std::string& s : settings.iceServers) {
-                const QJsonObject o = browserIceServer(s);
+            for (const QJsonObject& o : browserIceServers()) {
                 QByteArray link = "<" + o.value("urls").toString().toUtf8() + ">; rel=\"ice-server\"";
                 if (o.contains("username"))
                     link += "; username=\"" + o.value("username").toString().toUtf8() + "\"; credential=\"" + o.value("credential").toString().toUtf8() +
@@ -716,22 +1043,35 @@ struct BrowserReviewBackend::Impl {
         QTimer::singleShot(3000, c, [later] { later(); });  // (what was gathered by then)
     }
 
-    std::shared_ptr<Viewer> makeViewer(const std::string& sdp, const QString& address, std::string& why) {
+    std::shared_ptr<Viewer> makeViewer(const std::string& sdp, const QString& address, bool wantsHdr, std::string& why) {
         const rtc::Description offered(sdp, rtc::Description::Type::Offer);
         auto v = std::make_shared<Viewer>();
         v->id = randomHex(16).toStdString();
         v->address = address;
         rtc::Configuration conf;
         conf.iceServers = iceServers;
-        // Media on the same port number as the page (UDP), all viewers together: one port to open in a firewall.
-        conf.enableIceUdpMux = true;
-        conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) conf.bindAddress = host.toString().toStdString();
+        if (settings.relayOnly) conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
+        // Media on the same port number as the page (UDP), all viewers together: one port to open in a firewall. With
+        // a TURN relay, each viewer's connection has a port of its own instead (libjuice's shared socket cannot reach
+        // a relay), which only goes out to the relay and to the viewer.
+        if (!relayInUse) {
+            conf.enableIceUdpMux = true;
+            conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
+        }
+        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4 && !relayInUse)
+            conf.bindAddress = host.toString().toStdString();
         v->pc = std::make_shared<rtc::PeerConnection>(conf);
         // Only codecs this FFmpeg can encode are offered back: a browser picked one it cannot would see no picture.
         std::vector<std::string> order;
-        for (const std::string& c : {settings.codec, std::string("h264"), std::string("av1"), std::string("hevc")})
+        for (const std::string& c : {settings.codec, std::string("h264"), std::string("av1"), std::string("vp9"), std::string("hevc")})
             if (std::find(order.begin(), order.end(), c) == order.end() && canEncode(c)) order.push_back(c);
+        // 10-bit HDR to a player that asks for it, of an HDR sequence, in VP9 profile 2 or HEVC Main 10 (the preferred
+        // first), its transfer given by the colour space extension. (Not AV1: Chrome's WebRTC decodes 8-bit AV1 only,
+        // whatever its media capabilities say.)
+        std::vector<std::string> tenBit;
+        if (wantsHdr && settings.hdr && hdrSignal)
+            for (const std::string& c : {settings.codec, std::string("vp9"), std::string("hevc")})
+                if ((c == "vp9" || c == "hevc") && std::find(tenBit.begin(), tenBit.end(), c) == tenBit.end() && canEncode(c, true)) tenBit.push_back(c);
         const rtc::Description& o = offered;
         for (int i = 0; i < o.mediaCount(); ++i) {
             const auto entry = o.media(i);
@@ -742,15 +1082,25 @@ struct BrowserReviewBackend::Impl {
             if (dir != rtc::Description::Direction::RecvOnly && dir != rtc::Description::Direction::SendRecv) continue;
             const bool isVideo = media.type() == "video", isAudio = media.type() == "audio";
             if ((isVideo && v->video) || (isAudio && (v->audio || audioChannels <= 0)) || (!isVideo && !isAudio)) continue;
-            const Choice pick = choose(media, isVideo ? order : std::vector<std::string>{"opus"});
+            Choice pick;
+            bool hdr = false;
+            bool colourExtension = false;
+            rtc::Description::Media offeredMedia = media;  // (extIds is not const)
+            for (int id : offeredMedia.extIds())
+                if (const auto* e = offeredMedia.extMap(id); e && e->uri == "http://www.webrtc.org/experiments/rtp-hdrext/color-space") colourExtension = true;
+            if (isVideo && !tenBit.empty() && colourExtension) {
+                pick = choose(media, tenBit, true);
+                hdr = pick.pt >= 0;
+            }
+            if (pick.pt < 0) pick = choose(media, isVideo ? order : std::vector<std::string>{"opus"});
             if (pick.pt < 0) continue;
             const uint32_t ssrc = QRandomGenerator::system()->generate() | 1u;
             auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, "montage", uint8_t(pick.pt), isVideo ? 90000 : 48000);
             std::unique_ptr<rtc::Description::Media> answer;
             if (isVideo) {
                 auto d = std::make_unique<rtc::Description::Video>(media.mid(), rtc::Description::Direction::SendOnly);
-                d->addVideoCodec(pick.pt, pick.codec == "h264" ? "H264" : pick.codec == "av1" ? "AV1" : "H265",
-                                 pick.fmtp.empty() ? std::nullopt : std::optional<std::string>(pick.fmtp));
+                const char* name = pick.codec == "h264" ? "H264" : pick.codec == "av1" ? "AV1" : pick.codec == "vp9" ? "VP9" : "H265";
+                d->addVideoCodec(pick.pt, name, pick.fmtp.empty() ? std::nullopt : std::optional<std::string>(pick.fmtp));
                 d->addSSRC(ssrc, "montage", "montage", "video");
                 answer = std::move(d);
             } else {
@@ -759,7 +1109,8 @@ struct BrowserReviewBackend::Impl {
                 d->addSSRC(ssrc, "montage", "montage", "audio");
                 answer = std::move(d);
             }
-            // The extensions that say which medium a packet is (before SSRCs are known) and ask for no playout delay.
+            // The extensions that say which medium a packet is (before SSRCs are known), ask for no playout delay, and
+            // give the picture's colour (its primaries, transfer, matrix and range, as the codec's own headers do).
             rtc::Description::Media copy = media;
             for (int id : copy.extIds()) {
                 const rtc::Description::Media::ExtMap* e = copy.extMap(id);
@@ -772,6 +1123,16 @@ struct BrowserReviewBackend::Impl {
                     answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
                     cfg->playoutDelayId = uint8_t(id);
                     cfg->playoutDelayMin = cfg->playoutDelayMax = 0;
+                } else if (isVideo && e->uri == "http://www.webrtc.org/experiments/rtp-hdrext/color-space") {
+                    answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
+                    cfg->colorSpaceId = uint8_t(id);
+                    cfg->colorRange = 1;  // (limited)
+                    // (H.273's codes: BT.2020 and PQ or HLG and BT.2020's non-constant luminance matrix, or BT.709's)
+                    cfg->colorPrimaries = hdr ? 9 : 1;
+                    cfg->colorTransfer = hdr ? (eotf == Eotf::Pq ? 16 : 18) : 1;
+                    cfg->colorMatrix = hdr ? 9 : 1;
+                    cfg->colorChromaSitingHorz = 1;  // (co-sited on the left)
+                    cfg->colorChromaSitingVert = 2;  // (half way)
                 }
             }
             std::shared_ptr<rtc::Track> track = v->pc->addTrack(*answer);
@@ -781,6 +1142,7 @@ struct BrowserReviewBackend::Impl {
             if (codec == "h264") packetizer = std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, cfg);
             else if (codec == "hevc") packetizer = std::make_shared<rtc::H265RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, cfg);
             else if (codec == "av1") packetizer = std::make_shared<rtc::AV1RtpPacketizer>(rtc::AV1RtpPacketizer::Packetization::TemporalUnit, cfg);
+            else if (codec == "vp9") packetizer = v->vp9 = std::make_shared<Vp9Packetizer>(cfg);
             else packetizer = std::make_shared<rtc::OpusRtpPacketizer>(cfg);
             packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(cfg));
             packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
@@ -796,6 +1158,7 @@ struct BrowserReviewBackend::Impl {
                     if (now - last < 1000 || !v->lastKeyAsk.compare_exchange_strong(last, now)) return;
                     v->needKey = true;
                 }));
+                packetizer->addToChain(std::make_shared<FeedbackReader>(wv, ssrc));
                 track->onOpen([wv] {
                     if (auto v = wv.lock()) v->needKey = true;
                 });
@@ -805,13 +1168,14 @@ struct BrowserReviewBackend::Impl {
                 v->video = track;
                 v->vcfg = cfg;
                 v->codec = codec;
+                v->hdr = hdr;
             } else {
                 v->audio = track;
                 v->acfg = cfg;
             }
         }
         if (!v->video && !v->audio) {
-            why = "The offer asks for no picture Montage can send (H.264 in packetisation mode 1, AV1 or HEVC) and no Opus sound";
+            why = "The offer asks for no picture Montage can send (H.264 in packetisation mode 1, AV1, VP9 or HEVC) and no Opus sound";
             v->pc->close();
             return nullptr;
         }
@@ -871,7 +1235,16 @@ struct BrowserReviewBackend::Impl {
             o["color"] = QString::fromStdString(v.color);
         }
         o["codec"] = QString::fromStdString(v.codec);
+        o["hdr"] = v.hdr;
         sendText(v, o);
+        rungMessage(v);
+    }
+
+    // Which rung a viewer is on now (its size), for their page.
+    void rungMessage(Viewer& v) {
+        const int r = std::clamp(v.rung.load(), 0, int(ladder.size()) - 1);
+        if (ladder.empty()) return;
+        sendText(v, {{"t", "rung"}, {"i", r}, {"of", int(ladder.size())}, {"w", ladder[size_t(r)].width}, {"h", ladder[size_t(r)].height}, {"hdr", v.hdr}});
     }
 
     // Spends from a viewer's budgets (refilled at their rates); false when there is not enough.
@@ -1006,15 +1379,26 @@ struct BrowserReviewBackend::Impl {
 
     // ---- Encoding ----
 
-    // Whether there is an encoder for the codec ("h264", "av1", "hevc"), as encoder() would look for one.
+    // The encoders for a codec ("h264", "av1", "vp9", "hevc"), as encoder() tries them; `tenBit` those that may take
+    // 10-bit pictures (no hardware encoders there).
+    std::vector<std::string> encoderNames(const std::string& codec, bool tenBit) const {
+        if (codec == "h264") return tenBit ? std::vector<std::string>{} : std::vector<std::string>{settings.hardware ? "h264_nvenc" : "", "libx264"};
+        if (codec == "av1") return {"libsvtav1", "libaom-av1"};
+        if (codec == "vp9") return {"libvpx-vp9"};
+        if (codec == "hevc") return {settings.hardware && !tenBit ? "hevc_nvenc" : "", "libx265"};
+        return {};
+    }
+
+    // Whether there is an encoder for the codec, as encoder() would look for one.
     // A hardware encoder counts only when it opens: one built in with no such GPU here would give viewers black.
-    bool canEncode(const std::string& codec) const {
-        std::vector<const char*> names;
-        if (codec == "h264") names = {"libx264", settings.hardware ? "h264_nvenc" : ""};
-        else if (codec == "av1") names = {"libsvtav1", "libaom-av1"};
-        else if (codec == "hevc") names = {"libx265", settings.hardware ? "hevc_nvenc" : ""};
-        for (const char* n : names)
-            if (*n && avcodec_find_encoder_by_name(n) && (!std::strstr(n, "_nvenc") || hardwareOpens(n))) return true;
+    bool canEncode(const std::string& codec, bool tenBit = false) const {
+        for (const std::string& n : encoderNames(codec, tenBit)) {
+            const AVCodec* c = n.empty() ? nullptr : avcodec_find_encoder_by_name(n.c_str());
+            if (!c || (n.find("_nvenc") != std::string::npos && !hardwareOpens(n.c_str()))) continue;
+            if (!tenBit) return true;
+            for (const AVPixelFormat* f = c->pix_fmts; f && *f != AV_PIX_FMT_NONE; ++f)
+                if (*f == AV_PIX_FMT_YUV420P10) return true;
+        }
         return false;
     }
     bool hardwareOpens(const char* name) const {
@@ -1037,40 +1421,31 @@ struct BrowserReviewBackend::Impl {
     mutable std::mutex hardwareMutex;
     mutable std::map<std::string, bool> hardwareWorks;
 
-    VideoEncoder* encoder(const std::string& codec) {
-        auto it = encoders.find(codec);
+    VideoEncoder* encoder(const EncoderKey& key) {
+        auto it = encoders.find(key);
         if (it != encoders.end()) return it->second.get();
-        if (encoderErrors.count(codec)) return nullptr;
-        std::vector<std::string> names;
-        if (codec == "h264") {
-            if (settings.hardware) names.push_back("h264_nvenc");
-            names.push_back("libx264");
-        } else if (codec == "av1") {
-            names = {"libsvtav1", "libaom-av1"};
-        } else {
-            if (settings.hardware) names.push_back("hevc_nvenc");
-            names.push_back("libx265");
-        }
+        if (encoderErrors.count(key) || key.rung < 0 || key.rung >= int(ladder.size())) return nullptr;
+        const Rung& rung = ladder[size_t(key.rung)];
         const double fps = mode.fps.toDouble() > 0 ? mode.fps.toDouble() : 25;
-        std::string why = "This FFmpeg has no encoder for " + codec;
-        for (const std::string& name : names) {
-            const AVCodec* c = avcodec_find_encoder_by_name(name.c_str());
+        std::string why = "This FFmpeg has no encoder for " + key.codec + (key.hdr ? " at 10 bits" : "");
+        for (const std::string& name : encoderNames(key.codec, key.hdr)) {
+            const AVCodec* c = name.empty() ? nullptr : avcodec_find_encoder_by_name(name.c_str());
             if (!c) continue;
             AVCodecContext* e = avcodec_alloc_context3(c);
-            e->width = mode.width;
-            e->height = mode.height;
+            e->width = rung.width;
+            e->height = rung.height;
             e->time_base = AVRational{mode.fps.den, mode.fps.num};
             e->framerate = AVRational{mode.fps.num, mode.fps.den};
-            e->pix_fmt = AV_PIX_FMT_YUV420P;
+            e->pix_fmt = key.hdr ? AV_PIX_FMT_YUV420P10 : AV_PIX_FMT_YUV420P;
             e->gop_size = std::max(1, int(std::lround(fps * 4)));  // (and a key frame whenever a viewer joins or asks)
             e->max_b_frames = 0;
-            e->bit_rate = int64_t(settings.bitrateKbps) * 1000;
+            e->bit_rate = rung.bitrate;
             e->rc_max_rate = e->bit_rate;
             e->rc_buffer_size = int(e->bit_rate / 2);
             e->color_range = AVCOL_RANGE_MPEG;
-            e->colorspace = AVCOL_SPC_BT709;
-            e->color_primaries = AVCOL_PRI_BT709;
-            e->color_trc = AVCOL_TRC_BT709;
+            e->colorspace = key.hdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
+            e->color_primaries = key.hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
+            e->color_trc = !key.hdr ? AVCOL_TRC_BT709 : eotf == Eotf::Pq ? AVCOL_TRC_SMPTE2084 : AVCOL_TRC_ARIB_STD_B67;
             e->chroma_sample_location = AVCHROMA_LOC_LEFT;
             e->flags |= AV_CODEC_FLAG_LOW_DELAY;
             if (name.find("nvenc") != std::string::npos) {
@@ -1080,7 +1455,7 @@ struct BrowserReviewBackend::Impl {
                 av_opt_set_int(e->priv_data, "zerolatency", 1, 0);
                 av_opt_set_int(e->priv_data, "delay", 0, 0);
                 av_opt_set_int(e->priv_data, "forced-idr", 1, 0);
-                if (codec == "h264") av_opt_set(e->priv_data, "profile", "baseline", 0);
+                if (key.codec == "h264") av_opt_set(e->priv_data, "profile", "baseline", 0);
             } else if (name == "libx264") {
                 av_opt_set(e->priv_data, "preset", "veryfast", 0);
                 av_opt_set(e->priv_data, "tune", "zerolatency", 0);
@@ -1091,6 +1466,7 @@ struct BrowserReviewBackend::Impl {
                 av_opt_set(e->priv_data, "tune", "zerolatency", 0);
                 av_opt_set(e->priv_data, "x265-params", "log-level=error:repeat-headers=1", 0);
                 av_opt_set_int(e->priv_data, "forced-idr", 1, 0);
+                if (key.hdr) av_opt_set(e->priv_data, "profile", "main10", 0);
             } else if (name == "libsvtav1") {
                 av_opt_set(e->priv_data, "preset", "11", 0);
                 // (constant bit rate, which SVT-AV1 takes with its low-delay structure; it wants no maximum rate)
@@ -1101,6 +1477,14 @@ struct BrowserReviewBackend::Impl {
                 av_opt_set_int(e->priv_data, "cpu-used", 8, 0);  // (the most FFmpeg 6 takes)
                 av_opt_set_int(e->priv_data, "lag-in-frames", 0, 0);
                 av_opt_set_int(e->priv_data, "row-mt", 1, 0);
+            } else if (name == "libvpx-vp9") {
+                // (real time, no hidden reference frames, constant bit rate: libvpx takes it from equal rates)
+                av_opt_set(e->priv_data, "deadline", "realtime", 0);
+                av_opt_set_int(e->priv_data, "cpu-used", 8, 0);
+                av_opt_set_int(e->priv_data, "lag-in-frames", 0, 0);
+                av_opt_set_int(e->priv_data, "auto-alt-ref", 0, 0);
+                av_opt_set_int(e->priv_data, "row-mt", 1, 0);
+                e->rc_min_rate = e->bit_rate;
             }
             int r;
             {
@@ -1116,15 +1500,229 @@ struct BrowserReviewBackend::Impl {
             enc->ctx = e;
             enc->pkt = av_packet_alloc();
             enc->name = name;
+            enc->picture = av_frame_alloc();
+            enc->picture->format = e->pix_fmt;
+            enc->picture->width = rung.width;
+            enc->picture->height = rung.height;
+            if (av_frame_get_buffer(enc->picture, 0) < 0) {
+                why = "Out of memory";
+                continue;
+            }
             VideoEncoder* out = enc.get();
             std::lock_guard lock(m);
-            encoders[codec] = std::move(enc);
+            encoders[key] = std::move(enc);
             return out;
         }
-        encoderErrors[codec] = why;
+        encoderErrors[key] = why;
         std::lock_guard lock(m);
         lastError = why;
         return nullptr;
+    }
+
+    // What was sent a viewer over the last two seconds, in kb/s.
+    static double sentKbps(const Viewer& v, Clock::time_point now) {
+        size_t total = 0;
+        for (const auto& [at, n] : v.sent)
+            if (now - at <= std::chrono::seconds(2)) total += n;
+        return double(total) * 8 / 1000 / 2;
+    }
+    static void sentTo(Viewer& v, size_t n, Clock::time_point now) {
+        v.sent.emplace_back(now, n);
+        while (!v.sent.empty() && now - v.sent.front().first > std::chrono::seconds(3)) v.sent.pop_front();
+    }
+
+    // Moves a viewer down the ladder when their receiver reports lose more than a tenth of the packets (to the rung
+    // that fits what got through, at least one down), and up one rung after a while without loss to try it: a try that
+    // fails is not made again for twice as long (8 s at first, at most 32 s).
+    void steer(Viewer& v, Clock::time_point now) {
+        const int last = int(ladder.size()) - 1;
+        if (last <= 0 || v.wantRung != v.rung) return;
+        uint64_t reports;
+        double loss;
+        Clock::time_point at;
+        {
+            std::lock_guard lock(v.m);
+            reports = v.reports;
+            loss = v.loss;
+            at = v.reportAt;
+        }
+        if (v.trying && now - v.movedAt > std::chrono::seconds(6)) {
+            v.trying = false;
+            v.hold = std::chrono::milliseconds(8000);
+        }
+        if (reports == v.seenReports) return;
+        v.seenReports = reports;
+        if (at - v.movedAt < std::chrono::milliseconds(700)) return;  // (it counts the rung before's packets)
+        const int r = v.rung;
+        auto usable = [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); };
+        auto move = [&](int to) {
+            v.wantRung = to;
+            v.movedAt = now;
+            v.nextTry = now + v.hold;
+        };
+        if (loss > 0.10 && r < last) {
+            const double through = sentKbps(v, now) * (1 - loss);
+            int to = r + 1;
+            while (to < last && double(ladder[size_t(to)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through) ++to;
+            while (to > r && !usable(to)) --to;
+            if (v.trying) v.hold = std::min(v.hold * 2, std::chrono::milliseconds(32000));
+            v.trying = false;
+            if (to > r) move(to);
+        } else if (loss >= 0.02) {
+            v.nextTry = std::max(v.nextTry, now + v.hold);
+        } else if (r > 0 && now >= v.nextTry && usable(r - 1)) {
+            v.trying = true;
+            move(r - 1);
+        }
+    }
+
+    // A picture to each viewer: from the encoder for their codec, rung and depth (each one's tag first: its RTP
+    // timestamp, frame and timecode). A viewer waiting for a key frame gets nothing until one; a viewer moving to
+    // another rung keeps the one they are on until the new one's key frame.
+    void deliver(const std::vector<Coded>& coded, const std::vector<std::shared_ptr<Viewer>>& list) {
+        const double fps = mode.fps.toDouble() > 0 ? mode.fps.toDouble() : 25;
+        const auto now = Clock::now();
+        size_t total = 0;
+        for (const auto& v : list) {
+            if (!v->video || !v->video->isOpen()) continue;
+            const int cur = v->rung, want = v->wantRung;
+            auto send = [&](const Coded& c) {
+                const uint32_t ticks = uint32_t(int64_t(std::llround(double(c.pts) * 90000.0 / fps)) & 0xffffffff);
+                const uint32_t rtp = v->vcfg->startTimestamp + ticks;
+                if (c.tag.frame >= 0)
+                    sendText(*v, {{"t", "f"}, {"r", double(rtp)}, {"f", double(c.tag.frame)}, {"tc", QString::fromStdString(c.tag.timecode)}, {"seq", double(c.tag.sequence)}});
+                if (v->vp9) {
+                    v->vp9->width = c.width;
+                    v->vp9->height = c.height;
+                }
+                try {
+                    v->video->sendFrame(c.data.data(), c.data.size(), rtc::FrameInfo(rtp));
+                    v->lastPts = c.pts;
+                    sentTo(*v, c.data.size(), now);
+                    total = std::max(total, c.data.size());
+                } catch (const std::exception&) {
+                }
+            };
+            bool moved = false;
+            if (want != cur)
+                for (const Coded& c : coded) {
+                    if (c.key.codec != v->codec || c.key.hdr != v->hdr || c.key.rung != want) continue;
+                    if (!moved && (!c.keyFrame || c.pts <= v->lastPts)) continue;
+                    moved = true;
+                    send(c);
+                }
+            if (moved) {
+                v->rung = want;
+                v->needKey = false;
+                rungMessage(*v);
+                continue;
+            }
+            for (const Coded& c : coded) {
+                if (c.key.codec != v->codec || c.key.hdr != v->hdr || c.key.rung != cur) continue;
+                if (v->needKey) {
+                    if (!c.keyFrame) continue;
+                    v->needKey = false;
+                }
+                send(c);
+            }
+        }
+        if (total) counted(total);
+    }
+
+    bool encodePicture(const VideoFrame& f, int64_t pts, const std::vector<std::shared_ptr<Viewer>>& list) {
+        const auto now = Clock::now();
+        std::set<EncoderKey> keys;
+        for (const auto& v : list) {
+            if (!v->video || v->codec.empty()) continue;
+            steer(*v, now);
+            keys.insert({v->codec, v->rung, v->hdr});
+            if (v->wantRung != v->rung) keys.insert({v->codec, v->wantRung, v->hdr});
+        }
+        if (keys.empty()) return true;
+        StreamTag tag;
+        tag.frame = f.frame;
+        tag.timecode = streamTimecode(f.timecode);
+        tag.fps = f.fps;
+        {
+            std::lock_guard lock(m);
+            tag.sequence = sequence;
+        }
+        const Planes420 full = planesFrom(f);
+        // Each rung's picture once (and the SDR one of an HDR picture), the timecode burnt in at its own size.
+        std::map<std::pair<int, bool>, Planes420> pictures;
+        auto pictureFor = [&](int rung, bool hdr) -> const Planes420& {
+            if (auto it = pictures.find({rung, hdr}); it != pictures.end()) return it->second;
+            Planes420 p = shrink(full, ladder[size_t(rung)].width, ladder[size_t(rung)].height);
+            if (!hdr && toSdr) toSdr->apply(p);
+            if (settings.burnTimecode) burnTimecode(p, tag.timecode, hdr ? hdrWhite : uint16_t(940));
+            if (settings.frameCode) burnFrameCode(p, f.frame);
+            return pictures.emplace(std::make_pair(rung, hdr), std::move(p)).first->second;
+        };
+        std::vector<Coded> coded;
+        for (const EncoderKey& key : keys) {
+            VideoEncoder* enc = encoder(key);
+            if (!enc) {
+                // (a rung that cannot be made: whoever was moving to it stays where they are)
+                for (const auto& v : list)
+                    if (v->codec == key.codec && v->hdr == key.hdr && v->wantRung == key.rung && v->rung != key.rung) v->wantRung = v->rung.load();
+                continue;
+            }
+            const Planes420& p = pictureFor(key.rung, key.hdr);
+            AVFrame* picture = enc->picture;
+            if (av_frame_make_writable(picture) < 0) continue;
+            const int w = p.width, h = p.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+            if (key.hdr) {
+                for (int y = 0; y < h; ++y)
+                    std::memcpy(picture->data[0] + size_t(y) * size_t(picture->linesize[0]), &p.y[size_t(y) * size_t(w)], size_t(w) * 2);
+                for (int y = 0; y < ch; ++y) {
+                    std::memcpy(picture->data[1] + size_t(y) * size_t(picture->linesize[1]), &p.u[size_t(y) * size_t(cw)], size_t(cw) * 2);
+                    std::memcpy(picture->data[2] + size_t(y) * size_t(picture->linesize[2]), &p.v[size_t(y) * size_t(cw)], size_t(cw) * 2);
+                }
+            } else {
+                auto b8 = [](uint16_t v) { return uint8_t(std::min(255, (v + 2) >> 2)); };
+                for (int y = 0; y < h; ++y) {
+                    uint8_t* d = picture->data[0] + size_t(y) * size_t(picture->linesize[0]);
+                    for (int x = 0; x < w; ++x) d[x] = b8(p.y[size_t(y) * size_t(w) + size_t(x)]);
+                }
+                for (int y = 0; y < ch; ++y)
+                    for (int x = 0; x < cw; ++x) {
+                        const size_t i = size_t(y) * size_t(cw) + size_t(x);
+                        picture->data[1][size_t(y) * size_t(picture->linesize[1]) + size_t(x)] = b8(p.u[i]);
+                        picture->data[2][size_t(y) * size_t(picture->linesize[2]) + size_t(x)] = b8(p.v[i]);
+                    }
+            }
+            picture->pts = pts;
+            // A key frame for whoever waits for one on this encoder (just joined, lost pictures, or moving to its rung),
+            // at most twice a second whatever they ask.
+            bool keyFrame = false;
+            for (const auto& v : list)
+                keyFrame = keyFrame || (v->codec == key.codec && v->hdr == key.hdr && v->wantRung == key.rung && (v->needKey || v->wantRung != v->rung));
+            auto last = forcedKey.find(key);
+            keyFrame = keyFrame && (last == forcedKey.end() || now - last->second >= std::chrono::milliseconds(500));
+            if (keyFrame) forcedKey[key] = now;
+            picture->pict_type = keyFrame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+            enc->tags[pts] = tag;
+            while (enc->tags.size() > 64) enc->tags.erase(enc->tags.begin());
+            if (avcodec_send_frame(enc->ctx, picture) < 0) continue;
+            for (;;) {
+                const int r = avcodec_receive_packet(enc->ctx, enc->pkt);
+                if (r < 0) break;
+                Coded c;
+                c.key = key;
+                c.data.assign(reinterpret_cast<const std::byte*>(enc->pkt->data), reinterpret_cast<const std::byte*>(enc->pkt->data) + enc->pkt->size);
+                c.pts = enc->pkt->pts;
+                c.keyFrame = enc->pkt->flags & AV_PKT_FLAG_KEY;
+                auto t = enc->tags.find(enc->pkt->pts);
+                c.tag = t == enc->tags.end() ? StreamTag{} : t->second;
+                c.width = w;
+                c.height = h;
+                coded.push_back(std::move(c));
+                av_packet_unref(enc->pkt);
+            }
+            picture->pict_type = AV_PICTURE_TYPE_NONE;
+        }
+        deliver(coded, list);
+        return !coded.empty();
     }
 
     bool openSound(std::string* error) {
@@ -1165,7 +1763,7 @@ struct BrowserReviewBackend::Impl {
     }
 
     void freeEncoders() {
-        std::map<std::string, std::unique_ptr<VideoEncoder>> old;
+        std::map<EncoderKey, std::unique_ptr<VideoEncoder>> old;
         {
             std::lock_guard lock(m);
             old.swap(encoders);
@@ -1173,7 +1771,6 @@ struct BrowserReviewBackend::Impl {
         old.clear();
         encoderErrors.clear();
         forcedKey.clear();
-        av_frame_free(&picture);
         avcodec_free_context(&aenc);
         if (fifo) av_audio_fifo_free(fifo);
         fifo = nullptr;
@@ -1187,97 +1784,6 @@ struct BrowserReviewBackend::Impl {
         std::lock_guard lock(m);
         bytes.emplace_back(now, size);
         while (!bytes.empty() && now - bytes.front().first > std::chrono::seconds(3)) bytes.pop_front();
-    }
-
-    // A picture's packet to the viewers on its codec: each one's tag first (its RTP timestamp, frame and timecode), then
-    // the picture; a viewer waiting for a key frame gets nothing until one.
-    void deliver(const std::string& codec, const AVPacket* pkt, const StreamTag& tag, const std::vector<std::shared_ptr<Viewer>>& list) {
-        const bool key = pkt->flags & AV_PKT_FLAG_KEY;
-        const double fps = mode.fps.toDouble() > 0 ? mode.fps.toDouble() : 25;
-        const uint32_t ticks = uint32_t(int64_t(std::llround(double(pkt->pts) * 90000.0 / fps)) & 0xffffffff);
-        bool sent = false;
-        for (const auto& v : list) {
-            if (v->codec != codec || !v->video || !v->video->isOpen()) continue;
-            if (v->needKey) {
-                if (!key) continue;
-                v->needKey = false;
-            }
-            const uint32_t rtp = v->vcfg->startTimestamp + ticks;
-            if (tag.frame >= 0)
-                sendText(*v, {{"t", "f"}, {"r", double(rtp)}, {"f", double(tag.frame)}, {"tc", QString::fromStdString(tag.timecode)}, {"seq", double(tag.sequence)}});
-            try {
-                v->video->sendFrame(reinterpret_cast<const std::byte*>(pkt->data), size_t(pkt->size), rtc::FrameInfo(rtp));
-                sent = true;
-            } catch (const std::exception&) {
-            }
-        }
-        if (sent) counted(size_t(pkt->size));
-    }
-
-    bool encodePicture(const VideoFrame& f, int64_t pts, const std::vector<std::shared_ptr<Viewer>>& list) {
-        std::set<std::string> codecs;
-        for (const auto& v : list)
-            if (v->video && !v->codec.empty()) codecs.insert(v->codec);
-        if (codecs.empty()) return true;
-        Planes420 p = planesFrom(f);
-        if (settings.burnTimecode) burnTimecode(p, streamTimecode(f.timecode));
-        if (settings.frameCode) burnFrameCode(p, f.frame);
-        if (!picture) {
-            picture = av_frame_alloc();
-            picture->format = AV_PIX_FMT_YUV420P;
-            picture->width = mode.width;
-            picture->height = mode.height;
-            if (av_frame_get_buffer(picture, 0) < 0) return false;
-        }
-        if (av_frame_make_writable(picture) < 0) return false;
-        const int w = mode.width, h = mode.height, cw = (w + 1) / 2, ch = (h + 1) / 2;
-        auto b8 = [](uint16_t v) { return uint8_t(std::min(255, (v + 2) >> 2)); };
-        for (int y = 0; y < h; ++y) {
-            uint8_t* d = picture->data[0] + size_t(y) * size_t(picture->linesize[0]);
-            for (int x = 0; x < w; ++x) d[x] = b8(p.y[size_t(y) * size_t(w) + size_t(x)]);
-        }
-        for (int y = 0; y < ch; ++y)
-            for (int x = 0; x < cw; ++x) {
-                const size_t i = size_t(y) * size_t(cw) + size_t(x);
-                picture->data[1][size_t(y) * size_t(picture->linesize[1]) + size_t(x)] = b8(p.u[i]);
-                picture->data[2][size_t(y) * size_t(picture->linesize[2]) + size_t(x)] = b8(p.v[i]);
-            }
-        picture->pts = pts;
-        StreamTag tag;
-        tag.frame = f.frame;
-        tag.timecode = streamTimecode(f.timecode);
-        tag.fps = f.fps;
-        {
-            std::lock_guard lock(m);
-            tag.sequence = sequence;
-        }
-        bool any = false;
-        for (const std::string& codec : codecs) {
-            VideoEncoder* enc = encoder(codec);
-            if (!enc) continue;
-            // A key frame for whoever waits for one (just joined, or lost pictures), at most twice a second whatever
-            // they ask.
-            bool key = false;
-            for (const auto& v : list) key = key || (v->codec == codec && v->needKey);
-            const auto now = Clock::now();
-            auto last = forcedKey.find(codec);
-            key = key && (last == forcedKey.end() || now - last->second >= std::chrono::milliseconds(500));
-            if (key) forcedKey[codec] = now;
-            picture->pict_type = key ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
-            enc->tags[pts] = tag;
-            while (enc->tags.size() > 64) enc->tags.erase(enc->tags.begin());
-            if (avcodec_send_frame(enc->ctx, picture) < 0) continue;
-            for (;;) {
-                const int r = avcodec_receive_packet(enc->ctx, enc->pkt);
-                if (r < 0) break;
-                auto t = enc->tags.find(enc->pkt->pts);
-                deliver(codec, enc->pkt, t == enc->tags.end() ? StreamTag{} : t->second, list);
-                av_packet_unref(enc->pkt);
-                any = true;
-            }
-        }
-        picture->pict_type = AV_PICTURE_TYPE_NONE;
-        return any;
     }
 
     void encodeSound(const Audio& a, int64_t pictureAt, const std::vector<std::shared_ptr<Viewer>>& list) {
@@ -1323,6 +1829,7 @@ struct BrowserReviewBackend::Impl {
                     if (!v->audio || !v->audio->isOpen()) continue;
                     try {
                         v->audio->sendFrame(reinterpret_cast<const std::byte*>(apkt->data), size_t(apkt->size), rtc::FrameInfo(v->acfg->startTimestamp + ticks));
+                        sentTo(*v, size_t(apkt->size), Clock::now());
                         sent = true;
                     } catch (const std::exception&) {
                     }
@@ -1351,7 +1858,7 @@ std::vector<Device> BrowserReviewBackend::devices() {
     d.id = "browser";
     d.name = "Browser review";
     d.formats = {PixelFormat::P216, PixelFormat::Uyvy8};
-    d.hdr = false;
+    d.hdr = true;  // (to browsers that decode it, and tone mapped for the rest)
     d.audioChannels = {2};
     d.audioRates.clear();
     return {d};
@@ -1384,7 +1891,7 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
     if (!why.empty()) return fail(why);
     if (!isBrowserAddress(d.settings.address)) return fail("A browser review's address is https://host:port");
     if (mode.width % 2 || mode.height % 2) return fail("Streams need an even width and height");
-    if (signal.eotf != Eotf::Sdr) return fail("Browsers are sent the picture as the viewer shows it (Rec. 709), not HDR");
+    if (signal.eotf != Eotf::Sdr && signal.format == PixelFormat::Uyvy8) return fail("HDR needs a 10-bit signal (or the BT.709 picture)");
     std::string scheme, host;
     int port = 0;
     parseStreamAddress(d.settings.address, scheme, host, port);
@@ -1417,14 +1924,52 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
         if (d.key.isNull()) return fail("The private key is not an EC or RSA key in PEM (without a password)");
     }
     d.iceServers.clear();
+    d.relayInUse = false;
     for (const std::string& s : d.settings.iceServers) {
         try {
             d.iceServers.emplace_back(s);
+            d.relayInUse = d.relayInUse || d.iceServers.back().type == rtc::IceServer::Type::Turn;
         } catch (const std::exception& e) {
             return fail(std::string("ICE server ") + s + ": " + e.what());
         }
     }
+    if (!d.settings.turnServer.empty()) {
+        // (Montage reaches the relay over UDP; one over TLS only, turns:, is the browsers' alone)
+        std::string relayHost;
+        uint16_t relayPort = 0;
+        bool tls = false;
+        if (!parseRelay(d.settings.turnServer, relayHost, relayPort, tls)) return fail("The TURN relay's address is turn:host:port");
+        if (!tls) {
+            d.iceServers.emplace_back(relayHost, relayPort, d.settings.turnUser, d.settings.turnPassword, rtc::IceServer::RelayType::TurnUdp);
+            d.relayInUse = true;
+        } else if (d.settings.relayOnly) {
+            return fail("Only through the relay needs a relay Montage reaches over UDP (turn:, not turns:)");
+        }
+    }
     d.mode = mode;
+    // The ladder: full size, then half and quarter while they are 64 pixels or more each way, at three eighths and an
+    // eighth of the bit rate.
+    d.ladder.clear();
+    for (int i = 0; i < d.settings.rungs; ++i) {
+        Rung r;
+        r.width = (mode.width >> i) & ~1;
+        r.height = (mode.height >> i) & ~1;
+        if (i > 0 && (r.width < 64 || r.height < 64)) break;
+        r.bitrate = std::max<int64_t>(100000, int64_t(d.settings.bitrateKbps) * 1000 * (i == 0 ? 8 : i == 1 ? 3 : 1) / 8);
+        d.ladder.push_back(r);
+    }
+    // The frames' colour: HDR goes as it is to those who decode it, and every other picture is made BT.709 SDR.
+    d.eotf = signal.eotf;
+    d.hdrSignal = signal.eotf == Eotf::Pq || signal.eotf == Eotf::Hlg;
+    d.toSdr.reset();
+    if (signal.colorSpace != "rec709") {
+        const ColorSpace* from = findColorSpace(signal.colorSpace);
+        if (!from) return fail("Cannot show " + signal.colorSpace + " in a browser");
+        d.toSdr = std::make_unique<ToSdr>();
+        d.toSdr->build(*from, signal.bt2020, signal.masteringPeak);
+    }
+    // (burnt-in text at HDR reference white, 203 nits: PQ's 58 %, HLG's 75 %)
+    d.hdrWhite = uint16_t(std::lround(64 + 876 * (d.eotf == Eotf::Hlg ? 0.75 : 0.5806)));
     d.audioChannels = audioChannels;
     d.audioRate = audioRate > 0 ? audioRate : 48000;
     if (audioChannels > 0 && !d.openSound(&why)) return fail(why);
@@ -1542,7 +2087,15 @@ ReviewStats BrowserReviewBackend::stats() const {
         const double span = std::chrono::duration<double>(d_->bytes.back().first - d_->bytes.front().first).count();
         if (span > 0.2) s.kbps = double(total) * 8 / 1000 / span;
     }
-    for (const auto& [codec, e] : d_->encoders) s.encoder += (s.encoder.empty() ? "" : ", ") + e->name;
+    std::set<std::string> names;
+    for (const auto& [key, e] : d_->encoders)
+        if (names.insert(e->name).second) s.encoder += (s.encoder.empty() ? "" : ", ") + e->name;
+    s.rungViewers.assign(d_->ladder.size(), 0);
+    for (const auto& [id, v] : d_->viewers)
+        if (v->connected && !v->gone && v->video && d_->open && !d_->ladder.empty()) {
+            ++s.rungViewers[size_t(std::clamp(v->rung.load(), 0, int(d_->ladder.size()) - 1))];
+            s.hdrViewers += v->hdr;
+        }
     s.error = d_->lastError;
     s.markers = d_->markerCount;
     return s;

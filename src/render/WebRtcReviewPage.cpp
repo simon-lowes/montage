@@ -89,7 +89,7 @@ const char* browserReviewScript() {
   // What the page knows, kept where automatic checks can read it.
   const state = {
     stage: 'idle', error: '', author: '', fps: [25, 1], sequence: 0, color: '#ff3b30', codec: '',
-    frame: -1, tc: '', shownSequence: 0, rtp: null, presented: 0,
+    frame: -1, tc: '', shownSequence: 0, rtp: null, presented: 0, timing: '', hdr: false, rung: null,
     tags: new Map(), tagOrder: [], notes: new Map(), strokes: [], onFrame: [],
     pc: null, dc: null, session: null, pass: '',
   };
@@ -117,8 +117,10 @@ const char* browserReviewScript() {
     if (!r.ok) throw new Error((await r.text()) || r.statusText);
     const cfg = await r.json();
     state.fps = cfg.fps; state.sequence = cfg.sequence;
+    // HDR (PQ or HLG) where this browser says it decodes it, 10-bit AV1 or HEVC; SDR otherwise.
+    state.hdr = !!cfg.hdr && await decodesHdr(cfg);
     if (state.pc) state.pc.close();  // (an earlier try's)
-    const pc = new RTCPeerConnection({ iceServers: cfg.iceServers || [] });
+    const pc = new RTCPeerConnection({ iceServers: cfg.iceServers || [], iceTransportPolicy: cfg.iceTransportPolicy || 'all' });
     state.pc = pc;
     pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -136,11 +138,11 @@ const char* browserReviewScript() {
     };
     pc.onconnectionstatechange = () => {
       state.stage = pc.connectionState;
-      say({ connected: 'Live', connecting: 'Connecting…', failed: 'The connection failed', disconnected: 'Connection lost…', closed: 'Ended' }[pc.connectionState] || pc.connectionState);
+      status();
     };
     await pc.setLocalDescription(await pc.createOffer());
     await gathered(pc, 2000);
-    const w = await fetch('/whep', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+    const w = await fetch(state.hdr ? '/whep?hdr=1' : '/whep', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
     if (w.status === 401) { state.stage = 'refused'; throw new Error('Wrong passphrase'); }
     if (w.status !== 201) throw new Error((await w.text()) || ('The review refused: ' + w.status));
     state.session = w.headers.get('Location');
@@ -153,12 +155,41 @@ const char* browserReviewScript() {
   }
   state.join = join;
 
+  // Whether this browser's WebRTC decodes 10-bit VP9 (profile 2) or HEVC (Main 10), and says it plays the transfer.
+  async function decodesHdr(cfg) {
+    if (!navigator.mediaCapabilities || !window.RTCRtpReceiver || !RTCRtpReceiver.getCapabilities) return false;
+    const codecs = (RTCRtpReceiver.getCapabilities('video') || { codecs: [] }).codecs;
+    for (const type of ['video/VP9', 'video/H265']) {
+      if (!codecs.some((c) => c.mimeType.toLowerCase() === type.toLowerCase() && /profile-id=2/.test(c.sdpFmtpLine || ''))) continue;
+      try {
+        const info = await navigator.mediaCapabilities.decodingInfo({ type: 'webrtc', video: {
+          contentType: type, width: cfg.width, height: cfg.height, bitrate: 8e6, framerate: cfg.fps[0] / cfg.fps[1],
+          transferFunction: cfg.hdr, colorGamut: 'rec2020' } });
+        if (info.supported) return true;
+      } catch (e) { /* not this one */ }
+    }
+    return false;
+  }
+
+  function status() {
+    const live = { connected: 'Live', connecting: 'Connecting…', failed: 'The connection failed', disconnected: 'Connection lost…', closed: 'Ended' };
+    let text = live[state.stage] || state.stage || '';
+    if (state.stage === 'connected' && state.rung) {
+      text += state.rung.hdr ? ', HDR' : '';
+      if (state.rung.i > 0) text += ', ' + state.rung.w + ' × ' + state.rung.h + ' for this connection';
+    }
+    say(text);
+  }
+
   function message(m) {
     if (m.t === 'f') {
       const r = m.r >>> 0;
       state.tags.set(r, { f: m.f, tc: m.tc, seq: m.seq, at: performance.now() });
       state.tagOrder.push(r);
       while (state.tagOrder.length > 600) state.tags.delete(state.tagOrder.shift());
+    } else if (m.t === 'rung') {
+      state.rung = { i: m.i, of: m.of, w: m.w, h: m.h, hdr: !!m.hdr };
+      status();
     } else if (m.t === 'hello') {
       state.fps = m.fps; state.sequence = m.sequence; state.color = m.color || state.color; state.codec = m.codec || '';
     } else if (m.t === 'ack' || m.t === 'err') {
@@ -169,10 +200,17 @@ const char* browserReviewScript() {
     }
   }
 
-  // Which frame is on screen: the picture's RTP timestamp names it (else, where the browser does not say, the newest
-  // frame told of a frame's time ago).
+  // Which frame is on screen: the picture's RTP timestamp names it (else that of the picture the receiver last played
+  // out, else, where the browser says neither, the newest frame told of a frame's time ago).
   function shown(meta) {
-    if (meta && meta.rtpTimestamp !== undefined) return state.tags.get(meta.rtpTimestamp >>> 0);
+    if (meta && meta.rtpTimestamp !== undefined) { state.timing = 'frame'; return state.tags.get(meta.rtpTimestamp >>> 0); }
+    const pc = state.pc, rx = pc && pc.getReceivers ? pc.getReceivers().find((x) => x.track && x.track.kind === 'video') : null;
+    const sources = rx && rx.getSynchronizationSources ? rx.getSynchronizationSources() : [];
+    if (sources.length && sources[0].rtpTimestamp !== undefined) {
+      const t = state.tags.get(sources[0].rtpTimestamp >>> 0);
+      if (t) { state.timing = 'source'; return t; }
+    }
+    state.timing = 'guess';
     const now = performance.now(), wait = 1000 * state.fps[1] / state.fps[0];
     for (let i = state.tagOrder.length - 1; i >= 0; --i) {
       const t = state.tags.get(state.tagOrder[i]);

@@ -101,6 +101,10 @@
 #include "render/WebRtcReview.h"
 #include "render/HeadlessBrowser.h"
 #include "render/OGraf.h"
+#include "ReviewBrowsers.h"
+#ifdef MONTAGE_TEST_TURN
+#include <juice/juice.h>
+#endif
 #include "core/ReviewPage.h"
 #ifndef _WIN32
 #include <unistd.h>
@@ -17669,6 +17673,403 @@ colorspaces:
         QCOMPARE(review->receivers(), 1);
         // A wrong passphrase to the endpoint is refused too.
         QCOMPARE(js("fetch('/whep', { method: 'POST', headers: { Authorization: 'Bearer wrong', 'Content-Type': 'application/sdp' }, body: 'v=0' }).then(r => r.status)").toInt(), 401);
+    }
+
+    // Live review in a browser through the network's hard places: a viewer on a slow link moved down the ladder and
+    // back while another keeps the full picture.
+    void browserReviewSimulcast() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        // Noise, so each rung's encoder spends its whole bit rate (full 4 Mb/s, half 1.5, quarter 0.5).
+        ReviewRig rig;
+        rig.settings.codec = "h264";  // (or AV1 or VP9, where the browser has no H.264)
+        rig.settings.bitrateKbps = 4000;
+        rig.settings.audioBitrateKbps = 64;
+        rig.settings.rungs = 3;
+        rig.picture = [](FrameTime f) {
+            auto img = std::make_shared<Image>(640, 360);
+            uint32_t seed = uint32_t(f) * 2654435761u + 1;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    seed = seed * 1664525u + 1013904223u;
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(seed >> 24) / 255.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(640, 360, "rec709", &why), why.c_str());
+        rig.playing = true;  // (new noise each frame)
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why), why.c_str());
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        // One viewer on the page, as a reviewer joins; another through a relay that can be slowed.
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        ThrottledRelay relay;
+        QVERIFY(relay.start(quint16(rig.port())));
+        QCOMPARE(tab.js(whepPlayerScript("slow", rig.passphrase(), "/whep", rig.port(), relay.port())).toString(), QStringLiteral("ok"));
+        const QString full = decodedSizeScript("__montage.pc"), slow = decodedSizeScript("slow");
+        QVERIFY2(tab.until(full + ".then(s => s === '640x360')", 20), qPrintable(tab.js(full).toString()));
+        QVERIFY2(tab.until(slow + ".then(s => s === '640x360')", 20), qPrintable(tab.js(slow).toString()));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
+        qInfo("Codec: %s", rig.review->stats().encoder.c_str());
+
+        // The relay held to 1 Mb/s: down to the quarter rung within 5 s; the other viewer stays at full size.
+        std::vector<QString> fullSizes;
+        auto watch = [&](const QString& want, int ms) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < ms) {
+                fullSizes.push_back(tab.js(full).toString());
+                if (tab.js(slow).toString() == want) return t.elapsed();
+                QThread::msleep(100);
+            }
+            return qint64(-1);
+        };
+        relay.kbps = 1000;
+        const qint64 down = watch("160x90", 5000);
+        qInfo("At 1 Mb/s: the quarter rung after %lld ms (%lld packets dropped)", (long long)down, (long long)relay.dropped.load());
+        QVERIFY2(down >= 0, qPrintable(tab.js(slow).toString()));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{1, 0, 1}));
+        QVERIFY(tab.until("__montage.rung && __montage.rung.i === 0", 2));
+        // (held there while the link stays slow)
+        QThread::msleep(4000);
+        QCOMPARE(tab.js(slow).toString(), QStringLiteral("160x90"));
+        // Released: back up to full size.
+        relay.kbps = 0;
+        const qint64 up = watch("640x360", 45000);
+        qInfo("Released: full size again after %lld ms", (long long)up);
+        QVERIFY2(up >= 0, qPrintable(tab.js(slow).toString()));
+        for (const QString& s : fullSizes) QCOMPARE(s, QStringLiteral("640x360"));
+        QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{2, 0, 0}));
+    }
+
+    // An HDR (PQ) sequence: 10-bit PQ to a browser that says it decodes it, its codes as they were; SDR, tone mapped
+    // as the Program monitor shows it, to the rest.
+    void browserReviewHdr() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        // Four grey patches at PQ codes 0.25, 0.4, 0.58 (203 nits) and 0.75.
+        const double levels[4] = {0.25, 0.40, 0.58, 0.75};
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.hdr = true;
+        rig.settings.burnTimecode = false;
+        rig.picture = [&](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(levels[std::min(3, x / 80)]);
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec2100pq", &why), why.c_str());
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why), why.c_str());
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        // A decoded picture's codes at the patches' middles (the mean of 9 x 9 samples), its format and colour.
+        auto read = [&](const QString& track) {
+            return tab.js("(async () => { const track = " + track + ".clone(); const p = new MediaStreamTrackProcessor({ track });"
+                          "const reader = p.readable.getReader(); let out = null;"
+                          "for (let i = 0; i < 40 && !out; ++i) { const { value: f } = await reader.read(); if (!f) break;"
+                          "if (i < 15) { f.close(); continue; }"
+                          "const buf = new ArrayBuffer(f.allocationSize()); const planes = await f.copyTo(buf);"
+                          "const wide = /P1[02]/.test(f.format); const A = wide ? Uint16Array : Uint8Array, n = wide ? 2 : 1;"
+                          "const plane = (k) => ({ d: new A(buf, planes[k].offset), s: planes[k].stride / n });"
+                          "const Y = plane(0), U = plane(1), w = f.displayWidth, h = f.displayHeight; const y = [], u = [];"
+                          "for (let q = 0; q < 4; ++q) { const cx = Math.round(w * (q + 0.5) / 4), cy = Math.round(h / 2); let sy = 0, su = 0;"
+                          "for (let dy = -4; dy <= 4; ++dy) for (let dx = -4; dx <= 4; ++dx) { sy += Y.d[(cy + dy) * Y.s + cx + dx];"
+                          "su += U.d[((cy + dy) >> 1) * U.s + ((cx + dx) >> 1)]; } y.push(sy / 81); u.push(su / 81); }"
+                          "out = { format: f.format, w, h, y, u, color: f.colorSpace ? f.colorSpace.toJSON() : null }; f.close(); }"
+                          "reader.cancel(); track.stop(); return out; })()",
+                          60000)
+                .toObject();
+        };
+        // A browser that says it decodes HDR gets 10-bit PQ: each patch's code within 2 of what was sent.
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        QVERIFY(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 20));
+        const bool hdr = tab.js("__montage.hdr").toBool();
+        const QJsonObject shown = read("document.getElementById('video').srcObject.getVideoTracks()[0]");
+        qInfo("This browser %s HDR: %s", hdr ? "decodes" : "does not say it decodes", QJsonDocument(shown).toJson(QJsonDocument::Compact).constData());
+        if (hdr) {
+            QVERIFY(tab.until("__montage.rung && __montage.rung.hdr", 5));
+            QCOMPARE(rig.review->stats().hdrViewers, 1);
+            QCOMPARE(shown.value("format").toString(), QStringLiteral("I420P10"));
+            for (int q = 0; q < 4; ++q) {
+                const double want = 64 + 876 * levels[q], got = shown.value("y").toArray().at(q).toDouble();
+                QVERIFY2(std::abs(got - want) <= 2, qPrintable(QStringLiteral("patch %1: %2, not %3").arg(q).arg(got).arg(want)));
+                QVERIFY(std::abs(shown.value("u").toArray().at(q).toDouble() - 512) <= 2);
+            }
+        }
+        // A player that does not ask for HDR gets SDR: 8-bit BT.709, each patch as the Program monitor's tone mapping
+        // makes it.
+        QCOMPARE(tab.js(whepPlayerScript("sdr", rig.passphrase(), "/whep", rig.port(), 0)).toString(), QStringLiteral("ok"));
+        QVERIFY(tab.until("!!window.sdrTrack", 10));
+        QVERIFY(tab.until(decodedSizeScript("sdr") + ".then(s => s === '320x180')", 15));
+        const QJsonObject sdr = read("sdrTrack");
+        qInfo("SDR: %s", QJsonDocument(sdr).toJson(QJsonDocument::Compact).constData());
+        QVERIFY2(!sdr.value("format").toString().contains("P10"), qPrintable(sdr.value("format").toString()));
+        const ColorSpace* pq = findColorSpace("rec2100pq");
+        QVERIFY(pq);
+        for (int q = 0; q < 4; ++q) {
+            float rgb[3] = {float(levels[q]), float(levels[q]), float(levels[q])};
+            convertPixel(rgb, *pq, rec709Space(), rig.sequence->hdrPeakNits);
+            const double want = 16 + 219 * double(rgb[1]), got = sdr.value("y").toArray().at(q).toDouble();
+            QVERIFY2(std::abs(got - want) <= 3, qPrintable(QStringLiteral("SDR patch %1: %2, not %3").arg(q).arg(got).arg(want)));
+            QVERIFY(std::abs(sdr.value("u").toArray().at(q).toDouble() - 128) <= 2);
+        }
+        if (!hdr) QCOMPARE(rig.review->stats().hdrViewers, 0);
+    }
+
+    // Through a TURN relay the user runs (libjuice's own server here, on this computer), with ICE on both sides set
+    // to the relay only; VP9 this time.
+    void browserReviewThroughTurn() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef MONTAGE_TEST_TURN
+        QSKIP("Needs libjuice's TURN server (a build with WebRTC)");
+#else
+        if (ChromeTab::exe().empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        juice_server_credentials_t user{"reviewer", "relay-password-1", 0};
+        juice_server_config_t config{};
+        config.credentials = &user;
+        config.credentials_count = 1;
+        config.max_allocations = 16;
+        config.max_peers = 16;
+        config.bind_address = "127.0.0.1";
+        config.port = 0;
+        config.realm = "montage-test";
+        juice_server_t* turn = juice_server_create(&config);
+        QVERIFY(turn);
+        auto endTurn = qScopeGuard([&] { juice_server_destroy(turn); });
+        const int turnPort = juice_server_get_port(turn);
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.settings.turnServer = "turn:127.0.0.1:" + std::to_string(turnPort);
+        rig.settings.turnUser = "reviewer";
+        rig.settings.turnPassword = "relay-password-1";
+        rig.settings.relayOnly = true;
+        QVERIFY2(checkStreamSettings(rig.settings).empty(), checkStreamSettings(rig.settings).c_str());
+        rig.picture = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        ChromeTab tab;
+        QVERIFY2(tab.start(&why, {"--allow-loopback-in-peer-connection"}), why.c_str());
+        QVERIFY2(tab.open(rig.page(), &why), why.c_str());
+        // The page is given the relay with the passphrase, and nothing else.
+        QVERIFY(tab.js(frameCheckScript()).toBool());
+        QCOMPARE(tab.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        QVERIFY2(tab.until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                 (tab.js("__montage.stage").toString() + " " + QString::fromStdString(rig.review->stats().error)).toUtf8().constData());
+        QCOMPARE(tab.js("__montage.pc.getConfiguration().iceTransportPolicy").toString(), QStringLiteral("relay"));
+        QCOMPARE(tab.js("__montage.codec").toString(), QStringLiteral("vp9"));
+        // The browser's end of the pair in use is the relay's, so everything goes through it (Montage's end is its
+        // address at the relay, or this computer's own sending to the browser's there: "prflx").
+        const QJsonObject pair = tab.js("__montage.pc.getStats().then(r => { let p = null; r.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) p = r.get(s.selectedCandidatePairId); });"
+                                        "return p ? { local: r.get(p.localCandidateId).candidateType, remote: r.get(p.remoteCandidateId).candidateType,"
+                                        "localAt: r.get(p.localCandidateId).address + ':' + r.get(p.localCandidateId).port, remoteAt: r.get(p.remoteCandidateId).address + ':' + r.get(p.remoteCandidateId).port,"
+                                        "offered: __montage.pc.remoteDescription.sdp.split('\\r\\n').filter(l => l.startsWith('a=candidate')).join(' | ') } : null; })")
+                                     .toObject();
+        qInfo("Candidates: %s", QJsonDocument(pair).toJson(QJsonDocument::Compact).constData());
+        QCOMPARE(pair.value("local").toString(), QStringLiteral("relay"));
+        QVERIFY2(pair.value("remote").toString() == "relay" || pair.value("remote").toString() == "prflx", qPrintable(pair.value("remote").toString()));
+        QVERIFY(pair.value("offered").toString().contains(" typ relay "));
+        QVERIFY(!pair.value("offered").toString().contains(" typ host "));
+        // Frame-accurate as directly: parked on 500, every picture is 500's; playing, each within 2 of its tag.
+        rig.playhead = 500;
+        QVERIFY(tab.until("__montage.checks.length > 0 && __montage.checks[__montage.checks.length - 1].tag === 500", 10));
+        QThread::msleep(500);
+        const QJsonArray parked = tab.js("__montage.checks.slice(-5)").toArray();
+        for (const QJsonValue& c : parked) QVERIFY2(std::abs(c.toObject().value("code").toInt() - 500) <= 1, QJsonDocument(parked).toJson().constData());
+        QCOMPARE(tab.js("__montage.tc").toString(), QString::fromStdString(formatTimecode(500, {25, 1}, true)));
+        tab.js("__montage.checks.length = 0");
+        rig.playing = true;
+        QThread::msleep(3000);
+        rig.playing = false;
+        int worst = 0, read = 0;
+        for (const QJsonValue& c : tab.js("__montage.checks.slice()").toArray()) {
+            const int code = c.toObject().value("code").toInt(), tag = c.toObject().value("tag").toInt();
+            if (code < 0 || tag < 0) continue;
+            ++read;
+            worst = std::max(worst, std::abs(code - tag));
+        }
+        qInfo("Through the relay: %d pictures read, worst %d frames from their tags", read, worst);
+        QVERIFY(read >= 30);
+        QVERIFY2(worst <= 2, std::to_string(worst).c_str());
+        // Only through the relay needs one; a relay's user name and password go in their own fields.
+        StreamSettings bad = rig.settings;
+        bad.turnServer.clear();
+        QVERIFY(QString::fromStdString(checkStreamSettings(bad)).contains("relay"));
+        bad = rig.settings;
+        bad.turnServer = "turn:ana:secret@127.0.0.1:3478";
+        QVERIFY(!checkStreamSettings(bad).empty());
+        bad = rig.settings;
+        bad.turnPassword.clear();
+        QVERIFY(!checkStreamSettings(bad).empty());
+#endif
+    }
+
+    // Firefox (headless, through geckodriver) plays the stream in a codec it takes (VP9 preferred here) with the
+    // timecode of the frame shown.
+    void browserReviewInFirefox() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+        if (GeckoBrowser::firefox().empty() || GeckoBrowser::geckodriver().empty()) {
+            if (qEnvironmentVariableIsSet("MONTAGE_REQUIRE_FIREFOX")) QFAIL("MONTAGE_REQUIRE_FIREFOX is set, and no Firefox and geckodriver were found");
+            QSKIP("Needs Firefox and geckodriver (MONTAGE_FIREFOX, MONTAGE_GECKODRIVER, or both on the PATH)");
+        }
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.settings.codec = "vp9";
+        rig.picture = [](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        GeckoBrowser fx;
+        QVERIFY2(fx.start(&why), why.c_str());
+        qInfo("Firefox %s", qPrintable(fx.version()));
+        QVERIFY2(fx.navigate(rig.page(), &why), why.c_str());
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (fx.js(expression).toBool()) return true;
+                QThread::msleep(100);
+            }
+            return false;
+        };
+        QVERIFY2(until("document.readyState === 'complete' && !!window.__montage", 20), fx.log().right(2000).constData());
+        QCOMPARE(fx.js("__montage.join('Ana', 'not the passphrase').then(() => 'joined', e => e.message)").toString(), QStringLiteral("Wrong passphrase"));
+        QVERIFY(fx.js(frameCheckScript()).toBool());
+        QCOMPARE(fx.js("__montage.join('Ana', '" + rig.passphrase() + "').then(() => 'joined', e => e.message)").toString(), QStringLiteral("joined"));
+        QVERIFY2(until("__montage.stage === 'connected' && __montage.presented > 10", 30),
+                 (fx.js("__montage.stage").toString() + " " + QString::fromStdString(rig.review->stats().error)).toUtf8().constData());
+        const QString codec = fx.js("__montage.codec").toString();
+        qInfo("Firefox takes %s (%s); the page knows the frame shown by %s", qPrintable(codec), rig.review->stats().encoder.c_str(),
+              qPrintable(fx.js("__montage.timing").toString()));
+        QVERIFY(codec == "vp9" || codec == "av1" || codec == "h264");
+        // Parked on 500: every picture's frame code is 500, its timecode 500's.
+        rig.playhead = 500;
+        QVERIFY2(until("__montage.checks.length > 0 && __montage.checks[__montage.checks.length - 1].tag === 500", 10),
+                 QJsonDocument(fx.js("__montage.checks.slice(-5)").toArray()).toJson().constData());
+        QThread::msleep(500);
+        const QJsonArray parked = fx.js("__montage.checks.slice(-5)").toArray();
+        for (const QJsonValue& c : parked) {
+            QVERIFY2(std::abs(c.toObject().value("code").toInt() - 500) <= 1, QJsonDocument(parked).toJson().constData());
+            QCOMPARE(c.toObject().value("tag").toInt(), 500);
+        }
+        QCOMPARE(fx.js("__montage.tc").toString(), QString::fromStdString(formatTimecode(500, {25, 1}, true)));
+        // Playing: each picture within 2 frames of the frame its timecode names.
+        fx.js("__montage.checks.length = 0");
+        rig.playing = true;
+        QThread::msleep(4000);
+        rig.playing = false;
+        int worst = 0, read = 0;
+        QString timing;
+        for (const QJsonValue& c : fx.js("__montage.checks.slice()").toArray()) {
+            const int code = c.toObject().value("code").toInt(), tag = c.toObject().value("tag").toInt();
+            timing = c.toObject().value("timing").toString();
+            if (code < 0 || tag < 0) continue;
+            ++read;
+            worst = std::max(worst, std::abs(code - tag));
+        }
+        qInfo("Firefox playing: %d pictures read, worst %d frames from their tags (%s)", read, worst, qPrintable(timing));
+        QVERIFY(read >= 30);
+        QVERIFY2(worst <= 2, std::to_string(worst).c_str());
+        // Sound arrives.
+        QVERIFY(until("__montage.pc.getStats().then(r => { let n = 0; r.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'audio') n = s.packetsReceived; }); return n > 50; })", 10));
+    }
+
+    // The cases the nightly reviews found: a few addresses holding every connection keep no newcomer out, and guessing
+    // from a few networks keeps no newcomer elsewhere out.
+    void browserReviewLockoutAndSlots() {
+        using namespace montage::output;
+        using namespace montage::reviewtest;
+#ifndef Q_OS_LINUX
+        QSKIP("Needs every 127.x address to be this computer's (Linux)");
+#else
+        std::string why;
+        if (!BrowserReviewBackend().available(&why)) QSKIP(why.c_str());
+        ReviewRig rig;
+        rig.picture = [](FrameTime) { return std::make_shared<const Image>(320, 180); };
+        QVERIFY2(rig.start(320, 180, "rec709", &why), why.c_str());
+        const QByteArray pass = QByteArray::fromStdString(rig.settings.passphrase);
+        QCOMPARE(httpsStatus("127.0.1.2", rig.port(), "/config", pass), 200);
+        // Slots: eight addresses holding eight connections each (all 64) and sending nothing.
+        std::vector<std::unique_ptr<QTcpSocket>> idle;
+        for (int a = 2; a <= 9; ++a)
+            for (int k = 0; k < 8; ++k) {
+                auto c = std::make_unique<QTcpSocket>();
+                c->setProxy(QNetworkProxy::NoProxy);
+                if (!c->bind(QHostAddress(QStringLiteral("127.0.0.%1").arg(a)))) continue;
+                c->connectToHost(QStringLiteral("127.0.0.1"), quint16(rig.port()));
+                if (c->waitForConnected(2000)) idle.push_back(std::move(c));
+            }
+        QCOMPARE(idle.size(), size_t(64));
+        QThread::msleep(200);
+        // A ninth from one of them is turned away at once; a newcomer elsewhere is answered in one of their places.
+        QTcpSocket more;
+        more.setProxy(QNetworkProxy::NoProxy);
+        QVERIFY(more.bind(QHostAddress(QStringLiteral("127.0.0.2"))));
+        more.connectToHost(QStringLiteral("127.0.0.1"), quint16(rig.port()));
+        QVERIFY(more.waitForConnected(2000));
+        QVERIFY(more.state() != QAbstractSocket::ConnectedState || more.waitForDisconnected(2000));
+        QElapsedTimer took;
+        took.start();
+        QCOMPARE(httpsStatus("127.0.2.7", rig.port(), "/config", pass, 4000), 200);
+        int still = 0;
+        for (auto& c : idle) still += c->state() == QAbstractSocket::ConnectedState && !c->waitForDisconnected(1);
+        qInfo("A newcomer answered in %lld ms with %d of the 64 still held", (long long)took.elapsed(), still);
+        QVERIFY(still >= 60);  // (made room for, not timed out: the handshake allows 5 s)
+        idle.clear();
+        // Lockout: sixteen addresses of one network guessing as fast as they are let; meanwhile a newcomer from another
+        // network is let in at once, though the guessers' budget has run out.
+        std::atomic<bool> guessing{true};
+        std::atomic<int> refused{0}, wrong{0};
+        std::vector<std::thread> guessers;
+        for (int a = 2; a <= 17; ++a)
+            guessers.emplace_back([&, a] {
+                while (guessing) {
+                    const int s = httpsStatus(QStringLiteral("127.0.0.%1").arg(a), rig.port(), "/config", "not the passphrase", 5000);
+                    ++(s == 429 ? refused : wrong);
+                }
+            });
+        auto stopGuessing = qScopeGuard([&] {
+            guessing = false;
+            for (auto& t : guessers) t.join();
+        });
+        QThread::msleep(5000);
+        QCOMPARE(httpsStatus("127.0.3.4", rig.port(), "/config", pass, 4000), 200);
+        QCOMPARE(httpsStatus("127.0.3.5", rig.port(), "/config", pass, 4000), 200);
+        qInfo("Guessers: %d wrong, %d refused untried", wrong.load(), refused.load());
+        QVERIFY(refused > 0);
+#endif
     }
 
     void ndiOutput() {
