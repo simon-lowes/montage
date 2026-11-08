@@ -26,7 +26,7 @@ std::string averr(int code) {
 
 }  // namespace
 
-bool tsSegmentsCarry(const std::string& c) { return c == "h264" || c == "hevc" || c == "aac" || c == "ac3" || c == "eac3"; }
+bool tsSegmentsCarry(const std::string& c) { return c == "h264" || c == "aac" || c == "ac3" || c == "eac3"; }
 
 TsSegmenter::~TsSegmenter() {
     if (!oc_) return;
@@ -42,7 +42,7 @@ TsSegmenter::~TsSegmenter() {
 bool TsSegmenter::open(const AVCodecParameters* par, std::string* error) {
     const char* name = avcodec_get_name(par->codec_id);
     if (!name || !tsSegmentsCarry(name))
-        return failWith(error, std::string("MPEG-TS segments carry H.264, HEVC, AAC, AC-3 or E-AC-3, not ") + (name ? name : "this codec"));
+        return failWith(error, std::string("MPEG-TS segments carry H.264, AAC, AC-3 or E-AC-3, not ") + (name ? name : "this codec"));
     if (avformat_alloc_output_context2(&oc_, nullptr, "mpegts", nullptr) < 0 || !oc_) return failWith(error, "cannot make an MPEG-TS muxer");
     AVStream* st = avformat_new_stream(oc_, nullptr);
     if (!st || avcodec_parameters_copy(st->codecpar, par) < 0) return failWith(error, "cannot add the stream");

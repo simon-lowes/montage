@@ -12501,7 +12501,7 @@ void McpServer::Impl::addTools() {
                 "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
                 "audio_codec":{"type":"string","enum":["aac","libopus","ac3","eac3","none"],"default":"aac","description":"AAC, Opus, AC-3 (to 5.1) or E-AC-3 (to 7.1; the AC-3 family stating the mix's measured loudness as dialnorm)"},
                 "audio_bitrate":{"type":"integer","default":128000,"description":"A pair of channels' (more channels, more bits)"},
-                "segments":{"type":"string","enum":["cmaf","ts"],"default":"cmaf","description":"ts: HLS in MPEG-TS segments (H.264 or HEVC, AAC, AC-3 or E-AC-3; DASH stays CMAF)"},
+                "segments":{"type":"string","enum":["cmaf","ts"],"default":"cmaf","description":"ts: HLS in MPEG-TS segments (H.264 with AAC, AC-3 or E-AC-3; DASH stays CMAF)"},
                 "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"},
                 "low_latency":{"type":"boolean","default":false,"description":"With live: segments made of parts of part_seconds (LL-HLS parts and CMAF chunks), each sent as it is made"},
                 "live":{"type":"object","description":"A live package instead, from a recording as it is made (no project needed: output is the package's folder): a sliding window of HLS segments and a dynamic DASH MPD, fed by the feed for seconds. Waits until it ends","properties":{

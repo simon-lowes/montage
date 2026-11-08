@@ -558,7 +558,7 @@ bool isRenditionName(const QString& name) {
 bool holdsOnlyRenditionFiles(const QString& path) {
     QDir d(path);
     if (!d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System).isEmpty()) return false;
-    static const QRegularExpression file(QStringLiteral("^(seg\\d+(\\.\\d+)?\\.(m4s|vtt|ts)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml))$"));
+    static const QRegularExpression file(QStringLiteral("^(seg\\d+(\\.\\d+)?\\.(m4s|vtt|ts)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml))(\\.tmp)?$"));  // (.tmp: a live package's, left half written)
     static const QRegularExpression junk(QStringLiteral("^(\\.DS_Store|Thumbs\\.db|desktop\\.ini)$"));
     bool any = false;  // (an empty folder, or one of only junk, is not a rendition's: left alone)
     for (const QString& f : d.entryList(QDir::Files | QDir::Hidden | QDir::System)) {
@@ -569,6 +569,8 @@ bool holdsOnlyRenditionFiles(const QString& path) {
 }
 
 }  // namespace
+
+bool streamingRenditionFolder(const std::string& path) { return holdsOnlyRenditionFiles(QString::fromStdString(path)); }
 
 bool exportStreamingPackage(const Project& p, const Sequence& seq, const StreamingSettings& s, const ExportProgress& progress,
                             const std::atomic<bool>* cancel, std::string* error, StreamingResult* result) {
@@ -597,11 +599,12 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     }
     if (rungs.empty()) return fail("The ladder is empty");
     if (s.segmentFormat != "cmaf" && s.segmentFormat != "ts") return fail("Segments are cmaf or ts");
-    // MPEG-TS segments, for HLS (DASH keeps CMAF's): H.264 or HEVC, with AAC, AC-3 or E-AC-3.
+    // MPEG-TS segments, for HLS (DASH keeps CMAF's): H.264, with AAC, AC-3 or E-AC-3 (HLS players take HEVC in CMAF only).
     const bool ts = s.segmentFormat == "ts" && s.hls;
     if (ts) {
         for (const StreamingRung& r : rungs)
-            if (r.codec == "libsvtav1") return fail("MPEG-TS segments carry H.264 or HEVC, not AV1: choose CMAF segments for AV1 rungs");
+            if (r.codec != "libx264")
+                return fail(std::string("MPEG-TS segments carry H.264, not ") + (r.codec == "libx265" ? "HEVC" : "AV1") + ": choose CMAF segments for those rungs");
         if (s.audioCodec == "libopus") return fail("MPEG-TS segments carry AAC, AC-3 or E-AC-3 sound, not Opus");
     }
     // (with TS segments and no DASH, the CMAF fragments are only measured)

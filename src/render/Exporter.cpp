@@ -1837,7 +1837,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (Eac3Extended* x = extendedFor(o, ctx)) x->setDialnorm(dialnorm);
             else if (ctx) ac3SetDialnorm(ctx, dialnorm);
         };
-        if (o.actx) {
+        // (each stream's own: the mix's, and each extra audio stream's; in mono tracks, each channel's track its stream's)
+        std::vector<int> stated;
+        if (o.actx || !monos.empty()) {
             std::optional<int> d;
             if (s.loudnessTarget < 0) {
                 d = ac3Dialnorm(s.loudnessTarget);
@@ -1847,10 +1849,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 d = measure([&](int64_t pos, int n, float* dst) { mixBlock(meterMixer, pos, n, dst); }, audioCursor);
             }
             if (!d) return fail("Cancelled");
-            setDialnorm(o.actx, *d);
+            if (o.actx) setDialnorm(o.actx, *d);
+            stated.push_back(*d);
         }
         for (auto& e : extras) {
-            if (!e->ctx) continue;
+            if (!e->ctx && monos.empty()) continue;
             std::optional<int> d;
             if (s.loudnessTarget < 0 && e->normalise) {
                 d = ac3Dialnorm(s.loudnessTarget);
@@ -1863,7 +1866,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 }, e->cursor);
             }
             if (!d) return fail("Cancelled");
-            setDialnorm(e->ctx, *d);
+            if (e->ctx) setDialnorm(e->ctx, *d);
+            stated.push_back(*d);
+        }
+        for (size_t i = 0; i < monos.size(); ++i) {
+            const size_t stream = i / size_t(std::max(1, layoutChannels));
+            if (monos[i]->ctx && !stated.empty()) setDialnorm(monos[i]->ctx, stream < stated.size() ? stated[stream] : stated.front());
         }
     }
 

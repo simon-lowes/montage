@@ -18,7 +18,8 @@ namespace montage {
 
 constexpr int64_t kTsOffset = 900000;  // 90 kHz
 
-// Whether MPEG-TS segments carry this codec (H.264, HEVC, AAC, AC-3, E-AC-3; FFmpeg's names).
+// Whether MPEG-TS segments carry this codec (H.264, AAC, AC-3, E-AC-3; FFmpeg's names). HEVC goes in CMAF segments, as
+// HLS players take it only there.
 bool tsSegmentsCarry(const std::string& codecName);
 
 class TsSegmenter {

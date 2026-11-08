@@ -2489,6 +2489,8 @@ private slots:
         CaptureDialog* dlg = win_->captureDialog();
         QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live: "), 10000);
         QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
+        // (the package finished on a thread of its own, the window going on meanwhile)
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live package ended"), 20000);
         r = call({{"action", "status"}});
         const QJsonObject live = r.value("structuredContent").toObject().value("live").toObject();
         QVERIFY2(!live.value("running").toBool() && live.value("segments").toInt() >= 2 && live.value("error").toString().isEmpty(),

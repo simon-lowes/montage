@@ -293,6 +293,7 @@ CaptureDialog::~CaptureDialog() {
     // (the recorder's notices, queued to this, go with it)
     if (recorder_) recorder_->stop();
     endLive();
+    if (liveFinish_.joinable()) liveFinish_.join();
     if (origin_) origin_->stop();
     if (node_) node_->stop();
 }
@@ -330,6 +331,7 @@ QString CaptureDialog::liveUrl() const { return liveUrl_; }
 bool CaptureDialog::startLive(CaptureSettings& cs) {
     // (the last recording's package, and its serving, end here: its folder may be the same)
     endLive();
+    if (liveFinish_.joinable()) liveFinish_.join();
     if (origin_) origin_->stop();
     origin_.reset();
     packager_.reset();
@@ -376,8 +378,11 @@ bool CaptureDialog::startLive(CaptureSettings& cs) {
 }
 
 void CaptureDialog::endLive() {
-    // (the recording has ended: what was queued is packaged, and the playlists end; the origin goes on serving them)
-    if (packager_ && packager_->status().running) packager_->finish();
+    // (the recording has ended: what was queued is packaged and the playlists end, on a thread of its own so the
+    // window does not wait for the encoders; the origin goes on serving them)
+    if (!packager_ || !packager_->status().running || liveFinish_.joinable()) return;
+    LivePackager* p = packager_.get();
+    liveFinish_ = std::thread([p] { p->finish(); });
 }
 
 bool CaptureDialog::offerNmos(bool on, QString* error) {
@@ -597,9 +602,9 @@ void CaptureDialog::importNow() {
 void CaptureDialog::finished(int generation, bool ok, const QString& message) {
     if (generation != generation_) return;  // (an earlier recording's)
     recording_ = false;
-    tick_->stop();
     record_->setText(tr("Record"));
     endLive();
+    if (!packager_) tick_->stop();  // (else once the package is finished: refresh)
     if (!message.isEmpty()) error_ = message;  // (why it failed, or what went wrong in a recording kept)
     // (an MXF file, or a recording shorter than its first fragment, is imported now it is whole)
     if (ok) importNow();
@@ -766,6 +771,11 @@ void CaptureDialog::refresh() {
     if (packager_) {
         // The live package: its segments, and where it is.
         const LiveStatus ls = packager_->status();
+        if (!recording_ && !ls.running) {
+            // (finished: the thread that finished it ends, and so does the ticking)
+            if (liveFinish_.joinable()) liveFinish_.join();
+            tick_->stop();
+        }
         QString line = ls.running ? tr("Live: %n segment(s)", nullptr, int(ls.segments)) : tr("Live package ended: %n segment(s)", nullptr, int(ls.segments));
         if (ls.dropped) line += QStringLiteral(" · ") + tr("%1 pictures dropped (the encoders fell behind)").arg(ls.dropped);
         if (!liveUrl_.isEmpty()) {

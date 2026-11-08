@@ -254,16 +254,17 @@ int ac3Dialnorm(double lkfs) {
 void ac3EncoderOptions(const Ac3Metadata& m, bool eac3, bool centre, bool surround, AVDictionary** opts) {
     av_dict_set(opts, "per_frame_metadata", "1", 0);
     av_dict_set_int(opts, "dialnorm", std::clamp(m.dialnorm, -31, -1), 0);
-    // Levels as linear gains (each encoder takes the nearest its syntax has).
-    auto level = [](double db) {
+    // Levels as linear gains (each encoder takes the nearest its syntax has), to the most each field holds: A/52's own
+    // 0 dB, the Lo/Ro and Lt/Rt fields +3 dB.
+    auto level = [](double db, double most = 3) {
         char b[32];
-        std::snprintf(b, sizeof b, "%.4f", gainOf(db));
+        std::snprintf(b, sizeof b, "%.4f", gainOf(std::min(db, most)));
         return std::string(b);
     };
     if (!eac3) {
         // A/52's own fields (bsid 8): cmixlev -3, -4.5 or -6 dB; surmixlev -3, -6 dB or none.
-        if (centre) av_dict_set(opts, "center_mixlev", level(m.centreMixDb).c_str(), 0);
-        if (surround) av_dict_set(opts, "surround_mixlev", level(m.surroundMixDb).c_str(), 0);
+        if (centre) av_dict_set(opts, "center_mixlev", level(m.centreMixDb, 0).c_str(), 0);
+        if (surround) av_dict_set(opts, "surround_mixlev", level(m.surroundMixDb, 0).c_str(), 0);
     }
     if (centre || surround) {
         // The Lo/Ro and Lt/Rt levels (A/52 Annex D's extended syntax for AC-3, E-AC-3's mixing metadata), the same
@@ -273,8 +274,8 @@ void ac3EncoderOptions(const Ac3Metadata& m, bool eac3, bool centre, bool surrou
             av_dict_set(opts, "ltrt_cmixlev", level(m.centreMixDb).c_str(), 0);
         }
         if (surround) {
-            av_dict_set(opts, "loro_surmixlev", level(m.surroundMixDb).c_str(), 0);
-            av_dict_set(opts, "ltrt_surmixlev", level(m.surroundMixDb).c_str(), 0);
+            av_dict_set(opts, "loro_surmixlev", level(m.surroundMixDb, 0).c_str(), 0);
+            av_dict_set(opts, "ltrt_surmixlev", level(m.surroundMixDb, 0).c_str(), 0);
         }
         av_dict_set(opts, "dmix_mode", m.preferredDownmix == "ltrt" ? "ltrt" : m.preferredDownmix == "loro" ? "loro" : "notindicated", 0);
     }

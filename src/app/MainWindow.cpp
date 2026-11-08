@@ -8223,7 +8223,7 @@ void MainWindow::exportStreamingDialog() {
     segmentFormat->setObjectName(QStringLiteral("streamingSegmentFormat"));
     segmentFormat->addItem(tr("CMAF"), QStringLiteral("cmaf"));
     segmentFormat->addItem(tr("MPEG-TS for HLS (CMAF for DASH)"), QStringLiteral("ts"));
-    segmentFormat->setToolTip(tr("Transport stream segments for HLS players and CDNs that ask for them: H.264 or HEVC, with AAC, AC-3 or E-AC-3"));
+    segmentFormat->setToolTip(tr("Transport stream segments for HLS players and CDNs that ask for them: H.264, with AAC, AC-3 or E-AC-3"));
     form->addRow(tr("Segment format:"), segmentFormat);
     auto* audio = new QComboBox;
     audio->setObjectName(QStringLiteral("streamingSound"));
@@ -8269,8 +8269,8 @@ void MainWindow::exportStreamingDialog() {
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
     st.audioCodec = audio->currentData().toString().toStdString();
     st.segmentFormat = segmentFormat->currentData().toString().toStdString();
-    if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() == "libsvtav1")) {
-        state_->message(tr("MPEG-TS segments carry H.264 or HEVC, with AAC, AC-3 or E-AC-3"));
+    if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() != "libx264")) {
+        state_->message(tr("MPEG-TS segments carry H.264, with AAC, AC-3 or E-AC-3"));
         return;
     }
     st.cueCommand = cue->currentData().toString().toStdString();
@@ -10828,6 +10828,9 @@ void MainWindow::newSequence() {
             s.colorSpace = spec.colorSpace;
             s.hdrPeakNits = spec.hdrPeakNits;
             s.audioLayout = spec.audioLayout;
+            s.downmixCentreDb = spec.downmixCentreDb, s.downmixSurroundDb = spec.downmixSurroundDb;
+            s.preferredDownmix = spec.preferredDownmix;
+            s.mixingLevel = spec.mixingLevel, s.roomType = spec.roomType;
             s.spherical = spec.spherical;
             s.vr180 = spec.vr180;
             s.stereo3d = spec.stereo3d;

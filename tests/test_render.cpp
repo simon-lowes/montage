@@ -21044,6 +21044,10 @@ colorspaces:
         StreamingSettings av1 = st;
         av1.rungs[0].codec = "libsvtav1";
         QVERIFY(!exportStreamingPackage(p, s, av1, nullptr, nullptr, &err, &res) && err.find("AV1") != std::string::npos);
+        // (nor HEVC, which HLS players take in CMAF only)
+        StreamingSettings hevc = st;
+        hevc.rungs[0].codec = "libx265";
+        QVERIFY(!exportStreamingPackage(p, s, hevc, nullptr, nullptr, &err, &res) && err.find("HEVC") != std::string::npos);
         QVERIFY2(exportStreamingPackage(p, s, st, nullptr, nullptr, &err, &res), err.c_str());
         QCOMPARE(res.segments, (std::vector<FrameTime>{0, 50, 100}));
         const QDir pkg(QString::fromStdString(st.folder));
@@ -21546,6 +21550,25 @@ colorspaces:
             bad.lowLatency = true;
             LivePackager x;
             QVERIFY(!x.start(bad, &err) && err.find("CMAF") != std::string::npos);
+        }
+        {
+            // A folder of a rendition's name holding something else: left alone, and the package stops saying why.
+            LiveSettings other = ls;
+            other.folder = dir.filePath("other").toStdString();
+            QVERIFY(QDir().mkpath(dir.filePath("other/v1_180p_h264")));
+            QFile keep(dir.filePath("other/v1_180p_h264/notes.txt"));
+            QVERIFY(keep.open(QIODevice::WriteOnly) && keep.write("mine") == 4);
+            keep.close();
+            LivePackager x;
+            QVERIFY2(x.start(other, &err), err.c_str());
+            AVFrame* f = av_frame_alloc();
+            f->format = AV_PIX_FMT_YUV420P, f->width = 320, f->height = 180, f->pts = 0;
+            QVERIFY(av_frame_get_buffer(f, 0) >= 0);
+            x.picture(f, 25, 1);
+            av_frame_free(&f);
+            x.finish();
+            QVERIFY2(x.status().error.find("holds other files") != std::string::npos, x.status().error.c_str());
+            QVERIFY(QFile::exists(dir.filePath("other/v1_180p_h264/notes.txt")));
         }
         LivePackager packager;
         QVERIFY2(packager.start(ls, &err), err.c_str());

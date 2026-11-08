@@ -12,6 +12,7 @@
 #include <QDialog>
 #include <QJsonObject>
 #include <memory>
+#include <thread>
 
 #include "core/Model.h"
 #include "media/Capture.h"
@@ -125,6 +126,7 @@ private:
     QTimer* tick_;
     std::unique_ptr<LivePackager> packager_;  // (before the recorder, which feeds it: gone after it)
     std::unique_ptr<LiveOrigin> origin_;
+    std::thread liveFinish_;  // the package being finished once the recording ends (the queued pictures encoded)
     QString liveUrl_;
     std::unique_ptr<Recorder> recorder_;
     QString path_, error_;

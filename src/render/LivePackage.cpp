@@ -311,6 +311,7 @@ struct LivePackager::State {
     // is stated before the first segment is made, by when the feed has settled.
     int64_t epoch = INT64_MAX, firstPushed = AV_NOPTS_VALUE;
     bool published = false, firstSegment = false;
+    int64_t encodedSegment = -1;  // the segment (from 0) of the last picture encoded
     int64_t firstPicture = 0;         // its number in the recording
     int64_t segFrames = 50, partFrames = 50;
     double segSeconds = 2, partSeconds = 2, partTarget = 2;
@@ -383,18 +384,27 @@ struct LivePackager::State {
         return true;
     }
 
-    std::string renditionDir(const std::string& name) {
+    std::string renditionDir(const std::string& name, std::string* why) {
         QDir d(QString::fromStdString(folder + "/" + name));
-        // (what an earlier live package left there goes)
-        if (d.exists()) d.removeRecursively();
-        if (!QDir().mkpath(d.absolutePath())) return {};
+        // (what an earlier package left there goes; a folder of that name holding anything else is left alone)
+        if (d.exists() && !d.isEmpty(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System)) {
+            if (!streamingRenditionFolder(d.absolutePath().toStdString())) {
+                *why = folder + "/" + name + " holds other files: choose another folder for the package";
+                return {};
+            }
+            d.removeRecursively();
+        }
+        if (!QDir().mkpath(d.absolutePath())) {
+            *why = "Cannot make " + folder + "/" + name;
+            return {};
+        }
         return d.absolutePath().toStdString();
     }
 
     bool openOutputs(Rendition& r, const AVCodecParameters* par, AVRational tb) {
-        const std::string dir = renditionDir(r.name);
-        if (dir.empty()) return fail("Cannot make " + folder + "/" + r.name);
         std::string why;
+        const std::string dir = renditionDir(r.name, &why);
+        if (dir.empty()) return fail(why);
         if (cmaf) {
             r.cmaf = std::make_unique<LiveCmaf>();
             if (!r.cmaf->open(dir, par, tb, &why)) return fail(why);
@@ -417,7 +427,8 @@ struct LivePackager::State {
         for (const StreamingRung& rung : rungs) {
             if (rung.codec != "libx264" && rung.codec != "libx265" && rung.codec != "libsvtav1")
                 return fail("A rung's codec must be libx264, libx265 or libsvtav1");
-            if (ts && rung.codec == "libsvtav1") return fail("MPEG-TS segments carry H.264 or HEVC, not AV1");
+            if (ts && rung.codec != "libx264")
+                return fail(std::string("MPEG-TS segments carry H.264, not ") + (rung.codec == "libx265" ? "HEVC" : "AV1") + ": choose CMAF segments");
             auto r = std::make_unique<Rendition>();
             r->rung = rung;
             r->width = std::min(rung.width > 0 ? rung.width : f->width, f->width) & ~1;
@@ -835,10 +846,14 @@ struct LivePackager::State {
     bool encodePicture(const AVFrame* f) {
         const int64_t index = (f->pts == AV_NOPTS_VALUE ? 0 : f->pts) - firstPicture;
         if (index < 0) return true;
-        const bool start = index % segFrames == 0;
+        // (the first picture of a segment, or the first that came of it when the segment's first was dropped: a
+        // keyframe)
+        const int64_t segment = index / segFrames, before = encodedSegment;
+        const bool start = segment != before;
+        encodedSegment = segment;
         for (auto& v : video) {
             Rendition& r = *v;
-            if (start && index > 0 && r.rung.codec == "libsvtav1") {
+            if (start && before >= 0 && r.rung.codec == "libsvtav1") {
                 // (the segment's pictures all out, then a new encoder whose first picture is a keyframe)
                 avcodec_send_frame(r.enc, nullptr);
                 if (!takeVideo(r)) return false;
@@ -1142,6 +1157,11 @@ struct LiveOrigin::State {
         int part = -1;
         Clock::time_point came;
         qint64 sent = 0;
+        // (a held playlist request: the file as last read, so it is read again only when it has changed, or every
+        // tenth of a second at least)
+        qint64 seenSize = -1, seenModified = -1;
+        Clock::time_point seenAt;
+        double holdFor = 0;
     };
     std::vector<std::unique_ptr<Request>> requests;
 
@@ -1204,6 +1224,7 @@ struct LiveOrigin::State {
         const bool grows = growing && growing(r.rel.toStdString());
         if (r.streaming) {
             // A segment as it grows: what is new, then (once finished) the end.
+            if (grows && QFileInfo(f).size() <= r.sent) return;  // (nothing new yet)
             if (f.open(QIODevice::ReadOnly) && f.size() > r.sent && f.seek(r.sent)) {
                 const QByteArray more = f.read(f.size() - r.sent);
                 if (!more.isEmpty()) {
@@ -1222,12 +1243,20 @@ struct LiveOrigin::State {
             return;
         }
         if (r.msn >= 0 && r.rel.endsWith(".m3u8")) {
+            const QFileInfo fi(f);
+            const qint64 size = fi.size(), modified = fi.lastModified().toMSecsSinceEpoch();
+            if (size == r.seenSize && modified == r.seenModified && Clock::now() - r.seenAt < std::chrono::milliseconds(100)) {
+                if (after(r, r.holdFor)) answer(r, 503, "text/plain", "Not yet");
+                return;
+            }
             if (!f.open(QIODevice::ReadOnly)) return;
             const QByteArray text = f.readAll();
             f.close();
+            r.seenSize = size, r.seenModified = modified, r.seenAt = Clock::now();
             // (held for three target durations at most)
+            r.holdFor = targetDuration(text) * 3;
             if (!playlistHas(text, r.msn, r.part)) {
-                if (after(r, targetDuration(text) * 3)) answer(r, 503, "text/plain", "Not yet");
+                if (after(r, r.holdFor)) answer(r, 503, "text/plain", "Not yet");
                 return;
             }
         }
