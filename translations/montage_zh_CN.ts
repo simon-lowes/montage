@@ -6640,7 +6640,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Motion Deblur uses NAFNet (MIT, trained on the GoPro dataset, CC BY 4.0), an image model that runs on this computer. It takes seconds a frame, so the monitors show it once the frames are rendered (Sequence › Render In to Out); exports always include it.</source>
-        <translation type="unfinished">Deblur 运动使用 NAFNet (MIT, 接受过 GoPro 数据集培训, CC BY 4. 0) , 一种运行于此计算机的图像模型。 它需要几秒钟, 显示器在框架完成后显示( 序列 \ ender in off); 出口中总是包含它 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Depth</source>
@@ -7132,7 +7132,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 cannot be written</source>
-        <translation type="unfinished">\ %1 无法写入</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 damaged bytes in the middle were skipped</source>
@@ -8429,7 +8429,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Moved %1 captions to the top, clear of titles</source>
-        <translation type="unfinished">将 \ { %1 标题移到顶部, 清除标题</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No caption is over a low title</source>
@@ -8453,7 +8453,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 of %2 captions break the reading limits</source>
-        <translation type="unfinished">\ %1 的 %2 标题打破读数限制</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>All %1 captions are within the reading limits</source>
@@ -9031,7 +9031,7 @@ Download it now?</source>
     </message>
     <message>
         <source>the %1 selected captions</source>
-        <translation type="unfinished">\ %1 选中的字幕</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Move %1 by (seconds, or frames, negative for earlier):</source>
@@ -10766,7 +10766,7 @@ Download it now?</source>
     <name>montage::EditorState</name>
     <message>
         <source>This project is open read-only (File › Edit Project to make changes)</source>
-        <translation type="unfinished">此工程只打开只读 (文件 \ 编辑工程以进行修改)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Read-only: %1 is editing this project</source>
@@ -11992,7 +11992,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Add to Queue</source>
-        <translation type="unfinished">添加到 \ ueue</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Render it later from the Render Queue panel, and keep editing</source>
@@ -13687,7 +13687,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>◀ Track</source>
-        <translation type="unfinished">\ 音轨</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track the surface under the corners backwards from the playhead</source>
@@ -15936,7 +15936,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1 connected</source>
-        <translation type="unfinished">\ %1 已连接</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Tangent panels connected</source>
@@ -18520,7 +18520,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Transform › </source>
-        <translation type="unfinished">变换 \ \ \ \ \ \ \ \ \ \ \ </translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Setting:</source>
@@ -19918,7 +19918,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Queue Versions</source>
-        <translation type="unfinished">\ ueue 版本</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>LTC runs at 23.976, 24, 25, 29.97 or 30 frames a second (or twice that)</source>
@@ -20084,7 +20084,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>DCP %1 made, but this FFmpeg has no OpenJPEG, so the pictures are not in the DCI profile most cinema servers need</source>
-        <translation type="unfinished">DCP \ %1 已经制作, 但此 FFmpeg 没有 OpenJPEG, 所以图片不在 DCP 配置文件中 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> It is encrypted: make KDMs for the cinemas&apos; servers with File › Make KDMs (its keys are kept in %1).</source>
@@ -20588,7 +20588,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Encrypt (cinemas need a KDM to play it: File › Make KDMs…)</source>
-        <translation type="unfinished">加密( 辛玛斯需要 KDM 来播放 : 文件 \ make KDMs...)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build has no OpenSSL</source>
@@ -21171,7 +21171,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Create and Queue</source>
-        <translation type="unfinished">创建和 \ ueue</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 s</source>
@@ -21523,7 +21523,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>; %1 video tracks, %2 clips, %3 dissolves linked to the original files</source>
-        <translation type="unfinished">; ++ %1 视频轨迹, + %2 剪辑, \ %3 溶解到与原始文件连接的</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>AAF (*.aaf)</source>
@@ -23370,7 +23370,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>%1 connected</source>
-        <translation type="unfinished">\ %1 已连接</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>MIDI Learn: move a control on %1, then click a parameter (or the other way round)</source>
@@ -23849,7 +23849,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>%1 (bus; right-click to rename or delete)</source>
-        <translation type="unfinished">\ %1 (公交车; 右键单击以重命名或删除)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track Volume</source>
@@ -24063,7 +24063,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>The downloaded %1 is damaged (its checksum does not match)</source>
-        <translation type="unfinished">下载的 \ { %1 损坏( 校验和不匹配)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot save %1</source>
@@ -24667,7 +24667,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Put a multicam clip under the playhead (Media › Create Multicam Clip) to switch angles here.</source>
-        <translation type="unfinished">在播放头下放一个多相片夹(Media \ 创建多相片剪切), 以便在此切换角度 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Live: click an angle or press 1–%1 to cut to it.</source>

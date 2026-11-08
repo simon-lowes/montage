@@ -1576,12 +1576,12 @@ public:
     bool loseWhileRecording = false, staleStatus = false;
     double servoLockAfter = 0.2;
     // A deck's own ways: stopped, its LTC answered as corrected LTC (74.14); every so many timecodes one this many
-    // frames out (a jittery reader), or so many in a row that far out once it passes a frame in an edit; recording
-    // from In at once when told to edit, with no run up.
+    // frames out (a jittery reader), or so many in a row that far out once it passes a frame in an edit (and again
+    // once it passes a later one); recording from In at once when told to edit, with no run up.
     bool correctedLtcWhenStopped = false;
     int jitterEvery = 0, jitterFrames = 0, timecodeReads = 0;
-    int64_t burstFrom = -1;
-    int burstReads = 0;
+    int64_t burstFrom = -1, laterBurstFrom = -1;
+    int burstReads = 0, laterBurstReads = 0;
     bool recordWithoutRoll = false;
     int64_t heldUp = -1;  // a picture its output sends a frame and a half late (held up on its way)
 
@@ -1714,6 +1714,7 @@ private:
             ++timecodeReads;
             int64_t off = jitterEvery > 0 && timecodeReads % jitterEvery == 0 ? jitterFrames : 0;
             if (burstReads > 0 && autoEdit && here >= burstFrom) off = jitterFrames, --burstReads;
+            else if (laterBurstReads > 0 && autoEdit && here >= laterBurstFrom) off = jitterFrames, --laterBurstReads;
             return timecode(correctedLtcWhenStopped && speed == 0 ? cmd::CorrectedLtcTimeData : cmd::LtcTimeData, here + off);
         }
         if (q.is(6, cmd::StatusSense)) return status();
@@ -2454,7 +2455,7 @@ private slots:
         }
 
         // The reader slipping five frames for a moment just as the deck runs up to In: four readings in a row, and six
-        // (more than half of its last nine, so the deck seems somewhere else until it is seen where it was going). The
+        // (two-thirds of its last nine, so the deck seems somewhere else until it is seen where it was going). The
         // edit is made all the same, the Program started once and standing, rather than the run up taken as lost and
         // the edit failed when the deck records before it is seen running up again.
         TapeEdit eb = ej;
@@ -2469,6 +2470,42 @@ private slots:
             std::lock_guard lock(sim.m);
             sim.burstReads = 0;
             QVERIFY2(made, qPrintable(QString("%1 in a row: %2").arg(burst).arg(err.c_str())));
+            QCOMPARE(rolls, 1);
+            QCOMPARE(sim.recordedFrom, eb.in);
+            QCOMPARE(sim.recordedTo, eb.out);
+        }
+        // The same slip of six as the deck records, then the reader five frames out for twenty readings in a row
+        // halfway through: the run seen again where it was going clears the doubt about the recording, so the later
+        // misread does not fail the edit and stop the deck mid-recording.
+        {
+            eb.in += 250, eb.out = eb.in + 50;
+            {
+                std::lock_guard lock(sim.m);
+                sim.jitterFrames = 5, sim.burstFrom = eb.in - 2, sim.burstReads = 6;
+                sim.laterBurstFrom = eb.in + 25, sim.laterBurstReads = 20;
+            }
+            rolls = 0;
+            const bool made = editToTape(deck, eb, [&](int64_t, double) { ++rolls; }, nullptr, &err);
+            std::lock_guard lock(sim.m);
+            sim.burstReads = sim.laterBurstReads = 0;
+            QVERIFY2(made, err.c_str());
+            QCOMPARE(rolls, 1);
+            QCOMPARE(sim.recordedFrom, eb.in);
+            QCOMPARE(sim.recordedTo, eb.out);
+        }
+        // A reader alternating between two readings five frames apart: the run is kept through the off ones (rather
+        // than started again on each), so the deck is seen running up, the Program started once and the edit made.
+        {
+            eb.in += 250, eb.out = eb.in + 50;
+            {
+                std::lock_guard lock(sim.m);
+                sim.jitterEvery = 2, sim.jitterFrames = 5;
+            }
+            rolls = 0;
+            const bool made = editToTape(deck, eb, [&](int64_t, double) { ++rolls; }, nullptr, &err);
+            std::lock_guard lock(sim.m);
+            sim.jitterEvery = 0;
+            QVERIFY2(made, err.c_str());
             QCOMPARE(rolls, 1);
             QCOMPARE(sim.recordedFrom, eb.in);
             QCOMPARE(sim.recordedTo, eb.out);
@@ -25776,6 +25813,19 @@ if ui["pressed"] == "add":
                 QVERIFY(!runFarmNode(o, nullptr, &why));
                 QVERIFY2(QString::fromStdString(why).contains("every render node can read their key"), why.c_str());
                 QFile::remove(dir.path() + "/farm-link");
+                // (and a folder of its own whose private key is a link to a file on the share)
+                QVERIFY(QDir().mkpath(QString::fromStdString(farm) + "/stash") && QDir().mkpath(dir.path() + "/linked-keys"));
+                {
+                    QFile key(QString::fromStdString(farm) + "/stash/leaf.key");
+                    QVERIFY(key.open(QIODevice::WriteOnly));
+                }
+                QVERIFY(QFile::link(QString::fromStdString(farm) + "/stash/leaf.key", dir.path() + "/linked-keys/leaf.key"));
+                o.certificates = (dir.path() + "/linked-keys").toStdString();
+                why.clear();
+                QVERIFY(!runFarmNode(o, nullptr, &why));
+                QVERIFY2(QString::fromStdString(why).contains("every render node can read their key"), why.c_str());
+                QDir(dir.path() + "/linked-keys").removeRecursively();
+                QDir(QString::fromStdString(farm) + "/stash").removeRecursively();
 #endif
                 QVERIFY(!QFileInfo::exists(QString::fromStdString(farm) + "/nodes/Shared Keys.json") &&
                         !QFileInfo::exists(QString::fromStdString(farm) + "/nodes/Shared_Keys.json"));
@@ -33041,7 +33091,9 @@ if ui["pressed"] == "add":
         QCOMPARE(st.drafted, 0);
         QVERIFY(garbled.find("unk") == std::string::npos);
         // A file dialog's filters keep the source's patterns: the model's "(*.Montage)" becomes "(*.montage)" again, and a
-        // draft that lost a filter, or wrote a run of backslashes for words it could not place, is not kept.
+        // separator it doubled (";;;") or wrote its own way ("؛") is not left on a filter's name. A draft that lost a
+        // filter, kept only pieces of the patterns for a filter's name, or wrote backslashes for words it could not place
+        // (a run, or a single one), is not kept.
         const std::string filters = R"(<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE TS>
 <TS version="2.1" language="de">
@@ -33059,20 +33111,40 @@ if ui["pressed"] == "add":
         <source>Film list</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Add to Queue</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Timelines (*.xml *.otio);;OpenTimelineIO (*.otio)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>IAMF in MP4 (*.mp4);;IAMF stream (*.iamf)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>;;Text (*.txt)</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 </TS>
 )";
         std::string filtered;
         QVERIFY(draftInterfaceTranslation(filters, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
-            o = {"Montageprojekte (*.Montage);;Alle Dateien (*)", "EDL ändern (*.edl); Liste ändern (*.csv)", "\\\\ \\\\"};
-            return in.size() == 3;
+            o = {"Montageprojekte (*.Montage);;Alle Dateien (*)", "EDL ändern (*.edl); Liste ändern (*.csv)", "\\\\ \\\\", "Zur \\ ueue",
+                 "*.otio) (*.xml *.otio);;OpenTimelineIO (*.otio)", "IAMF en MP4 (*.mp4);;;IAMF stream (*.iamf)", ";;\xD8\x9B Text (*.txt)"};
+            return in.size() == 7;
         }, filtered, &st));
-        QCOMPARE(st.drafted, 1);
+        QCOMPARE(st.drafted, 3);
         QVERIFY2(filtered.find("<translation type=\"unfinished\">Montageprojekte (*.montage);;Alle Dateien (*)</translation>") !=
                      std::string::npos, filtered.c_str());
-        QVERIFY(filtered.find("Liste") == std::string::npos && filtered.find('\\') == std::string::npos);
-        // And none of the languages Montage ships holds such a draft: no "<unk>", no run of backslashes, and each file
-        // filter with the source's own patterns.
+        QVERIFY2(filtered.find("<translation type=\"unfinished\">IAMF en MP4 (*.mp4);;IAMF stream (*.iamf)</translation>") != std::string::npos,
+                 filtered.c_str());
+        QVERIFY2(filtered.find("<translation type=\"unfinished\">;;Text (*.txt)</translation>") != std::string::npos, filtered.c_str());
+        QVERIFY(filtered.find("Liste") == std::string::npos && filtered.find('\\') == std::string::npos && filtered.find("*.otio) (") == std::string::npos);
+        // And none of the languages Montage ships holds such a draft: no "<unk>", no backslash the source has not, and each
+        // file filter with the source's own patterns and a name of words (no asterisk, bracket left open or separator).
         const QDir shipped(QStringLiteral(MONTAGE_TEST_DATA_DIR "/../../translations"));
         const QStringList files = shipped.entryList({QStringLiteral("montage_*.ts")}, QDir::Files);
         QVERIFY(!files.isEmpty());
@@ -33092,10 +33164,16 @@ if ui["pressed"] == "add":
                 const auto m = it.next();
                 const QString source = m.captured(1), translation = m.captured(2);
                 if (translation.isEmpty()) continue;
-                QVERIFY2(!translation.contains(QStringLiteral("\\\\")) || source.contains(QStringLiteral("\\\\")),
-                         qPrintable(name + ": " + translation));
-                if (source.contains(QStringLiteral("(*")))
-                    QVERIFY2(patternsOf(translation) == patternsOf(source), qPrintable(name + ": " + source + " -> " + translation));
+                QVERIFY2(translation.count('\\') <= source.count('\\'), qPrintable(name + ": " + translation));
+                if (!source.contains(QStringLiteral("(*"))) continue;
+                QVERIFY2(patternsOf(translation) == patternsOf(source), qPrintable(name + ": " + source + " -> " + translation));
+                for (QString filter : translation.split(QStringLiteral(";;"))) {
+                    if (!filter.contains('*')) continue;
+                    filter = filter.left(filter.lastIndexOf('(')).trimmed();
+                    QVERIFY2(!filter.isEmpty() && !filter.contains('*') && filter.count('(') == filter.count(')') &&
+                                 !filter.startsWith(';') && !filter.startsWith(QChar(0x061B)),
+                             qPrintable(name + ": " + translation));
+                }
             }
         }
     }

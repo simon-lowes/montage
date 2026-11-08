@@ -19303,7 +19303,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
-        <translation type="unfinished">;;* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * (*.txt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Select the video clips to arrange, or put the playhead over them</source>
@@ -21701,7 +21701,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">*.fcpxml *.otio *.edl *.aaf *.avb (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF Komposition (CPL*.xml ASSETMAP.xml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import IMF Package</source>

@@ -332,7 +332,7 @@ bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void
     // readings moving forward at play speed, each where the run puts it, is the deck rolling. Where the deck is comes
     // from its run (the median of its last readings less play speed's frames since), so readings a few frames off (a
     // jittery time source) neither break the run nor move the Program's start: the deck is somewhere else only when
-    // most of its last nine readings say so. Should it seem to be once the Program was started, the Program stands
+    // two-thirds of its last nine readings say so. Should it seem to be once the Program was started, the Program stands
     // until a steady run shows where the deck is: the same place, or (before In) somewhere else, the Program started
     // again from there as it runs up; recording begun meanwhile fails only if the deck was somewhere else.
     const double limit = captureClock() + double(preroll + (e.out - e.in)) / fps + 60;
@@ -376,8 +376,12 @@ bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void
                 run.starts.push_back(start);
                 if (run.starts.size() > 5) run.starts.erase(run.starts.begin());
             } else {
+                // (somewhere else once two-thirds of the recent readings are off the run, not half: a reader alternating
+                // between two values keeps its run rather than starting one on each off reading)
                 run.latest = false;
-                if (recent.size() >= 5 && std::fabs(median(recent) - median(run.starts)) > slack) startRun();
+                const double at = median(run.starts);
+                const auto off = std::count_if(recent.begin(), recent.end(), [&](double r) { return std::fabs(r - at) > slack; });
+                if (recent.size() >= 5 && off * 3 >= ptrdiff_t(recent.size()) * 2 && std::fabs(median(recent) - at) > slack) startRun();
             }
         }
         // (where the deck is: its run's, else the reading's)
@@ -387,9 +391,15 @@ bool editToTape(ninepin::Deck& deck, const TapeEdit& e, const std::function<void
         if (st->record && !recorded && unsure) recordedUnsure = true;
         recorded = recorded || st->record;
         if (unsure && steady) {
-            if (std::fabs(median(run.starts) - rolledStart) <= slack) rolledOn = run.began;  // (where it was going: the Program stands)
-            else if (recordedUnsure) return fail("The deck jumped as it ran up to the edit's In, and recorded before it was seen running up again");
-            else if (!recorded && here < double(in)) rolled = false;  // (it jumped before In: the Program started again once it runs up)
+            if (std::fabs(median(run.starts) - rolledStart) <= slack) {
+                // (where it was going: the Program stands, and recording begun meanwhile was begun from there)
+                rolledOn = run.began;
+                recordedUnsure = false;
+            } else if (recordedUnsure) {
+                return fail("The deck jumped as it ran up to the edit's In, and recorded before it was seen running up again");
+            } else if (!recorded && here < double(in)) {
+                rolled = false;  // (it jumped before In: the Program started again once it runs up)
+            }
         }
         // (recording with the Program not started from where the deck ran up: the paused Program would go to tape)
         if (recorded && !rolled) return fail("The deck recorded without being seen running up to the edit's In");

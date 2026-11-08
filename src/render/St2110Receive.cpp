@@ -255,7 +255,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
             // (a few strangers counted at a time: the one heard least let go)
             auto least = who.others.begin();
             for (auto it = who.others.begin(); it != who.others.end(); ++it)
-                if (it->second < least->second) least = it;
+                if (it->second.count < least->second.count) least = it;
             who.others.erase(least);
         }
     };
@@ -264,9 +264,12 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
         // numbered as the stream is, not a stray far off; unless the stray is the other path's (heard first on a leg
         // that is otherwise dead): this one is taken once it has sent a window with fewer than a quarter as many of
         // that one's between, the count started again from its numbers and the other path let go to find its own.
-        if (who.others.empty()) who.otherAt = received[otherSide];
-        const int64_t theirs = ++who.others[p.ssrc];
-        if (theirs <= int64_t(window_) || (received[otherSide] - who.otherAt) * 4 >= theirs) return turnAway();
+        // (each counted against the other path's packets since it was first heard: a stray heard long before on this
+        // leg does not hold back a sender that starts on it once the other leg has died)
+        auto heard = who.others.find(p.ssrc);
+        if (heard == who.others.end()) heard = who.others.emplace(p.ssrc, Heard{0, received[otherSide]}).first;
+        const int64_t theirs = ++heard->second.count;
+        if (theirs <= int64_t(window_) || (received[otherSide] - heard->second.otherAt) * 4 >= theirs) return turnAway();
         other = Sender{};
         flush(out);
         started_ = false;
@@ -277,7 +280,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     if (who.have && p.ssrc != who.ssrc) {
         // (the one taken's packets counted from the first stranger's; all counted again once it has sent a window)
         if (who.others.empty()) who.own = 0;
-        const int64_t theirs = ++who.others[p.ssrc];
+        const int64_t theirs = ++who.others[p.ssrc].count;
         if (theirs <= int64_t(window_) || who.own * 4 >= theirs) return turnAway();
         // A window of another sender's, with few of the one taken between: that one now. The count starts again from
         // its numbers, unless the other path's new sender has just started it (both legs' senders started again).
@@ -290,7 +293,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
             sinceRestart_ = 0;
         }
     }
-    if (!who.have) who = Sender{true, p.ssrc, 0, {}, 0};
+    if (!who.have) who = Sender{true, p.ssrc, 0, {}};
     if (++who.own >= int64_t(window_)) who.own = 0, who.others.clear();
     ++sinceRestart_;
     ++received[path & 1];

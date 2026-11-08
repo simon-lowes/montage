@@ -8964,7 +8964,7 @@ Download it now?</source>
     </message>
     <message>
         <source>WebVTT (*.vtt)</source>
-        <translation type="unfinished">WebVTT*.vtt (*.vtt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Scenarist SCC, CEA-608 (*.scc)</source>
@@ -19759,7 +19759,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
-        <translation type="unfinished">;;؛ النص (*.txt)</translation>
+        <translation type="unfinished">;;النص (*.txt)</translation>
     </message>
     <message>
         <source>Select the video clips to arrange, or put the playhead over them</source>

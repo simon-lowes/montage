@@ -20358,7 +20358,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>IAMF in MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)</source>
-        <translation type="unfinished">IAMF en MP4 (*.mp4 *.m4a);;;IAMF stream (*.iamf)</translation>
+        <translation type="unfinished">IAMF en MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)</translation>
     </message>
     <message>
         <source>This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR</source>
@@ -21713,7 +21713,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;IMF composition (CPL*.xml ASSETMAP.xml)</source>
-        <translation type="unfinished">*.otio *.edl *.aaf *.avb) (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;; Final Cut Pro 7 XML (*.xml);;FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;AAF (Media Composer, Pro Tools) (*.aaf);;; Media Composer bin (*.avb);;composición del FMI (CPL*.xml ASSETMAP.xml)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Import IMF Package</source>

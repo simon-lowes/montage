@@ -14786,7 +14786,7 @@ const auto seq = [this] { return state()->sequence(); };
         });
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         state()->setInPoint(10);
-        state()->setOutPoint(19);
+        state()->setOutPoint(29);
         const bool was = program->loop();
         program->setLoop(true);
         std::vector<std::pair<qint64, FrameTime>> seen;
@@ -14796,30 +14796,33 @@ const auto seq = [this] { return state()->sequence(); };
         program->seek(10);
         program->play();
         QTest::qWait(3000);
+        const qint64 end = clock.elapsed();
         disconnect(c);
-        // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
+        // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it (and it
+        // goes on: a frozen player, staying where it is, does not pass).
         const FrameTime at = program->position();
         program->setLoop(false);
-        QTest::qWait(200);
+        QTRY_VERIFY_WITH_TIMEOUT(program->position() != at, 1000);
         const FrameTime after = program->position();
         program->pause();
         program->setLoop(was);
-        QVERIFY2(after >= at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
+        QVERIFY2(after > at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
         QVERIFY(seen.size() > 10);
         const double fps = state()->sequence()->fpsValue();
         int wraps = 0;
         for (size_t i = 0; i < seen.size(); ++i) {
-            QVERIFY2(seen[i].second >= 10 && seen[i].second <= 19, qPrintable(QString::number(seen[i].second)));
+            QVERIFY2(seen[i].second >= 10 && seen[i].second <= 29, qPrintable(QString::number(seen[i].second)));
             if (i > 0 && seen[i].second < seen[i - 1].second) ++wraps;  // (back to In)
         }
         QVERIFY2(wraps >= 2, qPrintable(QString::number(wraps)));
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
-        // Between two ticks the picture moves on by the difference of the two frames round the 10-frame loop: a tick that
-        // comes late and lands just past a wrap (14, then 11: 7 frames on) is not a step back. Ticks a whole pass (a third
-        // of a second) or more apart would hide passes: up to half a second, the passes are counted from the time between
-        // them; longer is a stall, and fails.
+        // Between two ticks the picture moves on by the difference of the two frames round the 20-frame loop: a tick that
+        // comes late and lands just past a wrap (24, then 11: 7 frames on) is not a step back. Half a second or more
+        // without a new frame is a stall, and fails, the last frame's to the end of the wait too; a pass is two-thirds of
+        // a second, so no pass hides between ticks closer than that, and a shorter freeze is credited with only the
+        // frames the picture moved, not with those the time between would have shown.
         // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
         size_t first = 1;
         while (first < seen.size() && seen[first].second == seen[0].second) ++first;
@@ -14828,9 +14831,9 @@ const auto seq = [this] { return state()->sequence(); };
         for (size_t i = first + 1; i < seen.size(); ++i) {
             const qint64 gap = seen[i].first - seen[i - 1].first;
             QVERIFY2(gap < 500, qPrintable(QStringLiteral("no new frame for %1 ms").arg(gap)));
-            const int on = int(((seen[i].second - seen[i - 1].second) % 10 + 10) % 10);
-            frames += on + 10.0 * std::max(0.0, std::round((double(gap) / 1000.0 * fps - on) / 10.0));
+            frames += double(((seen[i].second - seen[i - 1].second) % 20 + 20) % 20);
         }
+        QVERIFY2(end - seen.back().first < 500, qPrintable(QStringLiteral("no new frame for the last %1 ms").arg(end - seen.back().first)));
         const double rate = frames / (double(seen.back().first - seen[first].first) / 1000.0);
         QVERIFY2(std::fabs(rate - fps) < fps * 0.1, qPrintable(QStringLiteral("%1 frames a second, not %2").arg(rate).arg(fps)));
         state()->newProject();

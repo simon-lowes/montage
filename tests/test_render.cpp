@@ -15042,6 +15042,24 @@ colorspaces:
             for (size_t k = 3; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(100 + 16 + k - 3));
             QCOMPARE(merger.lost, int64_t(0));
         }
+        // A stray heard on leg B while leg A carries the stream, trickling on: once leg A dies, a sender that starts on
+        // leg B numbered far from the stream is taken after a window of it, the stray heard long before not counted
+        // against it with all of leg A's packets since.
+        {
+            st::PathMerger merger(false, 16);
+            std::vector<std::vector<uint8_t>> out;
+            for (uint32_t i = 0; i < 300; ++i) {
+                if (i % 16 == 5) merger.push(sent(9000 + i, 5), 1, out);
+                merger.push(sent(100 + i, 6), 0, out);
+            }
+            QCOMPARE(int(out.size()), 300);
+            for (uint32_t i = 0; i < 100; ++i) {
+                if (i % 16 == 5) merger.push(sent(9500 + i, 5), 1, out);
+                merger.push(sent(20000 + i, 60), 1, out);
+            }
+            QCOMPARE(int(out.size()), 300 + 100 - 16);
+            for (size_t k = 300; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(20016 + k - 300));
+        }
         // ST 2022-7 legs from senders with SSRCs of their own: merged by number, each leg's losses filled by the other;
         // and when both legs' senders start again with new SSRCs, the count starts again once, nothing given out twice.
         {
@@ -19874,6 +19892,35 @@ colorspaces:
                      qPrintable(QString("solo %1 after %2: %3 against %4").arg(solo).arg(was).arg(steps(crossed, before)).arg(bound)));
             was = solo;
             before = crossed;
+        }
+        // Moved on to a third band before the last move's fade is done (the band it left still the louder): each filter
+        // still heard fades out, none let go from one sample to the next.
+        {
+            std::vector<fx::EqBand> trio = loud;
+            trio.push_back({6000, 0, 2, fx::EqShape::BandPass});
+            auto settledOn = [&](int solo) {
+                fx::ParametricEq x;
+                x.set(sr, trio, 0, solo);
+                run(x, 0, 40);
+                return steps(run(x, 40 * block, 10));
+            };
+            fx::ParametricEq moving;
+            moving.set(sr, trio, 0, 1);
+            std::vector<float> heard = run(moving, 0, 40);
+            const size_t held = heard.size();
+            moving.set(sr, trio, 0, 0);
+            std::vector<float> part = tone(40 * block, block / 2, 200);
+            moving.process(part.data(), block / 2);
+            heard.insert(heard.end(), part.begin(), part.end());
+            moving.set(sr, trio, 0, 2);
+            for (int k = 0; k < 8; ++k) {
+                std::vector<float> buf = tone(40 * block + block / 2 + k * block, block, 200);
+                moving.process(buf.data(), block);
+                heard.insert(heard.end(), buf.begin(), buf.end());
+            }
+            const std::vector<float> before3(heard.begin(), heard.begin() + ptrdiff_t(held)), after3(heard.begin() + ptrdiff_t(held), heard.end());
+            const double bound = 1.1 * std::max({settledOn(1), settledOn(0), settledOn(2)}) + 2e-3;
+            QVERIFY2(steps(after3, before3) <= bound, qPrintable(QString("%1 against %2").arg(steps(after3, before3)).arg(bound)));
         }
         // A band with gain removed as it plays fades out as one switched off does, where it was among the others: no
         // step larger than the sound makes with it or without it; then it is gone.

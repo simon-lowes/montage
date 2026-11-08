@@ -3642,7 +3642,8 @@ struct AudioMixer::State {
     fx::Tremolo tremolo;
     fx::Saturator saturator;
     fx::StereoWidth width;
-    std::vector<double> lastParams;
+    std::vector<double> lastParams, params;  // (params: this block's, kept for its room)
+    std::vector<fx::EqBand> eqBands;          // (likewise: the EQ's bands as last set)
     // Dynamics' detector: the sidechain (or the signal) through an optional high-pass.
     Biquad keyHp;
     double keyHz = -1;
@@ -3869,10 +3870,12 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         if (!e.enabled || isSourceAudioEffect(e.type)) continue;
         auto& st = states_[{owner, e.id}];
         if (!st) st = std::make_unique<State>();
-        std::vector<double> params;
+        // (nothing allocated each block once the effect has played: the vectors keep their room)
+        std::vector<double>& params = st->params;
+        params.clear();
         for (const auto& [k, v] : e.params) params.push_back(v.at(lt));
         bool changed = params != st->lastParams;
-        st->lastParams = params;
+        std::swap(st->params, st->lastParams);
         if (e.type == "upmix") {
             // Here the sound stays stereo (a clip, a bus, a stereo mix): only the upmix's latency, so it stays in line.
             if (e.id == skipUpmix_) continue;
@@ -3953,8 +3956,8 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             std::string shape = e.s("audition") + '#' + std::to_string(e.params.size());
             if (changed || shape != st->eqShape) {
                 int solo = -1;
-                const std::vector<fx::EqBand> bands = fx::eqBandsOf(e, lt, &solo);
-                st->eq.set(sr, bands, e.p("output_db", lt, 0), solo);
+                fx::eqBandsOf(e, lt, st->eqBands, &solo);
+                st->eq.set(sr, st->eqBands, e.p("output_db", lt, 0), solo);
                 st->eqShape = std::move(shape);
             }
             st->eq.process(buf, frames);

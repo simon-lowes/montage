@@ -446,8 +446,9 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
     if (!make && present == 0) return fail("There is no DCP signing chain in " + dir.path().toStdString());
     // (and two programs at once, the app and the command-line tool sharing the folder: a lock file in it while one
     // is made, and another look once it is held)
+    // Only to make one: a chain that is only read and has a file missing is reported at once, not after a wait.
     std::optional<QLockFile> others;
-    if (present != 4 && QDir().mkpath(dir.path())) {
+    if (make && present != 4 && QDir().mkpath(dir.path())) {
         others.emplace(dir.filePath(QStringLiteral(".chain.lock")));
         others->setStaleLockTime(120000);
         if (others->tryLock(60000)) present = count();
@@ -458,9 +459,12 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
     if (present == 4) {
         CertificateChain chain;
         for (const char* name : files) {
+            // (unbuffered, and what was read wiped once copied: no copy of the private key left behind)
             QFile f(dir.filePath(QString::fromLatin1(name)));
-            if (!f.open(QIODevice::ReadOnly)) return fail("Cannot read " + f.fileName().toStdString());
-            std::string text = f.readAll().toStdString();
+            if (!f.open(QIODevice::ReadOnly | QIODevice::Unbuffered)) return fail("Cannot read " + f.fileName().toStdString());
+            QByteArray bytes = f.readAll();
+            std::string text(bytes.constData(), size_t(bytes.size()));
+            cleanse(bytes.data(), size_t(bytes.size()));
             if (text.empty()) return fail(f.fileName().toStdString() + " is empty: restore it from a backup (DKDMs need this signing chain)");
             if (std::strcmp(name, "leaf.key") == 0) chain.privateKey = std::move(text);
             else chain.certificates.push_back(std::move(text));

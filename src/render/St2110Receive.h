@@ -75,13 +75,16 @@ private:
     bool started_ = false;
     // Each path's sender: its SSRC, its packets since the others' were last counted from, and theirs (by SSRC, a few);
     // with none yet, those that would be its first but are numbered far from the stream, and the other path's count
-    // when the first of them came.
+    // when each of them was first heard.
+    struct Heard {
+        int64_t count = 0;
+        int64_t otherAt = 0;
+    };
     struct Sender {
         bool have = false;
         uint32_t ssrc = 0;
         int64_t own = 0;
-        std::map<uint32_t, int64_t> others;
-        int64_t otherAt = 0;
+        std::map<uint32_t, Heard> others;
     } sender_[2];
     int64_t next_ = 0;
     int64_t lateRun_ = 0;     // packets in a row from before the window (a sender restarted, or one jumped ahead of)

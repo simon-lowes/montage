@@ -19426,7 +19426,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
-        <translation type="unfinished">;;* Текст (*.txt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Select the video clips to arrange, or put the playhead over them</source>
