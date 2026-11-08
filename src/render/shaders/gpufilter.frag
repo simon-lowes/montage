@@ -41,6 +41,7 @@
 //      inverse map's rows, transparent outside)
 //   27 Find Edges, 28 Emboss, 29 Halftone, 30 Duotone, 31 VHS (the table each row's shift, tearing and scanline), 32 Tilt-Shift's
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
+//   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -309,6 +310,23 @@ float halftoneDot(ivec2 size, float x, float y, float c, float s, int channel) {
     const float r = cell * sqrt((1.0 - tone) / 3.14159265358979);
     const float d = length(vec2(u - cu, v - cv)) * cell;
     return smoothstepFx(r + 0.5, r - 0.5, d);
+}
+
+// The table's i-th texel, its rows read as one run.
+vec4 tableTexel(int i) {
+    const int w = textureSize(table, 0).x;
+    return texelFetch(table, ivec2(i % w, i / w), 0);
+}
+// render/MeshWarp's drawWarp sample: bilinear, clamped to the picture's edge.
+vec4 warpSample(ivec2 size, float x, float y) {
+    x = clamp(x - 0.5, 0.0, float(size.x - 1));
+    y = clamp(y - 0.5, 0.0, float(size.y - 1));
+    const int x0 = min(int(x), size.x - 1), y0 = min(int(y), size.y - 1), x1 = min(x0 + 1, size.x - 1), y1 = min(y0 + 1, size.y - 1);
+    const float fx = x - float(x0), fy = y - float(y0);
+    const vec4 a = texelFetch(srcTex, ivec2(x0, y0), 0), b = texelFetch(srcTex, ivec2(x1, y0), 0);
+    const vec4 c = texelFetch(srcTex, ivec2(x0, y1), 0), e = texelFetch(srcTex, ivec2(x1, y1), 0);
+    const vec4 top = a + (b - a) * fx, bottom = c + (e - c) * fx;
+    return top + (bottom - top) * fy;
 }
 
 void main() {
@@ -666,6 +684,38 @@ void main() {
         if (abs(p[2].w - 1.0) > 1e-4) {
             const float l = lumaOf(o);
             o.rgb = max(vec3(0.0), l + (o.rgb - l) * p[2].w);
+        }
+        fragColor = o;
+        return;
+    }
+    if (mode == 33) {
+        // Mesh Warp and Grid Warp (drawWarp): the triangles that may cover the pixel's tile, back to front, each drawing
+        // the pixels it owns by the CPU's rule over those before it. p[1] the tile's size, the tiles across, where the
+        // triangles start in the table; the table each tile's list (its start and length) at the tile's index, the lists,
+        // then each triangle in 6 texels (edges k: A, B and the vertex P they are worked out from; the values at the
+        // vertices with which edges' pixels it owns, by bit; its vertices at rest)
+        const int tile = int(p[1].x), tris = int(p[1].z);
+        const ivec2 tc = xy / tile;
+        const vec4 list = tableTexel(tc.y * int(p[1].y) + tc.x);
+        const int first = int(list.x), n = int(list.y);
+        const float x = float(xy.x) + 0.5, y = float(xy.y) + 0.5;
+        vec4 o = vec4(0.0);
+        for (int i = 0; i < n; ++i) {
+            const int at = tris + int(tableTexel(first + i).x) * 6;
+            const vec4 vals = tableTexel(at + 3);
+            const int own = int(vals.w);
+            vec3 l;
+            bool inside = true;
+            for (int k = 0; k < 3 && inside; ++k) {
+                const vec4 ed = tableTexel(at + k);
+                const float e = ed.x * (x - ed.z) + ed.y * (y - ed.w);
+                l[k] = e / vals[k];
+                inside = l[k] > 0.0 || (e == 0.0 && ((own >> k) & 1) != 0);
+            }
+            if (!inside) continue;
+            const vec4 r01 = tableTexel(at + 4), r2 = tableTexel(at + 5);
+            const vec4 s = warpSample(size, l.x * r01.x + l.y * r01.z + l.z * r2.x, l.x * r01.y + l.y * r01.w + l.z * r2.y);
+            o = s + o * (1.0 - s.a);
         }
         fragColor = o;
         return;

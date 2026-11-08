@@ -19227,6 +19227,13 @@ colorspaces:
             {"duotone", {{}, {{"mix", 60}, {"shadows.r", 0.3}}, {{"highlights.g", 0.2}}}},
             {"vhs", {{}, {{"amount", 60}, {"bleed", 7}, {"tracking", 80}}, {{"noise", 80}, {"scanlines", 70}}}},
             {"tilt_shift", {{}, {{"blur", 5}, {"angle", 30}, {"focus", 30}, {"saturation", 100}}, {{"blur", 0.2}, {"saturation", 150}}}},
+            {"mesh_warp",
+             {{{"mesh_from", 1}, {"pin1.kind", 0}, {"pin1.x", 0.3}, {"pin1.y", 0.4}, {"pin1.to_x", 0.4}, {"pin1.to_y", 0.47}, {"pin2.kind", 0}, {"pin2.x", 0.7}, {"pin2.y", 0.6}},
+              {{"mesh_from", 1}, {"density", 500}, {"pin1.kind", 0}, {"pin1.x", 0.2}, {"pin1.y", 0.2}, {"pin1.to_x", 0.15}, {"pin2.kind", 2}, {"pin2.x", 0.6},
+               {"pin2.y", 0.5}, {"pin2.angle", 30}, {"pin2.radius", 40}, {"pin3.kind", 3}, {"pin3.x", 0.5}, {"pin3.y", 0.5}, {"pin3.radius", 30}, {"pin3.depth", 80}},
+              {{"mesh_from", 1}, {"pin1.kind", 0}, {"pin1.x", 0.5}, {"pin1.y", 0.5}, {"pin1.to_x", 0.8}, {"pin1.to_y", 0.3}, {"pin2.kind", 1}, {"pin2.x", 0.2}, {"pin2.y", 0.7}}}},
+            {"grid_warp", {{{"g1_1.dx", 0.05}, {"g1_1.dy", -0.04}}, {{"rows", 2}, {"cols", 4}, {"shape", 1}, {"g1_2.dx", -0.06}, {"g1_1.dy", 0.1}},
+                           {{"g0_0.dx", 0.1}, {"g3_2.dy", -0.08}, {"g2_2.dx", 0.12}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {

@@ -406,6 +406,15 @@ WarpMesh meshFor(const Effect& e, int w, int h) {
     return buildWarpMesh(w, h, int(std::lround(e.p("density", 0, 2000))));
 }
 
+// Mesh Warp's pins leave the picture as it is (where they are, and no bends).
+bool pinsStill(const std::vector<WarpPin>& ps) {
+    for (const WarpPin& p : ps) {
+        if (p.kind == PinKind::Position && p.to != p.at) return false;
+        if (p.kind == PinKind::Bend && (p.angle != 0 || p.scale != 1)) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 WarpMesh buildWarpMesh(int w, int h, int vertices, const Image* alpha, double grow) {
@@ -604,18 +613,9 @@ std::vector<double> warpDepths(const WarpMesh& m, const std::vector<WarpPin>& pi
     return depth;
 }
 
-void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>& moved, const std::vector<double>& depth, Image& out) {
-    const int W = out.width, H = out.height;
-    if (W <= 0 || H <= 0 || moved.size() != m.rest.size()) return;
-    // Each triangle's edges as edge functions A x + B y + C, worked out from the edge's lower-numbered vertex to its
-    // other, so the two triangles either side of an edge see the same numbers and share its pixels out exactly.
-    struct Tri {
-        double A[3], B[3], C[3], at[3];  // edge opposite vertex k; its value at vertex k
-        bool own[3];                     // a pixel centre exactly on edge k is this triangle's
-        int x0, x1, y0, y1;
-        MeshPoint r[3];
-    };
-    std::vector<Tri> tris;
+std::vector<WarpTriangle> warpTriangles(const WarpMesh& m, const std::vector<MeshPoint>& moved, const std::vector<double>& depth, int W, int H) {
+    std::vector<WarpTriangle> tris;
+    if (W <= 0 || H <= 0 || moved.size() != m.rest.size()) return tris;
     tris.reserve(m.tris.size());
     std::vector<int> order(m.tris.size());
     std::iota(order.begin(), order.end(), 0);
@@ -624,7 +624,7 @@ void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>&
     });
     for (int t : order) {
         const auto& tr = m.tris[size_t(t)];
-        Tri d{};
+        WarpTriangle d{};
         bool ok = true;
         double minX = 1e300, maxX = -1e300, minY = 1e300, maxY = -1e300;
         for (int k = 0; k < 3; ++k) {
@@ -634,6 +634,7 @@ void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>&
             d.A[k] = -(Q[1] - P[1]);
             d.B[k] = Q[0] - P[0];
             d.C[k] = -d.A[k] * P[0] - d.B[k] * P[1];
+            d.P[k] = P;
             const MeshPoint& V = moved[size_t(tr[size_t(k)])];
             d.at[k] = d.A[k] * V[0] + d.B[k] * V[1] + d.C[k];
             if (!(std::fabs(d.at[k]) > 1e-12) || !std::isfinite(d.at[k])) ok = false;
@@ -647,6 +648,12 @@ void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>&
         if (d.x0 > d.x1 || d.y0 > d.y1) continue;
         tris.push_back(d);
     }
+    return tris;
+}
+
+void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>& moved, const std::vector<double>& depth, Image& out) {
+    const int H = out.height;
+    const std::vector<WarpTriangle> tris = warpTriangles(m, moved, depth, out.width, out.height);
     auto sample = [&](double x, double y, float o[4]) {
         // Bilinear, clamped to the picture's edge (pixel centres at +0.5).
         x = std::clamp(x - 0.5, 0.0, double(src.width - 1));
@@ -662,7 +669,7 @@ void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>&
     };
     if (src.empty()) return;
     parallelRows(H, [&](int y0, int y1) {
-        for (const Tri& d : tris) {
+        for (const WarpTriangle& d : tris) {
             const int ya = std::max(d.y0, y0), yb = std::min(d.y1, y1 - 1);
             for (int y = ya; y <= yb; ++y) {
                 const double py = y + 0.5;
@@ -712,13 +719,7 @@ void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const bool blur = e.p("motion_blur", t, 0) > 0.5;
     const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
     const bool show = e.p("show_mesh", t, 0) > 0.5;
-    auto still = [](const std::vector<WarpPin>& ps) {
-        for (const WarpPin& p : ps) {
-            if (p.kind == PinKind::Position && p.to != p.at) return false;
-            if (p.kind == PinKind::Bend && (p.angle != 0 || p.scale != 1)) return false;
-        }
-        return true;
-    };
+    auto still = [](const std::vector<WarpPin>& ps) { return pinsStill(ps); };
     // Pins where they are (and no bends) leave the picture exactly as it was.
     if (!show && still(meshWarpPins(e, double(t), W, H, pixelScale)) &&
         (!blur || (still(meshWarpPins(e, t - shutter / 2, W, H, pixelScale)) && still(meshWarpPins(e, t + shutter / 2, W, H, pixelScale)))))
@@ -804,16 +805,19 @@ MeshPoint gridWarpPointAt(const Effect& e, double t, int r, int c) {
     return {double(c) / cols + e.pAt(n + ".dx", t, 0), double(r) / rows + e.pAt(n + ".dy", t, 0)};
 }
 
-void gridWarp(const Effect& e, FrameTime t, Image& img) {
-    if (img.empty()) return;
-    const int W = img.width, H = img.height;
-    const int rows = std::clamp(int(std::lround(e.p("rows", 0, 3))), 1, 12), cols = std::clamp(int(std::lround(e.p("cols", 0, 3))), 1, 12);
-    const bool smooth = std::lround(e.p("shape", t, 0)) == 0;
-    const bool blur = e.p("motion_blur", t, 0) > 0.5;
-    const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
-    const bool show = e.p("show_grid", t, 0) > 0.5;
-    // The points' moves (pixels) at a time.
-    auto moves = [&](double time) {
+namespace {
+// Grid Warp's grid (its points' moves at a time, pixels) and the fine lattice whose vertices follow the points:
+// Catmull-Rom between them (the end points repeated), or straight.
+struct GridWarpSetup {
+    const Effect& e;
+    int W, H, rows, cols, per;
+    bool smooth;
+    WarpMesh mesh;
+    GridWarpSetup(const Effect& effect, FrameTime t, int w, int h)
+        : e(effect), W(w), H(h), rows(std::clamp(int(std::lround(effect.p("rows", 0, 3))), 1, 12)),
+          cols(std::clamp(int(std::lround(effect.p("cols", 0, 3))), 1, 12)), per(std::max(2, 64 / std::max(rows, cols))),
+          smooth(std::lround(effect.p("shape", t, 0)) == 0), mesh(lattice(cols * per, rows * per, w, h)) {}
+    std::vector<MeshPoint> moves(double time) const {
         std::vector<MeshPoint> d(size_t(rows + 1) * size_t(cols + 1));
         for (int r = 0; r <= rows; ++r)
             for (int c = 0; c <= cols; ++c) {
@@ -821,15 +825,11 @@ void gridWarp(const Effect& e, FrameTime t, Image& img) {
                 d[size_t(r) * size_t(cols + 1) + size_t(c)] = {e.pAt(n + ".dx", time, 0) * W, e.pAt(n + ".dy", time, 0) * H};
             }
         return d;
-    };
-    auto still = [](const std::vector<MeshPoint>& d) {
+    }
+    static bool still(const std::vector<MeshPoint>& d) {
         return std::all_of(d.begin(), d.end(), [](const MeshPoint& p) { return p[0] == 0 && p[1] == 0; });
-    };
-    if (!show && still(moves(double(t))) && (!blur || (still(moves(t - shutter / 2)) && still(moves(t + shutter / 2))))) return;
-    // A fine lattice whose vertices follow the points: Catmull-Rom between them (the end points repeated), or straight.
-    const int per = std::max(2, 64 / std::max(rows, cols));
-    const WarpMesh mesh = lattice(cols * per, rows * per, W, H);
-    auto moved = [&](double time) {
+    }
+    std::vector<MeshPoint> moved(double time) const {
         const std::vector<MeshPoint> d = moves(time);
         auto at = [&](int r, int c) -> const MeshPoint& {
             return d[size_t(std::clamp(r, 0, rows)) * size_t(cols + 1) + size_t(std::clamp(c, 0, cols))];
@@ -861,12 +861,24 @@ void gridWarp(const Effect& e, FrameTime t, Image& img) {
                 p[0] += m[0], p[1] += m[1];
             }
         return out;
-    };
+    }
+};
+
+}  // namespace
+
+void gridWarp(const Effect& e, FrameTime t, Image& img) {
+    if (img.empty()) return;
+    const GridWarpSetup g(e, t, img.width, img.height);
+    const bool blur = e.p("motion_blur", t, 0) > 0.5;
+    const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
+    const bool show = e.p("show_grid", t, 0) > 0.5;
+    if (!show && g.still(g.moves(double(t))) && (!blur || (g.still(g.moves(t - shutter / 2)) && g.still(g.moves(t + shutter / 2))))) return;
     const std::vector<double> flat;
-    throughShutter(img, double(t), blur, shutter, moved,
-                   [&](const Image& src, double time, Image& out) { drawWarp(src, mesh, moved(time), flat, out); });
+    throughShutter(img, double(t), blur, shutter, [&](double time) { return g.moved(time); },
+                   [&](const Image& src, double time, Image& out) { drawWarp(src, g.mesh, g.moved(time), flat, out); });
     if (show) {
-        const std::vector<MeshPoint> v = moved(double(t));
+        const int rows = g.rows, cols = g.cols, per = g.per;
+        const std::vector<MeshPoint> v = g.moved(double(t));
         const int stride = cols * per + 1;
         const float colour[4] = {0.75f, 0.75f, 0.75f, 0.75f};
         for (int r = 0; r <= rows * per; ++r)
@@ -876,6 +888,35 @@ void gridWarp(const Effect& e, FrameTime t, Image& img) {
                 if (c % per == 0 && r < rows * per) drawLine(img, p, v[size_t(r + 1) * size_t(stride) + size_t(c)], colour);
             }
     }
+}
+
+int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, WarpMesh& mesh, std::vector<MeshPoint>& moved,
+                std::vector<double>& depth) {
+    const bool grid = e.type == "grid_warp";
+    const bool blur = e.p("motion_blur", t, 0) > 0.5;
+    const double shutter = std::max(0.0, e.p("shutter", t, 180)) / 360;
+    const bool show = e.p(grid ? "show_grid" : "show_mesh", t, 0) > 0.5;
+    const bool overAlpha = !grid && std::lround(e.p("mesh_from", t, 0)) == 0;
+    if (w <= 0 || h <= 0) return show || blur || overAlpha ? -1 : 0;
+    if (grid) {
+        const GridWarpSetup g(e, t, w, h);
+        if (!show && g.still(g.moves(double(t))) && (!blur || (g.still(g.moves(t - shutter / 2)) && g.still(g.moves(t + shutter / 2)))))
+            return 0;
+        if (show || blur) return -1;
+        mesh = g.mesh;
+        moved = g.moved(double(t));
+        depth.clear();
+        return 1;
+    }
+    if (!show && pinsStill(meshWarpPins(e, double(t), w, h, pixelScale)) &&
+        (!blur || (pinsStill(meshWarpPins(e, t - shutter / 2, w, h, pixelScale)) && pinsStill(meshWarpPins(e, t + shutter / 2, w, h, pixelScale)))))
+        return 0;
+    if (show || blur || overAlpha) return -1;
+    mesh = buildWarpMesh(w, h, int(std::lround(e.p("density", t, 2000))), nullptr, std::max(0.0, e.p("expand", t, 3)) * pixelScale);
+    const std::vector<WarpPin> pins = meshWarpPins(e, double(t), w, h, pixelScale);
+    moved = solveWarp(mesh, pins);
+    depth = warpDepths(mesh, pins);
+    return 1;
 }
 
 bool trackMeshPins(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime at,

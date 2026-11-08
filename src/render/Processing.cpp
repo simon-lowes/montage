@@ -3544,7 +3544,8 @@ bool isGpuFilter(const std::string& type) {
                                                   "crosstalk", "colour_correlation", "hdr_palette", "color_warper", "color_slice",
                                                   "film_grain", "rgb_mixer", "grain_match", "edge_extend", "wave_warp", "twirl", "spherize",
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
-                                                  "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift"};
+                                                  "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
+                                                  "grid_warp"};
     return filters.count(type) > 0;
 }
 
@@ -3955,6 +3956,49 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                         for (int r = 0; r < 3; ++r)
                             for (int c = 0; c < 3; ++c) f.passes.back().params[4 + r * 4 + c] = float(inv[r * 3 + c] / big);
                     }
+                }
+            }
+        } else if (ty == "mesh_warp" || ty == "grid_warp") {
+            // drawWarp's triangles (render/MeshWarp: the mesh solved on the CPU, as there), listed by the 8-pixel tiles
+            // they may reach, in the order drawn (gpufilter.frag's mode 33)
+            WarpMesh mesh;
+            std::vector<MeshPoint> moved;
+            std::vector<double> depth;
+            const int how = warpDrawing(e, t, width, height, pixelScale, mesh, moved, depth);
+            if (how < 0) return false;
+            const std::vector<WarpTriangle> tris = how > 0 ? warpTriangles(mesh, moved, depth, width, height) : std::vector<WarpTriangle>{};
+            if (how > 0) {
+                constexpr int kTile = 8;
+                const int across = (width + kTile - 1) / kTile, down = (height + kTile - 1) / kTile;
+                std::vector<std::vector<int>> lists(size_t(across) * size_t(down));
+                for (size_t i = 0; i < tris.size(); ++i)
+                    for (int ty0 = tris[i].y0 / kTile; ty0 <= tris[i].y1 / kTile; ++ty0)
+                        for (int tx0 = tris[i].x0 / kTile; tx0 <= tris[i].x1 / kTile; ++tx0) lists[size_t(ty0) * size_t(across) + size_t(tx0)].push_back(int(i));
+                size_t entries = 0;
+                for (const auto& l : lists) entries += l.size();
+                const size_t start = lists.size() + entries, texels = start + tris.size() * 6;
+                add(33, {float(kTile), float(across), float(start)});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = int(std::min<size_t>(4096, std::max<size_t>(1, texels)));
+                const size_t rows = (texels + size_t(fp.tableWidth) - 1) / size_t(fp.tableWidth);
+                fp.table.assign(rows * size_t(fp.tableWidth) * 4, 0.0f);
+                float* tb = fp.table.data();
+                size_t at = lists.size();
+                for (size_t k = 0; k < lists.size(); ++k) {
+                    tb[k * 4] = float(at), tb[k * 4 + 1] = float(lists[k].size());
+                    for (int i : lists[k]) tb[at++ * 4] = float(i);
+                }
+                for (size_t i = 0; i < tris.size(); ++i) {
+                    const WarpTriangle& d = tris[i];
+                    float* q = tb + (start + i * 6) * 4;
+                    for (int k = 0; k < 3; ++k) {
+                        q[k * 4] = float(d.A[k]), q[k * 4 + 1] = float(d.B[k]);
+                        q[k * 4 + 2] = float(d.P[k][0]), q[k * 4 + 3] = float(d.P[k][1]);
+                    }
+                    q[12] = float(d.at[0]), q[13] = float(d.at[1]), q[14] = float(d.at[2]);
+                    q[15] = float((d.own[0] ? 1 : 0) | (d.own[1] ? 2 : 0) | (d.own[2] ? 4 : 0));
+                    q[16] = float(d.r[0][0]), q[17] = float(d.r[0][1]), q[18] = float(d.r[1][0]), q[19] = float(d.r[1][1]);
+                    q[20] = float(d.r[2][0]), q[21] = float(d.r[2][1]);
                 }
             }
         } else if (ty == "find_edges") {
