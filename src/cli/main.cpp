@@ -2282,6 +2282,7 @@ int main(int argc, char** argv) {
 #endif
         // A Model Context Protocol server on stdin/stdout: stdout carries only protocol messages.
         McpServer server;
+        server.resumeStoredJobs();  // (background calls a crash or a restart cut short)
         return server.run(std::cin, std::cout);
     }
     if (cmd == "--version" || cmd == "version") {

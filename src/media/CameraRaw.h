@@ -6,7 +6,9 @@
 // 16-bit Rec.709 RGB with the Rec.709 curve, so it edits like any other still.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -37,7 +39,10 @@ struct RawSettings {
     bool half = false;       // half size: each 2x2 block of the sensor one pixel (quick, for playback)
     bool dngOpcodes = true;  // a DNG's opcode lists applied (media/DngOpcodes.h: lens shading, distortion, bad pixels)
 };
-bool developRaw(const std::string& path, RawImage& out, std::string* error = nullptr, const RawSettings& settings = {});
+// False with `error` when it cannot be developed, or when `cancel` stops it (heard between LibRaw's steps, between a DNG's
+// opcodes and between their rows). `opcodeProgress` (0 to 1) is told after each opcode of a DNG's list 3.
+bool developRaw(const std::string& path, RawImage& out, std::string* error = nullptr, const RawSettings& settings = {},
+                const std::atomic<bool>* cancel = nullptr, const std::function<void(double)>& opcodeProgress = {});
 // The white balance multipliers (red, green, blue, green = 1) that make light of `kelvin` with `tint` neutral for a camera
 // whose XYZ-to-camera matrix is `camFromXyz` (rows red, green, blue). False if the matrix is empty.
 bool whiteBalanceMultipliers(const float camFromXyz[3][3], double kelvin, double tint, float out[3]);

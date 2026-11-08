@@ -2,7 +2,8 @@
 //
 // Wow and flutter: the speed the tape passed the head at is read from the steady partials in the sound (a pilot or
 // hum tone, sustained notes): each one's frequency followed hop by hop from the phase of its own DFT, against its usual
-// frequency. The speed's slow drift (wow, under 4 Hz) and fast wobble (flutter, above) each take their own amount, and
+// frequency (the DFTs of every partial made together from blocks of samples the overlapping hops share, across the
+// cores). The speed's slow drift (wow, under 4 Hz) and fast wobble (flutter, above) each take their own amount, and
 // the sound is resampled along the inverse of that time map with a windowed sinc, so pitch and timing come back
 // together (unlike a time stretch).
 //
@@ -17,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -32,14 +34,20 @@ struct TransferSpeed {
     double at(double seconds) const;
 };
 // `pilotHz` names a tone the tape carries (within 3 %); 0 finds the steady partials. Empty when none is found.
-TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz = 0, const std::atomic<bool>* cancel = nullptr);
+// `progress` (0 to 1, only rising) may be called from any thread.
+TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz = 0, const std::atomic<bool>* cancel = nullptr,
+                                   const std::function<void(double)>& progress = {});
 
 // Wow and flutter taken out by `wow` and `flutter` (0..1 each). `deviation`, if given, is set to the largest speed
 // error found (a fraction: 0.003 is 0.3 %). With nothing to correct (no steady partials, or nine readings in ten within
 // 0.003 %), `out` is `in` exactly, or, with `corrected` given, left as it was and `corrected` false (no copy of a long
-// sound). False when cancelled.
+// sound). False when cancelled (checked every few milliseconds of work). `progress` as measureTransferSpeed's.
 bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, double flutter, double pilotHz = 0,
-                      const std::atomic<bool>* cancel = nullptr, double* deviation = nullptr, bool* corrected = nullptr);
+                      const std::atomic<bool>* cancel = nullptr, double* deviation = nullptr, bool* corrected = nullptr,
+                      const std::function<void(double)>& progress = {});
+// For tests: wow and flutter taken out as Montage first did (each partial's DFT summed directly hop by hop, the sound
+// resampled on one thread), to check and time the quicker way against.
+void tapeRepairAsBefore(bool before);
 
 // How far the right channel (the second) lags the left, in samples (negative: it leads), over [from, to) (to < 0:
 // the end), and whether it is inverted. `coherence` 0..1: how much of the two channels is the same sound.

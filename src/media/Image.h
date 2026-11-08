@@ -118,7 +118,8 @@ using Frame16Ptr = std::shared_ptr<const Frame16>;
 
 Image toImage(const Frame16& f);
 // Y′CbCr planes as straight RGBA (alpha 1, colour clamped to 0..1) at their own size, as the GPU converts them: chroma
-// interpolated bilinearly from where its samples sit (edges repeated), the planes' matrix and range. Then, when the
+// interpolated bicubically (Keys' cubic, from the four samples either side along each axis) from where its samples sit
+// (edges repeated), the planes' matrix and range. (A decoder's high-quality frames at any size start from this.) Then, when the
 // size differs, resampled to w x h as the GPU resamples (resampleRgba).
 std::vector<float> ycbcrToRgba(const YcbcrPlanes& p, int w = 0, int h = 0);
 // The same at the planes' own size into 16-bit RGBA (as Frame16's px; alpha 65535).

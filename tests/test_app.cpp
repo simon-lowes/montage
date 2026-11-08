@@ -272,6 +272,7 @@
 #include "Recovery.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
+#include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
 #include "TimelineWidget.h"
 #include "PitchCurves.h"
@@ -518,6 +519,8 @@ private slots:
         qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
         // And a sound library (not the one on this computer, with its folders).
         qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
+        // And a job store (the render queue kept on disk) of their own.
+        qputenv("MONTAGE_JOBS_DIR", dir_.filePath(QStringLiteral("jobs")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -14217,6 +14220,142 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(!queue->running());
         QVERIFY(!QFileInfo::exists(dir_.path() + "/long.mp4"));
         QVERIFY(queue->remove(longJob));
+    }
+
+    void renderQueueSideBySideAndResumed() {
+        loadDemo();
+        const Id seq = state()->sequence()->id;
+        const Project project = state()->project();
+        QTemporaryDir store;  // (a queue kept in a folder of its own)
+        QVERIFY(store.isValid());
+        ExportSettings a = findExportPreset("H.264 - High Quality")->settings;
+        a.preset = "ultrafast";
+        a.gpu = exportsOnGpu();  // (as the queue renders it)
+        ExportSettings b = a;
+        b.width = 640;
+        b.height = 360;
+        const auto bytes = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        // One after the other, as the reference.
+        QElapsedTimer t;
+        t.start();
+        std::string err;
+        a.path = (dir_.path() + "/serial-a.mp4").toStdString();
+        b.path = (dir_.path() + "/serial-b.mp4").toStdString();
+        QVERIFY2(renderExport(project, seq, a, 0, {}, nullptr, &err), err.c_str());
+        QVERIFY2(renderExport(project, seq, b, 0, {}, nullptr, &err), err.c_str());
+        const qint64 serial = t.elapsed();
+        const QByteArray refA = bytes(dir_.path() + "/serial-a.mp4"), refB = bytes(dir_.path() + "/serial-b.mp4");
+        QVERIFY(refA.size() > 1000 && refB.size() > 1000);
+        // Two at once in the queue: both render together, and each file is the one rendered alone, byte for byte.
+        {
+            RenderQueue queue(nullptr, store.path());
+            queue.setAtOnce(2);
+            QCOMPARE(queue.atOnce(), 2);
+            a.path = (dir_.path() + "/together-a.mp4").toStdString();
+            b.path = (dir_.path() + "/together-b.mp4").toStdString();
+            const int ja = queue.add("A", "H.264", project, seq, a);
+            const int jb = queue.add("B", "H.264", project, seq, b);
+            int together = 0;
+            connect(&queue, &RenderQueue::changed, this, [&] { together = std::max(together, queue.rendering()); });
+            t.restart();
+            queue.start();
+            together = std::max(together, queue.rendering());
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 120000);
+            qInfo("render queue: two exports one after the other %lld ms, side by side %lld ms", serial, t.elapsed());
+            QCOMPARE(together, 2);
+            QCOMPARE(queue.job(ja)->status, RenderQueue::Status::Done);
+            QCOMPARE(queue.job(jb)->status, RenderQueue::Status::Done);
+            QVERIFY(bytes(dir_.path() + "/together-a.mp4") == refA);
+            QVERIFY(bytes(dir_.path() + "/together-b.mp4") == refB);
+            // Each is in the store with its project, as montage_job lists it.
+            jobs::Record r;
+            QVERIFY(jobs::load(RenderQueue::storeId(ja), r, store.path()));
+            QCOMPARE(r.status, QString("done"));
+            QCOMPARE(r.owner, QString("render-queue"));
+            QVERIFY(QFileInfo::exists(jobs::jobFolder(RenderQueue::storeId(ja), store.path()) + "/project.json"));
+            // Two writing the same file are not rendered together: the second waits for the first.
+            a.path = (dir_.path() + "/same.mp4").toStdString();
+            queue.add("A", "H.264", project, seq, a);
+            queue.add("A again", "H.264", project, seq, a);
+            together = 0;
+            queue.start();
+            together = std::max(together, queue.rendering());
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 120000);
+            QCOMPARE(together, 1);
+            QVERIFY(bytes(dir_.path() + "/same.mp4") == refA);
+            queue.clearFinished();
+            QVERIFY(jobs::all({}, store.path()).empty());
+        }
+        // A queue stopped halfway through a render, as by a crash: the next one (another Montage) renders it again from
+        // the start by itself, from the project kept with it, and gives the same file. (The project open now has
+        // changed: the job's own copy is the one rendered.)
+        // (a longer cut, at the smaller size, so it is still rendering when stopped)
+        QVERIFY(state()->edit("Long", [](Project&, Sequence& s) {
+            s.videoTracks[0].clips.back().duration = 3000;
+            return true;
+        }));
+        const Project longer = state()->project();
+        state()->undo();
+        ExportSettings c = b;
+        c.path = (dir_.path() + "/serial-long.mp4").toStdString();
+        QVERIFY2(renderExport(longer, seq, c, 0, {}, nullptr, &err), err.c_str());
+        const QByteArray refLong = bytes(dir_.path() + "/serial-long.mp4");
+        QVERIFY(refLong.size() > refB.size());
+        c.path = (dir_.path() + "/resumed.mp4").toStdString();
+        int id = 0;
+        {
+            RenderQueue queue(nullptr, store.path());
+            queue.setAtOnce(1);
+            id = queue.add("Long", "H.264", longer, seq, c);
+            queue.start();
+            QTRY_VERIFY_WITH_TIMEOUT(queue.job(id)->progress > 0, 60000);
+            queue.suspend();  // (the render stopped where it was; the store still says it renders)
+        }
+        jobs::Record r;
+        QVERIFY(jobs::load(RenderQueue::storeId(id), r, store.path()));
+        QCOMPARE(r.status, QString("running"));
+        // (as another process that crashed left it, its output half-written)
+        r.pid = 0x7ffffff0;
+        r.process = "gone";
+        QVERIFY(jobs::save(r, store.path()));
+        QVERIFY(jobs::load(RenderQueue::storeId(id), r, store.path()));
+        QCOMPARE(r.status, QString("interrupted"));
+        {
+            QFile half(dir_.path() + "/resumed.mp4");
+            QVERIFY(half.open(QIODevice::WriteOnly));
+            half.write(refLong.left(refLong.size() / 2));
+        }
+        QVERIFY(state()->apply("Clear", [](Project& p, Sequence& s) {
+            std::vector<Id> all;
+            for (TrackRef t : allTracks(s))
+                for (const Clip& c : trackAt(s, t)->clips) all.push_back(c.id);
+            return edit::removeClips(p, s, all, false);
+        }));
+        {
+            RenderQueue queue(nullptr, store.path());
+            QCOMPARE(queue.jobs().size(), size_t(1));
+            const RenderQueue::Job& j = queue.jobs()[0];
+            QVERIFY(j.resumed);
+            QCOMPARE(j.name, QString("Long"));
+            QTRY_VERIFY_WITH_TIMEOUT(queue.running(), 5000);  // (it was running: it starts by itself)
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 120000);
+            QCOMPARE(queue.jobs()[0].status, RenderQueue::Status::Done);
+            QVERIFY(bytes(dir_.path() + "/resumed.mp4") == refLong);
+            // A cancel asked for in the store (by montage_job) is heard: a waiting job is set aside when its turn comes.
+            const int waiting = queue.add("A", "H.264", project, seq, a);
+            QFile cancel(jobs::jobFolder(RenderQueue::storeId(waiting), store.path()) + "/cancel");
+            QVERIFY(cancel.open(QIODevice::WriteOnly));
+            cancel.close();
+            queue.start();
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 10000);
+            QCOMPARE(queue.job(waiting)->status, RenderQueue::Status::Cancelled);
+            QVERIFY(!QFileInfo::exists(cancel.fileName()));
+            queue.clearFinished();
+        }
+        state()->undo();
     }
 
     void keyframeGraphEditor() {

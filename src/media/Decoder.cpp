@@ -18,6 +18,7 @@
 #include "core/Cea708.h"
 #include "core/FilmCount.h"
 #include "SpatialAudio.h"
+#include "core/Expression.h"
 #include "core/Interpretation.h"
 
 #include <QColorSpace>
@@ -1015,6 +1016,8 @@ void VideoDecoder::freeCodec() {
 void VideoDecoder::close() {
     if (sws_) sws_freeContext(sws_);
     sws_ = nullptr;
+    if (resize_) sws_freeContext(resize_);
+    resize_ = nullptr;
     av_frame_free(&cur_);
     av_frame_free(&next_);
     av_frame_free(&hwTransfer_);
@@ -1822,7 +1825,8 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     int sw = (rotation_ % 180) ? h : w;
     int sh = (rotation_ % 180) ? w : h;
     std::shared_ptr<Frame16> out;
-    // (Not when a high-quality frame is resized: both sides then take the scaler's bicubic picture.)
+    // (Not when a high-quality frame is resized: both sides then take the scaler's picture, from the frame converted at
+    // its own size down to half, straight from Y′CbCr below that.)
     if (planes && !rotation_ && alpha_.empty() && !(hq && (sw != f->width || sh != f->height)))
         if (std::shared_ptr<const YcbcrPlanes> yc = ycbcrPlanesOf(f)) {
             out = std::make_shared<Frame16>();
@@ -1847,17 +1851,54 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     return out;
 }
 
+// A 16-bit RGBA frame resized to `w` x `h` by the scaler's bicubic (null if the scaler cannot).
+std::shared_ptr<Frame16> VideoDecoder::resizeRgba64(const Frame16& in, int w, int h) {
+    const int key[4] = {in.width, in.height, w, h};
+    if (!resize_ || !std::equal(key, key + 4, resizeKey_)) {
+        if (resize_) sws_freeContext(resize_);
+        resize_ = sws_alloc_context();
+        if (!resize_) return nullptr;
+        av_opt_set_int(resize_, "srcw", in.width, 0);
+        av_opt_set_int(resize_, "srch", in.height, 0);
+        av_opt_set_int(resize_, "src_format", AV_PIX_FMT_RGBA64LE, 0);
+        av_opt_set_int(resize_, "dstw", w, 0);
+        av_opt_set_int(resize_, "dsth", h, 0);
+        av_opt_set_int(resize_, "dst_format", AV_PIX_FMT_RGBA64LE, 0);
+        av_opt_set_int(resize_, "sws_flags", SWS_BICUBIC | SWS_ACCURATE_RND, 0);
+        av_opt_set_int(resize_, "threads", std::clamp(int(std::thread::hardware_concurrency()), 1, 8), 0);
+        if (sws_init_context(resize_, nullptr, nullptr) < 0) {
+            sws_freeContext(resize_);
+            resize_ = nullptr;
+            return nullptr;
+        }
+        std::copy(key, key + 4, resizeKey_);
+    }
+    auto out = std::make_shared<Frame16>();
+    out->width = w, out->height = h, out->pts = in.pts;
+    out->px.resize(size_t(w) * size_t(h) * 4);
+    const uint8_t* src[4] = {reinterpret_cast<const uint8_t*>(in.px.data()), nullptr, nullptr, nullptr};
+    const int srcStride[4] = {in.width * 8, 0, 0, 0};
+    uint8_t* dst[4] = {reinterpret_cast<uint8_t*>(out->px.data()), nullptr, nullptr, nullptr};
+    const int dstStride[4] = {w * 8, 0, 0, 0};
+    if (sws_scale(resize_, src, srcStride, 0, in.height, dst, dstStride) != h) return nullptr;
+    return out;
+}
+
 // The picture `f` scaled to `sw` x `sh` 16-bit RGBA by FFmpeg's scaler.
 std::shared_ptr<Frame16> VideoDecoder::convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq) {
     // High quality at the picture's own size: Y′CbCr the GPU takes is converted as the GPU converts it (exactly; the
     // scaler takes 8-bit samples a little short of their range), so either renders the same frame.
-    if (hq && sw == f->width && sh == f->height)
+    // At other sizes down to half, converted so at its own and then resized (the scaler's bicubic): one chroma filter
+    // at every size, so a frame at 99 % differs from the one at 100 % only by the resize. (Smaller, where the chroma is
+    // averaged away, the scaler takes the Y′CbCr straight to that size: a 6K or 8K frame is not converted whole.)
+    if (hq && sw * 2 >= f->width && sh * 2 >= f->height)
         if (std::shared_ptr<const YcbcrPlanes> yc = ycbcrPlanesOf(f)) {
             auto out = std::make_shared<Frame16>();
-            out->width = sw, out->height = sh, out->pts = pts;
-            out->px.resize(size_t(sw) * size_t(sh) * 4);
+            out->width = f->width, out->height = f->height, out->pts = pts;
+            out->px.resize(size_t(f->width) * size_t(f->height) * 4);
             ycbcrToRgba16(*yc, out->px.data());
-            return out;
+            if (sw == f->width && sh == f->height) return out;
+            if (auto resized = resizeRgba64(*out, sw, sh)) return resized;
         }
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
     AVPixelFormat srcFmt = dejpeg(AVPixelFormat(f->format), fullRange);
@@ -2143,7 +2184,8 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         if (n != rawFrame_) {
             RawImage img;
             std::string err;
-            if (!developRaw(imageSequenceFrame(seq, n), img, &err, rawSettings_) || !loadRaw(img, &err)) return nullptr;
+            // (a render's cancel heard while a frame develops)
+            if (!developRaw(imageSequenceFrame(seq, n), img, &err, rawSettings_, currentExpressionContext().cancel) || !loadRaw(img, &err)) return nullptr;
             rawFrame_ = n;
             stillFrame_.reset();
         }

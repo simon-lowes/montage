@@ -8,6 +8,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QUuid>
 #include <QSaveFile>
 #include <QImage>
 #include <QJsonArray>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <thread>
 #include <fstream>
 #include <iostream>
@@ -54,6 +56,7 @@
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
+#include "render/BackgroundJobs.h"
 #include "render/Dcp.h"
 #include "render/Adm.h"
 #include "render/Iamf.h"
@@ -226,7 +229,8 @@ const char* kInstructions =
     "strings like \"00:01:02:03\"; tracks are \"V1\", \"V2\", \"A1\"... Clips are referred to by the ids "
     "montage_project_info lists. Look at the result with montage_render_frame before rendering the whole sequence. "
     "Any tool called with \"async\": true runs in the background: it answers at once with a job id, read (progress, "
-    "result) or cancelled with montage_job. "
+    "result) or cancelled with montage_job; renders, exports and analyses run side by side, and jobs are kept on disk "
+    "(montage_job's list gives earlier servers' jobs and the render queue's exports too). "
     "If the project is open in the Montage app, reopen it there to see the changes.";
 
 QJsonObject serverInfo() {
@@ -258,11 +262,19 @@ QJsonObject resultJson(const ToolResult& r) {
 
 // ---- Background calls -------------------------------------------------------------
 
-// A tool call run in the background ("async": true), one at a time after the calls before it.
+// A tool call run in the background ("async": true), after the calls before it: one at a time, or side by side with
+// other background calls (up to the set number) for a tool that leaves the project alone (a render, a check, a read).
+// Each is kept in the job store (render/BackgroundJobs.h) as "mcp-<session>-<n>", so it is listed after a restart, and
+// one cut short by it is taken up again.
 struct ToolJob {
     QString id, tool;
+    QString stored;           // its id in the job store
+    bool sideBySide = false;  // runs alongside other such calls
+    QString resumedFrom;      // the stored job it takes up again
     QJsonObject args;
+    std::chrono::steady_clock::time_point persisted;  // when its progress was last written (under m)
     std::atomic<bool> cancel{false};
+    std::atomic<bool> cancelAsked{false};  // by montage_job (not by the server's end)
     std::mutex m;  // what follows
     QString status = QStringLiteral("queued");  // queued, running, done, failed, cancelled
     double fraction = 0;
@@ -822,21 +834,28 @@ struct McpServer::Impl {
         }
         turnWake.notify_all();
     }
-    std::mutex toolMutex;  // held while a tool runs (and while the notification sink changes)
+    // Held while a tool runs (and while the notification sink changes): alone by most, shared by background calls that
+    // run side by side.
+    std::shared_mutex toolMutex;
     // The call running now (its request id) and calls cancelled before they started.
     std::mutex cancelMutex;
     QString runningRequest;
     std::set<QString> cancelledRequests;
     std::deque<QString> cancelledOrder;  // (oldest first: the oldest forgotten past 1000)
     std::atomic<bool> callCancel{false};
-    // Background calls: all of them by id (the newest finished ones kept), those waiting, and the thread that runs them.
+    // Background calls: all of them by id (the newest finished ones kept), those waiting, and the threads that run them
+    // (as many as run at once).
     std::mutex jobsMutex;
     std::condition_variable jobsWake;
     std::map<QString, std::shared_ptr<ToolJob>> jobs;
     std::deque<std::shared_ptr<ToolJob>> jobQueue;
-    std::thread jobThread;
+    std::vector<std::thread> jobThreads;
+    int atOnce = jobs::atOnce();
     bool stopping = false;
     int jobsMade = 0;
+    // This server's calls in the job store: "mcp-<session>-<n>".
+    const QString session = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddHHmmss")) + QLatin1Char('-') +
+                            QUuid::createUuid().toString(QUuid::Id128).left(10);
 
     Impl() { addTools(); }
     ~Impl() {
@@ -851,7 +870,105 @@ struct McpServer::Impl {
             turnsStopped = true;
         }
         turnWake.notify_all();
-        if (jobThread.joinable()) jobThread.join();
+        for (std::thread& t : jobThreads)
+            if (t.joinable()) t.join();
+        // (calls cut short by the server's end, or never started, are taken up again by the next one)
+        for (auto& [id, j] : jobs) {
+            bool unfinished;
+            {
+                std::lock_guard jl(j->m);
+                unfinished = !j->finished() || j->status == QLatin1String("interrupted");
+                if (unfinished) j->status = QStringLiteral("interrupted");
+            }
+            if (unfinished) persist(*j, true);
+        }
+    }
+
+    // Tools that leave the project as it is and may run alongside each other in the background.
+    static bool runsSideBySide(const Tool& t) {
+        static const std::set<QString> also = {"montage_render", "montage_export_dcp", "montage_export_imf", "montage_export_review",
+                                               "montage_dialogue_loudness", "montage_verify_mhl"};
+        if (t.name == QLatin1String("montage_render_frame") || t.name == QLatin1String("montage_job")) return false;
+        return t.readOnly || also.count(t.name) > 0;
+    }
+    // An argument whose name says it is a secret: such a call is not written to disk with its arguments.
+    static bool secretArgs(const QJsonObject& a) {
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            const QString k = it.key().toLower();
+            if (k.contains("password") || k.contains("secret") || k.contains("token") || k.contains("passphrase")) return true;
+            if (it.value().isObject() && secretArgs(it.value().toObject())) return true;
+        }
+        return false;
+    }
+    // The job written to the store (its progress at most once a second unless `now`).
+    void persist(ToolJob& j, bool now = false) {
+        jobs::Record r;
+        {
+            std::lock_guard l(j.m);
+            const auto t = std::chrono::steady_clock::now();
+            if (!now && j.status == QLatin1String("running") && t - j.persisted < std::chrono::seconds(1)) return;
+            j.persisted = t;
+            r.id = j.stored;
+            r.owner = QStringLiteral("mcp");
+            r.kind = j.tool;
+            r.title = j.tool;
+            r.status = j.status == QLatin1String("queued") ? QStringLiteral("waiting") : j.status;
+            r.progress = j.fraction;
+            r.step = j.step;
+            r.order = j.id.mid(4).toInt();
+            r.pid = jobs::thisProcess();
+            r.process = jobs::thisProcessToken();
+            const bool secret = secretArgs(j.args);
+            r.data = QJsonObject{{"job", j.id}, {"session", session}, {"tool", j.tool}, {"sideBySide", j.sideBySide}, {"cwd", QDir::currentPath()}};
+            if (!secret) r.data["args"] = j.args;
+            else r.data["secret"] = true;
+            if (!j.resumedFrom.isEmpty()) r.data["resumedFrom"] = j.resumedFrom;
+            if (j.finished()) r.data["result"] = j.result;
+        }
+        jobs::Record was;
+        if (jobs::load(r.id, was)) r.created = was.created;
+        jobs::save(r);
+        // (a cancel asked for by another server's montage_job)
+        const QString cancelFile = jobs::jobFolder(r.id) + QStringLiteral("/cancel");
+        if (!r.finished() && QFileInfo::exists(cancelFile)) {
+            QFile::remove(cancelFile);
+            j.cancel = true;
+        }
+    }
+    // At the start (montage-cli mcp): the calls a server before this one was running (or had waiting) when it stopped or crashed. Those of
+    // tools that leave the project alone are run again, in their order; the rest wait for montage_job's resume.
+    int resumeStored() {
+        int n = 0;
+        for (const jobs::Record& r : jobs::all(QStringLiteral("mcp"))) {
+            if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting")) continue;
+            // (one left by a server of this same process waits for montage_job's resume: only a call whose process
+            // stopped, or crashed, is taken up by itself)
+            if (jobs::runningElsewhere(r) || jobs::runningHere(r) || r.data.value("session").toString() == session) continue;
+            const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == r.data.value("tool").toString(); });
+            if (tool == tools.end() || !runsSideBySide(*tool) || r.data.value("secret").toBool() || !r.data.contains("args")) continue;
+            // (its relative paths read as they were: only by a server started in the same folder)
+            if (r.data.value("cwd").toString() != QDir::currentPath()) continue;
+            if (resume(r, *tool)) ++n;
+        }
+        // (the store kept from growing: the newest 200 finished calls kept)
+        jobs::prune(QStringLiteral("mcp"), 200);
+        return n;
+    }
+    // A stored call run again here (once: the first server to claim it). Null when another has, or it cannot be.
+    std::shared_ptr<ToolJob> resume(const jobs::Record& r, const Tool& tool) {
+        QFile claim(jobs::jobFolder(r.id) + QStringLiteral("/resumed"));
+        if (!claim.open(QIODevice::WriteOnly | QIODevice::NewOnly)) return nullptr;
+        claim.close();
+        auto job = startJob(tool, r.data.value("args").toObject(), r.id);
+        if (!job) {
+            claim.remove();
+            return nullptr;
+        }
+        jobs::Record old = r;
+        old.status = QStringLiteral("resumed");
+        old.data["resumedAs"] = job->stored;
+        jobs::save(old);
+        return job;
     }
 
     static QString requestKey(const QJsonValue& id) { return QString::fromUtf8(QJsonDocument(QJsonArray{id}).toJson(QJsonDocument::Compact)); }
@@ -871,20 +988,33 @@ struct McpServer::Impl {
 
     static constexpr size_t kMaxQueuedJobs = 256;
     // Null when too many are waiting already.
-    std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args) {
+    std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args, const QString& resumedFrom = {}) {
         auto job = std::make_shared<ToolJob>();
         job->tool = tool.name;
         job->args = args;
-        std::lock_guard l(jobsMutex);
-        if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
-        job->id = QStringLiteral("job-%1").arg(++jobsMade);
-        job->turn = takeTurn();
-        jobs[job->id] = job;
-        jobQueue.push_back(job);
-        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
-        jobsWake.notify_all();
-        if (jobsMade % 64 == 0) pruneJobs();
+        job->sideBySide = runsSideBySide(tool);
+        job->resumedFrom = resumedFrom;
+        {
+            std::lock_guard l(jobsMutex);
+            if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
+            job->id = QStringLiteral("job-%1").arg(++jobsMade);
+            job->stored = QStringLiteral("mcp-%1-%2").arg(session).arg(jobsMade);
+            job->turn = takeTurn();
+            jobs[job->id] = job;
+            jobQueue.push_back(job);
+            spawnWorkers();
+            jobsWake.notify_all();
+            if (jobsMade % 64 == 0) pruneJobs();
+        }
+        persist(*job, true);
         return job;
+    }
+    // (jobsMutex held) Threads enough to run atOnce calls side by side.
+    void spawnWorkers() {
+        while (int(jobThreads.size()) < atOnce) {
+            const int index = int(jobThreads.size());
+            jobThreads.emplace_back([this, index] { runJobs(index); });
+        }
     }
     // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
     // (jobsMutex held)
@@ -901,12 +1031,15 @@ struct McpServer::Impl {
         for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
     }
 
-    void runJobs() {
+    // Worker `index` (of atOnce): takes the next call when its turn has come. One that runs side by side holds the tool
+    // lock shared and lets the next call's turn come as soon as it starts (so later calls see the project as every call
+    // before them left it, and the next background call can start beside it); any other holds it alone until done.
+    void runJobs(int index) {
         for (;;) {
             std::shared_ptr<ToolJob> job;
             {
                 std::unique_lock l(jobsMutex);
-                jobsWake.wait(l, [this] { return stopping || !jobQueue.empty(); });
+                jobsWake.wait(l, [this, index] { return stopping || (!jobQueue.empty() && index < atOnce); });
                 if (stopping) return;
                 job = jobQueue.front();
                 jobQueue.pop_front();
@@ -915,21 +1048,32 @@ struct McpServer::Impl {
             waitTurn(job->turn);
             struct TurnEnd {
                 Impl* d;
-                ~TurnEnd() { d->endTurn(); }
+                bool ended = false;
+                void end() {
+                    if (!ended) d->endTurn();
+                    ended = true;
+                }
+                ~TurnEnd() { end(); }
             } turnEnd{this};
             {
                 std::lock_guard l(jobsMutex);
                 if (stopping) return;
             }
-            std::unique_lock running(toolMutex);
+            std::shared_lock<std::shared_mutex> shared(toolMutex, std::defer_lock);
+            std::unique_lock<std::shared_mutex> alone(toolMutex, std::defer_lock);
+            if (job->sideBySide) shared.lock();
+            else alone.lock();
             {
                 std::lock_guard jl(job->m);
                 if (job->cancel || tool == tools.end()) {
                     job->status = QStringLiteral("cancelled");
-                    continue;
+                } else {
+                    job->status = QStringLiteral("running");
                 }
-                job->status = QStringLiteral("running");
             }
+            persist(*job, true);
+            if (job->status == QLatin1String("cancelled")) continue;
+            if (job->sideBySide) turnEnd.end();
             tCurrentJob = job.get();
             tCancel = &job->cancel;
             ToolResult r;
@@ -944,10 +1088,22 @@ struct McpServer::Impl {
             }
             tCurrentJob = nullptr;
             tCancel = nullptr;
-            std::lock_guard jl(job->m);
-            job->result = resultJson(r);
-            job->status = !r.error ? QStringLiteral("done") : job->cancel ? QStringLiteral("cancelled") : QStringLiteral("failed");
-            if (!r.error) job->fraction = 1;
+            bool stoppedByEnd;
+            {
+                std::lock_guard l(jobsMutex);
+                stoppedByEnd = stopping;
+            }
+            {
+                std::lock_guard jl(job->m);
+                job->result = resultJson(r);
+                job->status = !r.error                                  ? QStringLiteral("done")
+                              : job->cancelAsked                          ? QStringLiteral("cancelled")
+                              : job->cancel && stoppedByEnd               ? QStringLiteral("interrupted")
+                              : job->cancel                               ? QStringLiteral("cancelled")
+                                                                          : QStringLiteral("failed");
+                if (!r.error) job->fraction = 1;
+            }
+            persist(*job, true);
         }
     }
 
@@ -976,6 +1132,80 @@ struct McpServer::Impl {
         return ok(text, o);
     }
 
+    // A job in the store (one of an earlier server's, or the render queue's) as montage_job reports it.
+    static QJsonObject storedJson(const montage::jobs::Record& r, bool withResult) {
+        QJsonObject o{{"job", r.id}, {"owner", r.owner}, {"tool", r.owner == QLatin1String("mcp") ? r.data.value("tool").toString() : r.kind},
+                      {"title", r.title}, {"status", r.status}, {"progress", r.progress}, {"updated", r.updated}};
+        if (!r.step.isEmpty()) o["step"] = r.step;
+        if (!r.error.isEmpty()) o["error"] = r.error;
+        if (r.data.contains("resumedAs")) o["resumedAs"] = r.data.value("resumedAs");
+        if (r.data.contains("resumedFrom")) o["resumedFrom"] = r.data.value("resumedFrom");
+        if (r.owner == QLatin1String("render-queue") && r.data.contains("output")) o["output"] = r.data.value("output");
+        const QJsonObject result = r.data.value("result").toObject();
+        QString text;
+        for (const QJsonValue& c : result.value("content").toArray())
+            if (c.toObject().value("type").toString() == QLatin1String("text")) text += c.toObject().value("text").toString();
+        if (withResult && r.status == QLatin1String("done") && !result.isEmpty()) {
+            QJsonObject out = result.value("structuredContent").toObject();
+            if (out.isEmpty()) out["text"] = text;
+            else out["message"] = text;
+            o["result"] = out;
+        } else if (r.finished() && !text.isEmpty() && r.status != QLatin1String("done")) {
+            o["error"] = text;
+        }
+        return o;
+    }
+    static QString storedText(const montage::jobs::Record& r) {
+        const QString what = r.owner == QLatin1String("mcp") ? r.data.value("tool").toString() : r.title;
+        if (r.status == QLatin1String("running"))
+            return QStringLiteral("%1 (%2) is running: %3 %%4").arg(r.id, what).arg(std::lround(r.progress * 100)).arg(r.step.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(r.step));
+        if (r.status == QLatin1String("resumed")) return QStringLiteral("%1 (%2) was taken up again as %3").arg(r.id, what, r.data.value("resumedAs").toString());
+        return QStringLiteral("%1 (%2) is %3").arg(r.id, what, r.status);
+    }
+    // montage_job's status, cancel or resume of a job in the store.
+    ToolResult storedAction(montage::jobs::Record r, const QString& action) {
+        const bool queue = r.owner == QLatin1String("render-queue");
+        if (action == "cancel" && !r.finished() && r.status != QLatin1String("resumed")) {
+            if (queue || montage::jobs::runningElsewhere(r)) {
+                // (whoever runs it hears it: the render queue within a fifth of a second, a server at its next progress)
+                QFile f(montage::jobs::jobFolder(r.id) + QStringLiteral("/cancel"));
+                if (!f.open(QIODevice::WriteOnly)) return fail(QStringLiteral("Cannot ask %1 to stop").arg(r.id));
+                f.close();
+                QJsonObject o = storedJson(r, false);
+                o["cancelAsked"] = true;
+                return ok(QStringLiteral("%1 is asked to stop").arg(r.id), o);
+            }
+            // (nobody runs it: set aside, and claimed so no server takes it up again)
+            QFile claim(montage::jobs::jobFolder(r.id) + QStringLiteral("/resumed"));
+            if (!claim.open(QIODevice::WriteOnly | QIODevice::NewOnly)) return fail(QStringLiteral("%1 was taken up again already").arg(r.id));
+            claim.close();
+            r.status = QStringLiteral("cancelled");
+            montage::jobs::save(r);
+            return ok(QStringLiteral("%1 is cancelled").arg(r.id), storedJson(r, false));
+        }
+        if (action == "resume") {
+            if (queue) return fail(QStringLiteral("%1 is the render queue's: Montage renders it again when it starts").arg(r.id));
+            if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting"))
+                return fail(QStringLiteral("%1 is %2: only a call cut short is taken up again").arg(r.id, r.status));
+            if (montage::jobs::runningElsewhere(r)) return fail(QStringLiteral("%1 is held by a server still running").arg(r.id));
+            if (r.data.value("secret").toBool() || !r.data.contains("args"))
+                return fail(QStringLiteral("%1's arguments were not kept (they held a secret): call the tool again").arg(r.id));
+            if (r.data.value("cwd").toString() != QDir::currentPath())
+                return fail(QStringLiteral("%1 was asked for in %2: start the server there to run it again (its relative paths read from there)")
+                                .arg(r.id, r.data.value("cwd").toString()));
+            const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == r.data.value("tool").toString(); });
+            if (tool == tools.end()) return fail(QStringLiteral("%1's tool is gone").arg(r.id));
+            const std::shared_ptr<ToolJob> job = resume(r, *tool);
+            if (!job) return fail(QStringLiteral("%1 was taken up again already, or too many calls are waiting").arg(r.id));
+            return ok(QStringLiteral("%1 runs again as %2: montage_job reads it").arg(r.id, job->id),
+                      QJsonObject{{"job", job->id}, {"tool", job->tool}, {"status", "queued"}, {"resumedFrom", r.id}});
+        }
+        const QJsonObject o = storedJson(r, true);
+        QString text = storedText(r);
+        if (o.contains("error")) text += QStringLiteral(": ") + o.value("error").toString();
+        return ok(text, o);
+    }
+
     void add(const char* name, const char* title, const char* description, const char* schema, bool readOnly,
              std::function<ToolResult(const QJsonObject&)> run) {
         tools.push_back({name, title, description, QJsonDocument::fromJson(schema).object(), readOnly, std::move(run)});
@@ -983,9 +1213,12 @@ struct McpServer::Impl {
 
     void progress(double fraction, const QString& message) {
         if (ToolJob* j = tCurrentJob) {
-            std::lock_guard l(j->m);
-            j->fraction = std::clamp(fraction, 0.0, 1.0);
-            j->step = message;
+            {
+                std::lock_guard l(j->m);
+                j->fraction = std::clamp(fraction, 0.0, 1.0);
+                j->step = message;
+            }
+            persist(*j);
             return;
         }
         if (!notify || progressToken.isUndefined() || progressToken.isNull()) return;
@@ -14655,16 +14888,35 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_job", "Background calls",
-        "Read or cancel a tool call running in the background. Any tool called with \"async\": true answers at once with "
-        "a job id and runs in the background (after any calls before it, one at a time); this reads its status (queued, "
-        "running, done, failed, cancelled), its progress (0 to 1) and step, and once done its result (the tool's own "
-        "structured result, its text as \"message\"; a failed job's error). action cancel stops it (work that can stop "
-        "does, within a second or so), list gives every job. wait: seconds (up to 60) to wait for it to finish first.",
-        R"json({"type":"object","properties":{"job":{"type":"string","description":"The job id an async call answered with"},
-            "action":{"type":"string","enum":["status","cancel","list"],"default":"status"},
+        "Read, cancel or take up again a tool call running in the background, or an export in Montage's render queue. "
+        "Any tool called with \"async\": true answers at once with a job id and runs in the background, after the calls "
+        "before it; calls that leave the project as it is (renders, exports, analyses, probes) run side by side, up to "
+        "a set number at once (Settings' jobs/at_once, 2 unless set; action at_once with \"jobs\" changes it for this "
+        "server), the rest one at a time. This reads a job's status (queued, running, done, failed, cancelled; "
+        "interrupted for one cut short when its server stopped), its progress (0 to 1) and step, and once done its "
+        "result (the tool's own structured result, its text as \"message\"; a failed job's error). Jobs are kept on "
+        "disk: list gives this server's jobs and, as \"stored\", those of servers before it and the render queue's "
+        "exports (\"queue-N\"), by those ids. action cancel stops one (work that can stop does, within a second or so; "
+        "the render queue hears it within a fifth of a second), resume runs an interrupted call again (calls that leave "
+        "the project as it is are taken up again by themselves when a server starts after the one running them "
+        "stopped). wait: seconds (up to 60) to wait for it to finish first.",
+        R"json({"type":"object","properties":{"job":{"type":"string","description":"The job id an async call answered with, or a stored job's id from list"},
+            "action":{"type":"string","enum":["status","cancel","list","resume","at_once"],"default":"status"},
+            "jobs":{"type":"integer","minimum":1,"maximum":16,"description":"at_once: how many background calls run side by side"},
             "wait":{"type":"number","description":"Seconds to wait for it to finish before answering (at most 60)"}}})json",
         true, [this](const QJsonObject& a) {
             const QString action = str(a, "action", "status");
+            if (action == "at_once") {
+                const int n = std::clamp(int(a.value("jobs").toDouble(0)), 0, 16);
+                if (n < 1) throw ArgError{"\"jobs\" is how many run at once: 1 to 16"};
+                {
+                    std::lock_guard l(jobsMutex);
+                    atOnce = n;
+                    spawnWorkers();
+                }
+                jobsWake.notify_all();
+                return ok(QStringLiteral("Up to %1 background call(s) run side by side").arg(n), QJsonObject{{"jobs", n}});
+            }
             if (action == "list") {
                 std::vector<std::shared_ptr<ToolJob>> all;
                 {
@@ -14672,7 +14924,7 @@ void McpServer::Impl::addTools() {
                     for (auto& [id, j] : jobs) all.push_back(j);
                 }
                 std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return x->id.mid(4).toInt() < y->id.mid(4).toInt(); });
-                QJsonArray list;
+                QJsonArray list, stored;
                 QStringList lines;
                 for (auto& j : all) {
                     const ToolResult r = jobReport(*j, false);
@@ -14681,21 +14933,54 @@ void McpServer::Impl::addTools() {
                     list.append(o);
                     lines << r.text.section(QLatin1Char('\n'), 0, 0);
                 }
-                return ok(lines.isEmpty() ? QStringLiteral("No background calls") : lines.join(QLatin1Char('\n')), QJsonObject{{"jobs", list}});
+                // (those of servers before this one, and the render queue's)
+                // (the newest 100, newest last)
+                std::vector<montage::jobs::Record> others;
+                for (montage::jobs::Record& r : montage::jobs::all())
+                    if (r.owner != QLatin1String("mcp") || r.data.value("session").toString() != session) others.push_back(std::move(r));
+                std::stable_sort(others.begin(), others.end(), [](const auto& x, const auto& y) { return x.updated < y.updated; });
+                const size_t from = others.size() > 100 ? others.size() - 100 : 0;
+                for (size_t i = from; i < others.size(); ++i) {
+                    stored.append(storedJson(others[i], false));
+                    lines << storedText(others[i]);
+                }
+                if (from > 0) lines << QStringLiteral("(%1 older stored jobs not listed)").arg(from);
+                return ok(lines.isEmpty() ? QStringLiteral("No background calls") : lines.join(QLatin1Char('\n')),
+                          QJsonObject{{"jobs", list}, {"stored", stored}, {"storedCount", int(others.size())}});
             }
+            if (action != "status" && action != "cancel" && action != "resume") throw ArgError{"\"action\" is status, cancel, list, resume or at_once"};
+            const QString id = need(a, "job");
             std::shared_ptr<ToolJob> job;
             {
                 std::lock_guard l(jobsMutex);
-                const auto it = jobs.find(need(a, "job"));
-                if (it == jobs.end()) throw ArgError{QStringLiteral("No job %1 (montage_job with action list gives them)").arg(str(a, "job"))};
-                job = it->second;
+                const auto it = jobs.find(id);
+                if (it != jobs.end()) job = it->second;
+                else
+                    for (auto& [jid, j] : jobs)
+                        if (j->stored == id) job = j;
+            }
+            if (!job) {
+                montage::jobs::Record r;
+                if (id.contains(QLatin1Char('/')) || id.contains(QLatin1Char('\\')) || id.startsWith(QLatin1Char('.')) || !montage::jobs::load(id, r))
+                    throw ArgError{QStringLiteral("No job %1 (montage_job with action list gives them)").arg(id)};
+                return storedAction(r, action);
+            }
+            if (action == "resume") {
+                std::lock_guard l(job->m);
+                return fail(QStringLiteral("%1 is %2: only a call cut short is taken up again").arg(job->id, job->status));
             }
             if (action == "cancel") {
+                job->cancelAsked = true;
                 job->cancel = true;
-                std::lock_guard l(job->m);
-                if (job->status == QLatin1String("queued")) job->status = QStringLiteral("cancelled");
-            } else if (action != "status") {
-                throw ArgError{"\"action\" is status, cancel or list"};
+                bool changed = false;
+                {
+                    std::lock_guard l(job->m);
+                    if (job->status == QLatin1String("queued")) {
+                        job->status = QStringLiteral("cancelled");
+                        changed = true;
+                    }
+                }
+                if (changed) persist(*job, true);
             }
             // Waiting for it (not for long: other calls wait meanwhile).
             const double wait = std::clamp(a.value("wait").toDouble(0), 0.0, 60.0);
@@ -14832,7 +15117,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         // it does (an answer, or any exception at all): later calls never wait on a turn that never ends.
         struct Turn {
             Impl* d;
-            std::unique_lock<std::mutex> running;
+            std::unique_lock<std::shared_mutex> running;
             bool taken = false;
             ~Turn() { end(); }
             void end() {
@@ -14848,7 +15133,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
                 if (taken) d->endTurn();
                 taken = false;
             }
-        } turn{d_, std::unique_lock<std::mutex>(d_->toolMutex, std::defer_lock)};
+        } turn{d_, std::unique_lock<std::shared_mutex>(d_->toolMutex, std::defer_lock)};
         if (name != QLatin1String("montage_job")) {
             d_->waitTurn(d_->takeTurn());
             turn.taken = true;
@@ -14883,6 +15168,8 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
 }
 
 void McpServer::cancel(const QJsonValue& requestId) { d_->cancelRequest(requestId); }
+
+int McpServer::resumeStoredJobs() { return d_->resumeStored(); }
 
 void McpServer::setNotificationSink(std::function<void(const std::string&)> sink) {
     std::lock_guard l(d_->toolMutex);

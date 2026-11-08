@@ -346,16 +346,24 @@ vec2 chromaAt(ivec2 at) {
     if (p[6].z > 0.5) return vec2(planeSample(table, at, 0), planeSample(table, at, 1));
     return vec2(planeSample(table, at, 0), planeSample(maskTex, at, 0));
 }
+// Keys' cubic (a = -0.5) at the four samples about a point f (0..1) past the second, as media/Image's.
+vec4 cubicWeights(float f) {
+    return vec4(((-0.5 * f + 1.0) * f - 0.5) * f, (1.5 * f - 2.5) * f * f + 1.0, ((-1.5 * f + 2.0) * f + 0.5) * f, (0.5 * f - 0.5) * f * f);
+}
 vec4 ycbcr(ivec2 xy) {
     const ivec2 cs = ivec2(p[4].zw);
     const float cx = (float(xy.x) - p[5].z) / p[5].x, cy = (float(xy.y) - p[5].w) / p[5].y;
     const int cx0 = int(floor(cx)), cy0 = int(floor(cy));
-    const float fx = cx - float(cx0), fy = cy - float(cy0);
-    const int xa = clamp(cx0, 0, cs.x - 1), xb = clamp(cx0 + 1, 0, cs.x - 1);
-    const int ya = clamp(cy0, 0, cs.y - 1), yb = clamp(cy0 + 1, 0, cs.y - 1);
-    const vec2 aa = chromaAt(ivec2(xa, ya)), ba = chromaAt(ivec2(xb, ya)), ab = chromaAt(ivec2(xa, yb)), bb = chromaAt(ivec2(xb, yb));
-    const vec2 a = aa + (ba - aa) * fx, b = ab + (bb - ab) * fx;
-    const vec2 c = (a + (b - a) * fy - vec2(p[7].z)) / p[7].w;  // (Cb, Cr)
+    const vec4 wx = cubicWeights(cx - float(cx0)), wy = cubicWeights(cy - float(cy0));
+    // (down each of the four columns, then along them: the CPU's order)
+    vec2 c = vec2(0.0);
+    for (int i = 0; i < 4; ++i) {
+        const int xi = clamp(cx0 - 1 + i, 0, cs.x - 1);
+        vec2 v = vec2(0.0);
+        for (int j = 0; j < 4; ++j) v += wy[j] * chromaAt(ivec2(xi, clamp(cy0 - 1 + j, 0, cs.y - 1)));
+        c += wx[i] * v;
+    }
+    c = (c - vec2(p[7].z)) / p[7].w;  // (Cb, Cr)
     const float y = (planeSample(srcTex, xy, 0) - p[7].x) / p[7].y;
     const float kr = p[8].x, kb = p[8].y;
     const float r = y + 2.0 * (1.0 - kr) * c.y, bl = y + 2.0 * (1.0 - kb) * c.x;

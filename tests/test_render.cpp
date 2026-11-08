@@ -11032,6 +11032,46 @@ colorspaces:
         }
     }
 
+    void dcpXyzTableAndThreads() {
+        // A 4K frame of every kind of value (smooth ramps, random colours, black, white and values past 1) made into
+        // X'Y'Z' codes from the table, on 1 and 8 threads and on the shared pool: the same codes, bit for bit, as the
+        // 2.6 power itself gives (how Montage made them before).
+        const int W = 4096, H = 2160;
+        Image img(W, H);
+        std::mt19937 rng(9);
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = img.row(y) + size_t(x) * 4;
+                if (y < H / 4) p[0] = p[1] = p[2] = float(x) / float(W - 1);                               // (grey ramp)
+                else if (y < H / 2) p[0] = float(x) / float(W - 1), p[1] = float(y) / float(H), p[2] = 0.02f;  // (colour ramps)
+                else if (y < H - 8) p[0] = u(rng), p[1] = u(rng), p[2] = u(rng) * 1.2f - 0.1f;            // (random, some outside 0..1)
+                else p[0] = p[1] = p[2] = (y & 1) ? 1.0f : 0.0f;
+                p[3] = 1;
+            }
+        for (const char* id : {"rec709", "p3d65", "rec2020"}) {
+            const ColorSpace& cs = *findColorSpace(id);
+            std::vector<uint16_t> before, one, eight, pool;
+            QElapsedTimer clock;
+            clock.start();
+            dcpXyzCodes(img, cs, before, 1, true);
+            const double slow = clock.nsecsElapsed() / 1e6;
+            clock.restart();
+            dcpXyzCodes(img, cs, one, 1);
+            const double table = clock.nsecsElapsed() / 1e6;
+            dcpXyzCodes(img, cs, eight, 8);
+            clock.restart();
+            dcpXyzCodes(img, cs, pool);
+            const double shared = clock.nsecsElapsed() / 1e6;
+            qInfo("DCI X'Y'Z' of a 4K frame from %s: %.0f ms with the power, %.0f ms from the table, %.0f ms across the cores", id, slow, table,
+                  shared);
+            QCOMPARE(one.size(), size_t(W) * H * 3);
+            QVERIFY(one == before);
+            QVERIFY(eight == before);
+            QVERIFY(pool == before);
+        }
+    }
+
     void dcpTrackFiles() {
         // Stereoscopic, timed text and encrypted track files, read back as servers read them (and by asdcplib's tools
         // when MONTAGE_TEST_ASDCP names the folder they are in).
@@ -21100,6 +21140,42 @@ colorspaces:
                 }
             }
     }
+    void chromaAlikeAtEverySize() {
+        // Sharp chroma, each sample its own: a high-quality frame at 99 % is the one at 100 % resized, and nothing else
+        // (one chroma filter at every size: the picture is converted at its own size, then resized).
+        QTemporaryDir dir;
+        const int W = 320, H = 180, w = 317, h = 178;
+        for (const AVPixelFormat fmt : {AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV422P, AV_PIX_FMT_NV12}) {
+            const std::string path = dir.filePath(QStringLiteral("sharp%1.mkv").arg(int(fmt))).toStdString();
+            const int bits = av_pix_fmt_desc_get(fmt)->comp[0].depth;
+            QVERIFY(writeYcbcrVideo(path, fmt, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT, [bits](int c, int x, int y) {
+                const unsigned hash = unsigned(x * 73856093 ^ y * 19349663 ^ c * 83492791);
+                return int((16 + hash % 225) << (bits - 8));
+            }));
+            Frame16Ptr full = MediaPool::instance().videoFrame(path, 0, 0, 0, true);
+            Frame16Ptr most = MediaPool::instance().videoFrame(path, 0, w, h, true);
+            QVERIFY(full && most && full->width == W && most->width == w && most->height == h);
+            // (the full frame's chroma is the planes' bicubic, as the GPU converts them)
+            Frame16Ptr planes = MediaPool::instance().videoFrame(path, 0, 0, 0, false, true);
+            QVERIFY(planes && planes->planes);
+            std::vector<uint16_t> own(size_t(W) * H * 4);
+            ycbcrToRgba16(*planes->planes, own.data());
+            QVERIFY(std::equal(own.begin(), own.end(), full->px.begin()));
+            SwsContext* sws = sws_getContext(W, H, AV_PIX_FMT_RGBA64LE, w, h, AV_PIX_FMT_RGBA64LE, SWS_BICUBIC | SWS_ACCURATE_RND, nullptr, nullptr, nullptr);
+            QVERIFY(sws);
+            auto freeSws = qScopeGuard([&] { sws_freeContext(sws); });
+            std::vector<uint16_t> resized(size_t(w) * h * 4);
+            const uint8_t* src[4] = {reinterpret_cast<const uint8_t*>(full->px.data()), nullptr, nullptr, nullptr};
+            const int srcStride[4] = {W * 8, 0, 0, 0};
+            uint8_t* dst[4] = {reinterpret_cast<uint8_t*>(resized.data()), nullptr, nullptr, nullptr};
+            const int dstStride[4] = {w * 8, 0, 0, 0};
+            QCOMPARE(sws_scale(sws, src, srcStride, 0, H, dst, dstStride), h);
+            int worst = 0;
+            for (size_t i = 0; i < resized.size(); ++i) worst = std::max(worst, std::abs(int(resized[i]) - int(most->px[i])));
+            QVERIFY2(worst == 0, qPrintable(QStringLiteral("%1: %2 codes apart").arg(av_get_pix_fmt_name(fmt)).arg(worst)));
+        }
+    }
+
     void scte35SampleMessages() {
         // ANSI/SCTE 35 2023r1's own sample messages (section 14: a placement opportunity's start, a splice_insert, the
         // opportunity's end) read, and written again byte for byte.

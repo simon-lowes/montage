@@ -41,6 +41,10 @@ public:
     // thread of their own, while montage_job, cancellations and the rest are answered as they come). Returns the
     // exit code.
     int run(std::istream& in, std::ostream& out);
+    // Takes up again the background calls a server before this one left when its process stopped or crashed (those of
+    // tools that leave the project as it is: renders, exports, analyses), as `montage-cli mcp` does when it starts.
+    // Returns how many.
+    int resumeStoredJobs();
 
     static const std::vector<std::string>& protocolVersions();  // newest first
 

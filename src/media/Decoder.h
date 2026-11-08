@@ -95,6 +95,7 @@ private:
     bool seek(double t);
     Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq, bool planes = false);
     std::shared_ptr<Frame16> convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq);
+    std::shared_ptr<Frame16> resizeRgba64(const Frame16& in, int w, int h);
     // The file's frame shown at `t` (its own time), decoded (cur_ or next_), with its time in `pts`; null at the end.
     const AVFrame* decodedAt(double t, double* pts);
 
@@ -121,6 +122,8 @@ private:
     bool stillHq_ = true;  // stillFrame_ scaled with high quality (an MLV frame's)
     SwsContext* sws_ = nullptr;
     int swsKey_[8] = {};  // the conversion sws_ was made for: sizes, source format, flags, chroma siting
+    SwsContext* resize_ = nullptr;  // 16-bit RGBA resized (a high-quality frame at another size, converted at its own)
+    int resizeKey_[4] = {};
     // Hardware decoding: the device's pixel format (-1 = software), the frame
     // hardware frames are copied into, and whether a copy failed (reopen in software).
     int hwPixFmt_ = -1;

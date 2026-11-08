@@ -237,6 +237,7 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "render/BackgroundJobs.h"
 #include "media/SoundLibrary.h"
 #include "core/Ucs.h"
 #include "automation/PythonHost.h"
@@ -1798,6 +1799,11 @@ class TestMedia : public QObject {
     std::string path(const char* name) { return (dir_.path() + "/" + name).toStdString(); }
 
 private slots:
+    void initTestCase() {
+        // MCP's background calls kept in a job store of the tests' own.
+        qputenv("MONTAGE_JOBS_DIR", QByteArray::fromStdString(path("jobs")));
+    }
+
     void captureFromFeeds() {
         // Recording a feed: lavfi's test pattern and tone (a capture device FFmpeg offers everywhere, made to run in
         // real time) into ProRes HQ in QuickTime, at a set timecode, for three seconds.
@@ -7686,6 +7692,87 @@ private slots:
         item.path = interpretedPath(plain, off);
         QVERIFY(off.hasRaw() && interpretationOf(item).rawNoOpcodes);
         QVERIFY(item.path.find("rawop=0") != std::string::npos);
+    }
+
+    void dngOpcodesCancel() {
+        // A crafted list of 256 opcodes: warps, vignettes and gain maps over the whole picture, one after another.
+        auto be32 = [](std::vector<uint8_t>& b, uint32_t v) {
+            for (int s = 24; s >= 0; s -= 8) b.push_back(uint8_t(v >> s));
+        };
+        auto be64 = [&](std::vector<uint8_t>& b, double d) {
+            uint64_t v;
+            std::memcpy(&v, &d, 8);
+            be32(b, uint32_t(v >> 32)), be32(b, uint32_t(v));
+        };
+        DngOpcodeList crafted;
+        for (int i = 0; i < 256; ++i) {
+            std::vector<uint8_t> p;
+            if (i % 3 == 0) {  // (WarpRectilinear: one set of coefficients, a little barrel, the centre)
+                be32(p, 1);
+                for (double k : {1.0, 0.02, 0.0, 0.0, 0.0, 0.0}) be64(p, k);
+                be64(p, 0.5), be64(p, 0.5);
+                crafted.push_back({kWarpRectilinear, 0x01030000, 0, p});
+            } else if (i % 3 == 1) {  // (FixVignetteRadial)
+                for (double k : {0.01, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5}) be64(p, k);
+                crafted.push_back({kFixVignetteRadial, 0x01030000, 0, p});
+            } else {  // (GainMap of two points across, every plane)
+                for (uint32_t v : {0u, 0u, 100000u, 100000u, 0u, 3u, 1u, 1u, 1u, 2u}) be32(p, v);
+                for (double d : {1.0, 1.0, 0.0, 0.0}) be64(p, d);
+                be32(p, 1);
+                for (float g : {1.0f, 0.99f}) {
+                    uint32_t v;
+                    std::memcpy(&v, &g, 4);
+                    be32(p, v);
+                }
+                crafted.push_back({kGainMap, 0x01030000, 0, p});
+            }
+        }
+        // Applied to a large picture on another thread and cancelled part way through an opcode: it stops at once
+        // (100 ms is the aim; a loaded test machine is given a second).
+        {
+            const int W = 4000, H = 3000;
+            std::vector<float> px(size_t(W) * H * 3);
+            for (size_t i = 0; i < px.size(); ++i) px[i] = float(i % 997) / 997.0f;
+            std::atomic<bool> cancel{false}, begun{false};
+            int applied = 0;
+            std::thread work([&] { applied = applyDngPictureOpcodes(crafted, px.data(), W, H, 3, 0, 0, &cancel, [&](double) { begun = true; }); });
+            while (!begun) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            QElapsedTimer since;
+            since.start();
+            cancel = true;
+            work.join();
+            const double took = since.nsecsElapsed() / 1e6;
+            qInfo("256 DNG opcodes on a 4000 x 3000 picture: cancelled, stopped %.1f ms later", took);
+            QCOMPARE(applied, -1);
+            QVERIFY2(took < 1000, qPrintable(QString::number(took)));
+        }
+        if (!rawAvailable()) QSKIP("Built without LibRaw");
+        // The same list in a DNG's list 3, developed and cancelled while its opcodes are applied.
+        const int W = 2400, H = 1600;
+        const std::string file = path("op_crafted.dng");
+        QVERIFY(writeTestDng(file, W, H, [](int x, int y) { return std::array<double, 3>{0.2 + 0.0001 * x, 0.3, 0.2 + 0.0001 * y}; }, 1, {1, 1, 1}, 0,
+                             {std::vector<uint8_t>{}, std::vector<uint8_t>{}, dngOpcodeListBytes(crafted)}));
+        std::atomic<bool> cancel{false}, begun{false};
+        bool developed = true;
+        std::string err;
+        RawImage img;
+        std::thread work([&] { developed = developRaw(file, img, &err, {}, &cancel, [&](double) { begun = true; }); });
+        while (!begun) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        QElapsedTimer since;
+        since.start();
+        cancel = true;
+        work.join();
+        const double took = since.nsecsElapsed() / 1e6;
+        qInfo("A DNG of 256 opcodes, cancelled while they are applied: stopped %.1f ms later", took);
+        QVERIFY(!developed);
+        QVERIFY2(err.find("cancelled") != std::string::npos, err.c_str());
+        QVERIFY2(took < 1000, qPrintable(QString::number(took)));
+        // Not cancelled, it develops (the opcodes past the work budget left out).
+        QVERIFY2(developRaw(file, img, &err), err.c_str());
+        QCOMPARE(img.width, W);
+        std::remove(file.c_str());
     }
 
     void colourInteropIds() {
@@ -20638,6 +20725,8 @@ if __name__ == '__main__':
         // A second one cancelled while it runs, a third while it waits behind it: both end "cancelled" (the third never
         // started: no file), and the list has all three.
         const QString out2 = dir.path() + "/cancelled.mp4", out3 = dir.path() + "/queued.mp4";
+        // (one at a time, so the third waits: renders otherwise run side by side)
+        QCOMPARE(call("montage_job", {{"action", "at_once"}, {"jobs", 1}}).value("structuredContent").toObject().value("jobs").toInt(), 1);
         const QString id2 = call("montage_render", {{"project", project}, {"output", out2}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
         const QString id3 = call("montage_render", {{"project", project}, {"output", out3}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
         QTRY_VERIFY_WITH_TIMEOUT(job(id2).value("progress").toDouble() > 0, 30000);
@@ -20752,6 +20841,178 @@ if __name__ == '__main__':
         QCOMPARE(printed, (QStringList{"measure", "progress seen True done True", "cancelled cancelled", "measured"}));
         QVERIFY2(!heldUp(), qPrintable(QString("%1 ms, %2 waits over 50 ms").arg(longestWait).arg(slowTicks)));
         QVERIFY(QFileInfo(dir.path() + "/py.mp4").size() > 1000);
+    }
+
+    void backgroundJobsSideBySideAndKept() {
+        // Ten seconds of colour bars at 320x180.
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/kept.montage", longer = dir.path() + "/longer.montage";
+        double longSeconds = 0;
+        for (const QString& file : {project, longer}) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 320;
+            s.height = 180;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "bars", file == project ? 300 : 3000));
+            QVERIFY(saveProject(p, file.toStdString()));
+            if (file == longer) longSeconds = double(s.duration()) / s.fpsValue();
+        }
+        const auto bytes = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        const auto rpc = [](McpServer& server, const QString& name, const QJsonObject& args) {
+            static int id = 5000;
+            const QJsonObject msg{{"jsonrpc", "2.0"}, {"id", ++id}, {"method", "tools/call"}, {"params", QJsonObject{{"name", name}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(msg).toJson(QJsonDocument::Compact).toStdString());
+            return lines.empty() ? QJsonObject() : QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const auto job = [&](McpServer& server, const QString& id, const QJsonObject& more = {}) {
+            QJsonObject args{{"job", id}};
+            for (auto it = more.begin(); it != more.end(); ++it) args[it.key()] = it.value();
+            return rpc(server, "montage_job", args).value("structuredContent").toObject();
+        };
+        QElapsedTimer t;
+        {
+            // Plain calls, one after the other, as the reference.
+            McpServer server;
+            t.start();
+            for (const char* name : {"/serial-1.mp4", "/serial-2.mp4"}) {
+                const QJsonObject r = rpc(server, "montage_render", {{"project", project}, {"output", dir.path() + name}});
+                QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+            }
+            const qint64 serial = t.elapsed();
+            // Two in the background run side by side (renders leave the project as it is), and give the same files.
+            QCOMPARE(rpc(server, "montage_job", {{"action", "at_once"}, {"jobs", 2}}).value("structuredContent").toObject().value("jobs").toInt(), 2);
+            t.restart();
+            QStringList ids;
+            for (const char* name : {"/together-1.mp4", "/together-2.mp4"})
+                ids << rpc(server, "montage_render", {{"project", project}, {"output", dir.path() + name}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
+            bool together = false;
+            while (t.elapsed() < 120000) {
+                const QString a = job(server, ids[0]).value("status").toString(), b = job(server, ids[1]).value("status").toString();
+                if (a == "running" && b == "running") together = true;
+                if ((a == "done" || a == "failed") && (b == "done" || b == "failed")) break;
+                QThread::msleep(5);
+            }
+            qInfo("MCP: two renders one after the other %lld ms, side by side %lld ms", serial, t.elapsed());
+            QVERIFY(together);
+            QCOMPARE(job(server, ids[0]).value("status").toString(), QString("done"));
+            QCOMPARE(job(server, ids[1]).value("status").toString(), QString("done"));
+            QVERIFY(bytes(dir.path() + "/serial-1.mp4").size() > 1000);
+            QVERIFY(bytes(dir.path() + "/together-1.mp4") == bytes(dir.path() + "/serial-1.mp4"));
+            QVERIFY(bytes(dir.path() + "/together-2.mp4") == bytes(dir.path() + "/serial-2.mp4"));
+            // A call that changes the project still waits for them: it runs alone.
+            const QJsonArray mine = rpc(server, "montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray();
+            QCOMPARE(mine.size(), 2);
+        }
+        // A server after it lists them, as kept on disk, and reads one's result by its stored id.
+        QString interrupted, queuedBehind;
+        {
+            McpServer server;
+            const QJsonObject listed = rpc(server, "montage_job", {{"action", "list"}}).value("structuredContent").toObject();
+            QVERIFY(listed.value("jobs").toArray().isEmpty());
+            QJsonArray stored;
+            for (const QJsonValue& v : listed.value("stored").toArray())
+                if (v.toObject().value("tool").toString() == "montage_render" && v.toObject().value("status").toString() == "done") stored.append(v);
+            QVERIFY2(stored.size() >= 2, qPrintable(QJsonDocument(listed).toJson()));
+            const QString storedId = stored[stored.size() - 1].toObject().value("job").toString();
+            QVERIFY(storedId.startsWith("mcp-"));
+            const QJsonObject read = job(server, storedId);
+            QCOMPARE(read.value("status").toString(), QString("done"));
+            QVERIFY2(read.value("result").toObject().value("message").toString().contains(".mp4"), qPrintable(QJsonDocument(read).toJson()));
+            // A long render, and one waiting behind it, cut short by the server's end: both kept as interrupted.
+            QCOMPARE(rpc(server, "montage_job", {{"action", "at_once"}, {"jobs", 1}}).value("structuredContent").toObject().value("jobs").toInt(), 1);
+            const QString a = rpc(server, "montage_render", {{"project", longer}, {"output", dir.path() + "/resumed.mp4"}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
+            const QString b = rpc(server, "montage_render", {{"project", project}, {"output", dir.path() + "/behind.mp4"}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
+            QTRY_VERIFY_WITH_TIMEOUT(job(server, a).value("progress").toDouble() > 0, 30000);
+            QCOMPARE(job(server, b).value("status").toString(), QString("queued"));
+            // (their stored ids: the one running and the one waiting)
+            for (const jobs::Record& k : jobs::all("mcp")) {
+                if (k.status == "running") interrupted = k.id;
+                if (k.status == "waiting") queuedBehind = k.id;
+            }
+            QVERIFY(!interrupted.isEmpty() && !queuedBehind.isEmpty());
+        }
+        jobs::Record r;
+        QVERIFY(jobs::load(interrupted, r));
+        QCOMPARE(r.status, QString("interrupted"));
+        QVERIFY(jobs::load(queuedBehind, r));
+        QCOMPARE(r.status, QString("interrupted"));
+        {
+            // Left by a server of this same process: listed, not taken up by itself; resume runs it again.
+            McpServer server;
+            QCOMPARE(server.resumeStoredJobs(), 0);
+            QVERIFY(rpc(server, "montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray().isEmpty());
+            QCOMPARE(job(server, interrupted).value("status").toString(), QString("interrupted"));
+            const QJsonObject resumed = job(server, queuedBehind, {{"action", "resume"}});
+            QCOMPARE(resumed.value("resumedFrom").toString(), queuedBehind);
+            const QJsonObject done = job(server, resumed.value("job").toString(), {{"wait", 60}});
+            QCOMPARE(done.value("status").toString(), QString("done"));
+            QVERIFY(bytes(dir.path() + "/behind.mp4") == bytes(dir.path() + "/serial-1.mp4"));
+            QCOMPARE(job(server, queuedBehind).value("status").toString(), QString("resumed"));
+            QVERIFY(rpc(server, "montage_job", {{"job", queuedBehind}, {"action", "resume"}}).value("isError").toBool());  // (once only)
+        }
+        // As a crash leaves it (its process gone): the next server takes the render up again by itself, from the start.
+        QVERIFY(jobs::load(interrupted, r));
+        r.status = "running";
+        r.pid = 0x7ffffff0;
+        r.process = "gone";
+        QVERIFY(jobs::save(r));
+        {
+            McpServer server;
+            QCOMPARE(server.resumeStoredJobs(), 1);
+            QCOMPARE(McpServer().resumeStoredJobs(), 0);  // (taken once only)
+            const QJsonArray mine = rpc(server, "montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray();
+            QCOMPARE(mine.size(), 1);
+            const QString again = mine[0].toObject().value("job").toString();
+            QCOMPARE(mine[0].toObject().value("tool").toString(), QString("montage_render"));
+            QJsonObject done;
+            t.restart();
+            while (t.elapsed() < 300000) {
+                done = job(server, again, {{"wait", 60}});
+                if (done.value("status").toString() != "running" && done.value("status").toString() != "queued") break;
+            }
+            QCOMPARE(done.value("status").toString(), QString("done"));
+            MediaItem m;
+            QVERIFY(probeMedia((dir.path() + "/resumed.mp4").toStdString(), m));
+            QVERIFY2(std::fabs(m.duration - longSeconds) < 0.5, qPrintable(QString("%1 %2").arg(m.duration).arg(longSeconds)));
+            QCOMPARE(job(server, interrupted).value("resumedAs").toString().isEmpty(), false);
+        }
+        // A render queue export is cancelled by its stored id: the queue holding it finds the request in its folder.
+        jobs::Record q;
+        q.id = "queue-77";
+        q.owner = "render-queue";
+        q.kind = "export";
+        q.title = "Sequence 1 - H.264";
+        q.status = "waiting";
+        q.pid = jobs::thisProcess();
+        q.process = jobs::thisProcessToken();
+        QVERIFY(jobs::save(q));
+        {
+            McpServer server;
+            bool listed = false;
+            for (const QJsonValue& v : rpc(server, "montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("stored").toArray())
+                listed |= v.toObject().value("job").toString() == "queue-77" && v.toObject().value("owner").toString() == "render-queue";
+            QVERIFY(listed);
+            QVERIFY(job(server, "queue-77", {{"action", "cancel"}}).value("cancelAsked").toBool());
+            QVERIFY(QFileInfo::exists(jobs::jobFolder("queue-77") + "/cancel"));
+            QVERIFY(rpc(server, "montage_job", {{"job", "queue-77"}, {"action", "resume"}}).value("isError").toBool());
+            QVERIFY(rpc(server, "montage_job", {{"job", "../x"}}).value("isError").toBool());
+        }
+        QVERIFY(jobs::remove("queue-77"));
+        // A job's process counts as running it only while it keeps its "alive" file fresh, so a pid in use again
+        // after a restart is not taken for it.
+        jobs::Record held = q;
+        held.process = "another-montage";  // (this process's pid: alive)
+        QVERIFY(!jobs::runningElsewhere(held));
+        {
+            QFile alive(jobs::storeFolder() + "/alive/another-montage");
+            QVERIFY(alive.open(QIODevice::WriteOnly));
+        }
+        QVERIFY(jobs::runningElsewhere(held));
+        QVERIFY(QFileInfo::exists(jobs::storeFolder() + "/alive/" + jobs::thisProcessToken()));  // (this process's own)
+        QVERIFY(QFile::remove(jobs::storeFolder() + "/alive/another-montage"));
     }
 
     void luaScripts() {
@@ -42764,6 +43025,84 @@ private slots:
         Clip reframed = clip;
         reframed.effects.push_back(makeEffect(p, "reframe_360"));
         QVERIFY(!clipDepthAnalysed(p, s, reframed));
+    }
+
+    void tapeRepairQuickWithProgress() {
+        // The reference clip: 20 s of stereo music over a 1 kHz tone (as tapeAndArchiveRepair's), with 0.3 % of wow at
+        // 0.8 Hz and 0.05 % of flutter at 12 Hz.
+        constexpr int sr = 48000;
+        const double chords[4][3] = {{200, 300, 450}, {250, 375, 560}, {220, 330, 440}, {275, 350, 420}};
+        auto music = [&](double tau) {
+            double v = 0.3 * std::sin(2 * M_PI * 1000 * tau);
+            const auto& chord = chords[size_t(std::max(0.0, tau) / 0.5) % 4];
+            for (double f : chord) v += 0.06 * std::sin(2 * M_PI * f * tau) + 0.03 * std::sin(2 * M_PI * 2 * f * tau);
+            return v;
+        };
+        auto tauAt = [](double t) {
+            return t + 0.003 / (2 * M_PI * 0.8) * (1 - std::cos(2 * M_PI * 0.8 * t)) + 0.0005 / (2 * M_PI * 12) * (1 - std::cos(2 * M_PI * 12 * t));
+        };
+        const size_t n = size_t(20 * sr);
+        AudioBuffer tape;
+        tape.sampleRate = sr, tape.channels = 2;
+        tape.samples.resize(n * 2);
+        for (size_t i = 0; i < n; ++i) tape.samples[i * 2] = tape.samples[i * 2 + 1] = float(music(tauAt(double(i) / sr)));
+        // As Montage did it before (timed), then now: the same sound to within 1e-6, and quicker.
+        struct Back {
+            ~Back() { tapeRepairAsBefore(false); }
+        } back;
+        tapeRepairAsBefore(true);
+        const TransferSpeed speedBefore = measureTransferSpeed(tape);
+        QElapsedTimer clock;
+        clock.start();
+        AudioBuffer before;
+        QVERIFY(removeWowFlutter(tape, before, 1, 1));
+        const double slow = clock.nsecsElapsed() / 1e6;
+        tapeRepairAsBefore(false);
+        std::mutex m;
+        std::vector<double> seen;
+        clock.restart();
+        AudioBuffer now;
+        QVERIFY(removeWowFlutter(tape, now, 1, 1, 0, nullptr, nullptr, nullptr, [&](double f) {
+            std::lock_guard l(m);
+            seen.push_back(f);
+        }));
+        const double quick = clock.nsecsElapsed() / 1e6;
+        qInfo("Wow and flutter taken out of 20 s of stereo: %.0f ms as before, %.0f ms now (%.1f times as fast, %u cores)", slow, quick,
+              slow / std::max(quick, 1e-3), std::thread::hardware_concurrency());
+        QCOMPARE(now.samples.size(), before.samples.size());
+        double worst = 0;
+        for (size_t i = 0; i < now.samples.size(); ++i) worst = std::max(worst, double(std::fabs(now.samples[i] - before.samples[i])));
+        QVERIFY2(worst <= 1e-6, qPrintable(QString::number(worst)));
+        {
+            const TransferSpeed speedNow = measureTransferSpeed(tape);
+            QCOMPARE(speedNow.speed.size(), speedBefore.speed.size());
+            double off = 0;
+            for (size_t i = 0; i < speedNow.speed.size(); ++i) off = std::max(off, std::fabs(speedNow.speed[i] - speedBefore.speed[i]));
+            QVERIFY2(off < 1e-9, qPrintable(QString::number(off)));
+        }
+        // (5 times as fast is the aim on four cores, and 6 to 8.5 was measured; asked here only to be well over twice
+        // as fast, as test machines vary)
+        QVERIFY2(quick * 2.5 < slow, qPrintable(QStringLiteral("%1 ms against %2 ms").arg(quick).arg(slow)));
+        // Progress: rising all the way, to 1.
+        QVERIFY(seen.size() >= 10);
+        for (size_t i = 1; i < seen.size(); ++i) QVERIFY2(seen[i] > seen[i - 1], qPrintable(QString::number(seen[i])));
+        QVERIFY(seen.front() >= 0);
+        QCOMPARE(seen.back(), 1.0);
+        // Cancelled while it reads the speed and while it resamples: it stops at once (100 ms is the aim; a loaded
+        // test machine is given a second).
+        for (const double when : {0.2, 0.7}) {
+            std::atomic<bool> cancel{false};
+            QElapsedTimer since;
+            AudioBuffer stopped;
+            const bool finished = removeWowFlutter(tape, stopped, 1, 1, 0, &cancel, nullptr, nullptr, [&](double f) {
+                if (f >= when && !cancel.exchange(true)) since.start();
+            });
+            QVERIFY(!finished);
+            QVERIFY(since.isValid());
+            const double took = since.nsecsElapsed() / 1e6;
+            qInfo("Wow and flutter cancelled at %.0f %%: stopped %.1f ms later", when * 100, took);
+            QVERIFY2(took < 1000, qPrintable(QString::number(took)));
+        }
     }
 
     void tapeAndArchiveRepair() {

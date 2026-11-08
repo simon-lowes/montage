@@ -6,6 +6,9 @@
 #include <atomic>
 #include <cmath>
 #include <complex>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <limits>
 #include <numeric>
 
@@ -36,6 +39,48 @@ void fft(std::vector<cd>& a, bool inverse) {
                 a[i + k + len / 2] = u - v;
             }
         }
+    }
+}
+
+// An FFT as fft() makes it (to rounding: each twiddle read from `twiddle`, e^(-2 pi i k / L) for an FFT of L / 2 as
+// realPower's, rather than fft()'s running products), quicker: the complex products written out (std::complex's
+// multiply goes through a library call that checks for infinities).
+void fftQuick(std::vector<cd>& a, const std::vector<cd>& twiddle, size_t L) {
+    const size_t n = a.size();
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    double* d = reinterpret_cast<double*>(a.data());
+    const double* t = reinterpret_cast<const double*>(twiddle.data());
+    for (size_t len = 2; len <= n; len <<= 1) {
+        const size_t stride = L / len;
+        for (size_t i = 0; i < n; i += len)
+            for (size_t k = 0; k < len / 2; ++k) {
+                double* u = d + 2 * (i + k);
+                double* v = d + 2 * (i + k + len / 2);
+                const double wr = t[2 * k * stride], wi = t[2 * k * stride + 1];
+                const double vr = v[0] * wr - v[1] * wi, vi = v[0] * wi + v[1] * wr;
+                v[0] = u[0] - vr, v[1] = u[1] - vi;
+                u[0] += vr, u[1] += vi;
+            }
+    }
+}
+
+// |X[k]|^2, k = 0..L/2, of the DFT of L real samples `x` (L a power of two, 4 or more): one complex FFT of L/2 (the
+// even samples as the real part, the odd as the imaginary), split into the two halves' spectra and joined. `z` and
+// `twiddle` (e^(-2 pi i k / L), k < L/2) are the caller's, so a run of frames allocates nothing.
+void realPower(const double* x, size_t L, const std::vector<cd>& twiddle, std::vector<cd>& z, double* power) {
+    const size_t M = L / 2;
+    z.resize(M);
+    for (size_t n = 0; n < M; ++n) z[n] = {x[2 * n], x[2 * n + 1]};
+    fftQuick(z, twiddle, L);
+    for (size_t k = 0; k <= M; ++k) {
+        const cd a = z[k % M], b = std::conj(z[(M - k) % M]);
+        const cd even = 0.5 * (a + b), odd = cd(0, -0.5) * (a - b);
+        power[k] = std::norm(even + (k < M ? twiddle[k] : cd(-1, 0)) * odd);
     }
 }
 
@@ -80,6 +125,32 @@ struct SincTable {
             sum += tap(double(s) - at) * x[size_t(s) * nch + c];
         return sum;
     }
+    // Every channel at `at` into `out` (nch floats), the taps worked out once: the same as read() for each, to rounding.
+    void readAll(const float* x, size_t nch, int64_t n, double at, float* out) const {
+        const int64_t base = int64_t(std::floor(at));
+        const double frac = at - double(base);
+        if (frac == 0) {
+            for (size_t c = 0; c < nch; ++c) out[c] = float(base >= 0 && base < n ? double(x[size_t(base) * nch + c]) : 0.0);
+            return;
+        }
+        const int64_t s0 = std::max<int64_t>(0, base - kZeros + 1), s1 = std::min<int64_t>(n - 1, base + kZeros);
+        // (the taps a whole number of zero crossings apart share their place between table entries: at - s is
+        // frac + (base - s) up to `base`, and (1 - frac) + (s - base - 1) after it, each under 16, so never past the table)
+        double taps[2 * kZeros];
+        const double left = frac * kRes, right = (1 - frac) * kRes;
+        const size_t li = size_t(left), ri = size_t(right);
+        const double lf = left - double(li), rf = right - double(ri);
+        for (int64_t s = s0; s <= s1; ++s) {
+            const size_t i = s <= base ? li + size_t(base - s) * kRes : ri + size_t(s - base - 1) * kRes;
+            const double f = s <= base ? lf : rf;
+            taps[s - s0] = k[i] + (k[i + 1] - k[i]) * f;
+        }
+        for (size_t c = 0; c < nch; ++c) {
+            double sum = 0;
+            for (int64_t s = s0; s <= s1; ++s) sum += taps[s - s0] * x[size_t(s) * nch + c];
+            out[c] = float(sum);
+        }
+    }
 };
 
 const SincTable& sincTable() {
@@ -113,7 +184,164 @@ double median(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
+std::atomic<bool> gAsBefore{false};
+
+// Progress over [from, to) of a caller's 0..1, never going back (bands finish out of order); safe from any thread.
+struct Progress {
+    const std::function<void(double)>* fn = nullptr;
+    double from = 0, to = 1;
+    std::shared_ptr<std::mutex> m = std::make_shared<std::mutex>();
+    std::shared_ptr<double> last = std::make_shared<double>(-1);
+    void operator()(double f) const {
+        if (!fn || !*fn) return;
+        const double v = from + (to - from) * std::clamp(f, 0.0, 1.0);
+        std::lock_guard l(*m);
+        if (v <= *last) return;
+        *last = v;
+        (*fn)(v);
+    }
+    Progress part(double a, double b) const {
+        Progress p = *this;
+        p.from = from + (to - from) * a, p.to = from + (to - from) * b;
+        return p;
+    }
+};
+
+// fn(i0, i1) over 0..count in runs across the cores, however few (parallelRows gives a core 16 rows or more: here 16
+// rows an item).
+void acrossCores(size_t count, const std::function<void(size_t, size_t)>& fn) {
+    const int rows = int(std::min<size_t>(count, size_t(std::numeric_limits<int>::max() / 16)) * 16);
+    parallelRows(rows, [&](int r0, int r1) {
+        const size_t i0 = (size_t(r0) + 15) / 16, i1 = (size_t(r1) + 15) / 16;
+        if (i0 < i1) fn(i0, i1);
+    });
+}
+
+// The channels of interleaved `data` (C of them) mixed, sample i.
+inline double mixed(const float* data, size_t C, size_t i) {
+    if (C == 1) return double(data[i]);
+    double sum = 0;
+    for (size_t c = 0; c < C; ++c) sum += data[i * C + c];
+    return sum / double(C);
+}
+
+// Each hop m's (0..hops) Hann-windowed DFT of N samples from m * H at each partial's frequency, into at[m * P + p]:
+// the sum as written, each hop and partial on its own (how it was first made; kept to check the quicker one against).
+bool directPartialDfts(const float* data, size_t C, size_t N, size_t H, size_t hops, const std::vector<double>& partials, double fs,
+                       const std::atomic<bool>* cancel, const Progress& report, std::vector<cd>& at) {
+    const size_t P = partials.size();
+    at.assign((hops + 1) * P, 0.0);
+    const std::vector<double> w = hann(N);
+    for (size_t pi = 0; pi < P; ++pi) {
+        if (cancelled(cancel)) return false;
+        const double omega = 2 * M_PI * partials[pi] / fs;
+        std::vector<cd> kernel(N);
+        for (size_t n = 0; n < N; ++n) kernel[n] = w[n] * std::polar(1.0, -omega * double(n));
+        std::atomic<bool> stop{false};
+        const int bands = int(std::min<size_t>((hops + 1 + 1023) / 1024, size_t(std::numeric_limits<int>::max())));
+        parallelRows(bands, [&](int b0, int b1) {
+            for (size_t m = size_t(b0) * 1024; m < std::min(hops + 1, size_t(b1) * 1024); ++m) {
+                if ((m & 1023) == 0 && (stop || cancelled(cancel))) {
+                    stop = true;
+                    return;
+                }
+                cd X = 0;
+                if (C == 1) {
+                    const float* p = data + m * H;
+                    for (size_t n = 0; n < N; ++n) X += double(p[n]) * kernel[n];
+                } else {
+                    for (size_t n = 0; n < N; ++n) X += mixed(data, C, m * H + n) * kernel[n];
+                }
+                at[m * P + pi] = X;
+            }
+        });
+        if (stop) return false;
+        report(double(pi + 1) / double(P));
+    }
+    return true;
+}
+
+// The same sums, quicker and the same to rounding: the Hann window is three complex exponentials (0.5 at the partial's
+// frequency, -0.25 e^(+-i pi / N) a bin either side), so each hop's windowed DFT is three plain DFTs, and a plain DFT of
+// N samples from m * H is the sum, turned by each block's offset, of the DFTs of the H-sample blocks it covers (whole
+// ones, then the first N mod H samples of the next): blocks every overlapping hop shares, worked out once for all the
+// partials together. Hops in bands of 1024 across the cores, each band mixing its own samples.
+bool partialDfts(const float* data, size_t C, size_t N, size_t H, size_t hops, const std::vector<double>& partials, double fs,
+                 const std::atomic<bool>* cancel, const Progress& report, std::vector<cd>& at) {
+    const size_t P = partials.size(), K = 3 * P;  // frequency f = 3 p + r: the partial's, a bin below (r 0) and above (r 2)
+    const size_t Q = N / H, R = N - Q * H;
+    at.assign((hops + 1) * P, 0.0);
+    std::vector<double> omega(K);
+    for (size_t p = 0; p < P; ++p)
+        for (size_t r = 0; r < 3; ++r) omega[3 * p + r] = 2 * M_PI * partials[p] / fs + (double(r) - 1) * 2 * M_PI / double(N);
+    const cd weight[3] = {-0.25 * std::polar(1.0, M_PI / double(N)), 0.5, -0.25 * std::polar(1.0, -M_PI / double(N))};
+    // e^(-i w n) within a block (n < H), and e^(-i w q H) for its place in the window (q <= Q), frequency fastest.
+    std::vector<double> er(H * K), ei(H * K);
+    std::vector<cd> turn((Q + 1) * K);
+    for (size_t n = 0; n < H; ++n)
+        for (size_t f = 0; f < K; ++f) {
+            const cd e = std::polar(1.0, -omega[f] * double(n));
+            er[n * K + f] = e.real(), ei[n * K + f] = e.imag();
+        }
+    for (size_t q = 0; q <= Q; ++q)
+        for (size_t f = 0; f < K; ++f) turn[q * K + f] = std::polar(1.0, -omega[f] * double(q * H));
+    // (each core a run of hops, worked through 1024 at a time: the band's blocks, then its hops)
+    constexpr size_t kBand = 1024;
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> done{0};
+    parallelRows(int(std::min<size_t>(hops + 1, size_t(std::numeric_limits<int>::max()))), [&](int h0, int h1) {
+        std::vector<double> x;
+        std::vector<cd> whole, part;  // each block's DFT (blocks of the band), and of its first R samples
+        std::vector<double> sr(K), si(K), pr(K), pi_(K);
+        for (size_t m0 = size_t(h0); m0 < size_t(h1); m0 += kBand) {
+            if (stop || cancelled(cancel)) {
+                stop = true;
+                return;
+            }
+            const size_t m1 = std::min(size_t(h1), m0 + kBand);
+            const size_t blocks = m1 - m0 + Q;  // blocks m0 .. m1 - 1 + Q (the last ones' R samples only, perhaps)
+            const size_t first = m0 * H, samples = (m1 - 1) * H + N - first;  // (the last block's past R are not needed)
+            x.resize(blocks * H);
+            for (size_t i = 0; i < samples; ++i) x[i] = mixed(data, C, first + i);
+            std::fill(x.begin() + std::ptrdiff_t(samples), x.end(), 0.0);
+            whole.assign(blocks * K, 0.0);
+            part.assign(blocks * K, 0.0);
+            for (size_t j = 0; j < blocks; ++j) {
+                std::fill(sr.begin(), sr.end(), 0.0);
+                std::fill(si.begin(), si.end(), 0.0);
+                const double* xs = x.data() + j * H;
+                for (size_t n = 0; n < H; ++n) {
+                    if (n == R) pr = sr, pi_ = si;
+                    const double v = xs[n];
+                    const double* a = er.data() + n * K;
+                    const double* b = ei.data() + n * K;
+                    for (size_t f = 0; f < K; ++f) sr[f] += v * a[f], si[f] += v * b[f];
+                }
+                for (size_t f = 0; f < K; ++f) whole[j * K + f] = {sr[f], si[f]}, part[j * K + f] = {pr[f], pi_[f]};
+            }
+            // (products written out: std::complex's goes through a library call that checks for infinities)
+            const auto mul = [](const cd& a, const cd& b) { return cd(a.real() * b.real() - a.imag() * b.imag(), a.real() * b.imag() + a.imag() * b.real()); };
+            std::vector<cd> sum(K);
+            for (size_t m = m0; m < m1; ++m) {
+                const size_t j0 = m - m0;
+                for (size_t f = 0; f < K; ++f) sum[f] = mul(turn[Q * K + f], part[(j0 + Q) * K + f]);
+                for (size_t q = 0; q < Q; ++q) {
+                    const cd* t = turn.data() + q * K;
+                    const cd* b = whole.data() + (j0 + q) * K;
+                    for (size_t f = 0; f < K; ++f) sum[f] += mul(t[f], b[f]);
+                }
+                for (size_t p = 0; p < P; ++p)
+                    at[m * P + p] = weight[0] * sum[3 * p] + weight[1] * sum[3 * p + 1] + weight[2] * sum[3 * p + 2];
+            }
+            report(double(done.fetch_add(m1 - m0) + (m1 - m0)) / double(hops + 1));
+        }
+    });
+    return !stop;
+}
+
 }  // namespace
+
+void tapeRepairAsBefore(bool before) { gAsBefore = before; }
 
 double TransferSpeed::at(double seconds) const {
     if (speed.empty() || hop <= 0) return 1;
@@ -124,18 +352,15 @@ double TransferSpeed::at(double seconds) const {
     return speed[k] + (speed[k + 1] - speed[k]) * (i - double(k));
 }
 
-TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const std::atomic<bool>* cancel) {
+namespace {
+
+TransferSpeed measureSpeed(const AudioBuffer& in, double pilotHz, const std::atomic<bool>* cancel, const Progress& report) {
     TransferSpeed out;
     const double fs = in.sampleRate;
     // The channels mixed as they are read (a mixed copy of hours of a sound is gigabytes).
     const size_t C = size_t(std::max(1, in.channels)), length = in.samples.size() / C;
     const float* data = in.samples.data();
-    auto x = [data, C](size_t i) {
-        if (C == 1) return double(data[i]);
-        double sum = 0;
-        for (size_t c = 0; c < C; ++c) sum += data[i * C + c];
-        return sum / double(C);
-    };
+    auto x = [data, C](size_t i) { return mixed(data, C, i); };
     const size_t N = powerOfTwoAtLeast(fs * 0.042);  // (2048 at 48 kHz: partials 50 Hz apart are told apart)
     const size_t H = size_t(std::max(1L, std::lround(fs * 0.004)));
     if (fs <= 0 || length < N * 4) return out;
@@ -146,12 +371,48 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
     {
         const std::vector<double> w = hann(L);
         const size_t frames = (length - L) / (L / 2) + 1, step = std::max<size_t>(1, frames / 2000);
-        std::vector<cd> buf(L);
-        for (size_t f = 0; f < frames; f += step) {
+        if (gAsBefore) {
+            std::vector<cd> buf(L);
+            for (size_t f = 0; f < frames; f += step) {
+                if (cancelled(cancel)) return out;
+                report(0.1 * double(f) / double(frames));
+                for (size_t i = 0; i < L; ++i) buf[i] = x(f * (L / 2) + i) * w[i];
+                fft(buf, false);
+                for (size_t k = 0; k <= L / 2; ++k) power[k] += std::norm(buf[k]);
+            }
+        }
+        // (64 frames at a time across the cores, each through a real FFT of half its length, then added up in their
+        // order)
+        constexpr size_t kChunk = 64;
+        std::vector<cd> twiddle(L / 2);
+        for (size_t k = 0; k < L / 2; ++k) twiddle[k] = std::polar(1.0, -2 * M_PI * double(k) / double(L));
+        std::vector<double> each(kChunk * (L / 2 + 1));
+        std::vector<size_t> picked;
+        if (!gAsBefore)
+            for (size_t f = 0; f < frames; f += step) picked.push_back(f);
+        for (size_t c0 = 0; c0 < picked.size(); c0 += kChunk) {
             if (cancelled(cancel)) return out;
-            for (size_t i = 0; i < L; ++i) buf[i] = x(f * (L / 2) + i) * w[i];
-            fft(buf, false);
-            for (size_t k = 0; k <= L / 2; ++k) power[k] += std::norm(buf[k]);
+            report(0.1 * double(c0) / double(picked.size()));
+            const size_t count = std::min(kChunk, picked.size() - c0);
+            std::atomic<bool> stop{false};
+            acrossCores(count, [&](size_t i0, size_t i1) {
+                std::vector<double> buf(L);
+                std::vector<cd> z;
+                for (size_t i = i0; i < i1; ++i) {
+                    if (stop || cancelled(cancel)) {
+                        stop = true;
+                        return;
+                    }
+                    const size_t f = picked[c0 + i];
+                    for (size_t j = 0; j < L; ++j) buf[j] = x(f * (L / 2) + j) * w[j];
+                    realPower(buf.data(), L, twiddle, z, each.data() + i * (L / 2 + 1));
+                }
+            });
+            if (stop) return out;
+            for (size_t i = 0; i < count; ++i) {
+                const double* p = each.data() + i * (L / 2 + 1);
+                for (size_t k = 0; k <= L / 2; ++k) power[k] += p[k];
+            }
         }
     }
     const double df = fs / double(L);
@@ -182,45 +443,28 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
     }
     if (partials.empty()) return out;
     // Each partial's frequency hop by hop, from the phase its own DFT advances by.
-    const std::vector<double> w = hann(N);
     const size_t hops = (length - N) / H;
     if (hops < 2) return out;
-    // (ratio, weight) for each hop, from each partial in turn; a weight of 0 where it did not vote
     const size_t P = partials.size();
+    report(0.1);
+    std::vector<cd> at;  // (hops + 1) x P: each hop's DFT at each partial's frequency
+    const Progress dfts = report.part(0.1, 0.9);
+    if (!(gAsBefore ? directPartialDfts(data, C, N, H, hops, partials, fs, cancel, dfts, at)
+                     : partialDfts(data, C, N, H, hops, partials, fs, cancel, dfts, at)))
+        return {};
+    report(0.9);
+    // (ratio, weight) for each hop, from each partial in turn; a weight of 0 where it did not vote
     std::vector<std::pair<float, float>> votes(hops * P, {1.0f, 0.0f});
     for (size_t pi = 0; pi < P; ++pi) {
         const double f0 = partials[pi];
-        if (cancelled(cancel)) return {};
         const double omega = 2 * M_PI * f0 / fs;
-        std::vector<cd> kernel(N);
-        for (size_t n = 0; n < N; ++n) kernel[n] = w[n] * std::polar(1.0, -omega * double(n));
-        // (each hop's DFT on its own, the hops shared among the cores)
-        std::vector<cd> at(hops + 1);
-        std::atomic<bool> stop{false};
-        const int bands = int(std::min<size_t>((hops + 1 + 1023) / 1024, size_t(std::numeric_limits<int>::max())));
-        parallelRows(bands, [&](int b0, int b1) {
-            for (size_t m = size_t(b0) * 1024; m < std::min(hops + 1, size_t(b1) * 1024); ++m) {
-                if ((m & 1023) == 0 && (stop || cancelled(cancel))) {
-                    stop = true;
-                    return;
-                }
-                cd X = 0;
-                if (C == 1) {
-                    const float* p = data + m * H;
-                    for (size_t n = 0; n < N; ++n) X += double(p[n]) * kernel[n];
-                } else {
-                    for (size_t n = 0; n < N; ++n) X += x(m * H + n) * kernel[n];
-                }
-                at[m] = X;
-            }
-        });
-        if (stop) return {};
         std::vector<double> freq(hops), mag(hops);
         for (size_t m = 1; m <= hops; ++m) {
-            double d = std::arg(at[m]) - std::arg(at[m - 1]) - omega * double(H);
+            const cd a = at[(m - 1) * P + pi], b = at[m * P + pi];
+            double d = std::arg(b) - std::arg(a) - omega * double(H);
             d -= 2 * M_PI * std::round(d / (2 * M_PI));
             freq[m - 1] = f0 + d * fs / (2 * M_PI * double(H));
-            mag[m - 1] = std::sqrt(std::abs(at[m]) * std::abs(at[m - 1]));
+            mag[m - 1] = std::sqrt(std::abs(b) * std::abs(a));
         }
         // Counted where it is within 20 dB of its loudest (it may come and go) and within 1 % of its usual frequency
         // (not a neighbour leaking into it while it is away), against that frequency.
@@ -282,8 +526,21 @@ TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const 
     return out;
 }
 
+}  // namespace
+
+TransferSpeed measureTransferSpeed(const AudioBuffer& in, double pilotHz, const std::atomic<bool>* cancel,
+                                   const std::function<void(double)>& progress) {
+    Progress report;
+    report.fn = &progress;
+    TransferSpeed sp = measureSpeed(in, pilotHz, cancel, report);
+    if (!sp.speed.empty()) report(1);
+    return sp;
+}
+
 bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, double flutter, double pilotHz, const std::atomic<bool>* cancel,
-                      double* deviation, bool* corrected) {
+                      double* deviation, bool* corrected, const std::function<void(double)>& progress) {
+    Progress report;
+    report.fn = &progress;
     if (deviation) *deviation = 0;
     if (corrected) *corrected = false;
     // (`in` as it is, unless the caller only wants to hear of a correction: then nothing is copied)
@@ -291,9 +548,14 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
         if (!corrected) out = in;
         return true;
     };
-    const TransferSpeed sp = measureTransferSpeed(in, pilotHz, cancel);
+    // (the speed read in the first half of the time, the sound resampled in the second)
+    const TransferSpeed sp = measureSpeed(in, pilotHz, cancel, report.part(0, 0.5));
     if (cancelled(cancel)) return false;
-    if (sp.speed.empty()) return unchanged();
+    auto finish = [&](bool r) {
+        if (r) report(1);
+        return r;
+    };
+    if (sp.speed.empty()) return finish(unchanged());
     // The deviation split at 4 Hz: wow below, flutter above, each by its own amount.
     std::vector<double> d(sp.speed.size());
     for (size_t i = 0; i < d.size(); ++i) d[i] = sp.speed[i] - 1;
@@ -309,7 +571,7 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
     if (deviation) *deviation = most;
     // Nothing to put right when nine readings in ten are within 0.003 % (the odd one off is a note's onset, not the tape).
     std::nth_element(size.begin(), size.begin() + std::ptrdiff_t(size.size() * 9 / 10), size.end());
-    if (size[size.size() * 9 / 10] < 3e-5) return unchanged();
+    if (size[size.size() * 9 / 10] < 3e-5) return finish(unchanged());
     // Content time against tape time (the speed integrated), then each output sample read where its content was.
     const double fs = in.sampleRate;
     const int64_t n = in.frames();
@@ -329,16 +591,46 @@ bool removeWowFlutter(const AudioBuffer& in, AudioBuffer& out, double wow, doubl
     out.channels = in.channels;
     out.samples.assign(in.samples.size(), 0.0f);
     if (corrected) *corrected = true;
-    size_t j = 0;
-    for (int64_t o = 0; o < n; ++o) {
-        if ((o & 0xffff) == 0 && cancelled(cancel)) return false;
-        const double want = double(o);
-        while (j + 2 < points && tau[j + 1] < want) ++j;
-        const double span = tau[j + 1] - tau[j];
-        const double at = (double(j) + (span > 0 ? (want - tau[j]) / span : 0)) * step;
-        for (size_t c = 0; c < nch; ++c) out.samples[size_t(o) * nch + c] = float(sinc.read(in.samples.data(), nch, c, n, at));
+    if (gAsBefore) {
+        size_t j = 0;
+        for (int64_t o = 0; o < n; ++o) {
+            if ((o & 0xffff) == 0 && cancelled(cancel)) return false;
+            const double want = double(o);
+            while (j + 2 < points && tau[j + 1] < want) ++j;
+            const double span = tau[j + 1] - tau[j];
+            const double at = (double(j) + (span > 0 ? (want - tau[j]) / span : 0)) * step;
+            for (size_t c = 0; c < nch; ++c) out.samples[size_t(o) * nch + c] = float(sinc.read(in.samples.data(), nch, c, n, at));
+        }
+        return finish(true);
     }
-    return true;
+    // (the output in bands across the cores, each starting where the content it reads is found: tau only rises)
+    const Progress resampled = report.part(0.5, 1);
+    constexpr int64_t kBand = 1 << 12;  // (parallelRows gives each core 16 bands or more)
+    const int64_t bandCount = (n + kBand - 1) / kBand;
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> done{0};
+    parallelRows(int(std::min<int64_t>(bandCount, std::numeric_limits<int>::max())), [&](int b0, int b1) {
+        for (int64_t band = b0; band < b1; ++band) {
+            if (stop || cancelled(cancel)) {
+                stop = true;
+                return;
+            }
+            const int64_t o0 = band * kBand, o1 = std::min(n, o0 + kBand);
+            // (the first j with tau[j + 1] >= o0, as a walk from the start finds it, at most points - 2)
+            size_t j = size_t(std::lower_bound(tau.begin() + 1, tau.end(), double(o0)) - tau.begin()) - 1;
+            j = std::min(j, points - 2);
+            for (int64_t o = o0; o < o1; ++o) {
+                const double want = double(o);
+                while (j + 2 < points && tau[j + 1] < want) ++j;
+                const double span = tau[j + 1] - tau[j];
+                const double at = (double(j) + (span > 0 ? (want - tau[j]) / span : 0)) * step;
+                sinc.readAll(in.samples.data(), nch, n, at, out.samples.data() + size_t(o) * nch);
+            }
+            resampled(double(done.fetch_add(1) + 1) / double(bandCount));
+        }
+    });
+    if (stop) return false;
+    return finish(true);
 }
 
 Azimuth measureAzimuth(const AudioBuffer& in, int64_t from, int64_t to) {

@@ -21,6 +21,7 @@
 // verifyDcp checks them as libdcp's and ClairMeta's checks do.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -28,6 +29,9 @@
 #include "core/Model.h"
 
 namespace montage {
+
+struct ColorSpace;
+struct Image;
 
 struct DcpSettings {
     std::string title;                // what the film is called (the folder and the CPL take their name from it)
@@ -111,6 +115,11 @@ std::string dcpName(const DcpSettings& settings, int channels, const std::string
 // The name exportDcp gives the folder of a package of `s` made today (dcpName with the sequence's channels and its
 // subtitles' language).
 std::string dcpFolderName(const Sequence& s, const DcpSettings& settings);
+
+// A picture (the sequence's colour, `space`) as DCI X'Y'Z' codes, three per pixel, as a DCP's frames take them: rows
+// across the cores (`threads` 0, the shared pool; 1, the calling thread; more, threads of their own). `direct` works
+// each code out with the 2.6 power itself rather than its table (for tests: they give the same codes).
+void dcpXyzCodes(const Image& img, const ColorSpace& space, std::vector<uint16_t>& out, int threads = 0, bool direct = false);
 
 // Writes the DCP into a new folder named dcpName() under `parent`. `progress` (0..1) may return false to stop (the
 // half-written folder is removed).

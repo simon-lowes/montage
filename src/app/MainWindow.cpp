@@ -175,6 +175,7 @@ extern "C" {
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
+#include "render/BackgroundJobs.h"
 #include "MixerPanel.h"
 #include "ControlSurface.h"
 #include "MidiLearn.h"
@@ -779,7 +780,7 @@ void MainWindow::buildPanels() {
         const QString folder = QFileDialog::getExistingDirectory(this, tr("Render the Trim Passes Into"), QFileInfo(state_->filePath()).absolutePath());
         if (!folder.isEmpty()) queueTrimPasses(folder);
     });
-    queue_ = new RenderQueue(this);
+    queue_ = new RenderQueue(this, jobs::storeFolder());  // (kept on disk: after a restart or a crash its jobs go on)
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
     productionDock_ = makeDock(tr("Production"), "production", production_);
@@ -3789,7 +3790,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
         return;
     }
     if (queue_->running() &&
-        QMessageBox::question(this, tr("Render Queue"), tr("Renders are in progress. Stop them and quit?"),
+        QMessageBox::question(this, tr("Render Queue"), tr("Renders are in progress. Stop them and quit? They render again when Montage next starts."),
                               QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
         e->ignore();
         return;
@@ -3799,8 +3800,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
         e->ignore();
         return;
     }
-    queue_->stop();
-    queue_->waitForIdle();
+    queue_->suspend();  // (left as it was, to go on next time)
     backgroundRender_ = false;
     if (backgroundCancel_) *backgroundCancel_ = true;  // a background render stops at its next frame
     program_->pause();

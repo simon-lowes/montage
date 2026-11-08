@@ -10,6 +10,7 @@
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -55,32 +56,84 @@ QString fileHash(const QString& path, qint64* size = nullptr, const std::functio
 
 // ---- Picture: sequence colour to DCI X'Y'Z' -------------------------------------------------------------------------
 
+// DCI: 48 cd/m^2 white scaled to 52.37 so equal-energy white fits, a 2.6 power, 12 bits. The power as a table: for each
+// code the least value (of n, white scaled and clamped to 0..1) that rounds to it, found among the doubles by halving,
+// so the table gives exactly the code the power and rounding give (both rise with n); a value's code is looked up from
+// the codes at 1/65536 steps of n, then among the few between.
+struct DciCodes {
+    static uint16_t direct(double n) { return uint16_t(std::lround(4095.0 * std::pow(n, 1.0 / 2.6))); }
+    static double fromBits(uint64_t b) {
+        double d;
+        std::memcpy(&d, &b, 8);
+        return d;
+    }
+    double least[4097];       // least[c]: the smallest n whose code is c or more (least[4096] past 1)
+    uint16_t step[65538];     // the code of n = i / 65536
+    DciCodes() {
+        least[0] = 0;
+        for (int c = 1; c <= 4095; ++c) {
+            uint64_t lo = 0, hi = 0x3ff0000000000000ull;  // (1.0: positive doubles order as their bits)
+            while (lo < hi) {
+                const uint64_t mid = lo + (hi - lo) / 2;
+                if (direct(fromBits(mid)) >= c) hi = mid;
+                else lo = mid + 1;
+            }
+            least[c] = fromBits(lo);
+        }
+        least[4096] = 2;
+        for (int i = 0; i <= 65537; ++i) step[i] = i > 65536 ? 4095 : direct(i / 65536.0);
+    }
+    uint16_t operator()(double n) const {
+        const size_t i = size_t(n * 65536.0);  // (n in 0..1: exact)
+        int lo = step[i], hi = step[i + 1];
+        while (lo < hi) {  // (the largest c with least[c] <= n)
+            const int mid = (lo + hi + 1) / 2;
+            if (least[mid] <= n) lo = mid;
+            else hi = mid - 1;
+        }
+        return uint16_t(lo);
+    }
+};
+
+const DciCodes& dciCodes() {
+    static const DciCodes t;
+    return t;
+}
+
 struct XyzConverter {
     std::vector<float> toLinear;  // code value (65536 steps over 0..1) to display light
     double m[9];                  // linear RGB to CIE XYZ (D65 white kept)
+    const DciCodes& codes = dciCodes();
     explicit XyzConverter(const ColorSpace& cs) {
         toLinear.resize(65536);
         for (int i = 0; i < 65536; ++i) toLinear[size_t(i)] = float(std::clamp(montage::toLinear(cs.transfer, i / 65535.0), 0.0, 1.0));
         primariesToXyz(cs.primaries, m);
     }
-    // DCI: 48 cd/m^2 white scaled to 52.37 so equal-energy white fits, a 2.6 power, 12 bits.
-    static uint16_t code(double v) {
-        const double n = std::clamp(v * (48.0 / 52.37), 0.0, 1.0);
-        return uint16_t(std::lround(4095.0 * std::pow(n, 1.0 / 2.6)));
-    }
-    void convert(const Image& img, std::vector<uint16_t>& out) const {
-        out.resize(size_t(img.width) * size_t(img.height) * 3);
-        for (int y = 0; y < img.height; ++y) {
+    static double scaled(double v) { return std::clamp(v * (48.0 / 52.37), 0.0, 1.0); }
+    // Rows y0..y1 (`direct`: each code from the power itself, as Montage first made them).
+    void rows(const Image& img, uint16_t* outRows, int y0, int y1, bool direct) const {
+        for (int y = y0; y < y1; ++y) {
             const float* s = img.row(y);
-            uint16_t* d = out.data() + size_t(y) * size_t(img.width) * 3;
+            uint16_t* d = outRows + size_t(y) * size_t(img.width) * 3;
             for (int x = 0; x < img.width; ++x, s += 4, d += 3) {
                 auto lin = [&](float v) { return double(toLinear[size_t(std::clamp(int(std::lround(double(v) * 65535.0)), 0, 65535))]); };
                 const double r = lin(s[0]), g = lin(s[1]), b = lin(s[2]);
-                d[0] = code(m[0] * r + m[1] * g + m[2] * b);
-                d[1] = code(m[3] * r + m[4] * g + m[5] * b);
-                d[2] = code(m[6] * r + m[7] * g + m[8] * b);
+                const double X = scaled(m[0] * r + m[1] * g + m[2] * b), Y = scaled(m[3] * r + m[4] * g + m[5] * b),
+                             Z = scaled(m[6] * r + m[7] * g + m[8] * b);
+                if (direct) d[0] = DciCodes::direct(X), d[1] = DciCodes::direct(Y), d[2] = DciCodes::direct(Z);
+                else d[0] = codes(X), d[1] = codes(Y), d[2] = codes(Z);
             }
         }
+    }
+    // Rows across the cores (`threads` 0: the shared pool; 1: this thread; more: that many threads of its own).
+    void convert(const Image& img, std::vector<uint16_t>& out, int threads = 0, bool direct = false) const {
+        out.resize(size_t(img.width) * size_t(img.height) * 3);
+        if (threads == 1) return rows(img, out.data(), 0, img.height, direct);
+        if (threads <= 0) return parallelRows(img.height, [&](int y0, int y1) { rows(img, out.data(), y0, y1, direct); });
+        std::vector<std::thread> pool;
+        for (int t = 0; t < threads; ++t)
+            pool.emplace_back([&, t] { rows(img, out.data(), int(int64_t(img.height) * t / threads), int(int64_t(img.height) * (t + 1) / threads), direct); });
+        for (std::thread& t : pool) t.join();
     }
 };
 
@@ -336,6 +389,10 @@ int64_t dcpPackageFrames(const Sequence& s, const DcpSettings& settings) {
     FrameTime first = 0, end = s.duration();
     if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;
     return end > first ? (end - first) / step : 0;
+}
+
+void dcpXyzCodes(const Image& img, const ColorSpace& space, std::vector<uint16_t>& out, int threads, bool direct) {
+    XyzConverter(space).convert(img, out, threads, direct);
 }
 
 double dcpLeqmLimit(const std::string& kind) { return kind == "trailer" || kind == "teaser" ? 85.0 : kind == "advertisement" ? 82.0 : 0.0; }

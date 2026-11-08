@@ -237,6 +237,8 @@ class TestPlugins : public QObject {
 
 private slots:
     void initTestCase() {
+        // (MCP's background calls kept in a job store of the tests' own)
+        qputenv("MONTAGE_JOBS_DIR", dir_.filePath(QStringLiteral("jobs")).toUtf8());
         // Plug-ins run in Montage's own process unless a test says otherwise (it then names the grouping).
         setHostExecutable(MONTAGE_PLUGIN_HOST);
         HostingSettings h;

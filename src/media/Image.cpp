@@ -96,6 +96,15 @@ std::vector<float> resampleRgba(const float* src, int sw, int sh, int dw, int dh
 
 namespace {
 
+// Keys' cubic (a = -0.5) at the four samples about a point `f` (0..1) past the second: the GPU's chroma weights too
+// (render/shaders/gpucolor.frag).
+inline void cubicChromaWeights(float f, float w[4]) {
+    w[0] = ((-0.5f * f + 1.0f) * f - 0.5f) * f;
+    w[1] = (1.5f * f - 2.5f) * f * f + 1.0f;
+    w[2] = ((-1.5f * f + 2.0f) * f + 0.5f) * f;
+    w[3] = (0.5f * f - 0.5f) * f * f;
+}
+
 // Each pixel of `p` as straight RGB clamped to 0..1, given to put(x, y, r, g, b) row band by row band in parallel.
 template <class Put>
 void eachYcbcrPixel(const YcbcrPlanes& p, const Put& put) {
@@ -116,23 +125,33 @@ void eachYcbcrPixel(const YcbcrPlanes& p, const Put& put) {
     const float sx = float(1 << p.log2ChromaW), sy = float(1 << p.log2ChromaH);
     const float kr = p.kr, kb = p.kb, kg = 1.0f - kr - kb;
     parallelRows(H, [&](int y0, int y1) {
+        std::vector<float> column(size_t(cw) * 2);  // each chroma column's Cb and Cr at this row, interpolated down
         for (int y = y0; y < y1; ++y) {
-            // Where the luma sample falls among the chroma samples, interpolated between the two either side.
+            // Where the luma sample falls among the chroma samples, interpolated from the four either side (Keys'
+            // cubic, edges repeated): down each column first, then along the row.
             const float cy = (float(y) - p.chromaY) / sy;
             const int cy0 = int(std::floor(cy));
-            const float fy = cy - float(cy0);
-            const int ya = std::clamp(cy0, 0, ch - 1), yb = std::clamp(cy0 + 1, 0, ch - 1);
+            float wy[4];
+            cubicChromaWeights(cy - float(cy0), wy);
+            int ys[4];
+            for (int j = 0; j < 4; ++j) ys[j] = std::clamp(cy0 - 1 + j, 0, ch - 1);
+            for (int x = 0; x < cw; ++x)
+                for (int k = 0; k < 2; ++k) {
+                    float v = 0;
+                    for (int j = 0; j < 4; ++j) v += wy[j] * chroma(k, x, ys[j]);
+                    column[size_t(x) * 2 + size_t(k)] = v;
+                }
             for (int x = 0; x < W; ++x) {
                 const float cx = (float(x) - p.chromaX) / sx;
                 const int cx0 = int(std::floor(cx));
-                const float fx = cx - float(cx0);
-                const int xa = std::clamp(cx0, 0, cw - 1), xb = std::clamp(cx0 + 1, 0, cw - 1);
-                float c[2];
-                for (int k = 0; k < 2; ++k) {
-                    const float a = chroma(k, xa, ya) + (chroma(k, xb, ya) - chroma(k, xa, ya)) * fx;
-                    const float b = chroma(k, xa, yb) + (chroma(k, xb, yb) - chroma(k, xa, yb)) * fx;
-                    c[k] = (a + (b - a) * fy - cOff) / cRange;
+                float wx[4];
+                cubicChromaWeights(cx - float(cx0), wx);
+                float c[2] = {0, 0};
+                for (int i = 0; i < 4; ++i) {
+                    const float* v = &column[size_t(std::clamp(cx0 - 1 + i, 0, cw - 1)) * 2];
+                    c[0] += wx[i] * v[0], c[1] += wx[i] * v[1];
                 }
+                for (float& v : c) v = (v - cOff) / cRange;
                 const float Y = (sample(0, x, y) - yOff) / yRange;
                 const float r = Y + 2.0f * (1.0f - kr) * c[1], b = Y + 2.0f * (1.0f - kb) * c[0];
                 const float g = (Y - kr * r - kb * b) / kg;

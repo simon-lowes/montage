@@ -286,6 +286,7 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/RenderFarm.h render/RenderFarm.cpp
+  render/BackgroundJobs.h render/BackgroundJobs.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
   render/StreamingPackage.h render/StreamingPackage.cpp
   render/Ac3.h render/Ac3.cpp
