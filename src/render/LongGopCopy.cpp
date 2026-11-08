@@ -5,6 +5,8 @@
 #include <cmath>
 #include <climits>
 #include <cstdio>
+#include <array>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -12,6 +14,7 @@
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
 #include "render/ColorSpace.h"
+#include "render/NalBits.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -26,7 +29,41 @@ namespace montage {
 
 namespace {
 
-constexpr int kH264 = AV_CODEC_ID_H264, kHevc = AV_CODEC_ID_HEVC, kMpeg2 = AV_CODEC_ID_MPEG2VIDEO;
+constexpr int kH264 = AV_CODEC_ID_H264, kHevc = AV_CODEC_ID_HEVC, kMpeg2 = AV_CODEC_ID_MPEG2VIDEO, kAv1 = AV_CODEC_ID_AV1;
+
+// AV1: the OBUs of a temporal unit (or of av1C's configOBUs), each with its size field (5.3), as type and payload.
+template <typename F>
+void forEachObu(const uint8_t* d, size_t n, F&& f) {
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t h = d[i];
+        const int type = (h >> 3) & 15;
+        const bool ext = h & 4, sized = h & 2;
+        i += 1 + (ext ? 1 : 0);
+        size_t size = n - std::min(n, i);
+        if (sized) {
+            size = 0;
+            for (int k = 0; k < 8 && i < n; ++k) {
+                const uint8_t b = d[i++];
+                size |= size_t(b & 0x7f) << (7 * k);
+                if (!(b & 0x80)) break;
+            }
+        }
+        if (i + size > n) return;
+        f(type, d + i, size);
+        i += size;
+    }
+}
+
+// AV1: a stream's sequence header OBU's payload (from a temporal unit, an encoder's extradata, or av1C).
+std::vector<uint8_t> av1SequenceHeader(const uint8_t* d, size_t n) {
+    if (n >= 4 && (d[0] & 0x80) && (d[0] & 0x7f) == 1) d += 4, n -= 4;  // (av1C: its four bytes, then configOBUs)
+    std::vector<uint8_t> out;
+    forEachObu(d, n, [&](int type, const uint8_t* p, size_t len) {
+        if (type == 1 && out.empty()) out.assign(p, p + len);
+    });
+    return out;
+}
 
 bool fail(std::string* error, const std::string& why) {
     if (error) *error = why;
@@ -225,15 +262,246 @@ bool parseHvcc(const uint8_t* d, size_t n, std::vector<std::vector<uint8_t>>& se
 enum : uint8_t {
     kCopyPoint = 1,  // a GOP may start here (H.264 IDR; HEVC IRAP; MPEG-2 GOP header with an I-picture)
     kIdr = 2,        // and nothing after it refers to anything before it (H.264 IDR, HEVC IDR, MPEG-2 closed GOP)
-    kRasl = 4,       // HEVC: a RASL picture
+    kRasl = 4,       // HEVC: a RASL picture; H.264: a picture before its recovery point's I-picture (marked with the GOP)
+    kRef = 8,        // H.264: a reference picture (nal_ref_idc not 0)
+    kRecovery = 16,  // H.264: an I-picture with a recovery point SEI (recovery_frame_cnt 0): an open GOP's start
 };
+
+// H.264: whether an SEI NAL unit holds a recovery point whose pictures are right from this one on (recovery_frame_cnt 0).
+bool h264RecoveryNow(const uint8_t* nal, size_t n) {
+    const std::vector<uint8_t> rb = nal::unescape(nal, n);
+    size_t i = 1;
+    while (i + 2 <= rb.size()) {
+        if (rb[i] == 0x80 && i + 1 == rb.size()) break;
+        int type = 0, size = 0;
+        while (i < rb.size() && rb[i] == 0xff) type += 255, ++i;
+        if (i >= rb.size()) break;
+        type += rb[i++];
+        while (i < rb.size() && rb[i] == 0xff) size += 255, ++i;
+        if (i >= rb.size()) break;
+        size += rb[i++];
+        if (i + size_t(size) > rb.size()) break;
+        if (type == 6) {
+            nal::Reader r(rb.data() + i, size_t(size));
+            return r.ue() == 0 && r.ok;
+        }
+        i += size_t(size);
+    }
+    return false;
+}
+
+// H.264: the slice type of a slice NAL unit (0-9; -1 when it cannot be read).
+int h264SliceType(const uint8_t* nal, size_t n) {
+    const std::vector<uint8_t> rb = nal::unescape(nal, std::min<size_t>(n, 16));
+    nal::Reader r(rb, 8);
+    r.ue();
+    const int t = int(r.ue());
+    return r.ok ? t : -1;
+}
+
+// H.264 slice header fields up to the reference marking (7.3.3), for rewriting a slice.
+struct H264Slice {
+    std::vector<uint8_t> rb;  // the RBSP, its header byte first
+    const hrd::Sps* sps = nullptr;
+    const hrd::Pps* pps = nullptr;
+    uint64_t firstMb = 0, type = 0, ppsId = 0;
+    size_t frameNumAt = 0;   // bit of frame_num
+    uint64_t frameNum = 0;
+    size_t afterFrame = 0;   // after frame_num and the field flags
+    size_t markingAt = 0;    // dec_ref_pic_marking()
+    size_t afterMarking = 0;
+    bool adaptive = false;   // adaptive_ref_pic_marking_mode_flag, and its operations (op, then its one or two values)
+    std::vector<std::array<uint64_t, 3>> ops;
+    size_t dataAt = 0;       // where slice_data() begins (CABAC: before its alignment bits)
+};
+
+bool readH264Slice(const uint8_t* d, size_t n, const std::map<int, hrd::Sps>& sps, const std::map<int, hrd::Pps>& pps, H264Slice& sl,
+                   bool full) {
+    sl.rb = nal::unescape(d, n);
+    nal::Reader r(sl.rb, 8);
+    sl.firstMb = r.ue(), sl.type = r.ue(), sl.ppsId = r.ue();
+    auto pi = pps.find(int(sl.ppsId));
+    if (!r.ok || pi == pps.end() || !pi->second.valid) return false;
+    auto si = sps.find(pi->second.spsId);
+    if (si == sps.end() || !si->second.valid) return false;
+    sl.pps = &pi->second, sl.sps = &si->second;
+    const hrd::Sps& s = *sl.sps;
+    if (s.separateColourPlane) r.u(2);
+    sl.frameNumAt = r.pos;
+    sl.frameNum = r.u(s.log2MaxFrameNum);
+    bool field = false;
+    if (!s.frameMbsOnly) {
+        field = r.flag();
+        if (field) r.flag();
+    }
+    sl.afterFrame = r.pos;
+    if (!full) return r.ok;
+    const bool idr = (d[0] & 31) == 5;
+    if (idr) r.ue();
+    if (s.pocType == 0) {
+        r.u(s.log2MaxPocLsb);
+        if (sl.pps->bottomFieldPicOrder && !field) r.se();
+    } else if (s.pocType == 1 && !s.deltaPicOrderAlwaysZero) {
+        r.se();
+        if (sl.pps->bottomFieldPicOrder && !field) r.se();
+    }
+    if (sl.pps->redundantPicCnt) r.ue();
+    const int st = int(sl.type % 5);  // (0 P, 1 B, 2 I, 3 SP, 4 SI)
+    const bool intra = st == 2 || st == 4, bi = st == 1;
+    if (!intra) {
+        // The reference lists' sizes, their modifications and the prediction weights (7.3.3.1, 7.3.3.2).
+        if (bi) r.flag();  // direct_spatial_mv_pred_flag
+        uint64_t l0 = uint64_t(sl.pps->numRefIdxL0), l1 = uint64_t(sl.pps->numRefIdxL1);
+        if (r.flag()) {
+            l0 = r.ue() + 1;
+            if (bi) l1 = r.ue() + 1;
+        }
+        if (l0 > 32 || l1 > 32) return false;
+        for (int list = 0; list < (bi ? 2 : 1); ++list)
+            if (r.flag())
+                for (int k = 0; k < 100 && r.ok; ++k) {
+                    const uint64_t idc = r.ue();
+                    if (idc == 3) break;
+                    if (idc > 5) return false;
+                    r.ue();
+                }
+        if ((sl.pps->weightedPred && !bi) || (sl.pps->weightedBipred == 1 && bi)) {
+            const bool chroma = s.chromaFormat != 0 && !s.separateColourPlane;
+            r.ue();
+            if (chroma) r.ue();
+            for (int list = 0; list < (bi ? 2 : 1); ++list)
+                for (uint64_t i = 0; i < (list ? l1 : l0) && r.ok; ++i) {
+                    if (r.flag()) r.se(), r.se();
+                    if (chroma && r.flag()) r.se(), r.se(), r.se(), r.se();
+                }
+        }
+    }
+    sl.markingAt = r.pos;
+    if (d[0] & 0x60) {
+        if (idr) {
+            r.flag(), r.flag();
+        } else if ((sl.adaptive = r.flag())) {
+            for (int k = 0; k < 64 && r.ok; ++k) {
+                const uint64_t op = r.ue();
+                if (op == 0) break;
+                if (op > 6) return false;
+                std::array<uint64_t, 3> o{op, 0, 0};
+                if (op == 1 || op == 3) o[1] = r.ue();
+                if (op == 2) o[1] = r.ue();
+                if (op == 3 || op == 6) o[2] = r.ue();
+                if (op == 4) o[1] = r.ue();
+                sl.ops.push_back(o);
+            }
+        }
+    }
+    sl.afterMarking = r.pos;
+    if (sl.pps->cabac && !intra) r.ue();  // cabac_init_idc
+    r.se();                   // slice_qp_delta
+    if (st == 3) r.flag();    // sp_for_switch_flag
+    if (st == 3 || st == 4) r.se();  // slice_qs_delta
+    if (sl.pps->deblockingControl && r.ue() != 1) r.se(), r.se();
+    sl.dataAt = r.pos;
+    return r.ok;
+}
+
+// H.264: a slice of a non-IDR I-picture made an IDR picture's (7.4.1.2.4): nal_unit_type 5, frame_num 0, an
+// idr_pic_id, its reference marking an IDR's (the pictures before it still output, it not long-term); the slice data
+// itself as it was (CABAC's realigned to the byte). Empty when it cannot be.
+std::vector<uint8_t> h264SliceAsIdr(const uint8_t* d, size_t n, const std::map<int, hrd::Sps>& sps, const std::map<int, hrd::Pps>& pps,
+                                    int idrPicId) {
+    H264Slice sl;
+    if (n < 2 || (d[0] & 31) != 1 || !(d[0] & 0x60) || !readH264Slice(d, n, sps, pps, sl, true) || sl.type % 5 != 2) return {};
+    nal::Writer w;
+    w.copy(sl.rb, 8, sl.frameNumAt);
+    w.u(0, sl.sps->log2MaxFrameNum);
+    w.copy(sl.rb, sl.frameNumAt + size_t(sl.sps->log2MaxFrameNum), sl.afterFrame);
+    w.ue(uint64_t(idrPicId & 0xffff));
+    w.copy(sl.rb, sl.afterFrame, sl.markingAt);
+    w.flag(false);  // no_output_of_prior_pics_flag
+    w.flag(false);  // long_term_reference_flag
+    if (sl.pps->cabac) {
+        w.copy(sl.rb, sl.afterMarking, sl.dataAt);
+        while (!w.aligned()) w.bit(1);  // (cabac_alignment_one_bit)
+        const size_t from = (sl.dataAt + 7) / 8;
+        w.out.insert(w.out.end(), sl.rb.begin() + std::ptrdiff_t(from), sl.rb.end());
+    } else {
+        const size_t stop = nal::stopBit(sl.rb);
+        if (stop < sl.dataAt) return {};
+        w.copy(sl.rb, sl.afterMarking, stop);
+        w.trailing();
+    }
+    const uint8_t header = uint8_t((d[0] & 0xe0) | 5);
+    return nal::escape(&header, 1, w.out);
+}
+
+// H.264: a slice with `shift` taken off its frame_num (modulo MaxFrameNum), as after an I-picture made an IDR one. A
+// reference picture's marking operations on pictures from before that IDR picture (gone from the decoder there) are
+// left out; with none left, the sliding window marks as they did (it removes nothing the operations kept). Empty when
+// it cannot be done.
+std::vector<uint8_t> h264SliceFrameNum(const uint8_t* d, size_t n, const std::map<int, hrd::Sps>& sps, const std::map<int, hrd::Pps>& pps,
+                                       uint64_t shift) {
+    H264Slice sl;
+    if (!readH264Slice(d, n, sps, pps, sl, false)) return {};
+    const uint64_t wrap = uint64_t(1) << sl.sps->log2MaxFrameNum;
+    const uint64_t frameNum = (sl.frameNum + wrap - shift % wrap) % wrap;
+    const int bits = sl.sps->log2MaxFrameNum;
+    nal::Writer w;
+    w.copy(sl.rb, 8, sl.frameNumAt);
+    w.u(frameNum, bits);
+    if ((d[0] & 0x60) && readH264Slice(d, n, sps, pps, sl, true) && sl.adaptive) {
+        std::vector<std::array<uint64_t, 3>> kept;
+        for (const auto& o : sl.ops) {
+            // (difference_of_pic_nums_minus1: the picture CurrPicNum - (it + 1); before the IDR picture when below 0)
+            const bool before = (o[0] == 1 || o[0] == 3) && o[1] + 1 > frameNum;
+            if (before && o[0] == 3) return {};  // (a long-term reference made of a picture that is not there)
+            if (!before) kept.push_back(o);
+        }
+        if (kept.size() != sl.ops.size()) {
+            w.copy(sl.rb, sl.frameNumAt + size_t(bits), sl.markingAt);
+            w.flag(!kept.empty());
+            if (!kept.empty()) {
+                for (const auto& o : kept) {
+                    w.ue(o[0]);
+                    if (o[0] == 1 || o[0] == 2 || o[0] == 3 || o[0] == 4) w.ue(o[1]);
+                    if (o[0] == 3 || o[0] == 6) w.ue(o[2]);
+                }
+                w.ue(0);
+            }
+            if (sl.pps->cabac) {
+                w.copy(sl.rb, sl.afterMarking, sl.dataAt);
+                while (!w.aligned()) w.bit(1);  // (cabac_alignment_one_bit)
+                const size_t from = (sl.dataAt + 7) / 8;
+                w.out.insert(w.out.end(), sl.rb.begin() + std::ptrdiff_t(from), sl.rb.end());
+            } else {
+                const size_t stop = nal::stopBit(sl.rb);
+                if (stop < sl.dataAt) return {};
+                w.copy(sl.rb, sl.afterMarking, stop);
+                w.trailing();
+            }
+            return nal::escape(d, 1, w.out);
+        }
+    }
+    w.copy(sl.rb, sl.frameNumAt + size_t(bits), sl.rb.size() * 8);
+    return nal::escape(d, 1, w.out);
+}
 
 uint8_t packetKind(int codec, const uint8_t* d, size_t n, int lengthSize) {
     uint8_t kind = 0;
     if (codec == kH264) {
-        forEachNal(d, n, lengthSize, [&](const uint8_t* nal, size_t) {
-            if ((nal[0] & 31) == 5) kind |= kCopyPoint | kIdr;
+        bool recovery = false, intra = true, slices = false;
+        forEachNal(d, n, lengthSize, [&](const uint8_t* nal, size_t len) {
+            const int type = nal[0] & 31;
+            if (type == 5) kind |= kCopyPoint | kIdr;
+            if (type == 6 && !slices && h264RecoveryNow(nal, len)) recovery = true;
+            if (type == 1 || type == 5) {
+                if (!slices && (nal[0] & 0x60)) kind |= kRef;
+                slices = true;
+                const int st = h264SliceType(nal, len);
+                intra = intra && (st % 5 == 2);
+            }
         });
+        // (an I-picture, a reference, that starts a recovery point: copies may start there)
+        if (!(kind & kIdr) && recovery && slices && intra && (kind & kRef)) kind |= kCopyPoint | kRecovery;
     } else if (codec == kHevc) {
         bool seen = false;
         forEachNal(d, n, lengthSize, [&](const uint8_t* nal, size_t len) {
@@ -261,6 +529,19 @@ uint8_t packetKind(int codec, const uint8_t* d, size_t n, int lengthSize) {
         }
         // (with a sequence header: the GOP is then decoded with its own matrices and settings, whatever came before)
         if (seq && gop && type == 1) kind |= kCopyPoint | (closed ? kIdr : 0);
+    } else if (codec == kAv1) {
+        // A shown key frame with its sequence header: nothing after it refers to anything before it (7.5).
+        bool seq = false, reduced = false, seen = false;
+        forEachObu(d, n, [&](int type, const uint8_t* p, size_t len) {
+            if (type == 1 && len > 0) seq = true, reduced = (p[0] >> 3) & 1;
+            if ((type == 3 || type == 6) && len > 0 && !seen) {
+                seen = true;
+                const bool showExisting = p[0] & 0x80;
+                const int frameType = (p[0] >> 5) & 3;
+                const bool show = (p[0] >> 4) & 1;
+                if (seq && !reduced && !showExisting && frameType == 0 && show) kind |= kCopyPoint | kIdr;
+            }
+        });
     }
     return kind;
 }
@@ -478,6 +759,33 @@ std::vector<uint8_t> avccHighExtension(int profile, AVPixelFormat format, const 
     return o;
 }
 
+// The HRD a stream's parameter sets state (its first SPS with one), whole NAL units: what the copies and encoded parts
+// keep across the joins.
+struct StatedHrd {
+    bool has = false;
+    double rate = 0, size = 0;
+    bool cbr = false;
+    std::vector<uint8_t> sps;
+    bool same(const StatedHrd& o) const { return has == o.has && (!has || (rate == o.rate && size == o.size && cbr == o.cbr)); }
+};
+
+StatedHrd statedHrd(int codec, const std::vector<std::vector<uint8_t>>& sets) {
+    StatedHrd h;
+    for (const auto& u : sets) {
+        if (u.size() < 4) continue;
+        const int type = codec == kH264 ? (u[0] & 31) : (u[0] >> 1) & 0x3f;
+        if (type != (codec == kH264 ? 7 : 33)) continue;
+        const hrd::Sps sp = codec == kH264 ? hrd::parseH264Sps(u.data(), u.size()) : hrd::parseHevcSps(u.data(), u.size());
+        const hrd::Params* pr = sp.valid ? sp.active() : nullptr;
+        if (!pr || pr->cpbs.empty() || sp.tick() <= 0 || pr->subPic) continue;
+        h.has = true;
+        h.rate = pr->cpbs[0].bitRate, h.size = pr->cpbs[0].size, h.cbr = pr->cpbs[0].cbr;
+        h.sps = u;
+        break;
+    }
+    return h;
+}
+
 }  // namespace
 
 // ---- The plan ----
@@ -488,6 +796,7 @@ struct LongGopCopier::Packet {
     int size = 0;
     uint8_t kind = 0;
     bool key = false;
+    double asked = -1;  // a copy point's initial delay (seconds: its buffering period's, MPEG-2 its vbv_delay); -1 none
 };
 
 struct LongGopCopier::Gop {
@@ -498,6 +807,8 @@ struct LongGopCopier::Gop {
     bool entryWhole = false;
     bool idr = false;
     int64_t bytes = 0;
+    double asked = -1;    // the initial delay its first picture asks for (see Packet)
+    double margin = 1e9;  // the least time (seconds) any of its pictures' bits are in before it is decoded, so started
 };
 
 struct LongGopCopier::Source {
@@ -509,6 +820,8 @@ struct LongGopCopier::Source {
     std::vector<uint8_t> config;              // the decoder configuration (avcC, hvcC)
     std::vector<uint8_t> sets;                // HEVC: its VPS, SPS and PPS, length-prefixed
     Avcc avcc;                                // H.264
+    std::map<int, hrd::Sps> hsps;             // H.264: its parameter sets, read
+    std::map<int, hrd::Pps> hpps;
     int profile = 0, level = 0;
     AVPacket* held = nullptr;                 // read, not yet used
     int64_t nextDts = AV_NOPTS_VALUE;         // the packet a plain read gives next
@@ -550,9 +863,12 @@ double LongGopCopier::ceilingBitsPerFrame() const {
     if (codec_ == kMpeg2) return m->bit_rate > 0 ? 1.1 * double(m->bit_rate) / fps : 1e300;
     if (enc_.bitrate > 0) return 1.1 * double(enc_.bitrate) / fps;
     const double pixels = std::max(1.0, double(m->width) * double(m->height));
-    const double perPixel = codec_ == kHevc ? 0.05 * std::exp2((28 - enc_.crf) / 6.0) : 0.1 * std::exp2((23 - enc_.crf) / 6.0);
+    // (AV1's scale runs to 63: its 35 spends about what x265's 28 does)
+    const double perPixel = codec_ == kHevc  ? 0.05 * std::exp2((28 - enc_.crf) / 6.0)
+                            : codec_ == kAv1 ? 0.05 * std::exp2((35 - enc_.crf) / 6.0)
+                                             : 0.1 * std::exp2((23 - enc_.crf) / 6.0);
     const double size = std::pow(pixels / (1920.0 * 1080.0), -0.25);
-    const double fastest = enc_.preset == "ultrafast" || enc_.preset == "superfast" ? 2.0 : 1.0;
+    const double fastest = enc_.preset == "ultrafast" || enc_.preset == "superfast" || (codec_ == kAv1 && std::atoi(enc_.preset.c_str()) >= 10) ? 2.0 : 1.0;
     return 1.5 * perPixel * size * fastest * pixels;
 }
 
@@ -571,12 +887,14 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     if (!m || !m->codec || !oc || !vst || out <= in) return none("no video");
     const std::string name = m->codec->name;
     const int codec = m->codec_id;
-    if (!(name == "libx264" && codec == kH264) && !(name == "libx265" && codec == kHevc) && !(name == "mpeg2video" && codec == kMpeg2))
-        return none("copies H.264 (x264), HEVC (x265) and MPEG-2, not " + name);
+    const bool av1 = (name == "libsvtav1" || name == "libaom-av1") && codec == kAv1;
+    if (!(name == "libx264" && codec == kH264) && !(name == "libx265" && codec == kHevc) && !(name == "mpeg2video" && codec == kMpeg2) && !av1)
+        return none("copies H.264 (x264), HEVC (x265), MPEG-2 and AV1 (SVT-AV1, libaom), not " + name);
     const std::string format = oc->oformat->name;
     const bool isoFile = format.find("mp4") != std::string::npos || format.find("mov") != std::string::npos;
-    if (codec == kMpeg2 ? !(isoFile || format == "mxf" || format.rfind("mxf", 0) == 0) : !isoFile)
-        return none("copies into MP4 and MOV (MPEG-2: MXF and MOV)");
+    const bool mkvFile = format == "matroska" || format == "webm";
+    if (codec == kMpeg2 ? !(isoFile || format == "mxf" || format.rfind("mxf", 0) == 0) : av1 ? !(isoFile || mkvFile) : !isoFile)
+        return none("copies into MP4 and MOV (MPEG-2: MXF and MOV; AV1: MP4, Matroska and WebM)");
     const bool interlaced = m->field_order != AV_FIELD_PROGRESSIVE && m->field_order != AV_FIELD_UNKNOWN;
     if (interlaced && codec != kMpeg2) return none("copies interlaced MPEG-2 only");
 
@@ -627,6 +945,17 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     // The sources: the same pictures the encoder would make, in a file whose packets can be taken as they are, at no
     // profile, tier or level above what the export's encoder states (when it states them).
     const Stated exported = statedBy(codec, m);
+    // The buffer model: the first source's HRD (H.264, HEVC), kept across every join; sources stating another are not
+    // copied beside it. MPEG-2 at a constant rate keeps the export's (XDCAM HD422's) VBV.
+    StatedHrd mode;
+    bool modeSet = false;
+    auto hrdFits = [&](const StatedHrd& h) {
+        if (!modeSet) {
+            mode = h, modeSet = true;
+            return true;
+        }
+        return mode.same(h);
+    };
     std::set<int> spsIds, ppsIds;
     std::map<int, std::vector<uint8_t>> spsById, ppsById;
     for (auto& sp : lg->sources_) {
@@ -681,6 +1010,15 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
                         (exported.profile > 0 && (h264ProfileRank(s[1]) > h264ProfileRank(exported.profile) || s[3] > exported.level));
             if (above) continue;
             if (lg->firstSource_ >= 0 && src.avcc.lengthSize != lg->lengthSize_) continue;
+            if (!hrdFits(statedHrd(codec, src.avcc.sps))) continue;
+            for (const auto& u : src.avcc.sps) {
+                const hrd::Sps sp = hrd::parseH264Sps(u.data(), u.size());
+                if (sp.valid) src.hsps[sp.id] = sp;
+            }
+            for (const auto& u : src.avcc.pps) {
+                const hrd::Pps pp = hrd::parseH264Pps(u.data(), u.size(), src.hsps);
+                if (pp.valid) src.hpps[pp.id] = pp;
+            }
             bool clash = false;
             for (const auto& s : src.avcc.sps) {
                 const int id = h264SpsId(s.data(), s.size());
@@ -699,6 +1037,7 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             int size = 4;
             if (!parseHvcc(src.config.data(), src.config.size(), sets, size)) continue;
             if (lg->firstSource_ >= 0 && size != lg->lengthSize_) continue;
+            if (!hrdFits(statedHrd(codec, sets))) continue;
             if (lg->firstSource_ < 0) lg->lengthSize_ = size;
             for (const auto& s : sets) putNal(src.sets, s.data(), s.size(), size);
         }
@@ -709,6 +1048,27 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         if (lg->firstSource_ < 0) lg->firstSource_ = int(&sp - lg->sources_.data());
     }
     if (lg->firstSource_ < 0) return none("no source coded as the export is");
+    if (codec == kAv1) {
+        // AV1: one sequence header for the whole stream (the file's av1C states it): footage whose header is the one the
+        // export's encoder writes, so the encoded parts beside it share it.
+        lg->gop_ = std::max(1, m->gop_size);
+        std::string e;
+        AVCodecContext* probe = lg->openEncoder(0, &e);
+        if (!probe) return none(e);
+        const std::vector<uint8_t> ours = av1SequenceHeader(probe->extradata, size_t(std::max(0, probe->extradata_size)));
+        avcodec_free_context(&probe);
+        if (ours.empty()) return none("the AV1 encoder states no sequence header");
+        lg->firstSource_ = -1;
+        for (auto& sp : lg->sources_) {
+            if (!sp->usable) continue;
+            if (av1SequenceHeader(sp->config.data(), sp->config.size()) != ours) {
+                sp->usable = false;
+                continue;
+            }
+            if (lg->firstSource_ < 0) lg->firstSource_ = int(&sp - lg->sources_.data());
+        }
+        if (lg->firstSource_ < 0) return none("no AV1 footage has the sequence header the export's encoder writes");
+    }
 
     // Each run's packets, from the copy point before it to the one after it.
     AVPacket* pkt = av_packet_alloc();
@@ -725,6 +1085,26 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         src.nextDts = AV_NOPTS_VALUE;
         av_packet_unref(src.held);
         bool seenCopyPoint = false, bad = false;
+        // (its parameter sets, for what each copy point's buffering period asks)
+        std::map<int, hrd::Sps> hsps;
+        std::map<int, hrd::Pps> hpps;
+        if (mode.has) {
+            std::vector<std::vector<uint8_t>> sets;
+            int size = 4;
+            if (codec == kH264) {
+                sets = src.avcc.sps;
+                sets.insert(sets.end(), src.avcc.pps.begin(), src.avcc.pps.end());
+            } else {
+                parseHvcc(src.config.data(), src.config.size(), sets, size);
+            }
+            if (codec == kH264) sets.clear(), hsps = src.hsps, hpps = src.hpps;
+            for (const auto& u : sets) {
+                hrd::AccessUnit dummy;
+                std::vector<uint8_t> one{0, 0, 0, 1};
+                one.insert(one.end(), u.begin(), u.end());
+                hrd::readAccessUnit(codec, one.data(), one.size(), 0, hsps, hpps, dummy);
+            }
+        }
         for (;;) {
             av_packet_unref(pkt);
             if (av_read_frame(src.fmt, pkt) < 0) break;
@@ -747,6 +1127,16 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             }
             k.kind = packetKind(codec, pkt->data, size_t(pkt->size), lg->lengthSize_);
             if ((k.kind & kCopyPoint) && seenCopyPoint && k.frame >= s1) break;  // (the GOP after the run's)
+            if ((k.kind & kCopyPoint) && codec == kMpeg2) {
+                const int64_t d = vbvDelay(pkt->data, size_t(pkt->size));
+                k.asked = d >= 0 ? double(d) / 90000 : -1;
+            } else if ((k.kind & kCopyPoint) && mode.has) {
+                hrd::AccessUnit au;
+                if (hrd::readAccessUnit(codec, pkt->data, size_t(pkt->size), lg->lengthSize_, hsps, hpps, au) && au.bp.present) {
+                    const auto& d = !au.bp.nalDelay.empty() ? au.bp.nalDelay : au.bp.vclDelay;
+                    if (!d.empty()) k.asked = double(d[0]) / 90000;
+                }
+            }
             seenCopyPoint = seenCopyPoint || (k.kind & kCopyPoint);
             r.packets.push_back(k);
         }
@@ -763,6 +1153,15 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             Gop g;
             g.begin = i, g.end = j;
             g.idr = r.packets[i].kind & kIdr;
+            // H.264 from a recovery point: the pictures before its I-picture refer to the GOP before (as HEVC's RASL);
+            // entered after other pictures they are left out, which only non-reference ones can be.
+            bool leadingRef = false;
+            if (codec == kH264 && (r.packets[i].kind & kRecovery))
+                for (size_t k = i + 1; k < j; ++k)
+                    if (r.packets[k].frame < r.packets[i].frame) {
+                        r.packets[k].kind |= kRasl;
+                        leadingRef = leadingRef || (r.packets[k].kind & kRef);
+                    }
             std::vector<int64_t> all, entry;
             for (size_t k = i; k < j; ++k) {
                 all.push_back(r.packets[k].frame);
@@ -777,12 +1176,24 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
             };
             int64_t elo = 0, ehi = 0;
             g.whole = runsOn(all, g.lo, g.hi);
-            g.entryWhole = runsOn(entry, elo, ehi) && ehi == g.hi;
+            g.entryWhole = runsOn(entry, elo, ehi) && ehi == g.hi && !leadingRef;
             g.entryLo = elo;
             if (codec == kMpeg2 && !g.idr) {
                 // An open GOP with no leading B-pictures needs nothing before it.
                 const int64_t first = r.packets[i].frame;
                 if (g.lo == first) g.idr = true;
+            }
+            // At the buffer's rate, started as its first picture asks: how early the bits of each are in (its own
+            // pictures alone; a join before it that leaves the buffer lower takes from this).
+            g.asked = r.packets[i].asked;
+            const double R = codec == kMpeg2 ? double(m->rc_max_rate) : mode.rate;
+            const double fps = av_q2d(m->framerate);
+            if (g.asked >= 0 && R > 0 && fps > 0) {
+                double need = 0;
+                for (size_t k = i; k < j; ++k) {
+                    need += double(r.packets[k].size) * 8;
+                    g.margin = std::min(g.margin, g.asked + double(k - i) / fps - need / R);
+                }
             }
             r.gops.push_back(g);
             gopLengths.push_back(g.hi - g.lo + 1);
@@ -801,6 +1212,7 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     }
     if (encoder.gop > 0) lg->gop_ = encoder.gop;
 
+    std::vector<std::vector<uint8_t>> hrdSets;  // the stream's parameter sets, for the buffer model
     // Which GOPs are copied: wholly inside a run, and decodable where they land.
     FrameTime lastCopyEnd = -2;  // the last copied frame so far
     for (size_t ri = 0; ri < lg->runs_.size(); ++ri) {
@@ -821,16 +1233,18 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
                 ok = g.whole && g.lo >= r.s0 && g.hi < s1;
                 c.lo = r.e0 + (g.lo - r.s0);
                 c.chained = true;
-                c.standalone = codec != kHevc || g.idr;
+                c.standalone = (codec != kHevc && codec != kH264) || g.idr;
             } else {
-                const bool hevcCra = codec == kHevc && !g.idr;
+                // (HEVC from a CRA, H.264 from a recovery point: entered without what refers to the GOP before)
+                const bool hevcCra = (codec == kHevc || codec == kH264) && !g.idr;
                 const int64_t lo = hevcCra ? g.entryLo : g.lo;
                 ok = (hevcCra ? g.entryWhole : g.whole) && lo >= r.s0 && g.hi < s1;
                 c.lo = r.e0 + (lo - r.s0);
                 const bool afterCopy = c.lo == lastCopyEnd + 1, atStart = c.lo == 0;
                 if (ok && hevcCra) {
                     // A CRA after pictures not its own: its RASL pictures go, and it is marked a broken link (BLA), so
-                    // the decoder starts afresh there, as HEVC means splices to be made.
+                    // the decoder starts afresh there, as HEVC means splices to be made. H.264's I-picture is made an
+                    // IDR picture (and the frame numbers after it counted from it).
                     c.dropRasl = true;
                     c.broken = true;
                 } else if (ok && codec == kMpeg2 && !g.idr) {
@@ -856,7 +1270,7 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     if (lg->copies_.empty()) return none("no whole GOP of a source is untouched");
 
     // The decode delay: the most any picture is decoded ahead of where it is shown (the encoders': their B-pictures).
-    lg->depth_ = codec == kMpeg2 ? std::max(0, m->max_b_frames) : 3;
+    lg->depth_ = codec == kMpeg2 ? std::max(0, m->max_b_frames) : codec == kAv1 ? 0 : 3;
     for (const Copy& c : lg->copies_) {
         const Run& r = lg->runs_[size_t(c.run)];
         const Gop& g = r.gops[c.gop];
@@ -894,6 +1308,12 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         }
         avcodec_free_context(&probe);
         if (encoderSets.sps.size() != 1 || encoderSets.pps.size() != 1) return none("x264 did not take the parameter set id");
+        if (mode.has) {
+            // (the encoded parts state the footage's HRD, so the stream has one model throughout)
+            std::vector<uint8_t> spliced = hrd::spliceHrd(kH264, encoderSets.sps[0].data(), encoderSets.sps[0].size(), mode.sps.data(), mode.sps.size());
+            if (spliced.empty()) return none("the encoder's parameter sets cannot take the footage's HRD");
+            encoderSets.sps[0] = std::move(spliced);
+        }
         for (const auto* list : {&encoderSets.sps, &encoderSets.pps})
             for (const auto& s : *list) putNal(lg->encoderSets_, s.data(), s.size(), lg->lengthSize_);
         lg->activeEncoderSets_ = lg->encoderSets_;
@@ -920,6 +1340,8 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         all.tail = avccHighExtension(all.profile, m->pix_fmt, tails);
         lg->profile_ = all.profile, lg->level_ = all.level;
         if (all.sps.size() > 31 || all.pps.size() > 255) return none("too many parameter sets");
+        hrdSets = all.sps;
+        hrdSets.insert(hrdSets.end(), all.pps.begin(), all.pps.end());
         lg->sources_[size_t(lg->firstSource_)]->config = buildAvcc(all);
     }
     if (codec == kHevc) {
@@ -942,6 +1364,25 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         lg->profile_ = lg->sources_[size_t(lg->firstSource_)]->profile;
         lg->level_ = lg->sources_[size_t(lg->firstSource_)]->level;
     }
+    // The buffer model kept across the joins.
+    const double fps = av_q2d(m->framerate);
+    if (mode.has && codec != kMpeg2) {
+        if (codec == kHevc) {
+            int size = 4;
+            parseHvcc(lg->sources_[size_t(lg->firstSource_)]->config.data(), lg->sources_[size_t(lg->firstSource_)]->config.size(), hrdSets, size);
+        }
+        lg->hrdOn_ = lg->hrd_.start(codec, hrdSets, lg->lengthSize_, fps, lg->depth_);
+        lg->hrdSps_ = mode.sps;
+    } else if (codec == kMpeg2 && m->rc_max_rate > 0 && m->rc_max_rate == m->rc_min_rate && m->rc_buffer_size >= 16384) {
+        // (only footage that states its delays: a variable-rate source's 0xFFFF would be made into a constant-rate claim)
+        bool stated = true;
+        for (const Copy& c : lg->copies_) stated = stated && lg->runs_[size_t(c.run)].gops[c.gop].asked >= 0;
+        const double buffer = std::floor(double(m->rc_buffer_size) / 16384) * 16384;
+        if (stated) lg->hrdOn_ = lg->hrd_.start(codec, {}, 0, fps, lg->depth_, double(m->rc_max_rate), buffer);
+    }
+    if (lg->hrdOn_) {
+        lg->hrdRate_ = lg->hrd_.bitRate(), lg->hrdBuffer_ = lg->hrd_.bufferBits(), lg->hrdCbr_ = lg->hrd_.cbr();
+    }
     lg->pkt_ = av_packet_alloc();
     if (!lg->pkt_) return none("out of memory");
     return lg;
@@ -949,6 +1390,17 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
 
 bool LongGopCopier::prepareStream(std::string* error) {
     AVCodecParameters* par = vst_->codecpar;
+    if (codec_ == kAv1) {
+        // (the footage's av1C: its sequence header is the encoder's too)
+        const std::vector<uint8_t>& config = sources_[size_t(firstSource_)]->config;
+        av_freep(&par->extradata);
+        par->extradata_size = 0;
+        par->extradata = static_cast<uint8_t*>(av_mallocz(config.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (!par->extradata) return fail(error, "Out of memory");
+        std::memcpy(par->extradata, config.data(), config.size());
+        par->extradata_size = int(config.size());
+        return true;
+    }
     if (codec_ == kH264 || codec_ == kHevc) {
         const Source& first = *sources_[size_t(firstSource_)];
         const std::vector<uint8_t>& config = first.config;
@@ -984,7 +1436,63 @@ bool LongGopCopier::prepareStream(std::string* error) {
 
 // ---- Writing ----
 
-bool LongGopCopier::write(AVPacket* pkt, FrameTime display, std::string* error) {
+bool LongGopCopier::write(AVPacket* pkt, FrameTime display, bool ours, std::string* error) {
+    if (!hrdOn_) return writeFinal(pkt, display, error);
+    // Through the buffer model: each access unit held until the next is known (its filler, before a join, depends on
+    // what the next asks for), its picture timing and buffering period rewritten for its place.
+    int64_t shown = 0;
+    std::vector<uint8_t> before = hrd_.push(std::vector<uint8_t>(pkt->data, pkt->data + pkt->size), display, ours, true, &shown);
+    const int flags = heldFlags_;
+    heldFlags_ = pkt->flags & (AV_PKT_FLAG_KEY | AV_PKT_FLAG_DISPOSABLE);
+    if (before.empty()) return true;
+    AVPacket* out = av_packet_alloc();
+    if (!out || av_new_packet(out, int(before.size())) < 0) {
+        av_packet_free(&out);
+        return fail(error, "Out of memory");
+    }
+    std::memcpy(out->data, before.data(), before.size());
+    out->flags = flags;
+    const bool ok = writeFinal(out, FrameTime(shown), error);
+    av_packet_free(&out);
+    return ok;
+}
+
+bool LongGopCopier::writeHeld(std::vector<uint8_t> au, FrameTime display, std::string* error) {
+    if (au.empty()) return true;
+    AVPacket* out = av_packet_alloc();
+    if (!out || av_new_packet(out, int(au.size())) < 0) {
+        av_packet_free(&out);
+        return fail(error, "Out of memory");
+    }
+    std::memcpy(out->data, au.data(), au.size());
+    out->flags = heldFlags_;
+    const bool ok = writeFinal(out, display, error);
+    av_packet_free(&out);
+    return ok;
+}
+
+std::vector<uint8_t> LongGopCopier::withHrd(const uint8_t* sps, size_t n) const {
+    if (hrdSps_.empty()) return std::vector<uint8_t>(sps, sps + n);
+    std::vector<uint8_t> out = hrd::spliceHrd(codec_, sps, n, hrdSps_.data(), hrdSps_.size());
+    return out.empty() ? std::vector<uint8_t>(sps, sps + n) : out;
+}
+
+void LongGopCopier::setsWithHrd(std::vector<uint8_t>& sets) const {
+    if (hrdSps_.empty()) return;
+    std::vector<uint8_t> out;
+    forEachNal(sets.data(), sets.size(), lengthSize_, [&](const uint8_t* nal, size_t len) {
+        const int type = codec_ == kH264 ? (nal[0] & 31) : (nal[0] >> 1) & 0x3f;
+        if (type == (codec_ == kH264 ? 7 : 33)) {
+            const std::vector<uint8_t> v = withHrd(nal, len);
+            putNal(out, v.data(), v.size(), lengthSize_);
+        } else {
+            putNal(out, nal, len, lengthSize_);
+        }
+    });
+    sets = std::move(out);
+}
+
+bool LongGopCopier::writeFinal(AVPacket* pkt, FrameTime display, std::string* error) {
     const AVRational tb = enc_.main->time_base;
     pkt->pts = display;
     pkt->dts = decoded_++ - depth_;
@@ -1034,6 +1542,20 @@ AVCodecContext* LongGopCopier::openEncoder(int64_t bitrate, std::string* error) 
     c->thread_count = 0;
     c->gop_size = gop_;
     AVDictionary* opts = nullptr;
+    // The footage's buffer model: the encoder told the buffer stands where the stream's does, less what the copy after
+    // the part asks to find there, and a buffer that much smaller (so, keeping to its own, the part leaves the stream's
+    // at least that full).
+    int64_t vbvRate = 0, vbvSize = 0, vbvInit = 0;
+    if (hrdOn_) {
+        const double R = hrdRate_, B = hrdBuffer_;
+        const double level = std::clamp(hrd_.nextDelay() * R, 0.05 * B, B);
+        double ask = 0;
+        if (cursor_ < copies_.size()) ask = std::max(0.0, runs_[size_t(copies_[cursor_].run)].gops[copies_[cursor_].gop].asked) * R;
+        const double keep = std::clamp(ask, 0.0, 0.7 * level);
+        vbvRate = int64_t(R);
+        vbvSize = int64_t(B - keep);
+        vbvInit = std::clamp<int64_t>(int64_t(level - keep), 1, vbvSize);
+    }
     if (codec_ == kH264 || codec_ == kHevc) {
         // The export's quality, held under the rate of the GOPs copied either side (over a second). (Aiming at that
         // rate instead overshoots it several times in a part this short, its rate control starting low.)
@@ -1041,6 +1563,12 @@ AVCodecContext* LongGopCopier::openEncoder(int64_t bitrate, std::string* error) 
         else av_dict_set_int(&opts, "crf", enc_.crf, 0);
         c->rc_max_rate = bitrate;
         c->rc_buffer_size = int(std::min<int64_t>(bitrate, INT_MAX));
+        if (hrdOn_) {
+            if (enc_.bitrate > 0) c->bit_rate = std::min<int64_t>(c->bit_rate, vbvRate);
+            c->rc_max_rate = vbvRate;
+            c->rc_buffer_size = int(std::min<int64_t>(vbvSize, INT_MAX));
+            c->rc_initial_buffer_occupancy = int(std::min<int64_t>(vbvInit, INT_MAX));
+        }
     }
     if (codec_ == kH264) {
         // Closed GOPs (x264's own), the source's profile and level, its parameter sets under their own id, kept out of
@@ -1062,8 +1590,21 @@ AVCodecContext* LongGopCopier::openEncoder(int64_t bitrate, std::string* error) 
             params += lv;
         }
         params += highTier_ ? ":high-tier=1" : ":high-tier=0";  // (the sources' tier)
+        if (hrdOn_) {
+            char vbv[160];
+            // (hrd=1: x265 then writes the timing information in the SPS that the footage's HRD is put in)
+            std::snprintf(vbv, sizeof vbv, ":hrd=1:vbv-maxrate=%lld:vbv-bufsize=%lld:vbv-init=%.4f", static_cast<long long>(vbvRate / 1000),
+                          static_cast<long long>(vbvSize / 1000), double(vbvInit) / double(vbvSize));
+            params += vbv;
+        }
         av_dict_set(&opts, "x265-params", params.c_str(), 0);
         if (!enc_.preset.empty()) av_dict_set(&opts, "preset", enc_.preset.c_str(), 0);
+    } else if (codec_ == kAv1) {
+        // AV1: the export's encoder at its quality (or rate) and speed, its closed GOPs (key frames).
+        c->flags |= m->flags & AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (enc_.bitrate > 0) c->bit_rate = enc_.bitrate;
+        else av_dict_set_int(&opts, "crf", enc_.crf, 0);
+        if (!enc_.preset.empty() && std::string(m->codec->name) == "libsvtav1") av_dict_set(&opts, "preset", enc_.preset.c_str(), 0);
     } else {
         // MPEG-2: the export's own rate control (XDCAM HD422's constant rate) and GOP.
         c->bit_rate = m->bit_rate;
@@ -1076,6 +1617,11 @@ AVCodecContext* LongGopCopier::openEncoder(int64_t bitrate, std::string* error) 
         // At a constant rate, the buffer as the copied GOP before left it (so the stream's buffer model runs on across
         // the splice), and the GOP headers' time codes where the part sits in the export.
         if (vbvLevel_ >= 0 && m->rc_buffer_size > 0) c->rc_initial_buffer_occupancy = int(std::clamp<int64_t>(vbvLevel_, 1, m->rc_buffer_size));
+        if (hrdOn_) {
+            // (its sequence headers state the stream's buffer again, and its vbv_delays are set, as it is joined)
+            c->rc_buffer_size = int(std::min<int64_t>(vbvSize, INT_MAX));
+            c->rc_initial_buffer_occupancy = int(std::min<int64_t>(vbvInit, INT_MAX));
+        }
         int f[4] = {};
         av_dict_set(&opts, "gop_timecode", timecodeText(m->framerate, timecodeStart_, dropFrame_, partStart_, f).c_str(), 0);
         c->intra_dc_precision = m->intra_dc_precision;
@@ -1104,7 +1650,7 @@ bool LongGopCopier::flushPending(std::string* error) {
     }
     std::memcpy(out->data, pending_.data(), pending_.size());
     if (pendingKey_) out->flags |= AV_PKT_FLAG_KEY;
-    const bool ok = write(out, pendingPts_, error);
+    const bool ok = write(out, pendingPts_, true, error);
     av_packet_free(&out);
     return ok;
 }
@@ -1128,6 +1674,7 @@ bool LongGopCopier::receive(std::string* error) {
                 av_packet_unref(pkt_);
                 return fail(error, "Smart rendering: a coded picture is too large for the source's NAL unit lengths");
             }
+            if (codec_ == kHevc) setsWithHrd(pending_);  // (its SPS in the video: the footage's HRD in it)
         } else {
             pending_.assign(pkt_->data, pkt_->data + pkt_->size);
         }
@@ -1151,6 +1698,7 @@ bool LongGopCopier::startPart(FrameTime rel, std::string* error) {
             const int type = d[0] & 31;
             if (type == 7 || type == 8) putNal(partSets_, d, n, lengthSize_);
         }
+        setsWithHrd(partSets_);
     }
     ++parts_;
     return true;
@@ -1176,15 +1724,35 @@ bool LongGopCopier::encode(AVFrame* frame, FrameTime rel, std::string* error) {
     return true;
 }
 
-bool LongGopCopier::finish(std::string* error) { return endPart(error); }
+bool LongGopCopier::finish(std::string* error) {
+    if (!endPart(error)) return false;
+    if (!hrdOn_ || !hrd_.holding()) return true;
+    int64_t shown = 0;
+    std::vector<uint8_t> last = hrd_.finish(&shown);
+    return writeHeld(std::move(last), FrameTime(shown), error);
+}
 
 int LongGopCopier::copy(FrameTime rel, std::string* error) {
     while (cursor_ < copies_.size() && copies_[cursor_].hi < rel) ++cursor_;
     if (cursor_ >= copies_.size() || rel < copies_[cursor_].lo) return 0;
     if (rel == copies_[cursor_].lo) {
         if (!endPart(error)) return -1;  // (a part ends where a copy starts; done already unless frames were skipped)
+        // The buffer model: a copy after a join decodes as its footage did only when the buffer stands at least where
+        // its first picture asks (less what its pictures can spare); lower, its frames are encoded instead (a part
+        // then starts there, its buffering period where the buffer stands). Higher, the picture before is given filler.
+        const Copy& here = copies_[cursor_];
+        const bool join = !(here.chained && lastCopiedHi_ + 1 == here.lo);
+        bool declined = false;
+        if (hrdOn_ && join && !hvc1_ && hrd_.holding()) {
+            const Gop& g = runs_[size_t(here.run)].gops[here.gop];
+            double margin = g.margin;
+            for (size_t n = cursor_ + 1; n < copies_.size() && copies_[n].chained && copies_[n].lo == copies_[n - 1].hi + 1; ++n)
+                margin = std::min(margin, runs_[size_t(copies_[n].run)].gops[copies_[n].gop].margin);
+            declined = g.asked >= 0 && hrd_.nextDelay() < g.asked - 0.8 * std::clamp(margin, 0.0, g.asked);
+        }
         std::vector<AVPacket*> gop;
-        const int got = readGop(copies_[cursor_], gop, error);
+        const int got = declined ? 0 : readGop(copies_[cursor_], gop, error);
+        if (declined) ++hrdDeclined_;
         if (got < 0) return -1;
         if (got == 0 && hvc1_) {
             // (an encoded part's sets cannot go beside the source's out of band: the export is made again, encoded)
@@ -1202,6 +1770,7 @@ int LongGopCopier::copy(FrameTime rel, std::string* error) {
         const bool ok = writeGop(copies_[cursor_], gop, error);
         for (AVPacket*& k : gop) av_packet_free(&k);
         if (!ok) return -1;
+        lastCopiedHi_ = copies_[cursor_].hi;
     }
     return 1;
 }
@@ -1267,7 +1836,8 @@ bool LongGopCopier::writeGop(const Copy& c, const std::vector<AVPacket*>& gop, s
     const Gop& g = r.gops[c.gop];
     const Source& src = *sources_[size_t(r.source)];
     bool first = true;
-    std::vector<uint8_t> trimmed;
+    std::vector<uint8_t> trimmed, renumbered;
+    if (!c.chained || lastCopiedHi_ + 1 != c.lo) frameNumShift_ = -1;  // (after a join: its own numbers, unless made IDR)
     for (size_t k = g.begin; k < g.end; ++k) {
         AVPacket* in = gop[k - g.begin];
         const Packet& pk = r.packets[k];
@@ -1276,7 +1846,39 @@ bool LongGopCopier::writeGop(const Copy& c, const std::vector<AVPacket*>& gop, s
         // What the export did not ask for left out (captions, HDR10+, AFD, Dolby Vision's units).
         const bool less = withoutExtras(codec_, in->data, size_t(in->size), lengthSize_, trimmed);
         const uint8_t* body = less ? trimmed.data() : in->data;
-        const size_t bodySize = less ? trimmed.size() : size_t(in->size);
+        size_t bodySize = less ? trimmed.size() : size_t(in->size);
+        if (codec_ == kH264 && ((first && c.broken) || frameNumShift_ >= 0)) {
+            // From a recovery point after pictures not its own: its I-picture made an IDR picture, the pictures after
+            // it numbered from it (until the next IDR picture). The slice data is the source's, bit for bit.
+            renumbered.clear();
+            bool idr = false, bad = false, shiftSet = false;
+            const bool makeIdr = first && c.broken;
+            forEachNal(body, bodySize, lengthSize_, [&](const uint8_t* nal, size_t len) {
+                const int type = nal[0] & 31;
+                if (type == 5) idr = true;
+                std::vector<uint8_t> v;
+                if (type == 1 && makeIdr) {
+                    if (!shiftSet) {
+                        H264Slice sl;
+                        frameNumShift_ = readH264Slice(nal, len, src.hsps, src.hpps, sl, false) ? int64_t(sl.frameNum) : 0;
+                        shiftSet = true;
+                    }
+                    v = h264SliceAsIdr(nal, len, src.hsps, src.hpps, idrPicId_);
+                    bad = bad || v.empty();
+                } else if (type == 1 && frameNumShift_ >= 0 && !idr) {
+                    v = h264SliceFrameNum(nal, len, src.hsps, src.hpps, uint64_t(frameNumShift_));
+                    bad = bad || v.empty();
+                }
+                if (v.empty()) putNal(renumbered, nal, len, lengthSize_);
+                else putNal(renumbered, v.data(), v.size(), lengthSize_);
+            });
+            if (bad) return fail(error, "Smart rendering: an H.264 slice from a recovery point could not be rewritten");
+            if (makeIdr) idrPicId_ = (idrPicId_ + 1) & 0xffff;
+            if (idr && !makeIdr) frameNumShift_ = -1;
+            trimmed.swap(renumbered);
+            body = trimmed.data();
+            bodySize = trimmed.size();
+        }
         // HEVC in the video (hev1): the source's parameter sets in front of every copied GOP, so it decodes whatever the
         // decoder held before (another source's, or an encoded part's under the same ids, as after a seek).
         const bool prefix = first && codec_ == kHevc && !hvc1_;
@@ -1289,7 +1891,8 @@ bool LongGopCopier::writeGop(const Copy& c, const std::vector<AVPacket*>& gop, s
         if (lead) std::memcpy(out->data, src.sets.data(), lead);
         std::memcpy(out->data + lead, body, bodySize);
         out->flags = in->flags & (AV_PKT_FLAG_KEY | AV_PKT_FLAG_DISPOSABLE);
-        if (first && c.broken) {
+        if (first && c.broken && codec_ == kH264) out->flags |= AV_PKT_FLAG_KEY;
+        if (first && c.broken && codec_ == kHevc) {
             // The CRA's slices as BLA_W_RADL (its RASL pictures are left out): only the NAL unit type changes.
             forEachNal(out->data, size_t(out->size), lengthSize_, [](const uint8_t* nal, size_t len) {
                 if (len >= 2 && ((nal[0] >> 1) & 0x3f) == 21) const_cast<uint8_t*>(nal)[0] = uint8_t(17 << 1 | (nal[0] & 0x81));
@@ -1310,7 +1913,7 @@ bool LongGopCopier::writeGop(const Copy& c, const std::vector<AVPacket*>& gop, s
             else
                 vbvLevel_ = -1;
         }
-        const bool ok = write(out, display, error);
+        const bool ok = write(out, display, false, error);
         av_packet_free(&out);
         if (!ok) return false;
         first = false;

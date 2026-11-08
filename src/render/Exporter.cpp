@@ -32,6 +32,7 @@
 #include <QRandomGenerator>
 #include <QString>
 #include <algorithm>
+#include <climits>
 #include <functional>
 #include <optional>
 #include <thread>
@@ -1053,7 +1054,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             const int64_t rate = s.videoBitrate > 0 ? s.videoBitrate : 50000000;
             o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
             o.vctx->rc_buffer_size = 17825792;
-            o.vctx->rc_initial_buffer_occupancy = 17825792;
+            o.vctx->rc_initial_buffer_occupancy = s.vbvInit > 0 ? int(std::clamp(s.vbvInit, 0.05, 1.0) * 17825792) : 17825792;
             o.vctx->gop_size = exportMpeg2Gop(s, dseq.fps);
             o.vctx->max_b_frames = 2;
             o.vctx->intra_dc_precision = 2;
@@ -1065,13 +1066,38 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!s.startTimecode.empty()) av_dict_set(&opts, "gop_timecode", s.startTimecode.c_str(), 0);
         } else if (c == "libx264" || c == "libx265") {
             if (s.cea608) av_dict_set(&opts, "a53cc", "1", 0);
-            if (s.videoBitrate <= 0 || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
+            // A stated HRD (broadcast ingest's buffer model): at a constant rate the bit rate is the HRD's, filler
+            // data making up what the pictures leave over; at a variable one, no more than the HRD's rate.
+            const bool hrdCbr = s.hrd == "cbr", hrdVbr = s.hrd == "vbr";
+            const int64_t hrdRate = s.vbvMaxrate > 0 ? s.vbvMaxrate : s.videoBitrate;
+            if ((hrdCbr || hrdVbr) && hrdRate <= 0) {
+                av_dict_free(&opts);
+                return fail("A stated HRD needs a bit rate (the video bit rate, or the buffer's rate)");
+            }
+            const int64_t hrdBuffer = s.vbvBuffer > 0 ? s.vbvBuffer : hrdRate;
+            if (hrdCbr || hrdVbr) {
+                o.vctx->rc_max_rate = hrdRate;
+                o.vctx->rc_buffer_size = int(std::min<int64_t>(hrdBuffer, INT_MAX));
+                if (hrdCbr && pass != 1) o.vctx->bit_rate = o.vctx->rc_min_rate = hrdRate;
+                if (s.vbvInit > 0) o.vctx->rc_initial_buffer_occupancy = int(std::clamp(s.vbvInit, 0.05, 1.0) * double(o.vctx->rc_buffer_size));
+            }
+            if ((s.videoBitrate <= 0 && !hrdCbr) || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (pass && c == "libx264") av_dict_set(&opts, "stats", s.passStats.c_str(), 0);
-            if (c == "libx264" && s.parameterSetId > 0)
-                av_dict_set(&opts, "x264-params", ("sps-id=" + std::to_string(std::min(s.parameterSetId, 31))).c_str(), 0);
+            if (c == "libx264") {
+                std::string params;
+                if (s.parameterSetId > 0) params = "sps-id=" + std::to_string(std::min(s.parameterSetId, 31));
+                if (hrdCbr || hrdVbr) params += std::string(params.empty() ? "" : ":") + "nal-hrd=" + (hrdCbr && pass != 1 ? "cbr" : "vbr");
+                if (!params.empty()) av_dict_set(&opts, "x264-params", params.c_str(), 0);
+            }
             if (c == "libx265") {
                 std::string params = "log-level=error";
+                if (hrdCbr || hrdVbr) {
+                    // (kbit/s and kbit, as x265 takes them; strict-cbr pads with filler at a constant rate)
+                    params += ":hrd=1:vbv-maxrate=" + std::to_string(hrdRate / 1000) + ":vbv-bufsize=" + std::to_string(hrdBuffer / 1000);
+                    if (hrdCbr && pass != 1) params += ":strict-cbr=1";
+                    if (s.vbvInit > 0) params += ":vbv-init=" + std::to_string(std::clamp(s.vbvInit, 0.05, 1.0));
+                }
                 if (pass) {
                     // (Quoted: the path's colons and backslashes are its own, not the list's.)
                     std::string quoted = "'";
@@ -2339,7 +2365,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (wantVideo) {
         std::string e;
         if (longGop && !longGop->finish(&e)) return fail(e);
-        if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
+        // (with smart rendering the parts have encoders of their own and this one is given nothing: not flushed, as
+        // an AV1 encoder that was given no picture waits for one at its end)
+        if (!longGop && ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0))
             return fail("Finishing video failed: " + videoError(o, rc));
     }
     const int copiedFrames = (smart ? smart->copied() : 0) + (longGop ? longGop->copiedFrames() : 0);
@@ -2795,9 +2823,11 @@ std::string exportHwEncoder(const Sequence& seq, const ExportSettings& s, Ration
     return !c.empty() ? c : family == "hevc" ? "libx265" : "libx264";  // (no hardware encoder here)
 }
 
-bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
-                    LightLevels* light, bool* keptUnsigned) {
+namespace {
+
+bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                        LightLevels* light, bool* keptUnsigned) {
     if (s.twoPass && s.pass == 0) return exportInTwoPasses(p, seq, s, progress, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
     if (!s.mxfDelivery.empty()) {
         if (keptUnsigned) *keptUnsigned = false;
@@ -2902,6 +2932,34 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
             return false;
         }
     }
+    return ok;
+}
+
+}  // namespace
+
+bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
+    const std::string& c = s.videoCodec;
+    if (c != "libx264" && c != "libx265" && c != "mpeg2video") return false;
+    if (s.profile == "avci100" || s.path.find('%') != std::string::npos) return false;  // (intra only; image sequences)
+    return copiedFrames > 0 || s.hrd == "cbr" || s.hrd == "vbr";
+}
+
+bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                    LightLevels* light, bool* keptUnsigned, HrdReport* hrd) {
+    // (the outermost call checks: two passes export again through here)
+    static thread_local int depth = 0;
+    int copied = 0;
+    ++depth;
+    const bool ok = exportSequenceOnce(p, seq, s, progress, cancel, error, encoderUsed, &copied, light, keptUnsigned);
+    --depth;
+    if (smartRendered) *smartRendered = copied;
+    if (hrd) *hrd = HrdReport{};
+    if (!ok || depth > 0 || !exportNeedsHrdCheck(s, copied)) return ok;
+    const HrdReport r = checkHrd(s.path, cancel);
+    if (r.checked && r.signalled && !r.conforms())
+        qWarning("The export %s does not keep its buffer model: %s", s.path.c_str(), r.summary().c_str());
+    if (hrd) *hrd = r;
     return ok;
 }
 

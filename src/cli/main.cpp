@@ -107,6 +107,8 @@ int usage() {
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies] [--gpu]\n"
                  "                     [--bitrate BITS_PER_SECOND [--two-pass]]  (two passes: H.264 and H.265)\n"
+                 "                     [--hrd cbr|vbr [--vbv-maxrate BITS_PER_SECOND] [--vbv-buffer BITS]]  (H.264 and\n"
+                 "                     H.265: the buffer model stated in the stream; the file is checked against it)\n"
                  "                     [--loudness LUFS [--ceiling dBTP] [--dialogue-gated]]  (e.g. --loudness -14: normalise the mix;\n"
                  "                     --loudness -27 --ceiling -2 --dialogue-gated: by its dialogue, as Netflix asks)\n"
                  "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
@@ -433,6 +435,11 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
         else if (a == "--crf") crf = std::atoi(next().c_str());
         else if (a == "--bitrate") bitrate = std::atoll(next().c_str());
         else if (a == "--two-pass") twoPass = true;
+        else if (a == "--hrd") {
+            st.hrd = next();
+            if (st.hrd != "cbr" && st.hrd != "vbr") return usage();
+        } else if (a == "--vbv-maxrate") st.vbvMaxrate = std::atoll(next().c_str());
+        else if (a == "--vbv-buffer") st.vbvBuffer = std::atoll(next().c_str());
         else if (a == "--vcodec") vcodec = next();
         else if (a == "--acodec") acodec = next();
         else if (a == "--proxies") proxies = true;
@@ -473,7 +480,8 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
         return 1;
     }
     const bool burn = st.burnInCaptions, embed = st.embedCaptions;
-    const std::string colorSpace = st.colorSpace;
+    const std::string colorSpace = st.colorSpace, hrdMode = st.hrd;
+    const int64_t vbvMaxrate = st.vbvMaxrate, vbvBuffer = st.vbvBuffer;
     if (!colorSpace.empty() && (!findColorSpace(colorSpace) || findColorSpace(colorSpace)->sceneReferred)) {
         std::fprintf(stderr, "error: \"%s\" is not a delivery colour space (see `montage-cli colorspaces`)\n", colorSpace.c_str());
         return 1;
@@ -483,6 +491,9 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     st.embedCaptions = embed;
     st.colorSpace = colorSpace;
     st.burnIn = burnIns;
+    if (!hrdMode.empty()) st.hrd = hrdMode;
+    if (vbvMaxrate > 0) st.vbvMaxrate = vbvMaxrate;
+    if (vbvBuffer > 0) st.vbvBuffer = vbvBuffer;
     if (!load(projectPath, p)) return 1;
     if (captionAnimation >= 0)
         for (CaptionTrack& t : p.active()->captionTracks) t.style.animation = captionAnimation;
@@ -522,19 +533,21 @@ int cmdRender(const std::vector<std::string>& args) {
     const std::string outPath = st.path;
     std::signal(SIGINT, [](int) { gCancel = true; });
     std::string err;
+    HrdReport hrd;
     bool ok = exportSequence(
         p, *s, st,
         [](double f, FrameTime) {
             std::fprintf(stderr, "\rRendering... %5.1f%%", f * 100.0);
             std::fflush(stderr);
         },
-        &gCancel, &err);
+        &gCancel, &err, nullptr, nullptr, nullptr, nullptr, &hrd);
     std::fprintf(stderr, "\n");
     if (!ok) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
     std::printf("Wrote %s\n", outPath.c_str());
+    if (hrd.checked) std::printf("Buffer model: %s\n", hrd.summary().c_str());
     if (stems > 0) {
         std::vector<StemFile> files;
         if (!exportStems(

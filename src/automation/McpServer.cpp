@@ -5890,6 +5890,7 @@ void McpServer::Impl::addTools() {
             "markers":{"type":"boolean","default":false},
             "compare":{"type":"string","description":"A delivered file to compare with the sequence's render (or with reference)"},
             "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
+            "hrd":{"type":"string","description":"An H.264, HEVC or MPEG-2 file to check against its buffer model (H.264/H.265 Annex C HRD, MPEG-2 VBV; CBR and VBR): each underflow and overflow at the frame it falls on, and a summary line (taken as an export of the range)"},
             "metrics":{"type":"array","items":{"type":"string","enum":["psnr","ssim","ms_ssim","delta_ictcp","vmaf"]},
                 "description":"What to measure (default all but vmaf)"},
             "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
@@ -5949,6 +5950,12 @@ void McpServer::Impl::addTools() {
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
             if (a.contains("reference") && q.compareFile.empty()) throw ArgError{"\"reference\" is compared with the file named by \"compare\""};
+            if (a.contains("hrd")) {
+                const QString file = absolute(need(a, "hrd"));
+                if (!QFileInfo::exists(file)) throw ArgError{"No file at \"hrd\": " + file};
+                q.hrdFile = file.toStdString();
+            }
+            HrdReport hrd;
             std::vector<QcIssue> issues;
             // (file against file: frames are the reference file's, not the sequence's, so its spans are listed apart and
             // put no markers on the sequence)
@@ -5958,7 +5965,7 @@ void McpServer::Impl::addTools() {
                 // File against file: the sequence's own checks without the comparison, then the two files.
                 const std::string encode = q.compareFile;
                 q.compareFile.clear();
-                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(0.5 * f, "Checking"); });
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(0.5 * f, "Checking"); }, nullptr, nullptr, &hrd);
                 const QString ref = absolute(need(a, "reference"));
                 if (!QFileInfo::exists(ref)) throw ArgError{"No file at \"reference\": " + ref};
                 CompareOptions o;
@@ -5970,13 +5977,17 @@ void McpServer::Impl::addTools() {
                 for (const std::string& w : comparison.warnings) fileSpans += QStringLiteral("Encode quality: %1\n").arg(QString::fromStdString(w));
                 q.compareFile = encode;
             } else {
-                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); }, nullptr, &comparison);
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); }, nullptr, &comparison, &hrd);
             }
             QString text;
             for (const QcIssue& i : issues)
                 text += QStringLiteral("%1 - %2  %3: %4\n").arg(tc(i.start, s), tc(i.end, s), QString::fromLatin1(qcKindName(i.kind)),
                                                              QString::fromStdString(i.text));
             text += fileSpans;
+            if (!q.hrdFile.empty()) {
+                text += QStringLiteral("Buffer model: %1\n").arg(QString::fromStdString(hrd.summary()));
+                if (!hrd.note.empty()) text += QStringLiteral("  (%1)\n").arg(QString::fromStdString(hrd.note));
+            }
             if (comparison.ok) {
                 auto num = [](double v, int d) {
                     return std::isnan(v) ? QStringLiteral("-") : std::isinf(v) ? QStringLiteral("inf") : QString::number(v, 'f', d);
@@ -12381,6 +12392,9 @@ void McpServer::Impl::addTools() {
                 "audio_bitrate":{"type":"integer","default":128000},
                 "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
             "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
+            "hrd":{"type":"string","enum":["","cbr","vbr"],"default":"","description":"H.264 and H.265 (x264, x265): state a hypothetical reference decoder, as broadcast ingest checks it: cbr (a constant rate at bitrate, else vbv_maxrate, filler where the pictures need less) or vbr (no more than vbv_maxrate). The file is checked against it after rendering (the result's hrd)"},
+            "vbv_maxrate":{"type":"integer","minimum":0,"description":"The HRD's bit rate, bits/s (default: bitrate)"},
+            "vbv_buffer":{"type":"integer","minimum":0,"description":"The HRD's buffer, bits (default: a second at its rate)"},
             "two_pass":{"type":"boolean","default":false,"description":"H.264 and H.265 with a bitrate: coded twice, the first pass measuring the pictures so the second spends the bits where they are needed (H.264 in segments: each segment's first pass measures and the bits are shared out across them; H.265 in two passes is made in one go)"},
             "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265, MPEG-2 and AV1 with rate control per segment unless two_pass (H.264); hardware H.264 and H.265 by nodes with the same encoder; MOV, MP4, MKV, MXF, broadcast MXF and MPEG-TS files; image sequences frame by frame; IMF and DCP packages through montage_export_imf and montage_export_dcp with farm). The sound is rendered once, by the joining node. The job's id is the join's"}},
             "required":["project","output"]})json",
@@ -12424,6 +12438,13 @@ void McpServer::Impl::addTools() {
                 if (st.videoBitrate < 0) throw ArgError{"\"bitrate\" is bits a second (0: by quality)"};
             }
             st.twoPass = a.value("two_pass").toBool();
+            st.hrd = a.value("hrd").toString().toStdString();
+            if (!st.hrd.empty() && st.hrd != "cbr" && st.hrd != "vbr") throw ArgError{"\"hrd\" is cbr or vbr"};
+            st.vbvMaxrate = a.value("vbv_maxrate").toInteger();
+            st.vbvBuffer = a.value("vbv_buffer").toInteger();
+            if (!st.hrd.empty() && st.videoCodec != "libx264" && st.videoCodec != "libx265")
+                throw ArgError{"\"hrd\" is for H.264 and H.265 (software)"};
+            if (!st.hrd.empty() && st.videoBitrate <= 0 && st.vbvMaxrate <= 0) throw ArgError{"\"hrd\" needs a \"bitrate\" or \"vbv_maxrate\""};
             if (st.twoPass && ((st.videoCodec != "libx264" && st.videoCodec != "libx265") || st.videoBitrate <= 0))
                 throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
@@ -12673,13 +12694,21 @@ void McpServer::Impl::addTools() {
             const QString report = QString::fromStdString(loudnessReportBase(st.path)) + ".pdf";
             if (st.loudnessReport) QFile::remove(report);  // (one from before is not this one's)
             int copiedFrames = 0;
-            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, cancelFlag(), &err, nullptr, &copiedFrames, &light))
+            HrdReport hrd;
+            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, cancelFlag(), &err, nullptr, &copiedFrames, &light,
+                                nullptr, &hrd))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
             // Smart rendering: pictures of untouched footage copied from the source, not encoded again.
             o["copied_frames"] = copiedFrames;
             if (copiedFrames > 0) text += QStringLiteral("\n%1 frame%2 copied from the source as coded (smart rendering)").arg(copiedFrames).arg(copiedFrames == 1 ? "" : "s");
+            if (hrd.checked || !hrd.error.empty()) {
+                // (checked after a long-GOP smart render or a stated HRD; a file that does not keep it is kept, warned about)
+                o["hrd"] = QString::fromStdString(hrd.summary());
+                o["hrd_conforms"] = hrd.conforms();
+                text += QStringLiteral("\nBuffer model: %1").arg(QString::fromStdString(hrd.summary()));
+            }
             if (st.hdr10Plus) {
                 // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
                 const std::string carriage = hdr10PlusCarriage(s, st);

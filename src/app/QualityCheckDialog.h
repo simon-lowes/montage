@@ -64,6 +64,7 @@ private:
     QComboBox* intelligibilityPreset_ = nullptr;
     QComboBox* loudness_;
     QLineEdit* compareFile_ = nullptr;
+    QLineEdit* hrdFile_ = nullptr;
     QComboBox* qualityPreset_ = nullptr;
     QDoubleSpinBox* minPsnr_ = nullptr;
     QDoubleSpinBox* maxDeltaItp_ = nullptr;

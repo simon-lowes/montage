@@ -1311,9 +1311,11 @@ void ExportDialog::startExport() {
             std::string error, encoder;
             // With stems, the export fills the first half of the bar and the stems the second.
             const double share = stems > 0 ? 0.5 : 1.0;
+            HrdReport hrd;
             r.ok = exportSequence(
                 snap, *sq, s, [&](double f, FrameTime t) { onProgress(f * share, t); }, cancel, &error, &encoder, nullptr,
-                nullptr, &r.keptUnsigned);
+                nullptr, &r.keptUnsigned, &hrd);
+            if (r.ok && hrd.checked && hrd.signalled && !hrd.conforms()) r.hrd = QString::fromStdString(hrd.summary());
             if (r.ok && stems > 0)
                 r.ok = exportStems(
                     snap, *sq, s, stems, nullptr, [&](double f, FrameTime t) { onProgress(0.5 + f * 0.5, t); }, cancel, &error);
@@ -1359,9 +1361,16 @@ void ExportDialog::exportFinished() {
     setExporting(false);
     if (r.ok) {
         const QString where = QDir::toNativeSeparators(exportPath_);
-        state_->message(r.encoder.isEmpty() ? tr("Exported %1").arg(where)
-                                            : tr("Exported %1 (video encoder: %2)").arg(where, r.encoder),
-                        8000);
+        if (!r.hrd.isEmpty())
+            // (the file plays; only a receiver that holds to the buffer model strictly may refuse it)
+            state_->message(tr("Exported %1, but it does not keep its buffer model (%2). A strict ingest check may refuse it; "
+                               "Quality Check's Buffer model lists the frames.")
+                                .arg(where, r.hrd),
+                            20000);
+        else
+            state_->message(r.encoder.isEmpty() ? tr("Exported %1").arg(where)
+                                                : tr("Exported %1 (video encoder: %2)").arg(where, r.encoder),
+                            8000);
         accept();
         return;
     }

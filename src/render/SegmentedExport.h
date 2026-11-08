@@ -81,6 +81,9 @@ bool checkExportSegment(const ExportSettings& segment, SegmentCheck& out, std::s
 // does not fit the others (another encoder's, or not the frames it should hold).
 bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSettings& s, int stems, const std::vector<std::string>& files,
                         const std::vector<ExportSegment>& parts, const ExportProgress& progress, const std::atomic<bool>* cancel,
-                        std::string* error = nullptr);
+                        std::string* error = nullptr, HrdReport* hrd = nullptr);
+// (A stream that states a buffer model, H.264's and HEVC's HRD or MPEG-2's constant-rate VBV, is kept one model across
+// the joins: render/HrdCheck.h's HrdSplicer, the segments after the first started lower (segmentExportSettings). The
+// joined file is then checked, `hrd` given the report; one that does not conform is warned about and kept.)
 
 }  // namespace montage

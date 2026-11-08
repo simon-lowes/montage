@@ -14,6 +14,8 @@
 //  - for captions for the deaf and hard of hearing, loud sound outside speech that no caption describes.
 #pragma once
 
+#include "render/HrdCheck.h"
+
 #include <atomic>
 #include <functional>
 #include <string>
@@ -62,9 +64,13 @@ struct QcSettings {
     std::string compareFile;
     unsigned compareMetrics = MetricPsnr | MetricSsim | MetricMsSsim | MetricDeltaItp;
     QualityLimits qualityLimits;
+    // Buffer model (render/HrdCheck.h): this H.264, HEVC or MPEG-2 file against its HRD or VBV, each underflow and
+    // overflow reported at the frame it falls on ("" = not checked). As with compareFile, the file is taken to be an export
+    // of the range.
+    std::string hrdFile;
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness, EncodeQuality };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness, EncodeQuality, Hrd };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;
@@ -107,7 +113,7 @@ private:
 // handed back in `comparison`.
 std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime in, FrameTime out, const QcSettings& settings,
                                   const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                                  EncodeComparison* comparison = nullptr);
+                                  EncodeComparison* comparison = nullptr, HrdReport* hrd = nullptr);
 
 // Red markers spanning each issue, named "QC: <kind>", in place of earlier QC markers. Returns how many.
 int addQcMarkers(Sequence& s, const std::vector<QcIssue>& issues);

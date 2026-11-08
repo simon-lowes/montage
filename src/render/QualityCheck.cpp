@@ -72,6 +72,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::Uncaptioned: return "Sound without a caption";
         case QcKind::CinemaLoudness: return "Leq(M)";
         case QcKind::EncodeQuality: return "Encode quality";
+        case QcKind::Hrd: return "Buffer model";
     }
     return "";
 }
@@ -155,7 +156,7 @@ std::pair<int, int> FlashDetector::lastSecondSpan(bool red) const {
 
 std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime in, FrameTime out, const QcSettings& q,
                                   const std::function<void(double)>& progressAll, const std::atomic<bool>* cancel,
-                                  EncodeComparison* comparison) {
+                                  EncodeComparison* comparison, HrdReport* hrdOut) {
     std::vector<QcIssue> issues;
     // With an encode to compare, the other checks take the first half of the progress.
     const bool compare = !q.compareFile.empty();
@@ -532,6 +533,22 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
         }
         for (const QualitySpan& sp : qualityOverLimits(c, q.qualityLimits)) issues.push_back({QcKind::EncodeQuality, sp.first, sp.end, sp.text});
         if (comparison) *comparison = c;
+    }
+    if (!q.hrdFile.empty() && !(cancel && cancel->load())) {
+        // The delivered file's buffer model: each problem at the frame it shows (the file an export of the range).
+        const HrdReport r = checkHrd(q.hrdFile, cancel);
+        const FrameTime last = std::max(in, out - 1);
+        if (!r.error.empty() || !r.checked)
+            issues.push_back({QcKind::Hrd, in, std::min(out, in + 1), "The buffer model was not checked: " + (r.error.empty() ? r.note : r.error)});
+        for (const HrdIssue& i : r.issues) {
+            const FrameTime f = std::clamp<FrameTime>(in + FrameTime(i.shown), in, last);
+            std::string text = r.codec + " " + r.model + " " + i.kind + ": " + i.text;
+            if (!r.signalled) text += " (no HRD stated: the level's limits)";
+            issues.push_back({QcKind::Hrd, f, f + 1, text});
+        }
+        if (r.issueCount > int64_t(r.issues.size()))
+            issues.push_back({QcKind::Hrd, last, last + 1, std::to_string(r.issueCount - int64_t(r.issues.size())) + " more buffer model problems not listed"});
+        if (hrdOut) *hrdOut = r;
     }
     std::stable_sort(issues.begin(), issues.end(), [](const QcIssue& a, const QcIssue& b) { return a.start < b.start; });
     if (progressAll) progressAll(1.0);

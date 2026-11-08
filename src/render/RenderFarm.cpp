@@ -167,6 +167,10 @@ void visitSettings(S& s, V& v) {
     v("gop", s.gop);
     v("videoBitrate", s.videoBitrate);
     v("twoPass", s.twoPass);
+    v("hrd", s.hrd);
+    v("vbvMaxrate", s.vbvMaxrate);
+    v("vbvBuffer", s.vbvBuffer);
+    v("vbvInit", s.vbvInit);
     v("pass", s.pass);
     v("parameterSetId", s.parameterSetId);
     v("passStats", s.passStats);

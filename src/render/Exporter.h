@@ -10,6 +10,7 @@
 #include "core/Model.h"
 #include "media/Exr.h"
 #include "render/LightLevel.h"
+#include "render/HrdCheck.h"
 
 namespace montage {
 
@@ -60,6 +61,16 @@ struct ExportSettings {
     // H.264 (x264): the id its sequence and picture parameter sets take (0-31), so segments coded at different rates,
     // whose parameter sets differ, can sit side by side in one file's decoder configuration.
     int parameterSetId = 0;
+    // H.264 and H.265 (x264, x265): a hypothetical reference decoder stated in the stream, as broadcast ingest checks
+    // it (render/HrdCheck.h): "cbr" (a constant rate, filler data where the pictures need fewer bits), "vbr" (no more
+    // than the rate, at the quality or bit rate asked), or empty (none stated). The HRD's rate is vbvMaxrate (0: the
+    // video bit rate), its buffer vbvBuffer bits (0: a second at the rate).
+    std::string hrd;
+    int64_t vbvMaxrate = 0;
+    int64_t vbvBuffer = 0;
+    // How full the buffer is (a fraction of it) before the first picture, with a stated HRD or MPEG-2 at a constant
+    // rate; 0 = the encoder's own (90 %, MPEG-2 full). A farm's later segments start lower, so the join can meet them.
+    double vbvInit = 0;
     std::string preset = "medium";       // encoder speed preset
     std::string profile;                 // e.g. ProRes "hq" / "4444", DNxHR "dnxhr_hq", x264 "avci100" (AVC-Intra 100)
     std::string pixFmt;                  // empty = sensible default for the codec
@@ -289,7 +300,13 @@ std::string loudnessReportBase(const std::string& path);
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,
                     int* smartRendered = nullptr,  // frames copied by smart rendering
-                    LightLevels* light = nullptr, bool* keptUnsigned = nullptr);
+                    LightLevels* light = nullptr, bool* keptUnsigned = nullptr,
+                    HrdReport* hrd = nullptr);  // the buffer check after it (see below)
+// After a long-GOP export whose GOPs were copied (smart rendering), or one asked to state an HRD (`hrd` above), the file
+// is checked against its buffer model (render/HrdCheck.h). A file that does not conform is kept and warned about, not
+// failed: it decodes everywhere, receivers differ in how strictly they hold to the model, and the render it took may
+// have been long; the report (and its warning) names the first frame at fault.
+bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames);
 
 // An MPEG-2 (XDCAM HD422) export's GOP at `fps`: the one asked for, else 12 frames (15 at 30 and 60 frames a second).
 int exportMpeg2Gop(const ExportSettings& s, Rational fps);

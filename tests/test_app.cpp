@@ -861,6 +861,23 @@ private slots:
         QVERIFY2(!compare.issues().empty() && compare.issues()[0].kind == QcKind::EncodeQuality,
                  qPrintable(compare.findChild<QLabel*>("qcSummary")->text()));
         QVERIFY(std::any_of(timeline()->qualityLane().begin(), timeline()->qualityLane().end(), [](const auto& sp) { return sp.status == 2; }));
+        // A constant-rate H.264 file that states its buffer model: the Buffer model line reports it kept, with no
+        // problem listed.
+        ExportSettings cbr = st;
+        cbr.path = (dir_.path() + "/qc-hrd.mp4").toStdString();
+        cbr.videoCodec = "libx264";
+        cbr.preset = "veryfast";
+        cbr.videoBitrate = 300000;
+        cbr.hrd = "cbr";
+        QVERIFY2(exportSequence(state()->project(), seq, cbr, nullptr, nullptr, &err), err.c_str());
+        compare.findChild<QLineEdit*>("qcCompareFile")->clear();
+        QVERIFY(compare.findChild<QLineEdit*>("qcHrdFile"));
+        QVERIFY(compare.findChild<QPushButton*>("qcHrdBrowse"));
+        compare.findChild<QLineEdit*>("qcHrdFile")->setText(QString::fromStdString(cbr.path));
+        QVERIFY(compare.runCheck());
+        const QString summary = compare.findChild<QLabel*>("qcSummary")->text();
+        QVERIFY2(summary.contains("Buffer model: NAL HRD, CBR") && summary.contains("conforms"), qPrintable(summary));
+        QVERIFY(std::none_of(compare.issues().begin(), compare.issues().end(), [](const QcIssue& i) { return i.kind == QcKind::Hrd; }));
     }
 
     void conformCheckDialog() {
