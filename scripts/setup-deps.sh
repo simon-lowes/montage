@@ -8,8 +8,8 @@ SUDO=""
 APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=180)
 PACKAGES=(build-essential cmake ninja-build pkg-config nasm ffmpeg
   qt6-base-dev qt6-multimedia-dev libqt6opengl6-dev libgl1-mesa-dev qt6-l10n-tools
-  libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev libopencolorio-dev liblilv-dev libraw-dev libopenjp2-7-dev libjxl-dev liblcms2-dev libmysofa-dev uuid-dev libexpat1-dev libssl-dev
-  xvfb xauth curl)
+  libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev libopencolorio-dev liblilv-dev libraw-dev libopenjp2-7-dev libjxl-dev liblcms2-dev libmysofa-dev uuid-dev libexpat1-dev libssl-dev libasound2-dev
+  xvfb xauth curl jackd2)
 # (man pages' index is not rebuilt after each package: on CI runners that alone can take minutes)
 if [ -f /var/lib/man-db/auto-update ]; then $SUDO rm -f /var/lib/man-db/auto-update; fi
 install_packages() {
