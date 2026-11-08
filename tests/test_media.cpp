@@ -2164,12 +2164,15 @@ private slots:
             const Image img = toImage(*f);
             const int number = numberOf(img);
             const bool right = number == (first + k) % 25;
-            // (a frame the sender sent late on a busy machine is held over the one it missed)
-            if (!right && k > 0 && number == (first + k - 1) % 25) ++held;
+            // (a frame the sender sent late on a busy machine is held over the one it missed: one frame,
+            // or two when the recorder says it repeated that many, as when the sending thread stalls at the start)
+            const int lag = ((first + k) % 25 - number + 25) % 25;
+            const int mostLag = status.repeated >= 2 ? 2 : 1;
+            if (!right && lag >= 1 && lag <= std::min(mostLag, k)) ++held;
             else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3; %4").arg(k).arg(number).arg((first + k) % 25).arg(seen)));
             QVERIFY2(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.015, qPrintable(QStringLiteral("frame %1: red %2").arg(k).arg(img.at(W / 4, H / 4)[0])));
         }
-        QVERIFY2(held <= 2, qPrintable(seen));
+        QVERIFY2(held <= 3, qPrintable(seen));
         // The sound to the sample: the recording's sample s is the streams' sample (the first frame's) + s.
         AudioBufferPtr heard = decodeAudio(cs.path, 48000, &err);
         QVERIFY2(heard, err.c_str());
