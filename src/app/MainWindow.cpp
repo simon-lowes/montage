@@ -8176,9 +8176,9 @@ void MainWindow::exportStreamingDialog() {
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Export Streaming Package"));
     auto* form = new QFormLayout(&dlg);
-    auto* about = new QLabel(tr("The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF for HLS and "
-                                "DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers "
-                                "as SCTE 35 cues."));
+    auto* about = new QLabel(tr("The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF (or MPEG-TS) for "
+                                "HLS and DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers "
+                                "as SCTE 35 cues. Live packages are made from a recording: File › Capture."));
     about->setWordWrap(true);
     form->addRow(about);
     const ColorSpace* cs = findColorSpace(s->colorSpace);
@@ -8219,10 +8219,20 @@ void MainWindow::exportStreamingDialog() {
     auto* formats = new QHBoxLayout;
     formats->addWidget(hls), formats->addWidget(dash), formats->addStretch();
     form->addRow(tr("Formats:"), formats);
+    auto* segmentFormat = new QComboBox;
+    segmentFormat->setObjectName(QStringLiteral("streamingSegmentFormat"));
+    segmentFormat->addItem(tr("CMAF"), QStringLiteral("cmaf"));
+    segmentFormat->addItem(tr("MPEG-TS for HLS (CMAF for DASH)"), QStringLiteral("ts"));
+    segmentFormat->setToolTip(tr("Transport stream segments for HLS players and CDNs that ask for them: H.264 or HEVC, with AAC, AC-3 or E-AC-3"));
+    form->addRow(tr("Segment format:"), segmentFormat);
     auto* audio = new QComboBox;
+    audio->setObjectName(QStringLiteral("streamingSound"));
     audio->addItem(tr("AAC"), QStringLiteral("aac"));
     audio->addItem(tr("Opus"), QStringLiteral("libopus"));
+    if (avcodec_find_encoder_by_name("ac3")) audio->addItem(tr("AC-3 (to 5.1)"), QStringLiteral("ac3"));
+    if (avcodec_find_encoder_by_name("eac3")) audio->addItem(tr("E-AC-3 (to 7.1)"), QStringLiteral("eac3"));
     audio->addItem(tr("No sound"), QStringLiteral("none"));
+    audio->setToolTip(tr("AC-3 and E-AC-3 state the mix's loudness (dialnorm) and the sequence's downmix levels"));
     form->addRow(tr("Sound:"), audio);
     auto* cue = new QComboBox;
     cue->addItem(tr("splice_insert"), QStringLiteral("splice_insert"));
@@ -8258,6 +8268,11 @@ void MainWindow::exportStreamingDialog() {
     st.cutAligned = cutAligned->isChecked();
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
     st.audioCodec = audio->currentData().toString().toStdString();
+    st.segmentFormat = segmentFormat->currentData().toString().toStdString();
+    if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() == "libsvtav1")) {
+        state_->message(tr("MPEG-TS segments carry H.264 or HEVC, with AAC, AC-3 or E-AC-3"));
+        return;
+    }
     st.cueCommand = cue->currentData().toString().toStdString();
     if (inOut->isChecked()) st.in = s->inPoint, st.out = s->outPoint + 1;
     // From a copy, off the UI thread.
