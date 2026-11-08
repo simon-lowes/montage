@@ -517,6 +517,7 @@ private slots:
         // DCP signing certificates and DKDMs of their own too.
         qputenv("MONTAGE_DCP_CERTIFICATES", dir_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
         qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
+        qputenv("MONTAGE_DCP_FACILITIES", dir_.filePath(QStringLiteral("dcp-facilities.json")).toUtf8());
         // And a sound library (not the one on this computer, with its folders).
         qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
         // And a job store (the render queue kept on disk) of their own.
@@ -8727,6 +8728,113 @@ private slots:
                         .value("isError").toBool());
         }
         state()->newProject();
+    }
+
+    // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
+    void kdmsForScreensFromAnFlm() {
+        if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
+        std::string err;
+        // A DKDM, as exportDcp keeps one, to Montage's (the tests') own chain.
+        dcp::CertificateChain signer;
+        QVERIFY2(dcp::signerCertificateChain(signer, &err), err.c_str());
+        const int64_t now = QDateTime::currentSecsSinceEpoch();
+        dcp::KdmSettings keep;
+        keep.cplId = dcp::uuidString(dcp::newUuid());
+        keep.contentTitle = "Booked";
+        keep.notValidBefore = dcp::kdmTime(now - 60);
+        keep.notValidAfter = dcp::kdmTime(now + 30 * 86400LL);
+        keep.keys = {dcp::newContentKey("MDIK"), dcp::newContentKey("MDAK")};
+        keep.recipient = signer.certificates.back();
+        std::string text;
+        QVERIFY2(dcp::makeKdm(keep, signer, text, &err), err.c_str());
+        const QString dkdm = dir_.filePath("booked-dkdm.xml");
+        QVERIFY(dcp::writeWholeFile(dkdm.toStdString(), text));
+        // An Extended FLM of two screens, each a server and a projector.
+        dcp::CertificateChain servers[2], projectors[2];
+        for (int i = 0; i < 2; ++i) QVERIFY(dcp::makeCertificateChain("Server", servers[i], &err) && dcp::makeCertificateChain("Projector", projectors[i], &err));
+        auto keyInfo = [](const dcp::CertificateChain& chain) {
+            std::string x = "<KeyInfoList><ds:KeyInfo>";
+            for (const std::string& pem : chain.certificates) {
+                std::string b;
+                for (const QString& line : QString::fromStdString(pem).split('\n'))
+                    if (!line.startsWith("-----") && !line.isEmpty()) b += line.toStdString();
+                x += "<ds:X509Data><ds:X509Certificate>" + b + "</ds:X509Certificate></ds:X509Data>";
+            }
+            return x + "</ds:KeyInfo></KeyInfoList>";
+        };
+        auto device = [&](const char* type, const dcp::CertificateChain& chain) {
+            return "<Device><DeviceTypeID>" + std::string(type) + "</DeviceTypeID><DeviceIdentifier idtype=\"DeviceUID\">urn:uuid:" +
+                   dcp::uuidString(dcp::newUuid()) + "</DeviceIdentifier><Manufacturer>Test</Manufacturer><ModelNumber>1</ModelNumber><IsActive>true</IsActive>" +
+                   keyInfo(chain) + "<Capabilities/></Device>";
+        };
+        std::string flm = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><FacilityListMessage xmlns=\"http://www.smpte-ra.org/ns/430-16/2017/FLM\" "
+                          "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><MessageId>urn:uuid:" + dcp::uuidString(dcp::newUuid()) +
+                          "</MessageId><IssueDate>2026-11-01T10:00:00Z</IssueDate><FacilityInfo><FacilityID>urn:x-facilityID:test:park</FacilityID>"
+                          "<FacilityName>Park Screens</FacilityName><FacilityTimeZone>Europe/London</FacilityTimeZone><Circuit>none</Circuit><AddressList/>"
+                          "</FacilityInfo><AuditoriumList>";
+        for (int i = 0; i < 2; ++i)
+            flm += "<Auditorium><AuditoriumNumberOrName>" + std::to_string(i + 1) + "</AuditoriumNumberOrName><SuiteList><Suite>" + device("SM", servers[i]) +
+                   device("PR", projectors[i]) + "</Suite></SuiteList></Auditorium>";
+        flm += "</AuditoriumList></FacilityListMessage>";
+        const QString flmFile = dir_.filePath("park-flm.xml");
+        QVERIFY(dcp::writeWholeFile(flmFile.toStdString(), flm));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_make_kdm"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Read into the facility list (no DKDM: only read).
+        QJsonObject r = call({{"flm", QJsonArray{flmFile}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray cinemas = r.value("structuredContent").toObject().value("cinemas").toArray();
+        QVERIFY(cinemas.size() == 1 && cinemas.at(0).toObject().value("cinema").toString() == "Park Screens");
+        QCOMPARE(cinemas.at(0).toObject().value("screens").toArray().size(), 2);
+        // Booked over MCP: screen 2 only.
+        r = call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/2"}}, {"folder", dir_.filePath("mcp-booking")}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject made = r.value("structuredContent").toObject();
+        QVERIFY(made.value("kdms").toArray().size() == 1 && made.value("zips").toArray().size() == 1);
+        {
+            QFile k(made.value("kdms").toArray().at(0).toString());
+            QVERIFY(k.open(QIODevice::ReadOnly));
+            dcp::KdmContents opened;
+            QVERIFY2(dcp::readKdm(k.readAll().toStdString(), servers[1].privateKey, opened, &err), err.c_str());
+            dcp::CertificateInfo projector;
+            QVERIFY(dcp::readCertificate(projectors[1].certificates.back(), projector));
+            QVERIFY(opened.trustedDevices == std::vector<std::string>{projector.thumbprint});
+        }
+        // Refused: a screen not in the list, and a window past the DKDM's.
+        QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/7"}}, {"folder", dir_.filePath("mcp-booking")}}).value("isError").toBool());
+        QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens"}}, {"folder", dir_.filePath("mcp-booking")}, {"until", "2099-01-01T00:00:00Z"}})
+                    .value("isError")
+                    .toBool());
+        // The dialog lists the cinema and its screens from the kept list; both ticked and booked, one zip.
+        bool listed = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != QLatin1String("makeKdmsDialog")) return;
+            auto* tree = dlg->findChild<QTreeWidget*>("kdmScreens");
+            auto* dkdmEdit = dlg->findChild<QLineEdit*>("kdmDkdm");
+            auto* folder = dlg->findChild<QLineEdit*>("kdmFolder");
+            listed = tree && dkdmEdit && folder && tree->topLevelItemCount() == 1 && tree->topLevelItem(0)->text(0) == "Park Screens" &&
+                     tree->topLevelItem(0)->childCount() == 2 && tree->topLevelItem(0)->child(0)->text(2) == "PR" &&
+                     dlg->findChild<QPushButton*>("kdmReadFlm") && dlg->findChild<QPushButton*>("kdmAddScreen");
+            if (!listed) {
+                dlg->reject();
+                return;
+            }
+            tree->topLevelItem(0)->setCheckState(0, Qt::Checked);  // (a cinema ticks all its screens)
+            dkdmEdit->setText(dkdm);
+            folder->setText(dir_.filePath("dialog-booking"));
+            dlg->accept();
+        });
+        win_->makeKdmsDialog();
+        QVERIFY(listed);
+        QVERIFY2(win_->statusBar()->currentMessage().contains("zip"), qPrintable(win_->statusBar()->currentMessage()));
+        const QStringList zips = QDir(dir_.filePath("dialog-booking")).entryList({"*.zip"});
+        QCOMPARE(zips.size(), 1);
+        QCOMPARE(QDir(dir_.filePath("dialog-booking/Park_Screens")).entryList({"KDM_Booked_Park_Screens_*.xml"}).size(), 2);
     }
 
     void exportImfFromTheFileMenu() {

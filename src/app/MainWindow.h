@@ -314,7 +314,8 @@ public:
     QString exportDcpTo(const QString& parent, const DcpSettings& settings, QStringList* problems = nullptr);
     void exportDcpDialog();
     // File › Make KDMs…: keys for cinema servers to play an encrypted DCP (render/Dcp.h makeKdms), from its DKDM, for
-    // the servers' certificates and a window.
+    // a window: one for each screen ticked in the facility list (render/DcpFacilities: read from FLMs or added by hand,
+    // kept between sessions) and each server certificate given.
     void makeKdmsDialog();
     QString exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems = nullptr);
     void exportImfDialog();

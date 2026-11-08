@@ -225,6 +225,7 @@ add_library(montage_engine STATIC
   render/DcpMxf.h render/DcpMxf.cpp
   render/Dcp.h render/Dcp.cpp
   render/DcpSecurity.h render/DcpSecurity.cpp
+  render/DcpFacilities.h render/DcpFacilities.cpp
   render/XmlCanonical.h render/XmlCanonical.cpp
   render/RoomTone.h render/RoomTone.cpp
   render/ExtendClip.h render/ExtendClip.cpp

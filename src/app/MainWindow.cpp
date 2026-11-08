@@ -12,6 +12,7 @@
 #include "render/PaperworkOutput.h"
 #include "render/ImageSubtitles.h"
 #include "render/DcpSecurity.h"
+#include "render/DcpFacilities.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
@@ -87,6 +88,8 @@
 #include <QShortcut>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QSet>
+#include <QTreeWidget>
 #include <QChildEvent>
 #include <QTabBar>
 #include <QToolBar>
@@ -8829,9 +8832,9 @@ void MainWindow::makeKdmsDialog() {
     dlg.setObjectName(QStringLiteral("makeKdmsDialog"));
     dlg.setWindowTitle(tr("Make KDMs"));
     auto* form = new QFormLayout(&dlg);
-    auto* intro = new QLabel(tr("Keys for cinema servers to play an encrypted DCP: one KDM for each server certificate, valid "
-                                "between the times given. The cinema sends its servers' certificates; the DKDM is the file Montage kept "
-                                "when it made the DCP."),
+    auto* intro = new QLabel(tr("Keys for cinema servers to play an encrypted DCP, valid between the times given: one KDM for each screen "
+                                "ticked below and each server certificate given. Cinemas send their screens as Facility List Messages "
+                                "(FLMs) or as certificates; the DKDM is the file Montage kept when it made the DCP."),
                              &dlg);
     intro->setWordWrap(true);
     form->addRow(intro);
@@ -8854,10 +8857,151 @@ void MainWindow::makeKdmsDialog() {
     auto* dkdm = new QLineEdit(QString::fromStdString(lastDcp_.dkdm), &dlg);
     dkdm->setObjectName(QStringLiteral("kdmDkdm"));
     form->addRow(tr("DKDM:"), fileRow(dkdm, tr("Choose the DCP's DKDM"), tr("KDMs (*.xml)"), false));
+
+    // The facility list: cinemas and their screens, ticked for this booking.
+    std::vector<Facility> facilities;
+    std::string loadError;
+    if (!loadFacilities(facilities, &loadError)) state_->message(tr("The facility list cannot be read: %1").arg(QString::fromStdString(loadError)), 10000);
+    auto* tree = new QTreeWidget(&dlg);
+    tree->setObjectName(QStringLiteral("kdmScreens"));
+    tree->setHeaderLabels({tr("Cinema and screen"), tr("Server"), tr("Devices in its KDMs"), tr("Certificate ends")});
+    tree->setMinimumHeight(180);
+    tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    auto deviceText = [](const FacilityScreen& sc) {
+        QStringList parts;
+        for (const FacilityDevice& d : sc.devices)
+            if (d.active && !d.thumbprint.empty()) parts << QString::fromStdString(d.type.empty() ? d.name : d.type);
+        return parts.isEmpty() ? tr("any device") : parts.join(QStringLiteral(", "));
+    };
+    auto refresh = [&, tree] {
+        // (what was ticked stays ticked)
+        QSet<QString> ticked;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i)
+            for (int j = 0; j < tree->topLevelItem(i)->childCount(); ++j)
+                if (tree->topLevelItem(i)->child(j)->checkState(0) == Qt::Checked) ticked.insert(tree->topLevelItem(i)->child(j)->data(0, Qt::UserRole).toString());
+        tree->clear();
+        for (size_t i = 0; i < facilities.size(); ++i) {
+            const Facility& f = facilities[i];
+            auto* cinema = new QTreeWidgetItem(tree, {QString::fromStdString(f.name), QString(), QString(), QString()});
+            cinema->setFlags(cinema->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
+            cinema->setData(0, Qt::UserRole + 1, int(i));
+            QStringList tip{QString::fromStdString(f.id), tr("From: %1").arg(QString::fromStdString(f.source))};
+            if (!f.timeZone.empty()) tip << tr("Time zone: %1").arg(QString::fromStdString(f.timeZone));
+            for (const std::string& n : f.notes) tip << QString::fromStdString(n);
+            cinema->setToolTip(0, tip.join('\n'));
+            for (size_t j = 0; j < f.screens.size(); ++j) {
+                const FacilityScreen& sc = f.screens[j];
+                const QString key = QString::fromStdString(f.id + "\n" + sc.name);
+                auto* screen = new QTreeWidgetItem(cinema, {tr("Screen %1").arg(QString::fromStdString(sc.name)), QString::fromStdString(sc.server.commonName),
+                                                            deviceText(sc), QString::fromStdString(sc.server.notAfter).left(10)});
+                screen->setFlags(screen->flags() | Qt::ItemIsUserCheckable);
+                screen->setData(0, Qt::UserRole, key);
+                screen->setData(0, Qt::UserRole + 1, int(i));
+                screen->setData(0, Qt::UserRole + 2, int(j));
+                screen->setCheckState(0, ticked.contains(key) ? Qt::Checked : Qt::Unchecked);
+                if (!sc.server.chainComplete) screen->setToolTip(1, tr("A certificate sent alone: its chain was not checked"));
+            }
+            cinema->setExpanded(true);
+        }
+    };
+    refresh();
+    auto store = [&] {
+        std::string err;
+        if (!saveFacilities(facilities, &err)) state_->message(tr("The facility list cannot be saved: %1").arg(QString::fromStdString(err)), 10000);
+        refresh();
+    };
+    auto* readFlms = new QPushButton(tr("Read FLMs…"), &dlg);
+    readFlms->setObjectName(QStringLiteral("kdmReadFlm"));
+    connect(readFlms, &QPushButton::clicked, &dlg, [&] {
+        const QStringList files = QFileDialog::getOpenFileNames(&dlg, tr("Read Facility List Messages"), appSettings().value(QStringLiteral("dcp/flmFolder")).toString(),
+                                                                tr("FLMs (*.xml);;All files (*)"));
+        if (files.isEmpty()) return;
+        appSettings().setValue(QStringLiteral("dcp/flmFolder"), QFileInfo(files.front()).path());
+        QStringList problems;
+        int screens = 0, read = 0;
+        for (const QString& file : files) {
+            Facility f;
+            std::string err;
+            if (!readFlmFile(file.toStdString(), f, &err)) {
+                problems << QString::fromStdString(err);
+                continue;
+            }
+            screens += int(f.screens.size());
+            ++read;
+            mergeFacility(facilities, std::move(f));
+        }
+        store();
+        state_->message(tr("Read %n FLM(s) with %1 screen(s)", nullptr, read).arg(screens), 10000);
+        if (!problems.isEmpty()) QMessageBox::warning(&dlg, tr("Read FLMs"), tr("Not read:\n%1").arg(problems.join('\n')));
+    });
+    auto* addScreen = new QPushButton(tr("Add Screen…"), &dlg);
+    addScreen->setObjectName(QStringLiteral("kdmAddScreen"));
+    connect(addScreen, &QPushButton::clicked, &dlg, [&] {
+        QDialog add(&dlg);
+        add.setObjectName(QStringLiteral("kdmAddScreenDialog"));
+        add.setWindowTitle(tr("Add a Screen"));
+        auto* f = new QFormLayout(&add);
+        auto* cinema = new QComboBox(&add);
+        cinema->setObjectName(QStringLiteral("kdmAddCinema"));
+        cinema->setEditable(true);
+        for (const Facility& c : facilities) cinema->addItem(QString::fromStdString(c.name));
+        if (QTreeWidgetItem* at = tree->currentItem()) cinema->setCurrentIndex(at->data(0, Qt::UserRole + 1).toInt());
+        f->addRow(tr("Cinema:"), cinema);
+        auto* name = new QLineEdit(&add);
+        name->setObjectName(QStringLiteral("kdmAddScreenName"));
+        f->addRow(tr("Screen:"), name);
+        auto* server = new QLineEdit(&add);
+        server->setObjectName(QStringLiteral("kdmAddServer"));
+        server->setPlaceholderText(tr("the server's certificate or chain (.pem, .crt)"));
+        f->addRow(tr("Server:"), fileRow(server, tr("Choose the Server's Certificate"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), false));
+        auto* devices = new QLineEdit(&add);
+        devices->setObjectName(QStringLiteral("kdmAddDevices"));
+        devices->setPlaceholderText(tr("the projector's and other devices' certificates, separated by ;"));
+        f->addRow(tr("Devices:"), fileRow(devices, tr("Choose the Devices' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
+        auto* b = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &add);
+        connect(b, &QDialogButtonBox::accepted, &add, &QDialog::accept);
+        connect(b, &QDialogButtonBox::rejected, &add, &QDialog::reject);
+        f->addRow(b);
+        if (add.exec() != QDialog::Accepted) return;
+        std::vector<std::string> others;
+        for (const QString& d : devices->text().split(';', Qt::SkipEmptyParts)) others.push_back(d.trimmed().toStdString());
+        std::string err;
+        if (!addScreenByHand(facilities, cinema->currentText().toStdString(), name->text().toStdString(), server->text().trimmed().toStdString(), others, &err)) {
+            QMessageBox::warning(&dlg, tr("Add a Screen"), tr("The screen was not added: %1").arg(QString::fromStdString(err)));
+            return;
+        }
+        store();
+    });
+    auto* remove = new QPushButton(tr("Remove"), &dlg);
+    remove->setObjectName(QStringLiteral("kdmRemoveFacility"));
+    connect(remove, &QPushButton::clicked, &dlg, [&] {
+        QTreeWidgetItem* at = tree->currentItem();
+        if (!at) return;
+        const size_t i = size_t(at->data(0, Qt::UserRole + 1).toInt());
+        if (i >= facilities.size()) return;
+        if (at->parent()) {
+            const size_t j = size_t(at->data(0, Qt::UserRole + 2).toInt());
+            if (j < facilities[i].screens.size()) facilities[i].screens.erase(facilities[i].screens.begin() + qsizetype(j));
+            if (facilities[i].screens.empty()) facilities.erase(facilities.begin() + qsizetype(i));
+        } else {
+            facilities.erase(facilities.begin() + qsizetype(i));
+        }
+        store();
+    });
+    auto* list = new QVBoxLayout;
+    list->addWidget(tree, 1);
+    auto* listButtons = new QHBoxLayout;
+    listButtons->addWidget(readFlms);
+    listButtons->addWidget(addScreen);
+    listButtons->addWidget(remove);
+    listButtons->addStretch(1);
+    list->addLayout(listButtons);
+    form->addRow(tr("Screens:"), list);
+
     auto* servers = new QLineEdit(&dlg);
     servers->setObjectName(QStringLiteral("kdmServers"));
-    servers->setPlaceholderText(tr("the servers' certificates (.pem, .crt), separated by ;"));
-    form->addRow(tr("Servers:"), fileRow(servers, tr("Choose the Servers' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
+    servers->setPlaceholderText(tr("other servers' certificates (.pem, .crt), separated by ;"));
+    form->addRow(tr("Other servers:"), fileRow(servers, tr("Choose the Servers' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
     const QDateTime now = QDateTime::currentDateTime();
     auto* from = new QDateTimeEdit(now, &dlg);
     from->setObjectName(QStringLiteral("kdmFrom"));
@@ -8867,6 +9011,9 @@ void MainWindow::makeKdmsDialog() {
     until->setObjectName(QStringLiteral("kdmUntil"));
     until->setCalendarPopup(true);
     form->addRow(tr("Until:"), until);
+    auto* zoneNote = new QLabel(tr("A screen's KDM gives the window in its cinema's time zone when its FLM names one."), &dlg);
+    zoneNote->setWordWrap(true);
+    form->addRow(QString(), zoneNote);
     auto* folder = new QLineEdit(appSettings().value(QStringLiteral("dcp/kdmFolder"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString(), &dlg);
     folder->setObjectName(QStringLiteral("kdmFolder"));
     auto* browse = new QPushButton(tr("Choose…"), &dlg);
@@ -8886,18 +9033,31 @@ void MainWindow::makeKdmsDialog() {
     KdmRequest r;
     r.dkdm = dkdm->text().trimmed().toStdString();
     for (const QString& f : servers->text().split(';', Qt::SkipEmptyParts)) r.recipients.push_back(f.trimmed().toStdString());
+    for (int i = 0; i < tree->topLevelItemCount(); ++i)
+        for (int j = 0; j < tree->topLevelItem(i)->childCount(); ++j) {
+            const QTreeWidgetItem* screen = tree->topLevelItem(i)->child(j);
+            const size_t c = size_t(screen->data(0, Qt::UserRole + 1).toInt()), k = size_t(screen->data(0, Qt::UserRole + 2).toInt());
+            if (screen->checkState(0) == Qt::Checked && c < facilities.size() && k < facilities[c].screens.size())
+                r.screens.push_back(kdmScreen(facilities[c], facilities[c].screens[k]));
+        }
     r.notBefore = from->dateTime().toSecsSinceEpoch();
     r.notAfter = until->dateTime().toSecsSinceEpoch();
     r.offsetMinutes = from->dateTime().offsetFromUtc() / 60;
     r.folder = folder->text().toStdString();
     appSettings().setValue(QStringLiteral("dcp/kdmFolder"), folder->text());
-    std::vector<std::string> made;
+    std::vector<std::string> made, zips;
     std::string err;
-    if (!makeKdms(r, &made, &err)) {
+    if (!makeKdms(r, &made, &err, &zips)) {
         state_->message(tr("No KDMs: %1").arg(QString::fromStdString(err)), 10000);
         return;
     }
-    state_->message(tr("Made %n KDM(s) in %1: send each to its cinema", nullptr, int(made.size())).arg(QDir::toNativeSeparators(folder->text())), 10000);
+    if (zips.empty())
+        state_->message(tr("Made %n KDM(s) in %1: send each to its cinema", nullptr, int(made.size())).arg(QDir::toNativeSeparators(folder->text())), 10000);
+    else
+        state_->message(tr("Made %n KDM(s) in %1, a folder and a zip for each of %2 cinema(s): send each its zip", nullptr, int(made.size()))
+                            .arg(QDir::toNativeSeparators(folder->text()))
+                            .arg(zips.size()),
+                        10000);
 }
 
 namespace {

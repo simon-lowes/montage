@@ -62,6 +62,20 @@ bool chainKeyMatches(const CertificateChain& chain, std::string* error = nullptr
 // The certificates in a PEM file or a cinema's chain (several, in file order).
 std::vector<std::string> splitCertificates(const std::string& text);
 
+// A device's certificate chain checked as ST 430-2 has it: the leaf (the one certificate that is not a certificate
+// authority) and each issuer after it found among the others by name and key identifier, each signed by its issuer, a
+// certificate authority, up to a root that signs itself; every dnQualifier the SHA-1 of its certificate's public key;
+// the leaf's key RSA 2048. Certificates given in any order; ones not on the leaf's path are left out.
+struct ChainCheck {
+    std::vector<std::string> certificates;  // PEM, root first, leaf last
+    CertificateInfo leaf;
+    bool complete = false;  // up to a root (false: a leaf, or a leaf and some issuers, with `allowPartial`)
+};
+// `allowPartial`: a chain that stops before its root (a certificate sent alone) is taken, `complete` false; what is
+// there is still checked.
+bool checkCertificateChain(const std::vector<std::string>& certificates, ChainCheck& out, std::string* error = nullptr,
+                           bool allowPartial = false);
+
 // Signs a composition playlist or packing list in place: Signer and ds:Signature after the root's last child.
 bool signXml(std::string& xml, const CertificateChain& chain, std::string* error = nullptr);
 // Checks an enveloped signature: the digest of what each reference covers, the signature by the first KeyInfo
@@ -92,6 +106,7 @@ struct KdmSettings {
     std::vector<ContentKey> keys;
     std::string recipient;               // the recipient's (the server's leaf) certificate, PEM
     std::vector<std::string> trustedDevices;  // thumbprints of the devices the keys may play on; empty: any device
+    std::string deviceListDescription;   // AuthorizedDeviceInfo's description; empty: the recipient's name
 };
 // The timestamp form KDMs carry (exactly 25 characters), at `secondsSinceEpoch` in the offset given (minutes).
 std::string kdmTime(int64_t secondsSinceEpoch, int offsetMinutes = 0);
@@ -102,6 +117,8 @@ struct KdmContents {
     std::string signerThumbprint;  // the certificate that signed it (base64 SHA-1)
     std::string recipientSubject, recipientIssuer, recipientSerial;
     std::vector<ContentKey> keys;  // with `privateKey`: each key; without, their ids and types only
+    std::string deviceListDescription;
+    std::vector<std::string> trustedDevices;  // AuthorizedDeviceInfo's thumbprints, as the KDM lists them
 };
 // Reads a KDM: only what its signature covers (the public and private parts, each signed by reference); with the
 // recipient's private key (PEM), opens its keys too (checking each block's structure, signer thumbprint, composition,

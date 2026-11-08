@@ -4,6 +4,8 @@
 #include <QJsonArray>
 #include <QTemporaryDir>
 #include <QProcess>
+#include <QTimeZone>
+#include <cctype>
 #ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
@@ -31,6 +33,7 @@
 #include <tuple>
 
 #include "core/ClipAnimation.h"
+#include "core/Zip.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
 #include "core/GradeGraph.h"
@@ -76,6 +79,7 @@
 #include "render/ImageSubtitles.h"
 #include "media/TextReader.h"
 #include "render/DcpSecurity.h"
+#include "render/DcpFacilities.h"
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
@@ -666,6 +670,7 @@ private slots:
         // DCPs signed with a chain of the tests' own, their DKDMs kept with it (not in the user's data folder).
         qputenv("MONTAGE_DCP_CERTIFICATES", keys_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
         qputenv("MONTAGE_DCP_DKDMS", keys_.filePath(QStringLiteral("dkdm")).toUtf8());
+        qputenv("MONTAGE_DCP_FACILITIES", keys_.filePath(QStringLiteral("dcp-facilities.json")).toUtf8());
     }
 
     // Phase 13 #2: an encode compared with the picture it was made from.
@@ -11038,6 +11043,333 @@ colorspaces:
             QVERIFY(cm.waitForFinished(600000));
             QVERIFY2(cm.exitCode() == 0, qPrintable(QString::fromUtf8(cm.readAllStandardOutput() + cm.readAllStandardError())));
         }
+    }
+
+    // Phase 14 #11: cinemas and screens read from FLMs, and one KDM per screen of a booking.
+    void kdmsForEveryScreenFromFlms() {
+        if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
+        QTemporaryDir dir;
+        std::string err;
+        dcp::CertificateChain signer;
+        QVERIFY2(dcp::signerCertificateChain(signer, &err), err.c_str());
+        dcp::CertificateInfo own;
+        QVERIFY(dcp::readCertificate(signer.certificates.back(), own));
+        // The DKDM a booking starts from: an encrypted DCP's when ClairMeta is there to check the KDMs against it,
+        // else one made here as exportDcp makes it (to Montage's own leaf, for 60 days).
+        const QString python = qEnvironmentVariable("MONTAGE_TEST_CLAIRMETA");
+        const int64_t now = QDateTime::currentSecsSinceEpoch();
+        QString dkdmFile = dir.filePath("dkdm.xml");
+        DcpResult package;
+        if (!python.isEmpty()) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+            s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.4f, 0.3f, 0, 24));
+            DcpSettings st;
+            st.title = "Premiere";
+            st.encrypt = true;
+            st.threads = 2;
+            QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &package, {}, &err), err.c_str());
+            dkdmFile = QString::fromStdString(package.dkdm);
+        } else {
+            dcp::KdmSettings keep;
+            keep.cplId = dcp::uuidString(dcp::newUuid());
+            keep.contentTitle = "Premiere";
+            keep.annotation = "DKDM for Premiere";
+            keep.notValidBefore = dcp::kdmTime(now - 60);
+            keep.notValidAfter = dcp::kdmTime(now + 60 * 86400LL);
+            keep.keys = {dcp::newContentKey("MDIK"), dcp::newContentKey("MDAK")};
+            keep.recipient = signer.certificates.back();
+            std::string text;
+            QVERIFY2(dcp::makeKdm(keep, signer, text, &err), err.c_str());
+            QVERIFY(dcp::writeWholeFile(dkdmFile.toStdString(), text));
+        }
+        // Three cinemas, seven screens; each screen a suite of a security manager and a projector with chains of
+        // their own.
+        struct Screen {
+            std::string name;
+            dcp::CertificateChain server, projector;
+        };
+        struct Cinema {
+            std::string id, name, zone;
+            std::vector<Screen> screens;
+        };
+        std::vector<Cinema> cinemas = {{"urn:x-facilityID:test:riverside", "Riverside Cinema", "Europe/Paris", {}},
+                                       {"urn:x-facilityID:test:hilltop", "Hilltop Pictures", "America/New_York", {}},
+                                       {"urn:x-facilityID:test:harbour", "Harbour Hall", "Asia/Tokyo", {}}};
+        const int counts[3] = {3, 2, 2};
+        for (int c = 0; c < 3; ++c)
+            for (int n = 1; n <= counts[c]; ++n) {
+                Screen sc;
+                sc.name = std::to_string(n);
+                QVERIFY(dcp::makeCertificateChain("Server " + std::to_string(c) + std::to_string(n), sc.server, &err));
+                QVERIFY(dcp::makeCertificateChain("Projector " + std::to_string(c) + std::to_string(n), sc.projector, &err));
+                cinemas[size_t(c)].screens.push_back(sc);
+            }
+        auto thumb = [](const std::string& pem) {
+            dcp::CertificateInfo i;
+            dcp::readCertificate(pem, i);
+            return i.thumbprint;
+        };
+        auto body = [](const std::string& pem) {
+            std::string b;
+            for (const QString& line : QString::fromStdString(pem).split('\n'))
+                if (!line.startsWith("-----") && !line.isEmpty()) b += line.toStdString() + "\n";
+            return b;
+        };
+        // One X509Data for each certificate (ST 430-16 5.9.13), root first; the second cinema's leaf first, to show
+        // the order does not matter.
+        auto keyInfo = [&](const dcp::CertificateChain& chain, bool leafFirst) {
+            std::vector<std::string> certs = chain.certificates;
+            if (leafFirst) std::reverse(certs.begin(), certs.end());
+            std::string x = "<KeyInfoList><ds:KeyInfo>";
+            for (const std::string& c : certs) x += "<ds:X509Data><ds:X509Certificate>" + body(c) + "</ds:X509Certificate></ds:X509Data>";
+            return x + "</ds:KeyInfo></KeyInfoList>";
+        };
+        auto device = [&](const char* type, const std::string& identifier, const std::string& serial, const std::string& keys, bool active) {
+            return "<Device><DeviceTypeID scope=\"http://www.smpte-ra.org/schemas/433/2008/dcmlTypes/#device-type-tokens\">" + std::string(type) +
+                   "</DeviceTypeID><DeviceIdentifier idtype=\"CertThumbprint\">" + identifier + "</DeviceIdentifier><DeviceSerial>" + serial +
+                   "</DeviceSerial><Manufacturer>Test Maker</Manufacturer><ModelNumber>T-" + type + "</ModelNumber><IsActive>" +
+                   (active ? "true" : "false") + "</IsActive>" + keys + "<Capabilities/></Device>";
+        };
+        const std::string onlyThumbprint = "q83vEjRWeJCrze8SNFZ4kKvN7xI=", inactive = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        std::vector<QString> flms;
+        for (size_t c = 0; c < cinemas.size(); ++c) {
+            const Cinema& ci = cinemas[c];
+            std::string x = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<FacilityListMessage xmlns=\"http://www.smpte-ra.org/ns/430-16/2017/FLM\" "
+                            "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n";
+            x += "<MessageId>urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</MessageId><IssueDate>2026-11-01T10:00:00Z</IssueDate>\n";
+            x += "<FacilityInfo><FacilityID>" + ci.id + "</FacilityID><FacilityName>" + ci.name + "</FacilityName><FacilityTimeZone>" + ci.zone +
+                 "</FacilityTimeZone><Circuit>Test Circuit</Circuit><AddressList/><Capabilities><KDMDeliveryMethodList><DeliveryMethod><Email>"
+                 "<EmailAddress>kdm@cinema" + std::to_string(c) + ".example</EmailAddress></Email></DeliveryMethod></KDMDeliveryMethodList>"
+                 "</Capabilities></FacilityInfo>\n<AuditoriumList>\n";
+            for (size_t n = 0; n < ci.screens.size(); ++n) {
+                const Screen& sc = ci.screens[n];
+                x += "<Auditorium><AuditoriumNumberOrName>" + sc.name + "</AuditoriumNumberOrName><SeatingCapacity>200</SeatingCapacity><SuiteList><Suite>\n";
+                x += device("SM", thumb(sc.server.certificates.back()), "SM" + sc.name, keyInfo(sc.server, c == 1), true) + "\n";
+                x += device("PR", thumb(sc.projector.certificates.back()), "PR" + sc.name, keyInfo(sc.projector, c == 1), true) + "\n";
+                // The last cinema's second screen: a link decryptor known by its thumbprint only, and an inactive device.
+                if (c == 2 && n == 1) x += device("LD", onlyThumbprint, "LD2", "", true) + device("MDI", inactive, "MD2", "", false);
+                x += "</Suite></SuiteList><NonSecurityDeviceList><Device><DeviceTypeID>sound</DeviceTypeID><DeviceIdentifier idtype=\"DeviceUID\">urn:uuid:" +
+                     dcp::uuidString(dcp::newUuid()) +
+                     "</DeviceIdentifier><Manufacturer>Test Maker</Manufacturer><ModelNumber>S1</ModelNumber><IsActive>true</IsActive><Capabilities/></Device>"
+                     "</NonSecurityDeviceList></Auditorium>\n";
+            }
+            x += "</AuditoriumList>\n</FacilityListMessage>\n";
+            flms.push_back(dir.filePath(QStringLiteral("flm%1.xml").arg(c)));
+            QVERIFY(dcp::writeWholeFile(flms.back().toStdString(), x));
+        }
+        // Read, every chain checked: the screens, their servers and the devices that go into their KDMs.
+        std::vector<Facility> list;
+        for (size_t c = 0; c < flms.size(); ++c) {
+            Facility f;
+            QVERIFY2(readFlmFile(flms[c].toStdString(), f, &err), err.c_str());
+            QVERIFY(f.id == cinemas[c].id && f.name == cinemas[c].name && f.timeZone == cinemas[c].zone && f.source == "ST 430-16");
+            QVERIFY(f.kdmEmails.size() == 1 && f.circuit == "Test Circuit");
+            QCOMPARE(f.screens.size(), cinemas[c].screens.size());
+            for (size_t n = 0; n < f.screens.size(); ++n) {
+                const FacilityScreen& sc = f.screens[n];
+                QVERIFY(sc.name == cinemas[c].screens[n].name && sc.server.type == "SM" && sc.server.chainComplete && sc.server.certificates.size() == 3);
+                QCOMPARE(sc.server.thumbprint, thumb(cinemas[c].screens[n].server.certificates.back()));
+                QCOMPARE(sc.server.certificates.back(), cinemas[c].screens[n].server.certificates.back());
+                QVERIFY(!sc.devices.empty() && sc.devices[0].type == "PR" && sc.devices[0].chainComplete);
+                QCOMPARE(sc.devices[0].thumbprint, thumb(cinemas[c].screens[n].projector.certificates.back()));
+            }
+            QVERIFY2(f.notes.empty(), f.notes.empty() ? "" : f.notes.front().c_str());
+            mergeFacility(list, std::move(f));
+        }
+        QCOMPARE(list.size(), size_t(3));
+        // Read again (a newer FLM of a cinema): in place of the old.
+        {
+            Facility again;
+            QVERIFY(readFlmFile(flms[1].toStdString(), again, &err));
+            QCOMPARE(mergeFacility(list, again), size_t(1));
+            QCOMPARE(list.size(), size_t(3));
+        }
+        // (a base64 letter at or before `at` changed: a different certificate of the same length)
+        auto flip = [](std::string& text, size_t at) {
+            while (at > 0 && !std::isalnum(static_cast<unsigned char>(text[at]))) --at;
+            text[at] = text[at] == 'A' ? 'B' : 'A';
+        };
+        // A changed certificate is refused, and with it the FLM: a projector's signature altered, a server's leaf put
+        // in another chain, a dnQualifier that is not its key's.
+        {
+            QFile in(flms[0]);
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            const std::string original = in.readAll().toStdString();
+            const std::string projector = body(cinemas[0].screens[1].projector.certificates.back());
+            std::string changed = original;
+            const size_t at = changed.find(projector);
+            QVERIFY(at != std::string::npos);
+            flip(changed, at + projector.size() - 12);
+            Facility f;
+            QVERIFY(!readFlm(changed, f, &err));
+            QVERIFY2(err.find("has been changed") != std::string::npos && err.find("screen 2") != std::string::npos, err.c_str());
+            changed = original;
+            const std::string leaf = body(cinemas[0].screens[0].server.certificates.back());
+            changed.replace(changed.find(leaf), leaf.size(), body(cinemas[1].screens[0].server.certificates.back()));
+            QVERIFY(!readFlm(changed, f, &err));
+            QVERIFY2(err.find("stops at") != std::string::npos || err.find("Two leaf") != std::string::npos, err.c_str());
+            QVERIFY(readFlm(original, f, &err));
+            // A partial chain in an FLM is refused (an FLM gives whole chains).
+            changed = original;
+            const std::string root = body(cinemas[0].screens[2].server.certificates.front());
+            changed.replace(changed.find(root), root.size(), std::string());
+            QVERIFY(!readFlm(changed, f, &err) && err.find("issuer is not given") != std::string::npos);
+        }
+        // Kept in the facility list and read back.
+        const std::string listFile = dir.filePath("facilities.json").toStdString();
+        QVERIFY2(saveFacilities(list, &err, listFile), err.c_str());
+        std::vector<Facility> back;
+        QVERIFY2(loadFacilities(back, &err, listFile), err.c_str());
+        QVERIFY(back.size() == 3 && back[2].screens.size() == 2 && back[2].screens[1].devices.size() == 3 && !back[2].screens[1].devices[2].active);
+        QCOMPARE(back[0].screens[2].server.certificates, list[0].screens[2].server.certificates);
+        // Screens picked by name: a cinema's screen, or all a cinema's.
+        std::vector<KdmScreen> picked;
+        QVERIFY(pickScreens(back, {"riverside cinema/2"}, picked, &err) && picked.size() == 1 && picked[0].screen == "2");
+        QVERIFY(!pickScreens(back, {"Riverside Cinema/9"}, picked, &err) && err.find("Riverside Cinema/9") != std::string::npos);
+        QVERIFY2(pickScreens(back, {"Riverside Cinema", "Hilltop Pictures", "urn:x-facilityID:test:harbour", "Harbour Hall/1"}, picked, &err), err.c_str());
+        QCOMPARE(picked.size(), size_t(7));
+        // The booking: one KDM per screen, a folder and a zip for each cinema.
+        KdmRequest booking;
+        booking.dkdm = dkdmFile.toStdString();
+        booking.screens = picked;
+        booking.notBefore = now + 3600;
+        booking.notAfter = now + 14 * 86400;
+        booking.annotation = "Premiere, opening fortnight";
+        booking.folder = dir.filePath("booking").toStdString();
+        std::vector<std::string> kdms, zips;
+        QVERIFY2(makeKdms(booking, &kdms, &err, &zips), err.c_str());
+        QCOMPARE(kdms.size(), size_t(7));
+        QCOMPARE(zips.size(), size_t(3));
+        size_t k = 0;
+        for (size_t c = 0; c < cinemas.size(); ++c) {
+            ZipReader zip;
+            QVERIFY(zip.openFile(zips[c]));
+            QVERIFY2(QFileInfo(QString::fromStdString(zips[c])).fileName().startsWith("KDM_Premiere_" + QString::fromStdString(cinemas[c].name).replace(' ', '_') + "_"),
+                     zips[c].c_str());
+            QCOMPARE(zip.entries().size(), cinemas[c].screens.size());
+            const QTimeZone zone(QByteArray::fromStdString(cinemas[c].zone));
+            const int offset = zone.offsetFromUtc(QDateTime::fromSecsSinceEpoch(booking.notBefore)) / 60;
+            for (size_t n = 0; n < cinemas[c].screens.size(); ++n, ++k) {
+                const QFileInfo file(QString::fromStdString(kdms[k]));
+                QCOMPARE(file.dir().dirName(), QString::fromStdString(cinemas[c].name).replace(' ', '_'));
+                QFile f(file.filePath());
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                const std::string xml = f.readAll().toStdString();
+                std::string zipped;
+                QVERIFY(zip.read(file.fileName().toStdString(), zipped, &err) && zipped == xml);
+                // It opens with its own server's key and no other's, signed by Montage, its projector authorised.
+                dcp::KdmContents opened;
+                QVERIFY2(dcp::readKdm(xml, cinemas[c].screens[n].server.privateKey, opened, &err), err.c_str());
+                QVERIFY(opened.keys.size() == 2 && opened.signerThumbprint == own.thumbprint && opened.annotation == booking.annotation);
+                dcp::CertificateInfo server;
+                QVERIFY(dcp::readCertificate(cinemas[c].screens[n].server.certificates.back(), server));
+                QVERIFY(opened.recipientSubject == server.subject && opened.recipientSerial == server.serial);
+                QVERIFY(std::find(opened.trustedDevices.begin(), opened.trustedDevices.end(), thumb(cinemas[c].screens[n].projector.certificates.back())) !=
+                        opened.trustedDevices.end());
+                QVERIFY(std::find(opened.trustedDevices.begin(), opened.trustedDevices.end(), thumb(cinemas[c].screens[n].server.certificates.back())) ==
+                        opened.trustedDevices.end());
+                QCOMPARE(opened.deviceListDescription, cinemas[c].name + ", screen " + cinemas[c].screens[n].name);
+                QCOMPARE(opened.notValidBefore, dcp::kdmTime(booking.notBefore, offset));
+                const Screen& other = cinemas[(c + 1) % 3].screens[n % cinemas[(c + 1) % 3].screens.size()];
+                QVERIFY(!dcp::readKdm(xml, other.server.privateKey, opened, &err));
+                QVERIFY(!dcp::readKdm(xml, cinemas[c].screens[n].projector.privateKey, opened, &err));
+                dcp::SignatureCheck check;
+                QVERIFY(dcp::verifyXmlSignature(xml, &err, &check) && check.signerThumbprint == own.thumbprint);
+                if (c == 2 && n == 1) {
+                    // The thumbprint-only device in it, the inactive one not.
+                    QCOMPARE(opened.trustedDevices.size(), size_t(2));
+                    QVERIFY(std::find(opened.trustedDevices.begin(), opened.trustedDevices.end(), onlyThumbprint) != opened.trustedDevices.end());
+                } else {
+                    QCOMPARE(opened.trustedDevices.size(), size_t(1));
+                }
+            }
+        }
+        // ClairMeta (where it is set up) passes the package with a screen's KDM.
+        if (!python.isEmpty()) {
+            const QString keyFile = dir.filePath("screen.key");
+            QVERIFY(dcp::writeWholeFile(keyFile.toStdString(), cinemas[0].screens[0].server.privateKey, true));
+            QProcess cm;
+            cm.start(python, {"-m", "clairmeta.cli", "check", "-type", "dcp", QString::fromStdString(package.folder), "-kdm",
+                              QString::fromStdString(kdms[0]), "-key", keyFile});
+            QVERIFY(cm.waitForFinished(600000));
+            QVERIFY2(cm.exitCode() == 0, qPrintable(QString::fromUtf8(cm.readAllStandardOutput() + cm.readAllStandardError())));
+        }
+        // A window past the DKDM's is refused, and nothing is made.
+        KdmRequest late = booking;
+        late.folder = dir.filePath("late").toStdString();
+        dcp::KdmContents dkdm;
+        {
+            QFile f(dkdmFile);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY(dcp::readKdm(f.readAll().toStdString(), {}, dkdm, &err));
+        }
+        late.notAfter = QDateTime::fromString(QString::fromStdString(dkdm.notValidAfter), Qt::ISODate).toSecsSinceEpoch() + 86400;
+        QVERIFY(!makeKdms(late, nullptr, &err) && err.find("ends after the DKDM's") != std::string::npos);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(late.folder)));
+        // A screen added by hand: a certificate sent alone (taken, its chain not checked), or a whole chain (checked);
+        // a certificate authority is not a server.
+        std::vector<Facility> hand;
+        QVERIFY2(addScreenByHand(hand, "Village Hall", "Main", cinemas[0].screens[0].server.certificates.back(), {}, &err), err.c_str());
+        QVERIFY(hand.size() == 1 && hand[0].source == "by hand" && !hand[0].screens[0].server.chainComplete && hand[0].screens[0].devices.empty());
+        std::string chainText;
+        for (const std::string& c : cinemas[1].screens[1].server.certificates) chainText += c;
+        QVERIFY2(addScreenByHand(hand, "village hall", "Main", chainText, {cinemas[1].screens[1].projector.certificates.back()}, &err), err.c_str());
+        QVERIFY(hand.size() == 1 && hand[0].screens.size() == 1 && hand[0].screens[0].server.chainComplete && hand[0].screens[0].devices.size() == 1);
+        QVERIFY(!addScreenByHand(hand, "Village Hall", "Two", cinemas[1].screens[1].server.certificates.front(), {}, &err));
+        std::string tampered = chainText;
+        flip(tampered, tampered.find("-----END CERTIFICATE-----", tampered.rfind("-----BEGIN")) - 12);
+        QVERIFY(!addScreenByHand(hand, "Village Hall", "Two", tampered, {}, &err));
+        QVERIFY(pickScreens(hand, {"Village Hall"}, picked, &err) && picked.size() == 1 && picked[0].trustedDevices.size() == 1);
+        // An ST 430-7 FLM: a signed ETM of security devices, its signature checked. One security manager: its screen
+        // takes the other devices; two: they are kept apart (the FLM does not say whose they are).
+        dcp::CertificateChain facility, extraServer;
+        QVERIFY(dcp::makeCertificateChain("Lakeside", facility, &err));
+        QVERIFY(dcp::makeCertificateChain("Lakeside Two", extraServer, &err));
+        auto etmKeyInfo = [&](const dcp::CertificateChain& chain) {
+            std::string x = "<ds:KeyInfo>";
+            for (auto it = chain.certificates.rbegin(); it != chain.certificates.rend(); ++it)
+                x += "<ds:X509Data><ds:X509Certificate>" + body(*it) + "</ds:X509Certificate></ds:X509Data>";
+            return x + "</ds:KeyInfo>";
+        };
+        auto description = [](const char* type, const char* name) {
+            return "<DeviceDescription><DeviceIdentifier idtype=\"DeviceUID\">urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</DeviceIdentifier><DeviceTypeID>" +
+                   type + "</DeviceTypeID><DeviceSerial>1</DeviceSerial><DeviceName>" + name + "</DeviceName><VersionInfo><Name>a</Name><Value>1</Value></VersionInfo></DeviceDescription>";
+        };
+        auto etm = [&](bool twoServers) {
+            std::string x = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DCinemaSecurityMessage xmlns=\"http://www.smpte-ra.org/schemas/430-3/2006/ETM\" "
+                            "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n<AuthenticatedPublic Id=\"ID_AuthenticatedPublic\">\n";
+            x += "<MessageId>urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</MessageId><MessageType>http://www.smpte-ra.org/schemas/430-7/2008/FLM</MessageType>"
+                 "<IssueDate>2026-11-01T10:00:00+00:00</IssueDate><RequiredExtensions><FLMRequiredExtensions xmlns=\"http://www.smpte-ra.org/schemas/430-7/2008/FLM\">"
+                 "<FacilityInfo><FacilityID>urn:x-facilityID:test:lakeside</FacilityID><FacilityName>Lakeside Screens</FacilityName><UTCOffset><Offset>-05:00</Offset>"
+                 "</UTCOffset></FacilityInfo><SecurityDeviceList>";
+            x += "<SecurityDevice>" + etmKeyInfo(cinemas[0].screens[0].server) + description("SM", "Screen One") + "</SecurityDevice>";
+            if (twoServers) x += "<SecurityDevice>" + etmKeyInfo(extraServer) + description("SM", "Screen Two") + "</SecurityDevice>";
+            x += "<SecurityDevice>" + etmKeyInfo(cinemas[0].screens[0].projector) + description("PR", "Projector") + "</SecurityDevice>";
+            x += "</SecurityDeviceList></FLMRequiredExtensions></RequiredExtensions><NonCriticalExtensions/></AuthenticatedPublic>\n"
+                 "<AuthenticatedPrivate Id=\"ID_AuthenticatedPrivate\"/>\n</DCinemaSecurityMessage>\n";
+            return x;
+        };
+        std::string old = etm(false);
+        QVERIFY2(dcp::signXml(old, facility, &err), err.c_str());
+        Facility lake;
+        QVERIFY2(readFlm(old, lake, &err), err.c_str());
+        QVERIFY(lake.source == "ST 430-7" && lake.name == "Lakeside Screens" && lake.timeZone == "UTC-05:00" && lake.screens.size() == 1);
+        QVERIFY(lake.screens[0].name == "Screen One" && lake.screens[0].server.thumbprint == thumb(cinemas[0].screens[0].server.certificates.back()));
+        QVERIFY(lake.screens[0].devices.size() == 1 && lake.screens[0].devices[0].type == "PR" && lake.otherDevices.empty());
+        QVERIFY(QTimeZone(QByteArray::fromStdString(lake.timeZone)).isValid());
+        std::string changedFlm = old;
+        changedFlm.replace(changedFlm.find("Lakeside Screens"), 16, "Lakeside Cinemas");
+        QVERIFY(!readFlm(changedFlm, lake, &err) && err.find("signature") != std::string::npos);
+        std::string unsignedFlm = etm(false);
+        QVERIFY(!readFlm(unsignedFlm, lake, &err));
+        std::string two = etm(true);
+        QVERIFY(dcp::signXml(two, facility, &err));
+        QVERIFY2(readFlm(two, lake, &err), err.c_str());
+        QVERIFY(lake.screens.size() == 2 && lake.screens[0].devices.empty() && lake.otherDevices.size() == 1 && lake.notes.size() == 1);
+        // Neither kind of FLM: refused.
+        QVERIFY(!readFlm("<?xml version=\"1.0\"?><Other/>", lake, &err) && err.find("Not a Facility List Message") != std::string::npos);
     }
 
     void dcpXyzTableAndThreads() {

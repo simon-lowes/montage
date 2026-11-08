@@ -58,6 +58,7 @@
 #include "render/Versions.h"
 #include "render/BackgroundJobs.h"
 #include "render/Dcp.h"
+#include "render/DcpFacilities.h"
 #include "render/Adm.h"
 #include "render/Iamf.h"
 #include "render/Imf.h"
@@ -12489,21 +12490,61 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_make_kdm", "Make KDMs for an encrypted DCP",
-        "Make Key Delivery Messages (SMPTE ST 430-1) so cinema servers can play an encrypted DCP: one for each server "
-        "certificate (the files the cinema sends; a chain file's leaf is used), its keys valid from `from` to `until`, made "
-        "from the DKDM montage_export_dcp kept, signed by Montage's certificate chain. The window must sit inside the "
-        "DKDM's and the server certificate's. Returns the KDM files.",
+        "Make Key Delivery Messages (SMPTE ST 430-1) so cinema servers can play an encrypted DCP, made from the DKDM "
+        "montage_export_dcp kept, signed by Montage's certificate chain, its keys valid from `from` to `until`: one for "
+        "each server certificate in `servers` (the files the cinema sends; a chain file's leaf is used), and one for each "
+        "screen in `screens` from the facility list, encrypted to the screen's server with its projector and other "
+        "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
+        "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
+        "`flm` alone (no dkdm) it only reads them. The window must sit inside the DKDM's and each server certificate's. "
+        "Returns the KDM files, the cinemas' zips, and the cinemas and screens read.",
         R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
             "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
+            "flm":{"type":"array","items":{"type":"string"},"description":"FLM files to read into the facility list (kept for later bookings)"},
+            "screens":{"type":"array","items":{"type":"string"},"description":"Screens from the facility list: \"Cinema/Screen\", or \"Cinema\" for all its screens"},
             "from":{"type":"string","description":"ISO 8601 date and time; default now"},
             "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
             "folder":{"type":"string","description":"Where to write the KDMs"},
-            "annotation":{"type":"string"}},"required":["dkdm","servers","folder"]})json",
+            "annotation":{"type":"string"}}})json",
         false, [](const QJsonObject& a) {
+            std::string err;
+            QJsonArray read;
+            std::vector<Facility> facilities;
+            const bool reading = !a.value("flm").toArray().isEmpty();
+            if (reading || a.contains("screens")) {
+                if (!loadFacilities(facilities, &err)) return fail(QString::fromStdString(err));
+            }
+            if (reading) {
+                for (const QJsonValue& v : a.value("flm").toArray()) {
+                    Facility f;
+                    if (!readFlmFile(absolute(v.toString()).toStdString(), f, &err)) return fail(QString::fromStdString(err));
+                    QJsonArray screens, notes;
+                    for (const FacilityScreen& sc : f.screens) {
+                        QJsonArray devices;
+                        for (const FacilityDevice& d : sc.devices)
+                            devices.append(QJsonObject{{"type", QString::fromStdString(d.type)}, {"thumbprint", QString::fromStdString(d.thumbprint)}});
+                        screens.append(QJsonObject{{"name", QString::fromStdString(sc.name)},
+                                                   {"server", QString::fromStdString(sc.server.commonName)},
+                                                   {"server_thumbprint", QString::fromStdString(sc.server.thumbprint)},
+                                                   {"until", QString::fromStdString(sc.server.notAfter)},
+                                                   {"devices", devices}});
+                    }
+                    for (const std::string& n : f.notes) notes.append(QString::fromStdString(n));
+                    read.append(QJsonObject{{"cinema", QString::fromStdString(f.name)}, {"id", QString::fromStdString(f.id)},
+                                            {"source", QString::fromStdString(f.source)}, {"screens", screens}, {"notes", notes}});
+                    mergeFacility(facilities, std::move(f));
+                }
+                if (!saveFacilities(facilities, &err)) return fail(QString::fromStdString(err));
+                if (!a.contains("dkdm"))
+                    return ok(QStringLiteral("Read %1 FLM(s) into the facility list").arg(read.size()), QJsonObject{{"cinemas", read}});
+            }
             KdmRequest r;
             r.dkdm = absolute(need(a, "dkdm")).toStdString();
             for (const QJsonValue& v : a.value("servers").toArray()) r.recipients.push_back(absolute(v.toString()).toStdString());
-            if (r.recipients.empty()) throw ArgError{"servers names no certificate"};
+            std::vector<std::string> names;
+            for (const QJsonValue& v : a.value("screens").toArray()) names.push_back(v.toString().toStdString());
+            if (!names.empty() && !pickScreens(facilities, names, r.screens, &err)) throw ArgError{QString::fromStdString(err)};
+            if (r.recipients.empty() && r.screens.empty()) throw ArgError{"servers and screens name no certificate or screen"};
             auto when = [&](const char* key, const QDateTime& fallback) {
                 const QString text = str(a, key);
                 if (text.isEmpty()) return fallback;
@@ -12520,12 +12561,14 @@ void McpServer::Impl::addTools() {
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             r.folder = folder.toStdString();
-            std::vector<std::string> files;
-            std::string err;
-            if (!makeKdms(r, &files, &err)) return fail(QString::fromStdString(err));
-            QJsonArray made;
+            std::vector<std::string> files, zipped;
+            if (!makeKdms(r, &files, &err, &zipped)) return fail(QString::fromStdString(err));
+            QJsonArray made, zips;
             for (const std::string& f : files) made.append(QString::fromStdString(f));
-            return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), QJsonObject{{"kdms", made}});
+            for (const std::string& z : zipped) zips.append(QString::fromStdString(z));
+            QJsonObject out{{"kdms", made}, {"zips", zips}};
+            if (!read.isEmpty()) out.insert("cinemas", read);
+            return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), out);
         });
 
     add("montage_export_imf", "Export an IMF master",
