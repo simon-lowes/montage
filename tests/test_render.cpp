@@ -10391,8 +10391,10 @@ colorspaces:
                     QVERIFY2(readImfFrame(path, 0, codes, w, h, depth, &err), err.c_str());
                     QVERIFY2(depth == 12 && std::abs(int(codes[0]) - int(std::lround(30000 / 65535.0 * 4095))) <= 8, qPrintable(QString::number(codes[0])));
                 }
-                // In the package: the check names what it finds (the packing list's hash aside).
-                QFile::remove(QString::fromStdString(video));
+                // In the package: the check names what it finds (the packing list's hash aside). (The media pool's
+                // decoder, opened when the package was played above, let go first: Windows replaces no file held open.)
+                MediaPool::instance().forget(video);
+                QVERIFY(QFile::remove(QString::fromStdString(video)));
                 QVERIFY(QFile::copy(QString::fromStdString(path), QString::fromStdString(video)));
                 const std::vector<std::string> issues = verifyImf(full.folder);
                 const bool alphaNamed = std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("5.2.1") != std::string::npos; });

@@ -36431,7 +36431,8 @@ if ui["pressed"] == "add":
         // Lit by the scene, its picture still the clip's colour under the light (red, its highlight white).
         s.videoTracks[1].clips[0].generator.params["texture_light"] = 0.0;
         {
-            const float* mid = renderSequenceFrame(p, s, 2, o).at(W / 2, H / 2);
+            const Image lit = renderSequenceFrame(p, s, 2, o);
+            const float* mid = lit.at(W / 2, H / 2);
             QVERIFY2(mid[0] > mid[1] + 0.5f && std::fabs(mid[1] - mid[2]) < 1e-3f, qPrintable(QString("lit: %1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));
         }
         // Shapes: a box, a sphere and a cylinder, each drawn round the middle.
@@ -36731,7 +36732,8 @@ if ui["pressed"] == "add":
             PosedTriangles turned;
             face(turned, {0, 0, 0}, {-2, 0, 0}, {0, 2, 0});  // (facing -z, away from both)
             turned.materials = {0, 0};
-            const float* back = renderModel(sceneOf(turned, cam, &twoSided), cam, W, H).at(W / 2, H / 2);
+            const Image backImage = renderModel(sceneOf(turned, cam, &twoSided), cam, W, H);
+            const float* back = backImage.at(W / 2, H / 2);
             QVERIFY2(std::fabs(back[0] - red[0]) < 2.0f / 255 && std::fabs(back[1] - red[1]) < 2.0f / 255 && back[3] > 0.99f,
                      qPrintable(QString("the back of a two-sided face: %1 %2 %3 %4").arg(back[0]).arg(back[1]).arg(back[2]).arg(back[3])));
 
@@ -36766,7 +36768,8 @@ if ui["pressed"] == "add":
             face(walled, {2, 0, -6}, {0, 0, 1}, {0, 1, 0});
             const ModelCamera viewer = lookAt({1.4, 0, -2}, {2, 0, -6}, 280, W, H);
             QVERIFY(viewer.project({2, 0, -6}, px, py));
-            const float* beyond = renderModel(sceneOf(walled, projector, nullptr), viewer, W, H).at(int(px), int(py));
+            const Image walledImage = renderModel(sceneOf(walled, projector, nullptr), viewer, W, H);
+            const float* beyond = walledImage.at(int(px), int(py));
             QVERIFY2(beyond[3] > 0.99f && beyond[0] < 0.01f, qPrintable(QString("beyond the wall: %1 (alpha %2)").arg(beyond[0]).arg(beyond[3])));
             // (without the wall the picture reaches it)
             PosedTriangles open;
@@ -37451,7 +37454,8 @@ if ui["pressed"] == "add":
             one.params["f.s1.color." + c] = col;
         }
         setShapeContents(one, {rect, f2});
-        const float* px = renderShape(one, 5, W, H, 1).at(W / 2, H / 2);
+        const Image oneImage = renderShape(one, 5, W, H, 1);
+        const float* px = oneImage.at(W / 2, H / 2);
         QVERIFY2(std::fabs(px[0] - 0.75f) <= 2.0f / 255 && px[1] == 0.0f && std::fabs(px[2] - 0.25f) <= 2.0f / 255 && px[3] == 1.0f,
                  qPrintable(QString("%1 %2 %3 %4").arg(px[0]).arg(px[1]).arg(px[2]).arg(px[3])));
         // A stop's place keyed too: its params are listed for the Inspector, labelled by stop.
