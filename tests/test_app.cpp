@@ -11904,15 +11904,16 @@ const auto seq = [this] { return state()->sequence(); };
         dlg.findChild<QSpinBox*>("soundMove")->setValue(7);
         dlg.findChild<QSpinBox*>("soundTrimEnd")->setValue(100);
         QVERIFY(dlg.apply());
-        const Clip* c = edit::clipById(*state()->sequence(), id);
-        QVERIFY(std::fabs(c->head - 7.0 / 1600) < 1e-9);
-        QVERIFY(std::fabs(c->tail - 93.0 / 1600) < 1e-9);
+        // (a copy: an edit tried later may replace the sequence the clip is in)
+        const Clip c = *edit::clipById(*state()->sequence(), id);
+        QVERIFY(std::fabs(c.head - 7.0 / 1600) < 1e-9);
+        QVERIFY(std::fabs(c.tail - 93.0 / 1600) < 1e-9);
         QCOMPARE(dlg.span().left(16), QString("00:00:00:10+0007"));
         QCOMPARE(dlg.findChild<QSpinBox*>("soundMove")->value(), 0);
         dlg.findChild<QSpinBox*>("soundMove")->setValue(4000);
         QVERIFY(!dlg.apply());
         QVERIFY(dlg.error().contains("another clip"));
-        QCOMPARE(edit::clipById(*state()->sequence(), id)->head, c->head);
+        QVERIFY(*edit::clipById(*state()->sequence(), id) == c);
         state()->undo();
         QVERIFY(*edit::clipById(*state()->sequence(), id) == before);
     }
