@@ -1,4 +1,5 @@
 #include "Processing.h"
+#include <cstring>
 #include <set>
 #include "SurfaceTrack.h"
 #include "ColorChart.h"
@@ -2033,7 +2034,7 @@ EffectDomain effectDomain(const std::string& type) {
         std::map<std::string, EffectDomain> m;
         for (const char* t : {"color_correct", "curves", "hue_curves", "color_warper", "cdl", "lut", "hue_sat", "levels"})
             m[t] = EffectDomain::Log;
-        for (const char* t : {"gaussian_blur", "directional_blur", "channel_blur", "glow", "depth_blur", "depth_fog", "lens_flare",
+        for (const char* t : {"gaussian_blur", "directional_blur", "radial_blur", "channel_blur", "glow", "depth_blur", "depth_fog", "lens_flare",
                               "light_rays", "aperture_glare", "tilt_shift", "chromatic_aberration", "relight", "vignette", "drop_shadow",
                               "rgb_mixer", "mosaic", "focus_repair"})
             m[t] = EffectDomain::Linear;
@@ -2488,7 +2489,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
         } else if (from && to)
             convertColor(img, *from, *to);
     } else if (ty == "ocio")
-        applyOcio(e, img);
+        applyOcio(e, img, nullptr, t);
     else if (ty == "ofx")
         ofx::applyEffect(e, double(t), img, pixelScale, ofx::currentFetch(), nullptr, &currentWorkingSpace());
     else if (ty == "chroma_key") chromaKey(e, t, img);
@@ -2510,6 +2511,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "grain_match") grainMatch(e, t, img);
     else if (ty == "film_look") filmLook(img, filmLookSettings(e, t), t);
     else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
+    else if (ty == "radial_blur") sfx::radialBlur(e, t, img, pixelScale);
     else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);
     else if (ty == "lens_distortion") vfx::lensDistortion(e, t, img);
     else if (ty == "lens_correction") vfx::lensCorrection(e, t, img);
@@ -3547,7 +3549,7 @@ bool isGpuFilter(const std::string& type) {
                                                   "film_grain", "rgb_mixer", "grain_match", "edge_extend", "wave_warp", "twirl", "spherize",
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
-                                                  "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare"};
+                                                  "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare", "radial_blur"};
     return filters.count(type) > 0;
 }
 
@@ -3698,6 +3700,14 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             return !applyOcio(e, probe);  // (a broken config: the CPU leaves the picture alone too; else the CPU draws it)
         }
         if (!gpu::takesShaders(shader->key)) return false;  // (it would not build: the CPU draws it)
+        // (its live exposure, contrast and gamma, OCIO's dynamic properties: values the shader is drawn with)
+        for (const std::string& name : shader->uniforms) {
+            auto ends = [&](const char* tail) { return name.size() >= std::strlen(tail) && name.compare(name.size() - std::strlen(tail), std::string::npos, tail) == 0; };
+            if (ends("exposureVal")) op.values.push_back(float(e.p("exposure", t, 0)));
+            else if (ends("contrastVal")) op.values.push_back(float(e.p("contrast", t, 1)));
+            else if (ends("gammaVal")) op.values.push_back(float(e.p("gamma", t, 1)));
+            else return false;  // (a value the effect does not set)
+        }
         op.kind = gpu::ColorOp::Shader;
         op.shader = std::move(shader);
     } else if (e.type == "cdl") {
@@ -3833,6 +3843,9 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 const double ang = e.p("angle", t, 0) * M_PI / 180;
                 add(2, {float(length), float(std::clamp(int(std::ceil(length)), 2, 96)), float(std::cos(ang)), float(std::sin(ang))});
             }
+        } else if (ty == "radial_blur") {
+            sfx::RadialBlur rb;
+            if (sfx::radialBlurSetup(e, t, width, height, rb)) add(39, {rb.cx, rb.cy, rb.zoom, rb.spin});
         } else if (ty == "vignette") {
             add(6, {float(e.p("amount", t, 0.5)), float(e.p("size", t, 0.75)), float(e.p("softness", t, 0.5))});
         } else if (ty == "posterize") {
@@ -4104,8 +4117,9 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                          float(bandWidth / 2), float(bandWidth / 2 + std::max(0.02, bandWidth)), sat, blurred ? 1.0f : 0.0f});
         } else if (ty == "light_rays") {
             // lightRays' light above the threshold, its three passes towards the centre and the sum (gpufilter.frag's
-            // modes 35 to 37); shadows blocking the rays stay on the CPU
-            if (std::clamp(e.p("block", t, 0) / 100, 0.0, 1.0) > 0) return false;
+            // modes 35 to 37); with Shadows Block Rays, the small copy of what blocks them (40) and the light let through
+            // it from the centre's side (41) between, the sum taking the rays from where they were kept
+            const double block = std::clamp(e.p("block", t, 0) / 100, 0.0, 1.0);
             const double W = width, H = height;
             double cx = e.p("pos_x", t, 0.5) * W, cy = e.p("pos_y", t, 0.25) * H;
             if (e.p("follow", t, 0) > 0.5) {
@@ -4126,7 +4140,24 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     add(36, {float(cx), float(cy), float(step), 0, float(w[0] / sum), float(w[1] / sum), float(w[2] / sum), float(w[3] / sum),
                              float(w[4] / sum), float(w[5] / sum), float(w[6] / sum), float(w[7] / sum)});
                 }
-                add(37, {float(intensity)});
+                if (block > 0 && width > 0 && height > 0) {
+                    f.passes.back().save = 0;
+                    const sfx::RayShadowGrid grid = sfx::rayShadowGrid(width, height);
+                    add(40, {float(std::max(threshold, 1e-3)), float(block)});
+                    gpu::ColorOp::FilterPass& occ = f.passes.back();
+                    occ.width = grid.tw, occ.height = grid.th;
+                    occ.tableWidth = std::max(grid.tw, grid.th);
+                    occ.table.assign(size_t(occ.tableWidth) * 4, 0.0f);
+                    for (int x = 0; x < grid.tw; ++x) occ.table[size_t(x) * 4] = float(grid.x0[size_t(x)]), occ.table[size_t(x) * 4 + 1] = float(grid.x1[size_t(x)]);
+                    for (int y = 0; y < grid.th; ++y) occ.table[size_t(y) * 4 + 2] = float(grid.y0[size_t(y)]), occ.table[size_t(y) * 4 + 3] = float(grid.y1[size_t(y)]);
+                    add(41, {float(cx * grid.shrink), float(cy * grid.shrink), float(length), float(160.0 / std::max(grid.tw, grid.th))});
+                    f.passes.back().width = grid.tw, f.passes.back().height = grid.th;
+                    add(37, {float(intensity), 1});
+                    f.passes.back().extra = 0;
+                    f.passes.back().width = width, f.passes.back().height = height;
+                } else {
+                    add(37, {float(intensity)});
+                }
             }
         } else if (ty == "lens_flare") {
             // lensFlare's light, star, ring and ghosts at each pixel (gpufilter.frag's mode 38), the ghosts in the table

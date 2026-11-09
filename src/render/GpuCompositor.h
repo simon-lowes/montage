@@ -47,6 +47,9 @@ struct ShaderStep {
         std::vector<float> values;
     };
     std::vector<Texture> textures;
+    // Values set while it runs (OCIO's dynamic properties): floats each `uniforms[i]` names, the source reading them as
+    // montageValues[i / 4][i % 4] (the Params block), given by the ColorOp drawing it (ColorOp::values).
+    std::vector<std::string> uniforms;
 };
 
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).
@@ -74,6 +77,7 @@ struct ColorOp {
     };
     std::vector<FilterPass> passes;  // Filter
     std::shared_ptr<const ShaderStep> shader;  // Shader
+    std::vector<float> values;                 // Shader: its uniforms' values
     int slot = 0;                // Store, Load
     int passMode = 0;            // Pass
     int in[3] = {-1, -1, -1};    // Pass
@@ -142,6 +146,7 @@ struct Stats {
     long gpuFrames = 0, cpuFrames = 0;  // frames asked of the GPU path: drawn there, or fallen back
     long gpuLayers = 0, cpuLayers = 0;  // their layers: drawn from the source, or made on the CPU and uploaded
     long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
+    long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
     // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them

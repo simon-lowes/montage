@@ -362,7 +362,8 @@ std::vector<EffectInfo> buildCatalog() {
     {
         // OpenColorIO transform from a config file, a built-in config or $OCIO (render/Ocio.h).
         EffectInfo ocio{"ocio", "OpenColorIO Transform", EffectCategory::VideoFilter, "Color",
-                        {boolean("inverse", "Inverse")},
+                        {boolean("inverse", "Inverse"), num("exposure", "Exposure (stops)", -10, 10, 0, 0.01),
+                         num("contrast", "Contrast", 0, 4, 1, 0.01), num("gamma", "Gamma", 0.1, 4, 1, 0.01)},
                         {str("config", "Config", StringKind::File), str("mode", "Mode", StringKind::Choice, "Colour Space"),
                          str("src", "Input Space", StringKind::Dynamic), str("dst", "Output Space", StringKind::Dynamic),
                          str("display", "Display", StringKind::Dynamic), str("view", "View", StringKind::Dynamic),
@@ -631,6 +632,12 @@ std::vector<EffectInfo> buildCatalog() {
                  {str("profile", "Measured Profile", StringKind::Text)}});
     c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},
+                 {}});
+    // Smeared towards a centre (zoom) and round it (spin), or both, as the Zoom Blur and Spin transitions smear their
+    // pictures (render/StyleFx.h).
+    c.push_back({"radial_blur", "Radial Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {pct("zoom", "Zoom", 0, 100, 20), num("spin", "Spin (°)", 0, 180, 0, 0.1),
+                  num("center_x", "Center X", -0.5, 1.5, 0.5, 0.001), num("center_y", "Center Y", -0.5, 1.5, 0.5, 0.001)},
                  {}});
     c.push_back({"chromatic_aberration", "Chromatic Aberration", EffectCategory::VideoFilter, "Stylize",
                  {num("amount", "Amount (px)", -30, 30, 3, 0.1)},

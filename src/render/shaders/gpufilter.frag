@@ -43,7 +43,9 @@
 //      last step (the picture, orig, towards its blur by the distance from the band, and the saturation)
 //   33 Mesh Warp and Grid Warp (render/MeshWarp's drawWarp): the mesh's triangles, listed by the tiles they reach, in the table
 // and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth); Light Rays
-// (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture) and 38 Lens Flare.
+// (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture; with Shadows
+// Block Rays, 40 the small copy of what blocks them and 41 the light let through) and 38 Lens Flare;
+// 39 Radial Blur (render/StyleFx's radialBlur: p[1] the centre, the zoom's share of the way there, the spin in radians).
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -756,10 +758,80 @@ void main() {
         return;
     }
     if (mode == 37) {
-        // The rays (srcTex) added to the picture (orig) by p[1].x; light shows on transparent areas too
+        // The rays (srcTex) added to the picture (orig) by p[1].x; light shows on transparent areas too. With p[1].y,
+        // the rays are the ones kept (extra), and srcTex the light let through to each of the small copy's pixels (40
+        // and 41), drawn up between them
         const vec4 o = texelFetch(orig, xy, 0);
-        const vec3 add = px.rgb * p[1].x;
+        float k = p[1].x;
+        vec3 rays = px.rgb;
+        if (p[1].y > 0.5) {
+            rays = texelFetch(extra, xy, 0).rgb;
+            const ivec2 n = textureSize(srcTex, 0), full = textureSize(orig, 0);
+            const float fx = clamp((float(xy.x) + 0.5) * float(n.x) / float(full.x) - 0.5, 0.0, float(n.x - 1));
+            const float fy = clamp((float(xy.y) + 0.5) * float(n.y) / float(full.y) - 0.5, 0.0, float(n.y - 1));
+            const int x0 = int(fx), y0 = int(fy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
+            const float ax = fx - float(x0), ay = fy - float(y0);
+            const float t00 = texelFetch(srcTex, ivec2(x0, y0), 0).r, t10 = texelFetch(srcTex, ivec2(x1, y0), 0).r;
+            const float t01 = texelFetch(srcTex, ivec2(x0, y1), 0).r, t11 = texelFetch(srcTex, ivec2(x1, y1), 0).r;
+            k *= (t00 * (1.0 - ax) + t10 * ax) * (1.0 - ay) + (t01 * (1.0 - ax) + t11 * ax) * ay;
+        }
+        const vec3 add = rays * k;
         fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));
+        return;
+    }
+    if (mode == 40) {
+        // Shadows Block Rays' small copy: of the picture's (orig) pixels this one covers (the table's x of the column
+        // index: the columns from and to; zw of the row index: the rows), how much light each lets through, by its
+        // brightness against the threshold p[1].x, blocked by p[1].y
+        const vec4 cols = texelFetch(table, ivec2(xy.x, 0), 0), rows = texelFetch(table, ivec2(xy.y, 0), 0);
+        const int ax = int(cols.x), bx = int(cols.y), ay = int(rows.z), by = int(rows.w);
+        float sum = 0.0;
+        for (int sy = ay; sy < by; ++sy)
+            for (int sx = ax; sx < bx; ++sx) {
+                const vec4 q = texelFetch(orig, ivec2(sx, sy), 0);
+                const float l = q.a > 0.0 ? lumaOf(q) / q.a : 0.0;
+                sum += isinf(l) || isnan(l) ? 1.0 : clamp(l / p[1].x, 0.0, 1.0);
+            }
+        fragColor = vec4(1.0 - p[1].y * (1.0 - sum / float((bx - ax) * (by - ay))), 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 41) {
+        // The light let through to each of the small copy's pixels (srcTex, 40) from the centre's side: a step a pixel
+        // along p[1].z of the way to the centre (p[1].xy, the small copy's), each blocking by its share (p[1].w per
+        // pixel), bilinear between them, until the march leaves the picture
+        const ivec2 n = size;
+        const float x = float(xy.x) + 0.5, y = float(xy.y) + 0.5, len = p[1].z;
+        const float dx = p[1].x - x, dy = p[1].y - y, reach = sqrt(dx * dx + dy * dy) * len;
+        const int steps = max(1, int(ceil(reach)));
+        float logT = 0.0;
+        for (int j = 1; j <= steps; ++j) {
+            const float f = len * float(j) / float(steps);
+            const float qx = x + dx * f, qy = y + dy * f;
+            if (!(qx >= 0.0 && qy >= 0.0 && qx < float(n.x) && qy < float(n.y))) break;
+            const float fx = clamp(qx - 0.5, 0.0, float(n.x - 1)), fy = clamp(qy - 0.5, 0.0, float(n.y - 1));
+            const int x0 = int(fx), y0 = int(fy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
+            const float ax = fx - float(x0), ay = fy - float(y0);
+            const float v = (texelFetch(srcTex, ivec2(x0, y0), 0).r * (1.0 - ax) + texelFetch(srcTex, ivec2(x1, y0), 0).r * ax) * (1.0 - ay) +
+                            (texelFetch(srcTex, ivec2(x0, y1), 0).r * (1.0 - ax) + texelFetch(srcTex, ivec2(x1, y1), 0).r * ax) * ay;
+            logT += log(max(1e-4, v)) * (reach / float(steps)) * p[1].w;
+        }
+        fragColor = vec4(exp(logT), 0.0, 0.0, 0.0);
+        return;
+    }
+    if (mode == 39) {
+        // Radial Blur: Zoom Blur's and Spin's taps, one every 1.5 px the smear reaches (up to 64), towards the centre and
+        // turned either side, bilinear, transparent outside
+        const float fx = float(xy.x) + 0.5 - p[1].x, fy = float(xy.y) + 0.5 - p[1].y;
+        const float d = sqrt(fx * fx + fy * fy), zr = p[1].z * d, sr = p[1].w * d;
+        const int taps = clamp(int(sqrt(zr * zr + sr * sr) / 1.5) + 1, 1, 64);
+        vec4 acc = vec4(0.0);
+        for (int k = 0; k < taps; ++k) {
+            const float f = taps > 1 ? float(k) / float(taps - 1) : 0.0;
+            const float sc = 1.0 - p[1].z * f, ang = taps > 1 ? p[1].w * (f - 0.5) : 0.0;
+            const float cs = cos(ang), sn = sin(ang);
+            acc += bilinear(size, p[1].x + (fx * cs - fy * sn) * sc, p[1].y + (fx * sn + fy * cs) * sc);
+        }
+        fragColor = acc / float(taps);
         return;
     }
     if (mode == 38) {

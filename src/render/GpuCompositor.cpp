@@ -158,6 +158,7 @@ public:
 
     bool draw(const Frame& frame, Image* out, QImage* out8);
     long filterPasses = 0, mixPasses = 0;  // (the last frame's)
+    long shaderBuilds = 0;                 // (shader steps built, the last frame)
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
     std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
     std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
@@ -759,7 +760,7 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
     // The step's function on the picture's straight colour, premultiplied again (pixels without alpha left alone).
     const std::string source = "#version 440\n"
                                "layout(location = 0) out vec4 fragColor;\n"
-                               "layout(std140, binding = 0) uniform Params { vec4 p[16]; };\n"
+                               "layout(std140, binding = 0) uniform Params { vec4 montageValues[16]; };\n"
                                "layout(binding = 1) uniform sampler2D srcTex;\n" +
                                step.source +
                                "\nvoid main() {\n"
@@ -781,6 +782,7 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
     baker.setGeneratedShaderVariants({QShader::StandardShader});
     baker.setSourceString(QByteArray::fromStdString(source), QShader::FragmentStage);
     const QShader frag = baker.bake();
+    ++shaderBuilds;
     if (!frag.isValid()) return broken("it does not compile: " + baker.errorMessage().toStdString());
     using T = QRhiTexture;
     using B = QRhiShaderResourceBinding;
@@ -1133,6 +1135,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
             if (!prog) return nullptr;
             using B = QRhiShaderResourceBinding;
             std::fill(p, p + 64, 0.0f);
+            std::copy_n(op.values.begin(), std::min<size_t>(64, op.values.size()), p);  // (its dynamic properties)
             QVarLengthArray<QRhiShaderResourceBinding, 8> bindings = {B::uniformBuffer(0, B::FragmentStage, uniforms(u, p)),
                                                                       B::sampledTexture(1, B::FragmentStage, cur, sampler_)};
             for (const auto& [tex, linear] : prog->textures)
@@ -1281,7 +1284,7 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
-    filterPasses = mixPasses = 0;
+    filterPasses = mixPasses = shaderBuilds = 0;
     hwMapped = hwGpuCopies = 0;
     hwFallback.clear();
     if (!rhi_) return false;  // (lost, and not set up again)
@@ -1518,11 +1521,11 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     std::shared_lock lock(gDeviceMutex);
     if (!gDevice || !gDevice->ready()) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0, mapped = 0, copied = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0;
     std::string hwFallback;
     const bool ok = d->run([&] {
         const bool drawn = d->draw(frame, out, out8);
-        filters = d->filterPasses, mixes = d->mixPasses;
+        filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds;
         mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback;
         return drawn;
     });
@@ -1532,6 +1535,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
     }
+    gStats.shaderBuilds += builds;
     gStats.hwMapped += mapped;
     gStats.hwGpuCopies += copied;
     if (!hwFallback.empty()) gStats.lastHwFallback = hwFallback;

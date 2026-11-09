@@ -55,11 +55,30 @@ struct FlareGhosts {
 };
 bool lensFlareGhosts(int lens, FlareGhosts& out);
 
+// Radial Blur: each pixel smeared towards the centre (Zoom, the share of the way) and round it (Spin, degrees through
+// the pixel), or both, with Zoom Blur's and Spin's taps (one every 1.5 px the smear reaches, up to 64), bilinear,
+// transparent outside. The setup is what the GPU's pass takes too (render/Processing's gpuColorOps).
+struct RadialBlur {
+    float cx = 0, cy = 0;  // the centre, in the picture's pixels
+    float zoom = 0;        // 0..1 of the way to the centre
+    float spin = 0;        // radians, half each way
+};
+bool radialBlurSetup(const Effect& e, FrameTime t, int w, int h, RadialBlur& out);  // false: nothing to do
+void radialBlur(const Effect& e, FrameTime t, Image& img, double pixelScale);
+
 // Light Rays: light above a threshold in the picture (scene light, the linear domain), tinted, streaming out from a
 // centre (Light X and Y, keyed, or the effect's mask as tracked when `follow` is on): blurred along the lines through
 // the centre in three passes of growing length, fading with `decay`; with Shadows Block Rays, the picture's darker
 // parts cut the rays crossing them. Added to the picture.
 void lightRays(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// Shadows Block Rays works on a small copy of the picture (at most 320 pixels across): its size, and the picture's
+// columns [x0, x1) and rows [y0, y1) each of its pixels covers.
+struct RayShadowGrid {
+    int tw = 1, th = 1;
+    double shrink = 1;
+    std::vector<int> x0, x1, y0, y1;
+};
+RayShadowGrid rayShadowGrid(int W, int H);
 
 // Aperture Glare: the diffraction a lens's aperture makes of the highlights (spikes and a soft glow round them).
 struct ApertureShape {

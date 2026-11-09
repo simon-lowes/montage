@@ -59,10 +59,10 @@ OCIO::ConstConfigRcPtr loadConfig(const std::string& name, std::string* error) {
     }
 }
 
-OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error);
+OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool dynamic = false, FrameTime t = 0);
 
-OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, std::string* error) {
-    OCIO::ConstProcessorRcPtr proc = processorOf(e, error);
+OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, FrameTime t, std::string* error) {
+    OCIO::ConstProcessorRcPtr proc = processorOf(e, error, false, t);
     if (!proc) return nullptr;
     static std::map<const OCIO::Processor*, std::pair<OCIO::ConstProcessorRcPtr, OCIO::ConstCPUProcessorRcPtr>> cache;
     {
@@ -81,17 +81,23 @@ OCIO::ConstCPUProcessorRcPtr processorFor(const Effect& e, std::string* error) {
     }
 }
 
-// The effect's transform, one processor a transform (kept for the last 64).
-OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error) {
+// The effect's transform, one processor a transform (kept for the last 64). With its exposure, contrast and gamma
+// (once any is set: liveControls), an ExposureContrastTransform on the input first: at the values at `t`, or (`dynamic`,
+// for OCIO's GPU shader) as dynamic properties, set while the shader runs without building it again.
+OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error, bool dynamic, FrameTime t) {
     const std::string configName = e.s("config");
     OCIO::ConstConfigRcPtr cfg = loadConfig(configName, error);
     if (!cfg) return nullptr;
     const bool display = e.s("mode") == kDisplayMode;
     const bool inverse = e.p("inverse", 0) > 0.5;
     const std::string src = e.s("src"), dst = e.s("dst"), disp = e.s("display"), view = e.s("view"), look = e.s("look");
+    const bool live = ocioLiveControls(e);
+    const double exposure = e.p("exposure", t, 0), contrast = e.p("contrast", t, 1), gamma = e.p("gamma", t, 1);
     const std::string key = configName + '\x1f' + std::to_string(reinterpret_cast<uintptr_t>(cfg.get())) + '\x1f' +
                             (display ? "d" : "c") + (inverse ? "i" : "f") + '\x1f' + src + '\x1f' + dst + '\x1f' +
-                            disp + '\x1f' + view + '\x1f' + look;
+                            disp + '\x1f' + view + '\x1f' + look + '\x1f' +
+                            (!live ? std::string("-") : dynamic ? std::string("dynamic")
+                                                                : std::to_string(exposure) + ' ' + std::to_string(contrast) + ' ' + std::to_string(gamma));
     static std::map<std::string, OCIO::ConstProcessorRcPtr> cache;
     {
         std::lock_guard lock(ocioMutex());
@@ -100,6 +106,14 @@ OCIO::ConstProcessorRcPtr processorOf(const Effect& e, std::string* error) {
     try {
         const char* source = src.empty() ? OCIO::ROLE_SCENE_LINEAR : src.c_str();
         OCIO::GroupTransformRcPtr group = OCIO::GroupTransform::Create();
+        if (live) {
+            OCIO::ExposureContrastTransformRcPtr ec = OCIO::ExposureContrastTransform::Create();
+            ec->setStyle(OCIO::EXPOSURE_CONTRAST_LINEAR);
+            ec->setPivot(0.18);
+            ec->setExposure(exposure), ec->setContrast(contrast), ec->setGamma(gamma);
+            if (dynamic) ec->makeExposureDynamic(), ec->makeContrastDynamic(), ec->makeGammaDynamic();
+            group->appendTransform(ec);
+        }
         if (!look.empty()) {
             OCIO::LookTransformRcPtr lt = OCIO::LookTransform::Create();
             lt->setSrc(source);
@@ -176,9 +190,15 @@ std::vector<std::string> ocioChoices(const Effect& e, const std::string& param) 
     return {};
 }
 
-bool applyOcio(const Effect& e, Image& img, std::string* error) {
+bool ocioLiveControls(const Effect& e) {
+    for (const auto& [name, def] : {std::pair<const char*, double>{"exposure", 0}, {"contrast", 1}, {"gamma", 1}})
+        if (auto it = e.params.find(name); it != e.params.end() && (it->second.varies() || it->second.value != def)) return true;
+    return false;
+}
+
+bool applyOcio(const Effect& e, Image& img, std::string* error, FrameTime t) {
     if (img.empty()) return true;
-    OCIO::ConstCPUProcessorRcPtr cpu = processorFor(e, error);
+    OCIO::ConstCPUProcessorRcPtr cpu = processorFor(e, t, error);
     if (!cpu) return false;
     parallelRows(img.height, [&](int y0, int y1) {
         std::vector<float> row(size_t(img.width) * 4);
@@ -240,7 +260,7 @@ static std::string samplingFunction(const std::string& name, int dims, bool line
 }
 
 std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::string* error) {
-    OCIO::ConstProcessorRcPtr proc = processorOf(e, error);
+    OCIO::ConstProcessorRcPtr proc = processorOf(e, error, true);
     if (!proc) return nullptr;
     // (Kept by processor, which each entry holds so its address is not reused; one OCIO cannot draw is kept too, with
     // why, so it is not tried again each frame.)
@@ -272,7 +292,15 @@ std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::stri
         desc->setResourcePrefix("ocio");
         OCIO::ConstGPUProcessorRcPtr gpuProc = proc->getDefaultGPUProcessor();
         gpuProc->extractGpuShaderInfo(desc);
-        if (desc->getNumUniforms() > 0) return keep(nullptr, "the transform has values set while it runs");
+        // Its dynamic properties (the live exposure, contrast and gamma): each float uniform read from the values the
+        // step is drawn with (ShaderStep::uniforms), in the Params block; any other kind is the CPU's.
+        for (unsigned i = 0; i < desc->getNumUniforms(); ++i) {
+            OCIO::GpuShaderDesc::UniformData data;
+            const char* name = desc->getUniform(i, data);
+            if (!name || data.m_type != OCIO::UNIFORM_DOUBLE || step->uniforms.size() >= 64)
+                return keep(nullptr, "the transform has values set while it runs that the GPU does not take");
+            step->uniforms.push_back(name);
+        }
         step->key = std::string("ocio:") + gpuProc->getCacheID();
         step->function = "ocioTransform";
         // Each sampler's binding, from 2 in the order its texture comes (1D textures, then 3D).
@@ -319,6 +347,12 @@ std::shared_ptr<const gpu::ShaderStep> ocioShaderStep(const Effect& e, std::stri
         // OCIO's CPU path does, so the tables keep full precision (no half floats) and need no filtering of float
         // textures (which some devices lack: optional on Vulkan, an extension on GLES, some Apple GPUs only).
         std::string text = desc->getShaderText();
+        for (size_t i = 0; i < step->uniforms.size(); ++i) {
+            const std::regex uniform("uniform\\s+float\\s+" + step->uniforms[i] + "\\s*;");
+            if (!std::regex_search(text, uniform)) return keep(nullptr, "the shader does not declare its value " + step->uniforms[i]);
+            text = std::regex_replace(text, uniform,
+                                      "#define " + step->uniforms[i] + " montageValues[" + std::to_string(i / 4) + "]." + "xyzw"[i % 4]);
+        }
         static const std::regex declaration(R"(uniform\s+sampler([123])D\s+(\w+)\s*;)");
         std::vector<std::string> names;
         for (auto d = std::sregex_iterator(text.begin(), text.end(), declaration); d != std::sregex_iterator(); ++d)
@@ -444,7 +478,8 @@ bool ocioAvailable() { return false; }
 std::string ocioVersion() { return {}; }
 std::vector<std::string> ocioBuiltinConfigs() { return {}; }
 std::vector<std::string> ocioChoices(const Effect&, const std::string&) { return {}; }
-bool applyOcio(const Effect&, Image&, std::string* error) {
+bool ocioLiveControls(const Effect&) { return false; }
+bool applyOcio(const Effect&, Image&, std::string* error, FrameTime) {
     if (error) *error = "Montage was built without OpenColorIO";
     return false;
 }

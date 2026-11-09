@@ -5073,6 +5073,28 @@ colorspaces:
         const float beyondOpen = open.at(260, 90)[1] - 1, beyondBlocked = blocked.at(260, 90)[1] - 1;
         QVERIFY2(beyondOpen > 0.005f && beyondBlocked < 0.1f * beyondOpen, qPrintable(QStringLiteral("%1 %2").arg(beyondOpen).arg(beyondBlocked)));
         QVERIFY(blocked.at(230, 90)[1] - 1 > 0.5f * (open.at(230, 90)[1] - 1));  // (before the bar the ray is there)
+
+        // Radial Blur: a bright point up and to the right of the centre streaked outwards by Zoom (each pixel taking what
+        // lies on its way to the centre; not towards the centre, nor to the side), and round the centre by Spin (not
+        // along the line); the centre itself as it was.
+        Image zoomed = lit, spun = lit, still = lit;
+        std::fill_n(still.at(160, 90), 3, 3.0f);
+        Image stillZoomed = still;
+        applyVideoEffect(fx("radial_blur", {{"zoom", 30}}), 0, zoomed, 1);
+        applyVideoEffect(fx("radial_blur", {{"zoom", 0}, {"spin", 20}}), 0, spun, 1);
+        applyVideoEffect(fx("radial_blur", {{"zoom", 50}}), 0, stillZoomed, 1);
+        // (the point at (220, 60), 67 px from the centre: a pixel 81 px out reaches back 24 px, past it)
+        QVERIFY2(zoomed.at(232, 54)[1] > 0.01f, qPrintable(QString::number(zoomed.at(232, 54)[1])));
+        QVERIFY(zoomed.at(205, 67)[1] < 1e-6f && zoomed.at(212, 50)[1] < 1e-6f);
+        QVERIFY(zoomed.at(220, 60)[1] < 8.0f);
+        // (Spin 20 degrees: about 23 px along the circle through the point, 10 either side)
+        const double r = std::hypot(60.5, -29.5), a0 = std::atan2(-29.5, 60.5), a1 = a0 + 8 * M_PI / 180;
+        QVERIFY2(spun.at(int(160 + r * std::cos(a1)), int(90 + r * std::sin(a1)))[1] > 0.01f, "spin reaches round the circle");
+        QVERIFY(spun.at(205, 67)[1] < 1e-6f && spun.at(240, 50)[1] < 1e-6f);
+        QCOMPARE(stillZoomed.at(160, 90)[1], 3.0f);
+        Image none2 = lit;
+        applyVideoEffect(fx("radial_blur", {{"zoom", 0}, {"spin", 0}}), 0, none2, 1);
+        QVERIFY(none2.px == lit.px);
     }
 
     void distortAndStylize() {
@@ -21656,6 +21678,10 @@ colorspaces:
             {"light_rays", {{{"threshold", 0.5}}, {{"threshold", 0.3}, {"length", 90}, {"decay", 20}, {"pos_x", 0.8}, {"pos_y", -0.3}, {"intensity", 2}},
                             {{"threshold", 0.4}, {"follow", 1}, {"mask.shape", 1}, {"mask.x", 0.3}, {"mask.y", 0.6}, {"mask.w", 0.2}, {"mask.h", 0.2}}}},
             {"lens_flare", {{}, {{"lens", 3}, {"pos_x", 0.7}, {"pos_y", 0.6}, {"brightness", 150}}, {{"lens", 2}, {"ghosts", 50}, {"pos_x", -0.2}, {"color.b", 1}}}},
+            // (Shadows Block Rays: the small copy of what blocks them and the march through it, on the GPU too)
+            {"light_rays", {{{"threshold", 0.4}, {"block", 50}}, {{"threshold", 0.3}, {"block", 100}, {"pos_x", 1.2}, {"pos_y", -0.2}, {"length", 80}},
+                            {{"threshold", 0.5}, {"block", 30}, {"decay", 70}, {"pos_x", 0.4}}}},
+            {"radial_blur", {{{"zoom", 15}}, {{"zoom", 0}, {"spin", 20}, {"center_x", 0.3}}, {{"zoom", 40}, {"spin", 8}, {"center_y", 0.8}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -21666,7 +21692,7 @@ colorspaces:
                 const long passes = gpu::stats().filterPasses;
                 compare(7 + FrameTime(k), QString("%1 #%2").arg(type).arg(k + 1));
                 QVERIFY2(gpu::stats().filterPasses > passes, type);
-                if (std::string(type) == "light_rays") {  // (the picture has light above each threshold: the rays are there)
+                if (std::string(type) == "light_rays" || std::string(type) == "radial_blur") {  // (the rays, or the blur, are there)
                     RenderOptions o;
                     o.gpu = true;
                     const Image lit = renderProgramFrame(p, s, 7 + FrameTime(k), o);
@@ -24035,6 +24061,61 @@ colorspaces:
             QVERIFY2(worst <= bound, qPrintable(QStringLiteral("%1: differs by %2").arg(c.name).arg(worst)));
             qInfo("%s: GPU within %.2g of OpenColorIO's CPU processor", c.name, worst);
         }
+        // Live exposure, contrast and gamma (OCIO's dynamic properties on the GPU): each setting matches the CPU's, and
+        // once the shader is built, changing them (keyed, too) draws with new values without building it again.
+        Effect e = makeEffect(p, "ocio");
+        e.strings["config"] = dir.filePath("camera.ocio").toStdString();
+        e.strings["mode"] = "Colour Space";
+        e.strings["src"] = "linear";
+        e.strings["dst"] = "video";
+        QVERIFY(!ocioLiveControls(e));
+        Image in(W, 64, Image::Uninitialized{});
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = in.at(x, y);
+                px[0] = float(std::exp2(-8 + 12.0 * x / W)), px[1] = float(std::exp2(-8 + 12.0 * y / 64)), px[2] = 0.18f, px[3] = 1;
+            }
+        const struct {
+            double exposure, contrast, gamma;
+        } settings[] = {{0.7, 1.2, 0.9}, {-1.5, 0.8, 1.3}, {2, 1, 1}, {0, 1.6, 0.6}};
+        long builds = -1;
+        for (size_t k = 0; k < std::size(settings); ++k) {
+            e.params["exposure"] = settings[k].exposure, e.params["contrast"] = settings[k].contrast, e.params["gamma"] = settings[k].gamma;
+            if (k == 3) {  // (keyed: the value at the frame drawn)
+                e.params["exposure"].keys = {{0, -2.0}, {10, 2.0}};
+            }
+            QVERIFY(ocioLiveControls(e));
+            Image cpu = in;
+            std::string err;
+            QVERIFY2(applyOcio(e, cpu, &err, 5), err.c_str());
+            gpu::Frame frame;
+            frame.width = W, frame.height = 64;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.image = in;
+            item.a.place.full = true;
+            QVERIFY(gpuColorOps(e, 5, item.a.ops, W, 64));
+            QCOMPARE(item.a.ops.size(), size_t(1));
+            QCOMPARE(item.a.ops[0].values.size(), size_t(3));
+            frame.items.push_back(std::move(item));
+            const long before = gpu::stats().shaderBuilds;
+            Image onGpu;
+            QVERIFY(gpu::execute(frame, &onGpu));
+            if (k > 0) QCOMPARE(gpu::stats().shaderBuilds, before);  // (the shader built once, for the first)
+            builds = gpu::stats().shaderBuilds;
+            double worst = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i)
+                worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]) / std::max(1.0, std::fabs(double(cpu.px[i]))));
+            QVERIFY2(worst <= 1e-4, qPrintable(QStringLiteral("live controls #%1: differs by %2").arg(k + 1).arg(worst)));
+            if (k == 1) {  // (and they change the picture)
+                Effect plain = e;
+                plain.params.erase("exposure"), plain.params.erase("contrast"), plain.params.erase("gamma");
+                Image unchanged = in;
+                QVERIFY(applyOcio(plain, unchanged));
+                QVERIFY(unchanged.px != cpu.px);
+            }
+        }
+        QVERIFY(builds > 0);
     }
     void footageWordsReadAnswers() {
         // The sentences numbered, shortened when asked, several to a line when asked.
