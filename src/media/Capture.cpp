@@ -596,12 +596,15 @@ void LiveFeed::picture(const AVFrame* f) {
     QImage img(w, h, QImage::Format_RGB32);
     {
         // (the scaler, kept for the next picture: this thread alone uses it)
-        const int key[3] = {f->width, f->height, f->format};
-        if (!sws_ || !std::equal(key, key + 3, swsKey_)) {
+        // (keyed by everything the scaler is made for: the size made from the pixels' shape among them)
+        const int key[6] = {f->width, f->height, f->format, w, h, int(f->colorspace) << 8 | int(f->color_range)};
+        if (!sws_ || !std::equal(key, key + 6, swsKey_)) {
             sws_ = sws_getCachedContext(sws_, f->width, f->height, AVPixelFormat(f->format), w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-            std::copy(key, key + 3, swsKey_);
+            std::copy(key, key + 6, swsKey_);
             if (sws_) {
-                const int space = f->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : f->colorspace == AVCOL_SPC_SMPTE170M ? SWS_CS_ITU601 : SWS_CS_ITU709;
+                const int space = f->colorspace == AVCOL_SPC_BT2020_NCL                                         ? SWS_CS_BT2020
+                                  : f->colorspace == AVCOL_SPC_SMPTE170M || f->colorspace == AVCOL_SPC_BT470BG ? SWS_CS_ITU601
+                                                                                                                : SWS_CS_ITU709;
                 const bool full = f->color_range == AVCOL_RANGE_JPEG;
                 sws_setColorspaceDetails(sws_, sws_getCoefficients(space), full ? 1 : 0, sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16, 1 << 16);
             }
@@ -1060,6 +1063,10 @@ void Recorder::run() {
         pic->format = codec->pix;
         pic->width = width;
         pic->height = height;
+        // (as coded: narrow range in the recording's matrix, the feed's pixel shape; a live view reads them)
+        pic->colorspace = AVColorSpace(colorSpace);
+        pic->color_range = AVCOL_RANGE_MPEG;
+        pic->sample_aspect_ratio = f->sample_aspect_ratio;
         if (av_frame_get_buffer(pic, 0) < 0) {
             av_frame_free(&pic);
             fatal = "Out of memory";

@@ -326,6 +326,7 @@ private:
     std::vector<float> audioFifo_;
     std::vector<uint32_t> aesFifo_;  // (AM824 words: an AES3 stream's)
     int aesBlockFrame_ = 0;
+    bool aesQueued_ = false;  // (queueAes3 used: send's PCM not sent)
     std::vector<AncPacket> frameAnc_;
     std::vector<FastMetadata> nextMetadata_;
     std::string clock_, source_, source2_;

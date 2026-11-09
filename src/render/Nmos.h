@@ -258,6 +258,8 @@ private:
     std::vector<std::pair<QString, QJsonObject>> queue_;  // resources to POST, in order
     bool deleteFirst_ = false;
     int lookups_ = 0;
+    bool browsedMdns_ = false;  // (the last look for registries was by multicast DNS)
+    int mdnsRetryMs_ = 2000;    // (and the wait before the next, doubling while none is found: RFC 6762's 5.2)
     std::vector<Registry> found_;
     bool stopping_ = false;
 };

@@ -308,12 +308,13 @@ bool Multiviewer::startSlot(Slot& s, bool record, QString* error) {
     cs.live = s.feed;
     cs.codec = codec_->currentData().toString().toStdString();
     cs.openTimeout = 10;
+    if (record && (folder().isEmpty() || !QDir().mkpath(folder()))) {
+        // (watched on, unrecorded, saying why)
+        s.error = tr("Not recorded: choose a folder to record into");
+        if (error) *error = s.error;
+        record = false;
+    }
     if (record) {
-        if (folder().isEmpty() || !QDir().mkpath(folder())) {
-            s.error = tr("Choose a folder to record into");
-            if (error) *error = s.error;
-            return false;
-        }
         s.path = nextPath(labelOf(s.input));
         s.media = 0;
         s.importedPath.clear();
@@ -365,7 +366,9 @@ void Multiviewer::importSlot(Slot& s) {
 }
 
 void Multiviewer::announce(Slot& s) {
-    if (indexOf(&s) == onSource_ && onSource_ >= 0) emit showOnSource(s.feed, s.media, labelOf(s.input), s.recording && !s.ended, true);
+    // (its media only while it is the recording being made: one made earlier is not what the feed now numbers)
+    const bool recording = s.recording && !s.ended;
+    if (indexOf(&s) == onSource_ && onSource_ >= 0) emit showOnSource(s.feed, recording ? s.media : 0, labelOf(s.input), recording, true);
 }
 
 void Multiviewer::slotFinished(quint64 id, int generation, bool ok, const QString& message) {

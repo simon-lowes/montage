@@ -78,6 +78,7 @@ public:
     bool watchLive() const;
     std::shared_ptr<LiveFeed> liveFeed() const { return liveFeed_; }  // the recording's, while it is watched
     QString clipLabel() const;  // the recording's clip name
+    bool importedWhileRecording() const { return liveMarkable_; }  // (a QuickTime file into the bin: markable live)
 
     // ST 2110 receivers offered to NMOS controllers (IS-04, with IS-05 connections): what one connects them to
     // becomes the feed. False with why when the node cannot start.
@@ -123,6 +124,7 @@ private:
     QCheckBox* import_;
     QCheckBox* watch_;
     std::shared_ptr<LiveFeed> liveFeed_;
+    bool liveMarkable_ = false;
     QGroupBox* live_;
     QLineEdit* liveFolder_;
     QComboBox* liveFormats_;

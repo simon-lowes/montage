@@ -597,6 +597,7 @@ bool CaptureDialog::record() {
     settings.setValue(QStringLiteral("capture/watch"), watch_->isChecked());
     recording_ = true;
     liveFeed_ = watched;
+    liveMarkable_ = import_->isChecked() && ext == QLatin1String("mov");
     notedFrames_ = -1;
     importedPath_.clear();
     record_->setText(tr("Stop"));

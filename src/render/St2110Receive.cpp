@@ -481,8 +481,9 @@ InputStats Input::stats() const {
     // (a stream's lock is taken before the input's while packets come in, so never the other way round)
     for (const auto& st : streams_) {
         std::lock_guard sl(st->m);
-        s.packets[st->kind][0] = st->merger.received[0];
-        s.packets[st->kind][1] = st->merger.received[1];
+        // (each kind's streams together: several sound or data streams beside the picture)
+        s.packets[st->kind][0] += st->merger.received[0];
+        s.packets[st->kind][1] += st->merger.received[1];
         s.duplicates += st->merger.duplicates;
         s.lost += st->merger.lost;
     }

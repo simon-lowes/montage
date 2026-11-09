@@ -3310,7 +3310,9 @@ CaptureDialog* MainWindow::captureDialog() {
     if (!capture_) {
         capture_ = new CaptureDialog(state_, this);
         connect(capture_, &CaptureDialog::watching, this,
-                [this](std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool on) { showLive(std::move(feed), media, label, true, on); });
+                [this](std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool on) {
+                    showLive(std::move(feed), media, label, capture_->importedWhileRecording(), on);
+                });
     }
     return capture_;
 }
@@ -3352,7 +3354,7 @@ QString MainWindow::liveTool(const QJsonObject& args, QJsonObject& structured, b
                 isError = true;
                 return tr("Nothing is being recorded to watch: record with File › Capture (watched), or name a multiviewer input");
             }
-            showLive(d->liveFeed(), d->importedMedia(), d->clipLabel(), true, true);
+            showLive(d->liveFeed(), d->importedMedia(), d->clipLabel(), d->importedWhileRecording(), true);
         } else if (sourcePanel_->liveFeed()) {
             sourcePanel_->setLiveFeed(nullptr, 0, {});
         }

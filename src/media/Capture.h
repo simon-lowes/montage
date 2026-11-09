@@ -110,7 +110,7 @@ private:
     std::string first_;
     int fpsNum_ = 25, fpsDen_ = 1;
     SwsContext* sws_ = nullptr;
-    int swsKey_[3] = {0, 0, -1};
+    int swsKey_[6] = {0, 0, -1, 0, 0, 0};
 };
 
 // The clock CaptureSettings::label is asked by (seconds, steady).

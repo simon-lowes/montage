@@ -202,6 +202,7 @@ bool Node::start(const NodeOptions& o, QString* error) {
     stop();
     o_ = o;
     stopping_ = false;
+    mdnsRetryMs_ = 2000;
     run_ = new QObject(this);
     const QString host = o.hostname.isEmpty() ? QHostInfo::localHostName() : o.hostname;
     o_.hostname = host;
@@ -1819,6 +1820,7 @@ void Node::discover() {
     if (domain.isEmpty() || domain.compare(QStringLiteral("local"), Qt::CaseInsensitive) == 0 ||
         domain.compare(QStringLiteral("local."), Qt::CaseInsensitive) == 0) {
         // Multicast DNS on the local network (no search domain to look in by unicast DNS).
+        browsedMdns_ = true;
         lookups_ = 1;
         browseRegistries([this](std::vector<Registry> found) {
             if (stopping_) return;
@@ -1827,6 +1829,7 @@ void Node::discover() {
         });
         return;
     }
+    browsedMdns_ = false;
     auto* ptr = new QDnsLookup(QDnsLookup::PTR, QStringLiteral("_nmos-register._tcp.") + domain, run_);
     if (!o_.dnsServer.isEmpty()) ptr->setNameserver(QHostAddress(o_.dnsServer));
     lookups_ = 1;
@@ -1911,9 +1914,16 @@ void Node::lookupDone() {
     registries_ = list;
     if (registries_.empty()) {
         registryIndex_ = -1;
-        rediscover_->start(2000);
+        // (multicast queries further and further apart while no registry answers, to an hour at most)
+        if (browsedMdns_) {
+            rediscover_->start(mdnsRetryMs_);
+            mdnsRetryMs_ = std::min(mdnsRetryMs_ * 2, 3600 * 1000);
+        } else {
+            rediscover_->start(2000);
+        }
         return;
     }
+    mdnsRetryMs_ = 2000;
     registryIndex_ = 0;
     registerAll();
 }

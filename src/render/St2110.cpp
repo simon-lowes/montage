@@ -774,7 +774,8 @@ bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp
         packet.assign(12, 0);
         while (i < items.size()) {
             const size_t bytes = 4 + items[i].words.size() * 4;
-            if (packet.size() > 12 && packet.size() - 12 + bytes > size_t(std::max(maxPayload, 4 + 511 * 4))) break;
+            // (items a packet holds; one alone bigger than that still goes, a packet of its own)
+            if (packet.size() > 12 && packet.size() - 12 + bytes > size_t(std::max(maxPayload, 4))) break;
             const size_t at = packet.size();
             packet.resize(at + bytes);
             put32(packet.data() + at, items[i].type << 10 | uint32_t(items[i].k) << 9 | uint32_t(items[i].words.size()));
@@ -1057,9 +1058,10 @@ struct Sender::Sockets {
         const sockaddr_in* first[4] = {&video, &audio, &anc, &meta};
         const sockaddr_in* second[4] = {&video2, &audio2, &anc2, &meta2};
         const int paths = s2 != kBad ? 2 : 1;
-        int failed = 0;
+        int failed = 0, tried = 0;
         for (int path = 0; path < paths; ++path) {
             if (!pathOn[stream][path]) continue;
+            ++tried;  // (a leg turned off is not one that can fail)
             if (drop && drop(stream, path, index)) continue;
             const sockaddr_in& a = *(path ? second : first)[stream];
             // (a queue still full after a few milliseconds loses the packet, as a network would: the stream goes on)
@@ -1073,7 +1075,7 @@ struct Sender::Sockets {
             if (full) ++queueDrops;
             if (!sent && !full) ++errors[path], ++failed;
         }
-        return failed < paths;
+        return tried == 0 || failed < tried;
     }
 };
 
@@ -1195,6 +1197,7 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     audioFifo_.clear();
     aesFifo_.clear();
     aesBlockFrame_ = 0;
+    aesQueued_ = false;
     frameAnc_.clear();
     nextMetadata_.clear();
     frames_ = 0;
@@ -1247,6 +1250,7 @@ std::string Sender::sdpMetadata() const {
 
 void Sender::queueAes3(const uint32_t* words, int frames) {
     if (!s_ || !audio_.aes3 || !words || frames <= 0) return;
+    aesQueued_ = true;  // (in place of send's PCM from now)
     aesFifo_.insert(aesFifo_.end(), words, words + size_t(frames) * size_t(audio_.channels));
 }
 
@@ -1290,14 +1294,24 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
     const int64_t now = ptpNowNs();
     const int64_t catchUp = std::max<int64_t>(1, num / (5 * den));
     if (nextFrame_ == 0 || frameStart(nextFrame_ + catchUp) < now) {
+        const bool behind = nextFrame_ != 0;
         nextFrame_ = mulDiv(now, num, second * den) + 1;
         audioSample_ = mulDiv(frameStart(nextFrame_), audio_.rate, second);
         audioFifo_.clear();
-        // (AES3 words queued go on from the new start: they are the stream itself, not to be lost)
+        // (AES3 words fallen behind dropped as the PCM is, all but a frame's, in whole blocks of 192 frames so the
+        // channel status runs on)
+        const size_t ch = size_t(std::max(1, audio_.channels)), frames = aesFifo_.size() / ch;
+        const size_t due = size_t(mulDiv(int64_t(audio_.rate), den, num)) + 1;
+        if (behind && frames > due) {
+            const size_t drop = (frames - due) - (frames - due) % 192;
+            aesFifo_.erase(aesFifo_.begin(), aesFifo_.begin() + ptrdiff_t(drop * ch));
+        }
     }
     const int64_t start = frameStart(nextFrame_), end = frameStart(nextFrame_ + 1);
     if (o_.sendAudio && audio && audioFrames > 0) {
-        if (audio_.aes3) {
+        if (audio_.aes3 && aesQueued_) {
+            // (its subframes come from queueAes3)
+        } else if (audio_.aes3) {
             const std::vector<uint32_t> w = aes3FromPcm(audio, audioFrames, audio_.channels, aesBlockFrame_, aes3ChannelStatus(false));
             aesFifo_.insert(aesFifo_.end(), w.begin(), w.end());
         } else {

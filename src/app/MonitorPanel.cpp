@@ -829,6 +829,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
                 controller_->pause();
                 liveShown_ = -1;
                 liveTick();
+                emit liveChanged();  // (live again: the multiviewer's tally)
             } else {
                 viewer_->setImage(QImage());
                 emit liveChanged();  // (the recording so far, as media)
@@ -1170,7 +1171,8 @@ bool MonitorPanel::markLive(bool in) {
     const LiveFeed::Now now = live_->look();
     if (!liveMedia_) {
         state_->message(liveRecording_ ? tr("The recording is in the Captures bin a moment after it starts: mark it then")
-                                       : tr("%1 is watched, not recorded: there is nothing to mark").arg(liveLabel_));
+                                       : tr("%1 cannot be marked live: it is only watched, or its recording comes into the bin when it ends")
+                                             .arg(liveLabel_));
         return true;
     }
     const FrameTime t = sequenceFrame(now, state_->sequence());

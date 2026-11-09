@@ -16866,7 +16866,10 @@ colorspaces:
             for (size_t i = 0; i < packets.size(); ++i) {
                 st::RtpPacket p;
                 QVERIFY(st::parseRtp(packets[i].data(), packets[i].size(), p) && p.marker == (i + 1 == packets.size()));
+                const size_t had = back.size();
                 QVERIFY(st::unpackFastMetadata(p.payload, p.size, back));
+                // (within the payload a packet may have, unless one item alone is bigger)
+                QVERIFY2(p.size <= 1200 || back.size() == had + 1, qPrintable(QString::number(p.size)));
             }
             QVERIFY(back == items);
             std::vector<st::FastMetadata> none;

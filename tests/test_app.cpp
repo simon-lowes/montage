@@ -2866,10 +2866,21 @@ private slots:
             } while (std::abs(got - greyOf(first + in + k)) > 6 && wait.elapsed() < 15000);
             QVERIFY2(std::abs(got - greyOf(first + in + k)) <= 6, qPrintable(QStringLiteral("frame %1: %2, sent %3").arg(k).arg(got).arg(greyOf(first + in + k))));
         }
-        // Recording stopped: the file finished, the Source monitor back on it (the marks kept), the tallies off.
+        // LIVE off scrubs the recording so far (the tile no longer on the Source monitor); on again, it is.
+        auto* badge = source->findChild<QToolButton*>(QStringLiteral("liveBadge"));
+        QVERIFY(badge && badge->isVisible() && badge->isChecked());
+        badge->click();
+        QVERIFY(!source->liveShowing() && !mv->tile(0).onSource);
+        badge->click();
+        QVERIFY(source->liveShowing() && mv->tile(0).onSource);
+        // Recording stopped: the file finished, the marks kept, the input watched on but nothing of it to mark.
         r = call({{"action", "multiview"}, {"record", false}});
         QVERIFY(!r.value("structuredContent").toObject().value("recording").toBool());
         QVERIFY(!mv->tile(0).recording);
+        QCOMPARE(state()->sourceIn(), in);
+        QVERIFY(source->liveShowing() && source->liveMedia() == 0);
+        r = call({{"action", "live"}, {"mark_in", true}});
+        QVERIFY(r.value("isError").toBool());
         QCOMPARE(state()->sourceIn(), in);
         r = call({{"action", "live"}, {"watch", false}});
         QVERIFY(!source->liveShowing() && !source->liveFeed());
