@@ -212,6 +212,7 @@ private:
     void run() {
         std::vector<float> in(size_t(buffer_) * size_t(std::max(1, inputs_))), out(size_t(buffer_) * size_t(std::max(1, outputs_)));
         auto next = std::chrono::steady_clock::now();
+        bool wasLate = false;
         while (running_) {
             if (const int r = pendingRate_.exchange(0); r > 0 && r != rate_) {
                 rate_ = r;
@@ -224,12 +225,16 @@ private:
             if (cb_.process) cb_.process(in.data(), inputs_, out.data(), outputs_, buffer_);
             push(out.data());
             next += period;
+            // An interface's clock runs on whatever its callbacks do: blocks late here (a coarse system timer, a busy
+            // computer) are made up at once, back to back, so its sample count keeps to the time. A callback late by
+            // more than a block and a timer tick is an xrun (an interface would have run out), counted once while late;
+            // a thread held up for seconds (a debugger) starts the time afresh.
             const auto now = std::chrono::steady_clock::now();
-            if (now > next) {
-                ++xruns_;  // (the callback ended after its period: an interface would have run out)
-                if (now > next + 4 * period) next = now;
-            }
-            std::this_thread::sleep_until(next);
+            const bool late = now > next + std::max<std::chrono::nanoseconds>(2 * period, std::chrono::milliseconds(25));
+            if (late && !wasLate) ++xruns_;
+            wasLate = late;
+            if (now > next + std::chrono::seconds(2)) next = now;
+            if (now < next) std::this_thread::sleep_until(next);
         }
     }
     // The delay line: a ring of delay_ frames (inputs_ channels), the oldest at ring_: read a block from there, and the

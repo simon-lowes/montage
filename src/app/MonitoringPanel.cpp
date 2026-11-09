@@ -151,6 +151,7 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     df->addRow(tr("Rate and buffer"), rateRow);
     deviceClock_ = new QComboBox(deviceBox);
     deviceClock_->setObjectName(QStringLiteral("monitorDeviceClock"));
+    language::keepUntranslated(deviceClock_);  // (the device's own names for its clocks)
     df->addRow(tr("Clock"), deviceClock_);
     deviceInputs_ = new QSpinBox(deviceBox);
     deviceInputs_->setObjectName(QStringLiteral("monitorDeviceInputs"));

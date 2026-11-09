@@ -2584,12 +2584,14 @@ private slots:
         QCOMPARE(e.roundTripAt(48000), 256);  // (512 frames at 96 kHz)
         const int64_t at = recordClick(e);
         QVERIFY2(std::llabs(at - 4800) <= 16, qPrintable(QString::number(at)));
-        // The playback still runs in real time at its own rate: about 48000 of its samples a second.
+        // The playback still runs in real time at its own rate: about 48000 of its samples a second (of the time waited).
         Clicker clicker;
         const int id = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
         QVERIFY(id >= 0);
+        QElapsedTimer t;
+        t.start();
         QTest::qWait(1000);
-        const int64_t played = clicker.pos.load();
+        const int64_t played = std::llround(double(clicker.pos.load()) * 1e9 / double(std::max<qint64>(1, t.nsecsElapsed())));
         e.removeOutput(id);
         QVERIFY2(played > 40000 && played < 58000, qPrintable(QString::number(played)));
         audiodev::setLoopbackOptions({});
