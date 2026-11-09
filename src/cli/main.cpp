@@ -1263,6 +1263,13 @@ int cmdBench(const std::vector<std::string>& args) {
         std::printf("GPU (%s): %ld frames drawn there, %ld on the CPU; layers %ld from the source, %ld made on the CPU%s%s\n",
                     gpu::deviceName().c_str(), st.gpuFrames, st.cpuFrames, st.gpuLayers, st.cpuLayers,
                     st.lastFallback.empty() ? "" : "; last fallback: ", st.lastFallback.c_str());
+        // Hardware-decoded frames: how many were copied back to memory (the copy that sharing saves), mapped from
+        // the decoder's memory as they are, or copied on the GPU.
+        const std::string mapped = gpu::mappedHardware();
+        std::printf("Hardware frames (%s): copies per frame %.2f back to memory, %.2f on the GPU; %ld mapped without a copy%s%s\n",
+                    mapped.empty() ? "none mapped on this device" : ("mapped from " + mapped).c_str(), double(st.hwReadBacks) / frames,
+                    double(st.hwGpuCopies) / frames, st.hwMapped - st.hwGpuCopies, st.lastHwFallback.empty() ? "" : "; last copied back: ",
+                    st.lastHwFallback.c_str());
     }
     return 0;
 }

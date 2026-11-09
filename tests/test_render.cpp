@@ -83,6 +83,7 @@
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
+#include "media/HwAccel.h"
 #include "media/MediaPool.h"
 #include "media/Exr.h"
 #include "media/Jxl.h"
@@ -441,10 +442,10 @@ void fillYcbcrFrame(AVFrame* f, const std::function<int(int, int, int)>& code) {
     }
 }
 
-// A short video of Y′CbCr in `fmt` (three frames, each filled by fillYcbcrFrame), tagged with the matrix, range and
-// chroma siting given: FFV1 in Matroska, or NV12 raw there (FFV1 does not take it).
+// A short video of Y′CbCr in `fmt` (three frames, or `frames`, each filled by fillYcbcrFrame), tagged with the matrix,
+// range and chroma siting given: FFV1 in Matroska, or NV12 raw there (FFV1 does not take it).
 bool writeYcbcrVideo(const std::string& path, AVPixelFormat fmt, int w, int h, AVColorSpace space, AVColorRange range,
-                     AVChromaLocation siting, const std::function<int(int, int, int)>& code) {
+                     AVChromaLocation siting, const std::function<int(int, int, int)>& code, int frames = 3) {
     const bool raw = fmt == AV_PIX_FMT_NV12;
     AVFormatContext* oc = nullptr;
     if (avformat_alloc_output_context2(&oc, nullptr, "matroska", path.c_str()) < 0) return false;
@@ -482,7 +483,7 @@ bool writeYcbcrVideo(const std::string& path, AVPixelFormat fmt, int w, int h, A
         }
         return true;
     };
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < frames; ++i) {
         f->pts = i;
         if (avcodec_send_frame(cc, f) < 0 || !drain()) return false;
     }
@@ -21758,6 +21759,159 @@ colorspaces:
                                                            .arg(int(siting)).arg(av_get_pix_fmt_name(fmt)).arg(scale).arg(worst)));
                 }
             }
+    }
+    void gpuHardwareFrames() {
+        // Phase 14 #14: hardware-decoded frames drawn from the decoding device's memory as they are. Frames decoded in
+        // software are uploaded by FFmpeg into its Vulkan device's frames, as a hardware decoder would hand them over
+        // (an image a plane, and one image of all the planes, as Vulkan Video decodes into), and go through the same
+        // path: on Vulkan, where the compositor runs on FFmpeg's device, drawn with no read-back; on OpenGL here (no
+        // DMA-BUF), copied back after decoding and counted. Against the CPU's frame of the same file, a mapping refused
+        // (copied back, and saying why), seeks, the frame cache evicting them, frames outliving their decoder, more
+        // frames kept than the cap, and the device lost.
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        if (!gpu::takesPlanes()) QSKIP("this GPU does not take 8 and 16-bit textures of one and two channels");
+        if (!hwDevice(AV_HWDEVICE_TYPE_VULKAN)) QSKIP("FFmpeg makes no Vulkan device here");
+        const bool onVulkan = QString::fromStdString(gpu::deviceName()).startsWith("Vulkan");
+        const bool mapped = gpu::mappedHardware().find("vulkan") != std::string::npos;
+        // (On Vulkan the compositor runs on FFmpeg's device, unless told not to share it.)
+        if (onVulkan && qgetenv("MONTAGE_GPU_SHARE").toLower() != "off") QVERIFY2(mapped, gpu::deviceName().c_str());
+        auto restore = qScopeGuard([] {
+            setHwUploadForTesting("");
+            gpu::refuseHardwareFramesForTesting(false);
+            MediaPool::instance().setFrameCacheBudget(size_t(1) << 30);
+            MediaPool::instance().clear();
+        });
+        QTemporaryDir dir;
+        const int W = 96, H = 54;
+        auto smooth = [](int bits) {
+            return [bits](int c, int x, int y) {
+                const double unit = double(1 << (bits - 8));
+                const double v = c == 0 ? 0.5 + 0.35 * std::sin(x * 0.045 + y * 0.03) : 0.5 + 0.18 * std::sin(x * (c == 1 ? 0.07 : 0.05) - y * 0.04);
+                return int(std::lround(16 * unit + ((c ? 240 : 235) - 16) * unit * v));
+            };
+        };
+        QString where;  // (where worstOf found the largest difference)
+        auto worstOf = [&where](const Image& a, const Image& b) {
+            if (a.width != b.width || a.height != b.height) {
+                where = QStringLiteral(" (%1x%2 against %3x%4)").arg(a.width).arg(a.height).arg(b.width).arg(b.height);
+                return 1.0;
+            }
+            double worst = 0;
+            for (size_t i = 0; i < a.px.size(); ++i)
+                if (const double d = std::fabs(double(a.px[i]) - b.px[i]); d > worst) {
+                    worst = d;
+                    where = QStringLiteral(" at %1,%2 channel %3: %4 on the CPU, %5 here").arg(i / 4 % a.width).arg(i / 4 / a.width).arg(i % 4).arg(a.px[i]).arg(b.px[i]);
+                }
+            return worst;
+        };
+        const std::pair<AVPixelFormat, const char*> formats[] = {
+            {AV_PIX_FMT_NV12, "NV12"}, {AV_PIX_FMT_YUV420P, "4:2:0 8-bit"}, {AV_PIX_FMT_YUV420P10LE, "4:2:0 10-bit"}};
+        int n = 0;
+        for (const auto& [fmt, name] : formats) {
+            const std::string path = dir.filePath(QStringLiteral("v%1.mkv").arg(n++)).toStdString();
+            QVERIFY(writeYcbcrVideo(path, fmt, W, H, AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, AVCHROMA_LOC_LEFT, smooth(av_pix_fmt_desc_get(fmt)->comp[0].depth), 24));
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = W, s.height = H;
+            MediaItem m;
+            QVERIFY(probeMedia(path, m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 24, {TrackKind::Video, 0}, {}, false).ok);
+            RenderOptions cpuOptions;
+            cpuOptions.highQuality = true;
+            RenderOptions gpuOptions = cpuOptions;
+            gpuOptions.gpu = true;
+            // The CPU's frames, decoded in software as ever.
+            setHwUploadForTesting("");
+            MediaPool::instance().clear();
+            std::map<FrameTime, Image> cpu;
+            for (const FrameTime t : {1, 7, 2, 0, 20}) cpu[t] = renderProgramFrame(p, s, t, cpuOptions);
+            for (const char* how : {"vulkan", "vulkan-multiplane"}) {
+                const QString what = QStringLiteral("%1 uploaded as %2").arg(name, how);
+                setHwUploadForTesting(how);
+                MediaPool::instance().clear();
+                // Drawn from the device's memory (or, on OpenGL, copied back after decoding), as the CPU draws it;
+                // forward, a seek back and one ahead.
+                for (const FrameTime t : {1, 7, 2, 0, 20}) {
+                    gpu::resetStats();
+                    const Image onGpu = renderProgramFrame(p, s, t, gpuOptions);
+                    const gpu::Stats st = gpu::stats();
+                    const QString at = what + QStringLiteral(", frame %1").arg(t);
+                    QVERIFY2(st.gpuFrames == 1 && st.gpuLayers == 1, qPrintable(at + ": not on the GPU: " + QString::fromStdString(st.lastFallback)));
+                    const double worst = worstOf(cpu[t], onGpu);
+                    QVERIFY2(worst <= 1.0 / 1023, qPrintable(at + QStringLiteral(": differs by %1").arg(worst) + where));
+                    if (mapped) {
+                        QVERIFY2(st.hwReadBacks == 0, qPrintable(at + QStringLiteral(": %1 read back: ").arg(st.hwReadBacks) + QString::fromStdString(st.lastHwFallback)));
+                        QVERIFY2(st.hwMapped == 1, qPrintable(at + ": not drawn from the device's memory"));
+                        // (an image a plane sampled where it is; one image of all of them copied plane by plane)
+                        QVERIFY2(st.hwGpuCopies == (std::string(how) == "vulkan" ? 0 : 1), qPrintable(at + QStringLiteral(": %1 copied on the GPU").arg(st.hwGpuCopies)));
+                    } else {
+                        QVERIFY2(st.hwMapped == 0 && st.hwGpuCopies == 0, qPrintable(at));
+                        if (std::string(how) == "vulkan") QVERIFY2(st.hwReadBacks >= 1, qPrintable(at + ": no hardware frame"));
+                    }
+                }
+                // The CPU path given the same hardware frames: each copied back once, as before.
+                MediaPool::instance().clear();
+                const long copies = hwFrameCopies();
+                QVERIFY2(worstOf(cpu[2], renderProgramFrame(p, s, 2, cpuOptions)) == 0, qPrintable(what + ": on the CPU"));
+                if (std::string(how) == "vulkan") QVERIFY2(hwFrameCopies() > copies, qPrintable(what + ": no copy on the CPU"));
+            }
+            if (fmt != AV_PIX_FMT_NV12) continue;
+            setHwUploadForTesting("vulkan");
+            // A mapping that fails: the frame copied back, drawn just the same, and why said.
+            gpu::refuseHardwareFramesForTesting(true);
+            MediaPool::instance().clear();
+            gpu::resetStats();
+            QVERIFY(worstOf(cpu[7], renderProgramFrame(p, s, 7, gpuOptions)) <= 1.0 / 1023);
+            if (mapped) {
+                QVERIFY(gpu::stats().hwMapped == 0 && gpu::stats().hwReadBacks == 1);
+                QVERIFY2(gpu::stats().lastHwFallback.find("copied back") != std::string::npos, gpu::stats().lastHwFallback.c_str());
+            }
+            gpu::refuseHardwareFramesForTesting(false);
+            // The frame cache evicting each frame as soon as it is drawn (its images let go only after the GPU is done).
+            MediaPool::instance().setFrameCacheBudget(1);
+            for (const FrameTime t : {0, 1, 2, 1, 20, 7}) {
+                gpu::resetStats();
+                QVERIFY2(worstOf(cpu[t], renderProgramFrame(p, s, t, gpuOptions)) <= 1.0 / 1023, qPrintable(QStringLiteral("evicted, frame %1").arg(t)));
+                if (mapped) QCOMPARE(gpu::stats().hwReadBacks, 0L);
+            }
+            MediaPool::instance().setFrameCacheBudget(size_t(1) << 30);
+            // Frames that outlive their decoder and the cache, held across a lost device; more than the cap of kept
+            // frames held at once (those after it in memory, copied back).
+            MediaPool::instance().clear();
+            std::vector<Frame16Ptr> held;
+            const double step = m.fps.valid() ? 1 / m.fps.toDouble() : 0.04;
+            for (int i = 0; i < 20; ++i) {
+                held.push_back(MediaPool::instance().videoFrame(path, i * step, 0, 0, false, true));
+                QVERIFY(held.back() && held.back()->planes);
+            }
+            int kept = 0;
+            for (const Frame16Ptr& f : held) kept += f->planes->hw != nullptr;
+            if (mapped) QVERIFY2(kept > 0 && kept <= kMaxKeptHwFrames, qPrintable(QString::number(kept)));
+            else QCOMPARE(kept, 0);
+            MediaPool::instance().clear();
+            gpu::loseDeviceForTesting();
+            for (const int i : {0, 19, 3}) {
+                gpu::Frame g;
+                g.width = W, g.height = H;
+                g.items.emplace_back();
+                g.items[0].a.frame = held[size_t(i)];
+                g.items[0].a.place.full = true;
+                Image onGpu;
+                gpu::resetStats();
+                QVERIFY2(gpu::execute(g, &onGpu), qPrintable(QStringLiteral("held frame %1 after the device was lost").arg(i)));
+                QVERIFY2(worstOf(toImage(*held[size_t(i)]), onGpu) <= 1.0 / 1023, qPrintable(QStringLiteral("held frame %1").arg(i)));
+                if (mapped && held[size_t(i)]->planes->hw) QCOMPARE(gpu::stats().hwMapped, 1L);
+            }
+            held.clear();
+            // And the device after it was lost: frames drawn from its memory again.
+            gpu::resetStats();
+            QVERIFY(worstOf(cpu[20], renderProgramFrame(p, s, 20, gpuOptions)) <= 1.0 / 1023);
+            if (mapped) QVERIFY(gpu::stats().hwMapped == 1 && gpu::stats().hwReadBacks == 0);
+            QCOMPARE(gpu::mappedHardware().find("vulkan") != std::string::npos, mapped);
+        }
     }
     void chromaAlikeAtEverySize() {
         // Sharp chroma, each sample its own: a high-quality frame at 99 % is the one at 100 % resized, and nothing else

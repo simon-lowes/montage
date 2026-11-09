@@ -144,9 +144,20 @@ struct Stats {
     long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
+    // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them
+    // copied plane by plane on the GPU first, a device copy, no read-back), and copied back to memory (media/HwAccel's
+    // hwFrameCopies: after decoding, for the CPU, or as the GPU could not map them), since resetStats.
+    long hwMapped = 0, hwGpuCopies = 0, hwReadBacks = 0;
+    std::string lastHwFallback;  // why the last hardware frame the GPU could not map was copied back
 };
 Stats stats();
 void resetStats();
+// The decoding devices whose frames the GPU takes as they are ("vulkan, vaapi"; empty for none).
+std::string mappedHardware();
+// Tests: the device lost (simulated: the next frame finds it so and sets it up again), and hardware frames refused
+// (each copied back, as a mapping that fails is).
+void loseDeviceForTesting();
+void refuseHardwareFramesForTesting(bool refuse);
 void countFallback(const std::string& why);  // (render/Compositor's bookkeeping)
 void countLayer(bool onGpu, const std::string& how = {});  // (and with MONTAGE_GPU_LOG, says how it was drawn)
 

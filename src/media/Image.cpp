@@ -163,21 +163,31 @@ void eachYcbcrPixel(const YcbcrPlanes& p, const Put& put) {
 
 }  // namespace
 
-std::vector<float> ycbcrToRgba(const YcbcrPlanes& p, int w, int h) {
-    const int W = p.width, H = p.height;
+std::vector<float> ycbcrToRgba(const YcbcrPlanes& planes, int w, int h) {
+    const int W = planes.width, H = planes.height;
     std::vector<float> rgba(size_t(W) * size_t(H) * 4);
-    eachYcbcrPixel(p, [&](int x, int y, float r, float g, float b) {
-        float* o = &rgba[(size_t(y) * size_t(W) + size_t(x)) * 4];
-        o[0] = r, o[1] = g, o[2] = b, o[3] = 1.0f;
-    });
+    const YcbcrPlanes* p = planesInMemory(planes);
+    if (!p) {  // (a hardware frame that could not be copied back: black)
+        for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 1.0f;
+    } else {
+        eachYcbcrPixel(*p, [&](int x, int y, float r, float g, float b) {
+            float* o = &rgba[(size_t(y) * size_t(W) + size_t(x)) * 4];
+            o[0] = r, o[1] = g, o[2] = b, o[3] = 1.0f;
+        });
+    }
     if (w <= 0) w = W;
     if (h <= 0) h = H;
     return w == W && h == H ? rgba : resampleRgba(rgba.data(), W, H, w, h);
 }
 
-void ycbcrToRgba16(const YcbcrPlanes& p, uint16_t* dst) {
-    eachYcbcrPixel(p, [&](int x, int y, float r, float g, float b) {
-        uint16_t* o = dst + (size_t(y) * size_t(p.width) + size_t(x)) * 4;
+void ycbcrToRgba16(const YcbcrPlanes& planes, uint16_t* dst) {
+    const YcbcrPlanes* p = planesInMemory(planes);
+    if (!p) {
+        for (size_t i = 0; i < size_t(planes.width) * size_t(planes.height); ++i) dst[i * 4] = dst[i * 4 + 1] = dst[i * 4 + 2] = 0, dst[i * 4 + 3] = 65535;
+        return;
+    }
+    eachYcbcrPixel(*p, [&](int x, int y, float r, float g, float b) {
+        uint16_t* o = dst + (size_t(y) * size_t(p->width) + size_t(x)) * 4;
         o[0] = uint16_t(r * 65535.0f + 0.5f), o[1] = uint16_t(g * 65535.0f + 0.5f), o[2] = uint16_t(b * 65535.0f + 0.5f);
         o[3] = 65535;
     });

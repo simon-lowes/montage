@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "Processing.h"
+#include "media/HwAccel.h"
 
 namespace montage::gpu {
 
@@ -14,6 +15,7 @@ namespace {
 
 std::mutex gStatsMutex;
 Stats gStats;
+long gCopiesBefore = 0;  // (media/HwAccel's count of hardware frames copied back, at resetStats)
 
 bool logFallbacks() {
     static const bool on = [] {
@@ -27,12 +29,15 @@ bool logFallbacks() {
 
 Stats stats() {
     std::lock_guard lock(gStatsMutex);
-    return gStats;
+    Stats s = gStats;
+    s.hwReadBacks = hwFrameCopies() - gCopiesBefore;
+    return s;
 }
 
 void resetStats() {
     std::lock_guard lock(gStatsMutex);
     gStats = {};
+    gCopiesBefore = hwFrameCopies();
 }
 
 void countFallback(const std::string& why) {
@@ -72,6 +77,9 @@ bool takesPlanes() { return false; }
 bool takesShaders(const std::string&) { return false; }
 void shutdown() {}
 bool execute(const Frame&, Image*, QImage*) { return false; }
+std::string mappedHardware() { return {}; }
+void loseDeviceForTesting() {}
+void refuseHardwareFramesForTesting(bool) {}
 
 }  // namespace montage::gpu
 
@@ -87,6 +95,7 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 #define MONTAGE_GPU_VULKAN 1
 #include <QVulkanInstance>
 #endif
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -99,11 +108,15 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 #endif
 #include <thread>
 
+#include "GpuHardware.h"
+
 namespace montage::gpu {
 
 namespace {
 
 #include "shaders/GpuShaders.inc"
+
+std::atomic<bool> gRefuseHw{false};  // (tests: refuseHardwareFramesForTesting)
 
 QShader shader(const unsigned char* data, size_t size) {
     return QShader::fromSerialized(QByteArray::fromRawData(reinterpret_cast<const char*>(data), qsizetype(size)));
@@ -145,6 +158,13 @@ public:
 
     bool draw(const Frame& frame, Image* out, QImage* out8);
     long filterPasses = 0, mixPasses = 0;  // (the last frame's)
+    long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
+    std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
+    std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
+    std::string mapped() const {
+        std::lock_guard lock(brokenMutex_);
+        return mappedNames_;
+    }
 
 private:
     void loop();
@@ -177,6 +197,7 @@ private:
     void dropProgram(Program& prog, bool later = false);
     QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas = nullptr);
     void endFrame();
+    bool recover();  // (the device lost: everything made again, on FFmpeg's device again when shared, else on a new one)
 
     std::thread thread_;
     std::mutex queueMutex_;
@@ -196,9 +217,21 @@ private:
     int maxTexture_ = 0;
     bool planes_ = false;  // 8 and 16-bit one and two-channel textures, for Y′CbCr planes
     bool shaders_ = false;  // shaders compiled while running, with float textures sampled between texels
+    bool shareVulkan_ = true, shareD3D11_ = true;  // (FFmpeg's device tried for the compositor's, until it fails)
+#ifdef Q_OS_WIN
+    QRhiD3D11NativeHandles d3d11Import_;
+#endif
 
     QRhi* rhi_ = nullptr;
     QRhiCommandBuffer* cb_ = nullptr;
+    // FFmpeg's device, when the compositor runs on it (render/GpuHardware: Vulkan, Direct3D 11), and what maps
+    // decoders' hardware frames into the RHI.
+    AVBufferRef* shared_ = nullptr;
+#ifdef MONTAGE_GPU_VULKAN
+    QRhiVulkanNativeHandles vulkanImport_;
+#endif
+    std::unique_ptr<hw::Mapper> mapper_;
+    std::string mappedNames_;  // (brokenMutex_)
     QRhiSampler* sampler_ = nullptr;
     QRhiSampler* linear_ = nullptr;  // (shader steps' textures sampled between texels)
     std::map<std::string, Program> programs_;
@@ -303,8 +336,16 @@ bool Device::launch() {
             return false;
         }
         vulkan_ = new QVulkanInstance;
-        vulkan_->setExtensions(QRhiVulkanInitParams::preferredInstanceExtensions());
-        vulkan_->setApiVersion(vulkan_->supportedApiVersion());
+        // On FFmpeg's own device where there is one, so that decoders' Vulkan frames are on it (render/GpuHardware);
+        // its instance is FFmpeg's (of Vulkan 1.3).
+        void* instance = nullptr;
+        if (shareVulkan_ && (shared_ = hw::sharedVulkanDevice(&instance, &vulkanImport_))) {
+            vulkan_->setVkInstance(VkInstance(instance));
+            vulkan_->setApiVersion(std::min(vulkan_->supportedApiVersion(), QVersionNumber(1, 3)));
+        } else {
+            vulkan_->setExtensions(QRhiVulkanInitParams::preferredInstanceExtensions());
+            vulkan_->setApiVersion(vulkan_->supportedApiVersion());
+        }
         if (!vulkan_->create()) {
             delete vulkan_;
             vulkan_ = nullptr;
@@ -326,7 +367,13 @@ bool Device::launch() {
     thread_ = std::thread([this] { loop(); });
     const bool ok = run([this] { return create(); });
     if (!ok) {
+        const bool shared = shared_ && backend_ == QRhi::Vulkan;
         stop();
+        if (shared) {  // (FFmpeg's device would not do: one of the compositor's own, as before)
+            shareVulkan_ = false;
+            problem_.clear();
+            return launch();
+        }
         if (problem_.empty()) problem_ = "no graphics device";
     }
     return ok;
@@ -352,6 +399,7 @@ void Device::stop() {
     delete vulkan_;
     vulkan_ = nullptr;
 #endif
+    av_buffer_unref(&shared_);
     ready_ = false;
 }
 
@@ -383,7 +431,7 @@ bool Device::create() {
         case QRhi::Vulkan: {
             QRhiVulkanInitParams params;
             params.inst = vulkan_;
-            rhi_ = QRhi::create(QRhi::Vulkan, &params, flags);
+            rhi_ = QRhi::create(QRhi::Vulkan, &params, flags, shared_ ? &vulkanImport_ : nullptr);
             break;
         }
 #endif
@@ -397,7 +445,14 @@ bool Device::create() {
 #if defined(Q_OS_WIN)
         case QRhi::D3D11: {
             QRhiD3D11InitParams params;
-            rhi_ = QRhi::create(QRhi::D3D11, &params, flags);
+            // On FFmpeg's D3D11VA device where it can be, so decoders' textures are on it (render/GpuHardware).
+            if (!shared_ && shareD3D11_) shared_ = hw::sharedD3D11Device(&d3d11Import_);
+            if (shared_) rhi_ = QRhi::create(QRhi::D3D11, &params, flags, &d3d11Import_);
+            if (!rhi_) {
+                av_buffer_unref(&shared_);
+                shareD3D11_ = false;
+                rhi_ = QRhi::create(QRhi::D3D11, &params, flags);
+            }
             break;
         }
         case QRhi::D3D12: {
@@ -483,10 +538,37 @@ bool Device::create() {
         problem_ = "the graphics device cannot build the compositor's shaders";
         return false;
     }
+    // Hardware frames: the decoders of the devices whose frames map into this one keep them in the device's memory.
+    mapper_ = planes_ ? hw::Mapper::make(rhi_, shared_) : nullptr;
+    const std::vector<AVHWDeviceType> types = mapper_ ? mapper_->types() : std::vector<AVHWDeviceType>{};
+    std::string names;
+    for (AVHWDeviceType t : types)
+        if (const char* n = av_hwdevice_get_type_name(t)) names += (names.empty() ? "" : ", ") + std::string(n);
+    {
+        std::lock_guard lock(brokenMutex_);
+        mappedNames_ = names;
+    }
+    setHwFramesMapped(types);
     return true;
 }
 
+bool Device::recover() {
+    destroy();
+    failed_ = false;
+    if (create()) return true;
+    destroy();  // (nothing half made left to draw with: frames go to the CPU)
+    problem_ = "the graphics device was lost and could not be set up again";
+    return false;
+}
+
 void Device::destroy() {
+    if (mapper_) mapper_->endFrame();
+    mapper_.reset();
+    if (rhi_) setHwFramesMapped({});
+    {
+        std::lock_guard lock(brokenMutex_);
+        mappedNames_.clear();
+    }
     for (auto& [key, prog] : programs_) dropProgram(prog);
     programs_.clear();
     delete linear_, linear_ = nullptr;
@@ -506,7 +588,15 @@ void Device::destroy() {
     delete dummy2d_, delete dummy3d_, delete dummy16_, delete dummyR_, delete rpFloatTex_, delete rp8Tex_;
     dummy2d_ = dummy3d_ = dummy16_ = dummyR_ = rpFloatTex_ = rp8Tex_ = nullptr;
     delete sampler_, sampler_ = nullptr;
-    delete rhi_, rhi_ = nullptr;
+    {
+        // (On a shared device its queues are FFmpeg's too.)
+        std::unique_lock<std::recursive_mutex> queues;
+        if (shared_ && backend_ == QRhi::Vulkan) queues = std::unique_lock(vulkanQueueMutex());
+        const bool d3d11 = shared_ && backend_ == QRhi::D3D11;
+        if (d3d11) hw::lockSharedD3D11(true);
+        delete rhi_, rhi_ = nullptr;
+        if (d3d11) hw::lockSharedD3D11(false);
+    }
 }
 
 QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTarget) {
@@ -778,16 +868,42 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         if (!canvas) return nullptr;
         cur = canvas;
     } else if (l.frame && l.frame->planes) {
-        // Y′CbCr as decoded: each plane uploaded as it is, converted (24), resampled to the frame's size where that
-        // differs (25 along rows, then columns) and taken in as a decoded frame (24 itself, or 26).
-        const YcbcrPlanes& yc = *l.frame->planes;
+        // Y′CbCr as decoded: each plane uploaded as it is (or, a hardware frame's, mapped from the decoding device's
+        // memory: render/GpuHardware), converted (24), resampled to the frame's size where that differs (25 along
+        // rows, then columns) and taken in as a decoded frame (24 itself, or 26).
+        const YcbcrPlanes* inMemory = l.frame->planes.get();
+        hw::Planes mapped;
+        if (inMemory->hw) {
+            std::string why;
+            if (gRefuseHw) why = "refused (for testing)";
+            else if (!mapper_) why = "this device maps no hardware frames";
+            if (why.empty() && mapper_->map(*inMemory, cb_, mapped, &why)) {
+                ++hwMapped;
+                if (mapped.copied) ++hwGpuCopies;
+                if (logFallbacks()) std::fprintf(stderr, "montage gpu: hardware frame %s\n", mapped.how.c_str());
+            } else {
+                // Copied back, as before (and counted there: media/HwAccel). (What a mapping made before it failed
+                // is the mapper's, let go with the frame.)
+                mapped = {};
+                hwFallback = std::string("a hardware frame of ") + inMemory->hwType + " copied back: " + (why.empty() ? "it could not be mapped" : why);
+                if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s\n", hwFallback.c_str());
+                if (!(inMemory = planesInMemory(*inMemory))) return nullptr;
+            }
+        }
+        const YcbcrPlanes& yc = *inMemory;
         const int W = l.frame->width, H = l.frame->height, cw = yc.chromaWidth(), ch = yc.chromaHeight();
         const T::Format one = yc.wide ? T::R16 : T::R8, two = yc.wide ? T::RG16 : T::RG8;
         const int sample = yc.wide ? 2 : 1;
-        QRhiTexture* planes[3] = {texture(one, yc.width, yc.height, false), texture(yc.interleaved ? two : one, cw, ch, false),
-                                  yc.interleaved ? nullptr : texture(one, cw, ch, false)};
+        QRhiTexture* planes[3] = {};
+        if (mapped.tex[0]) {
+            std::copy(mapped.tex, mapped.tex + 3, planes);
+        } else {
+            planes[0] = texture(one, yc.width, yc.height, false);
+            planes[1] = texture(yc.interleaved ? two : one, cw, ch, false);
+            planes[2] = yc.interleaved ? nullptr : texture(one, cw, ch, false);
+        }
         if (!planes[0] || !planes[1] || (!yc.interleaved && !planes[2])) return nullptr;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 3 && !mapped.tex[0]; ++i) {
             if (!planes[i]) continue;
             const int pw = i ? cw : yc.width, ph = i ? ch : yc.height;
             const quint32 row = quint32(pw * sample * (i == 1 && yc.interleaved ? 2 : 1));
@@ -813,7 +929,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         pass(colorPs_, made, u, textures, uniforms(u, p));
         u = rhi_->nextResourceUpdateBatch();
         for (QRhiTexture* t : planes)
-            if (t) release(t);
+            if (t && !mapped.tex[0]) release(t);  // (mapped ones are the mapper's, until the frame ends)
         if (sized) {
             cur = made;
         } else {
@@ -1166,6 +1282,12 @@ void Device::endFrame() {
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
     filterPasses = mixPasses = 0;
+    hwMapped = hwGpuCopies = 0;
+    hwFallback.clear();
+    if (!rhi_) return false;  // (lost, and not set up again)
+    // A device lost (or, for tests, said to be): set up again on the same device, with what the frame cache holds still to
+    // draw from.
+    if ((lose.exchange(false) || rhi_->isDeviceLost()) && !recover()) return false;
     const int W = frame.width, H = frame.height;
     const int maxSize = maxTexture_;
     if (W <= 0 || H <= 0 || W > maxSize || H > maxSize) return false;
@@ -1174,7 +1296,24 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
             if (l && ((l->frame && (l->frame->planes ? std::max(l->frame->planes->width, l->frame->width) : l->frame->width * 2) > maxSize) ||
                       (l->frame && l->frame->planes && l->frame->planes->height > maxSize) || l->image.width > maxSize || l->image.height > maxSize))
                 return false;
-    if (rhi_->beginOffscreenFrame(&cb_) != QRhi::FrameOpSuccess) return false;
+    // (On FFmpeg's D3D11 device its decoders wait while a frame is drawn: they share its context.)
+    struct D3D11Turn {
+        bool on;
+        explicit D3D11Turn(bool on) : on(on) {
+            if (on) hw::lockSharedD3D11(true);
+        }
+        ~D3D11Turn() {
+            if (on) hw::lockSharedD3D11(false);
+        }
+    } turn(shared_ && backend_ == QRhi::D3D11);
+    QRhi::FrameOpResult begun = rhi_->beginOffscreenFrame(&cb_);
+    if (begun == QRhi::FrameOpDeviceLost && recover()) begun = rhi_->beginOffscreenFrame(&cb_);
+    if (begun == QRhi::FrameOpDeviceLost) {
+        // (Lost again at once: FFmpeg's shared device, say, which stays lost. Frames go to the CPU from now on.)
+        destroy();
+        problem_ = "the graphics device was lost and could not be set up again";
+    }
+    if (begun != QRhi::FrameOpSuccess) return false;
     bool ok = true;
     QRhiResourceUpdateBatch* u = rhi_->nextResourceUpdateBatch();
     QRhiTexture* canvas = nullptr;
@@ -1289,7 +1428,12 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         }
     }
     if (u) u->release();
-    if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
+    {
+        std::unique_lock<std::recursive_mutex> queues;  // (on FFmpeg's Vulkan device, its queues are shared)
+        if (shared_ && backend_ == QRhi::Vulkan) queues = std::unique_lock(vulkanQueueMutex());
+        if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
+    }
+    if (mapper_) mapper_->endFrame();  // (the frame has finished on the GPU: its hardware frames given back)
     if (!ok)
         for (const Lut3D* l : lutsNew_)
             if (auto it = luts_.find(l); it != luts_.end()) {
@@ -1374,20 +1518,37 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     std::shared_lock lock(gDeviceMutex);
     if (!gDevice || !gDevice->ready()) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0;
+    std::string hwFallback;
     const bool ok = d->run([&] {
         const bool drawn = d->draw(frame, out, out8);
         filters = d->filterPasses, mixes = d->mixPasses;
+        mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback;
         return drawn;
     });
+    std::lock_guard statsLock(gStatsMutex);
     if (ok) {
-        std::lock_guard statsLock(gStatsMutex);
         ++gStats.gpuFrames;
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
     }
+    gStats.hwMapped += mapped;
+    gStats.hwGpuCopies += copied;
+    if (!hwFallback.empty()) gStats.lastHwFallback = hwFallback;
     return ok;
 }
+
+std::string mappedHardware() {
+    std::shared_lock lock(gDeviceMutex);
+    return gDevice && gDevice->ready() ? gDevice->mapped() : std::string();
+}
+
+void loseDeviceForTesting() {
+    std::shared_lock lock(gDeviceMutex);
+    if (gDevice) gDevice->lose = true;
+}
+
+void refuseHardwareFramesForTesting(bool refuse) { gRefuseHw = refuse; }
 
 }  // namespace montage::gpu
 

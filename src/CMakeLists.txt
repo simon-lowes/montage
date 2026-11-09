@@ -123,7 +123,7 @@ add_library(montage_engine STATIC
   media/ValueMap.h
   media/Rife.h media/Rife.cpp
   media/VideoDepth.h media/VideoDepth.cpp
-  media/HwAccel.h media/HwAccel.cpp
+  media/HwAccel.h media/HwAccel.cpp media/HwVulkan.h
   media/MediaPool.h media/MediaPool.cpp
   media/Relink.h media/Relink.cpp
   media/Analysis.h media/Analysis.cpp
@@ -378,6 +378,11 @@ if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)
   if(TARGET Qt6::GuiPrivate)
     target_link_libraries(montage_engine PRIVATE Qt6::GuiPrivate)
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_GPU)
+    # Hardware-decoded frames mapped into the compositor's API (Vulkan, EGL, Metal through CoreVideo, Direct3D 11).
+    target_sources(montage_engine PRIVATE render/GpuHardware.h render/GpuHardware.cpp)
+    if(APPLE)
+      target_link_libraries(montage_engine PRIVATE "-framework CoreVideo")
+    endif()
     message(STATUS "GPU compositor: on (Qt ${Qt6_VERSION})")
     # Shaders compiled while running (OpenColorIO's), with Qt Shader Tools where it is installed (QShaderBaker is in
     # its private module, as QRhi is in GUI's).

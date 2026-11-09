@@ -16,6 +16,7 @@ struct AVFormatContext;
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
+struct AVBufferRef;
 struct SwsContext;
 
 namespace montage {
@@ -132,6 +133,16 @@ private:
     bool hwBroken_ = false;
     std::string hwName_;
     AVFrame* hwTransfer_ = nullptr;
+    // Hardware frames kept in the device's memory for the GPU (YcbcrPlanes::hw) that are still held (the frame cache's),
+    // counted down as each goes; past kMaxKeptHwFrames frames are copied back instead.
+    std::shared_ptr<std::atomic<int>> hwKept_ = std::make_shared<std::atomic<int>>(0);
+    bool hwKeep_ = false;  // (opened while the GPU mapped its device's frames: kept, its pool made larger for them)
+    // (Tests: software frames uploaded to a device's frames, media/HwAccel's setHwUploadForTesting.)
+    std::string hwUpload_;
+    AVBufferRef* hwUploadFrames_ = nullptr;
+    bool uploadForTesting(AVFrame* f);
+    // `f`, or when it is a hardware frame its copy in memory (in hwTransfer_, counted). Null if it cannot be copied.
+    const AVFrame* inMemory(const AVFrame* f);
     // Interpret Footage (core/Interpretation.h): file seconds per media second, pixel aspect (0 = the file's), how alpha
     // and fields are read.
     double timeScale_ = 1;
@@ -236,6 +247,10 @@ bool deinterlaceFrame(AVFrame* f);
 // bits, little-endian, three planes or Cb and Cr alternating in a second, no alpha; 4:2:0, 4:2:2 or 4:4:4), with its
 // matrix, range and chroma siting; null otherwise.
 std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f);
+// A hardware frame's planes as its device holds them (YcbcrPlanes::hw, held by a reference to the frame): the layout of
+// its frames' format in memory, as ycbcrPlanesOf has it; null when that is not one the GPU converts. `kept` counts the
+// frame while it is held.
+std::shared_ptr<const YcbcrPlanes> hwPlanesOf(const AVFrame* f, std::shared_ptr<std::atomic<int>> kept = {});
 // 0 progressive, 1 top field first, 2 bottom field first.
 int fieldDominance(const AVFrame* f);
 void setFieldDominance(AVFrame* f, int dominance);

@@ -2891,7 +2891,8 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
             *why = "an adjustment layer, on the canvas drawn so far";
         else if (planes)
             *why = "Y′CbCr " + std::string(planes->log2ChromaH ? "4:2:0" : planes->log2ChromaW ? "4:2:2" : "4:4:4") + " " +
-                   std::to_string(planes->bits) + "-bit, converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
+                   std::to_string(planes->bits) + "-bit" + (planes->hw ? std::string(" in ") + planes->hwType + "'s memory" : std::string()) +
+                   ", converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
         else *why = "a picture made on the CPU before its effects";
     }

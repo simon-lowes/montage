@@ -53,6 +53,7 @@ extern "C" {
 }
 
 #include "HwAccel.h"
+#include "HwVulkan.h"
 #include "render/AdaptiveHdr.h"
 #include "render/ColorSpace.h"
 #include "render/HdrStill.h"
@@ -1040,6 +1041,7 @@ void VideoDecoder::freeCodec() {
     if (hwSlot_) releaseHwDecoderSlot();
     hwSlot_ = false;
     hwPixFmt_ = -1;
+    hwKeep_ = false;
     hwName_.clear();
 }
 
@@ -1051,6 +1053,7 @@ void VideoDecoder::close() {
     av_frame_free(&cur_);
     av_frame_free(&next_);
     av_frame_free(&hwTransfer_);
+    av_buffer_unref(&hwUploadFrames_);
     av_packet_free(&pkt_);
     freeCodec();
     hwBroken_ = false;
@@ -1500,14 +1503,24 @@ bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
         for (int i = 0; (config = avcodec_get_hw_config(codec, i)); ++i)
             if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && config->device_type == type) break;
         if (!config) continue;
+        // (Vulkan for the codecs Vulkan Video decodes, not FFmpeg's compute decoders of others.)
+        const AVCodecID id = st->codecpar->codec_id;
+        if (type == AV_HWDEVICE_TYPE_VULKAN && id != AV_CODEC_ID_H264 && id != AV_CODEC_ID_HEVC && id != AV_CODEC_ID_AV1 && id != AV_CODEC_ID_VP9)
+            continue;
         AVBufferRef* device = hwDevice(type);
-        if (!device || !acquireHwDecoderSlot()) continue;
+        if (!device || !hwDeviceDecodes(type, device) || !acquireHwDecoderSlot()) continue;
         hwSlot_ = true;
         ctx_->hw_device_ctx = av_buffer_ref(device);
         hwPixFmt_ = config->pix_fmt;
         hwName_ = name;
+        // Frames kept for the GPU stay out of the decoder's pool while the frame cache holds them: fixed pools get
+        // that many more surfaces.
+        hwKeep_ = hwFramesMapped(type);
+        if (hwKeep_) ctx_->extra_hw_frames = kMaxKeptHwFrames + 2;
         break;
     }
+    // (Tests: decoded in software, then uploaded to a device's frames as a hardware decoder would hand them over.)
+    hwUpload_ = hwPixFmt_ < 0 && tryHardware && !proResRaw_ ? hwUploadForTesting() : std::string();
     if (hwPixFmt_ >= 0) {
         ctx_->opaque = this;
         ctx_->get_format = reinterpret_cast<AVPixelFormat (*)(AVCodecContext*, const AVPixelFormat*)>(&VideoDecoder::pickFormat);
@@ -1560,17 +1573,24 @@ int VideoDecoder::pickFormat(AVCodecContext* ctx, const int* formats) {
 bool VideoDecoder::decodeNext(AVFrame* into) {
     for (;;) {
         int rc = avcodec_receive_frame(ctx_, into);
-        if (rc == 0 && hwPixFmt_ >= 0 && into->format == hwPixFmt_) {
-            // Copy the hardware frame to memory for the CPU pipeline.
-            if (!hwTransfer_) hwTransfer_ = av_frame_alloc();
-            av_frame_unref(hwTransfer_);
-            if (av_hwframe_transfer_data(hwTransfer_, into, 0) < 0 || av_frame_copy_props(hwTransfer_, into) < 0) {
-                hwBroken_ = true;  // frameAt reopens the stream in software
+        if (rc == 0 && !hwUpload_.empty() && !uploadForTesting(into)) hwUpload_.clear();  // (as the device could not)
+        if (rc == 0 && into->hw_frames_ctx) {
+            // Kept in the device's memory where the GPU compositor takes this device's frames as they are (convert
+            // copies it back when it needs it in memory after all); else copied to memory for the CPU pipeline.
+            const auto* fc = reinterpret_cast<const AVHWFramesContext*>(into->hw_frames_ctx->data);
+            // (A decoder's own frames only if it was opened so, its pool then made larger; uploads' pools grow.)
+            if (!hwFramesMapped(fc->device_ctx->type) || (hwPixFmt_ >= 0 && !hwKeep_)) {
+                if (!hwTransfer_) hwTransfer_ = av_frame_alloc();
+                av_frame_unref(hwTransfer_);
+                if (av_hwframe_transfer_data(hwTransfer_, into, 0) < 0 || av_frame_copy_props(hwTransfer_, into) < 0) {
+                    hwBroken_ = true;  // frameAt reopens the stream in software
+                    av_frame_unref(into);
+                    return false;
+                }
+                countHwFrameCopy();
                 av_frame_unref(into);
-                return false;
+                av_frame_move_ref(into, hwTransfer_);
             }
-            av_frame_unref(into);
-            av_frame_move_ref(into, hwTransfer_);
         }
         // (IMF ProRes in full range, QE.2: its descriptor says so, the frames cannot)
         if (rc == 0 && imfFullRange_) into->color_range = AVCOL_RANGE_JPEG;
@@ -1766,33 +1786,44 @@ void chromaSiting(const AVFrame* f, int log2W, int log2H, float& x, float& y) {
 
 }  // namespace
 
-std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f) {
+namespace {
+
+// The planes' layout `f` has in `format` (its own, or a hardware frame's in memory), with its matrix, range and chroma
+// siting, into `p`; false when it is not one the GPU converts.
+bool ycbcrLayout(const AVFrame* f, AVPixelFormat format, YcbcrPlanes& p) {
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
-    const AVPixelFormat fmt = dejpeg(AVPixelFormat(f->format), fullRange);
+    const AVPixelFormat fmt = dejpeg(format, fullRange);
     const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fmt);
-    if (!d || d->nb_components != 3 || f->width <= 0 || f->height <= 0 || !f->buf[0] ||
+    if (!d || d->nb_components != 3 || f->width <= 0 || f->height <= 0 ||
         (d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_BITSTREAM |
                      AV_PIX_FMT_FLAG_FLOAT | AV_PIX_FMT_FLAG_ALPHA)) ||
         d->log2_chroma_w > 1 || d->log2_chroma_h > 1 || (d->log2_chroma_h && !d->log2_chroma_w))
-        return nullptr;
+        return false;
     const AVComponentDescriptor &Y = d->comp[0], &U = d->comp[1], &V = d->comp[2];
     const int bits = Y.depth;
-    if (bits < 8 || bits > 16 || U.depth != bits || V.depth != bits || Y.plane != 0 || Y.offset != 0) return nullptr;
-    auto p = std::make_shared<YcbcrPlanes>();
-    p->wide = Y.step == 2;
-    if (Y.step != (p->wide ? 2 : 1) || (!p->wide && bits != 8) || Y.shift != U.shift || Y.shift != V.shift) return nullptr;
+    if (bits < 8 || bits > 16 || U.depth != bits || V.depth != bits || Y.plane != 0 || Y.offset != 0) return false;
+    p.wide = Y.step == 2;
+    if (Y.step != (p.wide ? 2 : 1) || (!p.wide && bits != 8) || Y.shift != U.shift || Y.shift != V.shift) return false;
     if (U.plane == 1 && V.plane == 2 && U.step == Y.step && V.step == Y.step && U.offset == 0 && V.offset == 0) {
-        p->interleaved = false;
+        p.interleaved = false;
     } else if (U.plane == 1 && V.plane == 1 && U.step == Y.step * 2 && V.step == Y.step * 2 && U.offset == 0 && V.offset == Y.step) {
-        p->interleaved = true;  // (NV12, P010; NV21's Cr first is left to the scaler)
+        p.interleaved = true;  // (NV12, P010; NV21's Cr first is left to the scaler)
     } else {
-        return nullptr;
+        return false;
     }
-    p->width = f->width, p->height = f->height, p->bits = bits, p->shift = Y.shift;
-    p->log2ChromaW = d->log2_chroma_w, p->log2ChromaH = d->log2_chroma_h;
-    p->fullRange = fullRange;
-    ycbcrMatrix(f, p->kr, p->kb);
-    chromaSiting(f, p->log2ChromaW, p->log2ChromaH, p->chromaX, p->chromaY);
+    p.width = f->width, p.height = f->height, p.bits = bits, p.shift = Y.shift;
+    p.log2ChromaW = d->log2_chroma_w, p.log2ChromaH = d->log2_chroma_h;
+    p.fullRange = fullRange;
+    ycbcrMatrix(f, p.kr, p.kb);
+    chromaSiting(f, p.log2ChromaW, p.log2ChromaH, p.chromaX, p.chromaY);
+    return true;
+}
+
+}  // namespace
+
+std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f) {
+    auto p = std::make_shared<YcbcrPlanes>();
+    if (!f->buf[0] || !ycbcrLayout(f, AVPixelFormat(f->format), *p)) return nullptr;
     std::shared_ptr<AVFrame> held(av_frame_clone(f), [](AVFrame* fr) { av_frame_free(&fr); });
     if (!held) return nullptr;
     for (int i = 0; i < (p->interleaved ? 2 : 3); ++i) {
@@ -1806,6 +1837,99 @@ std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f) {
     for (int i = 0; i < held->nb_extended_buf; ++i)
         if (held->extended_buf[i]) p->heldBytes += held->extended_buf[i]->size;
     return p;
+}
+
+std::shared_ptr<const YcbcrPlanes> hwPlanesOf(const AVFrame* f, std::shared_ptr<std::atomic<int>> kept) {
+    if (!f->hw_frames_ctx) return nullptr;
+    const auto* fc = reinterpret_cast<const AVHWFramesContext*>(f->hw_frames_ctx->data);
+    auto p = std::make_shared<YcbcrPlanes>();
+    if (!ycbcrLayout(f, fc->sw_format, *p)) return nullptr;
+    AVFrame* clone = av_frame_clone(f);
+    if (!clone) return nullptr;
+    if (kept) ++*kept;
+    p->hw = std::shared_ptr<const AVFrame>(clone, [kept](const AVFrame* fr) {
+        AVFrame* g = const_cast<AVFrame*>(fr);
+        av_frame_free(&g);
+        if (kept) --*kept;
+    });
+    p->hwType = av_hwdevice_get_type_name(fc->device_ctx->type);
+    if (!p->hwType) p->hwType = "";
+    p->copied = std::make_shared<YcbcrPlanes::Copied>();
+    return p;
+}
+
+const YcbcrPlanes* planesInMemory(const YcbcrPlanes& p) {
+    if (!p.hw) return &p;
+    if (!p.copied) return nullptr;
+    std::lock_guard lock(p.copied->mutex);
+    if (!p.copied->tried) {
+        p.copied->tried = true;
+        const auto* fc = reinterpret_cast<const AVHWFramesContext*>(p.hw->hw_frames_ctx->data);
+        std::shared_ptr<AVFrame> sw(av_frame_alloc(), [](AVFrame* fr) { av_frame_free(&fr); });
+        if (sw) sw->format = fc->sw_format;
+        if (sw && av_hwframe_transfer_data(sw.get(), p.hw.get(), 0) >= 0 && av_frame_copy_props(sw.get(), p.hw.get()) >= 0) {
+            countHwFrameCopy();
+            p.copied->planes = ycbcrPlanesOf(sw.get());
+        }
+    }
+    return p.copied->planes.get();
+}
+
+const AVFrame* VideoDecoder::inMemory(const AVFrame* f) {
+    if (!f->hw_frames_ctx) return f;
+    if (!hwTransfer_) hwTransfer_ = av_frame_alloc();
+    if (!hwTransfer_) return nullptr;
+    av_frame_unref(hwTransfer_);
+    if (av_hwframe_transfer_data(hwTransfer_, f, 0) < 0 || av_frame_copy_props(hwTransfer_, f) < 0) {
+        hwBroken_ = true;  // frameAt reopens the stream in software
+        return nullptr;
+    }
+    countHwFrameCopy();
+    return hwTransfer_;
+}
+
+bool VideoDecoder::uploadForTesting(AVFrame* f) {
+    if (f->hw_frames_ctx) return true;
+    const bool multiplane = hwUpload_ == "vulkan-multiplane";
+    if (hwUpload_ != "vulkan" && !multiplane) return false;
+    AVBufferRef* device = hwDevice(AV_HWDEVICE_TYPE_VULKAN);
+    if (!device) return false;
+    if (hwUploadFrames_) {  // (one set of frames for the stream's size and format)
+        const auto* fc = reinterpret_cast<const AVHWFramesContext*>(hwUploadFrames_->data);
+        if (fc->width != f->width || fc->height != f->height || fc->sw_format != f->format) av_buffer_unref(&hwUploadFrames_);
+    }
+    if (!hwUploadFrames_) {
+        AVBufferRef* ref = av_hwframe_ctx_alloc(device);
+        if (!ref) return false;
+        auto* fc = reinterpret_cast<AVHWFramesContext*>(ref->data);
+        fc->format = AV_PIX_FMT_VULKAN;
+        fc->sw_format = AVPixelFormat(f->format);
+        fc->width = f->width, fc->height = f->height;
+#ifdef MONTAGE_HW_VULKAN
+        if (!multiplane) static_cast<AVVulkanFramesContext*>(fc->hwctx)->flags = AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE;
+#endif
+        if (av_hwframe_ctx_init(ref) < 0) {
+            av_buffer_unref(&ref);
+            return false;
+        }
+        hwUploadFrames_ = ref;
+    }
+    AVFrame* hw = av_frame_alloc();
+    if (!hw || av_hwframe_get_buffer(hwUploadFrames_, hw, 0) < 0 || av_hwframe_transfer_data(hw, f, 0) < 0 || av_frame_copy_props(hw, f) < 0) {
+        av_frame_free(&hw);
+        return false;
+    }
+#ifdef MONTAGE_HW_VULKAN
+    // (FFmpeg's upload may still be reading the decoded frame, which the decoder reuses: done before it goes.)
+    if (!vulkanFrameWait(hw, uint64_t(5) * 1000000000)) {
+        av_frame_free(&hw);
+        return false;
+    }
+#endif
+    av_frame_unref(f);
+    av_frame_move_ref(f, hw);
+    av_frame_free(&hw);
+    return true;
 }
 
 bool deinterlaceFrame(AVFrame* f) {
@@ -1831,6 +1955,7 @@ bool deinterlaceFrame(AVFrame* f) {
 Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bool hq, bool planes) {
     // ProRes RAW is developed first (RGB48, ACEScct), at half size when it is shown that small.
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> developed(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
+    if (proResRaw_ && in->hw_frames_ctx && !(in = inMemory(in))) return nullptr;
     if (proResRaw_) {
         const int tw = w > 0 ? w : dispW_, th = h > 0 ? h : dispH_;
         developed.reset(developProResRawFrame(in, rawSettings_, rotation_ % 180 ? th : tw, rotation_ % 180 ? tw : th));
@@ -1842,6 +1967,9 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     // Interpret Footage can say the frames are progressive, or which field comes first, whatever their flags say.
     // (Woven with its pulldown removed, it is whole.)
     const int dominance = pulldown_ || fields_ == "progressive" ? 0 : fields_ == "upper" ? 1 : fields_ == "lower" ? 2 : fieldDominance(in);
+    // A hardware frame stays in the device's memory only as the GPU takes it, its planes as they are (below); one
+    // with work to do on it here is copied back first.
+    if (in->hw_frames_ctx && (dominance || (!stereo_.empty() && stereo_ != "mv")) && !(in = inMemory(in))) return nullptr;
     if (dominance) {
         deint.reset(av_frame_clone(in));
         if (deint) setFieldDominance(deint.get(), dominance);
@@ -1875,12 +2003,18 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     std::shared_ptr<Frame16> out;
     // (Not when a high-quality frame is resized: both sides then take the scaler's picture, from the frame converted at
     // its own size down to half, straight from Y′CbCr below that.)
-    if (planes && !rotation_ && alpha_.empty() && !(hq && (sw != f->width || sh != f->height)))
-        if (std::shared_ptr<const YcbcrPlanes> yc = ycbcrPlanesOf(f)) {
-            out = std::make_shared<Frame16>();
-            out->width = sw, out->height = sh;
-            out->planes = std::move(yc);
-        }
+    // (A hardware frame's kept in the device's memory while this decoder holds fewer than kMaxKeptHwFrames of them, the
+    // frame cache's; past that, copied back and its planes taken from memory.)
+    const bool asPlanes = planes && !rotation_ && alpha_.empty() && !(hq && (sw != f->width || sh != f->height));
+    auto takePlanes = [&](std::shared_ptr<const YcbcrPlanes> yc) {
+        if (!yc) return;
+        out = std::make_shared<Frame16>();
+        out->width = sw, out->height = sh;
+        out->planes = std::move(yc);
+    };
+    if (asPlanes && f->hw_frames_ctx && hwKept_->load() < kMaxKeptHwFrames) takePlanes(hwPlanesOf(f, hwKept_));
+    if (!out && f->hw_frames_ctx && !(f = inMemory(f))) return nullptr;
+    if (!out && asPlanes) takePlanes(ycbcrPlanesOf(f));
     std::vector<float> rgba;
     if (!out) out = floatRgba(f, rgba) ? halfFrame(rgba.data(), f->width, f->height, sw, sh, pts) : convertFixed(f, pts, sw, sh, hq);
     if (!out) return nullptr;
@@ -2327,7 +2461,8 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
                     fields[at] = av_frame_clone(fields[1 - at]);
                     continue;
                 }
-                if (const AVFrame* d = decodedAt((double(which[at]) + 0.25) / std::max(1.0, fps_), nullptr)) fields[at] = av_frame_clone(d);
+                if (const AVFrame* d = decodedAt((double(which[at]) + 0.25) / std::max(1.0, fps_), nullptr))
+                    if ((d = inMemory(d))) fields[at] = av_frame_clone(d);
             }
             if (fields[0] || fields[1]) woven_ = weaveFields(fields[0], fields[1], pf.topFirst);
             av_frame_free(&fields[0]);
