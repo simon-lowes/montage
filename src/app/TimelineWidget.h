@@ -160,6 +160,8 @@ signals:
     // (timeline frames, -1 for none) and their labels, for a two-up view; then the end.
     void trimViewChanged(montage::FrameTime left, montage::FrameTime right, const QString& leftLabel, const QString& rightLabel);
     void trimViewEnded();
+    // The header menu's Group › Track Groups... (MainWindow opens the dialog).
+    void trackGroupsRequested();
 
 protected:
     void paintEvent(QPaintEvent* e) override;

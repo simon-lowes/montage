@@ -16,6 +16,7 @@ struct AVFormatContext;
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
+struct AVBufferRef;
 struct SwsContext;
 
 namespace montage {
@@ -48,6 +49,7 @@ struct ImageSequence;
 struct PulldownMap;
 class MlvReader;
 class JxlAnimationReader;
+class Av2Reader;
 namespace dcp {
 class ImfTrackReader;
 }
@@ -66,7 +68,7 @@ public:
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
     bool isOpen() const {
-        return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr ||
+        return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr || av2_ != nullptr ||
                jxl_ != nullptr || jxlAnimation_ != nullptr || !jxlFile_.empty();
     }
 
@@ -95,6 +97,7 @@ private:
     bool seek(double t);
     Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq, bool planes = false);
     std::shared_ptr<Frame16> convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq);
+    std::shared_ptr<Frame16> resizeRgba64(const Frame16& in, int w, int h);
     // The file's frame shown at `t` (its own time), decoded (cur_ or next_), with its time in `pts`; null at the end.
     const AVFrame* decodedAt(double t, double* pts);
 
@@ -121,6 +124,8 @@ private:
     bool stillHq_ = true;  // stillFrame_ scaled with high quality (an MLV frame's)
     SwsContext* sws_ = nullptr;
     int swsKey_[8] = {};  // the conversion sws_ was made for: sizes, source format, flags, chroma siting
+    SwsContext* resize_ = nullptr;  // 16-bit RGBA resized (a high-quality frame at another size, converted at its own)
+    int resizeKey_[4] = {};
     // Hardware decoding: the device's pixel format (-1 = software), the frame
     // hardware frames are copied into, and whether a copy failed (reopen in software).
     int hwPixFmt_ = -1;
@@ -128,6 +133,16 @@ private:
     bool hwBroken_ = false;
     std::string hwName_;
     AVFrame* hwTransfer_ = nullptr;
+    // Hardware frames kept in the device's memory for the GPU (YcbcrPlanes::hw) that are still held (the frame cache's),
+    // counted down as each goes; past kMaxKeptHwFrames frames are copied back instead.
+    std::shared_ptr<std::atomic<int>> hwKept_ = std::make_shared<std::atomic<int>>(0);
+    bool hwKeep_ = false;  // (opened while the GPU mapped its device's frames: kept, its pool made larger for them)
+    // (Tests: software frames uploaded to a device's frames, media/HwAccel's setHwUploadForTesting.)
+    std::string hwUpload_;
+    AVBufferRef* hwUploadFrames_ = nullptr;
+    bool uploadForTesting(AVFrame* f);
+    // `f`, or when it is a hardware frame its copy in memory (in hwTransfer_, counted). Null if it cannot be copied.
+    const AVFrame* inMemory(const AVFrame* f);
     // Interpret Footage (core/Interpretation.h): file seconds per media second, pixel aspect (0 = the file's), how alpha
     // and fields are read.
     double timeScale_ = 1;
@@ -143,6 +158,7 @@ private:
     int rawFrame_ = -1;                       // the run's (or Magic Lantern Video's) frame in raw_
     std::unique_ptr<MlvReader> mlv_;          // Magic Lantern Video: each frame's mosaic developed (media/Mlv.h)
     std::shared_ptr<const dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
+    std::unique_ptr<Av2Reader> av2_;          // AV2 decoded with dav2d (media/Av2.h)
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
     std::vector<float> exrRgba_;              // its frame rawFrame_, straight float RGBA (JPEG XL's too)
@@ -159,6 +175,7 @@ private:
     bool rawHalf_ = false;                    // raw_ developed at half size
     RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)
     bool proResRaw_ = false;                  // ProRes RAW: each frame's mosaic developed (media/ProResRaw.h)
+    bool imfFullRange_ = false;               // IMF ProRes whose descriptor says full range (QE.2)
     bool rawFrame(int width, int height, std::string* error, int format = -1);  // raw_ allocated at this size (RGB48)
     bool loadRaw(const RawImage& img, std::string* error);
 };
@@ -230,6 +247,10 @@ bool deinterlaceFrame(AVFrame* f);
 // bits, little-endian, three planes or Cb and Cr alternating in a second, no alpha; 4:2:0, 4:2:2 or 4:4:4), with its
 // matrix, range and chroma siting; null otherwise.
 std::shared_ptr<const YcbcrPlanes> ycbcrPlanesOf(const AVFrame* f);
+// A hardware frame's planes as its device holds them (YcbcrPlanes::hw, held by a reference to the frame): the layout of
+// its frames' format in memory, as ycbcrPlanesOf has it; null when that is not one the GPU converts. `kept` counts the
+// frame while it is held.
+std::shared_ptr<const YcbcrPlanes> hwPlanesOf(const AVFrame* f, std::shared_ptr<std::atomic<int>> kept = {});
 // 0 progressive, 1 top field first, 2 bottom field first.
 int fieldDominance(const AVFrame* f);
 void setFieldDominance(AVFrame* f, int dominance);

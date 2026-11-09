@@ -1,5 +1,7 @@
 #include "ReferenceOutputPanel.h"
 
+#include <cstring>
+
 #include "DisplayCalibration.h"
 #include "render/TrimPasses.h"
 
@@ -271,6 +273,12 @@ void ReferenceOutputController::updateNmos() {
             o.video = to.video;
             o.audio = to.audio;
             o.anc = to.anc;
+            // (ST 2022-7: the second legs' routes, and each leg on or off)
+            o.video2 = to.video2;
+            o.audio2 = to.audio2;
+            o.anc2 = to.anc2;
+            std::memcpy(o.pathOn, to.pathOn, sizeof o.pathOn);
+            if (!to.interfaceAddress2.empty()) o.interfaceAddress2 = to.interfaceAddress2;
             o.sendVideo = to.sendVideo;
             o.sendAnc = to.sendAnc;
             o.sourcePort = to.sourcePort;

@@ -1,7 +1,12 @@
 // Audio plugin tests: discovery, out-of-process scanning with cache and
-// blocklist, CLAP hosting, and plugin effects in the mixer.
+// blocklist, CLAP hosting, plugin effects in the mixer, and plug-ins in host
+// processes of their own (bit for bit the same, bypassed when they fail).
 #include <QtTest>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QThread>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonObject>
@@ -10,12 +15,18 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <functional>
+#include <mutex>
 
 #include "audio/AraHost.h"
+#include "audio/AudioDevice.h"
 #include "audio/PluginEffect.h"
+#include "audio/PluginHost.h"
+#include "audio/PluginIpc.h"
 #include "audio/Plugins.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -25,6 +36,8 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Ofx.h"
+#include "render/OfxRemote.h"
+#include "render/Exporter.h"
 #include "media/ImageSequence.h"
 #include "automation/McpServer.h"
 
@@ -104,6 +117,169 @@ void writeWavOf(const std::string& path, int rate, int frames, const std::functi
     std::fclose(f);
 }
 
+// ---- Plug-in hosts (audio/PluginHost.h) ----
+
+// The plug-in hosting settings for one test, put back (with the failure list cleared) when it ends.
+struct Hosting {
+    HostingSettings before = hosting();
+    explicit Hosting(Isolation i, const std::function<void(HostingSettings&)>& tweak = {}) {
+        HostingSettings s = before;
+        s.isolation = i;
+        if (tweak) tweak(s);
+        setHosting(s);
+        clearHostFailures();
+    }
+    ~Hosting();
+    Hosting(const Hosting&) = delete;
+    Hosting& operator=(const Hosting&) = delete;
+};
+
+// A fault (tests/plugins/test_fault.h) for the plug-in hosts that start while it is set. It reaches them through
+// their environment; nothing in the test's own process runs a plug-in meanwhile.
+struct Fault {
+    explicit Fault(const char* spec) { qputenv("MONTAGE_TEST_PLUGIN_FAULT", spec); }
+    ~Fault() { qunsetenv("MONTAGE_TEST_PLUGIN_FAULT"); }
+    Fault(const Fault&) = delete;
+    Fault& operator=(const Fault&) = delete;
+};
+
+// Waits for `done`, for as long as a busy machine could need (the condition is what is tested, not the time).
+bool eventually(const std::function<bool()>& done, int ms = 60000) {
+    QElapsedTimer clock;
+    clock.start();
+    while (!done()) {
+        if (clock.elapsed() > ms) return false;
+        QThread::msleep(5);
+    }
+    return true;
+}
+
+// (the hosts the test started end with it, so the next test's start afresh)
+Hosting::~Hosting() {
+    ofx::remote::releaseIdle();
+    eventually([] { return runningHosts().empty(); }, 20000);
+    setHosting(before);
+    clearHostFailures();
+}
+
+std::optional<Descriptor> clapPlugin(const char* sub, const std::string& id) {
+    for (const std::string& file : findPluginFiles(Format::Clap, {clapDir(sub)}))
+        for (const Descriptor& d : probeInProcess(Format::Clap, file))
+            if (d.pluginId == id) return d;
+    return std::nullopt;
+}
+
+// The test plug-ins by short name, as the tests use them: "gain", "invert", "delay", "convolver", "vst3", "lv2".
+std::optional<Descriptor> testPlugin(const QString& name) {
+    if (name == "gain") return clapPlugin("good", "org.montage.test.gain");
+    if (name == "invert") return clapPlugin("good", "org.montage.test.invert");
+    if (name == "delay") return clapPlugin("latency", "org.montage.test.delay64");
+    if (name == "convolver") return clapPlugin("convolver", "org.montage.test.convolver");
+#ifdef MONTAGE_WITH_VST3
+    if (name == "vst3") {
+        const auto files = findPluginFiles(Format::Vst3, {MONTAGE_TEST_VST3_DIR});
+        if (files.size() != 1) return std::nullopt;
+        const auto ds = probeInProcess(Format::Vst3, files[0]);
+        if (ds.size() == 1) return ds[0];
+    }
+#endif
+#ifdef MONTAGE_TEST_LV2_BUNDLE
+    if (name == "lv2") {
+        Registry& reg = Registry::instance();
+        reg.setSearchPaths(Format::Lv2, {QFileInfo(MONTAGE_TEST_LV2_BUNDLE).absolutePath().toStdString()});
+        reg.scan();
+        auto d = reg.find("lv2:urn:montage:test:lv2-gain");
+        reg.setSearchPaths(Format::Lv2, {"/nonexistent-montage-test-dir"});
+        return d;
+    }
+#endif
+    return std::nullopt;
+}
+
+// A setting of the gain-like test plug-ins and the gain it gives: CLAP 0..2, VST3 normalised (gain twice it), LV2 dB.
+struct GainSetting {
+    uint32_t id;
+    double value, gain;
+};
+GainSetting halfGain(const QString& name, Instance& inst) {
+    const auto params = inst.parameters();
+    const uint32_t id = params.empty() ? 0 : params[0].id;
+    if (name == "vst3") return {id, 0.25, 0.5};
+    if (name == "lv2") return {id, -6.0206, 0.5};
+    return {id, 0.5, 0.5};
+}
+
+std::optional<HostFailure> failureOf(const std::string& id) {
+    for (const HostFailure& f : hostFailures())
+        if (f.pluginId == id) return f;
+    return std::nullopt;
+}
+
+// Noise the same every run.
+std::vector<float> testNoise(size_t n, uint32_t seed) {
+    std::vector<float> v(n);
+    for (float& x : v) {
+        seed = seed * 1664525u + 1013904223u;
+        x = float(int32_t(seed >> 8) % 20000) / 20000.0f * 0.8f;
+    }
+    return v;
+}
+
+// A device test's playback: a click at timeline sample `clickAt` on its first channel, its blocks numbered from 0.
+struct Clicker {
+    std::atomic<int64_t> pos{0};
+    int64_t clickAt = 4800;
+    int64_t render(float* out, int channels, int frames) {
+        const int64_t p = pos.fetch_add(frames);
+        std::fill(out, out + size_t(frames) * size_t(channels), 0.0f);
+        if (clickAt >= p && clickAt < p + frames) out[size_t(clickAt - p) * size_t(channels)] = 0.8f;
+        return p;
+    }
+};
+
+// A device test's recording of the first input, placed as a take starting at timeline sample 0.
+struct Take {
+    std::mutex m;
+    std::vector<float> got;
+    audiodev::TakeAligner aligner{0, true};
+    void add(const float* in, int channels, int frames, int64_t sample) {
+        const audiodev::TakeAligner::Step st = aligner.next(sample, frames);
+        std::lock_guard<std::mutex> lock(m);
+        got.resize(got.size() + size_t(st.silence), 0.0f);
+        for (int i = st.skip; i < frames; ++i) got.push_back(in[size_t(i) * size_t(channels)]);
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m);
+        return got.size();
+    }
+    int64_t click() {
+        std::lock_guard<std::mutex> lock(m);
+        return audiodev::findClick(got.data(), int64_t(got.size()));
+    }
+};
+
+// Records a click through `e` (open): where it lands in the take.
+int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
+    Clicker clicker;
+    Take take;
+    const int out = e.addOutput(&clicker, rate, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+    const int in = e.addInput(&clicker, rate, [&](const float* i, int ch, int n, int64_t at) { take.add(i, ch, n, at); });
+    if (out < 0 || in < 0) return -2;
+    QElapsedTimer t;
+    t.start();
+    while (take.size() < size_t(clicker.clickAt + rate / 10) && t.elapsed() < 10000) QThread::msleep(10);
+    e.removeInput(in);
+    e.removeOutput(out);
+    return take.click();
+}
+
+// Each test runs twice: in Montage's own process and in plug-in hosts.
+void hostingRows() {
+    QTest::addColumn<bool>("isolated");
+    QTest::newRow("in process") << false;
+    QTest::newRow("in a plug-in host") << true;
+}
+
 }  // namespace
 
 class TestPlugins : public QObject {
@@ -112,6 +288,16 @@ class TestPlugins : public QObject {
     QString path(const char* name) const { return dir_.filePath(name); }
 
 private slots:
+    void initTestCase() {
+        // (MCP's background calls kept in a job store of the tests' own)
+        qputenv("MONTAGE_JOBS_DIR", dir_.filePath(QStringLiteral("jobs")).toUtf8());
+        // Plug-ins run in Montage's own process unless a test says otherwise (it then names the grouping).
+        setHostExecutable(MONTAGE_PLUGIN_HOST);
+        HostingSettings h;
+        h.isolation = Isolation::InProcess;
+        setHosting(h);
+    }
+
     void environmentVariableAddsSearchPath() {
 #ifdef _WIN32
         const char* extra = "C:/montage-test-clap";
@@ -127,7 +313,7 @@ private slots:
 
     void findsPluginFiles() {
         auto files = findPluginFiles(Format::Clap, {kClapDir.toStdString()});
-        QCOMPARE(files.size(), size_t(5));  // good, hang, crash, latency, sidechain
+        QCOMPARE(files.size(), size_t(6));  // good, hang, crash, latency, sidechain, convolver
         auto good = findPluginFiles(Format::Clap, {clapDir("good")});
         QCOMPARE(good.size(), size_t(1));
         QVERIFY(QString::fromStdString(good[0]).endsWith("MontageTestPlugins.clap"));
@@ -911,7 +1097,10 @@ private slots:
     }
 #endif
 
+    void hostsAClapPlugin_data() { hostingRows(); }
     void hostsAClapPlugin() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         auto d = gainDescriptor();
         QVERIFY(d.has_value());
         std::string err;
@@ -943,7 +1132,10 @@ private slots:
         QCOMPARE(other->parameter(7), 0.5);
     }
 
+    void clapEditorProtocol_data() { hostingRows(); }
     void clapEditorProtocol() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         // The test gain's "editor" asks for a size and turns its knob when shown.
         struct Listener : EditorListener {
             std::vector<std::pair<uint32_t, double>> params;
@@ -978,7 +1170,10 @@ private slots:
     }
 
 #ifdef MONTAGE_WITH_VST3
+    void vst3EditorProtocol_data() { hostingRows(); }
     void vst3EditorProtocol() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         struct Listener : EditorListener {
             std::vector<std::pair<uint32_t, double>> params;
             std::vector<std::pair<uint32_t, bool>> gestures;
@@ -1011,7 +1206,10 @@ private slots:
         QVERIFY(inst->hasEditor());
     }
 
+    void vst3Sidechain_data() { hostingRows(); }
     void vst3Sidechain() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         // The auxiliary input bus is the key: turned on, it hears what it is given, else silence.
         auto files = findPluginFiles(Format::Vst3, {MONTAGE_TEST_VST3_DIR});
         QCOMPARE(files.size(), size_t(1));
@@ -1099,7 +1297,10 @@ private slots:
 #endif
 
 #ifdef MONTAGE_TEST_LV2_BUNDLE
+    void hostsLv2Plugins_data() { hostingRows(); }
     void hostsLv2Plugins() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         QVERIFY(canHost(Format::Lv2));
         // Found by a scan of its folder (from the manifest, no code loaded).
         Registry& reg = Registry::instance();
@@ -1182,7 +1383,10 @@ private slots:
     }
 #endif
 
+    void pluginSidechain_data() { hostingRows(); }
     void pluginSidechain() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         // A plugin's key input hears what it is given, or silence; plugins without one say so.
         Registry& reg = Registry::instance();
         isolate(reg, path("cache-sidechain.json"), {clapDir("sidechain"), clapDir("good")});
@@ -1322,7 +1526,10 @@ private slots:
         QCOMPARE(duckedFrom(), int64_t(48000));
     }
 
+    void pluginDelayCompensation_data() { hostingRows(); }
     void pluginDelayCompensation() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         Registry& reg = Registry::instance();
         isolate(reg, path("cache-latency.json"), {clapDir("latency")});
         reg.scan();
@@ -1418,7 +1625,10 @@ private slots:
         }
     }
 
+    void pluginEffectRunsInTheMixer_data() { hostingRows(); }
     void pluginEffectRunsInTheMixer() {
+        QFETCH(bool, isolated);
+        Hosting hostingMode(isolated ? Isolation::PerPlugin : Isolation::InProcess);
         // The mixer finds plugins through the shared registry.
         Registry& reg = Registry::instance();
         isolate(reg, path("cache-mixer.json"), {clapDir("good")});
@@ -1477,6 +1687,1008 @@ private slots:
         AudioMixer fresh;
         fresh.mix(p, s, 24000, 4800, out.data());
         QVERIFY(std::fabs(out[200] - 0.5f) < 0.002f);
+    }
+
+    // ---- Plug-ins in host processes of their own ----
+
+    void isolatedPluginsSoundTheSame_data() {
+        QTest::addColumn<QString>("plugin");
+        QTest::newRow("CLAP gain") << QString("gain");
+        QTest::newRow("CLAP delay") << QString("delay");
+        QTest::newRow("CLAP convolver") << QString("convolver");
+#ifdef MONTAGE_WITH_VST3
+        QTest::newRow("VST3 gain") << QString("vst3");
+#endif
+#ifdef MONTAGE_TEST_LV2_BUNDLE
+        QTest::newRow("LV2 gain") << QString("lv2");
+#endif
+    }
+    void isolatedPluginsSoundTheSame() {
+        // The same sound, bit for bit, in Montage's process and in a plug-in host: blocks of every size, parameters
+        // changed between blocks, a reset, the transport, and the same latency and state.
+        QFETCH(QString, plugin);
+        const auto d = testPlugin(plugin);
+        QVERIFY(d.has_value());
+        const int frames = 48000;
+        const std::vector<float> inL = testNoise(size_t(frames), 1), inR = testNoise(size_t(frames), 2);
+        struct Run {
+            std::vector<float> l, r;
+            int latency = -1;
+            std::string state;
+            std::vector<plugins::ParamInfo> params;
+        };
+        auto run = [&](Instance& inst) {
+            Run out;
+            out.l = inL, out.r = inR;
+            if (!inst.activate(48000, 512)) return out;
+            out.latency = inst.latencySamples();
+            out.params = inst.parameters();
+            const int sizes[] = {1, 64, 128, 333, 512, 7, 500, 200, 512, 31};
+            int at = 0, block = 0;
+            while (at < frames) {
+                const int n = std::min(sizes[block % 10], frames - at);
+                if (!out.params.empty() && (block == 5 || block == 40 || block == 41)) {
+                    const plugins::ParamInfo& p0 = out.params[0];
+                    inst.setParameter(p0.id, p0.min + (p0.max - p0.min) * (block == 5 ? 0.3 : block == 40 ? 0.9 : 0.6));
+                }
+                if (block == 60) inst.reset();
+                inst.setTransport(at, true, 120, 4);
+                float* ch[2] = {out.l.data() + at, out.r.data() + at};
+                inst.process(ch, 2, n);
+                at += n;
+                ++block;
+            }
+            out.state = inst.saveState();
+            return out;
+        };
+        std::string err;
+        auto here = instantiateHere(*d, &err);
+        QVERIFY2(here, err.c_str());
+        Hosting hostingMode(Isolation::PerPlugin);
+        auto there = instantiateIsolated(*d, Isolation::PerPlugin, &err);
+        QVERIFY2(there, err.c_str());
+        QVERIFY(hostProcessOf(there.get()) > 0 && hostProcessOf(there.get()) != QCoreApplication::applicationPid());
+        QCOMPARE(hostProcessOf(here.get()), int64_t(0));
+        const Run a = run(*here), b = run(*there);
+        QVERIFY(a.latency >= 0);
+        QCOMPARE(b.latency, a.latency);
+        QCOMPARE(b.params.size(), a.params.size());
+        for (size_t i = 0; i < a.params.size(); ++i) {
+            QCOMPARE(b.params[i].id, a.params[i].id);
+            QCOMPARE(QString::fromStdString(b.params[i].name), QString::fromStdString(a.params[i].name));
+            QCOMPARE(b.params[i].max, a.params[i].max);
+        }
+        QVERIFY(b.state == a.state);
+        QVERIFY2(std::memcmp(a.l.data(), b.l.data(), a.l.size() * sizeof(float)) == 0 &&
+                     std::memcmp(a.r.data(), b.r.data(), a.r.size() * sizeof(float)) == 0,
+                 "the plug-in host's output differs from Montage's own");
+        QVERIFY(a.l != inL);  // (and it did something)
+        QVERIFY(!bypassed(there.get()));
+        QVERIFY(hostFailures().empty());
+    }
+
+    void isolatedDelayCompensationIsUnchanged() {
+        // In the mixer: plug-ins with latency on clips, tracks, a bus and the master give the same mix, sample for
+        // sample, in Montage's process and in plug-in hosts (and the step stays where the clip starts).
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-isolated-latency.json"), {clapDir("latency"), clapDir("convolver")});
+        reg.scan();
+        const auto delay = reg.find("clap:org.montage.test.delay64"), conv = reg.find("clap:org.montage.test.convolver");
+        QVERIFY(delay.has_value() && conv.has_value());
+        const std::string wav = path("isolated-step.wav").toStdString();
+        writeWav(wav, 48000, 2.0, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        m.id = p.newId();
+        std::string err;
+        QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, FrameTime(std::llround(s.fpsValue())), 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto fx = [&](const Descriptor& d) { return *makePluginEffect(p, d, &err); };
+        s.audioTracks[0].clips[0].effects.push_back(fx(*conv));
+        s.audioTracks[0].clips[0].effects.push_back(fx(*delay));
+        s.audioTracks[0].effects.push_back(fx(*delay));
+        Bus b;
+        b.id = p.newId();
+        b.effects.push_back(fx(*conv));
+        s.buses.push_back(b);
+        s.audioTracks[0].output = b.id;
+        s.masterEffects.push_back(fx(*delay));
+        size_t hostsSeen = 0;
+        auto mixFrom = [&](int64_t from, int blocks) {
+            AudioMixer mixer;
+            std::vector<float> all, out(1000 * 2);
+            for (int i = 0; i < blocks; ++i) {
+                mixer.mix(p, s, from + int64_t(i) * 1000, 1000, out.data());
+                all.insert(all.end(), out.begin(), out.end());
+            }
+            hostsSeen = runningHosts().size();
+            return all;
+        };
+        std::vector<float> here, there;
+        {
+            Hosting h(Isolation::InProcess);
+            here = mixFrom(47000, 6);
+            QCOMPARE(hostsSeen, size_t(0));
+        }
+        {
+            Hosting h(Isolation::PerPlugin);
+            there = mixFrom(47000, 6);
+            QCOMPARE(hostsSeen, size_t(2));  // (the delay's and the convolver's)
+        }
+        QCOMPARE(there.size(), here.size());
+        QVERIFY2(std::memcmp(here.data(), there.data(), here.size() * sizeof(float)) == 0, "the mixes differ");
+        // (the step at the clip's start, sample 48000: 1000 samples in)
+        QVERIFY(std::fabs(here[999 * 2]) < 1e-6f && std::fabs(here[1000 * 2]) > 0.05f);
+    }
+
+    void isolationModesGroupPlugInsIntoHosts() {
+        const auto gain = testPlugin("gain"), invert = testPlugin("invert"), delay = testPlugin("delay");
+        QVERIFY(gain && invert && delay);
+        QCOMPARE(gain->vendor, delay->vendor);
+        auto make = [](const Descriptor& d) {
+            std::string err;
+            auto inst = instantiate(d, &err);
+            if (inst) inst->activate(48000, 256);
+            return inst;
+        };
+        auto keys = [] {
+            QStringList k;
+            for (const HostInfo& h : runningHosts()) k << QString::fromStdString(h.key);
+            return k;
+        };
+        auto pid = [](const std::unique_ptr<Instance>& i) { return i ? hostProcessOf(i.get()) : int64_t(-1); };
+        {
+            // Each plug-in in a host of its own; the instances of one plug-in share it.
+            Hosting h(Isolation::PerPlugin);
+            auto a = make(*gain), b = make(*gain), c = make(*invert), e = make(*delay);
+            QVERIFY(a && b && c && e);
+            QVERIFY(pid(a) > 0 && pid(c) > 0 && pid(e) > 0);
+            QCOMPARE(pid(a), pid(b));
+            QVERIFY(pid(a) != pid(c) && pid(c) != pid(e) && pid(a) != pid(e));
+            QVERIFY2(keys().contains(QString::fromStdString("plugin:" + gain->id)), qPrintable(keys().join(", ")));
+        }
+        QVERIFY(eventually([&] { return runningHosts().empty(); }));  // (a host with nothing left in it ends)
+        {
+            // One host for each maker.
+            Hosting h(Isolation::PerVendor);
+            auto a = make(*gain), c = make(*invert), e = make(*delay);
+            QVERIFY(a && c && e && pid(a) > 0);
+            QVERIFY(pid(a) == pid(c) && pid(c) == pid(e));
+            QVERIFY2(keys().contains(QString::fromStdString("vendor:" + gain->vendor)), qPrintable(keys().join(", ")));
+        }
+        QVERIFY(eventually([&] { return runningHosts().empty(); }));
+        {
+            // All plug-ins in one host.
+            Hosting h(Isolation::Shared);
+            auto a = make(*gain), e = make(*delay);
+#ifdef MONTAGE_WITH_VST3
+            const auto vst3 = testPlugin("vst3");
+            QVERIFY(vst3.has_value());
+            auto v = make(*vst3);
+            QVERIFY(v && pid(v) == pid(a));
+#endif
+            QVERIFY(a && e && pid(a) > 0 && pid(a) == pid(e));
+            QCOMPARE(keys(), QStringList{"all"});
+            QCOMPARE(runningHosts()[0].pid, pid(a));
+        }
+        {
+            // Off: in Montage's own process.
+            Hosting h(Isolation::InProcess);
+            auto a = make(*gain);
+            QVERIFY(a);
+            QCOMPARE(pid(a), int64_t(0));
+        }
+        QVERIFY(eventually([&] { return runningHosts().empty(); }));
+        for (Isolation i : {Isolation::PerPlugin, Isolation::PerVendor, Isolation::Shared, Isolation::InProcess})
+            QVERIFY(isolationFromName(isolationName(i)) == std::optional<Isolation>(i));
+        QVERIFY(!isolationFromName("nonsense"));
+        // ARA plug-ins share the document: never in a host, whatever the setting.
+        Descriptor ara = *gain;
+        ara.ara = true;
+        Hosting h(Isolation::PerPlugin);
+        auto inProcess = instantiate(ara);
+        QVERIFY(inProcess);
+        QCOMPARE(hostProcessOf(inProcess.get()), int64_t(0));
+    }
+
+    void failingPluginsAreBypassed_data() {
+        QTest::addColumn<QString>("plugin");
+        QTest::addColumn<QString>("fault");
+        QTest::addColumn<bool>("realtime");
+        QStringList formats{"gain"};
+#ifdef MONTAGE_WITH_VST3
+        formats << "vst3";
+#endif
+#ifdef MONTAGE_TEST_LV2_BUNDLE
+        formats << "lv2";
+#endif
+        for (const QString& f : formats) {
+            for (const char* fault : {"crash", "hang", "overrun"})
+                QTest::addRow("%s %s, playing", qPrintable(f), fault) << f << QString(fault) << true;
+            // (a leak in an export: playback would also count the slow blocks it causes as late)
+            QTest::addRow("%s leak, exporting", qPrintable(f)) << f << QString("leak") << false;
+        }
+        QTest::addRow("gain crash, exporting") << QString("gain") << QString("crash") << false;
+        QTest::addRow("gain hang, exporting") << QString("gain") << QString("hang") << false;
+    }
+    void failingPluginsAreBypassed() {
+        // A plug-in that crashes, hangs, writes past its buffers or leaks memory takes only its host down: it is
+        // bypassed (its input passes), its failure is recorded by name, and Restart brings it back with its settings.
+        QFETCH(QString, plugin);
+        QFETCH(QString, fault);
+        QFETCH(bool, realtime);
+        const auto d = testPlugin(plugin);
+        QVERIFY(d.has_value());
+        const int missed = 8;
+        Hosting hostingMode(Isolation::PerPlugin, [&](HostingSettings& s) {
+            s.missedBlocks = missed;
+            s.memoryLimitMb = 1024;
+            s.exportTimeoutMs = 3000;
+            s.autoRestarts = 0;  // (it stays bypassed until Restart, below)
+        });
+        const int goodBlocks = 4;
+        const std::string spec = (fault + ":process:" + QString::number(goodBlocks)).toStdString();
+        std::string err;
+        std::unique_ptr<Instance> inst;
+        {
+            Fault f(spec.c_str());
+            inst = instantiateIsolated(*d, Isolation::PerPlugin, &err);
+        }
+        QVERIFY2(inst, err.c_str());
+        QVERIFY(inst->activate(48000, 128));
+        const GainSetting half = halfGain(plugin, *inst);
+        inst->setParameter(half.id, half.value);
+        const int64_t firstHost = hostProcessOf(inst.get());
+        QVERIFY(firstHost > 0);
+        const uint64_t offlineBefore = offlineFailureSerial();
+        RenderModeScope mode(realtime);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        auto block = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst->process(ch, 2, 128);
+        };
+        int blocks = 0;
+        qint64 slowest = 0;
+        QElapsedTimer clock;
+        while (blocks < 200 && !bypassed(inst.get())) {
+            clock.start();
+            block();
+            slowest = std::max(slowest, clock.elapsed());
+            ++blocks;
+        }
+        QVERIFY2(bypassed(inst.get()), qPrintable(QString("still running after %1 blocks").arg(blocks)));
+        // Bypassed at the block it failed in (a hang during playback: once it has been late the set number of
+        // blocks in a row; a leak: once its host passes the memory limit).
+        const int bound = fault == "leak" ? 64 : fault == "hang" && realtime ? goodBlocks + missed + 2 : goodBlocks + 2;
+        QVERIFY2(blocks <= bound, qPrintable(QString("bypassed after %1 blocks").arg(blocks)));
+        // Playback never waits long for it (an export waits up to its time limit).
+        QVERIFY2(slowest < (realtime ? 5000 : 30000), qPrintable(QString("a block took %1 ms").arg(slowest)));
+        // Its input passes (the LV2 gain's, delayed by its latency: the same, as it is constant).
+        block();
+        QVERIFY2(l[127] == 0.5f && r[0] == 0.5f, qPrintable(QString::number(l[127])));
+        // Named in the failure list, with what happened.
+        const QString kind = fault == "hang" ? "hang" : fault == "leak" ? "memory" : "crash";
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        const HostFailure f = *failureOf(d->id);
+        QCOMPARE(QString::fromStdString(f.name), QString::fromStdString(d->name));
+        QVERIFY2(QString::fromStdString(f.kind) == kind, (f.kind + ": " + f.reason).c_str());
+        QCOMPARE(f.count, 1);
+        QVERIFY(!f.reason.empty() && f.bypassedNow >= 1 && f.firstMs > 0);
+        // (a host over its memory limit may end between blocks: it is then found ended, not in a render)
+        if (fault != "leak") QVERIFY(f.offline == !realtime);
+        if (!realtime) {
+            QVERIFY(offlineFailureSerial() != offlineBefore);
+            QVERIFY2(QString::fromStdString(lastOfflineFailure()).startsWith(QString::fromStdString(d->name)), lastOfflineFailure().c_str());
+        }
+        // Restart: a new host, with the parameter as it was set.
+        QVERIFY(restartPlugin(d->id));
+        QVERIFY(eventually([&] {
+            block();
+            return !bypassed(inst.get());
+        }));
+        QVERIFY(hostProcessOf(inst.get()) != firstHost);
+        QVERIFY(eventually([&] {
+            block();
+            return std::fabs(l[127] - float(0.5 * half.gain)) < 1e-3f;
+        }, 10000));
+        QVERIFY(std::fabs(inst->parameter(half.id) - half.value) < 1e-4);
+        QVERIFY(eventually([&] { return failureOf(d->id)->restarts == 1; }));
+    }
+
+    void bypassCanBeSilence() {
+        // The setting: a bypassed plug-in gives silence instead of its input.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) {
+            s.bypassWithSilence = true;
+            s.autoRestarts = 0;
+        });
+        std::unique_ptr<Instance> inst;
+        {
+            Fault f("crash:process:0");
+            inst = instantiate(*d);
+        }
+        QVERIFY(inst && inst->activate(48000, 128));
+        std::vector<float> l(128, 0.5f), r(128, 0.5f);
+        float* ch[2] = {l.data(), r.data()};
+        inst->process(ch, 2, 128);
+        QVERIFY(bypassed(inst.get()));
+        QCOMPARE(l[0], 0.0f);
+        std::fill(l.begin(), l.end(), 0.5f);
+        inst->process(ch, 2, 128);
+        QCOMPARE(l[64], 0.0f);
+    }
+
+    void playbackCarriesOnWhenAPluginHangs() {
+        // A plug-in on a clip stops answering during playback: the mix goes on (the clip's sound passes) and the
+        // plug-in comes back by itself in a new host.
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-playback.json"), {clapDir("good")});
+        reg.scan();
+        const auto d = reg.find("clap:org.montage.test.gain");
+        QVERIFY(d.has_value());
+        const std::string wav = path("playback.wav").toStdString();
+        writeWav(wav, 48000, 20.0, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        m.id = p.newId();
+        std::string err;
+        QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        std::vector<float> out(128 * 2);
+        {
+            AudioMixer warm;  // (the clip's sound decoded, as playback has it)
+            warm.mix(p, s, 0, 128, out.data());
+        }
+        auto e = makePluginEffect(p, *d, &err);
+        QVERIFY2(e.has_value(), err.c_str());
+        e->params["param.7"] = Param(0.25);
+        s.audioTracks[0].clips[0].effects.push_back(*e);
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& h) {
+            h.missedBlocks = 8;
+            h.autoRestarts = 1;
+        });
+        AudioMixer mixer;
+        mixer.setNonBlocking(true);
+        {
+            Fault f("hang:process:40");
+            mixer.mix(p, s, 0, 128, out.data());
+        }
+        QVERIFY2(std::fabs(out[0] - 0.125f) < 0.002f, qPrintable(QString::number(out[0])));
+        int64_t pos = 128;
+        bool passed = false, back = false;
+        qint64 slowest = 0;
+        QElapsedTimer total, clock;
+        total.start();
+        while (!back && total.elapsed() < 60000) {
+            clock.start();
+            mixer.mix(p, s, pos, 128, out.data());
+            slowest = std::max(slowest, clock.elapsed());
+            pos += 128;
+            if (pos > 18 * 48000) pos = 128;
+            if (std::fabs(out[0] - 0.5f) < 0.002f) passed = true;
+            else if (passed && std::fabs(out[0] - 0.125f) < 0.002f) back = true;
+            QThread::usleep(2000);  // (about as fast as playback asks)
+        }
+        QVERIFY2(passed && back, qPrintable(QString("passed %1, back %2").arg(passed).arg(back)));
+        QVERIFY2(slowest < 5000, qPrintable(QString("a block took %1 ms").arg(slowest)));
+        const auto f = failureOf(d->id);
+        QVERIFY(f.has_value());
+        QCOMPARE(QString::fromStdString(f->kind), QString("hang"));
+        QCOMPARE(QString::fromStdString(f->name), QString("Montage Test Gain"));
+        QVERIFY(!f->offline && f->restarts == 1);
+    }
+
+    void exportStopsNamingAFailedPlugin() {
+        // An export with a plug-in that crashes stops and says which; the next export runs (in a new host).
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-export.json"), {clapDir("good")});
+        reg.scan();
+        const auto d = reg.find("clap:org.montage.test.gain");
+        QVERIFY(d.has_value());
+        const std::string wav = path("export.wav").toStdString();
+        writeWav(wav, 48000, 2.0, 0.5f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        MediaItem m;
+        m.id = p.newId();
+        std::string err;
+        QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        s.audioTracks[0].clips[0].effects.push_back(*makePluginEffect(p, *d, &err));
+        Hosting hostingMode(Isolation::PerPlugin);
+        ExportSettings st;
+        st.path = path("plugin-export.mkv").toStdString();
+        st.videoCodec = "ffv1";
+        st.audioCodec = "pcm_s16le";
+        bool ok = true;
+        {
+            Fault f("crash:process:3");
+            ok = exportSequence(p, s, st, nullptr, nullptr, &err);
+        }
+        QVERIFY(!ok);
+        QVERIFY2(QString::fromStdString(err).startsWith("Export stopped because the plug-in Montage Test Gain"), err.c_str());
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        QVERIFY(failureOf(d->id)->offline);
+        // (a host started again while the fault was set has it too: the next export is to get a host without it)
+        QVERIFY(eventually([] { return runningHosts().empty(); }, 20000));
+        err.clear();
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+    }
+
+    void offlineRenderWaitsForARestart() {
+        // A render that may wait (an export) and finds its plug-in being started again after a failure waits for it,
+        // within the export's limit, instead of stopping at it: it is heard, and no export is told of a failure.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) { s.autoRestarts = 2; });
+        auto inst = instantiate(*d);
+        QVERIFY(inst && inst->activate(48000, 256));
+        inst->setParameter(7, 0.7);
+        std::vector<float> l(256), r(256);
+        float* ch[2] = {l.data(), r.data()};
+        RenderModeScope offline(false);
+        auto level = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst->process(ch, 2, 256);
+            return l[255];
+        };
+        QCOMPARE(level(), 0.35f);
+        // Ended between blocks, and found so by the supervisor: bypassed, a new host on its way (being started: the
+        // instance still names the old one).
+        const int64_t pid = hostProcessOf(inst.get());
+        QVERIFY(ipc::killProcess(pid));
+        QVERIFY(eventually([&] { return bypassed(inst.get()) && hostProcessOf(inst.get()) == pid; }, 20000));
+        const uint64_t offlineBefore = offlineFailureSerial();
+        QCOMPARE(level(), 0.35f);  // (waited for, not bypassed)
+        QVERIFY(!bypassed(inst.get()) && hostProcessOf(inst.get()) != pid);
+        QCOMPARE(offlineFailureSerial(), offlineBefore);
+    }
+
+    void stateSurvivesAHostRestart() {
+        // A host that ends (here: killed) is started again with the instance's last state and parameters.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) { s.autoRestarts = 2; });
+        auto here = instantiateHere(*d);
+        QVERIFY(here && here->activate(48000, 256));
+        here->setParameter(7, 0.7);
+        std::vector<float> l(256, 0.5f), r(256, 0.5f);
+        float* ch[2] = {l.data(), r.data()};
+        here->process(ch, 2, 256);
+        const std::string state = here->saveState();
+        auto inst = instantiate(*d);
+        QVERIFY(inst && inst->activate(48000, 256));
+        QVERIFY(inst->loadState(state));
+        auto level = [&] {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst->process(ch, 2, 256);
+            return l[255];
+        };
+        QCOMPARE(level(), 0.35f);
+        auto killAndWait = [&] {
+            const int64_t pid = hostProcessOf(inst.get());
+            if (!ipc::killProcess(pid)) return false;
+            return eventually([&] {
+                level();
+                return !bypassed(inst.get()) && hostProcessOf(inst.get()) != pid && hostProcessOf(inst.get()) > 0;
+            });
+        };
+        QVERIFY(killAndWait());
+        QCOMPARE(level(), 0.35f);  // the state it was given
+        QCOMPARE(inst->parameter(7), 0.7);
+        inst->setParameter(7, 1.5);
+        QCOMPARE(level(), 0.75f);
+        QVERIFY(killAndWait());
+        QCOMPARE(level(), 0.75f);  // and the parameter set after it
+        QCOMPARE(inst->saveState().size(), sizeof(double));
+        const auto f = failureOf(d->id);
+        QVERIFY(f.has_value());
+        QCOMPARE(f->count, 2);
+        QCOMPARE(f->restarts, 2);
+        QCOMPARE(QString::fromStdString(f->kind), QString("crash"));
+    }
+
+    void pluginThatCrashesWhileLoadingIsBlocked() {
+        // As one that crashes the scan: on the blocklist until the file changes or it is tried again.
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-load-crash.json"), {clapDir("good")});
+        reg.scan();
+        const auto d = reg.find("clap:org.montage.test.gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin);
+        std::string err;
+        {
+            Fault f("crash:init");
+            QVERIFY(!instantiate(*d, &err));
+        }
+        QVERIFY(!err.empty());
+        bool blocked = false;
+        for (const Blocked& b : reg.blocklist()) blocked |= b.path == d->path && b.reason.find("crashed while loading") != std::string::npos;
+        QVERIFY(blocked);
+        QVERIFY(!reg.find("clap:org.montage.test.gain").has_value());
+        const auto f = failureOf(d->id);
+        QVERIFY(f.has_value());
+        QCOMPARE(QString::fromStdString(f->kind), QString("load"));
+        reg.unblock(d->path);
+        reg.scan();
+        QVERIFY(reg.find("clap:org.montage.test.gain").has_value());
+        QVERIFY(instantiate(*d, &err));
+    }
+
+    void editorEventsComeBackFromTheHost() {
+        // The editor runs in the host; its knob changes reach Montage (for undo and automation), and when the host
+        // fails the editor is closed.
+        struct Listener : EditorListener {
+            std::vector<std::pair<uint32_t, double>> params;
+            int closed = 0;
+            void editorParameter(uint32_t id, double v) override { params.emplace_back(id, v); }
+            void editorGesture(uint32_t, bool) override {}
+            void editorResize(int, int) override {}
+            void editorClosed() override { ++closed; }
+        } listener;
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) { s.autoRestarts = 0; });
+        auto inst = instantiate(*d);
+        QVERIFY(inst && inst->hasEditor());
+        int w = 0, h = 0, window = 0;
+        QVERIFY(inst->openEditor(&window, &listener, w, h));
+        QVERIFY(w > 0 && h > 0);
+        inst->idle();
+        QCOMPARE(listener.params.size(), size_t(1));
+        QCOMPARE(listener.params[0], std::make_pair(7u, 0.25));
+        QVERIFY(ipc::killProcess(hostProcessOf(inst.get())));
+        QVERIFY(eventually([&] {
+            inst->idle();
+            return listener.closed == 1;
+        }));
+    }
+
+    void roundTripAt128Samples() {
+        // What one block's trip to a plug-in host and back costs, at 128 samples and 48 kHz (2.67 ms of sound).
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting hostingMode(Isolation::PerPlugin);
+        auto inst = instantiate(*d);
+        QVERIFY(inst && inst->activate(48000, 128));
+        auto here = instantiateHere(*d);
+        QVERIFY(here && here->activate(48000, 128));
+        RenderModeScope playing(true);
+        std::vector<float> l(128, 0.5f), r(128, 0.5f);
+        float* ch[2] = {l.data(), r.data()};
+        auto measure = [&](Instance& i) {
+            for (int n = 0; n < 200; ++n) i.process(ch, 2, 128);
+            std::vector<double> us;
+            for (int n = 0; n < 2000; ++n) {
+                const auto t0 = std::chrono::steady_clock::now();
+                i.process(ch, 2, 128);
+                us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            }
+            std::sort(us.begin(), us.end());
+            return std::array<double, 3>{us[us.size() / 2], us[us.size() * 99 / 100], us.back()};
+        };
+        const auto remote = measure(*inst), local = measure(*here);
+        qInfo("Plug-in host round trip, 128 samples at 48 kHz: median %.1f us, 99th percentile %.1f us, slowest %.1f us "
+              "(in Montage's process: median %.1f us)", remote[0], remote[1], remote[2], local[0]);
+        QVERIFY(!bypassed(inst.get()));
+        QVERIFY2(remote[0] < 10000, "the median round trip takes longer than a few blocks");
+    }
+
+    void isolatedOpenFxRendersTheSame() {
+        // OpenFX effects, a temporal effect, a General plug-in reading another track, a transition and a generator:
+        // the same pictures, bit for bit, rendered in a plug-in host as in Montage's process, which loads none.
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-isolated-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert, temporal, matte, generator;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert) && reg.find("org.montage.test.temporal/1", temporal) &&
+                reg.find("org.montage.test.matte/1", matte) && reg.find("org.montage.test.generator/1", generator));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{25, 1};
+        auto colour = [&](float r, float g, float b, FrameTime len) {
+            Clip c = makeGeneratorClip(p, "color", len);
+            c.generator.params["color.r"] = Param(r);
+            c.generator.params["color.g"] = Param(g);
+            c.generator.params["color.b"] = Param(b);
+            return c;
+        };
+        const auto first = edit::overwrite(p, s, {TrackKind::Video, 0}, colour(0.9f, 0.2f, 0.1f, 30));
+        Clip second = colour(0.1f, 0.6f, 0.8f, 30);
+        second.start = 30;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, second);
+        QVERIFY(edit::addTransition(p, s, first.created[0], edit::Edge::Out, "ofx:org.montage.test.dissolve/1", 8).ok);
+        if (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        Clip half = makeGeneratorClip(p, "ofx:org.montage.test.generator/1", 60);
+        half.generator.params["param.colour.r"] = Param(1.0);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, half);
+        Clip* a = edit::clipById(s, first.created[0]);
+        Effect inv = ofx::makeEffect(p, invert);
+        inv.params["param.amount"].addKey(0, 0.0);
+        inv.params["param.amount"].addKey(10, 1.0);
+        inv.params["param.tint.g"] = Param(0.5);
+        a->effects.push_back(inv);
+        a->effects.push_back(ofx::makeEffect(p, temporal));
+        Effect m = ofx::makeEffect(p, matte);
+        m.strings["input.Matte"] = "track:" + std::to_string(s.videoTracks[1].id);
+        a->effects.push_back(m);
+        RenderOptions o;
+        const FrameTime frames[] = {0, 3, 7, 12, 25, 27, 29, 33, 45};
+        std::vector<Image> here, there;
+        {
+            Hosting h(Isolation::InProcess);
+            for (FrameTime f : frames) here.push_back(renderSequenceFrame(p, s, f, o));
+        }
+        const int loadedHere = ofx::instancesCreated();
+        {
+            Hosting h(Isolation::PerPlugin);
+            for (FrameTime f : frames) there.push_back(renderSequenceFrame(p, s, f, o));
+            QVERIFY(!runningHosts().empty());
+        }
+        QCOMPARE(ofx::instancesCreated(), loadedHere);  // (none made in this process)
+        for (size_t i = 0; i < here.size(); ++i) {
+            QCOMPARE(there[i].width, here[i].width);
+            QCOMPARE(there[i].height, here[i].height);
+            QVERIFY2(std::memcmp(here[i].px.data(), there[i].px.data(), here[i].px.size() * sizeof(float)) == 0,
+                     qPrintable(QString("frame %1 differs: %2 / %3").arg(frames[i]).arg(here[i].at(10, 18)[0]).arg(there[i].at(10, 18)[0])));
+        }
+        QVERIFY(std::fabs(here[1].at(10, 18)[0] - here[2].at(10, 18)[0]) > 0.01f);  // (the keyframes did something)
+    }
+
+    void failingOpenFxPluginsAreBypassed() {
+        // An OpenFX plug-in that crashes or hangs is bypassed for that frame (the picture as it came), named, and
+        // started again for the next; past its restarts it stays bypassed until Restart.
+        ofx::Registry& reg = ofx::Registry::instance();
+        reg.setCachePath(path("ofx-fault-cache.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
+        QCOMPARE(reg.scan(), 7);
+        ofx::PluginDesc invert;
+        QVERIFY(reg.find("org.montage.test.invert/1", invert));
+        Project p = makeDefaultProject();
+        const Effect e = ofx::makeEffect(p, invert);
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) {
+            s.autoRestarts = 1;
+            s.exportTimeoutMs = 2000;
+        });
+        auto render = [&](std::string* err) {
+            Image img(8, 8);
+            img.fill(0.2f, 0.4f, 0.6f, 1.0f);
+            const bool ok = ofx::applyEffect(e, 0, img, 1.0, {}, err);
+            return std::make_pair(ok, img.at(3, 3)[0]);
+        };
+        std::string err;
+        {
+            Fault f("crash:render:1");
+            QVERIFY2(render(&err).first, err.c_str());  // (the first render, in a host started with the fault)
+        }
+        auto r = render(&err);
+        QVERIFY(!r.first);
+        QCOMPARE(r.second, 0.2f);  // as it came
+        QVERIFY2(err.find("Test Invert") != std::string::npos, err.c_str());
+        auto f = failureOf(invert.id);
+        QVERIFY(f.has_value());
+        QCOMPARE(QString::fromStdString(f->kind), QString("crash"));
+        r = render(&err);
+        QVERIFY2(r.first && std::fabs(r.second - 0.8f) < 1e-5f, err.c_str());  // started again
+        ofx::remote::releaseIdle();
+        {
+            Fault fault("hang:render:0");
+            QElapsedTimer clock;
+            clock.start();
+            r = render(&err);
+            QVERIFY(!r.first);
+            QVERIFY2(clock.elapsed() < 30000, "waited past the time limit");
+        }
+        QVERIFY2(err.find("did not answer") != std::string::npos, err.c_str());
+        f = failureOf(invert.id);
+        QCOMPARE(QString::fromStdString(f->kind), QString("hang"));
+        QCOMPARE(f->count, 2);
+        // No restarts left: bypassed until Restart.
+        r = render(&err);
+        QVERIFY(!r.first);
+        QVERIFY2(err.find("bypassed") != std::string::npos, err.c_str());
+        QVERIFY(failureOf(invert.id)->bypassedNow >= 1);
+        QVERIFY(restartPlugin(invert.id));
+        r = render(&err);
+        QVERIFY2(r.first && std::fabs(r.second - 0.8f) < 1e-5f, err.c_str());
+    }
+
+    void mcpReportsAndSetsPluginHosting() {
+        // montage_plugins: the grouping read and set, the hosts running, and each failure (which plug-in, when, how
+        // often), with Restart.
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_plugins"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        Hosting hostingMode(Isolation::PerPlugin, [](HostingSettings& s) { s.autoRestarts = 0; });
+        QJsonObject r = call({});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject o = r.value("structuredContent").toObject();
+        QCOMPARE(o.value("isolation").toString(), QString("plugin"));
+        QVERIFY(o.value("host_available").toBool());
+        QCOMPARE(o.value("failures").toArray().size(), 0);
+        r = call({{"isolation", "vendor"}, {"missed_blocks", 32}, {"bypass", "silence"}});
+        o = r.value("structuredContent").toObject();
+        QCOMPARE(o.value("isolation").toString(), QString("vendor"));
+        QVERIFY(hosting().isolation == Isolation::PerVendor);
+        QCOMPARE(hosting().missedBlocks, 32);
+        QVERIFY(hosting().bypassWithSilence);
+        QVERIFY(call({{"isolation", "nonsense"}}).value("isError").toBool());
+        call({{"isolation", "plugin"}, {"bypass", "input"}});
+        // A crash, as the tool reports it.
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        std::unique_ptr<Instance> inst;
+        {
+            Fault f("crash:process:0");
+            inst = instantiate(*d);
+        }
+        QVERIFY(inst && inst->activate(48000, 128));
+        std::vector<float> l(128, 0.5f), rr(128, 0.5f);
+        float* ch[2] = {l.data(), rr.data()};
+        inst->process(ch, 2, 128);
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        o = call({}).value("structuredContent").toObject();
+        QCOMPARE(o.value("failures").toArray().size(), 1);
+        const QJsonObject fo = o.value("failures").toArray()[0].toObject();
+        QCOMPARE(fo.value("plugin").toString(), QString::fromStdString(d->id));
+        QCOMPARE(fo.value("name").toString(), QString("Montage Test Gain"));
+        QCOMPARE(fo.value("kind").toString(), QString("crash"));
+        QCOMPARE(fo.value("count").toInt(), 1);
+        QVERIFY(fo.value("bypassed").toInt() >= 1 && !fo.value("first").toString().isEmpty());
+        r = call({{"restart", QString::fromStdString(d->id)}});
+        QVERIFY(r.value("content").toArray()[0].toObject().value("text").toString().contains("Starting"));
+        QVERIFY(eventually([&] {
+            inst->process(ch, 2, 128);
+            return !bypassed(inst.get());
+        }));
+        o = call({{"clear_failures", true}}).value("structuredContent").toObject();
+        QCOMPARE(o.value("failures").toArray().size(), 0);
+        QVERIFY(!o.value("hosts").toArray().isEmpty());
+    }
+
+    void audioDeviceSettings() {
+        // The device's settings round-trip, buffers are powers of two from 32 to 2048, and a measured loopback is used
+        // only at the rate and buffer it was measured at.
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Jack;
+        s.output = "system";
+        s.sampleRate = 96000;
+        s.bufferFrames = 128;
+        s.clock = "Word clock";
+        s.inputs = 4;
+        s.inputNames = {"Dialogue", "", "Room"};
+        s.loopbackFrames = 700, s.loopbackRate = 96000, s.loopbackBuffer = 128;
+        QCOMPARE(audiodev::DeviceSettings::fromJson(s.toJson()), s);
+        QCOMPARE(audiodev::clampBuffer(1), 32);
+        QCOMPARE(audiodev::clampBuffer(100), 128);
+        QCOMPARE(audiodev::clampBuffer(256), 256);
+        QCOMPARE(audiodev::clampBuffer(9000), 2048);
+        QCOMPARE(audiodev::inputName(s, 0), std::string("Dialogue"));
+        QCOMPARE(audiodev::inputName(s, 1), std::string("In 2"));
+        QCOMPARE(audiodev::inputName(s, 3), std::string("In 4"));
+        bool measured = false;
+        QCOMPARE(audiodev::roundTrip(s, 96000, 128, {200, 300}, &measured), 700);
+        QVERIFY(measured);
+        QCOMPARE(audiodev::roundTrip(s, 48000, 128, {200, 300}, &measured), 500);
+        QVERIFY(!measured);
+        QCOMPARE(audiodev::hostFromId("wasapi_exclusive").value(), audiodev::Host::WasapiExclusive);
+        QVERIFY(!audiodev::hostFromId("nothing"));
+        QVERIFY(!audiodev::hostBuilt(audiodev::Host::Asio));  // (its SDK is not built)
+        QCOMPARE(audiodev::availableHosts().front(), audiodev::Host::Qt);
+
+        // A click is found at its first sample of half its peak; quiet recordings have none.
+        std::vector<float> r(1000, 0.001f);
+        r[400] = 0.3f, r[401] = 0.9f, r[402] = 0.5f;
+        QCOMPARE(audiodev::findClick(r.data(), 1000), int64_t(401));
+        QCOMPARE(audiodev::findClick(r.data(), 400), int64_t(-1));
+
+        // Takes: clocked, blocks wait for the playback; a later block starts after silence, an earlier one is cut.
+        audiodev::TakeAligner wait(1000, true);
+        QCOMPARE(wait.next(-1, 256).skip, 256);
+        QVERIFY(!wait.started());
+        audiodev::TakeAligner::Step st = wait.next(1100, 256);
+        QCOMPARE(st.silence, int64_t(100));
+        QCOMPARE(st.skip, 0);
+        audiodev::TakeAligner early(1000, true);
+        st = early.next(700, 256);
+        QCOMPARE(st.skip, 256);
+        st = early.next(956, 256);
+        QCOMPARE(st.skip, 44);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(early.next(1212, 256).skip, 0);
+        // Unclocked, the input's latency is taken off its start.
+        audiodev::TakeAligner loose(0, false, 300);
+        QCOMPARE(loose.next(-1, 256).skip, 256);
+        QCOMPARE(loose.next(-1, 256).skip, 44);
+        QCOMPARE(loose.next(-1, 256).skip, 0);
+    }
+
+    void loopbackRecordingLandsAtZero_data() {
+        QTest::addColumn<int>("buffer");
+        QTest::newRow("64") << 64;
+        QTest::newRow("256") << 256;
+        QTest::newRow("1024") << 1024;
+    }
+    void loopbackRecordingLandsAtZero() {
+        // A click played out through a loopback (the outputs back on the inputs, as by a cable) is recorded and, the
+        // device's reported latencies taken off, lands where it was played.
+        QFETCH(int, buffer);
+        audiodev::setLoopbackOptions({buffer, 2 * buffer, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = buffer;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        const audiodev::EngineStatus st = e.status();
+        QCOMPARE(st.buffer, buffer);
+        QCOMPARE(st.latency.input, buffer);
+        QCOMPARE(st.latency.output, 2 * buffer);
+        QCOMPARE(st.roundTrip, 3 * buffer);
+        QVERIFY(!st.measured);
+        QCOMPARE(recordClick(e), int64_t(4800));
+
+        // A round trip longer than the device says (converters it does not report): measured, and taken off instead.
+        audiodev::setLoopbackOptions({buffer, 2 * buffer, 300});
+        s.host = audiodev::Host::Qt;
+        e.setSettings(s);
+        QVERIFY(!e.isOpen());
+        s.host = audiodev::Host::Loopback;
+        e.setSettings(s);
+        QCOMPARE(recordClick(e), int64_t(4800 + 300));
+        std::string why;
+        QCOMPARE(e.measureLoopback(0, 0, 0.5, &why), 3 * buffer + 300);
+        QVERIFY(e.status().measured);
+        QCOMPARE(e.settings().loopbackFrames, 3 * buffer + 300);
+        QCOMPARE(recordClick(e), int64_t(4800));
+        // Nothing joined from that output to that input: nothing measured, and the last measurement kept.
+        QCOMPARE(e.measureLoopback(1, 0, 0.2, &why), -1);
+        QVERIFY(!why.empty());
+        QCOMPARE(e.settings().loopbackFrames, 3 * buffer + 300);
+        audiodev::setLoopbackOptions({});
+    }
+
+    void loopbackFollowsRateChanges() {
+        // The device's rate changed mid-session (as a server's is): Montage follows it, resampling its 48 kHz both ways,
+        // and recordings still land where they were played.
+        audiodev::setLoopbackOptions({256, 256, 0});
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QCOMPARE(recordClick(e), int64_t(4800));
+        audiodev::loopbackChangeRate(96000);
+        QTRY_COMPARE(e.status().rate, 96000);
+        QCOMPARE(e.status().rateChanges, 1);
+        QCOMPARE(e.roundTripAt(48000), 256);  // (512 frames at 96 kHz)
+        const int64_t at = recordClick(e);
+        QVERIFY2(std::llabs(at - 4800) <= 16, qPrintable(QString::number(at)));
+        // The playback still runs in real time at its own rate: about 48000 of its samples a second (of the time waited).
+        Clicker clicker;
+        const int id = e.addOutput(&clicker, 48000, 2, [&](float* o, int ch, int n) { return clicker.render(o, ch, n); });
+        QVERIFY(id >= 0);
+        QElapsedTimer t;
+        t.start();
+        QTest::qWait(1000);
+        const int64_t played = std::llround(double(clicker.pos.load()) * 1e9 / double(std::max<qint64>(1, t.nsecsElapsed())));
+        e.removeOutput(id);
+        QVERIFY2(played > 40000 && played < 58000, qPrintable(QString::number(played)));
+        audiodev::setLoopbackOptions({});
+    }
+
+    void overloadedCallbackIsAnXrun() {
+        // A callback held past its period (an overloaded computer) is counted as an xrun, and the count can be reset.
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 128;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        QTest::qWait(200);
+        e.resetXruns();
+        const int64_t before = e.status().xruns;
+        QVERIFY(before < 3);
+        audiodev::loopbackStall(60);
+        QTRY_VERIFY(e.status().xruns > before);
+        e.resetXruns();
+        QVERIFY(e.status().xruns < 3);
+    }
+
+    void jackPortsAndLoopback() {
+        // Under JACK's dummy driver (a test tool), or a PipeWire server with its JACK library: Montage's ports appear with
+        // the monitoring section's names, a click looped from an output port back into an input port is recorded and,
+        // the loop measured, lands where it was played at buffers of 64, 256 and 1024, and an overloaded callback is an
+        // xrun.
+        QProcess jackd;
+        const QString server = QStringLiteral("montage-test-%1").arg(QCoreApplication::applicationPid());
+        const QString exe = QStandardPaths::findExecutable(QStringLiteral("jackd"));
+        if (!exe.isEmpty()) {
+            qputenv("JACK_DEFAULT_SERVER", server.toUtf8());
+            qputenv("JACK_NO_AUDIO_RESERVATION", "1");
+            jackd.start(exe, {"--no-realtime", "-n", server, "-d", "dummy", "-r", "48000", "-p", "256"});
+            QVERIFY(jackd.waitForStarted(5000));
+        }
+        if (audiodev::jackLibrary().empty()) QSKIP("No JACK library (PipeWire's or a system libjack) loads here");
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Jack;
+        s.bufferFrames = 256;
+        s.inputs = 2;
+        s.inputNames = {"Dialogue", "Room"};
+        s.autoConnect = false;
+        e.setOutputNames({"L", "R", "C"});
+        e.setOutputChannels(3);
+        QElapsedTimer t;
+        t.start();
+        do {
+            e.setSettings(audiodev::DeviceSettings{});
+            e.setSettings(s);
+            if (!e.isOpen()) QThread::msleep(200);
+        } while (!e.isOpen() && t.elapsed() < 10000);
+        if (!e.isOpen()) {
+            if (exe.isEmpty()) QSKIP("No jackd here, and no JACK or PipeWire server answers");
+            QFAIL(e.status().error.c_str());
+        }
+        const audiodev::EngineStatus st = e.status();
+        for (const char* port : {":L", ":R", ":C", ":Dialogue", ":Room"})
+            QVERIFY2(std::any_of(st.ports.begin(), st.ports.end(), [&](const std::string& p) { return p.size() > strlen(port) && p.compare(p.size() - strlen(port), strlen(port), port) == 0; }),
+                     port);
+        const std::string client = st.ports.front().substr(0, st.ports.front().find(':'));
+        // The speakers renamed (another set): the ports follow.
+        e.setOutputNames({"Lw", "Rw", "Cw"});
+        const auto renamed = e.status().ports;
+        QVERIFY(std::find(renamed.begin(), renamed.end(), client + ":Lw") != renamed.end());
+        for (int buffer : {64, 256, 1024}) {
+            s.bufferFrames = buffer;
+            s.loopbackFrames = 0;
+            e.setSettings(audiodev::DeviceSettings{});
+            e.setSettings(s);
+            QVERIFY2(e.isOpen(), e.status().error.c_str());
+            QVERIFY(e.connect(client + ":Lw", client + ":Dialogue"));
+            std::string why;
+            const int trip = e.measureLoopback(0, 0, 0.5, &why);
+            QVERIFY2(trip > 0, why.c_str());
+            QCOMPARE(recordClick(e, e.status().rate), int64_t(4800));
+        }
+        // A callback that overruns its period.
+        e.resetXruns();
+        const int64_t before = e.status().xruns;
+        std::atomic<int> slow{1};
+        const int id = e.addOutput(&slow, 48000, 2, [&](float* o, int ch, int n) {
+            std::fill(o, o + size_t(n) * size_t(ch), 0.0f);
+            if (slow.exchange(0)) QThread::msleep(100);
+            return int64_t(-1);
+        });
+        QVERIFY(id >= 0);
+        QTRY_VERIFY_WITH_TIMEOUT(e.status().xruns > before, 5000);
+        e.removeOutput(id);
+        e.setSettings(audiodev::DeviceSettings{});
+        if (jackd.state() != QProcess::NotRunning) {
+            jackd.terminate();
+            jackd.waitForFinished(5000);
+        }
     }
 
     void araPlugIns() {

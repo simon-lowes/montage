@@ -25,7 +25,7 @@
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D srcTex;  // RGBA32F, premultiplied
-layout(binding = 2) uniform sampler2D src16;   // RG16
+layout(binding = 2) uniform sampler2D src16;   // RG16 (a Screen Key's clean plate, RGBA32F, where it has one)
 layout(binding = 3) uniform sampler3D lut3;    // RGBA32F, red along x
 layout(binding = 4) uniform sampler2D table;   // RGBA32F: a 1D LUT, or curve tables (one a channel)
 layout(binding = 5) uniform sampler2D maskTex; // R32F: the mask's shape, the layer's size
@@ -317,11 +317,22 @@ vec4 graphStep(ivec2 xy, int mode) {
 }
 
 // A Screen Key's matte (p as mode 20's): 1 where the subject is, 0 on the screen.
-float screenMatte(vec3 c, float a) {
+// A Screen Key's clean plate's colour at xy (src16 where p[4].x says it has one: render/CleanPlate's keyerPlate).
+vec3 plateColour(ivec2 xy) {
+    const vec4 q = texelFetch(src16, xy, 0);
+    return q.rgb / (q.a > 0.0 ? q.a : 1.0);
+}
+float screenMatte(vec3 c, float a, ivec2 xy) {
     if (a <= 0.0) return 0.0;
     const int dom = int(p[1].x), o1 = (dom + 1) % 3, o2 = (dom + 2) % 3;
     const float others = p[1].y * max(c[o1], c[o2]) + (1.0 - p[1].y) * min(c[o1], c[o2]);
-    const float m = clamp(1.0 - (c[dom] - others) / p[1].w * p[1].z, 0.0, 1.0);
+    float here = p[1].w;
+    if (p[4].x > 0.5) {  // (the plate's screen colour, where it is screen: p[4].y the least that counts)
+        const vec3 q = plateColour(xy);
+        const float lead = q[dom] - (p[1].y * max(q[o1], q[o2]) + (1.0 - p[1].y) * min(q[o1], q[o2]));
+        if (lead >= p[4].y) here = lead;
+    }
+    const float m = clamp(1.0 - (c[dom] - others) / here * p[1].z, 0.0, 1.0);
     return clamp((m - p[2].x) / (p[2].y - p[2].x), 0.0, 1.0);
 }
 
@@ -335,16 +346,24 @@ vec2 chromaAt(ivec2 at) {
     if (p[6].z > 0.5) return vec2(planeSample(table, at, 0), planeSample(table, at, 1));
     return vec2(planeSample(table, at, 0), planeSample(maskTex, at, 0));
 }
+// Keys' cubic (a = -0.5) at the four samples about a point f (0..1) past the second, as media/Image's.
+vec4 cubicWeights(float f) {
+    return vec4(((-0.5 * f + 1.0) * f - 0.5) * f, (1.5 * f - 2.5) * f * f + 1.0, ((-1.5 * f + 2.0) * f + 0.5) * f, (0.5 * f - 0.5) * f * f);
+}
 vec4 ycbcr(ivec2 xy) {
     const ivec2 cs = ivec2(p[4].zw);
     const float cx = (float(xy.x) - p[5].z) / p[5].x, cy = (float(xy.y) - p[5].w) / p[5].y;
     const int cx0 = int(floor(cx)), cy0 = int(floor(cy));
-    const float fx = cx - float(cx0), fy = cy - float(cy0);
-    const int xa = clamp(cx0, 0, cs.x - 1), xb = clamp(cx0 + 1, 0, cs.x - 1);
-    const int ya = clamp(cy0, 0, cs.y - 1), yb = clamp(cy0 + 1, 0, cs.y - 1);
-    const vec2 aa = chromaAt(ivec2(xa, ya)), ba = chromaAt(ivec2(xb, ya)), ab = chromaAt(ivec2(xa, yb)), bb = chromaAt(ivec2(xb, yb));
-    const vec2 a = aa + (ba - aa) * fx, b = ab + (bb - ab) * fx;
-    const vec2 c = (a + (b - a) * fy - vec2(p[7].z)) / p[7].w;  // (Cb, Cr)
+    const vec4 wx = cubicWeights(cx - float(cx0)), wy = cubicWeights(cy - float(cy0));
+    // (down each of the four columns, then along them: the CPU's order)
+    vec2 c = vec2(0.0);
+    for (int i = 0; i < 4; ++i) {
+        const int xi = clamp(cx0 - 1 + i, 0, cs.x - 1);
+        vec2 v = vec2(0.0);
+        for (int j = 0; j < 4; ++j) v += wy[j] * chromaAt(ivec2(xi, clamp(cy0 - 1 + j, 0, cs.y - 1)));
+        c += wx[i] * v;
+    }
+    c = (c - vec2(p[7].z)) / p[7].w;  // (Cb, Cr)
     const float y = (planeSample(srcTex, xy, 0) - p[7].x) / p[7].y;
     const float kr = p[8].x, kb = p[8].y;
     const float r = y + 2.0 * (1.0 - kr) * c.y, bl = y + 2.0 * (1.0 - kb) * c.x;
@@ -380,7 +399,7 @@ vec4 decoded(vec3 s, float a) {
 vec4 matteStep(ivec2 xy, int mode) {
     if (mode == 21) {
         const vec4 px = texelFetch(srcTex, xy, 0);
-        const float m = screenMatte(px.a > 0.0 ? px.rgb * (1.0 / px.a) : vec3(0.0), px.a);
+        const float m = screenMatte(px.a > 0.0 ? px.rgb * (1.0 / px.a) : vec3(0.0), px.a, xy);
         return vec4(m, m, m, 1.0);
     }
     const int r = int(p[1].x);
@@ -428,12 +447,19 @@ vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
         return vec4(c * (a * m), a * m);
     }
     // Screen Key. p[1]: the screen's channel, balance, gain, the screen's strength; p[2]: clip black and white,
-    // despill, restore; p[3]: edge desaturation, the view (0 the result, 1 the matte, 2 status), and the matte's
-    // shrink (negative: grow) and blur radii (either set: the matte made beforehand, in `table`).
+    // despill, restore; p[3]: edge desaturation, the view (0 the result, 1 the matte, 2 status, with a plate 3 the plate
+    // and 4 the screen evened out), and the matte's shrink (negative: grow) and blur radii (either set: the matte made
+    // beforehand, in `table`); p[4] a clean plate in src16 and the least screen it counts; p[5] the key colour.
     const int dom = int(p[1].x), o1 = (dom + 1) % 3, o2 = (dom + 2) % 3;
-    const float m = p[3].z != 0.0 || p[3].w != 0.0 ? texelFetch(table, xy, 0).r : screenMatte(c, a);
-    const float na = a * m;
     const int view = int(p[3].y);
+    if (p[4].x > 0.5 && view >= 3) {
+        // The plate (3), or the screen evened out by it (4: each channel by the key's over the plate's, at most four times).
+        const vec3 q = plateColour(xy);
+        if (view == 3) return vec4(q, 1.0);
+        return vec4(c * a * (p[5].xyz / max(q, 0.25 * p[5].xyz + 1e-4)), a);
+    }
+    const float m = p[3].z != 0.0 || p[3].w != 0.0 ? texelFetch(table, xy, 0).r : screenMatte(c, a, xy);
+    const float na = a * m;
     if (view == 1) return vec4(vec3(na), 1.0);
     if (view == 2) return vec4(vec3(na < 0.02 ? 0.0 : na > 0.98 ? 1.0 : 0.5), 1.0);
     vec3 o = c;

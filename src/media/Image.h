@@ -6,8 +6,11 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
+
+struct AVFrame;  // (FFmpeg's)
 
 namespace montage {
 
@@ -92,10 +95,25 @@ struct YcbcrPlanes {
     int stride[3] = {};                // bytes a row
     std::shared_ptr<const void> owner;  // what keeps the samples
     size_t heldBytes = 0;               // what the owner holds, when known (more than the samples shown: padding)
+    // Or a hardware frame, its samples in the decoding device's memory and `data` empty: FFmpeg's frame, held by
+    // reference (so the frame cache's copy keeps the device's surface), and the device type ("vaapi", "vulkan",
+    // "videotoolbox", "d3d11va"). render/GpuCompositor maps it into its own API; the CPU copies it back first
+    // (planesInMemory).
+    std::shared_ptr<const AVFrame> hw;
+    const char* hwType = "";
+    struct Copied {  // (that copy, made once)
+        std::mutex mutex;
+        bool tried = false;
+        std::shared_ptr<const YcbcrPlanes> planes;
+    };
+    std::shared_ptr<Copied> copied;
     int chromaWidth() const { return (width + (1 << log2ChromaW) - 1) >> log2ChromaW; }
     int chromaHeight() const { return (height + (1 << log2ChromaH) - 1) >> log2ChromaH; }
     size_t bytes() const;
 };
+// `p` with its samples in memory: `p` itself, or a hardware frame's copy, made the first time it is asked for
+// (media/HwAccel counts it with the decoder's copies: hwFrameCopies) and kept with `p`. Null if it cannot be copied.
+const YcbcrPlanes* planesInMemory(const YcbcrPlanes& p);
 
 // 16-bit RGBA straight alpha, as produced by the decoder (cache-friendly): code values 0..65535 for 0..1, or, for a
 // floating-point source (OpenEXR, float DPX/TIFF), half floats kept as they are, values past 0..1 included. Or, from a
@@ -118,7 +136,8 @@ using Frame16Ptr = std::shared_ptr<const Frame16>;
 
 Image toImage(const Frame16& f);
 // Y′CbCr planes as straight RGBA (alpha 1, colour clamped to 0..1) at their own size, as the GPU converts them: chroma
-// interpolated bilinearly from where its samples sit (edges repeated), the planes' matrix and range. Then, when the
+// interpolated bicubically (Keys' cubic, from the four samples either side along each axis) from where its samples sit
+// (edges repeated), the planes' matrix and range. (A decoder's high-quality frames at any size start from this.) Then, when the
 // size differs, resampled to w x h as the GPU resamples (resampleRgba).
 std::vector<float> ycbcrToRgba(const YcbcrPlanes& p, int w = 0, int h = 0);
 // The same at the planes' own size into 16-bit RGBA (as Frame16's px; alpha 65535).

@@ -196,7 +196,8 @@ SurroundGains surroundGains(const std::string& layout, const SurroundPan& p) {
     return out;
 }
 
-void downmixToStereo(const std::string& layout, const float* in, int frames, float* out) {
+void downmixToStereo(const std::string& layout, const float* in, int frames, float* out, double centreDb,
+                     double surroundDb) {
     if (const int order = ambisonicOrder(layout)) {
         const size_t stride = size_t(ambisonicChannels(order));
         for (int i = 0; i < frames; ++i) foaDecodeStereo(in + size_t(i) * stride, out[size_t(i) * 2], out[size_t(i) * 2 + 1]);
@@ -209,14 +210,16 @@ void downmixToStereo(const std::string& layout, const float* in, int frames, flo
         return;
     }
     std::vector<std::pair<float, float>> w(static_cast<size_t>(n));
+    auto gain = [](double db) { return db <= -99 ? 0.0f : float(std::pow(10.0, db / 20)); };
+    const float cg = centreDb == -3 ? 0.7071f : gain(centreDb), sg = surroundDb == -3 ? 0.7071f : gain(surroundDb);
     for (int c = 0; c < n; ++c) {
         const std::string name = sp[size_t(c)].name;
         if (sp[size_t(c)].lfe) w[size_t(c)] = {0, 0};
         else if (name == "L") w[size_t(c)] = {1, 0};
         else if (name == "R") w[size_t(c)] = {0, 1};
-        else if (name == "C") w[size_t(c)] = {0.7071f, 0.7071f};
-        else if (name[0] == 'L') w[size_t(c)] = {0.7071f, 0};
-        else w[size_t(c)] = {0, 0.7071f};
+        else if (name == "C") w[size_t(c)] = {cg, cg};
+        else if (name[0] == 'L') w[size_t(c)] = {sg, 0};
+        else w[size_t(c)] = {0, sg};
     }
     for (int i = 0; i < frames; ++i) {
         float l = 0, r = 0;

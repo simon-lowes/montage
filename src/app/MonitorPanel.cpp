@@ -5,18 +5,21 @@
 
 #include "ExposureView.h"
 
+#include <QActionGroup>
 #include <QApplication>
 #include <QComboBox>
 #include <QDrag>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QStyle>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -31,6 +34,7 @@
 #include "EditorState.h"
 #include "HdrSurface.h"
 #include "PlaybackController.h"
+#include "media/Capture.h"
 #include "media/Image.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
@@ -51,7 +55,7 @@ ViewerWidget::ViewerWidget(QWidget* parent) : QWidget(parent) {
 
 QImage ViewerWidget::drawnImage() {
     if (image_.isNull()) return {};
-    return calibrated_[0].get(exposure_ ? shownImage() : image_, DisplayCalibration::instance().screenLut(screen()));
+    return calibrated_[0].get(overlaid() ? shownImage() : image_, DisplayCalibration::instance().screenLut(screen()));
 }
 
 void ViewerWidget::setImage(const QImage& img, FrameTime t) {
@@ -60,7 +64,7 @@ void ViewerWidget::setImage(const QImage& img, FrameTime t) {
     imageTime_ = t;
     // Under the HDR surface the SDR picture is not seen: repainted (and the drawing over it sent again) only when its
     // place moved, or when the exposure check, drawn from it, is on.
-    if (!hdrShowing() || reshaped || exposure_ != 0) update();
+    if (!hdrShowing() || reshaped || overlaid()) update();
     // Overlays that move with playback (ADR streamers, handles on animated clips) repaint with each picture: theirs are
     // sent along with it, when they changed.
     else if (!overlays_.empty()) refreshOverlay(false);
@@ -82,6 +86,33 @@ void ViewerWidget::setExposureView(int mode) {
     update();
 }
 
+void ViewerWidget::setFocusPeaking(bool on) {
+    peaking_ = on;
+    update();
+}
+
+void ViewerWidget::setPeakingColour(const QColor& colour) {
+    peakingColour_ = colour;
+    update();
+}
+
+void ViewerWidget::setPeakingSensitivity(int sensitivity) {
+    peakingSensitivity_ = std::clamp(sensitivity, 0, 2);
+    update();
+}
+
+void ViewerWidget::setPeakingAtMonitorSize(bool on) {
+    peakingAtMonitorSize_ = on;
+    update();
+}
+
+QSize ViewerWidget::peakingSize() const {
+    if (!peakingAtMonitorSize_) return image_.size();
+    // The picture's area in device pixels, as it reaches the screen.
+    const QSizeF r = imageRect().size() * devicePixelRatioF();
+    return QSize(std::max(1, int(std::lround(r.width()))), std::max(1, int(std::lround(r.height()))));
+}
+
 void ViewerWidget::setSignal(const QImage& signal, FrameTime t, const QString& space) {
     signal_ = signal;
     signalTime_ = t;
@@ -90,7 +121,25 @@ void ViewerWidget::setSignal(const QImage& signal, FrameTime t, const QString& s
 }
 
 QImage ViewerWidget::shownImage() const {
-    if (exposure_ == 0 || image_.isNull()) return image_;
+    if (!overlaid() || image_.isNull()) return image_;
+    const QImage exposed = exposure_ ? exposedImage() : image_;
+    if (!peaking_) return exposed;
+    // Peaking over that, found in the picture itself (not in an exposure check's stripes and bands) at the monitor's size
+    // (scaled as it is drawn) or in its own pixels.
+    const QSize size = peakingSize();
+    const QString state = QStringLiteral("%1 %2 %3 %4x%5").arg(peakingColour_.name()).arg(peakingSensitivity_).arg(exposure_)
+                              .arg(size.width()).arg(size.height());
+    if (peakedKey_ != exposed.cacheKey() || peakedState_ != state || peaked_.isNull()) {
+        auto at = [&](const QImage& img) { return size == img.size() ? img : img.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation); };
+        const QImage picture = at(image_);
+        peaked_ = focusPeakingView(picture, peakingColour_, peakingSensitivity_, exposure_ ? at(exposed) : QImage());
+        peakedKey_ = exposed.cacheKey();
+        peakedState_ = state;
+    }
+    return peaked_;
+}
+
+QImage ViewerWidget::exposedImage() const {
     const bool gamut = exposure_ >= int(ExposureView::OutOfGamut709);
     // The gamut checks need the frame as delivered: none marked while the one at hand is another frame's.
     const QImage signal = gamut && !signal_.isNull() && signalTime_ == imageTime_ ? signal_ : QImage();
@@ -177,9 +226,9 @@ void ViewerWidget::paintContent(QPainter& p, bool picture) {
     }
     const QRectF r = imageRect();
     p.setRenderHint(QPainter::SmoothPixmapTransform);
-    if (picture || exposure_) {
-        // (the exposure check is an SDR picture, drawn over HDR too)
-        p.drawImage(r, calibrated_[0].get(exposure_ ? shownImage() : image_, lut));
+    if (picture || overlaid()) {
+        // (the exposure check and focus peaking are an SDR picture, drawn over HDR too)
+        p.drawImage(r, calibrated_[0].get(overlaid() ? shownImage() : image_, lut));
     } else {
         // Where the HDR surface's picture shows through.
         p.save();
@@ -685,6 +734,72 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
                              "magenta stripes over colours a Rec.709 or P3 delivery cannot show"));
     connect(exposure_, &QComboBox::currentIndexChanged, viewer_, &ViewerWidget::setExposureView);
     bar->addWidget(exposure_);
+    // Focus peaking on either monitor: on and off, and from its menu its colour, how sensitive, and where the edges
+    // are found (remembered for both monitors).
+    peaking_ = new QToolButton(this);
+    peaking_->setObjectName(QStringLiteral("focusPeaking"));
+    peaking_->setIcon(theme::icon("peaking"));
+    peaking_->setAutoRaise(true);
+    peaking_->setCheckable(true);
+    peaking_->setPopupMode(QToolButton::MenuButtonPopup);
+    peaking_->setAccessibleName(tr("Focus peaking"));
+    peaking_->setToolTip(tr("Focus peaking: the edges in focus marked in colour over the picture (its menu sets the colour, how "
+                            "sensitive it is, and whether edges are found at the monitor's size or in the picture's own pixels)"));
+    {
+        QSettings st = appSettings();
+        const auto& colours = peakingColours();
+        const int colour = std::clamp(st.value("monitor/peakingColour", 0).toInt(), 0, int(colours.size()) - 1);
+        viewer_->setPeakingColour(colours[size_t(colour)].first);
+        viewer_->setPeakingSensitivity(st.value("monitor/peakingSensitivity", 1).toInt());
+        viewer_->setPeakingAtMonitorSize(st.value("monitor/peakingAtMonitorSize", true).toBool());
+        auto* menu = new QMenu(peaking_);
+        menu->setObjectName(QStringLiteral("focusPeakingMenu"));
+        menu->addSection(tr("Colour"));
+        auto* colourGroup = new QActionGroup(menu);
+        for (int i = 0; i < int(colours.size()); ++i) {
+            QPixmap swatch(12, 12);
+            swatch.fill(colours[size_t(i)].first);
+            QAction* a = menu->addAction(QIcon(swatch), tr(colours[size_t(i)].second));
+            a->setObjectName(QStringLiteral("peakingColour%1").arg(i));
+            a->setCheckable(true);
+            a->setChecked(i == colour);
+            colourGroup->addAction(a);
+            connect(a, &QAction::triggered, this, [this, i] {
+                viewer_->setPeakingColour(peakingColours()[size_t(i)].first);
+                appSettings().setValue("monitor/peakingColour", i);
+            });
+        }
+        menu->addSection(tr("Sensitivity"));
+        auto* sensitivityGroup = new QActionGroup(menu);
+        const char* levels[] = {QT_TR_NOOP("Low (the crispest edges only)"), QT_TR_NOOP("Medium"), QT_TR_NOOP("High")};
+        for (int i = 0; i < 3; ++i) {
+            QAction* a = menu->addAction(tr(levels[i]));
+            a->setObjectName(QStringLiteral("peakingSensitivity%1").arg(i));
+            a->setCheckable(true);
+            a->setChecked(i == viewer_->peakingSensitivity());
+            sensitivityGroup->addAction(a);
+            connect(a, &QAction::triggered, this, [this, i] {
+                viewer_->setPeakingSensitivity(i);
+                appSettings().setValue("monitor/peakingSensitivity", i);
+            });
+        }
+        menu->addSection(tr("Found"));
+        auto* sizeGroup = new QActionGroup(menu);
+        for (bool monitorSize : {true, false}) {
+            QAction* a = menu->addAction(monitorSize ? tr("At the Monitor's Size") : tr("At 1:1 (the Picture's Own Pixels)"));
+            a->setObjectName(monitorSize ? QStringLiteral("peakingAtMonitorSize") : QStringLiteral("peakingAtFullSize"));
+            a->setCheckable(true);
+            a->setChecked(monitorSize == viewer_->peakingAtMonitorSize());
+            sizeGroup->addAction(a);
+            connect(a, &QAction::triggered, this, [this, monitorSize] {
+                viewer_->setPeakingAtMonitorSize(monitorSize);
+                appSettings().setValue("monitor/peakingAtMonitorSize", monitorSize);
+            });
+        }
+        peaking_->setMenu(menu);
+    }
+    connect(peaking_, &QToolButton::toggled, viewer_, &ViewerWidget::setFocusPeaking);
+    bar->addWidget(peaking_);
     bar->addStretch();
     durationLabel_ = new QLabel(this);
     durationLabel_->setFont(theme::monoFont(9));
@@ -695,17 +810,70 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     hdrBadge_->setStyleSheet(QStringLiteral("color: #111; background: #f0c040; border-radius: 3px; padding: 0 4px; font-weight: 600;"));
     hdrBadge_->hide();
     bar->addWidget(hdrBadge_);
+    if (mode == Mode::Source) {
+        // Live (setLiveFeed): on while a feed is watched; off, the recording so far is scrubbed and played as media.
+        auto* badge = new QToolButton(this);
+        badge->setObjectName(QStringLiteral("liveBadge"));
+        badge->setText(tr("LIVE"));
+        badge->setCheckable(true);
+        badge->setChecked(true);
+        badge->setAutoRaise(true);
+        badge->setStyleSheet(QStringLiteral("QToolButton { color: #888; font-weight: 600; padding: 0 4px; border-radius: 3px; }"
+                                            "QToolButton:checked { color: white; background: #c62828; }"));
+        badge->hide();
+        bar->addWidget(badge);
+        liveBadge_ = badge;
+        connect(badge, &QToolButton::toggled, this, [this](bool on) {
+            if (!live_) return;
+            if (on) {
+                controller_->pause();
+                liveShown_ = -1;
+                liveTick();
+                emit liveChanged();  // (live again: the multiviewer's tally)
+            } else {
+                viewer_->setImage(QImage());
+                emit liveChanged();  // (the recording so far, as media)
+                controller_->requestFrame();
+                refresh();
+            }
+        });
+        liveTimer_ = new QTimer(this);
+        liveTimer_->setInterval(40);
+        connect(liveTimer_, &QTimer::timeout, this, &MonitorPanel::liveTick);
+        // Its sound's meters, at the picture's right edge: green, then yellow from -18 dBFS and red from -6.
+        viewer_->addOverlay([this](QPainter& p, const QRectF& r) {
+            if (!liveShowing() || livePeaks_.empty()) return;
+            const int n = std::min<int>(16, int(livePeaks_.size()));
+            const double w = std::clamp(r.width() / 80, 3.0, 8.0), gap = std::max(1.0, w / 3);
+            const double h = r.height() * 0.6, bottom = r.bottom() - r.height() * 0.05;
+            double x = r.right() - 6 - n * (w + gap);
+            p.save();
+            p.fillRect(QRectF(x - gap, bottom - h - gap, n * (w + gap) + gap, h + 2 * gap), QColor(0, 0, 0, 150));
+            auto at = [h](double db) { return std::clamp((db + 60) / 60, 0.0, 1.0) * h; };
+            for (int c = 0; c < n; ++c, x += w + gap) {
+                const double db = livePeaks_[size_t(c)] > 0 ? 20 * std::log10(double(livePeaks_[size_t(c)])) : -100;
+                const double lit = at(db), yellow = at(-18), red = at(-6);
+                p.fillRect(QRectF(x, bottom - std::min(lit, yellow), w, std::min(lit, yellow)), QColor(60, 200, 90));
+                if (lit > yellow) p.fillRect(QRectF(x, bottom - std::min(lit, red), w, std::min(lit, red) - yellow), QColor(230, 200, 40));
+                if (lit > red) p.fillRect(QRectF(x, bottom - lit, w, lit - red), QColor(230, 50, 40));
+            }
+            p.restore();
+        });
+    }
     lay->addLayout(bar);
 
     connect(scrub_, &ScrubBar::seekRequested, controller_, &PlaybackController::seek);
+    connect(scrub_, &ScrubBar::seekRequested, this, [this] {
+        if (liveShowing()) liveBadge_->setChecked(false);  // (into the recording so far)
+    });
     connect(controller_, &PlaybackController::frameRendered, viewer_, [this](const QImage& img, FrameTime t) {
-        if (mode_ == Mode::Source && !state_->sourceMedia()) return;
+        if (mode_ == Mode::Source && (!state_->sourceMedia() || liveShowing())) return;
         viewer_->setImage(img, t);
     });
     connect(controller_, &PlaybackController::scopeFrameRendered, viewer_,
             [this](const QImage& img, FrameTime t, const QString& space, double) { viewer_->setSignal(img, t, space); });
     connect(controller_, &PlaybackController::hdrFrameRendered, viewer_, [this](HdrPicturePtr picture, FrameTime) {
-        if (mode_ == Mode::Source && !state_->sourceMedia()) return;
+        if (mode_ == Mode::Source && (!state_->sourceMedia() || liveShowing())) return;
         viewer_->setHdrPicture(std::move(picture));
     });
     // The HDR viewer's pictures through its display's calibration for PQ (applied as they are rendered).
@@ -891,10 +1059,15 @@ QString MonitorPanel::accessibleSummary() const {
     auto mark = [s](FrameTime t) { return t < 0 ? tr("not set") : timecodeString(s, t); };
     QString summary = tr("%1, In %2, Out %3").arg(timecode_->text(), mark(in), mark(out));
     if (mode_ == Mode::Source && !state_->sourceMedia()) summary = tr("Nothing open");
+    if (liveShowing()) summary = tr("Live: %1, %2").arg(liveLabel_, summary);
     return summary;
 }
 
 void MonitorPanel::refresh() {
+    if (liveShowing()) {
+        liveTick();
+        return;
+    }
     const Sequence* s = controller_->sequence();
     FrameTime d = duration();
     scrub_->setRange(std::max<FrameTime>(d, 1));
@@ -932,13 +1105,113 @@ void MonitorPanel::updateWaveform() {
 }
 
 void MonitorPanel::markIn() {
+    if (markLive(true)) return;
     if (mode_ == Mode::Source) state_->setSourceIn(controller_->position());
     else state_->setInPoint(controller_->position());
 }
 
 void MonitorPanel::markOut() {
+    if (markLive(false)) return;
     if (mode_ == Mode::Source) state_->setSourceOut(controller_->position());
     else state_->setOutPoint(controller_->position());
+}
+
+// ---- Live
+
+void MonitorPanel::setLiveFeed(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording) {
+    if (mode_ != Mode::Source || (feed == live_ && media == liveMedia_ && label == liveLabel_ && recording == liveRecording_)) return;
+    const bool was = bool(live_);
+    live_ = std::move(feed);
+    liveMedia_ = live_ ? media : 0;
+    liveLabel_ = live_ ? label : QString();
+    liveRecording_ = live_ && recording;
+    liveShown_ = -1;
+    livePeaks_.clear();
+    liveBadge_->setVisible(bool(live_));
+    liveBadge_->setToolTip(live_ ? tr("Watching %1 live (off: the recording so far)").arg(label) : QString());
+    {
+        const QSignalBlocker block(liveBadge_);
+        liveBadge_->setChecked(true);
+    }
+    if (live_) {
+        controller_->pause();
+        liveTimer_->start();
+        liveTick();
+    } else {
+        liveTimer_->stop();
+        if (was) {
+            viewer_->setImage(QImage());
+            controller_->requestFrame();
+        }
+        refresh();
+    }
+    if (was || live_) emit liveChanged();
+}
+
+void MonitorPanel::setLiveMedia(Id media) {
+    if (!live_ || media == liveMedia_) return;
+    liveMedia_ = media;
+    emit liveChanged();
+}
+
+bool MonitorPanel::liveShowing() const { return live_ && liveBadge_ && liveBadge_->isChecked(); }
+
+namespace {
+// The recording's picture at the active sequence's rate, as the Source monitor's marks are counted.
+FrameTime sequenceFrame(const LiveFeed::Now& now, const Sequence* s) {
+    if (now.frame < 0 || now.fps <= 0) return -1;
+    return FrameTime(std::floor(double(now.frame) / now.fps * (s ? s->fpsValue() : now.fps) + 1e-6));
+}
+}  // namespace
+
+FrameTime MonitorPanel::liveFrame() const { return live_ ? sequenceFrame(live_->look(), state_->sequence()) : -1; }
+
+bool MonitorPanel::markLive(bool in) {
+    if (!liveShowing()) return false;
+    const LiveFeed::Now now = live_->look();
+    if (!liveMedia_) {
+        state_->message(liveRecording_ ? tr("The recording is in the Captures bin a moment after it starts: mark it then")
+                                       : tr("%1 cannot be marked live: it is only watched, or its recording comes into the bin when it ends")
+                                             .arg(liveLabel_));
+        return true;
+    }
+    const FrameTime t = sequenceFrame(now, state_->sequence());
+    if (t < 0) return true;
+    if (state_->sourceMedia() != liveMedia_) state_->setSourceMedia(liveMedia_);  // (the recording, its marks)
+    // (as long as the recorder has it, ahead of what reading the file finds: cut in at once)
+    state_->noteRecordedLength(liveMedia_, double(now.frame + 1) / now.fps);
+    if (in) state_->setSourceIn(t);
+    else state_->setSourceOut(t);
+    return true;
+}
+
+void MonitorPanel::liveTick() {
+    if (!live_) return;
+    const LiveFeed::Now now = live_->look();
+    livePeaks_ = now.peaks;
+    if (!liveBadge_->isChecked()) return;
+    if (!now.picture.isNull() && now.pictures != liveShown_) {
+        liveShown_ = now.pictures;
+        viewer_->setImage(now.picture);
+    } else {
+        viewer_->update();  // (the meters)
+    }
+    const Sequence* s = state_->sequence();
+    const FrameTime t = sequenceFrame(now, s);
+    scrub_->setRange(std::max<FrameTime>(t + 1, 1));
+    scrub_->setPosition(std::max<FrameTime>(t, 0));
+    const bool marked = liveMedia_ && state_->sourceMedia() == liveMedia_;
+    const FrameTime in = marked ? state_->sourceIn() : -1, out = marked ? state_->sourceOut() : -1;
+    scrub_->setMarks(in, out);
+    if (!timecode_->hasFocus()) timecode_->setText(now.timecode.empty() ? (now.running ? tr("LIVE") : tr("Ended")) : QString::fromStdString(now.timecode));
+    QString text = now.running ? liveLabel_ : tr("%1 (ended)").arg(liveLabel_);
+    if (in >= 0 || out >= 0) {
+        const FrameTime a = std::max<FrameTime>(0, in), b = out >= 0 ? out + 1 : t + 1;
+        text = tr("In–Out %1").arg(durationString(s, std::max<FrameTime>(0, b - a)));
+    } else if (liveMedia_ && t >= 0) {
+        text += QStringLiteral(" · ") + durationString(s, t + 1);
+    }
+    durationLabel_->setText(text);
 }
 
 void MonitorPanel::goToIn() {

@@ -82,13 +82,15 @@ struct OutputCurve {
 
 // A DNG's opcode lists 1 and 2 applied to its mosaic as LibRaw unpacked it (list 1 to the whole stored picture, list 2
 // to the active area); Bayer mosaics only (a linear DNG's lists are passed over).
-void applyMosaicOpcodes(LibRaw& raw, const DngOpcodeLists& lists) {
+// False when `cancel` stopped it.
+bool applyMosaicOpcodes(LibRaw& raw, const DngOpcodeLists& lists, const std::atomic<bool>* cancel) {
     auto& rd = raw.imgdata.rawdata;
     const auto& sz = raw.imgdata.sizes;
-    if (!rd.raw_image || !raw.imgdata.idata.filters || sz.raw_pitch < 2) return;
+    if (!rd.raw_image || !raw.imgdata.idata.filters || sz.raw_pitch < 2) return true;
     const int stride = int(sz.raw_pitch / 2);
     const auto& col = raw.imgdata.color;
-    if (!lists.list[0].empty()) applyDngMosaicOpcodes(lists.list[0], 1, rd.raw_image, sz.raw_width, sz.raw_height, stride, 0, 65535);
+    if (!lists.list[0].empty() && applyDngMosaicOpcodes(lists.list[0], 1, rd.raw_image, sz.raw_width, sz.raw_height, stride, 0, 65535, nullptr, 0, 0, cancel) < 0)
+        return false;
     if (!lists.list[1].empty() && sz.top_margin + sz.height <= sz.raw_height && sz.left_margin + sz.width <= sz.raw_width) {
         // The black level by position: each mosaic colour's, and the DNG's BlackLevel pattern (its repeat in cblack[4], [5],
         // its values from cblack[6]) where LibRaw has not yet folded it in.
@@ -101,9 +103,11 @@ void applyMosaicOpcodes(LibRaw& raw, const DngOpcodeLists& lists) {
                 pattern[size_t(y) * size_t(cols) + size_t(x)] = col.cblack[std::clamp(raw.COLOR(y, x), 0, 3)] +
                                                               (repeat ? col.cblack[6 + (unsigned(y) % pr) * pc + unsigned(x) % pc] : 0);
         uint16_t* active = rd.raw_image + size_t(sz.top_margin) * size_t(stride) + sz.left_margin;
-        applyDngMosaicOpcodes(lists.list[1], 2, active, sz.width, sz.height, stride, col.black, col.maximum > 0 ? col.maximum : 65535,
-                              pattern.data(), rows, cols);
+        if (applyDngMosaicOpcodes(lists.list[1], 2, active, sz.width, sz.height, stride, col.black, col.maximum > 0 ? col.maximum : 65535,
+                                  pattern.data(), rows, cols, cancel) < 0)
+            return false;
     }
+    return true;
 }
 
 std::string cameraName(const LibRaw& raw) {
@@ -197,10 +201,21 @@ bool whiteBalanceMultipliers(const float camFromXyz[3][3], double kelvin, double
     return true;
 }
 
-bool developRaw(const std::string& path, RawImage& out, std::string* error, const RawSettings& settings) {
+bool developRaw(const std::string& path, RawImage& out, std::string* error, const RawSettings& settings, const std::atomic<bool>* cancel,
+                const std::function<void(double)>& opcodeProgress) {
 #ifdef MONTAGE_WITH_LIBRAW
+    auto stop = [&] { return cancel && cancel->load(); };
+    auto cancelled = [&] {
+        if (error) *error = "Developing " + path + " was cancelled";
+        return false;
+    };
+    if (stop()) return cancelled();
     auto raw = openRaw(path, error);
     if (!raw) return false;
+    // (LibRaw asks between its steps whether to go on)
+    if (cancel)
+        raw->set_progress_handler([](void* data, enum LibRaw_progress, int, int) { return static_cast<const std::atomic<bool>*>(data)->load() ? 1 : 0; },
+                                  const_cast<std::atomic<bool>*>(cancel));
     auto& p = raw->imgdata.params;
     if (settings.exposure != 0) {
         // LibRaw's own exposure shift reaches -2 to +3 stops (rolling brightened highlights off rather than clipping
@@ -258,8 +273,9 @@ bool developRaw(const std::string& path, RawImage& out, std::string* error, cons
         p.gamm[0] = p.gamm[1] = 1;
     }
     int rc = raw->unpack();
-    if (rc == LIBRAW_SUCCESS && !opcodes.empty()) applyMosaicOpcodes(*raw, opcodes);
+    if (rc == LIBRAW_SUCCESS && !opcodes.empty() && !applyMosaicOpcodes(*raw, opcodes, cancel)) return cancelled();
     if (rc == LIBRAW_SUCCESS) rc = raw->dcraw_process();
+    if (stop() || rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancelled();
     if (rc != LIBRAW_SUCCESS) {
         if (error) *error = "Cannot develop " + path + ": " + libraw_strerror(rc);
         return false;
@@ -280,7 +296,8 @@ bool developRaw(const std::string& path, RawImage& out, std::string* error, cons
         const int w = img->width, h = img->height, planes = img->colors;
         std::vector<float> lin(size_t(w) * size_t(h) * size_t(planes));
         for (size_t i = 0; i < lin.size(); ++i) lin[i] = src[i] / 65535.0f;
-        applyDngPictureOpcodes(opcodes.list[2], lin.data(), w, h, planes, fullWidth, fullHeight);
+        if (applyDngPictureOpcodes(opcodes.list[2], lin.data(), w, h, planes, fullWidth, fullHeight, cancel, opcodeProgress) < 0)
+            return cancelled();
         // The Rec.709 curve LibRaw would have made, then the turn upright (dcraw's flip_index).
         const OutputCurve curve(0.45, 4.5);
         std::vector<uint16_t> table(65536);
@@ -310,7 +327,7 @@ bool developRaw(const std::string& path, RawImage& out, std::string* error, cons
     return true;
 #else
     if (error) *error = "This build of Montage cannot read camera raw files (built without LibRaw)";
-    (void)path, (void)out, (void)settings;
+    (void)path, (void)out, (void)settings, (void)cancel, (void)opcodeProgress;
     return false;
 #endif
 }

@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "core/Adr.h"
@@ -143,6 +144,15 @@ public:
     // What the device gets through the monitoring section for `frames` samples from sample `start` (outputs channels,
     // interleaved), from a monitor of its own; `idle` as while stopped (no programme).
     std::vector<float> monitored(int64_t start, int frames, bool idle = false);
+    // The device's outputs' names for `channels` channels (JACK's ports): the speaker on each, "Cue 1" and "Cue 2", else
+    // "Out N".
+    std::vector<std::string> outputNames(int channels) const;
+    // Playing (or kept open) through the device chosen in Monitoring (audio/AudioDevice.h) rather than Qt Multimedia's.
+    bool onDevice() const { return engineOut_ >= 0; }
+    // The device chosen has changed: the sound and talkback opened again on it.
+    void reopenAudio();
+    // The same for every controller (the program and the source monitor).
+    static void reopenAllAudio();
     double speed() const { return speed_; }
     FrameTime position() const { return position_; }
 
@@ -198,6 +208,12 @@ private:
     bool monitorKeepsAudio() const { return (monitoring_.on && (calibration_ >= 0 || talkback_)) || sampler_ != nullptr; }
     std::shared_ptr<sampler::Engine> sampler_;
     void startTalkbackInput();
+    void stopTalkbackInput();
+    bool startDeviceAudio(FrameTime from, bool idle);  // through the device chosen; false: Qt Multimedia's
+    bool audioRunning() const { return sink_ || engineOut_ >= 0; }
+    double devicePlayed() const;  // the seconds the device has played of this play (-1 not known)
+    int engineOut_ = -1, engineRate_ = 0, talkTap_ = -1;
+    bool deviceChosen_ = false;  // whether a device was chosen when the sound last started (a failed one falls back to Qt's)
     FrameTime clampToSequence(FrameTime t) const;
     int playStep() const;
     void scrubAudio(FrameTime t);  // frames per tick direction for render-ahead (0 = paused)

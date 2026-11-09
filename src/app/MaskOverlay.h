@@ -6,6 +6,8 @@
 // point to close the path. After that drag points and handles, click the
 // outline to add a point, Alt-click a point to make it a corner or smooth,
 // and Ctrl/Cmd-click to remove it.
+// A shape layer's path picked in its contents is edited the same way (points, handles, adding and removing them), keyed
+// at the playhead when the path is animated.
 // Corner Pin effects show their four corners, to drag onto the surface a
 // picture is pinned to (then track it from the Inspector). Object masks are
 // picked here too: click the object (Alt-click: not the
@@ -20,6 +22,7 @@
 #include <QPointF>
 #include <QPolygonF>
 #include <QThreadPool>
+#include <QTransform>
 #include <functional>
 #include <map>
 #include <memory>
@@ -52,7 +55,13 @@ public:
         double rotation = 0;      // degrees
         std::vector<PathPoint> path;  // a Bézier mask's points (box units)
         bool open = false;            // still being drawn
-        bool drawing() const { return shape == 5 && (open || path.size() < 3); }
+        // A shape layer's path item (its contents' item picked in the Inspector; `effect` the layer's generator): its
+        // points in its own units, mapped to fractions of the clip's frame by toFrame; open or closed.
+        std::string item;
+        bool itemClosed = true;
+        QTransform toFrame;
+        bool drawing() const { return item.empty() && shape == 5 && (open || path.size() < 3); }
+        bool closedLoop() const { return item.empty() ? !drawing() : itemClosed; }
         MaskBox box() const { return {x, y, w, h, rotation}; }
     };
     // The shape masks of the selected clip's effects at the playhead.

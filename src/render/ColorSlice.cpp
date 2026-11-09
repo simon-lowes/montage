@@ -130,26 +130,35 @@ const std::vector<HueVector>& colorSliceVectors() {
     return v;
 }
 
-void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& img) {
-    struct Vec {
-        float centre, width, hue, sat, density;
-    };
-    std::vector<Vec> vecs;
+ColorSliceSetup colorSliceSetup(const Effect& e, FrameTime t) {
+    ColorSliceSetup s;
     for (const HueVector& v : colorSliceVectors()) {
         const std::string n = v.name;
-        const Vec vec{float(v.centre), 60, float(e.p(n + "_hue", t)), float(e.p(n + "_saturation", t, 1)), float(e.p(n + "_density", t))};
+        const ColorSliceSetup::Vec vec{float(v.centre), 60, float(e.p(n + "_hue", t)), float(e.p(n + "_saturation", t, 1)),
+                                       float(e.p(n + "_density", t))};
         // (A vector left as it is adds nothing to any colour's change.)
-        if (vec.hue != 0 || vec.sat != 1 || vec.density != 0) vecs.push_back(vec);
+        if (vec.hue != 0 || vec.sat != 1 || vec.density != 0) s.vecs.push_back(vec);
     }
-    bool any = !vecs.empty();
-    const Vec skin{float(e.p("skin_centre", t, 25)), std::max(1.0f, float(e.p("skin_width", t, 25))), float(e.p("skin_hue", t)),
-                   float(e.p("skin_saturation", t, 1)), float(e.p("skin_density", t))};
-    const float globalSat = float(e.p("saturation", t, 1)), globalDensity = float(e.p("density", t));
-    const float depth = float(e.p("depth", t, 100)) / 100, protect = float(e.p("protect_highlights", t, 50)) / 100;
-    const float mix = float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0));
-    const bool subtractive = e.p("subtractive", t, 1) >= 0.5;
-    any |= skin.hue != 0 || skin.sat != 1 || skin.density != 0 || globalSat != 1 || globalDensity != 0;
-    if (!any || mix <= 0) return;
+    s.skin = {float(e.p("skin_centre", t, 25)), std::max(1.0f, float(e.p("skin_width", t, 25))), float(e.p("skin_hue", t)),
+              float(e.p("skin_saturation", t, 1)), float(e.p("skin_density", t))};
+    s.globalSat = float(e.p("saturation", t, 1)), s.globalDensity = float(e.p("density", t));
+    s.depth = float(e.p("depth", t, 100)) / 100, s.protect = float(e.p("protect_highlights", t, 50)) / 100;
+    s.mix = float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0));
+    s.subtractive = e.p("subtractive", t, 1) >= 0.5;
+    s.any = (!s.vecs.empty() || s.skin.hue != 0 || s.skin.sat != 1 || s.skin.density != 0 || s.globalSat != 1 || s.globalDensity != 0) &&
+            s.mix > 0;
+    return s;
+}
+
+void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& img) {
+    const ColorSliceSetup setup = colorSliceSetup(e, t);
+    if (!setup.any) return;
+    using Vec = ColorSliceSetup::Vec;
+    const std::vector<Vec>& vecs = setup.vecs;
+    const Vec& skin = setup.skin;
+    const float globalSat = setup.globalSat, globalDensity = setup.globalDensity, depth = setup.depth, protect = setup.protect,
+                mix = setup.mix;
+    const bool subtractive = setup.subtractive;
 
     const TransferTables tables(space.transfer);
     const float white = toWhite(space);

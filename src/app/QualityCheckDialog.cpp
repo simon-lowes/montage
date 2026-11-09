@@ -83,6 +83,12 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     };
     form->addRow(QString(), row(black_, blackSeconds_, tr("Black for at least"), "qcBlack", 1.0, true));
     form->addRow(QString(), row(freeze_, freezeSeconds_, tr("Frozen for at least"), "qcFreeze", 5.0, true));
+    focus_ = new QCheckBox(tr("Soft focus and motion blur"), this);
+    focus_->setObjectName(QStringLiteral("qcFocus"));
+    focus_->setToolTip(tr("Stretches of a shot well under its own best, shots well under the other angles of their scene (from "
+                          "Group Shots, else the media's scene and camera), and blur that ran one way. Each frame is measured at up "
+                          "to 960 pixels wide, so this takes longer than the other picture checks."));
+    form->addRow(QString(), focus_);
     form->addRow(tr("Sound:"), row(silence_, silenceSeconds_, tr("Silent for at least"), "qcSilence", 2.0, true));
     clipping_ = new QCheckBox(tr("Clipping (sound at full scale)"), this);
     clipping_->setObjectName(QStringLiteral("qcClipping"));
@@ -166,6 +172,29 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
                                     "SSIM, MS-SSIM and the colour difference ΔICtCp (ITU-R BT.2124)%1")
                                      .arg(vmafAvailable() ? tr(", and VMAF") : QString()));
         form->addRow(tr("Encode:"), w);
+        {
+            // The buffer model (render/HrdCheck.h): an H.264, HEVC or MPEG-2 file against its HRD or VBV.
+            auto* bw = new QWidget(this);
+            auto* bh = new QHBoxLayout(bw);
+            bh->setContentsMargins(0, 0, 0, 0);
+            hrdFile_ = new QLineEdit(bw);
+            hrdFile_->setObjectName(QStringLiteral("qcHrdFile"));
+            hrdFile_->setPlaceholderText(tr("An H.264, HEVC or MPEG-2 file to check against its buffer model (optional)"));
+            hrdFile_->setToolTip(tr("Runs the file's pictures through the buffer its stream states (the HRD of H.264 and HEVC, the VBV of "
+                                    "MPEG-2), at a constant or a variable rate, and reports each frame where it would run dry or overflow, "
+                                    "as broadcast ingest checks. A stream that states none is checked against its level's limits."));
+            auto* hb = new QPushButton(tr("Browse…"), bw);
+            hb->setObjectName(QStringLiteral("qcHrdBrowse"));
+            connect(hb, &QPushButton::clicked, this, [this] {
+                const QString start = hrdFile_->text().isEmpty() ? compareFile_->text() : hrdFile_->text();
+                const QString f = QFileDialog::getOpenFileName(this, tr("Buffer Model"), QFileInfo(start).absolutePath(),
+                                                               tr("Video (*.mp4 *.mov *.mxf *.mkv *.m4v *.ts *.264 *.265 *.m2v);;All files (*)"));
+                if (!f.isEmpty()) hrdFile_->setText(f);
+            });
+            bh->addWidget(hrdFile_, 1);
+            bh->addWidget(hb);
+            form->addRow(tr("Buffer model:"), bw);
+        }
 
         auto* lw = new QWidget(this);
         auto* lh = new QHBoxLayout(lw);
@@ -266,6 +295,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.levels = levels_->isChecked();
     q.blackSeconds = black_->isChecked() ? blackSeconds_->value() : 0;
     q.freezeSeconds = freeze_->isChecked() ? freezeSeconds_->value() : 0;
+    q.focus = focus_->isChecked();
     q.silenceSeconds = silence_->isChecked() ? silenceSeconds_->value() : 0;
     q.clipping = clipping_->isChecked();
     q.phase = phase_->isChecked();
@@ -283,6 +313,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.intelligibilitySeconds = intelligibilitySeconds_->value();
     q.titleLanguage = titleSpellingLanguage().toStdString();
     q.compareFile = compareFile_->text().trimmed().toStdString();
+    q.hrdFile = hrdFile_->text().trimmed().toStdString();
     if (vmaf_->isChecked() && vmafAvailable()) q.compareMetrics |= MetricVmaf;
     q.qualityLimits.minPsnr = minPsnr_->value();
     q.qualityLimits.maxDeltaItp = maxDeltaItp_->value();
@@ -312,8 +343,9 @@ bool QualityCheckDialog::runCheck() {
     connect(&watcher, &QFutureWatcher<std::vector<QcIssue>>::finished, &wait, &QEventLoop::quit);
     const uint64_t revision = state_->history().revision();
     auto comparison = std::make_shared<EncodeComparison>();
-    watcher.setFuture(QtConcurrent::run([project, sequence, in, out, q, cancel, done, comparison] {
-        return qualityCheck(project, sequence, in, out, q, [done](double f) { *done = int(f * 999); }, cancel.get(), comparison.get());
+    auto hrd = std::make_shared<HrdReport>();
+    watcher.setFuture(QtConcurrent::run([project, sequence, in, out, q, cancel, done, comparison, hrd] {
+        return qualityCheck(project, sequence, in, out, q, [done](double f) { *done = int(f * 999); }, cancel.get(), comparison.get(), hrd.get());
     }));
     if (!watcher.isFinished()) wait.exec();
     tick.stop();
@@ -342,6 +374,7 @@ bool QualityCheckDialog::runCheck() {
         if (comparison_.offset) text += ' ' + tr("(the encode is %n frame(s) off the sequence)", nullptr, std::abs(comparison_.offset));
         emit compared(sequence.id, revision);
     }
+    if (!q.hrdFile.empty()) text += ' ' + tr("Buffer model: %1.").arg(QString::fromStdString(hrd->summary()));
     summary_->setText(text);
     markers_->setEnabled(!issues_.empty() || (comparison_.ok && !comparison_.worstFrames.empty()));
     report_->setEnabled(comparison_.ok);

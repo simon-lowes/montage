@@ -1,5 +1,6 @@
 // Montage — the Render Queue panel: the queued exports with their status and
-// progress, and Start, Stop, Remove, Retry, Clear Finished and Show File. Below them the render farm
+// progress, and Start, Stop, Remove, Retry, Clear Finished and Show File; Cancel Job for one job, and how many render
+// at once. Below them the render farm
 // (render/RenderFarm.h): a folder shared with other computers, where Send to Farm puts the picked job for the render
 // nodes there, its jobs and nodes shown as they go (read again on a worker every second and a half while the panel shows),
 // with Cancel, Retry and Remove.
@@ -49,6 +50,8 @@ private:
     QTreeWidget* list_;
     QPushButton* start_;
     QPushButton* stop_;
+    QPushButton* cancel_;
+    QSpinBox* atOnce_;
     QPushButton* remove_;
     QPushButton* retry_;
     QPushButton* clear_;

@@ -54,6 +54,7 @@ add_library(montage_engine STATIC
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
   core/TakeLanes.h core/TakeLanes.cpp
+  core/TrackGroups.h core/TrackGroups.cpp
   core/Provenance.h core/Provenance.cpp
   core/LensProfile.h core/LensProfile.cpp
   core/AudioDescription.h core/AudioDescription.cpp
@@ -91,6 +92,7 @@ add_library(montage_engine STATIC
   media/Usd.h media/Usd.cpp media/UsdModel.cpp media/Splats.h media/Splats.cpp
   media/Exr.h media/Exr.cpp
   media/Jxl.h media/Jxl.cpp
+  media/Av2.h media/Av2.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
@@ -121,7 +123,7 @@ add_library(montage_engine STATIC
   media/ValueMap.h
   media/Rife.h media/Rife.cpp
   media/VideoDepth.h media/VideoDepth.cpp
-  media/HwAccel.h media/HwAccel.cpp
+  media/HwAccel.h media/HwAccel.cpp media/HwVulkan.h
   media/MediaPool.h media/MediaPool.cpp
   media/Relink.h media/Relink.cpp
   media/Analysis.h media/Analysis.cpp
@@ -165,7 +167,7 @@ add_library(montage_engine STATIC
   media/Translator.h media/Translator.cpp
   media/InterfaceDrafts.h media/InterfaceDrafts.cpp
   render/Processing.h render/Processing.cpp render/TransferTables.h
-  render/Ofx.h render/Ofx.cpp render/OfxGl.h render/OfxGl.cpp
+  render/Ofx.h render/Ofx.cpp render/OfxGl.h render/OfxGl.cpp render/OfxRemote.h render/OfxRemote.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
@@ -224,6 +226,7 @@ add_library(montage_engine STATIC
   render/DcpMxf.h render/DcpMxf.cpp
   render/Dcp.h render/Dcp.cpp
   render/DcpSecurity.h render/DcpSecurity.cpp
+  render/DcpFacilities.h render/DcpFacilities.cpp
   render/XmlCanonical.h render/XmlCanonical.cpp
   render/RoomTone.h render/RoomTone.cpp
   render/ExtendClip.h render/ExtendClip.cpp
@@ -237,8 +240,10 @@ add_library(montage_engine STATIC
   render/AudioReactive.h render/AudioReactive.cpp
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
+  render/FocusCheck.h render/FocusCheck.cpp
   render/EncodeCompare.h render/EncodeCompare.cpp
   render/LongGopCopy.h render/LongGopCopy.cpp
+  render/HrdCheck.h render/HrdCheck.cpp render/NalBits.h
   render/SdhDraft.h render/SdhDraft.cpp
   render/LutExport.h render/LutExport.cpp
   render/LutToGrade.h render/LutToGrade.cpp
@@ -283,8 +288,12 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/RenderFarm.h render/RenderFarm.cpp
+  render/BackgroundJobs.h render/BackgroundJobs.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
   render/StreamingPackage.h render/StreamingPackage.cpp
+  render/Ac3.h render/Ac3.cpp
+  render/TsSegments.h render/TsSegments.cpp
+  render/LivePackage.h render/LivePackage.cpp
   render/Scte35.h render/Scte35.cpp
   render/GradeGraph.h render/GradeGraph.cpp
   render/CompositeRender.h render/CompositeRender.cpp
@@ -299,6 +308,7 @@ add_library(montage_engine STATIC
   render/MonitorCalibration.h render/MonitorCalibration.cpp
   render/MonitorSection.h render/MonitorSection.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
+  audio/PluginHost.h audio/PluginHost.cpp audio/PluginHostInternal.h audio/PluginIpc.h audio/PluginIpc.cpp audio/PluginWire.h
   audio/AraHost.h audio/AraHost.cpp ${PROJECT_SOURCE_DIR}/third_party/ara/ARA_Library/Dispatch/ARAHostDispatch.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
@@ -306,6 +316,7 @@ add_library(montage_engine STATIC
   audio/DialogueAlign.h audio/DialogueAlign.cpp
   audio/ElasticAudio.h audio/ElasticAudio.cpp
   audio/Sampler.h audio/Sampler.cpp
+  audio/AudioDevice.h audio/AudioDevice.cpp audio/AudioDeviceInternal.h audio/JackDevice.cpp audio/PortAudioDevice.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
   audio/Ltc.h audio/Ltc.cpp
   audio/LtcChase.h audio/LtcChase.cpp
@@ -367,6 +378,11 @@ if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)
   if(TARGET Qt6::GuiPrivate)
     target_link_libraries(montage_engine PRIVATE Qt6::GuiPrivate)
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_GPU)
+    # Hardware-decoded frames mapped into the compositor's API (Vulkan, EGL, Metal through CoreVideo, Direct3D 11).
+    target_sources(montage_engine PRIVATE render/GpuHardware.h render/GpuHardware.cpp)
+    if(APPLE)
+      target_link_libraries(montage_engine PRIVATE "-framework CoreVideo")
+    endif()
     message(STATUS "GPU compositor: on (Qt ${Qt6_VERSION})")
     # Shaders compiled while running (OpenColorIO's), with Qt Shader Tools where it is installed (QShaderBaker is in
     # its private module, as QRhi is in GUI's).
@@ -452,6 +468,23 @@ if(MONTAGE_WITH_JXL)
     endif()
   else()
     message(STATUS "libjxl not found: JPEG XL is read through FFmpeg only, and not written")
+  endif()
+endif()
+if(MONTAGE_WITH_AV2)
+  # Found from AV2_ROOT (scripts/build-av2.sh) or pkg-config, never fetched. Only media/Av2.cpp sees the libraries'
+  # headers and the definition, so turning AV2 on or off rebuilds that file alone; everything else asks av2Available().
+  if(AV2_ROOT)
+    list(PREPEND CMAKE_PREFIX_PATH "${AV2_ROOT}")
+  endif()
+  pkg_check_modules(AV2 avm>=1.0 dav2d)
+  if(AV2_FOUND)
+    message(STATUS "AV2: dav2d ${AV2_dav2d_VERSION} reads it, AVM ${AV2_avm_VERSION} writes it (both licences flagged: not for packages)")
+    set_property(SOURCE media/Av2.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${AV2_INCLUDE_DIRS})
+    set_property(SOURCE media/Av2.cpp APPEND PROPERTY COMPILE_DEFINITIONS MONTAGE_WITH_AV2)
+    # (static libraries as scripts/build-av2.sh installs them; their threads and libdl come with the engine's)
+    target_link_libraries(montage_engine PRIVATE ${AV2_LINK_LIBRARIES} m)
+  else()
+    message(FATAL_ERROR "MONTAGE_WITH_AV2 is on but AVM and dav2d are not found: build them with scripts/build-av2.sh <prefix> and set AV2_ROOT=<prefix>")
   endif()
 endif()
 if(MONTAGE_WITH_VMAF)
@@ -678,6 +711,11 @@ if(MONTAGE_WITH_THORVG)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_THORVG)
 endif()
 
+if(MONTAGE_WITH_PORTAUDIO)
+  target_link_libraries(montage_engine PRIVATE montage_portaudio)
+  target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_PORTAUDIO)
+endif()
+
 if(MONTAGE_WITH_LUA)
   target_link_libraries(montage_engine PRIVATE montage_lua)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_LUA)
@@ -804,3 +842,11 @@ montage_copy_runtime(montage-plugin-probe)
 set_target_properties(montage-plugin-probe PROPERTIES AUTOMOC OFF
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/app)
 install(TARGETS montage-plugin-probe RUNTIME DESTINATION bin)
+
+# Runs plug-ins in processes of their own while Montage uses them (audio/PluginHost.h), beside the editor as the probe is.
+add_executable(montage-pluginhost tools/plugin_host.cpp)
+target_link_libraries(montage-pluginhost PRIVATE montage_engine)
+montage_copy_runtime(montage-pluginhost)
+set_target_properties(montage-pluginhost PROPERTIES AUTOMOC OFF
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/app)
+install(TARGETS montage-pluginhost RUNTIME DESTINATION bin)

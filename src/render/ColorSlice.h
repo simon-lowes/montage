@@ -30,6 +30,18 @@ const std::vector<HueVector>& colorSliceVectors();
 float acesCct(float linear);
 float acesCctToLinear(float cct);
 
+// Colour Slice's settings at a time, as its pixels take them (gpufilter.frag takes the same): the six vectors that change
+// something, the skin vector, the whole picture's saturation and density, and whether anything changes.
+struct ColorSliceSetup {
+    struct Vec {
+        float centre = 0, width = 60, hue = 0, sat = 1, density = 0;
+    };
+    std::vector<Vec> vecs;
+    Vec skin;
+    float globalSat = 1, globalDensity = 0, depth = 1, protect = 0.5f, mix = 1;
+    bool subtractive = true, any = false;
+};
+ColorSliceSetup colorSliceSetup(const Effect& e, FrameTime t);
 void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& img);
 void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image& img, double pixelScale);
 

@@ -21,6 +21,7 @@
 
 #include "RenderQueue.h"
 #include "Settings.h"
+#include "render/BackgroundJobs.h"
 
 namespace montage {
 
@@ -59,6 +60,27 @@ RenderQueuePanel::RenderQueuePanel(RenderQueue* queue, QWidget* parent) : QWidge
     send_->setToolTip(tr("Send the job to the render farm, for its render nodes, and take it off this queue"));
     row->addStretch(1);
     localLay->addLayout(row);
+    // (a row of its own: the one above is already the panel's widest)
+    auto* second = new QHBoxLayout;
+    cancel_ = new QPushButton(tr("Cancel Job"), this);
+    cancel_->setObjectName(QStringLiteral("queueCancel"));
+    cancel_->setToolTip(tr("Stop the picked job (the others go on), or set a waiting one aside"));
+    second->addWidget(cancel_);
+    atOnce_ = new QSpinBox(this);
+    atOnce_->setObjectName(QStringLiteral("queueAtOnce"));
+    atOnce_->setRange(1, 16);
+    atOnce_->setPrefix(tr("Render "));
+    atOnce_->setSuffix(tr(" at once"));
+    atOnce_->setToolTip(tr("How many jobs render side by side (each with its own progress and cancel); also how many\n"
+                           "background calls MCP runs at once"));
+    atOnce_->setValue(queue_->atOnce());
+    connect(atOnce_, &QSpinBox::valueChanged, this, [this](int v) {
+        jobs::setAtOnce(v);
+        queue_->setAtOnce(v);
+    });
+    second->addWidget(atOnce_);
+    second->addStretch(1);
+    localLay->addLayout(second);
 
     // The render farm.
     auto* farmBox = new QWidget(split);
@@ -139,6 +161,7 @@ RenderQueuePanel::RenderQueuePanel(RenderQueue* queue, QWidget* parent) : QWidge
     connect(farmList_, &QTreeWidget::itemSelectionChanged, this, &RenderQueuePanel::refreshFarm);
     connect(start_, &QPushButton::clicked, queue_, &RenderQueue::start);
     connect(stop_, &QPushButton::clicked, queue_, &RenderQueue::stop);
+    connect(cancel_, &QPushButton::clicked, this, [this] { queue_->cancel(selectedJob()); });
     connect(remove_, &QPushButton::clicked, this, [this] { queue_->remove(selectedJob()); });
     connect(retry_, &QPushButton::clicked, this, [this] { queue_->retry(selectedJob()); });
     connect(clear_, &QPushButton::clicked, queue_, &RenderQueue::clearFinished);
@@ -281,7 +304,7 @@ void RenderQueuePanel::refresh() {
         const auto& j = jobs[size_t(i)];
         QString status;
         switch (j.status) {
-            case RenderQueue::Status::Waiting: status = tr("Waiting"); break;
+            case RenderQueue::Status::Waiting: status = j.resumed ? tr("Waiting (stopped part way: renders again)") : tr("Waiting"); break;
             case RenderQueue::Status::Rendering: status = tr("Rendering %1%").arg(int(j.progress * 100)); break;
             case RenderQueue::Status::Done:
                 status = tr("Done %1").arg(j.finished.toString("HH:mm")) + (j.encoder.isEmpty() ? QString() : " (" + j.encoder + ")");
@@ -297,6 +320,7 @@ void RenderQueuePanel::refresh() {
     start_->setEnabled(!queue_->running() && waiting);
     stop_->setEnabled(queue_->running());
     remove_->setEnabled(sel && sel->status != RenderQueue::Status::Rendering);
+    cancel_->setEnabled(sel && (sel->status == RenderQueue::Status::Rendering || sel->status == RenderQueue::Status::Waiting));
     retry_->setEnabled(sel && (sel->status == RenderQueue::Status::Failed || sel->status == RenderQueue::Status::Cancelled ||
                                sel->status == RenderQueue::Status::Done));
     clear_->setEnabled(std::any_of(jobs.begin(), jobs.end(), [](const auto& j) { return j.status == RenderQueue::Status::Done; }));

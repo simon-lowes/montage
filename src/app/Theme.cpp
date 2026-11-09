@@ -159,6 +159,17 @@ QIcon icon(const char* nameC) {
             p.drawLine(QPointF(bx, 2.5), QPointF(bx, 13.5));
             p.drawLine(QPointF(bx, 2.5), QPointF(bx + (in ? 4 : -4), 2.5));
             p.drawLine(QPointF(bx, 13.5), QPointF(bx + (in ? 4 : -4), 13.5));
+        } else if (name == "peaking") {
+            // A focus frame's corners round a crisp mark.
+            p.setPen(QPen(kText, 1.4));
+            p.setBrush(Qt::NoBrush);
+            for (int corner = 0; corner < 4; ++corner) {
+                const double x = corner % 2 ? 13.5 : 2.5, y = corner / 2 ? 13.5 : 2.5, dx = corner % 2 ? -3.5 : 3.5, dy = corner / 2 ? -3.5 : 3.5;
+                p.drawLine(QPointF(x, y), QPointF(x + dx, y));
+                p.drawLine(QPointF(x, y), QPointF(x, y + dy));
+            }
+            p.drawLine(QPointF(5.5, 10.5), QPointF(8, 5.5));
+            p.drawLine(QPointF(8, 5.5), QPointF(10.5, 10.5));
         } else if (name == "save") {
             p.setPen(QPen(kText, 1.4));
             p.setBrush(Qt::NoBrush);

@@ -167,6 +167,11 @@ void visitSettings(S& s, V& v) {
     v("gop", s.gop);
     v("videoBitrate", s.videoBitrate);
     v("twoPass", s.twoPass);
+    v("hrd", s.hrd);
+    v("vbvMaxrate", s.vbvMaxrate);
+    v("vbvBuffer", s.vbvBuffer);
+    v("vbvInit", s.vbvInit);
+    v("hrdCheck", s.hrdCheck);
     v("pass", s.pass);
     v("parameterSetId", s.parameterSetId);
     v("passStats", s.passStats);
@@ -411,6 +416,14 @@ bool folderWithin(const std::string& inner, const std::string& outer) {
         }
     }
     return false;
+}
+
+// Whether the signing chain in folder `certificates` has its private key within `outer`: the folder is there, or its
+// leaf.key is a link to a file there.
+bool keyWithin(const std::string& certificates, const std::string& outer) {
+    if (folderWithin(certificates, outer)) return true;
+    const QString real = QFileInfo(QDir(qs(certificates)).filePath(QStringLiteral("leaf.key"))).canonicalFilePath();
+    return !real.isEmpty() && folderWithin(ss(QFileInfo(real).path()), outer);
 }
 
 QString jobsDir(const std::string& farm) { return QDir(qs(farm)).filePath(QStringLiteral("jobs")); }
@@ -884,7 +897,7 @@ bool submitFarmDcp(const std::string& farm, const std::string& name, const Proje
         if (!dcp::securityAvailable()) return fail(error, "This build cannot encrypt (it has no OpenSSL)");
         const std::string certificates = settings.certificates.empty() ? dcp::signerFolder() : settings.certificates;
         for (const std::string& shared : {farm, parent})
-            if (folderWithin(certificates, shared))
+            if (keyWithin(certificates, shared))
                 return fail(error, "The certificates the package is signed with are in " + certificates +
                                        ", where every render node can read their key: keep them on the computers that join encrypted DCPs only");
         if (!dcp::signerCertificateChain(chain, &err, settings.certificates) || chain.empty() || !dcp::readCertificate(chain.certificates.back(), leaf, &err))
@@ -1064,7 +1077,8 @@ struct Node {
     std::map<std::string, int64_t> leftFor;  // segments this node failed, left for other nodes until then (its clock)
     std::map<std::string, std::string> found;  // the hardware encoders found, by family and size
     std::string signer;             // the leaf thumbprint of the DCP signing chain this node joins with (ownSigner)
-    int64_t signerRead = -1;        // when it was read (this node's clock)
+    int64_t signerRead = -1;        // when its files were last looked at (this node's clock)
+    std::string signerFiles;        // their sizes and times then: the key is read again only once one has changed
     std::set<std::string> told;     // what was said once (a job left for other nodes)
 
     explicit Node(const FarmNodeOptions& options) : o(options), watched(options.staleMs) {
@@ -1117,16 +1131,26 @@ struct Node {
     }
     // The leaf thumbprint of the signing chain in this node's certificates folder, "" with none there (never made here:
     // a chain made on the spot could open nothing sealed for the sender's), or with one that cannot open what is sealed
-    // for its leaf (a file missing or unreadable, or a key that is not the leaf's). Read again every ten seconds.
+    // for its leaf (a file missing or unreadable, or a key that is not the leaf's). Its files looked at every ten
+    // seconds, and the chain read again (the private key with it) only when one of them has changed.
     std::string ownSigner() {
         if (signerRead >= 0 && nowMs() - signerRead < 10000) return signer;
         signerRead = nowMs();
+        const QDir dir(qs(certificatesFolder()));
+        std::string files;
+        for (const char* file : {"root.pem", "intermediate.pem", "leaf.pem", "leaf.key"}) {
+            const QFileInfo f(dir.filePath(QString::fromLatin1(file)));
+            files += f.exists() ? std::to_string((long long)f.size()) + '@' + std::to_string((long long)f.lastModified().toMSecsSinceEpoch()) : "-";
+            files += ';';
+        }
+        if (files == signerFiles) return signer;
+        signerFiles = files;
         signer.clear();
         if (!dcp::securityAvailable()) return signer;
         dcp::CertificateChain chain;
         dcp::CertificateInfo info;
         std::string why;
-        if (!QFileInfo::exists(QDir(qs(certificatesFolder())).filePath(QStringLiteral("leaf.pem")))) return signer;  // (none: nothing to say)
+        if (!QFileInfo::exists(dir.filePath(QStringLiteral("leaf.pem")))) return signer;  // (none: nothing to say)
         if (dcp::signerCertificateChain(chain, &why, certificatesFolder(), false) && dcp::chainKeyMatches(chain, &why) &&
             dcp::readCertificate(chain.certificates.back(), info, &why))
             signer = info.thumbprint;
@@ -1476,7 +1500,7 @@ struct Node {
                 return failJob("The certificate the package's codestreams are sealed for is not its signer's");
             if (join) dcp.certificates = o.certificates;
             // (and never one where the package goes, beside the codestreams, for whoever is given it to read)
-            if (join && folderWithin(certificatesFolder(), st.path))
+            if (join && keyWithin(certificatesFolder(), st.path))
                 return failJob("This node's DCP certificates are in " + certificatesFolder() + ", inside " + st.path +
                                " where the package goes: anyone given it could read their key, which opens its codestreams and every DKDM "
                                "made with them. Keep them elsewhere on this computer (--certificates) and retry the job");
@@ -1797,7 +1821,7 @@ bool runFarmNode(const FarmNodeOptions& options, int* rendered, std::string* err
     // The DCP signing chain this node joins with is never on the farm's share, where every node (and anyone reading it)
     // would hold the key that opens every encrypted DCP's codestreams and DKDMs (submitFarmDcp refuses the sender's).
     const std::string certificates = options.certificates.empty() ? dcp::signerFolder() : options.certificates;
-    if (folderWithin(certificates, options.farm))
+    if (keyWithin(certificates, options.farm))
         return fail(error, "This node's DCP certificates folder " + certificates + " is in the render farm's folder " + options.farm +
                                ", where every render node can read their key: keep them on the computers that join encrypted DCPs only (--certificates)");
     Node n(options);

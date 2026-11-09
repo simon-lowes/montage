@@ -1,6 +1,7 @@
 // Montage — Source and Program monitors: viewer, scrub bar and transport.
 #pragma once
 
+#include <QColor>
 #include <QImage>
 #include <QPointer>
 #include <QWindow>
@@ -21,6 +22,7 @@ class QLineEdit;
 namespace montage {
 
 class EditorState;
+class LiveFeed;
 class PlaybackController;
 struct Peaks;
 class HdrSurface;
@@ -37,9 +39,20 @@ public:
     // An exposure check over the picture (ExposureView.h); 0 = off.
     void setExposureView(int mode);
     int exposureView() const { return exposure_; }
+    // Focus peaking over the picture (ExposureView.h focusPeakingView), over any exposure check: edges in focus in
+    // `colour`, at a sensitivity (0 low, 1 medium, 2 high), found in the picture as the monitor shows it (scaled to its
+    // size) or in the picture's own pixels (1:1).
+    void setFocusPeaking(bool on);
+    bool focusPeaking() const { return peaking_; }
+    void setPeakingColour(const QColor& colour);
+    QColor peakingColour() const { return peakingColour_; }
+    void setPeakingSensitivity(int sensitivity);
+    int peakingSensitivity() const { return peakingSensitivity_; }
+    void setPeakingAtMonitorSize(bool on);
+    bool peakingAtMonitorSize() const { return peakingAtMonitorSize_; }
     // The frame as delivered (code values in `space`), for the out-of-gamut checks: used while it is the picture's.
     void setSignal(const QImage& signal, montage::FrameTime t, const QString& space);
-    // The picture as drawn (with the exposure check), for testing.
+    // The picture as drawn (with the exposure check and focus peaking; at the monitor's size when peaking is), for testing.
     QImage shownImage() const;
     // That through the display's calibration LUT (app/DisplayCalibration.h), as it reaches the screen.
     QImage drawnImage();
@@ -128,6 +141,16 @@ private:
     QImage signal_;
     QString signalSpace_;
     mutable int exposedMode_ = 0;
+    bool overlaid() const { return exposure_ != 0 || peaking_; }  // the picture shown is not image_ as it is
+    QImage exposedImage() const;                                   // image_ with the exposure check
+    QSize peakingSize() const;                                     // the size peaking is found at
+    bool peaking_ = false;
+    QColor peakingColour_{255, 40, 40};
+    int peakingSensitivity_ = 1;
+    bool peakingAtMonitorSize_ = true;
+    mutable QImage peaked_;  // exposed_ (or image_) with focus peaking
+    mutable qint64 peakedKey_ = -1;
+    mutable QString peakedState_;
     bool dragSource_ = false;
     bool lookAround_ = false, looking_ = false;
     std::vector<std::function<void(QPainter&, const QRectF&)>> overlays_;
@@ -207,17 +230,32 @@ public:
     // HDR viewing (ViewerWidget::setHdrViewer): HDR sequences shown as HDR where the build and display can; the
     // controller renders their light only while that is so. An "HDR" badge says when it is.
     void setHdrViewer(bool on);
+    // Source: a feed watched live (media/Capture.h LiveFeed), its newest picture shown with its timecode in the
+    // counter, its sound's meters over the picture and a LIVE badge, while `feed` is set (null: the media as it is
+    // again). `recording`: it is being recorded; `media`, the recording's media item once imported (0 until then).
+    // In and Out marked while live are the pictures shown then, as frames of the recording; its length is noted as
+    // the recorder knows it, so the range can be cut in at once from the growing file.
+    void setLiveFeed(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording = true);
+    void setLiveMedia(Id media);  // (the recording's, once it has been imported)
+    std::shared_ptr<LiveFeed> liveFeed() const { return live_; }
+    bool liveShowing() const;  // live, and showing it (its LIVE badge on)
+    Id liveMedia() const { return liveMedia_; }
+    QString liveLabel() const { return liveLabel_; }
+    // The live picture's place in the recording, as a frame of the Source monitor's sequence (-1: none yet).
+    FrameTime liveFrame() const;
+    // Mark In or Out at the picture shown (or, while live, the live picture).
+    void markIn();
+    void markOut();
 
 signals:
     void activated();  // the user interacted with this monitor
     void exportFrameRequested();
+    void liveChanged();  // a live feed set or ended, its media known, or its recording so far shown instead
 
 protected:
     void mousePressEvent(QMouseEvent* e) override;
 
 private:
-    void markIn();
-    void markOut();
     void goToIn();
     void goToOut();
     FrameTime duration() const;
@@ -236,7 +274,19 @@ private:
     QToolButton* playButton_;
     QComboBox* resolution_ = nullptr;
     QComboBox* exposure_ = nullptr;  // exposure check (ExposureView.h)
+    QToolButton* peaking_ = nullptr;  // focus peaking, with its menu
     std::string waveformRequested_;  // the media whose audio decode this monitor started
+    // Live (setLiveFeed).
+    void liveTick();
+    bool markLive(bool in);  // false when not live
+    std::shared_ptr<LiveFeed> live_;
+    Id liveMedia_ = 0;
+    QString liveLabel_;
+    bool liveRecording_ = false;
+    QTimer* liveTimer_ = nullptr;
+    QToolButton* liveBadge_ = nullptr;
+    std::vector<float> livePeaks_;
+    int64_t liveShown_ = -1;  // the feed's picture count when last shown
 
     void renderTrimView();
     void updateLookAround();

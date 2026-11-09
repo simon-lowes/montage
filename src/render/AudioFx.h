@@ -130,9 +130,12 @@ private:
     static void soloFilter(Stage& st, double sr, const EqBand& b);
     static double stageDb(const Stage& st, double sr, double hz);
     std::vector<Stage> stages_, scratch_;  // (scratch_: where set makes the next stages_, kept for its room)
-    Stage solo_, soloOut_;  // the solo filter, and the one Solo was on before it moved to another band
+    // The solo filter, and those Solo was on before it moved to another band, fading out (each its `mix`): a few, so a
+    // move made before the last one's fade is done lets none go at once.
+    Stage solo_;
+    std::array<Stage, 3> soloOut_;
     bool soloing_ = false;
-    float soloMix_ = 0, soloOutMix_ = 0;  // how much of each is heard, as they cross over
+    float soloMix_ = 0;  // how much of the solo filter is heard, as it fades in or out
     bool primed_ = false; // something has been heard since the rate was set
     double sr_ = 48000;
     float output_ = 1;
@@ -141,6 +144,9 @@ private:
 // The Parametric EQ effect's bands at frame `t` (core/Effects.h eqBands), and which is soloed: its "audition" string
 // names the band only on the copy of the project playback hears while Solo is held (-1 when none).
 std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo = nullptr);
+// The same into `out`, which keeps its room: nothing is allocated once it has held as many (playback sets it each
+// block a setting changes).
+void eqBandsOf(const Effect& e, int64_t t, std::vector<EqBand>& out, int* solo = nullptr);
 
 // Turns down the sibilant band (above `hz`) when it is louder than the
 // threshold. The band is split off with a Linkwitz-Riley crossover, whose two

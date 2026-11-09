@@ -9,6 +9,7 @@
 #include <QHostInfo>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
+#include <QNetworkDatagram>
 #include <QNetworkInterface>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -17,6 +18,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QUdpSocket>
 #include <QUrl>
 #include <algorithm>
 #include <limits>
@@ -200,6 +202,7 @@ bool Node::start(const NodeOptions& o, QString* error) {
     stop();
     o_ = o;
     stopping_ = false;
+    mdnsRetryMs_ = 2000;
     run_ = new QObject(this);
     const QString host = o.hostname.isEmpty() ? QHostInfo::localHostName() : o.hostname;
     o_.hostname = host;
@@ -403,6 +406,9 @@ bool Node::start(const NodeOptions& o, QString* error) {
         flowVersion_[i] = newVersion();
     }
     setStreams(video_, audio_, options_, active_);
+    std::fill(std::begin(mdnsVersions_), std::end(mdnsVersions_), 0);
+    mdnsError_.clear();
+    if (o.announce || o.discover) startMdns();
     net_ = new QNetworkAccessManager(this);
     heartbeat_ = new QTimer(this);
     heartbeat_->setInterval(o.heartbeatMs);
@@ -431,8 +437,10 @@ void Node::stop() {
     heartbeat_ = nullptr;
     delete rediscover_;
     rediscover_ = nullptr;
-    delete run_;
+    if (o_.announce) announceNode();  // (a goodbye: its records' times to live 0)
+    delete run_;  // (the multicast DNS socket and timers with it)
     run_ = nullptr;
+    mdns_.reset();
     lookups_ = 0;
     // Then unregistered (a short wait: the node goes either way).
     if (registered_ && net_ && !registry().isEmpty()) {
@@ -460,15 +468,19 @@ void Node::stop() {
 
 // ---- What the senders send.
 
-st2110::Endpoint Node::endpointOf(int stream) const { return stream == 0 ? options_.video : stream == 1 ? options_.audio : options_.anc; }
+st2110::Endpoint Node::endpointOf(int stream, int leg) const {
+    if (leg == 1) return stream == 0 ? options_.video2 : stream == 1 ? options_.audio2 : options_.anc2;
+    return stream == 0 ? options_.video : stream == 1 ? options_.audio : options_.anc;
+}
 
-QString Node::sourceAddress() const {
+QString Node::sourceAddress(int leg) const {
+    if (leg == 1 && !options_.interfaceAddress2.empty()) return QString::fromStdString(options_.interfaceAddress2);
     if (!options_.interfaceAddress.empty()) return QString::fromStdString(options_.interfaceAddress);
     return address_;
 }
 
-QString Node::interfaceName() const {
-    const QString at = sourceAddress();
+QString Node::interfaceName(int leg) const {
+    const QString at = sourceAddress(leg);
     for (const QNetworkInterface& i : QNetworkInterface::allInterfaces())
         for (const QNetworkAddressEntry& e : i.addressEntries())
             if (e.ip().toString() == at) return i.name();
@@ -488,12 +500,17 @@ void Node::setStreams(const st2110::VideoFormat& video, const st2110::AudioForma
     // The active legs: where the output sends now.
     const bool enabled[3] = {o.sendVideo, o.sendAudio, o.sendAnc};
     for (Connection& c : connections_) {
-        const st2110::Endpoint e = endpointOf(c.stream);
-        c.leg.sourceIp = sourceAddress();
-        c.leg.destinationIp = QString::fromStdString(e.address);
-        c.leg.destinationPort = e.port;
-        c.leg.sourcePort = o.sourcePort > 0 ? o.sourcePort : 5004;
-        c.leg.rtpEnabled = enabled[c.stream];
+        for (int l = 0; l < 2; ++l) {
+            const st2110::Endpoint e = endpointOf(c.stream, l);
+            Leg& leg = c.leg[l];
+            leg.sourceIp = sourceAddress(l);
+            leg.destinationIp = QString::fromStdString(e.address);
+            leg.destinationPort = e.port;
+            leg.sourcePort = o.sourcePort > 0 ? o.sourcePort : 5004;
+            leg.rtpEnabled = enabled[c.stream] && o.pathOn[c.stream][l];
+            // (a leg added: staged as it is)
+            if (l >= senderLegs()) c.stagedLeg[l] = Leg{};
+        }
         c.masterEnable = active && enabled[c.stream];
         c.version = newVersion();
     }
@@ -515,8 +532,11 @@ void Node::setStreams(const st2110::VideoFormat& video, const st2110::AudioForma
 
 QJsonObject Node::nodeResource() const {
     QJsonArray interfaces;
+    // (the senders' legs' interfaces: the second path's may be another)
+    QStringList names{interfaceName(0)};
+    if (senderLegs() > 1 && !names.contains(interfaceName(1))) names << interfaceName(1);
     for (const QNetworkInterface& i : QNetworkInterface::allInterfaces()) {
-        if (i.name() != interfaceName()) continue;
+        if (!names.contains(i.name())) continue;
         QString mac = i.hardwareAddress().toLower().replace(':', '-');
         if (!QRegularExpression(QStringLiteral("^([0-9a-f]{2}-){5}[0-9a-f]{2}$")).match(mac).hasMatch()) mac = QStringLiteral("00-00-00-00-00-00");
         interfaces.append(QJsonObject{{"name", i.name()}, {"chassis_id", mac}, {"port_id", mac}});
@@ -655,7 +675,9 @@ QJsonArray Node::flowResources() const {
 QJsonObject Node::senderResource(int stream) const {
     const Connection& c = connections_[size_t(stream)];
     static const char* const labels[3] = {"Picture", "Sound", "Ancillary data"};
-    const bool multicast = st2110::isMulticast(c.leg.destinationIp.toStdString());
+    const bool multicast = st2110::isMulticast(c.leg[0].destinationIp.toStdString());
+    QJsonArray bindings{interfaceName(0)};
+    if (senderLegs() > 1) bindings.append(interfaceName(1));
     return QJsonObject{
         {"id", idText(c.id)},
         {"version", c.version},
@@ -671,7 +693,7 @@ QJsonObject Node::senderResource(int stream) const {
                                                           .arg(port())
                                                           .arg(idText(c.id)))
                                          : QJsonValue(QJsonValue::Null)},
-        {"interface_bindings", QJsonArray{interfaceName()}},
+        {"interface_bindings", bindings},
         // (parked: no receiver)
         {"subscription", QJsonObject{{"receiver_id", c.masterEnable ? c.receiverId : QJsonValue(QJsonValue::Null)}, {"active", c.masterEnable}}}};
 }
@@ -684,12 +706,18 @@ QJsonArray Node::senderResources() const {
 
 // ---- IS-05.
 
-QJsonObject Node::legJson(const Leg& l, int stream, bool resolve) const {
+QJsonArray Node::legsJson(const Leg* legs, int stream, bool resolve) const {
+    QJsonArray out;
+    for (int i = 0; i < senderLegs(); ++i) out.append(legJson(legs[i], stream, i, resolve));
+    return out;
+}
+
+QJsonObject Node::legJson(const Leg& l, int stream, int index, bool resolve) const {
     QJsonObject o{{"source_ip", l.sourceIp}, {"destination_ip", l.destinationIp}, {"source_port", l.sourcePort},
                   {"destination_port", l.destinationPort}, {"rtp_enabled", l.rtpEnabled}};
     if (resolve) {
-        const st2110::Endpoint e = endpointOf(stream);
-        if (l.sourceIp == "auto") o["source_ip"] = sourceAddress();
+        const st2110::Endpoint e = endpointOf(stream, index);
+        if (l.sourceIp == "auto") o["source_ip"] = sourceAddress(index);
         if (l.destinationIp == "auto") o["destination_ip"] = QString::fromStdString(e.address);
         if (l.sourcePort.isString()) o["source_port"] = 5004;
         if (l.destinationPort.isString()) o["destination_port"] = e.port > 0 ? e.port : 5004;
@@ -703,33 +731,44 @@ QJsonObject Node::connectionJson(const Connection& c, bool staged) const {
         activation = QJsonObject{{"mode", c.mode}, {"requested_time", c.requestedTime},
                                  {"activation_time", c.mode.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue(taiText(c.activationNs))}};
         return QJsonObject{{"receiver_id", c.stagedReceiverId}, {"master_enable", c.stagedMasterEnable}, {"activation", activation},
-                           {"transport_params", QJsonArray{legJson(c.stagedLeg, c.stream, false)}}};
+                           {"transport_params", legsJson(c.stagedLeg, c.stream, false)}};
     }
     activation = QJsonObject{{"mode", c.lastMode.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(c.lastMode)},
                              {"requested_time", c.lastRequested.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(c.lastRequested)},
                              {"activation_time", c.lastActivation.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(c.lastActivation)}};
     return QJsonObject{{"receiver_id", c.receiverId}, {"master_enable", c.masterEnable}, {"activation", activation},
-                       {"transport_params", QJsonArray{legJson(c.leg, c.stream, true)}}};
+                       {"transport_params", legsJson(c.leg, c.stream, true)}};
 }
 
 QJsonArray Node::constraintsJson(int) const {
-    QJsonArray sources;
-    if (!options_.interfaceAddress.empty()) {
-        sources.append(QString::fromStdString(options_.interfaceAddress));
-    } else {
-        for (const QHostAddress& a : QNetworkInterface::allAddresses())
-            if (a.protocol() == QAbstractSocket::IPv4Protocol) sources.append(a.toString());
+    QJsonArray out;
+    for (int leg = 0; leg < senderLegs(); ++leg) {
+        // (each leg from its own interface, when the output names one)
+        const std::string& given = leg == 1 && !options_.interfaceAddress2.empty() ? options_.interfaceAddress2 : options_.interfaceAddress;
+        QJsonArray sources;
+        if (!given.empty()) {
+            sources.append(QString::fromStdString(given));
+        } else {
+            for (const QHostAddress& a : QNetworkInterface::allAddresses())
+                if (a.protocol() == QAbstractSocket::IPv4Protocol) sources.append(a.toString());
+        }
+        out.append(QJsonObject{{"source_ip", QJsonObject{{"enum", sources}}},
+                               {"destination_ip", QJsonObject{}},
+                               {"source_port", QJsonObject{}},
+                               {"destination_port", QJsonObject{}},
+                               {"rtp_enabled", QJsonObject{}}});
     }
-    return QJsonArray{QJsonObject{{"source_ip", QJsonObject{{"enum", sources}}},
-                                  {"destination_ip", QJsonObject{}},
-                                  {"source_port", QJsonObject{}},
-                                  {"destination_port", QJsonObject{}},
-                                  {"rtp_enabled", QJsonObject{}}}};
+    return out;
 }
 
 QString Node::transportFile(int stream) const {
     const Connection& c = connections_[size_t(stream)];
-    const QJsonObject leg = legJson(c.leg, stream, true);
+    // The legs sending: both (ST 2022-7's two descriptions, grouped as duplicates), or the one on.
+    std::vector<int> on;
+    for (int l = 0; l < senderLegs(); ++l)
+        if (c.leg[l].rtpEnabled) on.push_back(l);
+    if (on.empty()) on.push_back(0);
+    const QJsonObject leg = legJson(c.leg[on[0]], stream, on[0], true);
     st2110::Endpoint to{leg["destination_ip"].toString().toStdString(), leg["destination_port"].toInt()};
     st2110::SdpOptions so;
     so.source = leg["source_ip"].toString().toStdString();
@@ -737,9 +776,17 @@ QString Node::transportFile(int stream) const {
     so.refclk = options_.refclk;
     so.ttl = options_.ttl;
     so.session = uint64_t(lastVersion_ / 1000000000);
-    if (stream == 0) return QString::fromStdString(st2110::videoSdp(video_, to, options_.videoPayload, so));
-    if (stream == 1) return QString::fromStdString(st2110::audioSdp(audio_, to, options_.audioPayload, so));
-    return QString::fromStdString(st2110::ancSdp(video_, to, options_.ancPayload, so));
+    st2110::Endpoint to2;
+    const st2110::Endpoint* second = nullptr;
+    if (on.size() > 1) {
+        const QJsonObject leg2 = legJson(c.leg[1], stream, 1, true);
+        to2 = {leg2["destination_ip"].toString().toStdString(), leg2["destination_port"].toInt()};
+        so.source2 = leg2["source_ip"].toString().toStdString();
+        second = &to2;
+    }
+    if (stream == 0) return QString::fromStdString(st2110::videoSdp(video_, to, options_.videoPayload, so, second));
+    if (stream == 1) return QString::fromStdString(st2110::audioSdp(audio_, to, options_.audioPayload, so, second));
+    return QString::fromStdString(st2110::ancSdp(video_, to, options_.ancPayload, so, {{0x60, 0x60}, {0x61, 0x01}}, second));
 }
 
 Node::Response Node::patchStaged(Connection& c, const QJsonObject& patch, bool bulk) {
@@ -754,14 +801,16 @@ Node::Response Node::patchStaged(Connection& c, const QJsonObject& patch, bool b
     }
     if (patch.contains("master_enable") && !patch["master_enable"].isBool()) return errorResponse(400, text("master_enable is true or false"));
     // The legs: as many as there are, only the parameters the constraints name, each of its type and allowed.
-    Leg leg = c.stagedLeg;
+    Leg legs[2] = {c.stagedLeg[0], c.stagedLeg[1]};
     if (patch.contains("transport_params")) {
         if (!patch["transport_params"].isArray()) return errorResponse(400, text("transport_params is an array"));
-        const QJsonArray legs = patch["transport_params"].toArray();
-        if (legs.size() != 1) return errorResponse(400, text("This sender has one leg"));
-        if (!legs[0].isObject()) return errorResponse(400, text("A leg is an object"));
-        const QJsonObject p = legs[0].toObject();
-        const QJsonArray allowedSources = constraintsJson(c.stream)[0].toObject()["source_ip"].toObject()["enum"].toArray();
+        const QJsonArray given = patch["transport_params"].toArray();
+        if (given.size() != senderLegs()) return errorResponse(400, senderLegs() == 1 ? text("This sender has one leg") : text("This sender has two legs"));
+        for (int i = 0; i < senderLegs(); ++i) {
+        if (!given[i].isObject()) return errorResponse(400, text("A leg is an object"));
+        Leg& leg = legs[i];
+        const QJsonObject p = given[i].toObject();
+        const QJsonArray allowedSources = constraintsJson(c.stream)[i].toObject()["source_ip"].toObject()["enum"].toArray();
         for (const QString& key : p.keys()) {
             const QJsonValue v = p[key];
             if (key == "source_ip" || key == "destination_ip") {
@@ -780,6 +829,7 @@ Node::Response Node::patchStaged(Connection& c, const QJsonObject& patch, bool b
             } else {
                 return errorResponse(400, text("This sender has no parameter \"%1\"").arg(key));
             }
+        }
         }
     }
     // Activation.
@@ -806,7 +856,7 @@ Node::Response Node::patchStaged(Connection& c, const QJsonObject& patch, bool b
     if (!c.mode.isNull() && !(mode.isNull() && !mode.isUndefined())) return errorResponse(423, text("An activation is scheduled: cancel it first"));
     if (patch.contains("receiver_id")) c.stagedReceiverId = patch["receiver_id"];
     if (patch.contains("master_enable")) c.stagedMasterEnable = patch["master_enable"].toBool();
-    c.stagedLeg = leg;
+    c.stagedLeg[0] = legs[0], c.stagedLeg[1] = legs[1];
     if (mode.isNull() && !mode.isUndefined()) {
         // Cancelled.
         delete c.timer;
@@ -863,7 +913,7 @@ void Node::activate(Connection& c, const QString& mode) {
     c.lastActivation = taiText(scheduled ? std::max(st2110::ptpNowNs(), c.activationNs) : st2110::ptpNowNs());
     c.receiverId = c.stagedReceiverId;
     c.masterEnable = c.stagedMasterEnable;
-    c.leg = c.stagedLeg;
+    c.leg[0] = c.stagedLeg[0], c.leg[1] = c.stagedLeg[1];
     c.mode = c.requestedTime = QJsonValue::Null;
     c.version = newVersion();
     applyActive();
@@ -874,16 +924,21 @@ void Node::applyActive() {
     // The output's options from the active legs ("auto": as it was).
     st2110::SenderOptions o = options_;
     for (const Connection& c : connections_) {
-        const QJsonObject leg = legJson(c.leg, c.stream, true);
-        st2110::Endpoint& e = c.stream == 0 ? o.video : c.stream == 1 ? o.audio : o.anc;
-        e.address = leg["destination_ip"].toString().toStdString();
-        e.port = leg["destination_port"].toInt();
-        const bool on = c.masterEnable && c.leg.rtpEnabled;
-        (c.stream == 0 ? o.sendVideo : c.stream == 1 ? o.sendAudio : o.sendAnc) = on;
-        if (c.stream == 0) {
-            if (c.leg.sourceIp != "auto") o.interfaceAddress = c.leg.sourceIp.toStdString();
-            if (c.leg.sourcePort.isDouble()) o.sourcePort = c.leg.sourcePort.toInt();
+        bool any = false;
+        for (int l = 0; l < senderLegs(); ++l) {
+            const QJsonObject leg = legJson(c.leg[l], c.stream, l, true);
+            st2110::Endpoint& e = l == 0 ? (c.stream == 0 ? o.video : c.stream == 1 ? o.audio : o.anc)
+                                         : (c.stream == 0 ? o.video2 : c.stream == 1 ? o.audio2 : o.anc2);
+            e.address = leg["destination_ip"].toString().toStdString();
+            e.port = leg["destination_port"].toInt();
+            o.pathOn[c.stream][l] = c.leg[l].rtpEnabled;
+            any = any || c.leg[l].rtpEnabled;
+            if (c.stream == 0) {
+                if (c.leg[l].sourceIp != "auto") (l == 0 ? o.interfaceAddress : o.interfaceAddress2) = c.leg[l].sourceIp.toStdString();
+                if (l == 0 && c.leg[l].sourcePort.isDouble()) o.sourcePort = c.leg[l].sourcePort.toInt();
+            }
         }
+        (c.stream == 0 ? o.sendVideo : c.stream == 1 ? o.sendAudio : o.sendAnc) = c.masterEnable && any;
     }
     options_ = o;
     if (onActivated) onActivated(o);
@@ -1422,6 +1477,336 @@ Node::Response Node::handle(const QByteArray& method, const QString& rawPath, co
 
 // ---- Registration.
 
+// ---- Multicast DNS (RFC 6762) and DNS-SD (RFC 6763): the Node announced as _nmos-node._tcp.local and answering
+// queries for it; registries browsed for as _nmos-register._tcp.local.
+
+namespace {
+
+constexpr quint16 kMdnsPort = 5353;
+constexpr quint16 kTypeA = 1, kTypePtr = 12, kTypeTxt = 16, kTypeSrv = 33, kTypeAny = 255;
+
+void putName(QByteArray& b, const QString& name) {
+    for (const QString& label : name.split('.', Qt::SkipEmptyParts)) {
+        const QByteArray l = label.toUtf8().left(63);
+        b.append(char(l.size()));
+        b.append(l);
+    }
+    b.append('\0');
+}
+void put16(QByteArray& b, quint16 v) { b.append(char(v >> 8)).append(char(v & 0xFF)); }
+void put32(QByteArray& b, quint32 v) { put16(b, quint16(v >> 16)), put16(b, quint16(v)); }
+quint16 get16(const QByteArray& m, int at) { return quint16(quint8(m[at]) << 8 | quint8(m[at + 1])); }
+
+// A name at `at` (with compression pointers, a few dozen at most), `at` moved past it.
+bool readName(const QByteArray& m, int& at, QString& out) {
+    QStringList labels;
+    int pos = at, jumps = 0;
+    bool jumped = false;
+    while (pos < m.size()) {
+        const quint8 len = quint8(m[pos]);
+        if (len == 0) {
+            if (!jumped) at = pos + 1;
+            out = labels.join('.');
+            return true;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            if (pos + 1 >= m.size() || ++jumps > 32) return false;
+            const int to = (len & 0x3F) << 8 | quint8(m[pos + 1]);
+            if (!jumped) at = pos + 2;
+            jumped = true;
+            pos = to;
+            continue;
+        }
+        if (len > 63 || pos + 1 + len > m.size()) return false;
+        labels << QString::fromUtf8(m.mid(pos + 1, len));
+        pos += 1 + len;
+    }
+    return false;
+}
+
+QByteArray record(const QString& name, quint16 type, bool flush, quint32 ttl, const QByteArray& data) {
+    QByteArray b;
+    putName(b, name);
+    put16(b, type);
+    put16(b, quint16(1 | (flush ? 0x8000 : 0)));
+    put32(b, ttl);
+    put16(b, quint16(data.size()));
+    return b + data;
+}
+
+QByteArray message(quint16 id, bool response, const QList<QByteArray>& questions, const QList<QByteArray>& answers) {
+    QByteArray b;
+    put16(b, id);
+    put16(b, response ? 0x8400 : 0);  // (a response: authoritative)
+    put16(b, quint16(questions.size()));
+    put16(b, quint16(answers.size()));
+    put16(b, 0), put16(b, 0);
+    for (const QByteArray& q : questions) b += q;
+    for (const QByteArray& a : answers) b += a;
+    return b;
+}
+
+QByteArray question(const QString& name, quint16 type) {
+    QByteArray b;
+    putName(b, name);
+    put16(b, type);
+    put16(b, 1);
+    return b;
+}
+
+// A DNS label of letters, digits and hyphens.
+QString dnsLabel(QString s) {
+    for (QChar& c : s)
+        if (!(c.isLetterOrNumber() && c.unicode() < 128) && c != '-') c = '-';
+    return s.left(40);
+}
+
+}  // namespace
+
+struct Node::Mdns {
+    QUdpSocket* socket = nullptr;  // (the Node's child)
+    QString instance, host;        // "<label>-<port>._nmos-node._tcp.local", "montage-<id>.local"
+    QHostAddress address;
+    int port = 0;
+    QTimer* announce = nullptr;
+    int announcing = 0;  // announcements still to send (two, a second apart)
+    // Browsing for registries: what the answers have said so far, by instance name.
+    struct Found {
+        QString target;
+        int port = 0, priority = 100;
+        bool txt = false, usable = true;
+    };
+    std::map<QString, Found> found;
+    std::map<QString, QHostAddress> addresses;  // (by host name, lower case)
+    QTimer* browse = nullptr;
+    int queries = 0;
+    std::function<void(std::vector<Registry>)> browsed;
+};
+
+QByteArray Node::mdnsTxt() const {
+    // IS-04's TXT record: the API's protocol, versions and authorisation; peer to peer (no registry), the resources'
+    // versions too (each counted round from 0 to 255 as resources of its kind change).
+    QByteArray b;
+    auto entry = [&](const QByteArray& kv) { b.append(char(kv.size())).append(kv); };
+    entry("api_proto=http");
+    entry("api_ver=v1.0,v1.1,v1.2,v1.3");
+    entry("api_auth=false");
+    if (!registered_) {
+        static const char* const kinds[6] = {"slf", "src", "flw", "dvc", "snd", "rcv"};
+        for (int i = 0; i < 6; ++i) entry(QByteArray("ver_") + kinds[i] + "=" + QByteArray::number(mdnsVersions_[i]));
+    }
+    return b;
+}
+
+void Node::announceNode() {
+    if (!mdns_ || !mdns_->socket) return;
+    Mdns& m = *mdns_;
+    const QString service = QStringLiteral("_nmos-node._tcp.local");
+    QByteArray srv;
+    put16(srv, 0), put16(srv, 0), put16(srv, quint16(m.port));
+    putName(srv, m.host);
+    QByteArray ptr;
+    putName(ptr, m.instance);
+    QByteArray enumerate;
+    putName(enumerate, service);
+    QByteArray a;
+    put32(a, m.address.toIPv4Address());
+    const quint32 ttl = stopping_ ? 0 : 120;
+    const QByteArray msg = message(0, true, {},
+                                   {record(service, kTypePtr, false, stopping_ ? 0 : 4500, ptr),
+                                    record(QStringLiteral("_services._dns-sd._udp.local"), kTypePtr, false, stopping_ ? 0 : 4500, enumerate),
+                                    record(m.instance, kTypeSrv, true, ttl, srv), record(m.instance, kTypeTxt, true, stopping_ ? 0 : 4500, mdnsTxt()),
+                                    record(m.host, kTypeA, true, ttl, a)});
+    m.socket->writeDatagram(msg, QHostAddress(QStringLiteral("224.0.0.251")), kMdnsPort);
+}
+
+void Node::startMdns() {
+    mdns_ = std::make_unique<Mdns>();
+    Mdns& m = *mdns_;
+    m.socket = new QUdpSocket(run_);
+    // (shared with the system's own responder, where there is one)
+    if (!m.socket->bind(QHostAddress::AnyIPv4, kMdnsPort, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
+        mdnsError_ = m.socket->errorString();
+        m.socket = nullptr;
+        return;
+    }
+    m.socket->setSocketOption(QAbstractSocket::MulticastLoopbackOption, 1);
+    m.socket->setSocketOption(QAbstractSocket::MulticastTtlOption, 255);
+    const QHostAddress group(QStringLiteral("224.0.0.251"));
+    // Listening on every interface that takes multicast (a query may come in on any); sent from the one the APIs are
+    // offered on, where it takes multicast, else as routing chooses.
+    m.socket->joinMulticastGroup(group);
+    for (const QNetworkInterface& i : QNetworkInterface::allInterfaces()) {
+        const auto f = i.flags();
+        if (!(f & QNetworkInterface::IsUp) || !(f & QNetworkInterface::CanMulticast)) continue;
+        m.socket->joinMulticastGroup(group, i);
+        for (const QNetworkAddressEntry& e : i.addressEntries())
+            if (e.ip().toString() == address_) m.socket->setMulticastInterface(i);
+    }
+    m.address = QHostAddress(address_);
+    m.port = port();
+    m.instance = dnsLabel(o_.label) + QStringLiteral("-%1._nmos-node._tcp.local").arg(m.port);
+    m.host = QStringLiteral("montage-%1.local").arg(idText(nodeId_).left(8));
+    connect(m.socket, &QUdpSocket::readyRead, this, [this] {
+        if (!mdns_ || !mdns_->socket) return;
+        Mdns& md = *mdns_;
+        while (md.socket->hasPendingDatagrams()) {
+            const QNetworkDatagram d = md.socket->receiveDatagram(9000);
+            const QByteArray msg = d.data();
+            if (msg.size() < 12) continue;
+            const quint16 id = get16(msg, 0), flags = get16(msg, 2);
+            const int qd = get16(msg, 4), records = get16(msg, 6) + get16(msg, 8) + get16(msg, 10);
+            int at = 12;
+            const QString service = QStringLiteral("_nmos-node._tcp.local");
+            bool wanted = false;
+            QList<QByteArray> asked;
+            for (int i = 0; i < qd && at < msg.size(); ++i) {
+                QString name;
+                if (!readName(msg, at, name) || at + 4 > msg.size()) break;
+                const quint16 type = get16(msg, at);
+                at += 4;
+                if (flags & 0x8000) continue;
+                const QString n = name.toLower();
+                const bool ours = (n == service && (type == kTypePtr || type == kTypeAny)) ||
+                                  (n == md.instance.toLower() && (type == kTypeSrv || type == kTypeTxt || type == kTypeAny)) ||
+                                  (n == md.host.toLower() && (type == kTypeA || type == kTypeAny)) ||
+                                  (n == QStringLiteral("_services._dns-sd._udp.local") && type == kTypePtr);
+                if (ours) wanted = true, asked << question(name, type);
+            }
+            if (!(flags & 0x8000)) {
+                if (!wanted || stopping_) continue;
+                // A query for the Node: answered to the group, and straight back to a querier not on port 5353 (a
+                // one-shot query, RFC 6762's legacy unicast: its id and questions with the answer).
+                if (d.senderPort() == kMdnsPort) {
+                    announceNode();
+                } else {
+                    QByteArray srv;
+                    put16(srv, 0), put16(srv, 0), put16(srv, quint16(md.port));
+                    putName(srv, md.host);
+                    QByteArray ptr, a;
+                    putName(ptr, md.instance);
+                    put32(a, md.address.toIPv4Address());
+                    const QByteArray answer = message(id, true, asked,
+                                                      {record(service, kTypePtr, false, 10, ptr), record(md.instance, kTypeSrv, false, 10, srv),
+                                                       record(md.instance, kTypeTxt, false, 10, mdnsTxt()), record(md.host, kTypeA, false, 10, a)});
+                    md.socket->writeDatagram(answer, d.senderAddress(), quint16(d.senderPort()));
+                }
+                continue;
+            }
+            // A response: what it says of registries, while browsing for them.
+            if (!md.browse) continue;
+            for (int i = 0; i < records && at < msg.size(); ++i) {
+                QString name;
+                if (!readName(msg, at, name) || at + 10 > msg.size()) break;
+                const quint16 type = get16(msg, at), length = get16(msg, at + 8);
+                const quint32 ttl = quint32(get16(msg, at + 4)) << 16 | get16(msg, at + 6);
+                int data = at + 10;
+                at = data + length;
+                if (at > msg.size()) break;
+                const QString n = name.toLower();
+                if (type == kTypePtr && (n == QStringLiteral("_nmos-register._tcp.local") || n == QStringLiteral("_nmos-registration._tcp.local"))) {
+                    QString instance;
+                    if (!readName(msg, data, instance)) continue;
+                    if (ttl == 0) md.found.erase(instance.toLower());  // (a goodbye)
+                    else md.found.emplace(instance.toLower(), Mdns::Found{});
+                } else if (!n.endsWith(QStringLiteral("._nmos-register._tcp.local")) && !n.endsWith(QStringLiteral("._nmos-registration._tcp.local"))) {
+                    if (type == kTypeA && length == 4) md.addresses[n] = QHostAddress(quint32(get16(msg, data)) << 16 | get16(msg, data + 2));
+                    continue;  // (another service's records: a Node's own, say)
+                } else if (type == kTypeSrv && length >= 7) {
+                    QString target;
+                    int t = data + 6;
+                    if (!readName(msg, t, target)) continue;
+                    Mdns::Found& f = md.found[n];
+                    f.target = target.toLower(), f.port = get16(msg, data + 4);
+                } else if (type == kTypeTxt) {
+                    Mdns::Found& f = md.found[n];
+                    QString ver, proto, auth = QStringLiteral("false");
+                    for (int p = data; p < data + length;) {
+                        const int len = quint8(msg[p]);
+                        const QByteArray kv = msg.mid(p + 1, len);
+                        p += 1 + len;
+                        const int eq = kv.indexOf('=');
+                        const QByteArray k = kv.left(eq), value = kv.mid(eq + 1);
+                        if (k == "api_ver") ver = QString::fromUtf8(value);
+                        else if (k == "api_proto") proto = QString::fromUtf8(value);
+                        else if (k == "api_auth") auth = QString::fromUtf8(value);
+                        else if (k == "pri") f.priority = value.toInt();
+                    }
+                    f.txt = true;
+                    // (as by unicast DNS: a registry speaking v1.3 over HTTP without authorisation)
+                    f.usable = ver.split(',').contains(QStringLiteral("v1.3")) && proto == "http" && auth == "false";
+                }
+            }
+        }
+    });
+    if (o_.announce) {
+        m.announce = new QTimer(run_);
+        m.announce->setInterval(1000);
+        m.announcing = 2;
+        connect(m.announce, &QTimer::timeout, this, [this] {
+            announceNode();
+            if (mdns_ && --mdns_->announcing <= 0) mdns_->announce->stop();
+        });
+        QTimer::singleShot(0, run_, [this] { announceNode(); });
+        m.announce->start();
+    }
+}
+
+void Node::mdnsChanged(int kind) {
+    if (kind >= 0 && kind < 6) mdnsVersions_[kind] = (mdnsVersions_[kind] + 1) % 256;
+    // (said again shortly, the changes of a moment together)
+    if (!mdns_ || !mdns_->announce) return;
+    mdns_->announcing = std::max(mdns_->announcing, 1);
+    if (!mdns_->announce->isActive()) mdns_->announce->start(100);
+}
+
+void Node::browseRegistries(std::function<void(std::vector<Registry>)> done) {
+    if (!mdns_ || !mdns_->socket) {
+        done({});
+        return;
+    }
+    Mdns& m = *mdns_;
+    m.found.clear();
+    m.browsed = std::move(done);
+    delete m.browse;
+    m.browse = new QTimer(run_);
+    m.browse->setInterval(600);
+    m.queries = 0;
+    auto ask = [this] {
+        Mdns& md = *mdns_;
+        // (the services; then, for those whose records have not all come, their SRV, TXT and the hosts' addresses)
+        QList<QByteArray> qs{question(QStringLiteral("_nmos-register._tcp.local"), kTypePtr),
+                             question(QStringLiteral("_nmos-registration._tcp.local"), kTypePtr)};
+        for (const auto& [name, f] : md.found) {
+            if (f.target.isEmpty()) qs << question(name, kTypeSrv);
+            if (!f.txt) qs << question(name, kTypeTxt);
+            if (!f.target.isEmpty() && !md.addresses.count(f.target)) qs << question(f.target, kTypeA);
+        }
+        md.socket->writeDatagram(message(0, false, qs, {}), QHostAddress(QStringLiteral("224.0.0.251")), kMdnsPort);
+    };
+    connect(m.browse, &QTimer::timeout, this, [this, ask] {
+        Mdns& md = *mdns_;
+        bool whole = !md.found.empty();
+        for (const auto& [name, f] : md.found) whole = whole && f.txt && !f.target.isEmpty() && md.addresses.count(f.target);
+        if (++md.queries < 4 && !whole) {
+            ask();
+            return;
+        }
+        md.browse->deleteLater();
+        md.browse = nullptr;
+        std::vector<Registry> out;
+        for (const auto& [name, f] : md.found) {
+            const auto a = md.addresses.find(f.target);
+            if (!f.usable || !f.txt || a == md.addresses.end() || f.port <= 0) continue;
+            out.push_back(Registry{QStringLiteral("http://%1:%2").arg(a->second.toString()).arg(f.port), f.priority, name});
+        }
+        auto done = std::move(md.browsed);
+        done(out);
+    });
+    ask();
+    m.browse->start();
+}
+
 void Node::discover() {
     if (stopping_ || !running()) return;
     if (!o_.registry.isEmpty()) {
@@ -1431,11 +1816,20 @@ void Node::discover() {
         return;
     }
     const QString domain = o_.domain.isEmpty() ? systemDomain() : o_.domain;
-    if (domain.isEmpty()) {
-        rediscover_->start(10000);
+    found_.clear();
+    if (domain.isEmpty() || domain.compare(QStringLiteral("local"), Qt::CaseInsensitive) == 0 ||
+        domain.compare(QStringLiteral("local."), Qt::CaseInsensitive) == 0) {
+        // Multicast DNS on the local network (no search domain to look in by unicast DNS).
+        browsedMdns_ = true;
+        lookups_ = 1;
+        browseRegistries([this](std::vector<Registry> found) {
+            if (stopping_) return;
+            found_ = std::move(found);
+            lookupDone();
+        });
         return;
     }
-    found_.clear();
+    browsedMdns_ = false;
     auto* ptr = new QDnsLookup(QDnsLookup::PTR, QStringLiteral("_nmos-register._tcp.") + domain, run_);
     if (!o_.dnsServer.isEmpty()) ptr->setNameserver(QHostAddress(o_.dnsServer));
     lookups_ = 1;
@@ -1520,9 +1914,16 @@ void Node::lookupDone() {
     registries_ = list;
     if (registries_.empty()) {
         registryIndex_ = -1;
-        rediscover_->start(2000);
+        // (multicast queries further and further apart while no registry answers, to an hour at most)
+        if (browsedMdns_) {
+            rediscover_->start(mdnsRetryMs_);
+            mdnsRetryMs_ = std::min(mdnsRetryMs_ * 2, 3600 * 1000);
+        } else {
+            rediscover_->start(2000);
+        }
         return;
     }
+    mdnsRetryMs_ = 2000;
     registryIndex_ = 0;
     registerAll();
 }
@@ -1547,6 +1948,7 @@ void Node::postNext() {
         registering_ = false;
         if (!registered_) {
             registered_ = true;
+            mdnsChanged(-1);  // (no longer peer to peer: the TXT record without the versions)
             if (onRegistered) onRegistered(true);
         }
         heartbeat_->start();
@@ -1617,12 +2019,16 @@ void Node::registryFailed() {
     registryIndex_ = -1;
     if (registered_) {
         registered_ = false;
+        mdnsChanged(-1);
         if (onRegistered) onRegistered(false);
     }
     rediscover_->start(1000);
 }
 
 void Node::resourceChanged(const QString& type, const QJsonObject& data) {
+    static const QStringList kinds{QStringLiteral("node"), QStringLiteral("source"), QStringLiteral("flow"), QStringLiteral("device"),
+                                   QStringLiteral("sender"), QStringLiteral("receiver")};
+    mdnsChanged(int(kinds.indexOf(type)));
     if (!registered_ || registering_ || stopping_ || registry().isEmpty()) return;
     QNetworkRequest req(QUrl(registry() + QStringLiteral("/x-nmos/registration/v1.3/resource")));
     req.setHeader(QNetworkRequest::ContentTypeHeader, QByteArrayLiteral("application/json"));

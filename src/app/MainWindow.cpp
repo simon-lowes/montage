@@ -12,6 +12,7 @@
 #include "render/PaperworkOutput.h"
 #include "render/ImageSubtitles.h"
 #include "render/DcpSecurity.h"
+#include "render/DcpFacilities.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
@@ -29,6 +30,7 @@
 #include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 
+#include <QStandardItemModel>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QAction>
@@ -86,6 +88,8 @@
 #include <QShortcut>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QSet>
+#include <QTreeWidget>
 #include <QChildEvent>
 #include <QTabBar>
 #include <QToolBar>
@@ -142,12 +146,16 @@ extern "C" {
 #include "InspectorWidget.h"
 #include "AutoDuckDialog.h"
 #include "AutoMixDialog.h"
+#include "TrackGroupsDialog.h"
+#include "core/TrackGroups.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
+#include "Multiviewer.h"
+#include "media/Capture.h"
 #include "DeckControl.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
@@ -172,6 +180,7 @@ extern "C" {
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
+#include "render/BackgroundJobs.h"
 #include "MixerPanel.h"
 #include "ControlSurface.h"
 #include "MidiLearn.h"
@@ -224,6 +233,7 @@ extern "C" {
 #include "HdrSurface.h"
 #include "MonitorPanel.h"
 #include "PlaybackController.h"
+#include "PluginFailureBar.h"
 #include "PluginManagerDialog.h"
 #include "ScopesWidget.h"
 #include "SpellUi.h"
@@ -278,6 +288,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildMenus();
     applyHdrViewer();
     keymap::load(this);
+
+    // How plug-ins run in host processes of their own (Tools › Audio Plugins › Hosting…).
+    PluginManagerDialog::applySavedHosting();
 
     // Crash safety: find sessions that did not exit cleanly before starting ours.
     recovery_ = new RecoveryManager(state_, QString(), this);
@@ -426,6 +439,10 @@ void MainWindow::buildPanels() {
         sequenceTabs_->setExpanding(false);
         sequenceTabs_->setDocumentMode(true);
         sequenceTabs_->setToolTip(tr("Open sequences: click to switch, drag to reorder, close to put away (double-click a sequence in the bin to open it)"));
+        // A plug-in that failed in its host, named, with Restart and Disable (it never stops playback).
+        auto* pluginFailures = new PluginFailureBar(centre);
+        connect(pluginFailures, &PluginFailureBar::pluginsChanged, this, [this] { effects_->reload(); });
+        v->addWidget(pluginFailures);
         v->addWidget(sequenceTabs_);
         v->addWidget(timeline_, 1);
         setCentralWidget(centre);
@@ -470,6 +487,12 @@ void MainWindow::buildPanels() {
         return d;
     };
     sourcePanel_ = new MonitorPanel(MonitorPanel::Mode::Source, state_, source_, this);
+    // A feed watched live, or no longer, or its recording so far shown: the recording's length as it is now, and the
+    // multiviewer's tallies.
+    connect(sourcePanel_, &MonitorPanel::liveChanged, this, [this] {
+        rebuildSourceProject();
+        if (multiviewer_) multiviewer_->sourceShowing(sourcePanel_->liveShowing() ? sourcePanel_->liveFeed() : nullptr);
+    });
     programPanel_ = new MonitorPanel(MonitorPanel::Mode::Program, state_, program_, this);
     // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
     new TransformOverlay(state_, programPanel_->viewer());
@@ -487,6 +510,7 @@ void MainWindow::buildPanels() {
                 programPanel_->showTrimView(left, right, leftLabel, rightLabel);
             });
     connect(timeline_, &TimelineWidget::trimViewEnded, programPanel_, &MonitorPanel::endTrimView);
+    connect(timeline_, &TimelineWidget::trackGroupsRequested, this, &MainWindow::trackGroupsDialog);
     bin_ = new MediaBinWidget(state_, this);
     connect(bin_, &MediaBinWidget::openInSource, this, &MainWindow::openInSource);
     connect(bin_, &MediaBinWidget::newTitleRequested, this, &MainWindow::addTitle);
@@ -767,7 +791,7 @@ void MainWindow::buildPanels() {
         const QString folder = QFileDialog::getExistingDirectory(this, tr("Render the Trim Passes Into"), QFileInfo(state_->filePath()).absolutePath());
         if (!folder.isEmpty()) queueTrimPasses(folder);
     });
-    queue_ = new RenderQueue(this);
+    queue_ = new RenderQueue(this, jobs::storeFolder());  // (kept on disk: after a restart or a crash its jobs go on)
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
     productionDock_ = makeDock(tr("Production"), "production", production_);
@@ -1395,6 +1419,12 @@ void MainWindow::buildMenus() {
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
+    add(file, QT_TR_NOOP("&Multiviewer…"), QKeySequence(), [this] {
+        Multiviewer* m = multiviewer();
+        m->show();
+        m->raise();
+        m->activateWindow();
+    })->setObjectName(QStringLiteral("multiviewerWindow"));
     add(file, QT_TR_NOOP("&Deck Control…"), QKeySequence(), [this] {
         if (!deckDialog_) deckDialog_ = new DeckDialog(deckControl_, state_, this);
         deckDialog_->show();
@@ -2266,6 +2296,25 @@ void MainWindow::buildMenus() {
         audioDescription_->show();
         audioDescription_->raise();
     })->setObjectName(QStringLiteral("audioDescription"));
+    // Track groups (core/TrackGroups.h): the dialog, and every group suspended at once (and back) with a key.
+    add(seqM, QT_TR_NOOP("Track &Groups…"), QKeySequence(), [this] { trackGroupsDialog(); })->setObjectName(QStringLiteral("trackGroups"));
+    {
+        QAction* suspend = add(seqM, QT_TR_NOOP("Suspend Track Groups"), QKeySequence("Ctrl+Shift+G"), [this] {
+            if (!state_->sequence()) return;
+            const bool on = !state_->sequence()->groupsSuspended;
+            state_->edit(on ? tr("Suspend Track Groups") : tr("Resume Track Groups"), [on](Project&, Sequence& s) {
+                s.groupsSuspended = on;
+                return true;
+            });
+            state_->message(on ? tr("Track groups suspended: each track acts alone (Ctrl+Shift+G again resumes them)") : tr("Track groups resumed"), 4000);
+        });
+        suspend->setObjectName(QStringLiteral("suspendTrackGroups"));
+        suspend->setCheckable(true);
+        connect(state_, &EditorState::projectChanged, suspend, [this, suspend] {
+            const QSignalBlocker block(suspend);
+            suspend->setChecked(state_->sequence() && state_->sequence()->groupsSuspended);
+        });
+    }
     add(seqM, QT_TR_NOOP("&Generate Voiceover…"), QKeySequence("Ctrl+Alt+G"), [this] {
         if (!state_->sequence()) return;
         SpeechDialog dlg(state_, this);
@@ -2307,11 +2356,11 @@ void MainWindow::buildMenus() {
     });
     seqM->addSeparator();
     add(seqM, QT_TR_NOOP("Mark &In"), QKeySequence(Qt::Key_I), [this] {
-        if (active_ == Monitor::Source) state_->setSourceIn(source_->position());
+        if (active_ == Monitor::Source) sourcePanel_->markIn();  // (a feed watched live: at its picture)
         else state_->setInPoint(program_->position());
     });
     add(seqM, QT_TR_NOOP("Mark &Out"), QKeySequence(Qt::Key_O), [this] {
-        if (active_ == Monitor::Source) state_->setSourceOut(source_->position());
+        if (active_ == Monitor::Source) sourcePanel_->markOut();
         else state_->setOutPoint(program_->position());
     });
     add(seqM, QT_TR_NOOP("Mark Clip"), QKeySequence(Qt::Key_X), [this] { markClip(); });
@@ -2746,6 +2795,9 @@ void MainWindow::buildMenus() {
     // Live feeds recorded (File › Capture), ST 2110 streams among them.
     if (liveLink_)
         liveLink_->addAppTool(CaptureDialog::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            const QString action = args.value("action").toString();
+            if (action == QLatin1String("live")) return liveTool(args, structured, isError);
+            if (action == QLatin1String("multiview")) return multiviewer()->runTool(args, structured, isError);
             return captureDialog()->runTool(args, structured, isError);
         });
     remoteReview_ = new RemoteReviewController(program_, this);
@@ -2833,6 +2885,10 @@ void MainWindow::buildMenus() {
     if (liveLink_)
         liveLink_->addAppTool(MonitoringPanel::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return monitoring_->runTool(args, structured, isError);
+        });
+    if (liveLink_)
+        liveLink_->addAppTool(MonitoringPanel::deviceToolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return monitoring_->runDeviceTool(args, structured, isError);
         });
     if (liveLink_)
         liveLink_->addAppTool(RemoteReviewController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
@@ -3056,6 +3112,7 @@ void MainWindow::buildMenus() {
         connect(dlg, &PluginManagerDialog::pluginsChanged, effects_, &EffectsBrowser::reload);
         dlg->show();
     });
+    add(toolsM, QT_TR_NOOP("Plug-in &Hosting…"), QKeySequence(), [this] { PluginManagerDialog::editHosting(this); });
     {
         // Where the AI models run (media/Inference.h): the GPU or NPU when there is one, or the processor only.
         // Provider libraries beside the program or in Montage's data folder are registered first.
@@ -3250,8 +3307,103 @@ void MainWindow::updateTitle() {
 }
 
 CaptureDialog* MainWindow::captureDialog() {
-    if (!capture_) capture_ = new CaptureDialog(state_, this);
+    if (!capture_) {
+        capture_ = new CaptureDialog(state_, this);
+        connect(capture_, &CaptureDialog::watching, this,
+                [this](std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool on) {
+                    showLive(std::move(feed), media, label, capture_->importedWhileRecording(), on);
+                });
+    }
     return capture_;
+}
+
+Multiviewer* MainWindow::multiviewer() {
+    if (!multiviewer_) {
+        multiviewer_ = new Multiviewer(state_, this);
+        connect(multiviewer_, &Multiviewer::showOnSource, this, &MainWindow::showLive);
+    }
+    return multiviewer_;
+}
+
+void MainWindow::showLive(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording, bool on) {
+    if (!on) {
+        if (feed && sourcePanel_->liveFeed() == feed) sourcePanel_->setLiveFeed(nullptr, 0, {});
+        return;
+    }
+    // (the recording in the Source monitor, its marks the live ones: the media opened before it is shown live)
+    if (media && state_->sourceMedia() != media) state_->setSourceMedia(media);
+    const bool fresh = sourcePanel_->liveFeed() != feed;
+    sourcePanel_->setLiveFeed(std::move(feed), media, label, recording);
+    if (fresh) {  // (a feed newly shown is what I and O mark; its updates leave the active monitor as it is)
+        sourceDock_->raise();
+        active_ = Monitor::Source;
+    }
+}
+
+QString MainWindow::liveTool(const QJsonObject& args, QJsonObject& structured, bool& isError) {
+    isError = false;
+    if (args.contains("input")) {
+        Multiviewer* m = multiviewer();
+        const int i = args.value("input").toInt(-1);
+        if (i < 0 || i >= m->inputCount()) {
+            isError = true;
+            return tr("No multiviewer input %1").arg(i);
+        }
+        m->setOnSource(i);
+    } else if (args.contains("watch")) {
+        if (args.value("watch").toBool()) {
+            CaptureDialog* d = captureDialog();
+            if (!d->liveFeed()) {
+                isError = true;
+                return tr("Nothing is being recorded to watch: record with File › Capture (watched), or name a multiviewer input");
+            }
+            showLive(d->liveFeed(), d->importedMedia(), d->clipLabel(), d->importedWhileRecording(), true);
+        } else if (sourcePanel_->liveFeed()) {
+            sourcePanel_->setLiveFeed(nullptr, 0, {});
+        }
+    }
+    const bool in = args.value("mark_in").toBool(), out = args.value("mark_out").toBool();
+    if (in || out || args.contains("edit")) {
+        if ((in || out) && !sourcePanel_->liveShowing()) {
+            isError = true;
+            return tr("The Source monitor is not showing a feed live");
+        }
+        if ((in || out) && !sourcePanel_->liveMedia()) {
+            isError = true;
+            return tr("Not marked: the feed is watched, not recorded, or its recording is not in the bin yet");
+        }
+        if (in) sourcePanel_->markIn();
+        if (out) sourcePanel_->markOut();
+    }
+    if (args.contains("edit")) {
+        const QString e = args.value("edit").toString();
+        const std::map<QString, EditorState::SourceEdit> modes{{"insert", EditorState::SourceEdit::Insert},
+                                                               {"overwrite", EditorState::SourceEdit::Overwrite},
+                                                               {"append", EditorState::SourceEdit::Append},
+                                                               {"place_on_top", EditorState::SourceEdit::PlaceOnTop}};
+        const auto it = modes.find(e);
+        if (it == modes.end()) {
+            isError = true;
+            return tr("An edit is insert, overwrite, append or place_on_top");
+        }
+        if (!state_->sourceEdit(it->second)) {
+            isError = true;
+            return tr("Not edited in");
+        }
+    }
+    structured["live"] = sourcePanel_->liveShowing();
+    structured["label"] = sourcePanel_->liveLabel();
+    if (const std::shared_ptr<LiveFeed> f = sourcePanel_->liveFeed()) {
+        const LiveFeed::Now now = f->look();
+        structured["timecode"] = QString::fromStdString(now.timecode);
+        structured["running"] = now.running;
+        structured["frame"] = double(sourcePanel_->liveFrame());
+    }
+    if (sourcePanel_->liveMedia()) structured["media"] = double(sourcePanel_->liveMedia());
+    structured["in"] = double(state_->sourceIn());
+    structured["out"] = double(state_->sourceOut());
+    if (!sourcePanel_->liveFeed()) return tr("The Source monitor shows no feed live");
+    return tr("Watching %1 live").arg(sourcePanel_->liveLabel()) + (structured.value("timecode").toString().isEmpty() ? QString() : QStringLiteral(" at ") + structured.value("timecode").toString());
 }
 
 PlaybackController* MainWindow::activeController() const { return active_ == Monitor::Source ? source_ : program_; }
@@ -3757,7 +3909,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
         return;
     }
     if (queue_->running() &&
-        QMessageBox::question(this, tr("Render Queue"), tr("Renders are in progress. Stop them and quit?"),
+        QMessageBox::question(this, tr("Render Queue"), tr("Renders are in progress. Stop them and quit? They render again when Montage next starts."),
                               QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
         e->ignore();
         return;
@@ -3767,8 +3919,7 @@ void MainWindow::closeEvent(QCloseEvent* e) {
         e->ignore();
         return;
     }
-    queue_->stop();
-    queue_->waitForIdle();
+    queue_->suspend();  // (left as it was, to go on next time)
     backgroundRender_ = false;
     if (backgroundCancel_) *backgroundCancel_ = true;  // a background render stops at its next frame
     program_->pause();
@@ -3896,14 +4047,8 @@ void MainWindow::addEdit(bool allTracks) {
             if (c.contains(t)) tracks.push_back(loc->track);
         }
     if (tracks.empty()) tracks = {{TrackKind::Video, state_->targetVideoTrack()}, {TrackKind::Audio, state_->targetAudioTrack()}};
-    state_->apply(tr("Add Edit"), [t, tracks](Project& p, Sequence& sq) {
-        edit::Result last = edit::Result::fail("No clip under the playhead");
-        for (TrackRef r : tracks) {
-            auto res = edit::razor(p, sq, r, t);
-            if (res.ok) last = res;
-        }
-        return last;
-    });
+    // (With the tracks grouped with them: core/TrackGroups.h razorTogether.)
+    state_->apply(tr("Add Edit"), [t, tracks](Project& p, Sequence& sq) { return edit::razorTogether(p, sq, tracks, t); });
 }
 
 void MainWindow::addTransitionsToSelection(std::optional<TrackKind> only) {
@@ -6357,7 +6502,7 @@ bool MainWindow::cycleTake(int step) {
     }
     const Id clip = c->id;
     return state_->apply(step > 0 ? tr("Next Take") : tr("Previous Take"),
-                         [clip, step](Project& p, Sequence& s) { return edit::cycleTake(p, s, clip, step); });
+                         [clip, step](Project& p, Sequence& s) { return edit::cycleGroupTake(p, s, clip, step); });
 }
 
 bool MainWindow::stepVfxVersion(int step) {
@@ -8151,9 +8296,9 @@ void MainWindow::exportStreamingDialog() {
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Export Streaming Package"));
     auto* form = new QFormLayout(&dlg);
-    auto* about = new QLabel(tr("The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF for HLS and "
-                                "DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers "
-                                "as SCTE 35 cues."));
+    auto* about = new QLabel(tr("The sequence rendered once and encoded as a ladder of renditions, packaged as CMAF (or MPEG-TS) for "
+                                "HLS and DASH: the mix and the other audio streams, each caption track, chapters, and ad-break markers "
+                                "as SCTE 35 cues. Live packages are made from a recording: File › Capture."));
     about->setWordWrap(true);
     form->addRow(about);
     const ColorSpace* cs = findColorSpace(s->colorSpace);
@@ -8194,10 +8339,20 @@ void MainWindow::exportStreamingDialog() {
     auto* formats = new QHBoxLayout;
     formats->addWidget(hls), formats->addWidget(dash), formats->addStretch();
     form->addRow(tr("Formats:"), formats);
+    auto* segmentFormat = new QComboBox;
+    segmentFormat->setObjectName(QStringLiteral("streamingSegmentFormat"));
+    segmentFormat->addItem(tr("CMAF"), QStringLiteral("cmaf"));
+    segmentFormat->addItem(tr("MPEG-TS for HLS (CMAF for DASH)"), QStringLiteral("ts"));
+    segmentFormat->setToolTip(tr("Transport stream segments for HLS players and CDNs that ask for them: H.264, with AAC, AC-3 or E-AC-3"));
+    form->addRow(tr("Segment format:"), segmentFormat);
     auto* audio = new QComboBox;
+    audio->setObjectName(QStringLiteral("streamingSound"));
     audio->addItem(tr("AAC"), QStringLiteral("aac"));
     audio->addItem(tr("Opus"), QStringLiteral("libopus"));
+    if (avcodec_find_encoder_by_name("ac3")) audio->addItem(tr("AC-3 (to 5.1)"), QStringLiteral("ac3"));
+    if (avcodec_find_encoder_by_name("eac3")) audio->addItem(tr("E-AC-3 (to 7.1)"), QStringLiteral("eac3"));
     audio->addItem(tr("No sound"), QStringLiteral("none"));
+    audio->setToolTip(tr("AC-3 and E-AC-3 state the mix's loudness (dialnorm) and the sequence's downmix levels"));
     form->addRow(tr("Sound:"), audio);
     auto* cue = new QComboBox;
     cue->addItem(tr("splice_insert"), QStringLiteral("splice_insert"));
@@ -8233,6 +8388,11 @@ void MainWindow::exportStreamingDialog() {
     st.cutAligned = cutAligned->isChecked();
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
     st.audioCodec = audio->currentData().toString().toStdString();
+    st.segmentFormat = segmentFormat->currentData().toString().toStdString();
+    if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() != "libx264")) {
+        state_->message(tr("MPEG-TS segments carry H.264, with AAC, AC-3 or E-AC-3"));
+        return;
+    }
     st.cueCommand = cue->currentData().toString().toStdString();
     if (inOut->isChecked()) st.in = s->inPoint, st.out = s->outPoint + 1;
     // From a copy, off the UI thread.
@@ -8276,11 +8436,19 @@ void MainWindow::exportImfDialog() {
     form->addRow(tr("Title:"), title);
     auto* kind = new QComboBox(&dlg);
     kind->setObjectName(QStringLiteral("imfKind"));
-    for (const auto& [label, value] : std::vector<std::pair<QString, QString>>{{tr("Feature"), "feature"}, {tr("Episode"), "episode"},
-                                                                             {tr("Short"), "short"}, {tr("Trailer"), "trailer"},
-                                                                             {tr("Teaser"), "teaser"}, {tr("Advertisement"), "advertisement"},
-                                                                             {tr("Promotion"), "promotion"}, {tr("Test"), "test"}})
-        kind->addItem(label, value);
+    // (ST 2067-3's kinds; Application DPP's own, RDD 59-1 Table 6, when that is the master)
+    const std::vector<std::pair<QString, QString>> kinds{{tr("Feature"), "feature"},     {tr("Episode"), "episode"},
+                                                         {tr("Short"), "short"},         {tr("Trailer"), "trailer"},
+                                                         {tr("Teaser"), "teaser"},       {tr("Advertisement"), "advertisement"},
+                                                         {tr("Promotion"), "promotion"}, {tr("Test"), "test"}};
+    const std::vector<std::pair<QString, QString>> dppKinds{{tr("Programme"), "programme"},
+                                                            {tr("Commercial"), "commercial"},
+                                                            {tr("Sponsorship"), "sponsorship"},
+                                                            {tr("Infomercial"), "infomercial"},
+                                                            {tr("Presentation (continuity, announcements)"), "presentation_event"},
+                                                            {tr("Promotion"), "promotion"},
+                                                            {tr("Music video"), "music_video"}};
+    for (const auto& [label, value] : kinds) kind->addItem(label, value);
     form->addRow(tr("Kind:"), kind);
     // Application #2E for delivery, or #5 for the archive: the pictures in ACES, with the output transform named.
     auto* application = new QComboBox(&dlg);
@@ -8288,6 +8456,13 @@ void MainWindow::exportImfDialog() {
     if (openJpegAvailable()) application->addItem(tr("Delivery master (Application #2E, JPEG 2000)"), 2);
     if (exrAvailable()) application->addItem(tr("Archival master (Application #5, ACES OpenEXR)"), 5);
     if (prores::encoderAvailable()) application->addItem(tr("ProRes master (Application ProRes, RDD 45)"), 45);
+    if (prores::encoderAvailable()) {
+        application->addItem(tr("Broadcast master (Application DPP (ProRes), RDD 59-1)"), 59);
+        application->setItemData(application->count() - 1,
+                                 tr("ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG, as UK and "
+                                    "North American broadcasters' IMF delivery specifications ask"),
+                                 Qt::ToolTipRole);
+    }
     form->addRow(tr("Master:"), application);
     // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
     auto* proresProfile = new QComboBox(&dlg);
@@ -8299,6 +8474,20 @@ void MainWindow::exportImfDialog() {
     proresProfile->addItem(tr("4444 XQ (4:4:4 RGB)"), "4444xq");
     proresProfile->setToolTip(tr("4:2:2 goes to 3840 x 2160 and 60 fps, in Rec.709, Rec.2020 PQ or HLG; 4:4:4 to 4096 x 3112 in any of the colours"));
     form->addRow(tr("ProRes:"), proresProfile);
+    // Application ProRes: fields, 4:4:4's components and range.
+    auto* fields = new QComboBox(&dlg);
+    fields->setObjectName(QStringLiteral("imfFields"));
+    fields->addItem(tr("Progressive"), QString());
+    fields->addItem(tr("Interlaced, top field first"), "tff");
+    fields->addItem(tr("Interlaced, bottom field first"), "bff");
+    fields->setToolTip(tr("Each picture coded as two fields (4:2:2, to 1920 x 1080 at 25, 29.97 or 30 fps, Rec.709), as 1080i deliveries ask"));
+    form->addRow(tr("Fields:"), fields);
+    auto* ycbcr444 = new QCheckBox(tr("4:4:4 as Y'CbCr (to 1920 x 1080, Rec.709), not RGB"), &dlg);
+    ycbcr444->setObjectName(QStringLiteral("imfYcbcr444"));
+    form->addRow(QString(), ycbcr444);
+    auto* fullRange = new QCheckBox(tr("Full range (QE.2: 0 to 1023, 4:4:4 RGB)"), &dlg);
+    fullRange->setObjectName(QStringLiteral("imfFullRange"));
+    form->addRow(QString(), fullRange);
     auto* graded = new QComboBox(&dlg);
     graded->setObjectName(QStringLiteral("imfGraded"));
     graded->addItem(tr("Graded"), true);
@@ -8440,21 +8629,69 @@ void MainWindow::exportImfDialog() {
     original->setToolTip(tr("The sequence the earlier package was mastered from, kept as it was: its cut is compared with this one "
                             "to find the pictures that changed"));
     form->addRow(tr("Mastered from:"), original);
+    // (the ProRes choices made before Application DPP was chosen, given back when another master is)
+    struct BeforeDpp {
+        bool kept = false;
+        int profile = 0, fields = 0;
+        bool ycbcr444 = false, fullRange = false;
+    };
+    auto beforeDpp = std::make_shared<BeforeDpp>();
     auto syncSupplemental = [=] {
         for (QWidget* w : {static_cast<QWidget*>(earlier), static_cast<QWidget*>(browseEarlier), static_cast<QWidget*>(original)}) w->setEnabled(supplemental->isChecked());
         // (a supplemental keeps the earlier picture's size, colour, depth and coding; an archival master's pictures are
         // ACES, uncoded)
         const bool aces = application->currentData().toInt() == 5;
-        const bool proresApp = application->currentData().toInt() == 45;
+        const bool dpp = application->currentData().toInt() == 59;
+        const bool proresApp = application->currentData().toInt() == 45 || dpp;
         size->setEnabled(!supplemental->isChecked());
         colour->setEnabled(!supplemental->isChecked() && !aces);
         for (QWidget* w : {static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)}) w->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
-        proresProfile->setEnabled(!supplemental->isChecked() && proresApp);
+        // (Application DPP: 422 HQ here, progressive, narrow range; its 4:4:4 is 12 bits, which no encoder here makes)
+        // Application DPP takes HD or UHD and no P3-D65 PQ: the others greyed out while it is chosen.
+        auto offer = [](QComboBox* box, const char* value, bool on) {
+            if (auto* m = qobject_cast<QStandardItemModel*>(box->model()))
+                if (QStandardItem* i = m->item(box->findData(QString::fromLatin1(value)))) i->setEnabled(on);
+        };
+        for (const char* v : {"sequence", "4k"}) offer(size, v, !dpp);
+        offer(colour, "p3d65-pq", !dpp);
+        if (dpp && !beforeDpp->kept) *beforeDpp = {true, proresProfile->currentIndex(), fields->currentIndex(), ycbcr444->isChecked(), fullRange->isChecked()};
+        if (!dpp && beforeDpp->kept) {
+            const BeforeDpp was = *beforeDpp;
+            beforeDpp->kept = false;
+            proresProfile->setCurrentIndex(was.profile);
+            fields->setCurrentIndex(was.fields);
+            ycbcr444->setChecked(was.ycbcr444);
+            fullRange->setChecked(was.fullRange);
+        }
+        if (dpp) {
+            if (colour->currentData().toString() == "p3d65-pq") colour->setCurrentIndex(colour->findData("rec2020-pq"));
+            proresProfile->setCurrentIndex(proresProfile->findData("hq"));
+            fields->setCurrentIndex(0);
+            ycbcr444->setChecked(false);
+            fullRange->setChecked(false);
+            if (size->currentData().toString() != "hd" && size->currentData().toString() != "uhd")
+                size->setCurrentIndex(size->findData(s->width > 1920 || s->height > 1080 ? "uhd" : "hd"));
+        }
+        proresProfile->setEnabled(!supplemental->isChecked() && proresApp && !dpp);
+        const bool fourFourFour = prores::fourFourFour(prores::profileOf(proresProfile->currentData().toString().toStdString()));
+        fields->setEnabled(!supplemental->isChecked() && proresApp && !dpp && !fourFourFour);
+        ycbcr444->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour);
+        fullRange->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour && !ycbcr444->isChecked());
+        // The kinds the master takes, the one chosen kept where it is one of them.
+        const QString was = kind->currentData().toString();
+        const bool showingDpp = kind->findData("programme") >= 0;
+        if (dpp != showingDpp) {
+            kind->clear();
+            for (const auto& [label, value] : dpp ? dppKinds : kinds) kind->addItem(label, value);
+            kind->setCurrentIndex(std::max(0, kind->findData(was)));
+        }
         graded->setEnabled(aces);
         target->setEnabled(aces);
     };
     connect(supplemental, &QCheckBox::toggled, &dlg, syncSupplemental);
     connect(application, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
+    connect(proresProfile, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
+    connect(ycbcr444, &QCheckBox::toggled, &dlg, syncSupplemental);
     syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
@@ -8495,14 +8732,19 @@ void MainWindow::exportImfDialog() {
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
     st.application = application->currentData().toInt();
-    if (st.application == 45) st.prores = proresProfile->currentData().toString().toStdString();
+    if (st.application == 45 || st.application == 59) {
+        st.prores = proresProfile->currentData().toString().toStdString();
+        if (fields->isEnabled()) st.fields = fields->currentData().toString().toStdString();
+        st.ycbcr444 = ycbcr444->isEnabled() && ycbcr444->isChecked();
+        st.fullRange = fullRange->isEnabled() && fullRange->isChecked();
+    }
     if (st.application == 5) {
         st.graded = graded->currentData().toBool();
         if (target->isChecked()) st.targetFrames = {state_->playhead()};
     }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
-    st.bits = st.application == 45 ? 10 : bits->currentData().toInt();
+    st.bits = st.application == 45 || st.application == 59 ? 10 : bits->currentData().toInt();
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
@@ -8706,9 +8948,9 @@ void MainWindow::makeKdmsDialog() {
     dlg.setObjectName(QStringLiteral("makeKdmsDialog"));
     dlg.setWindowTitle(tr("Make KDMs"));
     auto* form = new QFormLayout(&dlg);
-    auto* intro = new QLabel(tr("Keys for cinema servers to play an encrypted DCP: one KDM for each server certificate, valid "
-                                "between the times given. The cinema sends its servers' certificates; the DKDM is the file Montage kept "
-                                "when it made the DCP."),
+    auto* intro = new QLabel(tr("Keys for cinema servers to play an encrypted DCP, valid between the times given: one KDM for each screen "
+                                "ticked below and each server certificate given. Cinemas send their screens as Facility List Messages "
+                                "(FLMs) or as certificates; the DKDM is the file Montage kept when it made the DCP."),
                              &dlg);
     intro->setWordWrap(true);
     form->addRow(intro);
@@ -8731,10 +8973,168 @@ void MainWindow::makeKdmsDialog() {
     auto* dkdm = new QLineEdit(QString::fromStdString(lastDcp_.dkdm), &dlg);
     dkdm->setObjectName(QStringLiteral("kdmDkdm"));
     form->addRow(tr("DKDM:"), fileRow(dkdm, tr("Choose the DCP's DKDM"), tr("KDMs (*.xml)"), false));
+
+    // The facility list: cinemas and their screens, ticked for this booking.
+    std::vector<Facility> facilities;
+    std::string loadError;
+    // (a list that cannot be read is not written over: it is shown empty and left as it is)
+    const bool listRead = loadFacilities(facilities, &loadError);
+    if (!listRead) state_->message(tr("The facility list cannot be read: %1").arg(QString::fromStdString(loadError)), 10000);
+    auto* tree = new QTreeWidget(&dlg);
+    tree->setObjectName(QStringLiteral("kdmScreens"));
+    tree->setHeaderLabels({tr("Cinema and screen"), tr("Server"), tr("Devices in its KDMs"), tr("Certificate ends")});
+    tree->setMinimumHeight(180);
+    tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    // (what its KDMs will list: kdmScreen's choice, named by type)
+    auto deviceText = [](const Facility& f, const FacilityScreen& sc) {
+        const KdmScreen k = kdmScreen(f, sc);
+        QStringList parts;
+        for (const std::string& t : k.trustedDevices) {
+            if (t == sc.server.thumbprint) parts << tr("its server only");
+            for (const FacilityDevice& d : sc.devices)
+                if (d.thumbprint == t) {
+                    parts << QString::fromStdString(d.type.empty() ? d.name : d.type);
+                    break;
+                }
+        }
+        return parts.isEmpty() ? tr("any device") : parts.join(QStringLiteral(", "));
+    };
+    auto refresh = [&, tree] {
+        // (what was ticked stays ticked)
+        QSet<QString> ticked;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i)
+            for (int j = 0; j < tree->topLevelItem(i)->childCount(); ++j)
+                if (tree->topLevelItem(i)->child(j)->checkState(0) == Qt::Checked) ticked.insert(tree->topLevelItem(i)->child(j)->data(0, Qt::UserRole).toString());
+        tree->clear();
+        for (size_t i = 0; i < facilities.size(); ++i) {
+            const Facility& f = facilities[i];
+            auto* cinema = new QTreeWidgetItem(tree, {QString::fromStdString(f.name), QString(), QString(), QString()});
+            cinema->setFlags(cinema->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
+            cinema->setData(0, Qt::UserRole + 1, int(i));
+            QStringList tip{QString::fromStdString(f.id), tr("From: %1").arg(QString::fromStdString(f.source))};
+            if (!f.timeZone.empty()) tip << tr("Time zone: %1").arg(QString::fromStdString(f.timeZone));
+            for (const std::string& n : f.notes) tip << QString::fromStdString(n);
+            cinema->setToolTip(0, tip.join('\n'));
+            for (size_t j = 0; j < f.screens.size(); ++j) {
+                const FacilityScreen& sc = f.screens[j];
+                const QString key = QString::fromStdString(f.id + "\n" + sc.name);
+                auto* screen = new QTreeWidgetItem(cinema, {tr("Screen %1").arg(QString::fromStdString(sc.name)),
+                                                            sc.server.active ? QString::fromStdString(sc.server.commonName)
+                                                                             : tr("%1 (inactive)").arg(QString::fromStdString(sc.server.commonName)),
+                                                            deviceText(f, sc), QString::fromStdString(sc.server.notAfter).left(10)});
+                screen->setFlags(sc.server.active ? screen->flags() | Qt::ItemIsUserCheckable : screen->flags() & ~Qt::ItemIsEnabled);
+                screen->setData(0, Qt::UserRole, key);
+                screen->setData(0, Qt::UserRole + 1, int(i));
+                screen->setData(0, Qt::UserRole + 2, int(j));
+                screen->setCheckState(0, ticked.contains(key) ? Qt::Checked : Qt::Unchecked);
+                if (!sc.server.chainComplete) screen->setToolTip(1, tr("A certificate sent alone: its chain was not checked"));
+            }
+            cinema->setExpanded(true);
+        }
+    };
+    refresh();
+    auto store = [&] {
+        if (!listRead) {
+            refresh();
+            return;
+        }
+        std::string err;
+        if (!saveFacilities(facilities, &err)) state_->message(tr("The facility list cannot be saved: %1").arg(QString::fromStdString(err)), 10000);
+        refresh();
+    };
+    auto* readFlms = new QPushButton(tr("Read FLMs…"), &dlg);
+    readFlms->setObjectName(QStringLiteral("kdmReadFlm"));
+    connect(readFlms, &QPushButton::clicked, &dlg, [&] {
+        const QStringList files = QFileDialog::getOpenFileNames(&dlg, tr("Read Facility List Messages"), appSettings().value(QStringLiteral("dcp/flmFolder")).toString(),
+                                                                tr("FLMs (*.xml);;All files (*)"));
+        if (files.isEmpty()) return;
+        appSettings().setValue(QStringLiteral("dcp/flmFolder"), QFileInfo(files.front()).path());
+        QStringList problems;
+        int screens = 0, read = 0;
+        for (const QString& file : files) {
+            Facility f;
+            std::string err;
+            if (!readFlmFile(file.toStdString(), f, &err)) {
+                problems << QString::fromStdString(err);
+                continue;
+            }
+            screens += int(f.screens.size());
+            ++read;
+            mergeFacility(facilities, std::move(f));
+        }
+        store();
+        state_->message(tr("Read %n FLM(s) with %1 screen(s)", nullptr, read).arg(screens), 10000);
+        if (!problems.isEmpty()) QMessageBox::warning(&dlg, tr("Read FLMs"), tr("Not read:\n%1").arg(problems.join('\n')));
+    });
+    auto* addScreen = new QPushButton(tr("Add Screen…"), &dlg);
+    addScreen->setObjectName(QStringLiteral("kdmAddScreen"));
+    connect(addScreen, &QPushButton::clicked, &dlg, [&] {
+        QDialog add(&dlg);
+        add.setObjectName(QStringLiteral("kdmAddScreenDialog"));
+        add.setWindowTitle(tr("Add a Screen"));
+        auto* f = new QFormLayout(&add);
+        auto* cinema = new QComboBox(&add);
+        cinema->setObjectName(QStringLiteral("kdmAddCinema"));
+        cinema->setEditable(true);
+        for (const Facility& c : facilities) cinema->addItem(QString::fromStdString(c.name));
+        if (QTreeWidgetItem* at = tree->currentItem()) cinema->setCurrentIndex(at->data(0, Qt::UserRole + 1).toInt());
+        f->addRow(tr("Cinema:"), cinema);
+        auto* name = new QLineEdit(&add);
+        name->setObjectName(QStringLiteral("kdmAddScreenName"));
+        f->addRow(tr("Screen:"), name);
+        auto* server = new QLineEdit(&add);
+        server->setObjectName(QStringLiteral("kdmAddServer"));
+        server->setPlaceholderText(tr("the server's certificate or chain (.pem, .crt)"));
+        f->addRow(tr("Server:"), fileRow(server, tr("Choose the Server's Certificate"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), false));
+        auto* devices = new QLineEdit(&add);
+        devices->setObjectName(QStringLiteral("kdmAddDevices"));
+        devices->setPlaceholderText(tr("the projector's and other devices' certificates, separated by ;"));
+        f->addRow(tr("Devices:"), fileRow(devices, tr("Choose the Devices' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
+        auto* b = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &add);
+        connect(b, &QDialogButtonBox::accepted, &add, &QDialog::accept);
+        connect(b, &QDialogButtonBox::rejected, &add, &QDialog::reject);
+        f->addRow(b);
+        if (add.exec() != QDialog::Accepted) return;
+        std::vector<std::string> others;
+        for (const QString& d : devices->text().split(';', Qt::SkipEmptyParts)) others.push_back(d.trimmed().toStdString());
+        std::string err;
+        if (!addScreenByHand(facilities, cinema->currentText().toStdString(), name->text().toStdString(), server->text().trimmed().toStdString(), others, &err)) {
+            QMessageBox::warning(&dlg, tr("Add a Screen"), tr("The screen was not added: %1").arg(QString::fromStdString(err)));
+            return;
+        }
+        store();
+    });
+    auto* remove = new QPushButton(tr("Remove"), &dlg);
+    remove->setObjectName(QStringLiteral("kdmRemoveFacility"));
+    connect(remove, &QPushButton::clicked, &dlg, [&] {
+        QTreeWidgetItem* at = tree->currentItem();
+        if (!at) return;
+        const size_t i = size_t(at->data(0, Qt::UserRole + 1).toInt());
+        if (i >= facilities.size()) return;
+        if (at->parent()) {
+            const size_t j = size_t(at->data(0, Qt::UserRole + 2).toInt());
+            if (j < facilities[i].screens.size()) facilities[i].screens.erase(facilities[i].screens.begin() + qsizetype(j));
+            if (facilities[i].screens.empty()) facilities.erase(facilities.begin() + qsizetype(i));
+        } else {
+            facilities.erase(facilities.begin() + qsizetype(i));
+        }
+        store();
+    });
+    for (QPushButton* b : {readFlms, addScreen, remove}) b->setEnabled(listRead);
+    auto* list = new QVBoxLayout;
+    list->addWidget(tree, 1);
+    auto* listButtons = new QHBoxLayout;
+    listButtons->addWidget(readFlms);
+    listButtons->addWidget(addScreen);
+    listButtons->addWidget(remove);
+    listButtons->addStretch(1);
+    list->addLayout(listButtons);
+    form->addRow(tr("Screens:"), list);
+
     auto* servers = new QLineEdit(&dlg);
     servers->setObjectName(QStringLiteral("kdmServers"));
-    servers->setPlaceholderText(tr("the servers' certificates (.pem, .crt), separated by ;"));
-    form->addRow(tr("Servers:"), fileRow(servers, tr("Choose the Servers' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
+    servers->setPlaceholderText(tr("other servers' certificates (.pem, .crt), separated by ;"));
+    form->addRow(tr("Other servers:"), fileRow(servers, tr("Choose the Servers' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
     const QDateTime now = QDateTime::currentDateTime();
     auto* from = new QDateTimeEdit(now, &dlg);
     from->setObjectName(QStringLiteral("kdmFrom"));
@@ -8744,6 +9144,9 @@ void MainWindow::makeKdmsDialog() {
     until->setObjectName(QStringLiteral("kdmUntil"));
     until->setCalendarPopup(true);
     form->addRow(tr("Until:"), until);
+    auto* zoneNote = new QLabel(tr("A screen's KDM gives the window in its cinema's time zone when its FLM names one."), &dlg);
+    zoneNote->setWordWrap(true);
+    form->addRow(QString(), zoneNote);
     auto* folder = new QLineEdit(appSettings().value(QStringLiteral("dcp/kdmFolder"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString(), &dlg);
     folder->setObjectName(QStringLiteral("kdmFolder"));
     auto* browse = new QPushButton(tr("Choose…"), &dlg);
@@ -8763,18 +9166,31 @@ void MainWindow::makeKdmsDialog() {
     KdmRequest r;
     r.dkdm = dkdm->text().trimmed().toStdString();
     for (const QString& f : servers->text().split(';', Qt::SkipEmptyParts)) r.recipients.push_back(f.trimmed().toStdString());
+    for (int i = 0; i < tree->topLevelItemCount(); ++i)
+        for (int j = 0; j < tree->topLevelItem(i)->childCount(); ++j) {
+            const QTreeWidgetItem* screen = tree->topLevelItem(i)->child(j);
+            const size_t c = size_t(screen->data(0, Qt::UserRole + 1).toInt()), k = size_t(screen->data(0, Qt::UserRole + 2).toInt());
+            if (screen->checkState(0) == Qt::Checked && c < facilities.size() && k < facilities[c].screens.size() && facilities[c].screens[k].server.active)
+                r.screens.push_back(kdmScreen(facilities[c], facilities[c].screens[k]));
+        }
     r.notBefore = from->dateTime().toSecsSinceEpoch();
     r.notAfter = until->dateTime().toSecsSinceEpoch();
     r.offsetMinutes = from->dateTime().offsetFromUtc() / 60;
     r.folder = folder->text().toStdString();
     appSettings().setValue(QStringLiteral("dcp/kdmFolder"), folder->text());
-    std::vector<std::string> made;
+    std::vector<std::string> made, zips;
     std::string err;
-    if (!makeKdms(r, &made, &err)) {
+    if (!makeKdms(r, &made, &err, &zips)) {
         state_->message(tr("No KDMs: %1").arg(QString::fromStdString(err)), 10000);
         return;
     }
-    state_->message(tr("Made %n KDM(s) in %1: send each to its cinema", nullptr, int(made.size())).arg(QDir::toNativeSeparators(folder->text())), 10000);
+    if (zips.empty())
+        state_->message(tr("Made %n KDM(s) in %1: send each to its cinema", nullptr, int(made.size())).arg(QDir::toNativeSeparators(folder->text())), 10000);
+    else
+        state_->message(tr("Made %n KDM(s) in %1, a folder and a zip for each of %2 cinema(s): send each its zip", nullptr, int(made.size()))
+                            .arg(QDir::toNativeSeparators(folder->text()))
+                            .arg(zips.size()),
+                        10000);
 }
 
 namespace {
@@ -9364,6 +9780,14 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     box.exec();
     if (box.clickedButton() == go) state_->setPlayhead(l.maxCllFrame);
     return true;
+}
+
+void MainWindow::trackGroupsDialog() {
+    if (!state_->sequence()) return;
+    if (!trackGroups_) trackGroups_ = new TrackGroupsDialog(state_, this);
+    trackGroups_->show();
+    trackGroups_->raise();
+    trackGroups_->activateWindow();
 }
 
 void MainWindow::watchFoldersDialog() {
@@ -10780,6 +11204,9 @@ void MainWindow::newSequence() {
             s.colorSpace = spec.colorSpace;
             s.hdrPeakNits = spec.hdrPeakNits;
             s.audioLayout = spec.audioLayout;
+            s.downmixCentreDb = spec.downmixCentreDb, s.downmixSurroundDb = spec.downmixSurroundDb;
+            s.preferredDownmix = spec.preferredDownmix;
+            s.mixingLevel = spec.mixingLevel, s.roomType = spec.roomType;
             s.spherical = spec.spherical;
             s.vr180 = spec.vr180;
             s.stereo3d = spec.stereo3d;

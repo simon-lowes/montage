@@ -46,6 +46,7 @@ private:
         bool keptUnsigned = false;  // failed signing; the export is kept
         QString error;
         QString encoder;  // the video encoder that ran (hardware presets resolve at export time)
+        QString hrd;      // the buffer model's check when the export does not keep it (render/HrdCheck.h)
     };
 
     const ExportPreset* currentPreset() const;

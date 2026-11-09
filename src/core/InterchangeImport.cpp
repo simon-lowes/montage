@@ -21,6 +21,7 @@
 #include "History.h"
 #include "ImportBuilder.h"
 #include "Interchange.h"
+#include "TrackGroups.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -485,6 +486,45 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
     OtioReader r{p, probe, {}, {}, {}, {}};
     r.gather(tracks, 0);
     r.readTracks(b, tracks, rate, 0);
+    // Track colours (OpenTimelineIO 0.18's Color, or a "#rrggbb" string) and groups (in Montage's metadata).
+    {
+        Sequence& seq = b.sequence();
+        std::map<std::string, QJsonObject> switches;
+        for (const auto& gv : meta.value("track_groups").toArray())
+            switches[gv.toObject().value("name").toString().toStdString()] = gv.toObject();
+        int vi = 0, ai = 0;
+        for (const auto& tv : tracks) {
+            const QJsonObject t = tv.toObject();
+            const bool video = t.value("kind").toString() != "Audio";
+            Track* track = trackAt(seq, {video ? TrackKind::Video : TrackKind::Audio, video ? vi++ : ai++});
+            if (!track) continue;
+            const QJsonValue c = t.value("color");
+            if (c.isObject())
+                track->color = trackColorFromRgb(c.toObject().value("r").toDouble(), c.toObject().value("g").toDouble(), c.toObject().value("b").toDouble());
+            else if (c.isString())
+                track->color = normalizeTrackColor(c.toString().toStdString());
+            const QJsonObject own = t.value("metadata").toObject().value("montage").toObject();
+            track->colorClips = own.value("color_clips").toBool(false);
+            const std::string name = own.value("group").toString().toStdString();
+            if (name.empty()) continue;
+            const TrackGroup* g = findTrackGroup(seq, name);
+            if (!g) {
+                TrackGroup made;
+                made.id = p.newId();
+                made.name = name;
+                if (auto it = switches.find(name); it != switches.end()) {
+                    const QJsonObject& o = it->second;
+                    made.editing = o.value("editing").toBool(true), made.mute = o.value("mute").toBool(true);
+                    made.volume = o.value("volume").toBool(true), made.pan = o.value("pan").toBool(true);
+                    made.automation = o.value("automation").toBool(true), made.record = o.value("record").toBool(true);
+                    made.comp = o.value("comp").toBool(true), made.suspended = o.value("suspended").toBool(false);
+                }
+                seq.trackGroups.push_back(made);
+                g = &seq.trackGroups.back();
+            }
+            track->group = g->id;
+        }
+    }
     for (const auto& mv : stack.value("markers").toArray()) b.sequence().markers.push_back(otioMarker(mv.toObject(), rate));
     for (const std::string& w : r.nested.warnings) b.warn(w);
     ImportResult result = b.finish();

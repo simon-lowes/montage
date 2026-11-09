@@ -38,6 +38,7 @@
 #include <tuple>
 
 #include "AudioFx.h"
+#include "audio/PluginHost.h"
 #include "audio/Upmix.h"
 #include "ColorSpace.h"
 #include "CompositeRender.h"
@@ -54,6 +55,7 @@
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
+#include "ShapeLayers.h"
 #include "Titles.h"
 #include "Layer3D.h"
 #include "ModelClip.h"
@@ -72,6 +74,8 @@
 #include "render/Spherical.h"
 #include "render/AudioReactive.h"
 #include "core/EditOps.h"
+#include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/Surround.h"
@@ -867,6 +871,126 @@ int ofxInputTrack(const Sequence& seq, const std::string& connection) {
     return -1;
 }
 
+}  // namespace
+
+TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h) {
+    const int shape = int(std::lround(c.generator.p("path_shape", 0)));
+    const auto ps = c.generator.params.find("path_shape");
+    if (shape != 4 && shape != 5 && (ps == c.generator.params.end() || ps->second.keys.empty())) return {};
+    // The path at a frame of the clip.
+    auto atFrame = [&p, &seq, &c, w, h](FrameTime lt) -> std::optional<TitlePathCurve> {
+        const double t = double(lt);
+        const int kind = int(std::lround(c.generator.pAt("path_shape", t)));
+        using Seg = TitlePathCurve::Segment;
+        TitlePathCurve out;
+        auto cubic = [&](QPointF a, QPointF b, QPointF cc, QPointF d) {
+            Seg g;
+            g.kind = (a == b && cc == d) ? 0 : 1;
+            if (g.kind == 0) g.p[0] = a, g.p[1] = d;
+            else g.p[0] = a, g.p[1] = b, g.p[2] = cc, g.p[3] = d;
+            out.segments.push_back(g);
+        };
+        // A path's points (anchors and handles) mapped through `to`, as its segments.
+        auto pathSegments = [&](const std::vector<PathPoint>& pts, bool closed, const std::function<QPointF(double, double)>& to) {
+            const size_t n = pts.size();
+            for (size_t i = 0; i + 1 < n + (closed ? 1 : 0); ++i) {
+                const PathPoint &a = pts[i], &b = pts[(i + 1) % n];
+                cubic(to(a.x, a.y), to(a.x + a.ox, a.y + a.oy), to(b.x + b.ix, b.y + b.iy), to(b.x, b.y));
+            }
+            out.closed = closed;
+        };
+        if (kind == 4) {
+            // The clip's effects' masks drawn as shapes (ellipses, rectangles, Bézier paths), the Mask Number-th.
+            const int want = std::max(1, int(std::lround(c.generator.pAt("path_mask", t, 1))));
+            int k = 0;
+            for (const Effect& e : c.effects) {
+                const int ms = int(std::lround(e.p("mask.shape", lt)));
+                if (!e.enabled || (ms != 1 && ms != 2 && ms != 5) || ++k != want) continue;  // (as the monitor shows them)
+                const MaskBox b = maskBox(e, lt);
+                if (ms == 1) {
+                    // From the top, clockwise on screen (as the Circle path runs).
+                    Seg g;
+                    g.kind = 2;
+                    g.p[0] = QPointF(b.x * w, b.y * h);
+                    g.p[1] = QPointF(b.w * w / 2, b.h * h / 2);
+                    g.rotation = b.rotation * M_PI / 180;
+                    g.from = -M_PI / 2, g.to = 1.5 * M_PI;
+                    out.segments.push_back(g);
+                    out.closed = true;
+                    return out;
+                }
+                auto to = [&](double bx, double by) {
+                    double u = 0, v = 0;
+                    boxToFrame(b, w, h, bx, by, u, v);
+                    return QPointF(u * w, v * h);
+                };
+                if (ms == 2) pathSegments({{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}}, true, to);
+                else if (maskPathCount(e) >= 2) pathSegments(maskPath(e, lt), e.p("mask.open", lt) <= 0.5, to);
+                if (out.segments.empty()) return std::nullopt;
+                return out;
+            }
+            return std::nullopt;
+        }
+        if (kind != 5) return std::nullopt;
+        // A shape layer under the title (on Shape Track, or the nearest below it) at this time, and its path.
+        const auto loc = edit::locate(seq, c.id);
+        if (!loc || loc->track.kind != TrackKind::Video) return std::nullopt;
+        const FrameTime st = c.start + lt;
+        const int track = int(std::lround(c.generator.pAt("path_track", t)));
+        const Clip* layer = nullptr;
+        for (int i = track > 0 ? track - 1 : loc->track.index - 1; i >= 0 && i < int(seq.videoTracks.size()) && !layer; i = track > 0 ? -1 : i - 1)
+            for (const Clip& k : seq.videoTracks[size_t(i)].clips)
+                if (k.isGenerator() && k.generator.type == "shape" && k.contains(st) && k.id != c.id) {
+                    layer = &k;
+                    break;
+                }
+        if (!layer) return std::nullopt;
+        const std::string id = shapePathItem(layer->generator, c.generator.s("path_item"));
+        const FrameTime slt = st - layer->start;
+        QTransform toFrame;
+        if (id.empty() || !shapePathToFrame(layer->generator, id, slt, seq.width, seq.height, toFrame)) return std::nullopt;
+        const std::vector<PathPoint> pts = shapePathPoints(layer->generator, id, slt);
+        if (pts.size() < 2) return std::nullopt;
+        const std::vector<ShapeItem> contents = shapeContents(layer->generator);  // (kept: the item points into it)
+        const ShapeItem* item = findShapeItem(contents, id);
+        const bool closed = !item || item->closed;
+        // Its frame to the sequence through the layer's clip, then to the title's frame through the title's.
+        bool ok = true;
+        pathSegments(pts, closed, [&](double x, double y) {
+            const QPointF f = toFrame.map(QPointF(x, y));
+            double sx = 0, sy = 0, u = 0, v = 0;
+            ok = ok && clipFrameToSequence(p, seq, *layer, st, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+                 sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
+            return QPointF(u * w, v * h);
+        });
+        if (!ok || out.segments.empty()) return std::nullopt;
+        return out;
+    };
+    // Between frames (motion blur's samples), the paths of the frames either side mixed, as their keys run straight
+    // between them; before the clip's first frame or after its last, the path there.
+    return [atFrame, last = std::max<FrameTime>(0, c.duration - 1)](double t) -> std::optional<TitlePathCurve> {
+        const double ct = std::clamp(t, 0.0, double(last));
+        const FrameTime lt = FrameTime(std::floor(ct + 1e-9));
+        std::optional<TitlePathCurve> a = atFrame(lt);
+        const double f = ct - double(lt);
+        if (!a || f < 1e-9 || lt >= last) return a;
+        const std::optional<TitlePathCurve> b = atFrame(lt + 1);
+        if (!b || b->segments.size() != a->segments.size() || b->closed != a->closed) return a;
+        for (size_t i = 0; i < a->segments.size(); ++i) {
+            TitlePathCurve::Segment& sa = a->segments[i];
+            const TitlePathCurve::Segment& sb = b->segments[i];
+            if (sa.kind != sb.kind) return atFrame(lt);
+            for (int k = 0; k < 4; ++k) sa.p[k] += (sb.p[k] - sa.p[k]) * f;
+            sa.rotation += (sb.rotation - sa.rotation) * f;
+            sa.from += (sb.from - sa.from) * f;
+            sa.to += (sb.to - sa.to) * f;
+        }
+        return a;
+    };
+}
+
+namespace {
+
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
                 bool deferFrame, ClipSource& out) {
@@ -923,6 +1047,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
+              : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h))
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back
@@ -2706,7 +2831,8 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         return GpuLayerResult::Unsupported;
     };
     if (compositeShown(c)) return cpu("a compositing graph");
-    if (c.isGenerator() && c.generator.type == "adjustment") return cpu("an adjustment layer");
+    // An adjustment layer: the canvas beneath it, as drawn on the GPU so far, through its effects.
+    const bool adjustment = c.isGenerator() && c.generator.type == "adjustment";
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
     const FrameTime lt = t - c.start;
@@ -2715,10 +2841,30 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         if (!gpuChainOps(seq, c, lt, [](const Effect& e) { return runOnSource(e) || e.type == "aces_gamut_compress"; }, unused, 0, 0, 1))
             return cpu(cpuEffectReason(c, lt));
     }
+    const int SW = seq.width, SH = seq.height;
+    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
     ClipSource cs;
-    if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
+    Image canvasSize;  // (an adjustment layer's source: the canvas's size alone, its picture is the GPU's)
+    canvasSize.width = W, canvasSize.height = H;
+    if (!clipSource(p, seq, c, t, o, adjustment ? &canvasSize : nullptr, true, cs)) return GpuLayerResult::Nothing;
+    CleanPlateScope plateScope(cleanPlateFor(p, seq, c, t, o));  // (a Keyer's plate track, made here as clipLayer makes it)
+    // The clip's analysed depth, for the depth effects and masks (as clipLayer finds it; the still model's would need
+    // the picture here), and the media time, for object masks.
+    std::shared_ptr<const DepthMap> depth;
+    {
+        const std::vector<const Effect*> chain = gradeChain(seq, c);
+        if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, cs.lt); })) {
+            if (!cs.reframed && !cs.sourcePath.empty() && cs.sourceSeconds >= 0) depth = analysedDepth(cs.sourcePath, cs.sourceSeconds);
+            if (!depth && depthAvailable() && depthModel().installed()) return cpu("its depth, worked out from the picture");
+        }
+    }
+    DepthScope depthScope(depth);
+    SourceSecondsScope sourceTime(cs.sourceSeconds);
     int w = 0, h = 0;
-    if (cs.frame) {
+    if (adjustment) {
+        out.canvas = true;
+        w = W, h = H;
+    } else if (cs.frame) {
         out.frame = cs.frame;
         out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
                                 : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
@@ -2741,17 +2887,18 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     if ((planes ? std::max(planes->width, w) : cs.frame ? w * 2 : w) > maxSize || std::max(planes ? planes->height : 0, h) > maxSize)
         return cpu("a picture larger than the GPU takes");
     if (why) {
-        if (planes)
+        if (adjustment)
+            *why = "an adjustment layer, on the canvas drawn so far";
+        else if (planes)
             *why = "Y′CbCr " + std::string(planes->log2ChromaH ? "4:2:0" : planes->log2ChromaW ? "4:2:2" : "4:4:4") + " " +
-                   std::to_string(planes->bits) + "-bit, converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
+                   std::to_string(planes->bits) + "-bit" + (planes->hw ? std::string(" in ") + planes->hwType + "'s memory" : std::string()) +
+                   ", converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
         else *why = "a picture made on the CPU before its effects";
     }
     // Placed as transformLayer places it (worked out here in double).
     const Geometry& g = cs.g;
-    const int SW = seq.width, SH = seq.height;
     gpu::Placement& pl = out.place;
-    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
     Image probe;  // (identityLayer reads the size alone)
     probe.width = w, probe.height = h;
     if (identityLayer(probe, g, SW, SH, o.scale)) {
@@ -2760,6 +2907,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     }
     const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
     if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
+        out.canvas = false;
         out.frame.reset();
         out.image = Image();
         out.ops.clear();
@@ -2775,6 +2923,15 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
     pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
     return GpuLayerResult::Drawn;
+}
+
+// Whether the GPU mixes a transition itself: not Smooth Cut's flow or an OpenFX one, nor one with a clip turned as a
+// 3D Layer as it mixes (those are the CPU's).
+bool gpuMixesTransition(const Sequence& seq, const Track& track, const Transition& tr) {
+    if (tr.type == "smooth_cut" || tr.type == "ofx") return false;
+    for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)})
+        if (c && c->enabled && !(c->isGenerator() && c->generator.type == "model3d") && enabledEffect(seq, *c, "layer_3d")) return false;
+    return true;
 }
 
 // A layer made on the CPU, the canvas's size, for the GPU to blend.
@@ -2807,29 +2964,42 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     frame.height = std::max(1, int(std::lround(seq.height * o.scale)));
     const int W = frame.width, H = frame.height;
     if (W > gpu::maxTextureSize() || H > gpu::maxTextureSize()) return fallback("a frame larger than the GPU takes");
+    // (Tracks that are another clip's matte or map are not drawn themselves, as on the CPU.)
     const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
-    if (std::find(hiddenMatte.begin(), hiddenMatte.end(), true) != hiddenMatte.end()) return fallback("a track matte");
-    // The clips on screen that need the canvas beneath them, or another track, go to the CPU whole.
+    // The clips on screen that need the canvas beneath them, or another track, made on the CPU, go to the CPU whole.
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        if (solo < 0 && hiddenMatte[ti]) continue;
         FrameTime from = 0, to = 0;
         std::vector<const Clip*> shown;
-        if (const Transition* tr = activeTransition(track, t, from, to)) shown = {findClip(track, tr->clipA), findClip(track, tr->clipB)};
+        const Transition* tr = activeTransition(track, t, from, to);
+        if (tr) shown = {findClip(track, tr->clipA), findClip(track, tr->clipB)};
         else shown = {clipAt(track, t)};
         for (const Clip* c : shown)
             if (c && c->enabled) {
-                if (c->isGenerator() && c->generator.type == "adjustment") return fallback("an adjustment layer");
-                if (trackMatteOf(*c)) return fallback("a track matte");
+                if (c->isGenerator() && c->generator.type == "adjustment") {
+                    // (its effects all the GPU's, or the canvas beneath it would have to come back to the CPU; so too
+                    // a transition mixed there)
+                    std::vector<gpu::ColorOp> unused;
+                    if (compositeShown(*c) || !gpuChainOps(seq, *c, t - c->start, runOnSource, unused, 0, 0, 1))
+                        return fallback("an adjustment layer with " + cpuEffectReason(*c, t - c->start));
+                    if (tr && !gpuMixesTransition(seq, track, *tr)) return fallback("an adjustment layer in a " + tr->type + " transition");
+                }
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
                 if (enabledEffect(seq, *c, "displace_by_layer")) return fallback("Displace by Layer");
                 if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }
+    std::string adjustmentOnCpu;  // (an adjustment layer the GPU turned down after all: the frame is the CPU's)
     auto layerOf = [&](const Clip& c, gpu::Layer& l) {
         std::string how;
         const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l, &how);
+        if (r == GpuLayerResult::Unsupported && c.isGenerator() && c.generator.type == "adjustment") {
+            adjustmentOnCpu = how;
+            return false;
+        }
         if (r == GpuLayerResult::Unsupported) {
             l = {};
             Image img = clipLayer(p, seq, c, t, o, nullptr);
@@ -2842,6 +3012,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        if (solo < 0 && hiddenMatte[ti]) continue;
         FrameTime from = 0, to = 0;
         if (const Transition* active = activeTransition(track, t, from, to)) {
             const Clip* A = findClip(track, active->clipA);
@@ -2849,11 +3020,14 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             const Clip* top = B ? B : A;
             gpu::Item item;
             item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
-            if (active->type == "cross_dissolve") {
+            const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+            const int kind = active->type == "cross_dissolve" ? 0 : gpuTransitionParams(active->type, active->params, u, W, H, item.transitionParams);
+            if (gpuMixesTransition(seq, track, *active)) {
                 item.b.emplace();
                 if (A && A->enabled) layerOf(*A, item.a);
                 if (B && B->enabled) layerOf(*B, *item.b);
-                item.dissolve = float(std::clamp((double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from)), 0.0, 1.0));
+                item.dissolve = float(std::clamp(u, 0.0, 1.0));
+                if (active->type != "cross_dissolve") item.transition = kind;
             } else {
                 item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
                 gpu::countLayer(false, "a " + active->type + " transition");
@@ -2864,9 +3038,21 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
         if (const Clip* c = clipAt(track, t)) {
             gpu::Item item;
             item.blendMode = blendModeIndex(c->blendMode);
-            if (layerOf(*c, item.a)) frame.items.push_back(std::move(item));
+            if (!layerOf(*c, item.a)) continue;
+            if (const Effect* e = trackMatteOf(*c)) {
+                // Seen through the matte track's picture (none there now: an empty matte; no track: no matte).
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {
+                    const FrameTime lt = t - c->start;
+                    item.matte.emplace();
+                    item.matteLuma = e->p("composite", lt, 0) > 0.5, item.matteReverse = e->p("reverse", lt, 0) > 0.5;
+                    if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t); mc && !(mc->isGenerator() && mc->generator.type == "adjustment"))
+                        layerOf(*mc, *item.matte);
+                }
+            }
+            frame.items.push_back(std::move(item));
         }
     }
+    if (!adjustmentOnCpu.empty()) return fallback("an adjustment layer: " + adjustmentOnCpu);
     // Captions are drawn on the CPU, before the display transform.
     const CaptionTrack* captions = opts.captions ? captionTrackFor(seq) : nullptr;
     if (captions && !captionAt(*captions, t)) captions = nullptr;
@@ -3581,7 +3767,8 @@ struct AudioMixer::State {
     fx::Tremolo tremolo;
     fx::Saturator saturator;
     fx::StereoWidth width;
-    std::vector<double> lastParams;
+    std::vector<double> lastParams, params;  // (params: this block's, kept for its room)
+    std::vector<fx::EqBand> eqBands;          // (likewise: the EQ's bands as last set)
     // Dynamics' detector: the sidechain (or the signal) through an optional high-pass.
     Biquad keyHp;
     double keyHz = -1;
@@ -3808,10 +3995,12 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         if (!e.enabled || isSourceAudioEffect(e.type)) continue;
         auto& st = states_[{owner, e.id}];
         if (!st) st = std::make_unique<State>();
-        std::vector<double> params;
+        // (nothing allocated each block once the effect has played: the vectors keep their room)
+        std::vector<double>& params = st->params;
+        params.clear();
         for (const auto& [k, v] : e.params) params.push_back(v.at(lt));
         bool changed = params != st->lastParams;
-        st->lastParams = params;
+        std::swap(st->params, st->lastParams);
         if (e.type == "upmix") {
             // Here the sound stays stereo (a clip, a bus, a stereo mix): only the upmix's latency, so it stays in line.
             if (e.id == skipUpmix_) continue;
@@ -3892,8 +4081,8 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             std::string shape = e.s("audition") + '#' + std::to_string(e.params.size());
             if (changed || shape != st->eqShape) {
                 int solo = -1;
-                const std::vector<fx::EqBand> bands = fx::eqBandsOf(e, lt, &solo);
-                st->eq.set(sr, bands, e.p("output_db", lt, 0), solo);
+                fx::eqBandsOf(e, lt, st->eqBands, &solo);
+                st->eq.set(sr, st->eqBands, e.p("output_db", lt, 0), solo);
                 st->eqShape = std::move(shape);
             }
             st->eq.process(buf, frames);
@@ -4014,6 +4203,8 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                      std::vector<MeterLevels>* trackLevels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    // Plug-ins in host processes: in playback a block one cannot give back in time is bypassed; offline it is waited for.
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
     const int n = layoutChannels(seq.audioLayout);
     if (n == 2) {
         std::lock_guard lock(m_);
@@ -4054,12 +4245,13 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
             return;
         }
     }
-    downmixToStereo(seq.audioLayout, full.data(), frames, out);
+    downmixToStereo(seq.audioLayout, full.data(), frames, out, seq.downmixCentreDb, seq.downmixSurroundDb);
 }
 
 void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                            std::vector<MeterLevels>* trackLevels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
     const int n = layoutChannels(seq.audioLayout);
     std::lock_guard lock(m_);
     if (start != nextStart_) {
@@ -4498,6 +4690,7 @@ int AudioMixer::maxLatency(const Sequence& seq, double sr) {
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                          std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack, int channels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    plugins::RenderModeScope pluginTiming(nonBlocking_);
     const double sr = rate > 0 ? rate : seq.sampleRate;
     // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders. Nested
     // sequences mix as stereo, except an ambisonic one wanted as its field.

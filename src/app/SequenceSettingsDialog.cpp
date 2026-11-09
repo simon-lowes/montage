@@ -13,6 +13,7 @@
 #include <QPoint>
 #include <QPushButton>
 #include <QSettings>
+#include <QSpinBox>
 #include <QVBoxLayout>
 #include <algorithm>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include "Theme.h"
 #include "core/FilmCount.h"
 #include "core/History.h"
+#include "core/Surround.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -192,6 +194,58 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     form->addRow(tr("Frame rate:"), frameRate_);
     form->addRow(tr("Sample rate:"), sampleRate_);
     form->addRow(tr("Audio channels:"), audioLayout_);
+    // The stereo fold-down of a surround mix, as it is heard and as AC-3 and E-AC-3 tell decoders to make it.
+    {
+        auto* row = new QWidget(this);
+        auto* rl = new QHBoxLayout(row);
+        rl->setContentsMargins(0, 0, 0, 0);
+        downmixCentre_ = new QComboBox(row);
+        downmixCentre_->setObjectName(QStringLiteral("downmixCentre"));
+        for (double db : {-3.0, -4.5, -6.0}) downmixCentre_->addItem(tr("Centre %1 dB").arg(db), db);
+        downmixCentre_->addItem(tr("Centre off"), -99.0);
+        downmixSurround_ = new QComboBox(row);
+        downmixSurround_->setObjectName(QStringLiteral("downmixSurround"));
+        for (double db : {-3.0, -6.0}) downmixSurround_->addItem(tr("Surrounds %1 dB").arg(db), db);
+        downmixSurround_->addItem(tr("Surrounds off"), -99.0);
+        preferredDownmix_ = new QComboBox(row);
+        preferredDownmix_->setObjectName(QStringLiteral("preferredDownmix"));
+        preferredDownmix_->addItem(tr("Downmix not stated"), QString());
+        preferredDownmix_->addItem(tr("Lo/Ro preferred"), QStringLiteral("loro"));
+        preferredDownmix_->addItem(tr("Lt/Rt preferred"), QStringLiteral("ltrt"));
+        rl->addWidget(downmixCentre_);
+        rl->addWidget(downmixSurround_);
+        rl->addWidget(preferredDownmix_);
+        row->setToolTip(tr("How a surround mix folds down to stereo: as Montage plays it in stereo, and as AC-3 and E-AC-3\n"
+                           "exports tell decoders to (with the downmix a decoder should prefer)"));
+        form->addRow(tr("Stereo downmix:"), row);
+        auto* production = new QWidget(this);
+        auto* pl = new QHBoxLayout(production);
+        pl->setContentsMargins(0, 0, 0, 0);
+        mixingLevel_ = new QSpinBox(production);
+        mixingLevel_->setObjectName(QStringLiteral("mixingLevel"));
+        mixingLevel_->setRange(79, 111);
+        mixingLevel_->setSpecialValueText(tr("Mix level not stated"));
+        mixingLevel_->setSuffix(tr(" dB SPL"));
+        roomType_ = new QComboBox(production);
+        roomType_->setObjectName(QStringLiteral("roomType"));
+        roomType_->addItem(tr("Room not stated"), QString());
+        roomType_->addItem(tr("Large room (dubbing stage)"), QStringLiteral("large"));
+        roomType_->addItem(tr("Small room (flat monitor)"), QStringLiteral("small"));
+        connect(mixingLevel_, &QSpinBox::valueChanged, roomType_, [this](int v) { roomType_->setEnabled(v >= 80); });
+        pl->addWidget(mixingLevel_);
+        pl->addWidget(roomType_);
+        production->setToolTip(tr("Stated in AC-3 and E-AC-3 exports: the peak level the mix was monitored at, and the room it was mixed in"));
+        form->addRow(tr("Production:"), production);
+        auto surroundOnly = [this] {
+            const bool surround = layoutChannels(audioLayout_->currentData().toString().toStdString()) > 2 &&
+                                  !ambisonicLayout(audioLayout_->currentData().toString().toStdString());
+            downmixCentre_->setEnabled(surround);
+            downmixSurround_->setEnabled(surround);
+            preferredDownmix_->setEnabled(surround);
+        };
+        connect(audioLayout_, &QComboBox::currentIndexChanged, this, surroundOnly);
+        surroundOnly();
+    }
     form->addRow(tr("Colour space:"), colorSpace_);
     form->addRow(tr("HDR peak:"), hdrPeak_);
     form->addRow(tr("Working space:"), workingSpace_);
@@ -269,6 +323,21 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     outputTransform_->setCurrentIndex(ot >= 0 ? ot : 0);
     const int al = audioLayout_->findData(QString::fromStdString(spec.audioLayout));
     audioLayout_->setCurrentIndex(al >= 0 ? al : 0);
+    auto pick = [](QComboBox* c, const QVariant& v) {
+        int i = c->findData(v);
+        if (i < 0 && v.typeId() == QMetaType::Double) {
+            // (a level set another way, through MCP or a script: kept, shown as it is)
+            c->addItem(QString::number(v.toDouble()) + QStringLiteral(" dB"), v);
+            i = c->count() - 1;
+        }
+        c->setCurrentIndex(std::max(0, i));
+    };
+    pick(downmixCentre_, spec.downmixCentreDb <= -99 ? -99.0 : spec.downmixCentreDb);
+    pick(downmixSurround_, spec.downmixSurroundDb <= -99 ? -99.0 : spec.downmixSurroundDb);
+    pick(preferredDownmix_, QString::fromStdString(spec.preferredDownmix));
+    mixingLevel_->setValue(spec.mixingLevel >= 80 ? spec.mixingLevel : 79);
+    pick(roomType_, QString::fromStdString(spec.roomType));
+    roomType_->setEnabled(spec.mixingLevel >= 80);
     spherical_->setChecked(spec.spherical);
     vr180_->setChecked(spec.spherical && spec.vr180);
     stereo3d_->setChecked(spec.stereo3d);
@@ -294,6 +363,11 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.vr180 = s.spherical && vr180_->isChecked();
     s.stereo3d = stereo3d_->isChecked();
     s.filmGauge = filmGauge_->currentData().toString().toStdString();
+    s.downmixCentreDb = downmixCentre_->currentData().toDouble();
+    s.downmixSurroundDb = downmixSurround_->currentData().toDouble();
+    s.preferredDownmix = preferredDownmix_->currentData().toString().toStdString();
+    s.mixingLevel = mixingLevel_->value() >= 80 ? mixingLevel_->value() : 0;
+    s.roomType = s.mixingLevel ? roomType_->currentData().toString().toStdString() : std::string();
     return s;
 }
 
@@ -367,9 +441,12 @@ void SequenceSettingsDialog::updateSummary() {
 bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (!state || !state->sequence()) return false;
     const Sequence& seq = *state->sequence();
-    const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
-                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d,
-                                 seq.filmGauge, seq.workingSpace, seq.outputTransform};
+    NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
+                           seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d,
+                           seq.filmGauge, seq.workingSpace, seq.outputTransform};
+    before.downmixCentreDb = seq.downmixCentreDb, before.downmixSurroundDb = seq.downmixSurroundDb;
+    before.preferredDownmix = seq.preferredDownmix;
+    before.mixingLevel = seq.mixingLevel, before.roomType = seq.roomType;
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -386,7 +463,9 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
         after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical &&
         after.vr180 == before.vr180 && after.stereo3d == before.stereo3d && after.filmGauge == before.filmGauge &&
-        after.workingSpace == before.workingSpace && after.outputTransform == before.outputTransform)
+        after.workingSpace == before.workingSpace && after.outputTransform == before.outputTransform &&
+        after.downmixCentreDb == before.downmixCentreDb && after.downmixSurroundDb == before.downmixSurroundDb &&
+        after.preferredDownmix == before.preferredDownmix && after.mixingLevel == before.mixingLevel && after.roomType == before.roomType)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -405,6 +484,9 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.filmGauge = after.filmGauge;
         s.workingSpace = after.workingSpace;
         s.outputTransform = after.outputTransform;
+        s.downmixCentreDb = after.downmixCentreDb, s.downmixSurroundDb = after.downmixSurroundDb;
+        s.preferredDownmix = after.preferredDownmix;
+        s.mixingLevel = after.mixingLevel, s.roomType = after.roomType;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;

@@ -5,11 +5,13 @@
 #include <QDir>
 #include <QFile>
 #include <QSaveFile>
+#include <QTimeZone>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -36,6 +38,7 @@ extern "C" {
 #include "PackageFiles.h"
 #include "core/Captions.h"
 #include "core/Surround.h"
+#include "core/Zip.h"
 #include "media/Loudness.h"
 #include "media/SuperScale.h"
 
@@ -55,32 +58,84 @@ QString fileHash(const QString& path, qint64* size = nullptr, const std::functio
 
 // ---- Picture: sequence colour to DCI X'Y'Z' -------------------------------------------------------------------------
 
+// DCI: 48 cd/m^2 white scaled to 52.37 so equal-energy white fits, a 2.6 power, 12 bits. The power as a table: for each
+// code the least value (of n, white scaled and clamped to 0..1) that rounds to it, found among the doubles by halving,
+// so the table gives exactly the code the power and rounding give (both rise with n); a value's code is looked up from
+// the codes at 1/65536 steps of n, then among the few between.
+struct DciCodes {
+    static uint16_t direct(double n) { return uint16_t(std::lround(4095.0 * std::pow(n, 1.0 / 2.6))); }
+    static double fromBits(uint64_t b) {
+        double d;
+        std::memcpy(&d, &b, 8);
+        return d;
+    }
+    double least[4097];       // least[c]: the smallest n whose code is c or more (least[4096] past 1)
+    uint16_t step[65538];     // the code of n = i / 65536
+    DciCodes() {
+        least[0] = 0;
+        for (int c = 1; c <= 4095; ++c) {
+            uint64_t lo = 0, hi = 0x3ff0000000000000ull;  // (1.0: positive doubles order as their bits)
+            while (lo < hi) {
+                const uint64_t mid = lo + (hi - lo) / 2;
+                if (direct(fromBits(mid)) >= c) hi = mid;
+                else lo = mid + 1;
+            }
+            least[c] = fromBits(lo);
+        }
+        least[4096] = 2;
+        for (int i = 0; i <= 65537; ++i) step[i] = i > 65536 ? 4095 : direct(i / 65536.0);
+    }
+    uint16_t operator()(double n) const {
+        const size_t i = size_t(n * 65536.0);  // (n in 0..1: exact)
+        int lo = step[i], hi = step[i + 1];
+        while (lo < hi) {  // (the largest c with least[c] <= n)
+            const int mid = (lo + hi + 1) / 2;
+            if (least[mid] <= n) lo = mid;
+            else hi = mid - 1;
+        }
+        return uint16_t(lo);
+    }
+};
+
+const DciCodes& dciCodes() {
+    static const DciCodes t;
+    return t;
+}
+
 struct XyzConverter {
     std::vector<float> toLinear;  // code value (65536 steps over 0..1) to display light
     double m[9];                  // linear RGB to CIE XYZ (D65 white kept)
+    const DciCodes& codes = dciCodes();
     explicit XyzConverter(const ColorSpace& cs) {
         toLinear.resize(65536);
         for (int i = 0; i < 65536; ++i) toLinear[size_t(i)] = float(std::clamp(montage::toLinear(cs.transfer, i / 65535.0), 0.0, 1.0));
         primariesToXyz(cs.primaries, m);
     }
-    // DCI: 48 cd/m^2 white scaled to 52.37 so equal-energy white fits, a 2.6 power, 12 bits.
-    static uint16_t code(double v) {
-        const double n = std::clamp(v * (48.0 / 52.37), 0.0, 1.0);
-        return uint16_t(std::lround(4095.0 * std::pow(n, 1.0 / 2.6)));
-    }
-    void convert(const Image& img, std::vector<uint16_t>& out) const {
-        out.resize(size_t(img.width) * size_t(img.height) * 3);
-        for (int y = 0; y < img.height; ++y) {
+    static double scaled(double v) { return std::clamp(v * (48.0 / 52.37), 0.0, 1.0); }
+    // Rows y0..y1 (`direct`: each code from the power itself, as Montage first made them).
+    void rows(const Image& img, uint16_t* outRows, int y0, int y1, bool direct) const {
+        for (int y = y0; y < y1; ++y) {
             const float* s = img.row(y);
-            uint16_t* d = out.data() + size_t(y) * size_t(img.width) * 3;
+            uint16_t* d = outRows + size_t(y) * size_t(img.width) * 3;
             for (int x = 0; x < img.width; ++x, s += 4, d += 3) {
                 auto lin = [&](float v) { return double(toLinear[size_t(std::clamp(int(std::lround(double(v) * 65535.0)), 0, 65535))]); };
                 const double r = lin(s[0]), g = lin(s[1]), b = lin(s[2]);
-                d[0] = code(m[0] * r + m[1] * g + m[2] * b);
-                d[1] = code(m[3] * r + m[4] * g + m[5] * b);
-                d[2] = code(m[6] * r + m[7] * g + m[8] * b);
+                const double X = scaled(m[0] * r + m[1] * g + m[2] * b), Y = scaled(m[3] * r + m[4] * g + m[5] * b),
+                             Z = scaled(m[6] * r + m[7] * g + m[8] * b);
+                if (direct) d[0] = DciCodes::direct(X), d[1] = DciCodes::direct(Y), d[2] = DciCodes::direct(Z);
+                else d[0] = codes(X), d[1] = codes(Y), d[2] = codes(Z);
             }
         }
+    }
+    // Rows across the cores (`threads` 0: the shared pool; 1: this thread; more: that many threads of its own).
+    void convert(const Image& img, std::vector<uint16_t>& out, int threads = 0, bool direct = false) const {
+        out.resize(size_t(img.width) * size_t(img.height) * 3);
+        if (threads == 1) return rows(img, out.data(), 0, img.height, direct);
+        if (threads <= 0) return parallelRows(img.height, [&](int y0, int y1) { rows(img, out.data(), y0, y1, direct); });
+        std::vector<std::thread> pool;
+        for (int t = 0; t < threads; ++t)
+            pool.emplace_back([&, t] { rows(img, out.data(), int(int64_t(img.height) * t / threads), int(int64_t(img.height) * (t + 1) / threads), direct); });
+        for (std::thread& t : pool) t.join();
     }
 };
 
@@ -336,6 +391,10 @@ int64_t dcpPackageFrames(const Sequence& s, const DcpSettings& settings) {
     FrameTime first = 0, end = s.duration();
     if (settings.inOut && s.inPoint >= 0 && s.outPoint >= s.inPoint) first = s.inPoint, end = s.outPoint + 1;
     return end > first ? (end - first) / step : 0;
+}
+
+void dcpXyzCodes(const Image& img, const ColorSpace& space, std::vector<uint16_t>& out, int threads, bool direct) {
+    XyzConverter(space).convert(img, out, threads, direct);
 }
 
 double dcpLeqmLimit(const std::string& kind) { return kind == "trailer" || kind == "teaser" ? 85.0 : kind == "advertisement" ? 82.0 : 0.0; }
@@ -1150,7 +1209,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
     return true;
 }
 
-bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string* error) {
+bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string* error, std::vector<std::string>* zips) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -1167,15 +1226,20 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
     if (!dcp::readCertificate(chain.certificates.back(), own) || dkdm.signerThumbprint != own.thumbprint)
         return fail("The DKDM was not made by this signer");
     if (r.notAfter <= r.notBefore) return fail("The KDM's window ends before it starts");
-    if (r.recipients.empty()) return fail("No cinema server certificates");
+    if (r.recipients.empty() && r.screens.empty()) return fail("No cinema server certificates");
     // The window must sit inside the DKDM's (the keys are not to be given out for longer than they were kept for).
     const QDateTime from = QDateTime::fromString(QString::fromStdString(dkdm.notValidBefore), Qt::ISODate);
     const QDateTime to = QDateTime::fromString(QString::fromStdString(dkdm.notValidAfter), Qt::ISODate);
     if (to.isValid() && r.notAfter > to.toSecsSinceEpoch()) return fail("The window ends after the DKDM's (" + dkdm.notValidAfter + ")");
     if (from.isValid() && r.notBefore < from.toSecsSinceEpoch() - 86400) return fail("The window starts before the DKDM's (" + dkdm.notValidBefore + ")");
-    // Each server's leaf first, so a bad certificate makes no KDMs at all.
-    std::vector<std::pair<std::string, dcp::CertificateInfo>> servers;
-    for (const std::string& given : r.recipients) {
+    // What to make: one KDM for each server, every certificate read first, so a bad one makes no KDMs at all.
+    struct Target {
+        std::string leafPem;
+        dcp::CertificateInfo leaf;
+        const KdmScreen* screen = nullptr;
+    };
+    std::vector<Target> targets;
+    auto add = [&](const std::string& given, const KdmScreen* screen) {
         std::string pem = given;
         if (pem.find("-----BEGIN") == std::string::npos) {
             QFile c(QString::fromStdString(given));
@@ -1183,49 +1247,100 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
             pem = c.readAll().toStdString();
         }
         // A server's chain file: its leaf is the one that is not a certificate authority.
-        std::string leafPem;
-        dcp::CertificateInfo leaf;
+        Target t;
+        t.screen = screen;
         for (const std::string& c : dcp::splitCertificates(pem)) {
             dcp::CertificateInfo info;
-            if (dcp::readCertificate(c, info) && !info.ca) leafPem = c, leaf = info;
+            if (dcp::readCertificate(c, info) && !info.ca) t.leafPem = c, t.leaf = info;
         }
-        if (leafPem.empty()) return fail("No server certificate in " + (given.size() < 200 ? given : std::string("the text given")));
-        const QDateTime certStart = QDateTime::fromString(QString::fromStdString(leaf.notBefore), Qt::ISODate);
-        const QDateTime certEnd = QDateTime::fromString(QString::fromStdString(leaf.notAfter), Qt::ISODate);
-        if (!certStart.isValid() || !certEnd.isValid()) return fail("The certificate of " + leaf.commonName + " has no validity dates");
-        if (r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after the certificate of " + leaf.commonName + " does");
-        if (r.notBefore < certStart.toSecsSinceEpoch()) return fail("The window starts before the certificate of " + leaf.commonName + " does");
-        servers.emplace_back(leafPem, leaf);
-    }
-    if (!QDir().mkpath(QString::fromStdString(r.folder))) return fail("Cannot make " + r.folder);
+        const std::string what = screen ? "screen " + screen->screen + " of " + screen->cinema : t.leaf.commonName;
+        if (t.leafPem.empty())
+            return fail("No server certificate " + (screen ? "for " + what : "in " + (given.size() < 200 ? given : std::string("the text given"))));
+        const QDateTime certStart = QDateTime::fromString(QString::fromStdString(t.leaf.notBefore), Qt::ISODate);
+        const QDateTime certEnd = QDateTime::fromString(QString::fromStdString(t.leaf.notAfter), Qt::ISODate);
+        if (!certStart.isValid() || !certEnd.isValid()) return fail("The certificate of " + what + " has no validity dates");
+        if (t.leaf.bits != 2048) return fail("The key of " + what + " is not RSA 2048 (as cinema servers' are)");
+        if (r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after the certificate of " + what + " does (" + t.leaf.notAfter + ")");
+        if (r.notBefore < certStart.toSecsSinceEpoch()) return fail("The window starts before the certificate of " + what + " does (" + t.leaf.notBefore + ")");
+        if (screen && !screen->timeZone.empty() && !QTimeZone(QByteArray::fromStdString(screen->timeZone)).isValid())
+            return fail("The time zone of " + screen->cinema + " (" + screen->timeZone + ") is not one this system knows");
+        targets.push_back(std::move(t));
+        return true;
+    };
+    for (const std::string& given : r.recipients)
+        if (!add(given, nullptr)) return false;
+    for (const KdmScreen& screen : r.screens)
+        if (!add(screen.certificate, &screen)) return false;
+    const QDir root(QString::fromStdString(r.folder));
+    if (!QDir().mkpath(root.path())) return fail("Cannot make " + r.folder);
     auto safe = [](const std::string& text) {
         QString n = QString::fromStdString(text);
         n.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]+")), QStringLiteral("_"));
         n.replace(QRegularExpression(QStringLiteral("^[._]+")), QString());  // (no "..", no hidden files)
         return n.left(60).isEmpty() ? QStringLiteral("KDM") : n.left(60);
     };
+    const QString day = QDateTime::fromSecsSinceEpoch(r.notBefore).toUTC().toString("yyyyMMdd");
     std::vector<std::string> made;
-    for (const auto& [leafPem, leaf] : servers) {
+    struct Cinema {
+        std::string name;
+        QString folder;
+        std::vector<std::pair<QString, std::string>> kdms;  // file name, text
+    };
+    std::vector<Cinema> cinemas;
+    for (const Target& t : targets) {
         dcp::KdmSettings k;
         k.cplId = dkdm.cplId;
         k.contentTitle = dkdm.contentTitle;
         k.annotation = r.annotation.empty() ? dkdm.contentTitle : r.annotation;
-        k.notValidBefore = dcp::kdmTime(r.notBefore, r.offsetMinutes);
-        k.notValidAfter = dcp::kdmTime(r.notAfter, r.offsetMinutes);
+        int offset = r.offsetMinutes;
+        if (t.screen && !t.screen->timeZone.empty())
+            offset = QTimeZone(QByteArray::fromStdString(t.screen->timeZone)).offsetFromUtc(QDateTime::fromSecsSinceEpoch(r.notBefore)) / 60;
+        k.notValidBefore = dcp::kdmTime(r.notBefore, offset);
+        k.notValidAfter = dcp::kdmTime(r.notAfter, offset);
         k.keys = dkdm.keys;
-        k.recipient = leafPem;
+        k.recipient = t.leafPem;
+        if (t.screen) {
+            k.trustedDevices = t.screen->trustedDevices;
+            k.deviceListDescription = t.screen->cinema + ", screen " + t.screen->screen;
+        }
         std::string xml;
         if (!dcp::makeKdm(k, chain, xml, &err)) return fail(err);
-        // Named by the title, the server and the day; two servers of one name told apart by their certificates.
-        const QString stem = QStringLiteral("KDM_%1_%2_%3").arg(safe(dkdm.contentTitle), safe(leaf.commonName),
-                                                               QDateTime::fromSecsSinceEpoch(r.notBefore).toUTC().toString("yyyyMMdd"));
-        QString file = QDir(QString::fromStdString(r.folder)).filePath(stem + ".xml");
-        if (std::find(made.begin(), made.end(), file.toStdString()) != made.end())
-            file = QDir(QString::fromStdString(r.folder)).filePath(stem + "_" + safe(leaf.serial) + ".xml");
+        // Named by the title, the server (or cinema and screen) and the day; two of one name told apart by their
+        // certificates.
+        QDir in = root;
+        Cinema* cinema = nullptr;
+        if (t.screen) {
+            auto it = std::find_if(cinemas.begin(), cinemas.end(), [&](const Cinema& c) { return c.name == t.screen->cinema; });
+            if (it == cinemas.end()) {
+                QString folder = root.filePath(safe(t.screen->cinema));
+                // (two cinemas whose names come out the same: the second numbered)
+                for (int n = 2; std::any_of(cinemas.begin(), cinemas.end(), [&](const Cinema& c) { return c.folder == folder; }); ++n)
+                    folder = root.filePath(safe(t.screen->cinema) + "_" + QString::number(n));
+                cinemas.push_back({t.screen->cinema, folder, {}});
+                it = cinemas.end() - 1;
+            }
+            cinema = &*it;
+            if (!QDir().mkpath(cinema->folder)) return fail("Cannot make " + cinema->folder.toStdString());
+            in = QDir(cinema->folder);
+        }
+        const QString stem = t.screen ? QStringLiteral("KDM_%1_%2_%3_%4").arg(safe(dkdm.contentTitle), safe(t.screen->cinema), safe(t.screen->screen), day)
+                                      : QStringLiteral("KDM_%1_%2_%3").arg(safe(dkdm.contentTitle), safe(t.leaf.commonName), day);
+        QString file = in.filePath(stem + ".xml");
+        if (std::find(made.begin(), made.end(), file.toStdString()) != made.end()) file = in.filePath(stem + "_" + safe(t.leaf.serial) + ".xml");
         if (!dcp::writeWholeFile(file.toStdString(), xml)) return fail("Cannot write " + file.toStdString());
         made.push_back(file.toStdString());
+        if (cinema) cinema->kdms.emplace_back(QFileInfo(file).fileName(), std::move(xml));
+    }
+    std::vector<std::string> archives;
+    for (const Cinema& c : cinemas) {
+        ZipWriter zip;
+        for (const auto& [name, text] : c.kdms) zip.add(name.toStdString(), text);
+        const QString named = root.filePath(QStringLiteral("KDM_%1_%2_%3.zip").arg(safe(dkdm.contentTitle), QFileInfo(c.folder).fileName(), day));
+        if (!dcp::writeWholeFile(named.toStdString(), zip.finish())) return fail("Cannot write " + named.toStdString());
+        archives.push_back(named.toStdString());
     }
     if (files) *files = made;
+    if (zips) *zips = archives;
     return true;
 }
 

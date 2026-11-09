@@ -102,6 +102,17 @@ struct GrainSettings {
 };
 // Adds grain to `img` (premultiplied, in `space`), as frame `t` of a run of it.
 void addGrain(Image& img, const ColorSpace& space, const GrainProfile& g, const GrainSettings& s, int64_t t);
+// What addGrain adds to a picture w x h, for the GPU (render/shaders/gpufilter.frag adds it as addGrain does): the grain's
+// Gaussian fields, three to a pixel (RGBA, row by row, this frame's carried over from the last's), the Cholesky factor
+// mixing them, the power shaping them and its scale, and the amount. False when it adds nothing.
+struct GrainFields {
+    std::vector<float> z;
+    double L[3][3] = {};
+    double power = 1, shapeScale = 1, amount = 0;
+};
+bool grainFields(int w, int h, const GrainProfile& g, const GrainSettings& s, int64_t t, GrainFields& out);
+// Grain Match's settings at `t`, as it adds grain (Replace Grain's topped up).
+GrainSettings grainMatchSettings(const Effect& e, FrameTime t);
 
 // The grain of `current` (premultiplied, in `space`) taken out with its neighbouring frames (Video Noise Reduction's
 // temporal and spatial passes; `motion` as denoiseFrame takes it), the grain being as `g` says: the picture is first

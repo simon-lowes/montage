@@ -497,7 +497,7 @@ void Monitor::render(int64_t start, int frames, float* out, float* heard, std::v
         std::copy(full_.begin(), full_.end(), stereo_.begin());
     } else {
         program_.mixLayout(*project_, *seq_, start, frames, full_.data(), tracks);
-        downmixToStereo(layout_, full_.data(), frames, stereo_.data());
+        downmixToStereo(layout_, full_.data(), frames, stereo_.data(), seq_->downmixCentreDb, seq_->downmixSurroundDb);  // (the sequence's levels)
     }
     const float* beeps = nullptr;
     if (cycle) {

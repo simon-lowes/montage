@@ -1,4 +1,5 @@
 #include "AdrPanel.h"
+#include "core/TrackGroups.h"
 #include "Language.h"
 
 #include <QAbstractItemView>
@@ -60,6 +61,7 @@ public:
 
 AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget* viewer, QWidget* parent)
     : QWidget(parent), state_(state), program_(program), recorder_(new VoiceoverRecorder(state, this)) {
+    recorder_->setClock(program);
     setObjectName(QStringLiteral("adrPanel"));
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(4, 4, 4, 4);
@@ -795,7 +797,8 @@ void AdrPanel::pickTake(int index) {
     const AdrCue* q = s ? findAdrCue(*s, currentCue()) : nullptr;
     if (!q || !q->clip || cycle_) return;
     const Id clip = q->clip;
-    state_->apply(tr("Pick Take"), [&](Project& p, Sequence& sq) { return edit::pickTake(p, sq, clip, index); });
+    // (On the grouped tracks' auditions there too: core/TrackGroups.h.)
+    state_->apply(tr("Pick Take"), [&](Project& p, Sequence& sq) { return edit::pickGroupTake(p, sq, clip, index); });
     refresh();
 }
 

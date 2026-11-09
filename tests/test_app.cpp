@@ -104,13 +104,19 @@
 #include <QMessageBox>
 #include "media/ContentCredentials.h"
 #include "ExposureView.h"
+#include "core/Ale.h"
 #include "QualityCheckDialog.h"
 #include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "RepairMediaDialog.h"
 #include "CaptureDialog.h"
+#include "Multiviewer.h"
 #include "media/Capture.h"
+#include "render/VideoPacking.h"
+#ifdef MONTAGE_WITH_OMT
+#include "media/Omt.h"
+#endif
 #include "render/St2110.h"
 #include "render/Nmos.h"
 #include "SpellUi.h"
@@ -177,9 +183,12 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/AudioDevice.h"
 #include "audio/ElasticAudio.h"
 #include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
+#include "audio/PluginHost.h"
+#include "audio/PluginHostInternal.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "media/Beats.h"
@@ -207,6 +216,8 @@
 #include "control/MackieControl.h"
 #include "MulticamPanel.h"
 #include "PluginEditorWindow.h"
+#include "PluginFailureBar.h"
+#include "PluginManagerDialog.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
 #include "Accessibility.h"
@@ -222,6 +233,7 @@
 #include "LoudnessReadout.h"
 #include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
+#include "TrackGroupsDialog.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "FootageNotesDialog.h"
@@ -266,6 +278,7 @@
 #include "Recovery.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
+#include "render/BackgroundJobs.h"
 #include "render/RenderFarm.h"
 #include "TimelineWidget.h"
 #include "PitchCurves.h"
@@ -283,6 +296,7 @@
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 #include "media/Decoder.h"
 #include "media/LtcTimecode.h"
 #include "audio/Ltc.h"
@@ -296,6 +310,10 @@
 #include "render/SpatialVideo.h"
 #include "render/Ocio.h"
 #include "render/SurfaceTrack.h"
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
 
 using namespace montage;
 
@@ -505,8 +523,11 @@ private slots:
         // DCP signing certificates and DKDMs of their own too.
         qputenv("MONTAGE_DCP_CERTIFICATES", dir_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
         qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
+        qputenv("MONTAGE_DCP_FACILITIES", dir_.filePath(QStringLiteral("dcp-facilities.json")).toUtf8());
         // And a sound library (not the one on this computer, with its folders).
         qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
+        // And a job store (the render queue kept on disk) of their own.
+        qputenv("MONTAGE_JOBS_DIR", dir_.filePath(QStringLiteral("jobs")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -855,6 +876,24 @@ private slots:
         QVERIFY2(!compare.issues().empty() && compare.issues()[0].kind == QcKind::EncodeQuality,
                  qPrintable(compare.findChild<QLabel*>("qcSummary")->text()));
         QVERIFY(std::any_of(timeline()->qualityLane().begin(), timeline()->qualityLane().end(), [](const auto& sp) { return sp.status == 2; }));
+        // A constant-rate H.264 file that states its buffer model: the Buffer model line reports it kept, with no
+        // problem listed.
+        ExportSettings cbr = st;
+        cbr.path = (dir_.path() + "/qc-hrd.mp4").toStdString();
+        cbr.videoCodec = "libx264";
+        cbr.preset = "veryfast";
+        cbr.videoBitrate = 300000;
+        cbr.hrd = "cbr";
+        // (the sequence as it is now: the undo above replaced it)
+        QVERIFY2(exportSequence(state()->project(), *state()->sequence(), cbr, nullptr, nullptr, &err), err.c_str());
+        compare.findChild<QLineEdit*>("qcCompareFile")->clear();
+        QVERIFY(compare.findChild<QLineEdit*>("qcHrdFile"));
+        QVERIFY(compare.findChild<QPushButton*>("qcHrdBrowse"));
+        compare.findChild<QLineEdit*>("qcHrdFile")->setText(QString::fromStdString(cbr.path));
+        QVERIFY(compare.runCheck());
+        const QString summary = compare.findChild<QLabel*>("qcSummary")->text();
+        QVERIFY2(summary.contains("Buffer model: H.264 NAL HRD, CBR") && summary.contains("conforms"), qPrintable(summary));
+        QVERIFY(std::none_of(compare.issues().begin(), compare.issues().end(), [](const QcIssue& i) { return i.kind == QcKind::Hrd; }));
     }
 
     void conformCheckDialog() {
@@ -2435,6 +2474,63 @@ private slots:
         dlg->hide();
     }
 
+    void captureLivePackage() {
+        // A live package made while recording (montage_capture's live): lavfi's test pattern and tone, packaged as HLS
+        // in MPEG-TS segments and DASH, served from here while it records; ended with the recording, and still served.
+        const std::vector<std::string> kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build has no capture devices");
+        state()->newProject();
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QTemporaryDir dir;
+        const QString folder = dir.filePath("live");
+        const QString feed = "testsrc2=size=320x180:rate=25,realtime[out0];sine=sample_rate=48000,arealtime[out1]";
+        // (FFmpeg's own AC-3 encoder; the packaged FFmpeg has none, and the live package then has AAC sound)
+        const QString sound = avcodec_find_encoder_by_name("ac3") ? "ac3" : "aac";
+        // (low latency with MPEG-TS segments refused)
+        QJsonObject r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Live 01"}, {"seconds", 5},
+                              {"live", QJsonObject{{"folder", folder}, {"segments", "ts"}, {"low_latency", true}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Live 01"}, {"seconds", 5}, {"codec", "prores_proxy"},
+                  {"live", QJsonObject{{"folder", folder}, {"segments", "ts"}, {"sound", sound}, {"window", 3}, {"serve", true}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QString url = r.value("structuredContent").toObject().value("live_url").toString();
+        QVERIFY2(url.startsWith("http://127.0.0.1:"), qPrintable(url));
+        CaptureDialog* dlg = win_->captureDialog();
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live: "), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
+        // (the package finished on a thread of its own, the window going on meanwhile)
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live package ended"), 20000);
+        r = call({{"action", "status"}});
+        const QJsonObject live = r.value("structuredContent").toObject().value("live").toObject();
+        QVERIFY2(!live.value("running").toBool() && live.value("segments").toInt() >= 2 && live.value("error").toString().isEmpty(),
+                 QJsonDocument(r).toJson().constData());
+        QVERIFY(dlg->statusText().contains("Live package ended"));
+        // (served still: the playlists, ended)
+        QNetworkAccessManager net;
+        net.setProxy(QNetworkProxy::NoProxy);
+        std::unique_ptr<QNetworkReply> reply(net.get(QNetworkRequest(QUrl(url + "master.m3u8"))));
+        QTRY_VERIFY_WITH_TIMEOUT(reply->isFinished(), 10000);
+        QCOMPARE(reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt(), 200);
+        const QString master = QString::fromUtf8(reply->readAll());
+        QVERIFY2(master.contains(sound == "ac3" ? "ac-3" : "mp4a."), qPrintable(master));
+        const QString video = master.split('\n').filter(QRegularExpression("^v\\d.*playlist\\.m3u8$")).value(0);
+        QVERIFY2(!video.isEmpty(), qPrintable(master));
+        QFile list(folder + "/" + video);
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(list.readAll());
+        QVERIFY2(text.contains(".ts") && text.contains("#EXT-X-ENDLIST"), qPrintable(text));
+        QVERIFY(QFileInfo::exists(folder + "/manifest.mpd"));
+        dlg->setLive({});
+        dlg->hide();
+    }
+
     // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the
     // streams' time code.
     void captureSt2110OverTheAgentLink() {
@@ -2528,6 +2624,270 @@ private slots:
         call({{"action", "nmos"}, {"offer", false}});
         QVERIFY(!dlg->nmosNode()->running());
         dlg->hide();
+    }
+
+    // Live inputs: four feeds at once in the multiviewer over the agent link (two ST 2110 senders, an MPEG transport
+    // stream over SRT from FFmpeg with its GOP time code, an Open Media Transport source), each picture's grey its frame
+    // within the second, so each tile's picture is seen to be the one its timecode says was sent; their meters. The
+    // first recorded, watched on the Source monitor, In and Out marked live and the range cut in from the growing
+    // file: its frames are the ones sent, from the In's timecode on.
+    void liveInputsMultiviewer() {
+        namespace st = st2110;
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        state()->newProject();
+        QVERIFY(state()->edit("25p", [](Project&, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return true;
+        }));
+        // (Y' 16 + 8f of 255 for frame f within its second: shown full range)
+        auto greyOf = [](int64_t f) { return int(std::lround(double(f % 25) * 8 * 255.0 / 219)); };
+        std::atomic<bool> stop{false};
+        // Two ST 2110 senders, from 10:00:00:00 and 11:00:00:00, a quarter of full scale on both channels.
+        int ports[2][3];
+        {
+            st::Receiver probe[6];
+            for (int i = 0; i < 6; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i / 3][i % 3] = probe[i].port();
+            }
+        }
+        std::vector<st::Raster> rasters;
+        for (int f = 0; f < 25; ++f) {
+            st::Raster r(320, 180, st::Sampling::Ycc422, 10);
+            for (size_t i = 0; i < r.samples.size(); ++i) r.samples[i] = uint16_t(i % 2 ? 64 + 32 * f : 512);
+            rasters.push_back(std::move(r));
+        }
+        st::Sender tx[2];
+        std::atomic<int> sent[2] = {-1, -1};
+        std::thread sending[2];
+        std::string err;
+        for (int k = 0; k < 2; ++k) {
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[k][0]}, o.audio = {"127.0.0.1", ports[k][1]}, o.anc = {"127.0.0.1", ports[k][2]};
+            o.ttl = 1;
+            st::VideoFormat v;
+            v.width = 320, v.height = 180, v.fps = {25, 1}, v.sampling = st::Sampling::Ycc422, v.depth = 10;
+            QVERIFY2(tx[k].open(o, v, st::AudioFormat{}, &err), err.c_str());
+            sending[k] = std::thread([&, k] {
+                const std::vector<float> sound(1920 * 2, 0.25f);
+                for (int t = 0; !stop && t < 25 * 120; ++t) {
+                    const output::Timecode tc = output::timecodeOf(FrameTime((10 + k) * 3600 * 25 + t), {25, 1});
+                    sent[k] = t;
+                    if (!tx[k].send(rasters[size_t(t % 25)], sound.data(), 1920, &tc, {}, &stop)) break;
+                }
+            });
+        }
+        // An Open Media Transport source from 13:00:00:00 (where this build has it), else a second stream over UDP.
+        bool omtOk = false;
+#ifdef MONTAGE_WITH_OMT
+        omtOk = omt::vmxAvailable(&err);
+        omt::Sender omtTx;
+        std::atomic<int> omtSent{-1};
+        std::thread omtSending;
+        if (omtOk) {
+            omt::Sender::Options so;
+            so.name = "Multiviewer test";
+            so.announce = false;
+            QVERIFY2(omtTx.start(so, &err), err.c_str());
+            omtSending = std::thread([&] {
+                std::vector<std::vector<uint8_t>> pictures;
+                for (int f = 0; f < 25; ++f) {
+                    Image img(320, 180);
+                    for (int y = 0; y < 180; ++y)
+                        for (int x = 0; x < 320; ++x) {
+                            float* p = img.at(x, y);
+                            p[0] = p[1] = p[2] = float(f) * 8 / 219, p[3] = 1;
+                        }
+                    std::vector<uint8_t> out(size_t(320) * 180 * 4);
+                    video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), out.data(), size_t(320) * 2);
+                    pictures.push_back(std::move(out));
+                }
+                auto next = std::chrono::steady_clock::now();
+                for (int t = 0; !stop && t < 25 * 59; ++t) {
+                    const int64_t ts = (int64_t(13) * 3600 * 25 + t) * 400000;
+                    const std::vector<float> planar(size_t(1920) * 2, 0.5f);
+                    omtTx.sendAudio(planar.data(), 2, 1920, 1920, 48000, ts);
+                    omt::VideoOut v;
+                    v.width = 320, v.height = 180, v.stride = 320 * 2, v.data = pictures[size_t(t % 25)].data(), v.rateN = 25, v.rateD = 1;
+                    v.timestamp = ts;
+                    char tc[32];
+                    std::snprintf(tc, sizeof tc, "13:00:%02d:%02d", t / 25, t % 25);
+                    v.metadata = std::string("<montage_timecode value=\"") + tc + "\"/>";
+                    omtSent = t;
+                    omtTx.sendVideo(v);
+                    next += std::chrono::milliseconds(40);
+                    std::this_thread::sleep_until(next);
+                }
+            });
+        }
+#endif
+        // The stream over SRT (UDP where FFmpeg has no SRT), Montage listening.
+        QProcess protocols;
+        protocols.start(ffmpeg, {"-hide_banner", "-protocols"});
+        protocols.waitForFinished(20000);
+        const bool srt = QString::fromLocal8Bit(protocols.readAllStandardOutput()).contains(QRegularExpression(QStringLiteral("\\n\\s*srt\\s*\\n")));
+        int streamPorts[2];
+        for (int& port : streamPorts) {
+            QUdpSocket free;
+            free.bind(QHostAddress::LocalHost, 0);
+            port = int(free.localPort());
+        }
+        auto listen = [srt](int port) {
+            return srt ? QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port) : QStringLiteral("udp://127.0.0.1:%1").arg(port);
+        };
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QTemporaryDir dir;
+        QJsonArray inputs{QJsonObject{{"label", "Cam A"}, {"kind", "st2110"}, {"url", QString::fromStdString(tx[0].sdpVideo() + tx[0].sdpAudio() + tx[0].sdpAnc())}, {"record", true}},
+                          QJsonObject{{"label", "Cam B"}, {"kind", "st2110"}, {"url", QString::fromStdString(tx[1].sdpVideo() + tx[1].sdpAudio() + tx[1].sdpAnc())}},
+                          QJsonObject{{"label", "Stream"}, {"kind", ""}, {"url", listen(streamPorts[0])}}};
+#ifdef MONTAGE_WITH_OMT
+        if (omtOk) inputs.append(QJsonObject{{"label", "OMT"}, {"kind", "omt"}, {"url", QStringLiteral("omt://127.0.0.1:%1").arg(omtTx.port())}});
+#endif
+        if (!omtOk) inputs.append(QJsonObject{{"label", "Stream 2"}, {"kind", ""}, {"url", listen(streamPorts[1])}});
+        QJsonObject r = call({{"action", "multiview"}, {"inputs", inputs}, {"folder", dir.path()}, {"codec", "prores_proxy"}, {"record", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Multiviewer* mv = win_->multiviewer();
+        QCOMPARE(mv->inputCount(), 4);
+        std::vector<std::unique_ptr<QProcess>> streams;
+        for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
+            auto p = std::make_unique<QProcess>();
+            const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
+                                   : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
+            p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
+                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
+                              "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
+                              "-c:a", "mp2", "-f", "mpegts", to});
+            QVERIFY(p->waitForStarted(10000));
+            streams.push_back(std::move(p));
+        }
+        auto finish = qScopeGuard([&] {
+            stop = true;
+            for (auto& p : streams) p->kill(), p->waitForFinished(5000);
+            for (std::thread& t : sending)
+                if (t.joinable()) t.join();
+#ifdef MONTAGE_WITH_OMT
+            if (omtSending.joinable()) omtSending.join();
+            omtTx.stop();
+#endif
+            mv->clear();
+            mv->hide();
+            // (the Program monitor the active one again, as the tests after expect: watching live made the Source's)
+            for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+                if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
+        });
+        // (waiting on pictures, not the clock: a busy machine is slow)
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);
+        // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
+        const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
+        int checked[4] = {0, 0, 0, 0};
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < 40000 && *std::min_element(checked, checked + 4) < 15) {
+            QTest::qWait(30);
+            for (int i = 0; i < 4; ++i) {
+                const LiveFeed::Now now = mv->feed(i)->look();
+                if (now.picture.isNull()) continue;
+                int hh = 0, mm = 0, ss = 0, ff = 0;
+                QVERIFY2(std::sscanf(now.timecode.c_str(), "%d:%d:%d:%d", &hh, &mm, &ss, &ff) == 4 && hh == hours[i], now.timecode.c_str());
+                const int grey = qGray(now.picture.pixel(now.picture.width() / 2, now.picture.height() / 2));
+                QVERIFY2(std::abs(grey - greyOf(ff)) <= 6, qPrintable(QStringLiteral("input %1: grey %2 at %3").arg(i).arg(grey).arg(QString::fromStdString(now.timecode))));
+                const int at = (mm * 60 + ss) * 25 + ff;
+                const int sentNow = i < 2 ? sent[i].load() :
+#ifdef MONTAGE_WITH_OMT
+                                    i == 3 && omtOk ? omtSent.load() :
+#endif
+                                    -1;
+                if (sentNow >= 0) QVERIFY2(at <= sentNow && sentNow - at < 50, qPrintable(QStringLiteral("input %1 at %2, sent %3").arg(i).arg(at).arg(sentNow)));
+                ++checked[i];
+            }
+        }
+        for (int i = 0; i < 4; ++i) QVERIFY2(checked[i] >= 15, qPrintable(QString::number(i)));
+        // The meters: the senders' quarter of full scale (-12 dBFS), FFmpeg's sine at an eighth (-18).
+        r = call({{"action", "multiview"}});
+        const QJsonArray tiles = r.value("structuredContent").toObject().value("inputs").toArray();
+        QCOMPARE(tiles.size(), 4);
+        QVERIFY2(std::fabs(tiles[0].toObject().value("peaks_dbfs").toArray()[0].toDouble() + 12) < 1, QJsonDocument(tiles[0].toObject()).toJson().constData());
+        QVERIFY2(std::fabs(tiles[2].toObject().value("peaks_dbfs").toArray()[0].toDouble() + 18) < 1.5, QJsonDocument(tiles[2].toObject()).toJson().constData());
+        QVERIFY(tiles[0].toObject().value("recording").toBool() && !tiles[1].toObject().value("recording").toBool());
+        QCOMPARE(mv->tileWidget(0)->tally(), QColor(220, 30, 30));
+        QVERIFY(!mv->tileWidget(1)->tally().isValid());
+
+        // The recorded one watched on the Source monitor: its tally green within the red; In and Out marked live.
+        MonitorPanel* source = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) source = m;
+        QVERIFY(source);
+        r = call({{"action", "live"}, {"input", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(source->liveShowing() && mv->tile(0).onSource && !mv->tile(1).onSource);
+        QVERIFY(source->accessibleSummary().startsWith("Live: Cam A"));
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(), 20000);
+        const Id media = source->liveMedia();
+        QCOMPARE(mv->tile(0).media, media);
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= 30, 20000);
+        r = call({{"action", "live"}, {"mark_in", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject atIn = r.value("structuredContent").toObject();
+        const FrameTime in = FrameTime(atIn.value("in").toDouble());
+        QVERIFY2(in >= 30, QJsonDocument(atIn).toJson().constData());
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= in + 40, 20000);
+        r = call({{"action", "live"}, {"mark_out", true}});
+        const FrameTime out = FrameTime(r.value("structuredContent").toObject().value("out").toDouble());
+        QVERIFY2(out >= in + 40 && state()->sourceIn() == in, QJsonDocument(r).toJson().constData());
+        // Cut in at once (its length as the recorder knows it, ahead of the file), at the start of the sequence.
+        state()->setPlayhead(0);
+        r = call({{"action", "live"}, {"edit", "overwrite"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const Sequence* s = state()->sequence();
+        QVERIFY(!s->videoTracks.empty() && s->videoTracks[0].clips.size() == 1);
+        const Clip clip = s->videoTracks[0].clips[0];
+        QCOMPARE(clip.mediaId, media);
+        QCOMPARE(clip.duration, out - in + 1);
+        QCOMPARE(FrameTime(std::lround(clip.sourceIn)), in);
+        // Its frames, once the file holds them (it grows half a second at a time): the ones sent from In's timecode on.
+        const MediaItem* m = state()->project().findMedia(media);
+        QVERIFY(m);
+        const int64_t first = std::llround(m->timecode * 25);  // (the recording's first frame's timecode, in frames)
+        QCOMPARE(QString::fromStdString(mv->feed(0)->timecodeAt(0)).left(2), QString("10"));
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, 20000);
+        for (FrameTime k : {FrameTime(0), FrameTime(1), (out - in) / 2, out - in - 1, out - in}) {
+            int got = -1;
+            QElapsedTimer wait;
+            wait.start();
+            do {
+                if (got >= 0) QTest::qWait(200);
+                const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
+                got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
+            } while (std::abs(got - greyOf(first + in + k)) > 6 && wait.elapsed() < 15000);
+            QVERIFY2(std::abs(got - greyOf(first + in + k)) <= 6, qPrintable(QStringLiteral("frame %1: %2, sent %3").arg(k).arg(got).arg(greyOf(first + in + k))));
+        }
+        // LIVE off scrubs the recording so far (the tile no longer on the Source monitor); on again, it is.
+        auto* badge = source->findChild<QToolButton*>(QStringLiteral("liveBadge"));
+        QVERIFY(badge && badge->isVisible() && badge->isChecked());
+        badge->click();
+        QVERIFY(!source->liveShowing() && !mv->tile(0).onSource);
+        badge->click();
+        QVERIFY(source->liveShowing() && mv->tile(0).onSource);
+        // Recording stopped: the file finished, the marks kept, the input watched on but nothing of it to mark.
+        r = call({{"action", "multiview"}, {"record", false}});
+        QVERIFY(!r.value("structuredContent").toObject().value("recording").toBool());
+        QVERIFY(!mv->tile(0).recording);
+        QCOMPARE(state()->sourceIn(), in);
+        QVERIFY(source->liveShowing() && source->liveMedia() == 0);
+        r = call({{"action", "live"}, {"mark_in", true}});
+        QVERIFY(r.value("isError").toBool());
+        QCOMPARE(state()->sourceIn(), in);
+        r = call({{"action", "live"}, {"watch", false}});
+        QVERIFY(!source->liveShowing() && !source->liveFeed());
+        QTRY_VERIFY(!mv->tileWidget(0)->tally().isValid());
     }
 
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value
@@ -4026,6 +4386,199 @@ private slots:
         combo->setCurrentIndex(0);
     }
 
+    void focusPeakingAndSoftShots() {
+        // A chart of discs, sharp and through Gaussians.
+        const int W = 320, H = 180;
+        QImage chart(W, H, QImage::Format_RGB32);
+        chart.fill(qRgb(128, 128, 128));
+        {
+            QPainter painter(&chart);
+            painter.setRenderHint(QPainter::Antialiasing);
+            painter.setPen(Qt::NoPen);
+            QRandomGenerator rng(7);
+            for (int i = 0; i < W * H / 140; ++i) {
+                const int g = 25 + rng.bounded(205);
+                painter.setBrush(QColor(g, g, g));
+                const double r = 1.5 + rng.generateDouble() * 6;
+                painter.drawEllipse(QPointF(rng.generateDouble() * W, rng.generateDouble() * H), r, r);
+            }
+        }
+        auto blur = [&](const QImage& in, double sigma) {
+            const int r = int(std::ceil(4 * sigma));
+            std::vector<double> k;
+            double sum = 0;
+            for (int i = -r; i <= r; ++i) sum += k.emplace_back(std::exp(-0.5 * i * i / (sigma * sigma)));
+            std::vector<double> a(size_t(W) * H), b(a.size());
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) a[size_t(y) * W + size_t(x)] = qGray(in.pixel(x, y));
+            for (int pass = 0; pass < 2; ++pass) {
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        double acc = 0;
+                        for (int i = -r; i <= r; ++i)
+                            acc += k[size_t(i + r)] * (pass ? a[size_t(std::clamp(y + i, 0, H - 1)) * W + size_t(x)] : a[size_t(y) * W + size_t(std::clamp(x + i, 0, W - 1))]);
+                        b[size_t(y) * W + size_t(x)] = acc / sum;
+                    }
+                std::swap(a, b);
+            }
+            QImage out(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int g = std::clamp(int(std::lround(a[size_t(y) * W + size_t(x)])), 0, 255);
+                    out.setPixel(x, y, qRgb(g, g, g));
+                }
+            return out;
+        };
+        auto marked = [](const QImage& img, QRgb colour) {
+            int n = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) n += img.pixel(x, y) == colour;
+            return n;
+        };
+        const QColor red = peakingColours()[0].first, blue = peakingColours()[2].first;
+        // Peaking marks the chart's edges at σ 0.5 and none at σ 3, and dims the rest.
+        const QImage crisp = blur(chart, 0.5), soft = blur(chart, 3);
+        const QImage peakedCrisp = focusPeakingView(crisp, red, 1);
+        QVERIFY2(marked(peakedCrisp, red.rgb()) > W * H / 50, qPrintable(QString::number(marked(peakedCrisp, red.rgb()))));
+        QCOMPARE(marked(focusPeakingView(soft, red, 2), red.rgb()), 0);
+        QCOMPARE(qRed(focusPeakingView(soft, red, 1).pixel(5, 5)), qRed(soft.pixel(5, 5)) * 3 / 4);
+
+        // On a monitor: found at its size, or in the picture's own pixels; the picture itself is left as it is.
+        {
+            ViewerWidget v;
+            v.resize(660, 380);
+            v.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&v));
+            v.setImage(crisp, 0);
+            QCOMPARE(v.shownImage(), crisp);
+            v.setFocusPeaking(true);
+            const QSize at = (v.imageRect().size() * v.devicePixelRatioF()).toSize();
+            QVERIFY(at.width() > W);
+            const QImage shown = v.shownImage();
+            QCOMPARE(shown.size(), at);
+            QCOMPARE(shown, focusPeakingView(crisp.scaled(at, Qt::IgnoreAspectRatio, Qt::SmoothTransformation), red, 1));
+            v.setPeakingAtMonitorSize(false);
+            QCOMPARE(v.shownImage(), peakedCrisp);
+            v.setPeakingColour(blue);
+            QVERIFY(marked(v.shownImage(), blue.rgb()) > W * H / 50);
+            // Over an exposure check too: found in the picture, painted over the check's view of it.
+            v.setExposureView(int(ExposureView::FalseColor));
+            QCOMPARE(v.shownImage(), focusPeakingView(crisp, blue, 1, exposureView(crisp, ExposureView::FalseColor)));
+            QCOMPARE(v.image(), crisp);
+            // So zebra stripes over a flat white picture are not taken for detail.
+            QImage white(W, H, QImage::Format_RGB32);
+            white.fill(Qt::white);
+            v.setImage(white, 1);
+            v.setExposureView(int(ExposureView::Zebras100));
+            QVERIFY(exposureView(white, ExposureView::Zebras100) != white);
+            QCOMPARE(marked(v.shownImage(), blue.rgb()), 0);
+            v.setImage(crisp, 0);
+            v.setFocusPeaking(false);
+            v.setExposureView(0);
+            QCOMPARE(v.shownImage(), crisp);
+        }
+        // Both monitors have it, its menu setting the colour, sensitivity and size (remembered).
+        loadDemo();
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>()) {
+            auto* button = m->findChild<QToolButton*>("focusPeaking");
+            QVERIFY(button && button->menu());
+            button->setChecked(true);
+            QVERIFY(m->viewer()->focusPeaking());
+            button->menu()->findChild<QAction*>("peakingColour3")->trigger();
+            QCOMPARE(m->viewer()->peakingColour(), peakingColours()[3].first);
+            button->menu()->findChild<QAction*>("peakingSensitivity2")->trigger();
+            QCOMPARE(m->viewer()->peakingSensitivity(), 2);
+            button->menu()->findChild<QAction*>("peakingAtFullSize")->trigger();
+            QVERIFY(!m->viewer()->peakingAtMonitorSize());
+            QCOMPARE(appSettings().value("monitor/peakingColour").toInt(), 3);
+            // (put back)
+            button->menu()->findChild<QAction*>("peakingColour0")->trigger();
+            button->menu()->findChild<QAction*>("peakingSensitivity1")->trigger();
+            button->menu()->findChild<QAction*>("peakingAtMonitorSize")->trigger();
+            button->setChecked(false);
+            QVERIFY(!m->viewer()->focusPeaking());
+        }
+
+        // Quality Check: a second out of focus in a shot of the chart, found and marked.
+        const QString chartPng = dir_.path() + "/focus-chart.png";
+        QVERIFY(crisp.save(chartPng));
+        state()->newProject();
+        const auto ids = state()->importFiles({chartPng});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->edit("place", [&](Project& p, Sequence& s) {
+            s.width = W, s.height = H, s.fps = Rational{25, 1};
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 75, {TrackKind::Video, 0}, {}, false).ok) return false;
+            Effect fx = makeEffect(p, "gaussian_blur");
+            fx.params["radius"].addKey(0, 0, Interp::Hold);
+            fx.params["radius"].addKey(25, 4, Interp::Hold);
+            fx.params["radius"].addKey(50, 0, Interp::Hold);
+            s.videoTracks[0].clips[0].effects.push_back(fx);
+            return true;
+        });
+        QualityCheckDialog dlg(state(), win_.get());
+        for (const char* off : {"qcFlashing", "qcLevels", "qcBlack", "qcFreeze", "qcSilence", "qcClipping", "qcPhase", "qcDcOffset"})
+            if (auto* box = dlg.findChild<QCheckBox*>(off)) box->setChecked(false);
+        auto* focus = dlg.findChild<QCheckBox*>("qcFocus");
+        QVERIFY(focus && !focus->isChecked());
+        focus->setChecked(true);
+        QVERIFY(dlg.settings().focus);
+        QVERIFY(dlg.runCheck());
+        const auto& issues = dlg.issues();
+        const auto softAt = std::find_if(issues.begin(), issues.end(), [](const QcIssue& i) { return i.kind == QcKind::SoftFocus; });
+        QVERIFY(softAt != issues.end());
+        QVERIFY2(softAt->start == 25 && softAt->end == 50, softAt->text.c_str());
+        QVERIFY(dlg.addMarkers() >= 1);
+        const auto& marks = state()->sequence()->markers;
+        QVERIFY(std::any_of(marks.begin(), marks.end(), [](const Marker& m) { return m.name == "QC: Soft focus" && m.t == 25; }));
+
+        // Dailies: a take out of focus for its middle, checked in the media bin; the Focus column and the ALE say where.
+        const QString take = dir_.path() + "/focus-take.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = W, gs.height = H, gs.fps = Rational{25, 1};
+            MediaItem m;
+            QVERIFY(probeMedia(chartPng.toStdString(), m));
+            m.id = gen.newId();
+            gen.media.push_back(m);
+            QVERIFY(edit::placeMedia(gen, gs, m.id, 0, 0, 30, {TrackKind::Video, 0}, {}, false).ok);
+            Effect fx = makeEffect(gen, "gaussian_blur");
+            fx.params["radius"].addKey(0, 0, Interp::Hold);
+            fx.params["radius"].addKey(10, 4, Interp::Hold);
+            fx.params["radius"].addKey(20, 0, Interp::Hold);
+            gs.videoTracks[0].clips[0].effects.push_back(fx);
+            ExportSettings st;
+            st.path = take.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.crf = 12;
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto takes = state()->importFiles({take});
+        QCOMPARE(takes.size(), size_t(1));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin);
+        QCOMPARE(bin->checkFocus(takes), 1);
+        const MediaItem* takeItem = state()->project().findMedia(takes[0]);
+        const std::string found = takeItem->metadata.at("focus");
+        // (at the take's own timecode, where the export gave it one)
+        const FrameTime origin = takeItem->timecode > 0 ? FrameTime(std::llround(takeItem->timecode * 25)) : 0;
+        const std::string expected = "Soft " + formatTimecode(origin + 10, Rational{25, 1}) + "–" + formatTimecode(origin + 20, Rational{25, 1});
+        QVERIFY2(found == expected, found.c_str());
+        QCOMPARE(QString::fromStdString(mediaFieldText(*state()->project().findMedia(takes[0]), "focus")), QString::fromStdString(found));
+        auto* list = bin->findChild<QTreeView*>("mediaList");
+        QVERIFY(list && !list->isColumnHidden(MediaBinModel::columnOf("focus")));
+        const AleTable ale = aleFromMedia(state()->project(), takes, Rational{25, 1});
+        const auto column = std::find(ale.columns.begin(), ale.columns.end(), "Focus");
+        QVERIFY(column != ale.columns.end());
+        QCOMPARE(ale.rows.at(0).at(size_t(column - ale.columns.begin())), found);
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(takes[0])->metadata.count("focus"));
+        state()->newProject();
+    }
+
     void gamutScopeAndChecks() {
         // A Rec.2020 frame: the left half its pure green (outside Rec.709 and P3), the right half grey.
         QImage frame(160, 90, QImage::Format_RGBA64);
@@ -4487,6 +5040,61 @@ private slots:
         QVERIFY(!PluginEditorWindow::find(clip, eid));
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void pluginFailureBarAndHostingSettings() {
+        // A plug-in that failed in its host is named in the bar above the timeline, which never blocks; Disable keeps
+        // it bypassed and turns it off. Tools › Plug-in Hosting… sets how plug-ins run, saved for the next start.
+        auto* bar = win_->findChild<PluginFailureBar*>("pluginFailureBar");
+        QVERIFY(bar);
+        plugins::clearHostFailures();
+        QTRY_VERIFY(!bar->isVisible());
+        const std::string id = "clap:org.example.broken";
+        plugins::remote::recordFailure(id, "Broken Reverb", "Example", "crash", "crashed (signal 11); bypassed", false);
+        QTRY_VERIFY(bar->isVisible());
+        auto* text = bar->findChild<QLabel*>("pluginFailureText");
+        QVERIFY(text);
+        QVERIFY2(text->text().contains("Broken Reverb crashed in its plug-in host"), qPrintable(text->text()));
+        QVERIFY(bar->findChild<QPushButton*>("pluginFailureDisable")->isVisible());
+        plugins::remote::recordFailure(id, "Broken Reverb", "Example", "hang", "stopped responding; bypassed", false);
+        QTRY_VERIFY2(text->text().contains("Broken Reverb stopped responding") && text->text().contains("(2 time"), qPrintable(text->text()));
+        bar->findChild<QPushButton*>("pluginFailureDisable")->click();
+        QVERIFY(!bar->isVisible());
+        QVERIFY(plugins::Registry::instance().isPluginDisabled(id));
+        plugins::Registry::instance().setPluginDisabled(id, false);
+        plugins::clearHostFailures();
+        // A new failure shows it again; Close puts it away.
+        plugins::remote::recordFailure(id, "Broken Reverb", "Example", "memory", "used more memory than the limit (4096 MB); bypassed", false);
+        QTRY_VERIFY(bar->isVisible());
+        QVERIFY2(text->text().contains("used more memory than the limit"), qPrintable(text->text()));
+        bar->findChild<QPushButton*>("pluginFailureClose")->click();
+        QVERIFY(!bar->isVisible());
+        plugins::clearHostFailures();
+
+        const plugins::HostingSettings before = plugins::hosting();
+        whenModal<QDialog>(this, [](QDialog* d) {
+            QCOMPARE(d->objectName(), QString("pluginHostingDialog"));
+            auto* isolation = d->findChild<QComboBox*>("hostingIsolation");
+            QVERIFY(isolation && isolation->count() == 4);
+            isolation->setCurrentIndex(isolation->findData(int(plugins::Isolation::PerVendor)));
+            d->findChild<QSpinBox*>("hostingMissedBlocks")->setValue(40);
+            d->findChild<QComboBox*>("hostingBypass")->setCurrentIndex(1);
+            d->accept();
+        });
+        PluginManagerDialog::editHosting(win_.get());
+        // (the offscreen platform gives the focus to no window when a dialog closes; a desktop gives it back to the main
+        // window, as the tests after this one expect)
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        QVERIFY(plugins::hosting().isolation == plugins::Isolation::PerVendor);
+        QCOMPARE(plugins::hosting().missedBlocks, 40);
+        QVERIFY(plugins::hosting().bypassWithSilence);
+        QCOMPARE(appSettings().value("plugins/hosting/isolation").toString(), QString("vendor"));
+        plugins::setHosting(plugins::HostingSettings{});
+        PluginManagerDialog::applySavedHosting();
+        QVERIFY(plugins::hosting().isolation == plugins::Isolation::PerVendor && plugins::hosting().missedBlocks == 40);
+        plugins::setHostingAndSave(before);
+        QCOMPARE(appSettings().value("plugins/hosting/isolation").toString(), QString::fromLatin1(plugins::isolationName(before.isolation)));
     }
 
     void araPlugInDocument() {
@@ -8392,6 +9000,113 @@ private slots:
         state()->newProject();
     }
 
+    // Phase 14 #11: a cinema's screens read from its Extended FLM over MCP, then booked in File › Make KDMs.
+    void kdmsForScreensFromAnFlm() {
+        if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
+        std::string err;
+        // A DKDM, as exportDcp keeps one, to Montage's (the tests') own chain.
+        dcp::CertificateChain signer;
+        QVERIFY2(dcp::signerCertificateChain(signer, &err), err.c_str());
+        const int64_t now = QDateTime::currentSecsSinceEpoch();
+        dcp::KdmSettings keep;
+        keep.cplId = dcp::uuidString(dcp::newUuid());
+        keep.contentTitle = "Booked";
+        keep.notValidBefore = dcp::kdmTime(now - 60);
+        keep.notValidAfter = dcp::kdmTime(now + 30 * 86400LL);
+        keep.keys = {dcp::newContentKey("MDIK"), dcp::newContentKey("MDAK")};
+        keep.recipient = signer.certificates.back();
+        std::string text;
+        QVERIFY2(dcp::makeKdm(keep, signer, text, &err), err.c_str());
+        const QString dkdm = dir_.filePath("booked-dkdm.xml");
+        QVERIFY(dcp::writeWholeFile(dkdm.toStdString(), text));
+        // An Extended FLM of two screens, each a server and a projector.
+        dcp::CertificateChain servers[2], projectors[2];
+        for (int i = 0; i < 2; ++i) QVERIFY(dcp::makeCertificateChain("Server", servers[i], &err) && dcp::makeCertificateChain("Projector", projectors[i], &err));
+        auto keyInfo = [](const dcp::CertificateChain& chain) {
+            std::string x = "<KeyInfoList><ds:KeyInfo>";
+            for (const std::string& pem : chain.certificates) {
+                std::string b;
+                for (const QString& line : QString::fromStdString(pem).split('\n'))
+                    if (!line.startsWith("-----") && !line.isEmpty()) b += line.toStdString();
+                x += "<ds:X509Data><ds:X509Certificate>" + b + "</ds:X509Certificate></ds:X509Data>";
+            }
+            return x + "</ds:KeyInfo></KeyInfoList>";
+        };
+        auto device = [&](const char* type, const dcp::CertificateChain& chain) {
+            return "<Device><DeviceTypeID>" + std::string(type) + "</DeviceTypeID><DeviceIdentifier idtype=\"DeviceUID\">urn:uuid:" +
+                   dcp::uuidString(dcp::newUuid()) + "</DeviceIdentifier><Manufacturer>Test</Manufacturer><ModelNumber>1</ModelNumber><IsActive>true</IsActive>" +
+                   keyInfo(chain) + "<Capabilities/></Device>";
+        };
+        std::string flm = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><FacilityListMessage xmlns=\"http://www.smpte-ra.org/ns/430-16/2017/FLM\" "
+                          "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><MessageId>urn:uuid:" + dcp::uuidString(dcp::newUuid()) +
+                          "</MessageId><IssueDate>2026-11-01T10:00:00Z</IssueDate><FacilityInfo><FacilityID>urn:x-facilityID:test:park</FacilityID>"
+                          "<FacilityName>Park Screens</FacilityName><FacilityTimeZone>Europe/London</FacilityTimeZone><Circuit>none</Circuit><AddressList/>"
+                          "</FacilityInfo><AuditoriumList>";
+        for (int i = 0; i < 2; ++i)
+            flm += "<Auditorium><AuditoriumNumberOrName>" + std::to_string(i + 1) + "</AuditoriumNumberOrName><SuiteList><Suite>" + device("SM", servers[i]) +
+                   device("PR", projectors[i]) + "</Suite></SuiteList></Auditorium>";
+        flm += "</AuditoriumList></FacilityListMessage>";
+        const QString flmFile = dir_.filePath("park-flm.xml");
+        QVERIFY(dcp::writeWholeFile(flmFile.toStdString(), flm));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", "montage_make_kdm"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Read into the facility list (no DKDM: only read).
+        QJsonObject r = call({{"flm", QJsonArray{flmFile}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray cinemas = r.value("structuredContent").toObject().value("cinemas").toArray();
+        QVERIFY(cinemas.size() == 1 && cinemas.at(0).toObject().value("cinema").toString() == "Park Screens");
+        QCOMPARE(cinemas.at(0).toObject().value("screens").toArray().size(), 2);
+        // Booked over MCP: screen 2 only.
+        r = call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/2"}}, {"folder", dir_.filePath("mcp-booking")}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject made = r.value("structuredContent").toObject();
+        QVERIFY(made.value("kdms").toArray().size() == 1 && made.value("zips").toArray().size() == 1);
+        {
+            QFile k(made.value("kdms").toArray().at(0).toString());
+            QVERIFY(k.open(QIODevice::ReadOnly));
+            dcp::KdmContents opened;
+            QVERIFY2(dcp::readKdm(k.readAll().toStdString(), servers[1].privateKey, opened, &err), err.c_str());
+            dcp::CertificateInfo projector;
+            QVERIFY(dcp::readCertificate(projectors[1].certificates.back(), projector));
+            QVERIFY(opened.trustedDevices == std::vector<std::string>{projector.thumbprint});
+        }
+        // Refused: a screen not in the list, and a window past the DKDM's.
+        QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens/7"}}, {"folder", dir_.filePath("mcp-booking")}}).value("isError").toBool());
+        QVERIFY(call({{"dkdm", dkdm}, {"screens", QJsonArray{"Park Screens"}}, {"folder", dir_.filePath("mcp-booking")}, {"until", "2099-01-01T00:00:00Z"}})
+                    .value("isError")
+                    .toBool());
+        // The dialog lists the cinema and its screens from the kept list; both ticked and booked, one zip.
+        bool listed = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != QLatin1String("makeKdmsDialog")) return;
+            auto* tree = dlg->findChild<QTreeWidget*>("kdmScreens");
+            auto* dkdmEdit = dlg->findChild<QLineEdit*>("kdmDkdm");
+            auto* folder = dlg->findChild<QLineEdit*>("kdmFolder");
+            listed = tree && dkdmEdit && folder && tree->topLevelItemCount() == 1 && tree->topLevelItem(0)->text(0) == "Park Screens" &&
+                     tree->topLevelItem(0)->childCount() == 2 && tree->topLevelItem(0)->child(0)->text(2) == "PR" &&
+                     dlg->findChild<QPushButton*>("kdmReadFlm") && dlg->findChild<QPushButton*>("kdmAddScreen");
+            if (!listed) {
+                dlg->reject();
+                return;
+            }
+            tree->topLevelItem(0)->setCheckState(0, Qt::Checked);  // (a cinema ticks all its screens)
+            dkdmEdit->setText(dkdm);
+            folder->setText(dir_.filePath("dialog-booking"));
+            dlg->accept();
+        });
+        win_->makeKdmsDialog();
+        QVERIFY(listed);
+        QVERIFY2(win_->statusBar()->currentMessage().contains("zip"), qPrintable(win_->statusBar()->currentMessage()));
+        const QStringList zips = QDir(dir_.filePath("dialog-booking")).entryList({"*.zip"});
+        QCOMPARE(zips.size(), 1);
+        QCOMPARE(QDir(dir_.filePath("dialog-booking/Park_Screens")).entryList({"KDM_Booked_Park_Screens_*.xml"}).size(), 2);
+    }
+
     void exportImfFromTheFileMenu() {
         state()->newProject();
         QVERIFY(win_->findChild<QAction*>("exportImf"));
@@ -8455,6 +9170,36 @@ private slots:
             QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
                                                 {"prores_profile", "proxy"}})
                         .value("isError").toBool());
+            // Interlaced, Y'CbCr 4:4:4 and full range, each checked.
+            for (const QJsonObject& extra : {QJsonObject{{"fields", "tff"}}, QJsonObject{{"prores_profile", "4444"}, {"ycbcr444", true}},
+                                             QJsonObject{{"prores_profile", "4444xq"}, {"full_range", true}}}) {
+                QJsonObject args{{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
+                                 {"title", extra.keys().join(" ")}};
+                for (auto it = extra.begin(); it != extra.end(); ++it) args[it.key()] = it.value();
+                r = call("montage_export_imf", args);
+                QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+                const QJsonObject m = r.value("structuredContent").toObject();
+                QVERIFY2(m.value("problems").toArray().isEmpty() && m.value("fields").toString() == extra.value("fields").toString("progressive") &&
+                             m.value("ycbcr444").toBool() == extra.value("ycbcr444").toBool() && m.value("full_range").toBool() == extra.value("full_range").toBool(),
+                         QJsonDocument(m).toJson().constData());
+            }
+            QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
+                                                {"prores_profile", "4444"}, {"fields", "bff"}})
+                        .value("isError").toBool());
+            // Application DPP: 422 HQ in HD, a programme unless asked; its 4:4:4 (12 bits) refused.
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"title", "DPP"},
+                                            {"application", "dpp_prores"}, {"size", "hd"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject dpp = r.value("structuredContent").toObject();
+            QVERIFY2(dpp.value("problems").toArray().isEmpty() && dpp.value("application").toString() == "dpp_prores" &&
+                         dpp.value("prores_profile").toString() == "hq" && dpp.value("width").toInt() == 1920,
+                     QJsonDocument(dpp).toJson().constData());
+            ImfComposition dc;
+            std::string why;
+            QVERIFY(readImfComposition(dpp.value("cpl").toString().toStdString(), dc, &why) && dc.application == 59 && dc.contentKind == "programme");
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"application", "dpp_prores"},
+                                            {"size", "hd"}, {"prores_profile", "4444"}});
+            QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("12 bits"));
         }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});
@@ -8514,6 +9259,39 @@ private slots:
                 offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
                           !dlg->findChild<QComboBox*>("imfColour")->isEnabled();
                 application->setCurrentIndex(application->findData(2));
+            }
+            // Application ProRes: fields for 4:2:2, Y'CbCr and full range for 4:4:4. Application DPP: 422 HQ, progressive, HD
+            // or UHD, its own content kinds, the ProRes choices fixed.
+            if (offered && prores::encoderAvailable()) {
+                auto* profile = dlg->findChild<QComboBox*>("imfProResProfile");
+                auto* fieldsBox = dlg->findChild<QComboBox*>("imfFields");
+                auto* ycbcr = dlg->findChild<QCheckBox*>("imfYcbcr444");
+                auto* full = dlg->findChild<QCheckBox*>("imfFullRange");
+                auto* kindBox = dlg->findChild<QComboBox*>("imfKind");
+                auto* sizeBox = dlg->findChild<QComboBox*>("imfSize");
+                application->setCurrentIndex(application->findData(45));
+                profile->setCurrentIndex(profile->findData("hq"));
+                offered = fieldsBox->isEnabled() && !ycbcr->isEnabled() && !full->isEnabled();
+                profile->setCurrentIndex(profile->findData("4444"));
+                offered = offered && !fieldsBox->isEnabled() && ycbcr->isEnabled() && full->isEnabled();
+                ycbcr->setChecked(true);
+                offered = offered && !full->isEnabled();
+                application->setCurrentIndex(application->findData(59));
+                offered = offered && profile->currentData().toString() == "hq" && !profile->isEnabled() && !fieldsBox->isEnabled() &&
+                          !ycbcr->isChecked() && kindBox->findData("programme") >= 0 && kindBox->findData("feature") < 0 &&
+                          (sizeBox->currentData().toString() == "hd" || sizeBox->currentData().toString() == "uhd");
+                // (4K and P3-D65 PQ not offered; the ProRes choices given back on leaving)
+                auto* colourBox = dlg->findChild<QComboBox*>("imfColour");
+                auto enabled = [](QComboBox* box, const char* value) {
+                    auto* m = qobject_cast<QStandardItemModel*>(box->model());
+                    return m && m->item(box->findData(QString::fromLatin1(value)))->isEnabled();
+                };
+                offered = offered && !enabled(sizeBox, "4k") && enabled(sizeBox, "uhd") && !enabled(colourBox, "p3d65-pq") && enabled(colourBox, "rec2020-hlg");
+                application->setCurrentIndex(application->findData(45));
+                offered = offered && profile->currentData().toString() == "4444" && ycbcr->isChecked() && enabled(sizeBox, "4k");
+                ycbcr->setChecked(false);
+                application->setCurrentIndex(application->findData(2));
+                offered = offered && kindBox->findData("feature") >= 0;
             }
             if (supplemental) supplemental->setChecked(true);
             offered = offered && earlier->isEnabled() && !dlg->findChild<QComboBox*>("imfSize")->isEnabled();
@@ -11758,6 +12536,447 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void trackGroupsInTheApp() {
+        state()->newProject();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        // Three audio tracks, each with a clip of its own microphone over the same time.
+        std::vector<Id> clips;
+        QVERIFY(state()->apply("Clips", [&](Project& p, Sequence& s) {
+            for (int k = 0; k < 3; ++k) {
+                MediaItem m;
+                m.id = p.newId();
+                m.kind = MediaKind::Audio;
+                m.name = "mic" + std::to_string(k) + ".wav";
+                m.path = "/nonexistent/mic" + std::to_string(k) + ".wav";
+                m.duration = 10.0;
+                m.hasAudio = true;
+                p.media.push_back(m);
+                Clip c = makeClip(p, p.media.back(), TrackKind::Audio, s);
+                c.start = 30;
+                c.duration = 120;
+                clips.push_back(c.id);
+                edit::Result r = edit::overwrite(p, s, {TrackKind::Audio, k}, c);
+                if (!r.ok) return r;
+            }
+            s.audioTracks[1].volumeDb = -3;
+            s.audioTracks[2].volumeDb = 2;
+            return edit::Result{};
+        }));
+        auto track = [&](int k) -> const Track& { return state()->sequence()->audioTracks.at(size_t(k)); };
+
+        // Sequence › Track Groups… opens the dialog; nothing to switch until there is a group.
+        auto* open = win_->findChild<QAction*>("trackGroups");
+        QVERIFY(open);
+        open->trigger();
+        auto* dlg = win_->findChild<TrackGroupsDialog*>();
+        QVERIFY(dlg && dlg->isVisible());
+        QCOMPARE(dlg->groups()->count(), 0);
+        QVERIFY(!dlg->switchBox("groupEditing")->isEnabled());
+        QVERIFY(!dlg->groups()->accessibleName().isEmpty() && !dlg->tracks()->accessibleName().isEmpty());
+        auto rowOf = [&](int audio) {
+            for (int i = 0; i < dlg->tracks()->count(); ++i)
+                if (dlg->tracks()->item(i)->data(Qt::UserRole).toInt() == 100000 + audio) return i;
+            return -1;
+        };
+        // A group of the highlighted track (A1), then A2 and A3 ticked into it: one undo step each.
+        dlg->tracks()->setCurrentRow(rowOf(0));
+        QVERIFY(dlg->newGroup("Dialogue"));
+        QCOMPARE(state()->sequence()->trackGroups.size(), size_t(1));
+        const Id group = state()->sequence()->trackGroups[0].id;
+        QCOMPARE(track(0).group, group);
+        QCOMPARE(dlg->groups()->count(), 1);
+        QVERIFY(dlg->switchBox("groupEditing")->isEnabled() && dlg->switchBox("groupEditing")->isChecked());
+        QVERIFY(!dlg->newGroup("dialogue"));  // the name is taken
+        for (int k : {1, 2}) {
+            QListWidgetItem* it = dlg->tracks()->item(rowOf(k));
+            QVERIFY(it->flags() & Qt::ItemIsUserCheckable);
+            it->setCheckState(Qt::Checked);
+            QCOMPARE(track(k).group, group);
+        }
+        state()->undo();
+        QCOMPARE(track(2).group, Id(0));
+        state()->redo();
+        QCOMPARE(track(2).group, group);
+        // A switch turned off and on again in the dialog.
+        dlg->switchBox("groupPan")->click();
+        QVERIFY(!state()->sequence()->trackGroups[0].pan);
+        dlg->switchBox("groupPan")->click();
+        QVERIFY(state()->sequence()->trackGroups[0].pan);
+        // A2's colour chosen from the keyboard, and its clips drawn in it.
+        dlg->tracks()->setCurrentRow(rowOf(1));
+        QComboBox* color = dlg->colorBox();
+        QCOMPARE(color->currentIndex(), 0);  // None
+        // (Its list opened and the next colour picked with the keys.)
+        color->showPopup();
+        QTRY_VERIFY(color->view()->isVisible());
+        QTest::keyClick(color->view(), Qt::Key_Down);
+        QTest::keyClick(color->view(), Qt::Key_Return);
+        QCOMPARE(color->currentIndex(), 1);
+        const QString chosen = theme::labelColor(1).name();
+        QCOMPARE(QString::fromStdString(track(1).color), chosen);
+        dlg->colorClipsBox()->click();
+        QVERIFY(track(1).colorClips);
+        dlg->close();
+
+        // The header shows the colour, in a bar at its left edge.
+        TimelineWidget* tl = timeline();
+        tl->zoomToFit();
+        const int y = tl->spanBounds({TrackKind::Audio, 1}, 30, 40).center().y();
+        QVERIFY(y > 0);
+        QTRY_COMPARE(tl->viewport()->grab().toImage().pixelColor(4, y).name(), chosen);
+
+        // A click on one clip selects all three; Delete removes all three; one undo brings them back.
+        win_->activateWindow();
+        QTRY_COMPARE(QApplication::activeWindow(), static_cast<QWidget*>(win_.get()));  // (not the colour list's popup)
+        const QRect b = tl->clipBounds(clips[1]);
+        QVERIFY(!b.isEmpty() && tl->viewport()->rect().contains(b.center()));
+        // (Above its volume line, which a click in the middle would take hold of.)
+        const QPoint onClip(b.center().x(), b.top() + 6);
+        state()->setSelection({});
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, onClip);
+        QCOMPARE(state()->selectedClips().size(), size_t(3));
+        tl->setFocus();
+        QTest::keyClick(win_.get(), Qt::Key_Delete);
+        for (int k = 0; k < 3; ++k) QVERIFY(track(k).clips.empty());
+        state()->undo();
+        for (int k = 0; k < 3; ++k) QCOMPARE(track(k).clips.size(), size_t(1));
+
+        // Ctrl+Shift+G suspends every group: a click then selects the one clip; again resumes them.
+        auto* suspend = win_->findChild<QAction*>("suspendTrackGroups");
+        QVERIFY(suspend);
+        QTest::keyClick(win_.get(), Qt::Key_G, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(state()->sequence()->groupsSuspended);
+        QVERIFY(suspend->isChecked());
+        state()->setSelection({});
+        QTest::mouseClick(tl->viewport(), Qt::LeftButton, {}, onClip);
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{clips[1]});
+        QTest::keyClick(win_.get(), Qt::Key_G, Qt::ControlModifier | Qt::ShiftModifier);
+        QVERIFY(!state()->sequence()->groupsSuspended);
+        QVERIFY(!suspend->isChecked());
+
+        // A fader move on A1 moves A2 and A3 by as many decibels (their offsets stay); one undo puts all three back.
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(2));
+        mixer->trackFader(0)->setValue(-60);
+        QCOMPARE(track(0).volumeDb, -6.0);
+        QCOMPARE(track(1).volumeDb, -9.0);
+        QCOMPARE(track(2).volumeDb, -4.0);
+        state()->undo();
+        QCOMPARE(track(0).volumeDb, 0.0);
+        QCOMPARE(track(1).volumeDb, -3.0);
+        QCOMPARE(track(2).volumeDb, 2.0);
+        // Mute on one mutes the group.
+        mixer->trackMute(2)->click();
+        QVERIFY(track(0).muted && track(1).muted && track(2).muted);
+        state()->undo();
+        QVERIFY(!track(0).muted && !track(1).muted && !track(2).muted);
+
+        // Touch set on A1 is set on all three; a pass with A1's fader held writes the others' lanes by as much.
+        mixer->trackAutomationMode(0)->setCurrentIndex(int(AutomationMode::Touch));
+        for (int k = 0; k < 3; ++k) QCOMPARE(track(k).automation, int(AutomationMode::Touch));
+        QSlider* fader = mixer->trackFader(0);
+        mixer->playbackStarted(0);
+        QVERIFY(mixer->recordingAutomation());
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-30);
+            }
+            if (f == 15) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(60);
+        const double before[] = {0.0, -3.0, 2.0};
+        for (int k = 0; k < 3; ++k) {
+            QVERIFY(track(k).volumeAuto.animated());
+            QCOMPARE(track(k).volumeAuto.at(10), before[k] - 3.0);
+            QCOMPARE(track(k).volumeAuto.at(2), before[k]);
+            QCOMPARE(track(k).volumeAuto.at(50), before[k]);
+        }
+        state()->undo();
+        for (int k = 0; k < 3; ++k) QVERIFY(!track(k).volumeAuto.animated());
+
+        // With the group's automation switch off, the pass writes A1 alone.
+        QVERIFY(state()->apply("Switch", [&](Project&, Sequence& s) {
+            TrackGroup g = s.trackGroups[0];
+            g.automation = false;
+            return edit::setTrackGroupSwitches(s, group, g);
+        }));
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 30; ++f) {
+            if (f == 5) {
+                fader->setSliderDown(true);
+                fader->setValue(-60);
+            }
+            if (f == 15) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(30);
+        QCOMPARE(track(0).volumeAuto.at(10), -6.0);
+        QVERIFY(!track(1).volumeAuto.animated() && !track(2).volumeAuto.animated());
+        state()->newProject();
+    }
+
+    void groupLoopRecordingComp() {
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/grouploop.montage"));
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime in = 30, out = in + FrameTime(std::llround(8 * fps)), pre = 15;
+        QVERIFY(state()->apply("Group", [](Project& p, Sequence& s) {
+            return edit::createTrackGroup(p, s, "Band", {{TrackKind::Audio, 0}, {TrackKind::Audio, 1}, {TrackKind::Audio, 2}});
+        }));
+        // A loop recording onto A1 records A1-A3 (one input channel each): three passes, each sample saying which
+        // channel and where in the recording it is.
+        VoiceoverRecorder rec(state());
+        QVERIFY(rec.startLoop(in, out, pre, 0, {}, false, 48000, 1));
+        const double length = double(out - in) / fps * 48000;
+        const qint64 preroll = std::llround(double(pre) / fps * 48000);
+        auto passStart = [&](int k) { return preroll + qint64(std::llround(k * length)); };
+        auto value = [](qint64 i, int ch) { return float(i % 7919) / 7919.0f * 0.25f + 0.1f * float(ch); };
+        const qint64 total = passStart(3) + 4800;
+        std::vector<float> block(4800 * 3);
+        for (qint64 at = 0; at < total; at += 4800) {
+            const qint64 n = std::min<qint64>(4800, total - at);
+            for (qint64 i = 0; i < n; ++i)
+                for (int ch = 0; ch < 3; ++ch) block[size_t(i * 3 + ch)] = value(at + i, ch);
+            rec.feed(block.data(), n);
+        }
+        QCOMPARE(rec.passes(), 3);
+        QVERIFY(rec.stop());
+        auto track = [&](int k) -> const Track& { return state()->sequence()->audioTracks.at(size_t(k)); };
+        // Three lanes on each track; pass k has one pass id, one take number and one colour on all three, and each
+        // track's lane holds its own channel.
+        for (int t = 0; t < 3; ++t) {
+            QCOMPARE(track(t).lanes.size(), size_t(3));
+            QCOMPARE(track(t).clips.size(), size_t(1));  // the last pass comped
+        }
+        for (size_t k = 0; k < 3; ++k) {
+            const TakeLane& l0 = track(0).lanes[k];
+            QVERIFY(l0.pass != 0);
+            QCOMPARE(takeNumber(l0), int(k) + 1);
+            for (int t = 1; t < 3; ++t) {
+                const TakeLane& l = track(t).lanes[k];
+                QCOMPARE(l.pass, l0.pass);
+                QCOMPARE(takeNumber(l), takeNumber(l0));
+                QCOMPARE(takeColor(l), takeColor(l0));
+                QVERIFY(l.mediaId != l0.mediaId);
+            }
+            for (int t = 0; t < 3; ++t) {
+                QFile f(QString::fromStdString(state()->project().findMedia(track(t).lanes[k].mediaId)->path));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                f.seek(44);
+                const QByteArray data = f.readAll();
+                QCOMPARE(qint64(data.size() / 4), passStart(int(k) + 1) - passStart(int(k)));
+                QCOMPARE(reinterpret_cast<const float*>(data.constData())[0], value(passStart(int(k)), t));
+            }
+        }
+        QVERIFY(track(0).lanes[0].pass != track(0).lanes[1].pass);
+        // Take 2 comped from 4 s to 7 s on A2 alone; a copy comped track by track for comparison.
+        Project byHand = state()->project();
+        const FrameTime from = FrameTime(std::llround(4 * fps)), to = FrameTime(std::llround(7 * fps));
+        const Id take2 = track(1).lanes[1].id;
+        for (int t = 0; t < 3; ++t) {
+            Sequence& s = *byHand.active();
+            QVERIFY(edit::compTake(byHand, s, {TrackKind::Audio, t}, s.audioTracks[size_t(t)].lanes[1].id, from, to).ok);
+        }
+        QVERIFY(state()->apply("Comp", [&](Project& p, Sequence& s) { return edit::compGroup(p, s, {TrackKind::Audio, 1}, take2, from, to); }));
+        // All three switch at the same frames, with their crossfades at the same samples (the same joins and lengths).
+        auto joins = [&](int t) {
+            std::vector<std::tuple<FrameTime, FrameTime, std::string>> out;
+            for (const Transition& x : track(t).transitions) {
+                const Clip* a = edit::clipById(*state()->sequence(), x.clipA);
+                out.push_back({a ? a->end() : -1, x.duration, x.type});
+            }
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        for (int t = 0; t < 3; ++t) {
+            QCOMPARE(track(t).clips.size(), size_t(3));
+            QCOMPARE(compLaneOf(track(t), track(t).clips[1]), track(t).lanes[1].id);
+            QCOMPARE(track(t).transitions.size(), size_t(2));
+            for (size_t k = 0; k < 3; ++k) {
+                QCOMPARE(track(t).clips[k].start, track(0).clips[k].start);
+                QCOMPARE(track(t).clips[k].sourceIn, track(0).clips[k].sourceIn);
+            }
+            QCOMPARE(joins(t), joins(0));
+        }
+        // The mix from 3 s to 8 s equals the mix of the copy comped track by track, sample for sample.
+        const int64_t start = 3 * 48000;
+        const int frames = 5 * 48000;
+        std::vector<float> grouped(size_t(frames) * 2), single(size_t(frames) * 2);
+        {
+            AudioMixer m;
+            m.mix(state()->project(), *state()->sequence(), start, frames, grouped.data());
+        }
+        {
+            AudioMixer m;
+            m.mix(byHand, *byHand.active(), start, frames, single.data());
+        }
+        float peak = 0;
+        for (float v : grouped) peak = std::max(peak, std::fabs(v));
+        QVERIFY(peak > 0.05f);
+        QVERIFY(grouped == single);
+        // One undo takes the comp back off all three.
+        state()->undo();
+        for (int t = 0; t < 3; ++t) QCOMPARE(track(t).clips.size(), size_t(1));
+        // A rating on one track's take rates that pass on the others.
+        QVERIFY(state()->apply("Rate", [&](Project&, Sequence& s) { return edit::rateGroupLane(s, {TrackKind::Audio, 2}, s.audioTracks[2].lanes[0].id, 4); }));
+        for (int t = 0; t < 3; ++t) QCOMPARE(track(t).lanes[0].rating, 4);
+        state()->newProject();
+    }
+
+    void recordingThroughTheAudioDevice() {
+        // Through Monitoring's audio device (the loopback here: its outputs come back on its inputs, late by the
+        // latencies it reports, as an interface with a cable from output to input would), a voiceover take and an ADR
+        // take land where what was heard was played, the round trip taken off; the picture (and the sampler's notes)
+        // follow what is heard, the output latency taken off; MCP reads and sets it; Capture offers its input latency.
+        const int rate = 48000;
+        // (in a folder of its own: its takes are not counted by the other recording tests)
+        QVERIFY(QDir().mkpath(dir_.path() + "/device"));
+        const QString click = dir_.path() + "/device/click.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(click, rate, 1));
+            std::vector<float> x(size_t(rate) * 9, 0.0f);
+            x[size_t(rate)] = 0.8f;      // at 1 s
+            x[size_t(rate) * 6] = 0.8f;  // at 6 s (in the ADR line)
+            w.write(x.data(), qint64(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/device/device.montage"));
+        const auto ids = state()->importFiles({click});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Click", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids.front(), 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 1}, false);
+        }));
+        QCOMPARE(state()->sequence()->sampleRate, rate);
+        const double fps = state()->sequence()->fpsValue();
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        auto* monitoring = win_->findChild<MonitoringPanel*>();
+        QVERIFY(program && monitoring);
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_audio_device"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "get"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("hosts").toArray().first().toString(), QString("qt"));
+        QCOMPARE(r.value("structuredContent").toObject().value("status").toObject().value("open").toBool(), false);
+        audiodev::setLoopbackOptions({256, 512, 0});
+        r = call({{"action", "set"},
+                  {"settings", QJsonObject{{"host", "loopback"}, {"buffer", 256}, {"sample_rate", 0}, {"inputs", 2},
+                                           {"input_names", QJsonArray{"Talent", "Room"}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject st = r.value("structuredContent").toObject().value("status").toObject();
+        QVERIFY(st.value("open").toBool());
+        QCOMPARE(st.value("sample_rate").toInt(), rate);
+        QCOMPARE(st.value("buffer").toInt(), 256);
+        QCOMPARE(st.value("input_latency").toInt(), 256);
+        QCOMPARE(st.value("output_latency").toInt(), 512);
+        QCOMPARE(st.value("round_trip").toInt(), 768);
+        QCOMPARE(VoiceoverRecorder::inputs(), (QStringList{"Talent", "Room"}));
+        // The panel shows it (16 ms taken off recordings, as reported), with its driver chosen.
+        QTRY_VERIFY(monitoring->findChild<QLabel*>("monitorDeviceStatus")->text().contains("16.0 ms"));
+        QCOMPARE(monitoring->findChild<QComboBox*>("monitorDriver")->currentData().toString(), QString("loopback"));
+        QVERIFY(monitoring->findChild<QComboBox*>("monitorDeviceBuffer")->isEnabled());
+        // Capture offers the device's input latency for its sound (256 frames).
+        {
+            CaptureDialog capture(state());
+            QCOMPARE(capture.findChild<QDoubleSpinBox*>("captureSoundLatency")->value(), 5.3);
+        }
+
+        // A voiceover take: the click heard at 1 s is at 1 s in the take.
+        auto readTake = [&](const QString& path) {
+            QFile f(path);
+            std::vector<float> x;
+            if (!f.open(QIODevice::ReadOnly)) return x;
+            const QByteArray all = f.readAll();
+            x.resize(size_t(std::max<qsizetype>(0, all.size() - 44)) / 4);
+            std::memcpy(x.data(), all.constData() + 44, x.size() * 4);
+            return x;
+        };
+        {
+            VoiceoverRecorder rec(state());
+            rec.setClock(program);
+            rec.setPlacing(false);
+            QVERIFY(rec.start(0, 0, -1, "Talent"));
+            program->seek(0);
+            program->play();
+            QTRY_VERIFY(program->onDevice());
+            // The picture follows what is heard: the sample the program shows trails what was last sent by the output
+            // latency (512), within a block (a tap following it sees the block sent, less the round trip).
+            std::atomic<int64_t> sent{-1};
+            audiodev::Engine& engine = audiodev::Engine::shared();
+            const int tap = engine.addInput(program, rate, [&](const float*, int, int, int64_t at) {
+                if (at >= 0) sent = at + 768;
+            });
+            QVERIFY(tap >= 0);
+            std::vector<int64_t> gaps;
+            for (int i = 0; i < 20; ++i) {
+                QTest::qWait(40);
+                if (sent.load() >= 0) gaps.push_back(sent.load() - program->heardSample());
+            }
+            engine.removeInput(tap);
+            QVERIFY(gaps.size() > 10);
+            std::sort(gaps.begin(), gaps.end());
+            const int64_t gap = gaps[gaps.size() / 2];
+            QVERIFY2(gap > 512 - 300 && gap < 512 + 300, qPrintable(QString::number(gap)));
+            QTRY_VERIFY_WITH_TIMEOUT(rec.seconds() > 1.4, 5000);
+            rec.stop();
+            program->pause();
+            const std::vector<float> take = readTake(rec.lastTake());
+            QVERIFY(take.size() > size_t(rate));
+            const int64_t at = audiodev::findClick(take.data(), int64_t(take.size()));
+            QVERIFY2(std::llabs(at - rate) <= 1, qPrintable(QString::number(at)));
+        }
+
+        // An ADR take, through the ADR panel: the click on A2 at 6 s lands where the cycle had it.
+        state()->apply("Cue", [](Project& p, Sequence& s) {
+            CaptionTrack ct;
+            ct.id = p.newId();
+            Caption c;
+            c.start = 165, c.end = 200, c.text = "MAYA: We should go.";
+            ct.captions.push_back(c);
+            s.captionTracks.push_back(ct);
+            return edit::Result{};
+        });
+        auto* adr = win_->findChild<AdrPanel*>("adrPanel");
+        QVERIFY(adr);
+        auto* adrDock = qobject_cast<QDockWidget*>(adr->parentWidget());
+        const bool adrShown = adrDock && adrDock->isVisible();
+        win_->findChild<QAction*>("showAdr")->trigger();
+        adr->setUseInputDevice(true);
+        QCOMPARE(adr->addCuesFromCaptions(), 1);
+        adr->record();
+        QVERIFY(adr->isRecording());
+        const AdrCycle cyc = *program->adrCycle();
+        QTRY_VERIFY_WITH_TIMEOUT(!adr->isRunning(), 30000);
+        const Id clip = state()->sequence()->adrCues.empty() ? 0 : state()->sequence()->adrCues[0].clip;
+        QVERIFY(clip);
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c);
+        const std::vector<float> take = readTake(QString::fromStdString(state()->project().findMedia(c->mediaId)->path));
+        const int64_t want = 6 * rate - int64_t(std::llround(double(cyc.playFrom) / fps * rate));
+        const int64_t at = audiodev::findClick(take.data(), int64_t(take.size()));
+        QVERIFY2(std::llabs(at - want) <= 1, qPrintable(QString("%1, not %2").arg(at).arg(want)));
+
+        // Back to the system's devices.
+        r = call({{"action", "set"}, {"settings", QJsonObject{{"host", "qt"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!audiodev::Engine::shared().isOpen() && !program->onDevice());
+        QCOMPARE(monitoring->findChild<QComboBox*>("monitorDriver")->currentData().toString(), QString("qt"));
+        audiodev::setLoopbackOptions({});
+        if (adrDock && !adrShown) adrDock->hide();
+        state()->newProject();
+    }
+
     void adrPanelRecordsTakes() {
         state()->newProject();
         QVERIFY(state()->save(dir_.path() + "/adr.montage"));
@@ -13531,6 +14750,142 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(queue->remove(longJob));
     }
 
+    void renderQueueSideBySideAndResumed() {
+        loadDemo();
+        const Id seq = state()->sequence()->id;
+        const Project project = state()->project();
+        QTemporaryDir store;  // (a queue kept in a folder of its own)
+        QVERIFY(store.isValid());
+        ExportSettings a = findExportPreset("H.264 - High Quality")->settings;
+        a.preset = "ultrafast";
+        a.gpu = exportsOnGpu();  // (as the queue renders it)
+        ExportSettings b = a;
+        b.width = 640;
+        b.height = 360;
+        const auto bytes = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        // One after the other, as the reference.
+        QElapsedTimer t;
+        t.start();
+        std::string err;
+        a.path = (dir_.path() + "/serial-a.mp4").toStdString();
+        b.path = (dir_.path() + "/serial-b.mp4").toStdString();
+        QVERIFY2(renderExport(project, seq, a, 0, {}, nullptr, &err), err.c_str());
+        QVERIFY2(renderExport(project, seq, b, 0, {}, nullptr, &err), err.c_str());
+        const qint64 serial = t.elapsed();
+        const QByteArray refA = bytes(dir_.path() + "/serial-a.mp4"), refB = bytes(dir_.path() + "/serial-b.mp4");
+        QVERIFY(refA.size() > 1000 && refB.size() > 1000);
+        // Two at once in the queue: both render together, and each file is the one rendered alone, byte for byte.
+        {
+            RenderQueue queue(nullptr, store.path());
+            queue.setAtOnce(2);
+            QCOMPARE(queue.atOnce(), 2);
+            a.path = (dir_.path() + "/together-a.mp4").toStdString();
+            b.path = (dir_.path() + "/together-b.mp4").toStdString();
+            const int ja = queue.add("A", "H.264", project, seq, a);
+            const int jb = queue.add("B", "H.264", project, seq, b);
+            int together = 0;
+            connect(&queue, &RenderQueue::changed, this, [&] { together = std::max(together, queue.rendering()); });
+            t.restart();
+            queue.start();
+            together = std::max(together, queue.rendering());
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 120000);
+            qInfo("render queue: two exports one after the other %lld ms, side by side %lld ms", serial, t.elapsed());
+            QCOMPARE(together, 2);
+            QCOMPARE(queue.job(ja)->status, RenderQueue::Status::Done);
+            QCOMPARE(queue.job(jb)->status, RenderQueue::Status::Done);
+            QVERIFY(bytes(dir_.path() + "/together-a.mp4") == refA);
+            QVERIFY(bytes(dir_.path() + "/together-b.mp4") == refB);
+            // Each is in the store with its project, as montage_job lists it.
+            jobs::Record r;
+            QVERIFY(jobs::load(RenderQueue::storeId(ja), r, store.path()));
+            QCOMPARE(r.status, QString("done"));
+            QCOMPARE(r.owner, QString("render-queue"));
+            QVERIFY(QFileInfo::exists(jobs::jobFolder(RenderQueue::storeId(ja), store.path()) + "/project.json"));
+            // Two writing the same file are not rendered together: the second waits for the first.
+            a.path = (dir_.path() + "/same.mp4").toStdString();
+            queue.add("A", "H.264", project, seq, a);
+            queue.add("A again", "H.264", project, seq, a);
+            together = 0;
+            queue.start();
+            together = std::max(together, queue.rendering());
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 120000);
+            QCOMPARE(together, 1);
+            QVERIFY(bytes(dir_.path() + "/same.mp4") == refA);
+            queue.clearFinished();
+            QVERIFY(jobs::all({}, store.path()).empty());
+        }
+        // A queue stopped halfway through a render, as by a crash: the next one (another Montage) renders it again from
+        // the start by itself, from the project kept with it, and gives the same file. (The project open now has
+        // changed: the job's own copy is the one rendered.)
+        // (a longer cut, at the smaller size, so it is still rendering when stopped)
+        QVERIFY(state()->edit("Long", [](Project&, Sequence& s) {
+            s.videoTracks[0].clips.back().duration = 3000;
+            return true;
+        }));
+        const Project longer = state()->project();
+        state()->undo();
+        ExportSettings c = b;
+        c.path = (dir_.path() + "/serial-long.mp4").toStdString();
+        QVERIFY2(renderExport(longer, seq, c, 0, {}, nullptr, &err), err.c_str());
+        const QByteArray refLong = bytes(dir_.path() + "/serial-long.mp4");
+        QVERIFY(refLong.size() > refB.size());
+        c.path = (dir_.path() + "/resumed.mp4").toStdString();
+        int id = 0;
+        {
+            RenderQueue queue(nullptr, store.path());
+            queue.setAtOnce(1);
+            id = queue.add("Long", "H.264", longer, seq, c);
+            queue.start();
+            QTRY_VERIFY_WITH_TIMEOUT(queue.job(id)->progress > 0, 60000);
+            queue.suspend();  // (the render stopped where it was; the store still says it renders)
+        }
+        jobs::Record r;
+        QVERIFY(jobs::load(RenderQueue::storeId(id), r, store.path()));
+        QCOMPARE(r.status, QString("running"));
+        // (as another process that crashed left it, its output half-written)
+        r.pid = 0x7ffffff0;
+        r.process = "gone";
+        QVERIFY(jobs::save(r, store.path()));
+        QVERIFY(jobs::load(RenderQueue::storeId(id), r, store.path()));
+        QCOMPARE(r.status, QString("interrupted"));
+        {
+            QFile half(dir_.path() + "/resumed.mp4");
+            QVERIFY(half.open(QIODevice::WriteOnly));
+            half.write(refLong.left(refLong.size() / 2));
+        }
+        QVERIFY(state()->apply("Clear", [](Project& p, Sequence& s) {
+            std::vector<Id> all;
+            for (TrackRef t : allTracks(s))
+                for (const Clip& c : trackAt(s, t)->clips) all.push_back(c.id);
+            return edit::removeClips(p, s, all, false);
+        }));
+        {
+            RenderQueue queue(nullptr, store.path());
+            QCOMPARE(queue.jobs().size(), size_t(1));
+            const RenderQueue::Job& j = queue.jobs()[0];
+            QVERIFY(j.resumed);
+            QCOMPARE(j.name, QString("Long"));
+            QTRY_VERIFY_WITH_TIMEOUT(queue.running(), 5000);  // (it was running: it starts by itself)
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 120000);
+            QCOMPARE(queue.jobs()[0].status, RenderQueue::Status::Done);
+            QVERIFY(bytes(dir_.path() + "/resumed.mp4") == refLong);
+            // A cancel asked for in the store (by montage_job) is heard: a waiting job is set aside when its turn comes.
+            const int waiting = queue.add("A", "H.264", project, seq, a);
+            QFile cancel(jobs::jobFolder(RenderQueue::storeId(waiting), store.path()) + "/cancel");
+            QVERIFY(cancel.open(QIODevice::WriteOnly));
+            cancel.close();
+            queue.start();
+            QTRY_VERIFY_WITH_TIMEOUT(!queue.running(), 10000);
+            QCOMPARE(queue.job(waiting)->status, RenderQueue::Status::Cancelled);
+            QVERIFY(!QFileInfo::exists(cancel.fileName()));
+            queue.clearFinished();
+        }
+        state()->undo();
+    }
+
     void keyframeGraphEditor() {
         loadDemo();
         const Id red = clipNamed(*state()->sequence(), "Red")->id;
@@ -14727,7 +16082,7 @@ const auto seq = [this] { return state()->sequence(); };
         });
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         state()->setInPoint(10);
-        state()->setOutPoint(19);
+        state()->setOutPoint(29);
         const bool was = program->loop();
         program->setLoop(true);
         std::vector<std::pair<qint64, FrameTime>> seen;
@@ -14737,30 +16092,33 @@ const auto seq = [this] { return state()->sequence(); };
         program->seek(10);
         program->play();
         QTest::qWait(3000);
+        const qint64 end = clock.elapsed();
         disconnect(c);
-        // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
+        // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it (and it
+        // goes on: a frozen player, staying where it is, does not pass).
         const FrameTime at = program->position();
         program->setLoop(false);
-        QTest::qWait(200);
+        QTRY_VERIFY_WITH_TIMEOUT(program->position() != at, 1000);
         const FrameTime after = program->position();
         program->pause();
         program->setLoop(was);
-        QVERIFY2(after >= at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
+        QVERIFY2(after > at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
         QVERIFY(seen.size() > 10);
         const double fps = state()->sequence()->fpsValue();
         int wraps = 0;
         for (size_t i = 0; i < seen.size(); ++i) {
-            QVERIFY2(seen[i].second >= 10 && seen[i].second <= 19, qPrintable(QString::number(seen[i].second)));
+            QVERIFY2(seen[i].second >= 10 && seen[i].second <= 29, qPrintable(QString::number(seen[i].second)));
             if (i > 0 && seen[i].second < seen[i - 1].second) ++wraps;  // (back to In)
         }
         QVERIFY2(wraps >= 2, qPrintable(QString::number(wraps)));
         // The pace over all the passes: the frames shown, counted on through each wrap, against the time taken. (Each frame
         // is the clock's at the tick that shows it, so this holds however far apart the ticks come; timing the wraps
         // themselves did not, with a background app's timers coalesced to a tenth of a second.)
-        // Between two ticks the picture moves on by the difference of the two frames round the 10-frame loop: a tick that
-        // comes late and lands just past a wrap (14, then 11: 7 frames on) is not a step back. Ticks a whole pass (a third
-        // of a second) or more apart would hide passes: up to half a second, the passes are counted from the time between
-        // them; longer is a stall, and fails.
+        // Between two ticks the picture moves on by the difference of the two frames round the 20-frame loop: a tick that
+        // comes late and lands just past a wrap (24, then 11: 7 frames on) is not a step back. Half a second or more
+        // without a new frame is a stall, and fails, the last frame's to the end of the wait too; a pass is two-thirds of
+        // a second, so no pass hides between ticks closer than that, and a shorter freeze is credited with only the
+        // frames the picture moved, not with those the time between would have shown.
         // Counted from the first frame played, not from the seek before it: starting to play is not the pace.
         size_t first = 1;
         while (first < seen.size() && seen[first].second == seen[0].second) ++first;
@@ -14769,9 +16127,9 @@ const auto seq = [this] { return state()->sequence(); };
         for (size_t i = first + 1; i < seen.size(); ++i) {
             const qint64 gap = seen[i].first - seen[i - 1].first;
             QVERIFY2(gap < 500, qPrintable(QStringLiteral("no new frame for %1 ms").arg(gap)));
-            const int on = int(((seen[i].second - seen[i - 1].second) % 10 + 10) % 10);
-            frames += on + 10.0 * std::max(0.0, std::round((double(gap) / 1000.0 * fps - on) / 10.0));
+            frames += double(((seen[i].second - seen[i - 1].second) % 20 + 20) % 20);
         }
+        QVERIFY2(end - seen.back().first < 500, qPrintable(QStringLiteral("no new frame for the last %1 ms").arg(end - seen.back().first)));
         const double rate = frames / (double(seen.back().first - seen[first].first) / 1000.0);
         QVERIFY2(std::fabs(rate - fps) < fps * 0.1, qPrintable(QStringLiteral("%1 frames a second, not %2").arg(rate).arg(fps)));
         state()->newProject();
@@ -16926,6 +18284,113 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(pathRows, 1);
         QCOMPARE(maskPathKeyTimes(fx()), (std::vector<FrameTime>{10, 35}));
         for (const std::string& n : maskPathParams(fx())) QVERIFY(fx().params.at(n).keyAt(35));
+        state()->setSelection({}, false);
+    }
+
+    void shapePathInProgramMonitor() {
+        // A shape layer's path, keyed at frame 0, picked in its contents: its points are edited on the Program monitor
+        // with the mask tools. Dragging one at frame 20 writes a key there that one undo takes away again.
+        state()->newProject();
+        auto* browser = win_->findChild<EffectsBrowser*>();
+        emit browser->applyRequested("shape", EffectCategory::Generator);
+        const Id id = state()->primaryClip()->id;
+        QVERIFY(state()->edit("Path", [id](Project&, Sequence& s) {
+            Effect& g = edit::clipById(s, id)->generator;
+            ShapeItem path, fill;
+            path.type = "path", path.id = "path1", path.closed = true;
+            fill.type = "fill", fill.id = "fill1";
+            setShapeContents(g, {path, fill});
+            setShapePathPoints(g, "path1", 0, {{-200, -150}, {200, -150}, {200, 150}, {-200, 150}}, true);
+            return true;
+        }));
+        state()->setShapeItem(id, "path1");
+        state()->setSelection({id}, false);
+        state()->setPlayhead(20);
+        QApplication::processEvents();
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        auto pathShape = [&]() -> std::optional<MaskOverlay::Shape> {
+            for (const MaskOverlay::Shape& sh : overlay->shapes())
+                if (sh.clip == id && sh.item == "path1") return sh;
+            return std::nullopt;
+        };
+        QTRY_VERIFY(pathShape().has_value());
+        QVERIFY(!pathShape()->drawing());
+        auto gen = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), id)->generator; };
+        QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0}));
+        const std::vector<PathPoint> before = pathPoints(gen(), 20, "path1.");
+        // Point 1 (top right) on the widget, dragged 30 px left and 20 px down.
+        QPointF from;
+        QVERIFY(overlay->boxToWidget(*pathShape(), before[1].x, before[1].y, from));
+        const QPoint a = from.toPoint(), b = a + QPoint(-30, 20);
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, a);
+        QMouseEvent move(QEvent::MouseMove, QPointF(b), viewer->mapToGlobal(QPointF(b)), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewer, &move);
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, b);
+        QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0, 20}));
+        const std::vector<PathPoint> after = pathPoints(gen(), 20, "path1.");
+        QPointF to;
+        QVERIFY(overlay->boxToWidget(*pathShape(), after[1].x, after[1].y, to));
+        QVERIFY2(QLineF(to, QPointF(b)).length() < 1.5, qPrintable(QString("%1,%2 for %3,%4").arg(to.x()).arg(to.y()).arg(b.x()).arg(b.y())));
+        QVERIFY(after[0] == before[0] && after[2] == before[2] && after[3] == before[3]);
+        // Frame 0 keeps its shape; the drag was one undo step.
+        QVERIFY(pathPoints(gen(), 0, "path1.") == before);
+        QVERIFY(state()->canUndo());
+        state()->undo();
+        QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0}));
+        QVERIFY(pathPoints(gen(), 20, "path1.") == before);
+        // Dragging inside moves the whole path (a key at the playhead), one undo step.
+        QPointF inside;
+        QVERIFY(overlay->boxToWidget(*pathShape(), 0, 0, inside));
+        {
+            const QPoint c = inside.toPoint(), d = c + QPoint(25, 0);
+            QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, c);
+            QMouseEvent mv(QEvent::MouseMove, QPointF(d), viewer->mapToGlobal(QPointF(d)), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(viewer, &mv);
+            QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, d);
+        }
+        const std::vector<PathPoint> moved = pathPoints(gen(), 20, "path1.");
+        QVERIFY2(moved[0].x > before[0].x + 5 && std::abs((moved[0].x - before[0].x) - (moved[2].x - before[2].x)) < 1e-9 && std::abs(moved[0].y - before[0].y) < 1e-9,
+                 qPrintable(QString("%1 -> %2").arg(before[0].x).arg(moved[0].x)));
+        state()->undo();
+        QVERIFY(pathPoints(gen(), 20, "path1.") == before);
+        // Clicking the outline adds a point at every key; Ctrl-click removes it again.
+        QPointF top;
+        QVERIFY(overlay->boxToWidget(*pathShape(), 0, -150, top));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, top.toPoint());
+        QCOMPARE(pathPointCount(gen(), "path1."), 5);
+        QVERIFY(std::abs(pathPoints(gen(), 0, "path1.")[1].x) < 3);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, top.toPoint());
+        QCOMPARE(pathPointCount(gen(), "path1."), 4);
+        // The fill picked in the Inspector: Add Gradient Stop makes its two colours a list of stops and adds one
+        // between them, each stop's place, colour and opacity a setting of its own.
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QComboBox* list = nullptr;
+        QTRY_VERIFY((list = inspector->findChild<QComboBox*>("shapeItems")) != nullptr);
+        const int fillRow = list->findData(QStringLiteral("fill1"));
+        QVERIFY(fillRow >= 0);
+        list->setCurrentIndex(fillRow);
+        emit list->activated(fillRow);
+        QTRY_VERIFY(inspector->findChild<QPushButton*>("addGradientStop") != nullptr);
+        QCOMPARE(state()->shapeItem(id), std::string("fill1"));
+        QVERIFY(!pathShape().has_value());  // (no path picked: nothing to edit on the monitor)
+        inspector->findChild<QPushButton*>("addGradientStop")->click();
+        QTRY_COMPARE(int(shapeContents(gen())[1].stops.size()), 3);
+        QCOMPARE(gen().p("fill1.gradient", 0), 1.0);
+        const std::vector<std::array<double, 5>> stops = gradientStops(gen(), shapeContents(gen())[1], 20);
+        QVERIFY(std::abs(stops[1][0] - 0.5) < 1e-9 || std::abs(stops[2][0] - 0.5) < 1e-9);
+        auto placeRow = [&] {
+            for (auto* l : inspector->findChildren<QLabel*>())
+                if (l->text().startsWith("Stop 3 Place")) return true;
+            return false;
+        };
+        QTRY_VERIFY(placeRow());
         state()->setSelection({}, false);
     }
 
@@ -20568,8 +22033,28 @@ print("added " + ui["name"])
         QVERIFY(address->text().startsWith("https://"));
         auto* codec = dlg->findChild<QComboBox*>("reviewStreamCodec");
         QVERIFY(codec->findData(QStringLiteral("av1")) >= 0);
+        QVERIFY(codec->findData(QStringLiteral("vp9")) >= 0);
         QVERIFY(dlg->findChild<QLineEdit*>("reviewStreamIce")->isVisibleTo(dlg));
         QVERIFY(!dlg->findChild<QWidget*>("reviewStreamMarkersRow")->isVisibleTo(dlg));
+        // A TURN relay of the user's own (its password not shown), the sizes sent at once and HDR: a browser's settings.
+        auto* turn = dlg->findChild<QLineEdit*>("reviewStreamTurn");
+        auto* relayOnly = dlg->findChild<QCheckBox*>("reviewStreamRelayOnly");
+        auto* rungs = dlg->findChild<QComboBox*>("reviewStreamRungs");
+        auto* hdr = dlg->findChild<QCheckBox*>("reviewStreamHdr");
+        QVERIFY(turn && relayOnly && rungs && hdr);
+        QVERIFY(turn->isVisibleTo(dlg) && rungs->isVisibleTo(dlg) && hdr->isVisibleTo(dlg));
+        QCOMPARE(dlg->findChild<QLineEdit*>("reviewStreamTurnPassword")->echoMode(), QLineEdit::Password);
+        turn->clear();
+        QVERIFY(!relayOnly->isEnabled());  // (only with a relay)
+        turn->setText(QStringLiteral("turn:relay.example.com:3478"));
+        QVERIFY(relayOnly->isEnabled());
+        dlg->findChild<QLineEdit*>("reviewStreamTurnUser")->setText(QStringLiteral("ana"));
+        dlg->findChild<QLineEdit*>("reviewStreamTurnPassword")->setText(QStringLiteral("relay-secret"));
+        rungs->setCurrentIndex(rungs->findData(2));
+        hdr->setChecked(true);
+        viewers->setCurrentIndex(viewers->findData(false));
+        QVERIFY(!turn->isVisibleTo(dlg) && !rungs->isVisibleTo(dlg) && !hdr->isVisibleTo(dlg));
+        viewers->setCurrentIndex(viewers->findData(true));
         address->setText(QStringLiteral("https://127.0.0.1:%1").arg(port));
         codec->setCurrentIndex(codec->findData(QStringLiteral("h264")));
         dlg->findChild<QCheckBox*>("reviewStreamHardware")->setChecked(false);
@@ -20581,6 +22066,12 @@ print("added " + ui["name"])
         QVERIFY(controller->status().contains(tr("Waiting for viewers")));
         const QString howTo = dlg->findChild<QLabel*>("reviewStreamHowTo")->text();
         QVERIFY2(howTo.contains(QStringLiteral("https://127.0.0.1:%1/").arg(port)) && howTo.contains(pass), qPrintable(howTo));
+        QVERIFY2(howTo.contains(QStringLiteral("turn:relay.example.com:3478")) && !howTo.contains(QStringLiteral("relay-secret")), qPrintable(howTo));
+        QCOMPARE(controller->settings().turnServer, std::string("turn:relay.example.com:3478"));
+        QCOMPARE(controller->settings().turnUser, std::string("ana"));
+        QCOMPARE(controller->settings().rungs, 2);
+        QVERIFY(!controller->settings().relayOnly);
+        QVERIFY(!turn->isEnabled() && !rungs->isEnabled());  // (while it runs)
         // Montage's own certificate for this computer, kept for next time, its key this user's alone.
         QString cert, key;
         QVERIFY(RemoteReviewController::ownCertificate(cert, key));
@@ -20616,6 +22107,14 @@ print("added " + ui["name"])
         const auto config = get("/config", pass.toUtf8());
         QCOMPARE(config.first, 200);
         QCOMPARE(QJsonDocument::fromJson(config.second).object().value("sequence").toInteger(), qint64(state()->sequence()->id));
+        // (the page is given the relay, with its login, and the sizes)
+        const QJsonObject pageConfig = QJsonDocument::fromJson(config.second).object();
+        QCOMPARE(pageConfig.value("rungs").toArray().size(), 2);
+        bool relayGiven = false;
+        for (const QJsonValue& ice : pageConfig.value("iceServers").toArray())
+            relayGiven = relayGiven || (ice.toObject().value("urls").toVariant().toStringList().contains("turn:relay.example.com:3478") &&
+                                        ice.toObject().value("username").toString() == "ana" && ice.toObject().value("credential").toString() == "relay-secret");
+        QVERIFY2(relayGiven, config.second.constData());
 
         // An agent sees it, and can start it again for browsers by asking for WebRTC.
         auto call = [&](const QJsonObject& args) {
@@ -20638,6 +22137,40 @@ print("added " + ui["name"])
         QCOMPARE(r.value("structuredContent").toObject().value("passphrase").toString().size(), 20);
         QVERIFY(controller->running() && controller->browser());
         QCOMPARE(controller->settings().iceServers, std::vector<std::string>{"stun:stun.example.com:3478"});
+        // Simulcast, a TURN relay and HDR from an agent: the sizes and the viewers in HDR in its status.
+        call({{"action", "stop"}});
+        r = call({{"action", "start"}, {"simulcast", true}, {"hdr", false}, {"codec", "vp9"},
+                  {"turn", QJsonObject{{"url", "turn:relay.example.com:3478"}, {"username", "bo"}, {"password", "another-secret"}, {"relay_only", true}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(controller->settings().rungs, 3);
+        QVERIFY(!controller->settings().hdr);
+        QVERIFY(controller->settings().relayOnly);
+        QCOMPARE(controller->settings().codec, std::string("vp9"));
+        QCOMPARE(controller->settings().turnUser, std::string("bo"));
+        r = call({{"action", "status"}});
+        const QJsonObject st = r.value("structuredContent").toObject();
+        // (up to three sizes: none under 64 pixels each way)
+        QVERIFY(st.value("sizes").toArray().size() >= 2 && st.value("sizes").toArray().size() <= 3);
+        QCOMPARE(size_t(st.value("sizes").toArray().size()), controller->backend()->stats().rungViewers.size());
+        QCOMPARE(st.value("sizes").toArray().first().toObject().value("viewers").toInt(), 0);
+        QCOMPARE(st.value("hdr_viewers").toInt(), 0);
+        QCOMPARE(st.value("turn").toObject().value("url").toString(), QStringLiteral("turn:relay.example.com:3478"));
+        QVERIFY(st.value("turn").toObject().value("relay_only").toBool());
+        QVERIFY(!QJsonDocument(r).toJson().contains("another-secret"));  // (never the relay's password)
+        call({{"action", "stop"}});
+        // Refused: another relay without its own login (the last one's is not sent to it), more sizes than three, and
+        // only through a relay with none.
+        r = call({{"action", "start"}, {"turn", QJsonObject{{"url", "turn:other.example.com:3478"}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"simulcast", 5}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "start"}, {"simulcast", 2}, {"turn", QJsonObject{{"url", ""}, {"relay_only", true}}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(!controller->running());
+        r = call({{"action", "start"}, {"simulcast", false}, {"turn", QJsonObject{{"url", ""}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(controller->settings().rungs, 1);
+        QVERIFY(controller->settings().turnServer.empty() && controller->settings().turnPassword.empty() && !controller->settings().relayOnly);
         call({{"action", "stop"}});
         dlg->close();
         // (the round trip over SRT reads its settings back on the next run)
@@ -20645,6 +22178,10 @@ print("added " + ui["name"])
         back.address = "srt://0.0.0.0:9000";
         back.codec = "hevc";
         back.iceServers.clear();
+        back.turnServer.clear(), back.turnUser.clear(), back.turnPassword.clear();
+        back.relayOnly = false;
+        back.rungs = 3;
+        back.hdr = true;
         RemoteReviewController::saveSettings(back, RemoteReviewController::loadOptions());
     }
 

@@ -38,6 +38,12 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
 // False if cancelled (`progress` returning false) or on failure.
 bool analyzeVideoDepth(const std::string& path, double start, double end, int size = 518,
                        const std::function<bool(double)>& progress = {}, std::string* error = nullptr);
+// The same with the depth worked out by `estimate` (as estimateVideoDepth does it, given the frames' count, the frames at
+// the size the model would run at and where each frame's depth goes) in place of the model: depth made some other way.
+using VideoDepthEstimate = std::function<bool(int count, const std::function<bool(int, Image&)>& frameAt,
+                                              const std::function<bool(int, const DepthMap&)>& sink, float& lo, float& hi)>;
+bool analyzeVideoDepth(const std::string& path, double start, double end, const VideoDepthEstimate& estimate, int size = 518,
+                       std::string* error = nullptr);
 
 // What was analysed for the file as it is now (the same size and modification time): its media range (the first and
 // last frames analysed, `step` seconds apart; the depth reaches a step beyond either end), or false.

@@ -54,6 +54,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [RNNoise](https://github.com/xiph/rnnoise) and its model | BSD-3-Clause | the source's `COPYING` (copied into the packages) |
 | [SQLite](https://www.sqlite.org) 3.50 (with FTS5), for the sound library's index | Public domain | none needed ([sqlite.org/copyright.html](https://www.sqlite.org/copyright.html)) |
 | [Lua](https://www.lua.org) 5.4 | MIT | [LICENSES/MIT-Lua.txt](LICENSES/MIT-Lua.txt) |
+| [PortAudio](https://www.portaudio.com) 19.7.0 (its ALSA, Core Audio and WASAPI host APIs), for the audio devices | MIT (with non-binding requests) | the source's `LICENSE.txt` (copied into the packages) |
 | [libvmx](https://github.com/openmediatransport/libvmx) (commit 31724bb), Open Media Transport's VMX codec, with [sse2neon](https://github.com/DLTcollab/sse2neon) on ARM | MIT, MIT | the source's `LICENSE.txt` (copied into the packages); [LICENSES/MIT-sse2neon.txt](LICENSES/MIT-sse2neon.txt) |
 | [x265](https://www.x265.org) 4.2, built with its multiview encoder for spatial video (MV-HEVC) export | GPL-2.0-or-later | the source's `COPYING` (copied into the packages; the release sources carry its tarball) |
 | [ThorVG](https://github.com/thorvg/thorvg), with RapidJSON (MIT) and JerryScript (Apache-2.0) | MIT, MIT, Apache-2.0 | the source's licence files (copied into the packages) |
@@ -105,6 +106,14 @@ Nor does it include [libvmaf](https://github.com/Netflix/vmaf) or Netflix's VMAF
 Copyright Netflix, Inc.): a build configured with `MONTAGE_WITH_VMAF` (off by default) links the libvmaf installed on
 the computer for Compare Encode's VMAF scores and reads the models from `MONTAGE_VMAF_MODELS` or a `vmaf-models`
 folder beside the program.
+
+Nor AV2's libraries, which are optional, not in packages, and flagged: a build configured with `MONTAGE_WITH_AV2` (off
+by default; `scripts/build-av2.sh` builds them from pinned tags) links VideoLAN's
+[dav2d](https://code.videolan.org/videolan/dav2d) 0.0.1 to read AV2 (BSD-2-Clause, as its COPYING states: Copyright ©
+2018-2026, VideoLAN and dav2d authors) and the Alliance for Open Media's [AVM](https://github.com/AOMediaCodec/avm)
+v1.0.0, AV2's reference software, to write it (BSD-3-Clause-Clear, Copyright (c) 2021, Alliance for Open Media, with
+the Alliance for Open Media Patent License 1.0 in its PATENTS file). Both licences are flagged for review, so Montage's
+packages are built without AV2; only the Linux CI job builds it, to run its tests.
 
 AI models are not included either: Montage downloads each one when a feature first needs it, and names the model and
 its licence when it asks to download it. One is not under a software licence: Bandit v2's weights (dialogue, music and

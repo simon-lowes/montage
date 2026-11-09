@@ -1,4 +1,5 @@
 #include "Processing.h"
+#include <set>
 #include "SurfaceTrack.h"
 #include "ColorChart.h"
 #include "Ofx.h"
@@ -265,12 +266,18 @@ void colorWarper(const Effect& e, FrameTime t, Image& img);  // below, as hue cu
 // shows: SDR white and HDR's 203 nits are both 1.0), moved by the global exposure and each zone's exposure as far as the
 // pixel is in it (the curve kept rising), then the contrast round its pivot; the channels shifted by the zones' colour
 // balance (stops per channel), the saturation scaled, the black offset added, and the result coded back.
-void hdrPalette(const Effect& e, FrameTime t, Image& img) {
-    const ColorSpace& space = currentWorkingSpace();
-    const TransferTables tables(space.transfer);
-    float kr = 0.2126f, kg = 0.7152f, kb = 0.0722f;
-    if (space.primaries == Primaries::Bt2020) kr = 0.2627f, kg = 0.6780f, kb = 0.0593f;
-    else if (space.primaries == Primaries::P3D65) kr = 0.2290f, kg = 0.6917f, kb = 0.0793f;
+// Its settings at a time, as the pixels need them (gpufilter.frag takes the same): per stop of brightness, from -16 to
+// +12 in 1/32 steps, the brightness out, the saturation and the balance.
+struct HdrPaletteSetup {
+    static constexpr float kEvMin = -16, kEvMax = 12;
+    static constexpr int kSteps = int((kEvMax - kEvMin) * 32);
+    float kr = 0.2126f, kg = 0.7152f, kb = 0.0722f, toWhite = 1, blackOffset = 0, mix = 1;
+    std::vector<float> evOut, sat, bal[3];
+};
+HdrPaletteSetup hdrPaletteSetup(const Effect& e, FrameTime t, const ColorSpace& space) {
+    HdrPaletteSetup h;
+    if (space.primaries == Primaries::Bt2020) h.kr = 0.2627f, h.kg = 0.6780f, h.kb = 0.0593f;
+    else if (space.primaries == Primaries::P3D65) h.kr = 0.2290f, h.kg = 0.6917f, h.kb = 0.0793f;
     struct ZoneValues {
         float exposure, saturation, balance[3], range, falloff;
         bool dark;
@@ -288,11 +295,11 @@ void hdrPalette(const Effect& e, FrameTime t, Image& img) {
     const float exposure = float(e.p("exposure", t)), saturation = float(e.p("saturation", t, 1));
     const float global[3] = {float(e.p("global_r", t)), float(e.p("global_g", t)), float(e.p("global_b", t))};
     const float contrast = float(e.p("contrast", t, 1)), pivot = float(e.p("pivot", t));
-    const float blackOffset = float(e.p("black_offset", t)), mix = float(e.p("mix", t, 100)) / 100;
-    // Per stop of brightness, from -16 to +12 in 1/32 steps: the brightness out, the balance and the saturation.
-    constexpr float kEvMin = -16, kEvMax = 12;
-    constexpr int kSteps = int((kEvMax - kEvMin) * 32);
-    std::vector<float> evOut(kSteps + 1), sat(kSteps + 1), bal[3];
+    h.blackOffset = float(e.p("black_offset", t)), h.mix = float(e.p("mix", t, 100)) / 100;
+    constexpr int kSteps = HdrPaletteSetup::kSteps;
+    constexpr float kEvMin = HdrPaletteSetup::kEvMin, kEvMax = HdrPaletteSetup::kEvMax;
+    std::vector<float>&evOut = h.evOut, &sat = h.sat, (&bal)[3] = h.bal;
+    evOut.resize(kSteps + 1), sat.resize(kSteps + 1);
     for (auto& b : bal) b.assign(kSteps + 1, 0.0f);
     for (int i = 0; i <= kSteps; ++i) {
         const float ev = kEvMin + (kEvMax - kEvMin) * float(i) / kSteps;
@@ -316,14 +323,25 @@ void hdrPalette(const Effect& e, FrameTime t, Image& img) {
     for (int k = 0; k < 3; ++k)
         for (int i = 1; i <= kSteps; ++i)
             bal[k][size_t(i)] = std::max(bal[k][size_t(i)], evOut[size_t(i - 1)] + bal[k][size_t(i - 1)] - evOut[size_t(i)]);
+    // HLG decodes to scene light with its peak at 1; its reference white (75%) is brought to 1 like SDR white and PQ's
+    // 203 nits.
+    h.toWhite = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+    return h;
+}
+
+void hdrPalette(const Effect& e, FrameTime t, Image& img) {
+    const ColorSpace& space = currentWorkingSpace();
+    const TransferTables tables(space.transfer);
+    const HdrPaletteSetup h = hdrPaletteSetup(e, t, space);
+    constexpr int kSteps = HdrPaletteSetup::kSteps;
+    constexpr float kEvMin = HdrPaletteSetup::kEvMin, kEvMax = HdrPaletteSetup::kEvMax;
+    const float kr = h.kr, kg = h.kg, kb = h.kb, toWhite = h.toWhite, blackOffset = h.blackOffset, mix = h.mix;
     auto lookup = [&](const std::vector<float>& table, float x) {
         const int i = std::min(kSteps - 1, int(x));
         return table[size_t(i)] + (table[size_t(i + 1)] - table[size_t(i)]) * (x - float(i));
     };
     constexpr float kGrey = 0.18f;
-    // HLG decodes to scene light with its peak at 1; its reference white (75%) is brought to 1 like SDR white and PQ's
-    // 203 nits.
-    const float toWhite = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+    const std::vector<float>&evOut = h.evOut, &sat = h.sat, (&bal)[3] = h.bal;
     // perPixel hands over straight (unpremultiplied) colour and premultiplies after.
     perPixel(img, [&](float& r, float& g, float& b, float&) {
         const float code[3] = {r, g, b};
@@ -891,8 +909,11 @@ void transpose(const Image& src, Image& dst) {
 
 }  // namespace
 
-void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
-    if (radius < 0.5 || img.empty()) return;
+namespace {
+// The radii of gaussianBlur's box passes (each direction), none below half a pixel.
+std::vector<int> gaussianBoxRadii(double radius) {
+    std::vector<int> radii;
+    if (radius < 0.5) return radii;
     // Three box passes approximate a Gaussian with sigma ~ radius / 2.
     double sigma = radius / 2.0;
     int n = 3;
@@ -902,12 +923,19 @@ void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
     int wu = wl + 2;
     double mIdeal = (12.0 * sigma * sigma - n * wl * wl - 4.0 * n * wl - 3.0 * n) / (-4.0 * wl - 4.0);
     int m = int(std::lround(mIdeal));
+    for (int i = 0; i < n; ++i)
+        if (const int r = ((i < m ? wl : wu) - 1) / 2; r > 0) radii.push_back(r);
+    return radii;
+}
+}  // namespace
+
+void gaussianBlur(Image& img, double radius, bool horizontal, bool vertical) {
+    if (radius < 0.5 || img.empty()) return;
+    const std::vector<int> radii = gaussianBoxRadii(radius);
     Image tmp(img.width, img.height);
     auto passes = [&](Image& a) {
         Image t2(a.width, a.height);
-        for (int i = 0; i < n; ++i) {
-            int r = ((i < m ? wl : wu) - 1) / 2;
-            if (r <= 0) continue;
+        for (int r : radii) {
             boxBlurH(a, t2, r);
             std::swap(a.px, t2.px);
         }
@@ -1200,6 +1228,8 @@ FaceScope::~FaceScope() { tFaces = std::move(previous_); }
 const DepthMap* currentDepth() { return tDepth.get(); }
 DepthScope::DepthScope(std::shared_ptr<const DepthMap> depth) : previous_(std::move(tDepth)) { tDepth = std::move(depth); }
 DepthScope::~DepthScope() { tDepth = std::move(previous_); }
+SourceSecondsScope::SourceSecondsScope(double seconds) : previous_(tSourceSeconds) { tSourceSeconds = seconds; }
+SourceSecondsScope::~SourceSecondsScope() { tSourceSeconds = previous_; }
 const ValueMap* currentPersonMatte() { return tPerson.get(); }
 PersonScope::PersonScope(std::shared_ptr<const ValueMap> matte) : previous_(std::move(tPerson)) { tPerson = std::move(matte); }
 PersonScope::~PersonScope() { tPerson = std::move(previous_); }
@@ -3093,6 +3123,71 @@ Face projectFace(const double corners[4][3], double f, int w, int h) {
     return face;
 }
 
+
+// How far out Shape Wipe's shape must grow to cover a cell's corners (its edge walked all round: a shape's farthest
+// point need not be a corner).
+float shapeReach(int shape, int count, float cell, float rc, float rs, int w, int h) {
+    float reach = 0;
+    const float hx = count == 1 ? w / (2 * cell) : 1.0f, hy = count == 1 ? h / (2 * cell) : 1.0f;
+    for (int i = 0; i <= 64; ++i)
+        for (int side = 0; side < 4; ++side) {
+            const float t = float(i) / 64 * 2 - 1;
+            const float ex = side < 2 ? (side ? hx : -hx) : t * hx, ey = side < 2 ? t * hy : (side == 3 ? hy : -hy);
+            reach = std::max(reach, shapeDistance(shape, ex * rc + ey * rs, -ex * rs + ey * rc));
+        }
+    return reach;
+}
+
+// 3D Cube's and Flip's faces at uf (0 < uf < 1): A's face, then B's.
+void transitionFaces(const std::string& type, int dir, float uf, int w, int h, Face faces[2]) {
+    const float pi = float(M_PI);
+    const float bell = std::sin(pi * uf);
+    const double f = 2.0 * std::max(w, h), W2 = w / 2.0, H2 = h / 2.0;
+    const bool vertical = type == "cube" ? dir >= 2 : dir == 1;
+    // Turn about the vertical axis (or the horizontal one), then push back a little mid-way.
+    auto place = [&](double pts[4][3], double angle, double centreZ) {
+        const double c = std::cos(angle), s = std::sin(angle);
+        for (int i = 0; i < 4; ++i) {
+            double& p = vertical ? pts[i][1] : pts[i][0];
+            const double z = pts[i][2];
+            const double np = p * c + z * s, nz = -p * s + z * c;
+            p = np;
+            pts[i][2] = nz + centreZ;
+        }
+    };
+    if (type == "cube") {
+        const double D2 = vertical ? H2 : W2;  // half the cube's depth
+        const double sign = dir == 1 || dir == 3 ? -1 : 1;
+        const double angle = sign * uf * pi / 2, back = D2 + 0.6 * D2 * bell;
+        double front[4][3] = {{-W2, -H2, -D2}, {W2, -H2, -D2}, {W2, H2, -D2}, {-W2, H2, -D2}};
+        double side[4][3];
+        if (!vertical && sign > 0) {  // B on the right face
+            const double s[4][3] = {{W2, -H2, -D2}, {W2, -H2, D2}, {W2, H2, D2}, {W2, H2, -D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        } else if (!vertical) {  // on the left
+            const double s[4][3] = {{-W2, -H2, D2}, {-W2, -H2, -D2}, {-W2, H2, -D2}, {-W2, H2, D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        } else if (sign > 0) {  // below
+            const double s[4][3] = {{-W2, H2, -D2}, {W2, H2, -D2}, {W2, H2, D2}, {-W2, H2, D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        } else {  // above
+            const double s[4][3] = {{-W2, -H2, D2}, {W2, -H2, D2}, {W2, -H2, -D2}, {-W2, -H2, -D2}};
+            std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
+        }
+        place(front, angle, back);
+        place(side, angle, back);
+        faces[0] = projectFace(front, f, w, h);
+        faces[1] = projectFace(side, f, w, h);
+    } else {
+        // A card: A on its front for the first half, B on its back for the second.
+        const bool second = uf >= 0.5f;
+        const double angle = second ? (uf - 1) * pi : uf * pi, back = 0.5 * std::max(W2, H2) * bell;
+        double card[4][3] = {{-W2, -H2, 0}, {W2, -H2, 0}, {W2, H2, 0}, {-W2, H2, 0}};
+        place(card, angle, back);
+        faces[second ? 1 : 0] = projectFace(card, f, w, h);
+    }
+}
+
 }  // namespace
 
 Image transitionMix(const std::string& type, const Effect& params, const Image& aIn, const Image& bIn, double u, int w,
@@ -3116,11 +3211,14 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
         const float* p = img.at(x, y);
         std::copy(p, p + 4, o);
     };
-    const float uf = float(std::clamp(u, 0.0, 1.0));
-    const float soft = float(params.p("softness", 0, 0.05));
-    const int dir = int(params.p("direction", 0, 0));
-    const float ang = float(params.p("angle", 0, 0)) * float(M_PI) / 180.0f;
-    const float strength = float(params.p("strength", 0, 1));
+    // The settings as the GPU takes them too (gpuTransitionParams), so the two read them alike.
+    float q[44];
+    gpuTransitionParams(type, params, u, w, h, q);
+    const float uf = q[1];
+    const float soft = q[2];
+    const int dir = int(q[3]);
+    const float ang = q[4];
+    const float strength = q[5];
     const float pi = float(M_PI);
     const float bell = std::sin(pi * uf);  // 0 at the ends, 1 halfway
     auto zero = [](float o[4]) { o[0] = o[1] = o[2] = o[3] = 0; };
@@ -3133,77 +3231,20 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
         x ^= x >> 16, x *= 0x7feb352dU, x ^= x >> 15, x *= 0x846ca68bU, x ^= x >> 16;
         return float(x & 0xffffff) / float(0xffffff);
     };
-    const float turn = float(params.p("turn", 0, 180)) * pi / 180;
-    const float leak[3] = {float(params.p("color.r", 0, 1.0)), float(params.p("color.g", 0, 0.55)), float(params.p("color.b", 0, 0.2))};
-    const bool brightsFirst = params.p("invert", 0) > 0.5;
-    const uint32_t glitchSeed = uint32_t(uf * 40);  // the pattern jumps a few times through the transition
-    // Shape Wipe: square cells of the shape (one over the whole frame for a count of 1), and how far
-    // out the shape must grow to cover a cell's corners.
-    const int shape = int(std::lround(params.p("shape", 0, 0)));
-    const int count = std::clamp(int(std::lround(params.p("count", 0, 1))), 1, 64);
-    const float cell = count == 1 ? float(std::max(w, h)) : float(w) / count;
-    const float rot = float(params.p("angle", 0, 0)) * pi / 180, rc = std::cos(rot), rs = std::sin(rot);
-    float reach = 0;
-    if (type == "shape_wipe") {
-        const float hx = count == 1 ? w / (2 * cell) : 1.0f, hy = count == 1 ? h / (2 * cell) : 1.0f;
-        for (int i = 0; i <= 64; ++i)
-            for (int side = 0; side < 4; ++side) {
-                // The cell's edge, walked all round (a shape's farthest point need not be a corner).
-                const float t = float(i) / 64 * 2 - 1;
-                const float ex = side < 2 ? (side ? hx : -hx) : t * hx, ey = side < 2 ? t * hy : (side == 3 ? hy : -hy);
-                reach = std::max(reach, shapeDistance(shape, ex * rc + ey * rs, -ex * rs + ey * rc));
-            }
-    }
+    const float turn = q[6];
+    const float leak[3] = {q[8], q[9], q[10]};
+    const bool brightsFirst = q[7] > 0.5f;
+    const uint32_t glitchSeed = uint32_t(q[11]);  // the pattern jumps a few times through the transition
+    // Shape Wipe: square cells of the shape (one over the whole frame for a count of 1), and how far out the shape
+    // must grow to cover a cell's corners.
+    const int shape = int(q[12]);
+    const int count = int(q[13]);
+    const float cell = q[14], reach = q[15], rc = q[16], rs = q[17];
     // 3D Cube and Flip: the faces' projections for this moment.
     Face faces[2];
     const Image* faceImg[2] = {&a, &b};
     const bool threeD = type == "cube" || type == "flip";
-    if (threeD && uf > 0 && uf < 1) {
-        const double f = 2.0 * std::max(w, h), W2 = w / 2.0, H2 = h / 2.0;
-        const bool vertical = type == "cube" ? dir >= 2 : dir == 1;
-        // Turn about the vertical axis (or the horizontal one), then push back a little mid-way.
-        auto place = [&](double pts[4][3], double angle, double centreZ) {
-            const double c = std::cos(angle), s = std::sin(angle);
-            for (int i = 0; i < 4; ++i) {
-                double& p = vertical ? pts[i][1] : pts[i][0];
-                const double z = pts[i][2];
-                const double np = p * c + z * s, nz = -p * s + z * c;
-                p = np;
-                pts[i][2] = nz + centreZ;
-            }
-        };
-        if (type == "cube") {
-            const double D2 = vertical ? H2 : W2;  // half the cube's depth
-            const double sign = dir == 1 || dir == 3 ? -1 : 1;
-            const double angle = sign * uf * pi / 2, back = D2 + 0.6 * D2 * bell;
-            double front[4][3] = {{-W2, -H2, -D2}, {W2, -H2, -D2}, {W2, H2, -D2}, {-W2, H2, -D2}};
-            double side[4][3];
-            if (!vertical && sign > 0) {  // B on the right face
-                const double s[4][3] = {{W2, -H2, -D2}, {W2, -H2, D2}, {W2, H2, D2}, {W2, H2, -D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            } else if (!vertical) {  // on the left
-                const double s[4][3] = {{-W2, -H2, D2}, {-W2, -H2, -D2}, {-W2, H2, -D2}, {-W2, H2, D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            } else if (sign > 0) {  // below
-                const double s[4][3] = {{-W2, H2, -D2}, {W2, H2, -D2}, {W2, H2, D2}, {-W2, H2, D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            } else {  // above
-                const double s[4][3] = {{-W2, -H2, D2}, {W2, -H2, D2}, {W2, -H2, -D2}, {-W2, -H2, -D2}};
-                std::copy(&s[0][0], &s[0][0] + 12, &side[0][0]);
-            }
-            place(front, angle, back);
-            place(side, angle, back);
-            faces[0] = projectFace(front, f, w, h);
-            faces[1] = projectFace(side, f, w, h);
-        } else {
-            // A card: A on its front for the first half, B on its back for the second.
-            const bool second = uf >= 0.5f;
-            const double angle = second ? (uf - 1) * pi : uf * pi, back = 0.5 * std::max(W2, H2) * bell;
-            double card[4][3] = {{-W2, -H2, 0}, {W2, -H2, 0}, {W2, H2, 0}, {-W2, H2, 0}};
-            place(card, angle, back);
-            faces[second ? 1 : 0] = projectFace(card, f, w, h);
-        }
-    }
+    if (threeD && uf > 0 && uf < 1) transitionFaces(type, dir, uf, w, h, faces);
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -3409,6 +3450,40 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
     return out;
 }
 
+int gpuTransitionParams(const std::string& type, const Effect& params, double u, int w, int h, float q[44]) {
+    static const char* const kinds[] = {"cross_dissolve", "dip_to_black", "dip_to_white", "wipe", "iris", "push", "slide", "zoom", "whip_pan",
+                                        "zoom_blur", "spin", "glitch", "light_leak", "luma_wipe", "shape_wipe", "cube", "flip", "clock_wipe"};
+    int kind = 0;  // (any other: a cross dissolve, as transitionMix mixes it)
+    for (int i = 0; i < int(std::size(kinds)); ++i)
+        if (type == kinds[i]) kind = i;
+    // As transitionMix works them out, in gpumix.frag's order.
+    std::fill(q, q + 44, 0.0f);
+    const float pi = float(M_PI);
+    const float uf = float(std::clamp(u, 0.0, 1.0));
+    const int dir = int(params.p("direction", 0, 0));
+    q[0] = float(kind), q[1] = uf, q[2] = float(params.p("softness", 0, 0.05)), q[3] = float(dir);
+    q[4] = float(params.p("angle", 0, 0)) * float(M_PI) / 180.0f, q[5] = float(params.p("strength", 0, 1));
+    q[6] = float(params.p("turn", 0, 180)) * pi / 180, q[7] = params.p("invert", 0) > 0.5 ? 1 : 0;
+    q[8] = float(params.p("color.r", 0, 1.0)), q[9] = float(params.p("color.g", 0, 0.55)), q[10] = float(params.p("color.b", 0, 0.2));
+    q[11] = float(uint32_t(uf * 40));
+    const int shape = int(std::lround(params.p("shape", 0, 0)));
+    const int count = std::clamp(int(std::lround(params.p("count", 0, 1))), 1, 64);
+    const float cell = count == 1 ? float(std::max(w, h)) : float(w) / count;
+    const float rot = float(params.p("angle", 0, 0)) * pi / 180, rc = std::cos(rot), rs = std::sin(rot);
+    q[12] = float(shape), q[13] = float(count), q[14] = cell, q[15] = type == "shape_wipe" ? shapeReach(shape, count, cell, rc, rs, w, h) : 0.0f;
+    q[16] = rc, q[17] = rs;
+    if ((type == "cube" || type == "flip") && uf > 0 && uf < 1) {
+        q[18] = 1;
+        Face faces[2] = {};
+        transitionFaces(type, dir, uf, w, h, faces);
+        for (int k = 0; k < 2; ++k) {
+            for (int i = 0; i < 9; ++i) q[20 + k * 12 + i] = float(faces[k].inv[i]);
+            q[20 + k * 12 + 9] = faces[k].facing ? 1 : 0;
+        }
+    }
+    return type == "ofx" || type == "smooth_cut" ? -1 : kind;
+}
+
 const ColorSpace* sourceLookSpace(const Effect& e) {
     if (e.type != "cdl" && e.type != "lut") return nullptr;
     for (const auto& cs : colorSpaces())
@@ -3463,21 +3538,82 @@ void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& spac
     });
 }
 
+namespace {
+// The effects the GPU draws through gpufilter.frag.
+bool isGpuFilter(const std::string& type) {
+    static const std::set<std::string> filters = {"gaussian_blur", "sharpen", "glow", "channel_blur", "directional_blur", "vignette",
+                                                  "posterize", "letterbox", "mirror", "mosaic", "chromatic_aberration", "noise",
+                                                  "crosstalk", "colour_correlation", "hdr_palette", "color_warper", "color_slice",
+                                                  "film_grain", "rgb_mixer", "grain_match", "edge_extend", "wave_warp", "twirl", "spherize",
+                                                  "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
+                                                  "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
+                                                  "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare"};
+    return filters.count(type) > 0;
+}
+
+// The working space's transfer function as gpufilter.frag knows it (the display curves the GPU composites in), or -1.
+int gpuTransfer(const ColorSpace& space) {
+    switch (space.transfer) {
+        case Transfer::Bt1886:
+        case Transfer::Srgb:
+        case Transfer::Linear:
+        case Transfer::Pq:
+        case Transfer::Hlg:
+        case Transfer::Gamma22: return int(space.transfer);
+        default: return -1;
+    }
+}
+
+// A filter pass's table with the working space's transfer tables in its row 0 (decoding in x, encoding in y), `rows`
+// rows in all.
+void transferTableRows(gpu::ColorOp::FilterPass& fp, const ColorSpace& space, int rows) {
+    const TransferTables tables(space.transfer);
+    fp.tableWidth = TransferTables::kDecode + 1;
+    fp.table.assign(size_t(fp.tableWidth) * 4 * size_t(rows), 0.0f);
+    for (size_t i = 0; i < tables.dec.size(); ++i) fp.table[i * 4] = tables.dec[i];
+    for (size_t i = 0; i < tables.enc.size(); ++i) fp.table[i * 4 + 1] = tables.enc[i];
+}
+}  // namespace
+
 bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing) {
     const int shape = int(std::lround(e.p("mask.shape", t)));
-    if (shape == 3 || shape == 4 || shape > 6 || e.p("mask.depth", t) > 0.5 || (!showing && e.p("mask.show", t) > 0.5) ||
-        e.p("mask.surface", t) > 0.5 ||
+    if (shape == 4 || shape > 6 || (!showing && e.p("mask.show", t) > 0.5) || e.p("mask.surface", t) > 0.5 ||
         (shape > 0 && shape != 6 && e.p("mask.refine", t) > 0))
         return false;  // (what the picture holds, or the mask shown)
-    // As effectMatte makes it: the shape (and its holes closed) here, the qualifier, inverting and fading there.
+    // As effectMatte makes it: the shape (an object's from its segmentation) with its holes closed and the range of
+    // depths here, the qualifier, inverting and fading there.
     op.masked = true;
-    if (shape > 0 && width > 0 && height > 0) {
+    const bool depthRange = e.p("mask.depth", t) > 0.5;
+    if ((shape > 0 || depthRange) && width > 0 && height > 0) {
         op.mask.assign(size_t(width) * size_t(height), 1.0f);
-        drawMaskShape(e, t, shape, op.mask, width, height, pixelScale);
-        if (shape != 6) consolidateMatte(op.mask, width, height, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
+        if (shape == 3) {
+            std::vector<float> logits;
+            if (e.object && tSourceSeconds >= 0 && e.object->maskLogitsAt(tSourceSeconds, logits))
+                op.mask = objectMatte(logits, width, height, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
+            else
+                std::fill(op.mask.begin(), op.mask.end(), 0.f);
+        }
+        if (shape > 0) drawMaskShape(e, t, shape, op.mask, width, height, pixelScale);
+        if (shape > 0 && shape != 6) consolidateMatte(op.mask, width, height, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
+        if (depthRange) {
+            const DepthMap* depth = currentDepth();
+            const double lo = e.p("mask.depth_low", t, 50) / 100, hi = e.p("mask.depth_high", t, 100) / 100;
+            const double ramp = std::max(1e-4, e.p("mask.depth_soft", t, 10) / 100);
+            if (!depth) {
+                std::fill(op.mask.begin(), op.mask.end(), 0.f);
+            } else {
+                const std::vector<float> d = depth->resized(width, height);
+                for (size_t i = 0; i < op.mask.size(); ++i) {
+                    const double v = d[i];
+                    const double out = v < lo ? lo - v : v > hi ? v - hi : 0.0;
+                    const double k = std::clamp(1.0 - out / ramp, 0.0, 1.0);
+                    op.mask[i] *= float(k * k * (3 - 2 * k));
+                }
+            }
+        }
     }
     const bool qualify = e.p("mask.qualify", t) > 0.5;
-    const float m[12] = {shape > 0 ? 1.0f : 0.0f,
+    const float m[12] = {shape > 0 || depthRange ? 1.0f : 0.0f,
                          qualify ? 1.0f : 0.0f,
                          e.p("mask.invert", t) > 0.5 ? 1.0f : 0.0f,
                          float(std::clamp(e.p("mask.opacity", t, 100) / 100.0, 0.0, 1.0)),
@@ -3620,7 +3756,8 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[0] = float(e.p("threshold", t, 0.1)), op.params[1] = float(e.p("softness", t, 0.05));
         op.params[2] = e.p("invert", t) > 0.5 ? 1 : 0;
     } else if (e.type == "screen_key") {
-        if (std::lround(e.p("clean_plate", t, 0)) != 0) return false;  // (a clean plate is made and read on the CPU)
+        const int plateMode = int(std::lround(e.p("clean_plate", t, 0)));
+        if (plateMode == 1) return false;  // (a clean plate made from the picture itself: on the CPU, which has it)
         // (as screenKey, the matte shrunk or grown and softened by passes of its own when asked)
         const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
         op.kind = gpu::ColorOp::ScreenKey;
@@ -3635,6 +3772,505 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[6] = float(e.p("despill", t, 100) / 100), op.params[7] = float(e.p("restore", t, 50) / 100);
         op.params[8] = float(e.p("edge_desat", t, 0) / 100), op.params[9] = float(std::lround(e.p("view", t, 0)));
         op.params[10] = float(std::lround(shrink)), op.params[11] = float(std::lround(soften / 2));
+        // A plate track's picture as keyerPlate makes it (resized, in the effect's colours, blurred), on the CPU while the
+        // clip's layer is set up (render/Compositor's cleanPlateFor), where each pixel's screen colour is read.
+        if (plateMode == 2 && width > 0 && height > 0) {
+            Image size;
+            size.width = width, size.height = height;
+            Image plate = keyerPlate(e, t, size, pixelScale);
+            if (!plate.empty() && plate.width == width && plate.height == height) {
+                op.plate.assign(plate.px.begin(), plate.px.end());
+                op.params[12] = 1;
+                op.params[13] = std::max(1e-3f, float(std::clamp(e.p("plate_threshold", t, 50), 1.0, 100.0) / 100) * op.params[3]);
+            }
+        }
+        for (int k = 0; k < 3; ++k) op.params[16 + k] = sk[k];
+    } else if (e.type == "track_matte") {
+        return true;  // (the compositor applies it, render/Compositor)
+    } else if (isGpuFilter(e.type)) {
+        // gpufilter.frag's passes, as the effect runs on the CPU; through its mask, marked before and mixed after.
+        gpu::ColorOp f;
+        f.kind = gpu::ColorOp::Filter;
+        auto add = [&](int mode, std::initializer_list<float> params) {
+            gpu::ColorOp::FilterPass fp;
+            fp.mode = mode;
+            std::copy(params.begin(), params.end(), fp.params);
+            f.passes.push_back(fp);
+        };
+        // gaussianBlur's box passes along rows, then columns, in the channels given.
+        auto blur = [&](double radius, bool rows, bool columns, const float (&channels)[4]) {
+            const std::vector<int> radii = gaussianBoxRadii(radius);
+            for (int dim = 0; dim < 2; ++dim)
+                if (dim ? columns : rows)
+                    for (int r : radii) add(1, {float(r), float(dim), 0, 0, channels[0], channels[1], channels[2], channels[3]});
+        };
+        const float all[4] = {1, 1, 1, 1};
+        const std::string& ty = e.type;
+        if (ty == "gaussian_blur") {
+            const int dir = int(e.p("direction", t));
+            blur(e.p("radius", t, 10) * pixelScale, dir != 2, dir != 1, all);
+        } else if (ty == "sharpen") {
+            blur(e.p("radius", t, 1.5) * pixelScale, true, true, all);
+            add(3, {float(e.p("amount", t, 1))});
+        } else if (ty == "glow") {
+            const double radius = e.p("radius", t, 20) * pixelScale;
+            add(4, {float(e.p("threshold", t, 0.7))});
+            if (radius > 0.5) blur(radius, true, true, all);
+            add(5, {float(e.p("intensity", t, 1))});
+        } else if (ty == "channel_blur") {
+            const char* names[4] = {"red", "green", "blue", "alpha"};
+            const int dims = int(std::lround(e.p("dimensions", t, 0)));
+            for (int c = 0; c < 4; ++c) {
+                const double r = std::max(0.0, e.p(names[c], t, 0)) * pixelScale;
+                if (r < 0.05) continue;
+                float only[4] = {0, 0, 0, 0};
+                only[c] = 1;
+                blur(r, dims != 2, dims != 1, only);
+            }
+        } else if (ty == "directional_blur") {
+            const double length = e.p("length", t, 20) * pixelScale;
+            if (length >= 0.5) {
+                const double ang = e.p("angle", t, 0) * M_PI / 180;
+                add(2, {float(length), float(std::clamp(int(std::ceil(length)), 2, 96)), float(std::cos(ang)), float(std::sin(ang))});
+            }
+        } else if (ty == "vignette") {
+            add(6, {float(e.p("amount", t, 0.5)), float(e.p("size", t, 0.75)), float(e.p("softness", t, 0.5))});
+        } else if (ty == "posterize") {
+            add(7, {float(std::clamp(e.p("levels", t, 6), 2.0, 64.0)) - 1});
+        } else if (ty == "letterbox") {
+            static const double ratios[] = {2.39, 2.0, 1.85, 4.0 / 3.0, 1.0, 9.0 / 16.0};
+            const int choice = std::clamp(int(e.p("aspect", t, 0)), 0, int(std::size(ratios)) - 1);
+            add(8, {float(ratios[choice]), float(std::clamp(e.p("opacity", t, 100) / 100.0, 0.0, 1.0))});
+        } else if (ty == "mirror") {
+            add(9, {float(int(e.p("mode", t)))});
+        } else if (ty == "mosaic") {
+            if (const int size = std::max(1, int(std::lround(e.p("size", t, 16) * pixelScale))); size > 1) {
+                add(10, {float(size), 0});
+                add(10, {float(size), 1});
+            }
+        } else if (ty == "chromatic_aberration") {
+            if (const double amount = e.p("amount", t, 3) * pixelScale; std::fabs(amount) >= 0.01) add(11, {float(amount)});
+        } else if (ty == "noise") {
+            const float amount = float(std::clamp(e.p("amount", t, 20) / 100.0, 0.0, 1.0));
+            const uint32_t frame = uint32_t(t);
+            if (amount > 0)
+                add(12, {amount, e.p("color", t, 1) >= 0.5 ? 1.0f : 0.0f, e.p("clip", t, 1) >= 0.5 ? 1.0f : 0.0f, 0, float(frame & 0xffffu),
+                         float(frame >> 16)});
+        } else if (ty == "film_grain") {
+            // (its noise grid at the grain's size, new every frame, made in the shader by the CPU's hash)
+            const double size = std::max(0.5, e.p("size", t, 1.5) * pixelScale);
+            const int gw = std::max(1, int(std::ceil(width / size))), gh = std::max(1, int(std::ceil(height / size)));
+            const uint32_t seed = vfx::grainSeed(t);
+            add(18, {float(e.p("amount", t, 0.15)), e.p("color", t) > 0.5 ? 1.0f : 0.0f, float(gw), float(gh),
+                     float(double(gw) / std::max(1, width)), float(double(gh) / std::max(1, height)), float(seed & 0xffffu), float(seed >> 16)});
+        } else if (ty == "edge_extend") {
+            // fillHoles's pyramid (render/CleanPlate): the solid colours known, pulled up a level at a time (each kept),
+            // pushed back down and relaxed on each level (red then black), then mixed into the edges.
+            const float amount = float(std::clamp(e.p("amount", t, 100), 0.0, 100.0) / 100);
+            const float solid = float(std::clamp(e.p("solid", t, 95), 1.0, 100.0) / 100);
+            if (amount > 0 && width > 0 && height > 0) {
+                std::vector<std::pair<int, int>> levels{{width, height}};
+                while (levels.back().first > 1 || levels.back().second > 1)
+                    levels.push_back({(levels.back().first + 1) / 2, (levels.back().second + 1) / 2});
+                const int top = int(levels.size()) - 1;
+                auto sized = [&](int level) {
+                    f.passes.back().width = levels[size_t(level)].first, f.passes.back().height = levels[size_t(level)].second;
+                };
+                add(21, {solid});
+                f.passes.back().save = 0;
+                for (int l = 1; l <= top; ++l) {
+                    add(22, {});
+                    sized(l);
+                    f.passes.back().save = l;
+                }
+                constexpr int kSweeps = 2;  // (as edgeExtend asks fillHoles for)
+                for (int l = top - 1; l >= 0; --l) {
+                    add(23, {});
+                    sized(l);
+                    f.passes.back().extra = l;
+                    const int sweeps = l == 0 ? std::max(1, kSweeps / 8) : l == 1 ? std::max(1, kSweeps / 4) : kSweeps;
+                    for (int k = 0; k < sweeps; ++k)
+                        for (int colour = 0; colour < 2; ++colour) {
+                            add(24, {float(colour)});
+                            sized(l);
+                        }
+                }
+                add(25, {solid, amount});
+                f.passes.back().tableSlot = top;
+            }
+        } else if (ty == "wave_warp" || ty == "twirl" || ty == "spherize" || ty == "ripple" || ty == "turbulent_displace" ||
+                   ty == "motion_tile" || ty == "camera_shake" || ty == "corner_pin") {
+            // render/StyleFx's and render/VideoFx's warps: each pixel from where the warp says (gpufilter.frag's mode 26),
+            // what is the same for the whole frame worked out here (as the CPU does, before any pixel)
+            constexpr double kDeg = M_PI / 180;
+            const double W = width, H = height;
+            auto centre = [&](double& cx, double& cy) {
+                cx = W / 2.0 + e.p("center_x", t) * pixelScale;
+                cy = H / 2.0 + e.p("center_y", t) * pixelScale;
+            };
+            if (width <= 0 || height <= 0) {
+                // (the sizes are not known yet: only whether it can be drawn here)
+            } else if (ty == "wave_warp") {
+                const double waveHeight = e.p("height", t, 10) * pixelScale, waveWidth = std::max(1.0, e.p("width", t, 40) * pixelScale);
+                if (std::fabs(waveHeight) >= 1e-3) {
+                    const double dir = e.p("direction", t, 0) * kDeg;
+                    const double phase = std::fmod(e.p("phase", t, 0) * kDeg + double(t) * e.p("speed", t, 0) * kDeg, 2 * M_PI);
+                    add(26, {0, float(std::cos(dir)), float(std::sin(dir)), float(waveHeight), float(waveWidth), float(phase),
+                             float(std::lround(e.p("shape", t, 0)))});
+                }
+            } else if (ty == "twirl") {
+                const double angle = e.p("angle", t, 90) * kDeg;
+                if (std::fabs(angle) >= 1e-6) {
+                    double cx, cy;
+                    centre(cx, cy);
+                    const double R = std::max(1.0, e.p("radius", t, 50) / 100 * std::hypot(W, H) / 2);
+                    add(26, {1, 0, 0, 0, float(cx), float(cy), float(R), float(angle)});
+                }
+            } else if (ty == "spherize") {
+                const double amount = std::clamp(e.p("amount", t, 50) / 100, -1.0, 1.0);
+                if (std::fabs(amount) >= 1e-4) {
+                    double cx, cy;
+                    centre(cx, cy);
+                    const double R = std::max(1.0, e.p("radius", t, 50) / 100 * std::min(W, H) / 2.0);
+                    const double power = amount > 0 ? 1 + amount * 0.9 : 1 / (1 - amount * 0.9);
+                    add(26, {2, 0, 0, 0, float(cx), float(cy), float(R), float(power)});
+                }
+            } else if (ty == "ripple") {
+                const double amp = e.p("amplitude", t, 8) * pixelScale, lambda = std::max(1.0, e.p("wavelength", t, 40) * pixelScale);
+                if (std::fabs(amp) >= 1e-3) {
+                    double cx, cy;
+                    centre(cx, cy);
+                    const double R = std::max(1.0, e.p("radius", t, 100) / 100 * std::hypot(W, H) / 2);
+                    const double phase = std::fmod(double(t) * e.p("speed", t, 20) * kDeg, 2 * M_PI);
+                    add(26, {3, 0, 0, 0, float(cx), float(cy), float(R), float(amp), float(lambda), float(phase)});
+                }
+            } else if (ty == "turbulent_displace") {
+                const double amount = e.p("amount", t, 20) * pixelScale, size = std::max(1.0, e.p("size", t, 100) * pixelScale);
+                if (std::fabs(amount) >= 1e-3) {
+                    const int octaves = std::clamp(int(std::lround(e.p("complexity", t, 3))), 1, 8);
+                    const double z = (e.p("evolution", t, 0) + double(t) * e.p("speed", t, 0)) / 360;
+                    const uint32_t seed = uint32_t(std::lround(e.p("seed", t, 0)));
+                    const uint32_t sx = seed * 2 + 1, sy = seed * 2 + 2;
+                    add(26, {4, 0, 0, 0, float(size), float(amount), float(z), float(octaves), float(sx & 0xffffu), float(sx >> 16),
+                             float(sy & 0xffffu), float(sy >> 16)});
+                }
+            } else if (ty == "motion_tile") {
+                const double tw = std::clamp(e.p("tile_width", t, 100), 1.0, 100.0) / 100, th = std::clamp(e.p("tile_height", t, 100), 1.0, 100.0) / 100;
+                const double ox = e.p("offset_x", t) * pixelScale, oy = e.p("offset_y", t) * pixelScale;
+                if (!(tw == 1 && th == 1 && ox == 0 && oy == 0))
+                    add(26, {5, 0, 0, 0, float(ox), float(oy), float(W * tw), float(H * th), e.p("mirror", t) > 0.5 ? 1.0f : 0.0f});
+            } else if (ty == "camera_shake") {
+                sfx::ShakeMove m;
+                if (sfx::cameraShakeMove(e, t, width, height, pixelScale, m))
+                    add(26, {6, 0, 0, 0, float(W / 2), float(H / 2), float(m.ox), float(m.oy), float(m.zoom), float(std::cos(-m.angle)),
+                             float(std::sin(-m.angle))});
+            } else {
+                double q[4][2] = {{e.p("tl_x", t, 0) * W, e.p("tl_y", t, 0) * H},
+                                  {e.p("tr_x", t, 1) * W, e.p("tr_y", t, 0) * H},
+                                  {e.p("br_x", t, 1) * W, e.p("br_y", t, 1) * H},
+                                  {e.p("bl_x", t, 0) * W, e.p("bl_y", t, 1) * H}};
+                double m[9];
+                if (vfx::squareToQuad(q, m)) {
+                    const double inv[9] = {m[4] * m[8] - m[5] * m[7], m[2] * m[7] - m[1] * m[8], m[1] * m[5] - m[2] * m[4],
+                                           m[5] * m[6] - m[3] * m[8], m[0] * m[8] - m[2] * m[6], m[2] * m[3] - m[0] * m[5],
+                                           m[3] * m[7] - m[4] * m[6], m[1] * m[6] - m[0] * m[7], m[0] * m[4] - m[1] * m[3]};
+                    // (scaled so the largest is 1: the same map, within a float's range)
+                    double big = 0;
+                    for (double v : inv) big = std::max(big, std::fabs(v));
+                    if (big > 0) {
+                        add(26, {7});
+                        for (int r = 0; r < 3; ++r)
+                            for (int c = 0; c < 3; ++c) f.passes.back().params[4 + r * 4 + c] = float(inv[r * 3 + c] / big);
+                    }
+                }
+            }
+        } else if (ty == "mesh_warp" || ty == "grid_warp") {
+            // drawWarp's triangles (render/MeshWarp: the mesh solved on the CPU, as there), listed by the 8-pixel tiles
+            // they may reach, in the order drawn (gpufilter.frag's mode 33)
+            WarpMesh mesh;
+            std::vector<MeshPoint> moved;
+            std::vector<double> depth;
+            const int how = warpDrawing(e, t, width, height, pixelScale, mesh, moved, depth);
+            if (how < 0) return false;
+            const std::vector<WarpTriangle> tris = how > 0 ? warpTriangles(mesh, moved, depth, width, height) : std::vector<WarpTriangle>{};
+            if (how > 0) {
+                constexpr int kTile = 8;
+                const int across = (width + kTile - 1) / kTile, down = (height + kTile - 1) / kTile;
+                std::vector<std::vector<int>> lists(size_t(across) * size_t(down));
+                for (size_t i = 0; i < tris.size(); ++i)
+                    for (int ty0 = tris[i].y0 / kTile; ty0 <= tris[i].y1 / kTile; ++ty0)
+                        for (int tx0 = tris[i].x0 / kTile; tx0 <= tris[i].x1 / kTile; ++tx0) lists[size_t(ty0) * size_t(across) + size_t(tx0)].push_back(int(i));
+                size_t entries = 0;
+                for (const auto& l : lists) entries += l.size();
+                const size_t start = lists.size() + entries, texels = start + tris.size() * 6;
+                add(33, {float(kTile), float(across), float(start)});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = int(std::min<size_t>(4096, std::max<size_t>(1, texels)));
+                const size_t rows = (texels + size_t(fp.tableWidth) - 1) / size_t(fp.tableWidth);
+                fp.table.assign(rows * size_t(fp.tableWidth) * 4, 0.0f);
+                float* tb = fp.table.data();
+                size_t at = lists.size();
+                for (size_t k = 0; k < lists.size(); ++k) {
+                    tb[k * 4] = float(at), tb[k * 4 + 1] = float(lists[k].size());
+                    for (int i : lists[k]) tb[at++ * 4] = float(i);
+                }
+                for (size_t i = 0; i < tris.size(); ++i) {
+                    const WarpTriangle& d = tris[i];
+                    float* q = tb + (start + i * 6) * 4;
+                    for (int k = 0; k < 3; ++k) {
+                        q[k * 4] = float(d.A[k]), q[k * 4 + 1] = float(d.B[k]);
+                        q[k * 4 + 2] = float(d.P[k][0]), q[k * 4 + 3] = float(d.P[k][1]);
+                    }
+                    q[12] = float(d.at[0]), q[13] = float(d.at[1]), q[14] = float(d.at[2]);
+                    q[15] = float((d.own[0] ? 1 : 0) | (d.own[1] ? 2 : 0) | (d.own[2] ? 4 : 0));
+                    q[16] = float(d.r[0][0]), q[17] = float(d.r[0][1]), q[18] = float(d.r[1][0]), q[19] = float(d.r[1][1]);
+                    q[20] = float(d.r[2][0]), q[21] = float(d.r[2][1]);
+                }
+            }
+        } else if (ty == "depth_map" || ty == "depth_fog") {
+            // depthEffect's colour and amount at each pixel, from the frame's depth (currentDepth(): nothing without one)
+            const DepthMap* depth = currentDepth();
+            if (width > 0 && height > 0 && depth && !depth->empty()) {
+                const std::vector<float> d = depth->resized(width, height);
+                add(34, {});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = width;
+                fp.table.assign(d.size() * 4, 0.0f);
+                if (ty == "depth_map") {
+                    const bool farWhite = e.p("invert", t) > 0.5;
+                    const float mix = float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0));
+                    for (size_t i = 0; i < d.size(); ++i) {
+                        const float g = farWhite ? 1 - d[i] : d[i];
+                        fp.table[i * 4] = fp.table[i * 4 + 1] = fp.table[i * 4 + 2] = g;
+                        fp.table[i * 4 + 3] = mix;
+                    }
+                } else {
+                    const double start = std::max(0.01, e.p("start", t, 60) / 100), amount = std::clamp(e.p("amount", t, 70) / 100, 0.0, 1.0);
+                    const double curve = std::max(0.05, e.p("curve", t, 1.5));
+                    const float col[3] = {float(e.p("color.r", t, 0.78)), float(e.p("color.g", t, 0.82)), float(e.p("color.b", t, 0.88))};
+                    const double horizon = std::clamp(e.p("horizon", t, 50) / 100, 0.0, 1.0), lift = std::clamp(e.p("height", t, 0) / 100, 0.0, 1.0) * 8;
+                    for (size_t i = 0; i < d.size(); ++i) {
+                        const double far = std::clamp((start - d[i]) / start, 0.0, 1.0);
+                        const double above = std::max(0.0, horizon - (double(i / size_t(width)) + 0.5) / height);
+                        std::copy(col, col + 3, &fp.table[i * 4]);
+                        fp.table[i * 4 + 3] = float(amount * std::pow(far, curve) * std::exp(-lift * above));
+                    }
+                }
+            }
+        } else if (ty == "find_edges") {
+            add(27, {e.p("invert", t, 1) > 0.5 ? 1.0f : 0.0f, float(std::clamp(e.p("blend", t, 0) / 100, 0.0, 1.0))});
+        } else if (ty == "emboss") {
+            const double dir = e.p("direction", t, 135) * M_PI / 180, relief = std::max(0.25, e.p("relief", t, 2) * pixelScale);
+            add(28, {float(std::cos(dir) * relief), float(-std::sin(dir) * relief), float(e.p("contrast", t, 100) / 100) * 2,
+                     float(std::clamp(e.p("blend", t, 0) / 100, 0.0, 1.0))});
+        } else if (ty == "halftone") {
+            constexpr double kDeg = M_PI / 180;
+            const double angle = e.p("angle", t, 45) * kDeg;
+            const double a0 = angle + 15 * kDeg, a1 = angle + 75 * kDeg;
+            add(29, {float(std::max(2.0, e.p("dot_size", t, 8) * pixelScale)), e.p("mode", t, 0) > 0.5 ? 1.0f : 0.0f, 0, 0,
+                     float(std::cos(a0)), float(std::sin(a0)), float(std::cos(a1)), float(std::sin(a1)), float(std::cos(angle)),
+                     float(std::sin(angle)), float(std::cos(angle)), float(std::sin(angle))});
+        } else if (ty == "duotone") {
+            add(30, {float(e.p("shadows.r", t, 0.08)), float(e.p("shadows.g", t, 0.1)), float(e.p("shadows.b", t, 0.35)),
+                     float(std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0)), float(e.p("highlights.r", t, 1)), float(e.p("highlights.g", t, 0.85)),
+                     float(e.p("highlights.b", t, 0.6))});
+        } else if (ty == "vhs") {
+            sfx::VhsSetup vs;
+            if (width > 0 && height > 0 && sfx::vhsSetup(e, t, width, height, pixelScale, vs)) {
+                const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+                const double bleed = e.p("bleed", t, 4) * pixelScale * amount;
+                add(31, {amount, float(bleed), float(e.p("noise", t, 30) / 100) * amount, 0, float(1.2 * pixelScale * amount),
+                         float(vs.seed & 0xffffu), float(vs.seed >> 16), float(std::max(1, int(std::ceil(bleed)))),
+                         float(std::max(1, int(3 * pixelScale)))});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = height;
+                fp.table.assign(size_t(height) * 4, 0.0f);
+                for (int y = 0; y < height; ++y) {
+                    fp.table[size_t(y) * 4] = float(vs.shift[size_t(y)]);
+                    fp.table[size_t(y) * 4 + 1] = vs.torn[size_t(y)];
+                    fp.table[size_t(y) * 4 + 2] = vs.line[size_t(y)];
+                }
+            }
+        } else if (ty == "tilt_shift") {
+            // (the Gaussian of the whole picture, then the band kept sharp and the colour pushed, as tiltShift does)
+            const double radius = e.p("blur", t, 12) * pixelScale;
+            const double focus = e.p("focus", t, 50) / 100, bandWidth = std::max(0.0, e.p("width", t, 20) / 100);
+            const double angle = e.p("angle", t, 0) * M_PI / 180;
+            const float sat = float(e.p("saturation", t, 120) / 100);
+            const bool blurred = radius >= 0.5;
+            if (blurred) blur(radius, true, true, all);
+            if (blurred || std::fabs(sat - 1) > 1e-4f)
+                add(32, {float(width / 2.0), float(focus * height), float(-std::sin(angle)), float(std::cos(angle)), float(height),
+                         float(bandWidth / 2), float(bandWidth / 2 + std::max(0.02, bandWidth)), sat, blurred ? 1.0f : 0.0f});
+        } else if (ty == "light_rays") {
+            // lightRays' light above the threshold, its three passes towards the centre and the sum (gpufilter.frag's
+            // modes 35 to 37); shadows blocking the rays stay on the CPU
+            if (std::clamp(e.p("block", t, 0) / 100, 0.0, 1.0) > 0) return false;
+            const double W = width, H = height;
+            double cx = e.p("pos_x", t, 0.5) * W, cy = e.p("pos_y", t, 0.25) * H;
+            if (e.p("follow", t, 0) > 0.5) {
+                const MaskBox box = maskBox(e, t);
+                cx = box.x * W, cy = box.y * H;
+            }
+            cx = std::clamp(std::isfinite(cx) ? cx : W / 2.0, -4.0 * W, 5.0 * W), cy = std::clamp(std::isfinite(cy) ? cy : H / 2.0, -4.0 * H, 5.0 * H);
+            const double threshold = std::max(0.0, e.p("threshold", t, 0.8)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
+            const double length = std::clamp(e.p("length", t, 60) / 100, 0.0, 1.0), decay = std::clamp(e.p("decay", t, 50) / 100, 0.0, 1.0);
+            if (intensity > 0 && length > 0) {
+                add(35, {float(threshold), 0, 0, 0, float(e.p("color.r", t, 1.0)), float(e.p("color.g", t, 0.95)), float(e.p("color.b", t, 0.85))});
+                constexpr int kSamples = 8, kPasses = 3;
+                const double first = length / (std::pow(double(kSamples), kPasses) - 1), rate = decay * 6 / length;
+                for (int pass = 0; pass < kPasses; ++pass) {
+                    const double step = first * std::pow(double(kSamples), pass);
+                    double w[kSamples], sum = 0;
+                    for (int j = 0; j < kSamples; ++j) sum += w[j] = std::exp(-rate * j * step);
+                    add(36, {float(cx), float(cy), float(step), 0, float(w[0] / sum), float(w[1] / sum), float(w[2] / sum), float(w[3] / sum),
+                             float(w[4] / sum), float(w[5] / sum), float(w[6] / sum), float(w[7] / sum)});
+                }
+                add(37, {float(intensity)});
+            }
+        } else if (ty == "lens_flare") {
+            // lensFlare's light, star, ring and ghosts at each pixel (gpufilter.frag's mode 38), the ghosts in the table
+            sfx::FlareGhosts g;
+            const int lens = std::clamp(int(e.p("lens", t, 0)), 0, 3);
+            const double bright = std::max(0.0, e.p("brightness", t, 100) / 100);
+            if (bright > 0 && sfx::lensFlareGhosts(lens, g)) {
+                add(38, {float(e.p("pos_x", t, 0.3) * width), float(e.p("pos_y", t, 0.3) * height), float(std::hypot(width, height) / 2),
+                         float(lens), float(width / 2.0), float(height / 2.0), float(bright),
+                         float(std::max(0.0, e.p("ghosts", t, 100) / 100)), float(e.p("color.r", t, 1.0)), float(e.p("color.g", t, 0.9)),
+                         float(e.p("color.b", t, 0.75)), float(lens == 1 ? 6 : lens == 2 ? 8 : 4)});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = 2 * g.count;
+                fp.table.assign(size_t(fp.tableWidth) * 4, 0.0f);
+                for (int k = 0; k < g.count; ++k) {
+                    float* q = &fp.table[size_t(k) * 8];
+                    q[0] = float(g.at[k]), q[1] = float(g.radius[k]), q[2] = float(g.strength[k]);
+                    std::copy(g.rgb[k], g.rgb[k] + 3, q + 4);
+                }
+            }
+        } else if (ty == "rgb_mixer") {
+            float m[12] = {};
+            bool identity = true;
+            for (int o = 0; o < 3; ++o)
+                for (int i = 0; i < 3; ++i) {
+                    const std::string name = std::string(1, "rgb"[o]) + "." + "rgb"[i];
+                    m[o * 4 + i] = float(e.p(name, t, o == i ? 1 : 0));
+                    identity = identity && m[o * 4 + i] == (o == i ? 1.0f : 0.0f);
+                }
+            if (!identity) add(19, {0, 0, 0, 0, m[0], m[1], m[2], 0, m[4], m[5], m[6], 0, m[8], m[9], m[10]});
+        } else if (ty == "color_warper") {
+            ColorWarp w;
+            if (parseColorWarp(e.s("mesh"), w) && !w.empty()) {
+                const WarpField field(w);
+                add(16, {float(std::clamp(e.p("mix", t, 100) / 100.0, 0.0, 1.0)), e.p("preserve_luma", t) > 0.5 ? 1.0f : 0.0f});
+                gpu::ColorOp::FilterPass& fp = f.passes.back();
+                fp.tableWidth = kWarpSpokes * (kWarpRings + 1);
+                fp.table.assign(size_t(fp.tableWidth) * 4, 0.0f);
+                for (int i = 0; i < kWarpSpokes; ++i)
+                    for (int j = 0; j <= kWarpRings; ++j) {
+                        float* d = &fp.table[size_t(i * (kWarpRings + 1) + j) * 4];
+                        d[0] = float(field.dh[i][j]), d[1] = float(field.ds[i][j]), d[2] = float(field.dl[i][j]);
+                    }
+            }
+        } else {
+            // The colour tools on the working space's light, through its transfer function.
+            const ColorSpace& space = currentWorkingSpace();
+            const int tf = gpuTransfer(space);
+            if (tf < 0) return false;  // (a curve the shader does not have)
+            gpu::ColorOp::FilterPass fp;
+            auto rows3 = [&](int at, const double m[9]) {
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c) fp.params[(at - 1) * 4 + r * 4 + c] = float(m[r * 3 + c]);
+            };
+            fp.params[0] = float(tf);
+            if (ty == "crosstalk") {
+                double m[9];
+                if (crosstalkMatrix(e, t, space, m)) {
+                    fp.mode = 13;
+                    rows3(2, m);
+                }
+            } else if (ty == "colour_correlation") {
+                const CorrelationSettings cs = correlationSettings(e, t, space);
+                fp.mode = 14;
+                fp.params[1] = float(cs.saturation), fp.params[2] = float(cs.start);
+                fp.params[4] = float(cs.low), fp.params[5] = float(cs.high), fp.params[6] = float(cs.soft);
+                rows3(3, cs.toBoundary);
+                rows3(6, cs.fromBoundary);
+                for (int k = 0; k < 3; ++k) fp.params[32 + k] = float(cs.luma[k]);
+            } else if (ty == "hdr_palette") {
+                const HdrPaletteSetup h = hdrPaletteSetup(e, t, space);
+                fp.mode = 15;
+                fp.params[1] = h.toWhite, fp.params[2] = h.blackOffset, fp.params[3] = h.mix;
+                fp.params[4] = h.kr, fp.params[5] = h.kg, fp.params[6] = h.kb;
+                transferTableRows(fp, space, 3);
+                const size_t row = size_t(fp.tableWidth) * 4;
+                for (int i = 0; i <= HdrPaletteSetup::kSteps; ++i) {
+                    float* d = &fp.table[row + size_t(i) * 4];
+                    d[0] = h.evOut[size_t(i)], d[1] = h.sat[size_t(i)], d[2] = h.bal[0][size_t(i)], d[3] = h.bal[1][size_t(i)];
+                    fp.table[2 * row + size_t(i) * 4] = h.bal[2][size_t(i)];
+                }
+            } else if (ty == "color_slice") {
+                const ColorSliceSetup cs = colorSliceSetup(e, t);
+                if (cs.any) {
+                    fp.mode = 17;
+                    fp.params[1] = space.transfer == Transfer::Hlg ? float(1 / toLinear(Transfer::Hlg, 0.75)) : 1.0f;
+                    fp.params[2] = float(cs.vecs.size()), fp.params[3] = cs.mix;
+                    fp.params[4] = cs.globalSat, fp.params[5] = cs.globalDensity, fp.params[6] = cs.depth, fp.params[7] = cs.protect;
+                    fp.params[8] = cs.subtractive ? 1.0f : 0.0f, fp.params[9] = space.primaries != Primaries::Bt709 ? 1.0f : 0.0f;
+                    double toRef[9], fromRef[9];
+                    primariesMatrix(space.primaries, Primaries::Bt709, toRef);
+                    primariesMatrix(Primaries::Bt709, space.primaries, fromRef);
+                    rows3(4, toRef);
+                    rows3(7, fromRef);
+                    const float skin[5] = {cs.skin.centre, cs.skin.width, cs.skin.hue, cs.skin.sat, cs.skin.density};
+                    std::copy(skin, skin + 5, fp.params + 36);
+                    transferTableRows(fp, space, 3);
+                    const size_t row = size_t(fp.tableWidth) * 4;
+                    for (size_t i = 0; i < cs.vecs.size(); ++i) {
+                        const ColorSliceSetup::Vec& v = cs.vecs[i];
+                        const float d[4] = {v.centre, v.width, v.hue, v.sat};
+                        std::copy(d, d + 4, &fp.table[row + i * 4]);
+                        fp.table[2 * row + i * 4] = v.density;
+                    }
+                }
+            } else if (ty == "grain_match") {
+                // (its grain's fields made, and kept, on the CPU as addGrain makes them; added to the light here)
+                const GrainProfile g = effectGrainProfile(e);
+                GrainFields gf;
+                if (grainFields(width, height, g, grainMatchSettings(e, t), t, gf)) {
+                    fp.mode = 20;
+                    fp.params[1] = float(gf.amount), fp.params[2] = float(gf.power), fp.params[3] = float(gf.shapeScale);
+                    rows3(2, &gf.L[0][0]);
+                    int model = 0;  // (by channel: the amplitudes a model's, following the light)
+                    for (int c = 0; c < 3; ++c)
+                        if (g.response > 0 && std::all_of(g.amplitude[c], g.amplitude[c] + GrainProfile::kBands, [](double a) { return a > 0; }))
+                            model |= 1 << c;
+                    const double pqTop = toLinear(Transfer::Pq, 1), pqSlope = (pqTop - toLinear(Transfer::Pq, 1 - 1e-4)) / 1e-4;
+                    fp.params[16] = float(g.response), fp.params[17] = float(model);
+                    fp.params[18] = float(pqTop), fp.params[19] = float(pqSlope);
+                    for (int c = 0; c < 3; ++c)
+                        for (int b = 0; b < GrainProfile::kBands; ++b) fp.params[20 + c * 8 + b] = float(g.amplitude[c][b]);
+                    fp.table = std::move(gf.z);
+                    fp.tableWidth = width;
+                }
+            } else {
+                return false;  // (a filter without its passes here: the CPU draws it)
+            }
+            if (fp.mode) f.passes.push_back(std::move(fp));
+        }
+        if (f.passes.empty()) return true;  // (nothing changes)
+        // (rays from the mask's track take it as where they come from, not as a limit, as applyVideoEffect does)
+        if (!op.masked || (ty == "light_rays" && e.p("follow", t, 0) > 0.5)) {
+            out.push_back(std::move(f));
+            return true;
+        }
+        gpu::ColorOp mark;
+        mark.kind = gpu::ColorOp::Mark;
+        out.push_back(std::move(mark));
+        out.push_back(std::move(f));
+        op.kind = gpu::ColorOp::Mix;
+        gpuMask(e, t, op, width, height, pixelScale);
+        out.push_back(std::move(op));
+        return true;
     } else if (e.type == "levels") {
         op.kind = gpu::ColorOp::Levels;
         const float inB = float(e.p("in_black", t, 0)), inW = float(e.p("in_white", t, 1));

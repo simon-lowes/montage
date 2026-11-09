@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "Processing.h"
+#include "media/HwAccel.h"
 
 namespace montage::gpu {
 
@@ -14,6 +15,7 @@ namespace {
 
 std::mutex gStatsMutex;
 Stats gStats;
+long gCopiesBefore = 0;  // (media/HwAccel's count of hardware frames copied back, at resetStats)
 
 bool logFallbacks() {
     static const bool on = [] {
@@ -27,12 +29,15 @@ bool logFallbacks() {
 
 Stats stats() {
     std::lock_guard lock(gStatsMutex);
-    return gStats;
+    Stats s = gStats;
+    s.hwReadBacks = hwFrameCopies() - gCopiesBefore;
+    return s;
 }
 
 void resetStats() {
     std::lock_guard lock(gStatsMutex);
     gStats = {};
+    gCopiesBefore = hwFrameCopies();
 }
 
 void countFallback(const std::string& why) {
@@ -72,6 +77,9 @@ bool takesPlanes() { return false; }
 bool takesShaders(const std::string&) { return false; }
 void shutdown() {}
 bool execute(const Frame&, Image*, QImage*) { return false; }
+std::string mappedHardware() { return {}; }
+void loseDeviceForTesting() {}
+void refuseHardwareFramesForTesting(bool) {}
 
 }  // namespace montage::gpu
 
@@ -87,6 +95,7 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 #define MONTAGE_GPU_VULKAN 1
 #include <QVulkanInstance>
 #endif
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -99,11 +108,15 @@ bool execute(const Frame&, Image*, QImage*) { return false; }
 #endif
 #include <thread>
 
+#include "GpuHardware.h"
+
 namespace montage::gpu {
 
 namespace {
 
 #include "shaders/GpuShaders.inc"
+
+std::atomic<bool> gRefuseHw{false};  // (tests: refuseHardwareFramesForTesting)
 
 QShader shader(const unsigned char* data, size_t size) {
     return QShader::fromSerialized(QByteArray::fromRawData(reinterpret_cast<const char*>(data), qsizetype(size)));
@@ -144,6 +157,14 @@ public:
     }
 
     bool draw(const Frame& frame, Image* out, QImage* out8);
+    long filterPasses = 0, mixPasses = 0;  // (the last frame's)
+    long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
+    std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
+    std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
+    std::string mapped() const {
+        std::lock_guard lock(brokenMutex_);
+        return mappedNames_;
+    }
 
 private:
     void loop();
@@ -174,8 +195,9 @@ private:
     };
     Program* program(const ShaderStep& step, QRhiResourceUpdateBatch* u);
     void dropProgram(Program& prog, bool later = false);
-    QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u);
+    QRhiTexture* layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas = nullptr);
     void endFrame();
+    bool recover();  // (the device lost: everything made again, on FFmpeg's device again when shared, else on a new one)
 
     std::thread thread_;
     std::mutex queueMutex_;
@@ -195,9 +217,21 @@ private:
     int maxTexture_ = 0;
     bool planes_ = false;  // 8 and 16-bit one and two-channel textures, for Y′CbCr planes
     bool shaders_ = false;  // shaders compiled while running, with float textures sampled between texels
+    bool shareVulkan_ = true, shareD3D11_ = true;  // (FFmpeg's device tried for the compositor's, until it fails)
+#ifdef Q_OS_WIN
+    QRhiD3D11NativeHandles d3d11Import_;
+#endif
 
     QRhi* rhi_ = nullptr;
     QRhiCommandBuffer* cb_ = nullptr;
+    // FFmpeg's device, when the compositor runs on it (render/GpuHardware: Vulkan, Direct3D 11), and what maps
+    // decoders' hardware frames into the RHI.
+    AVBufferRef* shared_ = nullptr;
+#ifdef MONTAGE_GPU_VULKAN
+    QRhiVulkanNativeHandles vulkanImport_;
+#endif
+    std::unique_ptr<hw::Mapper> mapper_;
+    std::string mappedNames_;  // (brokenMutex_)
     QRhiSampler* sampler_ = nullptr;
     QRhiSampler* linear_ = nullptr;  // (shader steps' textures sampled between texels)
     std::map<std::string, Program> programs_;
@@ -207,6 +241,7 @@ private:
     QRhiTexture *dummy2d_ = nullptr, *dummy3d_ = nullptr, *dummy16_ = nullptr, *dummyR_ = nullptr;
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
+    QRhiGraphicsPipeline *filterPs_ = nullptr, *mixPs_ = nullptr;
     QRhiRenderPassDescriptor *rpFloat_ = nullptr, *rp8_ = nullptr;
     QRhiTexture *rpFloatTex_ = nullptr, *rp8Tex_ = nullptr;  // (the small targets they were made from)
     // Textures kept between frames (by format and size), lent out within one. Only let go between frames: a pass
@@ -301,8 +336,16 @@ bool Device::launch() {
             return false;
         }
         vulkan_ = new QVulkanInstance;
-        vulkan_->setExtensions(QRhiVulkanInitParams::preferredInstanceExtensions());
-        vulkan_->setApiVersion(vulkan_->supportedApiVersion());
+        // On FFmpeg's own device where there is one, so that decoders' Vulkan frames are on it (render/GpuHardware);
+        // its instance is FFmpeg's (of Vulkan 1.3).
+        void* instance = nullptr;
+        if (shareVulkan_ && (shared_ = hw::sharedVulkanDevice(&instance, &vulkanImport_))) {
+            vulkan_->setVkInstance(VkInstance(instance));
+            vulkan_->setApiVersion(std::min(vulkan_->supportedApiVersion(), QVersionNumber(1, 3)));
+        } else {
+            vulkan_->setExtensions(QRhiVulkanInitParams::preferredInstanceExtensions());
+            vulkan_->setApiVersion(vulkan_->supportedApiVersion());
+        }
         if (!vulkan_->create()) {
             delete vulkan_;
             vulkan_ = nullptr;
@@ -324,7 +367,13 @@ bool Device::launch() {
     thread_ = std::thread([this] { loop(); });
     const bool ok = run([this] { return create(); });
     if (!ok) {
+        const bool shared = shared_ && backend_ == QRhi::Vulkan;
         stop();
+        if (shared) {  // (FFmpeg's device would not do: one of the compositor's own, as before)
+            shareVulkan_ = false;
+            problem_.clear();
+            return launch();
+        }
         if (problem_.empty()) problem_ = "no graphics device";
     }
     return ok;
@@ -350,6 +399,7 @@ void Device::stop() {
     delete vulkan_;
     vulkan_ = nullptr;
 #endif
+    av_buffer_unref(&shared_);
     ready_ = false;
 }
 
@@ -381,7 +431,7 @@ bool Device::create() {
         case QRhi::Vulkan: {
             QRhiVulkanInitParams params;
             params.inst = vulkan_;
-            rhi_ = QRhi::create(QRhi::Vulkan, &params, flags);
+            rhi_ = QRhi::create(QRhi::Vulkan, &params, flags, shared_ ? &vulkanImport_ : nullptr);
             break;
         }
 #endif
@@ -395,7 +445,14 @@ bool Device::create() {
 #if defined(Q_OS_WIN)
         case QRhi::D3D11: {
             QRhiD3D11InitParams params;
-            rhi_ = QRhi::create(QRhi::D3D11, &params, flags);
+            // On FFmpeg's D3D11VA device where it can be, so decoders' textures are on it (render/GpuHardware).
+            if (!shared_ && shareD3D11_) shared_ = hw::sharedD3D11Device(&d3d11Import_);
+            if (shared_) rhi_ = QRhi::create(QRhi::D3D11, &params, flags, &d3d11Import_);
+            if (!rhi_) {
+                av_buffer_unref(&shared_);
+                shareD3D11_ = false;
+                rhi_ = QRhi::create(QRhi::D3D11, &params, flags);
+            }
             break;
         }
         case QRhi::D3D12: {
@@ -475,14 +532,43 @@ bool Device::create() {
     compositePs_ = pipeline(kCompositeFragQsb, sizeof kCompositeFragQsb, rpFloat_);
     outputPs_ = pipeline(kOutputFragQsb, sizeof kOutputFragQsb, rpFloat_);
     output8Ps_ = pipeline(kOutputFragQsb, sizeof kOutputFragQsb, rp8_);
-    if (!colorPs_ || !compositePs_ || !outputPs_ || !output8Ps_) {
+    filterPs_ = pipeline(kFilterFragQsb, sizeof kFilterFragQsb, rpFloat_);
+    mixPs_ = pipeline(kMixFragQsb, sizeof kMixFragQsb, rpFloat_);
+    if (!colorPs_ || !compositePs_ || !outputPs_ || !output8Ps_ || !filterPs_ || !mixPs_) {
         problem_ = "the graphics device cannot build the compositor's shaders";
         return false;
     }
+    // Hardware frames: the decoders of the devices whose frames map into this one keep them in the device's memory.
+    mapper_ = planes_ ? hw::Mapper::make(rhi_, shared_) : nullptr;
+    const std::vector<AVHWDeviceType> types = mapper_ ? mapper_->types() : std::vector<AVHWDeviceType>{};
+    std::string names;
+    for (AVHWDeviceType t : types)
+        if (const char* n = av_hwdevice_get_type_name(t)) names += (names.empty() ? "" : ", ") + std::string(n);
+    {
+        std::lock_guard lock(brokenMutex_);
+        mappedNames_ = names;
+    }
+    setHwFramesMapped(types);
     return true;
 }
 
+bool Device::recover() {
+    destroy();
+    failed_ = false;
+    if (create()) return true;
+    destroy();  // (nothing half made left to draw with: frames go to the CPU)
+    problem_ = "the graphics device was lost and could not be set up again";
+    return false;
+}
+
 void Device::destroy() {
+    if (mapper_) mapper_->endFrame();
+    mapper_.reset();
+    if (rhi_) setHwFramesMapped({});
+    {
+        std::lock_guard lock(brokenMutex_);
+        mappedNames_.clear();
+    }
     for (auto& [key, prog] : programs_) dropProgram(prog);
     programs_.clear();
     delete linear_, linear_ = nullptr;
@@ -495,14 +581,22 @@ void Device::destroy() {
     pool_.clear();
     for (QRhiBuffer* b : ubufs_) delete b;
     ubufs_.clear();
-    delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_;
-    colorPs_ = compositePs_ = outputPs_ = output8Ps_ = nullptr;
+    delete colorPs_, delete compositePs_, delete outputPs_, delete output8Ps_, delete filterPs_, delete mixPs_;
+    colorPs_ = compositePs_ = outputPs_ = output8Ps_ = filterPs_ = mixPs_ = nullptr;
     rpFloat_ = rp8_ = nullptr;  // (the targets' own)
     delete layout_, layout_ = nullptr;
     delete dummy2d_, delete dummy3d_, delete dummy16_, delete dummyR_, delete rpFloatTex_, delete rp8Tex_;
     dummy2d_ = dummy3d_ = dummy16_ = dummyR_ = rpFloatTex_ = rp8Tex_ = nullptr;
     delete sampler_, sampler_ = nullptr;
-    delete rhi_, rhi_ = nullptr;
+    {
+        // (On a shared device its queues are FFmpeg's too.)
+        std::unique_lock<std::recursive_mutex> queues;
+        if (shared_ && backend_ == QRhi::Vulkan) queues = std::unique_lock(vulkanQueueMutex());
+        const bool d3d11 = shared_ && backend_ == QRhi::D3D11;
+        if (d3d11) hw::lockSharedD3D11(true);
+        delete rhi_, rhi_ = nullptr;
+        if (d3d11) hw::lockSharedD3D11(false);
+    }
 }
 
 QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTarget) {
@@ -749,10 +843,12 @@ Device::Program* Device::program(const ShaderStep& step, QRhiResourceUpdateBatch
 #endif
 }
 
-// A layer's picture at its source size, through its colour steps (null when it could not be made).
-QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
+// A layer's picture at its source size, through its colour steps (null when it could not be made). An adjustment
+// layer's starts from `canvas`, which is never let go here.
+QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiTexture* canvas) {
     using T = QRhiTexture;
     QRhiTexture* cur = nullptr;
+    QRhiTexture* const pinned = l.canvas ? canvas : nullptr;
     float p[64] = {};
     // The input transform's LUT, for the steps that take a decoded frame in (gpucolor.frag's 0, 24 and 26).
     auto inputLut = [&](float* q, std::vector<std::pair<int, QRhiTexture*>>& textures) {
@@ -768,17 +864,46 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         if (l.input && l.input->is1D) textures.push_back({4, table});
         return true;
     };
-    if (l.frame && l.frame->planes) {
-        // Y′CbCr as decoded: each plane uploaded as it is, converted (24), resampled to the frame's size where that
-        // differs (25 along rows, then columns) and taken in as a decoded frame (24 itself, or 26).
-        const YcbcrPlanes& yc = *l.frame->planes;
+    if (l.canvas) {
+        if (!canvas) return nullptr;
+        cur = canvas;
+    } else if (l.frame && l.frame->planes) {
+        // Y′CbCr as decoded: each plane uploaded as it is (or, a hardware frame's, mapped from the decoding device's
+        // memory: render/GpuHardware), converted (24), resampled to the frame's size where that differs (25 along
+        // rows, then columns) and taken in as a decoded frame (24 itself, or 26).
+        const YcbcrPlanes* inMemory = l.frame->planes.get();
+        hw::Planes mapped;
+        if (inMemory->hw) {
+            std::string why;
+            if (gRefuseHw) why = "refused (for testing)";
+            else if (!mapper_) why = "this device maps no hardware frames";
+            if (why.empty() && mapper_->map(*inMemory, cb_, mapped, &why)) {
+                ++hwMapped;
+                if (mapped.copied) ++hwGpuCopies;
+                if (logFallbacks()) std::fprintf(stderr, "montage gpu: hardware frame %s\n", mapped.how.c_str());
+            } else {
+                // Copied back, as before (and counted there: media/HwAccel). (What a mapping made before it failed
+                // is the mapper's, let go with the frame.)
+                mapped = {};
+                hwFallback = std::string("a hardware frame of ") + inMemory->hwType + " copied back: " + (why.empty() ? "it could not be mapped" : why);
+                if (logFallbacks()) std::fprintf(stderr, "montage gpu: %s\n", hwFallback.c_str());
+                if (!(inMemory = planesInMemory(*inMemory))) return nullptr;
+            }
+        }
+        const YcbcrPlanes& yc = *inMemory;
         const int W = l.frame->width, H = l.frame->height, cw = yc.chromaWidth(), ch = yc.chromaHeight();
         const T::Format one = yc.wide ? T::R16 : T::R8, two = yc.wide ? T::RG16 : T::RG8;
         const int sample = yc.wide ? 2 : 1;
-        QRhiTexture* planes[3] = {texture(one, yc.width, yc.height, false), texture(yc.interleaved ? two : one, cw, ch, false),
-                                  yc.interleaved ? nullptr : texture(one, cw, ch, false)};
+        QRhiTexture* planes[3] = {};
+        if (mapped.tex[0]) {
+            std::copy(mapped.tex, mapped.tex + 3, planes);
+        } else {
+            planes[0] = texture(one, yc.width, yc.height, false);
+            planes[1] = texture(yc.interleaved ? two : one, cw, ch, false);
+            planes[2] = yc.interleaved ? nullptr : texture(one, cw, ch, false);
+        }
         if (!planes[0] || !planes[1] || (!yc.interleaved && !planes[2])) return nullptr;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 3 && !mapped.tex[0]; ++i) {
             if (!planes[i]) continue;
             const int pw = i ? cw : yc.width, ph = i ? ch : yc.height;
             const quint32 row = quint32(pw * sample * (i == 1 && yc.interleaved ? 2 : 1));
@@ -804,7 +929,7 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         pass(colorPs_, made, u, textures, uniforms(u, p));
         u = rhi_->nextResourceUpdateBatch();
         for (QRhiTexture* t : planes)
-            if (t) release(t);
+            if (t && !mapped.tex[0]) release(t);  // (mapped ones are the mapper's, until the frame ends)
         if (sized) {
             cur = made;
         } else {
@@ -873,7 +998,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         }
     }
     auto keep = [&](QRhiTexture* t) {
-        return std::find(marked.begin(), marked.end(), t) != marked.end() || std::find(kept.begin(), kept.end(), t) != kept.end();
+        return t == pinned || std::find(marked.begin(), marked.end(), t) != marked.end() ||
+               std::find(kept.begin(), kept.end(), t) != kept.end();
     };
     auto sweep = [&](size_t i) {
         for (size_t k = 0; k < kept.size(); ++k)
@@ -936,6 +1062,70 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
             continue;
         }
         const QSize size = cur->pixelSize();
+        if (op.kind == ColorOp::Filter) {
+            // Each pass on what the one before made, beside the picture the filter began with (and what earlier passes
+            // kept in the filter's slots).
+            QRhiTexture* at = cur;
+            std::vector<QRhiTexture*> saved;
+            auto slotted = [&](QRhiTexture* t) { return std::find(saved.begin(), saved.end(), t) != saved.end(); };
+            auto letGo = [&](QRhiTexture* t) {
+                if (t && t != cur && !slotted(t)) release(t);
+            };
+            auto slotAt = [&](int i) { return i >= 0 && size_t(i) < saved.size() ? saved[size_t(i)] : nullptr; };
+            bool failed = false;
+            for (const ColorOp::FilterPass& fp : op.passes) {
+                QRhiTexture* made = texture(T::RGBA32F, fp.width > 0 ? fp.width : size.width(), fp.height > 0 ? fp.height : size.height(), true);
+                if (!made) {
+                    failed = true;
+                    break;
+                }
+                std::fill(p, p + 64, 0.0f);
+                p[0] = float(fp.mode);
+                std::copy(fp.params, fp.params + 60, p + 4);
+                QRhiTexture* table = nullptr;
+                if (fp.tableWidth > 0 && !fp.table.empty()) {
+                    const int rows = int(fp.table.size() / (size_t(fp.tableWidth) * 4));
+                    table = texture(T::RGBA32F, fp.tableWidth, std::max(1, rows), false);
+                    if (!table) {
+                        release(made);
+                        failed = true;
+                        break;
+                    }
+                    QRhiTextureSubresourceUploadDescription d(fp.table.data(), quint32(fp.table.size() * sizeof(float)));
+                    u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
+                }
+                std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};
+                if (QRhiTexture* t = slotAt(fp.extra)) bound.push_back({2, t});
+                if (QRhiTexture* t = table ? table : slotAt(fp.tableSlot)) bound.push_back({5, t});
+                pass(filterPs_, made, u, bound, uniforms(u, p));
+                u = rhi_->nextResourceUpdateBatch();
+                if (table) release(table);
+                ++filterPasses;
+                if (fp.save >= 0) {
+                    if (saved.size() <= size_t(fp.save)) saved.resize(size_t(fp.save) + 1, nullptr);
+                    QRhiTexture* old = saved[size_t(fp.save)];
+                    saved[size_t(fp.save)] = made;
+                    if (old != at) letGo(old);
+                }
+                letGo(at);
+                at = made;
+            }
+            for (QRhiTexture*& t : saved)
+                if (t != at) {
+                    QRhiTexture* s = t;
+                    t = nullptr;
+                    letGo(s);
+                }
+            if (failed) {
+                letGo(at);
+                return nullptr;
+            }
+            if (at != cur) {
+                if (!keep(cur)) release(cur);
+                cur = at;
+            }
+            continue;
+        }
         QRhiTexture* next = texture(T::RGBA32F, size.width(), size.height(), true);
         if (!next) return nullptr;
         if (op.kind == ColorOp::Shader) {
@@ -987,6 +1177,15 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
                 textures.push_back({4, table});
             }
         }
+        QRhiTexture* plate = nullptr;  // (a ScreenKey's clean plate, read as src16)
+        if (op.kind == ColorOp::ScreenKey && !op.plate.empty()) {
+            if (op.plate.size() != size_t(size.width()) * size_t(size.height()) * 4) return nullptr;
+            plate = texture(T::RGBA32F, size.width(), size.height(), false);
+            if (!plate) return nullptr;
+            QRhiTextureSubresourceUploadDescription d(op.plate.data(), quint32(op.plate.size() * sizeof(float)));
+            u->uploadTexture(plate, QRhiTextureUploadEntry(0, 0, d));
+            textures.push_back({2, plate});
+        }
         if (op.kind == ColorOp::ScreenKey && (op.params[10] != 0 || op.params[11] != 0)) {
             // Its matte first, shrunk or grown and softened as render/Processing's screenKey does (gpucolor.frag's
             // 21 to 23), then read from the table.
@@ -995,7 +1194,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
             float q[64] = {};
             std::copy(p, p + 64, q);
             q[0] = 21;
-            pass(colorPs_, matte, u, {{1, cur}}, uniforms(u, q));
+            if (plate) pass(colorPs_, matte, u, {{1, cur}, {2, plate}}, uniforms(u, q));
+            else pass(colorPs_, matte, u, {{1, cur}}, uniforms(u, q));
             u = rhi_->nextResourceUpdateBatch();
             auto step = [&](int mode, int radius, bool maximum, bool column) {
                 QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
@@ -1036,11 +1236,11 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         if (!keep(cur)) release(cur);
         if (input && !keep(input)) release(input);
         for (const auto& [binding, tex] : textures)
-            if ((binding == 4 && op.kind != ColorOp::Lut && op.kind != ColorOp::Mix) || binding == 5) release(tex);
+            if ((binding == 4 && op.kind != ColorOp::Lut && op.kind != ColorOp::Mix) || binding == 5 || tex == plate) release(tex);
         cur = next;
     }
     for (QRhiTexture* t : kept)
-        if (t && t != cur) release(t);
+        if (t && t != cur && t != pinned) release(t);
     return cur;
 }
 
@@ -1081,6 +1281,13 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
+    filterPasses = mixPasses = 0;
+    hwMapped = hwGpuCopies = 0;
+    hwFallback.clear();
+    if (!rhi_) return false;  // (lost, and not set up again)
+    // A device lost (or, for tests, said to be): set up again on the same device, with what the frame cache holds still to
+    // draw from.
+    if ((lose.exchange(false) || rhi_->isDeviceLost()) && !recover()) return false;
     const int W = frame.width, H = frame.height;
     const int maxSize = maxTexture_;
     if (W <= 0 || H <= 0 || W > maxSize || H > maxSize) return false;
@@ -1089,7 +1296,24 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
             if (l && ((l->frame && (l->frame->planes ? std::max(l->frame->planes->width, l->frame->width) : l->frame->width * 2) > maxSize) ||
                       (l->frame && l->frame->planes && l->frame->planes->height > maxSize) || l->image.width > maxSize || l->image.height > maxSize))
                 return false;
-    if (rhi_->beginOffscreenFrame(&cb_) != QRhi::FrameOpSuccess) return false;
+    // (On FFmpeg's D3D11 device its decoders wait while a frame is drawn: they share its context.)
+    struct D3D11Turn {
+        bool on;
+        explicit D3D11Turn(bool on) : on(on) {
+            if (on) hw::lockSharedD3D11(true);
+        }
+        ~D3D11Turn() {
+            if (on) hw::lockSharedD3D11(false);
+        }
+    } turn(shared_ && backend_ == QRhi::D3D11);
+    QRhi::FrameOpResult begun = rhi_->beginOffscreenFrame(&cb_);
+    if (begun == QRhi::FrameOpDeviceLost && recover()) begun = rhi_->beginOffscreenFrame(&cb_);
+    if (begun == QRhi::FrameOpDeviceLost) {
+        // (Lost again at once: FFmpeg's shared device, say, which stays lost. Frames go to the CPU from now on.)
+        destroy();
+        problem_ = "the graphics device was lost and could not be set up again";
+    }
+    if (begun != QRhi::FrameOpSuccess) return false;
     bool ok = true;
     QRhiResourceUpdateBatch* u = rhi_->nextResourceUpdateBatch();
     QRhiTexture* canvas = nullptr;
@@ -1103,12 +1327,68 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         q[12] = g.u0, q[13] = g.u1, q[14] = g.v0, q[15] = g.v1;
         q[16] = g.kx, q[17] = g.ky, q[18] = g.px, q[19] = g.py;
     };
+    // A layer placed alone on a transparent canvas (a transition's or a matte's, before they are mixed).
+    auto placed = [&](const Layer* l, QRhiTexture* tex) -> QRhiTexture* {
+        QRhiTexture* to = texture(T::RGBA32F, W, H, true);
+        if (!to) return nullptr;
+        float q[64] = {};
+        q[1] = 1, q[3] = -1;
+        place(q + 4, l, tex);
+        pass(compositePs_, to, u, {{1, dummy2d_}, {2, tex ? tex : dummy2d_}, {3, dummy2d_}}, uniforms(u, q));
+        u = rhi_->nextResourceUpdateBatch();
+        return to;
+    };
+    auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n) -> QRhiTexture* {
+        QRhiTexture* to = a && b ? texture(T::RGBA32F, W, H, true) : nullptr;
+        if (!to) return nullptr;
+        float q[64] = {};
+        std::copy(params, params + n, q);
+        pass(mixPs_, to, u, {{1, a}, {4, b}}, uniforms(u, q));
+        u = rhi_->nextResourceUpdateBatch();
+        ++mixPasses;
+        release(a), release(b);
+        return to;
+    };
+    // (Nothing to draw, transparent: no picture, or an adjustment layer over nothing.)
+    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty(); };
+    Layer full;  // (a picture the canvas's size already)
+    full.place.full = true;
     for (const Item& it : frame.items) {
-        QRhiTexture* a = layer(it.a, u);
-        QRhiTexture* b = it.b ? layer(*it.b, u) : nullptr;
-        if ((!a && (it.a.frame || !it.a.image.empty())) || (it.b && !b && (it.b->frame || !it.b->image.empty()))) {
+        if (!it.b && it.a.canvas && !canvas) continue;  // (an adjustment layer over nothing shows nothing)
+        QRhiTexture* a = layer(it.a, u, canvas);
+        QRhiTexture* b = it.b ? layer(*it.b, u, canvas) : nullptr;
+        if ((!a && !absent(it.a)) || (it.b && !b && !absent(*it.b))) {
             ok = false;
             break;
+        }
+        const Layer* la = &it.a;
+        if ((it.b && it.transition >= 0) || it.matte) {
+            // Placed on the canvas, then mixed: a transition, then a track matte.
+            QRhiTexture* m = placed(&it.a, a);
+            if (a && a != canvas) release(a);
+            if (m && it.b && it.transition >= 0) {
+                QRhiTexture* mb = placed(&*it.b, b);
+                if (b && b != canvas) release(b);
+                b = nullptr;
+                m = mixed(m, mb, it.transitionParams, 44);
+            }
+            if (m && it.matte) {
+                QRhiTexture* matte = layer(*it.matte, u);
+                if (!matte && !absent(*it.matte)) {
+                    ok = false;
+                    break;
+                }
+                QRhiTexture* mm = placed(&*it.matte, matte);
+                if (matte) release(matte);
+                const float q[3] = {30, it.matteLuma ? 1.0f : 0.0f, it.matteReverse ? 1.0f : 0.0f};
+                m = mixed(m, mm, q, 3);
+            }
+            if (!m) {
+                ok = false;
+                break;
+            }
+            a = m;
+            la = &full;
         }
         QRhiTexture* next = texture(T::RGBA32F, W, H, true);
         if (!next) {
@@ -1119,9 +1399,9 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         p[0] = canvas ? 1 : 0;
         p[1] = !canvas && it.blendMode == 0 ? 1 : 0;  // the first normal layer is the canvas (as the CPU moves it in)
         p[2] = float(it.blendMode);
-        p[3] = it.b ? it.dissolve : -1;
-        place(p + 4, &it.a, a);
-        if (it.b) place(p + 24, &*it.b, b);
+        p[3] = it.b && la == &it.a ? it.dissolve : -1;  // (a cross dissolve, mixed as the two are placed)
+        place(p + 4, la, a);
+        if (la == &it.a && it.b) place(p + 24, &*it.b, b);
         QRhiBuffer* ub = uniforms(u, p);
         pass(compositePs_, next, u, {{1, canvas ? canvas : dummy2d_}, {2, a ? a : dummy2d_}, {3, b ? b : dummy2d_}}, ub);
         u = rhi_->nextResourceUpdateBatch();
@@ -1148,7 +1428,12 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         }
     }
     if (u) u->release();
-    if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
+    {
+        std::unique_lock<std::recursive_mutex> queues;  // (on FFmpeg's Vulkan device, its queues are shared)
+        if (shared_ && backend_ == QRhi::Vulkan) queues = std::unique_lock(vulkanQueueMutex());
+        if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
+    }
+    if (mapper_) mapper_->endFrame();  // (the frame has finished on the GPU: its hardware frames given back)
     if (!ok)
         for (const Lut3D* l : lutsNew_)
             if (auto it = luts_.find(l); it != luts_.end()) {
@@ -1233,13 +1518,37 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     std::shared_lock lock(gDeviceMutex);
     if (!gDevice || !gDevice->ready()) return false;
     Device* d = gDevice.get();
-    const bool ok = d->run([&] { return d->draw(frame, out, out8); });
+    long filters = 0, mixes = 0, mapped = 0, copied = 0;
+    std::string hwFallback;
+    const bool ok = d->run([&] {
+        const bool drawn = d->draw(frame, out, out8);
+        filters = d->filterPasses, mixes = d->mixPasses;
+        mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback;
+        return drawn;
+    });
+    std::lock_guard statsLock(gStatsMutex);
     if (ok) {
-        std::lock_guard statsLock(gStatsMutex);
         ++gStats.gpuFrames;
+        gStats.filterPasses += filters;
+        gStats.mixPasses += mixes;
     }
+    gStats.hwMapped += mapped;
+    gStats.hwGpuCopies += copied;
+    if (!hwFallback.empty()) gStats.lastHwFallback = hwFallback;
     return ok;
 }
+
+std::string mappedHardware() {
+    std::shared_lock lock(gDeviceMutex);
+    return gDevice && gDevice->ready() ? gDevice->mapped() : std::string();
+}
+
+void loseDeviceForTesting() {
+    std::shared_lock lock(gDeviceMutex);
+    if (gDevice) gDevice->lose = true;
+}
+
+void refuseHardwareFramesForTesting(bool refuse) { gRefuseHw = refuse; }
 
 }  // namespace montage::gpu
 

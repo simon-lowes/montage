@@ -1280,17 +1280,31 @@ std::vector<EffectInfo> buildCatalog() {
                              boolean("end_off", "End Off Screen", true),
                              num("motion_ease", "Ease In and Out (s)", 0, 10, 0, 0.1),
                              // Text set along a path: a circle about Position (radius), a wave through it (a quarter
-                             // of the radius high) or SVG path data from it, starting at Offset (% of its length).
-                             choice("path_shape", "Text on a Path", {"None", "Circle", "Wave", "Custom (SVG Path Data)"}, 0),
+                             // of the radius high) or SVG path data from it, a mask drawn on one of the clip's effects
+                             // (its Mask Number among them) or a path of a shape layer under the title (on Shape
+                             // Track, 0 the nearest below; Shape Path its name or id, empty its first), starting at
+                             // Offset (% of its length), placed along it as the text is aligned or as Along the Path
+                             // says, letters perpendicular to it unless kept upright.
+                             choice("path_shape", "Text on a Path",
+                                    {"None", "Circle", "Wave", "Custom (SVG Path Data)", "A Mask on the Clip", "A Shape Layer's Path"}, 0),
                              num("path_radius", "Path Radius (px)", 4, 4000, 300, 1),
                              num("path_wavelength", "Wavelength (px)", 4, 8000, 600, 1),
+                             num("path_mask", "Mask Number", 1, 64, 1, 1),
+                             num("path_track", "Shape Track (0 the Nearest Below)", 0, 99, 0, 1),
                              pct("path_offset", "Path Offset", -200, 200, 0),
+                             choice("path_align", "Along the Path", {"As the Text Is Aligned", "From the Start", "In the Middle", "To the End", "Spread From End to End"}, 0),
                              boolean("path_upright", "Keep Letters Upright"),
                              boolean("path_reverse", "Flip Path"),
+                             // Letters that move blurred as they move: renders through the shutter (degrees of a
+                             // frame, centred on it) averaged, as many as Samples.
+                             boolean("letter_blur", "Motion Blur"),
+                             num("letter_shutter", "Shutter Angle (°)", 0, 720, 180, 1),
+                             num("letter_samples", "Motion Blur Samples", 2, 64, 16, 1),
                          },
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif"),
-                          str("path_data", "Path (SVG Data)", StringKind::Text)}};
+                          str("path_data", "Path (SVG Data)", StringKind::Text),
+                          str("path_item", "Shape Path", StringKind::Text)}};
         c.push_back(title);
         // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera (or a camera in a
         // USD or glTF file).
@@ -1622,10 +1636,27 @@ std::vector<int> textAnimators(const Effect& e) {
     return out;
 }
 
-std::vector<ParamInfo> textAnimatorParams(int k) {
+std::vector<ParamInfo> textAnimatorParams(int k, const std::string& type) {
     const std::string pre = "ta" + std::to_string(k) + ".";
     ParamInfo rotation = angle(pre + "rotation", "Rotation");
     rotation.min = -720, rotation.max = 720;
+    // A 3D title's: what they pick, and how much deeper (or shallower) the letters picked are extruded.
+    if (type == "title3d")
+        return {
+            choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
+            choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),
+            pct(pre + "start", "Start", 0, 100, 0),
+            pct(pre + "end", "End", 0, 100, 100),
+            pct(pre + "offset", "Offset", -200, 200, 0),
+            pct(pre + "ease", "Ease", 0, 100, 0),
+            pct(pre + "amount", "Amount", -100, 100, 100),
+            choice(pre + "sweep", "Sweep", {"None (Offset Only)", "In Across", "Out Across", "In Together", "Out Together"}),
+            num(pre + "sweep_dur", "Sweep Duration (s)", 0.05, 10, 1.0, 0.05),
+            pct(pre + "random", "Randomness", 0, 100, 0),
+            boolean(pre + "shuffle", "Random Order"),
+            num(pre + "seed", "Random Seed", 0, 10000, 0, 1),
+            num(pre + "depth", "Extrusion (px)", -1000, 1000, 0, 0.5),
+        };
     return {
         choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
         choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),
@@ -1660,7 +1691,7 @@ int addTextAnimator(Effect& e, int k) {
         const std::vector<int> have = textAnimators(e);
         k = have.empty() ? 1 : have.back() + 1;
     }
-    for (const ParamInfo& pi : textAnimatorParams(k)) {
+    for (const ParamInfo& pi : textAnimatorParams(k, e.type)) {
         if (pi.kind == ParamKind::Color) {
             e.params.try_emplace(pi.name + ".r", Param(pi.def));
             e.params.try_emplace(pi.name + ".g", Param(pi.defG));
@@ -1891,9 +1922,14 @@ std::vector<ParamInfo> effectParams(const Effect& e) {
     if (e.type != "plugin" && e.type != "ofx") {
         const EffectInfo* info = findEffectInfo(e.type);
         std::vector<ParamInfo> out = info ? info->params : std::vector<ParamInfo>{};
-        if (e.type == "title")
+        if (e.type == "title" || e.type == "title3d")
             for (int k : textAnimators(e))
-                for (ParamInfo& pi : textAnimatorParams(k)) out.push_back(std::move(pi));
+                for (ParamInfo& pi : textAnimatorParams(k, e.type)) out.push_back(std::move(pi));
+        // A title's font axes of its own (axis.<tag>).
+        if (e.type == "title" || e.type == "title3d")
+            for (auto it = e.params.lower_bound("axis."); it != e.params.end() && it->first.rfind("axis.", 0) == 0; ++it)
+                if (it->first.size() > 5 && it->first.size() <= 9)
+                    out.push_back(num(it->first, "Font Axis " + it->first.substr(5), -1000, 1000, 0, 1));
         if (e.type == "mesh_warp")
             for (int k : meshPins(e))
                 for (ParamInfo& pi : meshPinParams(k, meshPinKind(e, k))) out.push_back(std::move(pi));

@@ -137,7 +137,22 @@ std::string checkStreamSettings(const StreamSettings& s) {
     if (!parseStreamAddress(s.address, scheme, host, port)) return "The address needs a host and a port, such as srt://0.0.0.0:9000";
     if (scheme == "https" || scheme == "http") {
         if (s.passphrase.size() < 10 || s.passphrase.size() > 79) return "Viewers in a browser need a passphrase of 10 to 79 characters";
-        if (s.codec != "h264" && s.codec != "av1" && s.codec != "hevc") return "The codec is \"h264\", \"av1\" or \"hevc\"";
+        if (s.codec != "h264" && s.codec != "av1" && s.codec != "vp9" && s.codec != "hevc") return "The codec is \"h264\", \"av1\", \"vp9\" or \"hevc\"";
+        if (s.rungs < 1 || s.rungs > 3) return "Browsers are sent the picture at 1 to 3 sizes at once";
+        if (!s.turnServer.empty()) {
+            if (s.turnServer.rfind("turn:", 0) != 0 && s.turnServer.rfind("turns:", 0) != 0)
+                return "A TURN relay's address starts turn: or turns: (such as turn:relay.example.com:3478)";
+            if (s.turnServer.find('@') != std::string::npos) return "The TURN relay's user name and password go in their own fields";
+            if (s.turnUser.empty() || s.turnPassword.empty()) return "A TURN relay needs its user name and password";
+        }
+        if (s.relayOnly && s.turnServer.empty()) return "Only through a relay needs a TURN relay";
+        if (s.relayOnly && !s.turnServer.empty() &&
+            (s.turnServer.rfind("turns:", 0) == 0 || QString::fromStdString(s.turnServer).toLower().contains(QLatin1String("transport=tcp"))))
+            return "Only through a relay needs a relay Montage reaches over UDP (turn:, not turns: or ?transport=tcp)";
+        // (they go to browsers in a header too)
+        for (const std::string& part : {s.turnServer, s.turnUser, s.turnPassword})
+            if (std::any_of(part.begin(), part.end(), [](char c) { return uint8_t(c) < 0x20 || c == 0x7f || c == '"' || c == '<' || c == '>'; }))
+                return "The TURN relay's address, user name or password has a character it cannot have";
         if (s.bitrateKbps < 250 || s.bitrateKbps > 200000) return "The bit rate is 250 to 200000 kb/s";
         if (s.certificateFile.empty() != s.keyFile.empty()) return "A certificate needs its private key (and a key its certificate)";
         if (scheme == "http" && !s.certificateFile.empty()) return "A certificate needs an https:// address";
@@ -255,7 +270,7 @@ Rect burnInBox(int width, int height, size_t chars) {
     return r;
 }
 
-void burnTimecode(Planes420& p, const std::string& text) {
+void burnTimecode(Planes420& p, const std::string& text, uint16_t white) {
     if (p.width <= 0 || p.height <= 0 || text.empty()) return;
     const Rect box = burnInBox(p.width, p.height, text.size());
     const int s = burnScale(p.height), cw = (p.width + 1) / 2;
@@ -275,7 +290,7 @@ void burnTimecode(Planes420& p, const std::string& text) {
                 for (int dy = 0; dy < s; ++dy)
                     for (int dx = 0; dx < s; ++dx) {
                         const int x = gx + col * s + dx, y = gy + row * s + dy;
-                        if (x < box.x + box.width && y < box.y + box.height) p.y[size_t(y) * size_t(p.width) + size_t(x)] = 940;
+                        if (x < box.x + box.width && y < box.y + box.height) p.y[size_t(y) * size_t(p.width) + size_t(x)] = white;
                     }
             }
     }

@@ -9,6 +9,13 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 }
+#include "HwVulkan.h"
+#if defined(_WIN32) && __has_include(<libavutil/hwcontext_d3d11va.h>)
+#define MONTAGE_HW_D3D11 1
+extern "C" {
+#include <libavutil/hwcontext_d3d11va.h>
+}
+#endif
 
 namespace montage {
 
@@ -16,8 +23,53 @@ namespace {
 
 std::atomic<int> gMode{-1};  // -1 = not yet read from the environment
 std::atomic<int> gActiveHw{0};
+std::atomic<uint64_t> gMapped{0};  // (a bit a device type)
+std::atomic<long> gCopies{0};
+std::mutex gUploadMutex;
+std::string gUpload;
+
+#ifdef MONTAGE_HW_D3D11
+void lockD3D11(void*) { d3d11DeviceMutex().lock(); }
+void unlockD3D11(void*) { d3d11DeviceMutex().unlock(); }
+#endif
+#ifdef MONTAGE_HW_VULKAN
+void lockQueue(AVHWDeviceContext*, uint32_t, uint32_t) { vulkanQueueMutex().lock(); }
+void unlockQueue(AVHWDeviceContext*, uint32_t, uint32_t) { vulkanQueueMutex().unlock(); }
+#endif
 
 }  // namespace
+
+void setHwFramesMapped(const std::vector<AVHWDeviceType>& types) {
+    uint64_t bits = 0;
+    for (AVHWDeviceType t : types)
+        if (int(t) > 0 && int(t) < 64) bits |= uint64_t(1) << int(t);
+    gMapped = bits;
+}
+
+bool hwFramesMapped(AVHWDeviceType type) { return int(type) > 0 && int(type) < 64 && (gMapped.load() >> int(type) & 1); }
+
+long hwFrameCopies() { return gCopies.load(); }
+void countHwFrameCopy() { ++gCopies; }
+
+std::recursive_mutex& d3d11DeviceMutex() {
+    static std::recursive_mutex m;
+    return m;
+}
+
+std::recursive_mutex& vulkanQueueMutex() {
+    static std::recursive_mutex m;
+    return m;
+}
+
+void setHwUploadForTesting(const std::string& how) {
+    std::lock_guard lock(gUploadMutex);
+    gUpload = how;
+}
+
+std::string hwUploadForTesting() {
+    std::lock_guard lock(gUploadMutex);
+    return gUpload;
+}
 
 void setHwDecodeMode(HwDecodeMode m) { gMode = int(m); }
 
@@ -37,7 +89,18 @@ std::vector<std::string> hwDeviceCandidates() {
 #elif defined(_WIN32)
     return {"d3d11va", "d3d12va", "cuda", "dxva2"};
 #else
-    return {"vaapi", "cuda"};
+    // (Vulkan Video ahead of CUDA where the GPU compositor takes Vulkan frames as they are: they need no copy then.)
+    if (hwFramesMapped(AV_HWDEVICE_TYPE_VULKAN)) return {"vaapi", "vulkan", "cuda"};
+    return {"vaapi", "cuda", "vulkan"};
+#endif
+}
+
+bool hwDeviceDecodes(AVHWDeviceType type, AVBufferRef* device) {
+    if (type != AV_HWDEVICE_TYPE_VULKAN) return device != nullptr;
+#ifdef MONTAGE_HW_VULKAN
+    return device && vulkanDecodeQueues(device);
+#else
+    return false;
 #endif
 }
 
@@ -49,6 +112,23 @@ AVBufferRef* hwDevice(AVHWDeviceType type) {
     if (it != devices.end()) return it->second;
     AVBufferRef* dev = nullptr;
     if (av_hwdevice_ctx_create(&dev, type, nullptr, nullptr, 0) < 0) dev = nullptr;
+#ifdef MONTAGE_HW_VULKAN
+    // (Its queues locked by one mutex, which the GPU compositor takes too when it runs on this device.)
+    if (dev && type == AV_HWDEVICE_TYPE_VULKAN) {
+        auto* vk = static_cast<AVVulkanDeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(dev->data)->hwctx);
+        vk->lock_queue = lockQueue;
+        vk->unlock_queue = unlockQueue;
+    }
+#endif
+#ifdef MONTAGE_HW_D3D11
+    // (Its context locked by one mutex, which the GPU compositor takes too when it runs on this device: set before any
+    // decoder has the device.)
+    if (dev && type == AV_HWDEVICE_TYPE_D3D11VA) {
+        auto* d3d = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(dev->data)->hwctx);
+        d3d->lock = lockD3D11;
+        d3d->unlock = unlockD3D11;
+    }
+#endif
     devices[int(type)] = dev;  // kept for the process lifetime
     return dev;
 }

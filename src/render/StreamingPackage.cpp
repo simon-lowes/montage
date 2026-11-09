@@ -17,6 +17,7 @@
 #include "core/Chapters.h"
 #include "render/ColorSpace.h"
 #include "render/Scte35.h"
+#include "render/TsSegments.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -151,6 +152,32 @@ int64_t mdatPayload(const uint8_t* d, size_t n) {
     return -1;
 }
 
+// Bits a second at the peak, as HLS defines it (the busiest run of whole segments lasting half to one and a half times
+// the target duration, so a short segment at a split cannot inflate it), from each segment's bytes and seconds.
+int64_t peakRate(const std::vector<std::pair<double, double>>& segs) {
+    double longest = 0;
+    for (const auto& s : segs) longest = std::max(longest, s.second);
+    const double target = std::max(1.0, std::round(longest));
+    double peak = 0;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        double bytes = 0, length = 0;
+        for (size_t j = i; j < segs.size() && length <= target * 1.5; ++j) {
+            bytes += segs[j].first, length += std::max(0.0, segs[j].second);
+            if (length >= target * 0.5 && length <= target * 1.5) peak = std::max(peak, bytes * 8 / length);
+        }
+    }
+    if (peak == 0)  // (no such run: a package shorter than half the target)
+        for (const auto& s : segs)
+            if (s.second > 0) peak = std::max(peak, s.first * 8 / s.second);
+    return int64_t(std::ceil(peak));
+}
+
+int64_t averageRate(const std::vector<std::pair<double, double>>& segs) {
+    double bytes = 0, length = 0;
+    for (const auto& s : segs) bytes += s.first, length += std::max(0.0, s.second);
+    return length > 0 ? int64_t(std::ceil(bytes * 8 / length)) : 0;
+}
+
 // One rendition written as CMAF: an initialisation segment, then a fragment (moof + mdat) per media segment, each its
 // own file, through FFmpeg's MP4 muxer with fragments cut where asked.
 class CmafTrack {
@@ -173,8 +200,12 @@ public:
             avformat_free_context(oc_);
         }
     }
-    bool open(const std::string& dir, const AVCodecParameters* par, AVRational tb, std::string* error) {
+    // `files` false: the fragments are made (their times and sizes known) but not written.
+    bool open(const std::string& dir, const AVCodecParameters* par, AVRational tb, std::string* error, bool files = true) {
         dir_ = dir;
+        files_ = files;
+        // (AC-3 and E-AC-3 sample entries describe the stream from its first frames: the moov waits for them)
+        delayed_ = par->codec_id == AV_CODEC_ID_AC3 || par->codec_id == AV_CODEC_ID_EAC3;
         if (avformat_alloc_output_context2(&oc_, nullptr, "mp4", nullptr) < 0 || !oc_) return fail(error, "cannot make an MP4 muxer");
         oc_->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;  // (Opus in MP4 on older FFmpeg)
         st_ = avformat_new_stream(oc_, nullptr);
@@ -182,7 +213,10 @@ public:
         st_->codecpar->codec_tag = par->codec_id == AV_CODEC_ID_HEVC ? MKTAG('h', 'v', 'c', '1') : 0;
         st_->time_base = tb;
         AVDictionary* opts = nullptr;
-        av_dict_set(&opts, "movflags", "+frag_custom+empty_moov+default_base_moof+negative_cts_offsets+skip_trailer", 0);
+        av_dict_set(&opts, "movflags",
+                    delayed_ ? "+frag_custom+empty_moov+delay_moov+default_base_moof+negative_cts_offsets+skip_trailer"
+                             : "+frag_custom+empty_moov+default_base_moof+negative_cts_offsets+skip_trailer",
+                    0);
         if (int rc = avio_open_dyn_buf(&oc_->pb); rc < 0) return fail(error, averr(rc));
         const int rc = avformat_write_header(oc_, &opts);
         av_dict_free(&opts);
@@ -193,7 +227,7 @@ public:
         init.assign(b, b + std::max(0, n));
         av_free(b);
         timescale = st_->time_base;
-        if (!writeFile(dir_ + "/init.mp4", init.data(), init.size())) return fail(error, "cannot write " + dir_ + "/init.mp4");
+        if (!delayed_ && files_ && !writeFile(dir_ + "/init.mp4", init.data(), init.size())) return fail(error, "cannot write " + dir_ + "/init.mp4");
         return true;
     }
     // Takes a packet whose times are in `from`.
@@ -217,10 +251,24 @@ public:
     bool open() const { return oc_ && oc_->pb; }
     bool cut(std::string* error) {
         if (!oc_ || !oc_->pb) return true;
+        int64_t head = 0;
+        if (delayed_ && init.empty()) {
+            av_write_frame(oc_, nullptr);  // (the first flush writes the header alone: ftyp and moov)
+            head = avio_tell(oc_->pb);
+        }
         av_write_frame(oc_, nullptr);  // the fragment
-        uint8_t* b = nullptr;
-        const int n = avio_close_dyn_buf(oc_->pb, &b);
+        uint8_t* full = nullptr;
+        const int total = avio_close_dyn_buf(oc_->pb, &full);
         oc_->pb = nullptr;
+        if (head > 0) {
+            init.assign(full, full + std::min<int64_t>(head, std::max(0, total)));
+            if (files_ && !writeFile(dir_ + "/init.mp4", init.data(), init.size())) {
+                av_free(full);
+                return fail(error, "cannot write " + dir_ + "/init.mp4");
+            }
+        }
+        uint8_t* b = full + std::min<int64_t>(head, std::max(0, total));
+        const int n = int(std::max<int64_t>(0, total - head));
         Segment& s = segments.back();
         char name[32];
         std::snprintf(name, sizeof name, "seg%05d.m4s", int(segments.size()));
@@ -228,13 +276,13 @@ public:
         s.bytes = std::max(0, n);
         std::string why;
         if (s.bytes > 0 && !presentAt(b, size_t(s.bytes), s.firstPts, &why)) {
-            av_free(b);
+            av_free(full);
             return fail(error, why);
         }
         const int64_t payload = mdatPayload(b, size_t(s.bytes));
         s.iframeBytes = payload >= 0 ? payload + s.firstSample : s.bytes;
-        const bool ok = writeFile(dir_ + "/" + name, b, size_t(s.bytes));
-        av_free(b);
+        const bool ok = !files_ || writeFile(dir_ + "/" + name, b, size_t(s.bytes));
+        av_free(full);
         if (!ok) return fail(error, "cannot write " + dir_ + "/" + name);
         if (s.bytes == 0) return fail(error, "an empty fragment");
         return true;
@@ -251,30 +299,14 @@ public:
         return true;
     }
     double seconds(int64_t t) const { return double(t) * timescale.num / timescale.den; }
-    // Bits a second: the peak as HLS defines it (the busiest run of whole segments lasting half to one and a half
-    // times the target duration, so a short segment at a split cannot inflate it), and over all.
-    int64_t peakBitrate() const {
-        double longest = 0;
-        for (const Segment& s : segments) longest = std::max(longest, seconds(s.end - s.start));
-        const double target = std::max(1.0, std::round(longest));
-        double peak = 0;
-        for (size_t i = 0; i < segments.size(); ++i) {
-            double bytes = 0, length = 0;
-            for (size_t j = i; j < segments.size() && length <= target * 1.5; ++j) {
-                bytes += double(segments[j].bytes), length += seconds(std::max<int64_t>(0, segments[j].end - segments[j].start));
-                if (length >= target * 0.5 && length <= target * 1.5) peak = std::max(peak, bytes * 8 / length);
-            }
-        }
-        if (peak == 0)  // (no such run: a package shorter than half the target)
-            for (const Segment& s : segments)
-                if (s.end > s.start) peak = std::max(peak, double(s.bytes) * 8 / seconds(s.end - s.start));
-        return int64_t(std::ceil(peak));
+    // Bits a second: the peak as HLS defines it, and over all.
+    std::vector<std::pair<double, double>> sizes() const {
+        std::vector<std::pair<double, double>> v;
+        for (const Segment& s : segments) v.emplace_back(double(s.bytes), seconds(std::max<int64_t>(0, s.end - s.start)));
+        return v;
     }
-    int64_t averageBitrate() const {
-        double bytes = 0, length = 0;
-        for (const Segment& s : segments) bytes += double(s.bytes), length += seconds(std::max<int64_t>(0, s.end - s.start));
-        return length > 0 ? int64_t(std::ceil(bytes * 8 / length)) : 0;
-    }
+    int64_t peakBitrate() const { return peakRate(sizes()); }
+    int64_t averageBitrate() const { return averageRate(sizes()); }
 
     std::vector<uint8_t> init;
     std::vector<Segment> segments;
@@ -286,8 +318,45 @@ private:
         return false;
     }
     std::string dir_;
+    bool files_ = true, delayed_ = false;
     AVFormatContext* oc_ = nullptr;
     AVStream* st_ = nullptr;
+};
+
+// A rendition's MPEG-TS segments for HLS, beside its CMAF ones (render/TsSegments.h).
+struct TsTrack {
+    TsSegmenter mux;
+    struct Segment {
+        int64_t bytes = 0, iframeBytes = 0;
+        double seconds = 0;
+    };
+    std::vector<Segment> segments;
+    std::string dir;
+    bool write(AVPacket* pkt, AVRational from, std::string* error) {
+        AVPacket* copy = av_packet_clone(pkt);
+        if (!copy) return false;
+        const bool ok = mux.write(copy, from.num, from.den, error);
+        av_packet_free(&copy);
+        return ok;
+    }
+    bool cut(std::string* error) {
+        if (!mux.started()) return true;
+        std::vector<uint8_t> bytes;
+        if (!mux.end(bytes, error)) return false;
+        char name[32];
+        std::snprintf(name, sizeof name, "/seg%05d.ts", int(segments.size() + 1));
+        if (!writeFile(dir + name, bytes.data(), bytes.size())) {
+            if (error) *error = "cannot write " + dir + name;
+            return false;
+        }
+        segments.push_back({int64_t(bytes.size()), mux.iframeBytes, double(mux.finish - mux.start) / 90000});
+        return true;
+    }
+    std::vector<std::pair<double, double>> sizes() const {
+        std::vector<std::pair<double, double>> v;
+        for (const Segment& s : segments) v.emplace_back(double(s.bytes), s.seconds);
+        return v;
+    }
 };
 
 struct Opened {
@@ -327,6 +396,7 @@ struct VideoOut {
     AVFrame* frame = nullptr;
     AVPacket* pkt = nullptr;
     std::unique_ptr<CmafTrack> track;
+    std::unique_ptr<TsTrack> ts;
     size_t next = 1;  // the segment whose first frame comes next
     std::string codecs, range;
     ~VideoOut() {
@@ -344,6 +414,7 @@ struct AudioOut {
     int stream = -1;
     AVRational tb{1, 1};
     std::unique_ptr<CmafTrack> track;
+    std::unique_ptr<TsTrack> ts;
     size_t next = 1;
     int64_t offset = AV_NOPTS_VALUE;  // the first sample's time, which becomes 0
     std::string codecs;
@@ -468,6 +539,8 @@ std::string streamingCodecName(const std::string& codec, const std::vector<uint8
         return buf;
     }
     if (codec == "opus") return "opus";  // (as the Opus-in-MP4 mapping names it; browsers want it lower case)
+    if (codec == "ac3") return "ac-3";   // (ETSI TS 102 366 Annex F's names)
+    if (codec == "eac3") return "ec-3";
     return "";
 }
 
@@ -485,7 +558,7 @@ bool isRenditionName(const QString& name) {
 bool holdsOnlyRenditionFiles(const QString& path) {
     QDir d(path);
     if (!d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System).isEmpty()) return false;
-    static const QRegularExpression file(QStringLiteral("^(seg\\d+\\.(m4s|vtt)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml))$"));
+    static const QRegularExpression file(QStringLiteral("^(seg\\d+(\\.\\d+)?\\.(m4s|vtt|ts)|init\\.mp4|playlist\\.m3u8|iframes\\.m3u8|all\\.(vtt|ttml))(\\.tmp)?$"));  // (.tmp: a live package's, left half written)
     static const QRegularExpression junk(QStringLiteral("^(\\.DS_Store|Thumbs\\.db|desktop\\.ini)$"));
     bool any = false;  // (an empty folder, or one of only junk, is not a rendition's: left alone)
     for (const QString& f : d.entryList(QDir::Files | QDir::Hidden | QDir::System)) {
@@ -496,6 +569,8 @@ bool holdsOnlyRenditionFiles(const QString& path) {
 }
 
 }  // namespace
+
+bool streamingRenditionFolder(const std::string& path) { return holdsOnlyRenditionFiles(QString::fromStdString(path)); }
 
 bool exportStreamingPackage(const Project& p, const Sequence& seq, const StreamingSettings& s, const ExportProgress& progress,
                             const std::atomic<bool>* cancel, std::string* error, StreamingResult* result) {
@@ -523,6 +598,17 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         if (r.width <= 0 || r.bitrate <= 0) return fail("Each rung needs a width and a bit rate");
     }
     if (rungs.empty()) return fail("The ladder is empty");
+    if (s.segmentFormat != "cmaf" && s.segmentFormat != "ts") return fail("Segments are cmaf or ts");
+    // MPEG-TS segments, for HLS (DASH keeps CMAF's): H.264, with AAC, AC-3 or E-AC-3 (HLS players take HEVC in CMAF only).
+    const bool ts = s.segmentFormat == "ts" && s.hls;
+    if (ts) {
+        for (const StreamingRung& r : rungs)
+            if (r.codec != "libx264")
+                return fail(std::string("MPEG-TS segments carry H.264, not ") + (r.codec == "libx265" ? "HEVC" : "AV1") + ": choose CMAF segments for those rungs");
+        if (s.audioCodec == "libopus") return fail("MPEG-TS segments carry AAC, AC-3 or E-AC-3 sound, not Opus");
+    }
+    // (with TS segments and no DASH, the CMAF fragments are only measured)
+    const bool cmafFiles = !ts || s.dash;
     if (hdr && std::any_of(rungs.begin(), rungs.end(), [](const StreamingRung& r) { return r.codec == "libx264"; }))
         res.warnings.push_back("HDR in H.264 (10-bit) plays on few devices and browsers: HEVC or AV1 rungs play far more widely");
 
@@ -778,7 +864,12 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
 #endif
         v->track = std::make_unique<CmafTrack>();
         std::string why;
-        if (!v->track->open(dir, par.get(), e->time_base, &why)) return fail(why);
+        if (!v->track->open(dir, par.get(), e->time_base, &why, cmafFiles)) return fail(why);
+        if (ts) {
+            v->ts = std::make_unique<TsTrack>();
+            v->ts->dir = dir;
+            if (!v->ts->mux.open(par.get(), &why)) return fail(why);
+        }
         v->codecs = codecNameOf(par.get(), *v->track);
         v->range = range;
         video.push_back(std::move(v));
@@ -794,12 +885,13 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 if (v.pkt->pts != segs[v.next] || !(v.pkt->flags & AV_PKT_FLAG_KEY))
                     return fail("The " + v.rung.codec + " encoder did not start segment " + std::to_string(v.next + 1) + " on a keyframe");
                 std::string why;
-                if (!v.track->cut(&why)) return fail(why);
+                if (!v.track->cut(&why) || (v.ts && !v.ts->cut(&why))) return fail(why);
                 ++v.next;
             } else if (!v.track->open() && !(v.pkt->flags & AV_PKT_FLAG_KEY)) {
                 return fail("The " + v.rung.codec + " encoder did not start on a keyframe");
             }
             std::string why;
+            if (v.ts && !v.ts->write(v.pkt, v.enc->time_base, &why)) return fail(why);
             if (!v.track->write(v.pkt, v.enc->time_base, &why)) return fail(why);
             av_packet_unref(v.pkt);
         }
@@ -856,7 +948,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             avcodec_send_frame(v->enc, nullptr);
             if (!take(*v)) return false;
             std::string why;
-            if (!v->track->finish(&why)) return fail(why);
+            if (!v->track->finish(&why) || (v->ts && !v->ts->cut(&why))) return fail(why);
+            if (v->ts && v->ts->segments.size() != segs.size()) return fail(v->name + " came out with a different number of TS segments");
             if (v->track->segments.size() != segs.size())
                 return fail(v->name + " came out with " + std::to_string(v->track->segments.size()) + " segments, not " + std::to_string(segs.size()));
         }
@@ -869,7 +962,12 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             if (dir.empty()) return fail("Cannot make " + folder + "/" + ao.name);
             ao.track = std::make_unique<CmafTrack>();
             std::string why;
-            if (!ao.track->open(dir, soundFile.fmt->streams[ao.stream]->codecpar, ao.tb, &why)) return fail(why);
+            if (!ao.track->open(dir, soundFile.fmt->streams[ao.stream]->codecpar, ao.tb, &why, cmafFiles)) return fail(why);
+            if (ts) {
+                ao.ts = std::make_unique<TsTrack>();
+                ao.ts->dir = dir;
+                if (!ao.ts->mux.open(soundFile.fmt->streams[ao.stream]->codecpar, &why)) return fail(why);
+            }
             ao.codecs = codecNameOf(soundFile.fmt->streams[ao.stream]->codecpar, *ao.track);
         }
         std::unique_ptr<AVPacket, void (*)(AVPacket*)> pkt(av_packet_alloc(), [](AVPacket* q) { av_packet_free(&q); });
@@ -886,17 +984,18 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                 const double t = double(pkt->pts) * ao.tb.num / ao.tb.den;
                 while (ao.next < segs.size() && t >= double(segs[ao.next]) * fps.den / fps.num - 1e-6) {
                     std::string why;
-                    if (!ao.track->cut(&why)) return fail(why);
+                    if (!ao.track->cut(&why) || (ao.ts && !ao.ts->cut(&why))) return fail(why);
                     ++ao.next;
                 }
                 std::string why;
+                if (ao.ts && !ao.ts->write(pkt.get(), ao.tb, &why)) return fail(why);
                 if (!ao.track->write(pkt.get(), ao.tb, &why)) return fail(why);
             }
             av_packet_unref(pkt.get());
         }
         for (AudioOut& ao : audio) {
             std::string why;
-            if (!ao.track->finish(&why)) return fail(why);
+            if (!ao.track->finish(&why) || (ao.ts && !ao.ts->cut(&why))) return fail(why);
         }
     }
     if (cancelled()) return fail("Cancelled");
@@ -922,10 +1021,12 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             to.name = "s" + std::to_string(texts.size() + 1) + "_" + pathName(to.language);
             texts.push_back(std::move(to));
         }
-    auto vttWithMap = [](std::string vtt) {
-        // (cue times are the presentation's, from 0, as the media's are: X-TIMESTAMP-MAP says so)
+    auto vttWithMap = [ts](std::string vtt) {
+        // (cue times are the presentation's, from 0, as the media's are, or from kTsOffset in TS segments:
+        // X-TIMESTAMP-MAP says so)
         const size_t nl = vtt.find('\n');
-        vtt.insert(nl == std::string::npos ? vtt.size() : nl + 1, "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n");
+        vtt.insert(nl == std::string::npos ? vtt.size() : nl + 1,
+                   "X-TIMESTAMP-MAP=MPEGTS:" + std::to_string(ts ? kTsOffset : 0) + ",LOCAL:00:00:00.000\n");
         return vtt;
     };
     for (TextOut& t : texts) {
@@ -996,13 +1097,15 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
     if (!start.isValid()) return fail("The start date is not an ISO 8601 date and time");
     auto seconds = [&](FrameTime f) { return double(f) * fps.den / fps.num; };
     auto dateAt = [&](FrameTime f) { return isoDate(start.addMSecs(qint64(std::llround(seconds(f) * 1000)))); };
-    auto mediaPlaylist = [&](const CmafTrack* track, bool frames, bool iframes, const std::string& ext) {
+    auto mediaPlaylist = [&](const CmafTrack* track, bool frames, bool iframes, const std::string& ext, const TsTrack* tsTrack = nullptr) {
         // Segment lengths: the frames' (video and captions), or the samples' (sound).
         std::vector<double> lengths;
-        const size_t count = frames || !track ? segs.size() : track->segments.size();
+        const size_t count = frames || !track ? segs.size() : tsTrack ? tsTrack->segments.size() : track->segments.size();
         for (size_t i = 0; i < count; ++i) {
             if (frames || !track) {
                 lengths.push_back(seconds(segEnd(i) - segs[i]));
+            } else if (tsTrack) {
+                lengths.push_back(tsTrack->segments[i].seconds);
             } else {
                 const auto& g = track->segments;
                 lengths.push_back(track->seconds((i + 1 < g.size() ? g[i + 1].start : g[i].end) - g[i].start));
@@ -1010,10 +1113,11 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
         }
         double longestSeg = 0;
         for (double l : lengths) longestSeg = std::max(longestSeg, l);
-        std::string m3u = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:" + std::to_string(std::max<long long>(1, std::llround(longestSeg))) +
+        std::string m3u = "#EXTM3U\n#EXT-X-VERSION:" + std::string(tsTrack && !iframes ? "3" : iframes && tsTrack ? "4" : "7") +
+                          "\n#EXT-X-TARGETDURATION:" + std::to_string(std::max<long long>(1, std::llround(longestSeg))) +
                           "\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n";
         if (iframes) m3u += "#EXT-X-I-FRAMES-ONLY\n";
-        if (track) m3u += "#EXT-X-MAP:URI=\"init.mp4\"\n";
+        if (track && !tsTrack) m3u += "#EXT-X-MAP:URI=\"init.mp4\"\n";
         m3u += "#EXT-X-PROGRAM-DATE-TIME:" + dateAt(0) + "\n";
         for (size_t i = 0; i < count; ++i) {
             if (!iframes)
@@ -1031,21 +1135,26 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             m3u += "#EXTINF:" + fmt("%.5f", lengths[i]) + ",\n";
             char name[32];
             std::snprintf(name, sizeof name, "seg%05d.%s", int(i + 1), ext.c_str());
-            if (iframes) m3u += "#EXT-X-BYTERANGE:" + std::to_string(track->segments[i].iframeBytes) + "@0\n";
+            if (iframes) m3u += "#EXT-X-BYTERANGE:" + std::to_string(tsTrack ? tsTrack->segments[i].iframeBytes : track->segments[i].iframeBytes) + "@0\n";
             m3u += std::string(name) + "\n";
         }
         return m3u + "#EXT-X-ENDLIST\n";
     };
+    // (HLS's bit rates are its segments': TS ones when it has them)
+    auto hlsPeak = [&](const CmafTrack& c, const TsTrack* t) { return t ? peakRate(t->sizes()) : c.peakBitrate(); };
+    auto hlsAverage = [&](const CmafTrack& c, const TsTrack* t) { return t ? averageRate(t->sizes()) : c.averageBitrate(); };
     int64_t audioPeak = 0, audioAverage = 0;
-    for (const AudioOut& ao : audio) audioPeak = std::max(audioPeak, ao.track->peakBitrate()), audioAverage = std::max(audioAverage, ao.track->averageBitrate());
+    for (const AudioOut& ao : audio)
+        audioPeak = std::max(audioPeak, hlsPeak(*ao.track, ao.ts.get())), audioAverage = std::max(audioAverage, hlsAverage(*ao.track, ao.ts.get()));
+    const std::string ext = ts ? "ts" : "m4s";
     if (s.hls) {
         for (auto& v : video) {
-            if (!writeFile(folder + "/" + v->name + "/playlist.m3u8", mediaPlaylist(v->track.get(), true, false, "m4s"))) return fail("Cannot write a playlist");
-            if (s.iframePlaylists && !writeFile(folder + "/" + v->name + "/iframes.m3u8", mediaPlaylist(v->track.get(), true, true, "m4s")))
+            if (!writeFile(folder + "/" + v->name + "/playlist.m3u8", mediaPlaylist(v->track.get(), true, false, ext, v->ts.get()))) return fail("Cannot write a playlist");
+            if (s.iframePlaylists && !writeFile(folder + "/" + v->name + "/iframes.m3u8", mediaPlaylist(v->track.get(), true, true, ext, v->ts.get())))
                 return fail("Cannot write an I-frame playlist");
         }
         for (const AudioOut& ao : audio)
-            if (!writeFile(folder + "/" + ao.name + "/playlist.m3u8", mediaPlaylist(ao.track.get(), false, false, "m4s"))) return fail("Cannot write a playlist");
+            if (!writeFile(folder + "/" + ao.name + "/playlist.m3u8", mediaPlaylist(ao.track.get(), false, false, ext, ao.ts.get()))) return fail("Cannot write a playlist");
         for (const TextOut& t : texts)
             if (!writeFile(folder + "/" + t.name + "/playlist.m3u8", mediaPlaylist(nullptr, true, false, "vtt"))) return fail("Cannot write a playlist");
         std::string m3u = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n";
@@ -1061,8 +1170,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
                    ",DEFAULT=NO,AUTOSELECT=YES,URI=\"" + t.name + "/playlist.m3u8\"\n";
         const std::string audioCodecs = audio.empty() ? "" : "," + audio.front().codecs;
         for (auto& v : video) {
-            m3u += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(v->track->peakBitrate() + audioPeak) +
-                   ",AVERAGE-BANDWIDTH=" + std::to_string(v->track->averageBitrate() + audioAverage) + ",CODECS=\"" + v->codecs + audioCodecs +
+            m3u += "#EXT-X-STREAM-INF:BANDWIDTH=" + std::to_string(hlsPeak(*v->track, v->ts.get()) + audioPeak) +
+                   ",AVERAGE-BANDWIDTH=" + std::to_string(hlsAverage(*v->track, v->ts.get()) + audioAverage) + ",CODECS=\"" + v->codecs + audioCodecs +
                    "\",RESOLUTION=" + std::to_string(v->width) + "x" + std::to_string(v->height) + ",FRAME-RATE=" + fmt("%.3f", fps.toDouble()) +
                    ",VIDEO-RANGE=" + v->range + (audio.empty() ? "" : ",AUDIO=\"audio\"") + (texts.empty() ? "" : ",SUBTITLES=\"subs\"") +
                    ",CLOSED-CAPTIONS=NONE\n" + v->name + "/playlist.m3u8\n";
@@ -1071,7 +1180,8 @@ bool exportStreamingPackage(const Project& p, const Sequence& seq, const Streami
             for (auto& v : video) {
                 int64_t peak = 0;
                 for (size_t i = 0; i < segs.size(); ++i)
-                    peak = std::max<int64_t>(peak, int64_t(std::ceil(v->track->segments[i].iframeBytes * 8 / seconds(segEnd(i) - segs[i]))));
+                    peak = std::max<int64_t>(peak, int64_t(std::ceil((v->ts ? v->ts->segments[i].iframeBytes : v->track->segments[i].iframeBytes) * 8 /
+                                                                     seconds(segEnd(i) - segs[i]))));
                 m3u += "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=" + std::to_string(peak) + ",CODECS=\"" + v->codecs + "\",RESOLUTION=" +
                        std::to_string(v->width) + "x" + std::to_string(v->height) + ",VIDEO-RANGE=" + v->range + ",URI=\"" + v->name + "/iframes.m3u8\"\n";
             }

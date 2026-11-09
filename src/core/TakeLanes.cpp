@@ -198,6 +198,7 @@ Result addTakeLane(Project& p, Sequence& s, TrackRef track, Id media, FrameTime 
         for (const TakeLane& o : t->lanes)
             if (o.name.rfind("Take ", 0) == 0) n = std::max(n, std::atoi(o.name.c_str() + 5));
         l.name = "Take " + std::to_string(std::max<int>(n, 0) + 1);
+        l.number = std::max<int>(n, 0) + 1;
     }
     t->lanes.push_back(l);
     Result r;
@@ -292,6 +293,9 @@ Result addLoopTakes(Project& p, Sequence& s, TrackRef track, const std::vector<I
     for (size_t k = 0; k < media.size(); ++k) {
         Result r = addTakeLane(p, s, track, media[k], in);
         if (!r.ok) return r;
+        // Each pass its own pass id (core/TrackGroups.h: passes recorded together on grouped tracks share one).
+        for (TakeLane& l : trackAt(s, track)->lanes)
+            if (l.id == r.created.front()) l.pass = p.newId();
         all.created.push_back(r.created.front());
         if (k >= complete.size() || complete[k]) compLane = r.created.front();
     }

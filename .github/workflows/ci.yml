@@ -29,8 +29,20 @@ jobs:
           key: c2pa-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('scripts/build-c2pa.sh') }}
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh ~/c2pa
+      # AV2 (dav2d and AVM, from pinned tags checked against their commits): built here only, so the AV2 tests run;
+      # packages leave AV2 out (MONTAGE_WITH_AV2 is off by default: both licences are flagged, THIRD_PARTY_NOTICES).
+      - name: Cache AV2's decoder and reference encoder
+        uses: actions/cache@v4
+        with:
+          path: ~/av2
+          key: av2-${{ runner.os }}-${{ hashFiles('scripts/build-av2.sh') }}
+      - name: AV2's decoder and reference encoder (dav2d, AVM)
+        run: |
+          command -v meson > /dev/null || sudo apt-get install -y --no-install-recommends meson
+          scripts/build-av2.sh ~/av2
+          echo "MONTAGE_TEST_AV2_TOOLS=$HOME/av2/bin" >> "$GITHUB_ENV"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2"
       - name: Build
         run: cmake --build build
       - name: Cache the speech model
@@ -236,6 +248,8 @@ jobs:
           (python3 -m venv ~/pyavb && ~/pyavb/bin/pip install -q pyavb==1.4.0 pyaaf2==1.7.1) && echo "MONTAGE_TEST_PYAVB=$HOME/pyavb/bin/python" >> "$GITHUB_ENV" \
             || echo "::warning::Could not install pyavb; the Avid bin tests' comparisons with pyavb will be skipped"
       - name: Test
+        env:
+          MONTAGE_REQUIRE_FIREFOX: "1"  # (the runner's Firefox and geckodriver: the browser review test fails rather than skips without them)
         run: ctest --test-dir build --output-on-failure
       - name: The window read over AT-SPI, as a screen reader on Linux reads it
         run: |
@@ -282,7 +296,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuYcbcrPlanes gpuExportMatchesCpu gpuOcioMatchesCpu ofxControlsAndOpenGl"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuYcbcrPlanes gpuHardwareFrames gpuExportMatchesCpu gpuOcioMatchesCpu ofxControlsAndOpenGl"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1

@@ -4,7 +4,8 @@
 // default 0.5 (unity). Its editor has no real window: attached() asks the
 // host frame for 360x240 and turns the gain to 0.125 through the component
 // handler, as a user dragging its knob would. An auxiliary input bus is the key:
-// once active, the gain is turned down by (1 - min(1, |key|)). Built as MontageTestVst3.vst3.
+// once active, the gain is turned down by (1 - min(1, |key|)). It misbehaves on request (test_fault.h). Built as
+// MontageTestVst3.vst3.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -20,6 +21,7 @@
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/ivstunits.h"
 #include "pluginterfaces/vst/vstspeaker.h"
+#include "test_fault.h"
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -135,6 +137,7 @@ public:
             float* out = data.outputs[0].channelBuffers32[c];
             for (int32 i = 0; i < data.numSamples; ++i) out[i] = in[i] * g * (key ? 1.0f - std::min(1.0f, std::fabs(key[i])) : 1.0f);
         }
+        montage_test_fault("process", data.outputs[0].channelBuffers32[1], size_t(data.numSamples));
         return kResultOk;
     }
     uint32 PLUGIN_API getTailSamples() override { return 0; }

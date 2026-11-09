@@ -8,6 +8,7 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QDateTime>
+#include <QColorDialog>
 #include <QContextMenuEvent>
 #include <QFileInfo>
 #include <QInputDialog>
@@ -43,6 +44,7 @@
 #include "core/CaptionTools.h"
 #include "core/KeyframeEdit.h"
 #include "core/Multicam.h"
+#include "core/TrackGroups.h"
 #include "media/MediaPool.h"
 #include "render/ColorSpace.h"
 #include "render/Ofx.h"
@@ -93,10 +95,12 @@ QString laneText(const L& lane, double v) {
 
 int trackHeight(const Track& t) { return t.height > 0 ? t.height : (t.kind == TrackKind::Video ? kVideoH : kAudioH); }
 
-QColor clipColor(const Project& p, const Clip& c, TrackKind kind) {
+QColor clipColor(const Project& p, const Clip& c, TrackKind kind, const Track* track) {
     if (!c.enabled) return theme::kDisabledClip;
     QColor label = theme::labelColor(c.colorLabel);
     if (label.isValid()) return label;
+    // A track's label colour on its clips, when it is set to colour them (core/TrackGroups.h).
+    if (track && track->colorClips && !track->color.empty()) return QColor(QString::fromStdString(track->color));
     if (c.isGenerator()) return theme::kGeneratorClip;
     if (const MediaItem* m = p.findMedia(c.mediaId))
         if (m->kind == MediaKind::Sequence) return theme::kCompoundClip;
@@ -316,9 +320,13 @@ void TimelineWidget::paintTakeLanes(QPainter& p, bool header, bool band) {
     for (const TakeLaneRow& l : takeLaneRows()) {
         if (l.pinned != band || l.y + kTakeLaneH < kRulerH || l.y > viewport()->height()) continue;
         const Track* t = trackAt(*s, l.ref);
+        // A take's colour follows its number (core/TrackGroups.h takeColor): one take is one colour on every track.
+        const TakeLane* lane = l.view.lane ? edit::findTakeLane(*t, l.view.lane) : nullptr;
+        const QColor takeHue = lane && !takeColor(*lane).empty() ? QColor(QString::fromStdString(takeColor(*lane))) : QColor(0x3d, 0x6b, 0x66);
         if (header) {
             const QRect hr(0, l.y, kHeaderW, kTakeLaneH);
             p.fillRect(hr, theme::kPanel.darker(125));
+            if (lane) p.fillRect(QRect(6, l.y + 4, 6, kTakeLaneH - 8), takeHue);
             p.setPen(l.view.lane ? theme::kText : theme::kTextDim);
             QString label = QString::fromStdString(l.view.name);
             if (l.view.rating > 0) label += QStringLiteral("  ") + QString(l.view.rating, QChar(0x2605));
@@ -331,13 +339,13 @@ void TimelineWidget::paintTakeLanes(QPainter& p, bool header, bool band) {
         const int xs = xForFrame(l.view.start), xe = xForFrame(l.view.end);
         const QRect band(xs, l.y + 2, std::max(2, xe - xs), kTakeLaneH - 5);
         p.setPen(Qt::NoPen);
-        p.setBrush(QColor(0x3d, 0x6b, 0x66, 150));
+        p.setBrush(QColor(takeHue.darker(140).red(), takeHue.darker(140).green(), takeHue.darker(140).blue(), 170));
         p.drawRoundedRect(band, 3, 3);
         // What the comp takes from it.
         for (const Clip& c : t->clips) {
             const bool used = l.view.lane ? compLaneOf(*t, c) == l.view.lane : false;
             if (!used) continue;
-            p.setBrush(QColor(0x5f, 0xc9, 0xb8, 220));
+            p.setBrush(QColor(takeHue.lighter(125).red(), takeHue.lighter(125).green(), takeHue.lighter(125).blue(), 230));
             p.drawRect(QRect(xForFrame(c.start), l.y + 2, std::max(1, xForFrame(c.end()) - xForFrame(c.start)), kTakeLaneH - 5));
         }
         p.setPen(theme::kText);
@@ -360,14 +368,15 @@ void TimelineWidget::takeLaneMenu(QMenu& menu, const TakeLaneRow& lane) {
         const Id clip = lane.view.clip;
         const int take = lane.view.take;
         menu.addAction(tr("Use This Take"), this, [this, clip, take] {
-            state_->apply(tr("Pick Take"), [clip, take](Project& p, Sequence& s) { return edit::pickTake(p, s, clip, take); });
+            state_->apply(tr("Pick Take"), [clip, take](Project& p, Sequence& s) { return edit::pickGroupTake(p, s, clip, take); });
         });
         return;
     }
     const Id id = lane.view.lane;
     const FrameTime from = lane.view.start, to = lane.view.end;
     menu.addAction(tr("Comp Whole Take"), this, [this, ref, id, from, to] {
-        state_->apply(tr("Comp Take"), [=](Project& p, Sequence& s) { return edit::compTake(p, s, ref, id, from, to); });
+        // (On every grouped track too: core/TrackGroups.h compGroup.)
+        state_->apply(tr("Comp Take"), [=](Project& p, Sequence& s) { return edit::compGroup(p, s, ref, id, from, to); });
     });
     menu.addAction(tr("Rename Take..."), this, [this, ref, id, name = lane.view.name] {
         bool ok = false;
@@ -378,7 +387,7 @@ void TimelineWidget::takeLaneMenu(QMenu& menu, const TakeLaneRow& lane) {
     QMenu* rate = menu.addMenu(tr("Rate"));
     for (int k = 0; k <= 5; ++k)
         rate->addAction(k ? QString(k, QChar(0x2605)) : tr("None"), this, [this, ref, id, k] {
-            state_->apply(tr("Rate Take"), [=](Project&, Sequence& s) { return edit::rateTakeLane(s, ref, id, k); });
+            state_->apply(tr("Rate Take"), [=](Project&, Sequence& s) { return edit::rateGroupLane(s, ref, id, k); });
         });
     menu.addAction(tr("Remove Take Lane"), this, [this, ref, id] {
         state_->apply(tr("Remove Take Lane"), [=](Project&, Sequence& s) { return edit::removeTakeLane(s, ref, id); });
@@ -1000,7 +1009,8 @@ void TimelineWidget::paintCaptionLanes(QPainter& p) {
 void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const QRect& r) {
     const Project& proj = state_->project();
     // Offline media in red, as the other editors show it.
-    QColor base = state_->isMediaOffline(c.mediaId) ? QColor(0x9a, 0x1c, 0x1c) : clipColor(proj, c, row.ref.kind);
+    const Track* track = state_->sequence() ? trackAt(*state_->sequence(), row.ref) : nullptr;
+    QColor base = state_->isMediaOffline(c.mediaId) ? QColor(0x9a, 0x1c, 0x1c) : clipColor(proj, c, row.ref.kind, track);
     bool sel = state_->isSelected(c.id);
     p.setPen(Qt::NoPen);
     p.setBrush(sel ? base.lighter(125) : base);
@@ -1961,6 +1971,7 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs, bool 
         QRect hr(0, r.y, kHeaderW, r.h);
         p.fillRect(hr, (r.ref.index % 2) ? theme::kPanelAlt : theme::kPanelAlt.darker(106));
         if (!t->folder.empty()) p.fillRect(QRect(0, r.y, 3, r.h), QColor(0xd8, 0xa8, 0x5a));  // in a folder
+        if (!t->color.empty()) p.fillRect(QRect(3, r.y, 3, r.h), QColor(QString::fromStdString(t->color)));  // its label colour
         if (t->pinned) p.fillRect(QRect(kHeaderW - 4, r.y, 3, r.h), theme::kAccent);         // pinned
         p.setPen(QColor(0, 0, 0, 120));
         p.drawLine(0, r.y + r.h - 1, kHeaderW, r.y + r.h - 1);
@@ -1979,7 +1990,12 @@ void TimelineWidget::paintHeaders(QPainter& p, const std::vector<Row>& rs, bool 
             p.setPen(theme::kTextDim);
             QRect info(8, r.y + r.h - 16, kHeaderW - 16, 14);
             QString detail = video ? tr("Video") : (t->volumeDb != 0 ? tr("%1 dB").arg(t->volumeDb, 0, 'f', 1) : tr("Audio"));
-            p.drawText(info, Qt::AlignLeft | Qt::AlignVCenter, detail);
+            // Its group, dimmed while the group (or every group) is suspended.
+            if (const TrackGroup* g = findTrackGroup(*s, t->group)) {
+                const bool off = g->suspended || s->groupsSuspended;
+                detail += QStringLiteral(" · ") + QString::fromStdString(g->name) + (off ? tr(" (suspended)") : QString());
+            }
+            p.drawText(info, Qt::AlignLeft | Qt::AlignVCenter, p.fontMetrics().elidedText(detail, Qt::ElideRight, info.width()));
         }
     }
     for (const FolderRow& f : band ? std::vector<FolderRow>() : folderRows()) {
@@ -2099,18 +2115,13 @@ void TimelineWidget::handleHeaderClick(const Hit& hit) {
             break;
         case HeaderButton::Visible:
         case HeaderButton::Mute:
+            // (With its group's tracks, through the group's mute switch.)
             state_->edit(ref.kind == TrackKind::Video ? tr("Toggle Track Output") : tr("Mute Track"), [ref](Project&, Sequence& s) {
-                Track* t = trackAt(s, ref);
-                t->muted = !t->muted;
-                return true;
+                return edit::setTrackMuted(s, ref, !trackAt(s, ref)->muted).ok;
             });
             break;
         case HeaderButton::Solo:
-            state_->edit(tr("Solo Track"), [ref](Project&, Sequence& s) {
-                Track* t = trackAt(s, ref);
-                t->solo = !t->solo;
-                return true;
-            });
+            state_->edit(tr("Solo Track"), [ref](Project&, Sequence& s) { return edit::setTrackSoloed(s, ref, !trackAt(s, ref)->solo).ok; });
             break;
         default: break;
     }
@@ -2142,7 +2153,7 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
         if (!lane->view.lane) {
             const Id clip = lane->view.clip;
             const int take = lane->view.take;
-            state_->apply(tr("Pick Take"), [clip, take](Project& p, Sequence& sq) { return edit::pickTake(p, sq, clip, take); });
+            state_->apply(tr("Pick Take"), [clip, take](Project& p, Sequence& sq) { return edit::pickGroupTake(p, sq, clip, take); });
             return;
         }
         drag_.kind = DragKind::TakeComp;
@@ -2213,28 +2224,9 @@ void TimelineWidget::beginDrag(QMouseEvent* e, const Hit& hit) {
         if (shift) state_->apply(tr("Add Edit to All Tracks"), [f](Project& p, Sequence& sq) { return edit::razorAll(p, sq, f); });
         else
             state_->apply(tr("Add Edit"), [f, t](Project& p, Sequence& sq) {
-                // Razor cuts linked partners too, like the industry-standard tools.
-                const Clip* c = edit::clipAt(sq, t, f);
-                if (!c) return edit::Result::fail("No clip here");
-                std::vector<TrackRef> tracks{t};
-                for (Id l : edit::linkedClips(sq, c->id))
-                    if (auto loc = edit::locate(sq, l)) tracks.push_back(loc->track);
-                edit::Result last = edit::Result::fail("Nothing to cut");
-                std::map<Id, Id> regroup;
-                for (TrackRef tr : tracks) {
-                    const Clip* under = edit::clipAt(sq, tr, f);
-                    Id group = under ? under->linkGroup : 0;
-                    auto r = edit::razor(p, sq, tr, f);
-                    if (r.ok) {
-                        last = r;
-                        if (group && !r.created.empty()) {
-                            auto it = regroup.find(group);
-                            if (it == regroup.end()) it = regroup.emplace(group, p.newId()).first;
-                            if (Clip* rc = edit::clipById(sq, r.created[0])) rc->linkGroup = it->second;
-                        }
-                    }
-                }
-                return last;
+                // The razor cuts linked partners too, and the tracks grouped with this one (core/TrackGroups.h).
+                if (!edit::clipAt(sq, t, f)) return edit::Result::fail("No clip here");
+                return edit::razorTogether(p, sq, {t}, f);
             });
         return;
     }
@@ -2270,7 +2262,7 @@ void TimelineWidget::beginDrag(QMouseEvent* e, const Hit& hit) {
         // Selection.
         if (ctrl || shift) {
             std::vector<Id> sel = state_->selectedClips();
-            auto group = alt ? std::vector<Id>{id} : edit::linkedClips(*s, id);
+            auto group = alt ? std::vector<Id>{id} : edit::expandGroups(*s, {id});
             if (state_->isSelected(id)) {
                 for (Id g : group) sel.erase(std::remove(sel.begin(), sel.end(), g), sel.end());
             } else {
@@ -2708,7 +2700,7 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
         const TrackRef ref = *drag_.pressTrack;
         const Id lane = drag_.clip;
         const FrameTime a = std::min(drag_.pressFrame, drag_.compTo), b = std::max(drag_.pressFrame, drag_.compTo);
-        state_->apply(tr("Comp Take"), [=](Project& p, Sequence& sq) { return edit::compTake(p, sq, ref, lane, a, b); });
+        state_->apply(tr("Comp Take"), [=](Project& p, Sequence& sq) { return edit::compGroup(p, sq, ref, lane, a, b); });
     }
     if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
         emit trimViewEnded();
@@ -2919,6 +2911,73 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
             for (const std::string& n : names)
                 folders->addAction(tr("Move to %1").arg(QString::fromStdString(n)), this, [moveTo, n] { moveTo(n); });
             if (!current.empty()) folders->addAction(tr("Remove from Folder"), this, [moveTo] { moveTo({}); });
+        }
+        // Track groups (core/TrackGroups.h): into a new or existing group, out of one, or its group suspended.
+        {
+            QMenu* groups = menu.addMenu(tr("Group"));
+            groups->setObjectName(QStringLiteral("trackGroupMenu"));
+            const Sequence* s = state_->sequence();
+            const Id current = trackAt(*s, ref)->group;
+            groups->addAction(tr("New Group..."), this, [this, ref] {
+                bool ok = false;
+                const QString name = QInputDialog::getText(this, tr("New Track Group"), tr("Group name:"), QLineEdit::Normal,
+                                                           tr("Group %1").arg(state_->sequence()->trackGroups.size() + 1), &ok);
+                if (ok && !name.trimmed().isEmpty())
+                    state_->apply(tr("New Track Group"), [ref, name](Project& p, Sequence& sq) {
+                        return edit::createTrackGroup(p, sq, name.trimmed().toStdString(), {ref});
+                    });
+            });
+            for (const TrackGroup& g : s->trackGroups) {
+                if (g.id == current) continue;
+                const Id id = g.id;
+                groups->addAction(tr("Add to %1").arg(QString::fromStdString(g.name)), this, [this, ref, id] {
+                    state_->apply(tr("Add Track to Group"), [ref, id](Project&, Sequence& sq) { return edit::setTrackGroup(sq, {ref}, id); });
+                });
+            }
+            if (const TrackGroup* g = findTrackGroup(*s, current)) {
+                groups->addAction(tr("Remove from %1").arg(QString::fromStdString(g->name)), this, [this, ref] {
+                    state_->apply(tr("Remove Track from Group"), [ref](Project&, Sequence& sq) { return edit::setTrackGroup(sq, {ref}, 0); });
+                });
+                QAction* suspend = groups->addAction(tr("Suspend %1").arg(QString::fromStdString(g->name)));
+                suspend->setObjectName(QStringLiteral("suspendTrackGroup"));
+                suspend->setCheckable(true);
+                suspend->setChecked(g->suspended);
+                connect(suspend, &QAction::toggled, this, [this, current](bool on) {
+                    state_->apply(on ? tr("Suspend Track Group") : tr("Resume Track Group"),
+                                  [current, on](Project&, Sequence& sq) { return edit::suspendTrackGroup(sq, current, on); });
+                });
+            }
+            groups->addSeparator();
+            groups->addAction(tr("Track Groups..."), this, [this] { emit trackGroupsRequested(); });
+        }
+        // Its label colour: one of the label colours, one of its own, or none; and whether its clips take it.
+        {
+            QMenu* colors = menu.addMenu(tr("Track Colour"));
+            colors->setObjectName(QStringLiteral("trackColorMenu"));
+            auto setColor = [this, ref](const QString& c) {
+                state_->apply(tr("Track Colour"), [ref, c](Project&, Sequence& sq) { return edit::setTrackColor(sq, {ref}, c.toStdString()); });
+            };
+            colors->addAction(tr("None"), this, [setColor] { setColor({}); });
+            for (int k = 1; k < theme::labelCount(); ++k) {
+                QPixmap px(12, 12);
+                px.fill(theme::labelColor(k));
+                const QString c = theme::labelColor(k).name();
+                colors->addAction(QIcon(px), tr(theme::labelName(k)), this, [setColor, c] { setColor(c); });
+            }
+            colors->addAction(tr("Custom..."), this, [this, ref, setColor] {
+                const Track* t = trackAt(*state_->sequence(), ref);
+                const QColor c = QColorDialog::getColor(t && !t->color.empty() ? QColor(QString::fromStdString(t->color)) : theme::kAccent, this,
+                                                        tr("Track Colour"));
+                if (c.isValid()) setColor(c.name());
+            });
+            colors->addSeparator();
+            QAction* clips = colors->addAction(tr("Colour Its Clips"));
+            clips->setObjectName(QStringLiteral("trackColorClips"));
+            clips->setCheckable(true);
+            clips->setChecked(trackAt(*state_->sequence(), ref)->colorClips);
+            connect(clips, &QAction::toggled, this, [this, ref](bool on) {
+                state_->apply(tr("Colour Track's Clips"), [ref, on](Project&, Sequence& sq) { return edit::setTrackColorClips(sq, {ref}, on); });
+            });
             menu.addSeparator();
         }
         menu.addAction(video ? tr("Add Video Track") : tr("Add Audio Track"), this, [this, ref] {

@@ -110,9 +110,10 @@ std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
 std::vector<ParamInfo> effectParams(const Effect& e);
 std::string pluginParamMeta(const ParamInfo& p);
 // A title's text animations (render/Titles.h): the k of each "ta<k>.by" param it has, in order, and the params an
-// animation has, named "ta<k>.<name>" (effectParams lists them after the title's own).
+// animation has, named "ta<k>.<name>" (effectParams lists them after the title's own). A 3D title's ("title3d") pick
+// letters the same way and set how deep they are extruded.
 std::vector<int> textAnimators(const Effect& e);
-std::vector<ParamInfo> textAnimatorParams(int k);
+std::vector<ParamInfo> textAnimatorParams(int k, const std::string& type = "title");
 // Adds text animation k to a title with its params at their defaults (a new k past the last when 0); returns k.
 int addTextAnimator(Effect& e, int k = 0);
 

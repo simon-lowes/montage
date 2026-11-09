@@ -30,9 +30,14 @@
 // package. Sound, timed text and supplementals are as for Application #2E.
 //
 // ProRes masters (Application ProRes, SMPTE RDD 45): the pictures coded as ProRes (RDD 36: 422 LT, 422 or 422 HQ as
-// Y'CbCr 4:2:2; 4444 or 4444 XQ as R'G'B' 4:4:4; 10 bits, narrow range) in the colours #2E has, with RDD 45's colour
-// codes in each frame, frame-wrapped as RDD 44 maps them (body partitions of about ten seconds, each with the previous
-// one's index). Sound, timed text and supplementals are as for Application #2E; FFmpeg reads the track files back.
+// Y'CbCr 4:2:2; 4444 or 4444 XQ as R'G'B' 4:4:4, or as Y'CbCr 4:4:4 to 1920 x 1080; 10 bits, narrow range, or full
+// range (QE.2) for R'G'B'; progressive, or 4:2:2 to 1920 x 1080 at 25, 29.97 or 30 as two fields with the top or the
+// bottom first) in the colours #2E has, with RDD 45's colour codes in each frame, frame-wrapped as RDD 44 maps them
+// (body partitions of about ten seconds, each with the previous one's index). Broadcasters' masters (Application DPP
+// (ProRes), SMPTE RDD 59-1, which the DPP and NABA wrote over RDD 45): ProRes 422 HQ at 1920 x 1080 or 3840 x 2160,
+// progressive, in Rec.709, Rec.2020 PQ or HLG, the DPP's identification and a DPP content kind. Sound, timed text and
+// supplementals are as for Application #2E; FFmpeg reads the track files back (and Montage reads 12-bit 4444, which
+// FFmpeg's encoder cannot make: it codes 10 bits).
 #pragma once
 
 #include <cstdint>
@@ -65,7 +70,10 @@ struct ImfText {
 
 struct ImfSettings {
     std::string title;
-    std::string kind = "feature";  // ST 2067-3 content kind: feature, episode, short, trailer, teaser, advertisement, test...
+    // ST 2067-3 content kind: feature, episode, short, trailer, teaser, advertisement, test...; Application DPP also takes
+    // RDD 59-1 Table 6's (programme, commercial, sponsorship, infomercial, presentation_event, promotion, music_video),
+    // written in the DPP's scope.
+    std::string kind = "feature";
     std::string issuer = "Montage";
     std::string language = "en";   // the sound's and the annotations' (RFC 5646)
     std::string colour;            // "rec709", "p3d65-pq", "rec2020-pq", "rec2020-hlg"; empty: as the sequence is
@@ -87,13 +95,23 @@ struct ImfSettings {
     // compared with this one to find the pictures that changed. 0: the picture has not changed (new sound or text).
     Id originalSequence = 0;
     // The IMF application: 2 (#2E, JPEG 2000 in the colour above), 5 (#5, an archival master in ACES 2065-1, where the
-    // colour, depth and coding above do not apply) or 45 (Application ProRes, SMPTE RDD 45: ProRes pictures in the colour
-    // above, 10 bits, in the profile below).
+    // colour, depth and coding above do not apply), 45 (Application ProRes, SMPTE RDD 45: ProRes pictures in the colour
+    // above, 10 bits, in the profile below) or 59 (Application DPP (ProRes), SMPTE RDD 59-1: 422 HQ at 1920 x 1080 or
+    // 3840 x 2160, progressive, Rec.709, Rec.2020 PQ or HLG; its 4:4:4 is 12 bits, which FFmpeg's encoder does not make).
     int application = 2;
     // Application ProRes: the profile ("lt", "422", "hq" as 4:2:2 Y'CbCr; "4444", "4444xq" as 4:4:4 R'G'B'). 4:2:2
     // takes pictures to 3840 x 2160 in Rec.709, Rec.2020 PQ or HLG at up to 60 fps; 4:4:4 to 4096 x 3112 in any of the
     // colours, at up to 120.
     std::string prores = "hq";
+    // Application ProRes: "" progressive, or interlaced as two fields of each picture, "tff" the top field first or "bff"
+    // the bottom first (4:2:2 to 1920 x 1080 at 25, 29.97 or 30 in Rec.709, RDD 45 Table 1). The fields are the halves
+    // of the frame rendered (segmented, as 1080i deliveries of progressive programmes are), not two moments.
+    std::string fields;
+    // Application ProRes: 4444 or 4444 XQ described as Y'CbCr 4:4:4 (a CDCI descriptor) rather than R'G'B' (to 1920 x
+    // 1080, progressive, Rec.709, narrow range).
+    bool ycbcr444 = false;
+    // Application ProRes: 4:4:4 R'G'B' over the full range (QE.2: 0 to 1023) rather than 64 to 940 (QE.1).
+    bool fullRange = false;
     // Application #5: the grade in the pictures; false leaves it off.
     bool graded = true;
     // Application #5: sequence frames (within what is exported) also given as target frames.
@@ -129,7 +147,9 @@ struct ImfResult {
     int64_t newSamples = 0;      // sample frames in its own sound track files
     std::vector<std::string> trackFiles;  // the track files written
     int application = 2;
-    std::string prores;           // Application ProRes: the profile
+    std::string prores;           // Application ProRes and DPP: the profile
+    std::string fields;           // ... "" progressive, "tff" or "bff"
+    bool ycbcr444 = false, fullRange = false;
     std::string outputTransform;  // Application #5: the output transform named (ACESAuthoringInformation)
     int targetFrames = 0;
     std::string amf;              // ... and the ACES Metadata File, when there are target frames
@@ -163,8 +183,13 @@ struct ImfComposition {
     uint16_t rsiz = 0;
     std::string colour;  // as ImfSettings::colour, or "aces2065-1" for Application #5 ("" when none of those)
     double masteringPeak = 0;
-    int application = 2;        // from its ApplicationIdentification (2 for #2E, 5 for #5, 45 for ProRes, 0 for another)
-    std::string prores;         // Application ProRes: the picture's profile (as ImfSettings::prores)
+    // From its ApplicationIdentification: 2 for #2E, 5 for #5, 45 for ProRes, 59 for DPP (ProRes: RDD 59-1's, or TSP
+    // 2121-1's before it), 0 for another.
+    int application = 2;
+    std::string prores;         // Application ProRes and DPP: the picture's profile (as ImfSettings::prores)
+    std::string fields;         // ... and its descriptor's fields, components and range (as ImfSettings has them)
+    bool ycbcr444 = false, fullRange = false;
+    std::string contentKind, contentKindScope;  // the CPL's ContentKind
     std::string acesAuthoring;  // Application #5: the output transform its pictures were made for
     std::vector<ImfVirtualTrack> tracks;
     std::map<std::string, std::string> descriptors;  // id: the descriptor's RegXML, as written
@@ -219,7 +244,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 // false to stop ("Stopped").
 std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {});
 
-// Frame `index` of an IMF picture track file decoded to RGB samples.
+// Frame `index` of an IMF picture track file decoded to RGB samples: JPEG 2000 at its depth, or ProRes (Application
+// ProRes and DPP) at its descriptor's (10 or 12; 4:4:4 decoded at 12), full range whatever its range (QE.1's 64 to 940
+// spread to the whole).
 bool readImfFrame(const std::string& mxf, int index, std::vector<uint16_t>& rgb, int& width, int& height, int& bits,
                   std::string* error = nullptr);
 // Frame `index` of an Application #5 track file as straight RGBA floats (ACES 2065-1), through OpenEXR.

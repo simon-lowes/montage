@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 
+#include "core/TrackGroups.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 
@@ -90,6 +91,33 @@ std::vector<TakeCandidate> takeCandidates(const Project& p, const Sequence& s, T
 TakeChoice chooseTake(const Project& p, const Sequence& s, TrackRef track, FrameTime from, FrameTime to, const std::string& line) {
     TakeChoice r;
     r.takes = takeCandidates(p, s, track, from, to);
+    r.best = suggestTake(r.takes, line, &r.why);
+    return r;
+}
+
+TakeChoice chooseGroupTake(const Project& p, const Sequence& s, TrackRef track, FrameTime from, FrameTime to, const std::string& line) {
+    TakeChoice r;
+    r.takes = takeCandidates(p, s, track, from, to);
+    const std::vector<TrackRef> tracks = groupTracks(s, track, GroupSwitch::Comp);
+    // Each pass judged by every grouped track that heard it: its words from whichever says the line best, clipping
+    // where any of them clips, its level from the loudest.
+    for (size_t k = 1; k < tracks.size(); ++k) {
+        const std::vector<TakeCandidate> others = takeCandidates(p, s, tracks[k], from, to);
+        for (TakeCandidate& t : r.takes) {
+            if (!t.lane) continue;
+            Id mate = 0;
+            for (const auto& [ref, id] : edit::passLanes(s, track, t.lane))
+                if (ref == tracks[k]) mate = id;
+            for (const TakeCandidate& o : others) {
+                if (!mate || o.lane != mate) continue;
+                if (o.transcribed && (!t.transcribed || lineWordErrors(o.said, line) < lineWordErrors(t.said, line))) t.said = o.said;
+                t.transcribed |= o.transcribed;
+                t.clippedSeconds = std::max(t.clippedSeconds, o.clippedSeconds);
+                t.peakDb = std::max(t.peakDb, o.peakDb);
+                t.rmsDb = std::max(t.rmsDb, o.rmsDb);
+            }
+        }
+    }
     r.best = suggestTake(r.takes, line, &r.why);
     return r;
 }

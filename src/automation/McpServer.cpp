@@ -8,6 +8,7 @@
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QUuid>
 #include <QSaveFile>
 #include <QImage>
 #include <QJsonArray>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <thread>
 #include <fstream>
 #include <iostream>
@@ -36,6 +38,7 @@
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/TakeLanes.h"
+#include "core/TrackGroups.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
@@ -53,7 +56,9 @@
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
+#include "render/BackgroundJobs.h"
 #include "render/Dcp.h"
+#include "render/DcpFacilities.h"
 #include "render/Adm.h"
 #include "render/Iamf.h"
 #include "render/Imf.h"
@@ -68,6 +73,7 @@
 #include "audio/ElasticAudio.h"
 #include "audio/TapeRepair.h"
 #include "audio/PluginEffect.h"
+#include "audio/PluginHost.h"
 #include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
@@ -75,6 +81,7 @@
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
+#include "media/Av2.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "media/Proxy.h"
@@ -198,6 +205,8 @@
 #include "render/RenderFarm.h"
 #include "render/SegmentedExport.h"
 #include "render/StreamingPackage.h"
+#include "render/LivePackage.h"
+#include "media/Capture.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -222,7 +231,8 @@ const char* kInstructions =
     "strings like \"00:01:02:03\"; tracks are \"V1\", \"V2\", \"A1\"... Clips are referred to by the ids "
     "montage_project_info lists. Look at the result with montage_render_frame before rendering the whole sequence. "
     "Any tool called with \"async\": true runs in the background: it answers at once with a job id, read (progress, "
-    "result) or cancelled with montage_job. "
+    "result) or cancelled with montage_job; renders, exports and analyses run side by side, and jobs are kept on disk "
+    "(montage_job's list gives earlier servers' jobs and the render queue's exports too). "
     "If the project is open in the Montage app, reopen it there to see the changes.";
 
 QJsonObject serverInfo() {
@@ -254,11 +264,20 @@ QJsonObject resultJson(const ToolResult& r) {
 
 // ---- Background calls -------------------------------------------------------------
 
-// A tool call run in the background ("async": true), one at a time after the calls before it.
+// A tool call run in the background ("async": true), after the calls before it: one at a time, or side by side with
+// other background calls (up to the set number) for a tool that leaves the project alone (a render, a check, a read).
+// Each is kept in the job store (render/BackgroundJobs.h) as "mcp-<session>-<n>", so it is listed after a restart, and
+// one cut short by it is taken up again.
 struct ToolJob {
     QString id, tool;
+    QString stored;           // its id in the job store
+    bool sideBySide = false;  // runs alongside other such calls
+    QString resumedFrom;      // the stored job it takes up again
     QJsonObject args;
+    std::chrono::steady_clock::time_point persisted;  // when its progress was last written (under m)
     std::atomic<bool> cancel{false};
+    std::atomic<bool> cancelAsked{false};  // by montage_job (not by the server's end)
+    std::mutex persistM;  // one write to the store at a time, so the last taken is the last written
     std::mutex m;  // what follows
     QString status = QStringLiteral("queued");  // queued, running, done, failed, cancelled
     double fraction = 0;
@@ -818,21 +837,28 @@ struct McpServer::Impl {
         }
         turnWake.notify_all();
     }
-    std::mutex toolMutex;  // held while a tool runs (and while the notification sink changes)
+    // Held while a tool runs (and while the notification sink changes): alone by most, shared by background calls that
+    // run side by side.
+    std::shared_mutex toolMutex;
     // The call running now (its request id) and calls cancelled before they started.
     std::mutex cancelMutex;
     QString runningRequest;
     std::set<QString> cancelledRequests;
     std::deque<QString> cancelledOrder;  // (oldest first: the oldest forgotten past 1000)
     std::atomic<bool> callCancel{false};
-    // Background calls: all of them by id (the newest finished ones kept), those waiting, and the thread that runs them.
+    // Background calls: all of them by id (the newest finished ones kept), those waiting, and the threads that run them
+    // (as many as run at once).
     std::mutex jobsMutex;
     std::condition_variable jobsWake;
     std::map<QString, std::shared_ptr<ToolJob>> jobs;
     std::deque<std::shared_ptr<ToolJob>> jobQueue;
-    std::thread jobThread;
+    std::vector<std::thread> jobThreads;
+    int atOnce = jobs::atOnce();
     bool stopping = false;
     int jobsMade = 0;
+    // This server's calls in the job store: "mcp-<session>-<n>".
+    const QString session = QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMddHHmmss")) + QLatin1Char('-') +
+                            QUuid::createUuid().toString(QUuid::Id128).left(10);
 
     Impl() { addTools(); }
     ~Impl() {
@@ -847,7 +873,107 @@ struct McpServer::Impl {
             turnsStopped = true;
         }
         turnWake.notify_all();
-        if (jobThread.joinable()) jobThread.join();
+        for (std::thread& t : jobThreads)
+            if (t.joinable()) t.join();
+        // (calls cut short by the server's end, or never started, are taken up again by the next one)
+        for (auto& [id, j] : jobs) {
+            bool unfinished;
+            {
+                std::lock_guard jl(j->m);
+                unfinished = !j->finished() || j->status == QLatin1String("interrupted");
+                if (unfinished) j->status = QStringLiteral("interrupted");
+            }
+            if (unfinished) persist(*j, true);
+        }
+    }
+
+    // Tools that leave the project as it is and may run alongside each other in the background.
+    static bool runsSideBySide(const Tool& t) {
+        static const std::set<QString> also = {"montage_render", "montage_export_dcp", "montage_export_imf", "montage_export_review",
+                                               "montage_dialogue_loudness", "montage_verify_mhl"};
+        if (t.name == QLatin1String("montage_render_frame") || t.name == QLatin1String("montage_job")) return false;
+        return t.readOnly || also.count(t.name) > 0;
+    }
+    // An argument whose name says it is a secret: such a call is not written to disk with its arguments.
+    static bool secretArgs(const QJsonObject& a) {
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            const QString k = it.key().toLower();
+            if (k.contains("password") || k.contains("secret") || k.contains("token") || k.contains("passphrase")) return true;
+            if (it.value().isObject() && secretArgs(it.value().toObject())) return true;
+        }
+        return false;
+    }
+    // The job written to the store (its progress at most once a second unless `now`).
+    void persist(ToolJob& j, bool now = false) {
+        // (the call's thread writes it queued while its runner may write it running: without this, the older could land last)
+        std::lock_guard order(j.persistM);
+        jobs::Record r;
+        {
+            std::lock_guard l(j.m);
+            const auto t = std::chrono::steady_clock::now();
+            if (!now && j.status == QLatin1String("running") && t - j.persisted < std::chrono::seconds(1)) return;
+            j.persisted = t;
+            r.id = j.stored;
+            r.owner = QStringLiteral("mcp");
+            r.kind = j.tool;
+            r.title = j.tool;
+            r.status = j.status == QLatin1String("queued") ? QStringLiteral("waiting") : j.status;
+            r.progress = j.fraction;
+            r.step = j.step;
+            r.order = j.id.mid(4).toInt();
+            r.pid = jobs::thisProcess();
+            r.process = jobs::thisProcessToken();
+            const bool secret = secretArgs(j.args);
+            r.data = QJsonObject{{"job", j.id}, {"session", session}, {"tool", j.tool}, {"sideBySide", j.sideBySide}, {"cwd", QDir::currentPath()}};
+            if (!secret) r.data["args"] = j.args;
+            else r.data["secret"] = true;
+            if (!j.resumedFrom.isEmpty()) r.data["resumedFrom"] = j.resumedFrom;
+            if (j.finished()) r.data["result"] = j.result;
+        }
+        jobs::Record was;
+        if (jobs::load(r.id, was)) r.created = was.created;
+        jobs::save(r);
+        // (a cancel asked for by another server's montage_job)
+        const QString cancelFile = jobs::jobFolder(r.id) + QStringLiteral("/cancel");
+        if (!r.finished() && QFileInfo::exists(cancelFile)) {
+            QFile::remove(cancelFile);
+            j.cancel = true;
+        }
+    }
+    // At the start (montage-cli mcp): the calls a server before this one was running (or had waiting) when it stopped or crashed. Those of
+    // tools that leave the project alone are run again, in their order; the rest wait for montage_job's resume.
+    int resumeStored() {
+        int n = 0;
+        for (const jobs::Record& r : jobs::all(QStringLiteral("mcp"))) {
+            if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting")) continue;
+            // (one left by a server of this same process waits for montage_job's resume: only a call whose process
+            // stopped, or crashed, is taken up by itself)
+            if (jobs::runningElsewhere(r) || jobs::runningHere(r) || r.data.value("session").toString() == session) continue;
+            const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == r.data.value("tool").toString(); });
+            if (tool == tools.end() || !runsSideBySide(*tool) || r.data.value("secret").toBool() || !r.data.contains("args")) continue;
+            // (its relative paths read as they were: only by a server started in the same folder)
+            if (r.data.value("cwd").toString() != QDir::currentPath()) continue;
+            if (resume(r, *tool)) ++n;
+        }
+        // (the store kept from growing: the newest 200 finished calls kept)
+        jobs::prune(QStringLiteral("mcp"), 200);
+        return n;
+    }
+    // A stored call run again here (once: the first server to claim it). Null when another has, or it cannot be.
+    std::shared_ptr<ToolJob> resume(const jobs::Record& r, const Tool& tool) {
+        QFile claim(jobs::jobFolder(r.id) + QStringLiteral("/resumed"));
+        if (!claim.open(QIODevice::WriteOnly | QIODevice::NewOnly)) return nullptr;
+        claim.close();
+        auto job = startJob(tool, r.data.value("args").toObject(), r.id);
+        if (!job) {
+            claim.remove();
+            return nullptr;
+        }
+        jobs::Record old = r;
+        old.status = QStringLiteral("resumed");
+        old.data["resumedAs"] = job->stored;
+        jobs::save(old);
+        return job;
     }
 
     static QString requestKey(const QJsonValue& id) { return QString::fromUtf8(QJsonDocument(QJsonArray{id}).toJson(QJsonDocument::Compact)); }
@@ -867,20 +993,33 @@ struct McpServer::Impl {
 
     static constexpr size_t kMaxQueuedJobs = 256;
     // Null when too many are waiting already.
-    std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args) {
+    std::shared_ptr<ToolJob> startJob(const Tool& tool, const QJsonObject& args, const QString& resumedFrom = {}) {
         auto job = std::make_shared<ToolJob>();
         job->tool = tool.name;
         job->args = args;
-        std::lock_guard l(jobsMutex);
-        if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
-        job->id = QStringLiteral("job-%1").arg(++jobsMade);
-        job->turn = takeTurn();
-        jobs[job->id] = job;
-        jobQueue.push_back(job);
-        if (!jobThread.joinable()) jobThread = std::thread([this] { runJobs(); });
-        jobsWake.notify_all();
-        if (jobsMade % 64 == 0) pruneJobs();
+        job->sideBySide = runsSideBySide(tool);
+        job->resumedFrom = resumedFrom;
+        {
+            std::lock_guard l(jobsMutex);
+            if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
+            job->id = QStringLiteral("job-%1").arg(++jobsMade);
+            job->stored = QStringLiteral("mcp-%1-%2").arg(session).arg(jobsMade);
+            job->turn = takeTurn();
+            jobs[job->id] = job;
+            jobQueue.push_back(job);
+            spawnWorkers();
+            jobsWake.notify_all();
+            if (jobsMade % 64 == 0) pruneJobs();
+        }
+        persist(*job, true);
         return job;
+    }
+    // (jobsMutex held) Threads enough to run atOnce calls side by side.
+    void spawnWorkers() {
+        while (int(jobThreads.size()) < atOnce) {
+            const int index = int(jobThreads.size());
+            jobThreads.emplace_back([this, index] { runJobs(index); });
+        }
     }
     // Finished jobs whose end was read: the newest 200 kept. Unread ones are kept for their caller (up to 10,000).
     // (jobsMutex held)
@@ -897,12 +1036,15 @@ struct McpServer::Impl {
         for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
     }
 
-    void runJobs() {
+    // Worker `index` (of atOnce): takes the next call when its turn has come. One that runs side by side holds the tool
+    // lock shared and lets the next call's turn come as soon as it starts (so later calls see the project as every call
+    // before them left it, and the next background call can start beside it); any other holds it alone until done.
+    void runJobs(int index) {
         for (;;) {
             std::shared_ptr<ToolJob> job;
             {
                 std::unique_lock l(jobsMutex);
-                jobsWake.wait(l, [this] { return stopping || !jobQueue.empty(); });
+                jobsWake.wait(l, [this, index] { return stopping || (!jobQueue.empty() && index < atOnce); });
                 if (stopping) return;
                 job = jobQueue.front();
                 jobQueue.pop_front();
@@ -911,21 +1053,32 @@ struct McpServer::Impl {
             waitTurn(job->turn);
             struct TurnEnd {
                 Impl* d;
-                ~TurnEnd() { d->endTurn(); }
+                bool ended = false;
+                void end() {
+                    if (!ended) d->endTurn();
+                    ended = true;
+                }
+                ~TurnEnd() { end(); }
             } turnEnd{this};
             {
                 std::lock_guard l(jobsMutex);
                 if (stopping) return;
             }
-            std::unique_lock running(toolMutex);
+            std::shared_lock<std::shared_mutex> shared(toolMutex, std::defer_lock);
+            std::unique_lock<std::shared_mutex> alone(toolMutex, std::defer_lock);
+            if (job->sideBySide) shared.lock();
+            else alone.lock();
             {
                 std::lock_guard jl(job->m);
                 if (job->cancel || tool == tools.end()) {
                     job->status = QStringLiteral("cancelled");
-                    continue;
+                } else {
+                    job->status = QStringLiteral("running");
                 }
-                job->status = QStringLiteral("running");
             }
+            persist(*job, true);
+            if (job->status == QLatin1String("cancelled")) continue;
+            if (job->sideBySide) turnEnd.end();
             tCurrentJob = job.get();
             tCancel = &job->cancel;
             ToolResult r;
@@ -940,10 +1093,22 @@ struct McpServer::Impl {
             }
             tCurrentJob = nullptr;
             tCancel = nullptr;
-            std::lock_guard jl(job->m);
-            job->result = resultJson(r);
-            job->status = !r.error ? QStringLiteral("done") : job->cancel ? QStringLiteral("cancelled") : QStringLiteral("failed");
-            if (!r.error) job->fraction = 1;
+            bool stoppedByEnd;
+            {
+                std::lock_guard l(jobsMutex);
+                stoppedByEnd = stopping;
+            }
+            {
+                std::lock_guard jl(job->m);
+                job->result = resultJson(r);
+                job->status = !r.error                                  ? QStringLiteral("done")
+                              : job->cancelAsked                          ? QStringLiteral("cancelled")
+                              : job->cancel && stoppedByEnd               ? QStringLiteral("interrupted")
+                              : job->cancel                               ? QStringLiteral("cancelled")
+                                                                          : QStringLiteral("failed");
+                if (!r.error) job->fraction = 1;
+            }
+            persist(*job, true);
         }
     }
 
@@ -972,6 +1137,80 @@ struct McpServer::Impl {
         return ok(text, o);
     }
 
+    // A job in the store (one of an earlier server's, or the render queue's) as montage_job reports it.
+    static QJsonObject storedJson(const montage::jobs::Record& r, bool withResult) {
+        QJsonObject o{{"job", r.id}, {"owner", r.owner}, {"tool", r.owner == QLatin1String("mcp") ? r.data.value("tool").toString() : r.kind},
+                      {"title", r.title}, {"status", r.status}, {"progress", r.progress}, {"updated", r.updated}};
+        if (!r.step.isEmpty()) o["step"] = r.step;
+        if (!r.error.isEmpty()) o["error"] = r.error;
+        if (r.data.contains("resumedAs")) o["resumedAs"] = r.data.value("resumedAs");
+        if (r.data.contains("resumedFrom")) o["resumedFrom"] = r.data.value("resumedFrom");
+        if (r.owner == QLatin1String("render-queue") && r.data.contains("output")) o["output"] = r.data.value("output");
+        const QJsonObject result = r.data.value("result").toObject();
+        QString text;
+        for (const QJsonValue& c : result.value("content").toArray())
+            if (c.toObject().value("type").toString() == QLatin1String("text")) text += c.toObject().value("text").toString();
+        if (withResult && r.status == QLatin1String("done") && !result.isEmpty()) {
+            QJsonObject out = result.value("structuredContent").toObject();
+            if (out.isEmpty()) out["text"] = text;
+            else out["message"] = text;
+            o["result"] = out;
+        } else if (r.finished() && !text.isEmpty() && r.status != QLatin1String("done")) {
+            o["error"] = text;
+        }
+        return o;
+    }
+    static QString storedText(const montage::jobs::Record& r) {
+        const QString what = r.owner == QLatin1String("mcp") ? r.data.value("tool").toString() : r.title;
+        if (r.status == QLatin1String("running"))
+            return QStringLiteral("%1 (%2) is running: %3 %%4").arg(r.id, what).arg(std::lround(r.progress * 100)).arg(r.step.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(r.step));
+        if (r.status == QLatin1String("resumed")) return QStringLiteral("%1 (%2) was taken up again as %3").arg(r.id, what, r.data.value("resumedAs").toString());
+        return QStringLiteral("%1 (%2) is %3").arg(r.id, what, r.status);
+    }
+    // montage_job's status, cancel or resume of a job in the store.
+    ToolResult storedAction(montage::jobs::Record r, const QString& action) {
+        const bool queue = r.owner == QLatin1String("render-queue");
+        if (action == "cancel" && !r.finished() && r.status != QLatin1String("resumed")) {
+            if (queue || montage::jobs::runningElsewhere(r)) {
+                // (whoever runs it hears it: the render queue within a fifth of a second, a server at its next progress)
+                QFile f(montage::jobs::jobFolder(r.id) + QStringLiteral("/cancel"));
+                if (!f.open(QIODevice::WriteOnly)) return fail(QStringLiteral("Cannot ask %1 to stop").arg(r.id));
+                f.close();
+                QJsonObject o = storedJson(r, false);
+                o["cancelAsked"] = true;
+                return ok(QStringLiteral("%1 is asked to stop").arg(r.id), o);
+            }
+            // (nobody runs it: set aside, and claimed so no server takes it up again)
+            QFile claim(montage::jobs::jobFolder(r.id) + QStringLiteral("/resumed"));
+            if (!claim.open(QIODevice::WriteOnly | QIODevice::NewOnly)) return fail(QStringLiteral("%1 was taken up again already").arg(r.id));
+            claim.close();
+            r.status = QStringLiteral("cancelled");
+            montage::jobs::save(r);
+            return ok(QStringLiteral("%1 is cancelled").arg(r.id), storedJson(r, false));
+        }
+        if (action == "resume") {
+            if (queue) return fail(QStringLiteral("%1 is the render queue's: Montage renders it again when it starts").arg(r.id));
+            if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting"))
+                return fail(QStringLiteral("%1 is %2: only a call cut short is taken up again").arg(r.id, r.status));
+            if (montage::jobs::runningElsewhere(r)) return fail(QStringLiteral("%1 is held by a server still running").arg(r.id));
+            if (r.data.value("secret").toBool() || !r.data.contains("args"))
+                return fail(QStringLiteral("%1's arguments were not kept (they held a secret): call the tool again").arg(r.id));
+            if (r.data.value("cwd").toString() != QDir::currentPath())
+                return fail(QStringLiteral("%1 was asked for in %2: start the server there to run it again (its relative paths read from there)")
+                                .arg(r.id, r.data.value("cwd").toString()));
+            const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == r.data.value("tool").toString(); });
+            if (tool == tools.end()) return fail(QStringLiteral("%1's tool is gone").arg(r.id));
+            const std::shared_ptr<ToolJob> job = resume(r, *tool);
+            if (!job) return fail(QStringLiteral("%1 was taken up again already, or too many calls are waiting").arg(r.id));
+            return ok(QStringLiteral("%1 runs again as %2: montage_job reads it").arg(r.id, job->id),
+                      QJsonObject{{"job", job->id}, {"tool", job->tool}, {"status", "queued"}, {"resumedFrom", r.id}});
+        }
+        const QJsonObject o = storedJson(r, true);
+        QString text = storedText(r);
+        if (o.contains("error")) text += QStringLiteral(": ") + o.value("error").toString();
+        return ok(text, o);
+    }
+
     void add(const char* name, const char* title, const char* description, const char* schema, bool readOnly,
              std::function<ToolResult(const QJsonObject&)> run) {
         tools.push_back({name, title, description, QJsonDocument::fromJson(schema).object(), readOnly, std::move(run)});
@@ -979,9 +1218,12 @@ struct McpServer::Impl {
 
     void progress(double fraction, const QString& message) {
         if (ToolJob* j = tCurrentJob) {
-            std::lock_guard l(j->m);
-            j->fraction = std::clamp(fraction, 0.0, 1.0);
-            j->step = message;
+            {
+                std::lock_guard l(j->m);
+                j->fraction = std::clamp(fraction, 0.0, 1.0);
+                j->step = message;
+            }
+            persist(*j);
             return;
         }
         if (!notify || progressToken.isUndefined() || progressToken.isNull()) return;
@@ -991,6 +1233,7 @@ struct McpServer::Impl {
     }
 
     void addTools();
+    ToolResult renderLive(const QJsonObject& a);
     struct SpeechLine {
         std::string text;
         FrameTime at = 0, fit = -1;  // fit: the room it has, in frames (-1: any)
@@ -1180,6 +1423,114 @@ McpServer::Impl::CloneVoice McpServer::Impl::cloneVoiceArg(const QJsonObject& a,
                  .arg(QString::fromUtf8(lang->name), QString::fromStdString(v.from), QDateTime::currentDateTime().toString(Qt::ISODate))
                  .toStdString();
     return v;
+}
+
+// montage_render's streaming.live: a live package from a recording as it is made (render/LivePackage.h).
+ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
+    const QJsonObject so = a.value("streaming").toObject();
+    if (!so.value("live").isObject()) throw ArgError{"\"live\" is an object: {url, seconds, ...}"};
+    if (a.contains("farm")) throw ArgError{"A live package is made here, not on a render farm"};
+    const QJsonObject lo = so.value("live").toObject();
+    LiveSettings ls;
+    ls.folder = absolute(need(a, "output")).toStdString();
+    ls.codec = str(so, "codec", "libx264").toStdString();
+    for (const QJsonValue& v : so.value("ladder").toArray()) {
+        const QJsonObject r = v.toObject();
+        StreamingRung rung;
+        rung.width = r.value("width").toInt(), rung.height = r.value("height").toInt();
+        rung.bitrate = r.value("bitrate").toInteger();
+        rung.codec = str(r, "codec", QString::fromStdString(ls.codec)).toStdString();
+        if (rung.width <= 0 || rung.bitrate <= 0) throw ArgError{"Each rung needs a width and a bitrate"};
+        ls.rungs.push_back(rung);
+    }
+    ls.segmentSeconds = so.value("segment_seconds").toDouble(2);
+    if (ls.segmentSeconds < 1 || ls.segmentSeconds > 6) throw ArgError{"A live package's \"segment_seconds\" is 1 to 6"};
+    ls.window = lo.value("window").toInt(6);
+    if (ls.window < 3 || ls.window > 100) throw ArgError{"\"window\" is 3 to 100 segments"};
+    ls.lowLatency = so.value("low_latency").toBool();
+    ls.partSeconds = lo.value("part_seconds").toDouble(0.5);
+    if (ls.partSeconds < 0.1 || ls.partSeconds > 1) throw ArgError{"\"part_seconds\" is 0.1 to 1"};
+    ls.hls = so.value("hls").toBool(true), ls.dash = so.value("dash").toBool(true);
+    ls.segmentFormat = str(so, "segments", "cmaf").toStdString();
+    if (ls.segmentFormat != "cmaf" && ls.segmentFormat != "ts") throw ArgError{"\"segments\" is cmaf or ts"};
+    ls.audioCodec = str(so, "audio_codec", "aac").toStdString();
+    if (ls.audioCodec != "aac" && ls.audioCodec != "libopus" && ls.audioCodec != "ac3" && ls.audioCodec != "eac3" && ls.audioCodec != "none")
+        throw ArgError{"\"audio_codec\" is aac, libopus, ac3, eac3 or none"};
+    ls.audioBitrate = so.value("audio_bitrate").toInteger(128000);
+    if (ls.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
+    if (a.contains("audio_name")) ls.audioName = str(a, "audio_name").toStdString();
+    if (a.contains("audio_language")) ls.audioLanguage = str(a, "audio_language").toStdString();
+
+    CaptureSettings cs;
+    cs.video.url = need(lo, "url").toStdString();
+    cs.video.device = str(lo, "device").toStdString();
+    const QJsonObject options = lo.value("options").toObject();
+    for (auto it = options.begin(); it != options.end(); ++it)
+        cs.video.options[it.key().toStdString()] = it.value().isString() ? it.value().toString().toStdString() : it.value().toVariant().toString().toStdString();
+    cs.seconds = lo.value("seconds").toDouble();
+    if (!(cs.seconds >= 1 && cs.seconds <= 86400)) throw ArgError{"\"seconds\" is how long to record, 1 to 86400"};
+    {
+        const QFileInfo fi(QString::fromStdString(ls.folder));
+        cs.path = lo.contains("record") ? absolute(str(lo, "record")).toStdString()
+                                        : fi.absoluteDir().filePath(fi.fileName() + ".mov").toStdString();
+    }
+    cs.codec = str(lo, "capture_codec", "prores_proxy").toStdString();
+    const bool serve = lo.value("serve").toBool();
+    const int port = lo.value("port").toInt(0);
+    if (port < 0 || port > 65535) throw ArgError{"\"port\" is 0 to 65535"};
+    const std::string address = str(lo, "address", "127.0.0.1").toStdString();
+    if (address != "127.0.0.1" && address != "0.0.0.0") throw ArgError{"\"address\" is 127.0.0.1 or 0.0.0.0"};
+
+    std::string why;
+    LivePackager packager;
+    if (!packager.start(ls, &why)) return fail(QString::fromStdString(why));
+    LiveOrigin origin;
+    if (serve && !origin.start(ls.folder, port, [&](const std::string& rel) { return packager.growing(rel); }, &why, address))
+        return fail(QString::fromStdString(why));
+    const int servedPort = serve ? origin.port() : 0;
+    cs.onPicture = [&](const AVFrame* f, int num, int den) { packager.picture(f, num, den); };
+    cs.onSound = [&](const AVFrame* f) { packager.sound(f); };
+    Recorder recorder;
+    if (!recorder.start(cs, &why)) return fail(QString::fromStdString(why));
+    const std::atomic<bool>* cancel = cancelFlag();
+    bool cancelled = false;
+    while (!recorder.wait(0.25)) {
+        const LiveStatus ps = packager.status();
+        progress(recorder.status().seconds / cs.seconds, QStringLiteral("Recording live: %1 segments").arg(ps.segments));
+        if ((cancel && cancel->load()) || !ps.error.empty()) {
+            cancelled = cancel && cancel->load();
+            break;
+        }
+    }
+    recorder.stop();
+    packager.finish();
+    origin.stop();
+    const CaptureStatus rs = recorder.status();
+    const LiveStatus ps = packager.status();
+    if (!rs.error.empty()) return fail(QString::fromStdString(rs.error));
+    if (!ps.error.empty()) return fail(QString::fromStdString(ps.error));
+    QJsonArray renditions;
+    for (const std::string& r : ps.renditions) renditions.append(QString::fromStdString(r));
+    QJsonObject o{{"folder", QString::fromStdString(ls.folder)}, {"renditions", renditions}, {"segments", double(ps.segments)},
+                  {"first_listed", double(ps.firstListed)}, {"frames", double(ps.frames)}, {"dropped", double(ps.dropped)},
+                  {"recording", QString::fromStdString(cs.path)}};
+    QString text = QStringLiteral("%1 a live package in %2: %3 renditions, %4 segments (the playlists hold the last %5)")
+                       .arg(cancelled ? "Stopped" : "Made", QString::fromStdString(ls.folder))
+                       .arg(ps.renditions.size())
+                       .arg(ps.segments)
+                       .arg(std::min<int64_t>(ps.segments, ls.window));
+    text += QStringLiteral("\nRecorded to %1").arg(QString::fromStdString(cs.path));
+    if (!ps.hls.empty()) o["hls"] = QString::fromStdString(ps.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(ps.hls));
+    if (!ps.dash.empty()) o["dash"] = QString::fromStdString(ps.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(ps.dash));
+    if (ls.audioCodec == "ac3" || ls.audioCodec == "eac3") o["dialnorm"] = ps.dialnorm;
+    if (ps.dropped) text += QStringLiteral("\n%1 picture(s) dropped while the encoders fell behind").arg(ps.dropped);
+    if (serve) {
+        const QString url = QStringLiteral("http://%1:%2/").arg(QString::fromStdString(address == "0.0.0.0" ? "127.0.0.1" : address)).arg(servedPort);
+        o["url"] = url;
+        text += QStringLiteral("\nServed at %1 while it recorded (now stopped)").arg(url);
+    }
+    if (!rs.warning.empty()) text += QStringLiteral("\n") + QString::fromStdString(rs.warning);
+    return ok(text, o);
 }
 
 void McpServer::Impl::addTools() {
@@ -2865,7 +3216,11 @@ void McpServer::Impl::addTools() {
         "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`. runs style stretches of the text "
         "(from and len count UTF-16 characters, newlines included): font, size, bold, italic, color and outline_color as "
         "[r, g, b] in 0..1, outline width, tracking, baseline shift (pixels up) and a variable font's axes ({\"wght\": 650}). "
-        "path sets the text along a circle (radius), a wave or SVG path data from the title's position. animations move "
+        "path sets the text along a circle (radius), a wave, SVG path data from the title's position, one of the title "
+        "clip's masks (mask; add one with montage_add_effect) or a shape layer's path below it (shape: track, item), from "
+        "offset % along it (offset_keys animate it), aligned at its start, middle or end or spread over it, the letters "
+        "at right angles to it unless perpendicular is false. axes sets a variable font's axes for the whole title; "
+        "motion_blur blurs moving letters (shutter angle, samples). animations move "
         "the text a letter, word or line at a time: a range (start, end and offset in % of the text; shape) selects "
         "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour) "
         "goes as far as it selects them; sweep runs the range across the text from the start (in_across) or to the end "
@@ -2879,8 +3234,15 @@ void McpServer::Impl::addTools() {
                 "color":{"type":"array","items":{"type":"number"}},"outline":{"type":"number"},
                 "outline_color":{"type":"array","items":{"type":"number"}},"tracking":{"type":"number"},"baseline":{"type":"number"},
                 "axes":{"type":"object","additionalProperties":{"type":"number"}}},"required":["from","len"]}},
-            "path":{"type":"object","properties":{"shape":{"type":"string","enum":["circle","wave","custom"]},"radius":{"type":"number"},
+            "path":{"type":"object","properties":{"shape":{"type":"string","enum":["circle","wave","custom","mask","shape"]},"radius":{"type":"number"},
                 "wavelength":{"type":"number"},"offset":{"type":"number","description":"% of the path's length"},
+                "offset_keys":{"type":"array","items":{"type":"object","properties":{"frame":{"type":"number"},"offset":{"type":"number"}}},
+                    "description":"The offset keyed: frames from the title's start"},
+                "align":{"type":"string","enum":["as_text","start","middle","end","spread"],"default":"as_text"},
+                "mask":{"type":"integer","description":"mask: which of the title clip's masks (1 the first)"},
+                "track":{"type":"integer","description":"shape: the shape layer's video track (1 the bottom; 0 the nearest below)"},
+                "item":{"type":"string","description":"shape: the path item's name or id (the first path when not given)"},
+                "perpendicular":{"type":"boolean","default":true,"description":"letters stand at right angles to the path (false: upright)"},
                 "upright":{"type":"boolean"},"reverse":{"type":"boolean","description":"run the other way (inside a circle)"},
                 "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"}},"required":["shape"]},
             "animations":{"type":"array","items":{"type":"object","properties":{
@@ -2891,8 +3253,13 @@ void McpServer::Impl::addTools() {
                 "random":{"type":"number"},"random_order":{"type":"boolean"},"seed":{"type":"number"},
                 "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"rotation":{"type":"number"},"opacity":{"type":"number"},
                 "blur":{"type":"number"},"tracking":{"type":"number"},"fill":{"type":"array","items":{"type":"number"}},"fill_amount":{"type":"number"},
-                "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"}}}},
-            "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels)"},
+                "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"},
+                "depth":{"type":"number","description":"3d: extrusion added where it selects (pixels)"}}}},
+            "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels); an animation's depth adds to it letter by letter"},
+            "axes":{"type":"object","additionalProperties":{"type":"number"},"description":"A variable font's axes for the whole title ({\"wght\": 650})"},
+            "motion_blur":{"type":"boolean","description":"Blur letters as they move"},
+            "shutter":{"type":"number","default":180,"description":"Motion blur shutter angle (degrees)"},
+            "samples":{"type":"integer","default":16,"description":"Motion blur samples (2-64)"},
             "spin_in":{"type":"boolean","description":"3d: spin in at the start"},
             "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
             "animate_by":{"type":"string","enum":["letter","word","line"],"default":"letter"},
@@ -2938,8 +3305,21 @@ void McpServer::Impl::addTools() {
                 if (a.value("animation_seconds").isDouble()) c.generator.params["text_anim_dur"] = Param(std::clamp(a.value("animation_seconds").toDouble(), 0.1, 10.0));
                 c.generator.params["text_anim_out"] = Param(a.value("animate_out").toBool() ? 1.0 : 0.0);
             }
-            if (type == "title3d" && (a.contains("path") || a.contains("animations")))
-                throw ArgError{"path and animations are for flat titles"};
+            if (type == "title3d" && (a.contains("path") || a.contains("motion_blur")))
+                throw ArgError{"path and motion_blur are for flat titles"};
+            if (a.contains("axes")) {
+                const QJsonObject ax = a.value("axes").toObject();
+                for (auto it = ax.begin(); it != ax.end(); ++it) {
+                    const QString tag = it.key();
+                    if (tag.isEmpty() || tag.size() > 4 || !it.value().isDouble()) throw ArgError{"\"axes\" maps tags of 1-4 letters to numbers"};
+                    c.generator.params["axis." + tag.toStdString()] = Param(it.value().toDouble());
+                }
+            }
+            if (a.contains("motion_blur")) {
+                c.generator.params["letter_blur"] = Param(a.value("motion_blur").toBool() ? 1.0 : 0.0);
+                if (a.value("shutter").isDouble()) c.generator.params["letter_shutter"] = Param(std::clamp(a.value("shutter").toDouble(), 0.0, 720.0));
+                if (a.value("samples").isDouble()) c.generator.params["letter_samples"] = Param(double(std::clamp(a.value("samples").toInt(), 2, 64)));
+            }
             if (a.contains("runs")) {
                 if (!a.value("runs").isArray()) throw ArgError{"\"runs\" is a list of {from, len, ...}"};
                 const QJsonArray arr = a.value("runs").toArray();
@@ -2950,16 +3330,36 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("path")) {
                 const QJsonObject pa = a.value("path").toObject();
-                const QStringList shapes{"none", "circle", "wave", "custom"};
+                const QStringList shapes{"none", "circle", "wave", "custom", "mask", "shape"};
                 const int sh = int(shapes.indexOf(pa.value("shape").toString()));
-                if (sh <= 0) throw ArgError{"\"path\" shape is circle, wave or custom"};
+                if (sh <= 0) throw ArgError{"\"path\" shape is circle, wave, custom, mask or shape"};
+                if (pa.contains("mask")) c.generator.params["path_mask"] = Param(double(std::clamp(pa.value("mask").toInt(1), 1, 64)));
+                if (pa.contains("track")) c.generator.params["path_track"] = Param(double(std::clamp(pa.value("track").toInt(0), 0, 99)));
+                if (pa.contains("item")) c.generator.strings["path_item"] = pa.value("item").toString().toStdString();
+                if (pa.contains("align")) {
+                    const QStringList aligns{"as_text", "start", "middle", "end", "spread"};
+                    const int al = int(aligns.indexOf(pa.value("align").toString()));
+                    if (al < 0) throw ArgError{"\"align\" is as_text, start, middle, end or spread"};
+                    c.generator.params["path_align"] = Param(double(al));
+                }
+                if (pa.contains("perpendicular")) c.generator.params["path_upright"] = Param(pa.value("perpendicular").toBool(true) ? 0.0 : 1.0);
                 if (sh == 3 && pa.value("data").toString().trimmed().isEmpty()) throw ArgError{"A custom path needs its SVG path data (data)"};
                 c.generator.params["path_shape"] = Param(double(sh));
                 for (const auto& [key, param] : std::vector<std::pair<const char*, const char*>>{
                          {"radius", "path_radius"}, {"wavelength", "path_wavelength"}, {"offset", "path_offset"}})
                     if (pa.value(key).isDouble()) c.generator.params[param] = Param(pa.value(key).toDouble());
-                c.generator.params["path_upright"] = Param(pa.value("upright").toBool() ? 1.0 : 0.0);
+                if (!pa.contains("perpendicular")) c.generator.params["path_upright"] = Param(pa.value("upright").toBool() ? 1.0 : 0.0);
                 c.generator.params["path_reverse"] = Param(pa.value("reverse").toBool() ? 1.0 : 0.0);
+                if (pa.contains("offset_keys")) {
+                    Param off;
+                    for (const QJsonValue& kv : pa.value("offset_keys").toArray()) {
+                        const QJsonObject ko = kv.toObject();
+                        if (!ko.value("frame").isDouble() || !ko.value("offset").isDouble()) throw ArgError{"Each offset key is {frame, offset}"};
+                        off.addKey(FrameTime(std::llround(ko.value("frame").toDouble())), ko.value("offset").toDouble());
+                    }
+                    if (off.keys.empty()) throw ArgError{"\"offset_keys\" is empty"};
+                    c.generator.params["path_offset"] = off;
+                }
                 if (sh == 3) c.generator.strings["path_data"] = pa.value("data").toString().toStdString();
             }
             if (a.contains("animations")) {
@@ -2984,8 +3384,11 @@ void McpServer::Impl::addTools() {
                              {"start", "start"}, {"end", "end"}, {"offset", "offset"}, {"ease", "ease"}, {"amount", "amount"},
                              {"sweep_seconds", "sweep_dur"}, {"random", "random"}, {"seed", "seed"}, {"x", "x"}, {"y", "y"},
                              {"scale", "scale"}, {"rotation", "rotation"}, {"opacity", "opacity"}, {"blur", "blur"},
-                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}})
+                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}, {"depth", "depth"}})
                         if (o.contains(key)) {
+                            if (std::string(name) == "depth" && type != "title3d") throw ArgError{"An animation's depth is for the 3d template"};
+                            if (type == "title3d" && std::string(name) != "depth" && std::string(" start end offset ease amount sweep_dur random seed ").find(" " + std::string(name) + " ") == std::string::npos)
+                                throw ArgError{QStringLiteral("A 3D title's animations select letters and set depth; \"%1\" is for flat titles").arg(key)};
                             if (!o.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
                             set(name, o.value(key).toDouble());
                         }
@@ -3365,11 +3768,11 @@ void McpServer::Impl::addTools() {
         "draw_on animates the outline drawing itself on over that many seconds (Trim End keyframed 0 to 100 %). Lottie "
         "animations (.json) and SVG graphics are placed like other media, with montage_place_media; svg (a file) instead "
         "makes an SVG's paths, groups, fills, strokes and gradients into an editable shape layer its size (what it cannot "
-        "make into shapes is listed in notes). items builds a layer of several things, in order, the first on top: "
+        "make into shapes is listed in notes; its text becomes title clips over it, counted in titles). items builds a layer of several things, in order, the first on top: "
         "{type, settings?, name?} with type a shape (rect, ellipse, polygon, star, or path with points [[x, y] or {x, y, "
         "in: [dx, dy], out: [dx, dy]}], closed, and keys [{frame, points}] to morph it), a paint (fill, stroke: settings "
         "color \"#rrggbb\", width, gradient 1 linear or 2 radial from start_x/y to end_x/y with color2, or stops "
-        "[[offset, \"#rrggbb\", opacity]]), an operator changing the paths above it in its group (merge: mode 0 keep "
+        "[[offset, \"#rrggbb\", opacity]], and gradient_keys [{frame, stops}] to animate the stops), an operator changing the paths above it in its group (merge: mode 0 keep "
         "each, 1 union, 2 subtract, 3 intersect, 4 exclude; offset: amount, join; round: radius; pucker: amount -100..100; "
         "twist: angle; zigzag: size, ridges, points 1 smooth; wiggle: size, spacing, speed, correlation, seed; trim: "
         "start, end, offset; repeater: copies, offset, pos_x/y, anchor_x/y, scale, rotation, start_opacity, end_opacity) "
@@ -3394,12 +3797,13 @@ void McpServer::Impl::addTools() {
             Effect built;
             std::vector<std::string> notes;
             double svgW = 0, svgH = 0;
+            std::vector<SvgText> svgTexts;
             if (a.contains("svg") && a.contains("items")) throw ArgError{"Give \"svg\" or \"items\", not both"};
             if (a.contains("svg")) {
                 const QFileInfo fi(absolute(str(a, "svg")));
                 if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(str(a, "svg"))};
                 std::string err;
-                if (!importSvgShapes(fi.absoluteFilePath().toStdString(), built, svgW, svgH, &notes, &err)) return fail(QString::fromStdString(err));
+                if (!importSvgShapes(fi.absoluteFilePath().toStdString(), built, svgW, svgH, &notes, &err, &svgTexts)) return fail(QString::fromStdString(err));
                 contents = shapeContents(built);
             } else if (a.contains("items")) {
                 std::set<std::string> usedIds;
@@ -3442,6 +3846,20 @@ void McpServer::Impl::addTools() {
                             const QColor col(st.at(1).toString());
                             if (!col.isValid()) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
                             it.stops.push_back({std::clamp(st.at(0).toDouble(), 0.0, 1.0), col.redF(), col.greenF(), col.blueF(), st.at(2).toDouble(1)});
+                        }
+                        for (const QJsonValue& kv : o.value("gradient_keys").toArray()) {
+                            // A gradient's stops keyed: [{frame, stops: [[offset, "#rrggbb", opacity]]}].
+                            const QJsonObject ko = kv.toObject();
+                            std::vector<std::array<double, 5>> stops;
+                            for (const QJsonValue& sv : ko.value("stops").toArray()) {
+                                const QJsonArray st = sv.toArray();
+                                const QColor col(st.at(1).toString());
+                                if (st.size() < 2 || !col.isValid()) throw ArgError{"A stop is [offset, \"#rrggbb\", opacity]"};
+                                stops.push_back({std::clamp(st.at(0).toDouble(), 0.0, 1.0), col.redF(), col.greenF(), col.blueF(), std::clamp(st.at(2).toDouble(1), 0.0, 1.0)});
+                            }
+                            if (stops.size() < 2) throw ArgError{"Each gradient key has two or more stops"};
+                            if (!it.stops.empty() && stops.size() != it.stops.size()) throw ArgError{"Each gradient key has as many stops as the gradient"};
+                            keyGradientStops(built, it, FrameTime(std::llround(ko.value("frame").toDouble())), stops);
                         }
                         if (it.type == "path") {
                             auto pointsOf = [](const QJsonArray& arr) {
@@ -3494,12 +3912,16 @@ void McpServer::Impl::addTools() {
                 for (const ShapeItem& it : shapeContents(sc->generator)) eraseShapeItemParams(sc->generator, it);
                 for (const auto& [k, v] : built.params) sc->generator.params[k] = v;
                 setShapeContents(sc->generator, contents);
+                const Id scId = sc->id;
+                const int titles = placeSvgTexts(l.project, s, scId, svgTexts, &notes);
                 save(l);
-                QJsonObject out = clipJson(l.project, s, *sc);
+                sc = edit::clipById(s, scId);
+                QJsonObject out = sc ? clipJson(l.project, s, *sc) : QJsonObject{};
+                if (titles) out["titles"] = titles;
                 QJsonArray ns;
                 for (const std::string& n : notes) ns.append(QString::fromStdString(n));
                 if (!ns.isEmpty()) out["notes"] = ns;
-                return ok(QStringLiteral("Replaced the shapes of %1").arg(QString::fromStdString(sc->name)), out);
+                return ok(QStringLiteral("Replaced the shapes of %1").arg(sc ? QString::fromStdString(sc->name) : QString()), out);
             }
             if (!a.contains("at")) throw ArgError{"\"at\" is needed"};
             TrackRef t{TrackKind::Video, 0};
@@ -3555,9 +3977,11 @@ void McpServer::Impl::addTools() {
             }
             const auto r = edit::overwrite(l.project, s, t, c);
             check(r);
+            const int titles = r.created.empty() ? 0 : placeSvgTexts(l.project, s, r.created[0], svgTexts, &notes);
             save(l);
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
             QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            if (titles) out["titles"] = titles;
             QJsonArray ns;
             for (const std::string& n : notes) ns.append(QString::fromStdString(n));
             if (!ns.isEmpty()) out["notes"] = ns;
@@ -3704,6 +4128,84 @@ void McpServer::Impl::addTools() {
             }
             const QJsonObject o{{"effects", list}};
             return ok(json(o), o);
+        });
+
+    add("montage_plugins", "Plug-in hosting",
+        "How plug-ins are hosted, and how they have failed. Audio plug-ins (CLAP, VST3, LV2, Audio Units) and OpenFX video "
+        "plug-ins run in plug-in host processes of their own, so one that crashes, hangs or uses too much memory is bypassed "
+        "(playback carries on; an export stops, naming it) and started again with its last settings. `isolation` reads or "
+        "sets the grouping: \"plugin\" (each plug-in in a host of its own, the default), \"vendor\" (one host for each maker), "
+        "\"shared\" (all plug-ins in one host) or \"off\" (in Montage's own process). ARA plug-ins always run in Montage's "
+        "process. Also sets missed_blocks (audio blocks a host may be late with in a row before it counts as hung), bypass "
+        "(\"input\" or \"silence\"), memory_limit_mb (0: none), export_timeout_s and auto_restarts (a session, for each "
+        "plug-in). The result lists the running hosts and every failure this session (which plug-in, its kind: crash, hang, "
+        "memory or load; when first and last, how many times, restarts, whether it is bypassed now). `restart` starts a "
+        "failed plug-in again; `disable` keeps it bypassed and turns it off in the plug-in list; `clear_failures` empties "
+        "the list.",
+        R"json({"type":"object","properties":{"isolation":{"type":"string","enum":["plugin","vendor","shared","off"]},"missed_blocks":{"type":"integer","minimum":1,"maximum":1000},"bypass":{"type":"string","enum":["input","silence"]},"memory_limit_mb":{"type":"integer","minimum":0},"export_timeout_s":{"type":"number","minimum":1},"auto_restarts":{"type":"integer","minimum":0,"maximum":100},"restart":{"type":"string","description":"the plug-in id of a failure to start again"},"disable":{"type":"string","description":"the plug-in id of a failure to keep bypassed"},"clear_failures":{"type":"boolean"}}})json",
+        false, [](const QJsonObject& a) {
+            plugins::HostingSettings h = plugins::hosting();
+            bool changed = false;
+            if (a.contains("isolation")) {
+                const auto i = plugins::isolationFromName(str(a, "isolation").toStdString());
+                if (!i) return fail("isolation is plugin, vendor, shared or off");
+                h.isolation = *i;
+                changed = true;
+            }
+            if (a.contains("missed_blocks")) h.missedBlocks = std::clamp(a.value("missed_blocks").toInt(16), 1, 1000), changed = true;
+            if (a.contains("bypass")) {
+                const QString b = str(a, "bypass");
+                if (b != "input" && b != "silence") return fail("bypass is input or silence");
+                h.bypassWithSilence = b == "silence";
+                changed = true;
+            }
+            if (a.contains("memory_limit_mb")) h.memoryLimitMb = std::max(0, a.value("memory_limit_mb").toInt()), changed = true;
+            if (a.contains("export_timeout_s")) h.exportTimeoutMs = int(std::lround(std::max(1.0, a.value("export_timeout_s").toDouble()) * 1000)), changed = true;
+            if (a.contains("auto_restarts")) h.autoRestarts = std::clamp(a.value("auto_restarts").toInt(), 0, 100), changed = true;
+            if (changed) plugins::setHostingAndSave(h);
+            QStringList did;
+            if (a.contains("restart")) {
+                const std::string id = str(a, "restart").toStdString();
+                did << (plugins::restartPlugin(id) ? QStringLiteral("Starting %1 again.").arg(QString::fromStdString(id))
+                                                   : QStringLiteral("%1 was not bypassed.").arg(QString::fromStdString(id)));
+            }
+            if (a.contains("disable")) {
+                plugins::disablePluginAfterFailure(str(a, "disable").toStdString());
+                did << QStringLiteral("%1 is kept bypassed and turned off.").arg(str(a, "disable"));
+            }
+            if (a.value("clear_failures").toBool()) {
+                plugins::clearHostFailures();
+                did << QStringLiteral("Failures cleared.");
+            }
+            h = plugins::hosting();
+            auto iso = [](int64_t ms) { return QDateTime::fromMSecsSinceEpoch(ms).toUTC().toString(Qt::ISODateWithMs); };
+            QJsonArray failures;
+            for (const plugins::HostFailure& f : plugins::hostFailures())
+                failures.append(QJsonObject{{"plugin", QString::fromStdString(f.pluginId)}, {"name", QString::fromStdString(f.name)},
+                                            {"vendor", QString::fromStdString(f.vendor)}, {"kind", QString::fromStdString(f.kind)},
+                                            {"reason", QString::fromStdString(f.reason)}, {"first", iso(f.firstMs)}, {"last", iso(f.lastMs)},
+                                            {"count", f.count}, {"restarts", f.restarts}, {"bypassed", f.bypassedNow},
+                                            {"offline", f.offline}, {"disabled", f.disabled}});
+            QJsonArray hosts;
+            for (const plugins::HostInfo& hi : plugins::runningHosts())
+                hosts.append(QJsonObject{{"key", QString::fromStdString(hi.key)}, {"pid", double(hi.pid)}, {"instances", hi.instances}});
+            const QJsonObject o{{"isolation", plugins::isolationName(h.isolation)},
+                                {"host_available", plugins::hostAvailable()},
+                                {"missed_blocks", h.missedBlocks},
+                                {"bypass", h.bypassWithSilence ? "silence" : "input"},
+                                {"memory_limit_mb", h.memoryLimitMb},
+                                {"export_timeout_s", h.exportTimeoutMs / 1000.0},
+                                {"auto_restarts", h.autoRestarts},
+                                {"hosts", hosts},
+                                {"failures", failures}};
+            QString text = QStringLiteral("Plug-ins: %1").arg(h.isolation == plugins::Isolation::PerPlugin  ? "each in a host of its own"
+                                                              : h.isolation == plugins::Isolation::PerVendor ? "one host for each maker"
+                                                              : h.isolation == plugins::Isolation::Shared    ? "all in one host"
+                                                                                                             : "in Montage's own process");
+            if (h.isolation != plugins::Isolation::InProcess && !plugins::hostAvailable()) text += " (the host program is missing: in Montage's own process)";
+            text += QStringLiteral("; %1 failure(s) this session.").arg(failures.size());
+            if (!did.isEmpty()) text += " " + did.join(' ');
+            return ok(text, o);
         });
 
     add("montage_add_effect", "Add an effect",
@@ -5428,6 +5930,105 @@ void McpServer::Impl::addTools() {
             return fail(QStringLiteral("Unknown action %1").arg(action));
         });
 
+    add("montage_track", "A track's group and colour",
+        "Track groups and colours. A group holds tracks edited, mixed and comped together; its switches say what a "
+        "change on one of them does to the others: editing (selecting, cutting, trimming, moving, deleting and fading "
+        "clips over the same time), mute (mute and solo), volume and pan (moves by the same amount, keeping offsets), "
+        "automation (modes, and lanes written in a pass), record (recording onto one records onto all) and comp (passes "
+        "recorded together share a pass id and take number; comping, ratings, auditions and Best Take act on the "
+        "group: see montage_takes). group puts the track (or tracks) in a group by name, made if new (\"\" takes "
+        "them out); switches sets the group's switches and suspended; suspend_all suspends (or resumes) every group. "
+        "color is the track's label colour (#rrggbb, \"\" none), drawn on its header and, with color_clips, its clips; "
+        "it is saved and carried in OpenTimelineIO. Without changes, lists the tracks and groups.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "track":{"type":"string","description":"V1, V2... or A1, A2..."},
+            "tracks":{"type":"array","items":{"type":"string"},"description":"Several tracks at once (instead of track)"},
+            "group":{"type":"string","description":"The group to put the track(s) in (made if new); \"\" takes them out"},
+            "switches":{"type":"object","description":"For the track's group (or `group`'s)","properties":{
+                "editing":{"type":"boolean"},"mute":{"type":"boolean"},"volume":{"type":"boolean"},"pan":{"type":"boolean"},
+                "automation":{"type":"boolean"},"record":{"type":"boolean"},"comp":{"type":"boolean"},"suspended":{"type":"boolean"}}},
+            "delete_group":{"type":"string","description":"A group to delete (its tracks stay)"},
+            "color":{"type":"string","description":"#rrggbb, or \"\" for none"},
+            "color_clips":{"type":"boolean","description":"Draw the colour on the track's clips that have no label of their own"},
+            "suspend_all":{"type":"boolean"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<TrackRef> tracks;
+            if (a.contains("tracks"))
+                for (const QJsonValue& v : a.value("tracks").toArray()) tracks.push_back(trackArg(v.toString(), s, false));
+            else if (a.contains("track"))
+                tracks.push_back(trackArg(str(a, "track"), s, false));
+            auto apply = [](const edit::Result& r) {
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                return r.ok;
+            };
+            bool changed = false;
+            const bool wantsTracks = a.contains("group") || a.contains("color") || a.contains("color_clips");
+            if (wantsTracks && tracks.empty()) return fail(QStringLiteral("Name the track (track or tracks)"));
+            if (a.contains("delete_group")) {
+                const TrackGroup* g = findTrackGroup(s, str(a, "delete_group").toStdString());
+                if (!g) return fail(QStringLiteral("No group called %1").arg(str(a, "delete_group")));
+                changed |= apply(edit::removeTrackGroup(s, g->id));
+            }
+            if (a.contains("group")) {
+                const std::string name = str(a, "group").trimmed().toStdString();
+                if (name.empty()) changed |= apply(edit::setTrackGroup(s, tracks, 0));
+                else if (const TrackGroup* g = findTrackGroup(s, name)) changed |= apply(edit::setTrackGroup(s, tracks, g->id));
+                else changed |= apply(edit::createTrackGroup(l.project, s, name, tracks));
+            }
+            if (a.contains("switches")) {
+                const TrackGroup* g = a.contains("group") && !str(a, "group").trimmed().isEmpty() ? findTrackGroup(s, str(a, "group").trimmed().toStdString())
+                                      : !tracks.empty()                                            ? findTrackGroup(s, trackAt(s, tracks.front())->group)
+                                                                                                   : nullptr;
+                if (!g) return fail(QStringLiteral("switches need a grouped track or a group"));
+                TrackGroup next = *g;
+                const QJsonObject sw = a.value("switches").toObject();
+                next.editing = sw.value("editing").toBool(next.editing), next.mute = sw.value("mute").toBool(next.mute);
+                next.volume = sw.value("volume").toBool(next.volume), next.pan = sw.value("pan").toBool(next.pan);
+                next.automation = sw.value("automation").toBool(next.automation), next.record = sw.value("record").toBool(next.record);
+                next.comp = sw.value("comp").toBool(next.comp), next.suspended = sw.value("suspended").toBool(next.suspended);
+                changed |= apply(edit::setTrackGroupSwitches(s, g->id, next));
+            }
+            if (a.contains("color")) changed |= apply(edit::setTrackColor(s, tracks, str(a, "color").trimmed().toStdString()));
+            if (a.contains("color_clips")) changed |= apply(edit::setTrackColorClips(s, tracks, a.value("color_clips").toBool()));
+            if (a.contains("suspend_all") && s.groupsSuspended != a.value("suspend_all").toBool()) {
+                s.groupsSuspended = a.value("suspend_all").toBool();
+                changed = true;
+            }
+            if (changed) save(l);
+            QJsonArray list, groups;
+            QStringList lines;
+            for (TrackRef r : allTracks(s)) {
+                const Track& t = *trackAt(s, r);
+                const QString ref = (r.kind == TrackKind::Video ? QStringLiteral("V") : QStringLiteral("A")) + QString::number(r.index + 1);
+                QJsonObject o{{"track", ref}, {"name", QString::fromStdString(t.name)}};
+                QString line = ref + QStringLiteral(" ") + QString::fromStdString(t.name);
+                if (const TrackGroup* g = findTrackGroup(s, t.group)) {
+                    o["group"] = QString::fromStdString(g->name);
+                    line += QStringLiteral(", group ") + QString::fromStdString(g->name);
+                }
+                if (!t.color.empty()) {
+                    o["color"] = QString::fromStdString(t.color);
+                    line += QStringLiteral(", colour ") + QString::fromStdString(t.color);
+                }
+                if (t.colorClips) o["color_clips"] = true;
+                list.append(o);
+                lines << line;
+            }
+            for (const TrackGroup& g : s.trackGroups) {
+                QJsonArray members;
+                for (TrackRef r : groupMembers(s, g.id))
+                    members.append((r.kind == TrackKind::Video ? QStringLiteral("V") : QStringLiteral("A")) + QString::number(r.index + 1));
+                groups.append(QJsonObject{{"name", QString::fromStdString(g.name)}, {"tracks", members}, {"editing", g.editing}, {"mute", g.mute},
+                                          {"volume", g.volume}, {"pan", g.pan}, {"automation", g.automation}, {"record", g.record},
+                                          {"comp", g.comp}, {"suspended", g.suspended}});
+                lines << QStringLiteral("Group %1%2: %3 track(s)").arg(QString::fromStdString(g.name), g.suspended ? QStringLiteral(" (suspended)") : QString()).arg(members.size());
+            }
+            if (s.groupsSuspended) lines << QStringLiteral("Every group is suspended");
+            return ok(lines.join('\n'), {{"tracks", list}, {"groups", groups}, {"groups_suspended", s.groupsSuspended}});
+        });
+
     add("montage_takes", "Take lanes, comps and track versions on an audio track",
         "Takes on lanes (Pro Tools' loop record, playlists and comping): an audio track keeps takes as lanes under it and "
         "plays a comp of them, its own clips cut from the lanes with short equal-power crossfades at the joins. list gives "
@@ -5449,12 +6050,15 @@ void McpServer::Impl::addTools() {
             "crossfade":{"type":"number","description":"Seconds (comp, join; default 0.01)"},
             "rating":{"type":"integer"},"name":{"type":"string"},"shown":{"type":"boolean"},
             "version":{"type":"string","enum":["new","switch","rename","delete"]},"index":{"type":"integer"},"empty":{"type":"boolean"},
-            "line":{"type":"string","description":"suggest: the words the take should say"}},"required":["project","action"]})json",
+            "line":{"type":"string","description":"suggest: the words the take should say"},
+            "group":{"type":"boolean","default":true,"description":"comp, rate and suggest act on the track's group (montage_track) when its comp switch is on; false for this track alone"},
+            "apply":{"type":"boolean","default":false,"description":"suggest: give the suggested take's from..to to the comp (on the group)"}},"required":["project","action"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
             if (track.kind != TrackKind::Audio) return fail(QStringLiteral("Take lanes are on audio tracks"));
+            const bool grouped = a.value("group").toBool(true);
             const QString action = need(a, "action");
             const double fps = s.fpsValue();
             auto laneArg = [&]() -> Id {
@@ -5471,8 +6075,16 @@ void McpServer::Impl::addTools() {
                 QString text;
                 for (const LaneView& v : laneViews(l.project, s, track)) {
                     QJsonObject o{{"name", QString::fromStdString(v.name)}, {"start", secs(v.start, s)}, {"end", secs(v.end, s)}, {"rating", v.rating}};
-                    if (v.lane) o["lane"] = double(v.lane);
-                    else o["clip"] = double(v.clip), o["take"] = v.take + 1;
+                    if (v.lane) {
+                        o["lane"] = double(v.lane);
+                        // Its pass (shared by the grouped tracks' lanes recorded with it), take number and colour.
+                        if (const TakeLane* ln = edit::findTakeLane(t, v.lane)) {
+                            if (ln->pass) o["pass"] = double(ln->pass);
+                            if (takeNumber(*ln)) o["number"] = takeNumber(*ln), o["color"] = QString::fromStdString(takeColor(*ln));
+                        }
+                    } else {
+                        o["clip"] = double(v.clip), o["take"] = v.take + 1;
+                    }
                     lanes.append(o);
                     text += QStringLiteral("%1%2 (%3 to %4)%5\n").arg(v.lane ? QStringLiteral("Lane ") : QStringLiteral("Audition take: "),
                                                                     QString::fromStdString(v.name), tc(v.start, s), tc(v.end, s),
@@ -5487,7 +6099,9 @@ void McpServer::Impl::addTools() {
                 for (size_t k = 0; k < t.versions.size(); ++k)
                     versions.append(QJsonObject{{"index", int(k) + 1}, {"name", QString::fromStdString(t.versions[k].name)}, {"shown", int(k) == t.version}});
                 text += QStringLiteral("%1 comp clip(s); %2 version(s)").arg(comp.size()).arg(std::max<qsizetype>(1, versions.size()));
-                return ok(text, {{"lanes", lanes}, {"comp", comp}, {"versions", versions}, {"lanes_shown", t.lanesShown}});
+                QJsonObject out{{"lanes", lanes}, {"comp", comp}, {"versions", versions}, {"lanes_shown", t.lanesShown}};
+                if (const TrackGroup* g = findTrackGroup(s, t.group)) out["group"] = QString::fromStdString(g->name);
+                return ok(text, out);
             };
             if (action == "list") return listing();
             if (action == "suggest") {
@@ -5502,9 +6116,16 @@ void McpServer::Impl::addTools() {
                 if (a.contains("from")) from = timeArg(a.value("from"), s, "from");
                 if (a.contains("to")) to = timeArg(a.value("to"), s, "to");
                 if (from < 0 || to <= from) return fail(QStringLiteral("suggest needs from and to"));
-                const TakeChoice choice = chooseTake(l.project, s, track, from, to, a.value("line").toString().toStdString());
+                // (Over the group: each pass judged by every grouped track's recording of it.)
+                const std::string line = a.value("line").toString().toStdString();
+                const TakeChoice choice = grouped ? chooseGroupTake(l.project, s, track, from, to, line) : chooseTake(l.project, s, track, from, to, line);
                 if (choice.best < 0) return fail(QStringLiteral("No takes cover that range"));
                 const TakeCandidate& b = choice.takes[size_t(choice.best)];
+                if (a.value("apply").toBool()) {
+                    if (!b.lane) return fail(QStringLiteral("The suggested take is an audition's: pick it with montage_audition"));
+                    check(grouped ? edit::compGroup(l.project, s, track, b.lane, from, to) : edit::compTake(l.project, s, track, b.lane, from, to));
+                    save(l);
+                }
                 QJsonArray all;
                 for (const TakeCandidate& t : choice.takes)
                     all.append(QJsonObject{{"name", QString::fromStdString(t.name)}, {"said", QString::fromStdString(t.said)},
@@ -5532,8 +6153,10 @@ void McpServer::Impl::addTools() {
                 for (const std::string& f : passes) media.push_back(mediaFor(l.project, QString::fromStdString(f)));
                 r = edit::addLoopTakes(l.project, s, track, media, complete, in, out);
             } else if (action == "comp") {
-                r = edit::compTake(l.project, s, track, laneArg(), timeArg(a.value("from"), s, "from"), timeArg(a.value("to"), s, "to"),
-                                   a.value("crossfade").toDouble(kCompCrossfadeSeconds));
+                // On the grouped tracks too (their lanes of the same pass, over the same frames).
+                const FrameTime from = timeArg(a.value("from"), s, "from"), to = timeArg(a.value("to"), s, "to");
+                const double xf = a.value("crossfade").toDouble(kCompCrossfadeSeconds);
+                r = grouped ? edit::compGroup(l.project, s, track, laneArg(), from, to, xf) : edit::compTake(l.project, s, track, laneArg(), from, to, xf);
             } else if (action == "join") {
                 const FrameTime at = timeArg(a.value("at"), s, "at");
                 if (a.contains("move")) r = edit::moveCompJoin(l.project, s, track, at, FrameTime(std::llround(a.value("move").toDouble() * fps)));
@@ -5541,7 +6164,7 @@ void McpServer::Impl::addTools() {
                 else return fail(QStringLiteral("join needs move or crossfade"));
             } else if (action == "rate") {
                 if (!a.value("rating").isDouble()) return fail(QStringLiteral("rate needs rating (0 to 5)"));
-                r = edit::rateTakeLane(s, track, laneArg(), a.value("rating").toInt());
+                r = grouped ? edit::rateGroupLane(s, track, laneArg(), a.value("rating").toInt()) : edit::rateTakeLane(s, track, laneArg(), a.value("rating").toInt());
             } else if (action == "rename") {
                 r = edit::renameTakeLane(s, track, laneArg(), need(a, "name").toStdString());
             } else if (action == "show") {
@@ -5590,9 +6213,9 @@ void McpServer::Impl::addTools() {
             if (a.contains("pick")) {
                 const QJsonValue pv = a.value("pick");
                 if (pv.isString() && (pv.toString() == "next" || pv.toString() == "previous"))
-                    check(edit::cycleTake(l.project, s, clip, pv.toString() == "next" ? 1 : -1));
+                    check(edit::cycleGroupTake(l.project, s, clip, pv.toString() == "next" ? 1 : -1));  // (with its track group)
                 else
-                    check(edit::pickTake(l.project, s, clip, (pv.isString() ? pv.toString().toInt() : pv.toInt()) - 1));
+                    check(edit::pickGroupTake(l.project, s, clip, (pv.isString() ? pv.toString().toInt() : pv.toInt()) - 1));
                 changed = true;
             }
             if (a.value("finalize").toBool()) {
@@ -5658,7 +6281,11 @@ void McpServer::Impl::addTools() {
         "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
         "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
         "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
-        "(`uncaptioned_seconds`), and a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`). Lists each "
+        "(`uncaptioned_seconds`), a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`), and with "
+        "`focus`, soft shots and motion blur: each frame's sharpness (fine detail against the picture's own contrast, so dark "
+        "or flat shots are not called soft) measured at `focus_width`, stretches of a shot well under its own best, shots well "
+        "under the other angles of their scene (Group Shots' groups, else the media's scene and camera), and motion blur told "
+        "apart from focus by which way the detail was lost. Lists each "
         "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
         "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's). `compare` sets a delivered "
         "file against the sequence's own render (or against `reference`, another file), aligned over ±12 frames, frame by "
@@ -5687,8 +6314,11 @@ void McpServer::Impl::addTools() {
             "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
             "uncaptioned_seconds":{"type":"number","default":0,"description":"Sound louder than -40 dBFS outside speech with no caption over it for this long (SDH); 0 = not checked"},
             "markers":{"type":"boolean","default":false},
+            "focus":{"type":"boolean","default":false,"description":"Soft focus and motion blur, frame by frame (renders the picture again, larger)"},
+            "focus_width":{"type":"integer","default":960,"description":"The width focus is measured at (never above the sequence's)"},
             "compare":{"type":"string","description":"A delivered file to compare with the sequence's render (or with reference)"},
             "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
+            "hrd":{"type":"string","description":"An H.264, HEVC or MPEG-2 file to check against its buffer model (H.264/H.265 Annex C HRD, MPEG-2 VBV; CBR and VBR): each underflow and overflow at the frame it falls on, and a summary line (taken as an export of the range)"},
             "metrics":{"type":"array","items":{"type":"string","enum":["psnr","ssim","ms_ssim","delta_ictcp","vmaf"]},
                 "description":"What to measure (default all but vmaf)"},
             "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
@@ -5747,7 +6377,18 @@ void McpServer::Impl::addTools() {
             q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
+            q.focus = a.value("focus").toBool(false);
+            if (a.contains("focus_width")) {
+                q.focusOptions.width = a.value("focus_width").toInt();
+                if (q.focusOptions.width < 64 || q.focusOptions.width > 8192) throw ArgError{"\"focus_width\" must be between 64 and 8192"};
+            }
             if (a.contains("reference") && q.compareFile.empty()) throw ArgError{"\"reference\" is compared with the file named by \"compare\""};
+            if (a.contains("hrd")) {
+                const QString file = absolute(need(a, "hrd"));
+                if (!QFileInfo::exists(file)) throw ArgError{"No file at \"hrd\": " + file};
+                q.hrdFile = file.toStdString();
+            }
+            HrdReport hrd;
             std::vector<QcIssue> issues;
             // (file against file: frames are the reference file's, not the sequence's, so its spans are listed apart and
             // put no markers on the sequence)
@@ -5757,7 +6398,7 @@ void McpServer::Impl::addTools() {
                 // File against file: the sequence's own checks without the comparison, then the two files.
                 const std::string encode = q.compareFile;
                 q.compareFile.clear();
-                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(0.5 * f, "Checking"); });
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(0.5 * f, "Checking"); }, nullptr, nullptr, &hrd);
                 const QString ref = absolute(need(a, "reference"));
                 if (!QFileInfo::exists(ref)) throw ArgError{"No file at \"reference\": " + ref};
                 CompareOptions o;
@@ -5769,13 +6410,17 @@ void McpServer::Impl::addTools() {
                 for (const std::string& w : comparison.warnings) fileSpans += QStringLiteral("Encode quality: %1\n").arg(QString::fromStdString(w));
                 q.compareFile = encode;
             } else {
-                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); }, nullptr, &comparison);
+                issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); }, nullptr, &comparison, &hrd);
             }
             QString text;
             for (const QcIssue& i : issues)
                 text += QStringLiteral("%1 - %2  %3: %4\n").arg(tc(i.start, s), tc(i.end, s), QString::fromLatin1(qcKindName(i.kind)),
                                                              QString::fromStdString(i.text));
             text += fileSpans;
+            if (!q.hrdFile.empty()) {
+                text += QStringLiteral("Buffer model: %1\n").arg(QString::fromStdString(hrd.summary()));
+                if (!hrd.note.empty()) text += QStringLiteral("  (%1)\n").arg(QString::fromStdString(hrd.note));
+            }
             if (comparison.ok) {
                 auto num = [](double v, int d) {
                     return std::isnan(v) ? QStringLiteral("-") : std::isinf(v) ? QStringLiteral("inf") : QString::number(v, 'f', d);
@@ -7717,7 +8362,7 @@ void McpServer::Impl::addTools() {
             if (action == "pick_take") {
                 const AdrCue& q = cueNamed(need(a, "cue"));
                 if (!q.clip || !edit::clipById(s, q.clip)) return fail("That cue has no takes");
-                const edit::Result r = edit::pickTake(l.project, s, q.clip, a.value("take").toInt(0) - 1);
+                const edit::Result r = edit::pickGroupTake(l.project, s, q.clip, a.value("take").toInt(0) - 1);
                 if (!r.ok) return fail(QString::fromStdString(r.error));
                 save(l);
                 return ok("Picked the take", listing());
@@ -11849,21 +12494,61 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_make_kdm", "Make KDMs for an encrypted DCP",
-        "Make Key Delivery Messages (SMPTE ST 430-1) so cinema servers can play an encrypted DCP: one for each server "
-        "certificate (the files the cinema sends; a chain file's leaf is used), its keys valid from `from` to `until`, made "
-        "from the DKDM montage_export_dcp kept, signed by Montage's certificate chain. The window must sit inside the "
-        "DKDM's and the server certificate's. Returns the KDM files.",
+        "Make Key Delivery Messages (SMPTE ST 430-1) so cinema servers can play an encrypted DCP, made from the DKDM "
+        "montage_export_dcp kept, signed by Montage's certificate chain, its keys valid from `from` to `until`: one for "
+        "each server certificate in `servers` (the files the cinema sends; a chain file's leaf is used), and one for each "
+        "screen in `screens` from the facility list, encrypted to the screen's server with its projector and other "
+        "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
+        "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
+        "`flm` alone (no dkdm) it only reads them. The window must sit inside the DKDM's and each server certificate's. "
+        "Returns the KDM files, the cinemas' zips, and the cinemas and screens read.",
         R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
             "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
+            "flm":{"type":"array","items":{"type":"string"},"description":"FLM files to read into the facility list (kept for later bookings)"},
+            "screens":{"type":"array","items":{"type":"string"},"description":"Screens from the facility list: \"Cinema/Screen\", or \"Cinema\" for all its screens"},
             "from":{"type":"string","description":"ISO 8601 date and time; default now"},
             "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
             "folder":{"type":"string","description":"Where to write the KDMs"},
-            "annotation":{"type":"string"}},"required":["dkdm","servers","folder"]})json",
+            "annotation":{"type":"string"}}})json",
         false, [](const QJsonObject& a) {
+            std::string err;
+            QJsonArray read;
+            std::vector<Facility> facilities;
+            const bool reading = !a.value("flm").toArray().isEmpty();
+            if (reading || a.contains("screens")) {
+                if (!loadFacilities(facilities, &err)) return fail(QString::fromStdString(err));
+            }
+            if (reading) {
+                for (const QJsonValue& v : a.value("flm").toArray()) {
+                    Facility f;
+                    if (!readFlmFile(absolute(v.toString()).toStdString(), f, &err)) return fail(QString::fromStdString(err));
+                    QJsonArray screens, notes;
+                    for (const FacilityScreen& sc : f.screens) {
+                        QJsonArray devices;
+                        for (const FacilityDevice& d : sc.devices)
+                            devices.append(QJsonObject{{"type", QString::fromStdString(d.type)}, {"thumbprint", QString::fromStdString(d.thumbprint)}});
+                        screens.append(QJsonObject{{"name", QString::fromStdString(sc.name)},
+                                                   {"server", QString::fromStdString(sc.server.commonName)},
+                                                   {"server_thumbprint", QString::fromStdString(sc.server.thumbprint)},
+                                                   {"until", QString::fromStdString(sc.server.notAfter)},
+                                                   {"devices", devices}});
+                    }
+                    for (const std::string& n : f.notes) notes.append(QString::fromStdString(n));
+                    read.append(QJsonObject{{"cinema", QString::fromStdString(f.name)}, {"id", QString::fromStdString(f.id)},
+                                            {"source", QString::fromStdString(f.source)}, {"screens", screens}, {"notes", notes}});
+                    mergeFacility(facilities, std::move(f));
+                }
+                if (!saveFacilities(facilities, &err)) return fail(QString::fromStdString(err));
+                if (!a.contains("dkdm"))
+                    return ok(QStringLiteral("Read %1 FLM(s) into the facility list").arg(read.size()), QJsonObject{{"cinemas", read}});
+            }
             KdmRequest r;
             r.dkdm = absolute(need(a, "dkdm")).toStdString();
             for (const QJsonValue& v : a.value("servers").toArray()) r.recipients.push_back(absolute(v.toString()).toStdString());
-            if (r.recipients.empty()) throw ArgError{"servers names no certificate"};
+            std::vector<std::string> names;
+            for (const QJsonValue& v : a.value("screens").toArray()) names.push_back(v.toString().toStdString());
+            if (!names.empty() && !pickScreens(facilities, names, r.screens, &err)) throw ArgError{QString::fromStdString(err)};
+            if (r.recipients.empty() && r.screens.empty()) throw ArgError{"servers and screens name no certificate or screen"};
             auto when = [&](const char* key, const QDateTime& fallback) {
                 const QString text = str(a, key);
                 if (text.isEmpty()) return fallback;
@@ -11880,12 +12565,14 @@ void McpServer::Impl::addTools() {
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             r.folder = folder.toStdString();
-            std::vector<std::string> files;
-            std::string err;
-            if (!makeKdms(r, &files, &err)) return fail(QString::fromStdString(err));
-            QJsonArray made;
+            std::vector<std::string> files, zipped;
+            if (!makeKdms(r, &files, &err, &zipped)) return fail(QString::fromStdString(err));
+            QJsonArray made, zips;
             for (const std::string& f : files) made.append(QString::fromStdString(f));
-            return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), QJsonObject{{"kdms", made}});
+            for (const std::string& z : zipped) zips.append(QString::fromStdString(z));
+            QJsonObject out{{"kdms", made}, {"zips", zips}};
+            if (!read.isEmpty()) out.insert("cinemas", read);
+            return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), out);
         });
 
     add("montage_export_imf", "Export an IMF master",
@@ -11907,9 +12594,16 @@ void McpServer::Impl::addTools() {
         "delivered, as reference stills, with an ACES Metadata File. `application` \"prores\" makes a ProRes master instead "
         "(Application ProRes, SMPTE RDD 45): the pictures in `prores_profile` (422 LT, 422 or 422 HQ as Y'CbCr 4:2:2, to "
         "3840 x 2160 and 60 fps, not P3-D65; 4444 or 4444 XQ as R'G'B' 4:4:4, to 4096 x 3112), 10 bits, in MXF as RDD 44 "
-        "maps them; sound, timed text and supplementals as for #2E.",
+        "maps them; sound, timed text and supplementals as for #2E. With it, `fields` \"tff\" or \"bff\" codes each picture as "
+        "two fields, the top or the bottom first (4:2:2 to 1920 x 1080 at 25, 29.97 or 30, Rec.709), `ycbcr444` describes "
+        "4444 as Y'CbCr 4:4:4 (to 1920 x 1080, Rec.709) and `full_range` codes 4:4:4 R'G'B' over the full range (QE.2). "
+        "`application` \"dpp_prores\" makes a broadcaster's master (Application DPP (ProRes), SMPTE RDD 59-1, as UK and "
+        "North American broadcasters ask for it): 422 HQ at 1920 x 1080 or 3840 x 2160 (`size` hd or uhd), progressive, Rec.709, Rec.2020 PQ or "
+        "HLG, with the DPP's identification and content kind (`kind` programme by default: programme, commercial, "
+        "sponsorship, infomercial, presentation_event, promotion or music_video). Its 4:4:4 is 12 bits, which FFmpeg's "
+        "ProRes encoder does not make, and RDD 45 takes no alpha, so neither is offered.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
-            "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
+            "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test","programme","commercial","sponsorship","infomercial","presentation_event","music_video"],"description":"Default feature (dpp_prores: programme; the last six are Application DPP's only)"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
             "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
@@ -11926,8 +12620,11 @@ void McpServer::Impl::addTools() {
                 "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
-            "application":{"enum":[2,5,"prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45)"},
-            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's)"},
+            "application":{"enum":[2,5,"prores","dpp_prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45); \"dpp_prores\": Application DPP (ProRes, RDD 59-1)"},
+            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's; DPP: hq)"},
+            "fields":{"type":"string","enum":["progressive","tff","bff"],"default":"progressive","description":"Application ProRes: two fields a picture, the top (tff) or the bottom (bff) first"},
+            "ycbcr444":{"type":"boolean","default":false,"description":"Application ProRes: 4444 described as Y'CbCr 4:4:4, not R'G'B'"},
+            "full_range":{"type":"boolean","default":false,"description":"Application ProRes: 4:4:4 R'G'B' over the full range (QE.2)"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
             "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"},
             "iab":{"type":"boolean","default":false,"description":"Immersive sound as well: the programme's beds and objects as an IABSequence (ST 2067-201) in `language`"},
@@ -11942,7 +12639,7 @@ void McpServer::Impl::addTools() {
             if (s.duration() == 0) return fail("The sequence is empty");
             ImfSettings st;
             st.title = str(a, "title", QFileInfo(need(a, "project")).completeBaseName()).toStdString();
-            st.kind = str(a, "kind", "feature").toStdString();
+            st.kind = str(a, "kind", a.value("application").toString() == "dpp_prores" ? "programme" : "feature").toStdString();
             st.colour = str(a, "colour").toStdString();
             st.size = str(a, "size", "sequence").toStdString();
             st.bits = a.value("bits").toInt(0);
@@ -11981,13 +12678,19 @@ void McpServer::Impl::addTools() {
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
             if (a.value("application").isString()) {
-                if (a.value("application").toString() != "prores") throw ArgError{"\"application\" is 2, 5 or \"prores\""};
-                st.application = 45;
+                const QString app = a.value("application").toString();
+                if (app != "prores" && app != "dpp_prores") throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
+                st.application = app == "prores" ? 45 : 59;
             } else {
                 st.application = a.value("application").toInt(2);
-                if (st.application != 2 && st.application != 5) throw ArgError{"\"application\" is 2, 5 or \"prores\""};
+                if (st.application != 2 && st.application != 5) throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
             }
             st.prores = str(a, "prores_profile", "hq").toStdString();
+            const QString fields = str(a, "fields", "progressive");
+            if (fields != "progressive" && fields != "tff" && fields != "bff") throw ArgError{"\"fields\" is progressive, tff or bff"};
+            st.fields = fields == "progressive" ? std::string() : fields.toStdString();
+            st.ycbcr444 = a.value("ycbcr444").toBool();
+            st.fullRange = a.value("full_range").toBool();
             st.graded = a.value("graded").toBool(true);
             st.immersive = a.value("iab").toBool();
             st.sadm = a.value("sadm").toBool();
@@ -12023,9 +12726,12 @@ void McpServer::Impl::addTools() {
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
                                   {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
-            if (r.application == 45) {
-                out["application"] = "prores";
+            if (r.application == 45 || r.application == 59) {
+                out["application"] = r.application == 45 ? "prores" : "dpp_prores";
                 out["prores_profile"] = QString::fromStdString(r.prores);
+                out["fields"] = r.fields.empty() ? QStringLiteral("progressive") : QString::fromStdString(r.fields);
+                out["ycbcr444"] = r.ycbcr444;
+                out["full_range"] = r.fullRange;
             }
             if (r.immersive) out["iab"] = QJsonObject{{"bed_channels", r.iabBedChannels}, {"objects", r.iabObjects}};
             if (r.sadm || r.adm)
@@ -12110,7 +12816,7 @@ void McpServer::Impl::addTools() {
         "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion. "
         "Smart rendering: where the preset codes video as the footage is (ProRes, DNxHR; H.264, HEVC and XDCAM HD422 a GOP "
         "at a time), untouched pictures are copied from the source; the result's copied_frames says how many.",
-        R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
+        R"json({"type":"object","properties":{"project":{"type":"string","description":"The project (not with streaming.live)"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
             "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
@@ -12167,6 +12873,10 @@ void McpServer::Impl::addTools() {
             "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
             "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
+            "video_codec":{"type":"string","enum":["av2"],"description":"av2: AV2 instead of the preset's video, coded by AVM (builds made with AV2 only), in the container the output's extension names: .ivf, .obu (a bare OBU stream) or else MP4 by AV2's ISO BMFF binding, a working draft. MP4 keeps the preset's sound as AAC; IVF and OBU have none"},
+            "av2_speed":{"type":"integer","minimum":0,"maximum":6,"default":6,"description":"AV2: AVM's speed preset, 0 slowest (smallest) to 6 fastest"},
+            "av2_quality":{"type":"integer","minimum":0,"maximum":63,"default":32,"description":"AV2 without a bitrate: the quantiser, 0 (best) to 63"},
+            "av2_10bit":{"type":"boolean","default":false,"description":"AV2: 10 bits (always for HDR)"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
             "streaming":{"type":"object","description":"A streaming package instead of a file: output is its folder. The sequence rendered once, encoded as a ladder of renditions whose segments start on keyframes at the same frames, packaged as CMAF for HLS (master.m3u8) and DASH (manifest.mpd), with the mix and audio_streams as languages, each caption track as WebVTT (and IMSC for DASH), chapters, and ad-break markers (montage_add_marker ad_break) as SCTE 35 cues","properties":{
                 "ladder":{"type":"array","items":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"},"bitrate":{"type":"integer","description":"bits a second"},"codec":{"type":"string","enum":["libx264","libx265","libsvtav1"]}},"required":["width","bitrate"]},"description":"The rungs (default: from the picture's size down to 360 lines)"},
@@ -12176,14 +12886,33 @@ void McpServer::Impl::addTools() {
                 "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
                 "iframe_playlists":{"type":"boolean","default":true},
                 "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
-                "audio_codec":{"type":"string","enum":["aac","libopus","none"],"default":"aac"},
-                "audio_bitrate":{"type":"integer","default":128000},
-                "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"}}},
+                "audio_codec":{"type":"string","enum":["aac","libopus","ac3","eac3","none"],"default":"aac","description":"AAC, Opus, AC-3 (to 5.1) or E-AC-3 (to 7.1; the AC-3 family stating the mix's measured loudness as dialnorm)"},
+                "audio_bitrate":{"type":"integer","default":128000,"description":"A pair of channels' (more channels, more bits)"},
+                "segments":{"type":"string","enum":["cmaf","ts"],"default":"cmaf","description":"ts: HLS in MPEG-TS segments (H.264 with AAC, AC-3 or E-AC-3; DASH stays CMAF)"},
+                "start_date":{"type":"string","description":"EXT-X-PROGRAM-DATE-TIME of the first frame, ISO 8601 UTC (default now)"},
+                "low_latency":{"type":"boolean","default":false,"description":"With live: segments made of parts of part_seconds (LL-HLS parts and CMAF chunks), each sent as it is made"},
+                "live":{"type":"object","description":"A live package instead, from a recording as it is made (no project needed: output is the package's folder): a sliding window of HLS segments and a dynamic DASH MPD, fed by the feed for seconds. Waits until it ends","properties":{
+                    "url":{"type":"string","description":"The feed: a stream's URL (srt://, rist://, udp://, rtmp://...), omt://host:port, or a capture device's name"},
+                    "device":{"type":"string","description":"The input device for url (v4l2, alsa, avfoundation, dshow, lavfi, omt); left out for a URL"},
+                    "options":{"type":"object","description":"FFmpeg input options, as strings"},
+                    "seconds":{"type":"number","minimum":1,"maximum":86400,"description":"How long to record"},
+                    "record":{"type":"string","description":"The recording made alongside (.mov or .mxf; default the folder's name with .mov, beside it)"},
+                    "capture_codec":{"type":"string","default":"prores_proxy","description":"The recording's codec (prores_proxy ... dnxhr_hqx)"},
+                    "window":{"type":"integer","minimum":3,"maximum":100,"default":6,"description":"Segments the playlists and the MPD's time-shift buffer hold"},
+                    "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5},
+                    "serve":{"type":"boolean","default":false,"description":"Serve the package over HTTP while it records (blocking playlist reloads, growing segments sent as they grow)"},
+                    "port":{"type":"integer","minimum":0,"maximum":65535,"default":0,"description":"serve: the port (0 any free one)"},
+                    "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"}},
+                    "required":["url","seconds"]}}},
             "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
+            "hrd":{"type":"string","enum":["","cbr","vbr"],"default":"","description":"H.264 and H.265 (x264, x265): state a hypothetical reference decoder, as broadcast ingest checks it: cbr (a constant rate at bitrate, else vbv_maxrate, filler where the pictures need less) or vbr (no more than vbv_maxrate). The file is checked against it after rendering (the result's hrd)"},
+            "vbv_maxrate":{"type":"integer","minimum":0,"description":"The HRD's bit rate, bits/s (default: bitrate)"},
+            "vbv_buffer":{"type":"integer","minimum":0,"description":"The HRD's buffer, bits (default: a second at its rate)"},
             "two_pass":{"type":"boolean","default":false,"description":"H.264 and H.265 with a bitrate: coded twice, the first pass measuring the pictures so the second spends the bits where they are needed (H.264 in segments: each segment's first pass measures and the bits are shared out across them; H.265 in two passes is made in one go)"},
             "segments":{"type":"integer","minimum":1,"maximum":256,"default":1,"description":"With farm: split the render into this many segments (at cuts near equal lengths) that several nodes render at once, then one joins them (ProRes, DNxHR, FFV1 and the like frame for frame; H.264, H.265, MPEG-2 and AV1 with rate control per segment unless two_pass (H.264); hardware H.264 and H.265 by nodes with the same encoder; MOV, MP4, MKV, MXF, broadcast MXF and MPEG-TS files; image sequences frame by frame; IMF and DCP packages through montage_export_imf and montage_export_dcp with farm). The sound is rendered once, by the joining node. The job's id is the join's"}},
-            "required":["project","output"]})json",
+            "required":["output"]})json",
         false, [this](const QJsonObject& a) {
+            if (a.value("streaming").toObject().contains("live")) return renderLive(a);
             Loaded l = open(a);
             Sequence& s = l.seq();
             const ExportPreset* pr = findExportPreset(str(a, "preset", "H.264 - High Quality").toStdString());
@@ -12223,6 +12952,13 @@ void McpServer::Impl::addTools() {
                 if (st.videoBitrate < 0) throw ArgError{"\"bitrate\" is bits a second (0: by quality)"};
             }
             st.twoPass = a.value("two_pass").toBool();
+            st.hrd = a.value("hrd").toString().toStdString();
+            if (!st.hrd.empty() && st.hrd != "cbr" && st.hrd != "vbr") throw ArgError{"\"hrd\" is cbr or vbr"};
+            st.vbvMaxrate = a.value("vbv_maxrate").toInteger();
+            st.vbvBuffer = a.value("vbv_buffer").toInteger();
+            if (!st.hrd.empty() && st.videoCodec != "libx264" && st.videoCodec != "libx265")
+                throw ArgError{"\"hrd\" is for H.264 and H.265 (software)"};
+            if (!st.hrd.empty() && st.videoBitrate <= 0 && st.vbvMaxrate <= 0) throw ArgError{"\"hrd\" needs a \"bitrate\" or \"vbv_maxrate\""};
             if (st.twoPass && ((st.videoCodec != "libx264" && st.videoCodec != "libx265") || st.videoBitrate <= 0))
                 throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
@@ -12268,6 +13004,26 @@ void McpServer::Impl::addTools() {
                 st.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
                 st.jxlPremultiplied = a.value("jxl_premultiplied").toBool();
             }
+            if (a.contains("video_codec")) {
+                if (str(a, "video_codec") != "av2") throw ArgError{"\"video_codec\" is av2"};
+                if (!av2EncoderAvailable()) throw ArgError{"This build of Montage writes no AV2 (AVM)"};
+                st.videoCodec = "av2";
+                st.preset = std::to_string(std::clamp(a.value("av2_speed").toInt(6), 0, 6));
+                st.crf = std::clamp(a.value("av2_quality").toInt(32), 0, 63);
+                st.pixFmt = a.value("av2_10bit").toBool() ? "yuv420p10le" : "";
+                st.profile.clear();
+                st.alpha = false;
+                if (st.audioCodec != "none") st.audioCodec = "aac";
+                st.format.clear();
+            } else if (a.contains("av2_speed") || a.contains("av2_quality") || a.contains("av2_10bit")) {
+                if (st.videoCodec != "av2") throw ArgError{"\"av2_speed\", \"av2_quality\" and \"av2_10bit\" are for AV2 (\"video_codec\": \"av2\")"};
+                if (a.contains("av2_speed")) st.preset = std::to_string(std::clamp(a.value("av2_speed").toInt(6), 0, 6));
+                if (a.contains("av2_quality")) st.crf = std::clamp(a.value("av2_quality").toInt(32), 0, 63);
+                if (a.contains("av2_10bit")) st.pixFmt = a.value("av2_10bit").toBool() ? "yuv420p10le" : "";
+            }
+            // (an IVF or OBU stream holds no sound, whether AV2 was asked for here or by its preset)
+            if (st.videoCodec == "av2" && av2ContainerForPath(st.path) != Av2Container::Mp4) st.audioCodec = "none";
+            if (st.videoCodec == "av2") st.chapters = false;  // (AVM's writer makes no chapters)
             if (a.contains("stereo_view")) {
                 StereoView v;
                 st.stereo = str(a, "stereo_view").toStdString();
@@ -12412,7 +13168,11 @@ void McpServer::Impl::addTools() {
                 ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
                 if (ss.cueCommand != "splice_insert" && ss.cueCommand != "time_signal") throw ArgError{"\"cue\" is splice_insert or time_signal"};
                 ss.audioCodec = str(so, "audio_codec", "aac").toStdString();
-                if (ss.audioCodec != "aac" && ss.audioCodec != "libopus" && ss.audioCodec != "none") throw ArgError{"\"audio_codec\" is aac, libopus or none"};
+                if (ss.audioCodec != "aac" && ss.audioCodec != "libopus" && ss.audioCodec != "ac3" && ss.audioCodec != "eac3" && ss.audioCodec != "none")
+                    throw ArgError{"\"audio_codec\" is aac, libopus, ac3, eac3 or none"};
+                ss.segmentFormat = str(so, "segments", "cmaf").toStdString();
+                if (ss.segmentFormat != "cmaf" && ss.segmentFormat != "ts") throw ArgError{"\"segments\" is cmaf or ts"};
+                if (so.contains("low_latency")) throw ArgError{"\"low_latency\" is for a live package (live)"};
                 ss.audioBitrate = so.value("audio_bitrate").toInteger(128000);
                 if (ss.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
                 ss.startDate = str(so, "start_date").toStdString();
@@ -12472,13 +13232,21 @@ void McpServer::Impl::addTools() {
             const QString report = QString::fromStdString(loudnessReportBase(st.path)) + ".pdf";
             if (st.loudnessReport) QFile::remove(report);  // (one from before is not this one's)
             int copiedFrames = 0;
-            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, cancelFlag(), &err, nullptr, &copiedFrames, &light))
+            HrdReport hrd;
+            if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, cancelFlag(), &err, nullptr, &copiedFrames, &light,
+                                nullptr, &hrd))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
             QString text = QStringLiteral("Wrote %1").arg(QString::fromStdString(st.path));
             // Smart rendering: pictures of untouched footage copied from the source, not encoded again.
             o["copied_frames"] = copiedFrames;
             if (copiedFrames > 0) text += QStringLiteral("\n%1 frame%2 copied from the source as coded (smart rendering)").arg(copiedFrames).arg(copiedFrames == 1 ? "" : "s");
+            if (hrd.checked || !hrd.error.empty()) {
+                // (checked after a long-GOP smart render or a stated HRD; a file that does not keep it is kept, warned about)
+                o["hrd"] = QString::fromStdString(hrd.summary());
+                o["hrd_conforms"] = hrd.conforms();
+                text += QStringLiteral("\nBuffer model: %1").arg(QString::fromStdString(hrd.summary()));
+            }
             if (st.hdr10Plus) {
                 // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
                 const std::string carriage = hdr10PlusCarriage(s, st);
@@ -14264,16 +15032,35 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_job", "Background calls",
-        "Read or cancel a tool call running in the background. Any tool called with \"async\": true answers at once with "
-        "a job id and runs in the background (after any calls before it, one at a time); this reads its status (queued, "
-        "running, done, failed, cancelled), its progress (0 to 1) and step, and once done its result (the tool's own "
-        "structured result, its text as \"message\"; a failed job's error). action cancel stops it (work that can stop "
-        "does, within a second or so), list gives every job. wait: seconds (up to 60) to wait for it to finish first.",
-        R"json({"type":"object","properties":{"job":{"type":"string","description":"The job id an async call answered with"},
-            "action":{"type":"string","enum":["status","cancel","list"],"default":"status"},
+        "Read, cancel or take up again a tool call running in the background, or an export in Montage's render queue. "
+        "Any tool called with \"async\": true answers at once with a job id and runs in the background, after the calls "
+        "before it; calls that leave the project as it is (renders, exports, analyses, probes) run side by side, up to "
+        "a set number at once (Settings' jobs/at_once, 2 unless set; action at_once with \"jobs\" changes it for this "
+        "server), the rest one at a time. This reads a job's status (queued, running, done, failed, cancelled; "
+        "interrupted for one cut short when its server stopped), its progress (0 to 1) and step, and once done its "
+        "result (the tool's own structured result, its text as \"message\"; a failed job's error). Jobs are kept on "
+        "disk: list gives this server's jobs and, as \"stored\", those of servers before it and the render queue's "
+        "exports (\"queue-N\"), by those ids. action cancel stops one (work that can stop does, within a second or so; "
+        "the render queue hears it within a fifth of a second), resume runs an interrupted call again (calls that leave "
+        "the project as it is are taken up again by themselves when a server starts after the one running them "
+        "stopped). wait: seconds (up to 60) to wait for it to finish first.",
+        R"json({"type":"object","properties":{"job":{"type":"string","description":"The job id an async call answered with, or a stored job's id from list"},
+            "action":{"type":"string","enum":["status","cancel","list","resume","at_once"],"default":"status"},
+            "jobs":{"type":"integer","minimum":1,"maximum":16,"description":"at_once: how many background calls run side by side"},
             "wait":{"type":"number","description":"Seconds to wait for it to finish before answering (at most 60)"}}})json",
         true, [this](const QJsonObject& a) {
             const QString action = str(a, "action", "status");
+            if (action == "at_once") {
+                const int n = std::clamp(int(a.value("jobs").toDouble(0)), 0, 16);
+                if (n < 1) throw ArgError{"\"jobs\" is how many run at once: 1 to 16"};
+                {
+                    std::lock_guard l(jobsMutex);
+                    atOnce = n;
+                    spawnWorkers();
+                }
+                jobsWake.notify_all();
+                return ok(QStringLiteral("Up to %1 background call(s) run side by side").arg(n), QJsonObject{{"jobs", n}});
+            }
             if (action == "list") {
                 std::vector<std::shared_ptr<ToolJob>> all;
                 {
@@ -14281,7 +15068,7 @@ void McpServer::Impl::addTools() {
                     for (auto& [id, j] : jobs) all.push_back(j);
                 }
                 std::sort(all.begin(), all.end(), [](const auto& x, const auto& y) { return x->id.mid(4).toInt() < y->id.mid(4).toInt(); });
-                QJsonArray list;
+                QJsonArray list, stored;
                 QStringList lines;
                 for (auto& j : all) {
                     const ToolResult r = jobReport(*j, false);
@@ -14290,21 +15077,54 @@ void McpServer::Impl::addTools() {
                     list.append(o);
                     lines << r.text.section(QLatin1Char('\n'), 0, 0);
                 }
-                return ok(lines.isEmpty() ? QStringLiteral("No background calls") : lines.join(QLatin1Char('\n')), QJsonObject{{"jobs", list}});
+                // (those of servers before this one, and the render queue's)
+                // (the newest 100, newest last)
+                std::vector<montage::jobs::Record> others;
+                for (montage::jobs::Record& r : montage::jobs::all())
+                    if (r.owner != QLatin1String("mcp") || r.data.value("session").toString() != session) others.push_back(std::move(r));
+                std::stable_sort(others.begin(), others.end(), [](const auto& x, const auto& y) { return x.updated < y.updated; });
+                const size_t from = others.size() > 100 ? others.size() - 100 : 0;
+                for (size_t i = from; i < others.size(); ++i) {
+                    stored.append(storedJson(others[i], false));
+                    lines << storedText(others[i]);
+                }
+                if (from > 0) lines << QStringLiteral("(%1 older stored jobs not listed)").arg(from);
+                return ok(lines.isEmpty() ? QStringLiteral("No background calls") : lines.join(QLatin1Char('\n')),
+                          QJsonObject{{"jobs", list}, {"stored", stored}, {"storedCount", int(others.size())}});
             }
+            if (action != "status" && action != "cancel" && action != "resume") throw ArgError{"\"action\" is status, cancel, list, resume or at_once"};
+            const QString id = need(a, "job");
             std::shared_ptr<ToolJob> job;
             {
                 std::lock_guard l(jobsMutex);
-                const auto it = jobs.find(need(a, "job"));
-                if (it == jobs.end()) throw ArgError{QStringLiteral("No job %1 (montage_job with action list gives them)").arg(str(a, "job"))};
-                job = it->second;
+                const auto it = jobs.find(id);
+                if (it != jobs.end()) job = it->second;
+                else
+                    for (auto& [jid, j] : jobs)
+                        if (j->stored == id) job = j;
+            }
+            if (!job) {
+                montage::jobs::Record r;
+                if (id.contains(QLatin1Char('/')) || id.contains(QLatin1Char('\\')) || id.startsWith(QLatin1Char('.')) || !montage::jobs::load(id, r))
+                    throw ArgError{QStringLiteral("No job %1 (montage_job with action list gives them)").arg(id)};
+                return storedAction(r, action);
+            }
+            if (action == "resume") {
+                std::lock_guard l(job->m);
+                return fail(QStringLiteral("%1 is %2: only a call cut short is taken up again").arg(job->id, job->status));
             }
             if (action == "cancel") {
+                job->cancelAsked = true;
                 job->cancel = true;
-                std::lock_guard l(job->m);
-                if (job->status == QLatin1String("queued")) job->status = QStringLiteral("cancelled");
-            } else if (action != "status") {
-                throw ArgError{"\"action\" is status, cancel or list"};
+                bool changed = false;
+                {
+                    std::lock_guard l(job->m);
+                    if (job->status == QLatin1String("queued")) {
+                        job->status = QStringLiteral("cancelled");
+                        changed = true;
+                    }
+                }
+                if (changed) persist(*job, true);
             }
             // Waiting for it (not for long: other calls wait meanwhile).
             const double wait = std::clamp(a.value("wait").toDouble(0), 0.0, 60.0);
@@ -14441,7 +15261,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
         // it does (an answer, or any exception at all): later calls never wait on a turn that never ends.
         struct Turn {
             Impl* d;
-            std::unique_lock<std::mutex> running;
+            std::unique_lock<std::shared_mutex> running;
             bool taken = false;
             ~Turn() { end(); }
             void end() {
@@ -14457,7 +15277,7 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
                 if (taken) d->endTurn();
                 taken = false;
             }
-        } turn{d_, std::unique_lock<std::mutex>(d_->toolMutex, std::defer_lock)};
+        } turn{d_, std::unique_lock<std::shared_mutex>(d_->toolMutex, std::defer_lock)};
         if (name != QLatin1String("montage_job")) {
             d_->waitTurn(d_->takeTurn());
             turn.taken = true;
@@ -14492,6 +15312,8 @@ std::vector<std::string> McpServer::handle(const std::string& message) {
 }
 
 void McpServer::cancel(const QJsonValue& requestId) { d_->cancelRequest(requestId); }
+
+int McpServer::resumeStoredJobs() { return d_->resumeStored(); }
 
 void McpServer::setNotificationSink(std::function<void(const std::string&)> sink) {
     std::lock_guard l(d_->toolMutex);

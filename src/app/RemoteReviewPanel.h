@@ -129,6 +129,12 @@ private:
     QLineEdit* key_;
     QLineEdit* ice_;
     QSpinBox* maxViewers_;
+    QLineEdit* turn_;
+    QLineEdit* turnUser_;
+    QLineEdit* turnPassword_;
+    QCheckBox* relayOnly_;
+    QComboBox* rungs_;
+    QCheckBox* hdr_;
     QFormLayout* form_;
     QString srtAddress_, browserAddress_;
     QLabel* howTo_;

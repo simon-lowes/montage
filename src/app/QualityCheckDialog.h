@@ -50,6 +50,7 @@ private:
     QDoubleSpinBox* blackSeconds_;
     QCheckBox* freeze_;
     QDoubleSpinBox* freezeSeconds_;
+    QCheckBox* focus_ = nullptr;
     QCheckBox* silence_;
     QDoubleSpinBox* silenceSeconds_;
     QCheckBox* clipping_;
@@ -64,6 +65,7 @@ private:
     QComboBox* intelligibilityPreset_ = nullptr;
     QComboBox* loudness_;
     QLineEdit* compareFile_ = nullptr;
+    QLineEdit* hrdFile_ = nullptr;
     QComboBox* qualityPreset_ = nullptr;
     QDoubleSpinBox* minPsnr_ = nullptr;
     QDoubleSpinBox* maxDeltaItp_ = nullptr;

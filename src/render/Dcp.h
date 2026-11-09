@@ -21,6 +21,7 @@
 // verifyDcp checks them as libdcp's and ClairMeta's checks do.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -28,6 +29,9 @@
 #include "core/Model.h"
 
 namespace montage {
+
+struct ColorSpace;
+struct Image;
 
 struct DcpSettings {
     std::string title;                // what the film is called (the folder and the CPL take their name from it)
@@ -112,6 +116,11 @@ std::string dcpName(const DcpSettings& settings, int channels, const std::string
 // subtitles' language).
 std::string dcpFolderName(const Sequence& s, const DcpSettings& settings);
 
+// A picture (the sequence's colour, `space`) as DCI X'Y'Z' codes, three per pixel, as a DCP's frames take them: rows
+// across the cores (`threads` 0, the shared pool; 1, the calling thread; more, threads of their own). `direct` works
+// each code out with the 2.6 power itself rather than its table (for tests: they give the same codes).
+void dcpXyzCodes(const Image& img, const ColorSpace& space, std::vector<uint16_t>& out, int threads = 0, bool direct = false);
+
 // Writes the DCP into a new folder named dcpName() under `parent`. `progress` (0..1) may return false to stop (the
 // half-written folder is removed).
 bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& settings, const std::string& parent, DcpResult* result = nullptr,
@@ -139,17 +148,33 @@ bool readDcpFrame(const std::string& mxf, int index, std::vector<uint16_t>& xyz,
 // marker, and 4K's one POC marker. Empty when it keeps them.
 std::vector<std::string> checkDciCodestream(const uint8_t* data, size_t size);
 
+// A screen KDMs are made for (render/DcpFacilities: a cinema's screen from its FLM, or one added by hand): the
+// server's (security manager's) leaf certificate the keys are encrypted to, and the thumbprints of the suite's other
+// devices (its projector, link decryptors and so on), which go into the KDM's AuthorizedDeviceInfo (ST 430-1).
+struct KdmScreen {
+    std::string cinema, screen;
+    std::string certificate;                  // the server's leaf, PEM
+    std::vector<std::string> trustedDevices;  // base64 SHA-1 thumbprints (ST 430-2); empty: any device
+    std::string timeZone;                     // IANA ("Europe/Paris"): the window is written in it; empty: offsetMinutes
+};
+
 // KDMs for an encrypted DCP, made from its DKDM: one for each cinema server certificate (PEM text, or a file of it),
-// the keys valid from `notBefore` to `notAfter` (seconds since the epoch), written into `folder`.
+// and one for each screen, the keys valid from `notBefore` to `notAfter` (seconds since the epoch). Server
+// certificates' KDMs go into `folder`; screens' into a folder of their cinema's in it, each cinema's also zipped beside
+// that folder ("KDM_<title>_<cinema>_<date>.zip"), as distributors send them. The window must sit inside the DKDM's
+// and each server certificate's, or nothing is made.
 struct KdmRequest {
     std::string dkdm;                     // the DKDM file (exportDcp's DcpResult::dkdm)
     std::vector<std::string> recipients;  // the servers' leaf certificates
+    std::vector<KdmScreen> screens;
     int64_t notBefore = 0, notAfter = 0;
     int offsetMinutes = 0;                // the time zone the window is written in
     std::string folder;
     std::string annotation;
     std::string certificates;             // the signer's chain folder (as for exportDcp)
 };
-bool makeKdms(const KdmRequest& request, std::vector<std::string>* files = nullptr, std::string* error = nullptr);
+// `files`: every KDM made (recipients' first, then the screens' in order); `zips`: one for each cinema, in order.
+bool makeKdms(const KdmRequest& request, std::vector<std::string>* files = nullptr, std::string* error = nullptr,
+              std::vector<std::string>* zips = nullptr);
 
 }  // namespace montage

@@ -230,6 +230,48 @@ double shapeItemParam(const Effect& g, const ShapeItem& item, const std::string&
     return g.p(item.id + "." + name, t, def);
 }
 
+std::vector<std::array<double, 5>> gradientStops(const Effect& g, const ShapeItem& item, FrameTime t) {
+    std::vector<std::array<double, 5>> out;
+    if (item.stops.empty()) {
+        out.push_back({0, shapeItemParam(g, item, "color.r", t), shapeItemParam(g, item, "color.g", t), shapeItemParam(g, item, "color.b", t), 1});
+        out.push_back({1, shapeItemParam(g, item, "color2.r", t), shapeItemParam(g, item, "color2.g", t), shapeItemParam(g, item, "color2.b", t), 1});
+    } else {
+        for (size_t i = 0; i < item.stops.size(); ++i) {
+            const auto& d = item.stops[i];
+            const std::string pre = item.id + ".s" + std::to_string(i) + ".";
+            out.push_back({g.p(pre + "pos", t, d[0] * 100) / 100, g.p(pre + "color.r", t, d[1]), g.p(pre + "color.g", t, d[2]),
+                           g.p(pre + "color.b", t, d[3]), g.p(pre + "opacity", t, d[4] * 100) / 100});
+        }
+        std::stable_sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a[0] < b[0]; });
+    }
+    for (auto& s : out)
+        for (double& v : s) v = std::clamp(v, 0.0, 1.0);
+    return out;
+}
+
+std::vector<ParamInfo> gradientStopParams(const ShapeItem& item) {
+    std::vector<ParamInfo> out;
+    for (size_t i = 0; i < item.stops.size(); ++i) {
+        const auto& d = item.stops[i];
+        const std::string pre = "s" + std::to_string(i) + ".", n = std::to_string(i + 1);
+        out.push_back(pct(pre + "pos", "Stop " + n + " Place", 0, 100, d[0] * 100));
+        ParamInfo c = color(pre + "color", "Stop " + n + " Color", d[1], d[2], d[3]);
+        out.push_back(c);
+        out.push_back(pct(pre + "opacity", "Stop " + n + " Opacity", 0, 100, d[4] * 100));
+    }
+    return out;
+}
+
+void keyGradientStops(Effect& g, ShapeItem& item, FrameTime t, const std::vector<std::array<double, 5>>& stops) {
+    while (item.stops.size() < stops.size()) item.stops.push_back(stops[item.stops.size()]);
+    for (size_t i = 0; i < stops.size(); ++i) {
+        const std::string pre = item.id + ".s" + std::to_string(i) + ".";
+        const double v[5] = {stops[i][0] * 100, stops[i][1], stops[i][2], stops[i][3], stops[i][4] * 100};
+        const char* names[5] = {"pos", "color.r", "color.g", "color.b", "opacity"};
+        for (int k = 0; k < 5; ++k) g.params[pre + names[k]].addKey(t, v[k]);
+    }
+}
+
 std::string newShapeItemId(const std::vector<ShapeItem>& items, const std::string& type) {
     std::set<std::string> used;
     eachShapeItem(items, [&](const ShapeItem& it, int) { used.insert(it.id); });

@@ -351,6 +351,12 @@ ExportSettings segmentExportSettings(const ExportSettings& s, const ExportSegmen
     // (A segment's GOPs copied from the footage bring the footage's parameter sets, which the one decoder configuration
     // the join keeps would not hold for the others.)
     if (exportSegmentsLongGop(s)) x.smartRender = false;
+    x.hrdCheck = false;  // (the join checks the whole)
+    // A stated buffer model (or MPEG-2's constant rate): segments after the first start with the buffer lower than an
+    // encoder's own start, so the join, which can only fill it (with filler data), meets each where it stands.
+    if ((s.hrd == "cbr" || s.hrd == "vbr" || s.videoCodec == "mpeg2video") && segment.in > rangeIn(s) && s.vbvInit <= 0) x.vbvInit = 0.5;
+    // (and one HRD for all: the whole's rate, whatever bits two passes give each segment)
+    if ((s.hrd == "cbr" || s.hrd == "vbr") && x.vbvMaxrate <= 0) x.vbvMaxrate = s.videoBitrate;
     if (exportIsImageSequence(s)) x.startNumber = s.startNumber + int(segment.in - rangeIn(s));
     else x.path = path;
     return x;
@@ -453,7 +459,9 @@ bool checkCodestreams(const std::string& folder, int64_t from, int64_t to, bool 
 
 bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSettings& s, int stems, const std::vector<std::string>& files,
                         const std::vector<ExportSegment>& parts, const ExportProgress& progress, const std::atomic<bool>* cancel,
-                        std::string* error) {
+                        std::string* error, HrdReport* hrd) {
+    if (hrd) *hrd = HrdReport{};
+    bool keptHrd = false;
     if (parts.empty()) return fail(error, "No segments to join");
     const FrameTime in = parts.front().in, out = parts.back().out;
     const bool wantAudio = !s.audioCodec.empty() && s.audioCodec != "none";
@@ -699,6 +707,57 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
             return false;
         };
         auto when = [](const AVPacket* pkt) { return pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts; };
+        // The buffer model, one across the joins: each segment's buffering periods set where the buffer stands, its
+        // picture timing counted on, filler before a join to meet what the next segment asks for (a packet held until
+        // the next is read).
+        HrdSplicer splicer;
+        {
+            const AVCodecParameters* par = vst->codecpar;
+            const double fps = av_q2d(AVRational{int(seq.fps.num), int(seq.fps.den)});
+            if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_HEVC) {
+                int lengthSize = 0;
+                const auto sets = hrd::parameterSets(par->codec_id, par->extradata, size_t(std::max(0, par->extradata_size)), lengthSize);
+                splicer.start(par->codec_id, sets, lengthSize, fps, par->video_delay > 0 ? par->video_delay : 2);
+            }
+            keptHrd = splicer.active();
+        }
+        // (MPEG-2, XDCAM HD422 at its constant rate: the rate and buffer its first sequence header states)
+        const bool mpeg2 = vst->codecpar->codec_id == AV_CODEC_ID_MPEG2VIDEO && s.videoCodec == "mpeg2video";
+        AVPacket* held = keptHrd || mpeg2 ? av_packet_alloc() : nullptr;
+        struct FreeHeld {
+            AVPacket*& p;
+            ~FreeHeld() { av_packet_free(&p); }
+        } freeHeld{held};
+        bool holding = false;
+        int64_t decoded = 0;
+        auto writeVideo = [&](AVPacket* pkt) -> int {
+            if (mpeg2 && decoded == 0) {
+                double rate = 0, buffer = 0;
+                if (hrd::mpeg2Rate(pkt->data, size_t(pkt->size), rate, buffer))
+                    keptHrd = splicer.start(AV_CODEC_ID_MPEG2VIDEO, {}, 0, av_q2d(AVRational{int(seq.fps.num), int(seq.fps.den)}), 2, rate, buffer);
+            }
+            ++decoded;
+            if (!keptHrd) return av_interleaved_write_frame(oc, pkt);
+            const int64_t display = av_rescale_q(pkt->pts, vst->time_base, frameTb);
+            int64_t shown = 0;
+            std::vector<uint8_t> before = splicer.push(std::vector<uint8_t>(pkt->data, pkt->data + pkt->size), display, false, true, &shown);
+            int r = 0;
+            if (holding) {
+                AVPacket* outp = av_packet_alloc();
+                if (!outp || av_new_packet(outp, int(before.size())) < 0) {
+                    av_packet_free(&outp);
+                    return AVERROR(ENOMEM);
+                }
+                std::copy(before.begin(), before.end(), outp->data);
+                av_packet_copy_props(outp, held);
+                r = av_interleaved_write_frame(oc, outp);
+                av_packet_free(&outp);
+            }
+            av_packet_unref(held);
+            av_packet_move_ref(held, pkt);
+            holding = true;
+            return r;
+        };
         const double rewrapShare = delivery ? 0.05 * (1 - stemShare) : 0;
         const double videoFrom = soundShare, videoShare = 1 - stemShare - soundShare - rewrapShare;
         for (;;) {
@@ -710,12 +769,26 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
             if (video) {
                 haveV = false;
                 ++copied;
-                if ((rc = av_interleaved_write_frame(oc, vpkt)) < 0) return drop("Writing the joined video failed: " + averr(rc));
+                if ((rc = writeVideo(vpkt)) < 0) return drop("Writing the joined video failed: " + averr(rc));
                 if (progress && copied % 25 == 0) progress(videoFrom + videoShare * double(copied) / double(total), in + copied);
             } else {
                 haveA = false;
                 if ((rc = av_interleaved_write_frame(oc, apkt)) < 0) return drop("Writing the sound failed: " + averr(rc));
             }
+        }
+        if (holding) {
+            int64_t shown = 0;
+            std::vector<uint8_t> last = splicer.finish(&shown);
+            AVPacket* outp = av_packet_alloc();
+            if (!outp || av_new_packet(outp, int(last.size())) < 0) {
+                av_packet_free(&outp);
+                return drop("Out of memory");
+            }
+            std::copy(last.begin(), last.end(), outp->data);
+            av_packet_copy_props(outp, held);
+            rc = av_interleaved_write_frame(oc, outp);
+            av_packet_free(&outp);
+            if (rc < 0) return drop("Writing the joined video failed: " + averr(rc));
         }
         if (copied != total)
             return drop("The segments hold " + std::to_string(copied) + " frames, not the " + std::to_string(total) + " of the range");
@@ -747,6 +820,13 @@ bool joinExportSegments(const Project& p, const Sequence& seq, const ExportSetti
         whole.out = out;
         std::string err;
         if (!exportStems(p, seq, whole, stems, nullptr, part(1 - stemShare, stemShare), cancel, &err)) return fail(error, err);
+    }
+    // The joined file against its buffer model (warned about, not failed: see exportNeedsHrdCheck).
+    if (!image && (keptHrd || exportNeedsHrdCheck(s, 0))) {
+        const HrdReport r = checkHrd(s.path, cancel);
+        if (r.checked && r.signalled && !r.conforms())
+            qWarning("The joined export %s does not keep its buffer model: %s", s.path.c_str(), r.summary().c_str());
+        if (hrd) *hrd = r;
     }
     if (progress) progress(1, out);
     return true;

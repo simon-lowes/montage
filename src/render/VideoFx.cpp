@@ -113,6 +113,8 @@ void glow(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     }
 }
 
+uint32_t grainSeed(FrameTime t) { return hash(uint32_t(t) * 2654435761U + 12345U); }
+
 void filmGrain(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const float amount = float(e.p("amount", t, 0.15));
     const double size = std::max(0.5, e.p("size", t, 1.5) * pixelScale);
@@ -120,7 +122,7 @@ void filmGrain(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     // A noise grid at the grain's size, new every frame, with a little blur to round it.
     const int gw = std::max(1, int(std::ceil(img.width / size))), gh = std::max(1, int(std::ceil(img.height / size)));
     Image noise(gw, gh);
-    const uint32_t seed = hash(uint32_t(t) * 2654435761U + 12345U);
+    const uint32_t seed = grainSeed(t);
     for (int y = 0; y < gh; ++y)
         for (int x = 0; x < gw; ++x) {
             float* n = noise.at(x, y);

@@ -21,6 +21,10 @@ struct TakeChoice {
     std::string why;
 };
 TakeChoice chooseTake(const Project& p, const Sequence& s, TrackRef track, FrameTime from, FrameTime to, const std::string& line);
+// Best Take over a track group (core/TrackGroups.h, comp switch): the track's takes, each pass judged by what every
+// grouped track recorded of it (the words of the one closest to the line, clipping where any clips, the loudest
+// level). The choice is a lane on `track`; compGroup gives its pass to every grouped track.
+TakeChoice chooseGroupTake(const Project& p, const Sequence& s, TrackRef track, FrameTime from, FrameTime to, const std::string& line);
 
 // A loop recording in a file (Record Voiceover's Loop takes one in passes; any file will do): its passes from In to
 // Out, `length` seconds each after `preroll` seconds, at `sampleRate`, written as 32-bit float WAVs `stem` 1, 2... in

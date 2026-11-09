@@ -1,4 +1,5 @@
 #include "PlaybackController.h"
+#include "audio/AudioDevice.h"
 #include "audio/Sampler.h"
 #include "render/DialogueLoudness.h"
 #include "render/TrimPasses.h"
@@ -27,6 +28,7 @@
 #include "core/Surround.h"
 #include "render/AdaptiveHdr.h"
 #include "render/ColorSpace.h"
+#include "audio/PluginHost.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
 #include "render/MonitorCalibration.h"
@@ -111,6 +113,7 @@ private:
 
     // The frame as delivered alone (a preview from the render cache has only its SDR picture).
     QImage renderSignal(const Request& r, FrameTime t) {
+        plugins::RenderModeScope live(true);  // (a plug-in failing in its host here is playback's, not an export's)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s || !ownSpace(*s, r.trim)) return {};
         RenderOptions o;
@@ -125,6 +128,7 @@ private:
 
     // The frame in a scene-referred sequence's working space alone, for the scopes.
     QImage renderWorkingSignal(const Request& r, FrameTime t) {
+        plugins::RenderModeScope live(true);  // (a plug-in failing in its host here is playback's, not an export's)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s || !sceneReferredWorking(*s)) return {};
         RenderOptions o;
@@ -174,6 +178,7 @@ private:
     }
 
     Rendered render(const Request& r, FrameTime t) {
+        plugins::RenderModeScope live(true);  // (a plug-in failing in its host here is playback's, not an export's)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return {};
         RenderOptions o;
@@ -468,6 +473,12 @@ public:
     }
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override { return (1 << 16) + QIODevice::bytesAvailable(); }
+    // For a device of audio/AudioDevice.h (its own thread): `frames` frames of float at the configured channels, and
+    // the timeline sample of the first (-1 while idle).
+    int64_t pull(float* out, int frames) {
+        readData(reinterpret_cast<char*>(out), qint64(frames) * channels_ * 4);
+        return lastFirst_.load();
+    }
 
 signals:
     void levels(float l, float r, const QVector<float>& tracks);
@@ -514,6 +525,7 @@ protected:
                 rate = s->sampleRate;
             }
             first = looped(sample_);
+            lastFirst_ = idle || !s ? -1 : first;
             if (!idle) sample_ += frames;
             if (sampler_) {
                 smp_.assign(size_t(frames) * 2, 0.0f);
@@ -639,6 +651,7 @@ private:
     std::shared_ptr<const Project> project_;
     Id seq_ = 0;
     int64_t sample_ = 0;  // (the play's samples so far, from where it began: looped() places them)
+    std::atomic<int64_t> lastFirst_{-1};  // (the last block's first sample on the timeline, -1 idle)
     int64_t loopIn_ = 0;
     double loopLength_ = 0;
     bool int16_ = false;
@@ -695,7 +708,19 @@ struct OutputAudio {
 
 // ---------------------------------------------------------------------------
 
+namespace {
+std::vector<PlaybackController*>& players() {  // (every controller, for a change of device; the main thread's)
+    static std::vector<PlaybackController*> all;
+    return all;
+}
+}  // namespace
+
+void PlaybackController::reopenAllAudio() {
+    for (PlaybackController* p : std::vector<PlaybackController*>(players())) p->reopenAudio();
+}
+
 PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
+    players().push_back(this);
     project_ = std::make_shared<Project>(makeDefaultProject());
     heard_ = project_;
     renderThread_ = new QThread(this);
@@ -723,9 +748,10 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
 }
 
 PlaybackController::~PlaybackController() {
+    players().erase(std::remove(players().begin(), players().end(), this), players().end());
     worker_->setSinks({});
     stopAudio(true);
-    if (talkSource_) talkSource_->stop();
+    stopTalkbackInput();
     renderThread_->quit();
     renderThread_->wait();
 }
@@ -1084,9 +1110,8 @@ void PlaybackController::tick() {
     // minus what is still buffered) so picture stays locked to sound. Backends
     // differ in how they report this, so only trust it when it is close to
     // the wall clock.
-    if (speed_ == 1 && sink_ && sink_->state() == QAudio::ActiveState) {
-        qint64 buffered = std::max<qint64>(0, sink_->bufferSize() - sink_->bytesFree());
-        double played = (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
+    if (speed_ == 1) {
+        const double played = devicePlayed();
         if (played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
     }
     // (never back: going between the two clocks would step the picture back a frame or two)
@@ -1134,8 +1159,13 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
         sink_->deleteLater();
         sink_ = nullptr;
     }
+    if (engineOut_ >= 0) {
+        audiodev::Engine::shared().removeOutput(engineOut_);
+        engineOut_ = -1;
+    }
     const Sequence* s = sequence();
     if (!s) return;
+    if (startDeviceAudio(from, idle)) return;
     QAudioDevice dev = QMediaDevices::defaultAudioOutput();
     if (monitoring_.on && !audioOutput_.isEmpty())  // (the section's device; without it, the system's as before)
         for (const QAudioDevice& d : QMediaDevices::audioOutputs())
@@ -1178,6 +1208,78 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     sink_->start(device_);
 }
 
+std::vector<std::string> PlaybackController::outputNames(int channels) const {
+    // Each channel the speaker on it, the cue mix's own, else its number.
+    std::vector<std::string> names(size_t(std::max(0, channels)));
+    for (int c = 0; c < channels; ++c) names[size_t(c)] = "Out " + std::to_string(c + 1);
+    if (!monitoring_.on) {
+        if (channels >= 2) names[0] = "L", names[1] = "R";
+        return names;
+    }
+    if (monitoring_.cue.on)
+        for (int k = 0; k < 2; ++k)
+            if (monitoring_.cue.output + k >= 0 && monitoring_.cue.output + k < channels) names[size_t(monitoring_.cue.output + k)] = "Cue " + std::to_string(k + 1);
+    const auto& speakers = monitorSpeakers(monitoring_.speakers);
+    for (int k = 0; k < int(speakers.size()); ++k) {
+        const MonitorSpeaker m = monitorSpeaker(monitoring_, k);
+        if (m.output >= 0 && m.output < channels) {
+            std::string& n = names[size_t(m.output)];
+            n = n.rfind("Out ", 0) == 0 ? std::string(speakers[size_t(k)].name) : n + "+" + speakers[size_t(k)].name;
+        }
+    }
+    // (JACK wants each port's name once)
+    for (size_t a = 0; a < names.size(); ++a)
+        for (size_t b = a + 1; b < names.size(); ++b)
+            if (names[b] == names[a]) names[b] += " " + std::to_string(b + 1);
+    return names;
+}
+
+bool PlaybackController::startDeviceAudio(FrameTime from, bool idle) {
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    deviceChosen_ = engine.active();
+    if (!deviceChosen_) return false;
+    const Sequence* s = sequence();
+    const int channels = monitoring_.on ? monitorOutputs(monitoring_) : 2;
+    engine.setPreferredRate(s->sampleRate);
+    engine.setOutputChannels(channels);
+    engine.setOutputNames(outputNames(channels));
+    device_->setMonitoring(monitoring_, s->sampleRate);
+    const int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
+    device_->configure(heard_, sequenceId_, startSample, false, channels, idle);
+    audioLoop_ = {-1, -1.0};
+    loopTaken_ = 0;
+    syncAudioLoop();
+    device_->setCalibration(calibration_, monitoring_, s->sampleRate);
+    device_->setTalkback(talkback_);
+    MixerDevice* mixer = device_;
+    std::string error;
+    engineOut_ = engine.addOutput(this, s->sampleRate, channels, [mixer](float* out, int, int frames) { return mixer->pull(out, frames); }, &error);
+    if (engineOut_ < 0) {
+        // (Qt Multimedia's device instead, as before one was chosen)
+        qWarning("The audio device could not be used (%s): playing through the system's", error.c_str());
+        return false;
+    }
+    engineRate_ = s->sampleRate;
+    outputChannels_ = channels;
+    return true;
+}
+
+double PlaybackController::devicePlayed() const {
+    // What the device has actually played (processed less what is still buffered, or sent less the output latency).
+    if (engineOut_ >= 0) return audiodev::Engine::shared().heardSeconds(engineOut_);
+    if (sink_ && sink_->state() == QAudio::ActiveState) {
+        const qint64 buffered = std::max<qint64>(0, sink_->bufferSize() - sink_->bytesFree());
+        return (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
+    }
+    return -1;
+}
+
+void PlaybackController::reopenAudio() {
+    stopTalkbackInput();
+    if (talkback_) startTalkbackInput();
+    if (audioRunning()) refreshAudio(true);
+}
+
 void PlaybackController::setSampler(std::shared_ptr<sampler::Engine> engine) {
     if (engine == sampler_) return;
     sampler_ = engine;
@@ -1193,11 +1295,7 @@ int64_t PlaybackController::heardSample(qint64 nsAgo) const {
     if (speed_ == 1 && clock_.isValid()) {
         // (as tick() finds the picture's time, without moving it)
         double elapsed = clock_.nsecsElapsed() / 1e9;
-        if (sink_ && sink_->state() == QAudio::ActiveState) {
-            const qint64 buffered = std::max<qint64>(0, sink_->bufferSize() - sink_->bytesFree());
-            const double played = (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
-            if (played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
-        }
+        if (const double played = devicePlayed(); played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
         t = double(startFrame_) / fps + std::max(elapsed, lastElapsed_);
     } else return std::llround(t * s->sampleRate);  // (stopped: the picture has not moved since)
     return std::llround((t - double(nsAgo) / 1e9) * s->sampleRate);
@@ -1216,7 +1314,7 @@ void PlaybackController::syncAudioLoop() {
 }
 
 void PlaybackController::stopAudio(bool force) {
-    if (!sink_) return;
+    if (!audioRunning()) return;
     // Calibration noise and talkback go on while stopped.
     if (!force && monitorKeepsAudio()) {
         // (with the sampler, the sink afresh: what it holds of the programme is not heard after the stop)
@@ -1224,6 +1322,11 @@ void PlaybackController::stopAudio(bool force) {
         else device_->setIdle(true);
         return;
     }
+    if (engineOut_ >= 0) {
+        audiodev::Engine::shared().removeOutput(engineOut_);
+        engineOut_ = -1;
+    }
+    if (!sink_) return;
     sink_->stop();
     sink_->deleteLater();
     sink_ = nullptr;
@@ -1256,27 +1359,26 @@ void PlaybackController::setMonitoring(const MonitorSettings& settings) {
     device_->setCalibration(calibration_, m, rate);
     device_->setTalkback(talkback_);
     testMonitor_.reset();
+    if (engineOut_ >= 0) audiodev::Engine::shared().setOutputNames(outputNames(m.on ? monitorOutputs(m) : 2));  // (JACK's ports)
     refreshAudio(reopen);
-    if (!talkback_ && talkSource_) {
-        talkSource_->stop();
-        talkSource_->deleteLater();
-        talkSource_ = nullptr;
-        talkIo_ = nullptr;
-    }
+    if (!talkback_) stopTalkbackInput();
     emit monitoringChanged();
 }
 
 void PlaybackController::refreshAudio(bool reopen) {
-    if (const Sequence* s = sequence(); sink_ && s && sink_->format().sampleRate() != s->sampleRate) reopen = true;  // (another sequence's rate)
+    if (const Sequence* s = sequence(); s && ((sink_ && sink_->format().sampleRate() != s->sampleRate) || (engineOut_ >= 0 && engineRate_ != s->sampleRate)))
+        reopen = true;  // (another sequence's rate)
+    // (the device chosen, or Qt's again: opened afresh)
+    if (deviceChosen_ != audiodev::Engine::shared().active() && audioRunning()) reopen = true;
     if (speed_ == 1) {
-        if (!sink_ || reopen) {
+        if (!audioRunning() || reopen) {
             // (the picture's clock afresh with the sound, as after a seek)
             startFrame_ = position_;
             restartClock();
             startAudio(position_);
         }
     } else if (monitorKeepsAudio()) {
-        if (!sink_ || reopen) startAudio(position_, true);
+        if (!audioRunning() || reopen) startAudio(position_, true);
         else device_->setIdle(true);
     } else {
         stopAudio(true);
@@ -1286,7 +1388,7 @@ void PlaybackController::refreshAudio(bool reopen) {
 void PlaybackController::setAudioOutput(const QString& description) {
     if (description == audioOutput_) return;
     audioOutput_ = description;
-    if (sink_ && monitoring_.on) refreshAudio(true);
+    if (audioRunning() && monitoring_.on) refreshAudio(true);
     emit monitoringChanged();
 }
 
@@ -1309,18 +1411,46 @@ void PlaybackController::setTalkback(bool on) {
     device_->setTalkback(on);
     if (testMonitor_) testMonitor_->section().setTalkback(on);
     if (on) startTalkbackInput();
-    else if (talkSource_) {
+    else stopTalkbackInput();
+    refreshAudio(false);
+    emit monitoringChanged();
+}
+
+void PlaybackController::stopTalkbackInput() {
+    if (talkTap_ >= 0) {
+        audiodev::Engine::shared().removeInput(talkTap_);
+        talkTap_ = -1;
+    }
+    if (talkSource_) {
         talkSource_->stop();
         talkSource_->deleteLater();
         talkSource_ = nullptr;
         talkIo_ = nullptr;
     }
-    refreshAudio(false);
-    emit monitoringChanged();
 }
 
 void PlaybackController::startTalkbackInput() {
-    if (talkSource_) return;
+    if (talkSource_ || talkTap_ >= 0) return;
+    if (audiodev::Engine& engine = audiodev::Engine::shared(); engine.active()) {
+        // The device's input named for talkback (its first, else), mono, straight into the cue mix on the audio thread.
+        const audiodev::DeviceSettings ds = engine.settings();
+        int channel = 0;
+        for (int k = 0; k < ds.inputs; ++k)
+            if (QString::fromStdString(audiodev::inputName(ds, k)) == talkbackInput_) channel = k;
+        MixerDevice* mixer = device_;
+        const Sequence* s = sequence();
+        talkTap_ = engine.addInput(nullptr, s ? s->sampleRate : 48000, [mixer, channel](const float* in, int channels, int frames, int64_t) {
+            if (channel >= channels) return;
+            float mono[512];
+            for (int done = 0; done < frames;) {
+                const int n = std::min(frames - done, 512);
+                for (int i = 0; i < n; ++i) mono[i] = in[size_t(done + i) * size_t(channels) + size_t(channel)];
+                mixer->feedTalkback(mono, n);
+                done += n;
+            }
+        });
+        if (talkTap_ >= 0) return;
+    }
     QAudioDevice dev = QMediaDevices::defaultAudioInput();
     if (!talkbackInput_.isEmpty())
         for (const QAudioDevice& d : QMediaDevices::audioInputs())

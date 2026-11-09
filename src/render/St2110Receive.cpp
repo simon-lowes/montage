@@ -54,6 +54,7 @@ std::string sdpText(const SdpStream& s) {
     o.source2 = s.source[1];
     const Endpoint* to2 = s.redundant() ? &s.path[1] : nullptr;
     if (s.media == "audio") return audioSdp(s.audio, s.path[0], s.payloadType, o, to2);
+    if (s.encoding == "ST2110-41") return metadataSdp(s.path[0], s.payloadType, o, s.metadataTypes, to2);
     if (s.encoding == "smpte291") return ancSdp(s.video, s.path[0], s.payloadType, o, {{0x60, 0x60}, {0x61, 0x01}}, to2);
     std::string text = videoSdp(s.video, s.path[0], s.payloadType, o, to2);
     if (s.fullRange) {
@@ -162,9 +163,20 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             if (!videoFormatOk(f, &why)) return fail(why);
         } else if (s.encoding == "smpte291") {
             if (m.fmtp.count("exactframerate")) rational(m.fmtp["exactframerate"], s.video.fps);
-        } else if (s.encoding == "L24" || s.encoding == "L16") {
+        } else if (s.encoding == "ST2110-41") {
+            // (DIT: the data item types, apart by commas)
+            std::istringstream types(m.fmtp["DIT"]);
+            for (std::string t; std::getline(types, t, ',');) {
+                t = trim(t);
+                if (t.empty()) continue;
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(t.c_str(), &end, 0);
+                if (end && *end == 0 && v <= 0x3FFFFF) s.metadataTypes.push_back(uint32_t(v));
+            }
+        } else if (s.encoding == "L24" || s.encoding == "L16" || s.encoding == "AM824") {
             AudioFormat& a = s.audio;
             a.bits = s.encoding == "L16" ? 16 : 24;
+            a.aes3 = s.encoding == "AM824";
             std::istringstream r(m.rtpmap.substr(slash + 1));
             std::string rate, ch;
             std::getline(r, rate, '/');
@@ -176,7 +188,7 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             if (a.rate != 44100 && a.rate != 48000 && a.rate != 96000) return fail("ST 2110-30 here is at 44.1, 48 or 96 kHz");
             if (a.packetUs > 20000) return fail("The audio's packets are at most 20 ms here");
         } else {
-            return fail("Montage receives ST 2110-20, -30 and -40 streams, not " + m.rtpmap);
+            return fail("Montage receives ST 2110-20, -30, -31, -40 and -41 streams, not " + m.rtpmap);
         }
     }
     // ST 2022-7: a group's second description is its first's other path.
@@ -255,7 +267,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
             // (a few strangers counted at a time: the one heard least let go)
             auto least = who.others.begin();
             for (auto it = who.others.begin(); it != who.others.end(); ++it)
-                if (it->second < least->second) least = it;
+                if (it->second.count < least->second.count) least = it;
             who.others.erase(least);
         }
     };
@@ -264,9 +276,12 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
         // numbered as the stream is, not a stray far off; unless the stray is the other path's (heard first on a leg
         // that is otherwise dead): this one is taken once it has sent a window with fewer than a quarter as many of
         // that one's between, the count started again from its numbers and the other path let go to find its own.
-        if (who.others.empty()) who.otherAt = received[otherSide];
-        const int64_t theirs = ++who.others[p.ssrc];
-        if (theirs <= int64_t(window_) || (received[otherSide] - who.otherAt) * 4 >= theirs) return turnAway();
+        // (each counted against the other path's packets since it was first heard: a stray heard long before on this
+        // leg does not hold back a sender that starts on it once the other leg has died)
+        auto heard = who.others.find(p.ssrc);
+        if (heard == who.others.end()) heard = who.others.emplace(p.ssrc, Heard{0, received[otherSide]}).first;
+        const int64_t theirs = ++heard->second.count;
+        if (theirs <= int64_t(window_) || (received[otherSide] - heard->second.otherAt) * 4 >= theirs) return turnAway();
         other = Sender{};
         flush(out);
         started_ = false;
@@ -277,7 +292,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     if (who.have && p.ssrc != who.ssrc) {
         // (the one taken's packets counted from the first stranger's; all counted again once it has sent a window)
         if (who.others.empty()) who.own = 0;
-        const int64_t theirs = ++who.others[p.ssrc];
+        const int64_t theirs = ++who.others[p.ssrc].count;
         if (theirs <= int64_t(window_) || who.own * 4 >= theirs) return turnAway();
         // A window of another sender's, with few of the one taken between: that one now. The count starts again from
         // its numbers, unless the other path's new sender has just started it (both legs' senders started again).
@@ -290,7 +305,7 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
             sinceRestart_ = 0;
         }
     }
-    if (!who.have) who = Sender{true, p.ssrc, 0, {}, 0};
+    if (!who.have) who = Sender{true, p.ssrc, 0, {}};
     if (++who.own >= int64_t(window_)) who.own = 0, who.others.clear();
     ++sinceRestart_;
     ++received[path & 1];
@@ -355,7 +370,8 @@ void PathMerger::flush(std::vector<std::vector<uint8_t>>& out) {
 // ---- The input.
 
 struct Input::Stream {
-    int kind = 0;  // 0 video, 1 audio, 2 ancillary data
+    int kind = 0;  // 0 video, 1 audio, 2 ancillary data, 3 fast metadata
+    int sound = -1;  // (audio: its place in sounds_)
     SdpStream sdp;
     Receiver socket[2];
     std::mutex m;
@@ -377,10 +393,12 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
     };
     options_ = o;
     stop_ = false;
+    int channels = 0;
     for (const SdpStream& s : streams) {
-        const int kind = s.encoding == "raw" ? 0 : s.encoding == "smpte291" ? 2 : 1;
-        for (const auto& have : streams_)
-            if (have->kind == kind) return fail("Montage takes one video, one audio and one ancillary data stream at a time");
+        const int kind = s.encoding == "raw" ? 0 : s.encoding == "smpte291" ? 2 : s.encoding == "ST2110-41" ? 3 : 1;
+        if (kind == 0)
+            for (const auto& have : streams_)
+                if (have->kind == 0) return fail("Montage takes one video stream at a time (with any number of sound and data streams)");
         auto st = std::make_unique<Stream>(kind, s);
         st->merger.setPayloadType(s.payloadType);
         if (kind == 0) {
@@ -398,10 +416,22 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
             const double rasterBytes = double(s.video.width) * s.video.height * (s.video.sampling == Sampling::Ycc422 ? 2 : 3) * 2;
             pendingLimit_ = size_t(std::clamp(512e6 / rasterBytes, 2.0, 16.0));
         } else if (kind == 1) {
-            audio_ = s.audio;
+            if (hasAudio_ && s.audio.rate != audio_.rate) return fail("The sound streams are at different rates");
+            if (channels + s.audio.channels > 64) return fail("Montage takes up to 64 channels of sound at a time");
+            if (!hasAudio_) audio_ = s.audio;
             hasAudio_ = true;
-        } else {
+            aes3_ = aes3_ || s.audio.aes3;
+            st->sound = int(sounds_.size());
+            Sound snd;
+            snd.format = s.audio;
+            snd.offset = channels;
+            sounds_.push_back(snd);
+            channels += s.audio.channels;
+            audio_.channels = channels;
+        } else if (kind == 2) {
             hasAnc_ = true;
+        } else {
+            hasMeta_ = true;
         }
         for (int p = 0; p < (s.redundant() ? 2 : 1); ++p) {
             std::string why;
@@ -427,10 +457,17 @@ void Input::close() {
     std::lock_guard lock(m_);
     pending_.clear();
     anc_.clear();
-    sound_.clear();
-    soundStart_ = -1;
+    meta_.clear();
+    sounds_.clear();
     hasAudio_ = hasAnc_ = ancSeen_ = joined_ = false;
+    hasMeta_ = metaSeen_ = aes3_ = false;
     stats_ = {};
+}
+
+std::vector<AudioFormat> Input::audioStreams() const {
+    std::vector<AudioFormat> out;
+    for (const Sound& s : sounds_) out.push_back(s.format);
+    return out;
 }
 
 bool Input::isOpen() const { return !streams_.empty(); }
@@ -444,8 +481,9 @@ InputStats Input::stats() const {
     // (a stream's lock is taken before the input's while packets come in, so never the other way round)
     for (const auto& st : streams_) {
         std::lock_guard sl(st->m);
-        s.packets[st->kind][0] = st->merger.received[0];
-        s.packets[st->kind][1] = st->merger.received[1];
+        // (each kind's streams together: several sound or data streams beside the picture)
+        s.packets[st->kind][0] += st->merger.received[0];
+        s.packets[st->kind][1] += st->merger.received[1];
         s.duplicates += st->merger.duplicates;
         s.lost += st->merger.lost;
     }
@@ -490,28 +528,61 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         cv_.notify_all();
     } else if (s.kind == 1) {
         const AudioFormat& a = s.sdp.audio;
-        const std::vector<float> samples = unpackAudio(p.payload, p.size, a.channels, a.bits);
+        // (AES3's words kept as they came; their 24 bits as the samples, exactly)
+        std::vector<uint32_t> words;
+        std::vector<float> samples;
+        if (a.aes3) {
+            words = unpackAm824(p.payload, p.size, a.channels);
+            samples.resize(words.size());
+            for (size_t i = 0; i < words.size(); ++i) samples[i] = float(double(am824Data(words[i])) / 8388608.0);
+        } else {
+            samples = unpackAudio(p.payload, p.size, a.channels, a.bits);
+        }
         const int64_t at = unwrap(p.timestamp, a.rate);
         const int64_t frames = int64_t(samples.size()) / a.channels;
         std::lock_guard lock(m_);
-        const int64_t held = soundStart_ + int64_t(sound_.size()) / a.channels;
+        Sound& snd = sounds_[size_t(s.sound)];
+        const int64_t held = snd.start + int64_t(snd.samples.size()) / a.channels;
         // (the first; after a long gap; or from well before what is held, so not a packet late by a little but time
         // gone back, a PTP step or the sender started again: from here)
-        if (soundStart_ < 0 || at > held + a.rate || at + frames + a.rate / 50 < held) {
-            sound_.clear();
-            soundStart_ = at;
+        if (snd.start < 0 || at > held + a.rate || at + frames + a.rate / 50 < held) {
+            snd.samples.clear();
+            snd.words.clear();
+            snd.start = at;
         }
-        const int64_t end = soundStart_ + int64_t(sound_.size()) / a.channels;
+        const int64_t end = snd.start + int64_t(snd.samples.size()) / a.channels;
         if (at + frames <= end) return;  // (already held)
-        if (at > end) sound_.insert(sound_.end(), size_t(at - end) * size_t(a.channels), 0.0f);  // (a gap: silence)
+        if (at > end) {
+            // (a gap: silence)
+            snd.samples.insert(snd.samples.end(), size_t(at - end) * size_t(a.channels), 0.0f);
+            if (a.aes3) snd.words.insert(snd.words.end(), size_t(at - end) * size_t(a.channels), 0u);
+        }
         const int64_t skip = std::max<int64_t>(0, end - at);
-        sound_.insert(sound_.end(), samples.begin() + ptrdiff_t(skip * a.channels), samples.end());
+        snd.samples.insert(snd.samples.end(), samples.begin() + ptrdiff_t(skip * a.channels), samples.end());
+        if (a.aes3) snd.words.insert(snd.words.end(), words.begin() + ptrdiff_t(skip * a.channels), words.end());
         // (two seconds kept)
         const int64_t keep = int64_t(a.rate) * 2;
-        const int64_t extra = int64_t(sound_.size()) / a.channels - keep;
+        const int64_t extra = int64_t(snd.samples.size()) / a.channels - keep;
         if (extra > 0) {
-            sound_.erase(sound_.begin(), sound_.begin() + ptrdiff_t(extra * a.channels));
-            soundStart_ += extra;
+            snd.samples.erase(snd.samples.begin(), snd.samples.begin() + ptrdiff_t(extra * a.channels));
+            if (a.aes3) snd.words.erase(snd.words.begin(), snd.words.begin() + ptrdiff_t(extra * a.channels));
+            snd.start += extra;
+        }
+        cv_.notify_all();
+    } else if (s.kind == 3) {
+        std::vector<FastMetadata> items;
+        if (!unpackFastMetadata(p.payload, p.size, items)) return;
+        std::lock_guard lock(m_);
+        auto& at = meta_[p.timestamp];
+        if (at.size() + items.size() > 256) return;
+        at.insert(at.end(), items.begin(), items.end());
+        if (!metaSeen_ || int32_t(p.timestamp - metaLatest_) > 0) metaLatest_ = p.timestamp;
+        metaSeen_ = true;
+        while (meta_.size() > 64) {
+            auto oldest = meta_.begin();
+            for (auto it = meta_.begin(); it != meta_.end(); ++it)
+                if (metaLatest_ - it->first > metaLatest_ - oldest->first) oldest = it;
+            meta_.erase(oldest);
         }
         cv_.notify_all();
     } else {
@@ -555,9 +626,12 @@ bool Input::ready(const Pending& p, std::chrono::steady_clock::time_point now) {
     if (now - p.at > std::chrono::milliseconds(options_.waitMs)) return true;
     // (its ancillary data, sent alongside on a socket of its own, may come a little after the picture)
     if (hasAnc_ && !(ancSeen_ && int32_t(ancLatest_ - p.ts) >= 0)) return false;
+    if (hasMeta_ && !(metaSeen_ && int32_t(metaLatest_ - p.ts) >= 0)) return false;
     if (!hasAudio_) return true;
     const Span sp = spanOf(p.ts, video_.fps, audio_.rate);
-    return soundStart_ >= 0 && soundStart_ + int64_t(sound_.size()) / audio_.channels >= sp.to;
+    for (const Sound& s : sounds_)
+        if (s.start < 0 || s.start + int64_t(s.samples.size()) / s.format.channels < sp.to) return false;
+    return true;
 }
 
 void Input::build(Pending& p, InputFrame& out) {
@@ -569,13 +643,38 @@ void Input::build(Pending& p, InputFrame& out) {
     out.lostPackets = p.lost;
     out.channels = hasAudio_ ? audio_.channels : 0;
     out.audio.clear();
+    out.aes3.clear();
     if (hasAudio_) {
-        const int ch = audio_.channels;
-        out.audio.assign(size_t(sp.to - sp.from) * size_t(ch), 0.0f);
-        for (int64_t i = std::max(sp.from, soundStart_); soundStart_ >= 0 && i < sp.to; ++i) {
-            const int64_t k = (i - soundStart_) * ch;
-            if (k + ch > int64_t(sound_.size())) break;
-            for (int c = 0; c < ch; ++c) out.audio[size_t((i - sp.from) * ch + c)] = sound_[size_t(k + c)];
+        const int all = audio_.channels;
+        out.audio.assign(size_t(sp.to - sp.from) * size_t(all), 0.0f);
+        if (aes3_) out.aes3.assign(out.audio.size(), 0u);
+        for (const Sound& snd : sounds_) {
+            const int ch = snd.format.channels;
+            for (int64_t i = std::max(sp.from, snd.start); snd.start >= 0 && i < sp.to; ++i) {
+                const int64_t k = (i - snd.start) * ch;
+                if (k + ch > int64_t(snd.samples.size())) break;
+                for (int c = 0; c < ch; ++c) {
+                    const size_t to = size_t((i - sp.from) * all + snd.offset + c);
+                    out.audio[to] = snd.samples[size_t(k + c)];
+                    if (!aes3_) continue;
+                    out.aes3[to] = snd.format.aes3 ? snd.words[size_t(k + c)]
+                                                   : uint32_t(int32_t(std::nearbyint(double(snd.samples[size_t(k + c)]) * 8388608.0))) & 0xFFFFFF;
+                }
+            }
+        }
+    }
+    // Its fast metadata: the items timed within the frame.
+    out.metadata.clear();
+    const uint32_t frame90 = uint32_t(int64_t(90000) * video_.fps.den / std::max(1, video_.fps.num));
+    for (auto it = meta_.begin(); it != meta_.end();) {
+        const uint32_t d = it->first - p.ts;
+        if (d < frame90) {
+            out.metadata.insert(out.metadata.end(), it->second.begin(), it->second.end());
+            it = meta_.erase(it);
+        } else if (int32_t(d) < 0) {
+            it = meta_.erase(it);
+        } else {
+            ++it;
         }
     }
     // Its ancillary data: the packets timed within the frame (both fields'), and its time code.

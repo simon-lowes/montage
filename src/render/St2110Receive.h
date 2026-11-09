@@ -5,6 +5,8 @@
 //    taken once from whichever path brought it.
 //  - Pictures, sound and ancillary data are put together by their RTP timestamps, which ST 2110 takes from PTP time: a
 //    frame comes with the samples of its own time span, its time code (ST 12-2), captions and HDR metadata.
+//  - Several sound streams (-30, and -31's AES3 subframes kept bit for bit), ancillary data streams and -41 fast
+//    metadata streams go with one picture.
 #pragma once
 
 #include <algorithm>
@@ -27,12 +29,13 @@ namespace montage::st2110 {
 // One stream an SDP describes: what it carries and where it arrives (with ST 2022-7, on two paths).
 struct SdpStream {
     std::string media;     // "video" or "audio"
-    std::string encoding;  // "raw", "smpte291", "L24" or "L16"
+    std::string encoding;  // "raw", "smpte291", "L24", "L16", "AM824" (ST 2110-31) or "ST2110-41"
     int payloadType = -1;
     Endpoint path[2];       // (path[1].port 0: one path)
     std::string source[2];  // the sender's address as its source filter gives it ("" not said)
     VideoFormat video;      // raw (all of it) and smpte291 (its frame rate)
-    AudioFormat audio;      // L24 and L16
+    AudioFormat audio;      // L24, L16 and AM824 (its `aes3`)
+    std::vector<uint32_t> metadataTypes;  // ST2110-41's data item types (its DIT)
     bool fullRange = false; // the video's RANGE=FULL (its codes from 0, not 16 at 8 bits)
     std::string interfaceAddress[2];  // where this stream joins on each path ("" as InputOptions say; not in its SDP)
     bool redundant() const { return path[1].port > 0; }
@@ -75,13 +78,16 @@ private:
     bool started_ = false;
     // Each path's sender: its SSRC, its packets since the others' were last counted from, and theirs (by SSRC, a few);
     // with none yet, those that would be its first but are numbered far from the stream, and the other path's count
-    // when the first of them came.
+    // when each of them was first heard.
+    struct Heard {
+        int64_t count = 0;
+        int64_t otherAt = 0;
+    };
     struct Sender {
         bool have = false;
         uint32_t ssrc = 0;
         int64_t own = 0;
-        std::map<uint32_t, int64_t> others;
-        int64_t otherAt = 0;
+        std::map<uint32_t, Heard> others;
     } sender_[2];
     int64_t next_ = 0;
     int64_t lateRun_ = 0;     // packets in a row from before the window (a sender restarted, or one jumped ahead of)
@@ -98,8 +104,13 @@ struct InputFrame {
     uint32_t rtpTimestamp = 0;
     int64_t ptpNs = 0;      // when it began (PTP time)
     int64_t number = 0;     // its frame count since the PTP epoch
-    std::vector<float> audio;  // its time span's samples, interleaved (silence where packets were missing)
+    std::vector<float> audio;  // its time span's samples, interleaved (silence where packets were missing): every
+                               // sound stream's channels in turn
     int channels = 0;
+    // With an AES3 stream (ST 2110-31) among them: the same samples as AM824 words, the AES3 streams' as they came
+    // (their user, validity and channel status bits too), the others' their PCM's 24 bits under an empty label.
+    std::vector<uint32_t> aes3;
+    std::vector<FastMetadata> metadata;  // ST 2110-41 data items timed within the frame
     std::vector<AncPacket> anc;  // its ancillary packets (both fields')
     bool hasTimecode = false;
     output::Timecode timecode;
@@ -114,11 +125,12 @@ struct InputOptions {
 
 struct InputStats {
     int64_t frames = 0, incomplete = 0, dropped = 0;  // (dropped: frames not taken in time)
-    int64_t packets[3][2] = {};                       // video, audio, ancillary on each path
+    int64_t packets[4][2] = {};                       // video, audio, ancillary, fast metadata on each path
     int64_t duplicates = 0, lost = 0;                 // after merging
 };
 
-// Receives the streams (one video, and at most one audio and one ancillary data stream) on threads of their own.
+// Receives the streams (one video, and any number of sound, ancillary data and fast metadata streams: sound streams at
+// one rate, up to 64 channels in all) on threads of their own.
 class Input {
 public:
     Input();
@@ -131,8 +143,11 @@ public:
     void close();
     bool isOpen() const;
     VideoFormat video() const { return video_; }
+    // The sound: the first stream's format with every stream's channels.
     AudioFormat audio() const { return audio_; }
     bool hasAudio() const { return hasAudio_; }
+    // Each sound stream's format, in the order their channels come.
+    std::vector<AudioFormat> audioStreams() const;
     InputStats stats() const;
 
 private:
@@ -151,6 +166,18 @@ private:
     VideoFormat video_;
     AudioFormat audio_;
     bool hasAudio_ = false, hasAnc_ = false, ancSeen_ = false, joined_ = false;
+    bool hasMeta_ = false, metaSeen_ = false, aes3_ = false;
+    uint32_t metaLatest_ = 0;
+    std::map<uint32_t, std::vector<FastMetadata>> meta_;  // by RTP timestamp
+    // Each sound stream's samples from `start` on (AES3's as words too), and where its channels go.
+    struct Sound {
+        AudioFormat format;
+        int offset = 0;
+        std::deque<float> samples;
+        std::deque<uint32_t> words;
+        int64_t start = -1;
+    };
+    std::vector<Sound> sounds_;
     size_t pendingLimit_ = 16;  // frames held for the reader (fewer of large pictures)
     uint32_t ancFirst_ = 0, ancLatest_ = 0;  // the first and latest ancillary data's RTP timestamps
     InputOptions options_;
@@ -161,8 +188,6 @@ private:
     std::condition_variable cv_;
     std::deque<Pending> pending_;
     std::map<uint32_t, std::vector<AncPacket>> anc_;  // by RTP timestamp
-    std::deque<float> sound_;                         // samples from soundStart_ on
-    int64_t soundStart_ = -1;
     InputStats stats_;
 };
 

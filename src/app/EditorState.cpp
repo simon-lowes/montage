@@ -1,5 +1,6 @@
 #include "EditorState.h"
 
+#include "core/TrackGroups.h"
 #include "core/Expression.h"
 #include "core/CompositeGraph.h"
 #include "core/GradeGraph.h"
@@ -327,7 +328,8 @@ bool EditorState::isSelected(Id clip) const {
 
 void EditorState::setSelection(std::vector<Id> clips, bool expandLinked) {
     primary_ = clips.empty() ? 0 : clips.front();
-    if (expandLinked && sequence()) clips = edit::expandLinks(*sequence(), clips);
+    // With the clips linked to them and, through a track group's editing switch, those over the same time on its tracks.
+    if (expandLinked && sequence()) clips = edit::expandGroups(*sequence(), clips);
     if (clips == selection_ && selectedTransition_ == 0 && (clips.empty() || !inspectedChain_)) return;
     selection_ = std::move(clips);
     selectedTransition_ = 0;
@@ -370,6 +372,18 @@ void EditorState::setMaskObject(Id effect, int which) {
     auto [it, added] = maskObjects_.try_emplace(effect, which);
     if (!added && it->second == which) return;
     it->second = which;
+    emit maskObjectChanged();
+}
+
+std::string EditorState::shapeItem(Id clip) const {
+    auto it = shapeItems_.find(clip);
+    return it == shapeItems_.end() ? std::string() : it->second;
+}
+
+void EditorState::setShapeItem(Id clip, const std::string& item) {
+    auto [it, added] = shapeItems_.try_emplace(clip, item);
+    if (!added && it->second == item) return;
+    it->second = item;
     emit maskObjectChanged();
 }
 
@@ -686,6 +700,26 @@ void EditorState::refreshLengths(const QStringList& paths) {
             emit self->growingRefreshed(changed);
         }, Qt::QueuedConnection);
     });
+}
+
+bool EditorState::noteRecordedLength(Id media, double seconds) {
+    const MediaItem* m = media ? project_.findMedia(media) : nullptr;
+    if (!m || m->path.empty() || m->subclipOf || m->kind == MediaKind::Sequence || seconds <= m->duration) return false;
+    const std::string path = m->path;
+    auto apply = [&](Project& p) {
+        bool changed = false;
+        for (MediaItem& x : p.media)
+            if (x.path == path && !x.subclipOf && x.duration < seconds) x.duration = seconds, changed = true;
+        return changed;
+    };
+    apply(project_);
+    history_.forEachState(apply);
+    if (gesture_) apply(gesture_->origin);
+    history_.touch();
+    // (its pictures read again from the file as it is now: the new end decoded once it is written)
+    MediaPool::instance().forget(path, false);
+    emit projectChanged();
+    return true;
 }
 
 QStringList EditorState::growingFiles() const {

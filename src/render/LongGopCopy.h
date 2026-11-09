@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "render/HrdCheck.h"
 
 struct AVCodecContext;
 struct AVFormatContext;
@@ -96,7 +97,12 @@ private:
     bool endPart(std::string* error);
     bool receive(std::string* error);
     bool flushPending(std::string* error);
-    bool write(AVPacket* pkt, FrameTime display, std::string* error);
+    bool write(AVPacket* pkt, FrameTime display, bool ours, std::string* error);
+    bool writeFinal(AVPacket* pkt, FrameTime display, std::string* error);
+    bool writeHeld(std::vector<uint8_t> au, FrameTime display, std::string* error);
+    // HRD: an SPS NAL unit (whole) with the footage's HRD in place of the encoder's; as it is when there is none.
+    std::vector<uint8_t> withHrd(const uint8_t* sps, size_t n) const;
+    void setsWithHrd(std::vector<uint8_t>& lengthPrefixed) const;
     int64_t partBitrate(FrameTime a, FrameTime b) const;
     double ceilingBitsPerFrame() const;
     AVCodecContext* openEncoder(int64_t bitrate, std::string* error) const;
@@ -134,6 +140,19 @@ private:
     FrameTime pendingPts_ = 0;
     bool pendingKey_ = false, havePending_ = false;
     int copied_ = 0, parts_ = 0;
+    // The buffer model (render/HrdCheck.h).
+    bool hrdOn_ = false;
+    double hrdRate_ = 0, hrdBuffer_ = 0;
+    std::vector<uint8_t> hrdSps_;  // H.264 and HEVC: the footage's SPS whose HRD the encoded parts are given
+    HrdSplicer hrd_;
+    int heldFlags_ = 0;
+    FrameTime lastCopiedHi_ = -2;
+    // H.264 entered at a recovery point: what its I-picture's frame_num was (taken off those after it until an IDR
+    // picture), and the idr_pic_id the next IDR picture made takes.
+    int64_t frameNumShift_ = -1;  // (H.264, after an I-picture made an IDR one: its frame_num, taken off those after; -1 none)
+    uint64_t pocShift_ = 0, sinceIdr_ = 0;  // (and its pic_order_cnt_lsb; the latest frame_num since, not wrapped)
+    // (2 to 65535: never x264's 0 and 1, so a made IDR picture right after an encoded one has another idr_pic_id)
+    int idrPicId_ = 2;
 };
 
 }  // namespace montage

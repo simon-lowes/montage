@@ -55,12 +55,30 @@ std::vector<double> warpDepths(const WarpMesh& m, const std::vector<WarpPin>& pi
 // `src` warped from the mesh at rest to `moved`, drawn over `out` (the same size) triangle by triangle, the furthest
 // back first (by `depth`, then in order). Every pixel is drawn by at most one triangle of a seamless part.
 void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>& moved, const std::vector<double>& depth, Image& out);
+// drawWarp's triangles for a w x h picture, in the order drawn, those that reach no pixel left out: each one's edges as
+// edge functions A x + B y + C (edge k opposite vertex k, worked out from its lower-numbered vertex P, so the two
+// triangles either side of an edge see the same numbers), their values at the vertices, whether a pixel centre exactly
+// on edge k is this triangle's, the pixels it may cover and its vertices' places at rest.
+struct WarpTriangle {
+    double A[3], B[3], C[3], at[3];
+    MeshPoint P[3];
+    bool own[3];
+    int x0, x1, y0, y1;
+    MeshPoint r[3];
+};
+std::vector<WarpTriangle> warpTriangles(const WarpMesh& m, const std::vector<MeshPoint>& moved, const std::vector<double>& depth, int w, int h);
 
 // The effects (Mesh Warp's pins read from its params at clip frame t; positions as fractions of the picture, sizes in
 // sequence pixels times `pixelScale`).
 std::vector<WarpPin> meshWarpPins(const Effect& e, double t, int w, int h, double pixelScale);
 void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void gridWarp(const Effect& e, FrameTime t, Image& img);
+// What Mesh Warp or Grid Warp `e` draws on clip frame t over a w x h picture, as one drawing (for render/Processing's GPU
+// passes): 1 with its mesh, the vertices moved and the triangles' depths; 0 when it leaves the picture as it is; -1 when
+// it needs more (the picture's alpha for its mesh, motion blur through the shutter, the mesh shown). With w or h 0, only
+// whether it can be drawn so (0 or -1).
+int warpDrawing(const Effect& e, FrameTime t, int w, int h, double pixelScale, WarpMesh& mesh, std::vector<MeshPoint>& moved,
+                std::vector<double>& depth);
 // Points on the picture at rest, where Mesh Warp `e` on clip frame t puts them (pixels of a w x h picture, on the mesh
 // it was last drawn with, or one over the whole frame), and the point at rest it puts at `shown` (false where nothing of the mesh is there): for
 // showing and placing pins on the monitor.

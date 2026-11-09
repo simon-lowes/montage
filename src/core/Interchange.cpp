@@ -16,6 +16,7 @@
 #include "Interpretation.h"
 #include "Multicam.h"
 #include "History.h"
+#include "TrackGroups.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -271,6 +272,13 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c, TrackKi
     return o;
 }
 
+// A label colour as OpenTimelineIO 0.18 writes one (its Color: red, green, blue and alpha, 0 to 1, and a name).
+QJsonObject otioTrackColor(const std::string& color) {
+    double r = 0, g = 0, b = 0;
+    trackColorRgb(color, r, g, b);
+    return QJsonObject{{"OTIO_SCHEMA", "Color.1"}, {"name", QString::fromStdString(color)}, {"r", r}, {"g", g}, {"b", b}, {"a", 1.0}};
+}
+
 QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int depth) {
     const double rate = s.fpsValue();
     QJsonObject o = item("Track.1", QString::fromStdString(t.name));
@@ -278,6 +286,14 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int d
     o["enabled"] = !t.muted;
     o["kind"] = t.kind == TrackKind::Video ? "Video" : "Audio";
     o["source_range"] = QJsonValue();
+    // Its colour (on the clips too when they take it), and its group in Montage's metadata.
+    if (depth == 0 && !t.color.empty()) o["color"] = otioTrackColor(t.color);
+    if (depth == 0) {
+        QJsonObject own;
+        if (const TrackGroup* g = findTrackGroup(s, t.group)) own["group"] = QString::fromStdString(g->name);
+        if (t.colorClips) own["color_clips"] = true;
+        if (!own.isEmpty()) o["metadata"] = QJsonObject{{"montage", own}};
+    }
     QJsonArray children;
     double cursor = 0;
     for (const Clip& c : t.clips) {
@@ -301,6 +317,7 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int d
                                         {"transition_type", type}, {"in_offset", rt(double(c.start - from), rate)},
                                         {"out_offset", rt(double(to - c.start), rate)}, {"metadata", QJsonObject()}});
         }
+        if (depth == 0 && t.colorClips && !t.color.empty() && c.colorLabel == 0) clip["color"] = otioTrackColor(t.color);
         if (placed) {
             const double from = c.reverse ? c.sourceIn + c.sourceExtent() - head * c.speed : c.sourceIn + head * c.speed;
             clip["source_range"] = range(from, double(c.duration) - head - tail, rate);
@@ -332,6 +349,15 @@ std::string exportOtio(const Project& p, const Sequence& sequence) {
     if (s.hdrPeakNits != 1000) own["hdr_peak_nits"] = s.hdrPeakNits;
     if (!s.workingSpace.empty()) own["working_space"] = QString::fromStdString(s.workingSpace);
     if (!s.outputTransform.empty()) own["output_transform"] = QString::fromStdString(s.outputTransform);
+    // Track groups: their switches (the tracks name their group).
+    if (!s.trackGroups.empty()) {
+        QJsonArray groups;
+        for (const TrackGroup& g : s.trackGroups)
+            groups.append(QJsonObject{{"name", QString::fromStdString(g.name)}, {"editing", g.editing}, {"mute", g.mute}, {"volume", g.volume},
+                                      {"pan", g.pan}, {"automation", g.automation}, {"record", g.record}, {"comp", g.comp},
+                                      {"suspended", g.suspended}});
+        own["track_groups"] = groups;
+    }
     QJsonObject root{{"OTIO_SCHEMA", "Timeline.1"},
                      {"name", QString::fromStdString(s.name)},
                      {"global_start_time", rt(0, rate)},

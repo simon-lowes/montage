@@ -58,6 +58,8 @@ const ColumnField kColumns[] = {
     {"AMF_NAME", "amf_name"}, {"AMF_UUID", "amf_uuid"},
     // Film: the key number and ink number of the clip's first frame (core/FilmCount.h).
     {"KN Start", "key_number"}, {"Ink Number", "ink_number"},
+    // What Check Focus found in the dailies (render/FocusCheck.h).
+    {"Focus", "focus"},
 };
 
 }  // namespace
@@ -316,6 +318,11 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
         t.columns.push_back("KN Start");
         t.columns.push_back("Ink Number");
     }
+    // And what Check Focus found, when it has been run on any of them.
+    bool anyFocus = false;
+    for (Id id : ids)
+        if (const MediaItem* m = p.findMedia(id); m && m->kind != MediaKind::Sequence && m->kind != MediaKind::Image) anyFocus |= m->metadata.count("focus") > 0;
+    if (anyFocus) t.columns.push_back("Focus");
     size_t row = 0;
     for (Id id : ids) {
         const MediaItem* m = p.findMedia(id);
@@ -336,6 +343,10 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
                 const auto it = m->metadata.find(key);
                 cells.push_back(it == m->metadata.end() ? std::string() : it->second);
             }
+        }
+        if (anyFocus) {
+            const auto it = m->metadata.find("focus");
+            cells.push_back(it == m->metadata.end() ? std::string() : it->second);
         }
         t.rows.push_back(cells);
     }

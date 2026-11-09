@@ -21,6 +21,11 @@ endfunction()
 montage_test(test_core)
 montage_test(test_render)
 target_link_libraries(test_render PRIVATE Qt6::Network)  # (free ports for the remote review stream)
+if(MONTAGE_HAVE_WEBRTC AND TARGET juice)
+  # libjuice's own TURN server (built with libdatachannel) as the relay a user runs, for the live review's TURN test
+  target_link_libraries(test_render PRIVATE juice)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_TURN)
+endif()
 # (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.) Qt 6.4's
 # watchdog stops a run 300 s after it starts, whichever function it is in, so the run is given as long as ctest gives it.
 set_tests_properties(test_render PROPERTIES TIMEOUT 900 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=900000")
@@ -116,6 +121,7 @@ target_compile_definitions(montage_test_hang PRIVATE MONTAGE_TEST_HANG)
 montage_test_clap(montage_test_crash MontageTestCrash crash plugins/test_clap_misbehaving.c)
 target_compile_definitions(montage_test_crash PRIVATE MONTAGE_TEST_CRASH)
 montage_test_clap(montage_test_latency MontageTestLatency latency plugins/test_clap_latency.c)
+montage_test_clap(montage_test_convolver MontageTestConvolver convolver plugins/test_clap_convolver.c)
 montage_test_clap(montage_test_sidechain MontageTestSidechain sidechain plugins/test_clap_sidechain.c)
 if(NOT WIN32 AND NOT APPLE)
   target_link_libraries(montage_test_sidechain PRIVATE m)
@@ -153,12 +159,13 @@ target_compile_definitions(test_render PRIVATE MONTAGE_TEST_OFX_DIR="${CMAKE_CUR
   MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
 
 montage_test(test_plugins)
-add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage_test_sidechain montage-plugin-probe
-  montage_test_ofx montage_test_ofx_crash)
+add_dependencies(test_plugins montage_test_plugins montage_test_hang montage_test_crash montage_test_latency montage_test_sidechain
+  montage_test_convolver montage-plugin-probe montage-pluginhost montage_test_ofx montage_test_ofx_crash)
 target_compile_definitions(test_plugins PRIVATE
   MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
   MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
-  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>")
+  MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
+  MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>")
 
 if(TARGET PkgConfig::LILV)
   # An LV2 gain with latency, as a bundle (shared module + Turtle files).

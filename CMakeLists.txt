@@ -25,6 +25,7 @@ option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its
 option(MONTAGE_WITH_THORVG "Lottie animations and SVG graphics with ThorVG (MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_FDL "ASC Framing Decision Lists (the ASC's libfdl_core, Apache-2.0, with jsoncons, BSL-1.0, fetched at configure time)" ON)
 option(MONTAGE_WITH_LUA "Lua scripting (Lua 5.4, MIT, fetched at configure time)" ON)
+option(MONTAGE_WITH_PORTAUDIO "ALSA, Core Audio and WASAPI devices for playback and recording (PortAudio, MIT, fetched at configure time); off, Qt Multimedia and JACK remain" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibRaw 0.20+ is installed" ON)
 option(MONTAGE_WITH_JXL "JPEG XL stills, frames and animations, float, HDR and alpha kept, when libjxl 0.7+ is installed" ON)
@@ -36,6 +37,8 @@ option(MONTAGE_WITH_SPATIAL_VIDEO "Spatial video out: MV-HEVC through x265's mul
 option(MONTAGE_WITH_OMT "Open Media Transport in and out (libvmx, its VMX codec, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_WEBRTC "Live review in any web browser over WebRTC (libdatachannel, MPL-2.0, with libjuice, usrsctp, libSRTP, Plog and nlohmann/json, fetched at configure time), when OpenSSL 3 is installed" ON)
 option(MONTAGE_WITH_BMX "Broadcast MXF by the book: AS-11, RDD 9 and ST 436 ancillary data (the EBU's bmx with libMXF, BSD, fetched at configure time)" ON)
+option(MONTAGE_WITH_AV2 "AV2 in and out: dav2d (VideoLAN, BSD-2-Clause) reads it and AVM (the AV2 reference encoder, BSD-3-Clause-Clear with the AOM patent licence) writes it, when both are installed (AV2_ROOT, as scripts/build-av2.sh builds them, or pkg-config); off: both licences are flagged and packages leave AV2 out" OFF)
+set(AV2_ROOT "" CACHE PATH "Where dav2d and AVM are installed (scripts/build-av2.sh <prefix>), for MONTAGE_WITH_AV2")
 option(MONTAGE_WITH_VMAF "VMAF scores in Compare Encode, when libvmaf 3+ is installed (Netflix, BSD-2-Clause-Patent; off until its licence is settled)" OFF)
 option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or later" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
@@ -254,9 +257,10 @@ endif()
 
 if(MONTAGE_WITH_LUA)
   include(FetchContent)
-  # Lua's own release; its library sources (not the lua and luac programs) compiled here.
+  # Lua's own release; its library sources (not the lua and luac programs) compiled here. (Debian's copy of the same
+  # tarball, the same bytes, is tried when lua.org cannot be reached.)
   FetchContent_Declare(lua
-    URL https://www.lua.org/ftp/lua-5.4.7.tar.gz
+    URL https://www.lua.org/ftp/lua-5.4.7.tar.gz https://deb.debian.org/debian/pool/main/l/lua5.4/lua5.4_5.4.7.orig.tar.gz
     URL_HASH SHA256=9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
     SOURCE_SUBDIR no-cmake)
   FetchContent_MakeAvailable(lua)
@@ -279,6 +283,65 @@ if(MONTAGE_WITH_LUA)
     target_compile_definitions(montage_lua PRIVATE LUA_USE_LINUX)
     target_link_libraries(montage_lua PRIVATE m ${CMAKE_DL_LIBS})
   endif()
+endif()
+
+if(MONTAGE_WITH_PORTAUDIO)
+  include(FetchContent)
+  # PortAudio's own release (v19.7.0); its sources compiled here with only the host APIs Montage offers: ALSA on Linux
+  # (when ALSA's headers are installed), Core Audio on macOS, WASAPI on Windows. JACK is not built in: Montage loads a
+  # JACK library itself when it runs (audio/JackDevice.cpp), never linked. ASIO is not built either (its SDK is not
+  # fetched): PA_USE_ASIO and the ASIO SDK's sources would go here.
+  FetchContent_Declare(portaudio
+    URL https://files.portaudio.com/archives/pa_stable_v190700_20210406.tgz
+    URL_HASH SHA256=47efbf42c77c19a05d22e627d42873e991ec0c1357219c0d74ce6a2948cb2def
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_MakeAvailable(portaudio)
+  enable_language(C)
+  set(PA_SRC ${portaudio_SOURCE_DIR}/src)
+  set(MONTAGE_PORTAUDIO_SOURCES
+    ${PA_SRC}/common/pa_allocation.c ${PA_SRC}/common/pa_converters.c ${PA_SRC}/common/pa_cpuload.c
+    ${PA_SRC}/common/pa_debugprint.c ${PA_SRC}/common/pa_dither.c ${PA_SRC}/common/pa_front.c
+    ${PA_SRC}/common/pa_process.c ${PA_SRC}/common/pa_ringbuffer.c ${PA_SRC}/common/pa_stream.c ${PA_SRC}/common/pa_trace.c)
+  set(MONTAGE_PORTAUDIO_DEFS "")
+  set(MONTAGE_PORTAUDIO_LIBS "")
+  set(MONTAGE_PORTAUDIO_INCLUDES ${portaudio_SOURCE_DIR}/include ${PA_SRC}/common)
+  if(WIN32)
+    list(APPEND MONTAGE_PORTAUDIO_SOURCES ${PA_SRC}/os/win/pa_win_hostapis.c ${PA_SRC}/os/win/pa_win_util.c
+         ${PA_SRC}/os/win/pa_win_waveformat.c ${PA_SRC}/os/win/pa_win_coinitialize.c ${PA_SRC}/hostapi/wasapi/pa_win_wasapi.c)
+    list(APPEND MONTAGE_PORTAUDIO_INCLUDES ${PA_SRC}/os/win)
+    list(APPEND MONTAGE_PORTAUDIO_DEFS PA_USE_WASAPI=1 _CRT_SECURE_NO_WARNINGS)
+    list(APPEND MONTAGE_PORTAUDIO_LIBS winmm ole32 uuid)
+  else()
+    list(APPEND MONTAGE_PORTAUDIO_SOURCES ${PA_SRC}/os/unix/pa_unix_hostapis.c ${PA_SRC}/os/unix/pa_unix_util.c)
+    list(APPEND MONTAGE_PORTAUDIO_INCLUDES ${PA_SRC}/os/unix)
+    if(APPLE)
+      list(APPEND MONTAGE_PORTAUDIO_SOURCES ${PA_SRC}/hostapi/coreaudio/pa_mac_core.c
+           ${PA_SRC}/hostapi/coreaudio/pa_mac_core_blocking.c ${PA_SRC}/hostapi/coreaudio/pa_mac_core_utilities.c)
+      list(APPEND MONTAGE_PORTAUDIO_DEFS PA_USE_COREAUDIO=1)
+      list(APPEND MONTAGE_PORTAUDIO_LIBS "-framework CoreAudio" "-framework AudioToolbox" "-framework AudioUnit"
+           "-framework CoreFoundation" "-framework CoreServices")
+    else()
+      find_package(ALSA QUIET)
+      if(ALSA_FOUND)
+        list(APPEND MONTAGE_PORTAUDIO_SOURCES ${PA_SRC}/hostapi/alsa/pa_linux_alsa.c)
+        list(APPEND MONTAGE_PORTAUDIO_DEFS PA_USE_ALSA=1)
+        list(APPEND MONTAGE_PORTAUDIO_INCLUDES ${ALSA_INCLUDE_DIRS})
+        list(APPEND MONTAGE_PORTAUDIO_LIBS ${ALSA_LIBRARIES})
+      else()
+        message(STATUS "PortAudio without ALSA (its headers were not found): JACK and Qt Multimedia remain")
+      endif()
+      list(APPEND MONTAGE_PORTAUDIO_LIBS m)
+    endif()
+    find_package(Threads REQUIRED)
+    list(APPEND MONTAGE_PORTAUDIO_LIBS Threads::Threads)
+  endif()
+  add_library(montage_portaudio STATIC ${MONTAGE_PORTAUDIO_SOURCES})
+  target_include_directories(montage_portaudio PUBLIC ${portaudio_SOURCE_DIR}/include PRIVATE ${MONTAGE_PORTAUDIO_INCLUDES})
+  target_compile_definitions(montage_portaudio PRIVATE ${MONTAGE_PORTAUDIO_DEFS})
+  target_link_libraries(montage_portaudio PRIVATE ${MONTAGE_PORTAUDIO_LIBS})
+  set_target_properties(montage_portaudio PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
+                        AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_compile_options(montage_portaudio PRIVATE $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<C_COMPILER_ID:MSVC>:/w /O2>)
 endif()
 
 if(MONTAGE_WITH_THORVG)

@@ -9,7 +9,9 @@
 // not apply WarpRectilinear2 itself).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -49,14 +51,16 @@ bool readDngOpcodeLists(const std::string& path, DngOpcodeLists& out);
 // The opcodes of list 1 or 2 (`stage`) applied to a Bayer mosaic of raw values (`stride` values a row): `black` and
 // `white` its levels (list 2's opcodes work between them, as 0 to 1), with `blackPattern` (`patternRows` by
 // `patternCols`, repeating from the top left) added to the black where the sensor's black differs by position. Returns
-// how many were applied.
+// how many were applied, or -1 when `cancel` stopped it (heard between opcodes and between rows; the mosaic then part
+// done). Each opcode's pixels are worked across the cores; `progress` (0 to 1) is told after each opcode.
 int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, int width, int height, int stride, double black,
-                          double white, const double* blackPattern = nullptr, int patternRows = 0, int patternCols = 0);
+                          double white, const double* blackPattern = nullptr, int patternRows = 0, int patternCols = 0,
+                          const std::atomic<bool>* cancel = nullptr, const std::function<void(double)>& progress = {});
 // The opcodes of list 3 applied to a demosaiced picture: `planes` floats a pixel (linear, 0 to 1), interleaved. A picture
 // developed smaller than the raw (half size) gives the full size, which gain maps' areas are given in. Returns how many
-// were applied.
+// were applied, or -1 when cancelled (as applyDngMosaicOpcodes).
 int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, int height, int planes, int fullWidth = 0,
-                           int fullHeight = 0);
+                           int fullHeight = 0, const std::atomic<bool>* cancel = nullptr, const std::function<void(double)>& progress = {});
 
 // Where a warp takes the picture's pixel (x, y) from in the picture before it (the specification's x', y'), for one
 // plane; false for an opcode that is not a warp, or a plane it has no coefficients for and no single set.

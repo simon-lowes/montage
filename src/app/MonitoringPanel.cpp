@@ -12,12 +12,14 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMediaDevices>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSpinBox>
 #include <QTableWidget>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -31,6 +33,46 @@ namespace montage {
 namespace {
 
 const char* kSettingsKey = "monitoring/settings";
+const char* kDeviceKey = "monitoring/device";
+
+QString hostName(audiodev::Host h) {
+    switch (h) {
+        case audiodev::Host::Qt: return MonitoringPanel::tr("System (Qt Multimedia)");
+        case audiodev::Host::Jack: return MonitoringPanel::tr("JACK");
+        case audiodev::Host::Alsa: return MonitoringPanel::tr("ALSA");
+        case audiodev::Host::CoreAudio: return MonitoringPanel::tr("Core Audio");
+        case audiodev::Host::Wasapi: return MonitoringPanel::tr("WASAPI");
+        case audiodev::Host::WasapiExclusive: return MonitoringPanel::tr("WASAPI (exclusive)");
+        case audiodev::Host::Asio: return MonitoringPanel::tr("ASIO");
+        case audiodev::Host::Loopback: return MonitoringPanel::tr("Loopback (a test device)");
+    }
+    return {};
+}
+
+QJsonObject statusJson(const audiodev::EngineStatus& st) {
+    QJsonArray ports, clocks;
+    for (const std::string& p : st.ports) ports.append(QString::fromStdString(p));
+    for (const std::string& c : st.clocks) clocks.append(QString::fromStdString(c));
+    QJsonObject o{{"open", st.open},
+                  {"host", audiodev::hostId(st.host)},
+                  {"device", QString::fromStdString(st.device)},
+                  {"sample_rate", st.rate},
+                  {"buffer", st.buffer},
+                  {"inputs", st.inputs},
+                  {"outputs", st.outputs},
+                  {"input_latency", st.latency.input},
+                  {"output_latency", st.latency.output},
+                  {"round_trip", st.roundTrip},
+                  {"round_trip_measured", st.measured},
+                  {"xruns", double(st.xruns)},
+                  {"rate_changes", st.rateChanges},
+                  {"ports", ports},
+                  {"clock", QString::fromStdString(st.clock)},
+                  {"clocks", clocks}};
+    if (!st.error.empty()) o["error"] = QString::fromStdString(st.error);
+    if (st.load >= 0) o["load"] = st.load;
+    return o;
+}
 
 QString setName(const QString& set) { return set == "headphones" ? MonitoringPanel::tr("Headphones") : set == "stereo" ? MonitoringPanel::tr("Stereo") : set; }
 
@@ -56,6 +98,9 @@ QToolButton* toggle(const QString& text, const char* name, QWidget* parent) {
 
 void MonitoringPanel::restore(PlaybackController* program) {
     const QSettings st = appSettings();
+    // (the device first: the section's outputs are then named on it)
+    const QJsonObject device = QJsonDocument::fromJson(st.value(kDeviceKey).toString().toUtf8()).object();
+    if (!device.isEmpty()) audiodev::Engine::shared().setSettings(audiodev::DeviceSettings::fromJson(device));
     const QJsonObject o = QJsonDocument::fromJson(st.value(kSettingsKey).toString().toUtf8()).object();
     program->setAudioOutput(st.value("monitoring/output").toString());
     program->setTalkbackInput(st.value("monitoring/talkbackInput").toString());
@@ -74,6 +119,85 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     auto* body = new QWidget(scroll);
     scroll->setWidget(body);
     auto* v = new QVBoxLayout(body);
+
+    // The audio device: its driver, devices, rate, buffer and clock, the round trip and xruns.
+    auto* deviceBox = new QGroupBox(tr("Audio device"), body);
+    deviceBox->setObjectName(QStringLiteral("monitorDeviceBox"));
+    auto* df = new QFormLayout(deviceBox);
+    driver_ = new QComboBox(deviceBox);
+    driver_->setObjectName(QStringLiteral("monitorDriver"));
+    driver_->setToolTip(tr("What playback and recording go through: the system's devices through Qt Multimedia, or a driver "
+                           "for professional interfaces with its latency reported and taken off every recording"));
+    for (audiodev::Host h : audiodev::availableHosts()) driver_->addItem(hostName(h), QString::fromLatin1(audiodev::hostId(h)));
+    df->addRow(tr("Driver"), driver_);
+    deviceOut_ = new QComboBox(deviceBox);
+    deviceOut_->setObjectName(QStringLiteral("monitorDeviceOutput"));
+    language::keepUntranslated(deviceOut_);
+    df->addRow(tr("Output device"), deviceOut_);
+    deviceIn_ = new QComboBox(deviceBox);
+    deviceIn_->setObjectName(QStringLiteral("monitorDeviceInput"));
+    language::keepUntranslated(deviceIn_);
+    df->addRow(tr("Input device"), deviceIn_);
+    deviceRate_ = new QComboBox(deviceBox);
+    deviceRate_->setObjectName(QStringLiteral("monitorDeviceRate"));
+    deviceRate_->addItem(tr("The sequence's"), 0);
+    for (int r : {44100, 48000, 88200, 96000, 176400, 192000}) deviceRate_->addItem(tr("%1 Hz").arg(r), r);
+    deviceBuffer_ = new QComboBox(deviceBox);
+    deviceBuffer_->setObjectName(QStringLiteral("monitorDeviceBuffer"));
+    for (int b = audiodev::kMinBuffer; b <= audiodev::kMaxBuffer; b *= 2) deviceBuffer_->addItem(tr("%1 samples").arg(b), b);
+    auto* rateRow = new QHBoxLayout;
+    rateRow->addWidget(deviceRate_, 1);
+    rateRow->addWidget(deviceBuffer_, 1);
+    df->addRow(tr("Rate and buffer"), rateRow);
+    deviceClock_ = new QComboBox(deviceBox);
+    deviceClock_->setObjectName(QStringLiteral("monitorDeviceClock"));
+    language::keepUntranslated(deviceClock_);  // (the device's own names for its clocks)
+    df->addRow(tr("Clock"), deviceClock_);
+    deviceInputs_ = new QSpinBox(deviceBox);
+    deviceInputs_->setObjectName(QStringLiteral("monitorDeviceInputs"));
+    deviceInputs_->setRange(0, 64);
+    inputNames_ = new QLineEdit(deviceBox);
+    inputNames_->setObjectName(QStringLiteral("monitorDeviceInputNames"));
+    inputNames_->setPlaceholderText(tr("Their names, apart by commas (In 1, In 2...)"));
+    auto* inRow = new QHBoxLayout;
+    inRow->addWidget(deviceInputs_);
+    inRow->addWidget(inputNames_, 1);
+    df->addRow(tr("Inputs"), inRow);
+    loopOut_ = new QSpinBox(deviceBox);
+    loopOut_->setObjectName(QStringLiteral("monitorLoopOutput"));
+    loopOut_->setRange(1, 64);
+    loopOut_->setPrefix(tr("Out "));
+    loopIn_ = new QSpinBox(deviceBox);
+    loopIn_->setObjectName(QStringLiteral("monitorLoopInput"));
+    loopIn_->setRange(1, 64);
+    loopIn_->setPrefix(tr("In "));
+    measure_ = new QPushButton(tr("Measure Loopback"), deviceBox);
+    measure_->setObjectName(QStringLiteral("monitorMeasureLoopback"));
+    measure_->setToolTip(tr("With a cable from the output to the input, a click is played and listened for: the round trip it "
+                            "takes is then taken off recordings instead of the latencies the device reports"));
+    forget_ = new QPushButton(tr("Forget"), deviceBox);
+    forget_->setObjectName(QStringLiteral("monitorForgetLoopback"));
+    auto* loopRow = new QHBoxLayout;
+    loopRow->addWidget(loopOut_);
+    loopRow->addWidget(loopIn_);
+    loopRow->addWidget(measure_, 1);
+    loopRow->addWidget(forget_);
+    df->addRow(tr("Loopback"), loopRow);
+    deviceStatus_ = new QLabel(deviceBox);
+    deviceStatus_->setObjectName(QStringLiteral("monitorDeviceStatus"));
+    deviceStatus_->setWordWrap(true);
+    deviceStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    resetXruns_ = new QPushButton(tr("Reset Xruns"), deviceBox);
+    resetXruns_->setObjectName(QStringLiteral("monitorResetXruns"));
+    auto* statusRow = new QHBoxLayout;
+    statusRow->addWidget(deviceStatus_, 1);
+    statusRow->addWidget(resetXruns_);
+    df->addRow(statusRow);
+    v->addWidget(deviceBox);
+    statusTimer_ = new QTimer(this);
+    statusTimer_->setInterval(500);
+    connect(statusTimer_, &QTimer::timeout, this, &MonitoringPanel::showDeviceStatus);
+    statusTimer_->start();
 
     // The room: the device, the speaker set and each speaker.
     on_ = new QCheckBox(tr("Monitoring section"), body);
@@ -225,9 +349,7 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     talkInput_ = new QComboBox(cueBox);
     talkInput_->setObjectName(QStringLiteral("monitorTalkbackInput"));
     language::keepUntranslated(talkInput_);
-    talkInput_->addItem(tr("System default"), QString());
-    for (const QAudioDevice& d : QMediaDevices::audioInputs()) talkInput_->addItem(d.description(), d.description());
-    qf->addRow(tr("Talkback mic"), talkInput_);
+    qf->addRow(tr("Talkback mic"), talkInput_);  // (its choices: refreshDevice)
     talk_ = new QToolButton(cueBox);
     talk_->setObjectName(QStringLiteral("monitorTalkback"));
     talk_->setText(tr("Talk"));
@@ -269,7 +391,241 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     connect(talk_, &QToolButton::released, this, [this] { program_->setTalkback(false); });
     connect(program_, &PlaybackController::monitoringChanged, this, &MonitoringPanel::refresh);
     connect(state_, &EditorState::projectChanged, this, &MonitoringPanel::refresh);
+    for (QComboBox* c : {driver_, deviceOut_, deviceIn_, deviceRate_, deviceBuffer_, deviceClock_})
+        connect(c, qOverload<int>(&QComboBox::currentIndexChanged), this, &MonitoringPanel::deviceEdited);
+    connect(deviceInputs_, qOverload<int>(&QSpinBox::valueChanged), this, &MonitoringPanel::deviceEdited);
+    connect(inputNames_, &QLineEdit::editingFinished, this, &MonitoringPanel::deviceEdited);
+    connect(measure_, &QPushButton::clicked, this, [this] {
+        QString why;
+        if (!measureLoopback(loopOut_->value() - 1, loopIn_->value() - 1, &why)) state_->message(why, 6000);
+    });
+    connect(forget_, &QPushButton::clicked, this, [this] {
+        audiodev::DeviceSettings s = audiodev::Engine::shared().settings();
+        s.loopbackFrames = s.loopbackRate = s.loopbackBuffer = 0;
+        applyDevice(s);
+    });
+    connect(resetXruns_, &QPushButton::clicked, this, [this] {
+        audiodev::Engine::shared().resetXruns();
+        showDeviceStatus();
+    });
+    refreshDevice();
     refresh();
+}
+
+void MonitoringPanel::applyDevice(audiodev::DeviceSettings s) {
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    const audiodev::DeviceSettings old = engine.settings();
+    // (a loopback measured on one device says nothing of another's: forgotten with it, unless a new one is given)
+    if ((s.host != old.host || s.output != old.output || s.input != old.input) && s.loopbackFrames == old.loopbackFrames &&
+        s.loopbackRate == old.loopbackRate && s.loopbackBuffer == old.loopbackBuffer)
+        s.loopbackFrames = s.loopbackRate = s.loopbackBuffer = 0;
+    engine.setSettings(s);
+    QSettings st = appSettings();
+    st.setValue(kDeviceKey, QString::fromUtf8(QJsonDocument(engine.settings().toJson()).toJson(QJsonDocument::Compact)));
+    PlaybackController::reopenAllAudio();
+    refreshDevice();
+}
+
+bool MonitoringPanel::measureLoopback(int output, int input, QString* error) {
+    if (program_->isPlaying()) program_->pause();  // (the programme would drown the click)
+    std::string why;
+    const int frames = audiodev::Engine::shared().measureLoopback(output, input, 1.0, &why);
+    if (frames < 0) {
+        if (error) *error = tr("Loopback not measured: %1").arg(QString::fromStdString(why));
+        showDeviceStatus();
+        return false;
+    }
+    applyDevice(audiodev::Engine::shared().settings());  // (kept)
+    return true;
+}
+
+void MonitoringPanel::deviceEdited() {
+    if (refreshing_) return;
+    audiodev::DeviceSettings s = audiodev::Engine::shared().settings();
+    const QString host = driver_->currentData().toString();
+    s.host = audiodev::hostFromId(host.toStdString()).value_or(audiodev::Host::Qt);
+    if (host != listedHost_) {
+        // (another driver: its default devices, not the last one's names)
+        s.output.clear();
+        s.input.clear();
+        s.clock.clear();
+    } else {
+        s.output = deviceOut_->currentData().toString().toStdString();
+        s.input = deviceIn_->currentData().toString().toStdString();
+        s.clock = deviceClock_->currentData().toString().toStdString();
+    }
+    s.sampleRate = deviceRate_->currentData().toInt();
+    s.bufferFrames = deviceBuffer_->currentData().toInt();
+    s.inputs = deviceInputs_->value();
+    s.inputNames.clear();
+    for (const QString& n : inputNames_->text().split(QLatin1Char(','), Qt::SkipEmptyParts)) s.inputNames.push_back(n.trimmed().toStdString());
+    if (s == audiodev::Engine::shared().settings()) return;
+    applyDevice(s);
+}
+
+void MonitoringPanel::refreshDevice() {
+    const bool was = refreshing_;
+    refreshing_ = true;
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    const audiodev::DeviceSettings s = engine.settings();
+    const QString host = QString::fromLatin1(audiodev::hostId(s.host));
+    if (driver_->findData(host) < 0) driver_->addItem(hostName(s.host), host);  // (set over MCP: the loopback, say)
+    driver_->setCurrentIndex(std::max(0, driver_->findData(host)));
+    const bool device = s.host != audiodev::Host::Qt;
+    if (host != listedHost_) {
+        listedHost_ = host;
+        deviceOut_->clear();
+        deviceIn_->clear();
+        deviceOut_->addItem(tr("Default"), QString());
+        deviceIn_->addItem(tr("Default"), QString());
+        for (const audiodev::DeviceInfo& d : audiodev::devices(s.host)) {
+            if (d.outputs > 0) deviceOut_->addItem(QString::fromStdString(d.name), QString::fromStdString(d.id));
+            if (d.inputs > 0) deviceIn_->addItem(QString::fromStdString(d.name), QString::fromStdString(d.id));
+        }
+    }
+    for (auto [combo, id] : {std::pair{deviceOut_, s.output}, std::pair{deviceIn_, s.input}}) {
+        const QString want = QString::fromStdString(id);
+        if (combo->findData(want) < 0) combo->addItem(want, want);  // (a device not here now: kept for when it is)
+        combo->setCurrentIndex(std::max(0, combo->findData(want)));
+    }
+    deviceRate_->setCurrentIndex(std::max(0, deviceRate_->findData(s.sampleRate)));
+    deviceBuffer_->setCurrentIndex(std::max(0, deviceBuffer_->findData(s.bufferFrames)));
+    deviceClock_->clear();
+    deviceClock_->addItem(tr("The device's own"), QString());
+    for (const std::string& c : engine.status().clocks) deviceClock_->addItem(QString::fromStdString(c), QString::fromStdString(c));
+    if (!s.clock.empty() && deviceClock_->findData(QString::fromStdString(s.clock)) < 0)
+        deviceClock_->addItem(QString::fromStdString(s.clock), QString::fromStdString(s.clock));
+    deviceClock_->setCurrentIndex(std::max(0, deviceClock_->findData(QString::fromStdString(s.clock))));
+    deviceInputs_->setValue(s.inputs);
+    QStringList names;
+    for (const std::string& n : s.inputNames) names << QString::fromStdString(n);
+    inputNames_->setText(names.join(QStringLiteral(", ")));
+    for (QWidget* w : std::initializer_list<QWidget*>{deviceOut_, deviceIn_, deviceRate_, deviceBuffer_, deviceClock_, deviceInputs_, inputNames_,
+                                                       loopOut_, loopIn_, measure_, forget_, resetXruns_})
+        w->setEnabled(device);
+    forget_->setEnabled(device && s.loopbackFrames > 0);
+    // The talkback microphone: one of the device's inputs, or of the system's.
+    const QString talk = program_->talkbackInput();
+    talkInput_->clear();
+    talkInput_->addItem(device ? tr("First input") : tr("System default"), QString());
+    if (device)
+        for (int k = 0; k < s.inputs; ++k) talkInput_->addItem(QString::fromStdString(audiodev::inputName(s, k)), QString::fromStdString(audiodev::inputName(s, k)));
+    else
+        for (const QAudioDevice& d : QMediaDevices::audioInputs()) talkInput_->addItem(d.description(), d.description());
+    talkInput_->setCurrentIndex(std::max(0, talkInput_->findData(talk)));
+    refreshing_ = was;
+    showDeviceStatus();
+}
+
+void MonitoringPanel::showDeviceStatus() {
+    if (!isVisible() && deviceStatus_->text().size() > 0 && sender() == statusTimer_) return;
+    const audiodev::EngineStatus st = audiodev::Engine::shared().status();
+    QString text;
+    if (st.host == audiodev::Host::Qt) text = tr("Through the system's devices (Qt Multimedia): their latency is not known");
+    else if (!st.open) text = tr("Not open: %1").arg(QString::fromStdString(st.error));
+    else {
+        auto ms = [&](int frames) { return QString::number(1000.0 * frames / std::max(1, st.rate), 'f', 1); };
+        text = tr("%1: %2 Hz, %3 samples; latency in %4 ms, out %5 ms; recordings moved %6 ms (%7); xruns %8")
+                   .arg(QString::fromStdString(st.device))
+                   .arg(st.rate)
+                   .arg(st.buffer)
+                   .arg(ms(st.latency.input), ms(st.latency.output), ms(st.roundTrip), st.measured ? tr("measured") : tr("as reported"))
+                   .arg(st.xruns);
+        if (st.rateChanges > 0) text += tr("; the rate changed %n time(s)", nullptr, st.rateChanges);
+    }
+    if (deviceStatus_->text() != text) deviceStatus_->setText(text);
+}
+
+QByteArray MonitoringPanel::deviceToolJson() {
+    return QJsonDocument(QJsonObject{
+        {"name", "montage_audio_device"},
+        {"title", "Audio device"},
+        {"description",
+         "The audio device playback and recording go through (Window > Monitoring, Audio device): \"get\" its settings and "
+         "state (sample_rate, buffer, input_latency and output_latency in frames as the device reports them, round_trip: what "
+         "every recording is moved earlier by, from a measured loopback where one was run; xruns, rate_changes, ports: JACK's "
+         "port names) and the hosts this build has; \"devices\" of a host; \"set\" (settings merged: host qt/jack/alsa/"
+         "coreaudio/wasapi/wasapi_exclusive, output, input (device ids from \"devices\"; JACK: the client whose physical ports "
+         "are joined), sample_rate (0 the sequence's), buffer (32 to 2048), clock, inputs, input_names, auto_connect); "
+         "\"measure\" a loopback (a cable from output to input, channels from 0: a click played and listened for); "
+         "\"reset_xruns\"."},
+        {"inputSchema",
+         QJsonObject{{"type", "object"},
+                     {"properties", QJsonObject{{"action", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"get", "devices", "set", "measure", "reset_xruns"}}}},
+                                                {"host", QJsonObject{{"type", "string"}}},
+                                                {"settings", QJsonObject{{"type", "object"}}},
+                                                {"output", QJsonObject{{"type", "integer"}, {"minimum", 0}}},
+                                                {"input", QJsonObject{{"type", "integer"}, {"minimum", 0}}}}},
+                     {"required", QJsonArray{"action"}}}}})
+        .toJson(QJsonDocument::Compact);
+}
+
+QString MonitoringPanel::runDeviceTool(const QJsonObject& args, QJsonObject& structured, bool& isError) {
+    const QString action = args.value("action").toString();
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    auto state = [&] {
+        structured = QJsonObject{{"settings", engine.settings().toJson()}, {"status", statusJson(engine.status())}};
+        QJsonArray hosts;
+        for (audiodev::Host h : audiodev::availableHosts()) hosts.append(QString::fromLatin1(audiodev::hostId(h)));
+        structured["hosts"] = hosts;
+        structured["jack_library"] = QString::fromStdString(audiodev::jackLibrary());
+    };
+    if (action == "get") {
+        state();
+        const audiodev::EngineStatus st = engine.status();
+        return st.open ? tr("%1 at %2 Hz, %3 samples, xruns %4").arg(QString::fromStdString(st.device)).arg(st.rate).arg(st.buffer).arg(st.xruns)
+                       : tr("Through the system's devices (Qt Multimedia)");
+    }
+    if (action == "devices") {
+        const auto host = audiodev::hostFromId(args.value("host").toString().toStdString());
+        if (!host) {
+            isError = true;
+            return tr("devices needs a host (see \"get\")");
+        }
+        std::string why;
+        QJsonArray list;
+        for (const audiodev::DeviceInfo& d : audiodev::devices(*host, &why))
+            list.append(QJsonObject{{"id", QString::fromStdString(d.id)}, {"name", QString::fromStdString(d.name)}, {"inputs", d.inputs},
+                                    {"outputs", d.outputs}, {"default_rate", d.defaultRate}});
+        structured = QJsonObject{{"devices", list}};
+        if (!why.empty()) structured["error"] = QString::fromStdString(why);
+        return tr("%n device(s)", nullptr, int(list.size()));
+    }
+    if (action == "set") {
+        QJsonObject merged = engine.settings().toJson();
+        const QJsonObject in = args.value("settings").toObject();
+        for (auto it = in.begin(); it != in.end(); ++it) merged[it.key()] = it.value();
+        const audiodev::DeviceSettings s = audiodev::DeviceSettings::fromJson(merged);
+        if (s.host != audiodev::Host::Loopback && !audiodev::hostBuilt(s.host)) {
+            isError = true;
+            return tr("This build or computer has no %1").arg(QString::fromLatin1(audiodev::hostId(s.host)));
+        }
+        applyDevice(s);
+        state();
+        const audiodev::EngineStatus st = engine.status();
+        if (s.host != audiodev::Host::Qt && !st.open) {
+            isError = true;
+            return tr("The device could not be opened: %1").arg(QString::fromStdString(st.error));
+        }
+        return tr("Audio device set");
+    }
+    if (action == "measure") {
+        QString why;
+        if (!measureLoopback(args.value("output").toInt(0), args.value("input").toInt(0), &why)) {
+            isError = true;
+            state();
+            return why;
+        }
+        state();
+        return tr("Round trip %1 frames").arg(engine.settings().loopbackFrames);
+    }
+    if (action == "reset_xruns") {
+        engine.resetXruns();
+        state();
+        return tr("Xruns reset");
+    }
+    isError = true;
+    return tr("Unknown action %1").arg(action);
 }
 
 void MonitoringPanel::apply(const MonitorSettings& s) {
@@ -438,6 +794,7 @@ void MonitoringPanel::refresh() {
                                                        cueLevel_, cueTracks_, cueBeeps_, cueProgram_, cueProgramLevel_, talkInput_, talk_})
         w->setEnabled(s.on && (w != bass_ || bass_->isEnabled()));
     talk_->setEnabled(s.on && s.cue.on);
+    output_->setEnabled(s.on && !audiodev::Engine::shared().active());  // (the system's device; the driver's is above)
     refreshing_ = false;
 }
 

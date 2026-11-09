@@ -4,20 +4,27 @@
 // timecode into a folder. A second into the recording the file is imported into the "Captures" bin, where it grows
 // as it records (EditorState's growing media), so it can be cut in at once. The dialog stays open beside the editor.
 // SMPTE ST 2110 streams are recorded from their SDP files (with ST 2022-7's two paths, and the time code their
-// ancillary data carries), or offered as NMOS receivers for a facility's controller to connect.
+// ancillary data carries), or offered as NMOS receivers for a facility's controller to connect. While it records, the
+// feed can also be packaged live (render/LivePackage.h: HLS and DASH with a sliding window, low latency if asked) into
+// a folder, and served from it over HTTP. It can be watched live on the Source monitor as it records (its picture,
+// meters and timecode), In and Out marked there and the range cut in from the growing file.
 #pragma once
 
 #include <QDialog>
 #include <QJsonObject>
 #include <memory>
+#include <thread>
 
 #include "core/Model.h"
 #include "media/Capture.h"
+#include "render/LivePackage.h"
 
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
+class QSpinBox;
 class QLineEdit;
 class QPushButton;
 class QTimer;
@@ -45,6 +52,19 @@ public:
     void setClipName(const QString& name);
     void setTimecode(const QString& tc);  // "" the feed's own, else the time of day
     void setSeconds(double s);            // 0 until stopped
+    // A live package made while it records: its folder ("" none), and how. Port 0 (with serve): any free one.
+    struct LiveOptions {
+        QString folder;
+        bool hls = true, dash = true, lowLatency = false;
+        int window = 6;
+        QString segments = QStringLiteral("cmaf");  // or "ts" (HLS in MPEG-TS)
+        QString sound = QStringLiteral("aac");      // aac, libopus, ac3, eac3 or none
+        bool serve = false, network = false;
+        int port = 0;
+    };
+    void setLive(const LiveOptions& o);
+    LiveOptions live() const;
+    QString liveUrl() const;  // where the package is served ("" not served)
 
     // Starts recording (false with the reason in the status line); stops it.
     bool record();
@@ -53,6 +73,12 @@ public:
     QString filePath() const { return path_; }  // the file being or last recorded
     Id importedMedia() const { return imported_; }
     QString statusText() const;
+    // Watched live on the Source monitor as it records (the next recording's; remembered).
+    void setWatchLive(bool on);
+    bool watchLive() const;
+    std::shared_ptr<LiveFeed> liveFeed() const { return liveFeed_; }  // the recording's, while it is watched
+    QString clipLabel() const;  // the recording's clip name
+    bool importedWhileRecording() const { return liveMarkable_; }  // (a QuickTime file into the bin: markable live)
 
     // ST 2110 receivers offered to NMOS controllers (IS-04, with IS-05 connections): what one connects them to
     // becomes the feed. False with why when the node cannot start.
@@ -66,18 +92,24 @@ public:
 
 signals:
     void recordingChanged();
+    // A recording to watch live (MonitorPanel::setLiveFeed): when it starts (media 0), once imported, and when it
+    // ends (on false).
+    void watching(std::shared_ptr<montage::LiveFeed> feed, montage::Id media, const QString& label, bool on);
 
 private:
     void refresh();
     void finished(int generation, bool ok, const QString& message);
     void importNow();
     void nmosConnected();
+    bool startLive(CaptureSettings& cs);  // false with error_ set
+    void endLive();
 
     EditorState* state_;
     QComboBox* kind_;
     QLineEdit* url_;
     QPushButton* find_;
     QLineEdit* sound_;
+    QDoubleSpinBox* soundLatency_;
     QLineEdit* options_;
     QCheckBox* nmos_;
     QLabel* nmosStatus_;
@@ -90,9 +122,26 @@ private:
     QLineEdit* timecode_;
     QDoubleSpinBox* seconds_;
     QCheckBox* import_;
+    QCheckBox* watch_;
+    std::shared_ptr<LiveFeed> liveFeed_;
+    bool liveMarkable_ = false;
+    QGroupBox* live_;
+    QLineEdit* liveFolder_;
+    QComboBox* liveFormats_;
+    QComboBox* liveSegments_;
+    QComboBox* liveSound_;
+    QCheckBox* liveLowLatency_;
+    QSpinBox* liveWindow_;
+    QCheckBox* liveServe_;
+    QSpinBox* livePort_;
+    QCheckBox* liveNetwork_;
     QPushButton* record_;
     QLabel* status_;
     QTimer* tick_;
+    std::unique_ptr<LivePackager> packager_;  // (before the recorder, which feeds it: gone after it)
+    std::unique_ptr<LiveOrigin> origin_;
+    std::thread liveFinish_;  // the package being finished once the recording ends (the queued pictures encoded)
+    QString liveUrl_;
     std::unique_ptr<Recorder> recorder_;
     QString path_, error_;
     QString importedPath_;  // the imported file's path on disk, while it records

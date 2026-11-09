@@ -20,6 +20,13 @@
 // are written keyframe-aware into a copy of the effect, which the editor makes one undo step. A plugin that crashes
 // while its controls run is blocked, as one that crashes on loading is, until its binary changes.
 //
+// Isolation: with plug-ins in host processes (audio/PluginHost.h), each render goes to a montage-pluginhost for the
+// plug-in (render/OfxRemote.h): its pictures through shared memory, and frames at other times and inputs asked back
+// from Montage while it renders. One that crashes or does not answer is bypassed (the picture as it came) and named in
+// the failure list; it is started again for the next render, a set number of times. An OpenGL render runs in the
+// host's own OpenGL context and its pictures come back through shared memory too. On-screen controls stay in
+// Montage's process (their drawing and pen events are Montage's own), guarded as before.
+//
 // GPU: a plugin that renders with OpenGL (kOfxImageEffectPropOpenGLRenderSupported) does so in Montage's own OpenGL
 // context, on a thread of its own, texture in and texture out; the pictures go up and come back. Without OpenGL, or
 // when it fails, the CPU render is used (a plugin that needs OpenGL then fails with why). CUDA, OpenCL and Metal
@@ -113,6 +120,10 @@ public:
     bool find(const std::string& id, PluginDesc& out) const;
     // The file naming the plug-in whose on-screen controls are running (the next scan blocks it if Montage stopped then).
     std::string guardPath() const;
+    // Takes a plug-in Montage's own scan found (in montage-pluginhost, which scans nothing itself).
+    void adopt(const PluginDesc& d);
+    // The plug-in an effect runs, if this computer's scan found it and did not block it (else false, with why).
+    bool lookUp(const Effect& e, PluginDesc& d, std::string* error = nullptr);
 
 private:
     Registry();
@@ -170,6 +181,8 @@ private:
     const InputResolver* previous_;
 };
 const InputResolver& currentInputs();
+// The mask an OwnMaskScope set on this thread (null: none).
+const std::vector<float>* currentOwnMask();
 // The effect's own mask (one value a pixel, the size of the picture it runs on) for an input connected to "mask".
 class OwnMaskScope {
 public:

@@ -8964,7 +8964,7 @@ Download it now?</source>
     </message>
     <message>
         <source>WebVTT (*.vtt)</source>
-        <translation type="unfinished">WebVTT*.vtt (*.vtt)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Scenarist SCC, CEA-608 (*.scc)</source>
@@ -19759,7 +19759,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>;;Text (*.txt)</source>
-        <translation type="unfinished">;;؛ النص (*.txt)</translation>
+        <translation type="unfinished">;;النص (*.txt)</translation>
     </message>
     <message>
         <source>Select the video clips to arrange, or put the playhead over them</source>
@@ -23065,6 +23065,10 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>ProRes:</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Plug-in &amp;Hosting…</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::MaskOverlay</name>
@@ -26329,6 +26333,87 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Plugin Settings</source>
         <translation type="unfinished">إعدادات الملحق</translation>
     </message>
+    <message>
+        <source>The editor of %1 is open in a window of its own, as the plug-in runs in a plug-in host. Closing either window closes the editor.</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::PluginFailureBar</name>
+    <message>
+        <source>Restart</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start the plug-in again in a new host, with its last settings</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Disable</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep the plug-in bypassed and turn it off in Tools › Audio Plugins (projects keep it)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation type="unfinished">أغلق</translation>
+    </message>
+    <message>
+        <source>%1 stopped responding</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 used more memory than the limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 crashed while loading and is blocked</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 crashed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rescan it in Tools › Audio Plugins to try it again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>It is bypassed; playback carries on.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>It was started again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 in its plug-in host at %2.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>(%n time(s) this session)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>%n other plug-in(s) also failed (montage_plugins lists them).</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
 </context>
 <context>
     <name>montage::PluginManagerDialog</name>
@@ -26424,17 +26509,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Blocked: %1</source>
         <translation type="unfinished">مُحَجَّد: %1</translation>
     </message>
-    <message numerus="yes">
-        <source>%n plugin(s) found, %1 ready to use, %2 blocked. Plugins are loaded in a separate process while scanning, so one that crashes is blocked instead of closing Montage.</source>
-        <translation type="unfinished">
-            <numerusform></numerusform>
-            <numerusform></numerusform>
-            <numerusform></numerusform>
-            <numerusform></numerusform>
-            <numerusform></numerusform>
-            <numerusform></numerusform>
-        </translation>
-    </message>
     <message>
         <source>Scanning…</source>
         <translation type="unfinished">جاري المسح…</translation>
@@ -26466,6 +26540,121 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Add Plugin Folder</source>
         <translation type="unfinished">أضف مجلد الملحق</translation>
+    </message>
+    <message>
+        <source>Plug-in Hosting</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-ins run in plug-in host processes of their own, so one that crashes, stops responding or uses too much memory is bypassed and started again instead of closing Montage. ARA plug-ins always run in Montage&apos;s own process.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each plug-in in a host of its own (recommended)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>One host for each maker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>All plug-ins in one host</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In Montage&apos;s own process (off)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Instances of one plug-in share its host. Fewer hosts use less memory; a fault then reaches every plug-in in the same host.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Run plug-ins:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> audio blocks</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>During playback, a plug-in that is late with this many blocks in a row is stopped and bypassed (each late block passes meanwhile).</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stopped responding after:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Its input (delayed by its latency)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Silence</source>
+        <translation type="unfinished">الصمت</translation>
+    </message>
+    <message>
+        <source>A bypassed plug-in gives:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> MB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop a host using more than:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> s</source>
+        <translation type="unfinished"> (ق)</translation>
+    </message>
+    <message>
+        <source>An export waits this long for a slow plug-in, then stops and names it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An export waits up to:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Times a session each plug-in is started again by itself after failing; after that it stays bypassed until you choose Restart.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start a failed plug-in again:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The plug-in host program is missing from this installation: plug-ins run in Montage&apos;s own process.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Changes apply to plug-ins loaded from now on.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hosting…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How plug-ins run in host processes of their own, and what happens when one fails</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n plugin(s) found, %1 ready to use, %2 blocked. Plugins are loaded in a separate process while scanning, so one that crashes is blocked instead of closing Montage, and run in plug-in hosts of their own while you work (Hosting…).</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
     </message>
 </context>
 <context>

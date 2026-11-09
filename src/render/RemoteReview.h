@@ -29,7 +29,7 @@ struct StreamSettings {
     bool listen = true;          // SRT: wait for a viewer to call (one at a time); else call the address
     std::string passphrase;      // SRT's key (10 to 79 characters), asked of viewers and of the marker channel
     std::string codec = "hevc";  // "hevc" (10-bit) or "h264" (8-bit, for players without HEVC); for browsers the one
-                                 // preferred, "h264", "av1" or "hevc" (8-bit), another the browser takes where it lacks it
+                                 // preferred, "h264", "av1", "vp9" or "hevc", another the browser takes where it lacks it
     bool hardware = true;        // NVENC where there is one
     int bitrateKbps = 8000;
     int audioBitrateKbps = 192;
@@ -39,7 +39,19 @@ struct StreamSettings {
     // Browsers only:
     std::string certificateFile, keyFile;  // PEM, for https ("" both: a certificate made for this computer)
     std::vector<std::string> iceServers;   // "stun:host:3478", "turn:user:password@host:3478", "turns:…" (none by default)
+    // A TURN relay the user runs (RFC 8656: "turn:host:3478", "turns:host:5349"), with its user name and password;
+    // viewers' pages are given it with the passphrase. With relayOnly every viewer's media goes through it, never
+    // directly: browsers use only the relay, and Montage offers only its own address there (it may still send from
+    // this computer to a browser's address at the relay, which passes that on).
+    std::string turnServer, turnUser, turnPassword;
+    bool relayOnly = false;
     int maxViewers = 8;
+    // Simulcast: the picture at 1 (one size for everyone), 2 (full and half size) or 3 rungs (and quarter size) at once,
+    // each viewer moved between them by their own connection's loss.
+    int rungs = 3;
+    // An HDR sequence (PQ or HLG) to browsers that say they decode it as 10-bit HDR (VP9 profile 2 or HEVC Main 10,
+    // its transfer signalled), and tone mapped to SDR (BT.709) for the rest; false: SDR for everyone.
+    bool hdr = true;
     // A row of black and white blocks at the top left giving each picture's frame number (frameCodeValue reads it), for
     // automatic checks of what a viewer shows.
     bool frameCode = false;
@@ -83,7 +95,7 @@ Planes420 planesFrom(const VideoFrame& f);
 // The box the timecode is burnt into (on even pixels), for `chars` characters, at the bottom centre.
 Rect burnInBox(int width, int height, size_t chars);
 // The timecode in white on a black box (digits, ":" and ";" drawn from a font of Montage's own).
-void burnTimecode(Planes420& p, const std::string& text);
+void burnTimecode(Planes420& p, const std::string& text, uint16_t white = 940);  // (white: its code)
 // The frame code: 24 blocks along the top left, black for 0 and white for 1, the frame number's lowest bit first.
 constexpr int kFrameCodeBits = 24;
 int frameCodeBlock(int height);  // a block's side, in pixels
@@ -103,11 +115,13 @@ struct ReviewStats {
     int viewers = 0;           // watching now
     int64_t encoded = 0;       // pictures sent since the viewer connected
     int64_t skipped = 0;       // ticks with no picture sent because encoding fell behind
-    double kbps = 0;           // the last few seconds' rate (to each viewer)
+    double kbps = 0;           // the last few seconds' rate to each viewer (a browser review: the most any one is sent)
     std::string encoder;       // "libx265", "hevc_nvenc" (a browser review: those in use, "libx264, libsvtav1")
     std::string error;         // the last connection's ("" none)
     int markersPort = -1;      // listening for markers on it (-1 none)
     int markers = 0;           // received since opened
+    std::vector<int> rungViewers;  // a browser review's viewers on each rung, full size first
+    int hdrViewers = 0;            // and of them, those sent HDR
 };
 
 // Where a reviewer in a browser points, in 0..1 of the picture.

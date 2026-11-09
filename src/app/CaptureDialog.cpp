@@ -8,6 +8,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGroupBox>
 #include <QJsonArray>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -18,6 +19,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -25,6 +27,7 @@
 #include "EditorState.h"
 #include "ReferenceOutputPanel.h"
 #include "Settings.h"
+#include "audio/AudioDevice.h"
 #include "media/ImageSequence.h"
 #include "render/Nmos.h"
 #include "render/St2110Receive.h"
@@ -107,6 +110,19 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     sound_->setObjectName(QStringLiteral("captureSound"));
     sound_->setPlaceholderText(tr("The feed's own sound"));
     form->addRow(tr("Sound device:"), sound_);
+    // The sound's latency, taken off so it lines up with the pictures: the device's input latency as Monitoring's audio
+    // device reports it (a measured loopback's half where one was run), or set by hand.
+    soundLatency_ = new QDoubleSpinBox(this);
+    soundLatency_->setObjectName(QStringLiteral("captureSoundLatency"));
+    soundLatency_->setRange(0, 2000);
+    soundLatency_->setDecimals(1);
+    soundLatency_->setSuffix(tr(" ms"));
+    soundLatency_->setToolTip(tr("How late a sound device's sound arrives (its input latency): taken off, so it lines up with the pictures (a feed's own sound keeps its times)"));
+    if (const audiodev::Engine& engine = audiodev::Engine::shared(); engine.active()) {
+        const audiodev::EngineStatus st = engine.status();
+        if (st.rate > 0) soundLatency_->setValue(1000.0 * (st.measured ? st.roundTrip / 2 : st.latency.input) / st.rate);
+    }
+    form->addRow(tr("Sound latency:"), soundLatency_);
     options_ = new QLineEdit(settings.value(QStringLiteral("capture/options")).toString(), this);
     options_->setObjectName(QStringLiteral("captureOptions"));
     options_->setPlaceholderText(tr("FFmpeg's input options, e.g. video_size=1920x1080 framerate=25"));
@@ -193,7 +209,87 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     import_->setObjectName(QStringLiteral("captureImport"));
     import_->setChecked(settings.value(QStringLiteral("capture/import"), true).toBool());
     form->addRow(QString(), import_);
+    watch_ = new QCheckBox(tr("Watch it on the Source monitor (mark In and Out as it records)"), this);
+    watch_->setObjectName(QStringLiteral("captureWatch"));
+    watch_->setChecked(settings.value(QStringLiteral("capture/watch"), true).toBool());
+    form->addRow(QString(), watch_);
     layout->addLayout(form);
+
+    // A live package of the feed as it records: HLS and DASH for players, from a folder, served from here if asked.
+    live_ = new QGroupBox(tr("Live package while recording"), this);
+    live_->setObjectName(QStringLiteral("captureLive"));
+    live_->setCheckable(true);
+    live_->setChecked(settings.value(QStringLiteral("capture/live"), false).toBool());
+    auto* liveForm = new QFormLayout(live_);
+    auto* liveFolderRow = new QHBoxLayout;
+    liveFolder_ = new QLineEdit(settings.value(QStringLiteral("capture/liveFolder")).toString(), live_);
+    liveFolder_->setObjectName(QStringLiteral("captureLiveFolder"));
+    liveFolder_->setPlaceholderText(tr("The package's folder (what it held is replaced)"));
+    auto* liveBrowse = new QPushButton(tr("Choose…"), live_);
+    connect(liveBrowse, &QPushButton::clicked, this, [this] {
+        const QString d = QFileDialog::getExistingDirectory(this, tr("Live Package Folder"), liveFolder_->text());
+        if (!d.isEmpty()) liveFolder_->setText(d);
+    });
+    liveFolderRow->addWidget(liveFolder_, 1);
+    liveFolderRow->addWidget(liveBrowse);
+    liveForm->addRow(tr("Folder:"), liveFolderRow);
+    liveFormats_ = new QComboBox(live_);
+    liveFormats_->setObjectName(QStringLiteral("captureLiveFormats"));
+    liveFormats_->addItem(tr("HLS and DASH"), QStringLiteral("both"));
+    liveFormats_->addItem(tr("HLS"), QStringLiteral("hls"));
+    liveFormats_->addItem(tr("DASH"), QStringLiteral("dash"));
+    liveForm->addRow(tr("For:"), liveFormats_);
+    liveSegments_ = new QComboBox(live_);
+    liveSegments_->setObjectName(QStringLiteral("captureLiveSegments"));
+    liveSegments_->addItem(tr("CMAF"), QStringLiteral("cmaf"));
+    liveSegments_->addItem(tr("MPEG-TS for HLS (CMAF for DASH)"), QStringLiteral("ts"));
+    liveForm->addRow(tr("Segments:"), liveSegments_);
+    liveSound_ = new QComboBox(live_);
+    liveSound_->setObjectName(QStringLiteral("captureLiveSound"));
+    liveSound_->addItem(tr("AAC"), QStringLiteral("aac"));
+    liveSound_->addItem(tr("Opus"), QStringLiteral("libopus"));
+    liveSound_->addItem(tr("AC-3 (to 5.1)"), QStringLiteral("ac3"));
+    liveSound_->addItem(tr("E-AC-3 (to 7.1)"), QStringLiteral("eac3"));
+    liveSound_->addItem(tr("None"), QStringLiteral("none"));
+    liveForm->addRow(tr("Sound:"), liveSound_);
+    liveLowLatency_ = new QCheckBox(tr("Low latency (segments sent in parts as they are made)"), live_);
+    liveLowLatency_->setObjectName(QStringLiteral("captureLiveLowLatency"));
+    liveForm->addRow(QString(), liveLowLatency_);
+    liveWindow_ = new QSpinBox(live_);
+    liveWindow_->setObjectName(QStringLiteral("captureLiveWindow"));
+    liveWindow_->setRange(3, 100);
+    liveWindow_->setValue(6);
+    liveWindow_->setSuffix(tr(" segments of 2 s"));
+    liveForm->addRow(tr("Window:"), liveWindow_);
+    auto* serveRow = new QHBoxLayout;
+    liveServe_ = new QCheckBox(tr("Serve on port"), live_);
+    liveServe_->setObjectName(QStringLiteral("captureLiveServe"));
+    livePort_ = new QSpinBox(live_);
+    livePort_->setObjectName(QStringLiteral("captureLivePort"));
+    livePort_->setRange(0, 65535);
+    livePort_->setValue(settings.value(QStringLiteral("capture/livePort"), 8080).toInt());
+    livePort_->setSpecialValueText(tr("Any free"));
+    liveNetwork_ = new QCheckBox(tr("To the network"), live_);
+    liveNetwork_->setObjectName(QStringLiteral("captureLiveNetwork"));
+    liveNetwork_->setToolTip(tr("Off: players on this computer only"));
+    serveRow->addWidget(liveServe_);
+    serveRow->addWidget(livePort_);
+    serveRow->addWidget(liveNetwork_);
+    serveRow->addStretch(1);
+    liveForm->addRow(QString(), serveRow);
+    auto liveEnable = [this] {
+        // (low latency's parts are CMAF chunks; MPEG-TS is HLS's alone)
+        const bool ts = liveSegments_->currentData().toString() == QLatin1String("ts");
+        if (ts) liveLowLatency_->setChecked(false);
+        liveLowLatency_->setEnabled(!ts);
+        if (ts && liveSound_->currentData().toString() == QLatin1String("libopus")) liveSound_->setCurrentIndex(0);
+        livePort_->setEnabled(liveServe_->isChecked());
+        liveNetwork_->setEnabled(liveServe_->isChecked());
+    };
+    connect(liveSegments_, &QComboBox::currentIndexChanged, this, liveEnable);
+    connect(liveServe_, &QCheckBox::toggled, this, liveEnable);
+    liveEnable();
+    layout->addWidget(live_);
 
     status_ = new QLabel(tr("Not recording"), this);
     status_->setObjectName(QStringLiteral("captureStatus"));
@@ -214,7 +310,97 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
 CaptureDialog::~CaptureDialog() {
     // (the recorder's notices, queued to this, go with it)
     if (recorder_) recorder_->stop();
+    endLive();
+    if (liveFinish_.joinable()) liveFinish_.join();
+    if (origin_) origin_->stop();
     if (node_) node_->stop();
+}
+
+void CaptureDialog::setLive(const LiveOptions& o) {
+    live_->setChecked(!o.folder.isEmpty());
+    if (!o.folder.isEmpty()) liveFolder_->setText(o.folder);
+    liveFormats_->setCurrentIndex(o.hls && o.dash ? 0 : o.hls ? 1 : 2);
+    if (const int i = liveSegments_->findData(o.segments); i >= 0) liveSegments_->setCurrentIndex(i);
+    if (const int i = liveSound_->findData(o.sound); i >= 0) liveSound_->setCurrentIndex(i);
+    liveLowLatency_->setChecked(o.lowLatency);
+    liveWindow_->setValue(o.window);
+    liveServe_->setChecked(o.serve);
+    livePort_->setValue(o.port);
+    liveNetwork_->setChecked(o.network);
+}
+
+CaptureDialog::LiveOptions CaptureDialog::live() const {
+    LiveOptions o;
+    if (live_->isChecked()) o.folder = liveFolder_->text().trimmed();
+    const QString f = liveFormats_->currentData().toString();
+    o.hls = f != QLatin1String("dash"), o.dash = f != QLatin1String("hls");
+    o.segments = liveSegments_->currentData().toString();
+    o.sound = liveSound_->currentData().toString();
+    o.lowLatency = liveLowLatency_->isChecked();
+    o.window = liveWindow_->value();
+    o.serve = liveServe_->isChecked();
+    o.port = livePort_->value();
+    o.network = liveNetwork_->isChecked();
+    return o;
+}
+
+QString CaptureDialog::liveUrl() const { return liveUrl_; }
+
+bool CaptureDialog::startLive(CaptureSettings& cs) {
+    // (the last recording's package, and its serving, end here: its folder may be the same)
+    endLive();
+    if (liveFinish_.joinable()) liveFinish_.join();
+    if (origin_) origin_->stop();
+    origin_.reset();
+    packager_.reset();
+    liveUrl_.clear();
+    const LiveOptions o = live();
+    if (!live_->isChecked()) return true;
+    if (o.folder.isEmpty()) {
+        error_ = tr("Choose a folder for the live package");
+        return false;
+    }
+    LiveSettings ls;
+    ls.folder = o.folder.toStdString();
+    ls.hls = o.hls, ls.dash = o.dash;
+    ls.segmentFormat = o.segments.toStdString();
+    ls.audioCodec = o.sound.toStdString();
+    ls.lowLatency = o.lowLatency;
+    ls.window = o.window;
+    auto packager = std::make_unique<LivePackager>();
+    std::string why;
+    if (!packager->start(ls, &why)) {
+        error_ = tr("Live package: %1").arg(QString::fromStdString(why));
+        return false;
+    }
+    if (o.serve) {
+        auto origin = std::make_unique<LiveOrigin>();
+        LivePackager* p = packager.get();
+        if (!origin->start(ls.folder, o.port, [p](const std::string& rel) { return p->growing(rel); }, &why,
+                           o.network ? "0.0.0.0" : "127.0.0.1")) {
+            packager->finish();
+            error_ = tr("Live package: %1").arg(QString::fromStdString(why));
+            return false;
+        }
+        liveUrl_ = QStringLiteral("http://127.0.0.1:%1/").arg(origin->port());
+        origin_ = std::move(origin);
+    }
+    LivePackager* p = packager.get();
+    cs.onPicture = [p](const AVFrame* f, int num, int den) { p->picture(f, num, den); };
+    cs.onSound = [p](const AVFrame* f) { p->sound(f); };
+    packager_ = std::move(packager);
+    QSettings settings = appSettings();
+    settings.setValue(QStringLiteral("capture/liveFolder"), o.folder);
+    if (o.serve) settings.setValue(QStringLiteral("capture/livePort"), o.port);
+    return true;
+}
+
+void CaptureDialog::endLive() {
+    // (the recording has ended: what was queued is packaged and the playlists end, on a thread of its own so the
+    // window does not wait for the encoders; the origin goes on serving them)
+    if (!packager_ || !packager_->status().running || liveFinish_.joinable()) return;
+    LivePackager* p = packager_.get();
+    liveFinish_ = std::thread([p] { p->finish(); });
 }
 
 bool CaptureDialog::offerNmos(bool on, QString* error) {
@@ -368,7 +554,15 @@ bool CaptureDialog::record() {
     cs.path = path_.toStdString();
     cs.timecode = tc.toStdString();
     cs.seconds = seconds_->value();
+    cs.soundLatency = soundLatency_->value() / 1000.0;
     if (recorder_) recorder_->stop();
+    // (watched at the Source monitor's size, about)
+    std::shared_ptr<LiveFeed> watched = watch_->isChecked() ? std::make_shared<LiveFeed>(1280, 720) : nullptr;
+    cs.live = watched;
+    if (!startLive(cs)) {
+        refresh();
+        return false;
+    }
     recorder_ = std::make_unique<Recorder>();
     const int generation = ++generation_;
     QPointer<CaptureDialog> self(this);
@@ -387,6 +581,7 @@ bool CaptureDialog::record() {
     if (!recorder_->start(cs, &err)) {
         error_ = QString::fromStdString(err);
         recorder_.reset();
+        endLive();
         refresh();
         return false;
     }
@@ -398,15 +593,24 @@ bool CaptureDialog::record() {
     settings.setValue(QStringLiteral("capture/folder"), dir);
     settings.setValue(QStringLiteral("capture/import"), import_->isChecked());
     settings.setValue(QStringLiteral("capture/options"), options_->text().trimmed());
+    settings.setValue(QStringLiteral("capture/live"), live_->isChecked());
+    settings.setValue(QStringLiteral("capture/watch"), watch_->isChecked());
     recording_ = true;
+    liveFeed_ = watched;
+    liveMarkable_ = import_->isChecked() && ext == QLatin1String("mov");
     notedFrames_ = -1;
     importedPath_.clear();
     record_->setText(tr("Stop"));
     tick_->start();
     refresh();
     emit recordingChanged();
+    if (liveFeed_) emit watching(liveFeed_, 0, clipLabel(), true);
     return true;
 }
+
+void CaptureDialog::setWatchLive(bool on) { watch_->setChecked(on); }
+bool CaptureDialog::watchLive() const { return watch_->isChecked(); }
+QString CaptureDialog::clipLabel() const { return QFileInfo(path_).completeBaseName(); }
 
 void CaptureDialog::stop() {
     if (recorder_) recorder_->stop();  // (finished() follows, queued)
@@ -420,6 +624,7 @@ void CaptureDialog::importNow() {
         imported_ = ids.front();
         // (as the project names it; kept, as another project opened meanwhile may have a media item of the same id)
         if (const MediaItem* m = state_->project().findMedia(imported_)) importedPath_ = QString::fromStdString(mediaFileOnDisk(m->path));
+        if (liveFeed_ && recording_) emit watching(liveFeed_, imported_, clipLabel(), true);
     }
     else if (!errors.isEmpty()) error_ = errors.front();
     refresh();
@@ -428,11 +633,13 @@ void CaptureDialog::importNow() {
 void CaptureDialog::finished(int generation, bool ok, const QString& message) {
     if (generation != generation_) return;  // (an earlier recording's)
     recording_ = false;
-    tick_->stop();
     record_->setText(tr("Record"));
+    endLive();
+    if (!packager_) tick_->stop();  // (else once the package is finished: refresh)
     if (!message.isEmpty()) error_ = message;  // (why it failed, or what went wrong in a recording kept)
     // (an MXF file, or a recording shorter than its first fragment, is imported now it is whole)
     if (ok) importNow();
+    if (std::shared_ptr<LiveFeed> ended = std::move(liveFeed_)) emit watching(ended, imported_, clipLabel(), false);
     // The next clip's name: the next number.
     const QRegularExpressionMatch m = QRegularExpression(QStringLiteral("^(.*?)(\\d+)$")).match(QFileInfo(path_).completeBaseName());
     if (ok && m.hasMatch()) name_->setText(m.captured(1) + QStringLiteral("%1").arg(m.captured(2).toInt() + 1, m.captured(2).size(), 10, QLatin1Char('0')));
@@ -446,12 +653,21 @@ QString CaptureDialog::statusText() const { return status_->text(); }
 
 QByteArray CaptureDialog::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_capture","title":"Capture (record a live feed)",
-"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url.",
+"description":"Records a live feed to ProRes or DNxHR with its timecode, as File > Capture does; a QuickTime recording is imported into the Captures bin a second after it starts and grows there. \"kinds\": the devices this build opens (\"st2110\" for SMPTE ST 2110 streams, \"omt\" for Open Media Transport, FFmpeg's capture devices) and the codecs. \"record\": kind (\"\" a network stream's URL), url (for st2110 the SDP files apart by ';', or the SDP text itself; ST 2022-7's two paths come from the SDP's DUP group), options (\"name=value\" apart by spaces: FFmpeg's input options, or for st2110 interface= and interface2=, the network interfaces of the two paths, and audio_interface=, data_interface= and their 2s for a sound or data stream joined elsewhere), sound (a sound device of the same kind), codec, wrapper (mov or mxf), folder, name, timecode (\"\" the feed's own: ST 2110's from its ancillary data), seconds (0 until stopped), sound_latency_ms (how late the sound arrives, taken off; default Monitoring's audio device's input latency). \"stop\" and \"status\". \"nmos\" (offer true or false): ST 2110 receivers offered to a facility's NMOS controller (IS-04 and IS-05, registered as the reference output's node is); what it connects them to becomes the st2110 feed, recorded by \"record\" with kind st2110 and no url. \"live\" with record: a live package of the feed as it records (HLS and DASH with a sliding window of window segments of 2 s, into folder; low_latency: in parts sent as they are made; segments ts: HLS in MPEG-TS; sound aac, libopus, ac3, eac3 or none; serve: from here over HTTP on port, network for other computers too); watch (default true): the recording watched live on the Source monitor. \"live\": the Source monitor watching a feed live (watch true: the recording File > Capture is making; input: a multiviewer input's index; watch false: back to the media), mark_in or mark_out (one a call) at the picture shown now, as frames of its recording (cut in at once from the growing file), and edit (insert, overwrite, append or place_on_top) the marked range into the sequence at its playhead; answers its label, timecode, frame, media, in and out. \"multiview\": up to 16 inputs watched side by side (inputs: [{label, kind, url, options, record}] added, as \"record\" takes a feed; remove: an index; clear), the chosen ones (choose: indices, or each input's record) recorded while record is true, each into folder (codec as \"record\") and the Captures bin; source: an input's index shown on the Source monitor (-1 none); answers each input's label, running, recording, on_source, timecode, pictures, peaks_dbfs, path and media.",
 "inputSchema":{"type":"object","properties":{
-"action":{"type":"string","enum":["kinds","record","stop","status","nmos"]},"offer":{"type":"boolean"},
+"action":{"type":"string","enum":["kinds","record","stop","status","nmos","live","multiview"]},"offer":{"type":"boolean"},
+"watch":{"type":"boolean"},"input":{"type":"integer","minimum":0,"maximum":15},"mark_in":{"type":"boolean"},"mark_out":{"type":"boolean"},
+"edit":{"type":"string","enum":["insert","overwrite","append","place_on_top"]},
+"inputs":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"label":{"type":"string"},"kind":{"type":"string"},"url":{"type":"string"},"options":{"type":"string"},"record":{"type":"boolean"}}}},
+"remove":{"type":"integer","minimum":0},"clear":{"type":"boolean"},"choose":{"type":"array","items":{"type":"integer"}},
+"record":{"type":"boolean"},"source":{"type":"integer","minimum":-1,"maximum":15},
 "kind":{"type":"string"},"url":{"type":"string"},"options":{"type":"string"},"sound":{"type":"string"},
 "codec":{"type":"string"},"wrapper":{"type":"string","enum":["mov","mxf"]},"folder":{"type":"string"},"name":{"type":"string"},
-"timecode":{"type":"string"},"seconds":{"type":"number","minimum":0}},"required":["action"]}})json");
+"timecode":{"type":"string"},"seconds":{"type":"number","minimum":0},"sound_latency_ms":{"type":"number","minimum":0,"maximum":2000},
+"live":{"type":"object","properties":{"folder":{"type":"string"},"hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
+"low_latency":{"type":"boolean","default":false},"window":{"type":"integer","minimum":3,"maximum":100,"default":6},
+"segments":{"type":"string","enum":["cmaf","ts"],"default":"cmaf"},"sound":{"type":"string","enum":["aac","libopus","ac3","eac3","none"],"default":"aac"},
+"serve":{"type":"boolean","default":false},"port":{"type":"integer","minimum":0,"maximum":65535,"default":0},"network":{"type":"boolean","default":false}},"required":["folder"]}},"required":["action"]}})json");
 }
 
 QString CaptureDialog::runTool(const QJsonObject& args, QJsonObject& structured, bool& isError) {
@@ -486,12 +702,50 @@ QString CaptureDialog::runTool(const QJsonObject& args, QJsonObject& structured,
         if (args.contains("name")) setClipName(args.value("name").toString());
         setTimecode(args.value("timecode").toString());
         setSeconds(args.value("seconds").toDouble(0));
+        if (args.contains("sound_latency_ms")) soundLatency_->setValue(args.value("sound_latency_ms").toDouble());
+        if (args.contains("watch")) setWatchLive(args.value("watch").toBool());
+        LiveOptions lo;  // (none unless asked)
+        if (args.value("live").isObject()) {
+            const QJsonObject l = args.value("live").toObject();
+            lo.folder = l.value("folder").toString();
+            if (lo.folder.isEmpty()) {
+                isError = true;
+                return tr("A live package needs a folder");
+            }
+            lo.hls = l.value("hls").toBool(true), lo.dash = l.value("dash").toBool(true);
+            lo.lowLatency = l.value("low_latency").toBool();
+            lo.window = l.value("window").toInt(6);
+            lo.segments = l.value("segments").toString(QStringLiteral("cmaf"));
+            lo.sound = l.value("sound").toString(QStringLiteral("aac"));
+            lo.serve = l.value("serve").toBool();
+            lo.port = l.value("port").toInt(0);
+            lo.network = l.value("network").toBool();
+            if (lo.window < 3 || lo.window > 100 || (lo.segments != QLatin1String("cmaf") && lo.segments != QLatin1String("ts")) ||
+                liveSound_->findData(lo.sound) < 0 || lo.port < 0 || lo.port > 65535) {
+                isError = true;
+                return tr("The live package's window is 3 to 100, its segments cmaf or ts, its sound aac, libopus, ac3, eac3 or none");
+            }
+            if (lo.lowLatency && lo.segments == QLatin1String("ts")) {
+                isError = true;
+                return tr("Low latency needs CMAF segments (its parts are CMAF chunks)");
+            }
+        }
+        setLive(lo);
         if (!record()) {
             isError = true;
             return statusText();
         }
         structured["path"] = path_;
-        return tr("Recording to %1").arg(QDir::toNativeSeparators(path_));
+        QString text = tr("Recording to %1").arg(QDir::toNativeSeparators(path_));
+        if (packager_) {
+            structured["live_folder"] = lo.folder;
+            text += QStringLiteral("\n") + tr("Packaged live into %1").arg(QDir::toNativeSeparators(lo.folder));
+            if (!liveUrl_.isEmpty()) {
+                structured["live_url"] = liveUrl_;
+                text += QStringLiteral(", served at %1").arg(liveUrl_);
+            }
+        }
+        return text;
     }
     if (action == QLatin1String("stop")) {
         stop();
@@ -503,6 +757,12 @@ QString CaptureDialog::runTool(const QJsonObject& args, QJsonObject& structured,
         structured["path"] = path_;
         structured["status"] = statusText();
         if (imported_) structured["media"] = double(imported_);
+        if (packager_) {
+            const LiveStatus ls = packager_->status();
+            structured["live"] = QJsonObject{{"running", ls.running}, {"segments", double(ls.segments)}, {"first_listed", double(ls.firstListed)},
+                                             {"hls", QString::fromStdString(ls.hls)}, {"dash", QString::fromStdString(ls.dash)},
+                                             {"url", liveUrl_}, {"error", QString::fromStdString(ls.error)}};
+        }
         return statusText();
     }
     if (action == QLatin1String("nmos")) {
@@ -546,6 +806,28 @@ void CaptureDialog::refresh() {
         text += QStringLiteral(" · TC ") + QString::fromStdString(st.timecode);
         if (st.dropped || st.repeated) text += QStringLiteral(" · ") + tr("%1 dropped, %2 repeated").arg(st.dropped).arg(st.repeated);
         if (!st.recording) text += QStringLiteral("\n") + QDir::toNativeSeparators(path_);
+    }
+    if (packager_) {
+        // The live package: its segments, and where it is.
+        const LiveStatus ls = packager_->status();
+        if (!recording_ && !ls.running) {
+            // (finished: the thread that finished it ends, and so does the ticking)
+            if (liveFinish_.joinable()) liveFinish_.join();
+            tick_->stop();
+        }
+        QString line = ls.running ? tr("Live: %n segment(s)", nullptr, int(ls.segments)) : tr("Live package ended: %n segment(s)", nullptr, int(ls.segments));
+        if (ls.dropped) line += QStringLiteral(" · ") + tr("%1 pictures dropped (the encoders fell behind)").arg(ls.dropped);
+        if (!liveUrl_.isEmpty()) {
+            QStringList at;
+            if (!ls.hls.empty()) at << liveUrl_ + QStringLiteral("master.m3u8");
+            if (!ls.dash.empty()) at << liveUrl_ + QStringLiteral("manifest.mpd");
+            if (!at.isEmpty()) line += QStringLiteral(" · ") + at.join(QStringLiteral(", "));
+            if (liveNetwork_->isChecked()) line += QStringLiteral(" ") + tr("(and at this computer's address on the network)");
+        } else if (!ls.hls.empty() || !ls.dash.empty()) {
+            line += QStringLiteral(" · ") + QDir::toNativeSeparators(QString::fromStdString(ls.hls.empty() ? ls.dash : ls.hls));
+        }
+        if (!ls.error.empty()) line += QStringLiteral("\n") + QString::fromStdString(ls.error);
+        text += (text.isEmpty() ? QString() : QStringLiteral("\n")) + line;
     }
     const QString note = !error_.isEmpty() ? error_ : QString::fromStdString(st.warning);
     if (!note.isEmpty()) text += (text.isEmpty() ? QString() : QStringLiteral("\n")) + note;

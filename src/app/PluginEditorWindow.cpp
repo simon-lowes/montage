@@ -1,6 +1,7 @@
 #include "PluginEditorWindow.h"
 
 #include <QCloseEvent>
+#include <QLabel>
 #include <QPointer>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -130,6 +131,19 @@ bool PluginEditorWindow::start(QString* error) {
     void* parent = reinterpret_cast<void*>(host_->winId());
     if (!inst->openEditor(parent, this, w, h)) return fail(tr("The plugin's editor could not be opened"));
     editorOpen_ = true;
+    if (inst->editorInOwnWindow()) {
+        // (macOS: the plug-in runs in a plug-in host, whose window Montage's cannot hold; this one stands for it)
+        auto* note = new QLabel(tr("The editor of %1 is open in a window of its own, as the plug-in runs in a plug-in "
+                                   "host. Closing either window closes the editor.")
+                                    .arg(QString::fromStdString(d->name)),
+                                this);
+        note->setWordWrap(true);
+        note->setMargin(12);
+        layout()->addWidget(note);
+        host_->hide();
+        w = 360, h = 90;
+        requestedW_ = requestedH_ = 0;
+    }
     if (requestedW_ > 0 && requestedH_ > 0) {
         w = requestedW_;
         h = requestedH_;
@@ -234,9 +248,20 @@ void PluginEditorWindow::editorResize(int width, int height) {
     resizing_ = false;
 }
 
+void PluginEditorWindow::editorClosed() {
+    if (!editorOpen_) return;
+    editorOpen_ = false;  // (nothing to close in the plug-in: it is gone already)
+    QTimer::singleShot(0, this, [self = QPointer<PluginEditorWindow>(this)] {
+        if (self) self->close();
+    });
+}
+
 void PluginEditorWindow::resizeEvent(QResizeEvent* e) {
     QWidget::resizeEvent(e);
-    if (!resizing_ && editorOpen_ && instance() && instance()->editorResizable()) instance()->setEditorSize(host_->width(), host_->height());
+    // (an editor in a window of its own, from its plug-in host, is sized there)
+    plugins::Instance* inst = instance();
+    if (!resizing_ && editorOpen_ && inst && inst->editorResizable() && !inst->editorInOwnWindow())
+        inst->setEditorSize(host_->width(), host_->height());
 }
 
 void PluginEditorWindow::saveSettings() {
@@ -270,8 +295,8 @@ void PluginEditorWindow::saveSettings() {
 }
 
 void PluginEditorWindow::closeEvent(QCloseEvent* e) {
+    saveSettings();  // (the last settings it had, also when its host failed)
     if (editorOpen_) {
-        saveSettings();
         instance()->closeEditor();
         editorOpen_ = false;
     }

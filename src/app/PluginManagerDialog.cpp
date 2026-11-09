@@ -2,7 +2,10 @@
 #include "Settings.h"
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
+#include <QFormLayout>
+#include <QSpinBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,6 +22,8 @@
 #include <QVBoxLayout>
 #include <QtConcurrent>
 #include <set>
+
+#include "audio/PluginHost.h"
 
 namespace montage {
 
@@ -38,6 +43,112 @@ void PluginManagerDialog::applySavedFolders() {
         for (const QString& d : s.value(settingsKey(f)).toStringList()) dirs.push_back(d.toStdString());
         Registry::instance().setExtraSearchPaths(f, std::move(dirs));
     }
+}
+
+void PluginManagerDialog::applySavedHosting() {
+    QSettings s = appSettings();
+    HostingSettings h;
+    if (const auto i = isolationFromName(s.value(QStringLiteral("plugins/hosting/isolation")).toString().toStdString())) h.isolation = *i;
+    h.missedBlocks = std::clamp(s.value(QStringLiteral("plugins/hosting/missedBlocks"), h.missedBlocks).toInt(), 1, 1000);
+    h.bypassWithSilence = s.value(QStringLiteral("plugins/hosting/bypassWithSilence"), h.bypassWithSilence).toBool();
+    h.exportTimeoutMs = std::max(1000, s.value(QStringLiteral("plugins/hosting/exportTimeoutMs"), h.exportTimeoutMs).toInt());
+    h.memoryLimitMb = std::max(0, s.value(QStringLiteral("plugins/hosting/memoryLimitMb"), h.memoryLimitMb).toInt());
+    h.autoRestarts = std::clamp(s.value(QStringLiteral("plugins/hosting/autoRestarts"), h.autoRestarts).toInt(), 0, 100);
+    setHosting(h);
+    onHostingChanged([](const HostingSettings& n) {
+        QSettings out = appSettings();
+        out.setValue(QStringLiteral("plugins/hosting/isolation"), QString::fromLatin1(isolationName(n.isolation)));
+        out.setValue(QStringLiteral("plugins/hosting/missedBlocks"), n.missedBlocks);
+        out.setValue(QStringLiteral("plugins/hosting/bypassWithSilence"), n.bypassWithSilence);
+        out.setValue(QStringLiteral("plugins/hosting/exportTimeoutMs"), n.exportTimeoutMs);
+        out.setValue(QStringLiteral("plugins/hosting/memoryLimitMb"), n.memoryLimitMb);
+        out.setValue(QStringLiteral("plugins/hosting/autoRestarts"), n.autoRestarts);
+    });
+}
+
+void PluginManagerDialog::editHosting(QWidget* parent) {
+    QDialog dlg(parent);
+    dlg.setObjectName(QStringLiteral("pluginHostingDialog"));
+    dlg.setWindowTitle(tr("Plug-in Hosting"));
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* help = new QLabel(tr("Plug-ins run in plug-in host processes of their own, so one that crashes, stops responding "
+                               "or uses too much memory is bypassed and started again instead of closing Montage. "
+                               "ARA plug-ins always run in Montage's own process."),
+                            &dlg);
+    help->setWordWrap(true);
+    lay->addWidget(help);
+    const HostingSettings h = hosting();
+    auto* form = new QFormLayout;
+    auto* isolation = new QComboBox(&dlg);
+    isolation->setObjectName(QStringLiteral("hostingIsolation"));
+    isolation->addItem(tr("Each plug-in in a host of its own (recommended)"), int(Isolation::PerPlugin));
+    isolation->addItem(tr("One host for each maker"), int(Isolation::PerVendor));
+    isolation->addItem(tr("All plug-ins in one host"), int(Isolation::Shared));
+    isolation->addItem(tr("In Montage's own process (off)"), int(Isolation::InProcess));
+    isolation->setCurrentIndex(std::max(0, isolation->findData(int(h.isolation))));
+    isolation->setToolTip(tr("Instances of one plug-in share its host. Fewer hosts use less memory; a fault then reaches "
+                             "every plug-in in the same host."));
+    form->addRow(tr("Run plug-ins:"), isolation);
+    auto* missed = new QSpinBox(&dlg);
+    missed->setObjectName(QStringLiteral("hostingMissedBlocks"));
+    missed->setRange(1, 1000);
+    missed->setValue(h.missedBlocks);
+    missed->setSuffix(tr(" audio blocks"));
+    missed->setToolTip(tr("During playback, a plug-in that is late with this many blocks in a row is stopped and bypassed "
+                          "(each late block passes meanwhile)."));
+    form->addRow(tr("Stopped responding after:"), missed);
+    auto* bypass = new QComboBox(&dlg);
+    bypass->setObjectName(QStringLiteral("hostingBypass"));
+    bypass->addItem(tr("Its input (delayed by its latency)"), false);
+    bypass->addItem(tr("Silence"), true);
+    bypass->setCurrentIndex(h.bypassWithSilence ? 1 : 0);
+    form->addRow(tr("A bypassed plug-in gives:"), bypass);
+    auto* memory = new QSpinBox(&dlg);
+    memory->setObjectName(QStringLiteral("hostingMemoryLimit"));
+    memory->setRange(0, 1 << 20);
+    memory->setSingleStep(512);
+    memory->setValue(h.memoryLimitMb);
+    memory->setSuffix(tr(" MB"));
+    memory->setSpecialValueText(tr("No limit"));
+    form->addRow(tr("Stop a host using more than:"), memory);
+    auto* wait = new QSpinBox(&dlg);
+    wait->setObjectName(QStringLiteral("hostingExportTimeout"));
+    wait->setRange(1, 3600);
+    wait->setValue(std::max(1, h.exportTimeoutMs / 1000));
+    wait->setSuffix(tr(" s"));
+    wait->setToolTip(tr("An export waits this long for a slow plug-in, then stops and names it."));
+    form->addRow(tr("An export waits up to:"), wait);
+    auto* restarts = new QSpinBox(&dlg);
+    restarts->setObjectName(QStringLiteral("hostingAutoRestarts"));
+    restarts->setRange(0, 100);
+    restarts->setValue(h.autoRestarts);
+    restarts->setToolTip(tr("Times a session each plug-in is started again by itself after failing; after that it stays "
+                            "bypassed until you choose Restart."));
+    form->addRow(tr("Start a failed plug-in again:"), restarts);
+    lay->addLayout(form);
+    if (!hostAvailable()) {
+        auto* missing = new QLabel(tr("The plug-in host program is missing from this installation: plug-ins run in "
+                                      "Montage's own process."),
+                                   &dlg);
+        missing->setWordWrap(true);
+        lay->addWidget(missing);
+    }
+    auto* note = new QLabel(tr("Changes apply to plug-ins loaded from now on."), &dlg);
+    note->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    lay->addWidget(note);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    lay->addWidget(box);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+    HostingSettings n = h;
+    n.isolation = Isolation(isolation->currentData().toInt());
+    n.missedBlocks = missed->value();
+    n.bypassWithSilence = bypass->currentData().toBool();
+    n.memoryLimitMb = memory->value();
+    n.exportTimeoutMs = wait->value() * 1000;
+    n.autoRestarts = restarts->value();
+    setHostingAndSave(n);
 }
 
 PluginManagerDialog::PluginManagerDialog(QWidget* parent) : QDialog(parent) {
@@ -74,6 +185,9 @@ PluginManagerDialog::PluginManagerDialog(QWidget* parent) : QDialog(parent) {
     retry_->setToolTip(tr("Load blocked plugins again, in case they have been fixed"));
     folders_ = buttons->addButton(tr("Folders…"), QDialogButtonBox::ActionRole);
     folders_->setToolTip(tr("Add folders to search for plugins"));
+    hosting_ = buttons->addButton(tr("Hosting…"), QDialogButtonBox::ActionRole);
+    hosting_->setObjectName(QStringLiteral("pluginHosting"));
+    hosting_->setToolTip(tr("How plug-ins run in host processes of their own, and what happens when one fails"));
     auto* showLog = buttons->addButton(tr("Show Log"), QDialogButtonBox::ActionRole);
     showLog->setCheckable(true);
     connect(showLog, &QPushButton::toggled, log_, &QWidget::setVisible);
@@ -89,6 +203,7 @@ PluginManagerDialog::PluginManagerDialog(QWidget* parent) : QDialog(parent) {
         startScan([list] { return Registry::instance().rescan(list); });
     });
     connect(folders_, &QPushButton::clicked, this, &PluginManagerDialog::editFolders);
+    connect(hosting_, &QPushButton::clicked, this, [this] { editHosting(this); });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     lay->addWidget(buttons);
     refresh();
@@ -145,7 +260,8 @@ void PluginManagerDialog::refresh() {
     table_->sortByColumn(1, Qt::AscendingOrder);
     if (!scanning_)
         summary_->setText(tr("%n plugin(s) found, %1 ready to use, %2 blocked. Plugins are loaded in a separate "
-                             "process while scanning, so one that crashes is blocked instead of closing Montage.",
+                             "process while scanning, so one that crashes is blocked instead of closing Montage, and "
+                             "run in plug-in hosts of their own while you work (Hosting…).",
                              "", int(all.size()))
                               .arg(ready)
                               .arg(blocked.size()));

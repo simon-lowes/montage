@@ -273,7 +273,13 @@ void halftone(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     // Dots on a grid turned by `angle`; each dot's area is the ink the cell's tone needs.
     auto dot = [&](double x, double y, double ang, int channel) {
         const double c = std::cos(ang), s = std::sin(ang);
-        const double u = (x * c + y * s) / cell, v = (-x * s + y * c) / cell;
+        // (a place within 1/1000 of a cell of the screen's lines is taken as on them, so a GPU's rounding cannot move a
+        // pixel on one, such as the diagonal at 45 degrees, into the next cell: render/shaders/gpufilter.frag)
+        auto onLine = [](double w) {
+            const double k = std::floor(w + 0.5);
+            return std::fabs(w - k) < 1e-3 ? k : w;
+        };
+        const double u = onLine((x * c + y * s) / cell), v = onLine((-x * s + y * c) / cell);
         const double cu = std::floor(u) + 0.5, cv = std::floor(v) + 0.5;
         const double px = (cu * c - cv * s) * cell, py = (cu * s + cv * c) * cell;
         float at[4];
@@ -320,28 +326,42 @@ void duotone(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
-void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+bool vhsSetup(const Effect& e, FrameTime t, int W, int H, double pixelScale, VhsSetup& out) {
     const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
-    if (amount <= 0) return;
-    const double bleed = e.p("bleed", t, 4) * pixelScale * amount;
-    const float noise = float(e.p("noise", t, 30) / 100) * amount, lines = float(e.p("scanlines", t, 30) / 100) * amount;
+    if (amount <= 0 || W <= 0 || H <= 0) return false;
+    const float lines = float(e.p("scanlines", t, 30) / 100) * amount;
     const double tracking = e.p("tracking", t, 30) / 100 * amount;
-    const int W = img.width, H = img.height;
-    const Image src = img;
-    const uint32_t seed = hash(uint32_t(t) * 2654435761U + 12345U);
+    out.seed = hash(uint32_t(t) * 2654435761U + 12345U);
+    const uint32_t seed = out.seed;
     // Each line wobbles a little; a band of bad tracking rolls up the frame; and the bottom
     // few lines tear sideways, where the heads switch.
     const double bandY = std::fmod(double(t) * 3.7 * pixelScale + double(seed % 997), double(H) * 1.5) - double(H) * 0.25;
     const double bandH = std::max(4.0, 0.06 * H), switchY = H * (1 - 0.025);
-    std::vector<double> shift(static_cast<size_t>(H));
-    std::vector<float> torn(static_cast<size_t>(H), 0.0f);
+    out.shift.assign(size_t(H), 0.0);
+    out.torn.assign(size_t(H), 0.0f);
+    out.line.assign(size_t(H), 1.0f);
     for (int y = 0; y < H; ++y) {
         const double wobble = (double(hash(seed ^ uint32_t(y / std::max(1, int(2 * pixelScale)))) & 0xffff) / 65535.0 - 0.5) * 1.5 * pixelScale;
         const double inBand = std::max(0.0, 1 - std::fabs(y - bandY) / bandH);
         const double inSwitch = y >= switchY ? (y - switchY) / (H - switchY) : 0;
-        shift[size_t(y)] = (wobble + inBand * inBand * 25 * pixelScale + inSwitch * 18 * pixelScale) * tracking;
-        torn[size_t(y)] = float(std::max(inBand * inBand, inSwitch) * tracking);
+        out.shift[size_t(y)] = (wobble + inBand * inBand * 25 * pixelScale + inSwitch * 18 * pixelScale) * tracking;
+        out.torn[size_t(y)] = float(std::max(inBand * inBand, inSwitch) * tracking);
+        out.line[size_t(y)] = (int(y / std::max(1.0, pixelScale)) & 1) ? 1 - lines * 0.5f : 1.0f;
     }
+    return true;
+}
+
+void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    VhsSetup setup;
+    if (!vhsSetup(e, t, img.width, img.height, pixelScale, setup)) return;
+    const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+    const double bleed = e.p("bleed", t, 4) * pixelScale * amount;
+    const float noise = float(e.p("noise", t, 30) / 100) * amount;
+    const int W = img.width, H = img.height;
+    const Image src = img;
+    const uint32_t seed = setup.seed;
+    const std::vector<double>& shift = setup.shift;
+    const std::vector<float>& torn = setup.torn;
     // Tape's narrow bandwidth: soft brightness, and colour smeared and lagging behind it.
     const double soft = 1.2 * pixelScale * amount;
     parallelRows(H, [&](int y0, int y1) {
@@ -375,7 +395,7 @@ void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale) {
                 if (torn[size_t(y)] > 0.3f && (h >> 16) % 7 == 0) l = std::max(l, 0.85f);  // dropouts
                 // Lifted blacks, a little less contrast and colour.
                 l = 0.04f * amount + l * (1 - 0.1f * amount);
-                const float row = (int(y / std::max(1.0, pixelScale)) & 1) ? 1 - lines * 0.5f : 1.0f;
+                const float row = setup.line[size_t(y)];
                 const float sat = 1 - 0.2f * amount;
                 const float r = l + cr * sat, b = l + cb * sat;
                 const float g = (l - 0.2126f * r - 0.0722f * b) / 0.7152f;
@@ -420,25 +440,52 @@ void tiltShift(const Effect& e, FrameTime t, Image& img, double pixelScale) {
         });
 }
 
-void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+bool cameraShakeMove(const Effect& e, FrameTime t, int w, int h, double pixelScale, ShakeMove& out) {
     const double amp = e.p("amplitude", t, 10) * pixelScale, rot = e.p("rotation", t, 1) * kDeg;
-    if (std::fabs(amp) < 1e-3 && std::fabs(rot) < 1e-6) return;
+    if (std::fabs(amp) < 1e-3 && std::fabs(rot) < 1e-6) return false;
     const double speed = std::max(0.0, e.p("speed", t, 50)) / 100 * 0.35;  // noise cycles per frame
     const uint32_t seed = uint32_t(std::lround(e.p("seed", t, 0)));
     const double s = double(t) * speed;
-    const double ox = amp * fbm(s, 0.5, 0, 3, seed * 3 + 1), oy = amp * fbm(s, 1.5, 0, 3, seed * 3 + 2);
-    const double a = rot * fbm(s, 2.5, 0, 3, seed * 3 + 3);
-    const double W = img.width, H = img.height, cx = W / 2, cy = H / 2;
+    out.ox = amp * fbm(s, 0.5, 0, 3, seed * 3 + 1), out.oy = amp * fbm(s, 1.5, 0, 3, seed * 3 + 2);
+    out.angle = rot * fbm(s, 2.5, 0, 3, seed * 3 + 3);
+    const double W = w, H = h;
     // Zoomed in just enough that the frame's edges never show.
-    double zoom = 1;
-    if (e.p("zoom", t, 1) > 0.5) zoom = 1 + 2 * std::fabs(amp) / std::min(W, H) + std::sin(std::fabs(rot)) * (W + H) / std::min(W, H);
-    const double c = std::cos(-a), sn = std::sin(-a);
+    out.zoom = 1;
+    if (e.p("zoom", t, 1) > 0.5) out.zoom = 1 + 2 * std::fabs(amp) / std::min(W, H) + std::sin(std::fabs(rot)) * (W + H) / std::min(W, H);
+    return true;
+}
+
+void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    ShakeMove m;
+    if (!cameraShakeMove(e, t, img.width, img.height, pixelScale, m)) return;
+    const double ox = m.ox, oy = m.oy, zoom = m.zoom;
+    const double W = img.width, H = img.height, cx = W / 2, cy = H / 2;
+    const double c = std::cos(-m.angle), sn = std::sin(-m.angle);
     remap(img, Edge::Clamp, [&](double x, double y, double& sx, double& sy) {
         const double rx = (x - cx - ox) / zoom, ry = (y - cy - oy) / zoom;
         sx = cx + rx * c - ry * sn;
         sy = cy + rx * sn + ry * c;
         return true;
     });
+}
+
+bool lensFlareGhosts(int lens, FlareGhosts& out) {
+    struct Ghost {
+        double at, radius, strength;
+        float rgb[3];
+    };
+    static const Ghost kZoom[] = {{0.45, 0.035, 0.10, {0.6f, 1.0f, 0.6f}}, {0.75, 0.09, 0.06, {0.7f, 0.5f, 1.0f}}, {1.25, 0.025, 0.14, {1.0f, 0.8f, 0.4f}},
+                                  {1.55, 0.13, 0.05, {0.5f, 0.8f, 1.0f}}, {1.9, 0.06, 0.08, {1.0f, 0.5f, 0.6f}},  {2.3, 0.17, 0.04, {0.6f, 1.0f, 0.8f}}};
+    static const Ghost kPrime[] = {{0.6, 0.05, 0.08, {0.8f, 0.9f, 1.0f}}, {1.3, 0.08, 0.06, {1.0f, 0.85f, 0.6f}}, {2.0, 0.12, 0.05, {0.7f, 1.0f, 0.8f}}};
+    static const Ghost kAnamorphic[] = {{0.5, 0.05, 0.08, {0.4f, 0.6f, 1.0f}}, {1.4, 0.09, 0.06, {0.5f, 0.7f, 1.0f}}, {2.1, 0.14, 0.04, {0.4f, 0.5f, 1.0f}}};
+    lens = std::clamp(lens, 0, 3);
+    const Ghost* ghosts = lens == 0 ? kZoom : lens == 3 ? kAnamorphic : kPrime;
+    out.count = lens == 0 ? 6 : 3;
+    for (int k = 0; k < out.count; ++k) {
+        out.at[k] = ghosts[k].at, out.radius[k] = ghosts[k].radius, out.strength[k] = ghosts[k].strength;
+        std::copy(ghosts[k].rgb, ghosts[k].rgb + 3, out.rgb[k]);
+    }
+    return true;
 }
 
 void lensFlare(const Effect& e, FrameTime t, Image& img) {
@@ -451,16 +498,8 @@ void lensFlare(const Effect& e, FrameTime t, Image& img) {
     if (bright <= 0) return;
     const double R = std::hypot(W, H) / 2, cx = W / 2.0, cy = H / 2.0;
     // Ghosts: discs along the line from the light through the centre, at these fractions of the way.
-    struct Ghost {
-        double at, radius, strength;
-        float rgb[3];
-    };
-    static const Ghost kZoom[] = {{0.45, 0.035, 0.10, {0.6f, 1.0f, 0.6f}}, {0.75, 0.09, 0.06, {0.7f, 0.5f, 1.0f}}, {1.25, 0.025, 0.14, {1.0f, 0.8f, 0.4f}},
-                                  {1.55, 0.13, 0.05, {0.5f, 0.8f, 1.0f}}, {1.9, 0.06, 0.08, {1.0f, 0.5f, 0.6f}},  {2.3, 0.17, 0.04, {0.6f, 1.0f, 0.8f}}};
-    static const Ghost kPrime[] = {{0.6, 0.05, 0.08, {0.8f, 0.9f, 1.0f}}, {1.3, 0.08, 0.06, {1.0f, 0.85f, 0.6f}}, {2.0, 0.12, 0.05, {0.7f, 1.0f, 0.8f}}};
-    static const Ghost kAnamorphic[] = {{0.5, 0.05, 0.08, {0.4f, 0.6f, 1.0f}}, {1.4, 0.09, 0.06, {0.5f, 0.7f, 1.0f}}, {2.1, 0.14, 0.04, {0.4f, 0.5f, 1.0f}}};
-    const Ghost* ghosts = lens == 0 ? kZoom : lens == 3 ? kAnamorphic : kPrime;
-    const int nGhosts = lens == 0 ? 6 : 3;
+    FlareGhosts ghosts;
+    lensFlareGhosts(lens, ghosts);
     const int spokes = lens == 1 ? 6 : lens == 2 ? 8 : 4;
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -488,14 +527,13 @@ void lensFlare(const Effect& e, FrameTime t, Image& img) {
                         light[c] += 0.07 * std::exp(-ring * ring);
                     }
                 }
-                for (int k = 0; k < nGhosts; ++k) {
-                    const Ghost& g = ghosts[k];
-                    const double gx = px + (cx - px) * g.at, gy = py + (cy - py) * g.at;  // 1 = the centre, 2 = opposite the light
-                    double gd = std::hypot((x + 0.5 - gx) / (lens == 3 ? 1.6 : 1.0), y + 0.5 - gy) / R / g.radius;
+                for (int k = 0; k < ghosts.count; ++k) {
+                    const double gx = px + (cx - px) * ghosts.at[k], gy = py + (cy - py) * ghosts.at[k];  // 1 = the centre, 2 = opposite the light
+                    double gd = std::hypot((x + 0.5 - gx) / (lens == 3 ? 1.6 : 1.0), y + 0.5 - gy) / R / ghosts.radius[k];
                     if (gd >= 1.15) continue;
                     // A soft-edged disc, a little brighter at its rim.
                     const double disc = (1 - std::clamp((gd - 0.85) / 0.3, 0.0, 1.0)) * (0.7 + 0.3 * std::min(1.0, gd));
-                    for (int c = 0; c < 3; ++c) light[c] += ghostAmt * g.strength * disc * g.rgb[c];
+                    for (int c = 0; c < 3; ++c) light[c] += ghostAmt * ghosts.strength[k] * disc * ghosts.rgb[k][c];
                 }
                 double lum = 0;
                 for (int c = 0; c < 3; ++c) {

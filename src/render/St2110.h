@@ -4,6 +4,9 @@
 //    interlaced (each field on its own), one sample row range per packet (the general packing mode), sent spread over
 //    each frame's time (wide pacing).
 //  - ST 2110-30 audio: AES67's L24 or L16, 1 ms or 125 µs packets, up to 8 channels at 48 kHz.
+//  - ST 2110-31 AES3 transparent audio: each AES3 subframe whole (its 24 bits, validity, user and channel status bits)
+//    in an AM824 word, so a payload that is not PCM (an ST 337 data burst) goes through bit for bit.
+//  - ST 2110-41 fast metadata: data items (a 22-bit type, its K bit and contents in 32-bit words) with each frame.
 //  - ST 2022-7: each stream sent on two paths at once (and merged again by RTP sequence number where received).
 //  - ST 2110-40 ancillary data (RFC 8331): ancillary time code (ST 12-2), CEA-608/708 captions in a CDP (ST 334) and
 //    HDR static metadata (ST 2108-1), a packet each frame or field even with none.
@@ -13,6 +16,7 @@
 // the leap seconds. Packets go through the operating system's UDP sockets, unicast or multicast.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -59,6 +63,7 @@ struct AudioFormat {
     int rate = 48000;
     int bits = 24;          // L24, or L16
     int packetUs = 1000;    // 1 ms packets (ST 2110-30 level A), or 125 µs (level C)
+    bool aes3 = false;      // ST 2110-31: AES3 subframes as AM824 words (`bits` not used)
     int packetSamples() const { return int(int64_t(rate) * packetUs / 1000000); }
 };
 struct SdpOptions {
@@ -76,6 +81,8 @@ std::string audioSdp(const AudioFormat& f, const Endpoint& to, int payloadType, 
 // (`ids`: the DID/SDID pairs it carries)
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o,
                    const std::vector<std::pair<int, int>>& ids = {{0x60, 0x60}, {0x61, 0x01}}, const Endpoint* to2 = nullptr);
+// ST 2110-41 fast metadata's stream (`types`: the data item types it carries, its fmtp's DIT).
+std::string metadataSdp(const Endpoint& to, int payloadType, const SdpOptions& o, const std::vector<uint32_t>& types, const Endpoint* to2 = nullptr);
 // An SDP's media format parameters (its a=fmtp line's "name=value;" pairs) and rtpmap encoding ("raw/90000").
 std::map<std::string, std::string> sdpParameters(const std::string& sdp, std::string* encoding = nullptr);
 
@@ -165,6 +172,41 @@ bool packAudio(const float* samples, int frames, int channels, uint32_t timestam
 // The samples of an L24 (or L16) payload, as floats (exactly what was sent, to its bits).
 std::vector<float> unpackAudio(const uint8_t* payload, size_t size, int channels, int bits = 24);
 
+// ---- ST 2110-31: AES3 subframes as IEC 61883-6's AM824 words: a label byte above the subframe's 24 bits. The label
+// (an IEC 60958 conformant subframe's): bit 5 the start of a channel status block (AES3's Z preamble), bit 4 the first
+// subframe of a frame, bit 3 the subframe's parity, bits 2 to 0 its channel status (C), user (U) and validity (V) bits.
+uint32_t am824Word(int32_t data24, bool blockStart, bool frameStart, bool c, bool u = false, bool v = false);
+inline int32_t am824Data(uint32_t word) { return int32_t(word << 8) >> 8; }  // (the 24 bits, signed)
+inline bool am824BlockStart(uint32_t word) { return (word >> 29) & 1; }
+inline bool am824C(uint32_t word) { return (word >> 26) & 1; }
+// Whether a word's parity bit gives even parity over its 24 bits and V, U, C and P (AES3's rule).
+bool am824ParityOk(uint32_t word);
+// Professional channel status: byte 0's bit 0 set, its bit 1 when the subframes carry something other than linear PCM
+// (an ST 337 data burst, say), byte 23 the CRC (CRC-8/AES over bytes 0 to 22).
+std::array<uint8_t, 24> aes3ChannelStatus(bool nonAudio);
+uint8_t aes3Crc(const uint8_t* bytes, size_t n);
+// A channel's status as its C bits carry it, from the first block start in `frames` frames of `channels` interleaved
+// words; false when no whole block is there.
+bool aes3ReadChannelStatus(const uint32_t* words, size_t frames, int channels, int channel, std::array<uint8_t, 24>& out);
+// Linear PCM as AM824 words: 24 bits each, the channel status `status` sent block by block (`blockFrame`: the frame
+// within the 192-frame block the next is, kept from one call to the next).
+std::vector<uint32_t> aes3FromPcm(const float* samples, int frames, int channels, int& blockFrame, const std::array<uint8_t, 24>& status);
+// One packet of `frames` frames of `channels` AM824 words, big-endian; and back.
+bool packAm824(const uint32_t* words, int frames, int channels, uint32_t timestamp, RtpState& rtp, const PacketSink& send);
+std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int channels);
+
+// ---- ST 2110-41 fast metadata: data items, each a 32-bit header (its type, 22 bits; the K bit; its length in 32-bit
+// words, 9 bits) and its contents, as many as fit in a packet, the frame's last packet marked.
+struct FastMetadata {
+    uint32_t type = 0;  // (22 bits)
+    bool k = false;
+    std::vector<uint32_t> words;  // (at most 511)
+    bool operator==(const FastMetadata& o) const = default;
+};
+bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
+// (false when an item runs past the payload)
+bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMetadata>& out);
+
 // ---- Ancillary data (ST 291 packets), as RFC 8331 carries them.
 struct AncPacket {
     uint8_t did = 0, sdid = 0;
@@ -211,13 +253,21 @@ struct SenderOptions {
     int ttl = 16;
     bool sendVideo = true, sendAudio = true, sendAnc = true;
     int videoPayload = 96, audioPayload = 97, ancPayload = 100;
+    // ST 2110-41 fast metadata (Sender::setNextMetadata), a packet each frame when on; the item types it names.
+    bool sendMetadata = false;
+    Endpoint metadata{"239.100.0.4", 5004}, metadata2{"239.101.0.4", 5004};
+    int metadataPayload = 101;
+    std::vector<uint32_t> metadataTypes;
     int maxPayload = 1200;  // bytes of pixels a packet
     std::string refclk = "ptp=IEEE1588-2008:traceable";
     // ST 2022-7: every packet also sent to these (from `interfaceAddress2`), when `redundant`.
     bool redundant = false;
     Endpoint video2{"239.101.0.1", 5004}, audio2{"239.101.0.2", 5004}, anc2{"239.101.0.3", 5004};
     std::string interfaceAddress2;
-    // (for tests: a packet of stream 0 video, 1 audio or 2 ancillary data, numbered from 0 as sent, left unsent on
+    // Each stream's (video, audio, ancillary data, fast metadata) paths sending: an NMOS controller may turn either of
+    // a stream's two legs off.
+    bool pathOn[4][2] = {{true, true}, {true, true}, {true, true}, {true, true}};
+    // (for tests: a packet of stream 0 video, 1 audio, 2 ancillary data or 3 fast metadata, numbered from 0 as sent, left unsent on
     // path 0 or 1 when this says so)
     std::function<bool(int stream, int path, uint64_t index)> drop;
 };
@@ -244,9 +294,14 @@ public:
               const std::vector<AncPacket>& anc, const std::atomic<bool>* stop = nullptr);
     // Ancillary packets sent with every frame from now (ST 2108-1's HDR metadata), and named in the SDP.
     void setFrameAnc(const std::vector<AncPacket>& anc) { frameAnc_ = anc; }
+    // ST 2110-31: AES3 subframes as they are (AM824 words, interleaved), sent in place of `send`'s PCM (which an AES3
+    // stream otherwise carries as linear PCM with professional channel status).
+    void queueAes3(const uint32_t* words, int frames);
+    // ST 2110-41: data items sent with the next frame.
+    void setNextMetadata(std::vector<FastMetadata> items) { nextMetadata_ = std::move(items); }
     void close();
     bool isOpen() const;
-    std::string sdpVideo() const, sdpAudio() const, sdpAnc() const;
+    std::string sdpVideo() const, sdpAudio() const, sdpAnc() const, sdpMetadata() const;
     std::string clockSource() const { return clock_; }
     const SenderOptions& options() const { return o_; }
     const VideoFormat& videoFormat() const { return video_; }
@@ -265,11 +320,15 @@ private:
     SenderOptions o_;
     VideoFormat video_;
     AudioFormat audio_;
-    RtpState rtpVideo_, rtpAudio_, rtpAnc_;
+    RtpState rtpVideo_, rtpAudio_, rtpAnc_, rtpMeta_;
     int64_t nextFrame_ = 0;       // the frame number (PTP time / frame period) sent next
     int64_t audioSample_ = 0;     // the next audio packet's first sample (PTP time at the audio rate)
     std::vector<float> audioFifo_;
+    std::vector<uint32_t> aesFifo_;  // (AM824 words: an AES3 stream's)
+    int aesBlockFrame_ = 0;
+    bool aesQueued_ = false;  // (queueAes3 used: send's PCM not sent)
     std::vector<AncPacket> frameAnc_;
+    std::vector<FastMetadata> nextMetadata_;
     std::string clock_, source_, source2_;
     int64_t frames_ = 0;
 };

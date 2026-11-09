@@ -35,6 +35,7 @@
 #include "core/Surround.h"
 #include "media/ContentCredentials.h"
 #include "media/Exr.h"
+#include "media/Av2.h"
 #include "media/Jxl.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
@@ -56,10 +57,10 @@ bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.video
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }
 
 bool usesCrf(const std::string& codec) {
-    return codec == "libx264" || codec == "libx265" || codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv";
+    return codec == "libx264" || codec == "libx265" || codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv" || codec == "av2";
 }
-// VP9, SVT-AV1 and APV (whose number is its QP) use a 0-63 quantiser scale, x264 / x265 0-51.
-int maxCrf(const std::string& codec) { return (codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv") ? 63 : 51; }
+// VP9, SVT-AV1, AV2 (AVM's quantiser, scaled) and APV (whose number is its QP) use a 0-63 quantiser scale, x264 / x265 0-51.
+int maxCrf(const std::string& codec) { return (codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv" || codec == "av2") ? 63 : 51; }
 
 QString videoCodecName(const ExportSettings& s) {
     const std::string& c = s.videoCodec;
@@ -80,6 +81,7 @@ QString videoCodecName(const ExportSettings& s) {
     }
     if (c == "libvpx-vp9") return QStringLiteral("VP9");
     if (c == "libsvtav1") return QStringLiteral("AV1");
+    if (c == "av2") return s.pixFmt.find("10") != std::string::npos ? QStringLiteral("AV2 10-bit") : QStringLiteral("AV2");
     if (c == "mjpeg") return QStringLiteral("Motion JPEG");
     if (c == "cfhd") return s.alpha ? QStringLiteral("CineForm RGBA") : QStringLiteral("CineForm");
     if (c == "ffv1") return QStringLiteral("FFV1 (lossless)");
@@ -95,6 +97,8 @@ QString audioCodecName(const ExportSettings& s) {
     const QString kbps = QString::number(s.audioBitrate / 1000);
     if (c == "aac") return QStringLiteral("AAC %1 kb/s").arg(kbps);
     if (c == "libopus") return QStringLiteral("Opus %1 kb/s").arg(kbps);
+    if (c == "ac3") return QStringLiteral("AC-3");
+    if (c == "eac3") return QStringLiteral("E-AC-3");
     if (c == "pcm_s16le") return QStringLiteral("PCM 16-bit");
     if (c == "pcm_s24le") return QStringLiteral("PCM 24-bit");
     if (c == "flac") return QStringLiteral("FLAC (lossless)");
@@ -882,15 +886,15 @@ void ExportDialog::updateControls() {
     {
         const QString e = p ? QString::fromStdString(p->extension).toLower() : QString();
         const bool container = e == QLatin1String("mp4") || e == QLatin1String("mov") || e == QLatin1String("mkv") || e == QLatin1String("mxf");
-        streams_->setEnabled(p && hasAudio(p->settings) && container);
-        described_->setEnabled(p && hasAudio(p->settings) && container && state_ && state_->sequence() &&
-                               hasDescriptionClips(*state_->sequence()));
+        streams_->setEnabled(p && hasAudio(p->settings) && container && p->settings.videoCodec != "av2");
+        described_->setEnabled(p && hasAudio(p->settings) && container && p->settings.videoCodec != "av2" && state_ &&
+                               state_->sequence() && hasDescriptionClips(*state_->sequence()));
     }
     const QString ext = p ? QString::fromStdString(p->extension).toLower() : QString();
     const bool chapterFile = ext == QLatin1String("mp4") || ext == QLatin1String("mov") || ext == QLatin1String("m4v") ||
                              ext == QLatin1String("mkv") || ext == QLatin1String("webm");
     const bool anyChapters = seq && std::any_of(seq->markers.begin(), seq->markers.end(), [](const Marker& m) { return m.chapter; });
-    chapters_->setEnabled(chapterFile && anyChapters);
+    chapters_->setEnabled(chapterFile && anyChapters && (!p || p->settings.videoCodec != "av2"));  // (AV2's own MP4 writer has none)
     startTc_->setEnabled(ext == QLatin1String("mxf") || ext == QLatin1String("mov"));
     {
         // The deliveries the preset's codec can make: RDD 9 and X8 for MPEG-2 HD, the DPP's and X2 for AVC-Intra.
@@ -996,6 +1000,12 @@ void ExportDialog::updateSummary() {
                            .arg(h)
                            .arg(fpsLabel(seq->fps));
         if (usesCrf(s.videoCodec)) line += (s.videoCodec == "liboapv" ? tr(", QP %1") : tr(", CRF %1")).arg(quality_->value());
+        // (AV2's ISO BMFF binding is not final: a player may read its MP4 differently later; IVF and OBU are settled)
+        if (s.videoCodec == "av2") {
+            const QString suffix = QFileInfo(path_->text()).suffix().toLower();
+            if (suffix != QLatin1String("ivf") && suffix != QLatin1String("obu"))
+                line += tr(" (in MP4 by AV2's draft binding, which may still change: name the file .ivf or .obu for a settled form, without sound)");
+        }
         if (s.alpha && !seq->stereo3d) line += tr(", with alpha");
         if (seq->stereo3d) line += ", " + stereo_->currentText();
         if (seq->stereo3d && stereo_->currentData().toString() == QLatin1String("mv") && s.videoCodec != "libx265" && s.videoCodec != "hw_hevc")
@@ -1013,7 +1023,8 @@ void ExportDialog::updateSummary() {
         lines << tr("Video: none");
     }
 
-    if (hasAudio(s)) {
+    const bool av2Bare = s.videoCodec == "av2" && av2ContainerForPath(path_->text().toStdString()) != Av2Container::Mp4;  // (no sound)
+    if (hasAudio(s) && !av2Bare) {
         int rate = s.sampleRate > 0 ? s.sampleRate : seq->sampleRate;
         if (s.audioCodec == "libopus") rate = 48000;  // Opus always encodes at 48 kHz
         // The mix's layout: stereo when folded, else the sequence's, or what the codec can carry of it (an immersive mix
@@ -1096,6 +1107,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.height = height_->value();
     }
     if (usesCrf(s.videoCodec)) s.crf = quality_->value();
+    if (s.videoCodec == "av2" && av2ContainerForPath(s.path) != Av2Container::Mp4) s.audioCodec = "none";  // (IVF and OBU hold no sound)
     if (captions_->isEnabled()) {
         const int mode = captions_->currentData().toInt();
         s.burnInCaptions = mode & 1;
@@ -1137,7 +1149,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/audioStreams", streams_->currentIndex());
     s.describedStream = described_->isEnabled() && described_->isChecked();
     settings.setValue("export/described", described_->isChecked());
-    s.chapters = chapters_->isChecked();
+    s.chapters = chapters_->isChecked() && s.videoCodec != "av2";  // (AVM's writer makes no chapters)
     settings.setValue("export/chapters", chapters_->isChecked());
     if (startTc_->isEnabled() && !startTc_->text().trimmed().isEmpty() && state_->sequence()) {
         FrameTime t = 0;
@@ -1311,9 +1323,11 @@ void ExportDialog::startExport() {
             std::string error, encoder;
             // With stems, the export fills the first half of the bar and the stems the second.
             const double share = stems > 0 ? 0.5 : 1.0;
+            HrdReport hrd;
             r.ok = exportSequence(
                 snap, *sq, s, [&](double f, FrameTime t) { onProgress(f * share, t); }, cancel, &error, &encoder, nullptr,
-                nullptr, &r.keptUnsigned);
+                nullptr, &r.keptUnsigned, &hrd);
+            if (r.ok && hrd.checked && hrd.signalled && !hrd.conforms()) r.hrd = QString::fromStdString(hrd.summary());
             if (r.ok && stems > 0)
                 r.ok = exportStems(
                     snap, *sq, s, stems, nullptr, [&](double f, FrameTime t) { onProgress(0.5 + f * 0.5, t); }, cancel, &error);
@@ -1359,9 +1373,16 @@ void ExportDialog::exportFinished() {
     setExporting(false);
     if (r.ok) {
         const QString where = QDir::toNativeSeparators(exportPath_);
-        state_->message(r.encoder.isEmpty() ? tr("Exported %1").arg(where)
-                                            : tr("Exported %1 (video encoder: %2)").arg(where, r.encoder),
-                        8000);
+        if (!r.hrd.isEmpty())
+            // (the file plays; only a receiver that holds to the buffer model strictly may refuse it)
+            state_->message(tr("Exported %1, but it does not keep its buffer model (%2). A strict ingest check may refuse it; "
+                               "Quality Check's Buffer model lists the frames.")
+                                .arg(where, r.hrd),
+                            20000);
+        else
+            state_->message(r.encoder.isEmpty() ? tr("Exported %1").arg(where)
+                                                : tr("Exported %1 (video encoder: %2)").arg(where, r.encoder),
+                            8000);
         accept();
         return;
     }

@@ -2,7 +2,7 @@
 # Runs AMWA's NMOS test suites (nmos-testing, Apache-2.0) against Montage's NMOS Node: IS-04's Node API and
 # registration (IS-04-01), IS-05's Connection API (IS-05-01) and the two together (IS-05-02), with the registry found by
 # unicast DNS-SD from the test tool's own DNS server. The Node is `montage-cli st2110`, sending colour bars and tone
-# and offering receivers.
+# on both of ST 2022-7's paths (its senders offering both legs through IS-05) and offering receivers with two legs.
 #
 #   sudo scripts/nmos-check.sh build/src/montage-cli <work directory>
 #
@@ -23,7 +23,8 @@ printf "from . import Config as CONFIG\nCONFIG.DNS_SD_MODE = 'unicast'\n" > "$wo
 # The address the tool's DNS server and mock registries use: the default route's interface's.
 host=$("$work/venv/bin/python" -I -c "import netifaces as n; i = n.gateways()['default'][n.AF_INET][1]; print(n.ifaddresses(i)[n.AF_INET][0]['addr'])")
 QT_QPA_PLATFORM=offscreen "$cli" st2110 --mode 720p50 --interface "$host" --nmos-port 8080 --domain testsuite.nmos.tv \
-    --dns-server "$host" --seconds 3600 --receivers > "$work/node.log" 2>&1 &
+    --dns-server "$host" --seconds 3600 --receivers --interface2 "$host" \
+    --video2 239.100.12.1:5004 --audio2 239.100.12.2:5004 --data2 239.100.12.3:5004 --send-interface2 "$host" > "$work/node.log" 2>&1 &
 node=$!
 trap 'kill $node 2> /dev/null || true' EXIT
 sleep 2

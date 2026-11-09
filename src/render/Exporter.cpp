@@ -6,6 +6,7 @@
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
+#include "media/Av2.h"
 #include "render/SegmentedExport.h"
 
 #include "core/ColorGroups.h"
@@ -20,6 +21,7 @@
 #include "core/Surround.h"
 #include "render/RateConversion.h"
 #include "render/Retime.h"
+#include "audio/PluginHost.h"
 #include "audio/TimeStretch.h"
 #include "media/Rife.h"
 
@@ -31,6 +33,7 @@
 #include <QRandomGenerator>
 #include <QString>
 #include <algorithm>
+#include <climits>
 #include <functional>
 #include <optional>
 #include <thread>
@@ -59,6 +62,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "render/DialogueLoudness.h"
+#include "render/Ac3.h"
 #include "render/LoudnessReport.h"
 #include "media/SuperScale.h"
 #include "media/ThreadScheduling.h"
@@ -237,11 +241,19 @@ struct Output {
     // Spatial video: the video "encoder" gives raw pictures (the eyes side by side), which this codes as MV-HEVC.
     std::unique_ptr<SpatialVideoEncoder> spatial;
     std::string spatialError;  // (what x265 said, when it failed)
+    // AV2 (media/Av2.h): the video "encoder" gives raw pictures, which AVM codes; it writes the file (the muxer is
+    // FFmpeg's null one), the sound's packets too.
+    std::unique_ptr<Av2Writer> av2;
+    AVFrame* av2Picture = nullptr;  // (a raw packet's planes, as AVM is handed them)
+    std::string av2Error;
+    // E-AC-3 above 5.1: the audio "encoder" is a description, the sound coded by two encoders as two substreams.
+    std::map<AVCodecContext*, std::unique_ptr<Eac3Extended>> extended;
     bool headerWritten = false;
     ~Output() {
         sws_freeContext(sws);
         av_frame_free(&vframe);
         av_frame_free(&aframe);
+        av_frame_free(&av2Picture);
         av_packet_free(&pkt);
         avcodec_free_context(&vctx);
         avcodec_free_context(&actx);
@@ -276,11 +288,23 @@ int writeSpatial(Output& o, std::vector<SpatialVideoEncoder::Packet>& coded) {
 }
 
 // Why writing video failed: x265's own words for spatial video.
-std::string videoError(const Output& o, int rc) { return o.spatialError.empty() ? averr(rc) : o.spatialError; }
+std::string videoError(const Output& o, int rc) { return !o.av2Error.empty() ? o.av2Error : o.spatialError.empty() ? averr(rc) : o.spatialError; }
+
+Eac3Extended* extendedFor(Output& o, AVCodecContext* ctx) {
+    auto it = o.extended.find(ctx);
+    return it == o.extended.end() ? nullptr : it->second.get();
+}
+
+// avcodec_send_frame, or to the E-AC-3 substreams' encoders when `ctx` describes them.
+int sendFrame(Output& o, AVCodecContext* ctx, const AVFrame* f) {
+    if (Eac3Extended* x = extendedFor(o, ctx)) return x->send(f);
+    return avcodec_send_frame(ctx, f);
+}
 
 int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
+    Eac3Extended* extended = extendedFor(o, ctx);
     for (;;) {
-        int rc = avcodec_receive_packet(ctx, o.pkt);
+        int rc = extended ? extended->receive(o.pkt) : avcodec_receive_packet(ctx, o.pkt);
         if (rc == AVERROR_EOF && o.spatial && st == o.vst) {
             std::vector<SpatialVideoEncoder::Packet> coded;
             return o.spatial->flush(coded, &o.spatialError) ? writeSpatial(o, coded) : AVERROR_EXTERNAL;
@@ -294,6 +318,24 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
             av_packet_unref(o.pkt);
             if (!ok) return AVERROR_EXTERNAL;
             if ((rc = writeSpatial(o, coded)) < 0) return rc;
+            continue;
+        }
+        if (o.av2 && st == o.vst) {
+            // (A picture, raw: coded by AVM.)
+            AVFrame* f = o.av2Picture;
+            f->format = ctx->pix_fmt;
+            f->width = ctx->width;
+            f->height = ctx->height;
+            const bool ok = av_image_fill_arrays(f->data, f->linesize, o.pkt->data, ctx->pix_fmt, ctx->width, ctx->height, 1) >= 0 &&
+                            o.av2->encode(f, &o.av2Error);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            continue;
+        }
+        if (o.av2 && st == o.ast) {
+            const bool ok = o.av2->audio(o.pkt, &o.av2Error);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
             continue;
         }
         if (st == o.vst && o.videoPacket && !o.videoPacket(o.pkt)) return AVERROR(EINVAL);
@@ -385,7 +427,27 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
             v.push_back(dnx);
         }
         v.push_back(preset("VP9 (WebM)", "webm", "Open web format, Opus audio", "libvpx-vp9", "libopus", 32, "good"));
+        {
+            // Broadcast and streaming sound: AC-3 to 5.1, E-AC-3 to 7.1, each stating its dialogue level (the mix as
+            // measured) and the sequence's downmix levels.
+            ExportPreset ts = preset("H.264 + AC-3 (MPEG-TS)", "ts",
+                                     "Transport stream for broadcast: H.264 with AC-3 sound to 5.1, its dialogue level measured",
+                                     "libx264", "ac3", 18, "medium");
+            ts.settings.audioBitrate = 192000;  // a pair of channels' (5.1: 576 kb/s)
+            v.push_back(ts);
+            ExportPreset ec3 = preset("H.264 + E-AC-3 (MP4)", "mp4", "H.264 with E-AC-3 sound to 7.1, its dialogue level measured",
+                                      "libx264", "eac3", 18, "slow");
+            ec3.settings.audioBitrate = 192000;  // (7.1: 768 kb/s)
+            v.push_back(ec3);
+        }
         v.push_back(preset("AV1 (SVT-AV1)", "mp4", "Next-generation efficiency", "libsvtav1", "aac", 32, "8"));
+        if (everyBuild || av2EncoderAvailable()) {
+            // AV2 through its reference encoder, AVM (media/Av2.h): in builds made with it only (its licence is flagged).
+            // Speed is AVM's preset, 0 (slowest) to 6; the MP4 binding is a working draft, so .ivf and .obu are offered too.
+            v.push_back(preset("AV2 (AVM, draft MP4 binding)", "mp4",
+                               "AV2 through its reference encoder (slow); its MP4 binding is a working draft, IVF or OBU by the file's extension",
+                               "av2", "aac", 32, "6"));
+        }
         {
             // Short-form social video: the platforms' -14 LUFS loudness, kept under -1 dBTP.
             ExportPreset p = preset("Social - TikTok / Reels / Shorts", "mp4",
@@ -860,6 +922,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (error) *error = msg;
         return false;
     };
+    // A plug-in that fails in its host while this renders stops the export, naming it (audio/PluginHost.h).
+    const uint64_t pluginFailures = plugins::offlineFailureSerial();
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());  // nothing past the end of the cut
@@ -894,6 +958,29 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (jxlFrames && (s.jxlDistance < 0 || s.jxlDistance > 25)) return fail("A JPEG XL distance is 0 (lossless) to 25");
     if (jxlFrames && s.alpha && s.jxlPremultiplied && !jxlWritesPremultiplied())
         return fail("This libjxl (before 0.9) cannot write premultiplied alpha: write it straight");  // written straight from the float picture, not through 16 bits
+    // AV2 coded by AVM (media/Av2.h), in the container the file name asks for: an IVF, a bare OBU stream (.obu), or MP4
+    // as AV2's ISO BMFF binding has it while it is a working draft.
+    const bool av2Out = s.videoCodec == "av2" && wantVideo;
+    const Av2Container av2Holder = av2ContainerForPath(s.path);
+    if (av2Out) {
+        if (!av2EncoderAvailable()) return fail("This build of Montage writes no AV2 (AVM)");
+        if (s.alpha || interlacedOut) return fail("AV2 is written without alpha or fields");
+        if (s.cea608 || s.embedCaptions) return fail("AV2 is written without embedded captions: burn them in, or deliver them beside the file");
+        if (s.adaptiveHdr) return fail("AV2 is written without adaptive HDR metadata");  // (HDR10+ goes beside it, as JSON)
+        if (s.twoPass || s.pass != 0) return fail("AV2 is written in one pass");
+        if (seq.stereo3d && s.stereo == "mv") return fail("Spatial video is MV-HEVC: choose H.265 (HEVC)");
+        // (AVM's writer, not FFmpeg's muxer, makes the file: what only a muxer writes is refused, not dropped)
+        if (seq.spherical) return fail("AV2 is written without 360° metadata");
+        StereoView eyes = StereoView::Left;
+        if (seq.stereo3d && stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, eyes) && eyes != StereoView::Left &&
+            eyes != StereoView::Right && eyes != StereoView::Anaglyph)
+            return fail("AV2 is written without stereoscopic 3D metadata: export one eye or an anaglyph");
+        if (s.chapters && std::any_of(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.chapter; }))
+            return fail("AV2 is written without chapters: turn chapters off");
+        if (wantAudio && av2Holder != Av2Container::Mp4) return fail("IVF and OBU streams hold no sound: export AV2 as MP4 for sound, or choose no audio codec");
+        if (wantAudio && s.audioCodec != "aac") return fail("AV2 in MP4 takes AAC sound");
+        if (s.monoAudioTracks > 0 || !s.extraAudio.empty()) return fail("AV2 in MP4 holds one sound stream");
+    }
     // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
     const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
@@ -913,7 +1000,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
     Output o;
-    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : s.format.empty() ? nullptr : s.format.c_str(),
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : av2Out ? "null" : s.format.empty() ? nullptr : s.format.c_str(),
                                             outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
@@ -980,7 +1067,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!jxlCanState(outSpace)) return fail("JPEG XL cannot state " + outSpace.label + ": deliver it in a display space or linear light");
             c = "png";
         }
-        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : c;
+        if (av2Out) c = "rawvideo";  // (FFmpeg's raw "encoder" hands each picture to AVM)
+        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : av2Out ? std::string("AVM (AV2)") : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
         // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
         if (c == "cfhd" && H % 8 != 0)
@@ -996,6 +1084,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->sample_aspect_ratio = AVRational{1, 1};
         o.vctx->pix_fmt = defaultPixFmt(s, c);
         if (outSpace.hdr() && s.pixFmt.empty()) o.vctx->pix_fmt = tenBitFormat(o.vctx->pix_fmt, o.vctx, codec);
+        // (AV2 in 4:2:0, 10 bits for HDR or when asked)
+        if (av2Out) o.vctx->pix_fmt = outSpace.hdr() || s.pixFmt.find("10") != std::string::npos ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
         o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(dseq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
         const ColorTags tags = colorTags(outSpace);
@@ -1050,7 +1140,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             const int64_t rate = s.videoBitrate > 0 ? s.videoBitrate : 50000000;
             o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
             o.vctx->rc_buffer_size = 17825792;
-            o.vctx->rc_initial_buffer_occupancy = 17825792;
+            o.vctx->rc_initial_buffer_occupancy = s.vbvInit > 0 ? int(std::clamp(s.vbvInit, 0.05, 1.0) * 17825792) : 17825792;
             o.vctx->gop_size = exportMpeg2Gop(s, dseq.fps);
             o.vctx->max_b_frames = 2;
             o.vctx->intra_dc_precision = 2;
@@ -1062,13 +1152,38 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!s.startTimecode.empty()) av_dict_set(&opts, "gop_timecode", s.startTimecode.c_str(), 0);
         } else if (c == "libx264" || c == "libx265") {
             if (s.cea608) av_dict_set(&opts, "a53cc", "1", 0);
-            if (s.videoBitrate <= 0 || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
+            // A stated HRD (broadcast ingest's buffer model): at a constant rate the bit rate is the HRD's, filler
+            // data making up what the pictures leave over; at a variable one, no more than the HRD's rate.
+            const bool hrdCbr = s.hrd == "cbr", hrdVbr = s.hrd == "vbr";
+            const int64_t hrdRate = s.vbvMaxrate > 0 ? s.vbvMaxrate : s.videoBitrate;
+            if ((hrdCbr || hrdVbr) && hrdRate <= 0) {
+                av_dict_free(&opts);
+                return fail("A stated HRD needs a bit rate (the video bit rate, or the buffer's rate)");
+            }
+            const int64_t hrdBuffer = s.vbvBuffer > 0 ? s.vbvBuffer : hrdRate;
+            if (hrdCbr || hrdVbr) {
+                o.vctx->rc_max_rate = hrdRate;
+                o.vctx->rc_buffer_size = int(std::min<int64_t>(hrdBuffer, INT_MAX));
+                if (hrdCbr && pass != 1) o.vctx->bit_rate = o.vctx->rc_min_rate = hrdRate;
+                if (s.vbvInit > 0) o.vctx->rc_initial_buffer_occupancy = int(std::clamp(s.vbvInit, 0.05, 1.0) * double(o.vctx->rc_buffer_size));
+            }
+            if ((s.videoBitrate <= 0 && !hrdCbr) || pass == 1) av_dict_set_int(&opts, "crf", s.crf, 0);
             if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
             if (pass && c == "libx264") av_dict_set(&opts, "stats", s.passStats.c_str(), 0);
-            if (c == "libx264" && s.parameterSetId > 0)
-                av_dict_set(&opts, "x264-params", ("sps-id=" + std::to_string(std::min(s.parameterSetId, 31))).c_str(), 0);
+            if (c == "libx264") {
+                std::string params;
+                if (s.parameterSetId > 0) params = "sps-id=" + std::to_string(std::min(s.parameterSetId, 31));
+                if (hrdCbr || hrdVbr) params += std::string(params.empty() ? "" : ":") + "nal-hrd=" + (hrdCbr && pass != 1 ? "cbr" : "vbr");
+                if (!params.empty()) av_dict_set(&opts, "x264-params", params.c_str(), 0);
+            }
             if (c == "libx265") {
                 std::string params = "log-level=error";
+                if (hrdCbr || hrdVbr) {
+                    // (kbit/s and kbit, as x265 takes them; strict-cbr pads with filler at a constant rate)
+                    params += ":hrd=1:vbv-maxrate=" + std::to_string(hrdRate / 1000) + ":vbv-bufsize=" + std::to_string(hrdBuffer / 1000);
+                    if (hrdCbr && pass != 1) params += ":strict-cbr=1";
+                    if (s.vbvInit > 0) params += ":vbv-init=" + std::to_string(std::clamp(s.vbvInit, 0.05, 1.0));
+                }
                 if (pass) {
                     // (Quoted: the path's colons and backslashes are its own, not the list's.)
                     std::string quoted = "'";
@@ -1278,6 +1393,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
 
     int audioFrameSize = 1024;
+    // AC-3 and E-AC-3: the downmix levels and production information the sequence states (the dialogue level is
+    // set once the mix is measured).
+    const bool ac3Family = s.audioCodec == "ac3" || s.audioCodec == "eac3";
+    Ac3Metadata ac3Meta;
+    ac3Meta.centreMixDb = seq.downmixCentreDb;
+    ac3Meta.surroundMixDb = seq.downmixSurroundDb;
+    ac3Meta.preferredDownmix = seq.preferredDownmix;
+    ac3Meta.mixingLevel = seq.mixingLevel;
+    ac3Meta.roomType = seq.roomType;
     // An audio encoder and its stream, in the sequence's layout (or stereo); "" or why not.
     auto openAudio = [&](AVCodecContext*& actx, AVStream*& ast, bool mono = false) -> std::string {
         const AVCodec* codec = avcodec_find_encoder_by_name(s.audioCodec.c_str());
@@ -1303,6 +1427,21 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             return "This FFmpeg cannot describe the " + seq.audioLayout + " channel layout";
         }
         if (mono) layout = AV_CHANNEL_LAYOUT_MONO;
+        if (s.audioCodec == "eac3" && layout.nb_channels > 6) {
+            // 7.1 as two substreams (render/Ac3.h); `actx` describes the stream for the muxer.
+            auto x = std::make_unique<Eac3Extended>();
+            std::string why;
+            const int64_t rate = std::clamp<int64_t>(int64_t(s.audioBitrate) * layout.nb_channels / 2, 256000, 2048000);
+            if (!x->open(sr, rate, ac3Meta, &why)) return why;
+            avcodec_free_context(&actx);
+            actx = x->describe();
+            if (!actx) return "Out of memory";
+            o.extended[actx] = std::move(x);
+            avcodec_parameters_from_context(ast->codecpar, actx);
+            ast->time_base = actx->time_base;
+            audioFrameSize = actx->frame_size;
+            return {};
+        }
         av_channel_layout_copy(&actx->ch_layout, &layout);
         actx->sample_rate = sr;
         if (s.audioCodec == "libopus" && sr != 48000) actx->sample_rate = 48000;
@@ -1328,8 +1467,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         const bool field = !mono && !s.downmixStereo && ambisonicLayout(seq.audioLayout);
         if (s.audioCodec == "aac" || s.audioCodec == "libopus")
             actx->bit_rate = s.audioBitrate * (field ? layoutChannels(seq.audioLayout) / 2 : 1);  // per pair of channels
+        else if (ac3Family)  // (per pair of channels too, to the most a frame holds: 640 kb/s for AC-3)
+            actx->bit_rate = std::clamp<int64_t>(int64_t(s.audioBitrate) * std::max(2, layout.nb_channels) / 2, 96000,
+                                                 s.audioCodec == "ac3" ? 640000 : 1024000);
         actx->time_base = AVRational{1, actx->sample_rate};
-        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if ((o.oc->oformat->flags & AVFMT_GLOBALHEADER) || av2Out) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
         if (field && s.audioCodec == "aac") {
             // The field's channels are not left and right: joint stereo coding (mid/side, intensity) and noise
@@ -1337,6 +1479,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             av_dict_set(&opts, "aac_ms", "0", 0);
             av_dict_set(&opts, "aac_is", "0", 0);
             av_dict_set(&opts, "aac_pns", "0", 0);
+        }
+        if (ac3Family) {
+            const bool centre = av_channel_layout_index_from_channel(&layout, AV_CHAN_FRONT_CENTER) >= 0 && layout.nb_channels > 2;
+            bool surround = false;
+            for (AVChannel ch : {AV_CHAN_SIDE_LEFT, AV_CHAN_BACK_LEFT, AV_CHAN_BACK_CENTER})
+                surround |= av_channel_layout_index_from_channel(&layout, ch) >= 0;
+            ac3EncoderOptions(ac3Meta, s.audioCodec == "eac3", centre, surround, &opts);
         }
         rc = avcodec_open2(actx, codec, &opts);
         av_dict_free(&opts);
@@ -1549,7 +1698,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering of long-GOP video (render/LongGopCopy.h): planned before the header, which carries the copied
     // sources' parameter sets. Only where nothing would change the source's pictures for the whole export, as below.
     std::unique_ptr<LongGopCopier> longGop;
-    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
+    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !av2Out && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
         !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && !s.alpha && !wantHdr10 && !wantAdaptive && sameColorSpace(outSpace, seqSpace) &&
         !trim && !sceneReferredWorking(seq) && !conv.active() && s.profile != "avci100") {
         LongGopEncoder lge;
@@ -1563,6 +1712,36 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         lge.main = o.vctx;
         longGop = LongGopCopier::plan(p, seq, in, out, seqSpace, lge, o.oc, o.vst);
         if (longGop && !longGop->prepareStream(nullptr)) longGop.reset();
+    }
+    if (av2Out && o.vctx) {
+        // AVM at the speed preset asked (0 slowest to 6 fastest; a named one, or none, is 6), the quantiser from the
+        // CRF or the bitrate, colour and HDR stated as the delivery's.
+        Av2WriteSettings as;
+        as.container = av2Holder;
+        as.width = W;
+        as.height = H;
+        as.bits = o.vctx->pix_fmt == AV_PIX_FMT_YUV420P10LE ? 10 : 8;
+        as.fpsNum = fps.num;
+        as.fpsDen = fps.den;
+        as.speed = !s.preset.empty() && std::all_of(s.preset.begin(), s.preset.end(), [](char ch) { return ch >= '0' && ch <= '9'; })
+                       ? std::clamp(std::atoi(s.preset.c_str()), 0, 6)
+                       : 6;
+        as.crf = std::clamp(s.crf, 0, 63);
+        as.bitrate = s.videoBitrate;
+        as.gop = o.vctx->gop_size;
+        as.primaries = int(o.vctx->color_primaries);
+        as.transfer = int(o.vctx->color_trc);
+        as.matrix = int(o.vctx->colorspace);
+        if (pq) {  // (as the other codecs state them)
+            as.maxCll = maxCll, as.maxFall = maxFall;
+            as.masteringMax = peakNits, as.masteringMin = 0.0001;
+        }
+        o.av2 = std::make_unique<Av2Writer>();
+        o.av2Picture = av_frame_alloc();
+        if (!o.av2Picture) return fail("Out of memory");
+        if (!o.av2->open(s.path, as, &o.av2Error)) return fail(o.av2Error);
+        opened = true;  // (removed if the export fails after AVM's writer has finished it)
+        if (o.actx && !o.av2->addAudio(o.ast->codecpar, o.actx->time_base.num, o.actx->time_base.den, &o.av2Error)) return fail(o.av2Error);
     }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
@@ -1726,6 +1905,64 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
 
+    // AC-3 and E-AC-3 state the programme's loudness (dialnorm): the target it was normalised to, or the mix measured.
+    if (wantAudio && ac3Family) {
+        const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
+        std::vector<float> chunk(size_t(8192) * size_t(nch));
+        auto measure = [&](const std::function<void(int64_t, int, float*)>& mixAt, int64_t from) -> std::optional<int> {
+            LoudnessMeter meter(mixRate);
+            for (int64_t pos = from; pos < end;) {
+                if (cancel && cancel->load()) return std::nullopt;
+                const int n = int(std::min<int64_t>(8192, end - pos));
+                mixAt(pos, n, chunk.data());
+                meter.addChannels(chunk.data(), n, nch, weights.data());
+                pos += n;
+            }
+            const LoudnessResult r = meter.result();
+            return ac3Dialnorm(r.valid ? r.integrated : -31.0);
+        };
+        auto setDialnorm = [&](AVCodecContext* ctx, int dialnorm) {
+            if (Eac3Extended* x = extendedFor(o, ctx)) x->setDialnorm(dialnorm);
+            else if (ctx) ac3SetDialnorm(ctx, dialnorm);
+        };
+        // (each stream's own: the mix's, and each extra audio stream's; in mono tracks, each channel's track its stream's)
+        std::vector<int> stated;
+        if (o.actx || !monos.empty()) {
+            std::optional<int> d;
+            if (s.loudnessTarget < 0) {
+                d = ac3Dialnorm(s.loudnessTarget);
+            } else {
+                AudioMixer meterMixer;
+                meterMixer.setTrackMask(s.audioTracks);
+                d = measure([&](int64_t pos, int n, float* dst) { mixBlock(meterMixer, pos, n, dst); }, audioCursor);
+            }
+            if (!d) return fail("Cancelled");
+            if (o.actx) setDialnorm(o.actx, *d);
+            stated.push_back(*d);
+        }
+        for (auto& e : extras) {
+            if (!e->ctx && monos.empty()) continue;
+            std::optional<int> d;
+            if (s.loudnessTarget < 0 && e->normalise) {
+                d = ac3Dialnorm(s.loudnessTarget);
+            } else {
+                AudioMixer m;
+                m.setTrackMask(e->tracks);
+                d = measure([&](int64_t pos, int n, float* dst) {
+                    if (nch > 2) m.mixLayout(p, e->seq, pos, n, dst);
+                    else m.mix(p, e->seq, pos, n, dst);
+                }, e->cursor);
+            }
+            if (!d) return fail("Cancelled");
+            if (e->ctx) setDialnorm(e->ctx, *d);
+            stated.push_back(*d);
+        }
+        for (size_t i = 0; i < monos.size(); ++i) {
+            const size_t stream = i / size_t(std::max(1, layoutChannels));
+            if (monos[i]->ctx && !stated.empty()) setDialnorm(monos[i]->ctx, stream < stated.size() ? stated[stream] : stated.front());
+        }
+    }
+
     auto encodeFifo = [&](AVCodecContext* actx, AVStream* ast, AVFrame* aframe, std::vector<float>& fifo, int64_t& audioPts,
                           bool final) -> bool {
         const size_t nc = size_t(actx->ch_layout.nb_channels);
@@ -1770,7 +2007,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             aframe->pts = audioPts;
             audioPts += n;
             fifo.erase(fifo.begin(), fifo.begin() + long(size_t(n) * nc));
-            if (avcodec_send_frame(actx, aframe) < 0) return false;
+            if (sendFrame(o, actx, aframe) < 0) return false;
             if (drain(o, actx, ast) < 0) return false;
         }
         return true;
@@ -1856,7 +2093,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.cancel = cancel;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
-    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
+    if (wantVideo && s.smartRender && o.vctx && !av2Out && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && sameColorSpace(outSpace, seqSpace) && !trim && !sceneGraded &&
         !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
@@ -2090,6 +2327,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     } freeSecond{secondField};
     for (FrameTime f = din; f < dout; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
+        if (plugins::offlineFailureSerial() != pluginFailures)
+            return fail("Export stopped because the plug-in " + plugins::lastOfflineFailure());
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         int longGopCopied = 0;
         std::string longGopError;
@@ -2316,8 +2555,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (wantAudio) {
         if (o.actx) {
             if (!encodeAudio(true)) return fail("Audio encoding failed");
-            if ((rc = avcodec_send_frame(o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0)
-                return fail("Finishing audio failed: " + averr(rc));
+            if ((rc = sendFrame(o, o.actx, nullptr)) < 0 || (rc = drain(o, o.actx, o.ast)) < 0) {
+                const Eac3Extended* x = extendedFor(o, o.actx);
+                return fail("Finishing audio failed: " + (x && !x->error.empty() ? x->error : averr(rc)));
+            }
         }
         for (auto& mo : monos) {
             if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, true)) return fail("Audio encoding failed");
@@ -2327,14 +2568,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         for (auto& e : extras) {
             if (!e->ctx) continue;
             if (!encodeFifo(e->ctx, e->st, e->frame, e->fifo, e->pts, true)) return fail("Audio encoding failed");
-            if ((rc = avcodec_send_frame(e->ctx, nullptr)) < 0 || (rc = drain(o, e->ctx, e->st)) < 0)
+            if ((rc = sendFrame(o, e->ctx, nullptr)) < 0 || (rc = drain(o, e->ctx, e->st)) < 0)
                 return fail("Finishing audio failed: " + averr(rc));
         }
     }
     if (wantVideo) {
         std::string e;
         if (longGop && !longGop->finish(&e)) return fail(e);
-        if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
+        // (with smart rendering the parts have encoders of their own and this one is given nothing: not flushed, as
+        // an AV1 encoder that was given no picture waits for one at its end)
+        if (!longGop && ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0))
             return fail("Finishing video failed: " + videoError(o, rc));
     }
     const int copiedFrames = (smart ? smart->copied() : 0) + (longGop ? longGop->copiedFrames() : 0);
@@ -2347,6 +2590,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
+    if (o.av2) {
+        // (an MP4 states the light levels as measured, its movie box being written last)
+        if (pq && measured.frames > 0) {
+            unsigned cll = 0, fall = 0;
+            hdr10LightLevels(measured, cll, fall);
+            o.av2->setLightLevels(int(cll), int(fall));
+        }
+        if (!o.av2->finish(&o.av2Error)) return fail(o.av2Error);
+    }
     if (o.spatial) {
         // The second view's configuration and Apple's stereo boxes, which FFmpeg does not write.
         if ((rc = avio_closep(&o.oc->pb)) < 0) return fail("Writing the file failed: " + averr(rc));
@@ -2474,6 +2726,7 @@ std::string exportAudioLayout(const std::string& layout, const std::string& code
     }
     if (exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
+    if (codec == "eac3" && (layout == "7.1" || ear == "7.1")) return "7.1";  // (in two substreams, render/Ac3.h)
     if (ear != layout && exportCodecCarries(codec, ear)) return ear;
     if (layoutChannels(layout) > 6 && exportCodecCarries(codec, "5.1")) return "5.1";
     return "stereo";
@@ -2790,9 +3043,11 @@ std::string exportHwEncoder(const Sequence& seq, const ExportSettings& s, Ration
     return !c.empty() ? c : family == "hevc" ? "libx265" : "libx264";  // (no hardware encoder here)
 }
 
-bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
-                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
-                    LightLevels* light, bool* keptUnsigned) {
+namespace {
+
+bool exportSequenceOnce(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                        LightLevels* light, bool* keptUnsigned) {
     if (s.twoPass && s.pass == 0) return exportInTwoPasses(p, seq, s, progress, cancel, error, encoderUsed, smartRendered, light, keptUnsigned);
     if (!s.mxfDelivery.empty()) {
         if (keptUnsigned) *keptUnsigned = false;
@@ -2825,9 +3080,15 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
                            containerCarriesStreams(s.path);
     // Smart rendering that cannot go on as planned (HEVC copied as hvc1 whose footage is not found where it was): made
     // again, encoded whole.
+    const uint64_t pluginFailures = plugins::offlineFailureSerial();
     auto exportOnce = [&](const Sequence& q, const ExportSettings& st) {
         bool again = false;
-        if (exportImpl(p, q, st, progress, cancel, error, opened, encoderUsed, smartRendered, light, &again)) return true;
+        if (exportImpl(p, q, st, progress, cancel, error, opened, encoderUsed, smartRendered, light, &again)) {
+            // (the last blocks, after the last check)
+            if (plugins::offlineFailureSerial() == pluginFailures) return true;
+            if (error) *error = "Export stopped because the plug-in " + plugins::lastOfflineFailure();
+            return false;
+        }
         if (!again || (cancel && cancel->load())) return false;
         ExportSettings whole = st;
         whole.smartRender = false;
@@ -2891,6 +3152,34 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
             return false;
         }
     }
+    return ok;
+}
+
+}  // namespace
+
+bool exportNeedsHrdCheck(const ExportSettings& s, int copiedFrames) {
+    const std::string& c = s.videoCodec;
+    if (!s.hrdCheck || (c != "libx264" && c != "libx265" && c != "mpeg2video")) return false;
+    if (s.profile == "avci100" || s.path.find('%') != std::string::npos) return false;  // (intra only; image sequences)
+    return copiedFrames > 0 || s.hrd == "cbr" || s.hrd == "vbr";
+}
+
+bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                    const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
+                    LightLevels* light, bool* keptUnsigned, HrdReport* hrd) {
+    // (the outermost call checks: two passes export again through here)
+    static thread_local int depth = 0;
+    int copied = 0;
+    ++depth;
+    const bool ok = exportSequenceOnce(p, seq, s, progress, cancel, error, encoderUsed, &copied, light, keptUnsigned);
+    --depth;
+    if (smartRendered) *smartRendered = copied;
+    if (hrd) *hrd = HrdReport{};
+    if (!ok || depth > 0 || !exportNeedsHrdCheck(s, copied)) return ok;
+    const HrdReport r = checkHrd(s.path, cancel);
+    if (r.checked && r.signalled && !r.conforms())
+        qWarning("The export %s does not keep its buffer model: %s", s.path.c_str(), r.summary().c_str());
+    if (hrd) *hrd = r;
     return ok;
 }
 

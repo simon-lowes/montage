@@ -148,8 +148,9 @@ InterfaceDraftStats interfaceTranslationStatus(const std::string& ts) {
 }
 
 // A file dialog's filter list ("Captions (*.srt *.vtt);;All files (*)") keeps the source's patterns, whatever the
-// model made of them ("(*.Montage)", "(*. srt)"): only each filter's name is the translation's. A draft that lost or
-// merged a filter, or kept no name for one, is not kept.
+// model made of them ("(*.Montage)", "(*. srt)"): only each filter's name is the translation's, less any separator the
+// model doubled or wrote its own way (";;;", "؛"). A draft that lost or merged a filter, or kept no name for one or only
+// pieces of the patterns ("*.otio *.edl)", "WebVTT*.vtt"), is not kept.
 static bool keepFilters(const QString& src, QString& d) {
     static const QRegularExpression patterns(QStringLiteral("\\(([^()]*\\*[^()]*)\\)\\s*$"));
     const QStringList from = src.split(QStringLiteral(";;")), to = d.split(QStringLiteral(";;"));
@@ -164,7 +165,10 @@ static bool keepFilters(const QString& src, QString& d) {
         }
         QString name = to[i].trimmed();
         if (const qsizetype open = name.lastIndexOf('('); open >= 0) name = name.left(open).trimmed();
-        if (name.isEmpty()) return false;
+        auto separator = [](QChar c) { return c.isSpace() || c == ';' || c == QChar(0x061B) || c == QChar(0xFF1B); };
+        while (!name.isEmpty() && separator(name.front())) name.remove(0, 1);
+        while (!name.isEmpty() && separator(name.back())) name.chop(1);
+        if (name.isEmpty() || name.contains('*') || name.count('(') != name.count(')')) return false;
         out << name + QStringLiteral(" (") + m.captured(1) + ')';
     }
     d = out.join(QStringLiteral(";;"));
@@ -231,8 +235,9 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
         }
         // A model that met a word or sign it has no piece for writes "<unk>" in its place: that draft is garbled, so the
         // text stays in English.
-        // (and one that wrote a run of backslashes for words it could not place is garbled the same way)
-        const bool garbled = d.contains(QStringLiteral("<unk>")) || (d.contains(QStringLiteral("\\\\")) && !src.contains(QStringLiteral("\\\\")));
+        // (and one that wrote backslashes for words it could not place, a run or a single one the source has not, is
+        // garbled the same way)
+        const bool garbled = d.contains(QStringLiteral("<unk>")) || d.count('\\') > src.count('\\');
         if (d.isEmpty() || garbled || placeholders(d) != placeholders(src) || !keepFilters(src, d)) {
             ++st.skipped;
             continue;

@@ -60,6 +60,15 @@ void setShapeContents(Effect& g, const std::vector<ShapeItem>& items);
 // An item's setting at t (the kind's default when it has none).
 double shapeItemParam(const Effect& g, const ShapeItem& item, const std::string& name, FrameTime t);
 
+// A gradient's stops at t (offset 0-1, r, g, b, a): its listed stops, each keyable as params "<id>.s<i>.pos" (% of the
+// way), "<id>.s<i>.color" (.r .g .b) and "<id>.s<i>.opacity" (%), the list's values where they are not set; for a
+// gradient without a list, its two colours at its ends. Sorted by offset.
+std::vector<std::array<double, 5>> gradientStops(const Effect& g, const ShapeItem& item, FrameTime t);
+// The params of a listed gradient's stops, their defaults the list's (for the Inspector).
+std::vector<ParamInfo> gradientStopParams(const ShapeItem& item);
+// Keys every stop of a listed gradient at t to `stops` (offset 0-1, r, g, b, a), the list made as long first.
+void keyGradientStops(Effect& g, ShapeItem& item, FrameTime t, const std::vector<std::array<double, 5>>& stops);
+
 // An id not yet used in the contents (the type and a number: "rect3").
 std::string newShapeItemId(const std::vector<ShapeItem>& items, const std::string& type);
 // The item with this id anywhere in the contents, with the list it is in and where (null when there is none).

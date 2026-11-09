@@ -446,8 +446,9 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
     if (!make && present == 0) return fail("There is no DCP signing chain in " + dir.path().toStdString());
     // (and two programs at once, the app and the command-line tool sharing the folder: a lock file in it while one
     // is made, and another look once it is held)
+    // Only to make one: a chain that is only read and has a file missing is reported at once, not after a wait.
     std::optional<QLockFile> others;
-    if (present != 4 && QDir().mkpath(dir.path())) {
+    if (make && present != 4 && QDir().mkpath(dir.path())) {
         others.emplace(dir.filePath(QStringLiteral(".chain.lock")));
         others->setStaleLockTime(120000);
         if (others->tryLock(60000)) present = count();
@@ -458,9 +459,12 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
     if (present == 4) {
         CertificateChain chain;
         for (const char* name : files) {
+            // (unbuffered, and what was read wiped once copied: no copy of the private key left behind)
             QFile f(dir.filePath(QString::fromLatin1(name)));
-            if (!f.open(QIODevice::ReadOnly)) return fail("Cannot read " + f.fileName().toStdString());
-            std::string text = f.readAll().toStdString();
+            if (!f.open(QIODevice::ReadOnly | QIODevice::Unbuffered)) return fail("Cannot read " + f.fileName().toStdString());
+            QByteArray bytes = f.readAll();
+            std::string text(bytes.constData(), size_t(bytes.size()));
+            cleanse(bytes.data(), size_t(bytes.size()));
             if (text.empty()) return fail(f.fileName().toStdString() + " is empty: restore it from a backup (DKDMs need this signing chain)");
             if (std::strcmp(name, "leaf.key") == 0) chain.privateKey = std::move(text);
             else chain.certificates.push_back(std::move(text));
@@ -527,6 +531,80 @@ bool chainKeyMatches(const CertificateChain& chain, std::string* error) {
     Ptr<EVP_PKEY> key = privateKeyFrom(chain.privateKey);
     if (!key) return fail("The private key cannot be read");
     if (X509_check_private_key(leaf.get(), key.get()) != 1) return fail("The private key is not the leaf certificate's");
+    return true;
+}
+
+bool checkCertificateChain(const std::vector<std::string>& given, ChainCheck& out, std::string* error, bool allowPartial) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        ERR_clear_error();
+        return false;
+    };
+    std::vector<Ptr<X509>> certs;
+    std::vector<std::string> pems;
+    for (const std::string& text : given) {
+        for (const std::string& pem : splitCertificates(text)) {
+            Ptr<X509> c = certificateFrom(pem);
+            if (!c) return fail("A certificate cannot be read");
+            certs.push_back(std::move(c));
+            pems.push_back(pem);
+        }
+    }
+    if (certs.empty()) return fail("No certificates");
+    auto name = [](X509* c) {
+        const std::string cn = entryText(X509_get_subject_name(c), NID_commonName);
+        return cn.empty() ? nameText(X509_get_subject_name(c)) : cn;
+    };
+    // Every dnQualifier the base64 SHA-1 of the certificate's public key (PKCS #1), as ST 430-2 has it.
+    for (auto& c : certs) {
+        const std::string dnq = entryText(X509_get_subject_name(c.get()), NID_dnQualifier);
+        if (dnq.empty()) continue;
+        unsigned char* der = nullptr;
+        const int n = i2d_PublicKey(X509_get0_pubkey(c.get()), &der);
+        if (n <= 0) return fail("The public key of " + name(c.get()) + " cannot be read");
+        uint8_t md[20];
+        SHA1(der, size_t(n), md);
+        OPENSSL_free(der);
+        if (base64(md, 20) != dnq) return fail("The dnQualifier of " + name(c.get()) + " is not its public key's: the certificate has been changed");
+    }
+    int leaf = -1;
+    for (size_t i = 0; i < certs.size(); ++i) {
+        if (X509_check_ca(certs[i].get()) > 0) continue;
+        if (leaf >= 0 && X509_cmp(certs[size_t(leaf)].get(), certs[i].get()) != 0)
+            return fail("Two leaf certificates (" + name(certs[size_t(leaf)].get()) + " and " + name(certs[i].get()) + ") in one chain");
+        if (leaf < 0) leaf = int(i);
+    }
+    if (leaf < 0) return fail("No leaf certificate: every certificate given is a certificate authority");
+    if (EVP_PKEY* key = X509_get0_pubkey(certs[size_t(leaf)].get()); !key || EVP_PKEY_get_base_id(key) != EVP_PKEY_RSA || EVP_PKEY_get_bits(key) != 2048)
+        return fail("The key of " + name(certs[size_t(leaf)].get()) + " is not RSA 2048 (as ST 430-2 has it)");
+    std::vector<int> path{leaf};
+    bool complete = false;
+    for (;;) {
+        X509* c = certs[size_t(path.back())].get();
+        if (X509_check_issued(c, c) == X509_V_OK) {
+            if (X509_verify(c, X509_get0_pubkey(c)) != 1) return fail("The root " + name(c) + " does not sign itself: the certificate has been changed");
+            if (path.size() > 1 && X509_check_ca(c) <= 0) return fail("The root " + name(c) + " is not a certificate authority");
+            complete = true;
+            break;
+        }
+        int by = -1;
+        for (size_t j = 0; j < certs.size() && by < 0; ++j)
+            if (std::find(path.begin(), path.end(), int(j)) == path.end() && X509_check_issued(certs[j].get(), c) == X509_V_OK) by = int(j);
+        if (by < 0) {
+            if (!allowPartial) return fail("The chain of " + name(certs[size_t(leaf)].get()) + " stops at " + name(c) + ": its issuer is not given");
+            break;
+        }
+        X509* issuer = certs[size_t(by)].get();
+        if (X509_check_ca(issuer) <= 0) return fail(name(issuer) + " issues " + name(c) + " but is not a certificate authority");
+        if (X509_verify(c, X509_get0_pubkey(issuer)) != 1) return fail("The signature on " + name(c) + " does not hold: the certificate has been changed");
+        path.push_back(by);
+        if (path.size() > 16) return fail("The chain of " + name(certs[size_t(leaf)].get()) + " is too long");
+    }
+    ChainCheck check;
+    for (auto it = path.rbegin(); it != path.rend(); ++it) check.certificates.push_back(pems[size_t(*it)]);
+    if (!readCertificate(pems[size_t(leaf)], check.leaf, error)) return false;
+    check.complete = complete;
+    out = std::move(check);
     return true;
 }
 
@@ -660,6 +738,7 @@ bool makeKdm(const KdmSettings& s, const CertificateChain& chain, std::string& x
     const std::string thumb = thumbprintBytes(signer.get());
     std::string description = entryText(X509_get_subject_name(recipient.get()), NID_commonName);
     if (const size_t dot = description.find('.'); dot != std::string::npos) description = description.substr(dot + 1);
+    if (!s.deviceListDescription.empty()) description = s.deviceListDescription;
 
     std::string x = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
     x += "<DCinemaSecurityMessage xmlns=\"http://www.smpte-ra.org/schemas/430-3/2006/ETM\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" "
@@ -830,13 +909,15 @@ bool readKdm(const std::string& xml, const std::string& privateKey, KdmContents&
             else if (name == QLatin1String("X509SerialNumber") && up == QLatin1String("X509IssuerSerial") && stack.size() > 2 &&
                      stack[stack.size() - 3] == QLatin1String("Recipient"))
                 k.recipientSerial = text;
+            else if (name == QLatin1String("CertificateThumbprint") && up == QLatin1String("DeviceList")) k.trustedDevices.push_back(text);
+            else if (name == QLatin1String("DeviceListDescription")) k.deviceListDescription += raw;
             else if (name == QLatin1String("KeyType") && !k.keys.empty()) k.keys.back().type = text;
             else if (name == QLatin1String("KeyId") && !k.keys.empty()) parseUuid(bare(text), k.keys.back().id);
         }
     }
     if (x.hasError()) return fail("The KDM is not well-formed");
     if (twice) return fail("The KDM gives a part or a field twice");
-    for (std::string* field : {&k.cplId, &k.contentTitle, &k.annotation, &k.notValidBefore, &k.notValidAfter})
+    for (std::string* field : {&k.cplId, &k.contentTitle, &k.annotation, &k.notValidBefore, &k.notValidAfter, &k.deviceListDescription})
         *field = QString::fromStdString(*field).trimmed().toStdString();
     if (k.cplId.rfind("urn:uuid:", 0) == 0) k.cplId = k.cplId.substr(9);
     // Both parts, and only they, signed (by reference to their ids).
@@ -1017,6 +1098,7 @@ bool makeCertificateChain(const std::string&, CertificateChain&, std::string* er
 bool signerCertificateChain(CertificateChain&, std::string* error, const std::string&, bool) { return none(error); }
 bool readCertificate(const std::string&, CertificateInfo&, std::string* error) { return none(error); }
 bool chainKeyMatches(const CertificateChain&, std::string* error) { return none(error); }
+bool checkCertificateChain(const std::vector<std::string>&, ChainCheck&, std::string* error, bool) { return none(error); }
 bool signXml(std::string&, const CertificateChain&, std::string* error) { return none(error); }
 bool verifyXmlSignature(const std::string&, std::string* error, SignatureCheck*) { return none(error); }
 ContentKey newContentKey(const std::string& type, bool* ok) {

@@ -47,7 +47,10 @@ QString codecText(const std::string& encoder) {
 QString browserCodecs(const std::string& encoders) {
     QStringList out;
     for (const QString& e : QString::fromStdString(encoders).split(QStringLiteral(", "), Qt::SkipEmptyParts))
-        out << (e.contains("264") ? QStringLiteral("H.264") : e.contains("av1") ? QStringLiteral("AV1") : QStringLiteral("HEVC"));
+        out << (e.contains("264") ? QStringLiteral("H.264")
+                : e.contains("av1")  ? QStringLiteral("AV1")
+                : e.contains("vpx")  ? QStringLiteral("VP9")
+                                     : QStringLiteral("HEVC"));
     return out.join(QObject::tr(" and "));
 }
 
@@ -83,7 +86,7 @@ output::StreamSettings RemoteReviewController::loadSettings() {
     c.listen = s.value("review/listen", true).toBool();
     c.passphrase = s.value("review/passphrase").toString().toStdString();
     const QString codec = s.value("review/codec", "hevc").toString();
-    c.codec = codec == "h264" || codec == "av1" ? codec.toStdString() : "hevc";
+    c.codec = codec == "h264" || codec == "av1" || codec == "vp9" ? codec.toStdString() : "hevc";
     c.hardware = s.value("review/hardware", true).toBool();
     c.bitrateKbps = std::clamp(s.value("review/bitrateKbps", c.bitrateKbps).toInt(), 250, 200000);
     c.latencyMs = std::clamp(s.value("review/latencyMs", c.latencyMs).toInt(), 20, 8000);
@@ -93,6 +96,12 @@ output::StreamSettings RemoteReviewController::loadSettings() {
     c.keyFile = s.value("review/keyFile").toString().toStdString();
     for (const QString& ice : s.value("review/iceServers").toStringList()) c.iceServers.push_back(ice.toStdString());
     c.maxViewers = std::clamp(s.value("review/maxViewers", c.maxViewers).toInt(), 1, 64);
+    c.turnServer = s.value("review/turnServer").toString().toStdString();
+    c.turnUser = s.value("review/turnUser").toString().toStdString();
+    c.turnPassword = s.value("review/turnPassword").toString().toStdString();
+    c.relayOnly = s.value("review/relayOnly", false).toBool() && !c.turnServer.empty();
+    c.rungs = std::clamp(s.value("review/rungs", c.rungs).toInt(), 1, 3);
+    c.hdr = s.value("review/hdr", true).toBool();
     return c;
 }
 
@@ -122,6 +131,12 @@ void RemoteReviewController::saveSettings(const output::StreamSettings& c, const
     for (const std::string& i : c.iceServers) ice << qs(i);
     s.setValue("review/iceServers", ice);
     s.setValue("review/maxViewers", c.maxViewers);
+    s.setValue("review/turnServer", qs(c.turnServer));
+    s.setValue("review/turnUser", qs(c.turnUser));
+    s.setValue("review/turnPassword", qs(c.turnPassword));
+    s.setValue("review/relayOnly", c.relayOnly);
+    s.setValue("review/rungs", c.rungs);
+    s.setValue("review/hdr", c.hdr);
     s.setValue("review/maxHeight", o.maxHeight);
     s.setValue("review/rec709", o.rec709);
     s.setValue("review/audio", o.audio);
@@ -183,8 +198,11 @@ bool RemoteReviewController::start(const output::StreamSettings& settings, const
     backend->setSequence(s->id);
     output::Config config;
     config.backend = backend->name();
-    config.depth = web || settings.codec == "h264" ? 8 : 10;
-    config.rec709 = web || options.rec709;  // (browsers are sent the picture as the viewer shows it)
+    // Browsers are sent the picture as the viewer shows it, or an HDR sequence's own (10-bit) with HDR to browsers on:
+    // the review tone maps it for those that do not decode HDR.
+    const bool hdrToBrowsers = web && settings.hdr && sequenceColorSpace(*s).hdr();
+    config.depth = hdrToBrowsers || (!web && settings.codec != "h264") ? 10 : 8;
+    config.rec709 = web ? !hdrToBrowsers : options.rec709;
     config.audioChannels = options.audio ? 2 : 0;
     config.scaling = output::Config::Scaling::Fit;
     const std::vector<output::Device> devices = backend->devices();
@@ -315,7 +333,18 @@ QString RemoteReviewController::status() const {
         const QString links = viewerAddresses().join(tr(" or "));
         QString text = st.viewers > 0 ? tr("%n viewer(s) watching in a browser: %1 × %2", "", st.viewers).arg(m.width).arg(m.height)
                                       : tr("Waiting for viewers at %1 (%2 × %3)").arg(links).arg(m.width).arg(m.height);
-        if (st.viewers > 0 && !st.encoder.empty()) text += tr(", %1, %2 Mb/s each").arg(browserCodecs(st.encoder)).arg(st.kbps / 1000, 0, 'f', 1);
+        if (st.viewers > 0 && !st.encoder.empty()) text += tr(", %1, up to %2 Mb/s each").arg(browserCodecs(st.encoder)).arg(st.kbps / 1000, 0, 'f', 1);
+        if (st.viewers > 0 && st.rungViewers.size() > 1) {
+            // (each viewer at the size their connection takes)
+            QStringList sizes;
+            for (size_t i = 0; i < st.rungViewers.size(); ++i)
+                if (st.rungViewers[i] > 0) {
+                    const int w = std::max(2, (m.width >> i) & ~1), h = std::max(2, (m.height >> i) & ~1);
+                    sizes << tr("%1 at %2 × %3").arg(st.rungViewers[i]).arg(w).arg(h);
+                }
+            if (!sizes.isEmpty()) text += tr(" (%1)").arg(sizes.join(tr(", ")));
+        }
+        if (st.hdrViewers > 0) text += tr(", %n in HDR", "", st.hdrViewers);
         if (st.skipped > 0) text += tr(", %n frame(s) skipped (encoding fell behind)", "", int(std::min<int64_t>(st.skipped, 1 << 30)));
         if (!st.error.empty()) text += QStringLiteral(" (%1)").arg(qs(st.error));
         return text + tr("; %n note(s) received", "", st.markers);
@@ -336,18 +365,21 @@ QString RemoteReviewController::status() const {
 
 QByteArray RemoteReviewController::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_remote_review","title":"Live remote review",
-"description":"Streams the Program monitor to reviewers elsewhere as it plays or parks, at low latency, the timecode burnt in. Over SRT (or UDP): HEVC 10-bit (or H.264 8-bit) with stereo sound in an MPEG transport stream (AES-256 with a passphrase; Montage listening for a viewer, or calling a relay that viewers watch); viewers watch in Montage (File > Watch Remote Review) or any player that reads SRT (ffplay), and a Montage viewer's notes come back as markers. With webrtc: to any web browser, which opens a link to a page Montage serves (HTTPS) and plays H.264 (or AV1 or HEVC) with Opus sound over WebRTC, several viewers at once, each asked for the passphrase; their notes and drawings come back as markers at the frame they saw, and other WHEP players can pull the stream from /whep. \"status\": whether it is on, the viewers connected, the rate and the markers received. \"start\": settings left out are the last used (a passphrase is made when there is none; it is given back). \"stop\".",
+"description":"Streams the Program monitor to reviewers elsewhere as it plays or parks, at low latency, the timecode burnt in. Over SRT (or UDP): HEVC 10-bit (or H.264 8-bit) with stereo sound in an MPEG transport stream (AES-256 with a passphrase; Montage listening for a viewer, or calling a relay that viewers watch); viewers watch in Montage (File > Watch Remote Review) or any player that reads SRT (ffplay), and a Montage viewer's notes come back as markers. With webrtc: to any web browser, which opens a link to a page Montage serves (HTTPS) and plays H.264 (or AV1, VP9 or HEVC) with Opus sound over WebRTC, several viewers at once, each asked for the passphrase and each sent the size their connection takes (simulcast), an HDR sequence as 10-bit HDR to browsers that decode it, through a TURN relay of the user's own where one is given; their notes and drawings come back as markers at the frame they saw, and other WHEP players can pull the stream from /whep. \"status\": whether it is on, the viewers connected (at each size, and in HDR), the rate and the markers received. \"start\": settings left out are the last used (a passphrase is made when there is none; it is given back). \"stop\".",
 "inputSchema":{"type":"object","properties":{
 "action":{"type":"string","enum":["status","start","stop"]},
 "webrtc":{"type":"boolean","description":"To web browsers over WebRTC (the address https://0.0.0.0:8443 unless one is given); false: over SRT (srt://0.0.0.0:9000 unless given)"},
 "address":{"type":"string","description":"srt://0.0.0.0:9000 (listening on every address), srt://relay:port?streamid=… (with listen false), udp://host:port, or for browsers https://0.0.0.0:8443 (TCP for the page and UDP for the media, both on that port)"},
 "listen":{"type":"boolean","description":"SRT: wait for a viewer to call (true) or call the address (false)"},
 "passphrase":{"type":"string","description":"SRT's key and the marker channel's, 10 to 79 characters"},
-"codec":{"type":"string","enum":["hevc","h264","av1"],"description":"Over SRT hevc or h264; for browsers the one preferred (h264, av1 or hevc), another where a browser lacks it"},
+"codec":{"type":"string","enum":["hevc","h264","av1","vp9"],"description":"Over SRT hevc or h264; for browsers the one preferred (h264, av1, vp9 or hevc), another where a browser lacks it"},
 "ice_servers":{"type":"array","items":{"type":"string"},"description":"Browsers: STUN and TURN servers for viewers on other networks, such as stun:stun.example.com:3478 or turn:user:password@turn.example.com:3478 (none by default)"},
 "certificate":{"type":"string","description":"Browsers: a PEM certificate file for https (with key); none: one Montage makes for this computer, which browsers warn about once"},
 "key":{"type":"string","description":"Browsers: the certificate's private key (PEM, without a password)"},
 "max_viewers":{"type":"number","description":"Browsers: viewers at once (1 to 64)"},
+"simulcast":{"type":["boolean","integer"],"description":"Browsers: the picture at several sizes at once, each viewer moved between them by their own connection: true (full, half and quarter size, the default), false (full size only), or the number of sizes, 1 to 3"},
+"turn":{"type":"object","description":"Browsers: a TURN relay the user runs (RFC 8656), given to viewers' pages with the passphrase; url \"\" for none","properties":{"url":{"type":"string","description":"turn:host:3478, or turns:host:5349 over TLS"},"username":{"type":"string"},"password":{"type":"string"},"relay_only":{"type":"boolean","description":"Every viewer's media through the relay, never directly"}}},
+"hdr":{"type":"boolean","description":"Browsers: an HDR sequence (PQ or HLG) as 10-bit HDR to browsers that decode it, tone mapped to Rec. 709 for the rest (default true); false: SDR for everyone"},
 "hardware":{"type":"boolean","description":"Encode on NVENC where there is one"},
 "bitrate_kbps":{"type":"number","description":"250 to 200000"},
 "height":{"type":"number","description":"The picture scaled down to this height (0: the sequence's)"},
@@ -375,7 +407,7 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
         if (has("webrtc") && args.value("webrtc").toBool() != output::isBrowserAddress(c.address) && !has("address")) {
             c.address = args.value("webrtc").toBool() ? "https://0.0.0.0:8443" : "srt://0.0.0.0:9000";
             if (args.value("webrtc").toBool() && c.codec == "hevc") c.codec = "h264";
-            if (!args.value("webrtc").toBool() && c.codec == "av1") c.codec = "hevc";
+            if (!args.value("webrtc").toBool() && (c.codec == "av1" || c.codec == "vp9")) c.codec = "hevc";
         }
         if (has("address")) c.address = args.value("address").toString().toStdString();
         if (has("listen")) c.listen = args.value("listen").toBool();
@@ -393,6 +425,27 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
         if (has("certificate")) c.certificateFile = args.value("certificate").toString().toStdString();
         if (has("key")) c.keyFile = args.value("key").toString().toStdString();
         if (has("max_viewers")) c.maxViewers = args.value("max_viewers").toInt();
+        if (has("simulcast")) {
+            const QJsonValue v = args.value("simulcast");
+            c.rungs = v.isBool() ? (v.toBool() ? 3 : 1) : v.toInt(-1);  // (a number out of range is refused below)
+        }
+        if (has("turn")) {
+            const QJsonObject t = args.value("turn").toObject();
+            if (t.contains("url")) {
+                const std::string url = t.value("url").toString().trimmed().toStdString();
+                if (url != c.turnServer) c.turnUser.clear(), c.turnPassword.clear();  // (one relay's login never goes to another)
+                c.turnServer = url;
+            }
+            if (t.contains("username")) c.turnUser = t.value("username").toString().toStdString();
+            if (t.contains("password")) c.turnPassword = t.value("password").toString().toStdString();
+            if (t.contains("relay_only")) c.relayOnly = t.value("relay_only").toBool();
+            if (c.turnServer.empty()) {
+                c.turnUser.clear();
+                c.turnPassword.clear();
+                if (!t.contains("relay_only")) c.relayOnly = false;
+            }
+        }
+        if (has("hdr")) c.hdr = args.value("hdr").toBool();
         if (has("height")) o.maxHeight = std::clamp(args.value("height").toInt(), 0, 4320);
         if (has("rec709")) o.rec709 = args.value("rec709").toBool();
         if (has("audio")) o.audio = args.value("audio").toBool();
@@ -424,6 +477,16 @@ QString RemoteReviewController::runTool(const QJsonObject& args, QJsonObject& st
         if (st.markersPort >= 0) structured["markers_port"] = st.markersPort;
         structured["addresses"] = QJsonArray::fromStringList(viewerAddresses());
         structured["mode"] = qs(scheduler_->mode().name);
+        if (browser()) {
+            QJsonArray sizes;
+            const output::Mode& m = scheduler_->mode();
+            for (size_t i = 0; i < st.rungViewers.size(); ++i)
+                sizes.append(QJsonObject{{"width", std::max(2, (m.width >> i) & ~1)}, {"height", std::max(2, (m.height >> i) & ~1)}, {"viewers", st.rungViewers[i]}});
+            structured["sizes"] = sizes;
+            structured["hdr"] = settings_.hdr;
+            structured["hdr_viewers"] = st.hdrViewers;
+            if (!settings_.turnServer.empty()) structured["turn"] = QJsonObject{{"url", qs(settings_.turnServer)}, {"relay_only", settings_.relayOnly}};
+        }
     }
     return status();
 }
@@ -558,6 +621,47 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     maxViewers_->setRange(1, 64);
     maxViewers_->setValue(st.maxViewers);
     form->addRow(tr("Viewers at once:"), maxViewers_);
+    turn_ = new QLineEdit(qs(st.turnServer), this);
+    turn_->setObjectName(QStringLiteral("reviewStreamTurn"));
+    turn_->setPlaceholderText(tr("None"));
+    turn_->setToolTip(tr("A TURN relay you run (turn:host:3478, or turns:host:5349 over TLS), for viewers whose networks let nothing "
+                         "through directly. Reviewers' pages are given it, with its user name and password, once they give the passphrase."));
+    form->addRow(tr("TURN relay:"), turn_);
+    auto* turnLogin = new QWidget(this);
+    turnLogin->setObjectName(QStringLiteral("reviewStreamTurnLogin"));
+    auto* loginRow = new QHBoxLayout(turnLogin);
+    loginRow->setContentsMargins(0, 0, 0, 0);
+    turnUser_ = new QLineEdit(qs(st.turnUser), this);
+    turnUser_->setObjectName(QStringLiteral("reviewStreamTurnUser"));
+    turnUser_->setPlaceholderText(tr("User name"));
+    turnPassword_ = new QLineEdit(qs(st.turnPassword), this);
+    turnPassword_->setObjectName(QStringLiteral("reviewStreamTurnPassword"));
+    turnPassword_->setPlaceholderText(tr("Password"));
+    turnPassword_->setEchoMode(QLineEdit::Password);
+    loginRow->addWidget(turnUser_, 1);
+    loginRow->addWidget(turnPassword_, 1);
+    form->addRow(tr("Relay login:"), turnLogin);
+    relayOnly_ = new QCheckBox(tr("Everything through the relay (never directly)"), this);
+    relayOnly_->setObjectName(QStringLiteral("reviewStreamRelayOnly"));
+    relayOnly_->setChecked(st.relayOnly);
+    form->addRow(QString(), relayOnly_);
+    rungs_ = new QComboBox(this);
+    rungs_->setObjectName(QStringLiteral("reviewStreamRungs"));
+    rungs_->addItem(tr("Full, half and quarter size"), 3);
+    rungs_->addItem(tr("Full and half size"), 2);
+    rungs_->addItem(tr("Full size only"), 1);
+    rungs_->setCurrentIndex(std::max(0, rungs_->findData(st.rungs)));
+    rungs_->setToolTip(tr("The picture encoded at each size at once; each viewer is moved between them as their own connection allows"));
+    form->addRow(tr("Sizes:"), rungs_);
+    hdr_ = new QCheckBox(tr("HDR to browsers that show it (SDR to the rest)"), this);
+    hdr_->setObjectName(QStringLiteral("reviewStreamHdr"));
+    hdr_->setChecked(st.hdr);
+    hdr_->setToolTip(tr("An HDR sequence (PQ or HLG) goes as 10-bit HDR to browsers that say they decode it, and tone mapped to Rec. 709 "
+                        "as the viewer shows it to the rest"));
+    form->addRow(QString(), hdr_);
+    auto relayChanged = [this] { relayOnly_->setEnabled(!controller_->running() && !turn_->text().trimmed().isEmpty()); };
+    connect(turn_, &QLineEdit::textChanged, this, relayChanged);
+    relayChanged();
     connect(viewers_, &QComboBox::currentIndexChanged, this, [this] {
         // Each kind keeps its own address while the other is chosen.
         const bool web = viewers_->currentData().toBool();
@@ -621,6 +725,7 @@ void RemoteReviewPanel::viewersChanged() {
     if (web) {
         codec_->addItem(tr("H.264 (every browser)"), QStringLiteral("h264"));
         codec_->addItem(tr("AV1, where the browser plays it"), QStringLiteral("av1"));
+        codec_->addItem(tr("VP9, where the browser plays it"), QStringLiteral("vp9"));
         codec_->addItem(tr("HEVC, where the browser plays it"), QStringLiteral("hevc"));
     } else {
         codec_->addItem(tr("HEVC, 10-bit"), QStringLiteral("hevc"));
@@ -633,7 +738,8 @@ void RemoteReviewPanel::viewersChanged() {
                                   "relay; udp://host:port sends unencrypted on a local network"));
     for (QWidget* w : std::initializer_list<QWidget*>{direction_, latency_}) form_->setRowVisible(w, !web);
     form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamMarkersRow")), !web);
-    for (QWidget* w : std::initializer_list<QWidget*>{certificate_, key_, ice_, maxViewers_}) form_->setRowVisible(w, web);
+    for (QWidget* w : std::initializer_list<QWidget*>{certificate_, key_, ice_, maxViewers_, turn_, relayOnly_, rungs_, hdr_}) form_->setRowVisible(w, web);
+    form_->setRowVisible(findChild<QWidget*>(QStringLiteral("reviewStreamTurnLogin")), web);
     if (web) colour_->setCurrentIndex(0);
     colour_->setEnabled(!web && !controller_->running());
 }
@@ -653,6 +759,12 @@ output::StreamSettings RemoteReviewPanel::chosenSettings() const {
     s.keyFile = key_->text().trimmed().toStdString();
     for (const QString& i : ice_->text().split(QRegularExpression(QStringLiteral("[\\s,]+")), Qt::SkipEmptyParts)) s.iceServers.push_back(i.toStdString());
     s.maxViewers = maxViewers_->value();
+    s.turnServer = turn_->text().trimmed().toStdString();
+    s.turnUser = turnUser_->text().trimmed().toStdString();
+    s.turnPassword = turnPassword_->text().toStdString();
+    s.relayOnly = relayOnly_->isChecked() && !s.turnServer.empty();
+    s.rungs = rungs_->currentData().toInt();
+    s.hdr = hdr_->isChecked();
     return s;
 }
 
@@ -668,8 +780,9 @@ void RemoteReviewPanel::refresh() {
     const bool on = controller_->running();
     start_->setText(on ? tr("Stop") : tr("Start"));
     for (QWidget* w : std::initializer_list<QWidget*>{viewers_, address_, direction_, passphrase_, codec_, hardware_, size_, bitrate_, colour_, burn_, audio_,
-                                                      markers_, latency_, certificate_, key_, ice_, maxViewers_})
+                                                      markers_, latency_, certificate_, key_, ice_, maxViewers_, turn_, turnUser_, turnPassword_, rungs_, hdr_})
         w->setEnabled(!on);
+    relayOnly_->setEnabled(!on && !turn_->text().trimmed().isEmpty());
     markersPort_->setEnabled(!on && markers_->isChecked());
     colour_->setEnabled(!on && !viewers_->currentData().toBool());
     status_->setText(controller_->status());
@@ -685,8 +798,11 @@ void RemoteReviewPanel::refresh() {
                            .arg(at.join(tr(" or ")), qs(s.passphrase));
         if (s.certificateFile.empty() && s.address.rfind("https", 0) == 0)
             text += tr(" The browser warns about Montage's own certificate the first time: they go on to the page.");
-        if (s.iceServers.empty())
-            text += tr(" From another network they need TCP and UDP port %1 forwarded here, or an ICE server named above.").arg(qs(s.address.substr(s.address.rfind(':') + 1)));
+        if (!s.turnServer.empty())
+            text += s.relayOnly ? tr(" Their pictures go through the relay %1, never directly.").arg(qs(s.turnServer))
+                                : tr(" Their browsers are given the relay %1 for when nothing gets through directly.").arg(qs(s.turnServer));
+        else if (s.iceServers.empty())
+            text += tr(" From another network they need TCP and UDP port %1 forwarded here, or a TURN relay or ICE server named above.").arg(qs(s.address.substr(s.address.rfind(':') + 1)));
         howTo_->setText(text);
         return;
     }

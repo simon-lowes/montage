@@ -2199,6 +2199,7 @@ const PrimerEntry kProResPrimer[] = {
     {0x3306, "060e2b34010101020401050305000000"}, {0x3308, "060e2b34010101020401050110000000"},
     {0x3401, "060e2b34010101020401050306000000"}, {0x3405, "060e2b34010101050401040401000000"},
     {0x3406, "060e2b3401010105040105030b000000"}, {0x3407, "060e2b3401010105040105030c000000"},
+    {0x3217, "060e2b34010101050401030207000000"}, {0x3309, "060e2b34010101020401050307000000"},
     {0x3f09, "060e2b34010101050404040106000000"}, {0xfff0, "060e2b340101010e0420040101010000"},
     {0xffef, "060e2b340101010e0420040101020000"}, {0xffee, "060e2b340101010e0420040101030000"},
     {0xffed, "060e2b340101010e0420040101040000"},
@@ -2219,7 +2220,9 @@ int64_t ImfProResWriter::partitionFrames(EditRate r) {
 }
 
 bool ImfProResWriter::open(const std::string& path, const Uuid& asset, EditRate rate, const ProResFormat& format, std::string* error) {
-    if (format.profile < 1 || format.profile > 6 || format.width <= 0 || format.height <= 0 || format.colour.codingEquations.empty()) {
+    if (format.profile < 1 || format.profile > 6 || format.width <= 0 || format.height <= 0 || format.colour.codingEquations.empty() ||
+        format.fields < 0 || format.fields > 2 || (format.fields && format.height % 2) || (format.bits != 10 && format.bits != 12) ||
+        (format.alphaBits && (format.profile < 5 || (format.alphaBits != 8 && format.alphaBits != 16)))) {
         if (error) *error = "Not a ProRes picture IMF Application ProRes takes";
         return false;
     }
@@ -2258,8 +2261,7 @@ std::vector<uint8_t> ImfProResWriter::headerMetadata(int64_t duration) const {
                               "File Package: SMPTE RDD 44 frame wrapping of ProRes pictures"));
     const ProResFormat& f = format_;
     const ImfColour& c = f.colour;
-    // Narrow range (QE.1): black at 64 and white at 940 in ten bits, scaled to the depth.
-    const uint32_t scale = 1u << (f.bits - 10);
+    const uint32_t low = uint32_t(f.low()), high = uint32_t(f.high());
     const std::string code = coding();
     {
         Set s;
@@ -2269,9 +2271,11 @@ std::vector<uint8_t> ImfProResWriter::headerMetadata(int64_t duration) const {
         s.rational(0x3001, rate_.num, rate_.den);
         s.i64(0x3002, duration);
         s.label(0x3004, kContainer);
-        s.u8(0x320c, 0);  // full frame
+        s.u8(0x320c, f.fields ? 1 : 0);  // full frame, or separate fields (both in one element, RDD 44 7.2)
         s.u32(0x3203, uint32_t(f.width));
-        s.u32(0x3202, uint32_t(f.height));
+        s.u32(0x3202, uint32_t(f.storedHeight()));
+        // (interlaced: which field the frames code first, as RDD 44 Table 6 ties it to their interlace_mode)
+        if (f.fields) s.u32(0x3217, f.fields == 2 ? 0xffffffffu : 0u);
         s.rational(0x320e, f.aspectNum, f.aspectDen);
         s.label(0x3210, c.transfer.c_str());
         s.label(0x3201, code.c_str());
@@ -2296,20 +2300,22 @@ std::vector<uint8_t> ImfProResWriter::headerMetadata(int64_t duration) const {
             s.u32(0xffed, uint64_t(std::llround(c.minLuminance * 10000)));
         }
         if (f.rgb) {
-            // R'G'B' of the depth, opaque (no alpha in the layout).
+            // R'G'B' of the depth, opaque (no alpha in the layout) or with A of alpha's.
             Bytes layout(16, 0);
             layout[0] = 'R', layout[1] = uint8_t(f.bits), layout[2] = 'G', layout[3] = uint8_t(f.bits), layout[4] = 'B', layout[5] = uint8_t(f.bits);
-            s.u32(0x3406, 940 * scale);
-            s.u32(0x3407, 64 * scale);
+            if (f.alphaBits) layout[6] = 'A', layout[7] = uint8_t(f.alphaBits);
+            s.u32(0x3406, high);
+            s.u32(0x3407, low);
             s.u8(0x3405, 0);
             s.item(0x3401, layout);
         } else {
             s.u32(0x3301, uint32_t(f.bits));
             s.u32(0x3302, uint32_t(f.horizontalSubsampling()));
             s.u32(0x3308, 1);
-            s.u32(0x3304, 64 * scale);
-            s.u32(0x3305, 940 * scale);
-            s.u32(0x3306, 897 * scale - (scale - 1));
+            s.u32(0x3304, low);
+            s.u32(0x3305, high);
+            s.u32(0x3306, uint32_t(f.colorRange()));
+            if (f.alphaBits) s.u32(0x3309, uint32_t(f.alphaBits));
         }
         putBytes(out, setKlv(f.rgb ? 0x29 : 0x28, s));
     }
@@ -3113,7 +3119,9 @@ std::string asciiOfUtf16(const Bytes& b) {
 
 }  // namespace
 
-bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfPictureOnly, bool immersiveOnly) {
+bool ImfTrackReader::openHeader(const std::string& path, std::string* error) { return open(path, error, false, false, true); }
+
+bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfPictureOnly, bool immersiveOnly, bool headerOnly) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -3124,6 +3132,9 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     channels_ = width_ = height_ = 0;
     rate_ = {};
     op1a_ = rgba_ = j2k_ = aces_ = prores_ = cdci_ = false;
+    frameLayout_ = storedHeight_ = displayF2Offset_ = componentBits_ = horizontalSubsampling_ = alphaBits_ = 0;
+    fullRange_ = false;
+    componentLow_ = componentHigh_ = -1;
     proresProfile_ = 0;
     lengthBytes_ = -1;
     bodyFrames_.clear();
@@ -3252,6 +3263,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             }
         } else if (std::memcmp(key, essence, 12) == 0) {
             // (past the header: what it said is all there is)
+            if (headerOnly) break;
             if (imfPictureOnly && !(op1a_ && rgba_ && (j2k_ || aces_))) return fail(path + " is not an IMF picture track file");
             if (immersiveOnly && !(iab || mga || adm_)) return fail(path + " is not immersive sound");
             if (key[12] == 0x15) {
@@ -3298,7 +3310,27 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                         const auto x = it.find(tag);
                         return x != it.end() && x->second.size() == 4 ? int(std::min<uint64_t>(beOf(x->second), 65536)) : 0;
                     };
-                    width_ = size(0x3203), height_ = size(0x3202);
+                    width_ = size(0x3203), height_ = storedHeight_ = size(0x3202);
+                    if (auto l = it.find(0x320c); l != it.end() && l->second.size() == 1) frameLayout_ = l->second[0];
+                    if (auto o = it.find(0x3217); o != it.end() && o->second.size() == 4) displayF2Offset_ = int(int32_t(uint32_t(beOf(o->second))));
+                    componentBits_ = size(0x3301);
+                    horizontalSubsampling_ = size(0x3302);
+                    auto level = [&](uint16_t tag) { return it.count(tag) ? size(tag) : -1; };
+                    if (key[14] == 0x28) {
+                        alphaBits_ = size(0x3309);
+                        componentLow_ = level(0x3304), componentHigh_ = level(0x3305);
+                    } else {
+                        if (auto l = it.find(0x3401); l != it.end()) {
+                            // (an RGBA layout: code and depth pairs, ending at a zero code)
+                            for (size_t i = 0; i + 1 < l->second.size() && l->second[i]; i += 2) {
+                                const uint8_t code = l->second[i], depth = l->second[i + 1];
+                                if (code == 'R' || code == 'G' || code == 'B') componentBits_ = depth;
+                                if (code == 'A') alphaBits_ = depth;
+                            }
+                        }
+                        componentLow_ = level(0x3407), componentHigh_ = level(0x3406);
+                    }
+                    fullRange_ = componentBits_ > 0 && componentBits_ <= 16 && componentLow_ == 0 && componentHigh_ == (1 << componentBits_) - 1;
                 }
                 // Sound Montage reads: 24-bit PCM at 48 or 96 kHz.
                 if (key[14] == 0x48) {
@@ -3325,6 +3357,12 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             }
         }
         at = value + length;
+    }
+    // (ProRes, RDD 44: separate fields store a field's height, both fields in each element)
+    if (prores_ && frameLayout_ == 1) height_ = std::min(2 * storedHeight_, 65536);
+    if (headerOnly) {
+        if (!sound && !text && (rgba_ || cdci_)) kind_ = Kind::Picture;
+        return true;
     }
     // (an edit rate a frame count can be turned into a time with)
     if (!text && (rate_.num == 0 || rate_.den == 0 || rate_.value() < 1 || rate_.value() > 192000))

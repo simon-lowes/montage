@@ -7,6 +7,9 @@
 // given in pixels look the same in previews at lower resolution.
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include "core/Model.h"
 #include "media/Image.h"
 
@@ -25,10 +28,32 @@ void duotone(const Effect& e, FrameTime t, Image& img);
 void vhs(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void tiltShift(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void cameraShake(const Effect& e, FrameTime t, Image& img, double pixelScale);
-// Lens Flare (Premiere's, Resolve's Lens Flare): light from a point (on or off the frame) as a lens would scatter
-// it: a hot core and halo, a star of rays (or an anamorphic streak), a ring, and ghosts strung along the line
-// through the frame's centre. Added to the picture.
+// What VHS and Camera Shake work out for the whole frame, w x h, before they touch a pixel (for render/Processing's
+// GPU passes too). VHS: each row's shift, tearing and scanline brightness, and the frame's seed (false when it is off).
+struct VhsSetup {
+    std::vector<double> shift;
+    std::vector<float> torn, line;
+    uint32_t seed = 0;
+};
+bool vhsSetup(const Effect& e, FrameTime t, int w, int h, double pixelScale, VhsSetup& out);
+// Camera Shake's move: its offset (pixels), turn (radians) and zoom (false when it leaves the frame as it is).
+struct ShakeMove {
+    double ox = 0, oy = 0, angle = 0, zoom = 1;
+};
+bool cameraShakeMove(const Effect& e, FrameTime t, int w, int h, double pixelScale, ShakeMove& out);
+// Lens Flare: light from a point (on or off the frame) as a lens would scatter it: a hot core and halo, a star of
+// rays (or an anamorphic streak), a ring, and ghosts strung along the line through the frame's centre. Added to the
+// picture.
 void lensFlare(const Effect& e, FrameTime t, Image& img);
+// Its ghosts for a lens (0 the zoom, 1 and 2 the primes, 3 anamorphic): each one's place along the line from the light
+// through the centre (1 the centre), radius (a share of half the diagonal), strength and colour.
+struct FlareGhosts {
+    static constexpr int kMost = 6;
+    int count = 0;
+    double at[kMost], radius[kMost], strength[kMost];
+    float rgb[kMost][3];
+};
+bool lensFlareGhosts(int lens, FlareGhosts& out);
 
 // Light Rays: light above a threshold in the picture (scene light, the linear domain), tinted, streaming out from a
 // centre (Light X and Y, keyed, or the effect's mask as tracked when `follow` is on): blurred along the lines through

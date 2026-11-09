@@ -9,6 +9,9 @@
 // missing repeated, frames early dropped; a jump in the feed's clock taken as a new start), its sound placed by its
 // time against the pictures' (silence where it is missing, trimmed where it runs early), and stops when asked, after
 // a set time, or when the feed stops (pictures and sound then end together).
+// A feed can also be watched live as it records, or without recording at all (LiveFeed: its latest picture, its
+// sound's levels and its timecode), as the Source monitor and the multiviewer show it. An MPEG transport stream's
+// own time code (its video's GOP time code, as an encoder sends it over SRT, RIST or UDP) is the feed's.
 // SDI and HDMI cards (Blackmagic DeckLink) and NDI need their makers' runtimes and are not here.
 #pragma once
 
@@ -23,6 +26,11 @@
 #include <thread>
 #include <vector>
 
+#include <QImage>
+
+struct AVFrame;
+struct SwsContext;
+
 namespace montage {
 
 struct CaptureSource {
@@ -32,15 +40,18 @@ struct CaptureSource {
     std::map<std::string, std::string> options;  // FFmpeg input options ("video_size", "framerate", "latency"...)
 };
 
+class LiveFeed;
+
 struct CaptureSettings {
     CaptureSource video;
     std::optional<CaptureSource> audio;  // a sound device of its own (else the video source's sound, if any)
-    std::string path;                    // .mov or .mxf
+    std::string path;                    // .mov or .mxf; "" to watch it without recording (`live` given)
     std::string codec = "prores_hq";     // prores_proxy, prores_lt, prores, prores_hq, dnxhr_lb, dnxhr_sq, dnxhr_hq, dnxhr_hqx
     std::string timecode;                // the first frame's ("hh:mm:ss:ff"); "" the feed's own, else the time of day
     double seconds = 0;                  // stop after this long (0: when stopped)
     double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)
     std::string reel;                    // the tape's name, kept with the timecode (QuickTime's reel name)
+    double soundLatency = 0;             // seconds a sound device's sound arrives late by (its input latency): taken off (not the feed's own)
     // A range of the feed's frames by their timecode (batch capture from a deck): pictures labelled before `fromFrame`
     // are passed over; the file starts on the first labelled `fromFrame` or later, with that label as its timecode, and
     // holds the pictures up to `fromFrame + frames`, each placed by its label. Labels are frame numbers at the feed's
@@ -51,6 +62,55 @@ struct CaptureSettings {
     int64_t frames = 0;
     std::function<int64_t(double arrived)> label;
     bool labelDropFrame = false;  // `label`'s frames counted in drop frame (at 29.97)
+    // Each picture and each stretch of sound as it is recorded, on the recording thread (so kept brief: a live package
+    // copies them, render/LivePackage.h): the picture as coded into the file, its pts the frame's number there at
+    // fpsNum/fpsDen frames a second; the sound at 48 kHz, its pts the first sample's number.
+    std::function<void(const AVFrame* picture, int fpsNum, int fpsDen)> onPicture;
+    std::function<void(const AVFrame* sound)> onSound;
+    // Watched live as it records (or, with no path, instead of recording).
+    std::shared_ptr<LiveFeed> live;
+};
+
+// A feed as it is now, for watching it live: its latest picture (scaled to fit `maxWidth` by `maxHeight`), that
+// picture's number in the recording and its timecode, and the sound's peak level on each channel (held, falling 20 dB
+// a second, as a meter shows it).
+// A Recorder fills it on its own thread (CaptureSettings::live); it is read from any thread.
+class LiveFeed {
+public:
+    explicit LiveFeed(int maxWidth = 640, int maxHeight = 360);
+    ~LiveFeed();
+    LiveFeed(const LiveFeed&) = delete;
+    LiveFeed& operator=(const LiveFeed&) = delete;
+
+    struct Now {
+        QImage picture;          // (null before the first)
+        int64_t frame = -1;      // the picture's number in the recording (its first is 0)
+        std::string timecode;    // the picture's ("hh:mm:ss:ff", ';' before the frames in drop frame)
+        double fps = 0;
+        int width = 0, height = 0;  // the feed's own size
+        int64_t pictures = 0;    // pictures seen in all
+        std::vector<float> peaks;  // each channel's peak level (0 to 1), held and falling
+        bool running = false;    // pictures still coming (since begin, until the recording ended)
+    };
+    Now look() const;
+    // The timecode of picture `frame` (its number in the recording): the first's counted on at the feed's rate.
+    std::string timecodeAt(int64_t frame) const;
+    std::string firstTimecode() const;
+
+    // (from the recording thread)
+    void begin(const std::string& timecode, int fpsNum, int fpsDen);
+    void picture(const AVFrame* f);
+    void sound(const AVFrame* f);
+    void end();
+
+private:
+    mutable std::mutex m_;
+    int maxWidth_, maxHeight_;
+    Now now_;
+    std::string first_;
+    int fpsNum_ = 25, fpsDen_ = 1;
+    SwsContext* sws_ = nullptr;
+    int swsKey_[6] = {0, 0, -1, 0, 0, 0};
 };
 
 // The clock CaptureSettings::label is asked by (seconds, steady).

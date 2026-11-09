@@ -14,7 +14,7 @@ ZIP="Montage-$VERSION-windows-x64.zip"
 
 rm -rf "$OUT" "dist/$ZIP"
 mkdir -p "$OUT"
-cp "$BUILD/src/app/montage.exe" "$BUILD/src/app/montage-plugin-probe.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
+cp "$BUILD/src/app/montage.exe" "$BUILD/src/app/montage-plugin-probe.exe" "$BUILD/src/app/montage-pluginhost.exe" "$BUILD/src/montage-cli.exe" "$OUT/"
 # ONNX Runtime goes beside the programs explicitly: Windows has an older
 # onnxruntime.dll of its own in System32, which ldd (and the loader) would
 # otherwise pick. Its own dependencies are collected below.

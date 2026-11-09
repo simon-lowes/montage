@@ -177,8 +177,9 @@ void ParametricEq::set(double sr, const std::vector<EqBand>& bands, double outpu
     const size_t n = std::min(bands.size(), size_t(kMaxBands));
     if (sr != sr_) {
         stages_.clear();
-        solo_ = soloOut_ = Stage{};
-        soloMix_ = soloOutMix_ = 0;
+        solo_ = Stage{};
+        soloOut_.fill(Stage{});
+        soloMix_ = 0;
         primed_ = false;
     }
     // (room for every stage there can be, kept from then on: set is called every block while a setting is keyframed)
@@ -219,13 +220,19 @@ void ParametricEq::set(double sr, const std::vector<EqBand>& bands, double outpu
         if (soloMix_ <= 0) {
             solo_.clear();
         } else if (id != solo_.id) {
-            // Moved to another band while held: the one it was on fades out as the new one fades in (back to the one
-            // still fading out, the two change places; a third so soon, the fainter of the two let go).
-            if (soloOutMix_ > 0 && id == soloOut_.id) {
-                std::swap(solo_, soloOut_);
-                std::swap(soloMix_, soloOutMix_);
+            // Moved to another band while held: the one it was on fades out as the new one fades in (back to one still
+            // fading out, the two change places; with every place taken, four moves within one fade, the faintest let
+            // go).
+            Stage was = solo_;
+            was.mix = soloMix_;
+            const auto back = std::find_if(soloOut_.begin(), soloOut_.end(), [&](const Stage& o) { return o.mix > 0 && o.id == id; });
+            if (back != soloOut_.end()) {
+                solo_ = *back;
+                soloMix_ = back->mix;
+                *back = was;
             } else {
-                if (soloMix_ >= soloOutMix_) soloOut_ = solo_, soloOutMix_ = soloMix_;
+                const auto faintest = std::min_element(soloOut_.begin(), soloOut_.end(), [](const Stage& x, const Stage& y) { return x.mix < y.mix; });
+                if (faintest->mix <= was.mix) *faintest = was;
                 solo_.clear();
                 soloMix_ = 0;
             }
@@ -234,7 +241,10 @@ void ParametricEq::set(double sr, const std::vector<EqBand>& bands, double outpu
         solo_.id = id;
     }
     soloing_ = soloNow;
-    if (!primed_) soloMix_ = soloing_ ? 1 : 0, soloOutMix_ = 0;
+    if (!primed_) {
+        soloMix_ = soloing_ ? 1 : 0;
+        for (Stage& o : soloOut_) o.mix = 0;
+    }
     output_ = dbToLin(outputDb);
     sr_ = sr;
 }
@@ -280,28 +290,36 @@ void ParametricEq::process(float* buf, int frames) {
             st.mix = st.on ? std::min(1.0f, st.mix + step) : std::max(0.0f, st.mix - step);
         }
         v[0] *= output_, v[1] *= output_;
-        if (soloing_ || soloMix_ > 0 || soloOutMix_ > 0) {
+        const bool fading = soloOut_[0].mix > 0 || soloOut_[1].mix > 0 || soloOut_[2].mix > 0;
+        if (soloing_ || soloMix_ > 0 || fading) {
             float w[2] = {f[0], f[1]};
             solo_.run(w);
-            if (soloing_ && soloMix_ >= 1 && soloOutMix_ <= 0) {
+            if (soloing_ && soloMix_ >= 1 && !fading) {
                 v[0] = w[0], v[1] = w[1];
             } else {
-                float u[2] = {f[0], f[1]};
-                if (soloOutMix_ > 0) soloOut_.run(u);
-                for (int ch = 0; ch < 2; ++ch) v[ch] += (w[ch] - v[ch]) * soloMix_ + (u[ch] - v[ch]) * soloOutMix_;
+                float d[2] = {(w[0] - v[0]) * soloMix_, (w[1] - v[1]) * soloMix_};
+                for (Stage& o : soloOut_) {
+                    if (o.mix <= 0) continue;
+                    float u[2] = {f[0], f[1]};
+                    o.run(u);
+                    for (int ch = 0; ch < 2; ++ch) d[ch] += (u[ch] - v[ch]) * o.mix;
+                    o.mix = std::max(0.0f, o.mix - step);
+                }
+                v[0] += d[0], v[1] += d[1];
                 soloMix_ = soloing_ ? std::min(1.0f, soloMix_ + step) : std::max(0.0f, soloMix_ - step);
-                soloOutMix_ = std::max(0.0f, soloOutMix_ - step);
             }
         }
         f[0] = v[0], f[1] = v[1];
     }
     // (a filter no longer heard put at rest, as it would be made when next heard)
     if (!soloing_ && soloMix_ <= 0) solo_.clear();
-    if (soloOutMix_ <= 0) soloOut_.clear();
+    for (Stage& o : soloOut_)
+        if (o.mix <= 0) o.clear();
     for (Stage& st : stages_)
         if (!st.on && st.mix <= 0) st.clear();
-    for (Stage* st : {&solo_, &soloOut_})
-        for (Biquad& b : st->sections) b.flushTiny();
+    for (Biquad& b : solo_.sections) b.flushTiny();
+    for (Stage& o : soloOut_)
+        for (Biquad& b : o.sections) b.flushTiny();
     for (Stage& st : stages_)
         for (Biquad& b : st.sections) b.flushTiny();
     primed_ = primed_ || frames > 0;
@@ -311,14 +329,29 @@ bool ParametricEq::atRest() const {
     auto still = [](const Stage& st) {
         return std::all_of(st.sections.begin(), st.sections.end(), [](const Biquad& b) { return !b.z1[0] && !b.z1[1] && !b.z2[0] && !b.z2[1]; });
     };
-    return still(solo_) && still(soloOut_) && std::all_of(stages_.begin(), stages_.end(), still);
+    return still(solo_) && std::all_of(soloOut_.begin(), soloOut_.end(), still) && std::all_of(stages_.begin(), stages_.end(), still);
 }
 
 std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo) {
     std::vector<EqBand> out;
+    eqBandsOf(e, t, out, solo);
+    return out;
+}
+
+void eqBandsOf(const Effect& e, int64_t t, std::vector<EqBand>& out, int* solo) {
+    out.clear();
+    if (out.capacity() < size_t(ParametricEq::kMaxBands)) out.reserve(size_t(ParametricEq::kMaxBands));
     const std::string audition = e.s("audition");
     if (solo) *solo = -1;
-    for (const std::string& band : eqBands(e)) {
+    // (the bands it has, as eqBands finds them, by slot: low, b1 to b16, high; the names short enough to need no room)
+    std::array<bool, kEqMaxBands + 2> have{};
+    std::string band;
+    for (const auto& kv : e.params)
+        if (isEqBandParam(kv.first, &band))
+            if (const int slot = eqBandSlot(band); slot >= 0 && slot < int(have.size())) have[size_t(slot)] = true;
+    for (int slot = 0; slot < int(have.size()); ++slot) {
+        if (!have[size_t(slot)]) continue;
+        band = slot == 0 ? std::string("low") : slot == kEqMaxBands + 1 ? std::string("high") : 'b' + std::to_string(slot);
         EqBand b;
         const int type = eqBandType(e, band);
         b.shape = EqShape(type);
@@ -332,7 +365,6 @@ std::vector<EqBand> eqBandsOf(const Effect& e, int64_t t, int* solo) {
         out.push_back(b);
         if (int(out.size()) == ParametricEq::kMaxBands) break;
     }
-    return out;
 }
 
 // ---- De-esser ----------------------------------------------------------------

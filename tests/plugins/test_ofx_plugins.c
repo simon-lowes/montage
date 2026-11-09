@@ -15,7 +15,8 @@
  * with a yellow cross through it; a press within the square and a drag move Centre. With MONTAGE_TEST_OFX_GL defined,
  * Test Invert also renders with OpenGL (the same formula in a shader) and has OpenGL on-screen controls: a green
  * square from canonical (100, 100) to (200, 200).
- * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist. */
+ * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist.
+ * Test Invert misbehaves on request when rendering (test_fault.h, call "render"). */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +25,8 @@
 #else
 #include <signal.h>
 #endif
+
+#include "test_fault.h"
 
 #include "ofxColour.h"
 #include "ofxCore.h"
@@ -390,6 +393,7 @@ static OfxStatus mainInvert(const char* action, const void* handle, OfxPropertyS
     if (!strcmp(action, kOfxActionOpenGLContextAttached)) return glAttached();
     if (!strcmp(action, kOfxActionOpenGLContextDetached)) return glDetached();
     if (!strcmp(action, kOfxImageEffectActionRender)) {
+        montage_test_fault("render", NULL, 0);
         int enabled = 0;
         gProp->propGetInt(in, kOfxImageEffectPropOpenGLEnabled, 0, &enabled);
         if (enabled) return renderInvertGl(effect, in);
@@ -397,7 +401,12 @@ static OfxStatus mainInvert(const char* action, const void* handle, OfxPropertyS
 #endif
     if (!strcmp(action, kOfxActionDescribe)) return describe(effect, "Test Invert", 0);
     if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeInContext(effect, 1);
-    if (!strcmp(action, kOfxImageEffectActionRender)) return render(effect, in, 1);
+    if (!strcmp(action, kOfxImageEffectActionRender)) {
+#ifndef MONTAGE_TEST_OFX_GL
+        montage_test_fault("render", NULL, 0);
+#endif
+        return render(effect, in, 1);
+    }
     return kOfxStatReplyDefault;
 }
 

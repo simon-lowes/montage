@@ -27,6 +27,7 @@
 #include "SurroundPanner.h"
 #include "core/Automation.h"
 #include "core/Surround.h"
+#include "core/TrackGroups.h"
 #include "Theme.h"
 
 namespace montage {
@@ -1060,12 +1061,44 @@ void MixerPanel::refresh() {
     showHeld();
 }
 
+std::vector<int> MixerPanel::groupedStrips(int index, GroupSwitch sw) const {
+    std::vector<int> out;
+    const Sequence* s = state_->sequence();
+    if (!s || index >= int(s->audioTracks.size())) return out;
+    // Written through the group only with its automation switch on too.
+    if (!activeGroup(*s, s->audioTracks[size_t(index)], GroupSwitch::Automation)) return out;
+    for (TrackRef r : groupTracks(*s, {TrackKind::Audio, index}, sw))
+        if (r.kind == TrackKind::Audio && r.index != index && r.index < int(strips_.size())) out.push_back(r.index);
+    return out;
+}
+
+bool MixerPanel::groupHeld(int index, GroupSwitch sw, bool pan) const {
+    for (int m : groupedStrips(index, sw))
+        if (pan ? strips_[size_t(m)].pan->isSliderDown() : strips_[size_t(m)].fader->isSliderDown()) return true;
+    return false;
+}
+
 void MixerPanel::setVolume(int index, double db) {
     if (index < int(strips_.size()))
         strips_[index].dbLabel->setText(dbText(db));
     // While automation is written the recorder samples the faders; nothing else is edited meanwhile.
     if (recordingAutomation()) {
-        if (std::none_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; })) refresh();
+        auto it = std::find_if(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; });
+        if (it == recording_.end()) {
+            refresh();
+            return;
+        }
+        // A grouped track's faders (volume and automation switches) move by as much, so the pass writes theirs too.
+        const double delta = db - it->shownDb;
+        it->shownDb = db;
+        for (int m : groupedStrips(index, GroupSwitch::Volume)) {
+            auto rm = std::find_if(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == m; });
+            if (rm == recording_.end() || automationTrims(rm->mode) != automationTrims(it->mode)) continue;
+            rm->shownDb = std::clamp(rm->shownDb + delta, -60.0, 12.0);
+            const QSignalBlocker block(strips_[size_t(m)].fader);
+            strips_[size_t(m)].fader->setValue(int(std::lround(rm->shownDb * 10.0)));
+            strips_[size_t(m)].dbLabel->setText(dbText(rm->shownDb));
+        }
         return;
     }
     if (const Sequence* seq = state_->sequence(); seq && index < int(seq->audioTracks.size())) {
@@ -1079,8 +1112,20 @@ void MixerPanel::setVolume(int index, double db) {
         [index, db, at](Project&, Sequence& s) {
             if (index >= int(s.audioTracks.size()))
                 return false;
-            Track& t = s.audioTracks[size_t(index)];
-            return setFaderLane(t.volumeAuto, t.volumeDb, t.volumeTrim, trackAutomation(t), at, db);
+            // The tracks of its group (volume switch) move by the same number of decibels, keeping their offsets: by
+            // less when one of them would go past the top of its fader.
+            std::vector<TrackRef> members = groupTracks(s, {TrackKind::Audio, index}, GroupSwitch::Volume);
+            std::erase_if(members, [](TrackRef r) { return r.kind != TrackKind::Audio; });
+            double delta = db - faderShows(s.audioTracks[size_t(index)], double(at));
+            for (TrackRef r : members)
+                if (const double v = faderShows(*trackAt(s, r), double(at)); delta > 0 && v < 12) delta = std::min(delta, 12 - v);
+            bool changed = false;
+            for (TrackRef r : members) {
+                Track& t = *trackAt(s, r);
+                const double v = r.index == index && delta == db - faderShows(t, double(at)) ? db : faderShows(t, double(at)) + delta;
+                changed |= setFaderLane(t.volumeAuto, t.volumeDb, t.volumeTrim, trackAutomation(t), at, v);
+            }
+            return changed;
         },
         mergeKey_.isEmpty() ? QStringLiteral("track-volume-%1").arg(index) : mergeKey_);
     if (!ok)
@@ -1091,7 +1136,22 @@ void MixerPanel::setPan(int index, double pan) {
     if (index < int(strips_.size()))
         strips_[index].panLabel->setText(panText(int(std::lround(pan * 100.0))));
     if (recordingAutomation()) {
-        if (std::none_of(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; })) refresh();
+        auto it = std::find_if(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == index; });
+        if (it == recording_.end()) {
+            refresh();
+            return;
+        }
+        // A grouped track's pans (pan and automation switches) move by as much.
+        const double delta = pan - it->shownPan;
+        it->shownPan = pan;
+        for (int m : groupedStrips(index, GroupSwitch::Pan)) {
+            auto rm = std::find_if(recording_.begin(), recording_.end(), [&](const Recording& r) { return r.track == m; });
+            if (rm == recording_.end()) continue;
+            rm->shownPan = std::clamp(rm->shownPan + delta, -1.0, 1.0);
+            const QSignalBlocker block(strips_[size_t(m)].pan);
+            strips_[size_t(m)].pan->setValue(int(std::lround(rm->shownPan * 100.0)));
+            strips_[size_t(m)].panLabel->setText(panText(strips_[size_t(m)].pan->value()));
+        }
         return;
     }
     if (const Sequence* seq = state_->sequence(); seq && index < int(seq->audioTracks.size())) {
@@ -1104,16 +1164,24 @@ void MixerPanel::setPan(int index, double pan) {
         [index, pan, at](Project&, Sequence& s) {
             if (index >= int(s.audioTracks.size()))
                 return false;
-            Track& t = s.audioTracks[size_t(index)];
-            if (t.panAuto.animated() && readsLanes(t)) {
-                if (t.panAuto.at(at) == pan && t.panAuto.keyAt(at)) return false;
-                t.panAuto.set(at, pan);
-                return true;
+            // The tracks of its group (pan switch) move by as much.
+            const double delta = pan - trackPanAt(s.audioTracks[size_t(index)], double(at));
+            bool changed = false;
+            for (TrackRef r : groupTracks(s, {TrackKind::Audio, index}, GroupSwitch::Pan)) {
+                if (r.kind != TrackKind::Audio) continue;
+                Track& t = *trackAt(s, r);
+                const double v = r.index == index ? pan : std::clamp(trackPanAt(t, double(at)) + delta, -1.0, 1.0);
+                if (t.panAuto.animated() && readsLanes(t)) {
+                    if (t.panAuto.at(at) == v && t.panAuto.keyAt(at)) continue;
+                    t.panAuto.set(at, v);
+                    changed = true;
+                    continue;
+                }
+                if (t.pan == v) continue;
+                t.pan = v;
+                changed = true;
             }
-            if (t.pan == pan)
-                return false;
-            t.pan = pan;
-            return true;
+            return changed;
         },
         mergeKey_.isEmpty() ? QStringLiteral("track-pan-%1").arg(index) : mergeKey_);
     if (!ok)
@@ -1121,10 +1189,10 @@ void MixerPanel::setPan(int index, double pan) {
 }
 
 void MixerPanel::setAutomationMode(int index, int mode) {
+    // (With its group's tracks, through the group's automation switch.)
     state_->edit(tr("Automation Mode"), [index, mode](Project&, Sequence& s) {
-        if (index >= int(s.audioTracks.size()) || s.audioTracks[size_t(index)].automation == mode) return false;
-        s.audioTracks[size_t(index)].automation = mode;
-        return true;
+        if (index >= int(s.audioTracks.size())) return false;
+        return edit::setTrackAutomationMode(s, {TrackKind::Audio, index}, mode).ok;
     });
 }
 
@@ -1458,21 +1526,24 @@ void MixerPanel::playbackPosition(FrameTime t) {
         if (r.track >= int(strips_.size())) continue;
         Strip& st = strips_[size_t(r.track)];
         const double db = st.fader->value() / 10.0, pan = st.pan->value() / 100.0;
-        const double showDb = r.volume.tick(t, db, st.fader->isSliderDown());
-        const double showPan = r.pan.tick(t, pan, st.pan->isSliderDown());
+        // Held, or a grouped track's control held (its move moves this one: setVolume, setPan).
+        const bool faderDown = st.fader->isSliderDown() || groupHeld(r.track, GroupSwitch::Volume, false);
+        const bool panDown = st.pan->isSliderDown() || groupHeld(r.track, GroupSwitch::Pan, true);
+        const double showDb = r.volume.tick(t, db, faderDown);
+        const double showPan = r.pan.tick(t, pan, panDown);
         // Not writing: the fader shows (and the mix plays) the automation that was there.
-        if (!r.volume.writing() && !st.fader->isSliderDown()) {
+        if (!r.volume.writing() && !faderDown) {
             const QSignalBlocker block(st.fader);
             st.fader->setValue(int(std::lround(std::clamp(showDb, -60.0, 12.0) * 10.0)));
             st.dbLabel->setText(dbText(showDb));
         }
-        if (!r.pan.writing() && !st.pan->isSliderDown()) {
+        if (!r.pan.writing() && !panDown) {
             const QSignalBlocker block(st.pan);
             st.pan->setValue(int(std::lround(std::clamp(showPan, -1.0, 1.0) * 100.0)));
             st.panLabel->setText(panText(st.pan->value()));
         }
-        r.shownDb = r.volume.writing() || st.fader->isSliderDown() ? db : showDb;
-        r.shownPan = r.pan.writing() || st.pan->isSliderDown() ? pan : showPan;
+        r.shownDb = r.volume.writing() || faderDown ? db : showDb;
+        r.shownPan = r.pan.writing() || panDown ? pan : showPan;
         Live lv{r.track, r.volume.writing(), r.pan.writing(), db, pan};
         lv.trim = automationTrims(r.mode);
         if (r.surround) {
@@ -1767,8 +1838,19 @@ void MixerPanel::setMute(int index, bool on) {
     if (recordingAutomation()) {
         // Written as a switch from this change (Latch and Touch), or all along (Write).
         const QString id = QStringLiteral("track-mute-%1").arg(index);
-        if (recordingLane(id)) touched_.insert(id);
-        else refresh();
+        if (!recordingLane(id)) {
+            refresh();
+            return;
+        }
+        touched_.insert(id);
+        // A grouped track's mute (mute and automation switches) switches with it, and is written too.
+        for (int m : groupedStrips(index, GroupSwitch::Mute)) {
+            const QString other = QStringLiteral("track-mute-%1").arg(m);
+            if (!recordingLane(other)) continue;
+            const QSignalBlocker block(strips_[size_t(m)].mute);
+            strips_[size_t(m)].mute->setChecked(on);
+            touched_.insert(other);
+        }
         return;
     }
     // On a track reading a mute lane the button switches the lane at the playhead (to its next point), as the fader
@@ -1776,13 +1858,19 @@ void MixerPanel::setMute(int index, bool on) {
     const FrameTime at = state_->playhead();
     const bool ok = state_->edit(on ? tr("Mute Track") : tr("Unmute Track"), [index, on, at](Project&, Sequence& s) {
         if (index >= int(s.audioTracks.size())) return false;
-        Track& t = s.audioTracks[size_t(index)];
-        const bool lane = readsLanes(t) && t.muteAuto.animated();
-        if (trackMutedAt(t, double(at)) == on) return false;
-        if (!on && t.muted) t.muted = false;
-        if (lane && laneMuted(t.muteAuto, false, double(at)) != on) switchFrom(t.muteAuto, at, on ? 1 : 0);
-        else if (on) t.muted = true;
-        return true;
+        // With its group's tracks (mute switch).
+        bool changed = false;
+        for (TrackRef r : groupTracks(s, {TrackKind::Audio, index}, GroupSwitch::Mute)) {
+            if (r.kind != TrackKind::Audio) continue;
+            Track& t = *trackAt(s, r);
+            const bool lane = readsLanes(t) && t.muteAuto.animated();
+            if (trackMutedAt(t, double(at)) == on) continue;
+            if (!on && t.muted) t.muted = false;
+            if (lane && laneMuted(t.muteAuto, false, double(at)) != on) switchFrom(t.muteAuto, at, on ? 1 : 0);
+            else if (on) t.muted = true;
+            changed = true;
+        }
+        return changed;
     });
     if (!ok)
         refresh();
@@ -1804,10 +1892,8 @@ void MixerPanel::setSolo(int index, bool on) {
         return;
     }
     const bool ok = state_->edit(on ? tr("Solo Track") : tr("Unsolo Track"), [index, on](Project&, Sequence& s) {
-        if (index >= int(s.audioTracks.size()) || s.audioTracks[index].solo == on)
-            return false;
-        s.audioTracks[index].solo = on;
-        return true;
+        if (index >= int(s.audioTracks.size())) return false;
+        return edit::setTrackSoloed(s, {TrackKind::Audio, index}, on).ok;  // (with its group's tracks: mute switch)
     });
     if (!ok)
         refresh();

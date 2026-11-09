@@ -6640,7 +6640,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Motion Deblur uses NAFNet (MIT, trained on the GoPro dataset, CC BY 4.0), an image model that runs on this computer. It takes seconds a frame, so the monitors show it once the frames are rendered (Sequence › Render In to Out); exports always include it.</source>
-        <translation type="unfinished">Deblur 运动使用 NAFNet (MIT, 接受过 GoPro 数据集培训, CC BY 4. 0) , 一种运行于此计算机的图像模型。 它需要几秒钟, 显示器在框架完成后显示( 序列 \ ender in off); 出口中总是包含它 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Depth</source>
@@ -7132,7 +7132,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 cannot be written</source>
-        <translation type="unfinished">\ %1 无法写入</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 damaged bytes in the middle were skipped</source>
@@ -8429,7 +8429,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Moved %1 captions to the top, clear of titles</source>
-        <translation type="unfinished">将 \ { %1 标题移到顶部, 清除标题</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No caption is over a low title</source>
@@ -8453,7 +8453,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 of %2 captions break the reading limits</source>
-        <translation type="unfinished">\ %1 的 %2 标题打破读数限制</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>All %1 captions are within the reading limits</source>
@@ -9031,7 +9031,7 @@ Download it now?</source>
     </message>
     <message>
         <source>the %1 selected captions</source>
-        <translation type="unfinished">\ %1 选中的字幕</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Move %1 by (seconds, or frames, negative for earlier):</source>
@@ -10766,7 +10766,7 @@ Download it now?</source>
     <name>montage::EditorState</name>
     <message>
         <source>This project is open read-only (File › Edit Project to make changes)</source>
-        <translation type="unfinished">此工程只打开只读 (文件 \ 编辑工程以进行修改)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Read-only: %1 is editing this project</source>
@@ -11992,7 +11992,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Add to Queue</source>
-        <translation type="unfinished">添加到 \ ueue</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Render it later from the Render Queue panel, and keep editing</source>
@@ -13687,7 +13687,7 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
     </message>
     <message>
         <source>◀ Track</source>
-        <translation type="unfinished">\ 音轨</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track the surface under the corners backwards from the playhead</source>
@@ -15936,7 +15936,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>%1 connected</source>
-        <translation type="unfinished">\ %1 已连接</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Tangent panels connected</source>
@@ -18520,7 +18520,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Transform › </source>
-        <translation type="unfinished">变换 \ \ \ \ \ \ \ \ \ \ \ </translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Setting:</source>
@@ -19918,7 +19918,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>Queue Versions</source>
-        <translation type="unfinished">\ ueue 版本</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>LTC runs at 23.976, 24, 25, 29.97 or 30 frames a second (or twice that)</source>
@@ -20084,7 +20084,7 @@ Take it over and edit it?</source>
     </message>
     <message>
         <source>DCP %1 made, but this FFmpeg has no OpenJPEG, so the pictures are not in the DCI profile most cinema servers need</source>
-        <translation type="unfinished">DCP \ %1 已经制作, 但此 FFmpeg 没有 OpenJPEG, 所以图片不在 DCP 配置文件中 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source> It is encrypted: make KDMs for the cinemas&apos; servers with File › Make KDMs (its keys are kept in %1).</source>
@@ -20588,7 +20588,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>Encrypt (cinemas need a KDM to play it: File › Make KDMs…)</source>
-        <translation type="unfinished">加密( 辛玛斯需要 KDM 来播放 : 文件 \ make KDMs...)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>This build has no OpenSSL</source>
@@ -21171,7 +21171,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Create and Queue</source>
-        <translation type="unfinished">创建和 \ ueue</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 s</source>
@@ -21523,7 +21523,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>; %1 video tracks, %2 clips, %3 dissolves linked to the original files</source>
-        <translation type="unfinished">; ++ %1 视频轨迹, + %2 剪辑, \ %3 溶解到与原始文件连接的</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>AAF (*.aaf)</source>
@@ -22251,6 +22251,10 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>ProRes:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-in &amp;Hosting…</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -23366,7 +23370,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>%1 connected</source>
-        <translation type="unfinished">\ %1 已连接</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>MIDI Learn: move a control on %1, then click a parameter (or the other way round)</source>
@@ -23845,7 +23849,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>%1 (bus; right-click to rename or delete)</source>
-        <translation type="unfinished">\ %1 (公交车; 右键单击以重命名或删除)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Track Volume</source>
@@ -24059,7 +24063,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>The downloaded %1 is damaged (its checksum does not match)</source>
-        <translation type="unfinished">下载的 \ { %1 损坏( 校验和不匹配)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Cannot save %1</source>
@@ -24663,7 +24667,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>Put a multicam clip under the playhead (Media › Create Multicam Clip) to switch angles here.</source>
-        <translation type="unfinished">在播放头下放一个多相片夹(Media \ 创建多相片剪切), 以便在此切换角度 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Live: click an angle or press 1–%1 to cut to it.</source>
@@ -25382,6 +25386,77 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Plugin Settings</source>
         <translation type="unfinished">插件设置</translation>
     </message>
+    <message>
+        <source>The editor of %1 is open in a window of its own, as the plug-in runs in a plug-in host. Closing either window closes the editor.</source>
+        <translation type="unfinished"></translation>
+    </message>
+</context>
+<context>
+    <name>montage::PluginFailureBar</name>
+    <message>
+        <source>Restart</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start the plug-in again in a new host, with its last settings</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Disable</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Keep the plug-in bypassed and turn it off in Tools › Audio Plugins (projects keep it)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation type="unfinished">关闭</translation>
+    </message>
+    <message>
+        <source>%1 stopped responding</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 used more memory than the limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 crashed while loading and is blocked</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 crashed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Rescan it in Tools › Audio Plugins to try it again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>It is bypassed; playback carries on.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>It was started again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>%1 in its plug-in host at %2.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>(%n time(s) this session)</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
+    <message numerus="yes">
+        <source>%n other plug-in(s) also failed (montage_plugins lists them).</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
+    </message>
 </context>
 <context>
     <name>montage::PluginManagerDialog</name>
@@ -25477,12 +25552,6 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
         <source>Blocked: %1</source>
         <translation type="unfinished">封锁: %1</translation>
     </message>
-    <message numerus="yes">
-        <source>%n plugin(s) found, %1 ready to use, %2 blocked. Plugins are loaded in a separate process while scanning, so one that crashes is blocked instead of closing Montage.</source>
-        <translation type="unfinished">
-            <numerusform></numerusform>
-        </translation>
-    </message>
     <message>
         <source>Scanning…</source>
         <translation type="unfinished">扫描中…</translation>
@@ -25514,6 +25583,116 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     <message>
         <source>Add Plugin Folder</source>
         <translation type="unfinished">添加插件文件夹</translation>
+    </message>
+    <message>
+        <source>Plug-in Hosting</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Plug-ins run in plug-in host processes of their own, so one that crashes, stops responding or uses too much memory is bypassed and started again instead of closing Montage. ARA plug-ins always run in Montage&apos;s own process.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Each plug-in in a host of its own (recommended)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>One host for each maker</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>All plug-ins in one host</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>In Montage&apos;s own process (off)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Instances of one plug-in share its host. Fewer hosts use less memory; a fault then reaches every plug-in in the same host.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Run plug-ins:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> audio blocks</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>During playback, a plug-in that is late with this many blocks in a row is stopped and bypassed (each late block passes meanwhile).</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stopped responding after:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Its input (delayed by its latency)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Silence</source>
+        <translation type="unfinished">安静</translation>
+    </message>
+    <message>
+        <source>A bypassed plug-in gives:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> MB</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>No limit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Stop a host using more than:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> s</source>
+        <translation type="unfinished"> 区域</translation>
+    </message>
+    <message>
+        <source>An export waits this long for a slow plug-in, then stops and names it.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>An export waits up to:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Times a session each plug-in is started again by itself after failing; after that it stays bypassed until you choose Restart.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Start a failed plug-in again:</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The plug-in host program is missing from this installation: plug-ins run in Montage&apos;s own process.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Changes apply to plug-ins loaded from now on.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hosting…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>How plug-ins run in host processes of their own, and what happens when one fails</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message numerus="yes">
+        <source>%n plugin(s) found, %1 ready to use, %2 blocked. Plugins are loaded in a separate process while scanning, so one that crashes is blocked instead of closing Montage, and run in plug-in hosts of their own while you work (Hosting…).</source>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+        </translation>
     </message>
 </context>
 <context>

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,8 @@ namespace {
 
 // Whole-frame passes one opcode list may cost (see the appliers).
 constexpr double kFramePassBudget = 16;
+
+bool stopped(const std::atomic<bool>* cancel) { return cancel && cancel->load(std::memory_order_relaxed); }
 
 // Big-endian reads from an opcode's parameters (opcode lists are always big-endian).
 struct Reader {
@@ -131,10 +134,10 @@ float sampleCubic(const float* src, int width, int height, int planes, int plane
     return float(sum);
 }
 
-void applyWarp(const WarpParams& w, float* pixels, int width, int height, int planes) {
+void applyWarp(const WarpParams& w, float* pixels, int width, int height, int planes, const std::atomic<bool>* cancel) {
     const std::vector<float> src(pixels, pixels + size_t(width) * size_t(height) * size_t(planes));
     parallelRows(height, [&](int y0, int y1) {  // (rows on every core: a camera's lens warp on each CinemaDNG frame)
-        for (int y = y0; y < y1; ++y)
+        for (int y = y0; y < y1 && !stopped(cancel); ++y)
             for (int x = 0; x < width; ++x)
                 for (int p = 0; p < planes; ++p) {
                     double sx, sy;
@@ -217,25 +220,33 @@ bool greenAt(uint32_t phase, int row, int col) { return ((row + col) & 1) == ((p
 
 // Each marked pixel replaced by the mean of its unmarked neighbours of its own colour (greens: the four diagonal ones
 // and the four two away; reds and blues: the eight two away).
-void patchBadPixels(uint16_t* raw, int width, int height, int stride, uint32_t phase, const std::vector<uint8_t>& bad) {
+// (Each band's fixes found across the cores from the mosaic as it was, then made.)
+void patchBadPixels(uint16_t* raw, int width, int height, int stride, uint32_t phase, const std::vector<uint8_t>& bad,
+                    const std::atomic<bool>* cancel) {
     static const int kGreen[8][2] = {{-1, -1}, {-1, 1}, {1, -1}, {1, 1}, {-2, 0}, {2, 0}, {0, -2}, {0, 2}};
     static const int kOther[8][2] = {{-2, -2}, {-2, 0}, {-2, 2}, {0, -2}, {0, 2}, {2, -2}, {2, 0}, {2, 2}};
-    std::vector<std::pair<size_t, uint16_t>> fixes;
-    for (int y = 0; y < height; ++y)
-        for (int x = 0; x < width; ++x) {
-            if (!bad[size_t(y) * size_t(width) + size_t(x)]) continue;
-            const auto& offs = greenAt(phase, y, x) ? kGreen : kOther;
-            double sum = 0;
-            int n = 0;
-            for (const auto& o : offs) {
-                const int yy = y + o[0], xx = x + o[1];
-                if (yy < 0 || xx < 0 || yy >= height || xx >= width || bad[size_t(yy) * size_t(width) + size_t(xx)]) continue;
-                sum += raw[size_t(yy) * size_t(stride) + size_t(xx)];
-                ++n;
+    std::vector<std::vector<std::pair<size_t, uint16_t>>> rows(static_cast<size_t>(height));
+    parallelRows(height, [&](int y0, int y1) {
+        for (int y = y0; y < y1 && !stopped(cancel); ++y) {
+            auto& fixes = rows[size_t(y)];
+            for (int x = 0; x < width; ++x) {
+                if (!bad[size_t(y) * size_t(width) + size_t(x)]) continue;
+                const auto& offs = greenAt(phase, y, x) ? kGreen : kOther;
+                double sum = 0;
+                int n = 0;
+                for (const auto& o : offs) {
+                    const int yy = y + o[0], xx = x + o[1];
+                    if (yy < 0 || xx < 0 || yy >= height || xx >= width || bad[size_t(yy) * size_t(width) + size_t(xx)]) continue;
+                    sum += raw[size_t(yy) * size_t(stride) + size_t(xx)];
+                    ++n;
+                }
+                if (n > 0) fixes.push_back({size_t(y) * size_t(stride) + size_t(x), uint16_t(std::lround(sum / n))});
             }
-            if (n > 0) fixes.push_back({size_t(y) * size_t(stride) + size_t(x), uint16_t(std::lround(sum / n))});
         }
-    for (const auto& [i, v] : fixes) raw[i] = v;
+    });
+    if (stopped(cancel)) return;
+    for (const auto& fixes : rows)
+        for (const auto& [i, v] : fixes) raw[i] = v;
 }
 
 // How many whole-frame passes a gain map's area at its pitch comes to (at least a little: each opcode costs).
@@ -350,7 +361,8 @@ bool dngWarpSource(const DngOpcode& op, int plane, double x, double y, int width
 }
 
 int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, int width, int height, int stride, double black,
-                          double white, const double* blackPattern, int patternRows, int patternCols) {
+                          double white, const double* blackPattern, int patternRows, int patternCols, const std::atomic<bool>* cancel,
+                          const std::function<void(double)>& progress) {
     if (!raw || width <= 0 || height <= 0) return 0;
     const double top = stage == 1 ? 65535.0 : white;  // (the logical range: list 1's the stored values', list 2's 0..1)
     const bool pattern = stage != 1 && blackPattern && patternRows > 0 && patternCols > 0;
@@ -364,10 +376,12 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
     };
     int applied = 0;
     // The work a list may ask for, in whole-frame passes: a camera's needs a few; a crafted one of hundreds of
-    // full-frame opcodes would stall every frame of a sequence, so those past the budget are left out.
+    // full-frame opcodes would stall every frame of a sequence, so those past the budget are left out. Each opcode's
+    // pixels across the cores, and a cancel heard between opcodes and between rows.
     double budget = kFramePassBudget;
-    for (const DngOpcode& op : list) {
-        if (budget <= 0) break;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const DngOpcode& op = list[i];
+        if (budget <= 0 || stopped(cancel)) break;
         switch (op.id) {
             case kGainMap: {
                 GainMap g;
@@ -375,10 +389,14 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                 budget -= gainMapPasses(g, width, height);
                 const int y0 = int(std::min<uint32_t>(g.top, uint32_t(height))), y1 = int(std::min<uint32_t>(g.bottom, uint32_t(height)));
                 const int x0 = int(std::min<uint32_t>(g.left, uint32_t(width))), x1 = int(std::min<uint32_t>(g.right, uint32_t(width)));
-                for (int y = y0; y < y1; y += int(g.rowPitch))
-                    for (int x = x0; x < x1; x += int(g.colPitch)) {
-                        scaled(raw[size_t(y) * size_t(stride) + size_t(x)], y, x, gainAt(g, 0, y, x, width, height));
+                const int rows = y1 > y0 ? (y1 - y0 + int(g.rowPitch) - 1) / int(g.rowPitch) : 0;
+                parallelRows(rows, [&](int r0, int r1) {
+                    for (int r = r0; r < r1 && !stopped(cancel); ++r) {
+                        const int y = y0 + r * int(g.rowPitch);
+                        for (int x = x0; x < x1; x += int(g.colPitch))
+                            scaled(raw[size_t(y) * size_t(stride) + size_t(x)], y, x, gainAt(g, 0, y, x, width, height));
                     }
+                });
                 ++applied;
                 break;
             }
@@ -387,7 +405,7 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                 if (!readVignette(op, vg)) break;
                 budget -= 1;
                 parallelRows(height, [&](int y0, int y1) {
-                    for (int y = y0; y < y1; ++y)
+                    for (int y = y0; y < y1 && !stopped(cancel); ++y)
                         for (int x = 0; x < width; ++x) scaled(raw[size_t(y) * size_t(stride) + size_t(x)], y, x, vignetteGain(vg, x, y, width, height));
                 });
                 ++applied;
@@ -399,9 +417,11 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                 if (!r.ok) break;
                 budget -= 2;
                 std::vector<uint8_t> bad(size_t(width) * size_t(height));
-                for (int y = 0; y < height; ++y)
-                    for (int x = 0; x < width; ++x) bad[size_t(y) * size_t(width) + size_t(x)] = raw[size_t(y) * size_t(stride) + size_t(x)] == constant;
-                patchBadPixels(raw, width, height, stride, phase & 3, bad);
+                parallelRows(height, [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = 0; x < width; ++x) bad[size_t(y) * size_t(width) + size_t(x)] = raw[size_t(y) * size_t(stride) + size_t(x)] == constant;
+                });
+                patchBadPixels(raw, width, height, stride, phase & 3, bad, cancel);
                 ++applied;
                 break;
             }
@@ -416,7 +436,7 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                     if (row < uint32_t(height) && col < uint32_t(width)) bad[size_t(row) * size_t(width) + col] = 1;
                 }
                 uint64_t area = 0;  // (bounded: a crafted list of whole-frame rectangles would take hours)
-                for (uint32_t i = 0; i < rects; ++i) {
+                for (uint32_t i = 0; i < rects && !stopped(cancel); ++i) {
                     const uint32_t t = r.u32(), l = r.u32(), b = std::min<uint32_t>(r.u32(), uint32_t(height)), rt = std::min<uint32_t>(r.u32(), uint32_t(width));
                     if (t < b && l < rt) area += uint64_t(b - t) * (rt - l);
                     if (area > 4 * uint64_t(width) * uint64_t(height)) break;
@@ -424,17 +444,19 @@ int applyDngMosaicOpcodes(const DngOpcodeList& list, int stage, uint16_t* raw, i
                         for (uint32_t x = l; x < rt; ++x) bad[size_t(y) * size_t(width) + x] = 1;
                 }
                 if (!r.ok) break;
-                patchBadPixels(raw, width, height, stride, phase & 3, bad);
+                patchBadPixels(raw, width, height, stride, phase & 3, bad, cancel);
                 ++applied;
                 break;
             }
             default: break;  // (warps belong to list 3; the rest Montage does not apply)
         }
+        if (progress) progress(double(i + 1) / double(list.size()));
     }
-    return applied;
+    return stopped(cancel) ? -1 : applied;
 }
 
-int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, int height, int planes, int fullWidth, int fullHeight) {
+int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, int height, int planes, int fullWidth, int fullHeight,
+                           const std::atomic<bool>* cancel, const std::function<void(double)>& progress) {
     if (!pixels || width <= 0 || height <= 0 || planes <= 0) return 0;
     // A gain map's area and pitch are in the full picture's pixels; a smaller one (half size) takes them scaled.
     const double scaleY = fullHeight > 0 ? double(height) / fullHeight : 1.0, scaleX = fullWidth > 0 ? double(width) / fullWidth : 1.0;
@@ -442,8 +464,9 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
     int applied = 0, warps = 0;
     bool skipWarp = false;
     double budget = kFramePassBudget;  // (as for the mosaic's lists)
-    for (const DngOpcode& op : list) {
-        if (budget <= 0) break;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const DngOpcode& op = list[i];
+        if (budget <= 0 || stopped(cancel)) break;
         const bool skip = skipWarp;
         skipWarp = false;
         switch (op.id) {
@@ -452,7 +475,7 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
                 WarpParams w;
                 if (skip || ++warps > 4 || !readWarp(op, w)) break;  // (a camera writes one; each resamples the whole picture)
                 budget -= 4;  // (a cubic resample of every plane: dearer than a gain)
-                applyWarp(w, pixels, width, height, planes);
+                applyWarp(w, pixels, width, height, planes, cancel);
                 ++applied;
                 break;
             }
@@ -461,7 +484,7 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
                 if (!readVignette(op, vg)) break;
                 budget -= 1;
                 parallelRows(height, [&](int y0, int y1) {
-                    for (int y = y0; y < y1; ++y)
+                    for (int y = y0; y < y1 && !stopped(cancel); ++y)
                         for (int x = 0; x < width; ++x) {
                             const float g = float(vignetteGain(vg, x, y, width, height));
                             float* px = pixels + (size_t(y) * size_t(width) + size_t(x)) * size_t(planes);
@@ -478,15 +501,20 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
                 const int y0 = scaled(g.top, scaleY, height), y1 = scaled(g.bottom, scaleY, height);
                 const int x0 = scaled(g.left, scaleX, width), x1 = scaled(g.right, scaleX, width);
                 const int rowStep = std::max(1, int(std::lround(g.rowPitch * scaleY))), colStep = std::max(1, int(std::lround(g.colPitch * scaleX)));
-                for (int y = y0; y < y1; y += rowStep)
-                    for (int x = x0; x < x1; x += colStep)
-                        for (uint32_t k = 0; k < g.planes; ++k) {
-                            const uint32_t p = g.plane + k;
-                            if (p >= uint32_t(planes)) break;
-                            const int mp = int(std::min(k, g.mapPlanes - 1));
-                            float& v = pixels[(size_t(y) * size_t(width) + size_t(x)) * size_t(planes) + p];
-                            v = std::clamp(float(v * gainAt(g, mp, y, x, width, height)), 0.0f, 1.0f);
-                        }
+                const int rows = y1 > y0 ? (y1 - y0 + rowStep - 1) / rowStep : 0;
+                parallelRows(rows, [&](int r0, int r1) {
+                    for (int r = r0; r < r1 && !stopped(cancel); ++r) {
+                        const int y = y0 + r * rowStep;
+                        for (int x = x0; x < x1; x += colStep)
+                            for (uint32_t k = 0; k < g.planes; ++k) {
+                                const uint32_t p = g.plane + k;
+                                if (p >= uint32_t(planes)) break;
+                                const int mp = int(std::min(k, g.mapPlanes - 1));
+                                float& v = pixels[(size_t(y) * size_t(width) + size_t(x)) * size_t(planes) + p];
+                                v = std::clamp(float(v * gainAt(g, mp, y, x, width, height)), 0.0f, 1.0f);
+                            }
+                    }
+                });
                 ++applied;
                 break;
             }
@@ -495,8 +523,9 @@ int applyDngPictureOpcodes(const DngOpcodeList& list, float* pixels, int width, 
                 break;
             default: break;
         }
+        if (progress) progress(double(i + 1) / double(list.size()));
     }
-    return applied;
+    return stopped(cancel) ? -1 : applied;
 }
 
 }  // namespace montage

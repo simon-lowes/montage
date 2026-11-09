@@ -60,6 +60,7 @@
 
 #include "EditorState.h"
 #include "media/DualSystem.h"
+#include "render/FocusCheck.h"
 #include "MediaBinModel.h"
 #include "StoryboardView.h"
 #include "core/Storyboard.h"
@@ -1407,6 +1408,12 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         std::vector<Id> taggable;
         for (Id id : ids)
             if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) taggable.push_back(id);
+        if (!taggable.empty()) {
+            QAction* a = menu.addAction(tr("Check Focus"), this, [this, taggable] { checkFocus(taggable); });
+            a->setObjectName(QStringLiteral("checkFocus"));
+            a->setToolTip(tr("Find soft focus and motion blur in each clip, frame by frame, and against the other angles of its scene; "
+                             "shown in the Focus column and written in the ALE"));
+        }
         if (!taggable.empty() && visualSearchAvailable())
             menu.addAction(tr("Auto-Tag Shots"), this, [this, taggable] { autoTag(taggable); })
                 ->setToolTip(tr("Add keywords for what each shot shows: close-up, medium or wide, interior or exterior, day or night, people"));
@@ -1968,6 +1975,46 @@ int MediaBinWidget::timecodeFromLtc(const std::vector<Id>& media) {
         });
     state_->message(found.empty() ? tr("No LTC was found on any channel of these files")
                                   : tr("Timecode from LTC: %1").arg(read.join(QStringLiteral("; "))),
+                    8000);
+    return int(found.size());
+}
+
+int MediaBinWidget::checkFocus(const std::vector<Id>& media) {
+    std::vector<Id> pictures;
+    for (Id id : media)
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->kind == MediaKind::Video && m->hasVideo) pictures.push_back(id);
+    if (pictures.empty()) return 0;
+    QProgressDialog progress(tr("Checking focus…"), tr("Cancel"), 0, 1000, window());
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    std::atomic<bool> cancel{false};
+    std::atomic<int> done{0};
+    // Away from the interface (the frames are read and measured there), so it stays live and Cancel stops it.
+    const Project project = state_->project();
+    QFuture<std::vector<MediaFocus>> checking = QtConcurrent::run([&project, &pictures, &cancel, &done] {
+        return checkMediaFocus(project, pictures, FocusOptions(), [&done](double f) { done = int(f * 999); }, &cancel);
+    });
+    while (!checking.isFinished()) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        progress.setValue(done.load());
+        if (progress.wasCanceled()) cancel = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    progress.setValue(1000);
+    const std::vector<MediaFocus> found = checking.result();
+    if (cancel || found.empty()) return 0;
+    int soft = 0;
+    for (const MediaFocus& f : found) soft += !f.issues.empty();
+    // (Not written to a read-only project, nor without a sequence to edit in: then nothing is claimed.)
+    if (!state_->edit(tr("Check Focus"), [found](Project& p, Sequence&) {
+            for (const MediaFocus& f : found)
+                if (MediaItem* m = p.findMedia(f.media)) m->metadata["focus"] = f.summary;
+            return true;
+        }))
+        return 0;
+    if (const int column = MediaBinModel::columnOf("focus"); column >= 0) list_->setColumnHidden(column, false);
+    state_->message(soft ? tr("Checked focus in %n clip(s): %1 with soft focus or motion blur (see the Focus column)", nullptr, int(found.size())).arg(soft)
+                         : tr("Checked focus in %n clip(s): all sharp", nullptr, int(found.size())),
                     8000);
     return int(found.size());
 }

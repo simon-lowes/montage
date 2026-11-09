@@ -184,8 +184,10 @@ QString InspectorWidget::signature() const {
         if (const auto sel = shapeSelection_.find(c->id); sel != shapeSelection_.end()) sig += QString::fromStdString(":" + sel->second);
     }
     // A title's text animations: rebuild when one is added or removed.
-    if (c->generator.type == "title")
+    if (c->generator.type == "title" || c->generator.type == "title3d") {
         for (int k : textAnimators(c->generator)) sig += QString("|A%1").arg(k);
+        for (const std::string& a : titleAxes(c->generator)) sig += QString::fromStdString("|X" + a);
+    }
     // A graphic's fields: rebuild when one is published, removed or renamed.
     if (const Sequence* g = graphicOf(state_->project(), *c)) {
         sig += QString("|F%1").arg(g->id);
@@ -556,6 +558,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             if (clip.generator.type == "shape") addShapeContents(g, clip, target(clip.generator.id));
             if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
             if (clip.generator.type == "title") addTitleTextTools(g, clip, target(clip.generator.id));
+            if (clip.generator.type == "title3d") addTextAnimations(clip, target(clip.generator.id));
         }
     }
     // ---- Fixed attributes ----------------------------------------------------
@@ -2942,6 +2945,63 @@ void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, con
         });
     });
 
+    addTextAnimations(clip, target);
+}
+
+void InspectorWidget::addTextAnimations(const Clip& clip, const Target& target) {
+    // A title's font axes of its own (variable fonts' weight, width, slant...): each a setting, keyed as any is.
+    {
+        auto* row = new QWidget(content_);
+        auto* h = new QHBoxLayout(row);
+        h->setContentsMargins(0, 0, 0, 0);
+        auto* tag = new QLineEdit(row);
+        tag->setObjectName(QStringLiteral("titleAxisTag"));
+        tag->setAccessibleName(tr("Font Axis Tag"));
+        tag->setPlaceholderText(tr("Axis tag (wght, wdth, slnt…)"));
+        tag->setMaxLength(4);
+        auto* addAxis = new QPushButton(tr("Add Font Axis"), row);
+        addAxis->setObjectName(QStringLiteral("addTitleAxis"));
+        addAxis->setToolTip(tr("Set a variable font axis for the whole title, to key like any setting (styled runs set their own)"));
+        h->addWidget(tag);
+        h->addWidget(addAxis);
+        h->addStretch(1);
+        layout_->addWidget(row);
+        connect(addAxis, &QPushButton::clicked, this, [this, target, tag] {
+            const std::string t = tag->text().trimmed().toStdString();
+            if (t.empty() || t.size() > 4 || !std::all_of(t.begin(), t.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)); })) {
+                state_->message(tr("A font axis tag is up to four letters or digits, such as wght or wdth"), 5000);
+                return;
+            }
+            QTimer::singleShot(0, this, [this, target, t] {
+                state_->edit(tr("Add Font Axis"), [target, t](Project&, Sequence& s) {
+                    Effect* e = target.resolve(s);
+                    if (!e || e->params.count("axis." + t)) return false;
+                    // (where the font sits now: its weight for wght, the axis's usual default otherwise)
+                    const double def = t == "wght" ? (e->p("bold", 0, 1) > 0.5 ? 700.0 : 400.0) : t == "wdth" ? 100.0 : 0.0;
+                    e->params["axis." + t] = Param(def);
+                    return true;
+                });
+                if (signature() != signature_) rebuild();
+            });
+        });
+    }
+    const std::string type = clip.generator.type;
+    if (!titleAxes(clip.generator).empty()) {
+        auto* remove = smallButton(nullptr, QStringLiteral("✕"), tr("Remove the Font Axes"));
+        QFormLayout* section = addSection(tr("Font Axes"), remove);
+        connect(remove, &QToolButton::clicked, this, [this, target] {
+            state_->edit(tr("Remove Font Axes"), [target](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                return std::erase_if(e->params, [](const auto& kv) { return kv.first.rfind("axis.", 0) == 0; }) > 0;
+            });
+        });
+        EffectInfo info;
+        info.type = type;
+        for (const ParamInfo& pi : effectParams(clip.generator))
+            if (pi.name.rfind("axis.", 0) == 0) info.params.push_back(pi);
+        addParamRows(section, info, target);
+    }
     // Text animations: each a range of the text and what it changes there, with its own settings.
     for (int k : textAnimators(clip.generator)) {
         auto* remove = smallButton(nullptr, QStringLiteral("✕"), tr("Remove Text Animation"));
@@ -2956,13 +3016,14 @@ void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, con
             });
         });
         EffectInfo info;
-        info.type = "title";
-        info.params = textAnimatorParams(k);
+        info.type = type;
+        info.params = textAnimatorParams(k, type);
         addParamRows(section, info, target);
     }
     auto* add = new QPushButton(tr("Add Text Animation"), content_);
     add->setObjectName(QStringLiteral("addTextAnimation"));
-    add->setToolTip(tr("Move, scale, turn, fade, blur or recolour the text a letter, word or line at a time"));
+    add->setToolTip(type == "title3d" ? tr("Extrude the letters deeper or shallower a letter, word or line at a time")
+                                      : tr("Move, scale, turn, fade, blur or recolour the text a letter, word or line at a time"));
     connect(add, &QPushButton::clicked, this, [this, target] {
         state_->edit(tr("Add Text Animation"), [target](Project&, Sequence& s) {
             Effect* e = target.resolve(s);
@@ -2982,6 +3043,7 @@ void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, cons
     std::string selected = shapeSelection_[clipId];
     if (!findShapeItem(items, selected)) selected = items.empty() ? std::string() : items.front().id;
     shapeSelection_[clipId] = selected;
+    state_->setShapeItem(clipId, selected);  // (a path picked is edited on the Program monitor)
     auto itemLabel = [](const ShapeItem& it) {
         if (!it.name.empty()) return QString::fromStdString(it.name);
         const ShapeItemKind* k = shapeItemKind(it.type);
@@ -3001,6 +3063,7 @@ void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, cons
         form->addRow(tr("Contents"), list);
         connect(list, &QComboBox::activated, this, [this, list, clipId](int) {
             shapeSelection_[clipId] = list->currentData().toString().toStdString();
+            state_->setShapeItem(clipId, shapeSelection_[clipId]);
             QTimer::singleShot(0, this, [this] {
                 if (signature() != signature_) rebuild();
             });
@@ -3101,23 +3164,25 @@ void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, cons
     svg->setObjectName(QStringLiteral("importSvgShapes"));
     svg->setToolTip(tr("Make an SVG drawing's paths, groups, fills, strokes and gradients this layer's contents, to edit and animate"));
     h->addWidget(svg);
-    connect(svg, &QPushButton::clicked, this, [this, target] { QTimer::singleShot(0, this, [this, target] {
+    connect(svg, &QPushButton::clicked, this, [this, target, clipId] { QTimer::singleShot(0, this, [this, target, clipId] {
         const QString file = QFileDialog::getOpenFileName(this, tr("Import SVG"), QString(), tr("SVG drawings (*.svg)"));
         if (file.isEmpty()) return;
         Effect made;
         double w = 0, h = 0;
         std::vector<std::string> notes;
+        std::vector<SvgText> texts;
         std::string err;
-        if (!importSvgShapes(file.toStdString(), made, w, h, &notes, &err)) {
+        if (!importSvgShapes(file.toStdString(), made, w, h, &notes, &err, &texts)) {
             state_->message(tr("Could not import %1: %2").arg(QFileInfo(file).fileName(), QString::fromStdString(err)), 6000);
             return;
         }
-        state_->edit(tr("Import SVG"), [&](Project&, Sequence& s) {
+        state_->edit(tr("Import SVG"), [&](Project& p, Sequence& s) {
             Effect* e = target.resolve(s);
             if (!e) return false;
             for (const ShapeItem& it : shapeContents(*e)) eraseShapeItemParams(*e, it);
             for (const auto& [k, v] : made.params) e->params[k] = v;
             setShapeContents(*e, shapeContents(made));
+            placeSvgTexts(p, s, clipId, texts, &notes);
             return true;
         });
         if (!notes.empty()) {
@@ -3202,6 +3267,47 @@ void InspectorWidget::addShapeContents(QFormLayout* form, const Clip& clip, cons
         info.params.push_back(pi);
     }
     addParamRows(section, info, target);
+    // A gradient's stops: each one's place, colour and opacity, keyed like any setting; Add Stop puts one between
+    // the last two (a gradient of two colours made a list of its two first).
+    if (picked->type == "fill" || picked->type == "stroke") {
+        if (!picked->stops.empty()) {
+            EffectInfo stops;
+            stops.type = "shape";
+            for (ParamInfo pi : gradientStopParams(*picked)) {
+                pi.name = id + "." + pi.name;
+                stops.params.push_back(pi);
+            }
+            addParamRows(addSection(tr("Gradient Stops")), stops, target);
+        }
+        auto* addStop = new QPushButton(tr("Add Gradient Stop"), content_);
+        addStop->setObjectName(QStringLiteral("addGradientStop"));
+        addStop->setToolTip(tr("Add a stop between the gradient's last two, its place, colour and opacity to key"));
+        section->addRow(QString(), addStop);
+        connect(addStop, &QPushButton::clicked, this, [change, id, target] {
+            const FrameTime t = target.time ? target.time() : 0;
+            change(tr("Add Gradient Stop"), [id, t](Effect& e, std::vector<ShapeItem>& its, std::string&) {
+                ShapeItem* it = findShapeItem(its, id);
+                if (!it) return false;
+                std::vector<std::array<double, 5>> now = gradientStops(e, *it, t);
+                if (it->stops.empty()) {
+                    // Its two colours become the list's ends, keys and all.
+                    it->stops = now;
+                    for (const char* ch : {"r", "g", "b"})
+                        for (const auto& [from, stop] : {std::pair{".color.", ".s0.color."}, std::pair{".color2.", ".s1.color."}})
+                            if (auto p = e.params.find(id + from + ch); p != e.params.end() && !p->second.keys.empty())
+                                e.params[id + stop + ch] = p->second;
+                }
+                if (now.size() < 2 || it->stops.size() >= 64) return false;
+                const auto& a = now[now.size() - 2];
+                const auto& b = now.back();
+                std::array<double, 5> mid;
+                for (size_t k = 0; k < 5; ++k) mid[k] = (a[k] + b[k]) / 2;
+                it->stops.push_back(mid);
+                if (e.p(id + ".gradient", t) < 0.5) e.params[id + ".gradient"] = Param(1.0);
+                return true;
+            });
+        });
+    }
 }
 
 void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target) {

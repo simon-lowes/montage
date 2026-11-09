@@ -36,6 +36,7 @@
 #include "render/EncodeCompare.h"
 
 class QAction;
+class QJsonObject;
 class QActionGroup;
 class QDockWidget;
 class QLabel;
@@ -46,6 +47,7 @@ class QTabBar;
 namespace montage {
 
 class QualityCheckDialog;
+class TrackGroupsDialog;
 
 class SpectralRepairDialog;
 class PanFollowDialog;
@@ -105,6 +107,8 @@ class OscControl;
 class SpeedEditorControl;
 class TangentControl;
 class CaptureDialog;
+class LiveFeed;
+class Multiviewer;
 class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
@@ -243,6 +247,7 @@ public:
     // Clip › Remove Letterbox: black bars baked into the selected video clips' pictures found, cropped off and the rest
     // scaled to fill the frame (render/Letterbox.h), one undo step. How many clips changed.
     int removeLetterbox();
+    void trackGroupsDialog();   // Sequence › Track Groups… (core/TrackGroups.h), kept open beside the work
     void watchFoldersDialog();  // File › Watch Folders… (EditorState::addWatchFolder)
     // Sequence › Analyse HDR Light Levels: an HDR sequence's MaxCLL and MaxFALL measured over In to Out (or all of it)
     // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
@@ -266,6 +271,11 @@ public:
     TangentControl* tangent() const { return tangent_; }
     // File › Capture (made when first opened; it stays, recording, while hidden).
     CaptureDialog* captureDialog();
+    // File › Multiviewer: up to 16 live inputs side by side, the chosen ones recorded (made when first opened).
+    Multiviewer* multiviewer();
+    // A feed watched live on the Source monitor (MonitorPanel::setLiveFeed), its recording's media item opened there
+    // once it is known; or (on false) that feed no longer, if it is the one shown.
+    void showLive(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording, bool on);
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -312,7 +322,8 @@ public:
     QString exportDcpTo(const QString& parent, const DcpSettings& settings, QStringList* problems = nullptr);
     void exportDcpDialog();
     // File › Make KDMs…: keys for cinema servers to play an encrypted DCP (render/Dcp.h makeKdms), from its DKDM, for
-    // the servers' certificates and a window.
+    // a window: one for each screen ticked in the facility list (render/DcpFacilities: read from FLMs or added by hand,
+    // kept between sessions) and each server certificate given.
     void makeKdmsDialog();
     QString exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems = nullptr);
     void exportImfDialog();
@@ -668,6 +679,8 @@ private:
     SpeedEditorControl* speedEditor_ = nullptr;
     TangentControl* tangent_ = nullptr;
     CaptureDialog* capture_ = nullptr;
+    Multiviewer* multiviewer_ = nullptr;
+    QString liveTool(const QJsonObject& args, QJsonObject& structured, bool& isError);  // montage_capture's "live"
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     SamplerPanel* sampler_ = nullptr;
@@ -681,6 +694,7 @@ private:
     bool takeEditInteractive();  // File › Edit Project: asks before discarding changes not saved
     void newProjectInProduction(const QString& folder);
     AudioDescriptionDialog* audioDescription_ = nullptr;
+    TrackGroupsDialog* trackGroups_ = nullptr;
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;

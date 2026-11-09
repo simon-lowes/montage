@@ -20,6 +20,8 @@
 #include <utility>
 
 #include "Plugins.h"
+#include "PluginHost.h"
+#include "PluginHostInternal.h"
 
 #ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
@@ -386,6 +388,20 @@ std::map<std::string, bool> gSidechains;  // descriptor id -> has a key input
 }  // namespace
 
 std::unique_ptr<Instance> instantiate(const Descriptor& d, std::string* error) {
+    // In a host process of its own (audio/PluginHost.h), unless isolation is off; ARA plug-ins share the document, so
+    // they run here.
+    if (!d.ara && isolating()) {
+        auto inst = instantiateIsolated(d, remote::currentIsolation(), error);
+        if (inst) {
+            std::lock_guard lock(gSidechainsM);
+            gSidechains[d.id] = inst->hasSidechain();
+        }
+        return inst;
+    }
+    return instantiateHere(d, error);
+}
+
+std::unique_ptr<Instance> instantiateHere(const Descriptor& d, std::string* error) {
     std::unique_ptr<Instance> inst;
     switch (d.format) {
         case Format::Clap: inst = instantiateClap(d, error); break;
@@ -824,6 +840,28 @@ void Registry::unblock(const std::string& path) {
     entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                                   [&](const Entry& e) { return e.blocked && e.path == path; }),
                    entries_.end());
+    saveCacheLocked();
+}
+
+void Registry::blockAfterCrash(Format f, const std::string& path, const std::string& reason) {
+    std::lock_guard lock(m_);
+    loadCacheLocked();
+    bool found = false;
+    for (Entry& e : entries_)
+        if (e.path == path) {
+            e.blocked = true;
+            e.reason = reason;
+            e.plugins.clear();
+            found = true;
+        }
+    if (!found) {
+        Entry e;
+        e.format = f;
+        e.path = path;
+        e.blocked = true;
+        e.reason = reason;
+        entries_.push_back(std::move(e));
+    }
     saveCacheLocked();
 }
 

@@ -2,6 +2,8 @@
 
 #include <QColor>
 #include <QFile>
+#include <QFont>
+#include <QFontMetricsF>
 #include <QFileInfo>
 #include <QImage>
 #include <QLinearGradient>
@@ -18,6 +20,7 @@
 #include <set>
 
 #include "Shapes.h"
+#include "core/EditOps.h"
 
 namespace montage {
 
@@ -422,8 +425,13 @@ QBrush paintBrush(const Effect& g, const ShapeItem& it, FrameTime t) {
     if (it.stops.empty()) {
         stops = {{0.0, colour(g, it, "color", t)}, {1.0, colour(g, it, "color2", t)}};
     } else {
-        for (const auto& s : it.stops)
-            stops.push_back({std::clamp(s[0], 0.0, 1.0), QColor::fromRgbF(float(s[1]), float(s[2]), float(s[3]), float(std::clamp(s[4], 0.0, 1.0)))});
+        // (keyed stops may pass one another: in order, and none on the same place, which Qt drops)
+        double last = -1;
+        for (const auto& s : gradientStops(g, it, t)) {
+            const double at = std::max(s[0], std::min(1.0, last + 1e-9));
+            last = at;
+            stops.push_back({at, QColor::fromRgbF(float(s[1]), float(s[2]), float(s[3]), float(s[4]))});
+        }
     }
     const QPointF a(P("start_x"), P("start_y")), b(P("end_x"), P("end_y"));
     QGradient grad;
@@ -468,7 +476,7 @@ double pointsIn(const Paths& ps) {
 
 double pointsIn(const std::vector<ShapePaint>& ops) {
     double n = 0;
-    for (const ShapePaint& op : ops) n += double(op.path.elementCount());
+    for (const ShapePaint& op : ops) n += double(op.path.elementCount()) + (op.isGroup ? pointsIn(op.group) : 0.0);
     return n;
 }
 
@@ -546,8 +554,18 @@ Drawn drawItems(const Effect& g, const std::vector<ShapeItem>& items, FrameTime 
             const QTransform G = m * own;
             const double opacity = std::clamp(P(it, "opacity") / 100, 0.0, 1.0);
             for (const BPath& p : in.paths) d.paths.push_back(mapped(p, G));
-            for (ShapePaint& op : in.ops) op.transform = op.transform * G, op.opacity *= opacity;
-            d.ops.insert(d.ops.begin(), in.ops.begin(), in.ops.end());
+            for (ShapePaint& op : in.ops) op.transform = op.transform * G;
+            if (opacity < 1 && in.ops.size() > 1) {
+                // Seen through as a whole: what overlaps inside it does not show through itself.
+                ShapePaint layer;
+                layer.isGroup = true;
+                layer.opacity = opacity;
+                layer.group = std::move(in.ops);
+                d.ops.insert(d.ops.begin(), std::move(layer));
+            } else {
+                for (ShapePaint& op : in.ops) op.opacity *= opacity;
+                d.ops.insert(d.ops.begin(), in.ops.begin(), in.ops.end());
+            }
         } else if (ty == "fill" || ty == "stroke") {
             if (d.paths.empty()) continue;
             ShapePaint op;
@@ -566,7 +584,13 @@ Drawn drawItems(const Effect& g, const std::vector<ShapeItem>& items, FrameTime 
                 op.pen.setMiterLimit(P(it, "miter"));
                 const double dash = P(it, "dash"), gap = std::max(0.0, P(it, "gap"));
                 if (dash > 0) {
-                    op.pen.setDashPattern({dash / width, std::max(gap, 0.01) / width});  // (in stroke widths)
+                    // Further dashes and gaps after the first pair: dash2, gap2, dash3... (in stroke widths)
+                    QList<qreal> pattern{dash / width, std::max(gap, 0.01) / width};
+                    for (int k = 2; k <= 64 && g.params.count(it.id + ".dash" + std::to_string(k)); ++k) {
+                        pattern << std::max(0.0, P(it, ("dash" + std::to_string(k)).c_str())) / width;
+                        pattern << std::max(0.01, P(it, ("gap" + std::to_string(k)).c_str())) / width;
+                    }
+                    op.pen.setDashPattern(pattern);
                     op.pen.setDashOffset(P(it, "dash_offset") / width);
                 }
             }
@@ -631,6 +655,50 @@ std::vector<ShapePaint> shapePaints(const Effect& g, FrameTime t, double fps) {
     return drawItems(g, shapeContents(g), t, fps, 0, budget).ops;
 }
 
+namespace {
+
+// Where what a paint draws can reach on the frame (device pixels), its stroke's half width and joins allowed for.
+QRectF paintBounds(const ShapePaint& op, const QTransform& to) {
+    if (op.isGroup) {
+        QRectF r;
+        for (const ShapePaint& c : op.group) r = r.united(paintBounds(c, c.transform * op.transform * to));
+        return r;
+    }
+    if (op.path.isEmpty()) return {};
+    const double grow = op.stroke ? op.pen.widthF() * std::max(1.0, op.pen.miterLimit()) / 2 + 1 : 1;
+    return to.mapRect(op.path.boundingRect().adjusted(-grow, -grow, grow, grow));
+}
+
+void drawPaints(QPainter& pa, const std::vector<ShapePaint>& ops, const QTransform& to, double opacity, int w, int h) {
+    for (const ShapePaint& op : ops) {
+        if (op.opacity <= 0) continue;
+        const QTransform m = op.transform * to;
+        if (op.isGroup) {
+            // Drawn together into a layer of their own over the part of the frame they reach, then laid down.
+            const QRect area = paintBounds(op, to).toAlignedRect().intersected(QRect(0, 0, w, h));
+            if (area.isEmpty()) continue;
+            QImage layer(area.size(), QImage::Format_RGBA8888_Premultiplied);
+            layer.fill(Qt::transparent);
+            {
+                QPainter lp(&layer);
+                lp.setRenderHint(QPainter::Antialiasing);
+                drawPaints(lp, op.group, m * QTransform::fromTranslate(-area.left(), -area.top()), 1.0, area.width(), area.height());
+            }
+            pa.resetTransform();
+            pa.setOpacity(opacity * op.opacity);
+            pa.drawImage(area.topLeft(), layer);
+            continue;
+        }
+        if (op.path.isEmpty()) continue;
+        pa.setTransform(m);
+        pa.setOpacity(opacity * op.opacity);
+        if (op.stroke) pa.strokePath(op.path, op.pen);
+        else pa.fillPath(op.path, op.brush);
+    }
+}
+
+}  // namespace
+
 Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
     QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
@@ -642,13 +710,7 @@ Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double sca
         layer.rotate(g.p("rotation", t));
         layer.scale(scale, scale);
         const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
-        for (const ShapePaint& op : shapePaints(g, t, fps)) {
-            if (op.opacity <= 0 || op.path.isEmpty()) continue;
-            pa.setTransform(op.transform * layer);
-            pa.setOpacity(opacity * op.opacity);
-            if (op.stroke) pa.strokePath(op.path, op.pen);
-            else pa.fillPath(op.path, op.brush);
-        }
+        drawPaints(pa, shapePaints(g, t, fps), layer, opacity, w, h);
     }
     Image img(w, h);
     const float k = 1.0f / 255.0f;
@@ -658,6 +720,55 @@ Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double sca
         for (int x = 0; x < w * 4; ++x) d[x] = s[x] * k;
     }
     return img;
+}
+
+namespace {
+
+// The transform from a path item's points to the layer through the groups holding it, as drawItems makes them.
+bool pathToLayer(const Effect& g, const std::vector<ShapeItem>& items, const std::string& id, FrameTime t, int depth, QTransform& out) {
+    if (depth > kShapeDepth) return false;
+    for (const ShapeItem& it : items) {
+        if (it.id == id && it.type == "path") {
+            out = QTransform();
+            return true;
+        }
+        if (it.type != "group") continue;
+        QTransform inner;
+        if (!pathToLayer(g, it.items, id, t, depth + 1, inner)) continue;
+        auto P = [&](const char* name) { return shapeItemParam(g, it, name, t); };
+        QTransform m;
+        if (it.hasMatrix) m = QTransform(it.matrix[0], it.matrix[1], it.matrix[2], it.matrix[3], it.matrix[4], it.matrix[5]);
+        QTransform own;
+        own.translate(P("pos_x"), P("pos_y"));
+        own.rotate(P("rotation"));
+        own.scale(P("scale_x") / 100, P("scale_y") / 100);
+        own.translate(-P("anchor_x"), -P("anchor_y"));
+        out = inner * (m * own);
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool shapePathToFrame(const Effect& g, const std::string& id, FrameTime t, double frameW, double frameH, QTransform& out) {
+    QTransform toLayer;
+    if (!pathToLayer(g, shapeContents(g), id, t, 0, toLayer)) return false;
+    QTransform layer;
+    layer.translate(frameW / 2.0 + g.p("pos_x", t), frameH / 2.0 + g.p("pos_y", t));
+    layer.rotate(g.p("rotation", t));
+    out = toLayer * layer;
+    return true;
+}
+
+std::string shapePathItem(const Effect& g, const std::string& nameOrId) {
+    std::string found, byName;
+    eachShapeItem(shapeContents(g), [&](const ShapeItem& it, int) {
+        if (it.type != "path" || !found.empty()) return;
+        if (nameOrId.empty() || it.id == nameOrId) found = it.id;
+        else if (byName.empty() && it.name == nameOrId) byName = it.id;
+    });
+    return found.empty() ? byName : found;
 }
 
 std::vector<ShapeItem> plainShapeAsContents(Effect& g) {
@@ -793,6 +904,7 @@ struct SvgNode {
     std::map<QString, QString> attrs;
     std::vector<SvgNode> children;
     QString text;
+    std::vector<int> childAt;  // where in `text` each child came (for text with tspans in it)
 };
 
 bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
@@ -808,6 +920,7 @@ bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
             c.name = xr.name().toString();
             if (!readSvgTree(xr, c, depth + 1)) return false;
             node.children.push_back(std::move(c));
+            node.childAt.push_back(int(node.text.size()));
         } else if (xr.isCharacters()) {
             node.text += xr.text();
         } else if (xr.isEndElement()) {
@@ -820,19 +933,158 @@ bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
 // The properties that pass down to children, and those an element sets for itself.
 using Style = std::map<QString, QString>;
 
-Style styleOf(const SvgNode& n) {
+// Declarations ("fill: red; stroke: none") into a style, a value's "!important" let go.
+void declarations(const QString& text, Style& s) {
+    for (const QString& decl : text.split(';', Qt::SkipEmptyParts)) {
+        const int colon = decl.indexOf(':');
+        if (colon <= 0) continue;
+        QString v = decl.mid(colon + 1).trimmed();
+        if (v.endsWith(QLatin1String("!important"), Qt::CaseInsensitive)) v = v.left(v.size() - 10).trimmed();
+        s[decl.left(colon).trimmed().toLower()] = v;
+    }
+}
+
+// A style sheet's rule: its selector (compound selectors, each a type or *, classes and an id, joined by descendant
+// or child combinators), how specific it is and where it came, and what it sets.
+struct CssCompound {
+    QString type;  // "" or "*": any
+    QStringList classes;
+    QString id;
+    bool child = false;  // its element is the next one's parent (else any ancestor)
+};
+struct CssRule {
+    std::vector<CssCompound> chain;
+    int specificity = 0, order = 0;
+    Style decls;
+};
+
+std::vector<CssRule> parseCss(QString text, int& order) {
+    std::vector<CssRule> out;
+    static const QRegularExpression comments(QStringLiteral(R"(/\*.*?\*/)"), QRegularExpression::DotMatchesEverythingOption);
+    text.remove(comments);
+    static const QRegularExpression compound(QStringLiteral(R"(^([A-Za-z_][\w-]*|\*)?((?:[.#][\w-]+)*)$)"));
+    static const QRegularExpression part(QStringLiteral(R"([.#][\w-]+)"));
+    qsizetype at = 0;
+    while (at < text.size()) {
+        const qsizetype open = text.indexOf('{', at);
+        if (open < 0) break;
+        // (to its matching brace: an @media or @supports block holds rules of its own)
+        qsizetype close = open;
+        for (int depth = 0; ++close < text.size();) {
+            if (text[close] == '{') ++depth;
+            else if (text[close] == '}' && depth-- == 0) break;
+        }
+        if (close >= text.size()) break;
+        const QString selectors = text.mid(at, open - at).trimmed();
+        Style decls;
+        declarations(text.mid(open + 1, close - open - 1), decls);
+        at = close + 1;
+        if (selectors.startsWith('@')) continue;  // (@media, @font-face: not read)
+        for (const QString& sel0 : selectors.split(',', Qt::SkipEmptyParts)) {
+            QString sel = sel0.trimmed();
+            sel.replace(QLatin1String(">"), QLatin1String(" > "));
+            CssRule r;
+            bool ok = !sel.isEmpty(), nextChild = false;
+            for (const QString& tok : sel.split(' ', Qt::SkipEmptyParts)) {
+                if (tok == ">") {
+                    nextChild = true;
+                    continue;
+                }
+                const QRegularExpressionMatch m = compound.match(tok);
+                if (!m.hasMatch()) {
+                    ok = false;  // (attribute selectors, pseudo-classes, siblings: not read)
+                    break;
+                }
+                CssCompound c;
+                c.type = m.captured(1) == "*" ? QString() : m.captured(1);
+                for (auto pm = part.globalMatch(m.captured(2)); pm.hasNext();) {
+                    const QString p = pm.next().captured();
+                    if (p.startsWith('#')) c.id = p.mid(1), r.specificity += 10000;
+                    else c.classes << p.mid(1), r.specificity += 100;
+                }
+                if (!c.type.isEmpty()) r.specificity += 1;
+                if (nextChild && !r.chain.empty()) r.chain.back().child = true;
+                nextChild = false;
+                r.chain.push_back(c);
+            }
+            if (!ok || r.chain.empty()) continue;
+            r.decls = decls;
+            r.order = order++;
+            out.push_back(std::move(r));
+        }
+    }
+    return out;
+}
+
+bool compoundMatches(const CssCompound& c, const SvgNode& n) {
+    if (!c.type.isEmpty() && c.type != n.name) return false;
+    if (!c.id.isEmpty() && (!n.attrs.count("id") || n.attrs.at("id") != c.id)) return false;
+    if (!c.classes.isEmpty()) {
+        const QStringList have = n.attrs.count("class") ? n.attrs.at("class").split(QRegularExpression(QStringLiteral(R"(\s+)")), Qt::SkipEmptyParts)
+                                                         : QStringList();
+        for (const QString& k : c.classes)
+            if (!have.contains(k)) return false;
+    }
+    return true;
+}
+
+// Whether a rule picks `n`, its ancestors outermost first.
+bool ruleMatches(const CssRule& r, const SvgNode& n, const std::vector<const SvgNode*>& ancestors) {
+    if (!compoundMatches(r.chain.back(), n)) return false;
+    long a = long(ancestors.size()) - 1;
+    for (long i = long(r.chain.size()) - 2; i >= 0; --i) {
+        const CssCompound& c = r.chain[size_t(i)];
+        if (c.child) {
+            if (a < 0 || !compoundMatches(c, *ancestors[size_t(a)])) return false;
+            --a;
+            continue;
+        }
+        while (a >= 0 && !compoundMatches(c, *ancestors[size_t(a)])) --a;
+        if (a < 0) return false;
+        --a;
+    }
+    return true;
+}
+
+// An element's own style: its presentation attributes, then the style sheets' rules that pick it (the least specific
+// first, then in order), then its style attribute.
+Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, const std::vector<const SvgNode*>* ancestors = nullptr) {
     Style s;
     static const char* const props[] = {"fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width", "stroke-linecap", "stroke-linejoin",
                                         "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "fill-rule", "opacity", "display",
-                                        "visibility", "stop-color", "stop-opacity", "filter", "mask", "clip-path"};
+                                        "visibility", "stop-color", "stop-opacity", "filter", "mask", "clip-path", "font-family",
+                                        "font-size", "font-weight", "font-style", "text-anchor"};
     for (const char* p : props)
         if (auto it = n.attrs.find(p); it != n.attrs.end()) s[p] = it->second.trimmed();
-    if (auto it = n.attrs.find("style"); it != n.attrs.end())
-        for (const QString& decl : it->second.split(';', Qt::SkipEmptyParts)) {
-            const int colon = decl.indexOf(':');
-            if (colon > 0) s[decl.left(colon).trimmed()] = decl.mid(colon + 1).trimmed();
-        }
+    if (sheet && !sheet->empty()) {
+        static const std::vector<const SvgNode*> none;
+        std::vector<const CssRule*> picked;
+        for (const CssRule& r : *sheet)
+            if (ruleMatches(r, n, ancestors ? *ancestors : none)) picked.push_back(&r);
+        std::stable_sort(picked.begin(), picked.end(), [](const CssRule* a, const CssRule* b) {
+            return a->specificity != b->specificity ? a->specificity < b->specificity : a->order < b->order;
+        });
+        for (const CssRule* r : picked)
+            for (const auto& [k, v] : r->decls) s[k] = v;
+    }
+    if (auto it = n.attrs.find("style"); it != n.attrs.end()) declarations(it->second, s);
     return s;
+}
+
+// All the character data in an element and the elements in it (tspans), in order, its runs of white space made
+// single spaces.
+QString textIn(const SvgNode& n) {
+    QString t;
+    int from = 0;
+    for (size_t i = 0; i < n.children.size(); ++i) {
+        const int at = std::clamp(i < n.childAt.size() ? n.childAt[i] : int(n.text.size()), from, int(n.text.size()));
+        t += n.text.mid(from, at - from);
+        from = at;
+        const SvgNode& c = n.children[i];
+        if (c.name == "tspan" || c.name == "textPath" || c.name == "a") t += textIn(c);
+    }
+    t += n.text.mid(from);
+    return t.simplified();
 }
 
 std::vector<double> numbersIn(const QString& s) {
@@ -1021,6 +1273,14 @@ public:
 
     void gather(const SvgNode& n) {
         if (auto it = n.attrs.find("id"); it != n.attrs.end()) ids_[it->second] = &n;
+        // (style sheets apply to the whole drawing, wherever they are in it)
+        if (n.name == "style") {
+            const QString type = n.attrs.count("type") ? n.attrs.at("type").trimmed() : QString();
+            if (type.isEmpty() || type == "text/css") {
+                std::vector<CssRule> rules = parseCss(n.text, cssOrder_);
+                sheet_.insert(sheet_.end(), rules.begin(), rules.end());
+            }
+        }
         for (const SvgNode& c : n.children) gather(c);
     }
 
@@ -1046,9 +1306,10 @@ public:
         if (n.attrs.count("spreadMethod")) out.spread = n.attrs.at("spreadMethod") == "reflect" ? 1 : n.attrs.at("spreadMethod") == "repeat" ? 2 : 0;
         std::vector<std::array<double, 5>> stops;
         double last = 0;
+        const std::vector<const SvgNode*> inGradient{&n};  // (so "#g stop" and "linearGradient > stop" match)
         for (const SvgNode& s : n.children) {
             if (s.name != "stop") continue;
-            const Style st = styleOf(s);
+            const Style st = styleOf(s, &sheet_, &inGradient);
             const QString off = s.attrs.count("offset") ? s.attrs.at("offset") : QString("0");
             double o = numbersIn(off).empty() ? 0 : numbersIn(off)[0];
             if (off.contains('%')) o /= 100;
@@ -1156,16 +1417,15 @@ public:
             return;
         }
         Style st = inherited;
-        const Style own = styleOf(n);
+        const Style own = styleOf(n, &sheet_, &ancestors_);
         for (const auto& [k, v] : own)
             if (k != "opacity" && k != "display") st[k] = v;
         if (own.count("display") && own.at("display") == "none") return;
         const QString& name = n.name;
         static const std::set<QString> skipped{"defs", "linearGradient", "radialGradient", "pattern", "clipPath", "mask", "symbol", "marker",
                                                "metadata", "title", "desc", "filter", "style", "script"};
-        if (name == "style") note("Stylesheets (styles in <style> are not read; attributes and style= are)");
         if (skipped.count(name)) return;
-        if (name == "text") return note("Text (add a title for it)");
+        if (name == "text") return text(n, st, own);
         if (name == "image") return note("Pictures inside the SVG (place the picture as a clip)");
         if (name == "foreignObject" || name == "switch") return note("Embedded content (foreignObject, switch)");
         if (own.count("filter") && own.at("filter") != "none") note("Filters (the shapes are drawn without them)");
@@ -1187,11 +1447,18 @@ public:
                 const SvgNode& target = *ids_.at(href.mid(1));
                 // (a <use> inside what it copies would copy itself for ever)
                 if (!using_.insert(&target).second) return note("A <use> that copies itself (left out)");
+                const QTransform ctm = ctm_;
+                const double alpha = alpha_;
+                ctm_ = m * ctm_;
+                alpha_ *= own.count("opacity") ? std::clamp(num(own, "opacity", 1), 0.0, 1.0) : 1.0;
+                ancestors_.push_back(&n);
                 if (target.name == "symbol") {
                     for (const SvgNode& c : target.children) element(c, st, group.items, depth + 1);
                 } else {
                     element(target, st, group.items, depth + 1);
                 }
+                ancestors_.pop_back();
+                ctm_ = ctm, alpha_ = alpha;
                 using_.erase(&target);
             }
         }
@@ -1203,7 +1470,14 @@ public:
         if (opacity < 1) set(group.id, "opacity", opacity * 100);
 
         if (name == "g" || name == "svg" || name == "a") {
+            const QTransform ctm = ctm_;
+            const double alpha = alpha_;
+            ctm_ = m * ctm_;
+            alpha_ *= opacity;
+            ancestors_.push_back(&n);
             for (const SvgNode& c : n.children) element(c, st, group.items, depth + 1);
+            ancestors_.pop_back();
+            ctm_ = ctm, alpha_ = alpha;
         }
         // (SVG paints later elements over earlier ones; here the first item is on top)
         if (name == "g" || name == "svg" || name == "a" || name == "use") {
@@ -1274,14 +1548,26 @@ public:
                     set(stroke.id, "join", join == "round" ? 1 : join == "bevel" ? 2 : 0);
                     set(stroke.id, "miter", std::clamp(num(st, "stroke-miterlimit", 4), 1.0, 100.0));
                     if (st.count("stroke-dasharray") && st.at("stroke-dasharray") != "none") {
+                        // Every dash and gap (a list of an odd length goes round twice, as SVG says), a solid line
+                        // when they add up to nothing.
                         std::vector<double> dashes = numbersIn(st.at("stroke-dasharray"));
-                        if (dashes.size() >= 2) {
-                            if (dashes.size() > 2) note("Dash patterns of more than one dash and gap (the first pair is used)");
-                            set(stroke.id, "dash", dashes[0]), set(stroke.id, "gap", dashes[1]);
-                        } else if (dashes.size() == 1 && dashes[0] > 0) {
-                            set(stroke.id, "dash", dashes[0]), set(stroke.id, "gap", dashes[0]);
+                        for (double& d : dashes) d = std::max(0.0, d);
+                        if (dashes.size() % 2 == 1) {
+                            const std::vector<double> once = dashes;
+                            dashes.insert(dashes.end(), once.begin(), once.end());
                         }
-                        set(stroke.id, "dash_offset", num(st, "stroke-dashoffset", 0));
+                        if (dashes.size() > 128) dashes.resize(128), note("Dash patterns of more than 64 dashes (the first 64 are used)");
+                        double sum = 0;
+                        for (double d : dashes) sum += d;
+                        if (sum > 0 && dashes.size() >= 2) {
+                            // (a dash of nothing first: drawn as the gap after it starting the line)
+                            set(stroke.id, "dash", std::max(dashes[0], 1e-6)), set(stroke.id, "gap", dashes[1]);
+                            for (size_t k = 1; 2 * k + 1 < dashes.size(); ++k) {
+                                set(stroke.id, ("dash" + std::to_string(k + 1)).c_str(), dashes[2 * k]);
+                                set(stroke.id, ("gap" + std::to_string(k + 1)).c_str(), dashes[2 * k + 1]);
+                            }
+                            set(stroke.id, "dash_offset", num(st, "stroke-dashoffset", 0));
+                        }
                     }
                     group.items.push_back(std::move(stroke));
                 }
@@ -1299,13 +1585,68 @@ public:
         out.push_back(std::move(group));
     }
 
+    // A text element: kept for a title, where its first line starts in the drawing's own units (the drawing's fit to
+    // the layer comes after), its size there.
+    void text(const SvgNode& n, const Style& st, const Style& own) {
+        if (!texts_) return note("Text (add a title for it)");
+        const QString str = textIn(n);
+        if (str.isEmpty()) return;
+        if (st.count("visibility") && (st.at("visibility") == "hidden" || st.at("visibility") == "collapse")) return;
+        const QTransform m = (n.attrs.count("transform") ? transformOf(n.attrs.at("transform")) : QTransform()) * ctm_;
+        if (std::abs(m.m12()) > 1e-9 || std::abs(m.m21()) > 1e-9) note("Turned or slanted text (made a title upright)");
+        auto first = [&](const SvgNode& e, const char* k, double& v) {
+            if (!e.attrs.count(k)) return false;
+            const std::vector<double> ns = numbersIn(e.attrs.at(k));
+            if (ns.empty()) return false;
+            v = ns[0];
+            return true;
+        };
+        double x = 0, y = 0;
+        bool hx = first(n, "x", x), hy = first(n, "y", y);
+        for (const SvgNode& c : n.children)
+            if (c.name == "tspan") {
+                if (!hx) hx = first(c, "x", x);
+                if (!hy) hy = first(c, "y", y);
+            }
+        SvgText t;
+        t.text = str.toStdString();
+        const QPointF at = m.map(QPointF(x, y));
+        t.x = at.x(), t.y = at.y();
+        const double k = std::sqrt(std::abs(m.determinant()));
+        t.size = std::max(1.0, lengthOf(st.count("font-size") ? st.at("font-size") : QString("16"), 16, 16) * k);
+        QString family = st.count("font-family") ? st.at("font-family") : QString();
+        family = family.split(',').value(0).trimmed();
+        family.remove('"').remove('\'');
+        t.font = family.isEmpty() || family == "sans-serif" ? "Sans Serif" : family == "serif" ? "Serif" : family == "monospace" ? "Monospace" : family.toStdString();
+        const QString weight = st.count("font-weight") ? st.at("font-weight") : QString();
+        t.bold = weight == "bold" || weight == "bolder" || (!numbersIn(weight).empty() && numbersIn(weight)[0] >= 600);
+        t.italic = st.count("font-style") && (st.at("font-style") == "italic" || st.at("font-style") == "oblique");
+        const QString anchor = st.count("text-anchor") ? st.at("text-anchor") : QString();
+        t.anchor = anchor == "middle" ? 1 : anchor == "end" ? 2 : 0;
+        const QColor c = parseColour(st.count("fill") ? st.at("fill") : QString("black"));
+        if (st.count("fill") && (st.at("fill") == "none" || st.at("fill").startsWith("url("))) {
+            if (st.at("fill") == "none") return;
+            note("Text filled with a gradient (its title is filled with black)");
+        }
+        if (c.isValid()) t.fill = {c.redF(), c.greenF(), c.blueF()};
+        const double ownOpacity = own.count("opacity") ? std::clamp(num(own, "opacity", 1), 0.0, 1.0) : 1.0;
+        t.opacity = std::clamp(alpha_ * ownOpacity * num(st, "fill-opacity", 1) * (c.isValid() ? c.alphaF() : 1.0), 0.0, 1.0);
+        texts_->push_back(t);
+    }
+
     // Subpaths as paths, open ones kept open (a closing segment SVG draws is a closed path).
     static Paths fromPainterPathKeepingOpen(const QPainterPath& q) { return fromPainterPath(q); }
 
     double viewW_ = 0, viewH_ = 0;
     bool tooBig_ = false;
+    std::vector<SvgText>* texts_ = nullptr;
 
 private:
+    std::vector<CssRule> sheet_;
+    int cssOrder_ = 0;
+    std::vector<const SvgNode*> ancestors_;
+    QTransform ctm_;
+    double alpha_ = 1;
     std::set<const SvgNode*> using_;
     long elements_ = 0;
     double points_ = 0;
@@ -1318,7 +1659,8 @@ private:
 
 }  // namespace
 
-bool importSvgShapes(const std::string& file, Effect& g, double& width, double& height, std::vector<std::string>* notes, std::string* error) {
+bool importSvgShapes(const std::string& file, Effect& g, double& width, double& height, std::vector<std::string>* notes, std::string* error,
+                     std::vector<SvgText>* texts) {
     QFile f(QString::fromStdString(file));
     if (!f.open(QIODevice::ReadOnly)) {
         if (error) *error = "Cannot open " + file;
@@ -1353,6 +1695,8 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
     for (const ShapeItem& it : shapeContents(work)) eraseShapeItemParams(work, it);
     SvgImporter im(work, notes);
     im.viewW_ = vw, im.viewH_ = vh;
+    std::vector<SvgText> found;
+    im.texts_ = texts ? &found : nullptr;
     im.gather(root);
     std::vector<ShapeItem> items;
     Style none;
@@ -1361,13 +1705,27 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
         if (error) *error = file + " is too large to make into shapes (over 50,000 elements or 100,000 points)";
         return false;
     }
-    if (items.empty()) {
+    if (items.empty() && found.empty()) {
         if (error) *error = file + " has nothing that can be drawn as shapes";
         return false;
     }
     // The drawing's own group: its viewBox into its size, the middle at the layer's middle.
     const double k = std::min(width / vw, height / vh);
     const QTransform fit = QTransform::fromTranslate(-vx - vw / 2, -vy - vh / 2) * QTransform::fromScale(k, k);
+    if (texts) {
+        for (SvgText& t : found) {
+            const QPointF at = fit.map(QPointF(t.x, t.y));
+            t.x = at.x(), t.y = at.y(), t.size *= k;
+        }
+        *texts = std::move(found);
+    }
+    if (items.empty()) {
+        // Only text: an empty group, so the layer draws nothing of its own.
+        ShapeItem empty;
+        empty.type = "group";
+        empty.id = "group1";
+        items.push_back(empty);
+    }
     ShapeItem& top = items.front();
     const QTransform own = top.hasMatrix ? QTransform(top.matrix[0], top.matrix[1], top.matrix[2], top.matrix[3], top.matrix[4], top.matrix[5]) : QTransform();
     const QTransform m = own * fit;
@@ -1377,6 +1735,67 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
     setShapeContents(work, items);
     g = std::move(work);
     return true;
+}
+
+Effect svgTextTitle(const SvgText& t, double scale) {
+    Effect e = makeEffect("title", 0);
+    e.strings["text"] = t.text;
+    e.strings["font"] = t.font;
+    const double size = std::clamp(t.size * scale, 4.0, 1000.0);
+    e.params["size"] = Param(size);
+    e.params["bold"] = Param(t.bold ? 1.0 : 0.0);
+    e.params["italic"] = Param(t.italic ? 1.0 : 0.0);
+    e.params["shadow"] = Param(0.0);
+    e.params["opacity"] = Param(t.opacity * 100);
+    e.params["align"] = Param(double(t.anchor == 0 ? 0 : t.anchor == 1 ? 1 : 2));
+    const char* ch[3] = {".r", ".g", ".b"};
+    for (int k = 0; k < 3; ++k) e.params[std::string("color") + ch[k]] = Param(t.fill[size_t(k)]);
+    // Where the title's one line falls (render/Titles: the block's middle at Position from the frame's middle, its
+    // baseline its ascent below the block's top) for its start, middle or end to be where the SVG's was.
+    QFont f(QString::fromStdString(t.font));
+    f.setPixelSize(std::max(1, int(std::lround(size))));
+    f.setBold(t.bold);
+    f.setItalic(t.italic);
+    f.setLetterSpacing(QFont::AbsoluteSpacing, 0);
+    f.setHintingPreference(QFont::PreferNoHinting);
+    const QFontMetricsF fm(f);
+    const double width = fm.horizontalAdvance(QString::fromStdString(t.text));
+    const double start = t.x * scale - (t.anchor == 1 ? width / 2 : t.anchor == 2 ? width : 0.0);
+    e.params["pos_x"] = Param(start + width / 2);
+    e.params["pos_y"] = Param(t.y * scale - fm.ascent() + fm.height() / 2);
+    return e;
+}
+
+int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>& texts, std::vector<std::string>* notes) {
+    const auto at = edit::locate(s, layer);
+    if (!at || at->track.kind != TrackKind::Video) return 0;
+    const Clip base = s.videoTracks[size_t(at->track.index)].clips[at->index];
+    int placed = 0;
+    for (const SvgText& t : texts) {
+        if (placed >= 32) {
+            if (notes) notes->push_back("Text past the first 32 pieces (no titles made for it)");
+            break;
+        }
+        Clip c = makeGeneratorClip(p, "title", base.duration);
+        const Id id = c.generator.id;
+        c.generator = svgTextTitle(t);
+        c.generator.id = id;
+        c.generator.params["pos_x"] = Param(c.generator.p("pos_x", 0) + base.generator.p("pos_x", 0));
+        c.generator.params["pos_y"] = Param(c.generator.p("pos_y", 0) + base.generator.p("pos_y", 0));
+        c.start = base.start;
+        c.name = QString::fromStdString(t.text).left(40).toStdString();
+        // The first track above the layer free for its length.
+        int track = -1;
+        for (int i = at->track.index + 1; i < int(s.videoTracks.size()) && track < 0; ++i) {
+            bool free = !s.videoTracks[size_t(i)].locked;
+            for (const Clip& k : s.videoTracks[size_t(i)].clips)
+                if (k.start < base.start + base.duration && base.start < k.start + k.duration) free = false;
+            if (free) track = i;
+        }
+        const TrackRef ref = track >= 0 ? TrackRef{TrackKind::Video, track} : edit::addTrack(p, s, TrackKind::Video);
+        if (edit::overwrite(p, s, ref, c).ok) ++placed;
+    }
+    return placed;
 }
 
 }  // namespace montage
