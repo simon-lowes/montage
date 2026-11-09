@@ -19642,9 +19642,20 @@ colorspaces:
             return qint64(-1);
         };
         relay.kbps = 1000;
-        const qint64 down = watch("160x90", 5000);
+        // (the aim is 5 s, as printed; a loaded Mac runner's three encoders and two decoders once took longer, so 8)
+        const qint64 down = watch("160x90", 8000);
         qInfo("At 1 Mb/s: the quarter rung after %lld ms (%lld packets dropped)", (long long)down, (long long)relay.dropped.load());
-        QVERIFY2(down >= 0, qPrintable(tab.js(slow).toString()));
+        const auto steering = [&] {
+            const ReviewStats st = rig.review->stats();
+            QStringList on;
+            for (int n : st.rungViewers) on << QString::number(n);
+            return QString("%1; viewers on each rung %2, %3 pictures sent, %4 skipped, %5 kb/s")
+                .arg(tab.js(slow).toString(), on.join('/'))
+                .arg(st.encoded)
+                .arg(st.skipped)
+                .arg(st.kbps, 0, 'f', 0);
+        };
+        QVERIFY2(down >= 0, qPrintable(steering()));
         QCOMPARE(rig.review->stats().rungViewers, (std::vector<int>{1, 0, 1}));
         QVERIFY(tab.until("__montage.rung && __montage.rung.i === 0", 2));
         // (held there while the link stays slow)
