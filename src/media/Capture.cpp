@@ -548,11 +548,9 @@ LiveFeed::LiveFeed(int maxWidth, int maxHeight) : maxWidth_(std::max(16, maxWidt
 
 LiveFeed::~LiveFeed() { sws_freeContext(sws_); }
 
-LiveFeed::Now LiveFeed::look() {
+LiveFeed::Now LiveFeed::look() const {
     std::lock_guard lock(m_);
-    Now out = now_;
-    std::fill(now_.peaks.begin(), now_.peaks.end(), 0.0f);
-    return out;
+    return now_;
 }
 
 std::string LiveFeed::firstTimecode() const {
@@ -638,9 +636,11 @@ void LiveFeed::sound(const AVFrame* f) {
                                                            : std::fabs(reinterpret_cast<const float*>(f->data[0])[at]);
             peak[size_t(c)] = std::max(peak[size_t(c)], v);
         }
+    // (a meter's fall: the peak held falls 20 dB a second, so any number of viewers read the same levels)
+    const float fall = float(std::pow(10.0, -f->nb_samples / 48000.0));
     std::lock_guard lock(m_);
     if (now_.peaks.size() != peak.size()) now_.peaks.assign(peak.size(), 0.0f);
-    for (size_t c = 0; c < peak.size(); ++c) now_.peaks[c] = std::max(now_.peaks[c], peak[c]);
+    for (size_t c = 0; c < peak.size(); ++c) now_.peaks[c] = std::max(now_.peaks[c] * fall, peak[c]);
 }
 
 Recorder::Recorder() : s_(std::make_unique<State>()) {}

@@ -6,7 +6,8 @@
 // SMPTE ST 2110 streams are recorded from their SDP files (with ST 2022-7's two paths, and the time code their
 // ancillary data carries), or offered as NMOS receivers for a facility's controller to connect. While it records, the
 // feed can also be packaged live (render/LivePackage.h: HLS and DASH with a sliding window, low latency if asked) into
-// a folder, and served from it over HTTP.
+// a folder, and served from it over HTTP. It can be watched live on the Source monitor as it records (its picture,
+// meters and timecode), In and Out marked there and the range cut in from the growing file.
 #pragma once
 
 #include <QDialog>
@@ -72,6 +73,11 @@ public:
     QString filePath() const { return path_; }  // the file being or last recorded
     Id importedMedia() const { return imported_; }
     QString statusText() const;
+    // Watched live on the Source monitor as it records (the next recording's; remembered).
+    void setWatchLive(bool on);
+    bool watchLive() const;
+    std::shared_ptr<LiveFeed> liveFeed() const { return liveFeed_; }  // the recording's, while it is watched
+    QString clipLabel() const;  // the recording's clip name
 
     // ST 2110 receivers offered to NMOS controllers (IS-04, with IS-05 connections): what one connects them to
     // becomes the feed. False with why when the node cannot start.
@@ -85,6 +91,9 @@ public:
 
 signals:
     void recordingChanged();
+    // A recording to watch live (MonitorPanel::setLiveFeed): when it starts (media 0), once imported, and when it
+    // ends (on false).
+    void watching(std::shared_ptr<montage::LiveFeed> feed, montage::Id media, const QString& label, bool on);
 
 private:
     void refresh();
@@ -112,6 +121,8 @@ private:
     QLineEdit* timecode_;
     QDoubleSpinBox* seconds_;
     QCheckBox* import_;
+    QCheckBox* watch_;
+    std::shared_ptr<LiveFeed> liveFeed_;
     QGroupBox* live_;
     QLineEdit* liveFolder_;
     QComboBox* liveFormats_;

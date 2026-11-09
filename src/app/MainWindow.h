@@ -36,6 +36,7 @@
 #include "render/EncodeCompare.h"
 
 class QAction;
+class QJsonObject;
 class QActionGroup;
 class QDockWidget;
 class QLabel;
@@ -106,6 +107,8 @@ class OscControl;
 class SpeedEditorControl;
 class TangentControl;
 class CaptureDialog;
+class LiveFeed;
+class Multiviewer;
 class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
@@ -268,6 +271,11 @@ public:
     TangentControl* tangent() const { return tangent_; }
     // File › Capture (made when first opened; it stays, recording, while hidden).
     CaptureDialog* captureDialog();
+    // File › Multiviewer: up to 16 live inputs side by side, the chosen ones recorded (made when first opened).
+    Multiviewer* multiviewer();
+    // A feed watched live on the Source monitor (MonitorPanel::setLiveFeed), its recording's media item opened there
+    // once it is known; or (on false) that feed no longer, if it is the one shown.
+    void showLive(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording, bool on);
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -671,6 +679,8 @@ private:
     SpeedEditorControl* speedEditor_ = nullptr;
     TangentControl* tangent_ = nullptr;
     CaptureDialog* capture_ = nullptr;
+    Multiviewer* multiviewer_ = nullptr;
+    QString liveTool(const QJsonObject& args, QJsonObject& structured, bool& isError);  // montage_capture's "live"
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     SamplerPanel* sampler_ = nullptr;

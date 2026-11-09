@@ -19,6 +19,7 @@
 #include <QStyle>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -33,6 +34,7 @@
 #include "EditorState.h"
 #include "HdrSurface.h"
 #include "PlaybackController.h"
+#include "media/Capture.h"
 #include "media/Image.h"
 #include "media/MediaPool.h"
 #include "render/Compositor.h"
@@ -808,17 +810,69 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     hdrBadge_->setStyleSheet(QStringLiteral("color: #111; background: #f0c040; border-radius: 3px; padding: 0 4px; font-weight: 600;"));
     hdrBadge_->hide();
     bar->addWidget(hdrBadge_);
+    if (mode == Mode::Source) {
+        // Live (setLiveFeed): on while a feed is watched; off, the recording so far is scrubbed and played as media.
+        auto* badge = new QToolButton(this);
+        badge->setObjectName(QStringLiteral("liveBadge"));
+        badge->setText(tr("LIVE"));
+        badge->setCheckable(true);
+        badge->setChecked(true);
+        badge->setAutoRaise(true);
+        badge->setStyleSheet(QStringLiteral("QToolButton { color: #888; font-weight: 600; padding: 0 4px; border-radius: 3px; }"
+                                            "QToolButton:checked { color: white; background: #c62828; }"));
+        badge->hide();
+        bar->addWidget(badge);
+        liveBadge_ = badge;
+        connect(badge, &QToolButton::toggled, this, [this](bool on) {
+            if (!live_) return;
+            if (on) {
+                controller_->pause();
+                liveShown_ = -1;
+                liveTick();
+            } else {
+                viewer_->setImage(QImage());
+                emit liveChanged();  // (the recording so far, as media)
+                controller_->requestFrame();
+                refresh();
+            }
+        });
+        liveTimer_ = new QTimer(this);
+        liveTimer_->setInterval(40);
+        connect(liveTimer_, &QTimer::timeout, this, &MonitorPanel::liveTick);
+        // Its sound's meters, at the picture's right edge: green, then yellow from -18 dBFS and red from -6.
+        viewer_->addOverlay([this](QPainter& p, const QRectF& r) {
+            if (!liveShowing() || livePeaks_.empty()) return;
+            const int n = std::min<int>(16, int(livePeaks_.size()));
+            const double w = std::clamp(r.width() / 80, 3.0, 8.0), gap = std::max(1.0, w / 3);
+            const double h = r.height() * 0.6, bottom = r.bottom() - r.height() * 0.05;
+            double x = r.right() - 6 - n * (w + gap);
+            p.save();
+            p.fillRect(QRectF(x - gap, bottom - h - gap, n * (w + gap) + gap, h + 2 * gap), QColor(0, 0, 0, 150));
+            auto at = [h](double db) { return std::clamp((db + 60) / 60, 0.0, 1.0) * h; };
+            for (int c = 0; c < n; ++c, x += w + gap) {
+                const double db = livePeaks_[size_t(c)] > 0 ? 20 * std::log10(double(livePeaks_[size_t(c)])) : -100;
+                const double lit = at(db), yellow = at(-18), red = at(-6);
+                p.fillRect(QRectF(x, bottom - std::min(lit, yellow), w, std::min(lit, yellow)), QColor(60, 200, 90));
+                if (lit > yellow) p.fillRect(QRectF(x, bottom - std::min(lit, red), w, std::min(lit, red) - yellow), QColor(230, 200, 40));
+                if (lit > red) p.fillRect(QRectF(x, bottom - lit, w, lit - red), QColor(230, 50, 40));
+            }
+            p.restore();
+        });
+    }
     lay->addLayout(bar);
 
     connect(scrub_, &ScrubBar::seekRequested, controller_, &PlaybackController::seek);
+    connect(scrub_, &ScrubBar::seekRequested, this, [this] {
+        if (liveShowing()) liveBadge_->setChecked(false);  // (into the recording so far)
+    });
     connect(controller_, &PlaybackController::frameRendered, viewer_, [this](const QImage& img, FrameTime t) {
-        if (mode_ == Mode::Source && !state_->sourceMedia()) return;
+        if (mode_ == Mode::Source && (!state_->sourceMedia() || liveShowing())) return;
         viewer_->setImage(img, t);
     });
     connect(controller_, &PlaybackController::scopeFrameRendered, viewer_,
             [this](const QImage& img, FrameTime t, const QString& space, double) { viewer_->setSignal(img, t, space); });
     connect(controller_, &PlaybackController::hdrFrameRendered, viewer_, [this](HdrPicturePtr picture, FrameTime) {
-        if (mode_ == Mode::Source && !state_->sourceMedia()) return;
+        if (mode_ == Mode::Source && (!state_->sourceMedia() || liveShowing())) return;
         viewer_->setHdrPicture(std::move(picture));
     });
     // The HDR viewer's pictures through its display's calibration for PQ (applied as they are rendered).
@@ -1004,10 +1058,15 @@ QString MonitorPanel::accessibleSummary() const {
     auto mark = [s](FrameTime t) { return t < 0 ? tr("not set") : timecodeString(s, t); };
     QString summary = tr("%1, In %2, Out %3").arg(timecode_->text(), mark(in), mark(out));
     if (mode_ == Mode::Source && !state_->sourceMedia()) summary = tr("Nothing open");
+    if (liveShowing()) summary = tr("Live: %1, %2").arg(liveLabel_, summary);
     return summary;
 }
 
 void MonitorPanel::refresh() {
+    if (liveShowing()) {
+        liveTick();
+        return;
+    }
     const Sequence* s = controller_->sequence();
     FrameTime d = duration();
     scrub_->setRange(std::max<FrameTime>(d, 1));
@@ -1045,13 +1104,112 @@ void MonitorPanel::updateWaveform() {
 }
 
 void MonitorPanel::markIn() {
+    if (markLive(true)) return;
     if (mode_ == Mode::Source) state_->setSourceIn(controller_->position());
     else state_->setInPoint(controller_->position());
 }
 
 void MonitorPanel::markOut() {
+    if (markLive(false)) return;
     if (mode_ == Mode::Source) state_->setSourceOut(controller_->position());
     else state_->setOutPoint(controller_->position());
+}
+
+// ---- Live
+
+void MonitorPanel::setLiveFeed(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording) {
+    if (mode_ != Mode::Source || (feed == live_ && media == liveMedia_ && label == liveLabel_ && recording == liveRecording_)) return;
+    const bool was = bool(live_);
+    live_ = std::move(feed);
+    liveMedia_ = live_ ? media : 0;
+    liveLabel_ = live_ ? label : QString();
+    liveRecording_ = live_ && recording;
+    liveShown_ = -1;
+    livePeaks_.clear();
+    liveBadge_->setVisible(bool(live_));
+    liveBadge_->setToolTip(live_ ? tr("Watching %1 live (off: the recording so far)").arg(label) : QString());
+    {
+        const QSignalBlocker block(liveBadge_);
+        liveBadge_->setChecked(true);
+    }
+    if (live_) {
+        controller_->pause();
+        liveTimer_->start();
+        liveTick();
+    } else {
+        liveTimer_->stop();
+        if (was) {
+            viewer_->setImage(QImage());
+            controller_->requestFrame();
+        }
+        refresh();
+    }
+    if (was || live_) emit liveChanged();
+}
+
+void MonitorPanel::setLiveMedia(Id media) {
+    if (!live_ || media == liveMedia_) return;
+    liveMedia_ = media;
+    emit liveChanged();
+}
+
+bool MonitorPanel::liveShowing() const { return live_ && liveBadge_ && liveBadge_->isChecked(); }
+
+namespace {
+// The recording's picture at the active sequence's rate, as the Source monitor's marks are counted.
+FrameTime sequenceFrame(const LiveFeed::Now& now, const Sequence* s) {
+    if (now.frame < 0 || now.fps <= 0) return -1;
+    return FrameTime(std::floor(double(now.frame) / now.fps * (s ? s->fpsValue() : now.fps) + 1e-6));
+}
+}  // namespace
+
+FrameTime MonitorPanel::liveFrame() const { return live_ ? sequenceFrame(live_->look(), state_->sequence()) : -1; }
+
+bool MonitorPanel::markLive(bool in) {
+    if (!liveShowing()) return false;
+    const LiveFeed::Now now = live_->look();
+    if (!liveMedia_) {
+        state_->message(liveRecording_ ? tr("The recording is in the Captures bin a moment after it starts: mark it then")
+                                       : tr("%1 is watched, not recorded: there is nothing to mark").arg(liveLabel_));
+        return true;
+    }
+    const FrameTime t = sequenceFrame(now, state_->sequence());
+    if (t < 0) return true;
+    if (state_->sourceMedia() != liveMedia_) state_->setSourceMedia(liveMedia_);  // (the recording, its marks)
+    // (as long as the recorder has it, ahead of what reading the file finds: cut in at once)
+    state_->noteRecordedLength(liveMedia_, double(now.frame + 1) / now.fps);
+    if (in) state_->setSourceIn(t);
+    else state_->setSourceOut(t);
+    return true;
+}
+
+void MonitorPanel::liveTick() {
+    if (!live_) return;
+    const LiveFeed::Now now = live_->look();
+    livePeaks_ = now.peaks;
+    if (!liveBadge_->isChecked()) return;
+    if (!now.picture.isNull() && now.pictures != liveShown_) {
+        liveShown_ = now.pictures;
+        viewer_->setImage(now.picture);
+    } else {
+        viewer_->update();  // (the meters)
+    }
+    const Sequence* s = state_->sequence();
+    const FrameTime t = sequenceFrame(now, s);
+    scrub_->setRange(std::max<FrameTime>(t + 1, 1));
+    scrub_->setPosition(std::max<FrameTime>(t, 0));
+    const bool marked = liveMedia_ && state_->sourceMedia() == liveMedia_;
+    const FrameTime in = marked ? state_->sourceIn() : -1, out = marked ? state_->sourceOut() : -1;
+    scrub_->setMarks(in, out);
+    if (!timecode_->hasFocus()) timecode_->setText(now.timecode.empty() ? (now.running ? tr("LIVE") : tr("Ended")) : QString::fromStdString(now.timecode));
+    QString text = now.running ? liveLabel_ : tr("%1 (ended)").arg(liveLabel_);
+    if (in >= 0 || out >= 0) {
+        const FrameTime a = std::max<FrameTime>(0, in), b = out >= 0 ? out + 1 : t + 1;
+        text = tr("In–Out %1").arg(durationString(s, std::max<FrameTime>(0, b - a)));
+    } else if (liveMedia_ && t >= 0) {
+        text += QStringLiteral(" · ") + durationString(s, t + 1);
+    }
+    durationLabel_->setText(text);
 }
 
 void MonitorPanel::goToIn() {

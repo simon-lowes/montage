@@ -702,6 +702,26 @@ void EditorState::refreshLengths(const QStringList& paths) {
     });
 }
 
+bool EditorState::noteRecordedLength(Id media, double seconds) {
+    const MediaItem* m = media ? project_.findMedia(media) : nullptr;
+    if (!m || m->path.empty() || m->subclipOf || m->kind == MediaKind::Sequence || seconds <= m->duration) return false;
+    const std::string path = m->path;
+    auto apply = [&](Project& p) {
+        bool changed = false;
+        for (MediaItem& x : p.media)
+            if (x.path == path && !x.subclipOf && x.duration < seconds) x.duration = seconds, changed = true;
+        return changed;
+    };
+    apply(project_);
+    history_.forEachState(apply);
+    if (gesture_) apply(gesture_->origin);
+    history_.touch();
+    // (its pictures read again from the file as it is now: the new end decoded once it is written)
+    MediaPool::instance().forget(path, false);
+    emit projectChanged();
+    return true;
+}
+
 QStringList EditorState::growingFiles() const {
     QStringList out;
     for (const auto& [path, g] : growth_)

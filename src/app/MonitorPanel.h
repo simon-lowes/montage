@@ -22,6 +22,7 @@ class QLineEdit;
 namespace montage {
 
 class EditorState;
+class LiveFeed;
 class PlaybackController;
 struct Peaks;
 class HdrSurface;
@@ -229,17 +230,32 @@ public:
     // HDR viewing (ViewerWidget::setHdrViewer): HDR sequences shown as HDR where the build and display can; the
     // controller renders their light only while that is so. An "HDR" badge says when it is.
     void setHdrViewer(bool on);
+    // Source: a feed watched live (media/Capture.h LiveFeed), its newest picture shown with its timecode in the
+    // counter, its sound's meters over the picture and a LIVE badge, while `feed` is set (null: the media as it is
+    // again). `recording`: it is being recorded; `media`, the recording's media item once imported (0 until then).
+    // In and Out marked while live are the pictures shown then, as frames of the recording; its length is noted as
+    // the recorder knows it, so the range can be cut in at once from the growing file.
+    void setLiveFeed(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording = true);
+    void setLiveMedia(Id media);  // (the recording's, once it has been imported)
+    std::shared_ptr<LiveFeed> liveFeed() const { return live_; }
+    bool liveShowing() const;  // live, and showing it (its LIVE badge on)
+    Id liveMedia() const { return liveMedia_; }
+    QString liveLabel() const { return liveLabel_; }
+    // The live picture's place in the recording, as a frame of the Source monitor's sequence (-1: none yet).
+    FrameTime liveFrame() const;
+    // Mark In or Out at the picture shown (or, while live, the live picture).
+    void markIn();
+    void markOut();
 
 signals:
     void activated();  // the user interacted with this monitor
     void exportFrameRequested();
+    void liveChanged();  // a live feed set or ended, its media known, or its recording so far shown instead
 
 protected:
     void mousePressEvent(QMouseEvent* e) override;
 
 private:
-    void markIn();
-    void markOut();
     void goToIn();
     void goToOut();
     FrameTime duration() const;
@@ -260,6 +276,17 @@ private:
     QComboBox* exposure_ = nullptr;  // exposure check (ExposureView.h)
     QToolButton* peaking_ = nullptr;  // focus peaking, with its menu
     std::string waveformRequested_;  // the media whose audio decode this monitor started
+    // Live (setLiveFeed).
+    void liveTick();
+    bool markLive(bool in);  // false when not live
+    std::shared_ptr<LiveFeed> live_;
+    Id liveMedia_ = 0;
+    QString liveLabel_;
+    bool liveRecording_ = false;
+    QTimer* liveTimer_ = nullptr;
+    QToolButton* liveBadge_ = nullptr;
+    std::vector<float> livePeaks_;
+    int64_t liveShown_ = -1;  // the feed's picture count when last shown
 
     void renderTrimView();
     void updateLookAround();

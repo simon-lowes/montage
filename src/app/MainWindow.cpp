@@ -154,6 +154,8 @@ extern "C" {
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
+#include "Multiviewer.h"
+#include "media/Capture.h"
 #include "DeckControl.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
@@ -485,6 +487,12 @@ void MainWindow::buildPanels() {
         return d;
     };
     sourcePanel_ = new MonitorPanel(MonitorPanel::Mode::Source, state_, source_, this);
+    // A feed watched live, or no longer, or its recording so far shown: the recording's length as it is now, and the
+    // multiviewer's tallies.
+    connect(sourcePanel_, &MonitorPanel::liveChanged, this, [this] {
+        rebuildSourceProject();
+        if (multiviewer_) multiviewer_->sourceShowing(sourcePanel_->liveShowing() ? sourcePanel_->liveFeed() : nullptr);
+    });
     programPanel_ = new MonitorPanel(MonitorPanel::Mode::Program, state_, program_, this);
     // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
     new TransformOverlay(state_, programPanel_->viewer());
@@ -1411,6 +1419,12 @@ void MainWindow::buildMenus() {
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
+    add(file, QT_TR_NOOP("&Multiviewer…"), QKeySequence(), [this] {
+        Multiviewer* m = multiviewer();
+        m->show();
+        m->raise();
+        m->activateWindow();
+    })->setObjectName(QStringLiteral("multiviewerWindow"));
     add(file, QT_TR_NOOP("&Deck Control…"), QKeySequence(), [this] {
         if (!deckDialog_) deckDialog_ = new DeckDialog(deckControl_, state_, this);
         deckDialog_->show();
@@ -2342,11 +2356,11 @@ void MainWindow::buildMenus() {
     });
     seqM->addSeparator();
     add(seqM, QT_TR_NOOP("Mark &In"), QKeySequence(Qt::Key_I), [this] {
-        if (active_ == Monitor::Source) state_->setSourceIn(source_->position());
+        if (active_ == Monitor::Source) sourcePanel_->markIn();  // (a feed watched live: at its picture)
         else state_->setInPoint(program_->position());
     });
     add(seqM, QT_TR_NOOP("Mark &Out"), QKeySequence(Qt::Key_O), [this] {
-        if (active_ == Monitor::Source) state_->setSourceOut(source_->position());
+        if (active_ == Monitor::Source) sourcePanel_->markOut();
         else state_->setOutPoint(program_->position());
     });
     add(seqM, QT_TR_NOOP("Mark Clip"), QKeySequence(Qt::Key_X), [this] { markClip(); });
@@ -2781,6 +2795,9 @@ void MainWindow::buildMenus() {
     // Live feeds recorded (File › Capture), ST 2110 streams among them.
     if (liveLink_)
         liveLink_->addAppTool(CaptureDialog::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            const QString action = args.value("action").toString();
+            if (action == QLatin1String("live")) return liveTool(args, structured, isError);
+            if (action == QLatin1String("multiview")) return multiviewer()->runTool(args, structured, isError);
             return captureDialog()->runTool(args, structured, isError);
         });
     remoteReview_ = new RemoteReviewController(program_, this);
@@ -3290,8 +3307,98 @@ void MainWindow::updateTitle() {
 }
 
 CaptureDialog* MainWindow::captureDialog() {
-    if (!capture_) capture_ = new CaptureDialog(state_, this);
+    if (!capture_) {
+        capture_ = new CaptureDialog(state_, this);
+        connect(capture_, &CaptureDialog::watching, this,
+                [this](std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool on) { showLive(std::move(feed), media, label, true, on); });
+    }
     return capture_;
+}
+
+Multiviewer* MainWindow::multiviewer() {
+    if (!multiviewer_) {
+        multiviewer_ = new Multiviewer(state_, this);
+        connect(multiviewer_, &Multiviewer::showOnSource, this, &MainWindow::showLive);
+    }
+    return multiviewer_;
+}
+
+void MainWindow::showLive(std::shared_ptr<LiveFeed> feed, Id media, const QString& label, bool recording, bool on) {
+    if (!on) {
+        if (feed && sourcePanel_->liveFeed() == feed) sourcePanel_->setLiveFeed(nullptr, 0, {});
+        return;
+    }
+    // (the recording in the Source monitor, its marks the live ones: the media opened before it is shown live)
+    if (media && state_->sourceMedia() != media) state_->setSourceMedia(media);
+    sourcePanel_->setLiveFeed(std::move(feed), media, label, recording);
+    sourceDock_->raise();
+    active_ = Monitor::Source;
+}
+
+QString MainWindow::liveTool(const QJsonObject& args, QJsonObject& structured, bool& isError) {
+    isError = false;
+    if (args.contains("input")) {
+        Multiviewer* m = multiviewer();
+        const int i = args.value("input").toInt(-1);
+        if (i < 0 || i >= m->inputCount()) {
+            isError = true;
+            return tr("No multiviewer input %1").arg(i);
+        }
+        m->setOnSource(i);
+    } else if (args.contains("watch")) {
+        if (args.value("watch").toBool()) {
+            CaptureDialog* d = captureDialog();
+            if (!d->liveFeed()) {
+                isError = true;
+                return tr("Nothing is being recorded to watch: record with File › Capture (watched), or name a multiviewer input");
+            }
+            showLive(d->liveFeed(), d->importedMedia(), d->clipLabel(), true, true);
+        } else if (sourcePanel_->liveFeed()) {
+            sourcePanel_->setLiveFeed(nullptr, 0, {});
+        }
+    }
+    const bool in = args.value("mark_in").toBool(), out = args.value("mark_out").toBool();
+    if (in || out || args.contains("edit")) {
+        if ((in || out) && !sourcePanel_->liveShowing()) {
+            isError = true;
+            return tr("The Source monitor is not showing a feed live");
+        }
+        if ((in || out) && !sourcePanel_->liveMedia()) {
+            isError = true;
+            return tr("Not marked: the feed is watched, not recorded, or its recording is not in the bin yet");
+        }
+        if (in) sourcePanel_->markIn();
+        if (out) sourcePanel_->markOut();
+    }
+    if (args.contains("edit")) {
+        const QString e = args.value("edit").toString();
+        const std::map<QString, EditorState::SourceEdit> modes{{"insert", EditorState::SourceEdit::Insert},
+                                                               {"overwrite", EditorState::SourceEdit::Overwrite},
+                                                               {"append", EditorState::SourceEdit::Append},
+                                                               {"place_on_top", EditorState::SourceEdit::PlaceOnTop}};
+        const auto it = modes.find(e);
+        if (it == modes.end()) {
+            isError = true;
+            return tr("An edit is insert, overwrite, append or place_on_top");
+        }
+        if (!state_->sourceEdit(it->second)) {
+            isError = true;
+            return tr("Not edited in");
+        }
+    }
+    structured["live"] = sourcePanel_->liveShowing();
+    structured["label"] = sourcePanel_->liveLabel();
+    if (const std::shared_ptr<LiveFeed> f = sourcePanel_->liveFeed()) {
+        const LiveFeed::Now now = f->look();
+        structured["timecode"] = QString::fromStdString(now.timecode);
+        structured["running"] = now.running;
+        structured["frame"] = double(sourcePanel_->liveFrame());
+    }
+    if (sourcePanel_->liveMedia()) structured["media"] = double(sourcePanel_->liveMedia());
+    structured["in"] = double(state_->sourceIn());
+    structured["out"] = double(state_->sourceOut());
+    if (!sourcePanel_->liveFeed()) return tr("The Source monitor shows no feed live");
+    return tr("Watching %1 live").arg(sourcePanel_->liveLabel()) + (structured.value("timecode").toString().isEmpty() ? QString() : QStringLiteral(" at ") + structured.value("timecode").toString());
 }
 
 PlaybackController* MainWindow::activeController() const { return active_ == Monitor::Source ? source_ : program_; }

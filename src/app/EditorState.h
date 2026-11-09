@@ -289,6 +289,10 @@ public:
     // while any file is being written), by the clock (setClock for tests; milliseconds).
     void noteMediaFileWritten(const QString& path);
     void checkGrowingMedia();
+    // A recording's length as its recorder knows it (the frames written, ahead of what reading the file would find):
+    // the media made at least that long, so a range marked live (MonitorPanel's live feed) can be cut in at once.
+    // A fact about the file, as the growing files' lengths are; false when it changed nothing.
+    bool noteRecordedLength(Id media, double seconds);
     void setClock(std::function<qint64()> clock);  // (empty: the real clock again)
 
 signals:

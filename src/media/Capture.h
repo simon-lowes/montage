@@ -72,7 +72,8 @@ struct CaptureSettings {
 };
 
 // A feed as it is now, for watching it live: its latest picture (scaled to fit `maxWidth` by `maxHeight`), that
-// picture's number in the recording and its timecode, and the sound's peak level on each channel since last looked at.
+// picture's number in the recording and its timecode, and the sound's peak level on each channel (held, falling 20 dB
+// a second, as a meter shows it).
 // A Recorder fills it on its own thread (CaptureSettings::live); it is read from any thread.
 class LiveFeed {
 public:
@@ -88,10 +89,10 @@ public:
         double fps = 0;
         int width = 0, height = 0;  // the feed's own size
         int64_t pictures = 0;    // pictures seen in all
-        std::vector<float> peaks;  // each channel's peak level (0 to 1) since the last look
+        std::vector<float> peaks;  // each channel's peak level (0 to 1), held and falling
         bool running = false;    // pictures still coming (since begin, until the recording ended)
     };
-    Now look();  // (the peaks start again from here)
+    Now look() const;
     // The timecode of picture `frame` (its number in the recording): the first's counted on at the feed's rate.
     std::string timecodeAt(int64_t frame) const;
     std::string firstTimecode() const;

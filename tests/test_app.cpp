@@ -111,7 +111,12 @@
 #include "OffloadDialog.h"
 #include "RepairMediaDialog.h"
 #include "CaptureDialog.h"
+#include "Multiviewer.h"
 #include "media/Capture.h"
+#include "render/VideoPacking.h"
+#ifdef MONTAGE_WITH_OMT
+#include "media/Omt.h"
+#endif
 #include "render/St2110.h"
 #include "render/Nmos.h"
 #include "SpellUi.h"
@@ -2619,6 +2624,256 @@ private slots:
         call({{"action", "nmos"}, {"offer", false}});
         QVERIFY(!dlg->nmosNode()->running());
         dlg->hide();
+    }
+
+    // Live inputs: four feeds at once in the multiviewer over the agent link (two ST 2110 senders, an MPEG transport
+    // stream over SRT from FFmpeg with its GOP time code, an Open Media Transport source), each picture's grey its frame
+    // within the second, so each tile's picture is seen to be the one its timecode says was sent; their meters. The
+    // first recorded, watched on the Source monitor, In and Out marked live and the range cut in from the growing
+    // file: its frames are the ones sent, from the In's timecode on.
+    void liveInputsMultiviewer() {
+        namespace st = st2110;
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        state()->newProject();
+        QVERIFY(state()->edit("25p", [](Project&, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return true;
+        }));
+        // (Y' 16 + 8f of 255 for frame f within its second: shown full range)
+        auto greyOf = [](int64_t f) { return int(std::lround(double(f % 25) * 8 * 255.0 / 219)); };
+        std::atomic<bool> stop{false};
+        // Two ST 2110 senders, from 10:00:00:00 and 11:00:00:00, a quarter of full scale on both channels.
+        int ports[2][3];
+        {
+            st::Receiver probe[6];
+            for (int i = 0; i < 6; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i / 3][i % 3] = probe[i].port();
+            }
+        }
+        std::vector<st::Raster> rasters;
+        for (int f = 0; f < 25; ++f) {
+            st::Raster r(320, 180, st::Sampling::Ycc422, 10);
+            for (size_t i = 0; i < r.samples.size(); ++i) r.samples[i] = uint16_t(i % 2 ? 64 + 32 * f : 512);
+            rasters.push_back(std::move(r));
+        }
+        st::Sender tx[2];
+        std::atomic<int> sent[2] = {-1, -1};
+        std::thread sending[2];
+        std::string err;
+        for (int k = 0; k < 2; ++k) {
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[k][0]}, o.audio = {"127.0.0.1", ports[k][1]}, o.anc = {"127.0.0.1", ports[k][2]};
+            o.ttl = 1;
+            st::VideoFormat v;
+            v.width = 320, v.height = 180, v.fps = {25, 1}, v.sampling = st::Sampling::Ycc422, v.depth = 10;
+            QVERIFY2(tx[k].open(o, v, st::AudioFormat{}, &err), err.c_str());
+            sending[k] = std::thread([&, k] {
+                const std::vector<float> sound(1920 * 2, 0.25f);
+                for (int t = 0; !stop && t < 25 * 120; ++t) {
+                    const output::Timecode tc = output::timecodeOf(FrameTime((10 + k) * 3600 * 25 + t), {25, 1});
+                    sent[k] = t;
+                    if (!tx[k].send(rasters[size_t(t % 25)], sound.data(), 1920, &tc, {}, &stop)) break;
+                }
+            });
+        }
+        // An Open Media Transport source from 13:00:00:00 (where this build has it), else a second stream over UDP.
+        bool omtOk = false;
+#ifdef MONTAGE_WITH_OMT
+        omtOk = omt::vmxAvailable(&err);
+        omt::Sender omtTx;
+        std::atomic<int> omtSent{-1};
+        std::thread omtSending;
+        if (omtOk) {
+            omt::Sender::Options so;
+            so.name = "Multiviewer test";
+            so.announce = false;
+            QVERIFY2(omtTx.start(so, &err), err.c_str());
+            omtSending = std::thread([&] {
+                std::vector<std::vector<uint8_t>> pictures;
+                for (int f = 0; f < 25; ++f) {
+                    Image img(320, 180);
+                    for (int y = 0; y < 180; ++y)
+                        for (int x = 0; x < 320; ++x) {
+                            float* p = img.at(x, y);
+                            p[0] = p[1] = p[2] = float(f) * 8 / 219, p[3] = 1;
+                        }
+                    std::vector<uint8_t> out(size_t(320) * 180 * 4);
+                    video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), out.data(), size_t(320) * 2);
+                    pictures.push_back(std::move(out));
+                }
+                auto next = std::chrono::steady_clock::now();
+                for (int t = 0; !stop && t < 25 * 59; ++t) {
+                    const int64_t ts = (int64_t(13) * 3600 * 25 + t) * 400000;
+                    const std::vector<float> planar(size_t(1920) * 2, 0.5f);
+                    omtTx.sendAudio(planar.data(), 2, 1920, 1920, 48000, ts);
+                    omt::VideoOut v;
+                    v.width = 320, v.height = 180, v.stride = 320 * 2, v.data = pictures[size_t(t % 25)].data(), v.rateN = 25, v.rateD = 1;
+                    v.timestamp = ts;
+                    char tc[32];
+                    std::snprintf(tc, sizeof tc, "13:00:%02d:%02d", t / 25, t % 25);
+                    v.metadata = std::string("<montage_timecode value=\"") + tc + "\"/>";
+                    omtSent = t;
+                    omtTx.sendVideo(v);
+                    next += std::chrono::milliseconds(40);
+                    std::this_thread::sleep_until(next);
+                }
+            });
+        }
+#endif
+        // The stream over SRT (UDP where FFmpeg has no SRT), Montage listening.
+        QProcess protocols;
+        protocols.start(ffmpeg, {"-hide_banner", "-protocols"});
+        protocols.waitForFinished(20000);
+        const bool srt = QString::fromLocal8Bit(protocols.readAllStandardOutput()).contains(QRegularExpression(QStringLiteral("\\n\\s*srt\\s*\\n")));
+        int streamPorts[2];
+        for (int& port : streamPorts) {
+            QUdpSocket free;
+            free.bind(QHostAddress::LocalHost, 0);
+            port = int(free.localPort());
+        }
+        auto listen = [srt](int port) {
+            return srt ? QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port) : QStringLiteral("udp://127.0.0.1:%1").arg(port);
+        };
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 5}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QTemporaryDir dir;
+        QJsonArray inputs{QJsonObject{{"label", "Cam A"}, {"kind", "st2110"}, {"url", QString::fromStdString(tx[0].sdpVideo() + tx[0].sdpAudio() + tx[0].sdpAnc())}, {"record", true}},
+                          QJsonObject{{"label", "Cam B"}, {"kind", "st2110"}, {"url", QString::fromStdString(tx[1].sdpVideo() + tx[1].sdpAudio() + tx[1].sdpAnc())}},
+                          QJsonObject{{"label", "Stream"}, {"kind", ""}, {"url", listen(streamPorts[0])}}};
+#ifdef MONTAGE_WITH_OMT
+        if (omtOk) inputs.append(QJsonObject{{"label", "OMT"}, {"kind", "omt"}, {"url", QStringLiteral("omt://127.0.0.1:%1").arg(omtTx.port())}});
+#endif
+        if (!omtOk) inputs.append(QJsonObject{{"label", "Stream 2"}, {"kind", ""}, {"url", listen(streamPorts[1])}});
+        QJsonObject r = call({{"action", "multiview"}, {"inputs", inputs}, {"folder", dir.path()}, {"codec", "prores_proxy"}, {"record", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Multiviewer* mv = win_->multiviewer();
+        QCOMPARE(mv->inputCount(), 4);
+        std::vector<std::unique_ptr<QProcess>> streams;
+        for (int k = 0; k < (omtOk ? 1 : 2); ++k) {
+            auto p = std::make_unique<QProcess>();
+            const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(streamPorts[k])
+                                   : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(streamPorts[k]);
+            p->start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128",
+                              "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "120", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12",
+                              "-bf", "0", "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", k ? "14:00:00:00" : "12:00:00:00",
+                              "-c:a", "mp2", "-f", "mpegts", to});
+            QVERIFY(p->waitForStarted(10000));
+            streams.push_back(std::move(p));
+        }
+        auto finish = qScopeGuard([&] {
+            stop = true;
+            for (auto& p : streams) p->kill(), p->waitForFinished(5000);
+            for (std::thread& t : sending)
+                if (t.joinable()) t.join();
+#ifdef MONTAGE_WITH_OMT
+            if (omtSending.joinable()) omtSending.join();
+            omtTx.stop();
+#endif
+            mv->clear();
+            mv->hide();
+        });
+        // (waiting on pictures, not the clock: a busy machine is slow)
+        QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);
+        // Each tile's picture the one its timecode names, its hour the source's, close behind what was sent.
+        const int hours[4] = {10, 11, 12, omtOk ? 13 : 14};
+        int checked[4] = {0, 0, 0, 0};
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < 40000 && *std::min_element(checked, checked + 4) < 15) {
+            QTest::qWait(30);
+            for (int i = 0; i < 4; ++i) {
+                const LiveFeed::Now now = mv->feed(i)->look();
+                if (now.picture.isNull()) continue;
+                int hh = 0, mm = 0, ss = 0, ff = 0;
+                QVERIFY2(std::sscanf(now.timecode.c_str(), "%d:%d:%d:%d", &hh, &mm, &ss, &ff) == 4 && hh == hours[i], now.timecode.c_str());
+                const int grey = qGray(now.picture.pixel(now.picture.width() / 2, now.picture.height() / 2));
+                QVERIFY2(std::abs(grey - greyOf(ff)) <= 6, qPrintable(QStringLiteral("input %1: grey %2 at %3").arg(i).arg(grey).arg(QString::fromStdString(now.timecode))));
+                const int at = (mm * 60 + ss) * 25 + ff;
+                const int sentNow = i < 2 ? sent[i].load() :
+#ifdef MONTAGE_WITH_OMT
+                                    i == 3 && omtOk ? omtSent.load() :
+#endif
+                                    -1;
+                if (sentNow >= 0) QVERIFY2(at <= sentNow && sentNow - at < 50, qPrintable(QStringLiteral("input %1 at %2, sent %3").arg(i).arg(at).arg(sentNow)));
+                ++checked[i];
+            }
+        }
+        for (int i = 0; i < 4; ++i) QVERIFY2(checked[i] >= 15, qPrintable(QString::number(i)));
+        // The meters: the senders' quarter of full scale (-12 dBFS), FFmpeg's sine at an eighth (-18).
+        r = call({{"action", "multiview"}});
+        const QJsonArray tiles = r.value("structuredContent").toObject().value("inputs").toArray();
+        QCOMPARE(tiles.size(), 4);
+        QVERIFY2(std::fabs(tiles[0].toObject().value("peaks_dbfs").toArray()[0].toDouble() + 12) < 1, QJsonDocument(tiles[0].toObject()).toJson().constData());
+        QVERIFY2(std::fabs(tiles[2].toObject().value("peaks_dbfs").toArray()[0].toDouble() + 18) < 1.5, QJsonDocument(tiles[2].toObject()).toJson().constData());
+        QVERIFY(tiles[0].toObject().value("recording").toBool() && !tiles[1].toObject().value("recording").toBool());
+        QCOMPARE(mv->tileWidget(0)->tally(), QColor(220, 30, 30));
+        QVERIFY(!mv->tileWidget(1)->tally().isValid());
+
+        // The recorded one watched on the Source monitor: its tally green within the red; In and Out marked live.
+        MonitorPanel* source = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Source) source = m;
+        QVERIFY(source);
+        r = call({{"action", "live"}, {"input", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(source->liveShowing() && mv->tile(0).onSource && !mv->tile(1).onSource);
+        QVERIFY(source->accessibleSummary().startsWith("Live: Cam A"));
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveMedia() != 0 && state()->sourceMedia() == source->liveMedia(), 20000);
+        const Id media = source->liveMedia();
+        QCOMPARE(mv->tile(0).media, media);
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= 30, 20000);
+        r = call({{"action", "live"}, {"mark_in", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject atIn = r.value("structuredContent").toObject();
+        const FrameTime in = FrameTime(atIn.value("in").toDouble());
+        QVERIFY2(in >= 30, QJsonDocument(atIn).toJson().constData());
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() >= in + 40, 20000);
+        r = call({{"action", "live"}, {"mark_out", true}});
+        const FrameTime out = FrameTime(r.value("structuredContent").toObject().value("out").toDouble());
+        QVERIFY2(out >= in + 40 && state()->sourceIn() == in, QJsonDocument(r).toJson().constData());
+        // Cut in at once (its length as the recorder knows it, ahead of the file), at the start of the sequence.
+        state()->setPlayhead(0);
+        r = call({{"action", "live"}, {"edit", "overwrite"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const Sequence* s = state()->sequence();
+        QVERIFY(!s->videoTracks.empty() && s->videoTracks[0].clips.size() == 1);
+        const Clip clip = s->videoTracks[0].clips[0];
+        QCOMPARE(clip.mediaId, media);
+        QCOMPARE(clip.duration, out - in + 1);
+        QCOMPARE(FrameTime(std::lround(clip.sourceIn)), in);
+        // Its frames, once the file holds them (it grows half a second at a time): the ones sent from In's timecode on.
+        const MediaItem* m = state()->project().findMedia(media);
+        QVERIFY(m);
+        const int64_t first = std::llround(m->timecode * 25);  // (the recording's first frame's timecode, in frames)
+        QCOMPARE(QString::fromStdString(mv->feed(0)->timecodeAt(0)).left(2), QString("10"));
+        QTRY_VERIFY_WITH_TIMEOUT(source->liveFrame() > out + 25, 20000);
+        for (FrameTime k : {FrameTime(0), FrameTime(1), (out - in) / 2, out - in - 1, out - in}) {
+            int got = -1;
+            QElapsedTimer wait;
+            wait.start();
+            do {
+                if (got >= 0) QTest::qWait(200);
+                const Image f = renderSequenceFrame(state()->project(), *state()->sequence(), k, {});
+                got = f.width > 0 ? int(std::lround(f.at(f.width / 2, f.height / 2)[1] * 255)) : 0;
+            } while (std::abs(got - greyOf(first + in + k)) > 6 && wait.elapsed() < 15000);
+            QVERIFY2(std::abs(got - greyOf(first + in + k)) <= 6, qPrintable(QStringLiteral("frame %1: %2, sent %3").arg(k).arg(got).arg(greyOf(first + in + k))));
+        }
+        // Recording stopped: the file finished, the Source monitor back on it (the marks kept), the tallies off.
+        r = call({{"action", "multiview"}, {"record", false}});
+        QVERIFY(!r.value("structuredContent").toObject().value("recording").toBool());
+        QVERIFY(!mv->tile(0).recording);
+        QCOMPARE(state()->sourceIn(), in);
+        r = call({{"action", "live"}, {"watch", false}});
+        QVERIFY(!source->liveShowing() && !source->liveFeed());
+        QTRY_VERIFY(!mv->tileWidget(0)->tally().isValid());
     }
 
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value
