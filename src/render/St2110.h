@@ -307,6 +307,9 @@ public:
     const VideoFormat& videoFormat() const { return video_; }
     const AudioFormat& audioFormat() const { return audio_; }
     int64_t framesSent() const { return frames_; }
+    // Frame slots passed over because `send` was called too late (over a fifth of a second behind): the frames after
+    // go out from now, so their timestamps run that many frames ahead of their count.
+    int64_t slotsSkipped() const { return skipped_; }
     int64_t packetsDropped() const;  // packets lost because the system's send queue stayed full
     // Packets path 0 or 1 could not send (its network down, say); with ST 2022-7 the other path goes on, and `send`
     // fails only when both do.
@@ -331,6 +334,7 @@ private:
     std::vector<FastMetadata> nextMetadata_;
     std::string clock_, source_, source2_;
     int64_t frames_ = 0;
+    std::atomic<int64_t> skipped_{0};
 };
 
 // What an ST 2110 output (output::backends()'s "ST 2110") sends now: its streams' formats and where they go; false when

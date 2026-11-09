@@ -1295,7 +1295,9 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
     const int64_t catchUp = std::max<int64_t>(1, num / (5 * den));
     if (nextFrame_ == 0 || frameStart(nextFrame_ + catchUp) < now) {
         const bool behind = nextFrame_ != 0;
-        nextFrame_ = mulDiv(now, num, second * den) + 1;
+        const int64_t from = mulDiv(now, num, second * den) + 1;
+        if (behind) skipped_ += std::max<int64_t>(0, from - nextFrame_);
+        nextFrame_ = from;
         audioSample_ = mulDiv(frameStart(nextFrame_), audio_.rate, second);
         audioFifo_.clear();
         // (AES3 words fallen behind dropped as the PCM is, all but a frame's, in whole blocks of 192 frames so the
