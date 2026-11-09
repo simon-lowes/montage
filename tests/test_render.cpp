@@ -21566,12 +21566,12 @@ colorspaces:
         QVERIFY(edit::clipById(s, maskedId));
         // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
-        adj.effects.push_back(makeEffect(p, "painterly"));
+        adj.effects.push_back(makeEffect(p, "depth_blur"));
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
         gpu::resetStats();
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
-        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Painterly") == 0, gpu::stats().lastFallback.c_str());
+        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Lens Blur (Depth)") == 0, gpu::stats().lastFallback.c_str());
     }
 
     // The filters, transitions, adjustment layers and track mattes the GPU draws, each at three settings, against the
@@ -21683,6 +21683,10 @@ colorspaces:
             {"radial_blur", {{{"zoom", 15}}, {{"zoom", 0}, {"spin", 20}, {"center_x", 0.3}}, {{"zoom", 40}, {"spin", 8}, {"center_y", 0.8}}}},
             {"aperture_glare", {{{"threshold", 0.5}, {"size", 20}}, {{"threshold", 0.3}, {"size", 60}, {"blades", 5}, {"rounding", 30}, {"rotation", 15}},
                                 {{"threshold", 0.6}, {"size", 150}, {"intensity", 2}, {"blades", 9}}}},
+            // (oil paint: a brush sampled at each pixel, then one wide enough to be sampled every few, on the boxes; and
+            // the smear along the contours)
+            {"painterly", {{}, {{"radius", 20}, {"sharpness", 12}, {"roundness", 0.5}, {"detail", 5}}, {{"radius", 9}, {"mix", 60}, {"detail", 1}}}},
+            {"painterly", {{{"style", 1}}, {{"style", 1}, {"length", 30}, {"levels", 0}, {"detail", 4}}, {{"style", 1}, {"length", 6}, {"levels", 4}, {"mix", 70}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -21694,7 +21698,7 @@ colorspaces:
                 compare(7 + FrameTime(k), QString("%1 #%2").arg(type).arg(k + 1));
                 QVERIFY2(gpu::stats().filterPasses > passes, type);
                 if (std::string(type) == "light_rays" || std::string(type) == "radial_blur" ||
-                    std::string(type) == "aperture_glare") {  // (the rays, the blur or the glare are there)
+                    std::string(type) == "aperture_glare" || std::string(type) == "painterly") {  // (the rays, blur, glare or paint are there)
                     RenderOptions o;
                     o.gpu = true;
                     const Image lit = renderProgramFrame(p, s, 7 + FrameTime(k), o);

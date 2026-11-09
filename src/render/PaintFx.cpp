@@ -12,9 +12,6 @@ namespace montage {
 
 namespace {
 
-// The most samples a Kuwahara brush takes along its radius (past it, its ellipse is sampled every few pixels).
-constexpr double kKuwaharaSamples = 8;
-
 // A box of 2r + 1 across `n`-channel rows (along x) or down columns (along y), edges held, `in` to `out`: a running
 // sum, so its cost does not grow with r. Each row (or column) on its own, so any number of threads gives the same.
 void boxPass(const std::vector<float>& in, std::vector<float>& out, int w, int h, int n, int r, bool alongY) {
@@ -64,33 +61,27 @@ void boxPass(const std::vector<float>& in, std::vector<float>& out, int w, int h
 // (past a sigma of 3) as three boxes each way (Kovesi's widths, "Fast Almost-Gaussian Filtering", 2010), whose cost
 // does not grow with the radius.
 void gaussian(std::vector<float>& v, int w, int h, int n, double sigma) {
-    if (sigma <= 0 || w <= 0 || h <= 0) return;
-    if (sigma > 3) {
-        const double ideal = std::sqrt(4 * sigma * sigma + 1);  // (12 sigma^2 / 3 boxes, + 1)
-        int lo = int(std::floor(ideal));
-        if (lo % 2 == 0) --lo;
-        const int m = int(std::lround((12 * sigma * sigma - 3.0 * lo * lo - 12.0 * lo - 9) / (-4.0 * lo - 4)));
+    if (w <= 0 || h <= 0) return;
+    const GaussianPlan plan = gaussianPlan(sigma);
+    if (plan.byBoxes) {
         std::vector<float> tmp(v.size());
         for (bool alongY : {false, true})
-            for (int pass = 0; pass < 3; ++pass) {
-                const int r = (pass < m ? lo : lo + 2) / 2;
+            for (int r : plan.boxes) {
                 boxPass(v, tmp, w, h, n, r, alongY);
                 v.swap(tmp);
             }
         return;
     }
-    const int r = std::max(1, int(std::ceil(3 * sigma)));
-    std::vector<float> k(size_t(2 * r + 1));
-    double sum = 0;
-    for (int i = -r; i <= r; ++i) sum += (k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma))));
-    for (float& x : k) x = float(x / sum);
+    if (plan.kernel.empty()) return;
+    const int r = int(plan.kernel.size()) - 1;
+    auto k = [&](int i) { return plan.kernel[size_t(std::abs(i))]; };
     std::vector<float> tmp(v.size());
     parallelRows(h, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)
             for (int x = 0; x < w; ++x)
                 for (int c = 0; c < n; ++c) {
                     float acc = 0;
-                    for (int i = -r; i <= r; ++i) acc += k[size_t(i + r)] * v[(size_t(y) * size_t(w) + size_t(std::clamp(x + i, 0, w - 1))) * size_t(n) + size_t(c)];
+                    for (int i = -r; i <= r; ++i) acc += k(i) * v[(size_t(y) * size_t(w) + size_t(std::clamp(x + i, 0, w - 1))) * size_t(n) + size_t(c)];
                     tmp[(size_t(y) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)] = acc;
                 }
     });
@@ -99,7 +90,7 @@ void gaussian(std::vector<float>& v, int w, int h, int n, double sigma) {
             for (int x = 0; x < w; ++x)
                 for (int c = 0; c < n; ++c) {
                     float acc = 0;
-                    for (int i = -r; i <= r; ++i) acc += k[size_t(i + r)] * tmp[(size_t(std::clamp(y + i, 0, h - 1)) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)];
+                    for (int i = -r; i <= r; ++i) acc += k(i) * tmp[(size_t(std::clamp(y + i, 0, h - 1)) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)];
                     v[(size_t(y) * size_t(w) + size_t(x)) * size_t(n) + size_t(c)] = acc;
                 }
     });
@@ -359,6 +350,27 @@ DisplaceSettings displaceSettings(const Effect& e, FrameTime t, double pixelScal
     return s;
 }
 
+GaussianPlan gaussianPlan(double sigma) {
+    GaussianPlan plan;
+    if (!(sigma > 0)) return plan;
+    if (sigma > 3) {
+        // (Kovesi's widths, "Fast Almost-Gaussian Filtering", 2010: 12 sigma^2 / 3 boxes, + 1)
+        const double ideal = std::sqrt(4 * sigma * sigma + 1);
+        int lo = int(std::floor(ideal));
+        if (lo % 2 == 0) --lo;
+        const int m = int(std::lround((12 * sigma * sigma - 3.0 * lo * lo - 12.0 * lo - 9) / (-4.0 * lo - 4)));
+        plan.byBoxes = true;
+        for (int pass = 0; pass < 3; ++pass) plan.boxes[pass] = (pass < m ? lo : lo + 2) / 2;
+        return plan;
+    }
+    const int r = std::max(1, int(std::ceil(3 * sigma)));
+    std::vector<float> k(size_t(2 * r + 1));
+    double sum = 0;
+    for (int i = -r; i <= r; ++i) sum += (k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma))));
+    for (int i = 0; i <= r; ++i) plan.kernel.push_back(float(k[size_t(i + r)] / sum));
+    return plan;
+}
+
 bool anisotropicKuwahara(Image& img, const KuwaharaSettings& s, const std::atomic<bool>* cancel) {
     if (img.empty() || s.radius <= 0) return true;
     const int W = img.width, H = img.height;
@@ -525,29 +537,29 @@ bool contourSmear(Image& img, const SmearSettings& s, const std::atomic<bool>* c
     return false;
 }
 
-void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
-    const double mix = std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0);
-    if (img.empty() || mix <= 0) return;
-    const Image before = mix < 1 ? img : Image();
+bool paintSetup(const Effect& e, FrameTime t, double pixelScale, PaintSetup& out) {
+    out.mix = std::clamp(e.p("mix", t, 100) / 100, 0.0, 1.0);
     // (within the ranges the effect offers, whatever was stored; brush and smear capped in pixels on big sources)
     const double detail = std::clamp(e.p("detail", t, 2), 0.5, 20.0) * pixelScale;
+    out.style = std::lround(e.p("style", t, 0)) == 1 ? 1 : 0;
+    out.smear.length = std::clamp(std::clamp(e.p("length", t, 12), 1.0, 100.0) * pixelScale, 1.0, 200.0);
+    out.smear.levels = int(std::lround(std::clamp(e.p("levels", t, 8), 0.0, 64.0)));
+    out.smear.tensorBlur = detail;
+    out.kuwahara.radius = std::clamp(std::clamp(e.p("radius", t, 6), 1.0, 40.0) * pixelScale, 1.0, 80.0);
+    out.kuwahara.sharpness = std::clamp(e.p("sharpness", t, 8), 1.0, 18.0);
+    out.kuwahara.anisotropy = std::clamp(e.p("roundness", t, 1), 0.1, 10.0);
+    out.kuwahara.tensorBlur = detail;
+    return out.mix > 0;
+}
+
+void paintEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    PaintSetup ps;
+    if (img.empty() || !paintSetup(e, t, pixelScale, ps)) return;
+    const double mix = ps.mix;
+    const Image before = mix < 1 ? img : Image();
     // (it runs for seconds a frame on big pictures: stopped with the render)
     const SlowEffects& slow = currentSlowEffects();
-    bool finished = true;
-    if (std::lround(e.p("style", t, 0)) == 1) {
-        SmearSettings s;
-        s.length = std::clamp(std::clamp(e.p("length", t, 12), 1.0, 100.0) * pixelScale, 1.0, 200.0);
-        s.levels = int(std::lround(std::clamp(e.p("levels", t, 8), 0.0, 64.0)));
-        s.tensorBlur = detail;
-        finished = contourSmear(img, s, slow.cancel);
-    } else {
-        KuwaharaSettings s;
-        s.radius = std::clamp(std::clamp(e.p("radius", t, 6), 1.0, 40.0) * pixelScale, 1.0, 80.0);
-        s.sharpness = std::clamp(e.p("sharpness", t, 8), 1.0, 18.0);
-        s.anisotropy = std::clamp(e.p("roundness", t, 1), 0.1, 10.0);
-        s.tensorBlur = detail;
-        finished = anisotropicKuwahara(img, s, slow.cancel);
-    }
+    const bool finished = ps.style == 1 ? contourSmear(img, ps.smear, slow.cancel) : anisotropicKuwahara(img, ps.kuwahara, slow.cancel);
     if (!finished) {
         // (the render was stopped part way: the picture as it came, and the frame not final)
         if (slow.issues) slow.issues->note("Painterly was stopped before it finished");

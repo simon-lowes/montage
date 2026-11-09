@@ -50,6 +50,9 @@
 // red + i green in xy and blue in zw): 45 the kernel's spectra from the table (M rows of red and green, then M of
 // blue), 42 a tile's light above the threshold, shrunk, 43 a stage of a transform, 44 through the kernel, 46 a tile's
 // glare added to what the tiles before made, 47 the glare added to the picture.
+// Painterly (render/PaintFx): 49 the structure tensor, smoothed by 1's boxes or 48's kernel, 50 its flow; then 52 the
+// anisotropic Kuwahara filter (a wide brush on 55 the picture and 51 its squares, each through 1's boxes) or 53 the
+// smear along the flow.
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -925,6 +928,161 @@ void main() {
         }
         const vec3 add = max(vec3(0.0), g) * p[1].y;
         fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));
+        return;
+    }
+    if (mode == 48) {
+        // a Gaussian's kernel along a row (p[1].y 0) or down a column (1), its p[1].x + 1 weights from the centre in
+        // p[2..], edges held (render/PaintFx's gaussian)
+        const int r = int(p[1].x);
+        const bool column = p[1].y > 0.5;
+        const int n = column ? size.y : size.x, at = column ? xy.y : xy.x;
+        vec4 acc = vec4(0.0);
+        for (int i = -r; i <= r; ++i) {
+            const int k = clamp(at + i, 0, n - 1), a = abs(i);
+            acc += p[2 + a / 4][a % 4] * texelFetch(srcTex, column ? ivec2(xy.x, k) : ivec2(k, xy.y), 0);
+        }
+        fragColor = acc;
+        return;
+    }
+    if (mode == 49) {
+        // the structure tensor of the picture's luma (Sobel, edges held): gx^2, gx gy, gy^2
+        const ivec2 hi = size - ivec2(1);
+        float L[9];
+        for (int j = -1; j <= 1; ++j)
+            for (int i = -1; i <= 1; ++i) {
+                const vec4 c = texelFetch(srcTex, clamp(xy + ivec2(i, j), ivec2(0), hi), 0);
+                L[(j + 1) * 3 + i + 1] = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+            }
+        const float gx = ((L[2] + 2.0 * L[5] + L[8]) - (L[0] + 2.0 * L[3] + L[6])) / 4.0;
+        const float gy = ((L[6] + 2.0 * L[7] + L[8]) - (L[0] + 2.0 * L[1] + L[2])) / 4.0;
+        fragColor = vec4(gx * gx, gx * gy, gy * gy, 0.0);
+        return;
+    }
+    if (mode == 50) {
+        // the flow from the smoothed tensor: the unit tangent (across the gradient) and the anisotropy; the tangent
+        // from whichever of its two equal forms keeps clear of cancellation
+        const float E = px.x, F = px.y, G = px.z;
+        const float root = sqrt((E - G) * (E - G) + 4.0 * F * F);
+        vec2 t;
+        if (E > G) t = vec2(abs(F), -(((E - G) + root) / 2.0) * sign(F));  // (l1 - G, without the cancellation)
+        else t = vec2(((G - E) + root) / 2.0, -F);                         // (l1 - E, likewise)
+        const float len = sqrt(t.x * t.x + t.y * t.y);
+        if (len > 1e-12) t /= len;
+        else t = E >= G && E > 0.0 ? vec2(0.0, 1.0) : vec2(1.0, 0.0);
+        fragColor = vec4(t, E + G > 1e-12 ? root / (E + G) : 0.0, 0.0);
+        return;
+    }
+    if (mode == 51) {
+        // the picture's squares (for a wide brush's box of them), 55 the picture as it is
+        const vec4 c = texelFetch(orig, xy, 0);
+        fragColor = vec4(c.rgb * c.rgb, 0.0);
+        return;
+    }
+    if (mode == 55) {
+        fragColor = texelFetch(orig, xy, 0);
+        return;
+    }
+    if (mode == 52) {
+        // the anisotropic Kuwahara filter (render/PaintFx's anisotropicKuwahara): p[1] the radius, alpha, q and the
+        // step; the flow in extra, the picture (orig) or at a step past 1 its box (srcTex) and its squares' (table);
+        // p[2].x the mix with the picture
+        const float radius = p[1].x, alpha = p[1].y, q = p[1].z;
+        const int step = int(p[1].w);
+        const vec4 fl = texelFetch(extra, xy, 0);
+        const float A = fl.z;
+        const float a = radius * clamp((alpha + A) / alpha, 0.1, 2.0), b = radius * clamp(alpha / (alpha + A), 0.1, 2.0);
+        const float c = fl.x, sn = fl.y;
+        const int maxX = int(sqrt(a * a * c * c + b * b * sn * sn)) / step * step;
+        const int maxY = int(sqrt(a * a * sn * sn + b * b * c * c)) / step * step;
+        vec4 m[8];
+        vec3 sq[8];
+        float mw[8];
+        for (int s = 0; s < 8; ++s) m[s] = vec4(0.0), sq[s] = vec3(0.0), mw[s] = 0.0;
+        const ivec2 hi = size - ivec2(1);
+        const float h = sqrt(0.5);
+        for (int j = -maxY; j <= maxY; j += step)
+            for (int k = -maxX; k <= maxX; k += step) {
+                float vx = (c * float(k) + sn * float(j)) * 0.5 / a, vy = (-sn * float(k) + c * float(j)) * 0.5 / b;
+                const float d2 = vx * vx + vy * vy;
+                if (d2 > 0.25) continue;
+                const ivec2 at = clamp(xy + ivec2(k, j), ivec2(0), hi);
+                const vec4 pc = step > 1 ? texelFetch(srcTex, at, 0) : texelFetch(orig, at, 0);
+                const vec3 p2 = step > 1 ? texelFetch(table, at, 0).rgb : pc.rgb * pc.rgb;
+                float w[8], n = 0.0;
+                for (int hf = 0; hf < 2; ++hf) {
+                    if (hf == 1) {
+                        const float rx = h * (vx - vy), ry = h * (vx + vy);
+                        vx = rx, vy = ry;
+                    }
+                    const float xx = 0.33 - 0.84 * vx * vx, yy = 0.33 - 0.84 * vy * vy;
+                    float z;
+                    z = max(0.0, vy + xx), w[hf] = z * z, n += w[hf];
+                    z = max(0.0, -vx + yy), w[2 + hf] = z * z, n += w[2 + hf];
+                    z = max(0.0, -vy + xx), w[4 + hf] = z * z, n += w[4 + hf];
+                    z = max(0.0, vx + yy), w[6 + hf] = z * z, n += w[6 + hf];
+                }
+                if (n <= 0.0) continue;
+                const float g = exp(-3.125 * d2) / n;
+                for (int s = 0; s < 8; ++s) {
+                    const float ws = w[s] * g;
+                    m[s] += ws * pc;
+                    sq[s] += ws * p2;
+                    mw[s] += ws;
+                }
+            }
+        vec4 outc = vec4(0.0);
+        float total = 0.0;
+        for (int s = 0; s < 8; ++s) {
+            const float ws = mw[s];
+            if (ws <= 0.0) continue;
+            const vec3 mean = m[s].rgb / ws, v = abs(sq[s] / ws - mean * mean);
+            const float sigma2 = v.r + v.g + v.b;
+            const float weight = 1.0 / (1.0 + (sigma2 > 0.0 ? pow(255.0 * sigma2, 0.5 * q) : 0.0));
+            outc += weight * (m[s] / ws);
+            total += weight;
+        }
+        const vec4 before = texelFetch(orig, xy, 0);
+        const vec4 painted = total > 0.0 ? outc / total : before;
+        fragColor = before + (painted - before) * p[2].x;
+        return;
+    }
+    if (mode == 53) {
+        // the smear along the flow (render/PaintFx's contourSmear): p[1] the steps each way, the Gaussian's sigma along
+        // them, the levels and the mix; the flow in srcTex, the picture in orig. Positions are kept as offsets from the
+        // pixel, so they stay as exact as the CPU's.
+        const int steps = int(p[1].x), levels = int(p[1].z);
+        const float sigma = p[1].y;
+        const ivec2 hi = size - ivec2(1);
+        vec4 acc = texelFetch(orig, xy, 0);
+        float total = 1.0;
+        for (int dir = -1; dir <= 1; dir += 2) {
+            vec2 o = vec2(0.5);  // (the position less the pixel's corner)
+            vec2 l = texelFetch(srcTex, xy, 0).xy * float(dir);
+            for (int k = 1; k <= steps; ++k) {
+                const vec2 mid = o + l * 0.5;
+                vec2 t = texelFetch(srcTex, clamp(xy + ivec2(floor(mid)), ivec2(0), hi), 0).xy;
+                if (t.x * l.x + t.y * l.y < 0.0) t = -t;
+                o += t;
+                l = t;
+                const vec2 at = vec2(xy) + o;
+                if (at.x < 0.0 || at.y < 0.0 || at.x >= float(size.x) || at.y >= float(size.y)) break;
+                const float w = exp(-0.5 * float(k * k) / (sigma * sigma));
+                // (bilinear, edges held)
+                const vec2 f = o - 0.5, fl = floor(f), fr = f - fl;
+                const ivec2 b = xy + ivec2(fl);
+                const vec4 p00 = texelFetch(orig, clamp(b, ivec2(0), hi), 0), p10 = texelFetch(orig, clamp(b + ivec2(1, 0), ivec2(0), hi), 0);
+                const vec4 p01 = texelFetch(orig, clamp(b + ivec2(0, 1), ivec2(0), hi), 0), p11 = texelFetch(orig, clamp(b + ivec2(1, 1), ivec2(0), hi), 0);
+                acc += w * (p00 * ((1.0 - fr.x) * (1.0 - fr.y)) + p10 * (fr.x * (1.0 - fr.y)) + p01 * ((1.0 - fr.x) * fr.y) + p11 * (fr.x * fr.y));
+                total += w;
+            }
+        }
+        vec4 d = acc / total;
+        if (levels >= 2 && d.a > 0.0) {
+            const float n = float(levels - 1);
+            for (int ch = 0; ch < 3; ++ch) d[ch] = floor(clamp(d[ch] / d.a, 0.0, 1.0) * n + 0.5) / n * d.a;  // (std::round, at or above 0)
+        }
+        const vec4 before = texelFetch(orig, xy, 0);
+        fragColor = before + (d - before) * p[1].w;
         return;
     }
     if (mode == 38) {

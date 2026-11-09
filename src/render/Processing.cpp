@@ -3550,7 +3550,7 @@ bool isGpuFilter(const std::string& type) {
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
                                                   "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare", "radial_blur",
-                                                  "aperture_glare"};
+                                                  "aperture_glare", "painterly"};
     return filters.count(type) > 0;
 }
 
@@ -4158,6 +4158,43 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     f.passes.back().width = width, f.passes.back().height = height;
                 } else {
                     add(37, {float(intensity)});
+                }
+            }
+        } else if (ty == "painterly") {
+            // paintEffect's passes: the structure tensor (49), smoothed as gaussian smooths it (1's boxes or 48's kernel),
+            // its flow (50); then the Kuwahara filter (52; a wide brush on the picture and its squares through boxes, 55
+            // and 51) or the smear (53), each mixed with the picture as it ends
+            PaintSetup ps;
+            if (paintSetup(e, t, pixelScale, ps)) {
+                const GaussianPlan plan = gaussianPlan(ps.style == 1 ? ps.smear.tensorBlur : ps.kuwahara.tensorBlur);
+                add(49, {});
+                if (plan.byBoxes) {
+                    for (int dim = 0; dim < 2; ++dim)
+                        for (int r : plan.boxes) add(1, {float(r), float(dim), 0, 0, 1, 1, 1, 1});
+                } else if (!plan.kernel.empty()) {
+                    for (int dim = 0; dim < 2; ++dim) {
+                        add(48, {float(plan.kernel.size() - 1), float(dim), 0, 0});
+                        std::copy(plan.kernel.begin(), plan.kernel.begin() + std::min<size_t>(plan.kernel.size(), 56), f.passes.back().params + 4);
+                    }
+                }
+                add(50, {});
+                if (ps.style == 1) {
+                    add(53, {float(std::max(1L, std::lround(ps.smear.length))), float(std::max(0.5, ps.smear.length / 2)), float(ps.smear.levels),
+                             float(ps.mix)});
+                } else {
+                    const KuwaharaSettings& k = ps.kuwahara;
+                    const int step = std::max(1, int(std::ceil(k.radius / kKuwaharaSamples)));
+                    f.passes.back().save = 0;  // (the flow)
+                    if (step > 1) {
+                        for (int which : {51, 55}) {
+                            add(which, {});
+                            for (int dim = 0; dim < 2; ++dim) add(1, {float(step / 2), float(dim), 0, 0, 1, 1, 1, 1});
+                            if (which == 51) f.passes.back().save = 1;  // (the squares' box)
+                        }
+                    }
+                    add(52, {float(k.radius), float(std::max(0.01, k.anisotropy)), float(std::max(0.0, k.sharpness)), float(step), float(ps.mix)});
+                    f.passes.back().extra = 0;
+                    if (step > 1) f.passes.back().tableSlot = 1;
                 }
             }
         } else if (ty == "aperture_glare") {
