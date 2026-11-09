@@ -3332,9 +3332,12 @@ void MainWindow::showLive(std::shared_ptr<LiveFeed> feed, Id media, const QStrin
     }
     // (the recording in the Source monitor, its marks the live ones: the media opened before it is shown live)
     if (media && state_->sourceMedia() != media) state_->setSourceMedia(media);
+    const bool fresh = sourcePanel_->liveFeed() != feed;
     sourcePanel_->setLiveFeed(std::move(feed), media, label, recording);
-    sourceDock_->raise();
-    active_ = Monitor::Source;
+    if (fresh) {  // (a feed newly shown is what I and O mark; its updates leave the active monitor as it is)
+        sourceDock_->raise();
+        active_ = Monitor::Source;
+    }
 }
 
 QString MainWindow::liveTool(const QJsonObject& args, QJsonObject& structured, bool& isError) {

@@ -2779,6 +2779,9 @@ private slots:
 #endif
             mv->clear();
             mv->hide();
+            // (the Program monitor the active one again, as the tests after expect: watching live made the Source's)
+            for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+                if (m->mode() == MonitorPanel::Mode::Program) emit m->activated();
         });
         // (waiting on pictures, not the clock: a busy machine is slow)
         QTRY_VERIFY_WITH_TIMEOUT(mv->tile(0).pictures > 10 && mv->tile(1).pictures > 10 && mv->tile(2).pictures > 10 && mv->tile(3).pictures > 10, 60000);
