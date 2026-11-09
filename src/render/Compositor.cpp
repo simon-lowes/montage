@@ -53,6 +53,7 @@
 #include "FrameRepair.h"
 #include "Particles.h"
 #include "Retime.h"
+#include "media/Tracking.h"
 #include "Shapes.h"
 #include "Title3D.h"
 #include "ShapeLayers.h"
@@ -1837,6 +1838,13 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
 
 namespace {
 
+// The name Smooth Cut's flow is kept under (render/Retime's frameFlow): the transition, its pair, the frame's size and
+// eye, and whether it is morphed as the display shows it.
+std::string smoothCutKey(const Transition& tr, FrameTime from, FrameTime to, int W, int H, const RenderOptions& o, bool shown) {
+    return "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' + std::to_string(W) + 'x' +
+           std::to_string(H) + (o.eye ? "#R" : "") + (shown ? "#shown" : "");
+}
+
 // A transition's picture at t (from to `to` on its track), on the CPU.
 // (`finish`, when given, does what compositing does to each clip's layer at the time it shows: Sky Replacement)
 // (`displayReferred`, when given, is told whether the picture is mixed as the display shows it: graded scene-referred,
@@ -1875,9 +1883,7 @@ Image transitionLayer(const Project& p, const Sequence& seq, const Track& track,
         if (sg)
             for (Image* l : {&la, &lb}) outputTransform(*l, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
         Image mix = la.width == W && la.height == H && lb.width == W && lb.height == H
-                        ? interpolateFrames(la, lb, u,
-                                            "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
-                                                std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : "") + (sg ? "#shown" : ""))
+                        ? interpolateFrames(la, lb, u, smoothCutKey(tr, from, to, W, H, o, sg != nullptr))
                         : transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
         if (sg) {
             inverseOutputTransform(mix, *sg->display, *sg->linear, sg->peakNits, sg->kind);
@@ -2925,12 +2931,14 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     return GpuLayerResult::Drawn;
 }
 
-// Whether the GPU mixes a transition itself: not Smooth Cut's flow or an OpenFX one, nor one with a clip turned as a
-// 3D Layer as it mixes (those are the CPU's).
+// Whether the GPU mixes a transition itself: not an OpenFX one, nor one with a clip turned as a 3D Layer as it mixes,
+// nor a Smooth Cut from or to an adjustment layer (those are the CPU's).
 bool gpuMixesTransition(const Sequence& seq, const Track& track, const Transition& tr) {
-    if (tr.type == "smooth_cut" || tr.type == "ofx") return false;
-    for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)})
+    if (tr.type == "ofx") return false;
+    for (const Clip* c : {findClip(track, tr.clipA), findClip(track, tr.clipB)}) {
         if (c && c->enabled && !(c->isGenerator() && c->generator.type == "model3d") && enabledEffect(seq, *c, "layer_3d")) return false;
+        if (c && tr.type == "smooth_cut" && c->isGenerator() && c->generator.type == "adjustment") return false;
+    }
     return true;
 }
 
@@ -2993,16 +3001,17 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             }
     }
     std::string adjustmentOnCpu;  // (an adjustment layer the GPU turned down after all: the frame is the CPU's)
-    auto layerOf = [&](const Clip& c, gpu::Layer& l) {
+    auto layerOf = [&](const Clip& c, gpu::Layer& l, FrameTime at = -1) {
+        if (at < 0) at = t;
         std::string how;
-        const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l, &how);
+        const GpuLayerResult r = gpuClipLayer(p, seq, c, at, o, l, &how);
         if (r == GpuLayerResult::Unsupported && c.isGenerator() && c.generator.type == "adjustment") {
             adjustmentOnCpu = how;
             return false;
         }
         if (r == GpuLayerResult::Unsupported) {
             l = {};
-            Image img = clipLayer(p, seq, c, t, o, nullptr);
+            Image img = clipLayer(p, seq, c, at, o, nullptr);
             if (img.empty()) return false;
             l = cpuLayer(std::move(img));
         }
@@ -3022,7 +3031,33 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
             const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
             const int kind = active->type == "cross_dissolve" ? 0 : gpuTransitionParams(active->type, active->params, u, W, H, item.transitionParams);
-            if (gpuMixesTransition(seq, track, *active)) {
+            // Smooth Cut: the transition's first frame of A and last of B, each drawn here, morphed along their flow (as
+            // transitionLayer does: measured once from the pair, on the CPU, and kept), gpumix.frag's 18.
+            std::shared_ptr<const FlowField> flow;
+            double flowScale = 1;
+            const bool smooth = active->type == "smooth_cut" && A && A->enabled && B && B->enabled;
+            if (smooth && W >= 16 && H >= 16 && gpuMixesTransition(seq, track, *active)) {
+                const std::string key = smoothCutKey(*active, from, to, W, H, o, false);
+                flow = frameFlow(nullptr, nullptr, key, W, flowScale);
+                if (!flow) {
+                    const Image fa = clipLayer(p, seq, *A, from, o, nullptr), fb = clipLayer(p, seq, *B, to - 1, o, nullptr);
+                    if (fa.width == W && fa.height == H && fb.width == W && fb.height == H) flow = frameFlow(&fa, &fb, key, W, flowScale);
+                }
+            }
+            if (flow) {
+                item.b.emplace();
+                layerOf(*A, item.a, from);
+                layerOf(*B, *item.b, to - 1);
+                std::fill(std::begin(item.transitionParams), std::end(item.transitionParams), 0.0f);
+                item.transitionParams[0] = 18, item.transitionParams[1] = float(std::clamp(u, 0.0, 1.0));
+                item.transitionParams[4] = float(flowScale), item.transitionParams[5] = float(flow->step);
+                item.transitionParams[6] = float(flow->gw), item.transitionParams[7] = float(flow->gh);
+                item.transitionTableWidth = flow->gw;
+                item.transitionTable.resize(size_t(flow->gw) * size_t(flow->gh) * 4);
+                for (size_t i = 0; i < flow->v.size(); ++i) item.transitionTable[i * 4] = float(flow->v[i].x), item.transitionTable[i * 4 + 1] = float(flow->v[i].y);
+                item.dissolve = item.transitionParams[1];
+                item.transition = 18;
+            } else if (!smooth && gpuMixesTransition(seq, track, *active)) {
                 item.b.emplace();
                 if (A && A->enabled) layerOf(*A, item.a);
                 if (B && B->enabled) layerOf(*B, *item.b);

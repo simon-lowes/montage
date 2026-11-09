@@ -1341,15 +1341,29 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         u = rhi_->nextResourceUpdateBatch();
         return to;
     };
-    auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n) -> QRhiTexture* {
+    auto mixed = [&](QRhiTexture* a, QRhiTexture* b, const float* params, int n, const std::vector<float>* rows = nullptr,
+                     int rowWidth = 0) -> QRhiTexture* {
         QRhiTexture* to = a && b ? texture(T::RGBA32F, W, H, true) : nullptr;
         if (!to) return nullptr;
         float q[64] = {};
         std::copy(params, params + n, q);
-        pass(mixPs_, to, u, {{1, a}, {4, b}}, uniforms(u, q));
+        QRhiTexture* table = nullptr;  // (Smooth Cut's flow)
+        if (rows && rowWidth > 0 && !rows->empty()) {
+            table = texture(T::RGBA32F, rowWidth, int(rows->size() / (size_t(rowWidth) * 4)), false);
+            if (!table) {
+                release(to);
+                return nullptr;
+            }
+            QRhiTextureSubresourceUploadDescription d(rows->data(), quint32(rows->size() * sizeof(float)));
+            u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
+        }
+        std::vector<std::pair<int, QRhiTexture*>> bound = {{1, a}, {4, b}};
+        if (table) bound.push_back({5, table});
+        pass(mixPs_, to, u, bound, uniforms(u, q));
         u = rhi_->nextResourceUpdateBatch();
         ++mixPasses;
         release(a), release(b);
+        if (table) release(table);
         return to;
     };
     // (Nothing to draw, transparent: no picture, or an adjustment layer over nothing.)
@@ -1373,7 +1387,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
                 QRhiTexture* mb = placed(&*it.b, b);
                 if (b && b != canvas) release(b);
                 b = nullptr;
-                m = mixed(m, mb, it.transitionParams, 44);
+                m = mixed(m, mb, it.transitionParams, 44, &it.transitionTable, it.transitionTableWidth);
             }
             if (m && it.matte) {
                 QRhiTexture* matte = layer(*it.matte, u);

@@ -7,11 +7,14 @@
 //   works out for it: p[0] y position, z softness, w direction; p[1] angle, strength, turn, brights first; p[2] the
 //   leak's colour and the glitch's seed; p[3] shape, count, cell, reach; p[4] the shape's cos and sin, 3D under way;
 //   p[5..7] and p[8..10] the 3D faces' inverse projections (nine each) and whether each faces the camera
+//   18: Smooth Cut, A's first frame morphed into B's last along their flow (render/Retime's interpolateFrames): p[0].y
+//   the position, p[1] the frames' pixels to the flow's, the flow's grid spacing and its size; `table` its moves
 //   30: a track matte, `aTex` through `bTex`'s alpha (or luma, p[0].y), or the reverse (p[0].z)
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D aTex;  // RGBA32F, premultiplied
 layout(binding = 4) uniform sampler2D bTex;
+layout(binding = 5) uniform sampler2D table;  // RGBA32F: Smooth Cut's flow
 
 const float PI = 3.14159265358979;
 
@@ -90,7 +93,38 @@ vec4 moved(bool b, ivec2 size, float fxp, float fyp, float k, bool zoom) {
     return o;
 }
 
+// Bilinear between pixel indices, clamped to the picture (render/Retime's sampleBilinear).
+vec4 clampedSample(sampler2D t, ivec2 size, float x, float y) {
+    x = clamp(x, 0.0, float(size.x - 1));
+    y = clamp(y, 0.0, float(size.y - 1));
+    const int x0 = int(x), y0 = int(y), x1 = min(x0 + 1, size.x - 1), y1 = min(y0 + 1, size.y - 1);
+    const float fx = x - float(x0), fy = y - float(y0);
+    const vec4 a = texelFetch(t, ivec2(x0, y0), 0), b = texelFetch(t, ivec2(x1, y0), 0);
+    const vec4 c = texelFetch(t, ivec2(x0, y1), 0), d = texelFetch(t, ivec2(x1, y1), 0);
+    const vec4 top = a + (b - a) * fx, bottom = c + (d - c) * fx;
+    return top + (bottom - top) * fy;
+}
+
+// Smooth Cut: the flow through this pixel (FlowField::at, bilinear on its grid), then A sampled where it was and B
+// where it will be.
+vec4 smoothCut(ivec2 xy, ivec2 size) {
+    const float u = p[0].y, scale = p[1].x, step = p[1].y;
+    const int gw = int(p[1].z), gh = int(p[1].w);
+    const float gx = clamp(((float(xy.x) + 0.5) / scale - 0.5) / step, 0.0, float(gw - 1));
+    const float gy = clamp(((float(xy.y) + 0.5) / scale - 0.5) / step, 0.0, float(gh - 1));
+    const int x0 = int(gx), y0 = int(gy), x1 = min(x0 + 1, gw - 1), y1 = min(y0 + 1, gh - 1);
+    const float fx = gx - float(x0), fy = gy - float(y0);
+    const vec2 a = texelFetch(table, ivec2(x0, y0), 0).xy, b = texelFetch(table, ivec2(x1, y0), 0).xy;
+    const vec2 c = texelFetch(table, ivec2(x0, y1), 0).xy, d = texelFetch(table, ivec2(x1, y1), 0).xy;
+    const vec2 f = ((a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy) * scale;
+    const float x = float(xy.x), y = float(xy.y);
+    const vec4 pa = clampedSample(aTex, size, x - u * f.x, y - u * f.y);
+    const vec4 pb = clampedSample(bTex, size, x + (1.0 - u) * f.x, y + (1.0 - u) * f.y);
+    return pa * (1.0 - u) + pb * u;
+}
+
 vec4 transition(int type, ivec2 xy, ivec2 size) {
+    if (type == 18) return smoothCut(xy, size);
     const int x = xy.x, y = xy.y, w = size.x, h = size.y;
     const float uf = p[0].y, soft = p[0].z, strength = p[1].y;
     const int dir = int(p[0].w);

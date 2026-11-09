@@ -21771,7 +21771,8 @@ colorspaces:
         s.videoTracks[2].clips.clear();
         edit::clipById(s, topId)->effects.clear();
 
-        // Every transition (but Smooth Cut's flow and OpenFX's), at three places, between two pictures on V1.
+        // Every transition but OpenFX's (Smooth Cut's flow measured once on the CPU, its morph drawn here), at three
+        // places, between two pictures on V1.
         QVERIFY(edit::placeMedia(p, s, other, 40, 0, 40, {TrackKind::Video, 0}, {}, false).ok);
         edit::clipById(s, topId)->motion.params["opacity"] = 0.0;  // (V2 out of the way)
         QVERIFY(edit::addTransition(p, s, r1.created[0], edit::Edge::Out, "cross_dissolve", 20).ok);
@@ -21783,7 +21784,7 @@ colorspaces:
             {"spin", {{{"turn", 90}}}}, {"glitch", {{{"strength", 1}}}}, {"light_leak", {{}}}, {"luma_wipe", {{}, {{"invert", 1}}}},
             {"shape_wipe", {{{"shape", 0}}, {{"shape", 3}, {"count", 3}, {"angle", 20}}, {{"shape", 4}}, {{"shape", 5}, {"count", 2}}, {{"shape", 1}}}},
             {"cube", {{{"direction", 0}}, {{"direction", 1}}, {{"direction", 2}}, {{"direction", 3}}}},
-            {"flip", {{{"direction", 0}}, {{"direction", 1}}}}, {"clock_wipe", {{}}}};
+            {"flip", {{{"direction", 0}}, {{"direction", 1}}}}, {"clock_wipe", {{}}}, {"smooth_cut", {{}}}};
         FrameTime from = 0, to = 0;
         QVERIFY(edit::transitionRange(s.videoTracks[0], tr, from, to));
         for (const auto& [type, settings] : transitions)

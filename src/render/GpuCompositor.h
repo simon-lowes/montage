@@ -124,6 +124,9 @@ struct Item {
     // gpuTransitionParams), both clips placed on the canvas first. (-1: a cross dissolve, mixed as they are placed.)
     int transition = -1;
     float transitionParams[44] = {};
+    // (Smooth Cut, 18: its flow, a grid of moves in RGBA rows of transitionTableWidth, read as gpumix.frag's table)
+    std::vector<float> transitionTable;
+    int transitionTableWidth = 0;
     // A track matte: the clip seen through another track's picture (placed at the canvas's size), by its alpha or
     // luma, or the reverse (render/Compositor's applyTrackMatte).
     std::optional<Layer> matte;
