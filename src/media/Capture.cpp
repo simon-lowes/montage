@@ -542,6 +542,107 @@ std::vector<std::string> captureDeviceKinds() {
     return out;
 }
 
+// ---- LiveFeed.
+
+LiveFeed::LiveFeed(int maxWidth, int maxHeight) : maxWidth_(std::max(16, maxWidth)), maxHeight_(std::max(16, maxHeight)) {}
+
+LiveFeed::~LiveFeed() { sws_freeContext(sws_); }
+
+LiveFeed::Now LiveFeed::look() {
+    std::lock_guard lock(m_);
+    Now out = now_;
+    std::fill(now_.peaks.begin(), now_.peaks.end(), 0.0f);
+    return out;
+}
+
+std::string LiveFeed::firstTimecode() const {
+    std::lock_guard lock(m_);
+    return first_;
+}
+
+std::string LiveFeed::timecodeAt(int64_t frame) const {
+    std::string first;
+    AVRational fps;
+    {
+        std::lock_guard lock(m_);
+        first = first_;
+        fps = {fpsNum_, fpsDen_};
+    }
+    AVTimecode tc;
+    if (first.empty() || frame < 0 || av_timecode_init_from_string(&tc, fps, first.c_str(), nullptr) < 0) return {};
+    char b[AV_TIMECODE_STR_SIZE];
+    return av_timecode_make_string(&tc, b, int(std::min<int64_t>(frame, INT32_MAX)));
+}
+
+void LiveFeed::begin(const std::string& timecode, int fpsNum, int fpsDen) {
+    std::lock_guard lock(m_);
+    first_ = timecode;
+    fpsNum_ = std::max(1, fpsNum), fpsDen_ = std::max(1, fpsDen);
+    now_ = {};
+    now_.fps = double(fpsNum_) / fpsDen_;
+    now_.running = true;
+}
+
+void LiveFeed::end() {
+    std::lock_guard lock(m_);
+    now_.running = false;
+}
+
+void LiveFeed::picture(const AVFrame* f) {
+    if (!f || f->width <= 0 || f->height <= 0) return;
+    // Scaled to fit, its shape kept (the pixels' aspect too), as RGB.
+    const double sar = f->sample_aspect_ratio.num > 0 && f->sample_aspect_ratio.den > 0 ? av_q2d(f->sample_aspect_ratio) : 1.0;
+    const double shown = f->width * sar;
+    const double k = std::min({1.0, maxWidth_ / shown, double(maxHeight_) / f->height});
+    const int w = std::max(2, int(std::lround(shown * k))), h = std::max(2, int(std::lround(f->height * k)));
+    QImage img(w, h, QImage::Format_RGB32);
+    {
+        // (the scaler, kept for the next picture: this thread alone uses it)
+        const int key[3] = {f->width, f->height, f->format};
+        if (!sws_ || !std::equal(key, key + 3, swsKey_)) {
+            sws_ = sws_getCachedContext(sws_, f->width, f->height, AVPixelFormat(f->format), w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            std::copy(key, key + 3, swsKey_);
+            if (sws_) {
+                const int space = f->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : f->colorspace == AVCOL_SPC_SMPTE170M ? SWS_CS_ITU601 : SWS_CS_ITU709;
+                const bool full = f->color_range == AVCOL_RANGE_JPEG;
+                sws_setColorspaceDetails(sws_, sws_getCoefficients(space), full ? 1 : 0, sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16, 1 << 16);
+            }
+        }
+        if (!sws_) return;
+        uint8_t* dst[1] = {img.bits()};
+        const int stride[1] = {int(img.bytesPerLine())};
+        sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, stride);
+    }
+    std::lock_guard lock(m_);
+    now_.picture = img;
+    now_.frame = f->pts;
+    now_.width = f->width, now_.height = f->height;
+    ++now_.pictures;
+    now_.timecode.clear();
+    AVTimecode tc;
+    if (!first_.empty() && f->pts >= 0 && av_timecode_init_from_string(&tc, AVRational{fpsNum_, fpsDen_}, first_.c_str(), nullptr) >= 0) {
+        char b[AV_TIMECODE_STR_SIZE];
+        now_.timecode = av_timecode_make_string(&tc, b, int(std::min<int64_t>(f->pts, INT32_MAX)));
+    }
+}
+
+void LiveFeed::sound(const AVFrame* f) {
+    if (!f || f->nb_samples <= 0) return;
+    const int ch = f->ch_layout.nb_channels;
+    if (ch <= 0 || (f->format != AV_SAMPLE_FMT_S32 && f->format != AV_SAMPLE_FMT_FLT)) return;
+    std::vector<float> peak(size_t(ch), 0.0f);
+    for (int i = 0; i < f->nb_samples; ++i)
+        for (int c = 0; c < ch; ++c) {
+            const size_t at = size_t(i) * size_t(ch) + size_t(c);
+            const float v = f->format == AV_SAMPLE_FMT_S32 ? std::fabs(float(reinterpret_cast<const int32_t*>(f->data[0])[at]) / 2147483648.0f)
+                                                           : std::fabs(reinterpret_cast<const float*>(f->data[0])[at]);
+            peak[size_t(c)] = std::max(peak[size_t(c)], v);
+        }
+    std::lock_guard lock(m_);
+    if (now_.peaks.size() != peak.size()) now_.peaks.assign(peak.size(), 0.0f);
+    for (size_t c = 0; c < peak.size(); ++c) now_.peaks[c] = std::max(now_.peaks[c], peak[c]);
+}
+
 Recorder::Recorder() : s_(std::make_unique<State>()) {}
 
 Recorder::~Recorder() { stop(); }
@@ -552,7 +653,7 @@ bool Recorder::start(const CaptureSettings& settings, std::string* error) {
         if (error) *error = "Unknown codec " + settings.codec;
         return false;
     }
-    if (!endsWith(settings.path, ".mov") && !endsWith(settings.path, ".mxf")) {
+    if (!(settings.path.empty() && settings.live) && !endsWith(settings.path, ".mov") && !endsWith(settings.path, ".mxf")) {
         if (error) *error = "Record to a .mov or .mxf file";
         return false;
     }
@@ -626,6 +727,7 @@ void Recorder::run() {
     double audioBase = 0;        // a sound device's: its first timestamp and the sample it was placed at
     int64_t audioBaseSample = 0;
     const bool mov = endsWith(cs.path, ".mov");
+    const bool watchOnly = cs.path.empty();
     int64_t frameLimit = 0;
     const bool ranged = cs.fromFrame >= 0;
     int64_t firstLabel = -1;  // a range's first picture's label
@@ -640,8 +742,14 @@ void Recorder::run() {
     bool interlaced = false, topFirst = true;
 
     auto write = [&](AVCodecContext* enc, AVStream* st, AVFrame* f) -> bool {
-        if (f && enc == venc && cs.onPicture) cs.onPicture(f, fps.num, fps.den);
-        else if (f && enc == aenc && cs.onSound) cs.onSound(f);
+        if (f && enc == venc) {
+            if (cs.onPicture) cs.onPicture(f, fps.num, fps.den);
+            if (cs.live) cs.live->picture(f);
+        } else if (f && enc == aenc) {
+            if (cs.onSound) cs.onSound(f);
+            if (cs.live) cs.live->sound(f);
+        }
+        if (watchOnly) return true;  // (watched, not recorded)
         int err = avcodec_send_frame(enc, f);
         if (err < 0 && err != AVERROR_EOF) {
             fatal = "Cannot encode: " + avError(err);
@@ -753,6 +861,16 @@ void Recorder::run() {
                     if (av_timecode_init_from_string(&check, fps, tc.c_str(), nullptr) < 0) tc.clear();  // (the feed's does not fit its rate)
                 }
             }
+        // (an MPEG-2 feed's GOP time code, on the picture beginning each group: an encoder's own over SRT, RIST, UDP)
+        if (tc.empty())
+            if (const AVFrameSideData* sd = av_frame_get_side_data(f, AV_FRAME_DATA_GOP_TIMECODE); sd && sd->size >= int(sizeof(int64_t))) {
+                int64_t gop = 0;
+                std::memcpy(&gop, sd->data, sizeof gop);
+                char b[AV_TIMECODE_STR_SIZE];
+                tc = av_timecode_make_mpeg_tc_string(b, uint32_t(gop));
+                AVTimecode check;
+                if (av_timecode_init_from_string(&check, fps, tc.c_str(), nullptr) < 0) tc.clear();
+            }
         if (tc.empty()) tc = timeOfDay(fps);
         if (AVTimecode check; av_timecode_init_from_string(&check, fps, tc.c_str(), nullptr) < 0) {
             char b[32];
@@ -760,8 +878,8 @@ void Recorder::run() {
             fatal = "The timecode " + tc + " does not fit the feed's " + b + " fps";
             return false;
         }
-        int err = avformat_alloc_output_context2(&oc, nullptr, nullptr, cs.path.c_str());
-        if (err < 0 || !oc) {
+        int err = watchOnly ? 0 : avformat_alloc_output_context2(&oc, nullptr, nullptr, cs.path.c_str());
+        if (!watchOnly && (err < 0 || !oc)) {
             fatal = "Cannot write " + cs.path + ": " + avError(err);
             return false;
         }
@@ -779,38 +897,41 @@ void Recorder::run() {
                      : height >= 720                                                                    ? AVCOL_SPC_BT709
                                                                                                         : AVCOL_SPC_SMPTE170M;
         const AVCodec* enc = avcodec_find_encoder_by_name(codec->encoder);
-        venc = avcodec_alloc_context3(enc);
-        venc->width = width;
-        venc->height = height;
-        venc->pix_fmt = codec->pix;
-        venc->time_base = av_inv_q(fps);
-        venc->framerate = fps;
-        venc->sample_aspect_ratio = f->sample_aspect_ratio.num > 0 ? f->sample_aspect_ratio : AVRational{1, 1};
-        venc->color_primaries = f->color_primaries != AVCOL_PRI_UNSPECIFIED ? f->color_primaries : colorSpace == AVCOL_SPC_BT709 ? AVCOL_PRI_BT709 : AVCOL_PRI_UNSPECIFIED;
-        venc->color_trc = f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : colorSpace == AVCOL_SPC_BT709 ? AVCOL_TRC_BT709 : AVCOL_TRC_UNSPECIFIED;
-        venc->colorspace = AVColorSpace(colorSpace);
-        venc->color_range = AVCOL_RANGE_MPEG;
-        venc->thread_count = 0;
-        venc->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-        if (interlaced) {
-            venc->field_order = topFirst ? AV_FIELD_TT : AV_FIELD_BB;
-            venc->flags |= AV_CODEC_FLAG_INTERLACED_DCT;
+        // (watched only: the pictures converted to the codec's format as if recorded, not encoded)
+        if (!watchOnly) {
+            venc = avcodec_alloc_context3(enc);
+            venc->width = width;
+            venc->height = height;
+            venc->pix_fmt = codec->pix;
+            venc->time_base = av_inv_q(fps);
+            venc->framerate = fps;
+            venc->sample_aspect_ratio = f->sample_aspect_ratio.num > 0 ? f->sample_aspect_ratio : AVRational{1, 1};
+            venc->color_primaries = f->color_primaries != AVCOL_PRI_UNSPECIFIED ? f->color_primaries : colorSpace == AVCOL_SPC_BT709 ? AVCOL_PRI_BT709 : AVCOL_PRI_UNSPECIFIED;
+            venc->color_trc = f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : colorSpace == AVCOL_SPC_BT709 ? AVCOL_TRC_BT709 : AVCOL_TRC_UNSPECIFIED;
+            venc->colorspace = AVColorSpace(colorSpace);
+            venc->color_range = AVCOL_RANGE_MPEG;
+            venc->thread_count = 0;
+            venc->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+            if (interlaced) {
+                venc->field_order = topFirst ? AV_FIELD_TT : AV_FIELD_BB;
+                venc->flags |= AV_CODEC_FLAG_INTERLACED_DCT;
+            }
+            av_opt_set(venc->priv_data, "profile", codec->profile, 0);
+            if (oc->oformat->flags & AVFMT_GLOBALHEADER) venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            if ((err = avcodec_open2(venc, enc, nullptr)) < 0) {
+                fatal = std::string("Cannot encode ") + codec->name + " at " + std::to_string(width) + "x" + std::to_string(height) + ": " + avError(err);
+                return false;
+            }
+            if (!(vst = avformat_new_stream(oc, nullptr))) {
+                fatal = "Out of memory";
+                return false;
+            }
+            avcodec_parameters_from_context(vst->codecpar, venc);
+            vst->time_base = venc->time_base;
+            vst->avg_frame_rate = fps;
+            av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);
+            if (!cs.reel.empty()) av_dict_set(&vst->metadata, "reel_name", cs.reel.c_str(), 0);
         }
-        av_opt_set(venc->priv_data, "profile", codec->profile, 0);
-        if (oc->oformat->flags & AVFMT_GLOBALHEADER) venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if ((err = avcodec_open2(venc, enc, nullptr)) < 0) {
-            fatal = std::string("Cannot encode ") + codec->name + " at " + std::to_string(width) + "x" + std::to_string(height) + ": " + avError(err);
-            return false;
-        }
-        if (!(vst = avformat_new_stream(oc, nullptr))) {
-            fatal = "Out of memory";
-            return false;
-        }
-        avcodec_parameters_from_context(vst->codecpar, venc);
-        vst->time_base = venc->time_base;
-        vst->avg_frame_rate = fps;
-        av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);
-        if (!cs.reel.empty()) av_dict_set(&vst->metadata, "reel_name", cs.reel.c_str(), 0);
         // Its sound: the video source's, else a sound device of its own (its format known from the first sound).
         const Input& ain = inputs[1].live() ? inputs[1] : inputs[0];
         int sourceChannels = ain.audio ? ain.audio->ch_layout.nb_channels : 0;
@@ -829,15 +950,26 @@ void Recorder::run() {
             else
                 av_channel_layout_default(&aenc->ch_layout, channels);
             aenc->time_base = {1, 48000};
-            if (oc->oformat->flags & AVFMT_GLOBALHEADER) aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-            if (avcodec_open2(aenc, pcm, nullptr) < 0 || !(ast = avformat_new_stream(oc, nullptr))) {
+            if (oc && (oc->oformat->flags & AVFMT_GLOBALHEADER)) aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            if (avcodec_open2(aenc, pcm, nullptr) < 0 || (!watchOnly && !(ast = avformat_new_stream(oc, nullptr)))) {
                 // (the picture is recorded without it)
                 avcodec_free_context(&aenc);
                 warning = "The sound could not be recorded";
-            } else {
+            } else if (ast) {
                 avcodec_parameters_from_context(ast->codecpar, aenc);
                 ast->time_base = aenc->time_base;
             }
+        }
+        if (watchOnly) {
+            headerWritten = true;  // (begun)
+            if (cs.live) cs.live->begin(tc, fps.num, fps.den);
+            std::lock_guard lock(s->m);
+            s->st.width = width;
+            s->st.height = height;
+            s->st.fps = av_q2d(fps);
+            s->st.timecode = tc;
+            s->st.channels = aenc ? aenc->ch_layout.nb_channels : 0;
+            return true;
         }
         av_dict_set(&oc->metadata, "timecode", tc.c_str(), 0);
         if (!(oc->oformat->flags & AVFMT_NOFILE)) {
@@ -860,6 +992,7 @@ void Recorder::run() {
             return false;
         }
         headerWritten = true;
+        if (cs.live) cs.live->begin(tc, fps.num, fps.den);
         std::lock_guard lock(s->m);
         s->st.width = width;
         s->st.height = height;
@@ -1433,13 +1566,14 @@ void Recorder::run() {
         s->queue.clear();
         s->queuedBytes = 0;
     }
-    if (headerWritten) {
+    if (cs.live) cs.live->end();
+    if (headerWritten && !watchOnly) {
         // The encoders emptied and the file finished (a QuickTime file already holds all but the last fragment).
         if (venc) write(venc, vst, nullptr);
         if (aenc) write(aenc, ast, nullptr);
         const int err = av_write_trailer(oc);
         if (err < 0 && fatal.empty()) fatal = "Cannot finish " + cs.path + ": " + avError(err);
-    } else if (fatal.empty()) {
+    } else if (!headerWritten && fatal.empty()) {
         fatal = warning.empty() ? "No picture came from the feed" : warning;
     }
     if (oc) {

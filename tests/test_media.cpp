@@ -2072,6 +2072,180 @@ private slots:
         }
     }
 
+    // A feed watched live without recording it (LiveFeed): an MPEG transport stream over SRT (UDP where FFmpeg has no
+    // SRT), its GOP time code the feed's own; each picture's grey its frame within the second, so the picture shown
+    // and its timecode are seen to belong together; its sound's levels.
+    void captureWatchedLive() {
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        QProcess probe;
+        probe.start(ffmpeg, {"-hide_banner", "-protocols"});
+        probe.waitForFinished(20000);
+        const bool srt = QString::fromLocal8Bit(probe.readAllStandardOutput()).contains(QRegularExpression(QStringLiteral("\\n\\s*srt\\s*\\n")));
+        QUdpSocket free;
+        free.bind(QHostAddress::LocalHost, 0);
+        const int port = int(free.localPort());
+        free.close();
+        CaptureSettings cs;
+        cs.video.url = (srt ? QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port)
+                            : QStringLiteral("udp://127.0.0.1:%1").arg(port))
+                           .toStdString();
+        cs.openTimeout = 15;
+        cs.live = std::make_shared<LiveFeed>(160, 90);
+        std::string err;
+        QVERIFY(!Recorder().start([] {
+            CaptureSettings none;
+            none.video.url = "udp://127.0.0.1:9";
+            return none;  // (no file and nothing to watch it: refused)
+        }(), &err));
+        Recorder r;
+        QVERIFY2(r.start(cs, &err), err.c_str());
+        QThread::msleep(300);
+        QProcess sender;
+        const QString to = srt ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(port)
+                               : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(port);
+        sender.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i",
+                              "color=size=320x180:rate=25,geq=lum='16+8*mod(N\\,25)':cb=128:cr=128", "-f", "lavfi", "-i",
+                              "sine=frequency=1000:sample_rate=48000", "-t", "60", "-c:v", "mpeg2video", "-q:v", "2", "-g", "12", "-bf", "0",
+                              "-flags", "+cgop", "-sc_threshold", "1000000000", "-timecode", "10:00:00:00", "-c:a", "mp2", "-f", "mpegts", to});
+        QVERIFY(sender.waitForStarted(10000));
+        // (waiting on pictures, not the clock: a busy machine is slow)
+        QElapsedTimer t;
+        t.start();
+        int checked = 0;
+        float loudest = 0;
+        QString why;
+        while (checked < 20 && t.elapsed() < 40000 && why.isEmpty()) {
+            QThread::msleep(40);
+            const LiveFeed::Now now = cs.live->look();
+            for (float p : now.peaks) loudest = std::max(loudest, p);
+            if (now.picture.isNull() || now.pictures < 5) continue;
+            if (now.picture.width() > 160 || now.picture.height() > 90 || now.width != 320 || now.fps != 25) why = "the picture's size or rate";
+            int hh = 0, mm = 0, ss = 0, ff = 0;
+            if (std::sscanf(now.timecode.c_str(), "%d:%d:%d:%d", &hh, &mm, &ss, &ff) != 4 || hh != 10) {
+                why = QString::fromStdString("timecode " + now.timecode);
+                break;
+            }
+            // (the grey, full range: 8 codes a frame above black, 255/219 of that)
+            const int grey = qGray(now.picture.pixel(now.picture.width() / 2, now.picture.height() / 2));
+            if (std::abs(grey - int(std::lround(ff * 8 * 255.0 / 219))) > 6)
+                why = QStringLiteral("picture %1 (grey %2) shown as %3").arg(now.frame).arg(grey).arg(QString::fromStdString(now.timecode));
+            if (cs.live->timecodeAt(now.frame) != now.timecode) why = "timecodeAt";
+            ++checked;
+        }
+        r.stop();
+        sender.kill();
+        sender.waitForFinished(5000);
+        if (r.status().error.find("Protocol not found") != std::string::npos) QSKIP("This build's FFmpeg cannot receive the feed");
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        QVERIFY2(checked >= 20, qPrintable(QString::number(checked)));
+        QVERIFY2(std::fabs(loudest - 0.125f) < 0.02f, qPrintable(QString::number(loudest)));  // (the sine's 1/8 of full scale)
+        QVERIFY(!cs.live->look().running);
+        QVERIFY(r.status().error.empty() && r.status().timecode.rfind("10:00:", 0) == 0);
+    }
+
+    // ST 2110-31 recorded: AES3 subframes carrying a payload that is not PCM (an ST 337 burst's preambles and counted
+    // words) are in the file bit for bit, as the 24-bit sound they were sent as, beside the picture.
+    void captureAes3BitExact() {
+        namespace st = montage::st2110;
+        int ports[3];
+        {
+            st::Receiver probe[3];
+            for (int i = 0; i < 3; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.ttl = 1;
+        st::VideoFormat v;
+        v.width = 160, v.height = 90, v.fps = {25, 1};
+        st::AudioFormat a;
+        a.aes3 = true, a.channels = 2;
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, a, &err), err.c_str());
+        const int total = 48000 * 30;
+        std::vector<uint32_t> words(size_t(total) * 2);
+        const auto status = st::aes3ChannelStatus(true);
+        for (int n = 0; n < total; ++n)
+            for (int c = 0; c < 2; ++c) {
+                const int k = n % 1536, b = n % 192;
+                const int32_t data = k == 0 ? (c ? 0xA54E1F : 0x96F872) : int32_t((n * 2 + c + 1) & 0xFFFFFF);
+                words[size_t(n) * 2 + size_t(c)] = st::am824Word(data, b == 0, c == 0, (status[size_t(b / 8)] >> (b % 8)) & 1);
+            }
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            const st::Raster pic(v.width, v.height, st::Sampling::Ycc422, 10);
+            for (int k = 0; !stop && k < 25 * 30; ++k) {
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + k), v.fps);
+                tx.queueAes3(words.data() + size_t(k) * 1920 * 2, 1920);
+                if (!tx.send(pic, nullptr, 0, &tc, {}, &stop)) break;
+            }
+        });
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = tx.sdpVideo() + tx.sdpAudio() + tx.sdpAnc();
+        cs.path = path("aes3.mov");
+        cs.codec = "prores_proxy";
+        cs.seconds = 2;
+        Recorder rec;
+        QVERIFY2(rec.start(cs, &err), err.c_str());
+        const bool ended = rec.wait(30);
+        stop = true;
+        sending.join();
+        QVERIFY(ended);
+        QVERIFY2(rec.status().error.empty(), rec.status().error.c_str());
+        QCOMPARE(rec.status().channels, 2);
+        // The file's sound, decoded to 32 bits: each sample's top 24 bits the AES3 word's, in the order sent.
+        AVFormatContext* fmt = nullptr;
+        QVERIFY(avformat_open_input(&fmt, cs.path.c_str(), nullptr, nullptr) >= 0);
+        avformat_find_stream_info(fmt, nullptr);
+        const int si = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        QVERIFY(si >= 0 && fmt->streams[si]->codecpar->codec_id == AV_CODEC_ID_PCM_S24LE);
+        const AVCodec* dec = avcodec_find_decoder(fmt->streams[si]->codecpar->codec_id);
+        AVCodecContext* ctx = avcodec_alloc_context3(dec);
+        avcodec_parameters_to_context(ctx, fmt->streams[si]->codecpar);
+        QVERIFY(avcodec_open2(ctx, dec, nullptr) >= 0);
+        std::vector<int32_t> got;
+        AVPacket* pkt = av_packet_alloc();
+        AVFrame* fr = av_frame_alloc();
+        while (av_read_frame(fmt, pkt) >= 0) {
+            if (pkt->stream_index == si && avcodec_send_packet(ctx, pkt) >= 0)
+                while (avcodec_receive_frame(ctx, fr) >= 0) {
+                    QCOMPARE(fr->format, int(AV_SAMPLE_FMT_S32));
+                    const auto* d = reinterpret_cast<const int32_t*>(fr->data[0]);
+                    got.insert(got.end(), d, d + size_t(fr->nb_samples) * 2);
+                }
+            av_packet_unref(pkt);
+        }
+        av_frame_free(&fr);
+        av_packet_free(&pkt);
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        // (the recording's first frame where the counted words begin; silence before it, if the sound began late)
+        size_t first = 0;
+        while (first < got.size() && got[first] == 0) ++first;
+        while (first + 1 < got.size() && (uint32_t(got[first] >> 8) & 0xFFFFFF) == 0x96F872) first += 2;
+        QVERIFY(first + 2 * 48000 <= got.size() + 2 * 4800);
+        const uint32_t start = uint32_t(got[first] >> 8) & 0xFFFFFF;
+        QVERIFY(start % 2 == 1);  // (a left subframe's count)
+        const int64_t n0 = (start - 1) / 2;
+        int64_t matched = 0;
+        for (size_t i = first; i + 1 < got.size() && got[i] != 0; i += 2, ++matched) {
+            const int64_t n = n0 + matched;
+            if (n >= total) break;
+            for (int c = 0; c < 2; ++c) {
+                const uint32_t want = words[size_t(n) * 2 + size_t(c)] & 0xFFFFFF;
+                if ((uint32_t(got[i + size_t(c)] >> 8) & 0xFFFFFF) != want || (got[i + size_t(c)] & 0xFF) != 0)
+                    QFAIL(qPrintable(QStringLiteral("sample %1 channel %2").arg(matched).arg(c)));
+            }
+        }
+        QVERIFY2(matched >= 48000 * 19 / 10, qPrintable(QString::number(matched)));
+        tx.close();
+    }
+
     void captureFromOmt() {
 #ifndef MONTAGE_WITH_OMT
         QSKIP("Built without Open Media Transport");
