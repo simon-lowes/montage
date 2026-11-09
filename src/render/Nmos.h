@@ -2,11 +2,14 @@
 // (render/St2110Receive.h), so a facility's broadcast controller finds and routes it as it does other IP gear:
 //  - IS-04 v1.3: the Node API over HTTP (the node, its device, the video, sound and data sources, flows and senders),
 //    registered with the registry found by DNS-SD (unicast DNS: _nmos-register._tcp in the search domain, from a
-//    given server or the system's; the best priority first, failing over to the next) or named outright, and kept
-//    there by a heartbeat.
+//    given server or the system's; or multicast DNS on the local network, in the domain "local"; the best priority
+//    first, failing over to the next) or named outright, and kept there by a heartbeat. The Node announces itself by
+//    multicast DNS-SD (_nmos-node._tcp.local), its resources' versions in its TXT record while no registry has it
+//    (peer to peer).
 //  - IS-05 v1.1: the Connection API for the three senders: their constraints, staged and active transport parameters
 //    (source and destination addresses and ports, on or off), activation at once or scheduled (absolute or relative
-//    TAI times), bulk changes, and the SDP transport file each sends.
+//    TAI times), bulk changes, and the SDP transport file each sends. A sender sending on two paths (ST 2022-7) offers
+//    both as its two legs, each turned on and off, and routed, by itself.
 //  - Receivers (video, audio and ancillary data), each with two legs for ST 2022-7: staged from a sender's SDP
 //    transport file or by their parameters (the multicast group, the source to take, the interface and port), and
 //    connected in IS-04 too by a PUT of a sender to their target (its manifest fetched).
@@ -52,6 +55,7 @@ struct NodeOptions {
     QString domain;
     QString dnsServer;
     bool discover = true;          // look for a registry at all (else the Node API alone, peer to peer)
+    bool announce = true;          // announce the Node by multicast DNS-SD
     int heartbeatMs = 5000;
     bool senders = true;           // offer the reference output's senders
     bool receivers = false;        // offer receivers
@@ -101,6 +105,8 @@ public:
     QString registry() const;
     std::vector<Registry> registries() const { return registries_; }
     bool registered() const { return registered_; }
+    // Why the Node is not announced by multicast DNS ("" when it is, or was not asked to be).
+    QString mdnsError() const { return mdnsError_; }
 
     // Ids, kept from one run to the next (made from the host name and label).
     QUuid nodeId() const { return nodeId_; }
@@ -141,11 +147,11 @@ private:
         int stream = 0;
         QJsonValue receiverId;  // (null)
         bool masterEnable = true;
-        Leg leg;
+        Leg leg[2];  // (the second when the output sends on two paths)
         // Staged, and when it is to happen.
         QJsonValue stagedReceiverId;
         bool stagedMasterEnable = true;
-        Leg stagedLeg;
+        Leg stagedLeg[2];
         QJsonValue mode, requestedTime;  // (null when none scheduled)
         int64_t activationNs = 0;
         QTimer* timer = nullptr;
@@ -162,16 +168,18 @@ private:
     QJsonObject senderResource(int stream) const;
     QJsonArray receiverResources() const;
     QJsonObject connectionJson(const Connection& c, bool staged) const;
-    QJsonObject legJson(const Leg& l, int stream, bool resolve) const;
+    QJsonObject legJson(const Leg& l, int stream, int index, bool resolve) const;
+    int senderLegs() const { return options_.redundant ? 2 : 1; }
+    QJsonArray legsJson(const Leg* legs, int stream, bool resolve) const;
     QJsonArray constraintsJson(int stream) const;
     QString transportFile(int stream) const;
     Response patchStaged(Connection& c, const QJsonObject& patch, bool bulk);
     void activate(Connection& c, const QString& mode);
     void applyActive();
     QString newVersion();
-    st2110::Endpoint endpointOf(int stream) const;
-    QString interfaceName() const;
-    QString sourceAddress() const;
+    st2110::Endpoint endpointOf(int stream, int leg = 0) const;
+    QString interfaceName(int leg = 0) const;
+    QString sourceAddress(int leg = 0) const;
 
     // Receivers.
     struct RLeg {
@@ -206,6 +214,17 @@ private:
     void activateReceiver(RConn& r, const QString& mode);
     Response putTarget(RConn& r, const QJsonObject& sender);
     std::vector<RConn> receivers_;
+
+    // Multicast DNS: the Node announced (and answered for), registries browsed for in "local".
+    struct Mdns;
+    std::unique_ptr<Mdns> mdns_;
+    void startMdns();
+    void announceNode();
+    QByteArray mdnsTxt() const;
+    void mdnsChanged(int kind);  // a resource of kind `kind` (IS-04's ver_ order, -1 none) changed: announced again
+    void browseRegistries(std::function<void(std::vector<Registry>)> done);
+    int mdnsVersions_[6] = {};
+    QString mdnsError_;
 
     // Registration.
     void discover();

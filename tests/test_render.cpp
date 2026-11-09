@@ -128,6 +128,7 @@
 #include <QSslKey>
 #include <QSslSocket>
 #include <QUdpSocket>
+#include <QNetworkDatagram>
 #include <QTcpSocket>
 #include <QNetworkProxy>
 #include <thread>
@@ -16828,6 +16829,196 @@ colorspaces:
         QVERIFY2(why.empty(), why.c_str());
     }
 
+    // ST 2110-31 and -41, and several sound streams to one picture: AES3 subframes carrying a payload that is not PCM
+    // (an ST 337 data burst's preambles, then counted words, with user and validity bits and channel status saying
+    // "not audio") arrive bit for bit beside a second sender's L24 sound, and each frame's fast metadata items with it.
+    void st2110Aes3AndMetadata() {
+        using namespace montage::output;
+        namespace st = montage::st2110;
+        // AES3's pieces: the channel status CRC (CRC-8/AES's check value), parity, linear PCM's 24 bits exactly.
+        const char* check = "123456789";
+        QCOMPARE(int(st::aes3Crc(reinterpret_cast<const uint8_t*>(check), 9)), 0x97);
+        const auto status = st::aes3ChannelStatus(true);
+        QVERIFY(status[0] == 0x03 && status[23] == st::aes3Crc(status.data(), 23));
+        for (uint32_t d : {0u, 1u, 0x96F872u, 0xFFFFFFu})
+            for (int bits = 0; bits < 8; ++bits) QVERIFY(st::am824ParityOk(st::am824Word(int32_t(d), true, bits & 1, bits & 2, bits & 4, bits & 1)));
+        {
+            const float pcm[4] = {0.5f, -0.25f, float(8388607.0 / 8388608.0), -1.0f};
+            int block = 0;
+            const auto w = st::aes3FromPcm(pcm, 2, 2, block, st::aes3ChannelStatus(false));
+            QVERIFY(w.size() == 4 && block == 2 && st::am824BlockStart(w[0]) && st::am824BlockStart(w[1]) && !st::am824BlockStart(w[2]));
+            QVERIFY(st::am824Data(w[0]) == 4194304 && st::am824Data(w[1]) == -2097152 && st::am824Data(w[2]) == 8388607 && st::am824Data(w[3]) == -8388608);
+            QVERIFY(((w[0] >> 28) & 1) && !((w[1] >> 28) & 1));  // (the frame's first subframe marked)
+            QVERIFY(st::am824C(w[0]) && st::am824C(w[1]));        // (professional: byte 0's bit 0)
+        }
+        // Fast metadata packed and read back, several items to a packet and the frame's last packet marked.
+        {
+            std::vector<st::FastMetadata> items;
+            for (uint32_t i = 0; i < 6; ++i) items.push_back({0x12345u + i, i % 2 == 1, std::vector<uint32_t>(100 + i * 50, 0xA5000000u | i)});
+            std::vector<std::vector<uint8_t>> packets;
+            st::RtpState rtp{101, 5, 0};
+            QVERIFY(st::packFastMetadata(items, 9000, rtp, [&](const uint8_t* d, size_t n) {
+                packets.emplace_back(d, d + n);
+                return true;
+            }));
+            QVERIFY(packets.size() > 1);
+            std::vector<st::FastMetadata> back;
+            for (size_t i = 0; i < packets.size(); ++i) {
+                st::RtpPacket p;
+                QVERIFY(st::parseRtp(packets[i].data(), packets[i].size(), p) && p.marker == (i + 1 == packets.size()));
+                QVERIFY(st::unpackFastMetadata(p.payload, p.size, back));
+            }
+            QVERIFY(back == items);
+            std::vector<st::FastMetadata> none;
+            const uint8_t cut[8] = {0, 0, 0x04, 0x05, 1, 2, 3, 4};  // (an item of 5 words, 1 there)
+            QVERIFY(!st::unpackFastMetadata(cut, 8, none));
+        }
+        int ports[5];
+        {
+            st::Receiver probe[5];
+            for (int i = 0; i < 5; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::VideoFormat v;
+        v.width = 160, v.height = 90, v.fps = {25, 1};
+        // Sender A: the picture, AES3 (two subframes, 125 µs packets), time code and fast metadata.
+        st::SenderOptions oa;
+        oa.video = {"127.0.0.1", ports[0]}, oa.audio = {"127.0.0.1", ports[1]}, oa.anc = {"127.0.0.1", ports[2]};
+        oa.metadata = {"127.0.0.1", ports[3]};
+        oa.sendMetadata = true;
+        oa.metadataTypes = {0x00123, 0x3FFFFF};
+        oa.ttl = 1;
+        st::AudioFormat aes;
+        aes.aes3 = true, aes.channels = 2, aes.packetUs = 125;
+        st::Sender a;
+        std::string err;
+        QVERIFY2(a.open(oa, v, aes, &err), err.c_str());
+        QVERIFY(a.sdpAudio().find("AM824/48000/2") != std::string::npos && a.sdpMetadata().find("ST2110-41/90000") != std::string::npos);
+        QVERIFY(a.sdpMetadata().find("DIT=0x000123,0x3FFFFF") != std::string::npos);
+        // Sender B: sound alone, L24 in four channels.
+        st::SenderOptions ob;
+        ob.audio = {"127.0.0.1", ports[4]};
+        ob.sendVideo = ob.sendAnc = false;
+        ob.ttl = 1;
+        st::AudioFormat l24;
+        l24.channels = 4;
+        st::Sender b;
+        QVERIFY2(b.open(ob, v, l24, &err), err.c_str());
+        std::vector<st::SdpStream> streams;
+        for (const std::string& sdp : {a.sdpVideo(), a.sdpAudio(), a.sdpAnc(), a.sdpMetadata(), b.sdpAudio()}) {
+            const auto found = st::parseSdp(sdp, &err);
+            QVERIFY2(found.size() == 1, err.c_str());
+            streams.push_back(found[0]);
+        }
+        QVERIFY(streams[1].audio.aes3 && streams[1].encoding == "AM824" && streams[3].encoding == "ST2110-41");
+        QVERIFY(streams[3].metadataTypes == std::vector<uint32_t>({0x123, 0x3FFFFF}));
+        QVERIFY(st::parseSdp(st::sdpText(streams[3]))[0].metadataTypes == streams[3].metadataTypes);
+        QVERIFY(st::parseSdp(st::sdpText(streams[1]))[0].audio.aes3);
+        // The AES3 stream: a burst every 1,536 frames (Pa and Pb, Pc and Pd in its first two frames), counted words
+        // after, user and validity bits from the count, channel status "not audio" in 192-frame blocks.
+        const int total = 48000 * 12;
+        std::vector<uint32_t> words(size_t(total) * 2);
+        for (int n = 0; n < total; ++n)
+            for (int c = 0; c < 2; ++c) {
+                const int k = n % 1536;
+                const int32_t data = k == 0 ? (c ? 0xA54E1F : 0x96F872) : k == 1 ? (c ? 0x000100 : 0x000007) : int32_t((n * 2 + c) & 0xFFFFFF);
+                const int b192 = n % 192;
+                words[size_t(n) * 2 + size_t(c)] = st::am824Word(data, b192 == 0, c == 0, (status[size_t(b192 / 8)] >> (b192 % 8)) & 1, (n >> 3) & 1, (n >> 5) & 1 && c);
+            }
+        const int frames = 75, perFrame = 1920;
+        std::atomic<bool> stop{false};
+        const st::Raster pic(v.width, v.height, st::Sampling::Ycc422, 10);
+        std::vector<float> tone(size_t(perFrame) * 4);
+        for (int i = 0; i < perFrame; ++i)
+            for (int c = 0; c < 4; ++c) tone[size_t(i) * 4 + size_t(c)] = float(c + 1) / 8.0f;
+        std::thread sendA([&] {
+            for (int k = 0; k < frames && !stop; ++k) {
+                const Timecode t = timecodeOf(FrameTime(36000 * 25 + k), v.fps);
+                a.queueAes3(words.data() + size_t(k) * perFrame * 2, perFrame);
+                a.setNextMetadata({{0x123, false, {uint32_t(k), 0xDEADBEEF}}, {0x3FFFFF, true, {}}});
+                if (!a.send(pic, nullptr, 0, &t, {}, &stop)) break;
+            }
+        });
+        std::thread sendB([&] {
+            for (int k = 0; k < frames + 25 && !stop; ++k)
+                if (!b.send(pic, tone.data(), perFrame, nullptr, {}, &stop)) break;
+        });
+        st::Input in;
+        QVERIFY2(in.open(streams, {}, &err), err.c_str());
+        QCOMPARE(in.audio().channels, 6);
+        QCOMPARE(int(in.audioStreams().size()), 2);
+        std::string error;
+        int got = 0, withMeta = 0;
+        int64_t matched = 0, at = -1;  // (the AES3 words matched in a row, and where in `words` the next is)
+        std::vector<uint32_t> received;
+        for (int idle = 0; got < frames - 10 && idle < 10 && error.empty();) {
+            st::InputFrame f;
+            if (!in.next(f, 300)) {
+                ++idle;
+                continue;
+            }
+            idle = 0;
+            ++got;
+            if (f.channels != 6 || f.aes3.size() != f.audio.size() || f.audio.size() != size_t(perFrame) * 6) {
+                error = "the frame's sound";
+                break;
+            }
+            // (each frame's metadata: its own count, matched with its time code)
+            if (f.hasTimecode) {
+                const int k = f.timecode.seconds * 25 + f.timecode.frames;
+                if (f.metadata.size() == 2) {
+                    ++withMeta;
+                    if (!(f.metadata[0].type == 0x123 && f.metadata[0].words == std::vector<uint32_t>({uint32_t(k), 0xDEADBEEF}) &&
+                          f.metadata[1].type == 0x3FFFFF && f.metadata[1].k && f.metadata[1].words.empty()))
+                        error = "metadata of frame " + std::to_string(k);
+                }
+            }
+            for (int i = 0; i < perFrame && error.empty(); ++i) {
+                const uint32_t w0 = f.aes3[size_t(i) * 6], w1 = f.aes3[size_t(i) * 6 + 1];
+                // B's PCM beside it: its own levels, and its 24 bits in the words.
+                for (int c = 0; c < 4; ++c)
+                    if (f.audio[size_t(i) * 6 + 2 + size_t(c)] != 0.0f &&
+                        (f.audio[size_t(i) * 6 + 2 + size_t(c)] != float(c + 1) / 8.0f || st::am824Data(f.aes3[size_t(i) * 6 + 2 + size_t(c)]) != (c + 1) << 20))
+                        error = "the L24 stream's channel " + std::to_string(c + 3);
+                if (w0 == 0 && w1 == 0) {
+                    at = -1;  // (a gap: silence)
+                    continue;
+                }
+                if (at < 0) {
+                    // (found again by a counted word: a burst's preambles come every 1,536 frames)
+                    if ((w0 & 0xFFFFFF) == 0x96F872 || (w0 & 0xFFFFFF) == 7) continue;
+                    const auto it = std::find(words.begin(), words.end(), w0);
+                    if (it == words.end() || (it - words.begin()) % 2) {
+                        error = "an AES3 word not sent";
+                        break;
+                    }
+                    at = it - words.begin();
+                }
+                if (at + 1 >= int64_t(words.size()) || words[size_t(at)] != w0 || words[size_t(at) + 1] != w1) {
+                    error = "AES3 frame " + std::to_string(at / 2) + " not as sent";
+                    break;
+                }
+                if (f.audio[size_t(i) * 6] != float(double(st::am824Data(w0)) / 8388608.0)) error = "the AES3 words' samples";
+                received.push_back(w0), received.push_back(w1);
+                at += 2;
+                ++matched;
+            }
+        }
+        stop = true;
+        sendA.join();
+        sendB.join();
+        in.close();
+        QVERIFY2(error.empty(), error.c_str());
+        QVERIFY2(got >= frames - 10 && withMeta >= got - 2, qPrintable(QStringLiteral("%1 frames, %2 with metadata").arg(got).arg(withMeta)));
+        QVERIFY2(matched >= 48000, qPrintable(QString::number(matched)));
+        // The channel status read back from the words received: not audio, its CRC whole.
+        std::array<uint8_t, 24> cs{};
+        QVERIFY(st::aes3ReadChannelStatus(received.data(), received.size() / 2, 2, 1, cs));
+        QVERIFY(cs == status);
+    }
+
     // NMOS receivers: a controller hands each one a sender's SDP (two paths, ST 2022-7) through IS-05, the parameters
     // follow it, and the streams those parameters describe are received; IS-04's target connects and disconnects.
     void nmosReceivers() {
@@ -17004,6 +17195,173 @@ colorspaces:
         QVERIFY(node.receiverConnection(0).active && node.receiverConnection(0).leg[1].port == ports[3]);
         snd.close();
         node.stop();
+    }
+
+    // NMOS senders on two paths (ST 2022-7): both legs offered through IS-05, each routed and turned off by itself, the
+    // transport file with both; and the Node announced by multicast DNS-SD, and a registry found by it.
+    void nmosSenderLegsAndMulticastDns() {
+        namespace st = montage::st2110;
+        montage::nmos::Node node;
+        montage::nmos::NodeOptions no;
+        no.address = QStringLiteral("127.0.0.1");
+        no.discover = false;
+        no.label = QStringLiteral("Legs");
+        st::SenderOptions so;
+        so.video = {"239.100.0.1", 5004}, so.video2 = {"239.101.0.1", 5004};
+        so.audio = {"239.100.0.2", 5004}, so.audio2 = {"239.101.0.2", 5004};
+        so.anc = {"239.100.0.3", 5004}, so.anc2 = {"239.101.0.3", 5004};
+        so.redundant = true;
+        st::VideoFormat v;
+        node.setStreams(v, st::AudioFormat{}, so, true);
+        QString why;
+        QVERIFY2(node.start(no, &why), qPrintable(why));
+        std::vector<st::SenderOptions> activated;
+        node.onActivated = [&](const st::SenderOptions& o) { activated.push_back(o); };
+        auto json = [&](const QByteArray& method, const QString& path, const QJsonValue& body = QJsonValue::Undefined) {
+            const QByteArray b = body.isObject() ? QJsonDocument(body.toObject()).toJson() : QByteArray();
+            const montage::nmos::Node::Response r = node.handle(method, path, b);
+            return std::pair{r.code, QJsonDocument::fromJson(r.body)};
+        };
+        const QString id = node.senderId(0).toString(QUuid::WithoutBraces);
+        const QString single = QStringLiteral("/x-nmos/connection/v1.1/single/senders/%1/").arg(id);
+        QCOMPARE(json("GET", single + "constraints").second.array().size(), 2);
+        QJsonArray legs = json("GET", single + "active").second.object()["transport_params"].toArray();
+        QCOMPARE(legs.size(), 2);
+        QCOMPARE(legs[1].toObject()["destination_ip"].toString(), QStringLiteral("239.101.0.1"));
+        QCOMPARE(json("GET", QStringLiteral("/x-nmos/node/v1.3/senders/") + id).second.object()["interface_bindings"].toArray().size(), 2);
+        // Both paths in the transport file, as ST 2022-7's duplicates.
+        const QString file = QString::fromUtf8(node.handle("GET", single + "transportfile", {}).body);
+        QVERIFY2(file.contains("a=group:DUP") && file.contains("239.100.0.1") && file.contains("239.101.0.1"), qPrintable(file));
+        QVERIFY(st::parseSdp(file.toStdString())[0].redundant());
+        // One leg given where there are two: refused. The second leg routed elsewhere and the first turned off.
+        QCOMPARE(json("PATCH", single + "staged", QJsonObject{{"transport_params", QJsonArray{QJsonObject{}}}}).first, 400);
+        const auto r = json("PATCH", single + "staged",
+                            QJsonObject{{"transport_params", QJsonArray{QJsonObject{{"rtp_enabled", false}},
+                                                                        QJsonObject{{"destination_ip", "239.102.0.9"}, {"destination_port", 5010}}}},
+                                        {"activation", QJsonObject{{"mode", "activate_immediate"}}}});
+        QCOMPARE(r.first, 200);
+        QCOMPARE(int(activated.size()), 1);
+        const st::SenderOptions& now = activated.back();
+        QVERIFY(now.redundant && now.sendVideo && !now.pathOn[0][0] && now.pathOn[0][1]);
+        QVERIFY(now.video2.address == "239.102.0.9" && now.video2.port == 5010 && now.video.address == "239.100.0.1");
+        const QString one = QString::fromUtf8(node.handle("GET", single + "transportfile", {}).body);
+        QVERIFY2(!one.contains("a=group:DUP") && one.contains("239.102.0.9") && !one.contains("239.100.0.1"), qPrintable(one));
+        // A sender so turned off sends on its other path alone.
+        {
+            int ports[2];
+            {
+                st::Receiver probe[2];
+                for (int i = 0; i < 2; ++i) {
+                    QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[0]}, o.video2 = {"127.0.0.1", ports[1]};
+            o.redundant = true, o.sendAudio = o.sendAnc = false, o.ttl = 1;
+            o.pathOn[0][0] = false;
+            st::Sender tx;
+            std::string err;
+            st::VideoFormat small;
+            small.width = 64, small.height = 36;
+            QVERIFY2(tx.open(o, small, st::AudioFormat{}, &err), err.c_str());
+            st::Receiver rx[2];
+            QVERIFY(rx[0].open({"127.0.0.1", ports[0]}) && rx[1].open({"127.0.0.1", ports[1]}));
+            QVERIFY(tx.send(st::Raster(64, 36, st::Sampling::Ycc422, 10), nullptr, 0, nullptr, {}));
+            std::vector<uint8_t> d;
+            QVERIFY(rx[1].receive(d, 2000));
+            QVERIFY(!rx[0].receive(d, 200));
+        }
+        node.stop();
+
+        // Multicast DNS: the Node answers a one-shot query for _nmos-node._tcp.local (to this socket, not port 5353)
+        // with its instance, port and TXT record (peer to peer: with its resources' versions).
+        auto putName = [](QByteArray& b, const QString& name) {
+            for (const QString& l : name.split('.', Qt::SkipEmptyParts)) b.append(char(l.size())).append(l.toUtf8());
+            b.append('\0');
+        };
+        auto put16 = [](QByteArray& b, int v) { b.append(char(v >> 8)).append(char(v & 0xFF)); };
+        auto query = [&](const QString& name, int type) {
+            QByteArray q;
+            put16(q, 0x1234), put16(q, 0), put16(q, 1), put16(q, 0), put16(q, 0), put16(q, 0);
+            putName(q, name);
+            put16(q, type), put16(q, 1);
+            return q;
+        };
+        no.discover = true;
+        no.domain = QStringLiteral("local");
+        montage::nmos::Node announced;
+        announced.setStreams(v, st::AudioFormat{}, so, true);
+        QVERIFY2(announced.start(no, &why), qPrintable(why));
+        if (!announced.mdnsError().isEmpty()) QSKIP(qPrintable("No multicast DNS here: " + announced.mdnsError()));
+        QUdpSocket asker;
+        QVERIFY(asker.bind(QHostAddress::AnyIPv4, 0));
+        asker.setSocketOption(QAbstractSocket::MulticastLoopbackOption, 1);
+        // (other Nodes on the network may answer too: this one's answer looked for)
+        QByteArray answer;
+        const QByteArray name = "Legs-" + QByteArray::number(announced.port());
+        for (int tries = 0; tries < 6 && answer.isEmpty(); ++tries) {
+            asker.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), QHostAddress(QStringLiteral("224.0.0.251")), 5353);
+            QElapsedTimer t;
+            t.start();
+            while (answer.isEmpty() && t.elapsed() < 500) {
+                QTest::qWait(20);
+                while (asker.hasPendingDatagrams()) {
+                    const QByteArray d = asker.receiveDatagram().data();
+                    if (d.contains(name)) answer = d;
+                }
+            }
+        }
+        // (a network that keeps multicast in, as macOS's local network privacy can, is passed over)
+        if (answer.isEmpty()) QSKIP("Multicast DNS queries were not answered here (multicast not delivered)");
+        QCOMPARE(int(uchar(answer[0])) << 8 | uchar(answer[1]), 0x1234);
+        QVERIFY(answer.contains("_nmos-node"));
+        QVERIFY(answer.contains("api_proto=http") && answer.contains("api_ver=v1.0,v1.1,v1.2,v1.3") && answer.contains("ver_snd="));
+        const QByteArray portBytes{char(announced.port() >> 8), char(announced.port() & 0xFF)};
+        QVERIFY(answer.contains(portBytes));
+
+        // A registry announced on the network (this test answering the Node's browse as a registry would) is found in
+        // the domain "local".
+        QUdpSocket registry;
+        QVERIFY(registry.bind(QHostAddress::AnyIPv4, 5353, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint));
+        registry.setSocketOption(QAbstractSocket::MulticastLoopbackOption, 1);
+        QVERIFY(registry.joinMulticastGroup(QHostAddress(QStringLiteral("224.0.0.251"))));
+        auto record = [&](QByteArray& b, const QString& name, int type, const QByteArray& data) {
+            putName(b, name);
+            put16(b, type), put16(b, 1), put16(b, 0), put16(b, 120), put16(b, data.size());
+            b += data;
+        };
+        const QString instance = QStringLiteral("reg1._nmos-register._tcp.local");
+        bool asked = false;
+        QElapsedTimer t;
+        t.start();
+        while (announced.registries().empty() && t.elapsed() < 15000) {
+            QTest::qWait(20);
+            while (registry.hasPendingDatagrams()) {
+                const QByteArray q = registry.receiveDatagram().data();
+                if (q.size() < 12 || (uchar(q[2]) & 0x80) || !q.contains("_nmos-register")) continue;
+                asked = true;
+                QByteArray b;
+                put16(b, 0), put16(b, 0x8400), put16(b, 0), put16(b, 4), put16(b, 0), put16(b, 0);
+                QByteArray ptr, srv, txt, a;
+                putName(ptr, instance);
+                record(b, QStringLiteral("_nmos-register._tcp.local"), 12, ptr);
+                put16(srv, 0), put16(srv, 0), put16(srv, 18235);
+                putName(srv, QStringLiteral("registry-test.local"));
+                record(b, instance, 33, srv);
+                for (const QByteArray kv : {QByteArray("api_proto=http"), QByteArray("api_ver=v1.2,v1.3"), QByteArray("api_auth=false"), QByteArray("pri=10")})
+                    txt.append(char(kv.size())).append(kv);
+                record(b, instance, 16, txt);
+                a.append(char(127)).append(char(0)).append(char(0)).append(char(1));
+                record(b, QStringLiteral("registry-test.local"), 1, a);
+                registry.writeDatagram(b, QHostAddress(QStringLiteral("224.0.0.251")), 5353);
+            }
+        }
+        QVERIFY(asked);
+        QVERIFY(!announced.registries().empty());
+        QCOMPARE(announced.registries()[0].url, QStringLiteral("http://127.0.0.1:18235"));
+        QCOMPARE(announced.registries()[0].priority, 10);
+        announced.stop();
     }
 
     // The NMOS Node: its IS-04 resources registered with a registry in order and kept there by heartbeats, and IS-05

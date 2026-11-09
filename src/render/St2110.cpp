@@ -1,6 +1,7 @@
 #include "St2110.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
@@ -409,11 +410,31 @@ std::string audioSdp(const AudioFormat& f, const Endpoint& to, int pt, const Sdp
     if (f.channels % 2) order += f.channels > 1 ? ",M" : "M";
     order += ")";
     std::ostringstream s;
-    s << "a=rtpmap:" << pt << " L" << (f.bits == 16 ? 16 : 24) << "/" << f.rate << "/" << f.channels << "\r\n"
-      << "a=fmtp:" << pt << " channel-order=" << order << "\r\n"
-      << "a=ptime:" << (f.packetUs == 125 ? "0.125" : "1") << "\r\n"
-      << sdpClock(o);
+    if (f.aes3) {
+        // (ST 2110-31: AM824 words, AES3's subframes in pairs; no channel order, as they need not be audio)
+        s << "a=rtpmap:" << pt << " AM824/" << f.rate << "/" << f.channels << "\r\n";
+    } else {
+        s << "a=rtpmap:" << pt << " L" << (f.bits == 16 ? 16 : 24) << "/" << f.rate << "/" << f.channels << "\r\n"
+          << "a=fmtp:" << pt << " channel-order=" << order << "\r\n";
+    }
+    s << "a=ptime:" << (f.packetUs == 125 ? "0.125" : "1") << "\r\n" << sdpClock(o);
     return sdpStreams(to, o, to2, "audio", pt, s.str());
+}
+
+std::string metadataSdp(const Endpoint& to, int pt, const SdpOptions& o, const std::vector<uint32_t>& types, const Endpoint* to2) {
+    std::ostringstream s;
+    s << "a=rtpmap:" << pt << " ST2110-41/90000\r\n";
+    if (!types.empty()) {
+        s << "a=fmtp:" << pt << " DIT=";
+        char t[16];
+        for (size_t i = 0; i < types.size(); ++i) {
+            std::snprintf(t, sizeof t, "%s0x%06X", i ? "," : "", unsigned(types[i] & 0x3FFFFF));
+            s << t;
+        }
+        s << "\r\n";
+    }
+    s << sdpClock(o);
+    return sdpStreams(to, o, to2, "video", pt, s.str());
 }
 
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const std::vector<std::pair<int, int>>& ids,
@@ -664,6 +685,127 @@ std::vector<float> unpackAudio(const uint8_t* payload, size_t size, int channels
     return out;
 }
 
+// ---- ST 2110-31.
+
+uint32_t am824Word(int32_t data24, bool blockStart, bool frameStart, bool c, bool u, bool v) {
+    const uint32_t data = uint32_t(data24) & 0xFFFFFF;
+    // (even parity over the 24 bits, V, U, C and P)
+    const bool odd = (std::popcount(data) + int(v) + int(u) + int(c)) & 1;
+    const uint32_t label = uint32_t(blockStart) << 5 | uint32_t(frameStart) << 4 | uint32_t(odd) << 3 | uint32_t(c) << 2 | uint32_t(u) << 1 | uint32_t(v);
+    return label << 24 | data;
+}
+
+bool am824ParityOk(uint32_t word) { return (std::popcount(word & 0x0FFFFFFFu) & 1) == 0; }
+
+uint8_t aes3Crc(const uint8_t* bytes, size_t n) {
+    // CRC-8/AES: x^8 + x^4 + x^3 + x^2 + 1, from all ones, each byte's bits least significant first (as they are sent).
+    uint8_t crc = 0xFF;
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= bytes[i];
+        for (int b = 0; b < 8; ++b) crc = (crc & 1) ? uint8_t((crc >> 1) ^ 0xB8) : uint8_t(crc >> 1);
+    }
+    return crc;
+}
+
+std::array<uint8_t, 24> aes3ChannelStatus(bool nonAudio) {
+    std::array<uint8_t, 24> s{};
+    s[0] = uint8_t(0x01 | (nonAudio ? 0x02 : 0));
+    s[23] = aes3Crc(s.data(), 23);
+    return s;
+}
+
+bool aes3ReadChannelStatus(const uint32_t* words, size_t frames, int channels, int channel, std::array<uint8_t, 24>& out) {
+    if (channels <= 0 || channel < 0 || channel >= channels) return false;
+    for (size_t f = 0; f + 192 <= frames; ++f) {
+        if (!am824BlockStart(words[f * size_t(channels) + size_t(channel)])) continue;
+        out.fill(0);
+        for (int i = 0; i < 192; ++i)
+            if (am824C(words[(f + size_t(i)) * size_t(channels) + size_t(channel)])) out[size_t(i / 8)] |= uint8_t(1 << (i % 8));
+        return true;
+    }
+    return false;
+}
+
+std::vector<uint32_t> aes3FromPcm(const float* samples, int frames, int channels, int& blockFrame, const std::array<uint8_t, 24>& status) {
+    std::vector<uint32_t> out(size_t(std::max(0, frames)) * size_t(std::max(0, channels)));
+    for (int f = 0; f < frames; ++f) {
+        const int b = (blockFrame + f) % 192;
+        const bool c = (status[size_t(b / 8)] >> (b % 8)) & 1;
+        for (int ch = 0; ch < channels; ++ch) {
+            const float x = samples ? samples[size_t(f) * size_t(channels) + size_t(ch)] : 0.0f;
+            const double v = std::nearbyint(double(std::isfinite(x) ? x : 0.0f) * 8388608.0);
+            const int32_t d = int32_t(std::clamp(v, -8388608.0, 8388607.0));
+            // (the first subframe of each pair begins a frame: AES3's channels go in pairs)
+            out[size_t(f) * size_t(channels) + size_t(ch)] = am824Word(d, b == 0, ch % 2 == 0, c);
+        }
+    }
+    blockFrame = (blockFrame + std::max(0, frames)) % 192;
+    return out;
+}
+
+bool packAm824(const uint32_t* words, int frames, int channels, uint32_t timestamp, RtpState& rtp, const PacketSink& send) {
+    if (frames <= 0 || channels <= 0) return false;
+    std::vector<uint8_t> packet(12 + size_t(frames) * size_t(channels) * 4);
+    rtpHeader(packet.data(), false, rtp, timestamp);
+    for (size_t i = 0, n = size_t(frames) * size_t(channels); i < n; ++i) put32(packet.data() + 12 + i * 4, words ? words[i] : 0);
+    ++rtp.sequence;
+    return send(packet.data(), packet.size());
+}
+
+std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int channels) {
+    std::vector<uint32_t> out;
+    if (channels <= 0) return out;
+    const size_t n = size / 4 / size_t(channels) * size_t(channels);
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) out[i] = get32(payload + i * 4);
+    return out;
+}
+
+// ---- ST 2110-41.
+
+bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload) {
+    for (const FastMetadata& m : items)
+        if (m.words.size() > 511 || m.type > 0x3FFFFF) return false;
+    std::vector<uint8_t> packet;
+    bool ok = true;
+    size_t i = 0;
+    // (at least one packet, empty when there is nothing: a stream with a packet each frame)
+    do {
+        packet.assign(12, 0);
+        while (i < items.size()) {
+            const size_t bytes = 4 + items[i].words.size() * 4;
+            if (packet.size() > 12 && packet.size() - 12 + bytes > size_t(std::max(maxPayload, 4 + 511 * 4))) break;
+            const size_t at = packet.size();
+            packet.resize(at + bytes);
+            put32(packet.data() + at, items[i].type << 10 | uint32_t(items[i].k) << 9 | uint32_t(items[i].words.size()));
+            for (size_t w = 0; w < items[i].words.size(); ++w) put32(packet.data() + at + 4 + w * 4, items[i].words[w]);
+            ++i;
+        }
+        rtpHeader(packet.data(), i >= items.size(), rtp, timestamp);
+        ++rtp.sequence;
+        ok = send(packet.data(), packet.size()) && ok;
+    } while (ok && i < items.size());
+    return ok;
+}
+
+bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMetadata>& out) {
+    size_t at = 0;
+    while (at + 4 <= size) {
+        const uint32_t h = get32(payload + at);
+        FastMetadata m;
+        m.type = h >> 10;
+        m.k = (h >> 9) & 1;
+        const size_t n = h & 0x1FF;
+        at += 4;
+        if (at + n * 4 > size) return false;
+        m.words.resize(n);
+        for (size_t w = 0; w < n; ++w) m.words[w] = get32(payload + at + w * 4);
+        at += n * 4;
+        out.push_back(std::move(m));
+    }
+    return at == size;
+}
+
 // ---- ST 2110-40 (RFC 8331).
 
 bool packAnc(const std::vector<AncPacket>& packets, int field, uint32_t timestamp, RtpState& rtp, const PacketSink& send) {
@@ -888,9 +1030,10 @@ SenderOptions outputOptions() {
 
 struct Sender::Sockets {
     sock_t s = kBad, s2 = kBad;  // (the second path's: ST 2022-7)
-    sockaddr_in video{}, audio{}, anc{}, video2{}, audio2{}, anc2{};
+    sockaddr_in video{}, audio{}, anc{}, meta{}, video2{}, audio2{}, anc2{}, meta2{};
     std::function<bool(int, int, uint64_t)> drop;
-    uint64_t sent[3] = {0, 0, 0};
+    bool pathOn[4][2] = {{true, true}, {true, true}, {true, true}, {true, true}};
+    uint64_t sent[4] = {0, 0, 0, 0};
     int64_t queueDrops = 0;  // packets the system's queue had no room for
     int64_t errors[2] = {0, 0};  // packets each path could not send (its interface down, no route)
 #ifdef _WIN32
@@ -907,15 +1050,16 @@ struct Sender::Sockets {
         timeEndPeriod(1);
 #endif
     }
-    // A packet of stream 0 (video), 1 (audio) or 2 (ancillary data), on each path; false only when every path failed
-    // (ST 2022-7: one path's error leaves the other sending, the error counted against its path).
+    // A packet of stream 0 (video), 1 (audio), 2 (ancillary data) or 3 (fast metadata), on each path; false only when
+    // every path failed (ST 2022-7: one path's error leaves the other sending, the error counted against its path).
     bool to(int stream, const uint8_t* data, size_t size) {
         const uint64_t index = sent[stream]++;
-        const sockaddr_in* first[3] = {&video, &audio, &anc};
-        const sockaddr_in* second[3] = {&video2, &audio2, &anc2};
+        const sockaddr_in* first[4] = {&video, &audio, &anc, &meta};
+        const sockaddr_in* second[4] = {&video2, &audio2, &anc2, &meta2};
         const int paths = s2 != kBad ? 2 : 1;
         int failed = 0;
         for (int path = 0; path < paths; ++path) {
+            if (!pathOn[stream][path]) continue;
             if (drop && drop(stream, path, index)) continue;
             const sockaddr_in& a = *(path ? second : first)[stream];
             // (a queue still full after a few milliseconds loses the packet, as a network would: the stream goes on)
@@ -1008,7 +1152,16 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     if (o.redundant)
         for (const Endpoint* e : {&o.video2, &o.audio2, &o.anc2})
             if (!ipv4(e->address, probe) || e->port <= 0 || e->port > 65535) return fail("Not an IPv4 address and port: " + endpointText(*e));
-    if (o.sendAudio && (audio.rate != 48000 || audio.channels < 1 || audio.channels > 8 || (audio.bits != 24 && audio.bits != 16) ||
+    if (o.sendMetadata)
+        for (const Endpoint* e : {&o.metadata, &o.metadata2}) {
+            if (e == &o.metadata2 && !o.redundant) continue;
+            if (!ipv4(e->address, probe) || e->port <= 0 || e->port > 65535) return fail("Not an IPv4 address and port: " + endpointText(*e));
+        }
+    // (a 1 ms packet of 4-byte words keeps within a network's 1,500 bytes up to 6 subframes)
+    if (o.sendAudio && audio.aes3 && (audio.rate != 48000 || audio.channels < 1 || (audio.packetUs != 1000 && audio.packetUs != 125) ||
+                                      audio.channels > (audio.packetUs == 125 ? 8 : 6)))
+        return fail("ST 2110-31 here carries AES3 subframes at 48 kHz: 1 to 6 in 1 ms packets, or up to 8 in 125 µs ones");
+    if (o.sendAudio && !audio.aes3 && (audio.rate != 48000 || audio.channels < 1 || audio.channels > 8 || (audio.bits != 24 && audio.bits != 16) ||
                         (audio.packetUs != 1000 && audio.packetUs != 125)))
         return fail("ST 2110-30 here carries 1 to 8 channels at 48 kHz, L24 or L16, in 1 ms or 125 µs packets");
     s_ = std::make_unique<Sockets>();
@@ -1020,8 +1173,11 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
         s_->video2 = socketAddress(o.video2);
         s_->audio2 = socketAddress(o.audio2);
         s_->anc2 = socketAddress(o.anc2);
+        if (o.sendMetadata) s_->meta2 = socketAddress(o.metadata2);
     }
+    if (o.sendMetadata) s_->meta = socketAddress(o.metadata);
     s_->drop = o.drop;
+    std::memcpy(s_->pathOn, o.pathOn, sizeof s_->pathOn);
     s_->video = socketAddress(o.video);
     s_->audio = socketAddress(o.audio);
     s_->anc = socketAddress(o.anc);
@@ -1033,10 +1189,14 @@ bool Sender::open(const SenderOptions& o, const VideoFormat& video, const AudioF
     rtpVideo_ = {uint8_t(o.videoPayload), uint32_t(rng()), uint32_t(rng())};
     rtpAudio_ = {uint8_t(o.audioPayload), uint32_t(rng()), uint32_t(rng())};
     rtpAnc_ = {uint8_t(o.ancPayload), uint32_t(rng()), uint32_t(rng())};
+    rtpMeta_ = {uint8_t(o.metadataPayload), uint32_t(rng()), uint32_t(rng())};
     nextFrame_ = 0;
     audioSample_ = 0;
     audioFifo_.clear();
+    aesFifo_.clear();
+    aesBlockFrame_ = 0;
     frameAnc_.clear();
+    nextMetadata_.clear();
     frames_ = 0;
     ptpNowNs(&clock_);
     source_ = sourceAddress(o.interfaceAddress, s_->video);
@@ -1078,6 +1238,16 @@ std::string Sender::sdpAnc() const {
     for (const AncPacket& a : frameAnc_)
         if (std::find(ids.begin(), ids.end(), std::pair<int, int>{a.did, a.sdid}) == ids.end()) ids.emplace_back(a.did, a.sdid);
     return ancSdp(video_, o_.anc, o_.ancPayload, sdpOptions(o_, source_, source2_), ids, o_.redundant ? &o_.anc2 : nullptr);
+}
+
+std::string Sender::sdpMetadata() const {
+    if (!isOpen() || !o_.sendMetadata) return {};
+    return metadataSdp(o_.metadata, o_.metadataPayload, sdpOptions(o_, source_, source2_), o_.metadataTypes, o_.redundant ? &o_.metadata2 : nullptr);
+}
+
+void Sender::queueAes3(const uint32_t* words, int frames) {
+    if (!s_ || !audio_.aes3 || !words || frames <= 0) return;
+    aesFifo_.insert(aesFifo_.end(), words, words + size_t(frames) * size_t(audio_.channels));
 }
 
 bool Sender::send(const uint8_t* data, size_t stride, output::PixelFormat format, const float* audio, int audioFrames,
@@ -1123,16 +1293,30 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
         nextFrame_ = mulDiv(now, num, second * den) + 1;
         audioSample_ = mulDiv(frameStart(nextFrame_), audio_.rate, second);
         audioFifo_.clear();
+        // (AES3 words queued go on from the new start: they are the stream itself, not to be lost)
     }
     const int64_t start = frameStart(nextFrame_), end = frameStart(nextFrame_ + 1);
-    if (o_.sendAudio && audio && audioFrames > 0) audioFifo_.insert(audioFifo_.end(), audio, audio + size_t(audioFrames) * size_t(audio_.channels));
+    if (o_.sendAudio && audio && audioFrames > 0) {
+        if (audio_.aes3) {
+            const std::vector<uint32_t> w = aes3FromPcm(audio, audioFrames, audio_.channels, aesBlockFrame_, aes3ChannelStatus(false));
+            aesFifo_.insert(aesFifo_.end(), w.begin(), w.end());
+        } else {
+            audioFifo_.insert(audioFifo_.end(), audio, audio + size_t(audioFrames) * size_t(audio_.channels));
+        }
+    }
     if (!waitUntil(start)) return false;
 
     bool ok = true;
     auto sendAudioDue = [&](int64_t until) {
         // Packets (1 ms or 125 µs) whose last sample's time has come.
         const int per = std::max(1, audio_.packetSamples()), ch = audio_.channels;
-        while (ok && o_.sendAudio && audioFifo_.size() >= size_t(per) * size_t(ch) &&
+        while (ok && o_.sendAudio && audio_.aes3 && aesFifo_.size() >= size_t(per) * size_t(ch) &&
+               mulDiv(audioSample_ + per, second, audio_.rate) <= until) {
+            ok = packAm824(aesFifo_.data(), per, ch, uint32_t(audioSample_), rtpAudio_, [&](const uint8_t* p, size_t n) { return s_->to(1, p, n); });
+            aesFifo_.erase(aesFifo_.begin(), aesFifo_.begin() + ptrdiff_t(per) * ch);
+            audioSample_ += per;
+        }
+        while (ok && o_.sendAudio && !audio_.aes3 && audioFifo_.size() >= size_t(per) * size_t(ch) &&
                mulDiv(audioSample_ + per, second, audio_.rate) <= until) {
             ok = packAudio(audioFifo_.data(), per, ch, uint32_t(audioSample_), rtpAudio_,
                            [&](const uint8_t* p, size_t n) { return s_->to(1, p, n); }, audio_.bits);
@@ -1158,6 +1342,10 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
                 out.insert(out.end(), anc.begin(), anc.end());
             }
             ok = packAnc(out, field, ts, rtpAnc_, [&](const uint8_t* p, size_t n) { return s_->to(2, p, n); });
+        }
+        if (ok && o_.sendMetadata && f == 0) {
+            ok = packFastMetadata(nextMetadata_, ts, rtpMeta_, [&](const uint8_t* p, size_t n) { return s_->to(3, p, n); }, o_.maxPayload);
+            nextMetadata_.clear();
         }
         packets.clear();
         if (ok && o_.sendVideo)
