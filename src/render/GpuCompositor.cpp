@@ -1085,15 +1085,16 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
                 p[0] = float(fp.mode);
                 std::copy(fp.params, fp.params + 60, p + 4);
                 QRhiTexture* table = nullptr;
-                if (fp.tableWidth > 0 && !fp.table.empty()) {
-                    const int rows = int(fp.table.size() / (size_t(fp.tableWidth) * 4));
+                const std::vector<float>& rowsOf = fp.sharedTable ? *fp.sharedTable : fp.table;
+                if (fp.tableWidth > 0 && !rowsOf.empty()) {
+                    const int rows = int(rowsOf.size() / (size_t(fp.tableWidth) * 4));
                     table = texture(T::RGBA32F, fp.tableWidth, std::max(1, rows), false);
                     if (!table) {
                         release(made);
                         failed = true;
                         break;
                     }
-                    QRhiTextureSubresourceUploadDescription d(fp.table.data(), quint32(fp.table.size() * sizeof(float)));
+                    QRhiTextureSubresourceUploadDescription d(rowsOf.data(), quint32(rowsOf.size() * sizeof(float)));
                     u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
                 }
                 std::vector<std::pair<int, QRhiTexture*>> bound = {{1, at}, {4, cur}};

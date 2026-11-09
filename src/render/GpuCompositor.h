@@ -70,6 +70,7 @@ struct ColorOp {
         int mode = 0;           // gpufilter.frag's
         float params[60] = {};  // its p[1..15]
         std::vector<float> table;  // RGBA rows of tableWidth (its `table`, as the mode says), or none
+        std::shared_ptr<const std::vector<float>> sharedTable;  // (or kept elsewhere, not copied: read in `table`'s place)
         int tableWidth = 0;
         int width = 0, height = 0;  // what it makes (0: the layer's size)
         int save = -1;              // the filter's slot it keeps what it makes in, for a later pass

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "core/Model.h"
@@ -95,6 +96,16 @@ std::vector<double> apertureDiffraction(const ApertureShape& a, double nm, int s
 // 3, `size` = 2 * radius + 1, round), each channel summing to 1. lambda / D at 550 nm is radius / 20 pixels.
 std::vector<float> apertureKernel(const ApertureShape& a, int radius);
 void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale);
+// What the GPU draws Aperture Glare from (render/Processing's gpuColorOps), as apertureGlare works it out: the light
+// above `threshold`, shrunk f times each way to GW x GH, convolved in tiles T square by FFTs M square (overlap-add)
+// with the kernel's spectra (M rows of red and green, then M of blue, complex, as RGBA), the FFTs' twiddles
+// (exp(-2 pi i k / M), k < M / 2) and the glare drawn back up by `intensity`. False: nothing to do.
+struct GlareSetup {
+    double threshold = 1, intensity = 1;
+    int f = 1, radius = 2, GW = 0, GH = 0, M = 0, T = 0;
+    std::shared_ptr<const std::vector<float>> spectra, twiddles;
+};
+bool apertureGlareSetup(const Effect& e, FrameTime t, int W, int H, double pixelScale, GlareSetup& out);
 
 // Smooth noise in 3D, about -1..1 (value noise, quintic-smoothed).
 double valueNoise(double x, double y, double z, uint32_t seed = 0);

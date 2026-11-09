@@ -21081,8 +21081,7 @@ colorspaces:
         compare(20, o, "color space transform");
         QVERIFY(gpu::stats().cpuLayers > 0);
         graded->effects.erase(graded->effects.begin() + 1);
-        // Aperture Glare is worked out on the CPU too (Light Rays as well when shadows block its rays), and the layer they
-        // make drawn there.
+        // Aperture Glare (its FFTs) and Light Rays with shadows blocking its rays, drawn on the GPU too.
         {
             Clip* generated = s.videoTracks[2].clips.empty() ? nullptr : &s.videoTracks[2].clips[0];
             QVERIFY(generated);
@@ -21095,7 +21094,7 @@ colorspaces:
             generated->effects = {rays, glare};
             gpu::resetStats();
             compare(20, o, "light rays and aperture glare");
-            QVERIFY(gpu::stats().cpuLayers > 0);
+            QCOMPARE(gpu::stats().cpuLayers, 0L);
             generated->effects.clear();
         }
         // As grade nodes in series, one with a window and a qualifier at 60 %, one faded to 50 %; then beside another
@@ -21682,6 +21681,8 @@ colorspaces:
             {"light_rays", {{{"threshold", 0.4}, {"block", 50}}, {{"threshold", 0.3}, {"block", 100}, {"pos_x", 1.2}, {"pos_y", -0.2}, {"length", 80}},
                             {{"threshold", 0.5}, {"block", 30}, {"decay", 70}, {"pos_x", 0.4}}}},
             {"radial_blur", {{{"zoom", 15}}, {{"zoom", 0}, {"spin", 20}, {"center_x", 0.3}}, {{"zoom", 40}, {"spin", 8}, {"center_y", 0.8}}}},
+            {"aperture_glare", {{{"threshold", 0.5}, {"size", 20}}, {{"threshold", 0.3}, {"size", 60}, {"blades", 5}, {"rounding", 30}, {"rotation", 15}},
+                                {{"threshold", 0.6}, {"size", 150}, {"intensity", 2}, {"blades", 9}}}},
         };
         for (const auto& [type, settings] : filters)
             for (size_t k = 0; k < settings.size(); ++k) {
@@ -21692,7 +21693,8 @@ colorspaces:
                 const long passes = gpu::stats().filterPasses;
                 compare(7 + FrameTime(k), QString("%1 #%2").arg(type).arg(k + 1));
                 QVERIFY2(gpu::stats().filterPasses > passes, type);
-                if (std::string(type) == "light_rays" || std::string(type) == "radial_blur") {  // (the rays, or the blur, are there)
+                if (std::string(type) == "light_rays" || std::string(type) == "radial_blur" ||
+                    std::string(type) == "aperture_glare") {  // (the rays, the blur or the glare are there)
                     RenderOptions o;
                     o.gpu = true;
                     const Image lit = renderProgramFrame(p, s, 7 + FrameTime(k), o);
@@ -24117,6 +24119,54 @@ colorspaces:
             }
         }
         QVERIFY(builds > 0);
+    }
+    // Aperture Glare's FFTs on the GPU at UHD, in tiles as the CPU makes them, against the CPU's: within 1/1023, at its
+    // own size and on a layer with more pixels than the sequence (shrunk and drawn back up).
+    void gpuApertureGlareUhd() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        Project p = makeDefaultProject();
+        const int W = 3840, H = 2160;
+        Image in(W, H, Image::Uninitialized{});
+        uint32_t seed = 7;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = in.at(x, y);
+                seed = seed * 1664525u + 1013904223u;
+                const bool spot = (seed >> 20) % 4096 == 0;  // (about 2000 bright points, and soft light between)
+                for (int c = 0; c < 3; ++c) px[c] = spot ? 4.0f + float(c) : 0.4f + 0.5f * float(std::sin(x * 0.01 + y * 0.013 + c));
+                px[3] = 1;
+            }
+        const struct {
+            double size, threshold, scale;
+            int blades;
+        } cases[] = {{100, 1.0, 1, 6}, {40, 0.8, 3, 7}};
+        for (const auto& k : cases) {
+            Effect e = makeEffect(p, "aperture_glare");
+            e.params["size"] = k.size, e.params["threshold"] = k.threshold, e.params["blades"] = double(k.blades);
+            Image cpu = in;
+            applyVideoEffect(e, 0, cpu, k.scale);
+            gpu::Frame frame;
+            frame.width = W, frame.height = H;
+            frame.flatten = false;
+            gpu::Item item;
+            item.a.image = in;
+            item.a.place.full = true;
+            QVERIFY(gpuColorOps(e, 0, item.a.ops, W, H, k.scale));
+            QCOMPARE(item.a.ops.size(), size_t(1));
+            QVERIFY(item.a.ops[0].kind == gpu::ColorOp::Filter && item.a.ops[0].passes.size() > 40);
+            frame.items.push_back(std::move(item));
+            Image onGpu;
+            QVERIFY(gpu::execute(frame, &onGpu));
+            double worst = 0, added = 0;
+            for (size_t i = 0; i < cpu.px.size(); ++i) {
+                worst = std::max(worst, std::fabs(double(cpu.px[i]) - onGpu.px[i]));
+                added += cpu.px[i] - in.px[i];
+            }
+            QVERIFY(added > 100);  // (there is glare)
+            QVERIFY2(worst <= 1.0 / 1023, qPrintable(QStringLiteral("size %1 at %2: differs by %3").arg(k.size).arg(k.scale).arg(worst)));
+            qInfo("size %g at scale %g: GPU within %.2g of the CPU", k.size, k.scale, worst);
+        }
     }
     void footageWordsReadAnswers() {
         // The sentences numbered, shortened when asked, several to a line when asked.

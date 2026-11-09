@@ -850,6 +850,9 @@ struct GlareKernel {
     ApertureShape shape;
     int radius = 0, fftSize = 0;
     std::vector<Cf> spectrum[3];  // each channel's kernel transformed, fftSize square
+    // The spectra as the GPU reads them (GlareSetup::spectra), made the first time it does.
+    mutable std::once_flag gpuOnce;
+    mutable std::shared_ptr<const std::vector<float>> gpu;
 };
 
 // The kernel transformed for convolving at `fftSize`, kept for the last few.
@@ -954,11 +957,12 @@ std::vector<float> apertureKernel(const ApertureShape& a, int radius) {
     return out;
 }
 
-void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) {
-    const int W = img.width, H = img.height;
-    if (W <= 0 || H <= 0) return;
-    const double threshold = std::max(0.0, e.p("threshold", t, 1.0)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
-    ApertureShape shape;
+namespace {
+
+// The settings both draw from: the shape, the shrink f and the kernel's radius at that size.
+bool glareSettings(const Effect& e, FrameTime t, double pixelScale, double& threshold, double& intensity, ApertureShape& shape, int& f,
+                   int& radius) {
+    threshold = std::max(0.0, e.p("threshold", t, 1.0)), intensity = std::max(0.0, e.p("intensity", t, 1.0));
     shape.blades = std::clamp(int(std::lround(e.p("blades", t, 6))), 3, 16);
     shape.rounding = std::round(std::clamp(e.p("rounding", t, 0) / 100, 0.0, 1.0) * 100) / 100;
     // (the pattern repeats every 360 / blades degrees, so a turn by a whole step makes the same kernel)
@@ -966,9 +970,61 @@ void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) 
     shape.rotation = std::round(std::fmod(std::fmod(e.p("rotation", t, 0), step) + step, step) * 10) / 10;
     // On a picture with more pixels than the sequence (a large layer scaled down) the glare is worked out on a picture
     // f times smaller each way, so that its kernel stays as small as at twice the sequence's size, and drawn back up.
-    const int f = pixelScale > 2 ? int(std::ceil(pixelScale / 2 - 1e-9)) : 1;
-    const int radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * pixelScale / f)));
-    if (intensity <= 0) return;
+    f = pixelScale > 2 ? int(std::ceil(pixelScale / 2 - 1e-9)) : 1;
+    radius = std::max(2, int(std::lround(std::clamp(e.p("size", t, 200), 10.0, 600.0) * pixelScale / f)));
+    return intensity > 0;
+}
+
+}  // namespace
+
+bool apertureGlareSetup(const Effect& e, FrameTime t, int W, int H, double pixelScale, GlareSetup& out) {
+    ApertureShape shape;
+    if (W <= 0 || H <= 0 || !glareSettings(e, t, pixelScale, out.threshold, out.intensity, shape, out.f, out.radius)) return false;
+    out.GW = (W + out.f - 1) / out.f, out.GH = (H + out.f - 1) / out.f;
+    const int K = 2 * out.radius + 1;
+    out.M = nextPow2(K + std::max(K / 2, 128)), out.T = out.M - K + 1;
+    const auto kernel = glareKernel(shape, out.radius, out.M);
+    std::call_once(kernel->gpuOnce, [&] {
+        const int M = out.M;
+        auto rows = std::make_shared<std::vector<float>>(size_t(M) * size_t(M) * 8);
+        for (size_t i = 0; i < size_t(M) * size_t(M); ++i) {
+            float* a = &(*rows)[i * 4];
+            float* b = &(*rows)[(size_t(M) * size_t(M) + i) * 4];
+            a[0] = kernel->spectrum[0][i].real(), a[1] = kernel->spectrum[0][i].imag();
+            a[2] = kernel->spectrum[1][i].real(), a[3] = kernel->spectrum[1][i].imag();
+            b[0] = kernel->spectrum[2][i].real(), b[1] = kernel->spectrum[2][i].imag();
+        }
+        kernel->gpu = std::move(rows);
+    });
+    out.spectra = kernel->gpu;
+    static std::mutex twiddleLock;
+    static std::vector<std::pair<int, std::shared_ptr<const std::vector<float>>>> twiddles;
+    {
+        const std::lock_guard<std::mutex> g(twiddleLock);
+        for (const auto& [n, tw] : twiddles)
+            if (n == out.M) out.twiddles = tw;
+        if (!out.twiddles) {
+            // (exp(-2 pi i k / M) for k < M / 2, as fftInPlace's table, in floats)
+            auto tw = std::make_shared<std::vector<float>>(size_t(out.M / 2) * 4, 0.0f);
+            for (int k = 0; k < out.M / 2; ++k) {
+                const Cf w = Cf(std::polar(1.0, -2 * M_PI * double(k) / double(out.M)));
+                (*tw)[size_t(k) * 4] = w.real(), (*tw)[size_t(k) * 4 + 1] = w.imag();
+            }
+            twiddles.insert(twiddles.begin(), {out.M, tw});
+            if (twiddles.size() > 4) twiddles.pop_back();
+            out.twiddles = tw;
+        }
+    }
+    return true;
+}
+
+void apertureGlare(const Effect& e, FrameTime t, Image& img, double pixelScale) {
+    const int W = img.width, H = img.height;
+    if (W <= 0 || H <= 0) return;
+    double threshold = 0, intensity = 0;
+    ApertureShape shape;
+    int f = 1, radius = 2;
+    if (!glareSettings(e, t, pixelScale, threshold, intensity, shape, f, radius)) return;
     // The highlights: the light above the threshold.
     std::vector<float> bright(size_t(W) * H * 3, 0.0f);
     bool any = false;

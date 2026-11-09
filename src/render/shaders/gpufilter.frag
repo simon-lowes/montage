@@ -45,7 +45,11 @@
 // and 34 Depth Map and Depth Fog (each pixel towards the table's colour by its w, from the frame's depth); Light Rays
 // (35 the light above the threshold, 36 a pass along the lines to the centre, 37 added to the picture; with Shadows
 // Block Rays, 40 the small copy of what blocks them and 41 the light let through) and 38 Lens Flare;
-// 39 Radial Blur (render/StyleFx's radialBlur: p[1] the centre, the zoom's share of the way there, the spin in radians).
+// 39 Radial Blur (render/StyleFx's radialBlur: p[1] the centre, the zoom's share of the way there, the spin in radians);
+// and Aperture Glare (render/StyleFx's apertureGlare, its convolution by FFTs in tiles; each texel of a transform holds
+// red + i green in xy and blue in zw): 45 the kernel's spectra from the table (M rows of red and green, then M of
+// blue), 42 a tile's light above the threshold, shrunk, 43 a stage of a transform, 44 through the kernel, 46 a tile's
+// glare added to what the tiles before made, 47 the glare added to the picture.
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -832,6 +836,95 @@ void main() {
             acc += bilinear(size, p[1].x + (fx * cs - fy * sn) * sc, p[1].y + (fx * sn + fy * cs) * sc);
         }
         fragColor = acc / float(taps);
+        return;
+    }
+    if (mode == 45) {
+        fragColor = texelFetch(table, xy, 0);
+        return;
+    }
+    if (mode == 42) {
+        // A tile's light above the threshold (p[1].x) at the glare's size (each its picture's pixels shrunk p[1].y times
+        // each way, their mean), from p[1].zw, p[2].xy wide and high; nothing beyond
+        const int f = int(p[1].y), tx = int(p[1].z), ty = int(p[1].w);
+        if (xy.x >= int(p[2].x) || xy.y >= int(p[2].y)) {
+            fragColor = vec4(0.0);
+            return;
+        }
+        const ivec2 full = textureSize(orig, 0);
+        const int gx = tx + xy.x, gy = ty + xy.y;
+        vec3 sum = vec3(0.0);
+        int n = 0;
+        for (int y = gy * f; y < min(full.y, (gy + 1) * f); ++y)
+            for (int x = gx * f; x < min(full.x, (gx + 1) * f); ++x) {
+                const vec4 q = texelFetch(orig, ivec2(x, y), 0);
+                const float l = q.a > 0.0 ? lumaOf(q) / q.a : 0.0;
+                if (!isinf(l) && !isnan(l) && l > p[1].x) sum += q.rgb * ((l - p[1].x) / l);
+                ++n;
+            }
+        if (f > 1) sum /= float(n);
+        fragColor = vec4(sum.r, sum.g, sum.b, 0.0);
+        return;
+    }
+    if (mode == 43) {
+        // A stage of a transform, M (p[1].x) along rows (p[1].z 0) or columns (1), forward or inverse (p[1].w): pairs
+        // p[1].y apart in the last stage's order, the second turned by its twiddle (the table's), summed and
+        // differenced into natural order (Stockham)
+        const int n = int(p[1].x), ns = int(p[1].y);
+        const bool column = p[1].z > 0.5;
+        const int j = column ? xy.y : xy.x;
+        const int r = j % (2 * ns), k = r % ns, i = (j / (2 * ns)) * ns + k;
+        const vec4 a = texelFetch(srcTex, column ? ivec2(xy.x, i) : ivec2(i, xy.y), 0);
+        const vec4 b = texelFetch(srcTex, column ? ivec2(xy.x, i + n / 2) : ivec2(i + n / 2, xy.y), 0);
+        vec2 w = texelFetch(table, ivec2(k * (n / (2 * ns)), 0), 0).xy;
+        if (p[1].w > 0.5) w.y = -w.y;
+        const vec4 v = vec4(b.x * w.x - b.y * w.y, b.x * w.y + b.y * w.x, b.z * w.x - b.w * w.y, b.z * w.y + b.w * w.x);
+        fragColor = r < ns ? a + v : a - v;
+        return;
+    }
+    if (mode == 44) {
+        // Through the kernel: red and green parted by the transform's symmetry, each by its own spectrum, blue by its
+        const int n = int(p[1].x);
+        const vec4 x = texelFetch(srcTex, xy, 0), y = texelFetch(srcTex, ivec2((n - xy.x) % n, (n - xy.y) % n), 0);
+        const vec2 red = vec2(x.x + y.x, x.y - y.y) * 0.5;               // (X + conj(Y)) / 2
+        const vec2 d = vec2(x.x - y.x, x.y + y.y);                       // X - conj(Y)
+        const vec2 green = vec2(d.y * -0.5, d.x * 0.5) * -1.0;           // times -i / 2
+        const vec4 s01 = texelFetch(table, xy, 0), s2 = texelFetch(table, ivec2(xy.x, xy.y + n), 0);
+        const vec2 rs = vec2(red.x * s01.x - red.y * s01.y, red.x * s01.y + red.y * s01.x);
+        const vec2 gs = vec2(green.x * s01.z - green.y * s01.w, green.x * s01.w + green.y * s01.z);
+        const vec2 bs = vec2(x.z * s2.x - x.w * s2.y, x.z * s2.y + x.w * s2.x);
+        fragColor = vec4(rs.x - gs.y, rs.y + gs.x, bs.x, bs.y);  // red + i green
+        return;
+    }
+    if (mode == 46) {
+        // A tile's glare (srcTex, unscaled: by p[2].z) added where it reaches (its tile, p[1], and the kernel's radius
+        // p[2].x round it) to what the tiles before made (extra, when p[2].w)
+        vec4 o = p[2].w > 0.5 ? texelFetch(extra, xy, 0) : vec4(0.0);
+        const int x = xy.x - int(p[1].x), y = xy.y - int(p[1].y), r = int(p[2].x), n = int(p[2].y);
+        if (x >= -r && y >= -r && x < int(p[1].z) + r && y < int(p[1].w) + r) {
+            const vec4 g = texelFetch(srcTex, ivec2((x + n) % n, (y + n) % n), 0);
+            o.rgb += vec3(g.x, g.y, g.z) * p[2].z;
+        }
+        fragColor = o;
+        return;
+    }
+    if (mode == 47) {
+        // The glare (srcTex, shrunk p[1].x times: drawn back up between its pixels) added to the picture by p[1].y
+        const vec4 o = texelFetch(orig, xy, 0);
+        const int f = int(p[1].x);
+        vec3 g;
+        if (f == 1) {
+            g = texelFetch(srcTex, xy, 0).rgb;
+        } else {
+            const ivec2 n = size;
+            const float sx = clamp((float(xy.x) + 0.5) / float(f) - 0.5, 0.0, float(n.x - 1));
+            const float sy = clamp((float(xy.y) + 0.5) / float(f) - 0.5, 0.0, float(n.y - 1));
+            const int x0 = int(sx), y0 = int(sy), x1 = min(n.x - 1, x0 + 1), y1 = min(n.y - 1, y0 + 1);
+            const float fx = sx - float(x0), fy = sy - float(y0);
+            g = (texelFetch(srcTex, ivec2(x0, y0), 0).rgb * (1.0 - fx) + texelFetch(srcTex, ivec2(x1, y0), 0).rgb * fx) * (1.0 - fy) +
+                (texelFetch(srcTex, ivec2(x0, y1), 0).rgb * (1.0 - fx) + texelFetch(srcTex, ivec2(x1, y1), 0).rgb * fx) * fy;
+        }
+        const vec3 add = max(vec3(0.0), g) * p[1].y;
+        fragColor = vec4(o.rgb + add, min(1.0, o.a + max(add.r, max(add.g, add.b))));
         return;
     }
     if (mode == 38) {
