@@ -37,6 +37,8 @@ option(MONTAGE_WITH_SPATIAL_VIDEO "Spatial video out: MV-HEVC through x265's mul
 option(MONTAGE_WITH_OMT "Open Media Transport in and out (libvmx, its VMX codec, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_WEBRTC "Live review in any web browser over WebRTC (libdatachannel, MPL-2.0, with libjuice, usrsctp, libSRTP, Plog and nlohmann/json, fetched at configure time), when OpenSSL 3 is installed" ON)
 option(MONTAGE_WITH_BMX "Broadcast MXF by the book: AS-11, RDD 9 and ST 436 ancillary data (the EBU's bmx with libMXF, BSD, fetched at configure time)" ON)
+option(MONTAGE_WITH_AV2 "AV2 in and out: dav2d (VideoLAN, BSD-2-Clause) reads it and AVM (the AV2 reference encoder, BSD-3-Clause-Clear with the AOM patent licence) writes it, when both are installed (AV2_ROOT, as scripts/build-av2.sh builds them, or pkg-config); off: both licences are flagged and packages leave AV2 out" OFF)
+set(AV2_ROOT "" CACHE PATH "Where dav2d and AVM are installed (scripts/build-av2.sh <prefix>), for MONTAGE_WITH_AV2")
 option(MONTAGE_WITH_VMAF "VMAF scores in Compare Encode, when libvmaf 3+ is installed (Netflix, BSD-2-Clause-Patent; off until its licence is settled)" OFF)
 option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or later" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)

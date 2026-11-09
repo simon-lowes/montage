@@ -95,6 +95,7 @@
 #include "media/LanguageModel.h"
 #include "media/Inference.h"
 #include "media/Proxy.h"
+#include "media/Av2.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
 #include "media/Breaths.h"
@@ -1791,6 +1792,139 @@ std::optional<ninepin::Message> askDeck(SerialPort& port, const ninepin::Message
     return std::nullopt;
 }
 #endif
+
+// ---- AV2 (media/Av2.h) ----
+
+// AVM's encoder or decoder (avmenc, avmdec) in MONTAGE_TEST_AV2_TOOLS, as scripts/build-av2.sh installs them in
+// <prefix>/bin; empty when it is not there.
+QString av2Tool(const char* name) {
+    const QString dir = qEnvironmentVariable("MONTAGE_TEST_AV2_TOOLS");
+    if (dir.isEmpty()) return {};
+    const QString f = QDir(dir).filePath(QString::fromLatin1(name));
+    return QFileInfo(f).isExecutable() ? f : QString();
+}
+
+bool runAv2Tool(const QString& exe, const QStringList& args, QString* said = nullptr) {
+    QProcess p;
+    p.setProcessChannelMode(QProcess::MergedChannels);
+    p.start(exe, args);
+    const bool done = p.waitForFinished(900000);
+    if (!done) p.kill();
+    if (said) *said = QString::fromLocal8Bit(p.readAll());
+    return done && p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
+}
+
+// Sample (x, y) of plane c of a moving, textured test picture at 8 bits (its 10-bit codes add finer steps).
+int av2TestSample(int c, int x, int y, int frame, int bits) {
+    int v = 0;
+    if (c == 0) v = 30 + int(180 * (0.5 + 0.5 * std::sin((x + 3 * frame) * 0.21) * std::cos((y - 2 * frame) * 0.17))) + (x * 7 + y * 13 + frame) % 5;
+    else if (c == 1) v = 128 + int(40 * std::sin((x + frame) * 0.1));
+    else v = 128 + int(40 * std::cos((y + frame) * 0.13));
+    return bits == 8 ? v : v * 4 + (x + 2 * y + frame) % 4;
+}
+
+// A Y4M file of the test picture, 4:2:0 at 8 or 10 bits (w and h even); grey, its chroma neutral, unless `colour`.
+bool writeAv2TestY4m(const QString& path, int w, int h, int frames, int bits, bool colour = true) {
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    f.write(QStringLiteral("YUV4MPEG2 W%1 H%2 F25:1 Ip A1:1 C%3\n").arg(w).arg(h).arg(bits == 8 ? "420jpeg" : "420p10").toLatin1());
+    for (int i = 0; i < frames; ++i) {
+        f.write("FRAME\n");
+        QByteArray b;
+        for (int c = 0; c < 3; ++c)
+            for (int y = 0; y < (c ? h / 2 : h); ++y)
+                for (int x = 0; x < (c ? w / 2 : w); ++x) {
+                    const int v = colour || !c ? av2TestSample(c, x, y, i, bits) : 128 << (bits - 8);
+                    b.append(char(v & 0xff));
+                    if (bits > 8) b.append(char(v >> 8));
+                }
+        f.write(b);
+    }
+    return true;
+}
+
+// Whether `f` (planar 4:2:0, 8 bits or 16-bit little-endian words) is frame `n` of `raw`, frames as avmdec's
+// --rawvideo writes them; what differs first, when not.
+QString av2SameAsRaw(const AVFrame* f, const QByteArray& raw, int n) {
+    const int bytes = f->format == AV_PIX_FMT_YUV420P ? 1 : 2;
+    const int w = f->width, h = f->height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+    const qsizetype frame = qsizetype(w * h + 2 * cw * ch) * bytes;
+    if (raw.size() < frame * (n + 1)) return QStringLiteral("avmdec gave %1 bytes, not %2 frames").arg(raw.size()).arg(n + 1);
+    const char* at = raw.constData() + frame * n;
+    for (int c = 0; c < 3; ++c) {
+        const int pw = c ? cw : w, ph = c ? ch : h;
+        for (int y = 0; y < ph; ++y) {
+            if (std::memcmp(f->data[c] + size_t(y) * size_t(f->linesize[c]), at, size_t(pw * bytes)) != 0)
+                return QStringLiteral("frame %1 plane %2 row %3 differs").arg(n).arg(c).arg(y);
+            at += pw * bytes;
+        }
+    }
+    return {};
+}
+
+// Frame n's planes as avmdec --rawvideo writes them.
+QByteArray av2RawOf(const AVFrame* f) {
+    const int bytes = f->format == AV_PIX_FMT_YUV420P ? 1 : 2;
+    QByteArray b;
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < (c ? (f->height + 1) / 2 : f->height); ++y)
+            b.append(reinterpret_cast<const char*>(f->data[c] + size_t(y) * size_t(f->linesize[c])), (c ? (f->width + 1) / 2 : f->width) * bytes);
+    return b;
+}
+
+// An AV2 MP4's elementary stream rebuilt as the binding's draft has it, independently of Montage's reader: each
+// sample as FFmpeg's demuxer gives it, after a temporal delimiter and, for a sync sample, the 'av2C' box's OBUs (after
+// its version and the sequence header's fields, 9 bytes); found by looking for the box in the file.
+bool av2Mp4Stream(const QString& mp4, QByteArray& out, QString& why) {
+    QFile file(mp4);
+    if (!file.open(QIODevice::ReadOnly)) { why = "cannot open"; return false; }
+    const QByteArray bytes = file.readAll();
+    const qsizetype at = bytes.indexOf("av2C");
+    if (at < 4) { why = "no av2C box"; return false; }
+    const auto* p = reinterpret_cast<const uint8_t*>(bytes.constData()) + at - 4;
+    const uint32_t size = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    if (size < 8 + 9 || at - 4 + qsizetype(size) > bytes.size() || uint8_t(bytes[at + 4]) != 1) { why = "a bad av2C box"; return false; }
+    const QByteArray config = bytes.mid(at + 4 + 9, size - 8 - 9);
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, mp4.toUtf8().constData(), nullptr, nullptr) < 0) { why = "FFmpeg cannot open it"; return false; }
+    int v = -1;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i)
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) v = int(i);
+    AVPacket* pkt = av_packet_alloc();
+    int samples = 0;
+    out.clear();
+    while (v >= 0 && av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == v) {
+            out.append("\x01\x08", 2);
+            if (pkt->flags & AV_PKT_FLAG_KEY) out.append(config);
+            out.append(reinterpret_cast<const char*>(pkt->data), pkt->size);
+            ++samples;
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    avformat_close_input(&fmt);
+    if (v < 0 || !samples) { why = "FFmpeg found no video samples"; return false; }
+    return true;
+}
+
+// The frames of an AV2 file as dav2d gives them through Montage, each as avmdec --rawvideo would write it.
+bool av2Frames(const std::string& file, QByteArray& raw, int64_t& frames, std::string& err) {
+    Av2Reader r;
+    if (!r.open(file, &err)) return false;
+    frames = r.info().frames;
+    raw.clear();
+    AVFrame* f = av_frame_alloc();
+    for (int64_t n = 0; n < frames; ++n) {
+        if (!r.frame(n, f, &err)) {
+            av_frame_free(&f);
+            return false;
+        }
+        raw.append(av2RawOf(f));
+    }
+    av_frame_free(&f);
+    return true;
+}
 
 }  // namespace
 
@@ -44671,6 +44805,297 @@ private slots:
               trainer.loss(), qint64(timer.elapsed()));
         QVERIFY2(before < 20, qPrintable(QString::number(before)));
         QVERIFY2(after >= 32, qPrintable(QString::number(after)));
+    }
+
+    void av2ReadAsTheReferenceDecoderReadsIt() {
+        // AV2 streams made by AVM's encoder, read through dav2d: every frame the same as AVM's decoder makes it, in
+        // any order asked; their colour and rate as the streams state them.
+        if (!av2Available()) QSKIP("Built without AV2 (MONTAGE_WITH_AV2)");
+        const QString enc = av2Tool("avmenc"), dec = av2Tool("avmdec");
+        if (enc.isEmpty() || dec.isEmpty()) QSKIP("No AVM encoder and decoder (MONTAGE_TEST_AV2_TOOLS)");
+        QVERIFY(QString::fromStdString(av2Versions()).contains("dav2d"));
+        struct Case {
+            const char* file;
+            int bits;
+            QStringList args;
+            std::string space;
+        };
+        const int w = 64, h = 48, frames = 6;
+        const std::vector<Case> cases = {
+            // 8 bits in IVF, AVM's own order (frames held back and shown later), a key frame every 3
+            {"avm8.ivf", 8, {"--ivf", "--kf-min-dist=3", "--kf-max-dist=3"}, ""},
+            // 10 bits as bare OBUs in PQ, each frame shown as it is decoded
+            {"avm10.obu", 10, {"--obu", "--bit-depth=10", "--enable-keyframe-filtering=0", "--monotonic-output-order=1", "--color-primaries=bt2020",
+                               "--transfer-characteristics=smpte2084", "--matrix-coefficients=bt2020ncl"}, "rec2100pq"},
+            // 10 bits in IVF in HLG
+            {"avm10hlg.ivf", 10, {"--ivf", "--bit-depth=10", "--color-primaries=bt2020", "--transfer-characteristics=hlg",
+                                  "--matrix-coefficients=bt2020ncl"}, "rec2100hlg"},
+        };
+        for (const Case& c : cases) {
+            const QString y4m = QString::fromStdString(path(c.file)) + ".y4m", out = QString::fromStdString(path(c.file)),
+                          raw = out + ".yuv";
+            QVERIFY(writeAv2TestY4m(y4m, w, h, frames, c.bits));
+            QString said;
+            QVERIFY2(runAv2Tool(enc, QStringList{"--cpu-used=9", "--qp=100", QStringLiteral("--limit=%1").arg(frames), "-o", out} + c.args + QStringList{y4m}, &said),
+                     qPrintable(said));
+            QVERIFY2(runAv2Tool(dec, {"--rawvideo", "-o", raw, out}, &said), qPrintable(said));
+            QFile rf(raw);
+            QVERIFY(rf.open(QIODevice::ReadOnly));
+            const QByteArray want = rf.readAll();
+
+            Av2Info info;
+            std::string err;
+            QVERIFY2(readAv2Info(out.toStdString(), info, &err), err.c_str());
+            QCOMPARE(info.container, std::string(c.file).rfind(".obu") != std::string::npos ? Av2Container::Obu : Av2Container::Ivf);
+            QCOMPARE(info.width, w);
+            QCOMPARE(info.height, h);
+            QCOMPARE(info.bits, c.bits);
+            QCOMPARE(info.chroma, 0);
+            QCOMPARE(info.frames, int64_t(frames));
+            QCOMPARE(info.colorSpace, c.space);
+            QVERIFY2(info.fpsNum == 25 * info.fpsDen, qPrintable(QStringLiteral("%1/%2").arg(info.fpsNum).arg(info.fpsDen)));
+            QByteArray got;
+            int64_t n = 0;
+            QVERIFY2(av2Frames(out.toStdString(), got, n, err), err.c_str());
+            QCOMPARE(n, int64_t(frames));
+            QVERIFY2(got == want, qPrintable(QStringLiteral("%1: %2 bytes from dav2d, %3 from avmdec").arg(c.file).arg(got.size()).arg(want.size())));
+            // Out of order: from the key frame before, or on from the frame before.
+            Av2Reader r;
+            QVERIFY2(r.open(out.toStdString(), &err), err.c_str());
+            AVFrame* f = av_frame_alloc();
+            for (int k : {4, 1, 5, 2, 3, 0, 5}) {
+                QVERIFY2(r.frame(k, f, &err), err.c_str());
+                const QString why = av2SameAsRaw(f, want, k);
+                QVERIFY2(why.isEmpty(), qPrintable(QString(c.file) + ": " + why));
+            }
+            if (!c.space.empty()) QCOMPARE(int(f->color_trc), c.space == "rec2100pq" ? int(AVCOL_TRC_SMPTE2084) : int(AVCOL_TRC_ARIB_STD_B67));
+            av_frame_free(&f);
+            QVERIFY(!r.frame(frames, nullptr, &err));
+
+            // As media: a video of its frames, decoded the same whatever was shown before.
+            MediaItem m;
+            QVERIFY2(probeMedia(out.toStdString(), m, &err), err.c_str());
+            QCOMPARE(m.videoCodec, std::string("av2"));
+            QCOMPARE(m.kind, MediaKind::Video);
+            QCOMPARE(m.width, w);
+            QCOMPARE(m.height, h);
+            QCOMPARE(m.fps.toDouble(), 25.0);
+            QVERIFY2(std::fabs(m.duration - frames / 25.0) < 1e-9, qPrintable(QString::number(m.duration)));
+            QCOMPARE(m.colorSpace, c.space);
+            QVERIFY(!m.hasAudio);
+            VideoDecoder d;
+            QVERIFY2(d.open(out.toStdString(), &err), err.c_str());
+            const Frame16Ptr third = d.frameAt(3.0 / 25);
+            QVERIFY(third && third->width == w && third->height == h);
+            const std::vector<uint16_t> thirdPx(third->px.begin(), third->px.end());
+            QVERIFY(d.frameAt(0.0));
+            QVERIFY(d.frameAt(5.0 / 25));
+            const Frame16Ptr again = d.frameAt(3.0 / 25);
+            QVERIFY(again && std::vector<uint16_t>(again->px.begin(), again->px.end()) == thirdPx);
+        }
+        // AV1 and other files are not taken for AV2.
+        QFile notAv2(QString::fromStdString(path("not-av2.ivf")));
+        QVERIFY(notAv2.open(QIODevice::WriteOnly));
+        notAv2.write(QByteArray("DKIF\0\0\x20\0AV01", 12) + QByteArray(20, '\0'));
+        notAv2.close();
+        QCOMPARE(av2Container(path("not-av2.ivf")), Av2Container::None);
+    }
+
+    void av2WrittenAsTheReferenceDecoderReadsIt() {
+        // Montage's AV2 exports, coded by AVM: each container decodes in AVM's decoder to the frames dav2d gives;
+        // the MP4 as the binding's draft has it (rebuilt here from FFmpeg's demuxer and the 'av2C' box), with its
+        // sound; PQ and HLG stated and read back; a proxy made from it; MCP's montage_render writes it too.
+        if (!av2Available() || !av2EncoderAvailable()) QSKIP("Built without AV2 (MONTAGE_WITH_AV2)");
+        const QString dec = av2Tool("avmdec");
+        if (dec.isEmpty()) QSKIP("No AVM decoder (MONTAGE_TEST_AV2_TOOLS)");
+        const int w = 64, h = 48, frames = 6;
+        const QString y4m = QString::fromStdString(path("av2-source.y4m"));
+        QVERIFY(writeAv2TestY4m(y4m, w, h, frames, 8, false));  // (grey: its codes the same whichever matrix reads it)
+        std::vector<float> tone(size_t(48000 * frames / 25));
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = 0.3f * float(std::sin(2 * M_PI * 440 * double(i) / 48000));
+        QVERIFY(writeMonoWav(path("av2-tone.wav"), tone, 48000));
+        auto project = [&](const std::string& space) {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.width = w, s.height = h, s.fps = {25, 1};
+            s.colorSpace = space;
+            s.hdrPeakNits = 1000;
+            MediaItem v = probeOrFail(p, y4m.toStdString());
+            p.media.push_back(v);
+            MediaItem a = probeOrFail(p, path("av2-tone.wav"));
+            p.media.push_back(a);
+            edit::placeMedia(p, s, v.id, 0, 0, frames, {TrackKind::Video, 0}, {}, false);
+            edit::placeMedia(p, s, a.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return p;
+        };
+        // AVM's decoder on the stream (an MP4's rebuilt), against what dav2d gives through Montage.
+        auto sameInBothDecoders = [&](const std::string& file) -> QString {
+            QString stream = QString::fromStdString(file);
+            if (av2Container(file) == Av2Container::Mp4) {
+                QByteArray es, mine;
+                QString why;
+                if (!av2Mp4Stream(stream, es, why)) return why;
+                // (Montage's own reading of it, unit by unit, the same)
+                Av2Reader r;
+                std::string err;
+                if (!r.open(file, &err)) return QString::fromStdString(err);
+                for (int64_t i = 0; i < r.temporalUnits(); ++i) {
+                    std::vector<uint8_t> tu;
+                    if (!r.temporalUnit(i, tu, nullptr, &err)) return QString::fromStdString(err);
+                    mine.append(reinterpret_cast<const char*>(tu.data()), qsizetype(tu.size()));
+                }
+                if (mine != es) return QStringLiteral("Montage rebuilds the MP4's stream otherwise than the binding");
+                stream += ".obu";
+                QFile o(stream);
+                if (!o.open(QIODevice::WriteOnly) || o.write(es) != es.size()) return "cannot write " + stream;
+            }
+            QString said;
+            if (!runAv2Tool(dec, {"--rawvideo", "-o", stream + ".yuv", stream}, &said)) return "avmdec: " + said;
+            QFile rf(stream + ".yuv");
+            if (!rf.open(QIODevice::ReadOnly)) return "avmdec wrote nothing";
+            QByteArray got;
+            int64_t n = 0;
+            std::string err;
+            if (!av2Frames(file, got, n, err)) return QString::fromStdString(err);
+            if (n != frames) return QStringLiteral("%1 frames").arg(n);
+            return got == rf.readAll() ? QString() : QStringLiteral("avmdec and dav2d differ");
+        };
+        std::string err, used;
+        struct Case {
+            const char* file;
+            std::string space;
+            const char* audio;
+            int bits;
+        };
+        for (const Case& c : {Case{"av2-out.mp4", "", "aac", 8}, Case{"av2-pq.ivf", "rec2100pq", "none", 10}, Case{"av2-hlg.obu", "rec2100hlg", "none", 10},
+                              Case{"av2-pq.mp4", "rec2100pq", "aac", 10}}) {
+            Project p = project(c.space);
+            ExportSettings st;
+            st.path = path(c.file);
+            st.videoCodec = "av2";
+            st.audioCodec = c.audio;
+            st.crf = 24;
+            st.preset = "6";
+            QVERIFY2(exportSequence(p, *p.active(), st, nullptr, nullptr, &err, &used), (std::string(c.file) + ": " + err).c_str());
+            QCOMPARE(used, std::string("AVM (AV2)"));
+            const QString why = sameInBothDecoders(st.path);
+            QVERIFY2(why.isEmpty(), qPrintable(QString(c.file) + ": " + why));
+            MediaItem m;
+            QVERIFY2(probeMedia(st.path, m, &err), err.c_str());
+            QCOMPARE(m.videoCodec, std::string("av2"));
+            QCOMPARE(m.width, w);
+            QCOMPARE(m.height, h);
+            QCOMPARE(m.fps.toDouble(), 25.0);
+            QVERIFY2(std::fabs(m.duration - frames / 25.0) < 1e-9, qPrintable(QString::number(m.duration)));
+            QCOMPARE(m.colorSpace, c.space);
+            QCOMPARE(m.hasAudio, std::string(c.audio) == "aac");
+            if (m.hasAudio) QCOMPARE(m.sampleRate, 48000);
+            if (c.space == "rec2100pq") QVERIFY2(m.maxCll > 0, qPrintable(QString::number(m.maxCll)));
+            Av2Info info;
+            QVERIFY2(readAv2Info(st.path, info, &err), err.c_str());
+            QCOMPARE(info.bits, c.bits);
+            QVERIFY(info.monotonic);
+            if (c.space == "rec2100pq") QVERIFY2(std::fabs(info.masteringMax - 1000) < 1, qPrintable(QString::number(info.masteringMax)));
+            // The picture as it went in, about.
+            Av2Reader r;
+            QVERIFY2(r.open(st.path, &err), err.c_str());
+            AVFrame* f = av_frame_alloc();
+            QVERIFY2(r.frame(2, f, &err), err.c_str());
+            if (c.space.empty()) {
+                double diff = 0;
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) diff += std::abs(int(f->data[0][size_t(y) * size_t(f->linesize[0]) + size_t(x)]) - av2TestSample(0, x, y, 2, 8));
+                diff /= w * h;
+                QVERIFY2(diff < 4, qPrintable(QString::number(diff)));
+            }
+            av_frame_free(&f);
+        }
+        // Sound goes in MP4 only.
+        {
+            Project p = project("");
+            ExportSettings st;
+            st.path = path("av2-sound.ivf");
+            st.videoCodec = "av2";
+            st.audioCodec = "aac";
+            QVERIFY(!exportSequence(p, *p.active(), st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("no sound"), err.c_str());
+            QVERIFY(!QFile::exists(QString::fromStdString(st.path)));
+        }
+        // What only a container's muxer would write is refused, not dropped: chapters, 360° metadata.
+        {
+            Project p = project("");
+            Marker m;
+            m.t = 2;
+            m.name = "Two";
+            m.chapter = true;
+            p.active()->markers.push_back(m);
+            ExportSettings st;
+            st.path = path("av2-chapters.mp4");
+            st.videoCodec = "av2";
+            st.audioCodec = "none";
+            QVERIFY(!exportSequence(p, *p.active(), st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("chapters"), err.c_str());
+            st.chapters = false;
+            p.active()->spherical = true;
+            QVERIFY(!exportSequence(p, *p.active(), st, nullptr, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("360"), err.c_str());
+            QVERIFY(!QFile::exists(QString::fromStdString(st.path)));
+        }
+        // Its sound as FFmpeg reads the MP4.
+        {
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, path("av2-out.mp4").c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            const int a = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            QVERIFY(a >= 0);
+            QCOMPARE(fmt->streams[a]->codecpar->codec_id, AV_CODEC_ID_AAC);
+            const double seconds = double(fmt->streams[a]->duration) * av_q2d(fmt->streams[a]->time_base);
+            avformat_close_input(&fmt);
+            QVERIFY2(std::fabs(seconds - frames / 25.0) < 0.03, qPrintable(QString::number(seconds)));
+        }
+        // A proxy made from it.
+        {
+            ProxyOptions po;
+            QVERIFY2(createProxy(path("av2-out.mp4"), path("av2-out-proxy.mp4"), po, {}, nullptr, &err), err.c_str());
+            MediaItem m;
+            QVERIFY2(probeMedia(path("av2-out-proxy.mp4"), m, &err), err.c_str());
+            QCOMPARE(m.videoCodec, std::string("h264"));
+            QCOMPARE(m.width, w);
+            QVERIFY2(std::fabs(m.duration - frames / 25.0) < 0.01, qPrintable(QString::number(m.duration)));
+        }
+        // Through MCP.
+        {
+            Project p = project("");
+            const QString saved = QString::fromStdString(path("av2-mcp.montage"));
+            QVERIFY(saveProject(p, saved.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"},
+                                                         {"arguments", QJsonObject{{"project", saved}, {"output", QString::fromStdString(path("av2-mcp.ivf"))},
+                                                                                   {"video_codec", "av2"}, {"av2_10bit", true}, {"av2_quality", 40}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            Av2Info info;
+            QVERIFY2(readAv2Info(path("av2-mcp.ivf"), info, &err), err.c_str());
+            QCOMPARE(info.container, Av2Container::Ivf);
+            QCOMPARE(info.bits, 10);
+            QCOMPARE(info.frames, int64_t(frames));
+            // The AV2 preset by name, into a bare OBU stream: its sound left out, as an OBU stream holds none.
+            QJsonObject byName = req;
+            QJsonObject params = byName.value("params").toObject();
+            params["arguments"] = QJsonObject{{"project", saved}, {"output", QString::fromStdString(path("av2-preset.obu"))},
+                                              {"preset", "AV2 (AVM, draft MP4 binding)"}};
+            byName["params"] = params;
+            const auto again = server.handle(QJsonDocument(byName).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r2 = QJsonDocument::fromJson(QByteArray::fromStdString(again.back())).object().value("result").toObject();
+            QVERIFY2(!r2.value("isError").toBool(), QJsonDocument(r2).toJson().constData());
+            QVERIFY2(readAv2Info(path("av2-preset.obu"), info, &err), err.c_str());
+            QCOMPARE(info.container, Av2Container::Obu);
+            QCOMPARE(info.frames, int64_t(frames));
+        }
     }
 };
 

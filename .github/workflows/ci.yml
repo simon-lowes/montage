@@ -29,8 +29,20 @@ jobs:
           key: c2pa-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('scripts/build-c2pa.sh') }}
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh ~/c2pa
+      # AV2 (dav2d and AVM, from pinned tags checked against their commits): built here only, so the AV2 tests run;
+      # packages leave AV2 out (MONTAGE_WITH_AV2 is off by default: both licences are flagged, THIRD_PARTY_NOTICES).
+      - name: Cache AV2's decoder and reference encoder
+        uses: actions/cache@v4
+        with:
+          path: ~/av2
+          key: av2-${{ runner.os }}-${{ hashFiles('scripts/build-av2.sh') }}
+      - name: AV2's decoder and reference encoder (dav2d, AVM)
+        run: |
+          command -v meson > /dev/null || sudo apt-get install -y --no-install-recommends meson
+          scripts/build-av2.sh ~/av2
+          echo "MONTAGE_TEST_AV2_TOOLS=$HOME/av2/bin" >> "$GITHUB_ENV"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMONTAGE_BUILD_APP=ON -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON -DMONTAGE_WITH_AV2=ON -DAV2_ROOT="$HOME/av2"
       - name: Build
         run: cmake --build build
       - name: Cache the speech model

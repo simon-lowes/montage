@@ -81,6 +81,7 @@
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
+#include "media/Av2.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "media/Proxy.h"
@@ -12872,6 +12873,10 @@ void McpServer::Impl::addTools() {
             "jxl_depth":{"type":"string","enum":["8","16","half","float"],"description":"JPEG XL preset: the frames' samples (default 16-bit, half floats in linear light)"},
             "jxl_distance":{"type":"number","minimum":0,"maximum":25,"default":0,"description":"JPEG XL preset: 0 lossless, else libjxl's distance (1 visually lossless)"},
             "jxl_premultiplied":{"type":"boolean","default":false,"description":"JPEG XL preset with alpha: written premultiplied rather than straight (libjxl 0.9 or later)"},
+            "video_codec":{"type":"string","enum":["av2"],"description":"av2: AV2 instead of the preset's video, coded by AVM (builds made with AV2 only), in the container the output's extension names: .ivf, .obu (a bare OBU stream) or else MP4 by AV2's ISO BMFF binding, a working draft. MP4 keeps the preset's sound as AAC; IVF and OBU have none"},
+            "av2_speed":{"type":"integer","minimum":0,"maximum":6,"default":6,"description":"AV2: AVM's speed preset, 0 slowest (smallest) to 6 fastest"},
+            "av2_quality":{"type":"integer","minimum":0,"maximum":63,"default":32,"description":"AV2 without a bitrate: the quantiser, 0 (best) to 63"},
+            "av2_10bit":{"type":"boolean","default":false,"description":"AV2: 10 bits (always for HDR)"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"},
             "streaming":{"type":"object","description":"A streaming package instead of a file: output is its folder. The sequence rendered once, encoded as a ladder of renditions whose segments start on keyframes at the same frames, packaged as CMAF for HLS (master.m3u8) and DASH (manifest.mpd), with the mix and audio_streams as languages, each caption track as WebVTT (and IMSC for DASH), chapters, and ad-break markers (montage_add_marker ad_break) as SCTE 35 cues","properties":{
                 "ladder":{"type":"array","items":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"},"bitrate":{"type":"integer","description":"bits a second"},"codec":{"type":"string","enum":["libx264","libx265","libsvtav1"]}},"required":["width","bitrate"]},"description":"The rungs (default: from the picture's size down to 360 lines)"},
@@ -12999,6 +13004,26 @@ void McpServer::Impl::addTools() {
                 st.jxlDistance = std::clamp(a.value("jxl_distance").toDouble(0), 0.0, 25.0);
                 st.jxlPremultiplied = a.value("jxl_premultiplied").toBool();
             }
+            if (a.contains("video_codec")) {
+                if (str(a, "video_codec") != "av2") throw ArgError{"\"video_codec\" is av2"};
+                if (!av2EncoderAvailable()) throw ArgError{"This build of Montage writes no AV2 (AVM)"};
+                st.videoCodec = "av2";
+                st.preset = std::to_string(std::clamp(a.value("av2_speed").toInt(6), 0, 6));
+                st.crf = std::clamp(a.value("av2_quality").toInt(32), 0, 63);
+                st.pixFmt = a.value("av2_10bit").toBool() ? "yuv420p10le" : "";
+                st.profile.clear();
+                st.alpha = false;
+                if (st.audioCodec != "none") st.audioCodec = "aac";
+                st.format.clear();
+            } else if (a.contains("av2_speed") || a.contains("av2_quality") || a.contains("av2_10bit")) {
+                if (st.videoCodec != "av2") throw ArgError{"\"av2_speed\", \"av2_quality\" and \"av2_10bit\" are for AV2 (\"video_codec\": \"av2\")"};
+                if (a.contains("av2_speed")) st.preset = std::to_string(std::clamp(a.value("av2_speed").toInt(6), 0, 6));
+                if (a.contains("av2_quality")) st.crf = std::clamp(a.value("av2_quality").toInt(32), 0, 63);
+                if (a.contains("av2_10bit")) st.pixFmt = a.value("av2_10bit").toBool() ? "yuv420p10le" : "";
+            }
+            // (an IVF or OBU stream holds no sound, whether AV2 was asked for here or by its preset)
+            if (st.videoCodec == "av2" && av2ContainerForPath(st.path) != Av2Container::Mp4) st.audioCodec = "none";
+            if (st.videoCodec == "av2") st.chapters = false;  // (AVM's writer makes no chapters)
             if (a.contains("stereo_view")) {
                 StereoView v;
                 st.stereo = str(a, "stereo_view").toStdString();

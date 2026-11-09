@@ -6,6 +6,7 @@
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Jxl.h"
+#include "media/Av2.h"
 #include "render/SegmentedExport.h"
 
 #include "core/ColorGroups.h"
@@ -240,6 +241,11 @@ struct Output {
     // Spatial video: the video "encoder" gives raw pictures (the eyes side by side), which this codes as MV-HEVC.
     std::unique_ptr<SpatialVideoEncoder> spatial;
     std::string spatialError;  // (what x265 said, when it failed)
+    // AV2 (media/Av2.h): the video "encoder" gives raw pictures, which AVM codes; it writes the file (the muxer is
+    // FFmpeg's null one), the sound's packets too.
+    std::unique_ptr<Av2Writer> av2;
+    AVFrame* av2Picture = nullptr;  // (a raw packet's planes, as AVM is handed them)
+    std::string av2Error;
     // E-AC-3 above 5.1: the audio "encoder" is a description, the sound coded by two encoders as two substreams.
     std::map<AVCodecContext*, std::unique_ptr<Eac3Extended>> extended;
     bool headerWritten = false;
@@ -247,6 +253,7 @@ struct Output {
         sws_freeContext(sws);
         av_frame_free(&vframe);
         av_frame_free(&aframe);
+        av_frame_free(&av2Picture);
         av_packet_free(&pkt);
         avcodec_free_context(&vctx);
         avcodec_free_context(&actx);
@@ -281,7 +288,7 @@ int writeSpatial(Output& o, std::vector<SpatialVideoEncoder::Packet>& coded) {
 }
 
 // Why writing video failed: x265's own words for spatial video.
-std::string videoError(const Output& o, int rc) { return o.spatialError.empty() ? averr(rc) : o.spatialError; }
+std::string videoError(const Output& o, int rc) { return !o.av2Error.empty() ? o.av2Error : o.spatialError.empty() ? averr(rc) : o.spatialError; }
 
 Eac3Extended* extendedFor(Output& o, AVCodecContext* ctx) {
     auto it = o.extended.find(ctx);
@@ -311,6 +318,24 @@ int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
             av_packet_unref(o.pkt);
             if (!ok) return AVERROR_EXTERNAL;
             if ((rc = writeSpatial(o, coded)) < 0) return rc;
+            continue;
+        }
+        if (o.av2 && st == o.vst) {
+            // (A picture, raw: coded by AVM.)
+            AVFrame* f = o.av2Picture;
+            f->format = ctx->pix_fmt;
+            f->width = ctx->width;
+            f->height = ctx->height;
+            const bool ok = av_image_fill_arrays(f->data, f->linesize, o.pkt->data, ctx->pix_fmt, ctx->width, ctx->height, 1) >= 0 &&
+                            o.av2->encode(f, &o.av2Error);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            continue;
+        }
+        if (o.av2 && st == o.ast) {
+            const bool ok = o.av2->audio(o.pkt, &o.av2Error);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
             continue;
         }
         if (st == o.vst && o.videoPacket && !o.videoPacket(o.pkt)) return AVERROR(EINVAL);
@@ -416,6 +441,13 @@ std::vector<ExportPreset> makePresets(bool everyBuild) {
             v.push_back(ec3);
         }
         v.push_back(preset("AV1 (SVT-AV1)", "mp4", "Next-generation efficiency", "libsvtav1", "aac", 32, "8"));
+        if (everyBuild || av2EncoderAvailable()) {
+            // AV2 through its reference encoder, AVM (media/Av2.h): in builds made with it only (its licence is flagged).
+            // Speed is AVM's preset, 0 (slowest) to 6; the MP4 binding is a working draft, so .ivf and .obu are offered too.
+            v.push_back(preset("AV2 (AVM, draft MP4 binding)", "mp4",
+                               "AV2 through its reference encoder (slow); its MP4 binding is a working draft, IVF or OBU by the file's extension",
+                               "av2", "aac", 32, "6"));
+        }
         {
             // Short-form social video: the platforms' -14 LUFS loudness, kept under -1 dBTP.
             ExportPreset p = preset("Social - TikTok / Reels / Shorts", "mp4",
@@ -926,6 +958,29 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (jxlFrames && (s.jxlDistance < 0 || s.jxlDistance > 25)) return fail("A JPEG XL distance is 0 (lossless) to 25");
     if (jxlFrames && s.alpha && s.jxlPremultiplied && !jxlWritesPremultiplied())
         return fail("This libjxl (before 0.9) cannot write premultiplied alpha: write it straight");  // written straight from the float picture, not through 16 bits
+    // AV2 coded by AVM (media/Av2.h), in the container the file name asks for: an IVF, a bare OBU stream (.obu), or MP4
+    // as AV2's ISO BMFF binding has it while it is a working draft.
+    const bool av2Out = s.videoCodec == "av2" && wantVideo;
+    const Av2Container av2Holder = av2ContainerForPath(s.path);
+    if (av2Out) {
+        if (!av2EncoderAvailable()) return fail("This build of Montage writes no AV2 (AVM)");
+        if (s.alpha || interlacedOut) return fail("AV2 is written without alpha or fields");
+        if (s.cea608 || s.embedCaptions) return fail("AV2 is written without embedded captions: burn them in, or deliver them beside the file");
+        if (s.adaptiveHdr) return fail("AV2 is written without adaptive HDR metadata");  // (HDR10+ goes beside it, as JSON)
+        if (s.twoPass || s.pass != 0) return fail("AV2 is written in one pass");
+        if (seq.stereo3d && s.stereo == "mv") return fail("Spatial video is MV-HEVC: choose H.265 (HEVC)");
+        // (AVM's writer, not FFmpeg's muxer, makes the file: what only a muxer writes is refused, not dropped)
+        if (seq.spherical) return fail("AV2 is written without 360° metadata");
+        StereoView eyes = StereoView::Left;
+        if (seq.stereo3d && stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, eyes) && eyes != StereoView::Left &&
+            eyes != StereoView::Right && eyes != StereoView::Anaglyph)
+            return fail("AV2 is written without stereoscopic 3D metadata: export one eye or an anaglyph");
+        if (s.chapters && std::any_of(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.chapter; }))
+            return fail("AV2 is written without chapters: turn chapters off");
+        if (wantAudio && av2Holder != Av2Container::Mp4) return fail("IVF and OBU streams hold no sound: export AV2 as MP4 for sound, or choose no audio codec");
+        if (wantAudio && s.audioCodec != "aac") return fail("AV2 in MP4 takes AAC sound");
+        if (s.monoAudioTracks > 0 || !s.extraAudio.empty()) return fail("AV2 in MP4 holds one sound stream");
+    }
     // (through the OpenEXR library whenever it is there, so the file says its colour space: the colorInteropID attribute)
     const bool exrLibrary = floatFrames && (exrAvailable() || !s.exrCompression.empty() || s.exrLayers);
     if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
@@ -945,7 +1000,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
     Output o;
-    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : s.format.empty() ? nullptr : s.format.c_str(),
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : av2Out ? "null" : s.format.empty() ? nullptr : s.format.c_str(),
                                             outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
@@ -1012,7 +1067,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!jxlCanState(outSpace)) return fail("JPEG XL cannot state " + outSpace.label + ": deliver it in a display space or linear light");
             c = "png";
         }
-        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : c;
+        if (av2Out) c = "rawvideo";  // (FFmpeg's raw "encoder" hands each picture to AVM)
+        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : jxlFrames ? std::string("libjxl") : av2Out ? std::string("AVM (AV2)") : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
         // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
         if (c == "cfhd" && H % 8 != 0)
@@ -1028,6 +1084,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->sample_aspect_ratio = AVRational{1, 1};
         o.vctx->pix_fmt = defaultPixFmt(s, c);
         if (outSpace.hdr() && s.pixFmt.empty()) o.vctx->pix_fmt = tenBitFormat(o.vctx->pix_fmt, o.vctx, codec);
+        // (AV2 in 4:2:0, 10 bits for HDR or when asked)
+        if (av2Out) o.vctx->pix_fmt = outSpace.hdr() || s.pixFmt.find("10") != std::string::npos ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
         o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(dseq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
         const ColorTags tags = colorTags(outSpace);
@@ -1413,7 +1471,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             actx->bit_rate = std::clamp<int64_t>(int64_t(s.audioBitrate) * std::max(2, layout.nb_channels) / 2, 96000,
                                                  s.audioCodec == "ac3" ? 640000 : 1024000);
         actx->time_base = AVRational{1, actx->sample_rate};
-        if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if ((o.oc->oformat->flags & AVFMT_GLOBALHEADER) || av2Out) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
         if (field && s.audioCodec == "aac") {
             // The field's channels are not left and right: joint stereo coding (mid/side, intensity) and noise
@@ -1640,7 +1698,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering of long-GOP video (render/LongGopCopy.h): planned before the header, which carries the copied
     // sources' parameter sets. Only where nothing would change the source's pictures for the whole export, as below.
     std::unique_ptr<LongGopCopier> longGop;
-    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
+    if (wantVideo && s.smartRender && o.vctx && !o.spatial && !av2Out && !floatFrames && W == seq.width && H == seq.height && !seq.stereo3d && !s.useProxies &&
         !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && !s.alpha && !wantHdr10 && !wantAdaptive && sameColorSpace(outSpace, seqSpace) &&
         !trim && !sceneReferredWorking(seq) && !conv.active() && s.profile != "avci100") {
         LongGopEncoder lge;
@@ -1654,6 +1712,36 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         lge.main = o.vctx;
         longGop = LongGopCopier::plan(p, seq, in, out, seqSpace, lge, o.oc, o.vst);
         if (longGop && !longGop->prepareStream(nullptr)) longGop.reset();
+    }
+    if (av2Out && o.vctx) {
+        // AVM at the speed preset asked (0 slowest to 6 fastest; a named one, or none, is 6), the quantiser from the
+        // CRF or the bitrate, colour and HDR stated as the delivery's.
+        Av2WriteSettings as;
+        as.container = av2Holder;
+        as.width = W;
+        as.height = H;
+        as.bits = o.vctx->pix_fmt == AV_PIX_FMT_YUV420P10LE ? 10 : 8;
+        as.fpsNum = fps.num;
+        as.fpsDen = fps.den;
+        as.speed = !s.preset.empty() && std::all_of(s.preset.begin(), s.preset.end(), [](char ch) { return ch >= '0' && ch <= '9'; })
+                       ? std::clamp(std::atoi(s.preset.c_str()), 0, 6)
+                       : 6;
+        as.crf = std::clamp(s.crf, 0, 63);
+        as.bitrate = s.videoBitrate;
+        as.gop = o.vctx->gop_size;
+        as.primaries = int(o.vctx->color_primaries);
+        as.transfer = int(o.vctx->color_trc);
+        as.matrix = int(o.vctx->colorspace);
+        if (pq) {  // (as the other codecs state them)
+            as.maxCll = maxCll, as.maxFall = maxFall;
+            as.masteringMax = peakNits, as.masteringMin = 0.0001;
+        }
+        o.av2 = std::make_unique<Av2Writer>();
+        o.av2Picture = av_frame_alloc();
+        if (!o.av2Picture) return fail("Out of memory");
+        if (!o.av2->open(s.path, as, &o.av2Error)) return fail(o.av2Error);
+        opened = true;  // (removed if the export fails after AVM's writer has finished it)
+        if (o.actx && !o.av2->addAudio(o.ast->codecpar, o.actx->time_base.num, o.actx->time_base.den, &o.av2Error)) return fail(o.av2Error);
     }
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
@@ -2005,7 +2093,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.cancel = cancel;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
-    if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
+    if (wantVideo && s.smartRender && o.vctx && !av2Out && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && sameColorSpace(outSpace, seqSpace) && !trim && !sceneGraded &&
         !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
@@ -2502,6 +2590,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
+    if (o.av2) {
+        // (an MP4 states the light levels as measured, its movie box being written last)
+        if (pq && measured.frames > 0) {
+            unsigned cll = 0, fall = 0;
+            hdr10LightLevels(measured, cll, fall);
+            o.av2->setLightLevels(int(cll), int(fall));
+        }
+        if (!o.av2->finish(&o.av2Error)) return fail(o.av2Error);
+    }
     if (o.spatial) {
         // The second view's configuration and Apple's stereo boxes, which FFmpeg does not write.
         if ((rc = avio_closep(&o.oc->pb)) < 0) return fail("Writing the file failed: " + averr(rc));

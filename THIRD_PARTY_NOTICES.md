@@ -107,6 +107,14 @@ Copyright Netflix, Inc.): a build configured with `MONTAGE_WITH_VMAF` (off by de
 the computer for Compare Encode's VMAF scores and reads the models from `MONTAGE_VMAF_MODELS` or a `vmaf-models`
 folder beside the program.
 
+Nor AV2's libraries, which are optional, not in packages, and flagged: a build configured with `MONTAGE_WITH_AV2` (off
+by default; `scripts/build-av2.sh` builds them from pinned tags) links VideoLAN's
+[dav2d](https://code.videolan.org/videolan/dav2d) 0.0.1 to read AV2 (BSD-2-Clause, as its COPYING states: Copyright ©
+2018-2026, VideoLAN and dav2d authors) and the Alliance for Open Media's [AVM](https://github.com/AOMediaCodec/avm)
+v1.0.0, AV2's reference software, to write it (BSD-3-Clause-Clear, Copyright (c) 2021, Alliance for Open Media, with
+the Alliance for Open Media Patent License 1.0 in its PATENTS file). Both licences are flagged for review, so Montage's
+packages are built without AV2; only the Linux CI job builds it, to run its tests.
+
 AI models are not included either: Montage downloads each one when a feature first needs it, and names the model and
 its licence when it asks to download it. One is not under a software licence: Bandit v2's weights (dialogue, music and
 effects) are CC BY-SA 4.0, so they are downloaded from the authors' Zenodo record as they are and never repackaged.

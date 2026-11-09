@@ -5,6 +5,7 @@
 #include "FieldRecorder.h"
 #include "Exr.h"
 #include "Jxl.h"
+#include "Av2.h"
 #include "render/DcpMxf.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
@@ -669,6 +670,35 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // AV2 (media/Av2.h), its pictures read with dav2d: an IVF or bare OBU stream, or an MP4 whose sound and tags are read
+    // as any other's (FFmpeg has no AV2, so its picture's facts come from the stream).
+    static thread_local bool av2Probing = false;
+    if (const Av2Container ac = av2Available() && !av2Probing ? av2Container(file) : Av2Container::None; ac != Av2Container::None) {
+        Av2Info ai;
+        if (!readAv2Info(file, ai, error)) return false;
+        MediaItem m = out;
+        if (ac == Av2Container::Mp4) {
+            av2Probing = true;
+            MediaItem viaContainer = out;
+            if (probeMedia(path, viaContainer, nullptr)) m = viaContainer;
+            av2Probing = false;
+        }
+        m.path = path;
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+        m.kind = MediaKind::Video;
+        m.hasVideo = true;
+        if (ac != Av2Container::Mp4) m.hasAudio = false;
+        m.width = std::max(1, int(std::lround(ai.width * (in.par > 0 ? in.par : 1.0))));  // (as the decoder hands it out)
+        m.height = ai.height;
+        m.fps = Rational{ai.fpsNum, ai.fpsDen};
+        m.duration = ai.seconds() / in.timeScale();
+        m.videoCodec = "av2";
+        m.colorSpace = ai.colorSpace;
+        m.maxCll = ai.maxCll;
+        m.maxFall = ai.maxFall;
+        out = m;
+        return true;
+    }
     // An IMF archival master's pictures (Application #5: ACES image containers, which FFmpeg does not read), in ACES 2065-1.
     if (file.size() >= 4 && exrAvailable() && QString::fromStdString(file.substr(file.size() - 4)).compare(".mxf", Qt::CaseInsensitive) == 0) {
         int w = 0, h = 0;
@@ -1036,6 +1066,7 @@ void VideoDecoder::close() {
     jxlAnimation_.reset();
     jxlFile_.clear();
     imf_.reset();
+    av2_.reset();
     pulldown_.reset();
     av_frame_free(&woven_);
     wovenIndex_ = -1;
@@ -1289,6 +1320,23 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     const std::string file = uninterpretedPath(path);
     std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : std::string();
     for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    // AV2 (media/Av2.h): decoded with dav2d, each frame converted as FFmpeg's would be.
+    if (av2Available() && av2Container(file) != Av2Container::None) {
+        auto reader = std::make_unique<Av2Reader>();
+        if (!reader->open(file, error)) return false;
+        const Av2Info& ai = reader->info();
+        av2_ = std::move(reader);
+        rawFrame_ = -1;
+        dispW_ = std::max(1, int(std::lround(ai.width * (par_ > 0 ? par_ : 1.0))));
+        dispH_ = ai.height;
+        fps_ = double(ai.fpsNum) / ai.fpsDen;
+        duration_ = ai.seconds();
+        still_ = false;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
+    }
     if (ext == ".mxf") {
         int w = 0, h = 0;
         if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h, &imfFullRange_)) {
@@ -2031,6 +2079,27 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         }
         if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_)) {
             stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality);
+            stillHq_ = highQuality;
+        }
+        curPts_ = double(n) / fps_;
+        return stillFrame_;
+    }
+    if (av2_) {
+        // The frame shown at `t`, decoded once and kept while it is asked for again.
+        const int64_t n = std::clamp(int64_t(std::floor(std::min(std::max(0.0, t) * timeScale_ * fps_ + 1e-6, 1e15))), int64_t(0),
+                                     std::max<int64_t>(0, av2_->info().frames - 1));
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_ || !raw_) {
+            if (!raw_ && !(raw_ = av_frame_alloc())) return nullptr;
+            rawFrame_ = -1;
+            if (!av2_->frame(n, raw_)) return nullptr;
+            rawFrame_ = n;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_) ||
+            (stillFrame_->planes && !planes)) {
+            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality, planes);
             stillHq_ = highQuality;
         }
         curPts_ = double(n) / fps_;

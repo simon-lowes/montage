@@ -59,6 +59,8 @@ const char* const kTexts[] = {
     QT_TRANSLATE_NOOP("Engine", "ARRI LogC4 / ALEXA Wide Gamut 4"),
     QT_TRANSLATE_NOOP("Engine", "ASC CDL"),
     QT_TRANSLATE_NOOP("Engine", "AV1 (SVT-AV1)"),
+    QT_TRANSLATE_NOOP("Engine", "AV2 (AVM, draft MP4 binding)"),
+    QT_TRANSLATE_NOOP("Engine", "AV2 through its reference encoder (slow); its MP4 binding is a working draft, IVF or OBU by the file's extension"),
     QT_TRANSLATE_NOOP("Engine", "AVC-Intra 100 (MXF)"),
     QT_TRANSLATE_NOOP("Engine", "Above"),
     QT_TRANSLATE_NOOP("Engine", "Accent Bar"),

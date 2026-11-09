@@ -92,6 +92,7 @@ add_library(montage_engine STATIC
   media/Usd.h media/Usd.cpp media/UsdModel.cpp media/Splats.h media/Splats.cpp
   media/Exr.h media/Exr.cpp
   media/Jxl.h media/Jxl.cpp
+  media/Av2.h media/Av2.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/DngOpcodes.h media/DngOpcodes.cpp
@@ -462,6 +463,23 @@ if(MONTAGE_WITH_JXL)
     endif()
   else()
     message(STATUS "libjxl not found: JPEG XL is read through FFmpeg only, and not written")
+  endif()
+endif()
+if(MONTAGE_WITH_AV2)
+  # Found from AV2_ROOT (scripts/build-av2.sh) or pkg-config, never fetched. Only media/Av2.cpp sees the libraries'
+  # headers and the definition, so turning AV2 on or off rebuilds that file alone; everything else asks av2Available().
+  if(AV2_ROOT)
+    list(PREPEND CMAKE_PREFIX_PATH "${AV2_ROOT}")
+  endif()
+  pkg_check_modules(AV2 avm>=1.0 dav2d)
+  if(AV2_FOUND)
+    message(STATUS "AV2: dav2d ${AV2_dav2d_VERSION} reads it, AVM ${AV2_avm_VERSION} writes it (both licences flagged: not for packages)")
+    set_property(SOURCE media/Av2.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${AV2_INCLUDE_DIRS})
+    set_property(SOURCE media/Av2.cpp APPEND PROPERTY COMPILE_DEFINITIONS MONTAGE_WITH_AV2)
+    # (static libraries as scripts/build-av2.sh installs them; their threads and libdl come with the engine's)
+    target_link_libraries(montage_engine PRIVATE ${AV2_LINK_LIBRARIES} m)
+  else()
+    message(FATAL_ERROR "MONTAGE_WITH_AV2 is on but AVM and dav2d are not found: build them with scripts/build-av2.sh <prefix> and set AV2_ROOT=<prefix>")
   endif()
 endif()
 if(MONTAGE_WITH_VMAF)
