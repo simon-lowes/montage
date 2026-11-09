@@ -276,6 +276,7 @@ struct ToolJob {
     std::chrono::steady_clock::time_point persisted;  // when its progress was last written (under m)
     std::atomic<bool> cancel{false};
     std::atomic<bool> cancelAsked{false};  // by montage_job (not by the server's end)
+    std::mutex persistM;  // one write to the store at a time, so the last taken is the last written
     std::mutex m;  // what follows
     QString status = QStringLiteral("queued");  // queued, running, done, failed, cancelled
     double fraction = 0;
@@ -903,6 +904,8 @@ struct McpServer::Impl {
     }
     // The job written to the store (its progress at most once a second unless `now`).
     void persist(ToolJob& j, bool now = false) {
+        // (the call's thread writes it queued while its runner may write it running: without this, the older could land last)
+        std::lock_guard order(j.persistM);
         jobs::Record r;
         {
             std::lock_guard l(j.m);
