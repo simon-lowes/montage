@@ -20985,11 +20985,14 @@ if __name__ == '__main__':
             QTRY_VERIFY_WITH_TIMEOUT(job(server, a).value("progress").toDouble() > 0, 30000);
             QCOMPARE(job(server, b).value("status").toString(), QString("queued"));
             // (their stored ids: the one running and the one waiting)
+            QString seen;
             for (const jobs::Record& k : jobs::all("mcp")) {
                 if (k.status == "running") interrupted = k.id;
                 if (k.status == "waiting") queuedBehind = k.id;
+                seen += QString("%1 %2 %3 (pid %4); ").arg(k.id, k.status, k.data.value("job").toString()).arg(k.pid);
             }
-            QVERIFY(!interrupted.isEmpty() && !queuedBehind.isEmpty());
+            QVERIFY2(!interrupted.isEmpty() && !queuedBehind.isEmpty(),
+                     qPrintable(QString("%1 is %2, %3 is %4; stored: %5").arg(a, job(server, a).value("status").toString(), b, job(server, b).value("status").toString(), seen)));
         }
         jobs::Record r;
         QVERIFY(jobs::load(interrupted, r));
