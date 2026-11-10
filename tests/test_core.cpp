@@ -9217,6 +9217,65 @@ private slots:
         QVERIFY(m && m->media == camB);
     }
 
+    // Nightly 10 Nov: a track group and a take pass made on each side since the base got the same ids, so the two
+    // groups became one; their side's are given new ids, the tracks and lanes following.
+    void projectMergeTrackGroupsAndPasses() {
+        Project base = makeDefaultProject();
+        while (base.active()->audioTracks.size() < 4) {
+            Track t;
+            t.id = base.newId();
+            t.name = "A" + std::to_string(base.active()->audioTracks.size() + 1);
+            base.active()->audioTracks.push_back(t);
+        }
+        MediaItem take;
+        take.id = base.newId();
+        take.kind = MediaKind::Audio;
+        take.name = "take.wav";
+        take.path = "/nonexistent/take.wav";
+        take.duration = 10;
+        take.hasAudio = true;
+        base.media.push_back(take);
+        auto side = [&](const char* name, int first) {
+            Project p = base;
+            Sequence& s = *p.active();
+            const edit::Result made = edit::createTrackGroup(p, s, name, {{TrackKind::Audio, first}, {TrackKind::Audio, first + 1}});
+            const Id pass = p.newId();
+            for (int k = first; k < first + 2; ++k) {
+                TakeLane l;
+                l.id = p.newId();
+                l.name = "Take 1";
+                l.mediaId = take.id;
+                l.pass = pass;
+                l.number = 1;
+                s.audioTracks[size_t(k)].lanes.push_back(l);
+            }
+            return std::make_pair(p, made.ok ? made.created.front() : Id(0));
+        };
+        const auto [mine, mineGroup] = side("Drums", 0);
+        const auto [theirs, theirGroup] = side("Vox", 2);
+        QVERIFY(mineGroup && mineGroup == theirGroup);  // (the same id made on each side)
+        const MergeResult r = mergeProjects(base, mine, theirs);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Sequence& s = *r.project.active();
+        QCOMPARE(s.trackGroups.size(), size_t(2));
+        QVERIFY(s.trackGroups[0].id != s.trackGroups[1].id);
+        auto groupNamed = [&](const char* name) {
+            for (const TrackGroup& g : s.trackGroups)
+                if (g.name == name) return g.id;
+            return Id(0);
+        };
+        QVERIFY(groupNamed("Drums") && groupNamed("Vox"));
+        QCOMPARE(s.audioTracks[0].group, groupNamed("Drums"));
+        QCOMPARE(s.audioTracks[1].group, groupNamed("Drums"));
+        QCOMPARE(s.audioTracks[2].group, groupNamed("Vox"));
+        QCOMPARE(s.audioTracks[3].group, groupNamed("Vox"));
+        QVERIFY(s.audioTracks[0].lanes.size() == 1 && s.audioTracks[2].lanes.size() == 1);
+        QCOMPARE(s.audioTracks[0].lanes[0].pass, s.audioTracks[1].lanes[0].pass);
+        QCOMPARE(s.audioTracks[2].lanes[0].pass, s.audioTracks[3].lanes[0].pass);
+        QVERIFY(s.audioTracks[0].lanes[0].pass != s.audioTracks[2].lanes[0].pass);
+        QCOMPARE(groupMembers(s, groupNamed("Drums")).size(), size_t(2));
+    }
+
     void projectMerge() {
         // The base: clips A and B on V1, C on V2, two captions and a bin.
         Fixture fx;

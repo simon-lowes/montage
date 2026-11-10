@@ -1249,19 +1249,27 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
         // A server's chain file: its leaf is the one that is not a certificate authority.
         Target t;
         t.screen = screen;
+        std::vector<dcp::CertificateInfo> all;
         for (const std::string& c : dcp::splitCertificates(pem)) {
             dcp::CertificateInfo info;
-            if (dcp::readCertificate(c, info) && !info.ca) t.leafPem = c, t.leaf = info;
+            if (!dcp::readCertificate(c, info)) continue;
+            if (!info.ca) t.leafPem = c, t.leaf = info;
+            all.push_back(std::move(info));
         }
         const std::string what = screen ? "screen " + screen->screen + " of " + screen->cinema : t.leaf.commonName;
         if (t.leafPem.empty())
             return fail("No server certificate " + (screen ? "for " + what : "in " + (given.size() < 200 ? given : std::string("the text given"))));
-        const QDateTime certStart = QDateTime::fromString(QString::fromStdString(t.leaf.notBefore), Qt::ISODate);
-        const QDateTime certEnd = QDateTime::fromString(QString::fromStdString(t.leaf.notAfter), Qt::ISODate);
-        if (!certStart.isValid() || !certEnd.isValid()) return fail("The certificate of " + what + " has no validity dates");
         if (t.leaf.bits != 2048) return fail("The key of " + what + " is not RSA 2048 (as cinema servers' are)");
-        if (r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after the certificate of " + what + " does (" + t.leaf.notAfter + ")");
-        if (r.notBefore < certStart.toSecsSinceEpoch()) return fail("The window starts before the certificate of " + what + " does (" + t.leaf.notBefore + ")");
+        if (!t.leaf.encipherment) return fail("The certificate of " + what + " does not allow key encipherment, so it cannot receive keys");
+        // Each certificate of the chain (the issuers' too) valid for the whole window.
+        for (const dcp::CertificateInfo& c : all) {
+            const std::string which = c.ca ? "the certificate " + c.commonName + " above " + what : "the certificate of " + what;
+            const QDateTime certStart = QDateTime::fromString(QString::fromStdString(c.notBefore), Qt::ISODate);
+            const QDateTime certEnd = QDateTime::fromString(QString::fromStdString(c.notAfter), Qt::ISODate);
+            if (!certStart.isValid() || !certEnd.isValid()) return fail("The certificate of " + what + " has no validity dates");
+            if (r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after " + which + " does (" + c.notAfter + ")");
+            if (r.notBefore < certStart.toSecsSinceEpoch()) return fail("The window starts before " + which + " does (" + c.notBefore + ")");
+        }
         if (screen && !screen->timeZone.empty() && !QTimeZone(QByteArray::fromStdString(screen->timeZone)).isValid())
             return fail("The time zone of " + screen->cinema + " (" + screen->timeZone + ") is not one this system knows");
         targets.push_back(std::move(t));

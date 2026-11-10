@@ -129,12 +129,19 @@ bool save(Record r, const QString& folder) {
     if (r.created.isEmpty()) r.created = now;
     r.updated = now;
     const QByteArray text = QJsonDocument(toJson(r)).toJson(QJsonDocument::Indented);
-    // (tried again for up to two seconds: on Windows a record cannot be replaced while another reader has it open, as
-    // a job list or a second Montage reading the store does for a moment)
+    // (tried again for up to two seconds when only putting it in place failed: on Windows a record cannot be replaced
+    // while another reader has it open, as a job list or a second Montage reading the store does for a moment. A write
+    // that fails, a full disk say, is not tried again: the GUI saves its running jobs every second.)
     for (int attempt = 0; attempt < 400; ++attempt) {
         QSaveFile f(dir + QStringLiteral("/job.json"));
         if (!f.open(QIODevice::WriteOnly)) return false;
-        if (f.write(text) == text.size() && f.commit()) return true;
+        if (f.write(text) != text.size()) return false;
+        if (f.commit()) return true;
+#ifdef Q_OS_WIN
+        if (f.error() != QFileDevice::RenameError) return false;
+#else
+        return false;
+#endif
         QThread::msleep(5);
     }
     return false;
@@ -170,12 +177,23 @@ bool remove(const QString& id, const QString& folder) {
 }
 
 int prune(const QString& owner, int keep, const QString& folder) {
+    // Folders left without a readable record (a crash as one was made, a record damaged) are never listed: those a day
+    // old go too.
+    int n = 0;
+    const QDir dir(folderOr(folder));
+    const QDateTime dayAgo = QDateTime::currentDateTimeUtc().addDays(-1);
+    for (const QFileInfo& d : dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        if (d.fileName() == QLatin1String("alive") || d.lastModified().toUTC() > dayAgo) continue;
+        Record r;
+        const QFileInfo record(d.filePath() + QStringLiteral("/job.json"));
+        if (record.exists() && record.lastModified().toUTC() > dayAgo) continue;
+        if (!load(d.fileName(), r, folder)) n += remove(d.fileName(), folder) ? 1 : 0;
+    }
     std::vector<Record> done;
     for (Record& r : all(owner, folder))
         if (r.finished() || r.status == QLatin1String("resumed")) done.push_back(std::move(r));
-    if (int(done.size()) <= keep) return 0;
+    if (int(done.size()) <= keep) return n;
     std::stable_sort(done.begin(), done.end(), [](const Record& a, const Record& b) { return a.updated < b.updated; });
-    int n = 0;
     for (size_t i = 0; i + size_t(std::max(0, keep)) < done.size(); ++i) n += remove(done[i].id, folder) ? 1 : 0;
     return n;
 }

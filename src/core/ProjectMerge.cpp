@@ -108,12 +108,12 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         for (Transition& t : v) fn(t.id), fn(t.clipA), fn(t.clipB), fx(t.params);
     };
     auto track = [&](Track& t) {
-        fn(t.id), fn(t.output);
+        fn(t.id), fn(t.output), fn(t.group);
         for (Clip& c : t.clips) clipAndOriginal(c);
         transitions(t.transitions);
         fxs(t.effects);
         for (Send& s : t.sends) fn(s.bus);
-        for (TakeLane& l : t.lanes) fn(l.id), fn(l.mediaId);
+        for (TakeLane& l : t.lanes) fn(l.id), fn(l.mediaId), fn(l.pass);
         for (SamplerPass& ps : t.sampler.passes) fn(ps.lane);
         for (TrackVersion& v : t.versions) {
             for (Clip& c : v.clips) clipAndOriginal(c);
@@ -130,6 +130,7 @@ void forEachId(Project& p, const std::function<void(Id&)>& fn) {
         for (Bus& b : s.buses) fn(b.id), fxs(b.effects);
         fxs(s.masterEffects);
         for (ColorGroup& g : s.colorGroups) fn(g.id), fn(g.postId), fn(g.parent), fxs(g.pre), fxs(g.post);
+        for (TrackGroup& g : s.trackGroups) fn(g.id);
         for (SharedNode& n : s.sharedNodes) fn(n.id), fxs(n.effects);
         for (AdrCue& c : s.adrCues) fn(c.id), fn(c.clip);
         for (VfxShotRecord& v : s.vfxShots) {

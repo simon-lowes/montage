@@ -2631,6 +2631,37 @@ private slots:
     // within the second, so each tile's picture is seen to be the one its timecode says was sent; their meters. The
     // first recorded, watched on the Source monitor, In and Out marked live and the range cut in from the growing
     // file: its frames are the ones sent, from the In's timecode on.
+    // Nightly 10 Nov: Remove on a tile's own context menu takes the tile away once its menu is done with (it was
+    // deleted inside its own event handler).
+    void multiviewTileRemovedFromItsMenu() {
+        Multiviewer* mv = win_->multiviewer();
+        mv->clear();
+        Multiviewer::Input in;
+        in.label = "Nowhere";
+        in.url = "udp://127.0.0.1:9?timeout=100000";  // (never sends: the tile waits)
+        QVERIFY(mv->addInput(in));
+        QCOMPARE(mv->inputCount(), 1);
+        QPointer<MultiviewTile> tile = mv->tileWidget(0);
+        QVERIFY(tile);
+        bool chose = false;
+        QTimer::singleShot(100, this, [&] {
+            for (QWidget* w : QApplication::topLevelWidgets())
+                if (auto* menu = qobject_cast<QMenu*>(w); menu && menu->isVisible())
+                    for (QAction* a : menu->actions())
+                        if (a->text() == tr("Remove")) {
+                            chose = true;
+                            a->trigger();
+                            menu->close();
+                        }
+        });
+        QContextMenuEvent e(QContextMenuEvent::Mouse, QPoint(5, 5), tile->mapToGlobal(QPoint(5, 5)));
+        QApplication::sendEvent(tile, &e);
+        QVERIFY(chose);
+        QCOMPARE(mv->inputCount(), 0);
+        QTRY_VERIFY(!tile);  // (gone once the event loop is back)
+        mv->clear();
+    }
+
     void liveInputsMultiviewer() {
         namespace st = st2110;
         const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
@@ -9029,7 +9060,8 @@ private slots:
         QVERIFY(dcp::writeWholeFile(dkdm.toStdString(), text));
         // An Extended FLM of two screens, each a server and a projector.
         dcp::CertificateChain servers[2], projectors[2];
-        for (int i = 0; i < 2; ++i) QVERIFY(dcp::makeCertificateChain("Server", servers[i], &err) && dcp::makeCertificateChain("Projector", projectors[i], &err));
+        for (int i = 0; i < 2; ++i)
+            QVERIFY(dcp::makeCertificateChain("Server", servers[i], &err, "SM") && dcp::makeCertificateChain("Projector", projectors[i], &err, "PR"));
         auto keyInfo = [](const dcp::CertificateChain& chain) {
             std::string x = "<KeyInfoList><ds:KeyInfo>";
             for (const std::string& pem : chain.certificates) {
@@ -9062,8 +9094,22 @@ private slots:
             const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
             return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         };
-        // Read into the facility list (no DKDM: only read).
+        // Read into the facility list (no DKDM: only read): refused while its roots are not trusted, naming their
+        // thumbprints; taken once they are given, as the user confirmed them.
         QJsonObject r = call({{"flm", QJsonArray{flmFile}}});
+        QVERIFY(r.value("isError").toBool());
+        QJsonArray thumbprints;
+        for (const dcp::CertificateChain* c : {&servers[0], &servers[1], &projectors[0], &projectors[1]}) {
+            dcp::CertificateInfo root;
+            QVERIFY(dcp::readCertificate(c->certificates.front(), root));
+            QVERIFY2(QJsonDocument(r).toJson().contains(root.thumbprint.c_str()), QJsonDocument(r).toJson().constData());
+            if (c != &projectors[1]) thumbprints.append(QString::fromStdString(root.thumbprint));
+        }
+        r = call({{"flm", QJsonArray{flmFile}}, {"trust_roots", thumbprints}});
+        QVERIFY(r.value("isError").toBool());  // (one still missing)
+        const QString rootFile = dir_.filePath("projector-root.pem");
+        QVERIFY(dcp::writeWholeFile(rootFile.toStdString(), projectors[1].certificates.front()));
+        r = call({{"flm", QJsonArray{flmFile}}, {"trust_roots", QJsonArray{rootFile}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonArray cinemas = r.value("structuredContent").toObject().value("cinemas").toArray();
         QVERIFY(cinemas.size() == 1 && cinemas.at(0).toObject().value("cinema").toString() == "Park Screens");

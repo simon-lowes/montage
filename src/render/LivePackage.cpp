@@ -570,14 +570,38 @@ struct LivePackager::State {
 
     std::string mediaPlaylist(const Rendition& r, bool ended) {
         const bool tsList = ts;
+        // The finished segments, and a gap for each number none was made for (all its pictures dropped): HLS numbers
+        // the segments by their place in the list, so a missing one is listed as EXT-X-GAP, never left out.
         std::vector<const Segment*> done;
         for (const Segment& s : r.segments)
             if (s.complete) done.push_back(&s);
-        while (int(done.size()) > set.window) done.erase(done.begin());
+        std::deque<Segment> gaps;  // (a deque: what is listed points into it)
         const Segment* making = !r.segments.empty() && !r.segments.back().complete ? &r.segments.back() : nullptr;
+        {
+            std::vector<const Segment*> listed;
+            auto fill = [&](int64_t upTo) {  // (the gaps before segment `upTo`)
+                if (listed.empty()) return;
+                for (int64_t k = std::max(listed.back()->number + 1, upTo - set.window); k < upTo; ++k) {
+                    Segment g;
+                    g.number = k;
+                    g.start = double(k - 1) * segSeconds;
+                    g.seconds = segSeconds;
+                    gaps.push_back(g);
+                    listed.push_back(&gaps.back());
+                }
+            };
+            for (const Segment* s : done) {
+                fill(s->number);
+                listed.push_back(s);
+            }
+            if (making && !ended) fill(making->number);  // (and before the one being made, whose parts come next)
+            done = std::move(listed);
+        }
+        const bool gap = !gaps.empty();
+        while (int(done.size()) > set.window) done.erase(done.begin());
         double longest = segSeconds;
         for (const Segment* s : done) longest = std::max(longest, s->seconds);
-        std::string m = "#EXTM3U\n#EXT-X-VERSION:" + std::string(tsList ? "3" : parts ? "9" : "7") + "\n#EXT-X-TARGETDURATION:" +
+        std::string m = "#EXTM3U\n#EXT-X-VERSION:" + std::string(parts ? "9" : gap ? "8" : tsList ? "3" : "7") + "\n#EXT-X-TARGETDURATION:" +
                         std::to_string(std::max<long long>(1, std::llround(longest))) + "\n";
         if (parts) {
             m += "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=" + fmt("%.3f", partTarget * 3) + "\n";
@@ -598,10 +622,12 @@ struct LivePackager::State {
                      (s.parts[j].independent ? ",INDEPENDENT=YES" : "") + "\n";
         };
         for (size_t i = 0; i < done.size(); ++i) {
-            date(*done[i]);
+            const bool missing = !done[i]->complete;
+            if (missing) dated = false;  // (the next real one dated again, after the gap)
+            else date(*done[i]);
             // (parts for the newest segments only, as the live edge needs them)
-            if (parts && !ended && i + 2 >= done.size()) listParts(*done[i]);
-            m += "#EXTINF:" + fmt("%.5f", done[i]->seconds) + ",\n" + segName(done[i]->number, tsList ? "ts" : "m4s") + "\n";
+            if (parts && !ended && !missing && i + 2 >= done.size()) listParts(*done[i]);
+            m += std::string(missing ? "#EXT-X-GAP\n" : "") + "#EXTINF:" + fmt("%.5f", done[i]->seconds) + ",\n" + segName(done[i]->number, tsList ? "ts" : "m4s") + "\n";
         }
         if (parts && !ended) {
             if (making) {
@@ -681,8 +707,12 @@ struct LivePackager::State {
             x += "<AdaptationSet id=\"" + std::to_string(id++) + "\" contentType=\"audio\" mimeType=\"audio/mp4\" lang=\"" +
                  xmlEscape(set.audioLanguage.empty() ? "und" : set.audioLanguage) + "\" segmentAlignment=\"true\">\n<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"main\"/>\n";
             x += "<Representation id=\"" + a->name + "\" bandwidth=\"" + std::to_string(a->enc ? a->enc->bit_rate : set.audioBitrate * 4) + "\" codecs=\"" + a->codecs +
-                 "\" audioSamplingRate=\"48000\">\n<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:mpegB:cicp:ChannelConfiguration\" value=\"" +
-                 std::to_string(a->channels == 8 ? 12 : a->channels) + "\"/>\n" + templ(*a) + "</Representation>\n</AdaptationSet>\n";
+                 "\" audioSamplingRate=\"48000\">\n" +
+                 (set.audioCodec == "ac3" || set.audioCodec == "eac3"
+                      ? ac3DashChannelConfiguration(a->channels)
+                      : "<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:mpegB:cicp:ChannelConfiguration\" value=\"" +
+                            std::to_string(a->channels == 8 ? 12 : a->channels) + "\"/>") +
+                 "\n" + templ(*a) + "</Representation>\n</AdaptationSet>\n";
         }
         x += "</Period>\n<UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:direct:2014\" value=\"" + isoDate(wallMs()) + "\"/>\n</MPD>\n";
         return writeAtomically(folder + "/manifest.mpd", x) || fail("Cannot write " + folder + "/manifest.mpd");
@@ -748,9 +778,10 @@ struct LivePackager::State {
             for (auto& o : audio)
                 if (!writePlaylist(*o)) return false;
         }
-        // The window: the playlists list `window` segments; the files of those a little older go (a player may still
-        // be fetching them).
-        while (int(r.segments.size()) > set.window + 3) {
+        // The window: the playlists list `window` segments; a segment's files stay for its own length and the
+        // playlist's after it leaves (RFC 8216 6.2.2: a player paused, behind a CDN or at the window's start may still
+        // fetch it), so `window` + 1 segments more are kept, then the oldest go.
+        while (int(r.segments.size()) > 2 * set.window + 2) {
             const Segment& old = r.segments.front();
             const QString dir = QString::fromStdString(folder + "/" + r.name + "/");
             QFile::remove(dir + QString::fromStdString(segName(old.number, "m4s")));
@@ -971,6 +1002,26 @@ struct LivePackager::State {
         return writeMpd(true, duration);
     }
 
+    // After an error: the playlists end and the MPD turns static at what was finished, and the segment being made is
+    // no longer streamed as it grows (players stop waiting for more, not only when the recording stops).
+    bool closedAfterError = false;
+    void closeAfterError() {
+        closedAfterError = true;
+        {
+            std::lock_guard lock(m);
+            growingFiles.clear();
+        }
+        if (!opened) return;
+        double duration = 0;
+        for (auto& v : video) {
+            for (const Segment& s : v->segments)
+                if (s.complete) duration = std::max(duration, s.start + s.seconds);
+            writePlaylist(*v, true);
+        }
+        for (auto& a : audio) writePlaylist(*a, true);
+        if (mastered) writeMpd(true, duration);
+    }
+
     void run() {
         for (;;) {
             Item it;
@@ -999,6 +1050,7 @@ struct LivePackager::State {
                 if (set.dash) st.dash = folder + "/manifest.mpd";
             }
             av_frame_free(&it.frame);
+            if (failed && !closedAfterError) closeAfterError();
         }
         if (!failed) finishAll();
         std::lock_guard lock(m);
@@ -1171,6 +1223,7 @@ struct LiveOrigin::State {
         int64_t msn = -1;
         int part = -1;
         Clock::time_point came;
+        Clock::time_point accepted = Clock::now();  // (a request not whole 10 s after this is let go)
         qint64 sent = 0;
         // (a held playlist request: the file as last read, so it is read again only when it has changed, or every
         // tenth of a second at least)
@@ -1254,7 +1307,11 @@ struct LiveOrigin::State {
             return;
         }
         if (!f.exists()) {
-            if (after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
+            // (waited for only when it is a name the packager is about to write, in a folder it writes)
+            const bool coming = (r.rel.endsWith(".m4s") || r.rel.endsWith(".ts") || r.rel.endsWith(".m3u8") || r.rel.endsWith(".mp4") ||
+                                 r.rel.endsWith(".mpd")) &&
+                                QFileInfo(f).dir().exists();
+            if (!coming || after(r, waitSeconds)) answer(r, 404, "text/plain", "Not found");
             return;
         }
         if (r.msn >= 0 && r.rel.endsWith(".m3u8")) {
@@ -1277,10 +1334,7 @@ struct LiveOrigin::State {
         }
         if (grows) {
             r.socket->write(headers(200, contentType(r.rel), -1, true));
-            if (r.head) {
-                r.socket->write("0\r\n\r\n");
-                return close(r);
-            }
+            if (r.head) return close(r);  // (the headers alone)
             r.streaming = true;
             return attempt(r);
         }
@@ -1307,7 +1361,21 @@ struct LiveOrigin::State {
         server.setMaxPendingConnections(64);
         server.incoming = [&](qintptr fd) {
             auto* socket = new QTcpSocket(&server);
-            if (!socket->setSocketDescriptor(fd) || requests.size() >= 256) {
+            // (full: the oldest still sending its request makes room, so connections that never finish one cannot
+            // keep players out)
+            auto open = std::count_if(requests.begin(), requests.end(), [](const std::unique_ptr<Request>& q) { return !q->done; });
+            if (open >= 256) {
+                Request* oldest = nullptr;
+                for (auto& q : requests)
+                    if (!q->parsed && !q->done && (!oldest || q->accepted < oldest->accepted)) oldest = q.get();
+                if (oldest) {
+                    oldest->done = true;
+                    oldest->socket->abort();  // (its request goes with the socket, once control is back in the loop)
+                    oldest->socket->deleteLater();
+                    --open;
+                }
+            }
+            if (!socket->setSocketDescriptor(fd) || open >= 256 || requests.size() >= 512) {
                 socket->abort();
                 socket->deleteLater();
                 return;
@@ -1337,10 +1405,17 @@ struct LiveOrigin::State {
         QTimer tick;
         QObject::connect(&tick, &QTimer::timeout, &server, [this] {
             // (a copy: answering can close a socket, but it goes only once control is back in the loop)
-            std::vector<Request*> waiting;
+            std::vector<Request*> waiting, slow;
+            const auto now = Clock::now();
             for (auto& r : requests)
                 if (!r->done && r->parsed) waiting.push_back(r.get());
+                else if (!r->done && now - r->accepted > std::chrono::seconds(10)) slow.push_back(r.get());
             for (Request* r : waiting) attempt(*r);
+            for (Request* r : slow) {
+                r->done = true;
+                r->socket->abort();
+                r->socket->deleteLater();
+            }
         });
         tick.start(10);
         {

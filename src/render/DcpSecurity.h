@@ -27,14 +27,37 @@ namespace montage::dcp {
 // Whether this build can encrypt, sign and make KDMs (OpenSSL 3).
 bool securityAvailable();
 
+void cleanse(void* data, size_t size);
+
 // PEM certificates root first, leaf last, and the leaf's private key (PKCS#8 PEM, unencrypted, as KDM tools read it).
+// The key is wiped when the chain goes or is given another.
 struct CertificateChain {
     std::vector<std::string> certificates;
     std::string privateKey;
     bool empty() const { return certificates.empty(); }
+    CertificateChain() = default;
+    CertificateChain(const CertificateChain&) = default;
+    CertificateChain(CertificateChain&&) noexcept = default;
+    CertificateChain& operator=(const CertificateChain& o) {
+        if (this != &o) wipe(), certificates = o.certificates, privateKey = o.privateKey;
+        return *this;
+    }
+    CertificateChain& operator=(CertificateChain&& o) noexcept {
+        if (this != &o) wipe(), certificates = std::move(o.certificates), privateKey = std::move(o.privateKey);
+        return *this;
+    }
+    ~CertificateChain() { wipe(); }
+
+private:
+    void wipe() {
+        cleanse(privateKey.data(), privateKey.size());
+        privateKey.clear();
+    }
 };
-// A new chain for `organisation` (PrintableString letters only are kept; "Montage" when none are left).
-bool makeCertificateChain(const std::string& organisation, CertificateChain& out, std::string* error = nullptr);
+// A new chain for `organisation` (PrintableString letters only are kept; "Montage" when none are left), its leaf's
+// common name naming `leafRole` (ST 430-2 roles: "CS" a content signer, "SM" a security manager, ...).
+bool makeCertificateChain(const std::string& organisation, CertificateChain& out, std::string* error = nullptr,
+                          const std::string& leafRole = "CS");
 // The chain in `folder` (root.pem, intermediate.pem, leaf.pem, leaf.key), made there first when there is none (unless
 // `make` is false: then only read). An empty folder means Montage's own: dcp-certificates in its data folder
 // (MONTAGE_DCP_CERTIFICATES overrides it).
@@ -53,6 +76,7 @@ struct CertificateInfo {
     std::string commonName, organisation, dnQualifier;
     std::string notBefore, notAfter;  // ISO 8601, UTC
     bool ca = false;
+    bool encipherment = true;  // its key usage allows key encipherment (or it states no key usage)
     int bits = 0;
 };
 bool readCertificate(const std::string& pem, CertificateInfo& out, std::string* error = nullptr);
@@ -78,13 +102,14 @@ bool checkCertificateChain(const std::vector<std::string>& certificates, ChainCh
 
 // Signs a composition playlist or packing list in place: Signer and ds:Signature after the root's last child.
 bool signXml(std::string& xml, const CertificateChain& chain, std::string* error = nullptr);
-// Checks an enveloped signature: the digest of what each reference covers, the signature by the first KeyInfo
+// Checks an enveloped signature (a document with more than one ds:Signature is refused): the digest of what each reference covers, the signature by the first KeyInfo
 // certificate, and that each certificate there is issued and signed by the next, a certificate authority. `check`
 // (when given) gets the references ("" the whole document, "#Id" an element) and the signer's thumbprint, so the
 // caller can require what must be covered.
 struct SignatureCheck {
     std::vector<std::string> references;
-    std::string signerThumbprint;  // base64 SHA-1, as CertificateInfo::thumbprint
+    std::string signerThumbprint;           // base64 SHA-1, as CertificateInfo::thumbprint
+    std::vector<std::string> certificates;  // the signer's chain as KeyInfo lists it (PEM, leaf first, a root last)
 };
 bool verifyXmlSignature(const std::string& xml, std::string* error = nullptr, SignatureCheck* check = nullptr);
 

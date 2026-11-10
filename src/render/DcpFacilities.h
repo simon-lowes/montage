@@ -7,8 +7,13 @@
 //
 // Every certificate chain is checked as it is read (render/DcpSecurity.h checkCertificateChain): a changed
 // certificate, or one whose issuer is not given, is refused, and with it the FLM. An ST 430-7 FLM's signature must hold
-// and cover its public part; an Extended FLM is not signed (ST 430-16 leaves the signature out), so only its chains
-// are checked.
+// and cover its public part, and its signer's chain must check too; an Extended FLM is not signed (ST 430-16 leaves the
+// signature out), so only its chains are checked.
+//
+// A chain that checks proves only that its root made it, and anyone can make a root: so an FLM is taken into the list
+// (takeFlm) only when each of its chains, and an ST 430-7 FLM's signer's, goes up to a root the user has trusted (kept
+// beside the list in dcp-trusted-roots.pem), or ends in a certificate the list already holds for that cinema. A root
+// is never trusted for being in the FLM itself.
 #pragma once
 
 #include <string>
@@ -48,6 +53,7 @@ struct Facility {
     // kept here, out of KDMs.
     std::vector<FacilityDevice> otherDevices;
     std::vector<std::string> notes;  // what reading it noticed that did not stop it
+    std::vector<std::string> signer;  // an ST 430-7 FLM's signer's chain (PEM, root first); empty for an Extended FLM
 };
 
 // Reads an Extended FLM (ST 430-16) or an FLM (ST 430-7); false (and why) when it is neither, a chain does not check,
@@ -61,8 +67,24 @@ std::string facilitiesFile();
 bool loadFacilities(std::vector<Facility>& out, std::string* error = nullptr, const std::string& file = {});
 bool saveFacilities(const std::vector<Facility>& list, std::string* error = nullptr, const std::string& file = {});
 // Puts `f` in the list: in place of the one with its id (a newer FLM of a cinema; screens added to it by hand stay,
-// unless the FLM now lists one of that name), or at the end. Its index.
-size_t mergeFacility(std::vector<Facility>& list, Facility f);
+// unless the FLM now lists one of that name), or at the end. Its index. `changes` gets what is different from the
+// cinema's last FLM that a booking would follow without being told: a screen's server certificate, or the signer.
+size_t mergeFacility(std::vector<Facility>& list, Facility f, std::vector<std::string>* changes = nullptr);
+
+// The roots the user trusts: dcp-trusted-roots.pem beside the facility list (`facilities`, or facilitiesFile()).
+std::string trustedRootsFile(const std::string& facilities = {});
+bool loadTrustedRoots(std::vector<std::string>& pems, std::string* error = nullptr, const std::string& facilities = {});
+// Adds roots (self-signed certificate authorities whose signatures hold; others refused) to the trusted ones.
+bool trustRoots(const std::vector<std::string>& pems, std::string* error = nullptr, const std::string& facilities = {});
+// The roots of `f`'s chains (and its signer's) that are neither among `trusted` (PEM) nor above a certificate `list`
+// already holds for `f`'s cinema: PEM, each once, in the order found.
+std::vector<std::string> untrustedRoots(const Facility& f, const std::vector<Facility>& list, const std::vector<std::string>& trusted);
+// An FLM read by readFlm put in the list (mergeFacility) once it is trusted; false, the list unchanged and `untrusted`
+// given the roots in the way, when it is not.
+bool takeFlm(std::vector<Facility>& list, Facility f, const std::vector<std::string>& trusted, std::string* error = nullptr,
+             std::vector<std::string>* untrusted = nullptr, std::vector<std::string>* changes = nullptr);
+// A root as the user is asked to check it: "<common name> (<organisation>), thumbprint <base64 SHA-1>".
+std::string rootDescription(const std::string& pem);
 // A screen added by hand to the cinema of that name (made when there is none): the server's certificate (PEM text or
 // a file of it; a chain is checked to its root, a leaf alone is taken as it is) and other devices' certificates
 // (likewise), which go into its KDMs. Replaces a screen of that name.

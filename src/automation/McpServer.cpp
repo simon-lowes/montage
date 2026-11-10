@@ -59,6 +59,7 @@
 #include "render/BackgroundJobs.h"
 #include "render/Dcp.h"
 #include "render/DcpFacilities.h"
+#include "render/DcpSecurity.h"
 #include "render/Adm.h"
 #include "render/Iamf.h"
 #include "render/Imf.h"
@@ -887,6 +888,53 @@ struct McpServer::Impl {
         }
     }
 
+    // The files and folders side-by-side calls running now write (or read): a call naming one waits until the call
+    // using it is done, so two background renders to one path never write it at once.
+    std::mutex outputsMutex;
+    std::condition_variable outputsFree;
+    std::multiset<QString> outputsInUse;
+    static QStringList outputsOf(const QJsonObject& a) {
+        QStringList out;
+        for (const char* key : {"path", "output", "file", "report", "folder"}) {
+            const QString v = a.value(QLatin1String(key)).toString();
+            if (!v.isEmpty()) out << QDir::cleanPath(absolute(v));
+        }
+        out.removeDuplicates();
+        return out;
+    }
+    struct OutputClaim {
+        Impl* d = nullptr;
+        QStringList paths;
+        ~OutputClaim() {
+            if (!d || paths.isEmpty()) return;
+            {
+                std::lock_guard l(d->outputsMutex);
+                for (const QString& p : paths) d->outputsInUse.erase(d->outputsInUse.find(p));
+            }
+            d->outputsFree.notify_all();
+        }
+    };
+    // Waits (its turn held, so later calls keep their order) while a running call uses one of `paths`; false when the
+    // call is cancelled or the server stops meanwhile.
+    bool claimOutputs(OutputClaim& claim, const QStringList& paths, const std::atomic<bool>& cancel) {
+        std::unique_lock l(outputsMutex);
+        const auto free = [&] {
+            return std::none_of(paths.begin(), paths.end(), [&](const QString& p) { return outputsInUse.count(p) > 0; });
+        };
+        while (!free()) {
+            if (cancel) return false;
+            {
+                std::lock_guard jl(jobsMutex);
+                if (stopping) return false;
+            }
+            outputsFree.wait_for(l, std::chrono::milliseconds(200));
+        }
+        for (const QString& p : paths) outputsInUse.insert(p);
+        claim.d = this;
+        claim.paths = paths;
+        return true;
+    }
+
     // Tools that leave the project as it is and may run alongside each other in the background.
     static bool runsSideBySide(const Tool& t) {
         static const std::set<QString> also = {"montage_render", "montage_export_dcp", "montage_export_imf", "montage_export_review",
@@ -941,19 +989,26 @@ struct McpServer::Impl {
         }
     }
     // At the start (montage-cli mcp): the calls a server before this one was running (or had waiting) when it stopped or crashed. Those of
-    // tools that leave the project alone are run again, in their order; the rest wait for montage_job's resume.
+    // tools that leave the project alone are run again, in their order, up to the first of that server's that cannot be
+    // (an edit, say): the calls after it may need what it would have done, so they wait with it for montage_job's resume.
     int resumeStored() {
         int n = 0;
+        std::set<QString> held;  // (servers whose calls wait from here on)
         for (const jobs::Record& r : jobs::all(QStringLiteral("mcp"))) {
             if (r.status != QLatin1String("interrupted") && r.status != QLatin1String("waiting")) continue;
             // (one left by a server of this same process waits for montage_job's resume: only a call whose process
             // stopped, or crashed, is taken up by itself)
             if (jobs::runningElsewhere(r) || jobs::runningHere(r) || r.data.value("session").toString() == session) continue;
+            const QString from = r.data.value("session").toString();
+            if (held.count(from)) continue;
             const auto tool = std::find_if(tools.begin(), tools.end(), [&](const Tool& t) { return t.name == r.data.value("tool").toString(); });
-            if (tool == tools.end() || !runsSideBySide(*tool) || r.data.value("secret").toBool() || !r.data.contains("args")) continue;
             // (its relative paths read as they were: only by a server started in the same folder)
-            if (r.data.value("cwd").toString() != QDir::currentPath()) continue;
-            if (resume(r, *tool)) ++n;
+            if (tool == tools.end() || !runsSideBySide(*tool) || r.data.value("secret").toBool() || !r.data.contains("args") ||
+                r.data.value("cwd").toString() != QDir::currentPath() || !resume(r, *tool)) {
+                held.insert(from);
+                continue;
+            }
+            ++n;
         }
         // (the store kept from growing: the newest 200 finished calls kept)
         jobs::prune(QStringLiteral("mcp"), 200);
@@ -1034,6 +1089,8 @@ struct McpServer::Impl {
         std::sort(unread.begin(), unread.end(), byAge);
         for (size_t i = 0; i + 200 < read.size(); ++i) jobs.erase(read[i]);
         for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
+        // (and the store's finished calls, as montage-cli mcp prunes them when it starts: the GUI's link never starts so)
+        jobs::prune(QStringLiteral("mcp"), 200);
     }
 
     // Worker `index` (of atOnce): takes the next call when its turn has come. One that runs side by side holds the tool
@@ -1068,9 +1125,11 @@ struct McpServer::Impl {
             std::unique_lock<std::shared_mutex> alone(toolMutex, std::defer_lock);
             if (job->sideBySide) shared.lock();
             else alone.lock();
+            OutputClaim outputs;
+            const bool claimed = !job->sideBySide || claimOutputs(outputs, outputsOf(job->args), job->cancel);
             {
                 std::lock_guard jl(job->m);
-                if (job->cancel || tool == tools.end()) {
+                if (!claimed || job->cancel || tool == tools.end()) {
                     job->status = QStringLiteral("cancelled");
                 } else {
                     job->status = QStringLiteral("running");
@@ -12500,11 +12559,16 @@ void McpServer::Impl::addTools() {
         "screen in `screens` from the facility list, encrypted to the screen's server with its projector and other "
         "devices in AuthorizedDeviceInfo, a folder and a zip for each cinema. `flm` reads Facility List Messages (Extended "
         "FLMs, SMPTE ST 430-16, or ST 430-7 FLMs) into the facility list first, every certificate chain checked; with "
-        "`flm` alone (no dkdm) it only reads them. The window must sit inside the DKDM's and each server certificate's. "
+        "`flm` alone (no dkdm) it only reads them. An FLM is read only when each chain in it goes up to a root the user "
+        "trusts, or ends in a certificate the list already holds for that cinema: `trust_roots` adds roots (a root "
+        "certificate file, or the thumbprint of a root in the FLM that the user has confirmed with its maker or the "
+        "cinema; an FLM refused names its roots' thumbprints). A cinema's changed server certificates are returned in "
+        "`changes`. The window must sit inside the DKDM's and each server certificate's. "
         "Returns the KDM files, the cinemas' zips, and the cinemas and screens read.",
         R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
             "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
             "flm":{"type":"array","items":{"type":"string"},"description":"FLM files to read into the facility list (kept for later bookings)"},
+            "trust_roots":{"type":"array","items":{"type":"string"},"description":"Roots to trust: root certificate files (PEM), or thumbprints (base64 SHA-1) of roots in the FLMs, confirmed by the user"},
             "screens":{"type":"array","items":{"type":"string"},"description":"Screens from the facility list: \"Cinema/Screen\", or \"Cinema\" for all its screens"},
             "from":{"type":"string","description":"ISO 8601 date and time; default now"},
             "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
@@ -12518,10 +12582,34 @@ void McpServer::Impl::addTools() {
             if (reading || a.contains("screens")) {
                 if (!loadFacilities(facilities, &err)) return fail(QString::fromStdString(err));
             }
+            QJsonArray changed;
             if (reading) {
+                // The roots trusted: the user's, with the files and thumbprints given added.
+                std::vector<std::string> trusted, files;
+                QStringList thumbprints;
+                for (const QJsonValue& v : a.value("trust_roots").toArray()) {
+                    const QString t = v.toString().trimmed();
+                    if (QRegularExpression(QStringLiteral("^[A-Za-z0-9+/]{27}=$")).match(t).hasMatch()) thumbprints << t;
+                    else {
+                        QFile c(absolute(t));
+                        if (!c.open(QIODevice::ReadOnly)) throw ArgError{QStringLiteral("Cannot read the root certificate %1").arg(t)};
+                        files.push_back(c.readAll().toStdString());
+                    }
+                }
+                if (!files.empty() && !trustRoots(files, &err)) return fail(QString::fromStdString(err));
+                if (!loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
                 for (const QJsonValue& v : a.value("flm").toArray()) {
                     Facility f;
                     if (!readFlmFile(absolute(v.toString()).toStdString(), f, &err)) return fail(QString::fromStdString(err));
+                    // (a thumbprint given trusts the root of the FLM that has it)
+                    std::vector<std::string> confirmed;
+                    for (const std::string& root : untrustedRoots(f, facilities, trusted)) {
+                        dcp::CertificateInfo info;
+                        if (dcp::readCertificate(root, info) && thumbprints.contains(QString::fromStdString(info.thumbprint))) confirmed.push_back(root);
+                    }
+                    if (!confirmed.empty()) {
+                        if (!trustRoots(confirmed, &err) || !loadTrustedRoots(trusted, &err)) return fail(QString::fromStdString(err));
+                    }
                     QJsonArray screens, notes;
                     for (const FacilityScreen& sc : f.screens) {
                         QJsonArray devices;
@@ -12536,11 +12624,16 @@ void McpServer::Impl::addTools() {
                     for (const std::string& n : f.notes) notes.append(QString::fromStdString(n));
                     read.append(QJsonObject{{"cinema", QString::fromStdString(f.name)}, {"id", QString::fromStdString(f.id)},
                                             {"source", QString::fromStdString(f.source)}, {"screens", screens}, {"notes", notes}});
-                    mergeFacility(facilities, std::move(f));
+                    std::vector<std::string> changes;
+                    if (!takeFlm(facilities, std::move(f), trusted, &err, nullptr, &changes))
+                        return fail(QString::fromStdString(err) + QStringLiteral(" (then pass its thumbprint in trust_roots)"));
+                    for (const std::string& c : changes) changed.append(QString::fromStdString(c));
                 }
                 if (!saveFacilities(facilities, &err)) return fail(QString::fromStdString(err));
                 if (!a.contains("dkdm"))
-                    return ok(QStringLiteral("Read %1 FLM(s) into the facility list").arg(read.size()), QJsonObject{{"cinemas", read}});
+                    return ok(QStringLiteral("Read %1 FLM(s) into the facility list").arg(read.size()) +
+                                  (changed.isEmpty() ? QString() : QStringLiteral("; %1 change(s): %2").arg(changed.size()).arg(changed.at(0).toString())),
+                              QJsonObject{{"cinemas", read}, {"changes", changed}});
             }
             KdmRequest r;
             r.dkdm = absolute(need(a, "dkdm")).toStdString();
@@ -12572,6 +12665,7 @@ void McpServer::Impl::addTools() {
             for (const std::string& z : zipped) zips.append(QString::fromStdString(z));
             QJsonObject out{{"kdms", made}, {"zips", zips}};
             if (!read.isEmpty()) out.insert("cinemas", read);
+            if (!changed.isEmpty()) out.insert("changes", changed);
             return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), out);
         });
 

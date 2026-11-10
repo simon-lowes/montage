@@ -78,8 +78,10 @@ private:
 // An HTTP origin for a package's folder, on a thread of its own: GET and HEAD of its files (no others: nothing
 // outside, nothing hidden), with CORS for players on other pages. HLS playlist requests asking for a part or segment
 // not yet made (_HLS_msn, _HLS_part) are held until it is (or three target durations, then 503); a file not yet there
-// is waited for (up to `waitSeconds`); a file still growing is sent as it grows (chunked); an MPD's UTCTiming
-// (urn:mpeg:dash:utc:direct:2014) is the time it is sent; /time is the time (ISO 8601).
+// is waited for (up to `waitSeconds`, when it is a playlist, segment or MPD in a folder there); a file still growing is
+// sent as it grows (chunked); an MPD's UTCTiming (urn:mpeg:dash:utc:direct:2014) is the time it is sent; /time is the
+// time (ISO 8601). A connection that has not sent its whole request in 10 s is closed, and with 256 open the oldest
+// still sending one makes room for the next.
 class LiveOrigin {
 public:
     LiveOrigin();

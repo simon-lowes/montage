@@ -246,6 +246,12 @@ Ac3FrameInfo::Ac3FrameInfo() {
     centreMixDb = surroundMixDb = ltrtCentreMixDb = ltrtSurroundMixDb = nan;
 }
 
+std::string ac3DashChannelConfiguration(int channels) {
+    // (the mask's bits, from the top: L C R Ls Rs Lc/Rc Lrs/Rrs Cs Ts Lsd/Rsd Lw/Rw Vhl/Vhr Vhc Lts/Rts LFE2 LFE)
+    const char* mask = channels == 1 ? "4000" : channels == 6 ? "F801" : channels == 8 ? "FA01" : "A000";
+    return std::string("<AudioChannelConfiguration schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"") + mask + "\"/>";
+}
+
 int ac3Dialnorm(double lkfs) {
     if (!std::isfinite(lkfs)) return -31;
     return int(std::clamp<long>(std::lround(lkfs), -31, -1));

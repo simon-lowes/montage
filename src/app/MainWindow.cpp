@@ -9049,8 +9049,28 @@ void MainWindow::makeKdmsDialog() {
                                                                 tr("FLMs (*.xml);;All files (*)"));
         if (files.isEmpty()) return;
         appSettings().setValue(QStringLiteral("dcp/flmFolder"), QFileInfo(files.front()).path());
-        QStringList problems;
+        QStringList problems, changed;
         int screens = 0, read = 0;
+        std::vector<std::string> trusted;
+        std::string trustError;
+        if (!loadTrustedRoots(trusted, &trustError)) problems << QString::fromStdString(trustError);
+        std::vector<Facility> waiting;     // (read, but from roots not yet trusted)
+        std::vector<std::string> roots;  // those roots, each once
+        auto take = [&](Facility f) {
+            std::string err;
+            std::vector<std::string> untrusted, changes;
+            const int n = int(f.screens.size());
+            if (!takeFlm(facilities, f, trusted, &err, &untrusted, &changes)) {
+                if (untrusted.empty()) problems << QString::fromStdString(err);
+                for (const std::string& r : untrusted)
+                    if (std::find(roots.begin(), roots.end(), r) == roots.end()) roots.push_back(r);
+                if (!untrusted.empty()) waiting.push_back(std::move(f));
+                return;
+            }
+            screens += n;
+            ++read;
+            for (const std::string& c : changes) changed << QString::fromStdString(c);
+        };
         for (const QString& file : files) {
             Facility f;
             std::string err;
@@ -9058,12 +9078,35 @@ void MainWindow::makeKdmsDialog() {
                 problems << QString::fromStdString(err);
                 continue;
             }
-            screens += int(f.screens.size());
-            ++read;
-            mergeFacility(facilities, std::move(f));
+            take(std::move(f));
+        }
+        // Roots not trusted yet: the user is asked, showing each root's thumbprint to check with its maker or the cinema
+        // (a root is never trusted for coming with the FLM).
+        if (!roots.empty()) {
+            QStringList names, cinemas;
+            for (const std::string& r : roots) names << QString::fromStdString(rootDescription(r));
+            for (const Facility& f : waiting) cinemas << QString::fromStdString(f.name);
+            QMessageBox ask(QMessageBox::Warning, tr("Read FLMs"),
+                            tr("The certificates of %1 come from roots Montage does not trust yet:\n\n%2\n\nTrust a root only once the cinema or "
+                               "the device's maker has confirmed its thumbprint. KDMs are made for whoever holds these certificates.")
+                                .arg(cinemas.join(QStringLiteral(", ")), names.join('\n')),
+                            QMessageBox::Cancel, &dlg);
+            ask.setObjectName(QStringLiteral("kdmTrustRoots"));
+            QPushButton* yes = ask.addButton(tr("Trust and Read"), QMessageBox::AcceptRole);
+            yes->setObjectName(QStringLiteral("kdmTrustRootsYes"));
+            ask.setDefaultButton(QMessageBox::Cancel);
+            ask.exec();
+            std::string err;
+            if (ask.clickedButton() == yes) {
+                if (!trustRoots(roots, &err) || !loadTrustedRoots(trusted, &err)) problems << QString::fromStdString(err);
+                else
+                    for (Facility& f : std::exchange(waiting, {})) take(std::move(f));
+            }
+            for (const Facility& f : waiting) problems << tr("%1: its roots are not trusted").arg(QString::fromStdString(f.name));
         }
         store();
         state_->message(tr("Read %n FLM(s) with %1 screen(s)", nullptr, read).arg(screens), 10000);
+        if (!changed.isEmpty()) QMessageBox::information(&dlg, tr("Read FLMs"), tr("Changed since the cinemas' last FLMs:\n%1").arg(changed.join('\n')));
         if (!problems.isEmpty()) QMessageBox::warning(&dlg, tr("Read FLMs"), tr("Not read:\n%1").arg(problems.join('\n')));
     });
     auto* addScreen = new QPushButton(tr("Add Screen…"), &dlg);

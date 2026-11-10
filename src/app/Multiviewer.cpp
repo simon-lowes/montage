@@ -437,7 +437,9 @@ bool Multiviewer::removeInput(int i) {
     } else if (i < onSource_) {
         --onSource_;
     }
-    delete s->widget;
+    // (later: the tile's own context menu may be what removes it, its handler still running)
+    s->widget->hide();
+    s->widget->deleteLater();
     relayout();
     emit changed();
     return true;
