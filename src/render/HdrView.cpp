@@ -122,4 +122,32 @@ void hdrViewImage(const Image& in, const ColorSpace& space, double hdrPeakNits, 
     });
 }
 
+void hdrSurfaceSignal(float rgb[3], Transfer transfer) {
+    static const std::array<double, 9> m = [] {
+        std::array<double, 9> out{};
+        primariesMatrix(Primaries::Bt709, Primaries::Bt2020, out.data());
+        return out;
+    }();
+    double l[3];
+    for (int r = 0; r < 3; ++r) l[r] = std::max(0.0, m[size_t(r) * 3] * rgb[0] + m[size_t(r) * 3 + 1] * rgb[1] + m[size_t(r) * 3 + 2] * rgb[2]);
+    encodeDisplayLight(*findColorSpace(transfer == Transfer::Hlg ? "rec2100hlg" : "rec2100pq"), l, rgb);
+}
+
+HdrSurfaceLight hdrSurfaceLight(const HdrPicture& picture, double headroom) {
+    HdrSurfaceLight out;
+    const double shown = std::max(1.0, std::min(picture.contentPeak, std::max(headroom, 1.0)));
+    out.masteringMaxNits = std::round(shown * kSdrWhiteNits);
+    if (picture.maxCll > 0) {
+        out.maxCll = std::clamp(std::round(picture.maxCll), 1.0, out.masteringMaxNits);
+        if (picture.maxFall > 0) out.maxFall = std::clamp(std::round(picture.maxFall), 1.0, out.maxCll);
+    }
+    return out;
+}
+
+double hdrHeadroomFromDescription(double referenceNits, double maxNits, double targetMaxNits) {
+    const double peak = targetMaxNits > 0 ? targetMaxNits : maxNits;
+    if (!(referenceNits > 0) || !(peak > 0) || !std::isfinite(peak / referenceNits)) return 1;
+    return std::max(1.0, peak / referenceNits);
+}
+
 }  // namespace montage

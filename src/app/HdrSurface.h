@@ -1,8 +1,10 @@
 // Montage — the viewer's HDR surface: a native window (embedded over the viewer) drawn with Qt's RHI into an
-// extended-range swap chain (macOS EDR through Metal, Windows HDR through Direct3D 11's scRGB), so HDR pictures are
-// shown as the light they ask for instead of tone mapped to SDR. It draws the picture (render/HdrView.h light, rolled
-// off to the display's headroom as it changes) and over it the viewer's own drawing (guides, handles, labels) at SDR
-// white, and hands the viewer every mouse, wheel and drag-and-drop event it gets. Built with Qt 6.7 or later.
+// extended-range swap chain (macOS EDR through Metal, Windows HDR through Direct3D 11's scRGB), or on Linux into a
+// 10-bit OpenGL one written as BT.2100 PQ or HLG and described so to the Wayland compositor (app/WaylandColor.h), so
+// HDR pictures are shown as the light they ask for instead of tone mapped to SDR. It draws the picture
+// (render/HdrView.h light, rolled off to the display's headroom as it changes) and over it the viewer's own drawing
+// (guides, handles, labels) at SDR white, and hands the viewer every mouse, wheel and drag-and-drop event it gets.
+// Built with Qt 6.7 or later.
 #pragma once
 
 #include <QElapsedTimer>
@@ -21,10 +23,14 @@ namespace montage {
 
 // Whether this build has the HDR viewer (Qt 6.7 or later, with its RHI).
 bool hdrViewerBuilt();
+// Whether it can describe its surface to Wayland compositors (Linux: Montage's binding of Wayland's colour management,
+// built where wayland-protocols 1.41 or later is found, else Qt's own from 6.10.2).
+bool hdrViewerOnWaylandBuilt();
 
 #ifdef MONTAGE_HDR_VIEWER
 
 class HdrSurfaceGpu;
+class WaylandColor;
 
 class HdrSurface : public QWindow {
     Q_OBJECT
@@ -42,8 +48,13 @@ public:
     double headroom() const { return headroom_; }
     // What 1.0 (SDR white) is written as: 1 on macOS, SDR white's nits / 80 for Windows' scRGB.
     float scale() const { return scale_; }
-    // SDR white in nits where the system says (Windows), else 0 (macOS EDR is relative to the display's brightness).
-    double sdrWhiteNits() const { return absoluteWhite_ ? double(scale_) * 80 : 0; }
+    // SDR white in nits where the system says (Windows; on Wayland the compositor's reference white for the surface),
+    // else 0 (macOS EDR is relative to the display's brightness).
+    double sdrWhiteNits() const { return whiteNits_; }
+    // Bits per channel of the swap chain's buffers: 16 (half floats) on macOS and Windows, 10 on Wayland.
+    int bufferBits() const;
+    // On Wayland, the transfer the surface is described with (PQ or HLG; Transfer::Linear while not yet described).
+    Transfer describedTransfer() const;
     // Why HDR stopped or was refused (empty while it shows).
     const QString& problem() const { return problem_; }
 
@@ -69,6 +80,7 @@ private:
     void readDisplay();
     bool displayShowsHdr();  // the display the viewer is on takes the extended-range swap chain (sets problem_ if not)
     void stopHdr(const QString& why);
+    void describeSurface();  // Wayland: the surface's image description, for the picture shown (before each frame)
 
     QPointer<QWidget> target_;
     std::unique_ptr<HdrSurfaceGpu> gpu_;
@@ -80,7 +92,9 @@ private:
     bool hdrActive_ = false;
     double headroom_ = 1;
     float scale_ = 1;
-    bool absoluteWhite_ = false;
+    double whiteNits_ = 0;
+    bool encoded_ = false;  // Linux: drawn as linear light, then written as PQ or HLG into a 10-bit swap chain
+    std::unique_ptr<WaylandColor> wayland_;
     int frames_ = 0;
     QString problem_;
     QElapsedTimer displayRead_;  // since the display's HDR range was last asked

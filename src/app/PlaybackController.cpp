@@ -230,6 +230,8 @@ private:
                 pic->width = img.width;
                 pic->height = img.height;
                 pic->contentPeak = hdrContentPeak(trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim));
+                pic->transfer = trimTargetSpace(*s, r.trim).transfer;
+                if (r.trim.empty()) pic->maxCll = s->hdrMaxCll, pic->maxFall = s->hdrMaxFall;  // (measured on the master)
                 hdrViewImage(img, trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim), pic->contentPeak, pic->rgba);  // (rolled off as drawn)
                 // The master's adaptive HDR metadata (render/AdaptiveHdr.h), while it matches the cut: tone mapped by its
                 // own curves to the display's headroom here, so the viewer has nothing left to roll off.

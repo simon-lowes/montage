@@ -20,6 +20,10 @@ struct HdrPicture {
     int width = 0, height = 0;
     std::vector<uint16_t> rgba;
     double contentPeak = 1;
+    // What it shows, for a surface whose light is described to the compositor (Linux, hdrSurfaceLight): the
+    // sequence's transfer (PQ or HLG) and its measured light levels in nits (0 = not measured).
+    Transfer transfer = Transfer::Pq;
+    double maxCll = 0, maxFall = 0;
 };
 using HdrPicturePtr = std::shared_ptr<const HdrPicture>;
 
@@ -35,5 +39,26 @@ void hdrViewPixel(float rgb[3], const ColorSpace& space, double hdrPeakNits, dou
 // multiplies the light: 1 where 1.0 is SDR white (macOS EDR), SDR white's nits / 80 for Windows' scRGB.
 void hdrViewImage(const Image& in, const ColorSpace& space, double hdrPeakNits, double headroom, std::vector<uint16_t>& out,
                   float scale = 1);
+
+// The viewer on a surface described to the compositor as BT.2100 (Linux, Wayland's colour management): light relative
+// to SDR white in Rec. 709 primaries, as drawn, to the PQ or HLG signal in BT.2020 primaries, SDR white at BT.2408's
+// 203 nits (HLG on its 1000-nit reference display), so a sequence's own code values come out as they went in. Light
+// outside BT.2020 is clipped to it. The viewer's shader does the same on the GPU.
+void hdrSurfaceSignal(float rgb[3], Transfer transfer);
+
+// The light such a surface carries, for its image description: the mastering display (P3-D65 primaries, its peak the
+// picture's, no darker than PQ's 0.005 nits so the volume stays inside the signal's) and the measured MaxCLL and
+// MaxFALL, none brighter than the display's peak (`headroom` times 203 nits) where the viewer rolls highlights off
+// to it, so the compositor does not roll them off a second time.
+struct HdrSurfaceLight {
+    double masteringMinNits = 0.005, masteringMaxNits = 1000;
+    double maxCll = 0, maxFall = 0;  // 0 = not stated
+    bool operator==(const HdrSurfaceLight&) const = default;
+};
+HdrSurfaceLight hdrSurfaceLight(const HdrPicture& picture, double headroom);
+
+// A display's headroom (its peak over SDR white) from the image description its compositor prefers for a surface:
+// the target volume's peak (else the primary volume's) over the reference white, at least 1.
+double hdrHeadroomFromDescription(double referenceNits, double maxNits, double targetMaxNits);
 
 }  // namespace montage

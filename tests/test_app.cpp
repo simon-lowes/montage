@@ -21058,6 +21058,160 @@ print("added " + ui["name"])
         state()->newProject();
     }
 
+    void hdrSurfaceSignalAndLight() {
+        // What the HDR viewer writes on a surface described to the compositor as BT.2100 (Linux): a PQ or HLG
+        // sequence's own code values back, where the display has the headroom (none rolled off).
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        auto roundTrip = [](const ColorSpace& space, std::array<float, 3> code) {
+            float c[3] = {code[0], code[1], code[2]};
+            hdrViewPixel(c, space, 1000, 1000.0 / 203);
+            hdrSurfaceSignal(c, space.transfer);
+            return std::array<float, 3>{c[0], c[1], c[2]};
+        };
+        const std::array<float, 3> codes[] = {{0, 0, 0}, {0.1f, 0.1f, 0.1f}, {0.3f, 0.3f, 0.3f}, {0.58f, 0.58f, 0.58f},
+                                              {0.75f, 0.75f, 0.75f}, {0.6f, 0.4f, 0.2f}, {0.2f, 0.65f, 0.35f}};
+        for (const ColorSpace* space : {&pq, &hlg})
+            for (const auto& code : codes) {
+                const auto back = roundTrip(*space, code);
+                for (int i = 0; i < 3; ++i)
+                    QVERIFY2(std::fabs(back[size_t(i)] - code[size_t(i)]) < 2e-4,
+                             qPrintable(QString("%1 %2 %3 %4: %5").arg(QString::fromStdString(space->id)).arg(code[0]).arg(code[1]).arg(code[2]).arg(back[size_t(i)])));
+            }
+        // SDR white is PQ's 203 nits and HLG's 75 %; light outside BT.2020 is clipped to it.
+        float white[3] = {1, 1, 1};
+        hdrSurfaceSignal(white, Transfer::Pq);
+        QVERIFY(std::fabs(white[1] - float(nitsToCode(pq, 203))) < 1e-5);
+        float hlgWhite[3] = {1, 1, 1};
+        hdrSurfaceSignal(hlgWhite, Transfer::Hlg);
+        QVERIFY2(std::fabs(hlgWhite[1] - 0.75f) < 0.01f, qPrintable(QString::number(hlgWhite[1])));
+        float outside[3] = {-1, 1, -1};
+        hdrSurfaceSignal(outside, Transfer::Pq);
+        QVERIFY(outside[0] >= 0 && outside[2] >= 0 && outside[1] > 0.5f);
+
+        // The light stated with it: the master's where the display reaches it, the display's peak where the viewer rolls
+        // highlights off to it (MaxCLL and MaxFALL no higher), nothing measured stated as nothing.
+        HdrPicture pic;
+        pic.contentPeak = 1000.0 / 203;
+        pic.maxCll = 1200, pic.maxFall = 300;
+        const HdrSurfaceLight full = hdrSurfaceLight(pic, 8);
+        QCOMPARE(full.masteringMaxNits, 1000.0);
+        QCOMPARE(full.masteringMinNits, 0.005);
+        QCOMPARE(full.maxCll, 1000.0);
+        QCOMPARE(full.maxFall, 300.0);
+        const HdrSurfaceLight rolled = hdrSurfaceLight(pic, 2);
+        QCOMPARE(rolled.masteringMaxNits, 406.0);
+        QCOMPARE(rolled.maxCll, 406.0);
+        QCOMPARE(rolled.maxFall, 300.0);
+        pic.maxCll = pic.maxFall = 0;
+        QCOMPARE(hdrSurfaceLight(pic, 8).maxCll, 0.0);
+        QCOMPARE(hdrSurfaceLight(pic, 8).maxFall, 0.0);
+        // The display's headroom from the description the compositor prefers: the target peak over reference white.
+        QVERIFY(std::fabs(hdrHeadroomFromDescription(203, 10000, 1000) - 1000.0 / 203) < 1e-9);
+        QVERIFY(std::fabs(hdrHeadroomFromDescription(203, 10000, 0) - 10000.0 / 203) < 1e-9);
+        QCOMPARE(hdrHeadroomFromDescription(80, 80, 80), 1.0);
+        QCOMPARE(hdrHeadroomFromDescription(0, 1000, 1000), 1.0);
+    }
+
+    void hdrViewerOnWayland() {
+        // Under Weston (scripts/wayland-hdr-check.sh, in CI): headless, its GL renderer, colour management on with a
+        // BT.2100 PQ output (reference white 203 nits, peak 1000; MONTAGE_TEST_WESTON_CM=true), or off.
+        const QString log = qEnvironmentVariable("MONTAGE_TEST_WESTON_LOG");
+        if (log.isEmpty() || !QGuiApplication::platformName().startsWith(QLatin1String("wayland")))
+            QSKIP("Runs under Weston (scripts/wayland-hdr-check.sh)");
+#ifndef MONTAGE_HDR_VIEWER
+        QFAIL("built without the HDR viewer (it needs Qt 6.7 or later)");
+#else
+        QVERIFY2(hdrViewerOnWaylandBuilt(), "built without Wayland's colour management");
+        const bool cm = qEnvironmentVariable("MONTAGE_TEST_WESTON_CM") == QLatin1String("true");
+        // A viewer of its own over the whole output (the kiosk shell gives it the screen), with an SDR picture to stand
+        // for the HDR one, and a PQ grey ramp from a sequence mastered at 800 nits: eight bars, eight texels each.
+        win_->hide();
+        auto restore = qScopeGuard([this] { win_->show(); });
+        ViewerWidget viewer;
+        viewer.showFullScreen();
+        QVERIFY(QTest::qWaitForWindowExposed(&viewer));
+        QImage sdr(viewer.size(), QImage::Format_RGBA8888);
+        sdr.fill(QColor(90, 90, 90));
+        viewer.setImage(sdr, 0);
+        const double nits[8] = {0, 5, 20, 50, 100, 203, 400, 800};
+        auto ramp = std::make_shared<HdrPicture>();
+        ramp->width = 64, ramp->height = 8;
+        ramp->contentPeak = 800.0 / 203;
+        ramp->maxCll = 800, ramp->maxFall = 200;
+        std::vector<float> texels(size_t(ramp->width) * size_t(ramp->height) * 4);
+        for (int y = 0; y < ramp->height; ++y)
+            for (int x = 0; x < ramp->width; ++x) {
+                float* t = &texels[(size_t(y) * size_t(ramp->width) + size_t(x)) * 4];
+                t[0] = t[1] = t[2] = float(nits[x / 8] / 203);
+                t[3] = 1;
+            }
+        ramp->rgba.resize(texels.size());
+        qFloatToFloat16(reinterpret_cast<qfloat16*>(ramp->rgba.data()), texels.data(), qsizetype(texels.size()));
+        viewer.setHdrViewer(true);
+        viewer.setHdrPicture(ramp);
+        if (!cm) {
+            // No colour management: SDR, and why.
+            QTRY_VERIFY(!viewer.hdrStatus().isEmpty());
+            QVERIFY(!viewer.hdrShowing());
+            QCOMPARE(viewer.hdrStatus(), QStringLiteral("This compositor does not take HDR pictures (it has no Wayland colour management)"));
+            QCOMPARE(viewer.hdrHeadroom(), 1.0);
+            return;
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(viewer.hdrShowing(), 10000);
+        QVERIFY2(viewer.hdrStatus().isEmpty(), qPrintable(viewer.hdrStatus()));
+        HdrSurface* surface = viewer.hdrSurface();
+        QVERIFY(surface);
+        // The output's reference white and peak, as Weston prefers them for the surface.
+        QVERIFY2(std::fabs(viewer.hdrHeadroom() - 1000.0 / 203) < 0.01, qPrintable(QString::number(viewer.hdrHeadroom())));
+        QCOMPARE(viewer.hdrSdrWhiteNits(), 203.0);
+        QCOMPARE(surface->bufferBits(), 10);
+        QCOMPARE(surface->describedTransfer(), Transfer::Pq);
+        QTRY_VERIFY(surface->framesDrawn() >= 3);
+        QTest::qWait(500);  // (Weston repaints)
+        // Weston's protocol log: the surface described as BT.2100 PQ (named transfer 11, primaries 6) with the master's
+        // light (800 nits from 0.005; MaxCLL 800, MaxFALL 200), and 10-bit buffers (AR30 or XR30).
+        auto logged = [&](const QString& what) {
+            QFile f(log);
+            return f.open(QIODevice::ReadOnly) && QString::fromUtf8(f.readAll()).contains(what);
+        };
+        for (const char* request : {"wp_image_description_creator_params_v1@", ".set_tf_named(11)", ".set_primaries_named(6)",
+                                    ".set_mastering_luminance(50, 800)", ".set_max_cll(800)", ".set_max_fall(200)",
+                                    "wp_color_management_surface_v1@", ".set_image_description(wp_image_description_v1@"})
+            QTRY_VERIFY2(logged(QString::fromLatin1(request)), request);
+        QFile f(log);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        bool tenBit = false;
+        for (const QByteArray& line : f.readAll().split('\n'))
+            if ((line.contains("create_buffer(") || line.contains("create_immed(") || line.contains(".create(")) &&
+                (line.contains(" 808669761") || line.contains(" 808669784")))
+                tenBit = true;
+        QVERIFY2(tenBit, "no 10-bit buffer in Weston's protocol log");
+        // Weston's screenshot of its PQ output: each bar's middle is the ramp's PQ code (8 bits) within 2.
+        const QString shooter = qEnvironmentVariable("MONTAGE_TEST_WESTON_SCREENSHOOTER");
+        const QDir shots(qEnvironmentVariable("XDG_PICTURES_DIR"));
+        QVERIFY(!shooter.isEmpty() && shots.exists());
+        QCOMPARE(QProcess::execute(shooter, {}), 0);
+        const QStringList pngs = shots.entryList({QStringLiteral("wayland-screenshot-*.png")}, QDir::Files, QDir::Time);
+        QVERIFY(!pngs.isEmpty());
+        const QImage shot = QImage(shots.filePath(pngs.first())).convertToFormat(QImage::Format_RGB32);
+        QVERIFY(!shot.isNull());
+        const QRectF r = viewer.imageRect().translated(QPointF(viewer.mapTo(viewer.window(), QPoint(0, 0))));
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        for (int i = 0; i < 8; ++i) {
+            const QPoint at(int(r.left() + (i + 0.5) * r.width() / 8), int(r.center().y()));
+            float signal[3] = {float(nits[i] / 203), float(nits[i] / 203), float(nits[i] / 203)};
+            hdrSurfaceSignal(signal, Transfer::Pq);
+            QVERIFY(std::fabs(signal[1] - nitsToCode(pq, nits[i])) < 1e-4);
+            const int expect = int(std::lround(signal[1] * 255));
+            const QRgb px = shot.pixel(at);
+            QVERIFY2(std::abs(qRed(px) - expect) <= 2 && std::abs(qGreen(px) - expect) <= 2 && std::abs(qBlue(px) - expect) <= 2,
+                     qPrintable(QString("bar %1 (%2 nits) at %3,%4: %5 %6 %7, expected %8").arg(i).arg(nits[i]).arg(at.x()).arg(at.y())
+                                    .arg(qRed(px)).arg(qGreen(px)).arg(qBlue(px)).arg(expect)));
+        }
+#endif
+    }
+
     void workspaces() {
         auto dock = [this](const char* name) { return win_->findChild<QDockWidget*>(name); };
         // On screen: shown and in front (Qt moves the panels behind a tab out of sight rather than hiding them).
