@@ -19,6 +19,7 @@
 #include <map>
 #include <set>
 
+#include "ShapeRaster.h"
 #include "Shapes.h"
 #include "core/EditOps.h"
 
@@ -655,71 +656,21 @@ std::vector<ShapePaint> shapePaints(const Effect& g, FrameTime t, double fps) {
     return drawItems(g, shapeContents(g), t, fps, 0, budget).ops;
 }
 
-namespace {
-
-// Where what a paint draws can reach on the frame (device pixels), its stroke's half width and joins allowed for.
-QRectF paintBounds(const ShapePaint& op, const QTransform& to) {
-    if (op.isGroup) {
-        QRectF r;
-        for (const ShapePaint& c : op.group) r = r.united(paintBounds(c, c.transform * op.transform * to));
-        return r;
-    }
-    if (op.path.isEmpty()) return {};
-    const double grow = op.stroke ? op.pen.widthF() * std::max(1.0, op.pen.miterLimit()) / 2 + 1 : 1;
-    return to.mapRect(op.path.boundingRect().adjusted(-grow, -grow, grow, grow));
+QTransform shapeLayerTransform(const Effect& g, FrameTime t, int w, int h, double scale) {
+    QTransform layer;
+    layer.translate(w / 2.0 + g.p("pos_x", t) * scale, h / 2.0 + g.p("pos_y", t) * scale);
+    layer.rotate(g.p("rotation", t));
+    layer.scale(scale, scale);
+    return layer;
 }
 
-void drawPaints(QPainter& pa, const std::vector<ShapePaint>& ops, const QTransform& to, double opacity, int w, int h) {
-    for (const ShapePaint& op : ops) {
-        if (op.opacity <= 0) continue;
-        const QTransform m = op.transform * to;
-        if (op.isGroup) {
-            // Drawn together into a layer of their own over the part of the frame they reach, then laid down.
-            const QRect area = paintBounds(op, to).toAlignedRect().intersected(QRect(0, 0, w, h));
-            if (area.isEmpty()) continue;
-            QImage layer(area.size(), QImage::Format_RGBA8888_Premultiplied);
-            layer.fill(Qt::transparent);
-            {
-                QPainter lp(&layer);
-                lp.setRenderHint(QPainter::Antialiasing);
-                drawPaints(lp, op.group, m * QTransform::fromTranslate(-area.left(), -area.top()), 1.0, area.width(), area.height());
-            }
-            pa.resetTransform();
-            pa.setOpacity(opacity * op.opacity);
-            pa.drawImage(area.topLeft(), layer);
-            continue;
-        }
-        if (op.path.isEmpty()) continue;
-        pa.setTransform(m);
-        pa.setOpacity(opacity * op.opacity);
-        if (op.stroke) pa.strokePath(op.path, op.pen);
-        else pa.fillPath(op.path, op.brush);
-    }
+ShapeRaster shapeContentsRaster(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
+    const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
+    return shapeRaster(shapePaints(g, t, fps), shapeLayerTransform(g, t, w, h, scale), opacity, w, h);
 }
-
-}  // namespace
 
 Image renderShapeContents(const Effect& g, FrameTime t, int w, int h, double scale, double fps) {
-    QImage qi(w, h, QImage::Format_RGBA8888_Premultiplied);
-    qi.fill(Qt::transparent);
-    {
-        QPainter pa(&qi);
-        pa.setRenderHint(QPainter::Antialiasing);
-        QTransform layer;
-        layer.translate(w / 2.0 + g.p("pos_x", t) * scale, h / 2.0 + g.p("pos_y", t) * scale);
-        layer.rotate(g.p("rotation", t));
-        layer.scale(scale, scale);
-        const double opacity = std::clamp(g.p("opacity", t, 100) / 100.0, 0.0, 1.0);
-        drawPaints(pa, shapePaints(g, t, fps), layer, opacity, w, h);
-    }
-    Image img(w, h);
-    const float k = 1.0f / 255.0f;
-    for (int y = 0; y < h; ++y) {
-        const uchar* s = qi.constScanLine(y);
-        float* d = img.row(y);
-        for (int x = 0; x < w * 4; ++x) d[x] = s[x] * k;
-    }
-    return img;
+    return drawShapeRaster(shapeContentsRaster(g, t, w, h, scale, fps));
 }
 
 namespace {
