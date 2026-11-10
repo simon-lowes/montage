@@ -8570,7 +8570,7 @@ void MainWindow::exportImfDialog() {
     form->addRow(tr("Title:"), title);
     auto* kind = new QComboBox(&dlg);
     kind->setObjectName(QStringLiteral("imfKind"));
-    // (ST 2067-3's kinds; Application DPP's own, RDD 59-1 Table 6, when that is the master)
+    // (ST 2067-3's kinds; Application DPP's own, RDD 59-1 Table 5, when that is the master)
     const std::vector<std::pair<QString, QString>> kinds{{tr("Feature"), "feature"},     {tr("Episode"), "episode"},
                                                          {tr("Short"), "short"},         {tr("Trailer"), "trailer"},
                                                          {tr("Teaser"), "teaser"},       {tr("Advertisement"), "advertisement"},
@@ -8593,11 +8593,23 @@ void MainWindow::exportImfDialog() {
     if (prores::encoderAvailable()) {
         application->addItem(tr("Broadcast master (Application DPP (ProRes), RDD 59-1)"), 59);
         application->setItemData(application->count() - 1,
-                                 tr("ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG, as UK and "
-                                    "North American broadcasters' IMF delivery specifications ask"),
+                                 tr("ProRes 422 HQ at 1920 x 1080 or 3840 x 2160, progressive, in Rec.709, Rec.2020 PQ or HLG (4444 in "
+                                    "Rec.2020 PQ or HLG), as UK and North American broadcasters' IMF delivery specifications ask"),
                                  Qt::ToolTipRole);
     }
     form->addRow(tr("Master:"), application);
+    // Application #2E's edition: ST 2067-21:2026 (8K, the markers as timed events), or the 2021 identification as before.
+    auto* edition = new QComboBox(&dlg);
+    edition->setObjectName(QStringLiteral("imfEdition"));
+    edition->addItem(tr("ST 2067-21:2026"), 2026);
+    edition->addItem(tr("ST 2067-21:2021 (as packages were before the 2026 edition)"), 2021);
+    edition->setToolTip(tr("The 2026 edition takes 8K pictures and carries the markers; a supplemental keeps the earlier package's edition"));
+    form->addRow(tr("Edition:"), edition);
+    auto* events = new QCheckBox(tr("Markers as timed events (their names, comments and colours)"), &dlg);
+    events->setObjectName(QStringLiteral("imfEvents"));
+    events->setChecked(true);
+    events->setToolTip(tr("Event-based metadata (SMPTE ST 2067-206) on a track of its own, read back as markers when the package is imported"));
+    form->addRow(QString(), events);
     // Application ProRes: the profile (4:2:2 Y'CbCr, or 4:4:4 R'G'B').
     auto* proresProfile = new QComboBox(&dlg);
     proresProfile->setObjectName(QStringLiteral("imfProResProfile"));
@@ -8636,6 +8648,7 @@ void MainWindow::exportImfDialog() {
     size->addItem(tr("HD (1920 x 1080)"), "hd");
     size->addItem(tr("UHD (3840 x 2160)"), "uhd");
     size->addItem(tr("4K (4096 x 2160)"), "4k");
+    size->addItem(tr("8K (7680 x 4320)"), "8k");
     form->addRow(tr("Picture:"), size);
     auto* colour = new QComboBox(&dlg);
     colour->setObjectName(QStringLiteral("imfColour"));
@@ -8787,6 +8800,13 @@ void MainWindow::exportImfDialog() {
                 if (QStandardItem* i = m->item(box->findData(QString::fromLatin1(value)))) i->setEnabled(on);
         };
         for (const char* v : {"sequence", "4k"}) offer(size, v, !dpp);
+        // (8K: Application #2E to the 2026 edition only)
+        const bool app2 = application->currentData().toInt() == 2;
+        edition->setEnabled(app2 && !supplemental->isChecked());
+        const bool eightK = app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026);
+        offer(size, "8k", eightK);
+        if (!eightK && size->currentData().toString() == "8k") size->setCurrentIndex(size->findData("uhd"));
+        events->setEnabled(!app2 || supplemental->isChecked() || edition->currentData().toInt() == 2026);
         offer(colour, "p3d65-pq", !dpp);
         offer(proresProfile, "422", !dpp);
         offer(proresProfile, "lt", !dpp);
@@ -8812,6 +8832,9 @@ void MainWindow::exportImfDialog() {
         }
         proresProfile->setEnabled(!supplemental->isChecked() && proresApp);
         const bool fourFourFour = prores::fourFourFour(prores::profileOf(proresProfile->currentData().toString().toStdString()));
+        // (Application DPP's 4:4:4 has no Rec.709, RDD 59-1:2022 Table 1)
+        offer(colour, "rec709", !(dpp && fourFourFour));
+        if (dpp && fourFourFour && colour->currentData().toString() == "rec709") colour->setCurrentIndex(colour->findData("rec2020-pq"));
         // (the depth: JPEG 2000's choice; Application ProRes's 4:4:4 at 10 or 12 bits, its 4:2:2 at 10; DPP's by profile)
         bits->setEnabled(!supplemental->isChecked() && !aces && (!proresApp || (!dpp && fourFourFour)));
         fields->setEnabled(!supplemental->isChecked() && proresApp && !dpp && !fourFourFour);
@@ -8832,6 +8855,7 @@ void MainWindow::exportImfDialog() {
     connect(application, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     connect(proresProfile, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     connect(ycbcr444, &QCheckBox::toggled, &dlg, syncSupplemental);
+    connect(edition, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
@@ -8872,6 +8896,8 @@ void MainWindow::exportImfDialog() {
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
     st.application = application->currentData().toInt();
+    st.edition = edition->currentData().toInt();
+    st.events = events->isEnabled() && events->isChecked();
     if (st.application == 45 || st.application == 59) {
         st.prores = proresProfile->currentData().toString().toStdString();
         if (fields->isEnabled()) st.fields = fields->currentData().toString().toStdString();

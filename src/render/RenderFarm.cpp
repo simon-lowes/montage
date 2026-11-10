@@ -253,6 +253,8 @@ void visitImf(S& s, V& v) {
     v("supplementOf", s.supplementOf);
     v("originalSequence", s.originalSequence);
     v("application", s.application);
+    v("edition", s.edition);
+    v("events", s.events);
     v("graded", s.graded);
     v("immersive", s.immersive);
     v("sadm", s.sadm);

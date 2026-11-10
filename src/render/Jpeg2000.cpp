@@ -67,8 +67,10 @@ void imfPictureCoding(uint16_t rsiz, uint8_t out[16]) {
     switch (profile) {
         case 0x0400: kind = 0x02; break;  // 2K lossy
         case 0x0500: kind = 0x03; break;  // 4K lossy
+        case 0x0600: kind = 0x04; break;  // 8K lossy
         case 0x0700: kind = 0x05; break;  // 2K reversible
         case 0x0800: kind = 0x06; break;  // 4K reversible
+        case 0x0900: kind = 0x07; break;  // 8K reversible
         default: return;
     }
     // The level byte counts on through the sub levels each main level allows.

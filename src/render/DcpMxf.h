@@ -657,11 +657,39 @@ private:
     std::vector<Uuid> resourceSets_;
 };
 
+// SMPTE ST 2067-206 (2026): a Timed Events Track File. One Timed Events Resource (a text document: XML or JSON) clip
+// wrapped as a TimedEventsDataElement, in the AS-02 layout; its TimedEventsTextDescriptor names the document's
+// character encoding, MIME type and Event Scheme URIs (the scheme first, then its parents), and the data tracks and
+// the descriptor last `duration` edit units, a long time, as Annex B asks (past any composition the file plays in).
+// The index is one segment of one entry, its edit unit byte count 0 (8.4). No ancillary resources.
+class ImfTimedEventsWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, EditRate rate, std::string* error = nullptr) {
+        return openImfFile(path, asset, rate, error);
+    }
+    bool write(const std::string& document, int64_t duration, const std::string& mime, const std::vector<std::string>& schemes,
+               std::string* error = nullptr);
+    int64_t duration() const override { return duration_; }
+    EditRate rate() const { return rate_; }
+    const std::string& mime() const { return mime_; }
+    const std::string& schemes() const { return schemes_; }  // space separated
+    static constexpr const char* kContainer = "060e2b340401010d0d01030102130102";  // MXFGCTimedEventsTextStream
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    int64_t duration_ = 0;
+    std::string mime_ = "text/xml", schemes_;
+};
+
 // Reads an IMF (AS-02) track file back: what it carries, its track file id (the file package's), each picture
 // frame, the samples of clip-wrapped sound, or the timed text document. Every length is checked against the file.
 class ImfTrackReader {
 public:
-    enum class Kind { Unknown, Picture, Sound, TimedText, Iab, Mga };
+    enum class Kind { Unknown, Picture, Sound, TimedText, Iab, Mga, TimedEvents };
     // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000 or imfAces), without walking
     // the rest of a file that is not; `immersiveOnly` the same unless it is immersive sound (IAB, MGA, or sound with ADM).
     bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false, bool immersiveOnly = false) {
@@ -721,6 +749,12 @@ public:
     // `count` sample frames from `first`, interleaved, as 24-bit integers (past the end: false).
     bool pcm(int64_t first, int64_t count, std::vector<int32_t>& out, std::string* error = nullptr) const;
     bool text(std::string& out, std::string* error = nullptr) const;
+    // Timed events (ST 2067-206): what the TimedEventsTextDescriptor says (its encoding, MIME type and Event Scheme
+    // URIs, space separated) and its container duration (-1: not given); text() gives the Timed Events Resource.
+    const std::string& textEncoding() const { return textEncoding_; }
+    const std::string& textMime() const { return textMime_; }
+    const std::string& eventSchemes() const { return eventSchemes_; }
+    int64_t containerDuration() const { return containerDuration_; }
     // Sound with ADM (ST 2067-204, ST 2131): its axml chunk, and the channel mapping its chna chunk had.
     bool adm() const { return kind_ == Kind::Sound && adm_; }
     bool admXml(std::string& out, std::string* error = nullptr) const;
@@ -757,6 +791,8 @@ private:
     uint32_t axmlStream_ = 0;
     uint64_t axmlAt_ = 0, axmlSize_ = 0;
     std::string acesAuthoring_;
+    std::string textEncoding_, textMime_, eventSchemes_;
+    int64_t containerDuration_ = -1;
     std::vector<TargetFrame> targets_;
     std::vector<std::pair<uint64_t, uint64_t>> elements_;  // picture frames: offset and size of each value
     uint64_t clipAt_ = 0, clipSize_ = 0;                    // sound or timed text: the one element's value

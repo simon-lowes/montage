@@ -4,6 +4,7 @@
 #include <QJsonArray>
 #include <QTemporaryDir>
 #include <QProcess>
+#include <QUrl>
 #include <QTimeZone>
 #include <cctype>
 #ifndef _WIN32
@@ -71,6 +72,7 @@
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
+#include "render/ImfEvents.h"
 #include "render/ImmersiveTrackFile.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
@@ -380,6 +382,34 @@ QStringList photonErrors(const QString& folder) {
         if (line.contains("ERROR-")) errors << line.mid(line.indexOf("ERROR-")).trimmed();
     if (java.exitCode() != 0 && errors.isEmpty()) errors << QStringLiteral("Photon exited with %1").arg(java.exitCode());
     return errors;
+}
+
+// What xmllint finds wrong with `xml` against SMPTE's published schemas, from the folder MONTAGE_TEST_SMPTE_XSD names:
+// `imports` (each a namespace and its schema's file there) are imported in that order by a schema written in `tmp`.
+// {"skipped"} without the folder or xmllint.
+QStringList xsdErrors(const QByteArray& xml, const std::vector<std::pair<QString, QString>>& imports, const QString& tmp) {
+    const QString folder = qEnvironmentVariable("MONTAGE_TEST_SMPTE_XSD");
+    if (folder.isEmpty() || QStandardPaths::findExecutable("xmllint").isEmpty()) return {"skipped"};
+    QString schema = QStringLiteral("<?xml version=\"1.0\"?>\n<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n");
+    for (const auto& [ns, file] : imports) {
+        const QString path = QDir(folder).filePath(file);
+        if (!QFileInfo::exists(path)) return {"no " + path};
+        schema += QStringLiteral("<xs:import namespace=\"%1\" schemaLocation=\"%2\"/>\n").arg(ns, QUrl::fromLocalFile(path).toString());
+    }
+    schema += QStringLiteral("</xs:schema>\n");
+    const QString wrapper = QDir(tmp).filePath("schemas.xsd"), doc = QDir(tmp).filePath("checked.xml");
+    QFile w(wrapper), d(doc);
+    if (!w.open(QIODevice::WriteOnly) || w.write(schema.toUtf8()) < 0 || !d.open(QIODevice::WriteOnly) || d.write(xml) != xml.size()) return {"cannot write"};
+    w.close(), d.close();
+    QProcess lint;
+    lint.setProcessChannelMode(QProcess::MergedChannels);
+    lint.start("xmllint", {"--noout", "--nonet", "--schema", wrapper, doc});
+    if (!lint.waitForFinished(120000)) return {"xmllint did not finish"};
+    QStringList out;
+    for (const QString& line : QString::fromUtf8(lint.readAll()).split('\n', Qt::SkipEmptyParts))
+        if (!line.endsWith(" validates")) out << line;
+    if (lint.exitCode() != 0 && out.isEmpty()) out << QStringLiteral("xmllint exited with %1").arg(lint.exitCode());
+    return lint.exitCode() == 0 ? QStringList() : out;
 }
 
 // Every picture of an MXF file's first stream as FFmpeg's demuxer and decoder give them (the decoder told the stream's
@@ -9631,6 +9661,295 @@ colorspaces:
         QVERIFY2(!more[1].checked && more[1].summary == "Not read", more[1].summary.c_str());
     }
 
+    // Markers as ST 2067-206 event-based metadata in an Application #2E master to ST 2067-21:2026: a Simple Scheme timed
+    // events track related to the picture, checked (by Montage, SMPTE's schemas and Photon), read back into markers with
+    // their frames, text and colours; a supplemental that changes one marker carries that event alone and plays with its
+    // original; the 2021 edition as packages were before it, with no events; 8K profiles in the 2026 edition only.
+    void exportsImfEvents() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.25f, 0.75f, 0, 48));
+        auto marker = [](FrameTime t, FrameTime d, const std::string& name, const std::string& comment, int colour) {
+            Marker m;
+            m.t = t, m.duration = d, m.name = name, m.comment = comment, m.color = colour;
+            return m;
+        };
+        s.markers.push_back(marker(30, 0, "Note: <check> & fix", "Line one\nLine two \xe2\x80\x94 \xc3\xbcn\xc3\xaf" "c\xc3\xb6" "de", 7));
+        s.markers.push_back(marker(4, 0, "Opening titles", "Fade in from black", 2));
+        s.markers.back().chapter = true;
+        s.markers.push_back(marker(12, 8, "Ad break", "", 0));
+        s.markers.back().adBreak = true;
+        s.markers.push_back(marker(36, 0, "", "", 0));
+        s.markers.back().shotChange = true;  // (scene detection's: not the programme's)
+        s.markers.push_back(marker(47, 0, "", "", 1));
+        // What the markers come back as: in order, the shot change left out.
+        auto expected = [&](const Sequence& q) {
+            std::vector<Marker> out;
+            for (const Marker& m : q.markers)
+                if (!m.shotChange) out.push_back(marker(m.t, m.duration, m.name, m.comment, m.color)), out.back().chapter = m.chapter, out.back().adBreak = m.adBreak;
+            std::stable_sort(out.begin(), out.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
+            return out;
+        };
+        auto describe = [](const std::vector<Marker>& ms) {
+            QStringList out;
+            for (const Marker& m : ms)
+                out << QStringLiteral("%1+%2 [%3] [%4] %5%6%7").arg(m.t).arg(m.duration).arg(QString::fromStdString(m.name), QString::fromStdString(m.comment)).arg(m.color)
+                           .arg(m.chapter ? " chapter" : "", m.adBreak ? " ad-break" : "");
+            return out.join("\n");
+        };
+        auto readBack = [&](const std::string& folder) {
+            Project q = makeDefaultProject();
+            const ImportResult in = importImf(q, folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+            const Sequence* opened = in.ok ? q.findSequence(in.sequence) : nullptr;
+            return opened ? opened->markers : std::vector<Marker>{marker(-1, 0, in.error, "", 0)};
+        };
+        auto fileText = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+        auto eventsDocument = [](const QString& mxf, std::string& xml) {
+            dcp::ImfTrackReader reader;
+            return reader.open(mxf.toStdString()) && reader.kind() == dcp::ImfTrackReader::Kind::TimedEvents && reader.text(xml);
+        };
+        const QString smpteResource = QString::fromLatin1(kImfSimpleSchemeResource);
+        const std::vector<std::pair<QString, QString>> cplSchemas = {
+            {"http://www.w3.org/2000/09/xmldsig#", "xmldsig-core-schema.xsd"},
+            {"http://www.smpte-ra.org/schemas/433/2008/dcmlTypes/", "dcmlTypes.xsd"},
+            {"http://www.smpte-ra.org/schemas/2067-3/2016", "imf-cpl-20160411.xsd"},
+            {"http://www.smpte-ra.org/ns/2067-2/2020", "imf-core-constraints-2020.xsd"},
+            {"http://www.smpte-ra.org/ns/2067-206/2023/cpl", "st2067-206a-2026-07-TimedEventsVirtualTrackParameterSet.xsd"},
+            {"http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme/cpl", "st2067-206g-2026-07-simple_scheme.sequence_elements.xsd"}};
+        QTemporaryDir scratch;
+
+        ImfSettings st;
+        st.title = "Events";
+        st.threads = 2;
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.edition == 2026 && r.events == 4 && r.newEvents == 4);
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out(QString::fromStdString(r.folder));
+        const QStringList eventFiles = out.entryList({"EVENTS_*.mxf"});
+        QCOMPARE(eventFiles.size(), 1);
+        const QByteArray cpl = fileText(QString::fromStdString(r.cpl));
+        ImfComposition comp;
+        QVERIFY(readImfComposition(r.cpl, comp, &err) && comp.edition == 2026 && comp.application == 2 && comp.picture());
+        for (const QByteArray& want : {QByteArray("http://www.smpte-ra.org/ns/2067-21/5ED</cc:ApplicationIdentification>"),
+                                       QByteArray("<imfses:SimpleSchemeMediaTimedEventsSequence>"), QByteArray("<imfebm:TimedEventsVirtualTrackParameterSet>"),
+                                       "<imfebm:RelatedTrackId>urn:uuid:" + QByteArray::fromStdString(comp.picture()->id) + "</imfebm:RelatedTrackId>",
+                                       QByteArray("<imfebm:RelationshipKind>urn:montage:imf:markers#marks-picture</imfebm:RelationshipKind>"),
+                                       QByteArray("<r0:TimedEventsTextDescriptor"), QByteArray("<r1:TextMIMEType>text/xml</r1:TextMIMEType>"),
+                                       QByteArray("<r1:EventSchemeURIs>urn:montage:imf:markers http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme</r1:EventSchemeURIs>"),
+                                       QByteArray("<IntrinsicDuration>2073600</IntrinsicDuration>")})
+            QVERIFY2(cpl.contains(want), want.constData());
+        const ImfVirtualTrack* eventsTrack = nullptr;
+        for (const ImfVirtualTrack& t : comp.tracks)
+            if (t.kind == "SimpleSchemeMediaTimedEventsSequence") eventsTrack = &t;
+        QVERIFY(eventsTrack && eventsTrack->resources.size() == 1 && eventsTrack->length() == 48 && eventsTrack->resources[0].intrinsic == 86400 * 24);
+        // The track file: a Simple Scheme document as Annex A has it, at the composition's rate, a day long.
+        {
+            dcp::ImfTrackReader reader;
+            QVERIFY(reader.open(out.filePath(eventFiles[0]).toStdString(), &err));
+            QVERIFY(reader.kind() == dcp::ImfTrackReader::Kind::TimedEvents && reader.textMime() == "text/xml" && reader.textEncoding() == "UTF-8");
+            QCOMPARE(reader.eventSchemes(), std::string("urn:montage:imf:markers http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme"));
+            QVERIFY(reader.containerDuration() == 2073600 && reader.rate().num == 24 && reader.rate().den == 1);
+        }
+        std::string xml;
+        QVERIFY(eventsDocument(out.filePath(eventFiles[0]), xml));
+        QVERIFY2(checkImfEventsDocument(xml).empty(), xml.c_str());
+        std::vector<ImfEvent> events;
+        uint32_t num = 0, den = 0;
+        QVERIFY(parseImfEventsDocument(xml, events, num, den, &err) && num == 24 && den == 1 && events.size() == 4);
+        QVERIFY(events[0].id == "M1" && events[0].start == 4 && events[0].end == 4 && events[0].chapter && events[0].colour == 2);
+        QVERIFY(events[1].start == 12 && events[1].end == 20 && events[1].adBreak && events[1].name == "Ad break");
+        QVERIFY(events[3].start == 47 && events[3].end == 47 && events[3].name.empty() && events[3].colour == 1);
+        // (the same events, the same document; another, another id)
+        QCOMPARE(imfEventsDocument(events, 24, 1), xml);
+        std::vector<ImfEvent> other = events;
+        other[2].comment += ".";
+        QVERIFY(imfEventsDocument(other, 24, 1).substr(0, 300) != xml.substr(0, 300));
+        // SMPTE's schemas (when given): the document, and the composition with its sequence and parameter set.
+        {
+            QStringList bad = xsdErrors(QByteArray::fromStdString(xml), {{smpteResource, "st2067-206b-2026-07-simple_scheme.TimedEventsResource.schema.xsd"}}, scratch.path());
+            QVERIFY2(bad.isEmpty() || bad == QStringList{"skipped"}, qPrintable(bad.join("\n")));
+            bad = xsdErrors(cpl, cplSchemas, scratch.path());
+            QVERIFY2(bad.isEmpty() || bad == QStringList{"skipped"}, qPrintable(bad.join("\n")));
+            // (and the schemas bite: a parameter set without its TrackId, an event without its id)
+            if (bad.isEmpty()) {
+                QByteArray broken = cpl;
+                broken.replace(QByteArray("<imfebm:TrackId>"), QByteArray("<imfebm:Track>"));
+                broken.replace(QByteArray("</imfebm:TrackId>"), QByteArray("</imfebm:Track>"));
+                QVERIFY(!xsdErrors(broken, cplSchemas, scratch.path()).isEmpty());
+                QByteArray noEventId = QByteArray::fromStdString(xml);
+                noEventId.replace(QByteArray("<id>M1</id>"), QByteArray());
+                QVERIFY(!xsdErrors(noEventId, {{smpteResource, "st2067-206b-2026-07-simple_scheme.TimedEventsResource.schema.xsd"}}, scratch.path()).isEmpty());
+            }
+        }
+        // Photon's general checks, but for what it says of ST 2067-206, which it does not know: the sequence, and the
+        // descriptor only that sequence's resources name.
+        {
+            QStringList photon = photonErrors(out.path());
+            const QString descriptor = QString::fromStdString(eventsTrack->resources[0].encoding);
+            photon.removeIf([&](const QString& e) {
+                return e.contains("Unsupported sequence type or schema Tag: imfses:SimpleSchemeMediaTimedEventsSequence") ||
+                       (e.contains(descriptor) && e.contains("is not referenced by any resource"));
+            });
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        }
+        // Montage's checker: what Annex A asks, named.
+        {
+            const QString good = QString::fromStdString(xml);
+            auto problems = [](const QString& x) { return checkImfEventsDocument(x.toStdString()); };
+            QVERIFY(problems(good).empty());
+            QVERIFY(!problems(QString(good).replace("<endCount>20</endCount>", "<endCount>3</endCount>")).empty());
+            QVERIFY(!problems(QString(good).replace("<id>M2</id>", "<id>M1</id>")).empty());
+            QVERIFY(!problems(QString(good).replace("<id>M3</id>", "<id>M,3</id>")).empty());
+            QVERIFY(!problems(QString(good).replace("<editRate>24 1</editRate>", "<editRate>24</editRate>")).empty());
+            QVERIFY(!problems(QString(good).replace("<startCount>12</startCount>", "<startCount>twelve</startCount>")).empty());
+            QVERIFY(!problems(QString(good).replace(smpteResource, "urn:other")).empty());
+        }
+        // Read back: the markers, with their frames, text, colours and kinds.
+        QCOMPARE(describe(readBack(r.folder)), describe(expected(s)));
+
+        // A supplemental with one marker's comment changed: the earlier events played again around that one, which its
+        // own track file carries alone.
+        Sequence now = s;
+        for (Marker& m : now.markers)
+            if (m.name == "Ad break") m.comment = "Two minutes";
+        ImfSettings sup = st;
+        sup.supplementOf = r.folder;
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY2(r2.supplemental && r2.codedFrames == 0 && r2.newSamples == 0 && r2.edition == 2026 && r2.events == 4 && r2.newEvents == 1,
+                 qPrintable(QStringLiteral("%1 %2 %3").arg(r2.codedFrames).arg(r2.events).arg(r2.newEvents)));
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out2(QString::fromStdString(r2.folder));
+        QCOMPARE(out2.entryList({"EVENTS_*.mxf"}).size(), 1);
+        QCOMPARE(out2.entryList({"*.mxf"}).size(), 1);  // (the picture and sound the earlier package's)
+        QVERIFY(eventsDocument(out2.filePath(out2.entryList({"EVENTS_*.mxf"})[0]), xml) && parseImfEventsDocument(xml, events, num, den));
+        QVERIFY(events.size() == 1 && events[0].name == "Ad break" && events[0].comment == "Two minutes" && events[0].start == 12 && events[0].end == 20);
+        ImfComposition comp2;
+        QVERIFY(readImfComposition(r2.cpl, comp2, &err) && comp2.edition == 2026);
+        const ImfVirtualTrack* eventsTrack2 = nullptr;
+        for (const ImfVirtualTrack& t : comp2.tracks)
+            if (t.kind == "SimpleSchemeMediaTimedEventsSequence") eventsTrack2 = &t;
+        QVERIFY(eventsTrack2 && eventsTrack2->id == eventsTrack->id && eventsTrack2->resources.size() == 3);
+        QVERIFY(eventsTrack2->resources[0].trackFile == eventsTrack->resources[0].trackFile && eventsTrack2->resources[0].duration == 12);
+        QVERIFY(eventsTrack2->resources[1].entry == 12 && eventsTrack2->resources[1].duration == 8 && eventsTrack2->resources[2].entry == 20);
+        QCOMPARE(describe(readBack(r2.folder)), describe(expected(now)));
+        {
+            const QStringList bad = xsdErrors(fileText(QString::fromStdString(r2.cpl)), cplSchemas, scratch.path());
+            QVERIFY2(bad.isEmpty() || bad == QStringList{"skipped"}, qPrintable(bad.join("\n")));
+        }
+        // Every marker taken away: the supplemental's empty document in place of them.
+        {
+            Sequence none = now;
+            none.markers.clear();
+            ImfResult r3;
+            ImfSettings sup3 = st;
+            sup3.supplementOf = r2.folder;
+            QVERIFY2(exportImf(p, none, sup3, dir.path().toStdString(), &r3, {}, &err), err.c_str());
+            QVERIFY(r3.events == 0 && r3.newEvents == 0);
+            issues = verifyImf(r3.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QVERIFY(readBack(r3.folder).empty());
+        }
+
+        // The 2021 edition: its identification, no events, the composition as the 2026 edition's without markers but for
+        // the identification (ids, dates and hashes aside).
+        {
+            QTemporaryDir a, b;
+            ImfSettings old = st;
+            old.edition = 2021;
+            ImfResult ro, rn;
+            QVERIFY2(exportImf(p, s, old, a.path().toStdString(), &ro, {}, &err), err.c_str());
+            QVERIFY(ro.edition == 2021 && ro.events == 0 && QDir(QString::fromStdString(ro.folder)).entryList({"EVENTS_*.mxf"}).isEmpty());
+            issues = verifyImf(ro.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QStringList photon = photonErrors(QString::fromStdString(ro.folder));
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            Sequence plain = s;
+            plain.markers.clear();
+            QVERIFY2(exportImf(p, plain, st, b.path().toStdString(), &rn, {}, &err), err.c_str());
+            QVERIFY(rn.edition == 2026 && rn.events == 0 && QDir(QString::fromStdString(rn.folder)).entryList({"EVENTS_*.mxf"}).isEmpty());
+            auto normal = [&](const std::string& path) {
+                QString x = QString::fromUtf8(fileText(QString::fromStdString(path)));
+                x.replace(QRegularExpression("urn:uuid:[0-9a-f-]{36}"), "urn:uuid:-");
+                x.replace(QRegularExpression("<IssueDate>[^<]*</IssueDate>"), "<IssueDate/>");
+                x.replace(QRegularExpression("<Hash>[^<]*</Hash>"), "<Hash/>");
+                x.replace(QRegularExpression("Events \\d{4}-\\d\\d-\\d\\d"), "Events");
+                return x;
+            };
+            const QString o = normal(ro.cpl), n = normal(rn.cpl);
+            QVERIFY(o.contains("http://www.smpte-ra.org/ns/2067-21/2021<") && !o.contains("TimedEvents") && !o.contains("2067-206"));
+            QCOMPARE(QString(n).replace("http://www.smpte-ra.org/ns/2067-21/5ED<", "http://www.smpte-ra.org/ns/2067-21/2021<"), o);
+            // A supplemental of a 2021 package keeps its edition: no events.
+            ImfSettings sup2021 = st;
+            sup2021.supplementOf = ro.folder;
+            ImfResult rs;
+            QVERIFY2(exportImf(p, now, sup2021, a.path().toStdString(), &rs, {}, &err), err.c_str());
+            QVERIFY(rs.edition == 2021 && rs.events == 0 && rs.codedFrames == 0);
+            QVERIFY(fileText(QString::fromStdString(rs.cpl)).contains("http://www.smpte-ra.org/ns/2067-21/2021<"));
+            old.edition = 2023;
+            QVERIFY(!exportImf(p, s, old, a.path().toStdString(), nullptr, {}, &err) && err.find("2026 or the 2021") != std::string::npos);
+        }
+
+        // 8K: the 2026 edition's profiles (ST 2067-21:2026 Table 5), a picture wider than 4096 in one; the 2021 edition
+        // refuses it.
+        {
+            Project wp = makeDefaultProject();
+            Sequence& wide = *wp.active();
+            wide.width = 4200, wide.height = 64, wide.fps = Rational{24, 1};
+            wide.videoTracks[0].clips.push_back(colorClip(wp, 0.2f, 0.6f, 0.4f, 0, 2));
+            QTemporaryDir w;
+            ImfSettings ws;
+            ws.title = "Wide";
+            ws.threads = 2;
+            ImfResult rw;
+            QVERIFY2(exportImf(wp, wide, ws, w.path().toStdString(), &rw, {}, &err), err.c_str());
+            QVERIFY2((rw.rsiz & 0xff00) == 0x0900 && rw.width == 4200, qPrintable(QString::number(rw.rsiz, 16)));
+            issues = verifyImf(rw.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QVERIFY(fileText(QString::fromStdString(rw.cpl)).contains("<r1:PictureCompression>urn:smpte:ul:060e2b34.0401010d.04010202.030107"));
+            int iw = 0, ih = 0;
+            QVERIFY(imfPictureSize(wide, "sequence", iw, ih, &err, 2026) && !imfPictureSize(wide, "sequence", iw, ih, &err, 2021));
+            QVERIFY(err.find("2026") != std::string::npos);
+            ws.edition = 2021;
+            QVERIFY(!exportImf(wp, wide, ws, w.path().toStdString(), nullptr, {}, &err));
+            uint8_t ul[16];
+            imfPictureCoding(0x0601, ul);
+            QVERIFY(ul[14] == 0x04 && ul[15] == 0x02);
+            imfPictureCoding(0x0902, ul);
+            QVERIFY(ul[14] == 0x07 && ul[15] == 0x04);
+            // (Montage's check: an 8K profile in a 2021 composition named)
+            QString c = QString::fromUtf8(fileText(QString::fromStdString(rw.cpl)));
+            c.replace("http://www.smpte-ra.org/ns/2067-21/5ED<", "http://www.smpte-ra.org/ns/2067-21/2021<");
+            QFile f(QString::fromStdString(rw.cpl));
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(c.toUtf8()) > 0);
+            f.close();
+            issues = verifyImf(rw.folder);
+            QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("2021 edition") != std::string::npos; }));
+            QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("8K profile") != std::string::npos; }));
+        }
+
+        // Montage's check: a media events track that relates to no virtual track is named.
+        {
+            QString c = QString::fromUtf8(cpl);
+            c.remove(QRegularExpression("<imfebm:TrackRelationship>.*</imfebm:TrackRelationship>", QRegularExpression::DotMatchesEverythingOption));
+            QFile f(QString::fromStdString(r.cpl));
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(c.toUtf8()) > 0);
+            f.close();
+            issues = verifyImf(r.folder);
+            QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("relate to") != std::string::npos; }));
+        }
+    }
+
     void exportsImfMaster() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         QTemporaryDir dir;
@@ -9688,7 +10007,7 @@ colorspaces:
         QFile cplFile(out.filePath(cpls[0]));
         QVERIFY(cplFile.open(QIODevice::ReadOnly));
         const QString cpl = QString::fromUtf8(cplFile.readAll());
-        for (const char* want : {"http://www.smpte-ra.org/ns/2067-21/2021</cc:ApplicationIdentification>", "<EditRate>24000 1001</EditRate>",
+        for (const char* want : {"http://www.smpte-ra.org/ns/2067-21/5ED</cc:ApplicationIdentification>", "<EditRate>24000 1001</EditRate>",
                                  "<IntrinsicDuration>24</IntrinsicDuration>", "<IntrinsicDuration>48048</IntrinsicDuration>",
                                  "<EditRate>48000 1</EditRate>", "<r1:Rsiz>1793</r1:Rsiz>", "<r2:Code>CompRed</r2:Code>",
                                  "<r1:ComponentMaxRef>1023</r1:ComponentMaxRef>", "060e2b34.04010106.04010101.03030000",
@@ -9769,7 +10088,7 @@ colorspaces:
             QFile htc(hto.filePath(hto.entryList({"CPL_*.xml"}).value(0)));
             QVERIFY(htc.open(QIODevice::ReadOnly));
             const QString httext = QString::fromUtf8(htc.readAll());
-            for (const char* want : {"http://www.smpte-ra.org/ns/2067-21/2023</cc:ApplicationIdentification>", "<r1:Rsiz>16384</r1:Rsiz>",
+            for (const char* want : {"http://www.smpte-ra.org/ns/2067-21/5ED</cc:ApplicationIdentification>", "<r1:Rsiz>16384</r1:Rsiz>",
                                      "<r1:PictureCompression>urn:smpte:ul:060e2b34.0401010d.04010202.03010801</r1:PictureCompression>",
                                      "<r1:J2KExtendedCapabilities>", "<r2:Pcap>131072</r2:Pcap>", "<r2:Ccapi>"})
                 QVERIFY2(httext.contains(want), want);
@@ -9789,7 +10108,8 @@ colorspaces:
             ht.title = "HT lossy";
             QVERIFY(!exportImf(p, s, ht, dir.path().toStdString(), nullptr, {}, &err) && err.find("lossless") != std::string::npos);
         }
-        // Refused: an unknown colour, a frame rate Application #2E does not take, a picture larger than 4096 x 3112.
+        // Refused: an unknown colour, a frame rate Application #2E does not take, a picture larger than 8192 x 6224 (4096 x
+        // 3112 to the 2021 edition).
         st.colour = "sepia";
         QVERIFY(!exportImf(p, s, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("colour") != std::string::npos);
         st.colour.clear();
@@ -9801,7 +10121,12 @@ colorspaces:
         int iw = 0, ih = 0;
         Sequence big = s;
         big.width = 7680, big.height = 4320;
-        QVERIFY(!imfPictureSize(big, "sequence", iw, ih, &err) && imfPictureSize(big, "uhd", iw, ih) && iw == 3840 && ih == 2160);
+        QVERIFY(imfPictureSize(big, "sequence", iw, ih, &err) && iw == 7680 && ih == 4320);
+        QVERIFY(!imfPictureSize(big, "sequence", iw, ih, &err, 2021) && imfPictureSize(big, "uhd", iw, ih, &err, 2021) && iw == 3840 && ih == 2160);
+        QVERIFY(imfPictureSize(big, "8k", iw, ih) && iw == 7680 && !imfPictureSize(big, "8k", iw, ih, &err, 2021));
+        big.width = 16384, big.height = 8640;
+        QVERIFY(!imfPictureSize(big, "sequence", iw, ih, &err) && err.find("8192 x 6224") != std::string::npos);
+        big.width = 7680, big.height = 4320;
         QCOMPARE(defaultImfColour(s), std::string("rec709"));
         big.colorSpace = "rec2100pq";
         QCOMPARE(defaultImfColour(big), std::string("rec2020-pq"));
@@ -10943,7 +11268,7 @@ colorspaces:
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
         QStringList photon = photonFindings(r.folder);
         QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
-        // The CPL: Application DPP's identification alone (RDD 59-1 Table 5), and the content kind in the DPP's scope.
+        // The CPL: Application DPP's identification alone (RDD 59-1 Table 4), and the content kind in the DPP's scope.
         QByteArray cplText;
         {
             QFile cpl(QString::fromStdString(r.cpl));
@@ -11290,10 +11615,11 @@ colorspaces:
                      qPrintable(QStringLiteral("%1 to %2").arg(reader.componentLow()).arg(reader.componentHigh())));
             QVERIFY2(framesRight(r.folder, p, s, xq, 4), profile);
         }
-        // Application DPP's 4:4:4 (RDD 59-1 Table 2): 4444 and 4444 XQ R'G'B' at 12 bits, HD at 25; then a supplemental
+        // Application DPP's 4:4:4 (RDD 59-1 Table 1): 4444 and 4444 XQ R'G'B' at 12 bits, HD at 25; then a supplemental
         // of the 4444 package with one shot changed codes only that shot's frames (the rest found the same by coding
         // them again, byte for byte).
         s.width = 1920, s.height = 1080, s.fps = Rational{25, 1};
+        s.colorSpace = "rec2100hlg";  // (Application DPP's 4:4:4 is in Rec.2020 PQ or HLG)
         Sequence cut1 = s;
         cut1.id = p.newId();
         cut1.name = "Cut 1";
@@ -11305,6 +11631,12 @@ colorspaces:
         st.application = 59;
         st.prores = "4444";
         st.kind = "programme";
+        // (RDD 59-1:2022 Table 1: 4:4:4 in Rec.2020 PQ or HLG, not Rec.709)
+        {
+            ImfSettings sdr = st;
+            sdr.colour = "rec709";
+            QVERIFY(!exportImf(p, now, sdr, dir.path().toStdString(), nullptr, {}, &err) && err.find("Rec.709") != std::string::npos);
+        }
         ImfResult r;
         QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
         QVERIFY(r.application == 59 && r.bits == 12 && r.prores == "4444" && r.frames == 4);

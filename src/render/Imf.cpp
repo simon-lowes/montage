@@ -8,6 +8,7 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
 #include <QXmlStreamReader>
 #include <QXmlStreamWriter>
 #include <algorithm>
@@ -36,6 +37,7 @@ extern "C" {
 #include "DcpMxf.h"
 #include "Iab.h"
 #include "ImageSubtitles.h"
+#include "ImfEvents.h"
 #include "ImmersiveTrackFile.h"
 #include "Jpeg2000.h"
 #include "ProRes.h"
@@ -109,7 +111,7 @@ bool validKind(const std::string& k) {
     return std::any_of(std::begin(kinds), std::end(kinds), [&](const char* x) { return k == x; });
 }
 
-// Application DPP's content kinds (RDD 59-1 Table 6), written in its own scope.
+// Application DPP's content kinds (RDD 59-1 Table 5), written in its own scope.
 bool dppKind(const std::string& k) {
     static const char* kinds[] = {"programme", "commercial", "sponsorship", "infomercial", "presentation_event", "promotion", "music_video"};
     return std::any_of(std::begin(kinds), std::end(kinds), [&](const char* x) { return k == x; });
@@ -556,8 +558,17 @@ bool decodeTiff16(const std::vector<uint8_t>& tiff, std::vector<uint16_t>& rgb, 
 }
 
 constexpr const char* kApp5 = "http://www.smpte-ra.org/ns/2067-50/2017";
+// Application #2E: ST 2067-21:2026's identification (8.1), and the one the 2020 amendment and the 2023 edition share.
+constexpr const char* kApp2E2026 = "http://www.smpte-ra.org/ns/2067-21/5ED";
+constexpr const char* kApp2E2021 = "http://www.smpte-ra.org/ns/2067-21/2021";
+// ST 2067-206: the Simple Scheme's sequences (Annex B), the virtual track parameter set's namespace (9.2.3), and the
+// relationship Montage names between its markers' track and the picture.
+constexpr const char* kEventsSequenceNs = "http://www.smpte-ra.org/ns/2067-206/2023/simple-scheme/cpl";
+constexpr const char* kEventsCplNs = "http://www.smpte-ra.org/ns/2067-206/2023/cpl";
+constexpr const char* kEventsSequence = "SimpleSchemeMediaTimedEventsSequence";
+constexpr const char* kMarksRelationship = "urn:montage:imf:markers#marks-picture";
 constexpr const char* kAppProRes = "tag:apple.com,2017:imf:rdd45:2022";  // (RDD 45 Table 6)
-// RDD 59-1 Table 5: writers use the second; readers take either (the first is TSP 2121-1's, which RDD 59-1 replaced).
+// RDD 59-1 Table 4: writers use the second; readers take either (the first is TSP 2121-1's, which RDD 59-1 replaced).
 constexpr const char* kAppDpp = "http://schema.thedpp.com/imf/RDD59-1/2021";
 constexpr const char* kAppDppBefore = "http://www.digitalproductionpartnership.co.uk/schema/imf/TSP2121-1/2018";
 
@@ -841,21 +852,28 @@ bool imfFrameRateAllowed(Rational fps, int width, int height, Rational* canonica
 
 bool imfFrameRateAllowed(const Sequence& s) { return imfFrameRateAllowed(s.fps, s.width, s.height); }
 
-bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error) {
+bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error, int edition) {
     if (size == "hd") width = 1920, height = 1080;
     else if (size == "uhd") width = 3840, height = 2160;
     else if (size == "4k") width = 4096, height = 2160;
+    else if (size == "8k") width = 7680, height = 4320;
     else if (size.empty() || size == "sequence") width = s.width, height = s.height;
     else {
-        if (error) *error = "The size is sequence, hd, uhd or 4k";
+        if (error) *error = "The size is sequence, hd, uhd, 4k or 8k";
         return false;
     }
     if (width <= 0 || height <= 0) {
         if (error) *error = "The sequence has no picture size";
         return false;
     }
-    if (width > 4096 || height > 3112) {
-        if (error) *error = "IMF Application #2E goes up to 4096 x 3112: choose UHD or 4K";
+    // (ST 2067-21:2026 Table 2: R'G'B' 4:4:4 to 8192 x 6224; its earlier editions' to 4096 x 3112)
+    if (edition >= 2026 && (width > 8192 || height > 6224)) {
+        if (error) *error = "IMF Application #2E goes up to 8192 x 6224: choose 8K or smaller";
+        return false;
+    }
+    if (edition < 2026 && (width > 4096 || height > 3112)) {
+        if (error) *error = edition ? "IMF Application #2E to the 2021 edition goes up to 4096 x 3112: choose UHD or 4K (the 2026 edition takes 8K)"
+                                    : "These IMF masters go up to 4096 x 3112: choose UHD or 4K";
         return false;
     }
     return true;
@@ -941,6 +959,70 @@ private:
     std::map<std::string, dcp::ImfTrackReader> open_;
 };
 
+// A timed events virtual track (ST 2067-206), of a Simple Scheme sequence.
+bool isEventsSequence(const std::string& kind) {
+    return kind == kEventsSequence || kind == "SimpleSchemeGenericTimedEventsSequence";
+}
+
+// Edit units at rate `from` as edit units at rate `to` (rounded to the nearest).
+int64_t unitsAt(int64_t n, uint64_t fromNum, uint64_t fromDen, uint64_t toNum, uint64_t toDen) {
+    const long double v = (long double)n * (long double)toNum * (long double)fromDen / ((long double)toDen * (long double)fromNum);
+    return int64_t(std::llround(double(v)));
+}
+
+// The events a timed events virtual track plays, in composition edit units: each resource's document's events within
+// the stretch it plays (cut to it), moved to where it plays it; the pieces of an event a resource's end cut joined
+// again. Simple Scheme XML documents only.
+bool playedEvents(const ImfVirtualTrack& t, TrackFiles& files, dcp::EditRate comp, std::vector<ImfEvent>& out, std::string* error = nullptr) {
+    out.clear();
+    std::map<std::string, std::pair<std::vector<ImfEvent>, dcp::EditRate>> docs;
+    int64_t at = 0;  // where the resource plays, in composition edit units
+    for (const ImfResource& r : t.resources) {
+        auto doc = docs.find(r.trackFile);
+        if (doc == docs.end()) {
+            const dcp::ImfTrackReader* f = files.get(r.trackFile, error);
+            if (!f) return false;
+            std::string xml;
+            std::vector<ImfEvent> events;
+            uint32_t num = 0, den = 0;
+            if (f->kind() != dcp::ImfTrackReader::Kind::TimedEvents || !f->text(xml, error)) {
+                if (error) *error = "Track file " + r.trackFile + " is not timed events";
+                return false;
+            }
+            if (!parseImfEventsDocument(xml, events, num, den, error)) return false;
+            doc = docs.emplace(r.trackFile, std::make_pair(std::move(events), dcp::EditRate{num, den})).first;
+        }
+        const dcp::EditRate docRate = doc->second.second;
+        const int64_t played = unitsAt(r.duration, r.rateNum, r.rateDen, comp.num, comp.den);
+        for (int64_t k = 0; k < std::max<int64_t>(1, r.repeat); ++k, at += played) {
+            const int64_t from = r.entry, to = r.entry + r.duration;  // the stretch, in the resource's edit units
+            for (ImfEvent e : doc->second.first) {
+                // (the document's counts in the resource's edit units; no start: from the timeline's start, no end: on)
+                int64_t a = e.start == std::numeric_limits<int64_t>::min() ? from : unitsAt(e.start, docRate.num, docRate.den, r.rateNum, r.rateDen);
+                int64_t b = e.end == std::numeric_limits<int64_t>::max() ? to : unitsAt(e.end, docRate.num, docRate.den, r.rateNum, r.rateDen);
+                b = std::max(a, b);
+                if (!(a < to && std::max(b, a + 1) > from)) continue;  // (an instant: its frame in the stretch)
+                a = std::max(a, from), b = std::min(b, to);
+                e.start = at + unitsAt(a - from, r.rateNum, r.rateDen, comp.num, comp.den);
+                e.end = at + unitsAt(std::max(b, a) - from, r.rateNum, r.rateDen, comp.num, comp.den);
+                out.push_back(std::move(e));
+            }
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [](const ImfEvent& a, const ImfEvent& b) { return a.start < b.start; });
+    std::vector<ImfEvent> joined;
+    for (ImfEvent& e : out) {
+        auto piece = std::find_if(joined.rbegin(), joined.rend(), [&](const ImfEvent& j) {
+            return j.end == e.start && j.start < j.end && j.id == e.id && j.name == e.name && j.comment == e.comment && j.colour == e.colour &&
+                   j.chapter == e.chapter && j.adBreak == e.adBreak;
+        });
+        if (piece != joined.rend() && e.end > e.start) piece->end = e.end;
+        else joined.push_back(std::move(e));
+    }
+    out = std::move(joined);
+    return true;
+}
+
 // The earlier composition's sound, through its resources, read a window at a time.
 class ComposedPcm {
 public:
@@ -1021,6 +1103,22 @@ std::function<QByteArray(const std::string&)> imscResource(const dcp::ImfTrackRe
     };
 }
 
+// A Timed Events Track File's TimedEventsTextDescriptor (ST 2067-206 8.6.2) as RegXML.
+void timedEventsDescriptor(QXmlStreamWriter& x, const dcp::ImfTimedEventsWriter& w) {
+    x.writeStartElement("r0:TimedEventsTextDescriptor");
+    x.writeNamespace(kGroups, "r0");
+    x.writeNamespace(kElements, "r1");
+    x.writeTextElement("r1:InstanceID", urn(w.descriptorId()));
+    x.writeTextElement("r1:LinkedTrackID", "1");
+    x.writeTextElement("r1:SampleRate", QStringLiteral("%1/%2").arg(w.rate().num).arg(w.rate().den));
+    x.writeTextElement("r1:EssenceLength", QString::number(w.duration()));
+    x.writeTextElement("r1:ContainerFormat", ulUrn(std::string(dcp::ImfTimedEventsWriter::kContainer)));
+    x.writeTextElement("r1:TextCharacterEncoding", "UTF-8");
+    x.writeTextElement("r1:TextMIMEType", QString::fromStdString(w.mime()));
+    x.writeTextElement("r1:EventSchemeURIs", QString::fromStdString(w.schemes()));
+    x.writeEndElement();
+}
+
 void timedTextDescriptor(QXmlStreamWriter& x, const dcp::ImfTimedTextWriter& w) {
     x.writeStartElement("r0:DCTimedTextDescriptor");
     x.writeNamespace(kGroups, "r0");
@@ -1055,7 +1153,7 @@ void timedTextDescriptor(QXmlStreamWriter& x, const dcp::ImfTimedTextWriter& w) 
 
 int64_t imfCompositionFrames(const Sequence& s, const ImfSettings& settings, std::string* error) {
     int W = 0, H = 0;
-    if (!imfPictureSize(s, settings.size, W, H, error)) return 0;
+    if (!imfPictureSize(s, settings.size, W, H, error, settings.application == 2 ? settings.edition : 0)) return 0;
     Rational canonical;
     if (!imfFrameRateAllowed(s.fps, W, H, &canonical)) {
         if (error) *error = "IMF masters here are 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)";
@@ -1127,9 +1225,13 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             return fail("A supplemental package goes beside the earlier one: make it in " + earlierParent.toStdString());
     }
     TrackFiles oldFiles(oldPaths);
+    // Application #2E's edition (ST 2067-21:2026, or the 2021 identification as before): a supplemental keeps the
+    // earlier package's.
+    const int edition = settings.application != 2 ? 0 : supplemental ? (old.edition ? old.edition : 2021) : settings.edition;
+    if (settings.application == 2 && edition != 2026 && edition != 2021) return fail("Application #2E is made to the 2026 or the 2021 edition of ST 2067-21");
     int W = 0, H = 0;
     if (supplemental) W = old.width, H = old.height;
-    else if (!imfPictureSize(s, settings.size, W, H, &err)) return fail(err);
+    else if (!imfPictureSize(s, settings.size, W, H, &err, edition)) return fail(err);
     Rational canonical;
     if (!imfFrameRateAllowed(s.fps, W, H, &canonical))
         return fail("IMF masters here are 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)");
@@ -1160,8 +1262,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     }
     // Application ProRes (RDD 45 Table 1): 4:2:2 Y'CbCr to 3840 x 2160 (no P3-D65, no 120 fps; interlaced to 1920 x 1080
     // at 25, 29.97 or 30 in Rec.709), 4:4:4 R'G'B' to 4096 x 3112 (QE.1 or QE.2), 4:4:4 Y'CbCr to 1920 x 1080 (progressive,
-    // Rec.709, QE.1). Application DPP (RDD 59-1 Table 2 and 4): 422 HQ or 4444 / 4444 XQ at 1920 x 1080 or 3840 x 2160,
-    // progressive, at up to 60 fps, Rec.709, Rec.2020 PQ or HLG; 4:4:4 at 12 bits.
+    // Rec.709, QE.1). Application DPP (RDD 59-1:2022 Tables 1 and 3): 422 HQ or 4444 / 4444 XQ at 1920 x 1080 or
+    // 3840 x 2160, progressive, at up to 60 fps; 4:2:2 at 10 bits in Rec.709, Rec.2020 PQ or HLG, 4:4:4 at 12 in Rec.2020
+    // PQ or HLG (the published edition has no COLOR.3 for 4:4:4).
     int proresProfile = 0, fields = 0;
     bool ycbcr444 = false, fullRange = false;
     if (proresApp) {
@@ -1174,15 +1277,16 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         const bool full = prores::fourFourFour(proresProfile);
         const double rateValue = double(canonical.num) / double(canonical.den);
         if (dpp) {
-            if (proresProfile != 4 && !full) return fail("Application DPP takes ProRes 422 HQ, 4444 or 4444 XQ (RDD 59-1 Table 4)");
-            if (full && bits != 12) return fail("Application DPP's 4:4:4 pictures are 12 bits (RDD 59-1 Table 2)");
-            if (!full && bits != 10) return fail("Application DPP's 422 HQ pictures are 10 bits (RDD 59-1 Table 2)");
+            if (proresProfile != 4 && !full) return fail("Application DPP takes ProRes 422 HQ, 4444 or 4444 XQ (RDD 59-1 Table 3)");
+            if (full && bits != 12) return fail("Application DPP's 4:4:4 pictures are 12 bits (RDD 59-1 Table 1)");
+            if (!full && bits != 10) return fail("Application DPP's 422 HQ pictures are 10 bits (RDD 59-1 Table 1)");
             if (!((W == 1920 && H == 1080) || (W == 3840 && H == 2160)))
                 return fail("Application DPP pictures are 1920 x 1080 or 3840 x 2160 (choose HD or UHD)");
             if (colourId == "p3d65-pq") return fail("Application DPP has Rec.709, Rec.2020 PQ and HLG, not P3-D65 PQ");
             if (fields) return fail("Application DPP pictures are progressive");
             if (!full && (ycbcr444 || fullRange)) return fail("Application DPP's 422 HQ is Y'CbCr 4:2:2 in narrow range (QE.1)");
-            if (full && ycbcr444) return fail("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 2), not Y'CbCr");
+            if (full && ycbcr444) return fail("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 1), not Y'CbCr");
+            if (full && colourId == "rec709") return fail("Application DPP's 4:4:4 is Rec.2020 PQ or HLG (RDD 59-1 Table 1 has no Rec.709 for it)");
             if (fullRange && colourId == "rec2020-hlg") return fail("Application DPP's HLG is in narrow range only (QE.1, RDD 59-1 5.2.2)");
             if (rateValue > 61) return fail("Application DPP masters run at up to 60 fps");
         }
@@ -1967,6 +2071,65 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         virtuals.push_back(std::move(vt));
     }
 
+    // Markers: event-based metadata (ST 2067-206), each of the programme's an event of a Simple Scheme document whose
+    // timeline is the composition's. A supplemental plays the earlier package's events again where they are the same,
+    // and carries only the stretches where they changed (an empty document where they were taken away).
+    int eventCount = 0, newEventCount = 0;
+    if (settings.events && (settings.application != 2 || edition >= 2026)) {
+        const std::vector<ImfEvent> events = imfEventsOfMarkers(s.markers, first, programme, frames);
+        eventCount = int(events.size());
+        const ImfVirtualTrack* was = nullptr;
+        for (const ImfVirtualTrack& t : old.tracks)
+            if (!was && isEventsSequence(t.kind)) was = &t;
+        if (!events.empty() || was) {
+            Virtual vt;
+            vt.kind = QString::fromLatin1(kEventsSequence);
+            vt.editRate = editRate;
+            vt.trackId = trackIdFor(was);
+            // Where the events differ from the earlier track's: all of it, unless that is at this edit rate and read.
+            std::vector<std::pair<int64_t, int64_t>> stretches{{0, frames}};
+            std::vector<ImfEvent> before;
+            if (was && was->kind == kEventsSequence && was->length() > 0 &&
+                std::all_of(was->resources.begin(), was->resources.end(),
+                            [&](const ImfResource& r) { return r.rateNum == rate.num && r.rateDen == rate.den; }) &&
+                playedEvents(*was, oldFiles, rate, before)) {
+                stretches = imfChangedEventStretches(before, events, frames);
+                if (was->length() < frames) {
+                    // (past the earlier track's end: carried here)
+                    if (!stretches.empty() && stretches.back().second >= was->length()) stretches.back().second = frames;
+                    else stretches.emplace_back(was->length(), frames);
+                }
+                vt.old = was;
+            }
+            std::vector<ImfEvent> mine;
+            for (const ImfEvent& e : events)
+                for (const auto& [from, to] : stretches)
+                    if (e.start >= from && e.start < to) mine.push_back(e);
+            int64_t at = 0;
+            for (const auto& [from, to] : stretches) {
+                if (from > at) addRun(vt.runs, true, at, from - at);
+                addRun(vt.runs, false, from, to - from);
+                at = to;
+            }
+            if (at < frames) addRun(vt.runs, true, at, frames - at);
+            if (!stretches.empty()) {
+                // (the Data Track "a large value" long, ST 2067-206 8.5: a day of edit units, or the composition)
+                const int64_t span = std::max<int64_t>(frames, 86400 * int64_t(rate.num) / int64_t(std::max<uint32_t>(1, rate.den)));
+                const size_t fileIndex = ownFile("EVENTS", vt.kind);
+                dcp::ImfTimedEventsWriter writer;
+                if (!writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, &err) ||
+                    !writer.write(imfEventsDocument(mine, rate.num, rate.den), span, "text/xml", {kImfMarkerScheme, kImfSimpleScheme}, &err) ||
+                    !writer.close(&err))
+                    return fail(err);
+                own[fileIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { timedEventsDescriptor(x, writer); });
+                vt.ownFile = int(fileIndex);
+                vt.ownDuration = span;
+                newEventCount = int(mine.size());
+            }
+            virtuals.push_back(std::move(vt));
+        }
+    }
+
     // The picture: the frames to code (all, or a supplemental's changed ones), several encoding at once.
     dcp::ImfColour colour;
     if (spec) {
@@ -2271,6 +2434,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                                 .arg(runSeconds / 3600, 2, 10, QLatin1Char('0'))
                                 .arg(runSeconds / 60 % 60, 2, 10, QLatin1Char('0'))
                                 .arg(runSeconds % 60, 2, 10, QLatin1Char('0'));
+    const Virtual* eventsTrack = nullptr;
+    for (const Virtual& v : virtuals)
+        if (v.kind == kEventsSequence) eventsTrack = &v;
     const bool cplOk = writeXml(cplFile, [&](QXmlStreamWriter& x) {
         x.writeStartElement("CompositionPlaylist");
         x.writeDefaultNamespace("http://www.smpte-ra.org/schemas/2067-3/2016");
@@ -2280,6 +2446,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (settings.immersive) x.writeNamespace(QString::fromLatin1(kIabNs), "iab");
         if (settings.sadm) x.writeNamespace(QString::fromLatin1(kSadmNs), "imfsadm");
         if (settings.adm) x.writeNamespace(QString::fromLatin1(kAdmNs), "imfadm");
+        if (eventsTrack) {
+            x.writeNamespace(QString::fromLatin1(kEventsSequenceNs), "imfses");
+            x.writeNamespace(QString::fromLatin1(kEventsCplNs), "imfebm");
+        }
         x.writeTextElement("Id", urn(cplId));
         text(x, "Annotation", title);
         x.writeTextElement("IssueDate", issued);
@@ -2309,12 +2479,13 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeTextElement("EditRate", editRate);
         x.writeTextElement("TotalRunningTime", running);
         x.writeStartElement("ExtensionProperties");
-        // (HTJ2K pictures came with the 2023 edition)
-        x.writeTextElement("cc:ApplicationIdentification", aces        ? kApp5
-                                                           : dpp       ? kAppDpp
-                                                           : proresApp ? kAppProRes
-                                                           : htj2k     ? "http://www.smpte-ra.org/ns/2067-21/2023"
-                                                                   : "http://www.smpte-ra.org/ns/2067-21/2021");
+        // (Application #2E: ST 2067-21:2026's identification, or the 2021 one, which the 2023 edition's HTJ2K pictures
+        // kept)
+        x.writeTextElement("cc:ApplicationIdentification", aces             ? kApp5
+                                                           : dpp            ? kAppDpp
+                                                           : proresApp      ? kAppProRes
+                                                           : edition >= 2026 ? kApp2E2026
+                                                                            : kApp2E2021);
         // Each ADM virtual track's parameters: Operational Mode A (every track file holds the whole programme).
         for (const Virtual& v : virtuals) {
             const bool sadm = v.kind == "MGASADMSignalSequence";
@@ -2324,6 +2495,18 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             x.writeTextElement(ns, "Id", urn(dcp::newUuid()));
             x.writeTextElement(ns, "TrackId", v.trackId);
             x.writeTextElement(ns, sadm ? "MGASADMOperationalMode" : "ADMOperationalMode", ns + "#Operational-Mode-A");
+            x.writeEndElement();
+        }
+        // The markers' virtual track's parameters (ST 2067-206 9.2.3): the picture, which its events mark.
+        if (eventsTrack) {
+            const QString ns = QString::fromLatin1(kEventsCplNs);
+            x.writeStartElement(ns, "TimedEventsVirtualTrackParameterSet");
+            x.writeTextElement(ns, "Id", urn(dcp::newUuid()));
+            x.writeTextElement(ns, "TrackId", eventsTrack->trackId);
+            x.writeStartElement(ns, "TrackRelationship");
+            x.writeTextElement(ns, "RelatedTrackId", virtuals.front().trackId);
+            x.writeTextElement(ns, "RelationshipKind", QString::fromLatin1(kMarksRelationship));
+            x.writeEndElement();
             x.writeEndElement();
         }
         x.writeEndElement();
@@ -2336,6 +2519,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             if (virtuals[i].kind == "IABSequence") x.writeStartElement(QString::fromLatin1(kIabNs), virtuals[i].kind);
             else if (virtuals[i].kind == "MGASADMSignalSequence") x.writeStartElement(QString::fromLatin1(kSadmNs), virtuals[i].kind);
             else if (virtuals[i].kind == "ADMAudioSequence") x.writeStartElement(QString::fromLatin1(kAdmNs), virtuals[i].kind);
+            else if (virtuals[i].kind == kEventsSequence) x.writeStartElement(QString::fromLatin1(kEventsSequenceNs), virtuals[i].kind);
             else x.writeStartElement("cc:" + virtuals[i].kind);
             x.writeTextElement("Id", urn(dcp::newUuid()));
             x.writeTextElement("TrackId", virtuals[i].trackId);
@@ -2450,6 +2634,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         result->trackFiles.clear();
         for (const Own& f : own) result->trackFiles.push_back(QDir(folder).filePath(f.file).toStdString());
         result->application = settings.application;
+        result->edition = edition;
+        result->events = eventCount;
+        result->newEvents = newEventCount;
         result->prores = proresApp ? prores::profileName(proresProfile) : std::string();
         result->fields = fields == 1 ? "tff" : fields == 2 ? "bff" : "";
         result->ycbcr444 = ycbcr444;
@@ -2518,9 +2705,9 @@ namespace {
 // What RDD 45 asks of an Application ProRes picture track file, as read: its profile, descriptor, size and rate
 // (Table 1: sampling, components, frame structure, quantization, colour and depth together), RDD 44's five-byte lengths
 // and body partitions of no more than 10.01 seconds, all but the last as long, separate fields as Table 6 has them, no
-// alpha (5.2.1), and every frame's header as the descriptor and Table 3 have it. Application DPP (RDD 59-1) narrows
-// that: 422 HQ, 4444 or 4444 XQ (Table 4) at 1920 x 1080 or 3840 x 2160, progressive, at up to 60 fps, 4:2:2 at 10 bits
-// and 4:4:4 R'G'B' at 12 (Table 2), not P3-D65, HLG in narrow range only (5.2.2).
+// alpha (5.2.1), and every frame's header as the descriptor and Table 3 have it. Application DPP (RDD 59-1:2022) narrows
+// that: 422 HQ, 4444 or 4444 XQ (Table 3) at 1920 x 1080 or 3840 x 2160, progressive, at up to 60 fps, 4:2:2 at 10 bits
+// and 4:4:4 R'G'B' at 12, not in Rec.709 (Table 1), not P3-D65, HLG in narrow range only (5.2.2).
 std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const ImfComposition& comp, const std::function<bool(int64_t bytes)>& read,
                                           bool& stopped) {
     std::vector<std::string> out;
@@ -2529,7 +2716,7 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
     if (profile == 0) return {"its picture coding label is not a ProRes profile"};
     if (profile == 1) out.push_back("it is ProRes 422 Proxy, which Application ProRes does not take");
     if (dpp && profile != 4 && profile != 5 && profile != 6)
-        out.push_back("it is " + prores::profileTitle(profile) + "; Application DPP takes 422 HQ, 4444 and 4444 XQ (RDD 59-1 Table 4)");
+        out.push_back("it is " + prores::profileTitle(profile) + "; Application DPP takes 422 HQ, 4444 and 4444 XQ (RDD 59-1 Table 3)");
     if (!comp.prores.empty() && prores::profileName(profile) != comp.prores)
         out.push_back("it is " + prores::profileTitle(profile) + " and the composition's first picture " + prores::profileTitle(prores::profileOf(comp.prores)) +
                       " (a main image virtual track keeps one profile)");
@@ -2541,7 +2728,7 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
         out.push_back("its frame layout (" + std::to_string(layout) + ") is neither full frames nor separate fields (segmented frames are not taken)");
     if (!full && rgb) out.push_back("4:2:2 ProRes is Y'CbCr, described by a CDCI descriptor, not RGBA");
     if (full && !rgb && (W > 1920 || H > 1080)) out.push_back("4:4:4 Y'CbCr is only up to 1920 x 1080");
-    if (full && !rgb && dpp) out.push_back("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 2), described by an RGBA descriptor");
+    if (full && !rgb && dpp) out.push_back("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 1), described by an RGBA descriptor");
     if (!full && (W > 3840 || H > 2160)) out.push_back("4:2:2 pictures are at most 3840 x 2160");
     if (W > 4096 || H > 3112 || W <= 0 || H <= 0) out.push_back("pictures are 1 to 4096 x 1 to 3112");
     if (dpp && !((W == 1920 && H == 1080) || (W == 3840 && H == 2160))) out.push_back("Application DPP pictures are 1920 x 1080 or 3840 x 2160");
@@ -2567,7 +2754,7 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
     // separate fields (the stored height a field's: each frame's header, which gives the frame's, is held to twice it
     // below), DisplayF2Offset as the frames' interlace_mode (RDD 44 Table 6).
     if (interlaced) {
-        if (dpp) out.push_back("Application DPP pictures are progressive (RDD 59-1 Table 2)");
+        if (dpp) out.push_back("Application DPP pictures are progressive (RDD 59-1 Table 1)");
         if (full) out.push_back("interlaced pictures are 4:2:2");
         if (W > 1920 || H > 1080) out.push_back("interlaced pictures are at most 1920 x 1080");
         if (!((num == 25 && den == 1) || (num == 30 && den == 1) || (num == 30000 && den == 1001)))
@@ -2580,8 +2767,9 @@ std::vector<std::string> checkProResTrack(const dcp::ImfTrackReader& r, const Im
     const int bits = r.componentBits();
     if (bits != 8 && bits != 10 && bits != 12) out.push_back("its component depth (" + std::to_string(bits) + ") is not 8, 10 or 12 bits");
     else if (bits == 8 && comp.colour != "rec709") out.push_back("8-bit pictures are Rec.709 (COLOR.1 to COLOR.3) only");
-    if (dpp && !full && bits != 10) out.push_back("Application DPP's 4:2:2 is 10 bits (RDD 59-1 Table 2)");
-    if (dpp && full && bits != 12) out.push_back("Application DPP's 4:4:4 is 12 bits (RDD 59-1 Table 2)");
+    if (dpp && !full && bits != 10) out.push_back("Application DPP's 4:2:2 is 10 bits (RDD 59-1 Table 1)");
+    if (dpp && full && bits != 12) out.push_back("Application DPP's 4:4:4 is 12 bits (RDD 59-1 Table 1)");
+    if (dpp && full && comp.colour == "rec709") out.push_back("Application DPP's 4:4:4 is not Rec.709 (RDD 59-1 Table 1 has no COLOR.3 for it)");
     if (bits >= 8 && bits <= 12) {
         const int scale = 1 << (bits - 8);  // (QE.1: 16 to 235 in eight bits)
         const bool qe1 = r.componentLow() == 16 * scale && r.componentHigh() == 235 * scale;
@@ -2748,8 +2936,8 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         }
         const ImfVirtualTrack* picture = comp.picture();
         if (!picture) issue(c.path + " has no picture");
-        // Application DPP (RDD 59-1 7 and 9.1): one identification, Table 5's, and a content kind, in the DPP's scope
-        // when it is one of Table 6's.
+        // Application DPP (RDD 59-1 7 and 9.1): one identification, Table 4's, and a content kind, in the DPP's scope
+        // when it is one of Table 5's.
         if (comp.application == 59) {
             int ids = 0;
             for (const auto& [path, text] : cplItems)
@@ -2759,9 +2947,121 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
             else if (dppKind(comp.contentKind) && comp.contentKindScope != kDppKindScope)
                 issue(c.path + " gives the content kind " + QString::fromStdString(comp.contentKind) + " outside the DPP's scope (RDD 59-1 9.1)");
         }
+        // Application #2E's sizes: to 8192 x 6224 (the 8K profiles) in ST 2067-21:2026, to 4096 x 3112 before it.
+        if (comp.application == 2 && comp.width > 0) {
+            const bool eightK = comp.edition >= 2026;
+            if (comp.width > (eightK ? 8192 : 4096) || comp.height > (eightK ? 6224 : 3112))
+                issue(QStringLiteral("%1's picture is %2 x %3, larger than Application #2E's %4 edition allows")
+                          .arg(c.path).arg(comp.width).arg(comp.height).arg(eightK ? 2026 : 2021));
+            if (!eightK && comp.rsiz != kHtj2kRsiz && ((comp.rsiz & 0xff00) == 0x0600 || (comp.rsiz & 0xff00) == 0x0900))
+                issue(c.path + " codes its picture in an 8K profile, which only Application #2E's 2026 edition (ST 2067-21:2026) has");
+        }
+        // Timed events' parameter sets (ST 2067-206 9.2.3): by the track they are of, the tracks it relates to.
+        std::map<std::string, std::vector<std::string>> related;
+        std::map<std::string, int> parameterSets;
+        {
+            std::string of;
+            for (const auto& [path, text] : cplItems) {
+                if (path.endsWith("ExtensionProperties/TimedEventsVirtualTrackParameterSet")) of.clear();
+                else if (path.endsWith("ExtensionProperties/TimedEventsVirtualTrackParameterSet/TrackId")) {
+                    of = packageBareId(text).toStdString();
+                    ++parameterSets[of];
+                    related[of];
+                } else if (path.endsWith("TimedEventsVirtualTrackParameterSet/TrackRelationship/RelatedTrackId") && !of.empty())
+                    related[of].push_back(packageBareId(text).toStdString());
+            }
+        }
         std::set<std::string> seen;
         for (const ImfVirtualTrack& t : comp.tracks) {
             const QString kind = QString::fromStdString(t.kind);
+            if (isEventsSequence(t.kind)) {
+                // Timed events (ST 2067-206): each resource a Timed Events Track File of the package or one beside it,
+                // the same encoding, type and schemes along the track, a Simple Scheme document (Annex A) at the
+                // resource's edit rate; media events' rate a whole multiple of the composition's, the track related to
+                // others of the composition by its parameter set.
+                const bool media = t.kind == kEventsSequence;
+                if (picture && !t.resources.empty()) {
+                    const ImfResource& r0 = t.resources.front();
+                    const int64_t want = picture->length() * int64_t(r0.rateNum) * int64_t(comp.rateDen) / (int64_t(r0.rateDen) * int64_t(comp.rateNum));
+                    if (t.length() != want) issue(QStringLiteral("A %1 lasts %2 edit units; the picture lasts %3").arg(kind).arg(t.length()).arg(want));
+                }
+                const auto set = related.find(t.id);
+                if (parameterSets[t.id] > 1) issue(QStringLiteral("The %1 %2 has more than one parameter set").arg(kind, QString::fromStdString(t.id)));
+                if (media && (set == related.end() || set->second.empty()))
+                    issue(QStringLiteral("The %1 %2 names no virtual track its events relate to (ST 2067-206 9.2.3)").arg(kind, QString::fromStdString(t.id)));
+                if (set != related.end()) {
+                    std::set<std::string> once;
+                    for (const std::string& o : set->second) {
+                        if (!once.insert(o).second) issue(QStringLiteral("The %1 %2 relates to %3 twice").arg(kind, QString::fromStdString(t.id), QString::fromStdString(o)));
+                        if (o == t.id || std::none_of(comp.tracks.begin(), comp.tracks.end(), [&](const ImfVirtualTrack& v) { return v.id == o; }))
+                            issue(QStringLiteral("The %1 %2 relates to %3, which is no other virtual track of the composition").arg(kind, QString::fromStdString(t.id), QString::fromStdString(o)));
+                    }
+                }
+                bool firstFile = true;
+                std::string encoding, mime, schemes;
+                for (const ImfResource& r : t.resources) {
+                    const QString id = QString::fromStdString(r.trackFile);
+                    if (r.encoding.empty() || !comp.descriptors.count(r.encoding))
+                        issue(QStringLiteral("%1 %2 has no essence descriptor in %3").arg(kind, id, c.path));
+                    if (r.intrinsic >= 0 && r.entry + r.duration > r.intrinsic) issue(QStringLiteral("%1 %2 plays past its end").arg(kind, id));
+                    if (media && (uint64_t(r.rateNum) * comp.rateDen) % (uint64_t(r.rateDen) * comp.rateNum) != 0)
+                        issue(QStringLiteral("%1 %2 plays at %3/%4, no whole multiple of the composition's edit rate").arg(kind, id).arg(r.rateNum).arg(r.rateDen));
+                    if (!seen.insert(r.trackFile).second) continue;
+                    const bool inside = assets.count(id) && !assets[id].hash.isEmpty();
+                    const auto out = beside.find(r.trackFile);
+                    if (!inside && out == beside.end()) {
+                        issue(QStringLiteral("%1 %2 in %3 is neither in the package nor in the packages beside it").arg(kind, id, c.path));
+                        continue;
+                    }
+                    const QString name = inside ? assets[id].path : QFileInfo(QString::fromStdString(out->second)).fileName();
+                    const std::string file = inside ? dir.filePath(assets[id].path).toStdString() : out->second;
+                    if (!inside && !r.hash.empty()) {
+                        const QString hash = packageFileHash(QString::fromStdString(file), nullptr, reading);
+                        if (stopped) {
+                            issue("Stopped");
+                            return issues;
+                        }
+                        if (hash != QString::fromStdString(r.hash)) {
+                            issue(QStringLiteral("%1 (beside the package) does not match its hash in %2").arg(QString::fromStdString(file), c.path));
+                            continue;
+                        }
+                    }
+                    dcp::ImfTrackReader reader;
+                    std::string xml;
+                    if (!reader.open(file, &err)) {
+                        issue(QString::fromStdString(err));
+                        continue;
+                    }
+                    if (reader.kind() != dcp::ImfTrackReader::Kind::TimedEvents) {
+                        issue(QStringLiteral("%1 is not the timed events its %2 plays").arg(name, kind));
+                        continue;
+                    }
+                    if (r.intrinsic >= 0 && reader.containerDuration() >= 0 && reader.containerDuration() != r.intrinsic)
+                        issue(QStringLiteral("%1 has %2 edit units; the composition says %3").arg(name).arg(reader.containerDuration()).arg(r.intrinsic));
+                    if (reader.rate().num != r.rateNum || reader.rate().den != r.rateDen)
+                        issue(QStringLiteral("%1 is at %2/%3; its resource plays it at %4/%5").arg(name).arg(reader.rate().num).arg(reader.rate().den).arg(r.rateNum).arg(r.rateDen));
+                    const QStringList uris = QString::fromStdString(reader.eventSchemes()).split(' ', Qt::SkipEmptyParts);
+                    if (!uris.contains(QLatin1String(kImfSimpleScheme)))
+                        issue(QStringLiteral("%1 does not list the Simple Scheme among its event schemes").arg(name));
+                    if (QSet<QString>(uris.begin(), uris.end()).size() != uris.size()) issue(QStringLiteral("%1 lists an event scheme twice").arg(name));
+                    if (reader.textMime() != "text/xml" || reader.textEncoding() != "UTF-8")
+                        issue(QStringLiteral("%1 is not a Simple Scheme XML document (text/xml, UTF-8), which Montage reads").arg(name));
+                    if (!firstFile && (reader.textEncoding() != encoding || reader.textMime() != mime || reader.eventSchemes() != schemes))
+                        issue(QStringLiteral("%1's encoding, type or schemes differ from the rest of its %2's (ST 2067-206 9.2.2)").arg(name, kind));
+                    firstFile = false;
+                    encoding = reader.textEncoding(), mime = reader.textMime(), schemes = reader.eventSchemes();
+                    if (!reader.text(xml, &err)) {
+                        issue(QStringLiteral("%1 holds no document Montage reads: %2").arg(name, QString::fromStdString(err)));
+                        continue;
+                    }
+                    for (const std::string& problem : checkImfEventsDocument(xml)) issue(QStringLiteral("%1: %2").arg(name, QString::fromStdString(problem)));
+                    std::vector<ImfEvent> events;
+                    uint32_t num = 0, den = 0;
+                    if (parseImfEventsDocument(xml, events, num, den) && media && uint64_t(num) * r.rateDen != uint64_t(den) * r.rateNum)
+                        issue(QStringLiteral("%1's document is at %2 %3; its resource plays it at %4 %5").arg(name).arg(num).arg(den).arg(r.rateNum).arg(r.rateDen));
+                }
+                continue;
+            }
             const bool image = t.kind == "MainImageSequence", sound = t.kind == "MainAudioSequence", iab = t.kind == "IABSequence";
             const bool mga = t.kind == "MGASADMSignalSequence", admSound = t.kind == "ADMAudioSequence";
             const bool text = isTextSequence(kind);
@@ -3075,8 +3375,10 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
             if (d == 3 && path[1] == "ExtensionProperties" && name == "ApplicationIdentification") {
                 take();
                 if (value.contains("http://www.smpte-ra.org/ns/2067-50/")) out.application = 5;
-                else if (value.contains("http://www.smpte-ra.org/ns/2067-21/")) out.application = 2;
-                else if (value.contains("http://schema.thedpp.com/imf/RDD59-1/") || value.contains(QLatin1String(kAppDppBefore))) out.application = 59;
+                else if (value.contains("http://www.smpte-ra.org/ns/2067-21/")) {
+                    out.application = 2;
+                    out.edition = value.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts).contains(QLatin1String(kApp2E2026)) ? 2026 : 2021;
+                } else if (value.contains("http://schema.thedpp.com/imf/RDD59-1/") || value.contains(QLatin1String(kAppDppBefore))) out.application = 59;
                 else if (value.contains("tag:apple.com,2017:imf:rdd45:")) out.application = 45;
                 else out.application = 0;
             } else if (d == 2 && name == "ContentKind") {
@@ -3578,6 +3880,24 @@ ImportResult importImf(Project& p, const std::string& path, const MediaProber& p
         }
         normalizeCaptions(track.captions);
         b.sequence().captionTracks.push_back(std::move(track));
+    }
+    // Timed events (ST 2067-206 Simple Scheme XML): the sequence's markers, where the composition plays them.
+    {
+        TrackFiles events(files);
+        bool any = false;
+        for (const ImfVirtualTrack& t : c.tracks) {
+            if (!isEventsSequence(t.kind)) continue;
+            std::vector<ImfEvent> played;
+            std::string err;
+            if (!playedEvents(t, events, {c.rateNum, c.rateDen}, played, &err)) {
+                b.warn("The timed events of track " + t.id + " could not be read" + (err.empty() ? std::string() : ": " + err));
+                continue;
+            }
+            for (const ImfEvent& e : played) b.sequence().markers.push_back(markerOfImfEvent(e, e.start, e.end - e.start));
+            any = any || !played.empty();
+        }
+        if (any)
+            std::stable_sort(b.sequence().markers.begin(), b.sequence().markers.end(), [](const Marker& x, const Marker& y) { return x.t < y.t; });
     }
     return b.finish();
 }

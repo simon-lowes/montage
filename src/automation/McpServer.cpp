@@ -12838,12 +12838,17 @@ void McpServer::Impl::addTools() {
 
     add("montage_export_imf", "Export an IMF master",
         "Make an IMF (Interoperable Master Format) package of the active sequence, as Netflix, Amazon, Disney+ and "
-        "broadcasters ask for: Application #2E (SMPTE ST 2067-21:2021), JPEG 2000 pictures in the IMF profiles (lossless "
+        "broadcasters ask for: Application #2E (SMPTE ST 2067-21:2026, or `edition` 2021 for the earlier identification as "
+        "before), JPEG 2000 pictures in the IMF profiles (lossless "
         "by default) as full-range RGB 4:4:4 of 10 or 12 bits in Rec.709, P3-D65 PQ, Rec.2020 PQ or Rec.2020 HLG (HDR "
         "with mastering display metadata), 24-bit 48 kHz sound in stereo, 5.1 or 7.1 DS with multichannel labels, a "
         "composition playlist with the essence descriptors, packing list with hashes and asset map, in a new folder under "
         "`folder`. The package is checked when done (as montage_verify_imf). `htj2k` codes the pictures as High-Throughput "
-        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode. Versions: `sounds` makes a sound "
+        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode; the 2026 edition takes pictures to "
+        "8192 x 6224 (`size` 8k: 7680 x 4320) in its 8K profiles. The sequence's markers (`events`, on by default; not "
+        "with edition 2021) go in as event-based metadata (ST 2067-206: a Simple Scheme timed events track related to "
+        "the picture), each with its frame, duration, name, comment, colour and kind, and come back as markers when the "
+        "package is imported; a supplemental carries only the events that changed. Versions: `sounds` makes a sound "
         "track per language and kind (each mixed from the roles it hears), the caption tracks become IMSC 1.1 subtitles, "
         "captions or forced narratives (`texts`), and `supplement_of` (an earlier package's folder) makes a supplemental "
         "package carrying only what changed since it: the composition plays the earlier package's track files where the "
@@ -12860,13 +12865,15 @@ void McpServer::Impl::addTools() {
         "4444 as Y'CbCr 4:4:4 (to 1920 x 1080, Rec.709) and `full_range` codes 4:4:4 R'G'B' over the full range (QE.2). "
         "`application` \"dpp_prores\" makes a broadcaster's master (Application DPP (ProRes), SMPTE RDD 59-1, as UK and "
         "North American broadcasters ask for it): 422 HQ at 1920 x 1080 or 3840 x 2160 (`size` hd or uhd), progressive, Rec.709, Rec.2020 PQ or "
-        "HLG, with the DPP's identification and content kind (`kind` programme by default: programme, commercial, "
+        "HLG (4444 and 4444 XQ at 12 bits in Rec.2020 PQ or HLG only), with the DPP's identification and content kind (`kind` programme by default: programme, commercial, "
         "sponsorship, infomercial, presentation_event, promotion or music_video). Its 4:4:4 is 12 bits, which FFmpeg's "
         "ProRes encoder does not make, and RDD 45 takes no alpha, so neither is offered.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test","programme","commercial","sponsorship","infomercial","presentation_event","music_video"],"description":"Default feature (dpp_prores: programme; the last six are Application DPP's only)"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
-            "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
+            "size":{"type":"string","enum":["sequence","hd","uhd","4k","8k"],"default":"sequence","description":"8k (7680 x 4320): Application #2E to the 2026 edition"},
+            "edition":{"type":"integer","enum":[2026,2021],"default":2026,"description":"Application #2E: ST 2067-21:2026's identification (8K, timed events), or the 2021 one, the package as before (a supplemental keeps the earlier package's)"},
+            "events":{"type":"boolean","default":true,"description":"The sequence's markers as ST 2067-206 timed events (not with edition 2021)"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
             "lossless":{"type":"boolean","default":true},"htj2k":{"type":"boolean","default":false},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
             "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
@@ -12939,6 +12946,9 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
+            st.edition = a.value("edition").toInt(2026);
+            if (st.edition != 2026 && st.edition != 2021) throw ArgError{"\"edition\" is 2026 or 2021"};
+            st.events = a.value("events").toBool(true);
             if (a.value("application").isString()) {
                 const QString app = a.value("application").toString();
                 if (app != "prores" && app != "dpp_prores") throw ArgError{"\"application\" is 2, 5, \"prores\" or \"dpp_prores\""};
@@ -12988,7 +12998,9 @@ void McpServer::Impl::addTools() {
                                   {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
-                                  {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+                                  {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application},
+                                  {"events", r.events}, {"new_events", r.newEvents}};
+            if (r.application == 2) out["edition"] = r.edition;
             if (r.application == 45 || r.application == 59) {
                 out["application"] = r.application == 45 ? "prores" : "dpp_prores";
                 out["prores_profile"] = QString::fromStdString(r.prores);
@@ -13014,7 +13026,8 @@ void McpServer::Impl::addTools() {
         "Check an IMF package folder: asset map, every file present at its size, packing list hashes, each composition's "
         "resources in the package with their essence descriptors and durations, the Application #2E or #5 identification, "
         "picture track files JPEG 2000 in an IMF profile (or ACES OpenEXR images, with their target frames) with the right number of frames, sound 24-bit 48 kHz with the "
-        "right number of samples, timed text that reads. A supplemental package's track files from earlier packages are "
+        "right number of samples, timed text that reads, timed events (ST 2067-206) as a Simple Scheme document with its "
+        "parameter set, Application #2E's sizes and profiles by its edition. A supplemental package's track files from earlier packages are "
         "looked for in the folders beside it. Returns the problems found (none: it passed).",
         R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
             const QString folder = absolute(need(a, "folder"));

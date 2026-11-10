@@ -173,6 +173,7 @@ add_library(montage_engine STATIC
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
   render/Imf.h render/Imf.cpp
+  render/ImfEvents.h render/ImfEvents.cpp
   render/ProRes.h render/ProRes.cpp
   render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp

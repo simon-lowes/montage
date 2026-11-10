@@ -3105,6 +3105,67 @@ std::vector<uint8_t> ImfTimedTextWriter::headerMetadata(int64_t duration) const 
 
 std::vector<uint8_t> ImfTimedTextWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
 
+// ---- IMF timed events (ST 2067-206) -------------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kTimedEventsElement = "060e2b34010201010d01030117011001";     // TimedEventsDataElement (8.2)
+constexpr const char* kTimedEventsDescriptor = "060e2b34025301010d01010101018113";  // TimedEventsTextDescriptor (Table 2)
+const PrimerEntry kTimedEventsPrimer[] = {
+    {0xfffe, "060e2b340101010e0403030301000000"},  // TextCharacterEncoding
+    {0xfffd, "060e2b340101010e0403030302000000"},  // TextMIMEType
+    {0xfffc, "060e2b340101010e0403030303000000"},  // EventSchemeURIs
+};
+
+}  // namespace
+
+bool ImfTimedEventsWriter::write(const std::string& document, int64_t duration, const std::string& mime, const std::vector<std::string>& schemes,
+                                 std::string* error) {
+    duration_ = duration;
+    mime_ = mime;
+    schemes_.clear();
+    for (const std::string& s : schemes) schemes_ += (schemes_.empty() ? "" : " ") + s;
+    return writeElement(ul(kTimedEventsElement).data(), reinterpret_cast<const uint8_t*>(document.data()), document.size(), error);
+}
+
+std::array<uint8_t, 16> ImfTimedEventsWriter::essenceContainer() const { return ul(kContainer); }
+
+std::vector<uint8_t> ImfTimedEventsWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kTimedEventsPrimer), std::end(kTimedEventsPrimer));
+    Bytes out = primerOf(entries);
+    // (the file package's data track numbered by the element key's last four bytes, 8.2)
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kContainer, kDataDef, "Data Track", 0x17011001,
+                              "File Package: SMPTE ST 2067-206 clip wrapping of event-based, text-based metadata"));
+    // A Generic Data Essence Descriptor's items without its DataEssenceCoding (8.6.2), and the three of its own.
+    Set s;
+    s.uuid(0x3c0a, ids_[kDescriptor]);
+    s.u32(0x3006, 1);
+    s.rational(0x3001, rate_.num, rate_.den);
+    s.i64(0x3002, duration);
+    s.label(0x3004, kContainer);
+    s.text(0xfffe, "UTF-8");
+    s.text(0xfffd, mime_);
+    s.text(0xfffc, schemes_);
+    putBytes(out, setKlv(kTimedEventsDescriptor, s));
+    return out;
+}
+
+std::vector<uint8_t> ImfTimedEventsWriter::indexSegments() const {
+    // One segment: an edit unit byte count of 0, no delta entries, one entry at offset 0 (8.4), an index duration of 1.
+    Set s;
+    indexBase(s, rate_, 0, 1, 0);
+    Bytes entries;
+    put32(entries, 1);
+    put32(entries, 11);
+    put8(entries, 0);
+    put8(entries, 0);
+    put8(entries, 0x80);
+    put64(entries, 0);
+    s.item(0x3f0a, entries);
+    return klv(ul("060e2b34025301010d01020101100100"), s.body);
+}
+
 // ---- Reading IMF track files --------------------------------------------------------------------------------------
 
 namespace {
@@ -3148,6 +3209,10 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     chna_.clear();
     axmlStream_ = 0;
     axmlAt_ = axmlSize_ = 0;
+    textEncoding_.clear();
+    textMime_.clear();
+    eventSchemes_.clear();
+    containerDuration_ = -1;
     std::map<uint16_t, std::string> primer;  // local tags and the labels they stand for (hex, the version byte as 00)
     // An item of a set by its label, through the primer (its dynamic tags differ between writers).
     auto item = [&](const std::map<uint16_t, Bytes>& set, const char* hex) -> const Bytes* {
@@ -3164,7 +3229,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     uint32_t stream = 0;                                            // the generic stream partition read last
     // Every KLV in turn: the header's sets (the file package's id, the sound's channels) and the essence elements
     // (06.0e.2b.34.01.02.01.01.0d.01.03.01, byte 12 the item: 15 picture, 16 sound, 17 data).
-    bool sound = false, text = false, iab = false, mga = false;
+    bool sound = false, text = false, iab = false, mga = false, events = false;
     for (uint64_t at = 0; at + 17 <= file.size;) {
         uint8_t key[16];
         uint64_t length = 0, head = 0;
@@ -3192,12 +3257,21 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             stream = uint32_t(beOf(Bytes(v.begin() + 60, v.begin() + 64)));
         } else if (std::memcmp(key, ul(kStreamElement).data(), 13) == 0) {
             if (stream) streamData[stream] = {value, length};
-        } else if (std::memcmp(key, set, 6) == 0 && key[14] == 0x81 && length < (1u << 20) && (key[15] == 0x06 || key[15] == 0x0d || key[15] == 0x0f)) {
-            // MGA's sound descriptor (ST 2127-1), and ST 2131's RIFF chunk definitions and ADM channel mappings.
+        } else if (std::memcmp(key, set, 6) == 0 && key[14] == 0x81 && length < (1u << 20) &&
+                   (key[15] == 0x06 || key[15] == 0x0d || key[15] == 0x0f || key[15] == 0x13)) {
+            // MGA's sound descriptor (ST 2127-1), ST 2131's RIFF chunk definitions and ADM channel mappings, and ST
+            // 2067-206's TimedEventsTextDescriptor.
             Bytes v(static_cast<size_t>(length));
             if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
             const auto it = items(v);
-            if (key[15] == 0x06) {
+            if (key[15] == 0x13) {
+                if (const Bytes* e = item(it, "060e2b340101010e0403030301000000")) textEncoding_ = asciiOfUtf16(*e);
+                if (const Bytes* m = item(it, "060e2b340101010e0403030302000000")) textMime_ = asciiOfUtf16(*m);
+                if (const Bytes* u = item(it, "060e2b340101010e0403030303000000")) eventSchemes_ = asciiOfUtf16(*u);
+                if (auto d = it.find(0x3002); d != it.end() && d->second.size() == 8) containerDuration_ = int64_t(std::min<uint64_t>(beOf(d->second), uint64_t(1) << 40));
+                if (auto r = it.find(0x3001); r != it.end() && r->second.size() == 8)
+                    rate_ = EditRate{uint32_t(beOf(Bytes(r->second.begin(), r->second.begin() + 4))), uint32_t(beOf(Bytes(r->second.begin() + 4, r->second.end())))};
+            } else if (key[15] == 0x06) {
                 mga = true;
                 if (auto c = it.find(0x3d07); c != it.end() && c->second.size() == 4) channels_ = int(std::min<uint64_t>(beOf(c->second), 4096));
                 if (auto q = it.find(0x3d01); q != it.end() && q->second.size() == 4 && beOf(q->second) != 24) return fail(path + " is not 24-bit sound");
@@ -3276,6 +3350,8 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             } else if (key[12] == 0x16 || key[12] == 0x17) {
                 if (clipSize_ || sound || text) return fail(path + " is not clip-wrapped");
                 (key[12] == 0x16 ? sound : text) = true;
+                // (a TimedEventsDataElement: 0d.01.03.01.17.01.10, its last byte 01, or 00 as 8.2 lets readers take)
+                events = key[12] == 0x17 && key[13] == 0x01 && key[14] == 0x10;
                 clipAt_ = value;
                 clipSize_ = length;
             }
@@ -3403,7 +3479,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
         kind_ = Kind::Mga;
     } else if (!elements_.empty() && !sound && !text) kind_ = Kind::Picture;
     else if (sound && elements_.empty() && channels_ > 0 && channels_ <= (adm_ ? 128 : 64)) kind_ = Kind::Sound;  // (ADM: up to 128)
-    else if (text && elements_.empty()) kind_ = Kind::TimedText;
+    else if (text && elements_.empty()) kind_ = events ? Kind::TimedEvents : Kind::TimedText;
     else return fail(path + " is not an IMF track file Montage reads");
     if (adm_ && axmlStream_)
         if (const auto d = streamData.find(axmlStream_); d != streamData.end()) axmlAt_ = d->second.first, axmlSize_ = d->second.second;
@@ -3560,7 +3636,7 @@ bool ImfTrackReader::mgaFrame(int64_t index, std::vector<int32_t>* pcm, std::str
 
 bool ImfTrackReader::text(std::string& out, std::string* error) const {
     File file;
-    if (kind_ != Kind::TimedText || clipSize_ > (uint64_t(64) << 20) || !openRead(file, path_) || !file.seek(clipAt_)) {
+    if ((kind_ != Kind::TimedText && kind_ != Kind::TimedEvents) || clipSize_ > (uint64_t(64) << 20) || !openRead(file, path_) || !file.seek(clipAt_)) {
         if (error) *error = "Cannot read the timed text of " + path_;
         return false;
     }

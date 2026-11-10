@@ -1,4 +1,4 @@
-// Montage — IMF masters (SMPTE ST 2067, Application #2E as ST 2067-21:2021 has it): the Interoperable Master Package
+// Montage — IMF masters (SMPTE ST 2067, Application #2E as ST 2067-21:2026 has it): the Interoperable Master Package
 // Netflix, Amazon, Disney+, Apple and broadcasters ask for instead of a ProRes file (DaVinci Resolve Studio and Avid
 // Media Composer export it; Premiere and Final Cut need a third-party tool).
 //
@@ -20,6 +20,17 @@
 // with the new one, each reused stretch checked against the old package's frames), the sound where its samples
 // differ, timed text that is new; its composition plays the earlier packages' track files by id around them. An IMF
 // package, original or supplemental, can also be opened as a sequence.
+//
+// Editions: Application #2E is made to ST 2067-21:2026 (its identification http://www.smpte-ra.org/ns/2067-21/5ED,
+// pictures to 8192 x 6224 in the 8K IMF profiles), or, for services that ask for it, to the identification before it
+// (http://www.smpte-ra.org/ns/2067-21/2021, ST 2067-21:2023's Table 15; pictures to 4096 x 3112), made as before but
+// that HTJ2K pictures now go under it too (Montage wrote /2023, which no edition defines).
+//
+// Markers (ST 2067-206:2026): the sequence's markers within the master travel as event-based, text-based metadata
+// (render/ImfEvents.h), a Simple Scheme document in a Timed Events Track File on a SimpleSchemeMediaTimedEventsSequence
+// whose parameter set relates it to the picture; a supplemental carries only the events that changed (its composition
+// plays the earlier track file around them), and opening a package brings them back as markers. Application #2E to
+// the 2021 edition carries none.
 //
 // Archival masters (Application #5, ST 2067-50): the programme as ACES 2065-1, half-float OpenEXR frames (ST 2065-4)
 // wrapped frame by frame (ST 2065-5), graded (the grade in the pictures, in the working space's light) or ungraded (each
@@ -71,13 +82,15 @@ struct ImfText {
 struct ImfSettings {
     std::string title;
     // ST 2067-3 content kind: feature, episode, short, trailer, teaser, advertisement, test...; Application DPP also takes
-    // RDD 59-1 Table 6's (programme, commercial, sponsorship, infomercial, presentation_event, promotion, music_video),
+    // RDD 59-1 Table 5's (programme, commercial, sponsorship, infomercial, presentation_event, promotion, music_video),
     // written in the DPP's scope.
     std::string kind = "feature";
     std::string issuer = "Montage";
     std::string language = "en";   // the sound's and the annotations' (RFC 5646)
     std::string colour;            // "rec709", "p3d65-pq", "rec2020-pq", "rec2020-hlg"; empty: as the sequence is
-    std::string size = "sequence";  // "sequence", "hd" (1920 x 1080), "uhd" (3840 x 2160), "4k" (4096 x 2160)
+    // "sequence", "hd" (1920 x 1080), "uhd" (3840 x 2160), "4k" (4096 x 2160), "8k" (7680 x 4320: Application #2E to
+    // the 2026 edition)
+    std::string size = "sequence";
     int bits = 0;                  // 10 or 12 (0: 10 for SDR, 12 for HDR; ProRes 10, but Application DPP's 4:4:4 12)
     bool lossless = true;          // the reversible profiles; else lossy within megabitsPerSecond
     bool htj2k = false;            // High-Throughput JPEG 2000 (ST 2067-21:2023; lossless only): far faster to code and decode
@@ -97,8 +110,8 @@ struct ImfSettings {
     // The IMF application: 2 (#2E, JPEG 2000 in the colour above), 5 (#5, an archival master in ACES 2065-1, where the
     // colour, depth and coding above do not apply), 45 (Application ProRes, SMPTE RDD 45: ProRes pictures in the colour
     // above, in the profile below: 10 bits, or 12 with 4444 and 4444 XQ, which Montage's own encoder codes) or 59
-    // (Application DPP (ProRes), SMPTE RDD 59-1: 422 HQ at 10 bits, or 4444 or 4444 XQ R'G'B' at 12, at 1920 x 1080 or
-    // 3840 x 2160, progressive, Rec.709, Rec.2020 PQ or HLG).
+    // (Application DPP (ProRes), SMPTE RDD 59-1:2022: 422 HQ at 10 bits, or 4444 or 4444 XQ R'G'B' at 12, at 1920 x 1080
+    // or 3840 x 2160, progressive, Rec.709 (4:2:2 only), Rec.2020 PQ or HLG).
     int application = 2;
     // Application ProRes: the profile ("lt", "422", "hq" as 4:2:2 Y'CbCr; "4444", "4444xq" as 4:4:4 R'G'B'). 4:2:2
     // takes pictures to 3840 x 2160 in Rec.709, Rec.2020 PQ or HLG at up to 60 fps; 4:4:4 to 4096 x 3112 in any of the
@@ -115,6 +128,10 @@ struct ImfSettings {
     bool ycbcr444 = false;
     // Application ProRes: 4:4:4 R'G'B' over the full range (QE.2: 0 to the top code) rather than 64 to 940 (QE.1, scaled).
     bool fullRange = false;
+    // Application #2E: the edition of ST 2067-21 followed, 2026 or 2021 (a supplemental keeps the earlier package's).
+    int edition = 2026;
+    // The sequence's markers as ST 2067-206 timed events (not with Application #2E to the 2021 edition).
+    bool events = true;
     // Application #5: the grade in the pictures; false leaves it off.
     bool graded = true;
     // Application #5: sequence frames (within what is exported) also given as target frames.
@@ -145,6 +162,9 @@ struct ImfResult {
     uint16_t rsiz = 0;  // the JPEG 2000 profile the pictures declare
     std::string colour;
     int sounds = 0, texts = 0;   // virtual tracks
+    int edition = 0;             // Application #2E: the edition followed (2026 or 2021)
+    int events = 0;              // the events (markers) the composition plays, 0 with no timed events track
+    int newEvents = 0;           // ... those in the package's own track file (a supplemental's: those of the stretches that changed)
     bool supplemental = false;
     int64_t codedFrames = 0;     // pictures in the package's own track file (a supplemental's: those that changed)
     int64_t newSamples = 0;      // sample frames in its own sound track files
@@ -189,6 +209,7 @@ struct ImfComposition {
     // From its ApplicationIdentification: 2 for #2E, 5 for #5, 45 for ProRes, 59 for DPP (ProRes: RDD 59-1's, or TSP
     // 2121-1's before it), 0 for another.
     int application = 2;
+    int edition = 0;            // Application #2E: 2026 (ST 2067-21:2026's identification), 2021 (an earlier edition's)
     std::string prores;         // Application ProRes and DPP: the picture's profile (as ImfSettings::prores)
     std::string fields;         // ... and its descriptor's fields, components and range (as ImfSettings has them)
     bool ycbcr444 = false, fullRange = false;
@@ -207,6 +228,7 @@ std::map<std::string, std::string> imfTrackFiles(const std::string& folder);
 // Opens a composition (a CPL file, or a package folder: its latest) as a new sequence: the pictures on V1, each sound
 // virtual track on an audio track of its own (the first programme heard, the others muted), each timed text track as a
 // caption track, the track files found in its package and those beside it.
+// Timed events (ST 2067-206) come back as the sequence's markers.
 ImportResult importImf(Project& p, const std::string& path, const MediaProber& probe = {});
 // Whether `path` is an IMF package to open with importImf: a folder with an asset map, an asset map, or a composition
 // playlist.
@@ -220,8 +242,9 @@ bool imfFrameRateAllowed(const Sequence& s);
 // The same for a picture of width x height at `fps`; `canonical`, if given, receives the rate as IMF writes it
 // (24000/1001 rather than 48000/2002).
 bool imfFrameRateAllowed(Rational fps, int width, int height, Rational* canonical = nullptr);
-// The picture size for `size`, or false (with the reason) when it is too large for Application #2E.
-bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error = nullptr);
+// The picture size for `size` ("sequence", "hd", "uhd", "4k" or "8k", 7680 x 4320), or false (with the reason) when it
+// is too large: for Application #2E to `edition` 2026, 8192 x 6224; to 2021 (or 0, another application), 4096 x 3112.
+bool imfPictureSize(const Sequence& s, const std::string& size, int& width, int& height, std::string* error = nullptr, int edition = 2026);
 
 // The frames a master of `s` made with `settings` holds (its programme, padded at 29.97 and 59.94); 0 with `error` when
 // it cannot be made at that size and rate.
@@ -243,8 +266,11 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 // with the attributes ST 2065-4 requires, every target frame in its stream; ProRes: RDD 45's profiles, sizes, rates and
 // descriptors, every frame's header as the descriptor and Table 3 have it, RDD 44's partitions and five-byte lengths)
 // with as many frames as the composition says, the
-// sound 24-bit 48 kHz with as many samples, the timed text TTML. An empty list means it passed; `progress` may return
-// false to stop ("Stopped").
+// sound 24-bit 48 kHz with as many samples, the timed text TTML, Application #2E's pictures within its edition's
+// sizes and profiles (8K only to the 2026 edition), and timed events as ST 2067-206 has them (the track files'
+// descriptors, durations and rates, one encoding, MIME type and scheme along a virtual track, the Simple Scheme document as
+// Annex A has it at the resources' edit rate, the virtual track's parameter set relating it to another track). An
+// empty list means it passed; `progress` may return false to stop ("Stopped").
 std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {});
 
 // Frame `index` of an IMF picture track file decoded to RGB samples: JPEG 2000 at its depth, or ProRes (Application

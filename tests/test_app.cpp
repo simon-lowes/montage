@@ -9444,9 +9444,9 @@ private slots:
             ImfComposition dc;
             std::string why;
             QVERIFY(readImfComposition(dpp.value("cpl").toString().toStdString(), dc, &why) && dc.application == 59 && dc.contentKind == "programme");
-            // Its 4:4:4 at 12 bits (Montage's own ProRes encoder); at 10 refused.
+            // Its 4:4:4 at 12 bits (Montage's own ProRes encoder) in Rec.2020 PQ; at 10 bits, or in Rec.709, refused.
             r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp444")}, {"application", "dpp_prores"},
-                                            {"size", "hd"}, {"prores_profile", "4444"}});
+                                            {"size", "hd"}, {"prores_profile", "4444"}, {"colour", "rec2020-pq"}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
             const QJsonObject dpp444 = r.value("structuredContent").toObject();
             QVERIFY2(dpp444.value("problems").toArray().isEmpty() && dpp444.value("prores_profile").toString() == "4444" && dpp444.value("bits").toInt() == 12,
@@ -9454,6 +9454,9 @@ private slots:
             r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"application", "dpp_prores"},
                                             {"size", "hd"}, {"prores_profile", "4444"}, {"bits", 10}});
             QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("12 bits"));
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"application", "dpp_prores"},
+                                            {"size", "hd"}, {"prores_profile", "4444"}, {"colour", "rec709"}});
+            QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("Rec.709"));
         }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});
@@ -9464,8 +9467,17 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         const QJsonObject supp = r.value("structuredContent").toObject();
         QVERIFY2(supp.value("supplemental").toBool() && supp.value("coded_frames").toInt() == 0 && supp.value("new_samples").toInt() == 48000 &&
-                     supp.value("sounds").toInt() == 2 && supp.value("problems").toArray().isEmpty(),
+                     supp.value("sounds").toInt() == 2 && supp.value("problems").toArray().isEmpty() && supp.value("edition").toInt() == 2026,
                  QJsonDocument(supp).toJson().constData());
+        // The edition: 2021's as packages were before 2026's (no timed events), another refused.
+        r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-edition")}, {"title", "Earlier edition"},
+                                        {"edition", 2021}, {"events", true}});
+        QVERIFY2(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("edition").toInt() == 2021 &&
+                     r.value("structuredContent").toObject().value("events").toInt() == 0 &&
+                     r.value("structuredContent").toObject().value("problems").toArray().isEmpty(),
+                 QJsonDocument(r).toJson().constData());
+        r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-edition")}, {"edition", 2023}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("2026 or 2021"));
         // The beds and objects as S-ADM and ADM over MCP, checked.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-adm")}, {"title", "Objects"},
                                         {"sadm", true}, {"adm", true}});
@@ -9504,6 +9516,22 @@ private slots:
             auto* admBox = dlg->findChild<QCheckBox*>("imfAdm");
             offered = iab && iab->isEnabled() && !iab->isChecked() && sadm && sadm->isEnabled() && admBox && admBox->isEnabled() && sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
+            // Application #2E's edition: 2026 (8K, the markers as timed events) or 2021 (neither).
+            auto* edition = dlg->findChild<QComboBox*>("imfEdition");
+            auto* eventsBox = dlg->findChild<QCheckBox*>("imfEvents");
+            auto offeredIn = [](QComboBox* box, const char* value) {
+                auto* m = qobject_cast<QStandardItemModel*>(box->model());
+                return m && m->item(box->findData(QString::fromLatin1(value)))->isEnabled();
+            };
+            auto* sizes = dlg->findChild<QComboBox*>("imfSize");
+            offered = offered && edition && edition->isEnabled() && edition->currentData().toInt() == 2026 && eventsBox && eventsBox->isEnabled() &&
+                      eventsBox->isChecked() && offeredIn(sizes, "8k");
+            if (offered) {
+                edition->setCurrentIndex(edition->findData(2021));
+                offered = !eventsBox->isEnabled() && !offeredIn(sizes, "8k");
+                edition->setCurrentIndex(edition->findData(2026));
+                offered = offered && eventsBox->isEnabled() && offeredIn(sizes, "8k");
+            }
             // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
             auto* application = dlg->findChild<QComboBox*>("imfApplication");
             auto* graded = dlg->findChild<QComboBox*>("imfGraded");
@@ -9511,7 +9539,7 @@ private slots:
             if (offered && exrAvailable()) {
                 application->setCurrentIndex(application->findData(5));
                 offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
-                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled();
+                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && eventsBox->isEnabled() && !offeredIn(sizes, "8k");
                 application->setCurrentIndex(application->findData(2));
             }
             // Application ProRes: fields for 4:2:2, Y'CbCr, full range and 12 bits for 4:4:4. Application DPP: 422 HQ, 4444
@@ -9544,8 +9572,12 @@ private slots:
                 // (DPP's 4:4:4, at 12 bits, chosen and kept)
                 profile->setCurrentIndex(profile->findData("4444xq"));
                 offered = offered && profile->currentData().toString() == "4444xq" && !ycbcr->isEnabled() && !full->isEnabled() && !depth->isEnabled();
-                // (4K and P3-D65 PQ not offered; the ProRes choices given back on leaving)
+                // (4K and P3-D65 PQ not offered, nor Rec.709 for 4:4:4 (RDD 59-1:2022); the ProRes choices given back on leaving)
                 auto* colourBox = dlg->findChild<QComboBox*>("imfColour");
+                offered = offered && !enabled(colourBox, "rec709") && colourBox->currentData().toString() != "rec709";
+                profile->setCurrentIndex(profile->findData("hq"));
+                offered = offered && enabled(colourBox, "rec709");
+                profile->setCurrentIndex(profile->findData("4444xq"));
                 offered = offered && !enabled(sizeBox, "4k") && enabled(sizeBox, "uhd") && !enabled(colourBox, "p3d65-pq") && enabled(colourBox, "rec2020-hlg");
                 application->setCurrentIndex(application->findData(45));
                 offered = offered && profile->currentData().toString() == "4444" && ycbcr->isChecked() && enabled(sizeBox, "4k");
