@@ -1,5 +1,6 @@
 #include "Nmos.h"
 
+#include "media/JpegXs.h"
 #include "render/St2110Receive.h"
 
 #include <QDnsLookup>
@@ -21,6 +22,7 @@
 #include <QUdpSocket>
 #include <QUrl>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <tuple>
@@ -492,7 +494,8 @@ QString Node::interfaceName(int leg) const {
 void Node::setStreams(const st2110::VideoFormat& video, const st2110::AudioFormat& audio, const st2110::SenderOptions& o, bool active) {
     const bool formatChanged = video.width != video_.width || video.height != video_.height || !(video.fps == video_.fps) ||
                                video.interlaced != video_.interlaced || video.depth != video_.depth || video.tcs != video_.tcs ||
-                               video.colorimetry != video_.colorimetry || audio.channels != audio_.channels;
+                               video.colorimetry != video_.colorimetry || audio.channels != audio_.channels || video.codec != video_.codec ||
+                               video.bpp != video_.bpp || video.packetMode != video_.packetMode || video.sampling != video_.sampling;
     video_ = video;
     audio_ = audio;
     options_ = o;
@@ -650,7 +653,15 @@ QJsonArray Node::flowResources() const {
             f["interlace_mode"] = video_.interlaced ? "interlaced_tff" : "progressive";
             f["colorspace"] = QString::fromStdString(video_.colorimetry);
             f["transfer_characteristic"] = QString::fromStdString(video_.tcs);
-            f["media_type"] = "video/raw";
+            f["media_type"] = video_.jpegXs() ? "video/jxsv" : "video/raw";
+            if (video_.jpegXs()) {
+                // (AMWA BCP-006-01: the codestream's profile, level and sublevel as its SDP names them, and its
+                // kilobits a second)
+                if (!video_.profile.empty()) f["profile"] = QString::fromStdString(video_.profile);
+                if (!video_.level.empty()) f["level"] = QString::fromStdString(video_.level);
+                if (!video_.sublevel.empty()) f["sublevel"] = QString::fromStdString(video_.sublevel);
+                f["bit_rate"] = qint64(std::ceil(double(w) * h * video_.bpp * video_.fps.toDouble() / 1000));
+            }
             const int cw = video_.sampling == st2110::Sampling::Ycc422 ? w / 2 : w;
             const bool rgb = video_.sampling == st2110::Sampling::Rgb;
             f["components"] = QJsonArray{QJsonObject{{"name", rgb ? "R" : "Y"}, {"width", w}, {"height", h}, {"bit_depth", d}},
@@ -678,11 +689,12 @@ QJsonObject Node::senderResource(int stream) const {
     const bool multicast = st2110::isMulticast(c.leg[0].destinationIp.toStdString());
     QJsonArray bindings{interfaceName(0)};
     if (senderLegs() > 1) bindings.append(interfaceName(1));
-    return QJsonObject{
+    const bool jxs = stream == 0 && video_.jpegXs();
+    QJsonObject out{
         {"id", idText(c.id)},
         {"version", c.version},
         {"label", o_.label + " " + labels[stream]},
-        {"description", text("ST 2110-%1").arg(stream == 0 ? "20" : stream == 1 ? "30" : "40")},
+        {"description", text("ST 2110-%1").arg(stream == 0 ? (jxs ? "22" : "20") : stream == 1 ? "30" : "40")},
         {"tags", QJsonObject{}},
         {"caps", QJsonObject{}},
         {"flow_id", idText(flowIds_[stream])},
@@ -696,6 +708,13 @@ QJsonObject Node::senderResource(int stream) const {
         {"interface_bindings", bindings},
         // (parked: no receiver)
         {"subscription", QJsonObject{{"receiver_id", c.masterEnable ? c.receiverId : QJsonValue(QJsonValue::Null)}, {"active", c.masterEnable}}}};
+    if (jxs) {
+        // (BCP-006-01: the bandwidth its SDP's b=AS gives, its ST 2110-21 type and RFC 9134's packetization mode)
+        out["bit_rate"] = qint64(video_.bandwidthKbps);
+        out["st2110_21_sender_type"] = "2110TPW";
+        out["packet_transmission_mode"] = video_.packetMode == 1 ? "slice_sequential" : "codestream";
+    }
+    return out;
 }
 
 QJsonArray Node::senderResources() const {
@@ -954,7 +973,9 @@ QString Node::legInterface(int index) const {
 QJsonObject Node::receiverResource(const RConn& r) const {
     static const char* const labels[3] = {"Picture", "Sound", "Ancillary data"};
     static const char* const formats[3] = {"urn:x-nmos:format:video", "urn:x-nmos:format:audio", "urn:x-nmos:format:data"};
-    const QJsonArray types = r.stream == 0 ? QJsonArray{"video/raw"} : r.stream == 1 ? QJsonArray{"audio/L24", "audio/L16"} : QJsonArray{"video/smpte291"};
+    const QJsonArray types = r.stream == 0   ? (jpegXsAvailable() ? QJsonArray{"video/raw", "video/jxsv"} : QJsonArray{"video/raw"})
+                             : r.stream == 1 ? QJsonArray{"audio/L24", "audio/L16"}
+                                             : QJsonArray{"video/smpte291"};
     // (each leg bound to its interface)
     auto nameOf = [&](const QString& address) {
         for (const QNetworkInterface& i : QNetworkInterface::allInterfaces())
@@ -965,7 +986,7 @@ QJsonObject Node::receiverResource(const RConn& r) const {
     return QJsonObject{{"id", idText(r.id)},
                        {"version", r.version},
                        {"label", o_.label + " " + labels[r.stream] + " in"},
-                       {"description", text("ST 2110-%1 receiver (ST 2022-7)").arg(r.stream == 0 ? "20" : r.stream == 1 ? "30" : "40")},
+                       {"description", text("ST 2110-%1 receiver (ST 2022-7)").arg(r.stream == 0 ? (jpegXsAvailable() ? "20 and -22" : "20") : r.stream == 1 ? "30" : "40")},
                        {"tags", QJsonObject{}},
                        {"device_id", idText(deviceId_)},
                        {"transport", "urn:x-nmos:transport:rtp"},
@@ -1059,7 +1080,7 @@ Node::Response Node::patchReceiver(RConn& r, const QJsonObject& patch) {
             const std::vector<st2110::SdpStream> found = st2110::parseSdp(data.toString().toStdString(), &why);
             if (found.empty()) return errorResponse(400, QString::fromStdString(why));
             const std::string& e = found.front().encoding;
-            if ((r.stream == 0) != (e == "raw") || (r.stream == 2) != (e == "smpte291"))
+            if ((r.stream == 0) != (e == "raw" || e == "jxsv") || (r.stream == 2) != (e == "smpte291"))
                 return errorResponse(400, text("The SDP describes another kind of stream than this receiver takes"));
             for (int i = 0; i < 2; ++i) {
                 RLeg& l = legs[i];

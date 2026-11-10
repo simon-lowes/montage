@@ -285,6 +285,12 @@ bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMet
 // Annex A's simple object segmentation: an object of `size` bytes (zeros after it to a whole word) as items of `type`,
 // each its segment's offset in words and then at most `maxWords` - 1 of its words, the last with K set.
 std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size_t size, size_t maxWords = kMaxMetadataWords);
+// The item Montage's own senders put with each frame (an experimental type, from ST 2110-41's 3FF000h to 3FFFFFh,
+// which need no registration): the sequence's frame number (64 bits, two words) and the frame's time code (hours,
+// minutes, seconds and frames a byte each, drop frame in the top bit).
+constexpr uint32_t kFrameItemType = 0x3FF4D0;
+FastMetadata frameItem(int64_t frame, const output::Timecode& tc);
+bool parseFrameItem(const FastMetadata& m, int64_t& frame, output::Timecode* tc = nullptr);
 // And back: the object's words from a stream's items of `type` in the order they came (the segments from offset 0 to
 // the one with K set, each where the one before ended); false while it is not whole.
 bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out);

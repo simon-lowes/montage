@@ -120,6 +120,7 @@
 #include "media/Omt.h"
 #endif
 #include "render/St2110.h"
+#include "media/JpegXs.h"
 #include "render/Nmos.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
@@ -23183,6 +23184,26 @@ print("added " + ui["name"])
         const QString redundantSdp = r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString();
         QVERIFY2(redundantSdp.contains("a=group:DUP") && redundantSdp.contains("m=video 15104 RTP/AVP 96"), qPrintable(redundantSdp));
         QVERIFY(ReferenceOutputController::loadSt2110().redundant && ReferenceOutputController::loadSt2110().anc2.port == 15108);
+        // ST 2110-22 and -41: the picture as JPEG XS a slice at a time, and each frame's number and time code as fast
+        // metadata, its SDP among the status's; the NMOS flow and sender JPEG XS ones (AMWA BCP-006-01). Then back.
+        if (jpegXsAvailable()) {
+            r = call({{"action", "start"}, {"st2110", QJsonObject{{"redundant", false}, {"jpeg_xs_bpp", 4}, {"jpeg_xs_slices", true}, {"send_metadata", true},
+                                                                  {"metadata", "127.0.0.1:15012"}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            r = call({{"action", "status"}});
+            const QJsonObject jxsSdp = r.value("structuredContent").toObject().value("sdp").toObject();
+            const QString jxsVideo = jxsSdp.value("video").toString(), meta = jxsSdp.value("metadata").toString();
+            QVERIFY2(jxsVideo.contains("jxsv/90000") && jxsVideo.contains("packetmode=1") && jxsVideo.contains("b=AS:"), qPrintable(jxsVideo));
+            QVERIFY2(meta.contains("m=application 15012 ") && meta.contains("ST2110-41/90000") && meta.contains("DIT=3FF4D0"), qPrintable(meta));
+            QVERIFY(controller->nmosNode());
+            QVERIFY(controller->nmosNode()->handle("GET", "/x-nmos/node/v1.3/flows/", {}).body.contains("video/jxsv"));
+            QVERIFY(controller->nmosNode()->handle("GET", "/x-nmos/node/v1.3/senders/", {}).body.contains("slice_sequential"));
+            r = call({{"action", "start"}, {"st2110", QJsonObject{{"jpeg_xs_bpp", 0}, {"send_metadata", false}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            r = call({{"action", "status"}});
+            QVERIFY(r.value("structuredContent").toObject().value("sdp").toObject().value("video").toString().contains("raw/90000"));
+            QVERIFY(call({{"action", "start"}, {"st2110", QJsonObject{{"jpeg_xs_bpp", 30}}}}).value("isError").toBool());
+        }
         r = call({{"action", "start"}, {"st2110", QJsonObject{{"video", "not an address"}}}});
         QVERIFY(r.value("isError").toBool());
         call({{"action", "stop"}});

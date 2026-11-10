@@ -2,7 +2,8 @@
 # Runs AMWA's NMOS test suites (nmos-testing, Apache-2.0) against Montage's NMOS Node: IS-04's Node API and
 # registration (IS-04-01), IS-05's Connection API (IS-05-01) and the two together (IS-05-02), with the registry found by
 # unicast DNS-SD from the test tool's own DNS server. The Node is `montage-cli st2110`, sending colour bars and tone
-# on both of ST 2022-7's paths (its senders offering both legs through IS-05) and offering receivers with two legs.
+# on both of ST 2022-7's paths (its senders offering both legs through IS-05) and offering receivers with two legs:
+# once with ST 2110-20's uncompressed video, then again with ST 2110-22's JPEG XS (AMWA BCP-006-01's flows and senders).
 #
 #   sudo scripts/nmos-check.sh build/src/montage-cli <work directory>
 #
@@ -22,12 +23,22 @@ printf "from . import Config as CONFIG\nCONFIG.DNS_SD_MODE = 'unicast'\n" > "$wo
 
 # The address the tool's DNS server and mock registries use: the default route's interface's.
 host=$("$work/venv/bin/python" -I -c "import netifaces as n; i = n.gateways()['default'][n.AF_INET][1]; print(n.ifaddresses(i)[n.AF_INET][0]['addr'])")
-QT_QPA_PLATFORM=offscreen "$cli" st2110 --mode 720p50 --interface "$host" --nmos-port 8080 --domain testsuite.nmos.tv \
-    --dns-server "$host" --seconds 3600 --receivers --interface2 "$host" \
-    --video2 239.100.12.1:5004 --audio2 239.100.12.2:5004 --data2 239.100.12.3:5004 --send-interface2 "$host" > "$work/node.log" 2>&1 &
-node=$!
-trap 'kill $node 2> /dev/null || true' EXIT
-sleep 2
+node=
+trap '[ -z "$node" ] || kill $node 2> /dev/null || true' EXIT
+# The Node, with what else it is given (the video's coding).
+start_node() {
+    QT_QPA_PLATFORM=offscreen "$cli" st2110 --mode 720p50 --interface "$host" --nmos-port 8080 --domain testsuite.nmos.tv \
+        --dns-server "$host" --seconds 3600 --receivers --interface2 "$host" \
+        --video2 239.100.12.1:5004 --audio2 239.100.12.2:5004 --data2 239.100.12.3:5004 --send-interface2 "$host" "$@" > "$work/node.log" 2>&1 &
+    node=$!
+    sleep 2
+}
+stop_node() {
+    kill $node 2> /dev/null || true
+    wait $node 2> /dev/null || true
+    node=
+    sleep 1
+}
 
 failed=0
 run() {
@@ -73,11 +84,26 @@ for b in bad:
 sys.exit(1 if bad or passed == 0 else 0)
 EOF
 }
-run IS-04-01 --host "$host" --port 8080 --version v1.3
-run IS-05-01 --host "$host" --port 8080 --version v1.1
-run IS-05-02 --host "$host" "$host" --port 8080 8080 --version v1.3 v1.1
+suites() {
+    run IS-04-01 --host "$host" --port 8080 --version v1.3
+    run IS-05-01 --host "$host" --port 8080 --version v1.1
+    run IS-05-02 --host "$host" "$host" --port 8080 8080 --version v1.3 v1.1
+}
+start_node
+suites
 if [ "$failed" -ne 0 ]; then
     echo "The Node's log:"
     cat "$work/node.log"
 fi
-exit "$failed"
+stop_node
+echo "Again with JPEG XS (ST 2110-22) senders:"
+before=$failed
+failed=0
+start_node --jpeg-xs 4 --slices
+suites
+if [ "$failed" -ne 0 ]; then
+    echo "The Node's log:"
+    cat "$work/node.log"
+fi
+stop_node
+[ "$before" -eq 0 ] && [ "$failed" -eq 0 ]

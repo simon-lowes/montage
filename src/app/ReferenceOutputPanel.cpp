@@ -7,6 +7,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
@@ -25,6 +26,7 @@
 
 #include "PlaybackController.h"
 #include "Settings.h"
+#include "media/JpegXs.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -117,6 +119,13 @@ st2110::SenderOptions ReferenceOutputController::loadSt2110() {
     endpoint("output/st2110/audio2", o.audio2);
     endpoint("output/st2110/data2", o.anc2);
     o.interfaceAddress2 = s.value("output/st2110/interface2").toString().trimmed().toStdString();
+    // ST 2110-22's JPEG XS in place of -20, and ST 2110-41's fast metadata.
+    o.jpegXs = s.value("output/st2110/jpegXs", false).toBool() && jpegXsAvailable();
+    o.jpegXsBpp = std::clamp(s.value("output/st2110/jpegXsBpp", o.jpegXsBpp).toDouble(), 0.5, 24.0);
+    o.jpegXsPacketMode = s.value("output/st2110/jpegXsSlices", false).toBool() ? 1 : 0;
+    o.sendMetadata = s.value("output/st2110/sendMetadata", false).toBool();
+    endpoint("output/st2110/metadata", o.metadata);
+    endpoint("output/st2110/metadata2", o.metadata2);
     return o;
 }
 
@@ -133,6 +142,12 @@ void ReferenceOutputController::saveSt2110(const st2110::SenderOptions& o) {
     s.setValue("output/st2110/audio2", qs(st2110::endpointText(o.audio2)));
     s.setValue("output/st2110/data2", qs(st2110::endpointText(o.anc2)));
     s.setValue("output/st2110/interface2", qs(o.interfaceAddress2));
+    s.setValue("output/st2110/jpegXs", o.jpegXs);
+    s.setValue("output/st2110/jpegXsBpp", o.jpegXsBpp);
+    s.setValue("output/st2110/jpegXsSlices", o.jpegXsPacketMode == 1);
+    s.setValue("output/st2110/sendMetadata", o.sendMetadata);
+    s.setValue("output/st2110/metadata", qs(st2110::endpointText(o.metadata)));
+    s.setValue("output/st2110/metadata2", qs(st2110::endpointText(o.metadata2)));
 }
 
 QString ReferenceOutputController::formatKey() const {
@@ -376,7 +391,11 @@ QByteArray ReferenceOutputController::toolJson() {
 "clock":{"type":"string","description":"The SDP's ts-refclk: \"ptp=IEEE1588-2008:traceable\" or the grandmaster's \"ptp=IEEE1588-2008:<id>:<domain>\""},
 "redundant":{"type":"boolean","description":"ST 2022-7: every packet sent on a second path too (video2, audio2 and data2, from interface2), the SDPs grouping both as duplicates"},
 "video2":{"type":"string"},"audio2":{"type":"string"},"data2":{"type":"string"},
-"interface2":{"type":"string","description":"The address of the interface the second path goes from (\"\" as routing chooses)"}}},
+"interface2":{"type":"string","description":"The address of the interface the second path goes from (\"\" as routing chooses)"},
+"jpeg_xs_bpp":{"type":"number","description":"ST 2110-22: the picture coded as JPEG XS at this many bits a pixel (0.5 to 24), a constant number of bytes a frame; 0 sends it uncompressed (ST 2110-20)"},
+"jpeg_xs_slices":{"type":"boolean","description":"JPEG XS sent a slice at a time (RFC 9134's slice packetization mode) instead of a codestream at a time"},
+"send_metadata":{"type":"boolean","description":"ST 2110-41: each frame's sequence frame number and time code as fast metadata"},
+"metadata":{"type":"string","description":"Where the fast metadata goes"},"metadata2":{"type":"string","description":"Its second path's address (ST 2022-7)"}}},
 "nmos":{"type":"object","description":"ST 2110's streams offered to broadcast controllers as an AMWA NMOS Node (IS-04 and IS-05; settings left out are the last used)","properties":{
 "enabled":{"type":"boolean"},
 "registry":{"type":"string","description":"The registry's Registration API, \"http://host:port\" (empty: found by DNS-SD)"},
@@ -473,7 +492,8 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
             const QJsonObject x = args.value("st2110").toObject();
             st2110::SenderOptions o = st2110::outputOptions();
             for (const auto& [key, endpoint] : {std::pair{"video", &o.video}, std::pair{"audio", &o.audio}, std::pair{"data", &o.anc},
-                                                std::pair{"video2", &o.video2}, std::pair{"audio2", &o.audio2}, std::pair{"data2", &o.anc2}}) {
+                                                std::pair{"video2", &o.video2}, std::pair{"audio2", &o.audio2}, std::pair{"data2", &o.anc2},
+                                                std::pair{"metadata", &o.metadata}, std::pair{"metadata2", &o.metadata2}}) {
                 if (!x.contains(QLatin1String(key))) continue;
                 if (!st2110::parseEndpoint(x.value(QLatin1String(key)).toString().toStdString(), *endpoint)) {
                     isError = true;
@@ -488,6 +508,21 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
             if (x.contains("clock")) o.refclk = x.value("clock").toString().trimmed().toStdString();
             if (x.contains("redundant")) o.redundant = x.value("redundant").toBool();
             if (x.contains("interface2")) o.interfaceAddress2 = x.value("interface2").toString().trimmed().toStdString();
+            if (x.contains("jpeg_xs_bpp")) {
+                const double bpp = x.value("jpeg_xs_bpp").toDouble();
+                if (bpp != 0 && !(bpp >= 0.5 && bpp <= 24)) {
+                    isError = true;
+                    return tr("st2110.jpeg_xs_bpp is 0.5 to 24 bits a pixel, or 0 for uncompressed video");
+                }
+                if (bpp != 0 && !jpegXsAvailable()) {
+                    isError = true;
+                    return tr("This build of Montage has no JPEG XS (SVT-JPEG-XS)");
+                }
+                o.jpegXs = bpp != 0;
+                if (bpp != 0) o.jpegXsBpp = bpp;
+            }
+            if (x.contains("jpeg_xs_slices")) o.jpegXsPacketMode = x.value("jpeg_xs_slices").toBool() ? 1 : 0;
+            if (x.contains("send_metadata")) o.sendMetadata = x.value("send_metadata").toBool();
             st2110::setOutputOptions(o);
         }
         if (has("nmos")) {
@@ -630,6 +665,46 @@ ReferenceOutputPanel::ReferenceOutputPanel(ReferenceOutputController* controller
     form->addRow(tr("Sound stream:"), st2110Audio_);
     st2110Data_ = endpoint("outputSt2110Data", so.anc, tr("The ancillary data stream's address and port: time code, captions and HDR metadata"));
     form->addRow(tr("Data stream:"), st2110Data_);
+    // ST 2110-22: the picture as JPEG XS, at a constant number of bits a pixel.
+    st2110Codec_ = new QComboBox(this);
+    st2110Codec_->setObjectName(QStringLiteral("outputSt2110Codec"));
+    st2110Codec_->addItem(tr("Uncompressed (ST 2110-20)"), false);
+    if (jpegXsAvailable()) st2110Codec_->addItem(tr("JPEG XS (ST 2110-22)"), true);
+    st2110Codec_->setCurrentIndex(so.jpegXs && jpegXsAvailable() ? 1 : 0);
+    st2110Codec_->setToolTip(tr("JPEG XS sends each frame in a constant number of bytes, a fraction of the uncompressed picture's, "
+                                "with a few lines' delay"));
+    form->addRow(tr("Video coding:"), st2110Codec_);
+    st2110Bpp_ = new QDoubleSpinBox(this);
+    st2110Bpp_->setObjectName(QStringLiteral("outputSt2110JpegXsBpp"));
+    st2110Bpp_->setRange(0.5, 24);
+    st2110Bpp_->setDecimals(1);
+    st2110Bpp_->setSingleStep(0.5);
+    st2110Bpp_->setValue(so.jpegXsBpp);
+    st2110Bpp_->setSuffix(tr(" bits a pixel"));
+    st2110Bpp_->setToolTip(tr("JPEG XS's rate: 3 to 6 bits a pixel keep 4:2:2 10-bit pictures visually lossless"));
+    form->addRow(tr("JPEG XS rate:"), st2110Bpp_);
+    st2110Slices_ = new QCheckBox(tr("Packets a slice at a time (RFC 9134's slice mode)"), this);
+    st2110Slices_->setObjectName(QStringLiteral("outputSt2110JpegXsSlices"));
+    st2110Slices_->setChecked(so.jpegXsPacketMode == 1);
+    st2110Slices_->setToolTip(tr("Each slice of 16 lines in packets of its own, so a receiver can decode as the slices come and a lost "
+                                 "packet damages only its slice"));
+    form->addRow(QString(), st2110Slices_);
+    auto codecOn = [this] {
+        const bool jxs = st2110Codec_->currentData().toBool();
+        st2110Bpp_->setEnabled(jxs);
+        st2110Slices_->setEnabled(jxs);
+    };
+    connect(st2110Codec_, &QComboBox::currentIndexChanged, this, codecOn);
+    codecOn();
+    // ST 2110-41: each frame's number and time code.
+    st2110Meta_ = new QCheckBox(tr("Send each frame's number and time code as fast metadata (ST 2110-41)"), this);
+    st2110Meta_->setObjectName(QStringLiteral("outputSt2110Metadata"));
+    st2110Meta_->setChecked(so.sendMetadata);
+    form->addRow(QString(), st2110Meta_);
+    st2110MetaTo_ = endpoint("outputSt2110MetadataTo", so.metadata, tr("The fast metadata stream's address and port"));
+    form->addRow(tr("Metadata stream:"), st2110MetaTo_);
+    connect(st2110Meta_, &QCheckBox::toggled, st2110MetaTo_, &QWidget::setEnabled);
+    st2110MetaTo_->setEnabled(so.sendMetadata);
     st2110Ttl_ = new QSpinBox(this);
     st2110Ttl_->setObjectName(QStringLiteral("outputSt2110Ttl"));
     st2110Ttl_->setRange(1, 255);
@@ -647,9 +722,11 @@ ReferenceOutputPanel::ReferenceOutputPanel(ReferenceOutputController* controller
     st2110Redundant_->setObjectName(QStringLiteral("outputSt2110Redundant"));
     st2110Redundant_->setChecked(so.redundant);
     form->addRow(QString(), st2110Redundant_);
-    st2110Paths2_ = new QLineEdit(qs(st2110::endpointText(so.video2) + " " + st2110::endpointText(so.audio2) + " " + st2110::endpointText(so.anc2)), this);
+    st2110Paths2_ = new QLineEdit(qs(st2110::endpointText(so.video2) + " " + st2110::endpointText(so.audio2) + " " + st2110::endpointText(so.anc2) +
+                                     " " + st2110::endpointText(so.metadata2)),
+                                  this);
     st2110Paths2_->setObjectName(QStringLiteral("outputSt2110Paths2"));
-    st2110Paths2_->setToolTip(tr("The second path's video, sound and data addresses and ports, apart by spaces"));
+    st2110Paths2_->setToolTip(tr("The second path's video, sound, data and fast metadata addresses and ports, apart by spaces"));
     form->addRow(tr("Second path:"), st2110Paths2_);
     st2110Interface2_ = new QLineEdit(qs(so.interfaceAddress2), this);
     st2110Interface2_->setObjectName(QStringLiteral("outputSt2110Interface2"));
@@ -745,8 +822,9 @@ void ReferenceOutputPanel::fillDevices() {
     hdr_->setEnabled(!network);  // (NDI and OMT carry the colour, not HDR10's mastering metadata)
     device_->setToolTip(network ? tr("The %1 source's name (other computers see \"<this computer> (Montage)\")").arg(qs(b->name())) : QString());
     const bool ip = b && b->name() == "ST 2110";
-    for (QWidget* w : std::initializer_list<QWidget*>{st2110Video_, st2110Audio_, st2110Data_, st2110Ttl_, st2110Clock_, st2110Redundant_, st2110Paths2_,
-                                                      st2110Interface2_, nmos_, nmosRegistry_, saveSdp_})
+    for (QWidget* w : std::initializer_list<QWidget*>{st2110Video_, st2110Audio_, st2110Data_, st2110Codec_, st2110Bpp_, st2110Slices_, st2110Meta_,
+                                                      st2110MetaTo_, st2110Ttl_, st2110Clock_, st2110Redundant_, st2110Paths2_, st2110Interface2_, nmos_,
+                                                      nmosRegistry_, saveSdp_})
         form_->setRowVisible(w, ip);
     captions_->setEnabled(std::any_of(devices_.begin(), devices_.end(), [](const output::Device& d) { return d.captions; }));
     fillModes();    refresh();  // (Start, as there is a device now or not)
@@ -790,10 +868,15 @@ st2110::SenderOptions ReferenceOutputPanel::chosenSt2110() const {
     o.refclk = clock.isEmpty() ? st2110::SenderOptions{}.refclk : clock.toStdString();
     o.redundant = st2110Redundant_->isChecked();
     const QStringList second = st2110Paths2_->text().split(QRegularExpression(QStringLiteral("[\\s,]+")), Qt::SkipEmptyParts);
-    st2110::Endpoint* const to2[3] = {&o.video2, &o.audio2, &o.anc2};
-    for (int i = 0; i < 3 && i < int(second.size()); ++i)
+    st2110::Endpoint* const to2[4] = {&o.video2, &o.audio2, &o.anc2, &o.metadata2};
+    for (int i = 0; i < 4 && i < int(second.size()); ++i)
         if (!st2110::parseEndpoint(second[i].toStdString(), *to2[i])) *to2[i] = {second[i].toStdString(), 0};
     o.interfaceAddress2 = st2110Interface2_->text().trimmed().toStdString();
+    o.jpegXs = st2110Codec_->currentData().toBool();
+    o.jpegXsBpp = st2110Bpp_->value();
+    o.jpegXsPacketMode = st2110Slices_->isChecked() ? 1 : 0;
+    o.sendMetadata = st2110Meta_->isChecked();
+    if (!st2110::parseEndpoint(st2110MetaTo_->text().trimmed().toStdString(), o.metadata)) o.metadata = {st2110MetaTo_->text().trimmed().toStdString(), 0};
     return o;
 }
 

@@ -41,6 +41,7 @@
 #include "media/Decoder.h"
 #include "media/Loudness.h"
 #include "render/Nmos.h"
+#include "media/JpegXs.h"
 #include "render/St2110.h"
 #include "render/St2110Receive.h"
 #include "render/VideoPacking.h"
@@ -130,11 +131,13 @@ int usage() {
                  "                     [--interface ADDR] [--ttl N] [--channels 2|8] [--seconds N] [--no-nmos] [--nmos-port N]\n"
                  "                     [--label NAME] [--registry URL | --domain DOMAIN [--dns-server ADDR]]\n"
                  "                     [--video2 ADDR:PORT --audio2 ADDR:PORT --data2 ADDR:PORT [--send-interface2 ADDR]]\n"
-                 "                     [--receivers [--interface2 ADDR]]\n"
+                 "                     [--receivers [--interface2 ADDR]] [--jpeg-xs BITS [--slices]] [--metadata ADDR:PORT [--metadata2 ADDR:PORT]]\n"
                  "                     (colour bars and a tone sent as SMPTE ST 2110 video, sound and time code, their SDP files\n"
                  "                      printed; an NMOS node registers them and lets a controller route them; with --receivers\n"
                  "                      it offers receivers too, and says what a controller connects them to brings; the\n"
-                 "                      second path's addresses send every packet twice, as ST 2022-7 does)\n"
+                 "                      second path's addresses send every packet twice, as ST 2022-7 does; --jpeg-xs: the\n"
+                 "                      bars coded as JPEG XS at BITS a pixel (ST 2110-22, a slice a packet unit with --slices);\n"
+                 "                      --metadata: each frame's number and time code as ST 2110-41 fast metadata)\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif|.heic> [--rendition master|<trim target>] [--gain-map]\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -715,6 +718,8 @@ int cmdSt2110(const std::vector<std::string>& args) {
     using namespace montage::output;
     std::string modeName = "1080p25";
     int depth = 10, channels = 2, seconds = 0;
+    double jpegXsBpp = 0;
+    bool slices = false;
     bool nmosOn = true;
     st2110::SenderOptions so = st2110::SenderOptions{};
     nmos::NodeOptions no;
@@ -751,6 +756,10 @@ int cmdSt2110(const std::vector<std::string>& args) {
         else if (a == "--dns-server") no.dnsServer = QString::fromStdString(next());
         else if (a == "--receivers") no.receivers = true;
         else if (a == "--interface2") no.interface2 = QString::fromStdString(next());
+        else if (a == "--jpeg-xs") jpegXsBpp = std::atof(next().c_str());
+        else if (a == "--slices") slices = true;
+        else if (a == "--metadata") { if (!endpoint(so.metadata)) return 2; so.sendMetadata = true; }
+        else if (a == "--metadata2") { if (!endpoint(so.metadata2)) return 2; }
         else return usage();
     }
     if (no.receivers && !nmosOn) {
@@ -765,6 +774,14 @@ int cmdSt2110(const std::vector<std::string>& args) {
     }
     st2110::VideoFormat vf;
     vf.width = mode->width, vf.height = mode->height, vf.fps = mode->fps, vf.interlaced = mode->interlaced, vf.depth = depth;
+    if (jpegXsBpp != 0) {
+        if (!jpegXsAvailable()) {
+            std::fprintf(stderr, "error: this build has no JPEG XS (SVT-JPEG-XS)\n");
+            return 2;
+        }
+        vf.codec = "jxsv", vf.bpp = jpegXsBpp, vf.packetMode = slices ? 1 : 0;
+    }
+    if (so.sendMetadata) so.metadataTypes = {st2110::kFrameItemType};
     st2110::AudioFormat af;
     af.channels = channels;
     // 75 % colour bars (BT.709): white, yellow, cyan, green, magenta, red, blue.
@@ -796,8 +813,8 @@ int cmdSt2110(const std::vector<std::string>& args) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-    std::printf("Sending %s, PTP time from the %s\n\n%s\n%s\n%s\n", mode->name.c_str(), sender.clockSource().c_str(), sender.sdpVideo().c_str(),
-                sender.sdpAudio().c_str(), sender.sdpAnc().c_str());
+    std::printf("Sending %s, PTP time from the %s\n\n%s\n%s\n%s\n%s%s", mode->name.c_str(), sender.clockSource().c_str(), sender.sdpVideo().c_str(),
+                sender.sdpAudio().c_str(), sender.sdpAnc().c_str(), sender.sdpMetadata().c_str(), so.sendMetadata ? "\n" : "");
     std::fflush(stdout);
     std::signal(SIGINT, [](int) { gStopSending = true; });
     std::thread sending([&] {
@@ -823,6 +840,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
             for (int i = 0; i < n; ++i, ++sample)
                 for (int c = 0; c < channels; ++c) tone[size_t(i) * size_t(channels) + size_t(c)] = float(0.1 * std::sin(2 * M_PI * 1000 * double(sample) / 48000));
             const Timecode tc = timecodeOf((start + frame) % day, vf.fps);
+            if (sender.isOpen() && sender.options().sendMetadata) sender.setNextMetadata({st2110::frameItem(frame, tc)});
             if (!sender.isOpen() || !sender.send(picture.data(), rowBytes(format, vf.width), format, tone.data(), n, &tc, {}, &gStopSending))
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             ++frame;
@@ -885,7 +903,7 @@ int cmdSt2110(const std::vector<std::string>& args) {
             inOptions.interfaceAddress[1] = interfaces.value(1).toStdString();
             reconnect = true;
         };
-        node.setStreams(vf, af, so, true);
+        node.setStreams(sender.videoFormat(), af, so, true);
         node.onActivated = [&](const st2110::SenderOptions& o) {
             std::lock_guard lock(m);
             pending = o;

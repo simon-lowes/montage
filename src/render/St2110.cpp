@@ -846,6 +846,26 @@ std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size
     return out;
 }
 
+FastMetadata frameItem(int64_t frame, const output::Timecode& tc) {
+    FastMetadata m;
+    m.type = kFrameItemType;
+    const uint32_t when = uint32_t(tc.dropFrame) << 31 | uint32_t(tc.hours & 0x7F) << 24 | uint32_t(tc.minutes & 0xFF) << 16 |
+                          uint32_t(tc.seconds & 0xFF) << 8 | uint32_t(tc.frames & 0xFF);
+    m.words = {uint32_t(uint64_t(frame) >> 32), uint32_t(uint64_t(frame)), when};
+    return m;
+}
+
+bool parseFrameItem(const FastMetadata& m, int64_t& frame, output::Timecode* tc) {
+    if (m.type != kFrameItemType || m.words.size() < 3) return false;
+    frame = int64_t(uint64_t(m.words[0]) << 32 | m.words[1]);
+    if (tc) {
+        const uint32_t w = m.words[2];
+        tc->dropFrame = w >> 31;
+        tc->hours = int((w >> 24) & 0x7F), tc->minutes = int((w >> 16) & 0xFF), tc->seconds = int((w >> 8) & 0xFF), tc->frames = int(w & 0xFF);
+    }
+    return true;
+}
+
 bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out) {
     out.clear();
     for (const FastMetadata& m : items) {
@@ -1717,6 +1737,9 @@ public:
         a.channels = std::max(1, audioChannels);
         a.rate = audioRate;
         o.sendAudio = o.sendAudio && audioChannels > 0;
+        // (ST 2110-41: each frame's number and time code, the item named in the SDP)
+        if (o.sendMetadata && std::find(o.metadataTypes.begin(), o.metadataTypes.end(), st2110::kFrameItemType) == o.metadataTypes.end())
+            o.metadataTypes.push_back(st2110::kFrameItemType);
         std::lock_guard lock(m_);
         stop_ = false;
         cdpSequence_ = 0;
@@ -1735,6 +1758,7 @@ public:
         }
         const float* audio = a.channels > 0 ? a.samples : nullptr;
         const int audioFrames = a.channels > 0 ? a.frames : 0;
+        if (sender_.options().sendMetadata) sender_.setNextMetadata({st2110::frameItem(f.frame, f.timecode)});
         if (f.format == PixelFormat::V210 || f.format == PixelFormat::Uyvy8)
             return sender_.send(f.data, f.stride, f.format, audio, audioFrames, &f.timecode, anc, &stop_);
         // The 16-bit formats' samples cut to the stream's depth.
@@ -1777,6 +1801,7 @@ public:
         out["video"] = sender_.sdpVideo();
         if (!sender_.sdpAudio().empty()) out["audio"] = sender_.sdpAudio();
         if (!sender_.sdpAnc().empty()) out["data"] = sender_.sdpAnc();
+        if (!sender_.sdpMetadata().empty()) out["metadata"] = sender_.sdpMetadata();
         return out;
     }
     bool streams(st2110::VideoFormat& video, st2110::AudioFormat& audio, st2110::SenderOptions& options) {
