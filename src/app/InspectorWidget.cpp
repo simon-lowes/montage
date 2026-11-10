@@ -3022,7 +3022,7 @@ void InspectorWidget::addTextAnimations(const Clip& clip, const Target& target) 
     }
     auto* add = new QPushButton(tr("Add Text Animation"), content_);
     add->setObjectName(QStringLiteral("addTextAnimation"));
-    add->setToolTip(type == "title3d" ? tr("Extrude the letters deeper or shallower a letter, word or line at a time")
+    add->setToolTip(type == "title3d" ? tr("Extrude, move, turn, scale or recolour the letters in 3D a letter, word or line at a time")
                                       : tr("Move, scale, turn, fade, blur or recolour the text a letter, word or line at a time"));
     connect(add, &QPushButton::clicked, this, [this, target] {
         state_->edit(tr("Add Text Animation"), [target](Project&, Sequence& s) {

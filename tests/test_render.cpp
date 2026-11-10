@@ -22217,7 +22217,7 @@ colorspaces:
         g.params["specular"] = Param(0.0);
         const int k = addTextAnimator(g);
         const std::string pre = "ta" + std::to_string(k) + ".";
-        QVERIFY(g.params.count(pre + "depth") && !g.params.count(pre + "x"));
+        QVERIFY(g.params.count(pre + "depth") && g.params.count(pre + "z") && !g.params.count(pre + "blur"));
         g.params[pre + "by"] = Param(3.0);  // lines
         g.params[pre + "start"] = Param(50.0);
         g.params[pre + "depth"] = Param(80.0);
@@ -22260,6 +22260,152 @@ colorspaces:
         const std::vector<Run> same = runs(renderGenerator(plain, 0, w, h, 1.0, 90, 30));
         QCOMPARE(int(same.size()), 2);
         QVERIFY(std::abs(deep(same[1]) - deep(same[0])) <= 1 && std::abs(deep(same[0]) - 40) <= 4);
+    }
+
+    void titles3DLetterTransforms() {
+        // A 3D title's text animations move, turn, scale and colour its letters in 3D, each such letter a solid of its
+        // own. An "I" 40 px deep turned 90 degrees about Y by an animation, through a 5 degree lens (so nearly without
+        // perspective): its side shows, in the sides' colour, its silhouette as wide as its extrusion within 0.5 px
+        // (the alpha across its middle row, averaged over four placings an eighth of a pixel apart, a quarter of the
+        // renderer's sample spacing, so the edges are found finer than its samples).
+        auto title = [](const std::string& text) {
+            Effect g = makeEffect("title3d", 1);
+            g.strings["text"] = text;
+            g.strings["font"] = "DejaVu Sans";
+            g.params["size"] = Param(160.0);
+            g.params["depth"] = Param(40.0);
+            g.params["rot_x"] = Param(0.0);
+            g.params["rot_y"] = Param(0.0);
+            g.params["fov"] = Param(5.0);
+            g.params["ambient"] = Param(100.0);
+            g.params["specular"] = Param(0.0);
+            g.params["color.r"] = Param(1.0), g.params["color.g"] = Param(0.8), g.params["color.b"] = Param(0.2);
+            g.params["side_color.r"] = Param(0.2), g.params["side_color.g"] = Param(0.3), g.params["side_color.b"] = Param(0.9);
+            return g;
+        };
+        const int w = 640, h = 360;
+        Effect g = title("I");
+        const int k = addTextAnimator(g);
+        const std::string pre = "ta" + std::to_string(k) + ".";
+        QVERIFY(g.params.count(pre + "z") && g.params.count(pre + "rot_x") && g.params.count(pre + "rot_y") && g.params.count(pre + "rotation") &&
+                g.params.count(pre + "side.r") && g.params.count(pre + "fill_mix"));
+        g.params[pre + "rot_y"] = Param(90.0);
+        auto inkRows = [&](const Image& img, int& y0, int& y1) {
+            y0 = h, y1 = -1;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    if (img.at(x, y)[3] > 0.5f) y0 = std::min(y0, y), y1 = std::max(y1, y);
+        };
+        double across = 0;
+        Image turned;
+        for (int i = 0; i < 4; ++i) {
+            g.params["pos_x"] = Param(0.125 * i);
+            const Image img = renderGenerator(g, 0, w, h, 1.0, 90, 30);
+            int y0 = 0, y1 = 0;
+            inkRows(img, y0, y1);
+            QVERIFY(y1 > y0 + 50);
+            double row = 0;
+            for (int x = 0; x < w; ++x) row += img.at(x, (y0 + y1) / 2)[3];
+            across += row / 4;
+            if (i == 0) turned = img;
+        }
+        QVERIFY2(std::abs(across - 40) <= 0.5, qPrintable(QString("the turned letter's silhouette is %1 px across, for 40").arg(across, 0, 'f', 3)));
+        {
+            int y0 = 0, y1 = 0, x0 = w, x1 = -1;
+            inkRows(turned, y0, y1);
+            for (int x = 0; x < w; ++x)
+                if (turned.at(x, (y0 + y1) / 2)[3] > 0.99f) x0 = std::min(x0, x), x1 = std::max(x1, x);
+            const float* c = turned.at((x0 + x1) / 2, (y0 + y1) / 2);
+            QVERIFY2(std::abs(c[0] - 0.2f) < 0.01f && std::abs(c[1] - 0.3f) < 0.01f && std::abs(c[2] - 0.9f) < 0.01f,
+                     qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));  // its side, not its face
+        }
+
+        // An "O" moved back 100 px (Position Z -100) through a 50 mm lens (a 36 mm sensor across the frame's width, so
+        // 2 atan(10.125 / 50) across its height), flat: smaller by the camera's f / (f + 100), f the lens in pixels.
+        // Its mean distance from its middle (alpha-weighted) against the unmoved letter's, as pixels of its width,
+        // within 0.1 px; its middle stays at the frame's.
+        Effect o = title("O");
+        o.params["depth"] = Param(0.0);
+        const double fov = 2 * std::atan(10.125 / 50) * 180 / M_PI;
+        o.params["fov"] = Param(fov);
+        const int ko = addTextAnimator(o);
+        const std::string po = "ta" + std::to_string(ko) + ".";
+        const int W = 1280, H = 720;
+        struct Spread {
+            double cx = 0, cy = 0, mean = 0, width = 0;
+        };
+        auto spread = [&](const Image& img) {
+            Spread sp;
+            double sum = 0;
+            int x0 = W, x1 = -1;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const double a = img.at(x, y)[3];
+                    sum += a, sp.cx += a * (x + 0.5), sp.cy += a * (y + 0.5);
+                    if (a > 0.5) x0 = std::min(x0, x), x1 = std::max(x1, x);
+                }
+            sp.cx /= sum, sp.cy /= sum;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) sp.mean += img.at(x, y)[3] * std::hypot(x + 0.5 - sp.cx, y + 0.5 - sp.cy);
+            sp.mean /= sum;
+            sp.width = x1 - x0 + 1;
+            return sp;
+        };
+        o.params[po + "z"] = Param(0.0);
+        const Spread near = spread(renderGenerator(o, 0, W, H, 1.0, 90, 30));
+        o.params[po + "z"] = Param(-100.0);
+        const Spread far = spread(renderGenerator(o, 0, W, H, 1.0, 90, 30));
+        const double f = (H / 2.0) / std::tan(fov * M_PI / 360), want = f / (f + 100);
+        const double off = std::abs(far.mean / near.mean - want) * near.width;
+        qInfo("A letter at Z -100 through a 50 mm lens: %.5f of its size, %.5f wanted (%.3f px of its %.0f px width off)", far.mean / near.mean, want, off,
+              near.width);
+        QVERIFY2(off < 0.1 && want < 0.95, qPrintable(QString("%1 px off").arg(off)));
+        QVERIFY(std::abs(far.cx - W / 2.0) < 0.1 && std::abs(far.cy - near.cy) < 0.1);
+
+        // Coloured: the second of two letters given the animation's face colour (green) at full amount, the first left
+        // in the title's; and sorted by depth: the second moved over the first, in front of it when it comes forward
+        // (Z +50) and behind it when it goes back (Z -50).
+        Effect two = title("HH");
+        two.params["depth"] = Param(0.0);
+        two.params["fov"] = Param(20.0);
+        const int kc = addTextAnimator(two);
+        const std::string pc = "ta" + std::to_string(kc) + ".";
+        two.params[pc + "start"] = Param(50.0);
+        two.params[pc + "fill.r"] = Param(0.0), two.params[pc + "fill.g"] = Param(1.0), two.params[pc + "fill.b"] = Param(0.0);
+        two.params[pc + "fill_mix"] = Param(100.0);
+        auto colourAt = [&](const Image& img, double fx) {
+            // The colour most covered along the middle row near fx of the frame's width.
+            const int y = h / 2;
+            for (int dx = 0; dx < 60; ++dx)
+                for (int x : {int(fx * w) + dx, int(fx * w) - dx})
+                    if (x >= 0 && x < w && img.at(x, y)[3] > 0.99f) return std::array<float, 3>{img.at(x, y)[0], img.at(x, y)[1], img.at(x, y)[2]};
+            return std::array<float, 3>{-1, -1, -1};
+        };
+        Image cols = renderGenerator(two, 0, w, h, 1.0, 90, 30);
+        int left = w, right = -1;
+        for (int x = 0; x < w; ++x)
+            if (cols.at(x, h / 2)[3] > 0.5f) left = std::min(left, x), right = std::max(right, x);
+        QVERIFY(right > left + 100);
+        const std::array<float, 3> first = colourAt(cols, (left + 10.0) / w), second = colourAt(cols, (right - 10.0) / w);
+        QVERIFY2(std::abs(first[0] - 1) < 0.01f && std::abs(first[1] - 0.8f) < 0.01f && std::abs(second[0]) < 0.01f && std::abs(second[1] - 1) < 0.01f,
+                 qPrintable(QString("%1,%2 and %3,%4").arg(first[0]).arg(first[1]).arg(second[0]).arg(second[1])));
+        // (moved left by half the pair's width: over the first letter's middle)
+        two.params[pc + "x"] = Param(-(right - left) / 2.0);
+        for (const double z : {50.0, -50.0}) {
+            two.params[pc + "z"] = Param(z);
+            const Image img = renderGenerator(two, 0, w, h, 1.0, 90, 30);
+            // Where both cover, the nearer shows: along the row, green pixels where the second covers the first's
+            // stems in front; none of the first's face colour left in front of it.
+            int green = 0, gold = 0;
+            for (int x = 0; x < w; ++x) {
+                const float* c = img.at(x, h / 2);
+                if (c[3] < 0.99f) continue;
+                if (c[1] > 0.99f && c[0] < 0.01f) ++green;
+                if (c[0] > 0.99f) ++gold;
+            }
+            if (z > 0) QVERIFY2(green > gold, qPrintable(QString("in front: %1 green, %2 gold").arg(green).arg(gold)));
+            else QVERIFY2(gold > green, qPrintable(QString("behind: %1 green, %2 gold").arg(green).arg(gold)));
+        }
     }
 
     void titles3D() {

@@ -1291,12 +1291,16 @@ std::vector<EffectInfo> buildCatalog() {
                              // (its Mask Number among them) or a path of a shape layer under the title (on Shape
                              // Track, 0 the nearest below; Shape Path its name or id, empty its first), starting at
                              // Offset (% of its length), placed along it as the text is aligned or as Along the Path
-                             // says, letters perpendicular to it unless kept upright.
+                             // says, letters perpendicular to it unless kept upright. The mask or shape layer can be
+                             // another clip's (Mask or Shape Path From Clip: its name or id); a mask's path is set off
+                             // by its expansion and, On the Feather, across its feather (-100 % its inner edge, 100 %
+                             // its outer).
                              choice("path_shape", "Text on a Path",
                                     {"None", "Circle", "Wave", "Custom (SVG Path Data)", "A Mask on the Clip", "A Shape Layer's Path"}, 0),
                              num("path_radius", "Path Radius (px)", 4, 4000, 300, 1),
                              num("path_wavelength", "Wavelength (px)", 4, 8000, 600, 1),
                              num("path_mask", "Mask Number", 1, 64, 1, 1),
+                             pct("path_feather", "On the Feather", -100, 100, 0),
                              num("path_track", "Shape Track (0 the Nearest Below)", 0, 99, 0, 1),
                              pct("path_offset", "Path Offset", -200, 200, 0),
                              choice("path_align", "Along the Path", {"As the Text Is Aligned", "From the Start", "In the Middle", "To the End", "Spread From End to End"}, 0),
@@ -1311,7 +1315,8 @@ std::vector<EffectInfo> buildCatalog() {
                          {str("text", "Text", StringKind::MultilineText, "Title"),
                           str("font", "Font", StringKind::Font, "Sans Serif"),
                           str("path_data", "Path (SVG Data)", StringKind::Text),
-                          str("path_item", "Shape Path", StringKind::Text)}};
+                          str("path_item", "Shape Path", StringKind::Text),
+                          str("path_clip", "Mask or Shape Path From Clip", StringKind::Text)}};
         c.push_back(title);
         // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera (or a camera in a
         // USD or glTF file).
@@ -1647,8 +1652,11 @@ std::vector<ParamInfo> textAnimatorParams(int k, const std::string& type) {
     const std::string pre = "ta" + std::to_string(k) + ".";
     ParamInfo rotation = angle(pre + "rotation", "Rotation");
     rotation.min = -720, rotation.max = 720;
-    // A 3D title's: what they pick, and how much deeper (or shallower) the letters picked are extruded.
-    if (type == "title3d")
+    // A 3D title's: what they pick, how much deeper (or shallower) the letters picked are extruded, and how they are
+    // moved (Z towards the camera), turned and scaled in 3D about their middles and coloured (face and sides).
+    if (type == "title3d") {
+        ParamInfo rx = angle(pre + "rot_x", "Tilt (X°)"), ry = angle(pre + "rot_y", "Turn (Y°)"), rz = angle(pre + "rotation", "Roll (Z°)");
+        for (ParamInfo* r : {&rx, &ry, &rz}) r->min = -720, r->max = 720;
         return {
             choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
             choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),
@@ -1663,7 +1671,19 @@ std::vector<ParamInfo> textAnimatorParams(int k, const std::string& type) {
             boolean(pre + "shuffle", "Random Order"),
             num(pre + "seed", "Random Seed", 0, 10000, 0, 1),
             num(pre + "depth", "Extrusion (px)", -1000, 1000, 0, 0.5),
+            num(pre + "x", "Position X", -4000, 4000, 0, 1),
+            num(pre + "y", "Position Y", -4000, 4000, 0, 1),
+            num(pre + "z", "Position Z", -8000, 8000, 0, 1),
+            rx,
+            ry,
+            rz,
+            pct(pre + "scale", "Scale", 0, 1000, 100),
+            color(pre + "fill", "Face", 1, 1, 1),
+            pct(pre + "fill_mix", "Face Color Amount", 0, 100, 0),
+            color(pre + "side", "Sides", 1, 1, 1),
+            pct(pre + "side_mix", "Sides Color Amount", 0, 100, 0),
         };
+    }
     return {
         choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
         choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),
