@@ -1978,6 +1978,31 @@ private slots:
         QVERIFY(table && table->rowCount() == 1);
         table->item(0, 7)->setText("2");  // the choke group
         QCOMPARE(track().sampler.pads[0].choke, 2);
+        // The slot's velocity curve and output track, and passes placed a clip a hit: each one undo step.
+        {
+            auto* curve = panel->findChild<QComboBox*>("samplerCurve48");
+            auto* output = panel->findChild<QComboBox*>("samplerOutput48");
+            auto* perHit = panel->findChild<QCheckBox*>("samplerClipPerHit");
+            QVERIFY(curve && output && perHit);
+            QVERIFY(!qobject_cast<QStandardItemModel*>(curve->model())->item(3)->isEnabled());  // (drawn: no points)
+            curve->setCurrentIndex(2);
+            emit curve->activated(2);
+            QCOMPARE(track().sampler.pads[0].velocityCurve, 2);
+            output = panel->findChild<QComboBox*>("samplerOutput48");  // (the table made again)
+            QCOMPARE(output->count(), int(state()->sequence()->audioTracks.size()));  // (this track, then the others)
+            output->setCurrentIndex(1);
+            emit output->activated(1);
+            QCOMPARE(track().sampler.pads[0].output, state()->sequence()->audioTracks[1].id);
+            state()->undo();
+            QCOMPARE(track().sampler.pads[0].output, Id(0));
+            state()->undo();
+            QCOMPARE(track().sampler.pads[0].velocityCurve, 0);
+            perHit = panel->findChild<QCheckBox*>("samplerClipPerHit");
+            perHit->setChecked(true);
+            QVERIFY(track().sampler.clipPerHit);
+            perHit->setChecked(false);
+            QVERIFY(!track().sampler.clipPerHit);
+        }
         // The computer's keys: Z plays C3 (48), the sound in the sampler at once.
         panel->setComputerKeys(true);
         QWidget* focus = win_->findChild<TimelineWidget*>();

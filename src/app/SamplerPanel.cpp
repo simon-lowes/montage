@@ -5,6 +5,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QStandardItemModel>
 #include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -43,7 +44,7 @@ QString keyText(int key) {
     return QStringLiteral("%1 %2%3").arg(key).arg(QLatin1String(names[key % 12])).arg(key / 12 - 1);
 }
 
-enum Column { Key, Name, Sounds, Gain, Attack, Release, OneShot, Choke, Pitch, Level, Columns };
+enum Column { Key, Name, Sounds, Gain, Attack, Release, OneShot, Choke, Pitch, Level, Curve, Output, Columns };
 
 }  // namespace
 
@@ -79,7 +80,7 @@ SamplerPanel::SamplerPanel(EditorState* state, PlaybackController* program, QWid
     table_ = new QTableWidget(0, Columns);
     table_->setObjectName(QStringLiteral("samplerSlots"));
     table_->setHorizontalHeaderLabels({tr("Key"), tr("Name"), tr("Sounds"), tr("Gain (dB)"), tr("Attack (s)"), tr("Release (s)"), tr("One-shot"),
-                                       tr("Choke"), tr("Pitch ±"), tr("Level ±")});
+                                       tr("Choke"), tr("Pitch ±"), tr("Level ±"), tr("Velocity Curve"), tr("Output")});
     table_->verticalHeader()->hide();
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -100,6 +101,9 @@ SamplerPanel::SamplerPanel(EditorState* state, PlaybackController* program, QWid
     recordButton_ = new QPushButton(tr("Record"));
     recordButton_->setObjectName(QStringLiteral("samplerRecord"));
     recordButton_->setCheckable(true);
+    clipPerHitBox_ = new QCheckBox(tr("One Clip a Hit"));
+    clipPerHitBox_->setObjectName(QStringLiteral("samplerClipPerHit"));
+    clipPerHitBox_->setToolTip(tr("Place each pass recorded as a clip for each note, cut where the next note falls"));
     passBox_ = new QComboBox;
     passBox_->setObjectName(QStringLiteral("samplerPass"));
     auto* revoiceButton = new QPushButton(tr("Voice Again"));
@@ -107,6 +111,7 @@ SamplerPanel::SamplerPanel(EditorState* state, PlaybackController* program, QWid
     revoiceButton->setToolTip(tr("Render the pass's notes again through the slots as they are now"));
     for (QWidget* w : {static_cast<QWidget*>(add), static_cast<QWidget*>(split), static_cast<QWidget*>(remove)}) buttons->addWidget(w);
     buttons->addStretch();
+    buttons->addWidget(clipPerHitBox_);
     buttons->addWidget(recordButton_);
     buttons->addWidget(passBox_);
     buttons->addWidget(revoiceButton);
@@ -121,6 +126,16 @@ SamplerPanel::SamplerPanel(EditorState* state, PlaybackController* program, QWid
         if (!connectMidi(i > 0 ? midiBox_->itemText(i) : QString(), &why)) status_->setText(why);
     });
     connect(keysBox_, &QCheckBox::toggled, this, &SamplerPanel::setComputerKeys);
+    connect(clipPerHitBox_, &QCheckBox::toggled, this, [this](bool on) {
+        if (refreshing_) return;
+        const Track* t = audioTrack();
+        if (!t || t->sampler.clipPerHit == on) return;
+        state_->apply(tr("Sampler: One Clip a Hit"), [&](Project&, Sequence& s) {
+            if (track_ >= int(s.audioTracks.size())) return edit::Result::fail("No such track");
+            s.audioTracks[size_t(track_)].sampler.clipPerHit = on;
+            return edit::Result{};
+        });
+    });
     connect(table_, &QTableWidget::cellChanged, this, &SamplerPanel::cellEdited);
     connect(add, &QPushButton::clicked, this, [this] {
         const QStringList files = QFileDialog::getOpenFileNames(this, tr("Add Sounds"), QString(), tr("Sounds (*.wav *.aif *.aiff *.flac *.mp3 *.ogg *.m4a *.caf);;All files (*)"));
@@ -242,9 +257,54 @@ void SamplerPanel::refreshTable() {
         set(Choke, sl.choke ? QString::number(sl.choke) : QString());
         set(Pitch, QString::number(sl.pitchVariation, 'g', 4));
         set(Level, QString::number(sl.levelVariation, 'g', 4));
+        // How the force played comes out (drawn only from a curve given over MCP), and the track its part of a pass
+        // is recorded onto.
+        set(Curve, QString(), false);
+        auto* curve = new QComboBox;
+        curve->setObjectName(QStringLiteral("samplerCurve%1").arg(sl.key));
+        curve->addItems({tr("As Played"), tr("Soft"), tr("Hard"), tr("Drawn")});
+        if (sl.velocityPoints.empty()) qobject_cast<QStandardItemModel*>(curve->model())->item(3)->setEnabled(false);
+        else {
+            QStringList pts;
+            for (const auto& [in, o] : sl.velocityPoints) pts << QStringLiteral("%1 → %2").arg(in).arg(o);
+            curve->setToolTip(tr("Drawn through %1").arg(pts.join(QStringLiteral(", "))));
+        }
+        curve->setCurrentIndex(std::clamp(sl.velocityCurve, 0, 3));
+        connect(curve, &QComboBox::activated, this, [this, key = sl.key](int i) { changeSlot(key, [i](SamplerSlot& x) { x.velocityCurve = i; }); });
+        table_->setCellWidget(r, Curve, curve);
+        set(Output, QString(), false);
+        auto* output = new QComboBox;
+        output->setObjectName(QStringLiteral("samplerOutput%1").arg(sl.key));
+        output->addItem(tr("This Track"), qlonglong(0));
+        if (const Sequence* sq = state_->sequence())
+            for (size_t i = 0; i < sq->audioTracks.size(); ++i)
+                if (int(i) != track_) {
+                    const std::string& n = sq->audioTracks[i].name;
+                    output->addItem(n.empty() ? QStringLiteral("A%1").arg(i + 1) : QStringLiteral("A%1 %2").arg(i + 1).arg(QString::fromStdString(n)),
+                                    qlonglong(sq->audioTracks[i].id));
+                }
+        output->setCurrentIndex(std::max(0, output->findData(qlonglong(sl.output))));
+        connect(output, &QComboBox::activated, this, [this, key = sl.key, output](int i) {
+            const Id to = Id(output->itemData(i).toLongLong());
+            changeSlot(key, [to](SamplerSlot& x) { x.output = to; });
+        });
+        table_->setCellWidget(r, Output, output);
         if (sl.key == key) table_->setCurrentCell(r, Name);
     }
+    clipPerHitBox_->setChecked(t && t->sampler.clipPerHit);
     refreshing_ = false;
+}
+
+void SamplerPanel::changeSlot(int key, const std::function<void(SamplerSlot&)>& change) {
+    const Track* t = audioTrack();
+    if (!t) return;
+    for (const SamplerSlot& e : t->sampler.pads)
+        if (e.key == key) {
+            SamplerSlot sl = e;
+            change(sl);
+            if (!(sl == e)) setSlot(sl, tr("Sampler Slot"));
+            return;
+        }
 }
 
 void SamplerPanel::refreshPasses() {
