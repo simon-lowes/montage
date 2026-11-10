@@ -177,17 +177,25 @@ bool remove(const QString& id, const QString& folder) {
 }
 
 int prune(const QString& owner, int keep, const QString& folder) {
-    // Folders left without a readable record (a crash as one was made, a record damaged) are never listed: those a day
-    // old go too.
+    // Folders left without a record (a crash as one was made) or with one that was read but is damaged are never
+    // listed: those a day old go too. One whose folder or record cannot be read (no permission, a file another
+    // process holds, a read error) is left alone: what could not be read is never taken for damaged.
     int n = 0;
     const QDir dir(folderOr(folder));
     const QDateTime dayAgo = QDateTime::currentDateTimeUtc().addDays(-1);
     for (const QFileInfo& d : dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
         if (d.fileName() == QLatin1String("alive") || d.lastModified().toUTC() > dayAgo) continue;
-        Record r;
+        if (!d.isReadable() || !d.isExecutable()) continue;  // (its contents cannot be seen)
         const QFileInfo record(d.filePath() + QStringLiteral("/job.json"));
         if (record.exists() && record.lastModified().toUTC() > dayAgo) continue;
-        if (!load(d.fileName(), r, folder)) n += remove(d.fileName(), folder) ? 1 : 0;
+        if (record.exists()) {
+            QFile f(record.filePath());
+            if (!f.open(QIODevice::ReadOnly)) continue;
+            const QByteArray bytes = f.readAll();
+            if (f.error() != QFileDevice::NoError || bytes.size() < f.size()) continue;
+            if (QJsonDocument::fromJson(bytes).isObject()) continue;  // (a record: listed, and pruned below if done)
+        }
+        n += remove(d.fileName(), folder) ? 1 : 0;
     }
     std::vector<Record> done;
     for (Record& r : all(owner, folder))

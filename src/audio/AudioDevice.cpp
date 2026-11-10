@@ -154,7 +154,7 @@ TakeAligner::Step TakeAligner::next(int64_t sample, int frames) {
         started_ = true;
         next_ = start_;
         if (!clocked_) skip_ = std::max<int64_t>(0, fallback_);
-        else if (sample > start_) st.silence = std::min<int64_t>(sample - start_, int64_t(48000) * 60);
+        else if (sample > start_) st.silence = std::min<int64_t>(sample - start_, rate_ * 60);
         else skip_ = start_ - sample;
     } else if (clocked_ && placed_ && skip_ == 0 && sample >= 0) {
         // A block that is not where the take has reached: frames lost to an input overflow (or a few lost each time,
@@ -162,7 +162,7 @@ TakeAligner::Step TakeAligner::next(int64_t sample, int frames) {
         // a block is kept as it comes. A jump back (the playback looped or was moved back, or frames came twice) or
         // forward by more than two seconds (moved on) is not the device's: the take goes on from there, nothing of it
         // passed over and no silence put in.
-        const int64_t off = sample - next_, slack = std::max<int64_t>(frames, 256), far = 96000;
+        const int64_t off = sample - next_, slack = std::max<int64_t>(frames, 256), far = 2 * rate_;
         if (off > slack && off <= far) st.silence = off;
         else if (off < -slack || off > far) next_ = sample;
     }

@@ -888,53 +888,73 @@ struct McpServer::Impl {
         }
     }
 
-    // The files and folders side-by-side calls running now write (or read): a call naming one waits until the call
-    // using it is done, so two background renders to one path never write it at once.
+    // The files and folders side-by-side calls running now write or read: a call writing one waits until no other call
+    // uses it, and a call reading one waits only while another writes it, so two background renders to one path never
+    // write it at once and calls that only read a file run side by side.
     std::mutex outputsMutex;
     std::condition_variable outputsFree;
-    std::multiset<QString> outputsInUse;
-    // The paths a call's arguments name (path, file, folder, output, report, any *_path, *_file, *_folder, *_dir,
-    // *_output or *_report, and lists of them): of a read-only tool only what it writes (output and report), so
-    // read-only calls on one project or file still run side by side.
-    static QStringList outputsOf(const QJsonObject& a, bool writesOnly = false) {
-        QStringList out;
-        const auto named = [writesOnly](const QString& k) {
+    struct PathUse {
+        int readers = 0, writers = 0;
+    };
+    std::map<QString, PathUse> pathsInUse;
+    // The paths a call's arguments name: what it writes (output, report, any *_output or *_report) and what it reads
+    // (path, file, folder, files, paths, dir, any *_path, *_file, *_folder or *_dir; lists of them too). A path it both
+    // reads and writes counts as written.
+    struct CallPaths {
+        QStringList writes, reads;
+    };
+    static CallPaths pathsOf(const QJsonObject& a) {
+        CallPaths out;
+        const auto kind = [](const QString& k) {
             static const char* const writes[] = {"output", "report"};
             static const char* const reads[] = {"path", "file", "folder", "files", "paths", "dir"};
             for (const char* w : writes)
-                if (k == QLatin1String(w) || k.endsWith(QLatin1Char('_') + QLatin1String(w))) return true;
-            if (writesOnly) return false;
+                if (k == QLatin1String(w) || k.endsWith(QLatin1Char('_') + QLatin1String(w))) return 2;
             for (const char* r : reads)
-                if (k == QLatin1String(r) || k.endsWith(QLatin1Char('_') + QLatin1String(r))) return true;
-            return false;
+                if (k == QLatin1String(r) || k.endsWith(QLatin1Char('_') + QLatin1String(r))) return 1;
+            return 0;
         };
         for (auto it = a.begin(); it != a.end(); ++it) {
-            if (!named(it.key())) continue;
+            const int k = kind(it.key());
+            if (!k) continue;
             const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
             for (const QJsonValue& v : list)
-                if (v.isString() && !v.toString().isEmpty()) out << QDir::cleanPath(absolute(v.toString()));
+                if (v.isString() && !v.toString().isEmpty()) (k == 2 ? out.writes : out.reads) << QDir::cleanPath(absolute(v.toString()));
         }
-        out.removeDuplicates();
+        out.writes.removeDuplicates();
+        out.reads.removeDuplicates();
+        for (const QString& w : out.writes) out.reads.removeAll(w);
         return out;
     }
     struct OutputClaim {
         Impl* d = nullptr;
-        QStringList paths;
+        CallPaths paths;
         ~OutputClaim() {
-            if (!d || paths.isEmpty()) return;
+            if (!d) return;
             {
                 std::lock_guard l(d->outputsMutex);
-                for (const QString& p : paths) d->outputsInUse.erase(d->outputsInUse.find(p));
+                auto drop = [&](const QString& p, bool write) {
+                    auto it = d->pathsInUse.find(p);
+                    if (it == d->pathsInUse.end()) return;
+                    (write ? it->second.writers : it->second.readers) -= 1;
+                    if (it->second.readers <= 0 && it->second.writers <= 0) d->pathsInUse.erase(it);
+                };
+                for (const QString& p : paths.writes) drop(p, true);
+                for (const QString& p : paths.reads) drop(p, false);
             }
             d->outputsFree.notify_all();
         }
     };
-    // Waits (its turn held, so later calls keep their order) while a running call uses one of `paths`; false when the
-    // call is cancelled or the server stops meanwhile.
-    bool claimOutputs(OutputClaim& claim, const QStringList& paths, const std::atomic<bool>& cancel) {
+    // Waits (its turn held, so later calls keep their order) while a running call writes one of the paths this one
+    // uses, or uses one it writes; false when the call is cancelled or the server stops meanwhile.
+    bool claimOutputs(OutputClaim& claim, const CallPaths& paths, const std::atomic<bool>& cancel) {
         std::unique_lock l(outputsMutex);
         const auto free = [&] {
-            return std::none_of(paths.begin(), paths.end(), [&](const QString& p) { return outputsInUse.count(p) > 0; });
+            for (const QString& p : paths.writes)
+                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && (it->second.readers > 0 || it->second.writers > 0)) return false;
+            for (const QString& p : paths.reads)
+                if (auto it = pathsInUse.find(p); it != pathsInUse.end() && it->second.writers > 0) return false;
+            return true;
         };
         while (!free()) {
             if (cancel) return false;
@@ -944,7 +964,8 @@ struct McpServer::Impl {
             }
             outputsFree.wait_for(l, std::chrono::milliseconds(200));
         }
-        for (const QString& p : paths) outputsInUse.insert(p);
+        for (const QString& p : paths.writes) ++pathsInUse[p].writers;
+        for (const QString& p : paths.reads) ++pathsInUse[p].readers;
         claim.d = this;
         claim.paths = paths;
         return true;
@@ -1145,7 +1166,7 @@ struct McpServer::Impl {
             else alone.lock();
             OutputClaim outputs;
             const bool claimed = !job->sideBySide || tool == tools.end() ||
-                                 claimOutputs(outputs, outputsOf(job->args, tool->readOnly), job->cancel);
+                                 claimOutputs(outputs, pathsOf(job->args), job->cancel);
             {
                 std::lock_guard jl(job->m);
                 if (!claimed || job->cancel || tool == tools.end()) {

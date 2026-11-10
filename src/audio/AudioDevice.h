@@ -83,10 +83,12 @@ int64_t findClick(const float* samples, int64_t n, int stride = 1, float floor =
 // before `start` passed over where it is earlier), and a later block more than a block (and at most two seconds) past
 // where the take has reached (frames lost to an input overflow) is placed by its own sample again; a jump back, or
 // further on, carries the take on from there. Unclocked: the first `fallback` frames
-// (what arrived late from before the take began) are passed over and the rest kept as they come.
+// (what arrived late from before the take began) are passed over and the rest kept as they come. `rate` is the take's
+// (its seconds are counted in its own samples).
 class TakeAligner {
 public:
-    TakeAligner(int64_t start = 0, bool clocked = false, int64_t fallback = 0) : start_(start), fallback_(fallback), clocked_(clocked) {}
+    TakeAligner(int64_t start = 0, bool clocked = false, int64_t fallback = 0, int rate = 48000)
+        : start_(start), fallback_(fallback), rate_(rate > 0 ? rate : 48000), clocked_(clocked) {}
     struct Step {
         int64_t silence = 0;  // frames of silence before this block's
         int skip = 0;         // this block's first frames passed over
@@ -95,7 +97,7 @@ public:
     bool started() const { return started_; }
 
 private:
-    int64_t start_, fallback_, skip_ = 0, next_ = 0;  // (next_: the timeline sample the take has reached)
+    int64_t start_, fallback_, rate_, skip_ = 0, next_ = 0;  // (next_: the timeline sample the take has reached)
     bool clocked_, started_ = false, placed_ = false;
 };
 

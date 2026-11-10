@@ -189,7 +189,7 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         const int64_t first = std::llround(double(at_) / s->fpsValue() * rate_);
         const audiodev::EngineStatus st = engine.status();
         const int64_t fallback = st.rate > 0 ? std::llround(double(st.measured ? st.roundTrip / 2 : st.latency.input) * rate_ / st.rate) : 0;
-        aligner_ = audiodev::TakeAligner(first, clock_ != nullptr, fallback);
+        aligner_ = audiodev::TakeAligner(first, clock_ != nullptr, fallback, rate_);
         {
             std::lock_guard<std::mutex> lock(pendingM_);
             pending_.clear();
