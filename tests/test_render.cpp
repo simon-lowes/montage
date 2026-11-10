@@ -21900,7 +21900,8 @@ colorspaces:
             QCOMPARE(gpu::stats().cpuLayers, layers);
         }
     }
-    // The depth effects and masks and object masks on the GPU, once their models have run: a video clip with its depth
+    // The depth effects (Lens Blur (Depth) among them: round and bladed, with highlights, a point racked, squeezed with a
+    // cat's eye and breathing, and through a mask) and masks and object masks on the GPU, once their models have run: a video clip with its depth
     // analysed (made here from each frame's brightness, in the model's place) and an object segmented on every frame,
     // within 1/1023 of the CPU with nothing made there.
     void gpuDepthAndObjectMasks() {
@@ -22015,6 +22016,13 @@ colorspaces:
             {"invert", {{"mask.shape", 3}, {"mask.feather", 6}}, true},
             {"gaussian_blur", {{"radius", 4}, {"mask.shape", 3}, {"mask.expansion", 5}, {"mask.invert", 1}}, true},
             {"invert", {{"mask.shape", 3}, {"mask.depth", 1}, {"mask.depth_high", 60}}, true},
+            {"depth_blur", {}, false},
+            {"depth_blur", {{"focus", 30}, {"radius", 20}, {"blades", 6}, {"blade_rotation", 15}, {"highlights", 60}, {"threshold", 50}}, false},
+            {"depth_blur",
+             {{"follow", 1}, {"point_x", 0.3}, {"point_y", 0.6}, {"squeeze", 1.6}, {"cat_eye", 60}, {"near", 0}, {"breathing", 80}, {"fstop", 1.4},
+              {"range", 4}, {"falloff", 60}},
+             false},
+            {"depth_blur", {{"radius", 8}, {"focus", 50}, {"mask.shape", 2}, {"mask.w", 0.6}, {"mask.h", 0.5}, {"mask.feather", 10}}, false},
         };
         for (size_t k = 0; k < cases.size(); ++k) {
             Effect e = makeEffect(p, cases[k].type);
@@ -22022,9 +22030,11 @@ colorspaces:
             if (cases[k].object) e.object = object;
             edit::clipById(s, clipId)->effects = {e};
             const QString what = QString("%1 #%2").arg(cases[k].type).arg(k + 1);
+            const long passes = gpu::stats().filterPasses;
             compare(3 + FrameTime(k), what);
+            if (k >= 11) QVERIFY2(gpu::stats().filterPasses > passes + 5, qPrintable(what + ": not drawn in passes"));
             // (it did something: the depth and the object were there)
-            if (k == 0 || k == 6 || k == 8) QVERIFY2(renderProgramFrame(p, s, 5, plain).px != untouched.px, qPrintable(what));
+            if (k == 0 || k == 6 || k == 8 || k >= 11) QVERIFY2(renderProgramFrame(p, s, 5, plain).px != untouched.px, qPrintable(what));
         }
         qunsetenv("MONTAGE_DEPTH_CACHE");
     }

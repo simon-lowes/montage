@@ -2213,6 +2213,27 @@ double depthBlurFocus(const Effect& e, FrameTime t, const std::vector<float>& de
 }
 
 namespace {
+// Lens Blur (Depth)'s settings at t, over the frame's depth (W x H), as both renderers draw it.
+LensBlurSettings depthBlurSettings(const Effect& e, FrameTime t, const std::vector<float>& d, int W, int H, double pixelScale) {
+    LensBlurSettings ls;
+    ls.focus = depthBlurFocus(e, t, d, W, H);
+    ls.half = e.p("range", t, 10) / 200;
+    ls.falloff = std::max(0.01, e.p("falloff", t, 30) / 100);
+    ls.blurNear = e.p("near", t, 1) > 0.5;
+    // The radius is the blur at f/2.8; a wider aperture blurs more, in proportion.
+    ls.radius = std::max(0.0, e.p("radius", t, 12) * pixelScale) * 2.8 / std::clamp(e.p("fstop", t, 2.8), 0.7, 64.0);
+    ls.aperture.blades = int(std::lround(e.p("blades", t, 0)));
+    if (ls.aperture.blades > 0 && ls.aperture.blades < 3) ls.aperture.blades = 3;  // the fewest a polygon has
+    ls.aperture.rotation = e.p("blade_rotation", t, 0);
+    ls.aperture.squeeze = std::max(1.0, e.p("squeeze", t, 1));
+    ls.aperture.catEye = std::clamp(e.p("cat_eye", t, 0) / 100, 0.0, 1.0);
+    ls.highlights = std::clamp(e.p("highlights", t, 0) / 100, 0.0, 1.0);
+    ls.threshold = std::clamp(e.p("threshold", t, 80) / 100, 0.05, 1.0);
+    return ls;
+}
+}  // namespace
+
+namespace {
 // Depth Map, Depth Fog and Lens Blur (Depth), from currentDepth(); nothing without one.
 void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const DepthMap* depth = currentDepth();
@@ -2246,20 +2267,7 @@ void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
         return;
     }
     // Lens Blur (render/LensBlur.h): each pixel blurred by its own circle of confusion, in layers far to near.
-    LensBlurSettings ls;
-    ls.focus = depthBlurFocus(e, t, d, W, H);
-    ls.half = e.p("range", t, 10) / 200;
-    ls.falloff = std::max(0.01, e.p("falloff", t, 30) / 100);
-    ls.blurNear = e.p("near", t, 1) > 0.5;
-    // The radius is the blur at f/2.8; a wider aperture blurs more, in proportion.
-    ls.radius = std::max(0.0, e.p("radius", t, 12) * pixelScale) * 2.8 / std::clamp(e.p("fstop", t, 2.8), 0.7, 64.0);
-    ls.aperture.blades = int(std::lround(e.p("blades", t, 0)));
-    if (ls.aperture.blades > 0 && ls.aperture.blades < 3) ls.aperture.blades = 3;  // the fewest a polygon has
-    ls.aperture.rotation = e.p("blade_rotation", t, 0);
-    ls.aperture.squeeze = std::max(1.0, e.p("squeeze", t, 1));
-    ls.aperture.catEye = std::clamp(e.p("cat_eye", t, 0) / 100, 0.0, 1.0);
-    ls.highlights = std::clamp(e.p("highlights", t, 0) / 100, 0.0, 1.0);
-    ls.threshold = std::clamp(e.p("threshold", t, 80) / 100, 0.05, 1.0);
+    const LensBlurSettings ls = depthBlurSettings(e, t, d, W, H, pixelScale);
     const ColorSpace& working = currentWorkingSpace();
     std::unique_ptr<TransferTables> tables;
     if (working.transfer != Transfer::Linear) tables = std::make_unique<TransferTables>(working.transfer);
@@ -3550,7 +3558,7 @@ bool isGpuFilter(const std::string& type) {
                                                   "ripple", "turbulent_displace", "motion_tile", "camera_shake", "corner_pin",
                                                   "find_edges", "emboss", "halftone", "duotone", "vhs", "tilt_shift", "mesh_warp",
                                                   "grid_warp", "depth_map", "depth_fog", "light_rays", "lens_flare", "radial_blur",
-                                                  "aperture_glare", "painterly"};
+                                                  "aperture_glare", "painterly", "depth_blur"};
     return filters.count(type) > 0;
 }
 
@@ -4040,6 +4048,106 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     q[16] = float(d.r[0][0]), q[17] = float(d.r[0][1]), q[18] = float(d.r[1][0]), q[19] = float(d.r[1][1]);
                     q[20] = float(d.r[2][0]), q[21] = float(d.r[2][1]);
                 }
+            }
+        } else if (ty == "depth_blur") {
+            // lensBlur's plan (render/LensBlur), from the frame's depth, as passes: the state S (what is laid down, in
+            // light, beside its coverage) twice the layer's width, each layer laid down sharp, or what is behind it
+            // filled through a pyramid and the layer gathered at 1/f through the aperture's taps and laid over S. (The
+            // nearest face's depth needs the faces, found on the CPU.)
+            if (std::lround(e.p("follow", t, 0)) == 2) return false;
+            const DepthMap* depth = currentDepth();
+            if (width > 0 && height > 0 && depth && !depth->empty()) {
+                const std::vector<float> d = depth->resized(width, height);
+                const LensBlurSettings ls = depthBlurSettings(e, t, d, width, height, pixelScale);
+                const ColorSpace& space = currentWorkingSpace();
+                const bool light = space.transfer != Transfer::Linear;
+                const int tf = light ? gpuTransfer(space) : 0;
+                if (light && tf < 0) return false;  // (a curve the shader does not have)
+                std::unique_ptr<TransferTables> tables;
+                if (light) tables = std::make_unique<TransferTables>(space.transfer);
+                const LensBlurPlan plan = lensBlurPlan(d, width, height, ls, tables.get());
+                const int W = width, H = height;
+                enum { kLB = 1, kS = 2, kLevels = 4 };
+                auto pass = [&](int mode, int w, int h, int save, int extra, int tableSlot) -> gpu::ColorOp::FilterPass& {
+                    add(mode, {});
+                    gpu::ColorOp::FilterPass& fp = f.passes.back();
+                    fp.width = w, fp.height = h, fp.save = save, fp.extra = extra, fp.tableSlot = tableSlot;
+                    return fp;
+                };
+                auto set = [](gpu::ColorOp::FilterPass& fp, std::initializer_list<float> v) { std::copy(v.begin(), v.end(), fp.params); };
+                if (!plan.none) {
+                    {
+                        gpu::ColorOp::FilterPass& fp = pass(58, 2 * W, H, kLB, -1, -1);
+                        set(fp, {light ? 1.0f : 0.0f, float(plan.liftThreshold), float(plan.lift), float(W), float(tf)});
+                        fp.tableWidth = std::max(TransferTables::kDecode + 1, W);
+                        fp.table.assign(size_t(fp.tableWidth) * 4 * size_t(H + 1), 0.0f);
+                        if (tables) {
+                            for (size_t i = 0; i < tables->dec.size(); ++i) fp.table[i * 4] = tables->dec[i];
+                            for (size_t i = 0; i < tables->enc.size(); ++i) fp.table[i * 4 + 1] = tables->enc[i];
+                        }
+                        for (int y = 0; y < H; ++y)
+                            for (int x = 0; x < W; ++x) {
+                                const size_t i = size_t(y) * size_t(W) + size_t(x), o = (size_t(y + 1) * size_t(fp.tableWidth) + size_t(x)) * 4;
+                                fp.table[o] = float(plan.bin0[i]), fp.table[o + 1] = plan.share[i];
+                            }
+                    }
+                    set(pass(59, 2 * W, H, kS, -1, -1), {0, 0, 0, float(W)});
+                    for (const LensBlurLayer& L : plan.layers) {
+                        if (L.sharp) {
+                            set(pass(60, 2 * W, H, kS, kS, kLB), {0, 0, 0, float(W), float(L.k), float(L.bx0), float(L.by0), float(L.bx1), float(L.by1)});
+                            continue;
+                        }
+                        if (L.fill) {
+                            // fillBehind's pyramid over the box, pulled to one cell, its means pushed back down
+                            std::vector<std::pair<int, int>> levels;
+                            int w = L.fx1 - L.fx0 + 1, h = L.fy1 - L.fy0 + 1;
+                            while (w > 1 || h > 1) {
+                                const int nw = (w + 1) / 2, nh = (h + 1) / 2;
+                                const bool fromS = levels.empty();
+                                set(pass(61, 2 * nw, nh, kLevels + int(levels.size()), fromS ? kS : -1, -1),
+                                    {0, 0, 0, float(nw), fromS ? 1.0f : 0.0f, fromS ? float(L.fx0) : 0.0f, fromS ? float(L.fy0) : 0.0f, float(w), float(h),
+                                     fromS ? float(W) : float(levels.back().first)});
+                                levels.push_back({nw, nh});
+                                w = nw, h = nh;
+                            }
+                            if (!levels.empty()) {
+                                for (size_t lv = levels.size(); lv-- > 0;)
+                                    set(pass(63, levels[lv].first, levels[lv].second, -1, kLevels + int(lv), -1),
+                                        {0, 0, 0, float(levels[lv].first), lv + 1 < levels.size() ? 1.0f : 0.0f});
+                                set(pass(64, 2 * W, H, kS, kS, kLevels + int(levels.size()) - 1),
+                                    {0, 0, 0, float(W), float(L.fx0), float(L.fy0), float(L.fx1), float(L.fy1)});
+                            }
+                        }
+                        if (L.taps.empty()) continue;
+                        set(pass(65, 2 * L.lw, L.lh, -1, kLB, -1),
+                            {0, 0, 0, float(L.lw), float(L.k), float(L.x0), float(L.y0), float(L.x1), float(L.y1), float(L.f),
+                             1.0f / float(L.f * L.f), float(W)});
+                        {
+                            gpu::ColorOp::FilterPass& fp = pass(66, 2 * L.lw, L.lh, -1, -1, -1);
+                            const double cx = W / 2.0, cy = H / 2.0;
+                            set(fp, {0, 0, 0, float(L.lw), float(L.taps.size()), float(L.lh), float(L.rr), float(ls.aperture.catEye),
+                                     float(std::max(1.0, ls.aperture.squeeze)), float(L.x0), float(L.y0), float(L.f), float(cx), float(cy),
+                                     float(std::hypot(cx, cy)), 0, L.x0 == 0 ? 1.0f : 0.0f, L.x1 == W - 1 ? 1.0f : 0.0f, L.y0 == 0 ? 1.0f : 0.0f,
+                                     L.y1 == H - 1 ? 1.0f : 0.0f});
+                            fp.tableWidth = 1024;
+                            fp.table.assign(((L.taps.size() * 2 + 1023) / 1024) * 1024 * 4, 0.0f);
+                            for (size_t i = 0; i < L.taps.size(); ++i) {
+                                const LensBlurTap& tp = L.taps[i];
+                                const float v[8] = {float(tp.dx), float(tp.dy), float(tp.kx), float(tp.ky), tp.w, 0, 0, 0};
+                                std::copy(v, v + 8, &fp.table[i * 8]);
+                            }
+                        }
+                        set(pass(67, 2 * W, H, kS, kS, -1),
+                            {0, 0, 0, float(W), float(L.x0), float(L.y0), float(L.x1), float(L.y1), float(L.f), float(L.lw), float(L.lh)});
+                    }
+                    gpu::ColorOp::FilterPass& fp = pass(68, 0, 0, -1, kS, -1);
+                    set(fp, {light ? 1.0f : 0.0f, float(plan.liftThreshold), float(plan.lift), float(W), float(tf)});
+                    if (tables) transferTableRows(fp, space, 1);
+                }
+                // Focus breathing: a little larger focused near (up to 4 %), as depthEffect does it.
+                const double breathing = std::clamp(e.p("breathing", t, 0) / 100, 0.0, 1.0);
+                if (const double scale = 1 + 0.04 * breathing * ls.focus; breathing > 0 && std::fabs(scale - 1) >= 1e-4)
+                    set(pass(69, 0, 0, -1, -1, -1), {0, 0, 0, float(W), float(scale)});
             }
         } else if (ty == "depth_map" || ty == "depth_fog") {
             // depthEffect's colour and amount at each pixel, from the frame's depth (currentDepth(): nothing without one)
