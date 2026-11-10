@@ -29413,6 +29413,50 @@ background calls MCP runs at once</source>
         <source>Cannot open %1: %2</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Velocity Curve</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Output</source>
+        <translation type="unfinished">Ausgabe</translation>
+    </message>
+    <message>
+        <source>One Clip a Hit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Place each pass recorded as a clip for each note, cut where the next note falls</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sampler: One Clip a Hit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>As Played</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Soft</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Hard</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drawn</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Drawn through %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This Track</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::ScopesWidget</name>
@@ -32945,6 +32989,14 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>The audio input could not be opened: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The grouped take could not be split by track (is the disk full?): it is kept in %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Some tracks of the grouped take could not be imported</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
