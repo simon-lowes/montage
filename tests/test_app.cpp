@@ -41,6 +41,7 @@
 #include <QMimeData>
 #include <QScrollBar>
 #include <QSlider>
+#include <QVBoxLayout>
 #include <QPushButton>
 #include <QTextBrowser>
 #include <QColorDialog>
@@ -1778,6 +1779,157 @@ private slots:
         reopened.disconnectDevice();
         learn->disconnectDevice();
         QVERIFY(!learn->isConnected());
+    }
+    void midiLearnInDialogsAndOnOtherPorts() {
+        // Through a stand-in MIDI connection: a parameter in a dialog learnt, a key's pressure learnt by pressing into
+        // it, one fader driving three parameters in their own ranges, and automation shown on another output port.
+        struct Port : MidiConnection {
+            std::string name;
+            std::shared_ptr<std::vector<MidiMessage>> sent = std::make_shared<std::vector<MidiMessage>>();
+            bool send(const MidiMessage& m) override {
+                sent->push_back(m);
+                return true;
+            }
+            std::string inputName() const override { return name; }
+            std::string outputName() const override { return name; }
+        };
+        QTemporaryDir maps;
+        MidiLearn* learn = win_->midiLearn();
+        learn->setFolder(maps.path());
+        learn->setHoldTime(600000);
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QTRY_VERIFY(mixer->trackStrips() >= 1);
+        auto controller = std::make_unique<Port>();
+        controller->name = "Pads";
+        learn->setConnection(std::move(controller), "Pads");
+        auto motors = std::make_shared<std::vector<MidiMessage>>();
+        QStringList opened;
+        learn->setOutputOpener([&](const QString& name, QString*) -> std::unique_ptr<MidiConnection> {
+            opened << name;
+            if (name != QLatin1String("Motors")) return nullptr;
+            auto p = std::make_unique<Port>();
+            p->name = "Motors";
+            p->sent = motors;
+            return p;
+        });
+
+        // A dialog of Montage's (named, parented to the main window): its spin boxes are learnt as a panel's are.
+        QDialog dlg(win_.get());
+        dlg.setObjectName("midiTestDialog");
+        auto* layout = new QVBoxLayout(&dlg);
+        auto spin = [&](const char* name) {
+            auto* s = new QDoubleSpinBox(&dlg);
+            s->setObjectName(name);
+            s->setRange(0, 10);
+            s->setDecimals(3);
+            layout->addWidget(s);
+            return s;
+        };
+        QDoubleSpinBox* gain = spin("gain");
+        QDoubleSpinBox* trim = spin("trim");
+        QDoubleSpinBox* mix = spin("mix");
+        dlg.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&dlg) || dlg.isVisible());
+        QCOMPARE(learn->panelOf(gain), QString("dialog:midiTestDialog"));
+        QCOMPARE(learn->targetAt(gain), QString("widget:dialog:midiTestDialog/gain"));
+        QSignalSpy learnt(learn, &MidiLearn::learnt);
+        learn->setLearning(true);
+        for (int v = 10; v < 16; ++v) learn->handle({0xB0, 20, uint8_t(v)});
+        learn->learnTarget(learn->targetAt(gain));
+        QCOMPARE(learnt.size(), 1);
+        QCOMPARE(learnt[0][0].toString(), QString("cc:1:20"));
+        // A key learnt, then pressed into: its pressure is what drives the parameter.
+        learn->handle({0x90, 50, 100});
+        learn->learnTarget(learn->targetAt(trim));
+        QCOMPARE(learnt.size(), 2);
+        QCOMPARE(learnt[1][0].toString(), QString("note:1:50"));
+        learn->handle({0xD0, 40});
+        QCOMPARE(learnt.size(), 3);
+        QCOMPARE(learnt[2][0].toString(), QString("at:1:0"));
+        QCOMPARE(learnt[2][1].toString(), learn->targetAt(trim));
+        learn->handle({0x80, 50, 0});
+        learn->setLearning(false);
+        learn->handle({0xD0, 127});
+        QCOMPARE(trim->value(), 10.0);
+        learn->handle({0xD0, 0});
+        QCOMPARE(trim->value(), 0.0);
+        learn->handle({0xB0, 20, 0});  // (taken over from 0)
+        learn->handle({0xB0, 20, 127});
+        QCOMPARE(gain->value(), 10.0);
+
+        // "Add to its targets": a fader learnt three times drives all three, each set to a range of its own.
+        learn->setLearnAdds(true);
+        learn->setLearning(true);
+        const QStringList three{learn->targetAt(mix), learn->targetAt(mixer->trackFader(0)), learn->targetAt(gain)};
+        QCOMPARE(three[1], QString("strip:1:volume"));
+        for (const QString& t : three) {
+            QTest::qWait(650);  // (a control just learnt is not learnt again while it still moves)
+            for (int v = 30; v < 36; ++v) learn->handle({0xB0, 21, uint8_t(v)});
+            learn->learnTarget(t);
+        }
+        learn->setLearning(false);
+        learn->setLearnAdds(false);
+        std::vector<size_t> on21;
+        for (size_t i = 0; i < learn->mappings().size(); ++i)
+            if (learn->mappings()[i].key == (midimap::Key{midimap::Kind::Cc, 0, 21})) on21.push_back(i);
+        QCOMPARE(on21.size(), size_t(3));
+        const std::pair<double, double> ranges[] = {{0.2, 0.4}, {0.5, 1.0}, {0.0, 0.5}};
+        for (size_t k = 0; k < 3; ++k) {
+            midimap::Mapping m = learn->mappings()[on21[k]];
+            QCOMPARE(QString::fromStdString(m.target), three[int(k)]);
+            m.low = ranges[k].first;
+            m.high = ranges[k].second;
+            m.pickup = false;
+            if (k == 1) m.output = "Motors";  // the strip's volume shown on the motor fader bank
+            learn->setMapping(on21[k], m);
+        }
+        QCOMPARE(learn->mappings().size(), size_t(5));  // (gain kept its other control, CC 20)
+        QSlider* fader = mixer->trackFader(0);
+        learn->handle({0xB0, 21, 127});
+        QCOMPARE(mix->value(), 4.0);
+        QCOMPARE(fader->value(), fader->maximum());
+        QCOMPARE(gain->value(), 5.0);
+        learn->handle({0xB0, 21, 0});
+        QCOMPARE(mix->value(), 2.0);
+        QCOMPARE(fader->value(), int(std::lround(fader->minimum() + 0.5 * (fader->maximum() - fader->minimum()))));
+        QCOMPARE(gain->value(), 0.0);
+        learn->releaseHolds();
+        QVERIFY(opened.contains("Motors"));
+        QVERIFY(!motors->empty() && motors->back()[1] == 21);
+
+        // Automation read back on the strip: each move shown on the motor port as it plays, in order.
+        QVERIFY(state()->edit("Ride", [](Project&, Sequence& s) {
+            Track& t = s.audioTracks[0];
+            t.automation = int(AutomationMode::Read);
+            t.volumeAuto.addKey(0, -6);
+            t.volumeAuto.addKey(40, 12);
+            return true;
+        }));
+        motors->clear();
+        std::vector<MidiMessage> wanted;
+        const midimap::Mapping shown = learn->mappings()[on21[1]];
+        for (FrameTime f = 0; f <= 48; ++f) {
+            state()->setPlayhead(f);
+            mixer->playbackPosition(f);
+            learn->refresh();
+            const double v = learn->targetValue("strip:1:volume");
+            const auto q = uint8_t(std::lround(std::clamp(midimap::Mapper::toPosition(shown, v), 0.0, 1.0) * 127));
+            if (wanted.empty() || wanted.back()[2] != q) wanted.push_back({0xB0, 21, q});
+        }
+        QCOMPARE(*motors, wanted);
+        QVERIFY(wanted.size() > 20 && wanted.back()[2] == 127);
+        QVERIFY(std::is_sorted(wanted.begin(), wanted.end(), [](const MidiMessage& a, const MidiMessage& b) { return a[2] < b[2]; }));
+        QCOMPARE(opened.count("Motors"), 1);
+        // Saved with the map, and read again.
+        MidiLearn reopened(state(), mixer, win_.get());
+        reopened.setFolder(maps.path());
+        reopened.setConnection(std::make_unique<Port>(), "Pads");
+        QCOMPARE(reopened.mappings().size(), size_t(5));
+        QCOMPARE(reopened.mappings()[on21[1]].output, std::string("Motors"));
+        reopened.disconnectDevice();
+        learn->disconnectDevice();
+        dlg.close();
     }
     void samplerPanel() {
         // The Sampler panel: a sound put on a key and heard from the computer's keys, a slot's setting changed in the

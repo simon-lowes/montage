@@ -15,7 +15,7 @@ namespace montage::midimaps {
 struct Map {
     QString device;     // the controller's name, as its MIDI port gives it
     int bankSize = 8;   // the strips a bank moves by
-    std::vector<midimap::Mapping> mappings;
+    std::vector<midimap::Mapping> mappings;  // (a control may have several in a layer, one a target)
 };
 
 QJsonObject toJson(const midimap::Mapping& m);

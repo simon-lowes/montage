@@ -90,6 +90,7 @@
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 #include "control/MidiMap.h"
+#include "core/MidiMaps.h"
 #include "audio/Sampler.h"
 #include "render/Titles.h"
 
@@ -1994,6 +1995,202 @@ private slots:
             m.unmap(all.key, "");
             QCOMPARE(m.mappings().size(), size_t(1));
         }
+    }
+    void midiLearnPressureIncrementsAndSeveralTargets() {
+        using namespace montage::midimap;
+        Decoder decoder;
+        auto decode = [&](const std::vector<uint8_t>& bytes) {
+            std::vector<Event> events;
+            MidiParser parser;
+            parser.feed(bytes.data(), bytes.size(), [&](const MidiMessage& m) {
+                decoder.feed(m, [&](const Event& e) { events.push_back(e); });
+            });
+            return events;
+        };
+        // ---- Channel and polyphonic aftertouch: decoded, named and labelled.
+        auto events = decode({0xD3, 90, 0xA3, 60, 70, 0xA3, 61});
+        QCOMPARE(events.size(), size_t(2));
+        QVERIFY(events[0].key == (Key{Kind::Aftertouch, 3, 0}) && events[0].value == 90 && events[0].resolution == 128);
+        QVERIFY(events[1].key == (Key{Kind::PolyAftertouch, 3, 60}) && events[1].value == 70);
+        QCOMPARE(keyName({Kind::Aftertouch, 0, 0}), std::string("at:1:0"));
+        QCOMPARE(keyName({Kind::PolyAftertouch, 9, 36}), std::string("pat:10:36"));
+        QVERIFY(keyFromName("pat:4:60") == (Key{Kind::PolyAftertouch, 3, 60}));
+        QVERIFY(keyFromName("at:16:0") == (Key{Kind::Aftertouch, 15, 0}));
+        QVERIFY(!keyFromName("at:1:3") && !keyFromName("pat:1:128"));
+        QCOMPARE(keyLabel({Kind::Aftertouch, 0, 0}), std::string("Aftertouch (ch 1)"));
+        QCOMPARE(keyLabel({Kind::PolyAftertouch, 0, 60}), std::string("Aftertouch C4 (ch 1)"));
+        // Learnt from a key pressed into: the pressure, not the note.
+        {
+            Learner l;
+            l.add({{Kind::Note, 2, 48}, 100, 128});
+            for (int v : {20, 40, 60, 80}) l.add({{Kind::Aftertouch, 2, 0}, v, 128});
+            const auto got = l.finish();
+            QVERIFY(got && got->key == (Key{Kind::Aftertouch, 2, 0}) && got->encoding == Encoding::Absolute);
+            l.add({{Kind::Note, 2, 48}, 100, 128});
+            l.add({{Kind::PolyAftertouch, 2, 50}, 64, 128});  // another key's pressure: not this one's
+            QVERIFY(l.finish()->key == (Key{Kind::Note, 2, 48}));
+            l.add({{Kind::Note, 2, 48}, 100, 128});
+            l.add({{Kind::PolyAftertouch, 2, 48}, 64, 128});
+            l.add({{Kind::PolyAftertouch, 2, 48}, 70, 128});
+            QVERIFY(l.finish()->key == (Key{Kind::PolyAftertouch, 2, 48}));
+        }
+
+        std::map<std::string, double> values;
+        Targets targets{[&](const Mapping& m) { return values.count(m.target) ? values[m.target] : std::nan(""); },
+                        [&](const Mapping& m, const Change& c) { values[m.target] = c.value; }};
+        // Aftertouch drives its target over the mapping's range, and shows it back.
+        {
+            Mapper m;
+            Mapping pressure;
+            pressure.key = {Kind::PolyAftertouch, 3, 60};
+            pressure.target = "pressure";
+            pressure.pickup = false;
+            pressure.low = 0.25;
+            pressure.high = 0.75;
+            m.map(pressure);
+            values["pressure"] = 0;
+            m.handle(events[1], targets);
+            QVERIFY(std::fabs(values["pressure"] - (0.25 + 0.5 * 70 / 127.0)) < 1e-12);
+            m.handle({pressure.key, 127, 128}, targets);
+            QCOMPARE(values["pressure"], 0.75);
+            values["pressure"] = 0.5;
+            QCOMPARE(m.refresh(targets.get), (std::vector<MidiMessage>{{0xA3, 60, 64}}));
+            QCOMPARE(Mapper::feedback(Mapping{Key{Kind::Aftertouch, 1, 0}}, 1.0), (std::vector<MidiMessage>{{0xD1, 127}}));
+        }
+
+        // ---- NRPN data increment and decrement: steps of the mapping's own, from where the target is, in its range.
+        decoder.reset();
+        events = decode({0xB1, 99, 3, 0xB1, 98, 4, 0xB1, 96, 0, 0xB1, 96, 1, 0xB1, 96, 0, 0xB1, 97, 0});
+        const Key nrpn{Kind::Nrpn, 1, 3 << 7 | 4};
+        QCOMPARE(events.size(), size_t(4));
+        for (size_t i = 0; i < 4; ++i) QVERIFY(events[i].key == nrpn && events[i].steps == (i < 3 ? 1 : -1));
+        QVERIFY(decode({0xB2, 96, 0}).front().key == (Key{Kind::Cc, 2, 96}));  // with no parameter chosen: a controller
+        {
+            Mapper m;
+            Mapping inc;
+            inc.key = nrpn;
+            inc.target = "inc";
+            inc.low = 0.2;
+            inc.high = 0.6;
+            inc.step = 0.05;
+            m.map(inc);
+            values["inc"] = 0.3;
+            for (const Event& e : events) m.handle(e, targets);
+            QVERIFY(std::fabs(values["inc"] - (0.3 + 2 * 0.05 * 0.4)) < 1e-12);
+            for (int i = 0; i < 40; ++i) m.handle(events[0], targets);
+            QCOMPARE(values["inc"], 0.6);  // (stops at the range's end)
+            Mapping down = m.mappings()[0];
+            down.invert = true;
+            m.setMappingOptions(0, down);
+            m.handle(events[0], targets);
+            QVERIFY(std::fabs(values["inc"] - (0.6 - 0.05 * 0.4)) < 1e-12);
+            QVERIFY(m.refresh(targets.get).size() == 4);  // shown back on the control (NRPN: four messages)
+        }
+
+        // ---- One fader, three targets, each in its own range.
+        {
+            Mapper m;
+            Mapping a;
+            a.key = {Kind::Cc, 0, 7};
+            a.pickup = false;
+            a.target = "a";
+            Mapping b = a, c = a;
+            b.target = "b";
+            b.low = 0.5;
+            c.target = "c";
+            c.low = 0.2;
+            c.high = 0.4;
+            c.invert = true;
+            m.add(a);
+            m.add(b);
+            m.add(c);
+            QCOMPARE(m.mappings().size(), size_t(3));
+            values["a"] = values["b"] = values["c"] = 0;
+            auto cc = [](int v) { return Event{{Kind::Cc, 0, 7}, v, 128}; };
+            m.handle(cc(127), targets);
+            QVERIFY(values["a"] == 1 && values["b"] == 1 && values["c"] == 0.2);
+            m.handle(cc(0), targets);
+            QVERIFY(values["a"] == 0 && values["b"] == 0.5 && values["c"] == 0.4);
+            m.handle(cc(64), targets);
+            QVERIFY(std::fabs(values["a"] - 64 / 127.0) < 1e-12);
+            QVERIFY(std::fabs(values["b"] - (0.5 + 0.5 * 64 / 127.0)) < 1e-12);
+            QVERIFY(std::fabs(values["c"] - (0.4 - 0.2 * 64 / 127.0)) < 1e-12);
+            // Added again onto the same target: replaced, not doubled. Unmapped from one: the others stay.
+            Mapping b2 = b;
+            b2.high = 0.9;
+            m.add(b2);
+            QCOMPARE(m.mappings().size(), size_t(3));
+            QCOMPARE(m.mappings()[1].high, 0.9);
+            m.unmap(a.key, "", "b");
+            QCOMPARE(m.mappings().size(), size_t(2));
+            QVERIFY(m.mappings()[0].target == "a" && m.mappings()[1].target == "c");
+            // Settings moved onto a target another of the control's mappings has: that one gives way.
+            Mapping onto = m.mappings()[1];
+            onto.target = "a";
+            m.setMappingOptions(1, onto);
+            QCOMPARE(m.mappings().size(), size_t(1));
+            QVERIFY(m.mappings()[0].target == "a" && m.mappings()[0].invert);
+            // map() leaves the control one target again.
+            m.add(b);
+            m.add(c);
+            m.map(a);
+            QCOMPARE(m.mappings().size(), size_t(1));
+            QVERIFY(m.mappings()[0].target == "a" && !m.mappings()[0].invert);
+        }
+
+        // ---- Shown on another port: what automation does to the target is sent there, every move, in order; the
+        // controller's own port shows one of the control's mappings, and its own moves are not echoed to it.
+        {
+            Mapper m;
+            Mapping own;
+            own.key = {Kind::Cc, 0, 7};
+            own.pickup = false;
+            own.target = "level";
+            Mapping second = own;
+            second.target = "pan";
+            Mapping motor = own;
+            motor.target = "level";
+            motor.key = {Kind::Cc, 0, 8};
+            motor.output = "Motors";
+            m.add(own);
+            m.add(second);
+            m.add(motor);
+            values["level"] = 0;
+            values["pan"] = 0.5;
+            auto all = m.refreshAll(targets.get);
+            QCOMPARE(all.size(), size_t(2));
+            QVERIFY(all[0].port.empty() && all[0].message == (MidiMessage{0xB0, 7, 0}));
+            QVERIFY(all[1].port == "Motors" && all[1].message == (MidiMessage{0xB0, 8, 0}));
+            std::vector<MidiMessage> wanted, got;
+            for (int f = 1; f <= 60; ++f) {
+                values["level"] = std::min(1.0, f / 50.0);  // (a lane rising, then holding)
+                const auto q = uint8_t(std::lround(values["level"] * 127));
+                if (wanted.empty() || wanted.back()[2] != q) wanted.push_back({0xB0, 8, q});
+                for (const Mapper::Out& o : m.refreshAll(targets.get))
+                    if (o.port == "Motors") got.push_back(o.message);
+            }
+            QCOMPARE(got, wanted);
+            QCOMPARE(got.size(), size_t(50));
+            // The fader moved by hand: not echoed to itself, but the other port follows.
+            m.handle({own.key, 30, 128}, targets);
+            all = m.refreshAll(targets.get);
+            QCOMPARE(all.size(), size_t(1));
+            QVERIFY(all[0].port == "Motors" && all[0].message == (MidiMessage{0xB0, 8, 30}));
+            QVERIFY(m.refresh(targets.get).empty());
+        }
+
+        // ---- Saved and read again, with the output.
+        Mapping saved;
+        saved.key = {Kind::PolyAftertouch, 0, 60};
+        saved.target = "strip:1:volume";
+        saved.output = "Motors";
+        Mapping back;
+        QString error;
+        QVERIFY2(midimaps::fromJson(midimaps::toJson(saved), back, &error), qPrintable(error));
+        QVERIFY(back.key == saved.key && back.output == "Motors");
+        QJsonObject wrong = midimaps::toJson(saved);
+        wrong["control"] = "pressure:1";
+        QVERIFY(!midimaps::fromJson(wrong, back, &error) && error.contains("pat:1:60"));
     }
     void oscMessages() {
         using osc::Message;

@@ -4,14 +4,18 @@
 // curve, inversion, toggle or momentary behaviour and soft takeover; what it controls lights the controller back
 // (buttons, LED rings, motor faders). Mixer strips are counted from a bank that bank buttons move across the tracks,
 // and a mapping can belong to one panel, taking over the control while that panel has focus. A fader on a track's
-// volume holds it while it moves, so Touch and Latch write automation as the mixer's own fader does. Each
-// controller's map is a JSON file (core/MidiMaps.h) found again by the device's name when it is plugged back in.
+// volume holds it while it moves, so Touch and Latch write automation as the mixer's own fader does. One control can
+// drive several targets, each with its own range (learnt with "Add to its targets" on), and a mapping can show its
+// target's value on another MIDI output (motor faders or LED rings on another device), so they follow automation.
+// Parameters in Montage's dialogs are learnt as those in its panels. Each controller's map is a JSON file
+// (core/MidiMaps.h) found again by the device's name when it is plugged back in.
 #pragma once
 
 #include <QObject>
 #include <QPointer>
 #include <QString>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -59,6 +63,9 @@ public:
     bool isLearning() const { return learning_; }
     void setLearnInPanel(bool on) { learnInPanel_ = on; }  // learnt mappings belong to the focused panel
     bool learnsInPanel() const { return learnInPanel_; }
+    // A control learnt again adds the parameter to those it drives (else it drives only the one learnt last).
+    void setLearnAdds(bool on) { learnAdds_ = on; }
+    bool learnAdds() const { return learnAdds_; }
     // A parameter chosen while learning (what a click picks; tests and the dialog call it too).
     void learnTarget(const QString& target);
     // What a click on this widget would learn ("" for nothing mappable).
@@ -87,8 +94,12 @@ public:
     // Lets go of everything held (as when each control rests).
     void releaseHolds();
     void setHoldTime(int ms) { holdMs_ = ms; }
-    // Sends the controller what changed (also on a timer while connected).
+    // Sends the controller what changed (also on a timer while connected), and mappings' own outputs theirs.
     void refresh();
+    // How a mapping's own output port is opened, by its name (tests pass stand-ins; by default the system's MIDI
+    // output of that name). Ports are opened when first sent to; one that cannot be is looked for again in a while.
+    using OutputOpener = std::function<std::unique_ptr<MidiConnection>(const QString& port, QString* error)>;
+    void setOutputOpener(OutputOpener opener);
     // The controller's ports, Learn, and the map as a table to adjust (range, curve, inversion, toggle, takeover).
     QDialog* openDialog(QWidget* parent);
 
@@ -113,7 +124,8 @@ private:
     void hold(const QString& target, QObject* what);
     void release(const QString& target);
     QWidget* widgetFor(const QString& target) const;
-    bool inApp(const QWidget* w) const;  // in the main window or one of its floating panels
+    bool inApp(const QWidget* w) const;  // in the main window, one of its floating panels or one of its dialogs
+    MidiConnection* outputPort(const std::string& name);
 
     EditorState* state_;
     MixerPanel* mixer_;
@@ -128,7 +140,8 @@ private:
     midimap::Decoder decoder_;
     midimap::Learner learner_;
     midimap::Mapper mapper_;
-    bool learning_ = false, learnInPanel_ = false;
+    bool learning_ = false, learnInPanel_ = false, learnAdds_ = false;
+    QString justLearntTarget_;  // (a key learnt, then pressed into: its aftertouch takes the mapping over)
     std::optional<midimap::Learnt> pendingControl_;
     QString pendingTarget_;
     std::optional<midimap::Key> justLearnt_;  // its moves after it was learnt are not learnt again until it rests
@@ -146,6 +159,9 @@ private:
     int holdMs_ = 1000;
     std::map<QString, QTimer*> holds_;
     bool applying_ = false;
+    OutputOpener openOutput_;
+    std::map<std::string, std::unique_ptr<MidiConnection>> outputs_;  // mappings' own ports, by name
+    std::map<std::string, qint64> outputFailed_;                       // (when each last could not be opened)
 };
 
 }  // namespace montage

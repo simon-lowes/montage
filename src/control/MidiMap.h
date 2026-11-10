@@ -1,8 +1,10 @@
 // Montage — MIDI Learn: any MIDI controller's knobs, faders, encoders and buttons mapped onto the app's parameters.
-// What a controller sends is decoded into controls (notes, 7-bit and 14-bit controllers, NRPN and RPN parameters,
-// pitch bend, program changes); a control touched while learning is recognised, relative encoders in the three
-// common encodings included; and each mapping turns a control's moves into a target's value with its range, curve,
-// inversion, button behaviour and soft takeover, and the target's value back into what lights the control.
+// What a controller sends is decoded into controls (notes, 7-bit and 14-bit controllers, NRPN and RPN parameters with
+// data increment and decrement, pitch bend, program changes, channel and polyphonic aftertouch); a control touched
+// while learning is recognised, relative encoders in the three common encodings included; and each mapping turns a
+// control's moves into a target's value with its range, curve, inversion, button behaviour and soft takeover, and the
+// target's value back into what lights the control (or into another port: a mapping's own output). One control can
+// drive several targets, each with its own range.
 // No Qt here: the app (app/MidiLearn) owns the targets and the saved maps.
 #pragma once
 
@@ -19,11 +21,11 @@
 
 namespace montage::midimap {
 
-enum class Kind : uint8_t { None, Note, Cc, Cc14, Nrpn, Rpn, PitchBend, Program };
+enum class Kind : uint8_t { None, Note, Cc, Cc14, Nrpn, Rpn, PitchBend, Program, Aftertouch, PolyAftertouch };
 
 // One control on a controller: what it sends, on which channel (0-15), and its number (the note, the controller —
 // for 14-bit pairs the first of the pair, 0-31 —, the parameter for NRPN and RPN, 0-16383, the program for program
-// changes; 0 for pitch bend, one control per channel).
+// changes, the note for polyphonic aftertouch; 0 for pitch bend and channel aftertouch, one control per channel).
 struct Key {
     Kind kind = Kind::None;
     int channel = 0;
@@ -37,15 +39,19 @@ struct Key {
 // "cc:1:7" style names (channels counted from 1, as controllers label them) for saved maps and the MCP tool.
 std::string keyName(const Key& key);
 std::optional<Key> keyFromName(const std::string& name);
-// What a person reads: "CC 7 (ch 1)", "14-bit CC 7/39 (ch 1)", "Note C3 (ch 10)", "NRPN 1:2 (ch 1)".
+// What a person reads: "CC 7 (ch 1)", "14-bit CC 7/39 (ch 1)", "Note C3 (ch 10)", "NRPN 1:2 (ch 1)",
+// "Aftertouch (ch 1)", "Aftertouch C3 (ch 1)". Saved names: at:<ch>:0 and pat:<ch>:<note> for aftertouch.
 std::string keyLabel(const Key& key);
 
 // A control moved: its value, out of `resolution` steps (128 for notes, 7-bit controllers and program changes;
 // 16384 for 14-bit controllers, NRPN and RPN, and pitch bend). A note's value is its velocity, 0 when it ends.
+// NRPN and RPN's data increment and decrement (controllers 96 and 97) come as `steps` (+1 or -1 each, as RP-018 has
+// it: their value is not read), with no value: the mapping moves its target by that many of its steps.
 struct Event {
     Key key;
     int value = 0;
     int resolution = 128;
+    int steps = 0;
     double position() const { return resolution > 1 ? double(value) / double(resolution - 1) : 0.0; }
 };
 
@@ -115,7 +121,8 @@ private:
 Encoding classify7Bit(const std::vector<int>& values);
 
 // One control mapped onto one target. `target` is the app's: "command:<action>", "widget:<path>",
-// "strip:<n>:volume|pan|mute|solo" (a mixer strip counted from the bank's first track) and so on.
+// "strip:<n>:volume|pan|mute|solo" (a mixer strip counted from the bank's first track) and so on. A control may have
+// several mappings in a layer, one a target, each with its own range: one fader moving several parameters.
 struct Mapping {
     Key key;
     Encoding encoding = Encoding::Absolute;
@@ -126,7 +133,10 @@ struct Mapping {
     bool invert = false;
     bool toggle = false;     // buttons: each press flips the target; else it is on while held (momentary)
     bool pickup = true;      // absolute controls: soft takeover, ignored until they reach the target's value
-    double step = 1.0 / 128; // relative encoders: the part of the range one step turns
+    double step = 1.0 / 128; // relative encoders (and NRPN increments): the part of the range one step turns
+    // Where the target's value is shown: "" the controller's own port (the first of a control's mappings there), or
+    // the name of another MIDI output (a fader bank with motors, LED rings on another device).
+    std::string output;
 };
 
 // What a mapping asks of its target: a value (0-1 over the target's whole range) and, for buttons and controls
@@ -147,9 +157,13 @@ public:
     const std::vector<Mapping>& mappings() const { return mappings_; }
     void setMappingOptions(size_t index, const Mapping& m);  // the same control and layer, other settings
     void clear();
-    // Replaces (or adds) the mapping for this control in this layer.
+    // The control's only mapping in this layer: every other it had there goes.
     void map(const Mapping& m);
-    void unmap(const Key& key, const std::string& layer);
+    // One more target for the control in this layer (replacing only a mapping of it onto the same target).
+    void add(const Mapping& m);
+    void unmap(const Key& key, const std::string& layer);  // all of them
+    void unmap(const Key& key, const std::string& layer, const std::string& target);
+    void remove(size_t index);
     // The focused panel; layered mappings follow it. Changing it (or the bank) takes over the controls afresh.
     void setLayer(const std::string& layer);
     const std::string& layer() const { return layer_; }
@@ -164,8 +178,15 @@ public:
 
     // Bytes that show a mapping's target value on its control (lit buttons, LED rings, motor faders).
     static std::vector<MidiMessage> feedback(const Mapping& m, double targetValue);
-    // What changed since last time, for the active mappings (a control's own moves are not echoed back to it).
+    // What changed since last time, for the active mappings shown on the controller's own port (a control's own moves
+    // are not echoed back to it; of several mappings of one control, the first shows).
     std::vector<MidiMessage> refresh(const std::function<double(const Mapping&)>& get);
+    // The same for every port: each message with the output it goes to ("" the controller's own), in order.
+    struct Out {
+        std::string port;
+        MidiMessage message;
+    };
+    std::vector<Out> refreshAll(const std::function<double(const Mapping&)>& get);
     // Everything shown again (a controller plugged back in, the layer changed).
     void reshow();
 
@@ -182,6 +203,8 @@ private:
         int shown = -1;        // feedback: the quantised position last sent (or received)
     };
     Run& run(size_t index);
+    bool shows(size_t index) const;  // its control's first mapping on the controller's own port, or one with its own
+    std::vector<Out> collect(const std::function<double(const Mapping&)>& get, bool own, bool others);
     std::vector<Mapping> mappings_;
     std::vector<Run> runs_;
     std::string layer_;

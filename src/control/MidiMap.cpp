@@ -18,6 +18,8 @@ const char* kindName(Kind k) {
         case Kind::Rpn: return "rpn";
         case Kind::PitchBend: return "bend";
         case Kind::Program: return "program";
+        case Kind::Aftertouch: return "at";
+        case Kind::PolyAftertouch: return "pat";
         case Kind::None: break;
     }
     return "";
@@ -27,11 +29,13 @@ int maxNumber(Kind k) {
     switch (k) {
         case Kind::Note:
         case Kind::Cc:
-        case Kind::Program: return 127;
+        case Kind::Program:
+        case Kind::PolyAftertouch: return 127;
         case Kind::Cc14: return 31;
         case Kind::Nrpn:
         case Kind::Rpn: return 16383;
-        case Kind::PitchBend: return 0;
+        case Kind::PitchBend:
+        case Kind::Aftertouch: return 0;
         case Kind::None: break;
     }
     return -1;
@@ -64,7 +68,8 @@ std::optional<Key> keyFromName(const std::string& name) {
     if (b == std::string::npos) return std::nullopt;
     const std::string kind = name.substr(0, a);
     Key key;
-    for (Kind k : {Kind::Note, Kind::Cc, Kind::Cc14, Kind::Nrpn, Kind::Rpn, Kind::PitchBend, Kind::Program})
+    for (Kind k : {Kind::Note, Kind::Cc, Kind::Cc14, Kind::Nrpn, Kind::Rpn, Kind::PitchBend, Kind::Program, Kind::Aftertouch,
+                   Kind::PolyAftertouch})
         if (kind == kindName(k)) key.kind = k;
     if (key.kind == Kind::None) return std::nullopt;
     auto number = [](const std::string& s, int& out) {
@@ -85,12 +90,13 @@ std::optional<Key> keyFromName(const std::string& name) {
 std::string keyLabel(const Key& key) {
     char buf[64];
     const int ch = key.channel + 1;
+    static const char* names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
     switch (key.kind) {
-        case Kind::Note: {
-            static const char* names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-            std::snprintf(buf, sizeof buf, "Note %s%d (ch %d)", names[key.number % 12], key.number / 12 - 1, ch);
+        case Kind::Note: std::snprintf(buf, sizeof buf, "Note %s%d (ch %d)", names[key.number % 12], key.number / 12 - 1, ch); break;
+        case Kind::Aftertouch: std::snprintf(buf, sizeof buf, "Aftertouch (ch %d)", ch); break;
+        case Kind::PolyAftertouch:
+            std::snprintf(buf, sizeof buf, "Aftertouch %s%d (ch %d)", names[key.number % 12], key.number / 12 - 1, ch);
             break;
-        }
         case Kind::Cc: std::snprintf(buf, sizeof buf, "CC %d (ch %d)", key.number, ch); break;
         case Kind::Cc14: std::snprintf(buf, sizeof buf, "14-bit CC %d/%d (ch %d)", key.number, key.number + 32, ch); break;
         case Kind::Nrpn: std::snprintf(buf, sizeof buf, "NRPN %d:%d (ch %d)", key.number >> 7, key.number & 127, ch); break;
@@ -127,11 +133,15 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
             if (m.size() > 2) out({{Kind::Note, ch, d1}, d2, 128});
             return;
         case 0xC0: out({{Kind::Program, ch, d1}, 127, 128}); return;
+        case 0xD0: out({{Kind::Aftertouch, ch, 0}, d1, 128}); return;
+        case 0xA0:
+            if (m.size() > 2) out({{Kind::PolyAftertouch, ch, d1}, d2, 128});
+            return;
         case 0xE0:
             if (m.size() > 2) out({{Kind::PitchBend, ch, 0}, d1 | (d2 << 7), 16384});
             return;
         case 0xB0: break;
-        default: return;  // aftertouch
+        default: return;
     }
     if (m.size() < 3) return;
     Channel& c = ch_[ch];
@@ -159,8 +169,13 @@ void Decoder::feed(const MidiMessage& m, const std::function<void(const Event&)>
             if (msb < 0)
                 if (const auto it = coarse_.find(id); it != coarse_.end()) msb = it->second;
             out({key, (std::max(msb, 0) << 7) | v, 16384});
+        } else {
+            // Data increment (96) and decrement (97): a step each, their value not read (RP-018).
+            Event e{key, 0, fine_.count(id) ? 16384 : 128};
+            e.steps = n == 96 ? 1 : -1;
+            out(e);
         }
-        return;  // (increment and decrement are not read: no controller in common use sends them for knobs)
+        return;
     }
     const int last = c.last;
     c.last = n;
@@ -262,6 +277,10 @@ void Learner::add(const Event& e) {
                (e.key.number == key_.number || e.key.number + 32 == key_.number)) {
         key_ = e.key;  // the controller turned out to be a 14-bit pair
         values_.clear();
+    } else if (key_.kind == Kind::Note && !values_.empty() && values_.back() > 0 && e.key.channel == key_.channel &&
+               (e.key.kind == Kind::Aftertouch || (e.key.kind == Kind::PolyAftertouch && e.key.number == key_.number))) {
+        key_ = e.key;  // a key pressed into: its aftertouch is what is learnt
+        values_.clear();
     } else if (e.key != key_) {
         return;  // the first control touched is the one learnt
     }
@@ -310,14 +329,44 @@ void Mapper::clear() {
 
 void Mapper::setMappingOptions(size_t index, const Mapping& m) {
     if (index >= mappings_.size() || mappings_[index].key != m.key || mappings_[index].layer != m.layer) return;
+    // (onto a target another of the control's mappings has: that one gives way)
+    for (size_t i = 0; i < mappings_.size(); ++i)
+        if (i != index && mappings_[i].key == m.key && mappings_[i].layer == m.layer && mappings_[i].target == m.target) {
+            remove(i);
+            if (i < index) --index;
+            break;
+        }
     mappings_[index] = m;
     run(index) = Run();
 }
 
 void Mapper::map(const Mapping& m) {
     if (runs_.size() != mappings_.size()) runs_.resize(mappings_.size());
-    for (size_t i = 0; i < mappings_.size(); ++i)
+    // (in the first one's place, so the map's order stays as it was)
+    size_t at = mappings_.size();
+    for (size_t i = 0; i < mappings_.size();)
         if (mappings_[i].key == m.key && mappings_[i].layer == m.layer) {
+            if (at == mappings_.size()) {
+                at = i++;
+                continue;
+            }
+            remove(i);
+        } else {
+            ++i;
+        }
+    if (at < mappings_.size()) {
+        mappings_[at] = m;
+        runs_[at] = Run();
+        return;
+    }
+    mappings_.push_back(m);
+    runs_.push_back(Run());
+}
+
+void Mapper::add(const Mapping& m) {
+    if (runs_.size() != mappings_.size()) runs_.resize(mappings_.size());
+    for (size_t i = 0; i < mappings_.size(); ++i)
+        if (mappings_[i].key == m.key && mappings_[i].layer == m.layer && mappings_[i].target == m.target) {
             mappings_[i] = m;
             runs_[i] = Run();
             return;
@@ -326,14 +375,21 @@ void Mapper::map(const Mapping& m) {
     runs_.push_back(Run());
 }
 
-void Mapper::unmap(const Key& key, const std::string& layer) {
+void Mapper::remove(size_t index) {
     if (runs_.size() != mappings_.size()) runs_.resize(mappings_.size());
-    for (size_t i = 0; i < mappings_.size(); ++i)
-        if (mappings_[i].key == key && mappings_[i].layer == layer) {
-            mappings_.erase(mappings_.begin() + std::ptrdiff_t(i));
-            runs_.erase(runs_.begin() + std::ptrdiff_t(i));
-            return;
-        }
+    if (index >= mappings_.size()) return;
+    mappings_.erase(mappings_.begin() + std::ptrdiff_t(index));
+    runs_.erase(runs_.begin() + std::ptrdiff_t(index));
+}
+
+void Mapper::unmap(const Key& key, const std::string& layer) {
+    for (size_t i = mappings_.size(); i-- > 0;)
+        if (mappings_[i].key == key && mappings_[i].layer == layer) remove(i);
+}
+
+void Mapper::unmap(const Key& key, const std::string& layer, const std::string& target) {
+    for (size_t i = mappings_.size(); i-- > 0;)
+        if (mappings_[i].key == key && mappings_[i].layer == layer && mappings_[i].target == target) remove(i);
 }
 
 void Mapper::setLayer(const std::string& layer) {
@@ -384,7 +440,16 @@ void Mapper::handle(const Event& e, const Targets& targets) {
         Change change;
         bool set = false, echo = false;
         const double p = e.position();
-        if (m.encoding == Encoding::Button) {
+        if (e.steps != 0) {
+            // NRPN's data increment and decrement: the target moved by the mapping's steps, from where it is (no
+            // takeover: the control has no position of its own); shown back on the control.
+            if (m.encoding == Encoding::Button) continue;
+            const int steps = m.invert ? -e.steps : e.steps;
+            const double lo = std::min(m.low, m.high), hi = std::max(m.low, m.high);
+            const double base = isNaN(cur) ? m.low : cur;
+            change.value = std::clamp(base + steps * m.step * (hi - lo), lo, hi);
+            set = true;
+        } else if (m.encoding == Encoding::Button) {
             const bool down = e.key.kind == Kind::Note ? e.value > 0 : e.key.kind == Kind::Program || e.value >= 64;
             // A controller button pressed again with no release between: one that sends none.
             if (down && r.down && e.key.kind == Kind::Cc) r.down = false;
@@ -430,10 +495,10 @@ void Mapper::handle(const Event& e, const Targets& targets) {
         }
         if (!set) continue;
         if (targets.set) targets.set(m, change);
-        if (i >= mappings_.size() || !(mappings_[i].key == m.key && mappings_[i].layer == m.layer)) continue;
+        if (i >= mappings_.size() || !(mappings_[i].key == m.key && mappings_[i].layer == m.layer && mappings_[i].target == m.target)) continue;
         Run& after = run(i);
         after.settled = targets.get ? targets.get(m) : change.value;
-        if (echo && !isNaN(after.settled))  // what the control itself shows is not sent back to it
+        if (echo && m.output.empty() && !isNaN(after.settled))  // what the control itself shows is not sent back to it
             after.shown = int(std::lround(toPosition(m, after.settled) * (resolutionOf(m.key.kind) - 1)));
     }
 }
@@ -461,17 +526,28 @@ std::vector<MidiMessage> Mapper::feedback(const Mapping& m, double targetValue) 
                     {uint8_t(0xB0 | ch), 38, uint8_t(q14 & 127)}};
         }
         case Kind::PitchBend: return {{uint8_t(0xE0 | ch), uint8_t(q14 & 127), uint8_t(q14 >> 7)}};
+        case Kind::Aftertouch: return {{uint8_t(0xD0 | ch), uint8_t(std::lround(p * 127))}};
+        case Kind::PolyAftertouch: return {{uint8_t(0xA0 | ch), uint8_t(m.key.number), uint8_t(std::lround(p * 127))}};
         case Kind::Program:
         case Kind::None: break;
     }
     return {};
 }
 
-std::vector<MidiMessage> Mapper::refresh(const std::function<double(const Mapping&)>& get) {
-    std::vector<MidiMessage> out;
+bool Mapper::shows(size_t index) const {
+    const Mapping& m = mappings_[index];
+    if (!m.output.empty()) return true;
+    for (size_t i = 0; i < index; ++i)  // (of a control's mappings shown on its own port, the first active one)
+        if (mappings_[i].key == m.key && mappings_[i].output.empty() && active(i)) return false;
+    return true;
+}
+
+std::vector<Mapper::Out> Mapper::collect(const std::function<double(const Mapping&)>& get, bool own, bool others) {
+    std::vector<Out> out;
     for (size_t i = 0; i < mappings_.size(); ++i) {
         const Mapping& m = mappings_[i];
-        if (m.key.kind == Kind::Program || !active(i)) continue;
+        if (m.key.kind == Kind::Program || !active(i) || !shows(i)) continue;
+        if (m.output.empty() ? !own : !others) continue;
         const double v = get ? get(m) : std::nan("");
         if (isNaN(v)) continue;
         const double p = toPosition(m, v);
@@ -480,9 +556,17 @@ std::vector<MidiMessage> Mapper::refresh(const std::function<double(const Mappin
         Run& r = run(i);
         if (q == r.shown) continue;
         r.shown = q;
-        for (MidiMessage& b : feedback(m, v)) out.push_back(std::move(b));
+        for (MidiMessage& b : feedback(m, v)) out.push_back({m.output, std::move(b)});
     }
     return out;
 }
+
+std::vector<MidiMessage> Mapper::refresh(const std::function<double(const Mapping&)>& get) {
+    std::vector<MidiMessage> out;
+    for (Out& o : collect(get, true, false)) out.push_back(std::move(o.message));
+    return out;
+}
+
+std::vector<Mapper::Out> Mapper::refreshAll(const std::function<double(const Mapping&)>& get) { return collect(get, true, true); }
 
 }  // namespace montage::midimap

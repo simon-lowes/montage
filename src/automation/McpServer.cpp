@@ -1973,14 +1973,17 @@ void McpServer::Impl::addTools() {
     add("montage_midi_map", "MIDI controller maps",
         "The maps MIDI Learn keeps for each MIDI controller (one JSON file per device, found again by its name when it is "
         "plugged back in): `list` the devices with maps and the MIDI inputs plugged in now; `show` a device's mappings; "
-        "`map` a control onto a target (replacing that control's mapping for that panel); `unmap` it. Controls: "
-        "cc:<channel>:<n>, cc14:<channel>:<n> (the 14-bit pair n and n+32, n 0-31), note:<channel>:<n>, "
-        "nrpn:<channel>:<parameter> and rpn:<channel>:<parameter> (0-16383), bend:<channel>:0, program:<channel>:<n>, "
-        "channels counted from 1. Targets: command:<a menu command's id as Keyboard Shortcuts lists it, e.g. "
+        "`map` a control onto a target (replacing that control's mappings for that panel; with `add` true, one more "
+        "target for it, each with its own range: one fader on several parameters); `unmap` it (with `target`, only that "
+        "one). Controls: cc:<channel>:<n>, cc14:<channel>:<n> (the 14-bit pair n and n+32, n 0-31), note:<channel>:<n>, "
+        "nrpn:<channel>:<parameter> and rpn:<channel>:<parameter> (0-16383; data increment and decrement move the "
+        "target by `step`), bend:<channel>:0, program:<channel>:<n>, at:<channel>:0 (channel aftertouch), "
+        "pat:<channel>:<note> (polyphonic aftertouch), channels counted from 1. Targets: command:<a menu command's id as Keyboard Shortcuts lists it, e.g. "
         "Sequence/Add Marker>, widget:<panel>/<control name> (e.g. widget:inspector/param_3_opacity; add #x or #y for a "
-        "colour wheel's axis), strip:<n>:volume|pan|mute|solo (n from 1, counted from the bank's first track), "
+        "colour wheel's axis; widget:dialog:<dialog name>/<control name> in a dialog), strip:<n>:volume|pan|mute|solo (n from 1, counted from the bank's first track), "
         "master:volume, bank:previous|next. Encodings: absolute (faders, knobs), button, and relative encoders: "
-        "twos-complement, sign-magnitude, offset-64. A running Montage uses the change at once.",
+        "twos-complement, sign-magnitude, offset-64. `output` names another MIDI output the target's value is shown on "
+        "(motor faders, LED rings), following automation. A running Montage uses the change at once.",
         R"json({"type":"object","properties":{
             "action":{"type":"string","enum":["list","show","map","unmap"],"default":"list"},
             "device":{"type":"string","description":"The controller's MIDI input name"},
@@ -1993,7 +1996,9 @@ void McpServer::Impl::addTools() {
             "curve":{"type":"number","description":"Above 1 finer at the bottom of the travel"},
             "invert":{"type":"boolean"},"toggle":{"type":"boolean","description":"Buttons: each press flips the target"},
             "pickup":{"type":"boolean","description":"Soft takeover (default true)"},
-            "step":{"type":"number","description":"Relative encoders: the part of the range one step turns (default 1/128)"},
+            "step":{"type":"number","description":"Relative encoders and NRPN increments: the part of the range one step turns (default 1/128)"},
+            "add":{"type":"boolean","description":"map: one more target for the control (default false: its only one)"},
+            "output":{"type":"string","description":"map: the MIDI output the target's value is shown on (default the controller's own)"},
             "bank_size":{"type":"integer","minimum":1,"maximum":64},
             "folder":{"type":"string","description":"Where maps are kept (default Montage's own)"}}})json",
         false, [](const QJsonObject& a) {
@@ -2054,30 +2059,38 @@ void McpServer::Impl::addTools() {
             }
             if (action == QLatin1String("map")) {
                 QJsonObject o{{"control", need(a, "control")}, {"target", need(a, "target")}};
-                for (const char* k : {"encoding", "low", "high", "curve", "invert", "toggle", "pickup", "step"})
+                for (const char* k : {"encoding", "low", "high", "curve", "invert", "toggle", "pickup", "step", "output"})
                     if (a.contains(k)) o[k] = a.value(k);
                 if (a.contains("panel")) o["layer"] = a.value("panel");
                 midimap::Mapping m;
                 QString why;
                 if (!midimaps::fromJson(o, m, &why)) return fail(why);
-                bool replaced = false;
-                for (midimap::Mapping& old : map.mappings)
-                    if (old.key == m.key && old.layer == m.layer) {
-                        old = m;
-                        replaced = true;
-                    }
-                if (!replaced) map.mappings.push_back(m);
+                // (as the app's map does: in the place of the first it replaces; with `add`, only one onto the same target)
+                const bool adding = a.value("add").toBool(false);
+                auto same = [&](const midimap::Mapping& old) {
+                    return old.key == m.key && old.layer == m.layer && (!adding || old.target == m.target);
+                };
+                const auto first = std::find_if(map.mappings.begin(), map.mappings.end(), same);
+                const bool replaced = first != map.mappings.end();
+                if (replaced) {
+                    *first = m;
+                    const auto at = first - map.mappings.begin();
+                    for (auto i = map.mappings.size(); i-- > size_t(at) + 1;)
+                        if (same(map.mappings[i])) map.mappings.erase(map.mappings.begin() + std::ptrdiff_t(i));
+                } else {
+                    map.mappings.push_back(m);
+                }
                 return saved(QStringLiteral("%1 %2 → %3").arg(replaced ? QStringLiteral("Remapped") : QStringLiteral("Mapped"),
                                                              QString::fromStdString(midimap::keyLabel(m.key)), QString::fromStdString(m.target)));
             }
             if (action == QLatin1String("unmap")) {
                 const auto key = midimap::keyFromName(need(a, "control").toStdString());
                 if (!key) return fail(QStringLiteral("unknown control \"%1\"").arg(str(a, "control")));
-                const std::string layer = str(a, "panel").toStdString();
-                const auto it = std::find_if(map.mappings.begin(), map.mappings.end(),
-                                             [&](const midimap::Mapping& m) { return m.key == *key && m.layer == layer; });
-                if (it == map.mappings.end()) return fail(QStringLiteral("%1 has no mapping for %2").arg(device, str(a, "control")));
-                map.mappings.erase(it);
+                const std::string layer = str(a, "panel").toStdString(), target = str(a, "target").toStdString();
+                const size_t gone = std::erase_if(map.mappings, [&](const midimap::Mapping& m) {
+                    return m.key == *key && m.layer == layer && (target.empty() || m.target == target);
+                });
+                if (!gone) return fail(QStringLiteral("%1 has no mapping for %2").arg(device, str(a, "control")));
                 return saved(QStringLiteral("Unmapped %1").arg(QString::fromStdString(midimap::keyLabel(*key))));
             }
             return fail(QStringLiteral("unknown action \"%1\" (list, show, map, unmap)").arg(action));
