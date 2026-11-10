@@ -82,7 +82,9 @@ private:
     struct Heard {
         int64_t count = 0;
         int64_t otherAt = 0;
+        int64_t last = 0;  // (when last heard, by heardClock_)
     };
+    int64_t heardClock_ = 0;
     struct Sender {
         bool have = false;
         uint32_t ssrc = 0;

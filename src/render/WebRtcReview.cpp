@@ -111,7 +111,52 @@ std::vector<ReviewPointer> BrowserReviewBackend::pointers() const { return {}; }
 
 #else
 
+int RungSteering::report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
+                         const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable) {
+    using std::chrono::milliseconds;
+    // A try that has lasted 20 s without heavy loss fits (a link that buffers a long way brings its loss late).
+    if (trying && now - triedAt > std::chrono::seconds(20)) {
+        trying = false;
+        hold = milliseconds(8000);
+    }
+    if (at - movedAt < milliseconds(700)) return rung;  // (it counts the rung before's packets)
+    auto move = [&](int to) {
+        movedAt = now;
+        nextTry = now + hold;
+        postponed = false;
+        return to;
+    };
+    if (loss > 0.10) {
+        if (trying) hold = std::min(hold * 2, milliseconds(32000));
+        trying = false;
+        int to = std::min(rung + 1, last);
+        while (to < last && tooBig(to)) ++to;
+        while (to > rung && !usable(to)) --to;
+        if (to > rung) return move(to);
+        nextTry = std::max(nextTry, now + hold);  // (the smallest already, or none below works)
+        return rung;
+    }
+    if (loss >= 0.02 && !postponed) {
+        nextTry = std::max(nextTry, now + hold);
+        postponed = true;
+    }
+    if (rung > 0 && now >= nextTry && usable(rung - 1)) {
+        trying = true;
+        triedAt = now;
+        return move(rung - 1);
+    }
+    return rung;
+}
+
+void RungSteering::switched(Clock::time_point now) {
+    movedAt = now;
+    nextTry = std::max(nextTry, now + hold);
+    if (trying) triedAt = now;
+}
+
 namespace {
+
+const std::string kColourSpaceExtension = "http://www.webrtc.org/experiments/rtp-hdrext/color-space";
 
 using Clock = std::chrono::steady_clock;
 
@@ -423,9 +468,7 @@ struct Viewer {
     // (send's thread) How the ladder steers them: reports read, when they last moved, when they may next try the rung
     // above, how long they wait between tries (doubled each time one fails), and what was sent them lately.
     uint64_t seenReports = 0;
-    Clock::time_point movedAt = Clock::now(), nextTry = Clock::now() + std::chrono::seconds(3);
-    std::chrono::milliseconds hold{8000};
-    bool trying = false;  // moved up a rung lately, to see whether it fits
+    RungSteering steering;
     int64_t lastPts = -1;
     std::deque<std::pair<Clock::time_point, size_t>> sent;
 };
@@ -1070,10 +1113,12 @@ struct BrowserReviewBackend::Impl {
             conf.enableIceUdpMux = true;
             conf.portRangeBegin = conf.portRangeEnd = uint16_t(port);
         }
-        // (bound to the review's own address, unless that is this computer's loopback and a relay elsewhere must be
-        // reached)
-        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4 && (!relayInUse || !host.isLoopback()))
-            conf.bindAddress = host.toString().toStdString();
+        // (bound to the review's own address; when that is this computer's loopback and a relay elsewhere must be
+        // reached, unbound but through the relay only, so no other interface's address is offered)
+        if (host != QHostAddress::Any && host != QHostAddress::AnyIPv6 && host != QHostAddress::AnyIPv4) {
+            if (!relayInUse || !host.isLoopback()) conf.bindAddress = host.toString().toStdString();
+            else conf.iceTransportPolicy = rtc::TransportPolicy::Relay;
+        }
         v->pc = std::make_shared<rtc::PeerConnection>(conf);
         // Only codecs this FFmpeg can encode are offered back: a browser picked one it cannot would see no picture.
         std::vector<std::string> order;
@@ -1100,8 +1145,10 @@ struct BrowserReviewBackend::Impl {
             bool hdr = false;
             bool colourExtension = false;
             rtc::Description::Media offeredMedia = media;  // (extIds is not const)
+            // (an ID of 1-14 only: libdatachannel writes this extension's element in the one-byte form whatever its
+            // ID, so one above 14 would arrive malformed and the picture's transfer lost; such a viewer gets SDR)
             for (int id : offeredMedia.extIds())
-                if (const auto* e = offeredMedia.extMap(id); e && e->uri == "http://www.webrtc.org/experiments/rtp-hdrext/color-space") colourExtension = true;
+                if (const auto* e = offeredMedia.extMap(id); e && e->uri == kColourSpaceExtension && id >= 1 && id <= 14) colourExtension = true;
             if (isVideo && !tenBit.empty() && colourExtension) {
                 pick = choose(media, tenBit, true);
                 hdr = pick.pt >= 0;
@@ -1137,7 +1184,7 @@ struct BrowserReviewBackend::Impl {
                     answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
                     cfg->playoutDelayId = uint8_t(id);
                     cfg->playoutDelayMin = cfg->playoutDelayMax = 0;
-                } else if (isVideo && e->uri == "http://www.webrtc.org/experiments/rtp-hdrext/color-space") {
+                } else if (isVideo && e->uri == kColourSpaceExtension && colourExtension) {
                     answer->addExtMap(rtc::Description::Media::ExtMap(id, e->uri));
                     cfg->colorSpaceId = uint8_t(id);
                     cfg->colorRange = 1;  // (limited)
@@ -1554,9 +1601,7 @@ struct BrowserReviewBackend::Impl {
         while (!v.sent.empty() && now - v.sent.front().first > std::chrono::seconds(3)) v.sent.pop_front();
     }
 
-    // Moves a viewer down the ladder when their receiver reports lose more than a tenth of the packets (to the rung
-    // that fits what got through, at least one down), and up one rung after a while without loss to try it: a try that
-    // fails is not made again for twice as long (8 s at first, at most 32 s).
+    // Moves a viewer on the ladder by their receiver reports (RungSteering).
     void steer(Viewer& v, Clock::time_point now) {
         const int last = int(ladder.size()) - 1;
         if (last <= 0 || v.wantRung != v.rung) return;
@@ -1569,34 +1614,13 @@ struct BrowserReviewBackend::Impl {
             loss = v.loss;
             at = v.reportAt;
         }
-        if (v.trying && now - v.movedAt > std::chrono::seconds(6)) {
-            v.trying = false;
-            v.hold = std::chrono::milliseconds(8000);
-        }
         if (reports == v.seenReports) return;
         v.seenReports = reports;
-        if (at - v.movedAt < std::chrono::milliseconds(700)) return;  // (it counts the rung before's packets)
-        const int r = v.rung;
-        auto usable = [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); };
-        auto move = [&](int to) {
-            v.wantRung = to;
-            v.movedAt = now;
-            v.nextTry = now + v.hold;
-        };
-        if (loss > 0.10 && r < last) {
-            const double through = sentKbps(v, now) * (1 - loss);
-            int to = r + 1;
-            while (to < last && double(ladder[size_t(to)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through) ++to;
-            while (to > r && !usable(to)) --to;
-            if (v.trying) v.hold = std::min(v.hold * 2, std::chrono::milliseconds(32000));
-            v.trying = false;
-            if (to > r) move(to);
-        } else if (loss >= 0.02) {
-            v.nextTry = std::max(v.nextTry, now + v.hold);
-        } else if (r > 0 && now >= v.nextTry && usable(r - 1)) {
-            v.trying = true;
-            move(r - 1);
-        }
+        const double through = sentKbps(v, now) * (1 - loss);
+        v.wantRung = v.steering.report(
+            v.rung, last, loss, at, now,
+            [&](int i) { return double(ladder[size_t(i)].bitrate) / 1000 + settings.audioBitrateKbps > 0.85 * through; },
+            [&](int i) { return !encoderErrors.count({v.codec, i, v.hdr}); });
     }
 
     // A picture to each viewer: from the encoder for their codec, rung and depth (each one's tag first: its RTP
@@ -1638,8 +1662,7 @@ struct BrowserReviewBackend::Impl {
                 v->rung = want;
                 v->needKey = false;
                 // (reports and tries count from the switch, not from when it was asked for)
-                v->movedAt = now;
-                v->nextTry = std::max(v->nextTry, now + v->hold);
+                v->steering.switched(now);
                 rungMessage(*v);
                 continue;
             }
@@ -1953,8 +1976,12 @@ bool BrowserReviewBackend::open(const Device&, const Mode& mode, const Signal& s
     d.relayInUse = false;
     for (const std::string& s : d.settings.iceServers) {
         try {
-            d.iceServers.emplace_back(s);
-            d.relayInUse = d.relayInUse || d.iceServers.back().type == rtc::IceServer::Type::Turn;
+            // (a relay over TLS or TCP is the browsers' alone: Montage's ICE reaches relays over UDP only, and one it
+            // cannot use must not cost the viewers the shared port)
+            rtc::IceServer server(s);
+            if (server.type == rtc::IceServer::Type::Turn && server.relayType != rtc::IceServer::RelayType::TurnUdp) continue;
+            d.relayInUse = d.relayInUse || server.type == rtc::IceServer::Type::Turn;
+            d.iceServers.push_back(std::move(server));
         } catch (const std::exception& e) {
             return fail(std::string("ICE server ") + s + ": " + e.what());
         }

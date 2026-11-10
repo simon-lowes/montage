@@ -33,6 +33,7 @@ class Host {
 public:
     ~Host();
     std::string key;
+    bool gpu = false;  // started with --gpu (OpenFX renders on the GPU): not shared with a host started without
     std::unique_ptr<ipc::Process> proc;
     Channel control;
     std::mutex controlM;
@@ -42,12 +43,14 @@ public:
     // What the host said as it crashed (signal or exception code; 0: it did not), told before the process ends.
     uint32_t crashCode() const;
     void kill();
+    // Whether Montage stopped it (kill: for a hang, memory, a failed attach), its failure recorded by whoever did.
+    bool stoppedByMontage() const { return killed_.load(std::memory_order_acquire); }
     std::atomic<int> instances{0};
     // Set by the first to report this host's end (renders on several threads see it end together; one failure).
     std::atomic<bool> failureTaken{false};
 
 private:
-    std::atomic<bool> dead_{false};
+    std::atomic<bool> dead_{false}, killed_{false};
 };
 
 // The running host for a key, or a new one (null with why when none can start).

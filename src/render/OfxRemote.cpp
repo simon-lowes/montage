@@ -32,10 +32,11 @@ struct Link {
         if (attached && host) --host->instances;
     }
     // Room for `bytes` in the arena (a new, larger block when needed; the host maps it at its next look).
-    bool room(size_t bytes) {
+    bool room(size_t bytes, std::string* error = nullptr) {
         if (arena && arena->size() >= bytes) return true;
         const size_t size = std::max(bytes, arena ? arena->size() * 2 : size_t(16) << 20);
-        auto next = ipc::SharedMemory::create(ipc::uniqueName("a"), size);
+        auto next = ipc::SharedMemory::create(ipc::uniqueName("a"), size, error);
+        if (!next && size > bytes) next = ipc::SharedMemory::create(ipc::uniqueName("a"), bytes, error);  // (no room to grow ahead)
         if (!next) return false;
         arena = std::move(next);
         std::memset(chan.h->arenaName, 0, sizeof chan.h->arenaName);
@@ -54,16 +55,16 @@ std::map<std::string, std::vector<std::unique_ptr<Link>>>& idleLinks() {
 }
 
 std::unique_ptr<Link> takeLink(const std::string& key, std::string* error) {
+    const bool gpu = gpuRendering() && gpuAvailable();
     {
         std::lock_guard lock(gLinksM);
         auto& v = idleLinks()[key];
         while (!v.empty()) {
             std::unique_ptr<Link> l = std::move(v.back());
             v.pop_back();
-            if (l->host->alive()) return l;
+            if (l->host->alive() && l->host->gpu == gpu) return l;
         }
     }
-    const bool gpu = gpuRendering() && gpuAvailable();
     auto host = hostFor(key, gpu, error);
     if (!host) return nullptr;
     auto link = std::make_unique<Link>();
@@ -129,8 +130,9 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     const size_t maskBytes = withMask ? size_t(w) * size_t(h) * sizeof(float) : 0;
     const size_t outOff = size_t(images) * slot + maskBytes;
     const size_t answerOff = outOff + slot;
-    if (!link->room(answerOff + slot)) {
-        if (error) *error = "no memory to share the pictures with the plug-in host";
+    if (std::string why; !link->room(answerOff + slot, &why)) {
+        if (error) *error = "no memory to share the pictures with the plug-in host: " + why;
+        giveBack(key, std::move(link));
         return false;
     }
     if (a) std::memcpy(link->at(0), a->px.data(), slot);
@@ -138,7 +140,9 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     if (withMask) std::memcpy(link->at(size_t(images) * slot), mask->data(), maskBytes);
     const std::string msg = effectToJsonString(baked(e, t)) + std::string(1, '\0') + descriptionsToJson({d}) + std::string(1, '\0') +
                             (working ? working->id : std::string());
-    const int64_t timeout = int64_t(hosting().exportTimeoutMs) * 1000;
+    // (during playback a picture is waited for 5 s at most, not an export's 30: a hung plug-in holds the viewer no
+    // longer than that, each time)
+    const int64_t timeout = int64_t(renderingRealtime() ? std::min(hosting().exportTimeoutMs, 5000) : hosting().exportTimeoutMs) * 1000;
     Result r = Result::Ok;
     if (sendPayload(c, *link->host, msg, timeout, &r)) {
         const InputResolver& inputs = currentInputs();
@@ -183,9 +187,12 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
             giveBack(key, std::move(link));
             return false;
         }
-        const int ow = int(hd->resultI), oh = int(hd->resultI2);
-        const size_t bytes = size_t(std::max(0, ow)) * size_t(std::max(0, oh)) * 16;
-        if (outOff + bytes > link->arena->size()) {
+        // (the size the host gives is not trusted: negative or past 64K a side is refused before anything is made)
+        const int64_t rw = hd->resultI, rh = hd->resultI2;
+        const bool sane = rw >= 0 && rh >= 0 && rw <= 65536 && rh <= 65536;
+        const int ow = sane ? int(rw) : 0, oh = sane ? int(rh) : 0;
+        const size_t bytes = size_t(ow) * size_t(oh) * 16;
+        if (!sane || outOff + bytes > link->arena->size()) {
             if (error) *error = d.label + " gave back a picture of the wrong size";
             return false;
         }

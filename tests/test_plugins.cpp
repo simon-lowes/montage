@@ -1999,6 +1999,66 @@ private slots:
         QVERIFY(eventually([&] { return failureOf(d->id)->restarts == 1; }));
     }
 
+    // Nightly 10 Nov: a hang in a shared host is recorded once. The other instance in that host (idle, or playing on
+    // into the host Montage stopped) is started again without a "crashed (signal 9)" of its own, and without using
+    // an automatic restart.
+    void hangInASharedHostRecordedOnce() {
+        const auto d = testPlugin("gain");
+        QVERIFY(d.has_value());
+        Hosting h(Isolation::Shared, [](HostingSettings& s) {
+            s.missedBlocks = 4;
+            s.autoRestarts = 1;
+        });
+        std::string err;
+        std::unique_ptr<Instance> hangs, idle;
+        {
+            Fault f("hang:process:3");
+            hangs = instantiate(*d, &err);
+            QVERIFY2(hangs, err.c_str());
+            idle = instantiate(*d, &err);
+            QVERIFY2(idle, err.c_str());
+        }
+        QVERIFY(hangs->activate(48000, 128) && idle->activate(48000, 128));
+        QVERIFY(hostProcessOf(hangs.get()) > 0 && hostProcessOf(hangs.get()) == hostProcessOf(idle.get()));
+        RenderModeScope mode(true);
+        std::vector<float> l(128), r(128);
+        float* ch[2] = {l.data(), r.data()};
+        auto block = [&](Instance& inst) {
+            std::fill(l.begin(), l.end(), 0.5f);
+            std::fill(r.begin(), r.end(), 0.5f);
+            inst.process(ch, 2, 128);
+        };
+        for (int i = 0; i < 200 && !bypassed(hangs.get()); ++i) block(*hangs);
+        QVERIFY(bypassed(hangs.get()));
+        QVERIFY(eventually([&] { return failureOf(d->id).has_value(); }));
+        // Both come back (the hung one with the one automatic restart, the other freely), the failure once.
+        QVERIFY(eventually([&] {
+            block(*idle);
+            block(*hangs);
+            return !bypassed(idle.get()) && !bypassed(hangs.get());
+        }));
+        QThread::msleep(500);  // (the supervisor's passes after it)
+        const HostFailure f = *failureOf(d->id);
+        QCOMPARE(f.count, 1);
+        QVERIFY2(f.kind == "hang", (f.kind + ": " + f.reason).c_str());
+    }
+
+    // Nightly 10 Nov: shared memory is reserved when it is made, so a block /dev/shm cannot hold is refused then
+    // (with why), rather than Montage ending with SIGBUS when the plug-in host's picture first reaches it.
+    void sharedMemoryTooLargeIsRefused() {
+#ifdef __linux__
+        std::string err;
+        auto huge = ipc::SharedMemory::create(ipc::uniqueName("t"), size_t(1) << 44, &err);  // (16 TB)
+        QVERIFY(!huge);
+        QVERIFY2(err.find("not enough shared memory") != std::string::npos || err.find("cannot") != std::string::npos, err.c_str());
+        auto fine = ipc::SharedMemory::create(ipc::uniqueName("t"), size_t(1) << 20, &err);
+        QVERIFY2(fine && fine->size() == size_t(1) << 20, err.c_str());
+        std::memset(fine->data(), 1, fine->size());
+#else
+        QSKIP("/dev/shm is Linux's");
+#endif
+    }
+
     void bypassCanBeSilence() {
         // The setting: a bypassed plug-in gives silence instead of its input.
         const auto d = testPlugin("gain");
@@ -2513,6 +2573,16 @@ private slots:
         QCOMPARE(st.skip, 44);
         QCOMPARE(st.silence, int64_t(0));
         QCOMPARE(early.next(1212, 256).skip, 0);
+        // After an input overflow (a kilosample lost), the rest lands where its blocks say, not early; a few samples'
+        // jitter is kept as it comes; frames come twice are passed over.
+        QCOMPARE(early.next(1468 + 1024, 256).silence, int64_t(1024));
+        st = early.next(2748 + 10, 256);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(st.skip, 0);
+        st = early.next(3014 - 600, 256);
+        QCOMPARE(st.skip, 256);
+        QCOMPARE(early.next(2670, 256).skip, 256);
+        QCOMPARE(early.next(2926, 256).skip, 88);
         // Unclocked, the input's latency is taken off its start.
         audiodev::TakeAligner loose(0, false, 300);
         QCOMPARE(loose.next(-1, 256).skip, 256);

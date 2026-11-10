@@ -206,6 +206,7 @@ std::string Host::howItEnded() {
 }
 
 void Host::kill() {
+    killed_.store(true, std::memory_order_release);
     if (proc) proc->kill();
     dead_.store(true, std::memory_order_release);
 }
@@ -229,10 +230,13 @@ std::map<std::string, std::weak_ptr<Host>>& pool() {
 
 std::shared_ptr<Host> hostFor(const std::string& key, bool gpu, std::string* error) {
     std::lock_guard lock(gPoolM);
-    if (auto h = pool()[key].lock(); h && h->alive()) return h;
+    // (pooled by key and by --gpu: a host started without it never takes a GPU render, nor the other way round)
+    const std::string poolKey = gpu ? key + "\n--gpu" : key;
+    if (auto h = pool()[poolKey].lock(); h && h->alive()) return h;
     const std::string exe = hostExecutable();
     auto host = std::make_shared<Host>();
     host->key = key;
+    host->gpu = gpu;
     if (!host->control.create(error)) return nullptr;
     std::vector<std::string> args{"--control", host->control.mem->name(), "--parent", std::to_string(ipc::ownPid()),
                                   "--memory-limit-mb", std::to_string(gMemoryLimitMb.load())};
@@ -253,7 +257,7 @@ std::shared_ptr<Host> hostFor(const std::string& key, bool gpu, std::string* err
         return nullptr;
     }
     host->control.unlinkNames();
-    pool()[key] = host;
+    pool()[poolKey] = host;
     return host;
 }
 
@@ -376,13 +380,16 @@ bool sendPayload(Channel& c, Host& host, const std::string& data, int64_t timeou
 
 bool receiveBlob(Channel& c, Host& host, int64_t size, std::string& out, int64_t timeoutUs, Result* r) {
     *r = Result::Ok;
-    out.assign(wire::payload(c.base()), size_t(std::min<uint64_t>(uint64_t(std::max<int64_t>(0, size)), c.h->payloadBytes)));
+    out.clear();
+    // (what the host says is not trusted: a size past 256 MB is refused, and no more than the payload area is read)
+    if (size < 0 || size > (int64_t(256) << 20)) return false;
+    out.assign(wire::payload(c.base()), size_t(std::min<uint64_t>({uint64_t(size), c.h->payloadBytes, uint64_t(wire::kPayload)})));
     while (int64_t(out.size()) < size) {
         c.h->command = wire::FetchBlob;
         c.h->argI = int64_t(out.size());
         c.h->paramCount = 0;
         if ((*r = call(c, host, timeoutUs)) != Result::Ok || c.h->payloadBytes == 0) return false;
-        out.append(wire::payload(c.base()), size_t(std::min<uint64_t>(c.h->payloadBytes, wire::kPayload)));
+        out.append(wire::payload(c.base()), size_t(std::min<uint64_t>({c.h->payloadBytes, uint64_t(wire::kPayload), uint64_t(size) - out.size()})));
     }
     return true;
 }
@@ -524,6 +531,9 @@ struct Core {
     std::atomic<int> missed{0};
     std::atomic<bool> attention{false};
     std::atomic<bool> restartAsked{false};
+    // In a shared host Montage stopped for another instance's failure: started again, nothing recorded, no automatic
+    // restart used (the failure was the other's, and is recorded once).
+    std::atomic<bool> innocent{false};
     std::atomic<int64_t> hostPid{0};
     std::weak_ptr<Host> host;  // (the supervisor's copy, under memM)
     // Remembered for a restart.
@@ -684,6 +694,11 @@ void reportFailure(Core& core, bool same) {
         std::lock_guard lock(core.memM);
         host = core.host.lock();
     }
+    // (a host Montage stopped for another instance's failure, recorded by that one: this one was only in it)
+    if (core.failure == Crashed && host && host->stoppedByMontage()) {
+        core.innocent = true;
+        return;
+    }
     const bool offline = core.failedOffline.load();
     std::string kind = "crash", reason;
     if (core.failure == Hung) {
@@ -724,8 +739,9 @@ void Supervisor::pass() {
         if (core->attention.exchange(false)) reportFailure(*core, restartedNow.count(core->d.id) > 0);
         if (st != 1) continue;
         const bool asked = core->restartAsked.exchange(false);
+        const bool innocent = core->innocent.exchange(false);
         if (pluginHeldBypassed(core->d.id) && !asked) continue;
-        if (!asked && !restartedNow.count(core->d.id)) {
+        if (!asked && !innocent && !restartedNow.count(core->d.id)) {
             if (autoRestartsLeft(core->d.id) <= 0) continue;
             useAutoRestart(core->d.id);
         }
@@ -1381,7 +1397,7 @@ std::vector<HostInfo> runningHosts() {
     std::vector<HostInfo> out;
     std::lock_guard lock(gPoolM);
     for (const auto& [key, w] : pool())
-        if (auto h = w.lock(); h && h->alive()) out.push_back({key, h->proc ? h->proc->pid() : 0, h->instances.load()});
+        if (auto h = w.lock(); h && h->alive()) out.push_back({h->key, h->proc ? h->proc->pid() : 0, h->instances.load()});
     return out;
 }
 

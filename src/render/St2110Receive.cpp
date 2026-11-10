@@ -264,11 +264,12 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     auto turnAway = [&] {
         ++rejected;
         if (who.others.size() > 8) {
-            // (a few strangers counted at a time: the one heard least let go)
-            auto least = who.others.begin();
+            // (a few strangers counted at a time: the one heard longest ago let go, never this one, so a sender that
+            // keeps sending builds up its count however many strays trickle in beside it)
+            auto least = who.others.end();
             for (auto it = who.others.begin(); it != who.others.end(); ++it)
-                if (it->second.count < least->second.count) least = it;
-            who.others.erase(least);
+                if (it->first != p.ssrc && (least == who.others.end() || it->second.last < least->second.last)) least = it;
+            if (least != who.others.end()) who.others.erase(least);
         }
     };
     if (!who.have && started_ && other.have && p.ssrc != other.ssrc && std::llabs(place() - next_) > int64_t(window_)) {
@@ -279,7 +280,8 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
         // (each counted against the other path's packets since it was first heard: a stray heard long before on this
         // leg does not hold back a sender that starts on it once the other leg has died)
         auto heard = who.others.find(p.ssrc);
-        if (heard == who.others.end()) heard = who.others.emplace(p.ssrc, Heard{0, received[otherSide]}).first;
+        if (heard == who.others.end()) heard = who.others.emplace(p.ssrc, Heard{0, received[otherSide], 0}).first;
+        heard->second.last = ++heardClock_;
         const int64_t theirs = ++heard->second.count;
         if (theirs <= int64_t(window_) || (received[otherSide] - heard->second.otherAt) * 4 >= theirs) return turnAway();
         other = Sender{};
@@ -292,7 +294,9 @@ void PathMerger::push(std::vector<uint8_t> packet, int path, std::vector<std::ve
     if (who.have && p.ssrc != who.ssrc) {
         // (the one taken's packets counted from the first stranger's; all counted again once it has sent a window)
         if (who.others.empty()) who.own = 0;
-        const int64_t theirs = ++who.others[p.ssrc].count;
+        Heard& h = who.others[p.ssrc];
+        h.last = ++heardClock_;
+        const int64_t theirs = ++h.count;
         if (theirs <= int64_t(window_) || who.own * 4 >= theirs) return turnAway();
         // A window of another sender's, with few of the one taken between: that one now. The count starts again from
         // its numbers, unless the other path's new sender has just started it (both legs' senders started again).
@@ -378,6 +382,9 @@ struct Input::Stream {
     PathMerger merger{true};
     std::unique_ptr<VideoAssembler> assembler;
     std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
+    // Ancillary data and metadata: the latest RTP timestamp this stream brought (the input's lock held).
+    bool dataSeen = false;
+    uint32_t dataLatest = 0;
     Stream(int k, const SdpStream& s) : kind(k), sdp(s), merger(k == 0) {}
 };
 
@@ -433,6 +440,10 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
         } else {
             hasMeta_ = true;
         }
+        // (a gap waited on, and a new sender passed over, for about half a second of packets: a data stream sends a
+        // packet or two a frame, so 512 of them were twenty seconds; sound by its packet time)
+        if (kind == 1) st->merger.setWindow(std::clamp<size_t>(size_t(500000 / std::max(1, s.audio.packetUs)), 64, 4096));
+        else if (kind >= 2) st->merger.setWindow(32);
         for (int p = 0; p < (s.redundant() ? 2 : 1); ++p) {
             std::string why;
             const std::string& at = s.interfaceAddress[p].empty() ? o.interfaceAddress[p] : s.interfaceAddress[p];
@@ -573,11 +584,15 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         std::vector<FastMetadata> items;
         if (!unpackFastMetadata(p.payload, p.size, items)) return;
         std::lock_guard lock(m_);
-        auto& at = meta_[p.timestamp];
-        if (at.size() + items.size() > 256) return;
+        // (no entry made for what is refused: an empty one would never be let go)
+        const auto have = meta_.find(p.timestamp);
+        if ((have == meta_.end() ? 0 : have->second.size()) + items.size() > 256) return;
+        auto& at = have == meta_.end() ? meta_[p.timestamp] : have->second;
         at.insert(at.end(), items.begin(), items.end());
         if (!metaSeen_ || int32_t(p.timestamp - metaLatest_) > 0) metaLatest_ = p.timestamp;
         metaSeen_ = true;
+        if (!s.dataSeen || int32_t(p.timestamp - s.dataLatest) > 0) s.dataLatest = p.timestamp;
+        s.dataSeen = true;
         while (meta_.size() > 64) {
             auto oldest = meta_.begin();
             for (auto it = meta_.begin(); it != meta_.end(); ++it)
@@ -589,11 +604,15 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         std::vector<AncPacket> anc;
         if (!unpackAnc(p.payload, p.size, anc)) return;
         std::lock_guard lock(m_);
-        auto& at = anc_[p.timestamp];
-        // (a frame carries a few dozen packets: no more held for one time, whatever a sender repeats)
-        if (at.size() + anc.size() > 256) return;
+        // (a frame carries a few dozen packets: no more held for one time, whatever a sender repeats; and no entry
+        // made for what is refused)
+        const auto have = anc_.find(p.timestamp);
+        if ((have == anc_.end() ? 0 : have->second.size()) + anc.size() > 256) return;
+        auto& at = have == anc_.end() ? anc_[p.timestamp] : have->second;
         at.insert(at.end(), anc.begin(), anc.end());
         if (!ancSeen_ || int32_t(p.timestamp - ancLatest_) > 0) ancLatest_ = p.timestamp;
+        if (!s.dataSeen || int32_t(p.timestamp - s.dataLatest) > 0) s.dataLatest = p.timestamp;
+        s.dataSeen = true;
         // (the oldest let go: furthest behind the latest, as the map's order breaks where the timestamps wrap)
         while (anc_.size() > 64) {
             auto oldest = anc_.begin();
@@ -624,9 +643,10 @@ Span spanOf(uint32_t ts, Rational fps, int rate) {
 
 bool Input::ready(const Pending& p, std::chrono::steady_clock::time_point now) {
     if (now - p.at > std::chrono::milliseconds(options_.waitMs)) return true;
-    // (its ancillary data, sent alongside on a socket of its own, may come a little after the picture)
-    if (hasAnc_ && !(ancSeen_ && int32_t(ancLatest_ - p.ts) >= 0)) return false;
-    if (hasMeta_ && !(metaSeen_ && int32_t(metaLatest_ - p.ts) >= 0)) return false;
+    // (its ancillary data and metadata, sent alongside on sockets of their own, may come a little after the picture:
+    // each such stream must have reached the picture's time, not only the quickest of them)
+    for (const auto& st : streams_)
+        if ((st->kind == 2 || st->kind == 3) && !(st->dataSeen && int32_t(st->dataLatest - p.ts) >= 0)) return false;
     if (!hasAudio_) return true;
     const Span sp = spanOf(p.ts, video_.fps, audio_.rate);
     for (const Sound& s : sounds_)

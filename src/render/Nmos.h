@@ -264,4 +264,8 @@ private:
     bool stopping_ = false;
 };
 
+// A DNS name in a multicast DNS message at `at` (compression pointers followed, 32 at most), `at` moved past it; false
+// when it runs off the message or is longer than 255 octets (RFC 1035), however its pointers make it.
+bool readDnsName(const QByteArray& message, int& at, QString& out);
+
 }  // namespace montage::nmos

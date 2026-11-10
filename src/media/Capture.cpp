@@ -243,7 +243,11 @@ struct Recorder::State {
 namespace {
 
 // Packets waiting beyond this many bytes: pictures are dropped (whole runs, to the next keyframe) until it halves.
+// A recording waits a long way behind before it lets a picture go; a feed only watched (a multiviewer tile) keeps up
+// with the feed instead, a few seconds of it at most.
 constexpr int64_t kQueueBytes = int64_t(512) << 20;
+constexpr int64_t kWatchQueueBytes = int64_t(32) << 20;
+int64_t queueLimit(const Recorder::State* s) { return s->settings.path.empty() ? kWatchQueueBytes : kQueueBytes; }
 
 struct Interrupt {
     Recorder::State* s;
@@ -304,7 +308,7 @@ struct Input {
     }
 };
 
-AVCodecContext* openDecoder(AVStream* st, std::string* error) {
+AVCodecContext* openDecoder(AVStream* st, std::string* error, bool watchOnly = false) {
     const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
     if (!dec) {
         if (error) *error = std::string("No decoder for ") + avcodec_get_name(st->codecpar->codec_id);
@@ -313,8 +317,10 @@ AVCodecContext* openDecoder(AVStream* st, std::string* error) {
     AVCodecContext* c = avcodec_alloc_context3(dec);
     avcodec_parameters_to_context(c, st->codecpar);
     c->pkt_timebase = st->time_base;
-    c->thread_count = 0;  // (as many as there are cores: HD and UHD feeds keep up)
-    c->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    // As many threads as there are cores, so HD and UHD feeds keep up; a watched feed (one tile of many) takes a few,
+    // and only slice threads, which add no delay.
+    c->thread_count = watchOnly ? 4 : 0;
+    c->thread_type = watchOnly ? FF_THREAD_SLICE : FF_THREAD_FRAME | FF_THREAD_SLICE;
     if (const int err = avcodec_open2(c, dec, nullptr); err < 0) {
         if (error) *error = "Cannot decode the feed: " + avError(err);
         avcodec_free_context(&c);
@@ -473,7 +479,7 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
     }
     if (in.videoStream >= 0) {
         AVStream* st = in.fmt->streams[in.videoStream];
-        if (!(in.video = openDecoder(st, error))) return false;
+        if (!(in.video = openDecoder(st, error, s->settings.path.empty()))) return false;
         in.videoTb = st->time_base;
         in.rate = st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0 ? st->avg_frame_rate : st->r_frame_rate;
     }
@@ -1408,7 +1414,7 @@ void Recorder::run() {
                         item.st2110 = f;
                         item.arrived = captureClockNow();
                         std::lock_guard lock(s->qm);
-                        if (s->queuedBytes > kQueueBytes) {
+                        if (s->queuedBytes > queueLimit(s)) {
                             // (the sound kept, as for other feeds: the picture let go)
                             f->picture = {};
                             if (f->audio.empty()) continue;
@@ -1449,7 +1455,7 @@ void Recorder::run() {
                         item.omt = f;
                         item.arrived = captureClockNow();
                         std::lock_guard lock(s->qm);
-                        if (f->header.type == omt::Video && s->queuedBytes > kQueueBytes) continue;
+                        if (f->header.type == omt::Video && s->queuedBytes > queueLimit(s)) continue;
                         s->queuedBytes += itemBytes(item);
                         s->queue.push_back(item);
                         s->qc.notify_all();
@@ -1497,8 +1503,8 @@ void Recorder::run() {
                     std::lock_guard lock(s->qm);
                     if (p->stream_index == in.videoStream) {
                         // Falling behind: pictures dropped, whole runs to the next keyframe (sound never).
-                        if (s->queuedBytes > kQueueBytes) dropping = true;
-                        else if (dropping && s->queuedBytes < kQueueBytes / 2 && (p->flags & AV_PKT_FLAG_KEY)) dropping = false;
+                        if (s->queuedBytes > queueLimit(s)) dropping = true;
+                        else if (dropping && s->queuedBytes < queueLimit(s) / 2 && (p->flags & AV_PKT_FLAG_KEY)) dropping = false;
                         if (dropping) {
                             av_packet_free(&item.packet);
                             continue;

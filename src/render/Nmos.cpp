@@ -1497,10 +1497,13 @@ void put16(QByteArray& b, quint16 v) { b.append(char(v >> 8)).append(char(v & 0x
 void put32(QByteArray& b, quint32 v) { put16(b, quint16(v >> 16)), put16(b, quint16(v)); }
 quint16 get16(const QByteArray& m, int at) { return quint16(quint8(m[at]) << 8 | quint8(m[at + 1])); }
 
-// A name at `at` (with compression pointers, a few dozen at most), `at` moved past it.
-bool readName(const QByteArray& m, int& at, QString& out) {
+// A name at `at` (with compression pointers, a few dozen at most; 255 octets at most in all, as RFC 1035 holds names
+// to, so a chain of pointers cannot make one long), `at` moved past it.
+}  // namespace
+
+bool readDnsName(const QByteArray& m, int& at, QString& out) {
     QStringList labels;
-    int pos = at, jumps = 0;
+    int pos = at, jumps = 0, octets = 1;
     bool jumped = false;
     while (pos < m.size()) {
         const quint8 len = quint8(m[pos]);
@@ -1518,11 +1521,16 @@ bool readName(const QByteArray& m, int& at, QString& out) {
             continue;
         }
         if (len > 63 || pos + 1 + len > m.size()) return false;
+        if ((octets += 1 + len) > 255) return false;
         labels << QString::fromUtf8(m.mid(pos + 1, len));
         pos += 1 + len;
     }
     return false;
 }
+
+namespace {
+
+bool readName(const QByteArray& m, int& at, QString& out) { return readDnsName(m, at, out); }
 
 QByteArray record(const QString& name, quint16 type, bool flush, quint32 ttl, const QByteArray& data) {
     QByteArray b;
@@ -1581,6 +1589,17 @@ struct Node::Mdns {
     QTimer* browse = nullptr;
     int queries = 0;
     std::function<void(std::vector<Registry>)> browsed;
+    // The local links (RFC 6762 11: only a sender on one of them is heard), and when the Node last answered to the
+    // group (once a second at most, as 6.2 has it).
+    std::vector<std::pair<QHostAddress, int>> links;
+    QElapsedTimer answered;
+    bool onLink(const QHostAddress& from) const {
+        QHostAddress a = from;
+        bool v4 = false;
+        if (const quint32 four = a.toIPv4Address(&v4); v4) a = QHostAddress(four);
+        if (a.isLoopback() || a.isLinkLocal()) return true;
+        return std::any_of(links.begin(), links.end(), [&](const auto& l) { return a.isInSubnet(l.first, l.second); });
+    }
 };
 
 QByteArray Node::mdnsTxt() const {
@@ -1640,8 +1659,10 @@ void Node::startMdns() {
         const auto f = i.flags();
         if (!(f & QNetworkInterface::IsUp) || !(f & QNetworkInterface::CanMulticast)) continue;
         m.socket->joinMulticastGroup(group, i);
-        for (const QNetworkAddressEntry& e : i.addressEntries())
+        for (const QNetworkAddressEntry& e : i.addressEntries()) {
             if (e.ip().toString() == address_) m.socket->setMulticastInterface(i);
+            if (e.prefixLength() >= 0) m.links.emplace_back(e.ip(), e.prefixLength());
+        }
     }
     m.address = QHostAddress(address_);
     m.port = port();
@@ -1653,7 +1674,7 @@ void Node::startMdns() {
         while (md.socket->hasPendingDatagrams()) {
             const QNetworkDatagram d = md.socket->receiveDatagram(9000);
             const QByteArray msg = d.data();
-            if (msg.size() < 12) continue;
+            if (msg.size() < 12 || !md.onLink(d.senderAddress())) continue;  // (from off the local links: not heard)
             const quint16 id = get16(msg, 0), flags = get16(msg, 2);
             const int qd = get16(msg, 4), records = get16(msg, 6) + get16(msg, 8) + get16(msg, 10);
             int at = 12;
@@ -1678,6 +1699,8 @@ void Node::startMdns() {
                 // A query for the Node: answered to the group, and straight back to a querier not on port 5353 (a
                 // one-shot query, RFC 6762's legacy unicast: its id and questions with the answer).
                 if (d.senderPort() == kMdnsPort) {
+                    if (md.answered.isValid() && md.answered.elapsed() < 1000) continue;
+                    md.answered.start();
                     announceNode();
                 } else {
                     QByteArray srv;
@@ -1708,10 +1731,17 @@ void Node::startMdns() {
                     QString instance;
                     if (!readName(msg, data, instance)) continue;
                     if (ttl == 0) md.found.erase(instance.toLower());  // (a goodbye)
-                    else md.found.emplace(instance.toLower(), Mdns::Found{});
+                    else if (md.found.size() < 256) md.found.emplace(instance.toLower(), Mdns::Found{});
                 } else if (!n.endsWith(QStringLiteral("._nmos-register._tcp.local")) && !n.endsWith(QStringLiteral("._nmos-registration._tcp.local"))) {
-                    if (type == kTypeA && length == 4) md.addresses[n] = QHostAddress(quint32(get16(msg, data)) << 16 | get16(msg, data + 2));
+                    if (type == kTypeA && length == 4) {
+                        if (ttl == 0) md.addresses.erase(n);  // (a goodbye)
+                        else if (md.addresses.size() < 1024 || md.addresses.count(n))
+                            md.addresses[n] = QHostAddress(quint32(get16(msg, data)) << 16 | get16(msg, data + 2));
+                    }
                     continue;  // (another service's records: a Node's own, say)
+                } else if (ttl == 0 || (!md.found.count(n) && md.found.size() >= 256)) {
+                    if (ttl == 0) md.found.erase(n);
+                    continue;
                 } else if (type == kTypeSrv && length >= 7) {
                     QString target;
                     int t = data + 6;
@@ -1723,6 +1753,7 @@ void Node::startMdns() {
                     QString ver, proto, auth = QStringLiteral("false");
                     for (int p = data; p < data + length;) {
                         const int len = quint8(msg[p]);
+                        if (p + 1 + len > data + length) break;  // (a string past its record's end)
                         const QByteArray kv = msg.mid(p + 1, len);
                         p += 1 + len;
                         const int eq = kv.indexOf('=');
