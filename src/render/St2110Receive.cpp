@@ -3,9 +3,13 @@
 #include "media/JpegXs.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
+
+#include <QFile>
 
 namespace montage::st2110 {
 
@@ -589,8 +593,7 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
             return;
         }
         while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
-        pending_.push_back({rasterOf(pic), s.jxsv->timestamp(), s.jxsv->lostInFrame(), std::chrono::steady_clock::now()});
-        pending_.back().codestream = cs;
+        pending_.push_back({rasterOf(pic), s.jxsv->timestamp(), s.jxsv->lostInFrame(), std::chrono::steady_clock::now(), cs});
         if (s.jxsv->lostInFrame()) ++stats_.incomplete;
         stats_.concealedSlices += s.jxsv->concealedSlices();
         cv_.notify_all();
@@ -599,7 +602,7 @@ void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
         std::lock_guard lock(m_);
         // (a reader that falls behind loses the oldest frames, not the newest)
         while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
-        pending_.push_back({s.assembler->raster(), s.assembler->timestamp(), s.assembler->lostInFrame(), std::chrono::steady_clock::now()});
+        pending_.push_back({s.assembler->raster(), s.assembler->timestamp(), s.assembler->lostInFrame(), std::chrono::steady_clock::now(), {}});
         if (s.assembler->lostInFrame()) ++stats_.incomplete;
         cv_.notify_all();
     } else if (s.kind == 1) {
@@ -799,6 +802,84 @@ bool Input::next(InputFrame& out, int ms) {
         if (stop_ || now >= until) return false;
         cv_.wait_until(lock, std::min(until, now + std::chrono::milliseconds(10)));
     }
+}
+
+std::string fastMetadataSidecar(const std::string& recording) { return recording + ".st2110-41.jsonl"; }
+
+std::string fastMetadataLine(int64_t frame, const std::vector<FastMetadata>& items) {
+    std::string line = "{\"frame\":" + std::to_string(frame) + ",\"items\":[";
+    char hex[16];
+    for (size_t i = 0; i < items.size(); ++i) {
+        std::snprintf(hex, sizeof hex, "%06X", unsigned(items[i].type & 0x3FFFFF));
+        line += std::string(i ? "," : "") + "{\"type\":\"" + hex + "\",\"k\":" + (items[i].k ? "true" : "false") + ",\"words\":\"";
+        for (uint32_t w : items[i].words) {
+            std::snprintf(hex, sizeof hex, "%08X", unsigned(w));
+            line += hex;
+        }
+        line += "\"}";
+    }
+    return line + "]}";
+}
+
+bool readFastMetadataSidecar(const std::string& file, std::map<int64_t, std::vector<FastMetadata>>& out, std::string* error) {
+    out.clear();
+    QFile in(QString::fromStdString(file));
+    if (!in.open(QIODevice::ReadOnly)) {
+        if (error) *error = "Cannot read " + file;
+        return false;
+    }
+    // (the lines as fastMetadataLine writes them: its fields in its order)
+    auto field = [](const std::string& s, size_t& at, const char* name) {
+        const std::string key = std::string("\"") + name + "\":";
+        const size_t p = s.find(key, at);
+        if (p == std::string::npos) return false;
+        at = p + key.size();
+        return true;
+    };
+    auto quoted = [](const std::string& s, size_t& at, std::string& v) {
+        if (at >= s.size() || s[at] != '"') return false;
+        const size_t end = s.find('"', at + 1);
+        if (end == std::string::npos) return false;
+        v = s.substr(at + 1, end - at - 1);
+        at = end + 1;
+        return true;
+    };
+    auto isHex = [](const std::string& v) { return std::all_of(v.begin(), v.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }); };
+    int number = 0;
+    while (!in.atEnd()) {
+        const std::string line = in.readLine().trimmed().toStdString();
+        ++number;
+        if (line.empty()) continue;
+        auto bad = [&] {
+            if (error) *error = file + ": line " + std::to_string(number) + " is not fast metadata";
+            out.clear();
+            return false;
+        };
+        size_t at = 0;
+        if (!field(line, at, "frame")) return bad();
+        char* end = nullptr;
+        const long long frame = std::strtoll(line.c_str() + at, &end, 10);
+        if (end == line.c_str() + at || frame < 0) return bad();
+        at = size_t(end - line.c_str());
+        if (!field(line, at, "items")) return bad();
+        std::vector<FastMetadata>& items = out[frame];
+        while (true) {
+            const size_t next = line.find("{\"type\":", at);
+            if (next == std::string::npos) break;
+            at = next + 1;
+            FastMetadata m;
+            std::string type, words;
+            if (!field(line, at, "type") || !quoted(line, at, type) || type.empty() || type.size() > 6 || !isHex(type)) return bad();
+            m.type = uint32_t(std::stoul(type, nullptr, 16));
+            if (!field(line, at, "k")) return bad();
+            if (line.compare(at, 4, "true") == 0) m.k = true;
+            else if (line.compare(at, 5, "false") != 0) return bad();
+            if (!field(line, at, "words") || !quoted(line, at, words) || words.size() % 8 || !isHex(words)) return bad();
+            for (size_t i = 0; i < words.size(); i += 8) m.words.push_back(uint32_t(std::stoul(words.substr(i, 8), nullptr, 16)));
+            items.push_back(std::move(m));
+        }
+    }
+    return true;
 }
 
 }  // namespace montage::st2110

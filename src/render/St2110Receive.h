@@ -197,4 +197,13 @@ private:
     InputStats stats_;
 };
 
+// ---- Fast metadata kept with a recording: beside it, in <recording>.st2110-41.jsonl, a line for each recorded frame
+// that came with any (a frame passed over gives its items to the next one recorded):
+//   {"frame":12,"items":[{"type":"3FF4D0","k":false,"words":"000000000000002A0A000000"}]}
+// (the type in hexadecimal; the words each eight hexadecimal digits, in order).
+std::string fastMetadataSidecar(const std::string& recording);
+std::string fastMetadataLine(int64_t frame, const std::vector<FastMetadata>& items);
+// The items by frame (false when the file cannot be read or a line is not one of these).
+bool readFastMetadataSidecar(const std::string& file, std::map<int64_t, std::vector<FastMetadata>>& out, std::string* error = nullptr);
+
 }  // namespace montage::st2110

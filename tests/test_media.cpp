@@ -108,6 +108,7 @@
 #include "media/Omt.h"
 #include "render/VideoPacking.h"
 #include "render/St2110Receive.h"
+#include "media/JpegXs.h"
 #endif
 #include "media/Mlv.h"
 #include "media/Decoder.h"
@@ -2517,6 +2518,139 @@ private slots:
         QVERIFY(never.wait(15));
         QVERIFY(!never.status().error.empty());
         QVERIFY(!QFile::exists(QString::fromStdString(none.path)));
+    }
+
+    // ST 2110-22 (JPEG XS, a packet of each slice its own) recorded with its -41 fast metadata stream: the items each
+    // frame came with kept beside the recording at the frame it became, the picture there the one they were sent with.
+    // (Uncompressed -20 video when built without SVT-JPEG-XS.)
+    void captureSt2110FastMetadata() {
+        namespace st = st2110;
+        int ports[4];
+        {
+            st::Receiver probe[4];
+            for (int i = 0; i < 4; ++i) {
+                QVERIFY(probe[i].open({"127.0.0.1", 0}));
+                ports[i] = probe[i].port();
+            }
+        }
+        st::SenderOptions o;
+        o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+        o.metadata = {"127.0.0.1", ports[3]};
+        o.ttl = 1, o.sendMetadata = true, o.metadataTypes = {st::kFrameItemType, 0x3FF001};
+        const int W = 640, H = 360, spf = 1920;
+        st::VideoFormat v;
+        v.width = W, v.height = H, v.fps = {25, 1};
+        if (jpegXsAvailable()) v.codec = "jxsv", v.bpp = 4, v.packetMode = 1;
+        st::Sender tx;
+        std::string err;
+        QVERIFY2(tx.open(o, v, st::AudioFormat{}, &err), err.c_str());
+        // Each picture's frame number (mod 32) in five squares along the top, dark for 0 and light for 1.
+        auto picture = [&](int t) {
+            st::Raster r(W, H, st::Sampling::Ycc422, 10);
+            for (int y = 0; y < H; ++y) {
+                uint16_t* d = r.row(y);
+                for (int x = 0; x < W; ++x) {
+                    const bool square = y >= 8 && y < 56 && x >= 16 && x < 16 + 5 * 96 && (x - 16) % 96 < 64;
+                    const uint16_t luma = uint16_t(square ? (((t % 32) >> ((x - 16) / 96)) & 1 ? 880 : 100) : 200 + x / 2);
+                    d[2 * x] = 512, d[2 * x + 1] = luma;
+                }
+            }
+            return r;
+        };
+        std::string url;
+        for (const auto& [name, text] : {std::pair{"video", tx.sdpVideo()}, {"audio", tx.sdpAudio()}, {"data", tx.sdpAnc()}, {"meta", tx.sdpMetadata()}}) {
+            QVERIFY2(!text.empty(), name);
+            const std::string file = path(QStringLiteral("st2110-41-%1.sdp").arg(QLatin1String(name)).toStdString().c_str());
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(text.c_str());
+            url += (url.empty() ? "" : ";") + file;
+        }
+        QVERIFY2(tx.sdpMetadata().find("3FF4D0") != std::string::npos && tx.sdpMetadata().find("3FF001") != std::string::npos, tx.sdpMetadata().c_str());
+        // A large object (Annex A's segmentation) with every fifth frame, beside the frame's own item.
+        std::vector<uint8_t> object(3001);
+        for (size_t i = 0; i < object.size(); ++i) object[i] = uint8_t(i * 7 + 1);
+        std::vector<uint32_t> objectWords((object.size() + 3) / 4, 0);
+        for (size_t i = 0; i < object.size(); ++i) objectWords[i / 4] |= uint32_t(object[i]) << (24 - 8 * (i % 4));
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            for (int t = 0; !stop && t < 25 * 20; ++t) {
+                std::vector<float> sound(size_t(spf) * 2, 0.0f);
+                const output::Timecode tc = output::timecodeOf(FrameTime(36000 * 25 + t), {25, 1});
+                std::vector<st::FastMetadata> items = {st::frameItem(t, tc)};
+                if (t % 5 == 0)
+                    for (st::FastMetadata& m : st::segmentObject(0x3FF001, object.data(), object.size())) items.push_back(std::move(m));
+                tx.setNextMetadata(items);
+                if (!tx.send(picture(t), sound.data(), spf, &tc, {}, &stop)) break;
+            }
+        });
+        CaptureSettings cs;
+        cs.video.device = "st2110";
+        cs.video.url = url;
+        cs.path = path("capture-st2110-41.mov");
+        cs.seconds = 2;
+        // (an earlier recording's fast metadata at this path: not this one's)
+        {
+            QFile old(QString::fromStdString(st::fastMetadataSidecar(cs.path)));
+            QVERIFY(old.open(QIODevice::WriteOnly));
+            old.write("{\"frame\":999,\"items\":[]}\n");
+        }
+        Recorder rec;
+        QVERIFY2(rec.start(cs, &err), err.c_str());
+        const bool ended = rec.wait(20);
+        stop = true;
+        sending.join();
+        tx.close();
+        QVERIFY(ended);
+        const CaptureStatus status = rec.status();
+        QVERIFY2(status.error.empty(), status.error.c_str());
+        QCOMPARE(status.frames, int64_t(50));
+        std::map<int64_t, std::vector<st::FastMetadata>> kept;
+        QVERIFY2(st::readFastMetadataSidecar(st::fastMetadataSidecar(cs.path), kept, &err), err.c_str());
+        QVERIFY(!kept.count(999));
+        VideoDecoder dec;
+        QVERIFY(dec.open(cs.path));
+        auto numberOf = [&](const Image& img) {
+            int n = 0;
+            for (int i = 0; i < 5; ++i) n |= (img.at(16 + 96 * i + 32, 32)[1] > 0.5f ? 1 : 0) << i;
+            return n;
+        };
+        // Every recorded frame that came with items: its frame item names the picture recorded there (its number and
+        // time code), the frames in order; an object whole wherever its segments came (a picture the recorder
+        // dropped gives its items to the next, so a frame may hold two frames' items: the last is its own).
+        int64_t previous = -1;
+        int framed = 0, objects = 0;
+        QString seen = QStringLiteral("dropped %1, repeated %2:").arg(status.dropped).arg(status.repeated);
+        for (const auto& [n, items] : kept) seen += QStringLiteral(" %1=%2").arg(n).arg(items.size());
+        for (const auto& [n, items] : kept) {
+            QVERIFY2(n >= 0 && n < 50, qPrintable(seen));
+            int64_t sent = -1;
+            output::Timecode tc;
+            std::vector<st::FastMetadata> segments;
+            for (const st::FastMetadata& m : items) {
+                if (m.type == st::kFrameItemType) QVERIFY(st::parseFrameItem(m, sent, &tc));
+                else if (m.type == 0x3FF001) segments.push_back(m);
+            }
+            QVERIFY2(sent > previous, qPrintable(seen));
+            previous = sent;
+            const output::Timecode want = output::timecodeOf(FrameTime(36000 * 25 + sent), {25, 1});
+            QVERIFY(tc.hours == want.hours && tc.minutes == want.minutes && tc.seconds == want.seconds && tc.frames == want.frames);
+            if (!segments.empty()) {
+                std::vector<uint32_t> words;
+                QVERIFY(st::joinObject(segments, 0x3FF001, words));
+                QVERIFY(words == objectWords);
+                ++objects;
+            }
+            const Frame16Ptr f = dec.frameAt((double(n) + 0.5) / 25.0);
+            QVERIFY(f);
+            if (numberOf(toImage(*f)) == int(sent % 32)) ++framed;
+        }
+        QVERIFY2(int(kept.size()) + status.repeated >= 48, qPrintable(seen));
+        QVERIFY2(framed >= int(kept.size()) - 2, qPrintable(seen + QStringLiteral(" matched %1").arg(framed)));
+        QVERIFY2(objects >= 8, qPrintable(seen));
+        // The recording's first frame's time code is its frame item's.
+        QVERIFY(!kept.empty());
+        QVERIFY2(QString::fromStdString(status.timecode).startsWith("10:00:"), status.timecode.c_str());
     }
 
     void deckControlProtocol() {

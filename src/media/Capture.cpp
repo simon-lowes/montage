@@ -424,7 +424,7 @@ bool openSt2110(Recorder::State* s, const CaptureSource& src, bool wantVideo, bo
         return false;
     }
     for (const auto& x : streams)
-        if (x.encoding == "raw") in.st2110Full = x.fullRange;
+        if (x.encoding == "raw" || x.encoding == "jxsv") in.st2110Full = x.fullRange;
     in.st2110Video = in.st2110->video();
     in.st2110Channels = in.st2110->hasAudio() ? in.st2110->audio().channels : 0;
     const auto until = Clock::now() + std::chrono::milliseconds(int64_t(s->settings.openTimeout * 1000));
@@ -818,6 +818,9 @@ void Recorder::run() {
     int colorSpace = AVCOL_SPC_BT709;
     bool interlaced = false, topFirst = true;
     std::vector<uint8_t> ccCarried;  // (a dropped picture's caption data, for the next one)
+    // ST 2110-41 fast metadata kept beside the recording, a line a frame (a dropped picture's items go with the next).
+    std::vector<st2110::FastMetadata> metaCarried;
+    std::unique_ptr<QFile> metaFile;
     // The feed's other sound streams (allSound): each converted and placed as the recorded one is.
     struct ExtraPlace {
         SwrContext* swr = nullptr;
@@ -1157,6 +1160,8 @@ void Recorder::run() {
                 return false;
             }
         }
+        // (fast metadata an earlier recording here kept: not this one's)
+        if (!watchOnly) QFile::remove(QString::fromStdString(st2110::fastMetadataSidecar(cs.path)));
         headerWritten = true;
         if (cs.live) cs.live->begin(tc, fps.num, fps.den);
         std::lock_guard lock(s->m);
@@ -1608,9 +1613,26 @@ void Recorder::run() {
                     w[1] = av_timecode_get_smpte(in.rate, t.dropFrame ? 1 : 0, t.hours, t.minutes, t.seconds, t.frames);
                     w[2] = w[3] = 0;
                 }
+            const int64_t before = nextFrame;
+            if (!watchOnly && metaCarried.size() < 4096) metaCarried.insert(metaCarried.end(), f.metadata.begin(), f.metadata.end());
             const bool ok = putPicture(pic, in);
             av_frame_free(&pic);
             if (!ok) return false;
+            // (its fast metadata at the frame it was recorded as; none kept before the recording starts)
+            if (!headerWritten) metaCarried.clear();
+            if (nextFrame > before && !metaCarried.empty()) {
+                if (!metaFile) {
+                    metaFile = std::make_unique<QFile>(QString::fromStdString(st2110::fastMetadataSidecar(cs.path)));
+                    if (!metaFile->open(QIODevice::WriteOnly | QIODevice::Truncate)) metaFile->setFileName(QString());
+                }
+                if (metaFile->isOpen()) {
+                    const std::string line = st2110::fastMetadataLine(nextFrame - 1, metaCarried) + "\n";
+                    metaFile->write(line.data(), qint64(line.size()));
+                } else if (warning.empty()) {
+                    warning = "The feed's fast metadata could not be written beside the recording";
+                }
+                metaCarried.clear();
+            }
         }
         if (in.audioStream >= 0 && f.channels > 0 && !f.audio.empty()) {
             const st2110::AudioFormat a = in.st2110->audio();
@@ -1893,6 +1915,7 @@ void Recorder::run() {
     }
     // (nothing usable: the file begun is taken away again)
     if (fileMade && !headerWritten) QFile::remove(QString::fromStdString(cs.path));
+    if (metaFile) metaFile->close();
     avcodec_free_context(&venc);
     avcodec_free_context(&aenc);
     sws_freeContext(sws);
