@@ -12996,6 +12996,8 @@ void McpServer::Impl::addTools() {
                 "codec":{"type":"string","enum":["libx264","libx265","libsvtav1"],"default":"libx264","description":"The default ladder's codec"},
                 "segment_seconds":{"type":"number","minimum":2,"maximum":6,"default":4},
                 "cut_aligned":{"type":"boolean","default":false,"description":"Segments end at the cut nearest each nominal end"},
+                "per_shot":{"type":"boolean","default":false,"description":"Rungs set per shot: each shot (from the cuts and shot changes) starts a segment, is tried at several CRFs on each rung and scored by VMAF, and gets the CRF that reaches vmaf_target for the fewest bits (or, with no target, that spends the rung's bitrate best); each rung's bitrate is then its cap. Writes ladder.csv"},
+                "vmaf_target":{"type":"number","minimum":0,"maximum":100,"description":"With per_shot: the VMAF each shot is to reach on each rung (default none: fill each rung's bitrate)"},
                 "hls":{"type":"boolean","default":true},"dash":{"type":"boolean","default":true},
                 "iframe_playlists":{"type":"boolean","default":true},
                 "cue":{"type":"string","enum":["splice_insert","time_signal"],"default":"splice_insert"},
@@ -13276,6 +13278,10 @@ void McpServer::Impl::addTools() {
                 ss.segmentSeconds = so.value("segment_seconds").toDouble(4);
                 if (ss.segmentSeconds < 2 || ss.segmentSeconds > 6) throw ArgError{"\"segment_seconds\" is 2 to 6"};
                 ss.cutAligned = so.value("cut_aligned").toBool();
+                ss.perShot = so.value("per_shot").toBool();
+                ss.vmafTarget = so.value("vmaf_target").toDouble(0);
+                if (so.contains("vmaf_target") && !ss.perShot) throw ArgError{"\"vmaf_target\" is for per_shot"};
+                if (!(ss.vmafTarget >= 0 && ss.vmafTarget <= 100)) throw ArgError{"\"vmaf_target\" is 0 to 100"};
                 ss.hls = so.value("hls").toBool(true), ss.dash = so.value("dash").toBool(true);
                 ss.iframePlaylists = so.value("iframe_playlists").toBool(true);
                 ss.cueCommand = str(so, "cue", "splice_insert").toStdString();
@@ -13316,6 +13322,20 @@ void McpServer::Impl::addTools() {
                 if (!res.hls.empty()) o["hls"] = QString::fromStdString(res.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(res.hls));
                 if (!res.dash.empty()) o["dash"] = QString::fromStdString(res.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(res.dash));
                 if (!res.breaks.empty()) text += QStringLiteral("\n%1 ad break(s) as SCTE 35 cues").arg(res.breaks.size());
+                if (!res.perShot.empty()) {
+                    // (each rung's shots: CRF, rate and VMAF as delivered)
+                    QJsonArray rungs;
+                    for (const StreamingRungShots& rs : res.perShot) {
+                        QJsonArray shots;
+                        for (const StreamingShot& sh : rs.shots)
+                            shots.append(QJsonObject{{"from", tc(sh.first + std::max<FrameTime>(0, ss.in), s)}, {"frames", double(sh.end - sh.first)},
+                                                     {"crf", sh.crf}, {"bitrate", double(sh.bitrate)}, {"vmaf", sh.vmaf}});
+                        rungs.append(QJsonObject{{"rendition", QString::fromStdString(rs.rendition)}, {"bitrate", double(rs.bitrate)}, {"vmaf", rs.vmaf}, {"shots", shots}});
+                        text += QStringLiteral("\n%1: %2 kb/s, VMAF %3 over %4 shots").arg(QString::fromStdString(rs.rendition)).arg(rs.bitrate / 1000).arg(rs.vmaf, 0, 'f', 1).arg(rs.shots.size());
+                    }
+                    o["per_shot"] = rungs;
+                    o["ladder_report"] = QString::fromStdString(res.ladderReport);
+                }
                 for (const std::string& w : res.warnings) text += QStringLiteral("\n") + QString::fromStdString(w);
                 return ok(text, o);
             }

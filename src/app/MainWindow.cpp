@@ -265,6 +265,7 @@ extern "C" {
 #include "media/Sofa.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
+#include "render/EncodeCompare.h"
 #include "render/Exporter.h"
 #include "render/StreamingPackage.h"
 #include "render/Processing.h"
@@ -8333,6 +8334,32 @@ void MainWindow::exportStreamingDialog() {
     form->addRow(tr("Segments:"), seconds);
     auto* cutAligned = new QCheckBox(tr("End segments at cuts"));
     form->addRow(cutAligned);
+    // Each rung's rate set per shot from a trial at several qualities, scored by VMAF: to a score, or filling the rate.
+    auto* perShot = new QCheckBox(tr("Set each rung's rate per shot"));
+    perShot->setObjectName(QStringLiteral("streamingPerShot"));
+    auto* target = new QDoubleSpinBox;
+    target->setObjectName(QStringLiteral("streamingVmafTarget"));
+    target->setRange(0, 100);
+    target->setDecimals(1);
+    target->setValue(93);
+    target->setSpecialValueText(tr("Fill the rung's rate"));
+    target->setPrefix(tr("VMAF "));
+    target->setToolTip(tr("Each shot gets the quality that reaches this VMAF for the fewest bits, the rung's rate its cap; at 0, the "
+                          "rung's rate spread over the shots for the most VMAF. The package gets ladder.csv, each shot's rate and score."));
+    perShot->setToolTip(tr("Each shot (between cuts and marked shot changes, a second at the least) starts a segment and is "
+                           "first encoded at several qualities on each rung, then scored by VMAF at the rung's size: longer to make"));
+    const bool vmaf = vmafAvailable() && !(hdr && vmafModelFor([&] {
+                                                     QualityPicture q;
+                                                     q.width = s->width, q.height = s->height, q.transfer = cs->transfer == Transfer::Pq ? "pq" : "hlg";
+                                                     return q;
+                                                 }(), CompareOptions{}).empty());
+    perShot->setEnabled(vmaf);
+    if (!vmaf) perShot->setToolTip(tr("Needs VMAF (libvmaf %1), and for HDR an HDR VMAF model").arg(QString::fromStdString(vmafVersion())));
+    target->setEnabled(false);
+    connect(perShot, &QCheckBox::toggled, target, &QWidget::setEnabled);
+    auto* rates = new QHBoxLayout;
+    rates->addWidget(perShot), rates->addWidget(target), rates->addStretch();
+    form->addRow(tr("Rates:"), rates);
     auto* hls = new QCheckBox(tr("HLS"));
     auto* dash = new QCheckBox(tr("DASH"));
     hls->setChecked(true), dash->setChecked(true);
@@ -8387,6 +8414,8 @@ void MainWindow::exportStreamingDialog() {
     st.segmentSeconds = seconds->value();
     st.cutAligned = cutAligned->isChecked();
     st.hls = hls->isChecked(), st.dash = dash->isChecked();
+    st.perShot = perShot->isChecked();
+    st.vmafTarget = st.perShot ? target->value() : 0;
     st.audioCodec = audio->currentData().toString().toStdString();
     st.segmentFormat = segmentFormat->currentData().toString().toStdString();
     if (st.segmentFormat == "ts" && (st.audioCodec == "libopus" || codec->currentData().toString() != "libx264")) {
@@ -8404,7 +8433,19 @@ void MainWindow::exportStreamingDialog() {
                                         return exportStreamingPackage(project, seq, st, [&](double f, FrameTime) { progress(f); }, cancel, err, &result);
                                     });
     if (!ok) return;
-    state_->message(tr("Streaming package written in %1: %2 renditions, %3 segments").arg(QString::fromStdString(st.folder)).arg(result.renditions.size()).arg(result.segments.size()),
+    QString shots;
+    if (!result.perShot.empty()) {
+        // (each rung's mean rate and VMAF, set per shot)
+        QStringList r;
+        for (const StreamingRungShots& rs : result.perShot)
+            r << tr("%1 %2 kb/s, VMAF %3").arg(QString::fromStdString(rs.rendition)).arg(double(rs.bitrate) / 1000, 0, 'f', 0).arg(rs.vmaf, 0, 'f', 1);
+        shots = tr("; set per shot (ladder.csv): %1").arg(r.join(QStringLiteral(", ")));
+    }
+    state_->message(tr("Streaming package written in %1: %2 renditions, %3 segments%4")
+                        .arg(QString::fromStdString(st.folder))
+                        .arg(result.renditions.size())
+                        .arg(result.segments.size())
+                        .arg(shots),
                     10000);
 }
 

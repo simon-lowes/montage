@@ -10584,6 +10584,24 @@ private slots:
         QVERIFY(playlist.open(QIODevice::ReadOnly));
         const QByteArray m3u = playlist.readAll();
         QVERIFY(m3u.contains("SCTE35-OUT=0xFC") && m3u.contains("SCTE35-IN=0xFC"));
+        // Set per shot (one shot here) to a VMAF target: each rung's shots and the ladder's report; a target without
+        // per_shot, or past 100, refused.
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"vmaf_target", 90}}}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", folder}, {"streaming", QJsonObject{{"per_shot", true}, {"vmaf_target", 150}}}}).value("isError").toBool());
+        if (vmafAvailable()) {
+            r = call("montage_render", {{"output", folder},
+                                        {"streaming", QJsonObject{{"segment_seconds", 2}, {"dash", false}, {"audio_codec", "none"}, {"per_shot", true}, {"vmaf_target", 90},
+                                                                  {"ladder", QJsonArray{QJsonObject{{"width", 192}, {"height", 108}, {"bitrate", 150000}}}}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject shots = r.value("structuredContent").toObject();
+            const QJsonArray rungs = shots.value("per_shot").toArray();
+            QCOMPARE(rungs.size(), 1);
+            const QJsonArray list = rungs[0].toObject().value("shots").toArray();
+            QCOMPARE(list.size(), 1);
+            QCOMPARE(list[0].toObject().value("frames").toInt(), 200);
+            QVERIFY(list[0].toObject().value("vmaf").toDouble() > 50 && list[0].toObject().value("bitrate").toDouble() <= 150000 * 1.1);
+            QVERIFY(QFileInfo::exists(shots.value("ladder_report").toString()));
+        }
         QDir(folder).removeRecursively();
     }
 

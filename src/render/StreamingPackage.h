@@ -47,7 +47,28 @@ struct StreamingSettings {
     FrameTime in = -1, out = -1;
     bool useProxies = false;
     bool keepWork = false;              // keep the render and the sound it encoded from (in folder/work)
+    // Rungs set per shot: each shot (between the sequence's cuts and shot changes, a second at the least) starts a
+    // segment, is encoded first at several quality settings (CRF) for each rung, and scored by VMAF at the rung's
+    // size; the rung then gives each shot the setting from those rate–quality points that reaches vmafTarget for the
+    // fewest bits, or, with no target, that spends the rung's bit rate over the range for the most VMAF. A rung's bit
+    // rate is then its cap: no shot's mean goes past it (and its peaks stay within 1.5 times it). Needs VMAF (and, for
+    // HDR, an HDR VMAF model). The package gets ladder.csv, each shot's rate and score on each rung.
+    bool perShot = false;
+    double vmafTarget = 0;              // 0: fill each rung's bit rate instead
 };
+
+// One quality setting tried on a shot: the encoder's CRF, the bits it took and the VMAF it scored (its frames' mean).
+struct ShotTrialPoint {
+    double crf = 0;
+    int64_t bits = 0;
+    double vmaf = 0;
+};
+// Which of each shot's trial points a rung uses. With `target` > 0: the fewest bits reaching it within the shot's cap
+// (`capBits`), else the highest VMAF within the cap, else the fewest bits. With no target: the points on each shot's
+// convex hull (bits against frames x VMAF) that give the most VMAF over all for `budgetBits`, each within its cap, all
+// starting from the cheapest. `frames` weighs each shot. Returns an index into each shot's points.
+std::vector<size_t> chooseShotPoints(const std::vector<std::vector<ShotTrialPoint>>& shots, const std::vector<FrameTime>& frames,
+                                     const std::vector<int64_t>& capBits, double target, int64_t budgetBits);
 
 struct StreamingAdBreak {
     FrameTime at = 0, duration = 0;  // from the range's start
@@ -55,11 +76,28 @@ struct StreamingAdBreak {
     std::string name;
 };
 
+// A shot of a per-shot rung: its frames (from the range's start), the CRF it was given, its bits a second and VMAF as
+// delivered (decoded from the rendition, against the render at the rung's size), and the VMAF its trial expected.
+struct StreamingShot {
+    FrameTime first = 0, end = 0;
+    double crf = 0;
+    int64_t bitrate = 0;
+    double vmaf = 0, trialVmaf = 0;
+};
+struct StreamingRungShots {
+    std::string rendition;
+    int64_t bitrate = 0;  // over the range
+    double vmaf = 0;      // the mean of its frames
+    std::vector<StreamingShot> shots;
+};
+
 struct StreamingResult {
     std::string hls, dash;              // the multivariant playlist and the MPD written ("" when not asked for)
     std::vector<FrameTime> segments;    // each segment's first frame, from the range's start
     std::vector<StreamingAdBreak> breaks;
     std::vector<std::string> renditions;  // folder names, video then audio then captions
+    std::vector<StreamingRungShots> perShot;  // each video rung's shots, when set per shot
+    std::string ladderReport;            // ladder.csv, when set per shot
     std::vector<std::string> warnings;
 };
 
