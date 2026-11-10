@@ -10655,6 +10655,74 @@ private slots:
         QFile::remove(out.value("recording").toString());
     }
 
+    void mcpLiveLanguagesAndCues() {
+        // montage_render's streaming.live with every sound stream (FFmpeg's test source with two tones, named English
+        // and French), captions listed though the feed has none, an ad break and two chapters placed ahead, in low
+        // latency CMAF: both languages in the multivariant playlist, the break a date range on a keyframe, the
+        // chapters a WebVTT file, the caption rendition's playlist there and ended.
+        const auto kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build reaches no FFmpeg input devices (libavdevice)");
+        const QString folder = QString::fromStdString(path("live-languages"));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](QJsonObject args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_render"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject live{{"url", "testsrc2=size=320x180:rate=25,realtime[out0];sine=f=500:sample_rate=48000,arealtime[out1];"
+                                 "sine=f=800:sample_rate=48000,arealtime[out2]"},
+                         {"device", "lavfi"}, {"seconds", 6}, {"window", 6}, {"part_seconds", 0.2},
+                         {"languages", QJsonArray{"en", "fr"}}, {"captions", "always"}, {"caption_language", "de"},
+                         {"cues", QJsonArray{QJsonObject{{"at", 2.4}, {"duration", 1}}}},
+                         {"chapters", QJsonArray{QJsonObject{{"at", 0}, {"title", "Opening"}}, QJsonObject{{"at", 3}, {"title", "Second part"}}}}};
+        const QJsonObject streaming{{"live", live}, {"segment_seconds", 1}, {"low_latency", true}, {"audio_codec", "aac"},
+                                    {"ladder", QJsonArray{QJsonObject{{"width", 320}, {"height", 180}, {"bitrate", 300000}}}}};
+        // Refused: a caption mode or cue it does not know, a cue with no time.
+        for (const auto& [key, value] : std::vector<std::pair<QString, QJsonValue>>{{"captions", "maybe"}, {"languages", 3}, {"cues", QJsonArray{QJsonObject{{"duration", 2}}}},
+                                                                                     {"chapters", QJsonArray{QJsonObject{{"at", 1}}}}}) {
+            QJsonObject bad = live;
+            bad[key] = value;
+            QJsonObject so = streaming;
+            so["live"] = bad;
+            QVERIFY2(call({{"output", folder}, {"streaming", so}}).value("isError").toBool(), qPrintable(key));
+        }
+        const QJsonObject r = call({{"output", folder}, {"streaming", streaming}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("sound_renditions").toInt(), 2);
+        QVERIFY(out.value("captioned").toBool());
+        QCOMPARE(out.value("chapters").toInt(), 2);
+        const QJsonArray cues = out.value("cues").toArray();
+        QCOMPARE(cues.size(), qsizetype(1));
+        QCOMPARE(cues.at(0).toObject().value("frame").toInt(), 60);  // (2.4 s at 25 fps)
+        QVERIFY(cues.at(0).toObject().value("keyframe").toBool() && cues.at(0).toObject().value("returned").toBool());
+        auto readFile = [](const QString& f) {
+            QFile file(f);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
+        const QString master = readFile(folder + "/master.m3u8");
+        QVERIFY2(master.contains("TYPE=AUDIO") && master.contains("LANGUAGE=\"en\"") && master.contains("LANGUAGE=\"fr\""), qPrintable(master));
+        QVERIFY2(master.contains("TYPE=SUBTITLES") && master.contains("LANGUAGE=\"de\"") && master.contains("chapters.vtt"), qPrintable(master));
+        const QString video = readFile(folder + "/" + out.value("renditions").toArray().at(0).toString() + "/playlist.m3u8");
+        QVERIFY2(video.contains("#EXT-X-DATERANGE:ID=\"cue-1\"") && video.contains("SCTE35-OUT=0x") && video.contains("CAN-SKIP-UNTIL="), qPrintable(video));
+        QVERIFY(video.contains("#EXT-X-ENDLIST"));
+        QString captionList;
+        for (const QJsonValue& n : out.value("renditions").toArray())
+            if (n.toString().startsWith("s1_")) captionList = readFile(folder + "/" + n.toString() + "/playlist.m3u8");
+        QVERIFY2(captionList.contains("#EXTINF:") && captionList.contains("#EXT-X-ENDLIST"), qPrintable(captionList));
+        const QString chapters = readFile(folder + "/chapters.vtt");
+        QVERIFY2(chapters.startsWith("WEBVTT") && chapters.contains("Opening") && chapters.contains("Second part") && chapters.contains("00:00:03.000"),
+                 qPrintable(chapters));
+        const QString mpd = readFile(folder + "/manifest.mpd");
+        QVERIFY2(mpd.contains("lang=\"en\"") && mpd.contains("lang=\"fr\"") && mpd.contains("urn:scte:scte35:2013:bin") && mpd.contains("stpp"), qPrintable(mpd));
+        QDir(folder).removeRecursively();
+        QFile::remove(out.value("recording").toString());
+    }
+
     void samplerPasses() {
         // A Foley sampler over MCP: steps on a key (two sounds taking turns), cloth on another, a recording of hits cut
         // onto keys; a pass played from notes lands on a take lane and in the comp, its mix the sampler's render sample for

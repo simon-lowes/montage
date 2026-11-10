@@ -1561,6 +1561,35 @@ ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
     if (ls.audioBitrate <= 0) throw ArgError{"\"audio_bitrate\" must be above 0"};
     if (a.contains("audio_name")) ls.audioName = str(a, "audio_name").toStdString();
     if (a.contains("audio_language")) ls.audioLanguage = str(a, "audio_language").toStdString();
+    const QJsonValue languages = lo.value("languages");
+    if (!languages.isUndefined() && !languages.isBool() && !languages.isArray()) throw ArgError{"\"languages\" is true or a list of languages"};
+    const bool allSound = languages.isArray() || languages.toBool();
+    for (const QJsonValue& v : languages.toArray()) {
+        if (!v.isString()) throw ArgError{"\"languages\" lists each sound stream's language, as text"};
+        ls.languages.push_back(v.toString().toStdString());
+    }
+    ls.captions = str(lo, "captions", "auto").toStdString();
+    if (ls.captions != "auto" && ls.captions != "always" && ls.captions != "none") throw ArgError{"\"captions\" is auto, always or none"};
+    ls.captionLanguage = str(lo, "caption_language", "en").toStdString();
+    ls.captionName = str(lo, "caption_name").toStdString();
+    ls.cueCommand = str(so, "cue", "splice_insert").toStdString();
+    if (ls.cueCommand != "splice_insert" && ls.cueCommand != "time_signal") throw ArgError{"\"cue\" is splice_insert or time_signal"};
+    const bool feedCues = lo.value("feed_cues").toBool(true);
+    std::vector<LiveCue> cues;
+    for (const QJsonValue& v : lo.value("cues").toArray()) {
+        const QJsonObject c = v.toObject();
+        LiveCue cue;
+        cue.at = c.value("at").toDouble(-1), cue.duration = c.value("duration").toDouble(0);
+        if (cue.at < 0 || cue.duration < 0) throw ArgError{"Each cue has its time (\"at\", seconds into the recording) and a duration of 0 or more"};
+        cues.push_back(cue);
+    }
+    std::vector<std::pair<double, std::string>> chapters;
+    for (const QJsonValue& v : lo.value("chapters").toArray()) {
+        const QJsonObject c = v.toObject();
+        const double at = c.value("at").toDouble(-1);
+        if (at < 0 || !c.value("title").isString()) throw ArgError{"Each chapter has its time (\"at\", seconds into the recording) and a title"};
+        chapters.emplace_back(at, c.value("title").toString().toStdString());
+    }
 
     CaptureSettings cs;
     cs.video.url = need(lo, "url").toStdString();
@@ -1591,6 +1620,18 @@ ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
     const int servedPort = serve ? origin.port() : 0;
     cs.onPicture = [&](const AVFrame* f, int num, int den) { packager.picture(f, num, den); };
     cs.onSound = [&](const AVFrame* f) { packager.sound(f); };
+    if (allSound) {
+        cs.allSound = true;
+        cs.onTrackSound = [&](int track, const AVFrame* f) { packager.sound(f, track); };
+        cs.onSoundTracks = [&](const std::vector<CaptureSettings::SoundTrack>& tracks) {
+            std::vector<LiveSoundTrack> list;
+            for (const auto& t : tracks) list.push_back({t.language, t.title, t.channels});
+            packager.soundTracks(list);
+        };
+    }
+    if (feedCues) cs.onCue = [&](const std::vector<uint8_t>& section, double zero, double at) { packager.cueFromFeed(section, zero, at); };
+    for (const LiveCue& c : cues) packager.cue(c);
+    for (const auto& [at, title] : chapters) packager.chapter(title, at);
     Recorder recorder;
     if (!recorder.start(cs, &why)) return fail(QString::fromStdString(why));
     const std::atomic<bool>* cancel = cancelFlag();
@@ -1624,6 +1665,18 @@ ToolResult McpServer::Impl::renderLive(const QJsonObject& a) {
     if (!ps.hls.empty()) o["hls"] = QString::fromStdString(ps.hls), text += QStringLiteral("\nHLS: %1").arg(QString::fromStdString(ps.hls));
     if (!ps.dash.empty()) o["dash"] = QString::fromStdString(ps.dash), text += QStringLiteral("\nDASH: %1").arg(QString::fromStdString(ps.dash));
     if (ls.audioCodec == "ac3" || ls.audioCodec == "eac3") o["dialnorm"] = ps.dialnorm;
+    o["sound_renditions"] = ps.soundRenditions;
+    o["captioned"] = ps.captioned;
+    if (ps.captioned) {
+        o["caption_cues"] = double(ps.captionCues);
+        text += QStringLiteral("\nCaptions: %1 shown").arg(ps.captionCues);
+    }
+    QJsonArray cueList;
+    for (const LiveCueStatus& c : ps.cues)
+        cueList.append(QJsonObject{{"id", c.id}, {"frame", double(c.frame)}, {"seconds", c.seconds}, {"duration", c.duration},
+                                   {"from_feed", c.fromFeed}, {"keyframe", c.keyframe}, {"returned", c.returned}, {"late", c.late}});
+    if (!cueList.isEmpty()) o["cues"] = cueList, text += QStringLiteral("\n%1 ad cue(s) placed").arg(cueList.size());
+    if (ps.chapters) o["chapters"] = ps.chapters, text += QStringLiteral("\n%1 chapter(s) in chapters.vtt").arg(ps.chapters);
     if (ps.dropped) text += QStringLiteral("\n%1 picture(s) dropped while the encoders fell behind").arg(ps.dropped);
     if (serve) {
         const QString url = QStringLiteral("http://%1:%2/").arg(QString::fromStdString(address == "0.0.0.0" ? "127.0.0.1" : address)).arg(servedPort);
@@ -13115,7 +13168,17 @@ void McpServer::Impl::addTools() {
                     "part_seconds":{"type":"number","minimum":0.1,"maximum":1,"default":0.5},
                     "serve":{"type":"boolean","default":false,"description":"Serve the package over HTTP while it records (blocking playlist reloads, growing segments sent as they grow)"},
                     "port":{"type":"integer","minimum":0,"maximum":65535,"default":0,"description":"serve: the port (0 any free one)"},
-                    "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"}},
+                    "address":{"type":"string","enum":["127.0.0.1","0.0.0.0"],"default":"127.0.0.1","description":"serve: this computer only, or the network's"},
+                    "languages":{"type":["boolean","array"],"items":{"type":"string"},"description":"Every sound stream of the feed packaged, each a rendition (an adaptation set) in its language: true for the languages the feed states, or each stream's language in order (\"\" the feed's own), as RFC 5646 or ISO 639-2 codes. Left out: the main sound only"},
+                    "captions":{"type":"string","enum":["auto","always","none"],"default":"auto","description":"The feed's CEA-608/708 captions as live WebVTT (HLS) and IMSC 1 (DASH): auto when the feed carries them, always listed, or none"},
+                    "caption_language":{"type":"string","default":"en"},
+                    "caption_name":{"type":"string","description":"The caption rendition's name (default the language's)"},
+                    "feed_cues":{"type":"boolean","default":true,"description":"The feed's SCTE 35 cues (an MPEG transport stream's) placed as EXT-X-DATERANGE and DASH events on a keyframe at their splice"},
+                    "cues":{"type":"array","description":"Ad breaks placed while it records, each on a keyframe made there: a splice_insert (or time_signal, streaming.cue) as EXT-X-DATERANGE and a DASH event","items":{"type":"object","properties":{
+                        "at":{"type":"number","minimum":0,"description":"Seconds into the recording"},
+                        "duration":{"type":"number","minimum":0,"default":0,"description":"The break's length (0 not known)"}},"required":["at"]}},
+                    "chapters":{"type":"array","description":"Chapters (each to the next), as the package's chapters.vtt","items":{"type":"object","properties":{
+                        "at":{"type":"number","minimum":0,"description":"Seconds into the recording"},"title":{"type":"string"}},"required":["at","title"]}}},
                     "required":["url","seconds"]}}},
             "bitrate":{"type":"integer","minimum":0,"description":"The video's bitrate in bits a second, for codecs that take one (H.264, H.265, AV1...); 0 or left out: by quality"},
             "hrd":{"type":"string","enum":["","cbr","vbr"],"default":"","description":"H.264 and H.265 (x264, x265): state a hypothetical reference decoder, as broadcast ingest checks it: cbr (a constant rate at bitrate, else vbv_maxrate, filler where the pictures need less) or vbr (no more than vbv_maxrate). The file is checked against it after rendering (the result's hrd)"},
