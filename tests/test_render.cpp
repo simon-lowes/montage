@@ -16067,7 +16067,8 @@ colorspaces:
         qInfo("Motion blur on a 40-letter title with one moving: %.1f ms, against %.1f ms drawing the whole title at every sample (%.1f times as "
               "fast), %.3f of 255 apart",
               now / 1e6, before / 1e6, double(before) / double(std::max<qint64>(1, now)), worst * 255);
-        QVERIFY2(worst <= 1.0 / 255, qPrintable(QString("%1 of 255 off").arg(worst * 255)));
+        // (a code at most, give or take float rounding: Windows' build came to 1.00003)
+        QVERIFY2(worst <= 1.0 / 255 + 1e-6, qPrintable(QString("%1 of 255 off").arg(worst * 255)));
         QVERIFY2(before >= 4 * now, qPrintable(QString("%1 ms against %2 ms").arg(now / 1e6).arg(before / 1e6)));
         // Blurred indeed (the moving letter smeared), and with a box behind the text (which every sample draws) the
         // whole title is drawn at every sample, as before.
