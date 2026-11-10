@@ -31,6 +31,7 @@
 
 #include "EditorState.h"
 #include "PlaybackController.h"
+#include "audio/AudioDevice.h"
 #include "media/Capture.h"
 
 namespace montage {
@@ -369,6 +370,43 @@ void DeckController::publish() {
 
 bool DeckController::startChase(const QString& input, int channel, int64_t offsetFrames, double freewheelSeconds, QString* error) {
     stopChase();
+    audiodev::Engine& engine = audiodev::Engine::shared();
+    if (engine.active()) {
+        // Through the audio device chosen (Monitoring › Audio device): one of its inputs by its port name, else the
+        // channel counted across them.
+        const audiodev::DeviceSettings ds = engine.settings();
+        int k = channel;
+        for (int i = 0; i < ds.inputs; ++i)
+            if (QString::fromStdString(audiodev::inputName(ds, i)) == input) k = i;
+        if (k < 0 || k >= std::max(0, ds.inputs)) {
+            if (error) *error = tr("The audio device has no input %1 to read LTC from").arg(k + 1);
+            return false;
+        }
+        chase_ = std::make_unique<LtcChase>(48000, base(), dropFrame());
+        chaseRate_ = 48000;
+        chase_->setOffset(offsetFrames);
+        chase_->setFreewheel(freewheelSeconds);
+        chaseChannel_ = 0;
+        chaseChannels_ = 1;
+        auto queue = std::make_shared<ChaseQueue>();
+        std::string why;
+        const int id = engine.addInput(nullptr, 48000, [queue, k](const float* in, int channels, int frames, int64_t) {
+            if (k >= channels || frames <= 0) return;
+            std::lock_guard<std::mutex> lock(queue->m);
+            if (queue->samples.size() > 48000 * 4) return;  // (not drained for seconds: let go)
+            for (int i = 0; i < frames; ++i) queue->samples.push_back(in[size_t(i) * size_t(channels) + size_t(k)]);
+        }, &why);
+        if (id < 0) {
+            chase_.reset();
+            if (error) *error = tr("The audio device is not open: %1").arg(QString::fromStdString(why));
+            return false;
+        }
+        chaseQueue_ = queue;
+        chaseInputId_ = id;
+        chaseTimer_->start();
+        emit chaseChanged(true);
+        return true;
+    }
     QAudioDevice dev = QMediaDevices::defaultAudioInput();
     for (const QAudioDevice& d : QMediaDevices::audioInputs())
         if (d.description() == input) dev = d;
@@ -418,6 +456,9 @@ bool DeckController::startChase(const QString& input, int channel, int64_t offse
 
 void DeckController::stopChase() {
     chaseTimer_->stop();
+    if (chaseInputId_ >= 0) audiodev::Engine::shared().removeInput(chaseInputId_);  // (its tap is done with once this returns)
+    chaseInputId_ = -1;
+    chaseQueue_.reset();
     if (chaseSource_) {
         chaseSource_->stop();
         chaseSource_->deleteLater();
@@ -463,7 +504,22 @@ QString DeckController::chaseStatus() const {
     }
 }
 
+void DeckController::drainChase() {
+    if (!chaseQueue_ || !chase_) return;
+    std::vector<float> got;
+    {
+        std::lock_guard<std::mutex> lock(chaseQueue_->m);
+        got.swap(chaseQueue_->samples);
+    }
+    if (got.empty()) return;
+    chaseQueue_->taken += int64_t(got.size());
+    feedChase(got.data(), int(got.size()), 1);
+}
+
+int64_t DeckController::chaseSamplesFromDevice() const { return chaseQueue_ ? chaseQueue_->taken.load() : -1; }
+
 void DeckController::chaseTick() {
+    drainChase();
     if (!chase_ || !program_) return;
     const LtcChase::Position p = chaseNow();
     if (p.state == LtcChase::State::Locked || p.state == LtcChase::State::Freewheel) {
@@ -861,8 +917,17 @@ DeckDialog::DeckDialog(DeckController* deck, EditorState* state, QWidget* parent
     connect(remote_, &QPushButton::clicked, this, &DeckDialog::toggleRemote);
     remoteForm->addRow(remote_);
     chaseInput_ = new QComboBox(this);
-    chaseInput_->addItem(tr("Default input"), QString());
-    for (const QAudioDevice& d : QMediaDevices::audioInputs()) chaseInput_->addItem(d.description(), d.description());
+    if (audiodev::Engine::shared().active()) {
+        // (the audio device chosen in Monitoring › Audio device: its inputs, by their port names)
+        const audiodev::DeviceSettings ds = audiodev::Engine::shared().settings();
+        for (int i = 0; i < ds.inputs; ++i) {
+            const QString name = QString::fromStdString(audiodev::inputName(ds, i));
+            chaseInput_->addItem(name, name);
+        }
+    } else {
+        chaseInput_->addItem(tr("Default input"), QString());
+        for (const QAudioDevice& d : QMediaDevices::audioInputs()) chaseInput_->addItem(d.description(), d.description());
+    }
     remoteForm->addRow(tr("LTC from:"), chaseInput_);
     chaseChannel_ = new QSpinBox(this);
     chaseChannel_->setRange(1, 32);

@@ -226,4 +226,52 @@ private:
     std::unique_ptr<Impl> d_;
 };
 
+// ---------------------------------------------------------------------------
+// Sound that is not the timeline's (scrubbing, the sound library's preview, a remote review's sound), played through
+// the engine's device as one more output at its own rate: pushed from one thread (the GUI's), played from the audio
+// thread, through a ring that holds `seconds` of it. Not on the timeline: inputs do not follow it.
+class Feed {
+public:
+    explicit Feed(Engine& engine = Engine::shared());
+    ~Feed();
+    Feed(const Feed&) = delete;
+    Feed& operator=(const Feed&) = delete;
+
+    // False with the reason when the engine has no device open.
+    bool open(int rate, int channels, double seconds = 0.5, std::string* error = nullptr);
+    void close();
+    bool isOpen() const { return id_ >= 0; }
+    int rate() const { return rate_; }
+    int channels() const { return channels_; }
+    int64_t room() const;                              // frames that can be pushed now
+    int64_t push(const float* interleaved, int frames);  // as many as there is room for; the frames taken
+    int64_t queued() const;                            // pushed and not yet played
+    int64_t played() const;                            // frames played since open
+    int64_t starved() const;                           // frames the device asked for while something was owed
+    void clear();                                      // what is queued let go
+
+    struct Ring;
+
+private:
+    Engine& engine_;
+    std::shared_ptr<Ring> ring_;
+    int id_ = -1, rate_ = 0, channels_ = 0;
+};
+
+// The rate a device really runs at, judged from the frames its callbacks bring over time: for hosts that say nothing
+// when a device's rate is changed under them (by its control panel, or another program). Windows of a second; a rate
+// within 2% of a standard one is taken as that one, and reported once two windows in a row agree on it and it is more
+// than 4% from the last. A gap of more than half a second between callbacks starts it again.
+class RateWatch {
+public:
+    void reset(int nominal);
+    // A callback of `frames` at `ns` (a steady clock): the new rate when it has just been judged to change, else 0.
+    int add(int frames, int64_t ns);
+    int rate() const { return rate_; }
+
+private:
+    int rate_ = 0, candidate_ = 0;
+    int64_t start_ = -1, last_ = -1, frames_ = 0;
+};
+
 }  // namespace montage::audiodev

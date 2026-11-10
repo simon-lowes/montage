@@ -13,6 +13,8 @@
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
+
+#include "SoundOut.h"
 #include <QAudioSource>
 #include <QIODevice>
 #include <QMediaDevices>
@@ -982,36 +984,25 @@ std::vector<float> PlaybackController::heard(int64_t start, int frames) {
 void PlaybackController::scrubAudio(FrameTime t) {
     const Sequence* s = sequence();
     if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_ || (monitoring_.on && monitoring_.mute)) return;
-    if (!scrubSink_) {
-        QAudioDevice dev = QMediaDevices::defaultAudioOutput();
-        if (dev.isNull()) {
-            scrubbing_ = false;  // no output device: don't try again
-            return;
-        }
-        QAudioFormat fmt;
-        fmt.setSampleRate(s->sampleRate);
-        fmt.setChannelCount(2);
-        fmt.setSampleFormat(QAudioFormat::Int16);
-        if (!dev.isFormatSupported(fmt)) {
-            scrubbing_ = false;
-            return;
-        }
-        scrubSink_ = new QAudioSink(dev, fmt, this);
-        scrubSink_->setBufferSize(fmt.bytesForDuration(150000));
-        scrubIo_ = scrubSink_->start();
-        scrubRate_ = s->sampleRate;
-        if (!scrubIo_) return;
+    // Through the audio device chosen (its ports, as playback's), else Qt Multimedia's output; opened again when the
+    // sequence's rate or the device chosen changes.
+    const bool device = audiodev::Engine::shared().active();
+    if (!scrubOut_) scrubOut_ = new SoundOut(this);
+    if (!scrubOut_->isOpen() || scrubOut_->rate() != s->sampleRate || scrubOut_->onDevice() != device) {
+        if (scrubNoOutput_ && scrubTriedDevice_ == device && scrubTriedRate_ == s->sampleRate) return;
+        scrubTriedDevice_ = device;
+        scrubTriedRate_ = s->sampleRate;
+        scrubNoOutput_ = !scrubOut_->open(s->sampleRate, 2, 0.15);
+        if (scrubNoOutput_) return;  // (nothing to play on: not tried again until that changes)
     }
-    if (!scrubIo_ || scrubRate_ != s->sampleRate) return;
     // One frame of audio (at least 40 ms), faded at both ends to avoid clicks.
-    int frames = std::max(int(s->sampleRate / s->fpsValue()), s->sampleRate / 25);
-    if (scrubSink_->bytesFree() < frames * 4) return;  // still playing the previous snippet
+    const int frames = std::max(int(s->sampleRate / s->fpsValue()), s->sampleRate / 25);
+    if (scrubOut_->room() < frames) return;  // still playing the previous snippet
     std::vector<float> mix(size_t(frames) * 2);
     int64_t start = int64_t(std::llround(double(t) * s->sampleRate / s->fpsValue()));
     scrubMixer_.reset();
     scrubMixer_.setNonBlocking(true);
     scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
-    std::vector<int16_t> pcm(mix.size());
     const int fade = std::min(frames / 4, 240);
     // (The monitoring section's level and Dim, though not its speakers: scrubbing is heard in stereo.)
     const float level = monitoring_.on ? float(std::pow(10.0, (monitoring_.levelDb + (monitoring_.dim ? monitoring_.dimDb : 0.0)) / 20)) : 1.0f;
@@ -1019,10 +1010,12 @@ void PlaybackController::scrubAudio(FrameTime t) {
         float g = level;
         if (i < fade) g *= float(i) / fade;
         if (i >= frames - fade) g *= float(frames - 1 - i) / fade;
-        for (int c = 0; c < 2; ++c)
-            pcm[size_t(i) * 2 + size_t(c)] = int16_t(std::lround(std::clamp(mix[size_t(i) * 2 + size_t(c)] * g, -1.0f, 1.0f) * 32767));
+        for (int c = 0; c < 2; ++c) {
+            float& x = mix[size_t(i) * 2 + size_t(c)];
+            x = std::clamp(x * g, -1.0f, 1.0f);
+        }
     }
-    scrubIo_->write(reinterpret_cast<const char*>(pcm.data()), qint64(pcm.size() * sizeof(int16_t)));
+    scrubOut_->write(mix.data(), frames);
 }
 
 void PlaybackController::step(int frames) {

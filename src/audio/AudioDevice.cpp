@@ -851,4 +851,125 @@ int Engine::measureLoopback(int output, int input, double seconds, std::string* 
     return int(at);
 }
 
+// ---- Feed.
+
+struct Feed::Ring {
+    std::vector<float> buf;
+    int64_t capacity = 0;  // frames
+    int channels = 2;
+    std::atomic<int64_t> written{0}, read{0}, played{0}, starved{0}, dropTo{-1};
+
+    // The audio thread: what is queued, and silence after it.
+    void render(float* out, int ch, int frames) {
+        if (const int64_t d = dropTo.exchange(-1); d >= 0 && d > read.load()) read = d;
+        const int64_t r = read.load(), w = written.load(std::memory_order_acquire);
+        const int64_t n = std::min<int64_t>(frames, w - r);
+        for (int64_t i = 0; i < n; ++i) {
+            const float* src = buf.data() + size_t((r + i) % capacity) * size_t(channels);
+            float* dst = out + size_t(i) * size_t(ch);
+            for (int k = 0; k < ch; ++k) dst[k] = k < channels ? src[k] : 0.0f;
+        }
+        std::fill(out + size_t(std::max<int64_t>(0, n)) * size_t(ch), out + size_t(frames) * size_t(ch), 0.0f);
+        if (n > 0) {
+            read.store(r + n, std::memory_order_release);
+            played += n;
+        }
+        // (frames short while it was playing: the writer did not keep up)
+        if (n < frames && n > 0) starved += frames - n;
+    }
+    int64_t readNow() const { return std::max(read.load(std::memory_order_acquire), dropTo.load()); }
+};
+
+Feed::Feed(Engine& engine) : engine_(engine) {}
+
+Feed::~Feed() { close(); }
+
+bool Feed::open(int rate, int channels, double seconds, std::string* error) {
+    close();
+    rate_ = rate > 0 ? rate : 48000;
+    channels_ = std::clamp(channels, 1, 64);
+    auto ring = std::make_shared<Ring>();
+    ring->channels = channels_;
+    ring->capacity = std::max<int64_t>(256, int64_t(std::clamp(seconds, 0.02, 30.0) * rate_));
+    ring->buf.assign(size_t(ring->capacity) * size_t(channels_), 0.0f);
+    const int id = engine_.addOutput(ring.get(), rate_, channels_, [ring](float* out, int ch, int frames) -> int64_t {
+        ring->render(out, ch, frames);
+        return -1;  // (not the timeline)
+    }, error);
+    if (id < 0) return false;
+    ring_ = std::move(ring);
+    id_ = id;
+    return true;
+}
+
+void Feed::close() {
+    if (id_ >= 0) engine_.removeOutput(id_);  // (the audio thread has let the ring go once this returns)
+    id_ = -1;
+    ring_.reset();
+}
+
+int64_t Feed::queued() const { return ring_ ? std::max<int64_t>(0, ring_->written.load() - ring_->readNow()) : 0; }
+
+int64_t Feed::room() const { return ring_ ? std::max<int64_t>(0, ring_->capacity - queued()) : 0; }
+
+int64_t Feed::push(const float* interleaved, int frames) {
+    if (!ring_ || frames <= 0) return 0;
+    Ring& r = *ring_;
+    const int64_t n = std::min<int64_t>(frames, room());
+    const int64_t w = r.written.load();
+    for (int64_t i = 0; i < n; ++i)
+        std::copy(interleaved + size_t(i) * size_t(channels_), interleaved + size_t(i + 1) * size_t(channels_),
+                  r.buf.begin() + std::ptrdiff_t(size_t((w + i) % r.capacity) * size_t(channels_)));
+    r.written.store(w + n, std::memory_order_release);
+    return n;
+}
+
+int64_t Feed::played() const { return ring_ ? ring_->played.load() : 0; }
+
+int64_t Feed::starved() const { return ring_ ? ring_->starved.load() : 0; }
+
+void Feed::clear() {
+    if (ring_) ring_->dropTo = ring_->written.load();
+}
+
+// ---- RateWatch.
+
+void RateWatch::reset(int nominal) {
+    rate_ = nominal;
+    candidate_ = 0;
+    start_ = last_ = -1;
+    frames_ = 0;
+}
+
+int RateWatch::add(int frames, int64_t ns) {
+    if (last_ < 0 || ns - last_ > 500'000'000LL || ns < last_) {
+        // (the first callback, or one after a gap: the frames are counted from here)
+        start_ = last_ = ns;
+        frames_ = 0;
+        candidate_ = 0;
+        return 0;
+    }
+    last_ = ns;
+    frames_ += frames;
+    if (ns - start_ < 1'000'000'000LL) return 0;
+    const double measured = double(frames_) * 1e9 / double(ns - start_);
+    start_ = ns;
+    frames_ = 0;
+    static const int standard[] = {8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000, 352800, 384000};
+    int snapped = 0;
+    for (int s : standard)
+        if (std::fabs(measured - s) <= 0.02 * s) snapped = s;
+    if (!snapped || rate_ <= 0 || std::fabs(measured - rate_) <= 0.04 * rate_) {
+        candidate_ = 0;
+        return 0;
+    }
+    if (candidate_ != snapped) {
+        candidate_ = snapped;
+        return 0;
+    }
+    rate_ = snapped;
+    candidate_ = 0;
+    return rate_;
+}
+
 }  // namespace montage::audiodev

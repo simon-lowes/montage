@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -164,6 +165,7 @@ public:
         rate_ = info && info->sampleRate > 0 ? int(info->sampleRate + 0.5) : rate;
         latency_.input = info && inputs_ > 0 ? int(info->inputLatency * rate_ + 0.5) : 0;
         latency_.output = info && outputs_ > 0 ? int(info->outputLatency * rate_ + 0.5) : 0;
+        watch_.reset(rate_);
         name_ = oi ? oi->name : ii->name;
         in_.assign(size_t(kMaxBuffer) * size_t(std::max(1, inputs_)), 0.0f);
         // (a stream that ends without being stopped: its device went away, unplugged or taken; the engine is told)
@@ -175,7 +177,7 @@ public:
         return true;
     }
 
-    int sampleRate() const override { return rate_; }
+    int sampleRate() const override { return rate_.load(); }
     int bufferFrames() const override { return buffer_; }
     int inputs() const override { return inputs_; }
     int outputs() const override { return outputs_; }
@@ -188,6 +190,13 @@ private:
     static int callback(const void* input, void* output, unsigned long frames, const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags flags,
                         void* arg) {
         auto* self = static_cast<PaStreamBox*>(arg);
+        // PortAudio says nothing when the device's rate is changed under it (its control panel, another program): the
+        // rate is judged from the frames the callbacks bring, and followed.
+        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (const int r = self->watch_.add(int(frames), ns); r > 0) {
+            self->rate_ = r;
+            if (self->cb_.rateChanged) self->cb_.rateChanged(r);
+        }
         if (flags & (paInputUnderflow | paInputOverflow | paOutputUnderflow | paOutputOverflow)) ++self->xruns_;
         const float* in = static_cast<const float*>(input);
         if (!in && self->inputs_ > 0) {
@@ -214,7 +223,9 @@ private:
     StreamCallbacks cb_;
     std::atomic<bool> closing_{false};
     PaStream* stream_ = nullptr;
-    int rate_ = 0, buffer_ = 0, inputs_ = 0, outputs_ = 0;
+    std::atomic<int> rate_{0};
+    int buffer_ = 0, inputs_ = 0, outputs_ = 0;
+    RateWatch watch_;  // (the audio thread's)
     Latency latency_;
     std::string name_;
     std::vector<float> in_;

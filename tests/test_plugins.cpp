@@ -274,6 +274,146 @@ int64_t recordClick(audiodev::Engine& e, int rate = 48000) {
     return take.click();
 }
 
+// A tone's frequency in a recording: its rising zero crossings counted, from the first to the last (0 if fewer than 3).
+double toneHz(const std::vector<float>& x, int rate) {
+    double first = -1, last = -1;
+    int crossings = 0;
+    for (size_t i = 1; i < x.size(); ++i)
+        if (x[i - 1] < 0 && x[i] >= 0) {
+            const double at = double(i - 1) + double(-x[i - 1]) / double(x[i] - x[i - 1]);
+            if (first < 0) first = at;
+            last = at;
+            ++crossings;
+        }
+    return crossings < 3 ? 0.0 : double(crossings - 1) * rate / (last - first);
+}
+
+// A device test's recording of the first input, every sample as it comes (no clock).
+struct Listener {
+    std::mutex m;
+    std::vector<float> got;
+    void add(const float* in, int channels, int frames) {
+        std::lock_guard<std::mutex> lock(m);
+        for (int i = 0; i < frames; ++i) got.push_back(in[size_t(i) * size_t(channels)]);
+    }
+    std::vector<float> take() {
+        std::lock_guard<std::mutex> lock(m);
+        std::vector<float> out;
+        out.swap(got);
+        return out;
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m);
+        return got.size();
+    }
+};
+
+// A 1 kHz sine at its own rate, for as long as it is asked.
+struct TonePump {
+    std::atomic<int64_t> pos{0};
+    int rate = 48000;
+    int64_t render(float* out, int channels, int frames) {
+        const int64_t p = pos.fetch_add(frames);
+        for (int i = 0; i < frames; ++i) {
+            const float v = float(0.4 * std::sin(2 * M_PI * 1000 * double(p + i) / rate));
+            for (int c = 0; c < channels; ++c) out[size_t(i) * size_t(channels) + size_t(c)] = v;
+        }
+        return p;
+    }
+};
+
+// libjackserver driven from a Python child (its own process: never alongside the JACK client library Montage loads):
+// a server on the dummy driver at 48 kHz, its rate switched when asked ("rate N" on stdin). Lines it prints for the
+// test begin "@@ ".
+const char* kJackServerScript =
+    "import ctypes, sys\n"
+    "name = sys.argv[1]\n"
+    "try:\n"
+    "    js = ctypes.CDLL('libjackserver.so.0')\n"
+    "except OSError:\n"
+    "    print('@@ nolib', flush=True)\n"
+    "    sys.exit(0)\n"
+    "class JSList(ctypes.Structure):\n"
+    "    pass\n"
+    "JSList._fields_ = [('data', ctypes.c_void_p), ('next', ctypes.POINTER(JSList))]\n"
+    "class Value(ctypes.Union):\n"
+    "    _fields_ = [('ui', ctypes.c_uint32), ('i', ctypes.c_int32), ('s', ctypes.c_char * 128), ('b', ctypes.c_bool), ('c', ctypes.c_char)]\n"
+    "V = ctypes.c_void_p\n"
+    "L = ctypes.POINTER(JSList)\n"
+    "def sig(f, res, args):\n"
+    "    getattr(js, f).restype = res\n"
+    "    getattr(js, f).argtypes = args\n"
+    "sig('jackctl_server_create2', V, [V, V, V])\n"
+    "sig('jackctl_server_get_drivers_list', L, [V])\n"
+    "sig('jackctl_server_get_parameters', L, [V])\n"
+    "sig('jackctl_driver_get_name', ctypes.c_char_p, [V])\n"
+    "sig('jackctl_driver_get_parameters', L, [V])\n"
+    "sig('jackctl_parameter_get_name', ctypes.c_char_p, [V])\n"
+    "sig('jackctl_parameter_set_value', ctypes.c_bool, [V, ctypes.POINTER(Value)])\n"
+    "sig('jackctl_server_open', ctypes.c_bool, [V, V])\n"
+    "sig('jackctl_server_switch_master', ctypes.c_bool, [V, V])\n"
+    "for f in ('jackctl_server_start', 'jackctl_server_stop', 'jackctl_server_close'):\n"
+    "    sig(f, ctypes.c_bool, [V])\n"
+    "sig('jackctl_server_destroy', None, [V])\n"
+    "def items(lst):\n"
+    "    out = []\n"
+    "    while lst:\n"
+    "        out.append(lst.contents.data)\n"
+    "        lst = lst.contents.next\n"
+    "    return out\n"
+    "def setp(params, key, field, value):\n"
+    "    for p in items(params):\n"
+    "        if js.jackctl_parameter_get_name(p) == key:\n"
+    "            v = Value()\n"
+    "            setattr(v, field, value)\n"
+    "            return js.jackctl_parameter_set_value(p, ctypes.byref(v))\n"
+    "    return False\n"
+    "server = js.jackctl_server_create2(None, None, None)\n"
+    "if not server:\n"
+    "    print('@@ noserver', flush=True)\n"
+    "    sys.exit(0)\n"
+    "sp = js.jackctl_server_get_parameters(server)\n"
+    "setp(sp, b'name', 's', name.encode())\n"
+    "setp(sp, b'realtime', 'b', False)\n"
+    "drivers = [d for d in items(js.jackctl_server_get_drivers_list(server)) if js.jackctl_driver_get_name(d) == b'dummy']\n"
+    "if not drivers:\n"
+    "    print('@@ nodrivers', flush=True)\n"
+    "    sys.exit(0)\n"
+    "dummy = drivers[0]\n"
+    "dp = js.jackctl_driver_get_parameters(dummy)\n"
+    "setp(dp, b'rate', 'ui', 48000)\n"
+    "setp(dp, b'period', 'ui', 256)\n"
+    "if not (js.jackctl_server_open(server, dummy) and js.jackctl_server_start(server)):\n"
+    "    print('@@ nostart', flush=True)\n"
+    "    sys.exit(0)\n"
+    "print('@@ started', flush=True)\n"
+    "for line in iter(sys.stdin.readline, ''):\n"
+    "    words = line.split()\n"
+    "    if len(words) == 2 and words[0] == 'rate':\n"
+    "        setp(dp, b'rate', 'ui', int(words[1]))\n"
+    "        print('@@ switched %d' % int(js.jackctl_server_switch_master(server, dummy)), flush=True)\n"
+    "    else:\n"
+    "        break\n"
+    "js.jackctl_server_stop(server)\n"
+    "js.jackctl_server_close(server)\n"
+    "js.jackctl_server_destroy(server)\n"
+    "print('@@ stopped', flush=True)\n";
+
+// The next line from the script beginning "@@ " (its server's own output passed over), "" when none comes in time.
+QString scriptLine(QProcess& p, int ms) {
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < ms) {
+        while (p.canReadLine()) {
+            const QString line = QString::fromUtf8(p.readLine()).trimmed();
+            if (line.startsWith(QLatin1String("@@ "))) return line.mid(3);
+        }
+        if (p.state() == QProcess::NotRunning && !p.canReadLine()) return {};
+        p.waitForReadyRead(100);
+    }
+    return {};
+}
+
 // Each test runs twice: in Montage's own process and in plug-in hosts.
 void hostingRows() {
     QTest::addColumn<bool>("isolated");
@@ -3119,6 +3259,188 @@ private slots:
         e.removeOutput(id);
         QVERIFY2(played > 40000 && played < 58000, qPrintable(QString::number(played)));
         audiodev::setLoopbackOptions({});
+    }
+
+    void rateWatchJudgesTheDevicesRate() {
+        // A host that says nothing when the device's rate changes (PortAudio): the rate judged from the callbacks' frames
+        // over time, a little jitter and drift aside, reported once.
+        audiodev::RateWatch w;
+        w.reset(48000);
+        int64_t ns = 0;
+        int calls = 0;
+        auto run = [&](double rate, double seconds, std::vector<int>& reported) {
+            const int frames = 256;
+            const int n = int(seconds * rate / frames);
+            for (int i = 0; i < n; ++i, ++calls) {
+                ns += int64_t(1e9 * frames / rate) + ((calls % 2) ? 150000 : -150000);  // (callbacks a little early, then late)
+                if (const int r = w.add(frames, ns)) reported.push_back(r);
+            }
+        };
+        std::vector<int> reported;
+        run(48000, 5, reported);
+        QVERIFY(reported.empty());
+        run(48000 * 1.01, 4, reported);  // (a clock a little fast: not another rate)
+        QVERIFY(reported.empty());
+        run(96000, 4, reported);
+        QCOMPARE(reported, std::vector<int>{96000});
+        QCOMPARE(w.rate(), 96000);
+        run(96000, 3, reported);
+        QCOMPARE(reported.size(), size_t(1));
+        run(60000, 4, reported);  // (no standard rate: kept)
+        QCOMPARE(w.rate(), 96000);
+        reported.clear();
+        ns += 2000000000LL;  // (a gap: the stream stopped a while)
+        run(44100, 4, reported);
+        QCOMPARE(reported, std::vector<int>{44100});
+    }
+
+    void feedPlaysThroughTheDevice() {
+        // Sound that is not the timeline (scrubbing, previews) played through the device at its own rate: every frame
+        // pushed is played, the tone keeps its pitch through the resampler, and what is queued can be let go.
+        audiodev::setLoopbackOptions({});
+        audiodev::Engine e;
+        audiodev::Feed closed(e);
+        std::string why;
+        QVERIFY(!closed.open(48000, 2, 0.5, &why) && !why.empty());  // (no device open)
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Loopback;
+        s.bufferFrames = 256;
+        s.sampleRate = 48000;
+        e.setSettings(s);
+        QVERIFY(e.isOpen());
+        Listener heard;
+        const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        QVERIFY(in >= 0);
+        audiodev::Feed f(e);
+        QVERIFY2(f.open(44100, 2, 0.25, &why), why.c_str());
+        QVERIFY(f.isOpen() && f.rate() == 44100 && f.channels() == 2);
+        QCOMPARE(f.room(), int64_t(11025));
+        std::vector<float> tone(size_t(44100) * 2);
+        for (int i = 0; i < 44100; ++i) tone[size_t(i) * 2] = tone[size_t(i) * 2 + 1] = float(0.4 * std::sin(2 * M_PI * 1000 * i / 44100.0));
+        heard.take();
+        int64_t sent = 0;
+        QElapsedTimer t;
+        t.start();
+        while ((sent < 44100 || f.queued() > 0) && t.elapsed() < 10000) {
+            if (sent < 44100) sent += f.push(tone.data() + size_t(sent) * 2, int(44100 - sent));
+            QThread::msleep(5);
+        }
+        QCOMPARE(sent, int64_t(44100));
+        QCOMPARE(f.queued(), int64_t(0));
+        QCOMPARE(f.played(), int64_t(44100));
+        QThread::msleep(100);
+        const std::vector<float> got = heard.take();
+        double energy = 0;
+        std::vector<float> sounding;
+        for (float v : got)
+            if (std::fabs(v) > 1e-4f || !sounding.empty()) sounding.push_back(v);
+        while (!sounding.empty() && std::fabs(sounding.back()) < 1e-4f) sounding.pop_back();
+        for (float v : sounding) energy += double(v) * v;
+        // A second of it at 48 kHz (the resampler's edges aside), at its pitch.
+        QVERIFY2(std::llabs(int64_t(sounding.size()) - 48000) < 600, qPrintable(QString::number(sounding.size())));
+        QVERIFY2(std::fabs(energy - 48000 * 0.08) < 48000 * 0.08 * 0.05, qPrintable(QString::number(energy)));
+        // (counted away from the ends, where the resampler's ringing crosses zero at a whisper)
+        const double hz = toneHz(std::vector<float>(sounding.begin() + 1000, sounding.end() - 1000), 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 1, qPrintable(QString::number(hz)));
+        // Let go: what was queued is not played.
+        const int64_t played = f.played();
+        QCOMPARE(f.push(tone.data(), 11025), int64_t(11025));
+        f.clear();
+        QCOMPARE(f.queued(), int64_t(0));
+        QThread::msleep(100);
+        QVERIFY2(f.played() - played < 2048, qPrintable(QString::number(f.played() - played)));
+        QCOMPARE(f.room(), int64_t(11025));
+        f.close();
+        QVERIFY(!f.isOpen() && f.push(tone.data(), 10) == 0);
+        e.removeInput(in);
+    }
+
+    void jackServerRateChange() {
+        // Under JACK's dummy driver: the server's rate moves from 48 to 96 kHz while a 1 kHz tone plays (out of Montage's
+        // port and back into its input port); Montage follows, and the tone it hears keeps its pitch and its pace.
+        const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+        if (python.isEmpty()) QSKIP("No python3 to drive the JACK server");
+        const QString server = QStringLiteral("montage-rate-%1").arg(QCoreApplication::applicationPid());
+        qputenv("JACK_DEFAULT_SERVER", server.toUtf8());
+        qputenv("JACK_NO_AUDIO_RESERVATION", "1");
+        QProcess jack;
+        jack.start(python, {"-c", QString::fromUtf8(kJackServerScript), server});
+        QVERIFY(jack.waitForStarted(5000));
+        auto quit = [&] {
+            jack.write("quit\n");
+            jack.closeWriteChannel();
+            if (!jack.waitForFinished(5000)) {
+                jack.kill();
+                jack.waitForFinished(2000);
+            }
+        };
+        const QString started = scriptLine(jack, 15000);
+        if (started != QLatin1String("started")) {
+            quit();
+            QSKIP(qPrintable(QStringLiteral("No JACK server on the dummy driver here (%1)").arg(started.isEmpty() ? QStringLiteral("no answer") : started)));
+        }
+        if (audiodev::jackLibrary().empty()) {
+            quit();
+            QSKIP("No JACK library loads here");
+        }
+        audiodev::Engine e;
+        audiodev::DeviceSettings s;
+        s.host = audiodev::Host::Jack;
+        s.bufferFrames = 256;
+        s.inputs = 1;
+        s.inputNames = {"Tone"};
+        s.autoConnect = false;
+        e.setOutputNames({"L", "R"});
+        QElapsedTimer t;
+        t.start();
+        do {
+            e.setSettings(audiodev::DeviceSettings{});
+            e.setSettings(s);
+            if (!e.isOpen()) QThread::msleep(200);
+        } while (!e.isOpen() && t.elapsed() < 10000);
+        if (!e.isOpen()) {
+            quit();
+            QFAIL(e.status().error.c_str());
+        }
+        QCOMPARE(e.status().rate, 48000);
+        const std::vector<std::string> ports = e.status().ports;
+        const std::string client = ports.front().substr(0, ports.front().find(':'));
+        QVERIFY(e.connect(client + ":L", client + ":Tone"));
+        TonePump tone;
+        Listener heard;
+        const int out = e.addOutput(&tone, 48000, 2, [&](float* o, int ch, int n) { return tone.render(o, ch, n); });
+        const int in = e.addInput(nullptr, 48000, [&](const float* i, int ch, int n, int64_t) { heard.add(i, ch, n); });
+        QVERIFY(out >= 0 && in >= 0);
+        auto listen = [&](double seconds) {
+            heard.take();
+            QElapsedTimer w;
+            w.start();
+            QThread::msleep(int(seconds * 1000));
+            const double took = double(w.nsecsElapsed()) / 1e9;
+            std::vector<float> got = heard.take();
+            return std::pair{got, double(got.size()) / took};
+        };
+        auto [before, paceBefore] = listen(1.0);
+        double hz = toneHz(before, 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 5, qPrintable(QString::number(hz)));
+        jack.write("rate 96000\n");
+        const QString switched = scriptLine(jack, 15000);
+        QVERIFY2(switched == QLatin1String("switched 1"), qPrintable(switched));
+        t.restart();
+        while (e.status().rate != 96000 && t.elapsed() < 10000) QThread::msleep(50);
+        QCOMPARE(e.status().rate, 96000);
+        QVERIFY(e.status().rateChanges >= 1);
+        QThread::msleep(300);  // (the switch settles)
+        auto [after, paceAfter] = listen(1.5);
+        hz = toneHz(after, 48000);
+        QVERIFY2(std::fabs(hz - 1000) < 5, qPrintable(QString::number(hz)));
+        // Still about 48000 of its samples a second, as before (not twice as many, not half).
+        QVERIFY2(paceAfter > 40000 && paceAfter < 56000, qPrintable(QString::number(paceAfter)));
+        Q_UNUSED(paceBefore);
+        e.removeInput(in);
+        e.removeOutput(out);
+        e.setSettings(audiodev::DeviceSettings{});
+        quit();
     }
 
     void overloadedCallbackIsAnXrun() {

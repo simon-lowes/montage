@@ -72,6 +72,7 @@
 #include "Language.h"
 #include "media/InterfaceDrafts.h"
 #include "RemoteReviewPanel.h"
+#include "SoundOut.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1850,6 +1851,7 @@ private slots:
         QCOMPARE(learnt[2][1].toString(), learn->targetAt(trim));
         learn->handle({0x80, 50, 0});
         learn->setLearning(false);
+        learn->handle({0xD0, 0});  // (taken over from 0)
         learn->handle({0xD0, 127});
         QCOMPARE(trim->value(), 10.0);
         learn->handle({0xD0, 0});
@@ -13272,6 +13274,135 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void everySoundThroughTheDevice() {
+        // With an audio device chosen in Monitoring (the loopback here: its outputs come back on its inputs), scrubbing,
+        // the sound library's preview, a remote review's sound and LTC chase all go through it, not Qt Multimedia's
+        // default output: what each plays is counted coming back on the device's first input.
+        const int rate = 48000;
+        QVERIFY(QDir().mkpath(dir_.path() + "/everysound"));
+        const QString tone = dir_.path() + "/everysound/tone.wav";
+        {
+            WavWriter w;
+            QVERIFY(w.open(tone, rate, 1));
+            std::vector<float> x(size_t(rate) * 4);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({tone});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Tone", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids.front(), 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+        }));
+        audiodev::setLoopbackOptions({});
+        audiodev::Engine& engine = audiodev::Engine::shared();
+        const audiodev::DeviceSettings before = engine.settings();
+        audiodev::DeviceSettings ds;
+        ds.host = audiodev::Host::Loopback;
+        ds.bufferFrames = 256;
+        ds.sampleRate = rate;
+        ds.inputs = 2;
+        ds.inputNames = {"Timecode", "Room"};
+        engine.setSettings(ds);
+        QVERIFY2(engine.isOpen(), engine.status().error.c_str());
+        struct Heard {
+            std::mutex m;
+            double energy = 0;
+            int64_t samples = 0;
+        };
+        auto heard = std::make_shared<Heard>();
+        const int tap = engine.addInput(nullptr, rate, [heard](const float* in, int ch, int n, int64_t) {
+            std::lock_guard<std::mutex> lock(heard->m);
+            for (int i = 0; i < n; ++i) heard->energy += double(in[size_t(i) * size_t(ch)]) * in[size_t(i) * size_t(ch)];
+            heard->samples += n;
+        });
+        QVERIFY(tap >= 0);
+        auto energy = [&] {
+            std::lock_guard<std::mutex> lock(heard->m);
+            return heard->energy;
+        };
+        auto reset = [&] {
+            std::lock_guard<std::mutex> lock(heard->m);
+            heard->energy = 0;
+        };
+
+        // Scrubbing: a snippet at each seek while paused (the first may come before the mixer has the sound read).
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        QVERIFY(program);
+        program->pause();
+        program->setAudioScrubbing(true);
+        reset();
+        QElapsedTimer t;
+        t.start();
+        for (int f = 10; energy() < 1.0 && t.elapsed() < 5000; ++f) {
+            program->seek(f % 90 + 5);
+            QTest::qWait(60);
+        }
+        QVERIFY(program->scrubOutput() && program->scrubOutput()->onDevice());
+        QVERIFY2(energy() >= 1.0, qPrintable(QString::number(energy())));
+        QVERIFY(program->scrubOutput()->played() > 0);
+
+        // The sound library's preview: all of it played through the device, then stopped by itself.
+        const QString sfx = dir_.path() + "/everysound/sfx";
+        QVERIFY(QDir().mkpath(sfx));
+        QVERIFY(QFile::copy(tone, sfx + "/TONE_Test_Lib.wav"));
+        auto library = std::make_shared<SoundLibrary>();
+        QVERIFY(library->open((dir_.path() + "/everysound/library.sqlite").toStdString()));
+        auto panel = std::make_unique<SoundLibraryPanel>(state(), library);
+        QVERIFY(panel->addFolder(sfx));
+        panel->rescan(true);
+        QCOMPARE(panel->search(""), 1);
+        panel->select(0);
+        panel->setRange(0, 24000);  // (half a second)
+        QTest::qWait(100);
+        reset();
+        panel->play();
+        QVERIFY(panel->playing());
+        QVERIFY(panel->previewOutput() && panel->previewOutput()->onDevice());
+        QTRY_VERIFY_WITH_TIMEOUT(!panel->playing(), 5000);
+        QTest::qWait(100);
+        // (a 0.3 peak tone, 0.045 a sample, played on both sides at -3 dB: about 0.0225 a sample on the first)
+        QVERIFY2(energy() > 24000 * 0.0225 * 0.9 && energy() < 24000 * 0.0225 * 1.1, qPrintable(QString::number(energy())));
+
+        // A remote review's sound: through the device too.
+        {
+            ReviewViewerWindow viewer;
+            viewer.findChild<QLineEdit*>("reviewAddress")->setText(QStringLiteral("srt://127.0.0.1:1"));
+            viewer.findChild<QLineEdit*>("reviewPassphrase")->setText(QStringLiteral("a passphrase for the test"));
+            viewer.findChild<QPushButton*>("reviewConnect")->click();
+            if (viewer.watching()) {
+                QVERIFY(viewer.soundOutput() && viewer.soundOutput()->onDevice() && viewer.soundOutput()->isOpen());
+                viewer.findChild<QPushButton*>("reviewConnect")->click();
+            }
+        }
+
+        // LTC chase on the device's input named "Timecode": the loopback brings what a feed plays on output 1 back on it.
+        DeckController deck(state(), program);
+        QString why;
+        QVERIFY2(deck.startChase("Timecode", 0, 0, 2, &why), qPrintable(why));
+        QCOMPARE(deck.chaseSamplesFromDevice(), int64_t(0));
+        const Rational fps = state()->sequence()->fps;
+        const int base = int(std::lround(fps.toDouble()));
+        const std::vector<float> ltc = encodeLtc(ltcFrameNumber({1, 0, 0, 0}, base), int64_t(base) * 4, fps, false, rate);
+        audiodev::Feed feed;
+        std::string ferr;
+        QVERIFY2(feed.open(rate, 1, 1.0, &ferr), ferr.c_str());
+        size_t sent = 0;
+        t.restart();
+        while (t.elapsed() < 4000 && deck.chasePosition().state != LtcChase::State::Locked) {
+            if (sent < ltc.size()) sent += size_t(feed.push(ltc.data() + sent, int(ltc.size() - sent)));
+            QTest::qWait(20);
+        }
+        QCOMPARE(deck.chasePosition().state, LtcChase::State::Locked);
+        QVERIFY2(deck.chaseSamplesFromDevice() > rate / 25, qPrintable(QString::number(deck.chaseSamplesFromDevice())));
+        deck.stopChase();
+        QCOMPARE(deck.chaseSamplesFromDevice(), int64_t(-1));
+        feed.close();
+        engine.removeInput(tap);
+        engine.setSettings(before);
+        state()->newProject();
+    }
     void recordingThroughTheAudioDevice() {
         // Through Monitoring's audio device (the loopback here: its outputs come back on its inputs, late by the
         // latencies it reports, as an interface with a cable from output to input would), a voiceover take and an ADR
