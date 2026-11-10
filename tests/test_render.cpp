@@ -18790,6 +18790,267 @@ colorspaces:
         QVERIFY(cs == status);
     }
 
+    // ST 2110-22's JPEG XS (RFC 9134), in both packetization modes: packets as the RFC lays them out (a constant number
+    // each frame, every payload of a unit as long but its last, the marker on the frame's last), rebuilt to the very
+    // codestream; one lost packet damages only its slices' lines (taken from the frame before); and over the loopback
+    // interface, on two paths each losing packets the other has, frames identical to decoding the codestream directly.
+    void st2110JpegXs() {
+        namespace st = montage::st2110;
+        using montage::JxsSampling;
+        if (!montage::jpegXsAvailable()) QSKIP("Built without SVT-JPEG-XS");
+        const int w = 640, h = 360;
+        montage::JxsEncodeSettings es;
+        es.width = w, es.height = h, es.depth = 10, es.sampling = JxsSampling::Ycc422, es.bppNum = 4, es.slices = true;
+        montage::JxsEncoder enc;
+        std::string why;
+        QVERIFY2(enc.open(es, &why), why.c_str());
+        std::vector<std::vector<uint8_t>> cs(3);
+        std::vector<uint32_t> units, firstUnits;
+        for (int k = 0; k < 3; ++k) {
+            QVERIFY2(enc.encode(jxsTestPicture(w, h, 10, JxsSampling::Ycc422, k * 5), cs[size_t(k)], &units, &why), why.c_str());
+            if (k == 0) firstUnits = units;
+            QVERIFY(units == firstUnits);
+        }
+        montage::JxsHeader hd;
+        QVERIFY(montage::readJxsHeader(cs[0].data(), cs[0].size(), hd));
+        st::VideoFormat vf;
+        vf.width = w, vf.height = h, vf.codec = "jxsv", vf.bpp = 4;
+        QVERIFY(st::videoFormatOk(vf));
+        const std::vector<uint8_t> boxes = st::jxsvBoxes(vf, hd.ppih, hd.plev, uint32_t(cs[0].size()));
+        QCOMPARE(int(boxes.size()), 42 + 18);
+        QVERIFY(std::memcmp(boxes.data() + 4, "jpvs", 4) == 0 && std::memcmp(boxes.data() + 12, "jpvi", 4) == 0 &&
+                std::memcmp(boxes.data() + 34, "jxpl", 4) == 0 && std::memcmp(boxes.data() + 46, "colr", 4) == 0);
+        montage::JxsDecoder dec;
+        auto decoded = [&](const std::vector<uint8_t>& c) {
+            montage::JxsPicture p;
+            std::string e;
+            return dec.decode(c.data(), c.size(), p, &e) ? p : montage::JxsPicture{};
+        };
+        // Where each slice starts in the codestream (from the encoder's units), and the lines it codes.
+        std::vector<size_t> sliceAt{units[0]};
+        for (size_t s = 1; s < units.size(); ++s) sliceAt.push_back(sliceAt.back() + units[s]);
+        const int sliceLines = hd.sliceLines();
+        QVERIFY(sliceLines > 0 && int(units.size()) - 1 == (h + sliceLines - 1) / sliceLines);
+        for (int mode : {0, 1}) {
+            const QString what = mode ? QStringLiteral("slice mode") : QStringLiteral("codestream mode");
+            st::RtpState rtp{96, 1234, 65500};
+            std::vector<std::vector<std::vector<uint8_t>>> frames(3);
+            for (int k = 0; k < 3; ++k) {
+                QVERIFY(st::packJxsv(boxes, cs[size_t(k)].data(), cs[size_t(k)].size(), units, mode, k, uint32_t(9000 + 3600 * k), rtp,
+                                     [&](const uint8_t* d, size_t n) {
+                                         frames[size_t(k)].emplace_back(d, d + n);
+                                         return true;
+                                     }));
+                QCOMPARE(int(frames[size_t(k)].size()), st::jxsvPacketCount(boxes.size(), cs[size_t(k)].size(), units, mode));
+                QCOMPARE(frames[size_t(k)].size(), frames[0].size());
+            }
+            // The payload headers: sequential, the mode, the last of each unit marked (and the marker on the frame's
+            // last alone), the frame counted, SEP and P as the mode counts them; every payload of a unit as long.
+            int units_ = 0;
+            size_t unitLength = 0;
+            for (size_t i = 0; i < frames[1].size(); ++i) {
+                st::RtpPacket p;
+                QVERIFY(st::parseRtp(frames[1][i].data(), frames[1][i].size(), p) && p.size >= 4 && p.timestamp == 12600);
+                const uint32_t hh = uint32_t(p.payload[0]) << 24 | uint32_t(p.payload[1]) << 16 | uint32_t(p.payload[2]) << 8 | p.payload[3];
+                QVERIFY2((hh >> 31) == 1 && int((hh >> 30) & 1) == mode && ((hh >> 27) & 3) == 0 && ((hh >> 22) & 31) == 1, qPrintable(what));
+                const bool last = (hh >> 29) & 1;
+                QCOMPARE(p.marker, i + 1 == frames[1].size());
+                if (mode == 0) QCOMPARE(last, p.marker);
+                if (!last) {
+                    QVERIFY(unitLength == 0 || unitLength == p.size);
+                    unitLength = p.size;
+                }
+                if (mode == 1 && i == 0) QVERIFY(((hh >> 11) & 0x7FF) == 0x7FF && (hh & 0x7FF) == 0);
+                if (last) ++units_;
+            }
+            QCOMPARE(units_, mode ? int(units.size()) : 1);
+            // Rebuilt: the same codestreams.
+            st::JxsvAssembler as;
+            int done = 0;
+            for (int k = 0; k < 3; ++k)
+                for (const auto& d : frames[size_t(k)]) {
+                    st::RtpPacket p;
+                    QVERIFY(st::parseRtp(d.data(), d.size(), p));
+                    if (as.add(p)) {
+                        QCOMPARE(as.codestream(), cs[size_t(done)]);
+                        QVERIFY(as.lostInFrame() == 0 && as.timestamp() == uint32_t(9000 + 3600 * done));
+                        ++done;
+                    }
+                }
+            QCOMPARE(done, 3);
+            QVERIFY(as.lost() == 0 && as.packetMode() == mode);
+            // One packet of the third frame lost (in the middle of the picture): the frame still comes, decoded the
+            // same as the whole codestream but in the lines of the slices that packet carried (and a slice's height
+            // either side, as the wavelet reaches); a frame missing a packet with none whole before it is passed over.
+            const size_t drop = frames[2].size() / 2;
+            size_t from, to;
+            {
+                st::RtpPacket p;
+                st::parseRtp(frames[2][drop].data(), frames[2][drop].size(), p);
+                const uint32_t hh = uint32_t(p.payload[0]) << 24 | uint32_t(p.payload[1]) << 16 | uint32_t(p.payload[2]) << 8 | p.payload[3];
+                if (mode == 1) {
+                    const size_t s = (hh >> 11) & 0x7FF;
+                    from = sliceAt[s] + (hh & 0x7FF) * unitLength;
+                } else {
+                    from = (((hh >> 11) & 0x7FF) * 2048 + (hh & 0x7FF)) * unitLength - boxes.size();
+                }
+                to = from + p.size - 4;
+            }
+            int firstSlice = -1, lastSlice = -1;
+            for (size_t s = 0; s + 1 < sliceAt.size(); ++s)
+                if (sliceAt[s] < to && (s + 2 < sliceAt.size() ? sliceAt[s + 1] : cs[2].size()) > from) {
+                    if (firstSlice < 0) firstSlice = int(s);
+                    lastSlice = int(s);
+                }
+            QVERIFY(firstSlice > 0 && lastSlice + 1 < int(units.size()) - 1);
+            for (size_t i = 0; i < frames[2].size(); ++i) {
+                if (i == drop) continue;
+                st::RtpPacket p;
+                st::parseRtp(frames[2][i].data(), frames[2][i].size(), p);
+                // (numbered on from the frames already given)
+                std::vector<uint8_t> again = frames[2][i];
+                const uint16_t seq = uint16_t(p.sequence + frames[2].size());
+                again[2] = uint8_t(seq >> 8), again[3] = uint8_t(seq);
+                again[4] = 0, again[5] = 0, again[6] = 0xAF, again[7] = 0xC8;  // (timestamp 45000)
+                st::parseRtp(again.data(), again.size(), p);
+                if (as.add(p)) ++done;
+            }
+            QCOMPARE(done, 4);
+            QVERIFY2(as.lostInFrame() == 1 && as.concealedSlices() == lastSlice - firstSlice + 1 && as.timestamp() == 45000, qPrintable(what));
+            const montage::JxsPicture whole = decoded(cs[2]), patched = decoded(as.codestream());
+            QVERIFY(whole.width == w && patched.width == w);
+            const int damagedFrom = firstSlice * sliceLines - sliceLines, damagedTo = (lastSlice + 1) * sliceLines + sliceLines;
+            for (int c = 0; c < 3; ++c) {
+                const size_t pw = size_t(whole.planeWidth(c));
+                for (int y = 0; y < h; ++y) {
+                    if (y >= damagedFrom && y < damagedTo) continue;
+                    QVERIFY2(std::equal(whole.planes[c].begin() + ptrdiff_t(size_t(y) * pw), whole.planes[c].begin() + ptrdiff_t(size_t(y + 1) * pw),
+                                        patched.planes[c].begin() + ptrdiff_t(size_t(y) * pw)),
+                             qPrintable(what + QStringLiteral(": line %1 of plane %2").arg(y).arg(c)));
+                }
+            }
+            st::JxsvAssembler fresh;
+            int freshDone = 0;
+            for (size_t i = 0; i < frames[0].size(); ++i) {
+                if (i == drop) continue;
+                st::RtpPacket p;
+                st::parseRtp(frames[0][i].data(), frames[0][i].size(), p);
+                if (fresh.add(p)) ++freshDone;
+            }
+            QVERIFY(freshDone == 0 && fresh.passedOver() == 1);
+        }
+
+        // Over the loopback interface (on two paths, each losing a packet in twenty the other has), in each mode: the
+        // SDP as ST 2110-22 and RFC 9134 have it, and every frame the codestream sent and its picture as it decodes.
+        auto loopback = [&](st::VideoFormat v, int frames) -> std::string {
+            int ports[6];
+            {
+                st::Receiver probe[6];
+                for (int i = 0; i < 6; ++i) {
+                    if (!probe[i].open({"127.0.0.1", 0})) return "no free port";
+                    ports[i] = probe[i].port();
+                }
+            }
+            st::SenderOptions o;
+            o.video = {"127.0.0.1", ports[0]}, o.audio = {"127.0.0.1", ports[1]}, o.anc = {"127.0.0.1", ports[2]};
+            o.video2 = {"127.0.0.1", ports[3]}, o.audio2 = {"127.0.0.1", ports[4]}, o.anc2 = {"127.0.0.1", ports[5]};
+            o.ttl = 1, o.redundant = true, o.sendAudio = false;
+            o.drop = [](int, int path, uint64_t i) { return i % 20 == (path ? 11u : 3u); };
+            st::Sender snd;
+            std::string e;
+            if (!snd.open(o, v, {}, &e)) return e;
+            const std::string sdp = snd.sdpVideo();
+            for (const char* want : {"a=rtpmap:96 jxsv/90000", "packetmode=", "transmode=1", "profile=", "level=", "sublevel=", "SSN=ST2110-22:2022",
+                                     "TP=2110TPW", "\r\nb=AS:", "exactframerate="})
+                if (sdp.find(want) == std::string::npos) return std::string("SDP without ") + want;
+            if (sdp.find(" profile=Main 4") != std::string::npos) return "a profile name with a space";
+            std::vector<st::SdpStream> streams;
+            for (const std::string& s : {sdp, snd.sdpAnc()}) {
+                const auto found = st::parseSdp(s, &e);
+                if (found.size() != 1) return "SDP: " + e;
+                streams.push_back(found[0]);
+            }
+            const st::VideoFormat& got = streams[0].video;
+            if (!(got.jpegXs() && got.packetMode == v.packetMode && got.width == v.width && got.sampling == v.sampling && got.depth == v.depth &&
+                  got.profile == snd.videoFormat().profile && got.bandwidthKbps == snd.videoFormat().bandwidthKbps && got.bandwidthKbps > 0 &&
+                  streams[0].redundant()))
+                return "SDP video format";
+            // (the bandwidth: each frame's bytes and packets' headers at the frame rate, within a packet's worth)
+            const double frameBits = double(v.width) * v.height * v.bpp;
+            if (got.bandwidthKbps * 1000 < frameBits * v.fps.toDouble() || got.bandwidthKbps * 1000 > frameBits * v.fps.toDouble() * 1.1)
+                return "b=AS " + std::to_string(got.bandwidthKbps);
+            st::Input in;
+            if (!in.open(streams, {}, &e)) return e;
+            // What each picture codes to and decodes as, straight from the encoder.
+            const JxsSampling js = v.sampling == st::Sampling::Ycc422 ? JxsSampling::Ycc422 : v.sampling == st::Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
+            const montage::JxsPicture pics[2] = {jxsTestPicture(v.width, v.height, v.depth, js, 0), jxsTestPicture(v.width, v.height, v.depth, js, 9)};
+            montage::JxsEncoder direct;
+            montage::JxsEncodeSettings ds;
+            ds.width = v.width, ds.height = v.height, ds.depth = v.depth, ds.sampling = js, ds.bppNum = int(std::lround(v.bpp * 1000)), ds.bppDen = 1000;
+            ds.slices = v.packetMode == 1;
+            if (!direct.open(ds, &e)) return e;
+            std::vector<uint8_t> codes[2];
+            st::Raster expect[2];
+            for (int k = 0; k < 2; ++k) {
+                if (!direct.encode(pics[k], codes[k], nullptr, &e)) return e;
+                montage::JxsPicture p;
+                if (!dec.decode(codes[k].data(), codes[k].size(), p, &e, js)) return e;
+                expect[k] = st::rasterOf(p);
+            }
+            const st::Raster rasters[2] = {st::rasterOf(pics[0]), st::rasterOf(pics[1])};
+            const int base = 36000 * int(std::lround(v.fps.toDouble()));
+            std::atomic<bool> stop{false};
+            std::thread sending([&] {
+                for (int k = 0; k < frames && !stop; ++k) {
+                    const montage::output::Timecode t = montage::output::timecodeOf(montage::FrameTime(base + k), v.fps);
+                    snd.send(rasters[k % 2], nullptr, 0, &t, {}, &stop);
+                }
+            });
+            std::string error;
+            int received = 0;
+            for (int idle = 0; received < frames && idle < 10 && error.empty();) {
+                st::InputFrame f;
+                if (!in.next(f, 300)) {
+                    ++idle;
+                    continue;
+                }
+                idle = 0;
+                if (!f.hasTimecode) {
+                    error = "a frame without its time code";
+                    break;
+                }
+                const montage::output::Timecode& t = f.timecode;
+                const int k = ((t.hours * 60 + t.minutes) * 60 + t.seconds) * int(std::lround(v.fps.toDouble())) + t.frames - base;
+                if (k < 0 || k >= frames) error = "time code " + std::to_string(k);
+                else if (f.lostPackets) error = "packets lost in frame " + std::to_string(k);
+                else if (f.codestream != codes[k % 2]) error = "the codestream of frame " + std::to_string(k);
+                else if (!(f.picture == expect[k % 2])) error = "the picture of frame " + std::to_string(k);
+                ++received;
+            }
+            stop = true;
+            sending.join();
+            if (error.empty() && received != frames) error = std::to_string(received) + " of " + std::to_string(frames) + " frames";
+            const st::InputStats s = in.stats();
+            if (error.empty() && (s.lost || s.incomplete || s.concealedSlices)) error = "packets lost after merging";
+            if (error.empty() && !(s.duplicates > 0 && s.packets[0][1] > 0)) error = "the second path unused";
+            in.close();
+            return error;
+        };
+        st::VideoFormat v;
+        v.codec = "jxsv", v.width = 640, v.height = 360, v.fps = {25, 1}, v.depth = 10, v.bpp = 3;
+        for (int mode : {0, 1}) {
+            v.packetMode = mode;
+            const std::string e = loopback(v, 20);
+            QVERIFY2(e.empty(), (std::string(mode ? "slice mode: " : "codestream mode: ") + e).c_str());
+        }
+        v.packetMode = 1, v.sampling = st::Sampling::Rgb, v.depth = 12, v.bpp = 6, v.fps = {50, 1};
+        const std::string e = loopback(v, 20);
+        QVERIFY2(e.empty(), ("RGB 12-bit: " + e).c_str());
+        // Interlaced JPEG XS is refused, as the RFC's second picture segment is not sent here.
+        v.interlaced = true;
+        QVERIFY(!st::videoFormatOk(v));
+    }
+
     // JPEG XS coded and decoded through SVT-JPEG-XS: the header read without it, a constant number of bytes a picture
     // (and of slices, each's bytes known), the quality each rate keeps, and frames identical to SVT's own tools'.
     void jpegXsCodestreams() {

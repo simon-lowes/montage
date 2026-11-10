@@ -1,6 +1,7 @@
 // Montage — receiving SMPTE ST 2110: a facility's IP feeds recorded as SDI capture cards record theirs.
 //  - The streams are found from their SDP files (as a sender or an NMOS controller gives them): ST 2110-20 video at
-//    any sampling and depth render/St2110 sends, -30 audio (L24 or L16, 1 ms or 125 µs packets) and -40 ancillary data.
+//    any sampling and depth render/St2110 sends, -22's JPEG XS (RFC 9134, either packetization mode; a lost packet
+//    damaging only the lines of its slices), -30 audio (L24 or L16, 1 ms or 125 µs packets) and -40 ancillary data.
 //  - ST 2022-7: a stream that arrives on two paths (an SDP's "a=group:DUP") is merged by RTP sequence number, each packet
 //    taken once from whichever path brought it.
 //  - Pictures, sound and ancillary data are put together by their RTP timestamps, which ST 2110 takes from PTP time: a
@@ -29,11 +30,11 @@ namespace montage::st2110 {
 // One stream an SDP describes: what it carries and where it arrives (with ST 2022-7, on two paths).
 struct SdpStream {
     std::string media;     // "video" or "audio"
-    std::string encoding;  // "raw", "smpte291", "L24", "L16", "AM824" (ST 2110-31) or "ST2110-41"
+    std::string encoding;  // "raw", "jxsv" (ST 2110-22's JPEG XS), "smpte291", "L24", "L16", "AM824" (ST 2110-31) or "ST2110-41"
     int payloadType = -1;
     Endpoint path[2];       // (path[1].port 0: one path)
     std::string source[2];  // the sender's address as its source filter gives it ("" not said)
-    VideoFormat video;      // raw (all of it) and smpte291 (its frame rate)
+    VideoFormat video;      // raw and jxsv (all of it) and smpte291 (its frame rate)
     AudioFormat audio;      // L24, L16 and AM824 (its `aes3`)
     std::vector<uint32_t> metadataTypes;  // ST2110-41's data item types (its DIT)
     bool fullRange = false; // the video's RANGE=FULL (its codes from 0, not 16 at 8 bits)
@@ -103,6 +104,7 @@ private:
 // A frame as received.
 struct InputFrame {
     Raster picture;
+    std::vector<uint8_t> codestream;  // ST 2110-22: the JPEG XS codestream it was decoded from (as rebuilt)
     uint32_t rtpTimestamp = 0;
     int64_t ptpNs = 0;      // when it began (PTP time)
     int64_t number = 0;     // its frame count since the PTP epoch
@@ -129,6 +131,7 @@ struct InputStats {
     int64_t frames = 0, incomplete = 0, dropped = 0;  // (dropped: frames not taken in time)
     int64_t packets[4][2] = {};                       // video, audio, ancillary, fast metadata on each path
     int64_t duplicates = 0, lost = 0;                 // after merging
+    int64_t concealedSlices = 0;                      // ST 2110-22: slices taken from the frame before (packets lost)
 };
 
 // Receives the streams (one video, and any number of sound, ancillary data and fast metadata streams: sound streams at
@@ -159,6 +162,7 @@ private:
         uint32_t ts = 0;
         int64_t lost = 0;
         std::chrono::steady_clock::time_point at;
+        std::vector<uint8_t> codestream;
     };
     void receive(Stream* s, int path);
     void take(Stream& s, const std::vector<uint8_t>& packet);

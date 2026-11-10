@@ -303,7 +303,7 @@ add_library(montage_engine STATIC
   render/CompositeRender.h render/CompositeRender.cpp
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
-  render/St2110.h render/St2110.cpp render/St2110Receive.h render/St2110Receive.cpp render/Nmos.h render/Nmos.cpp
+  render/St2110.h render/St2110.cpp render/St2110Jxs.cpp render/St2110Receive.h render/St2110Receive.cpp render/Nmos.h render/Nmos.cpp
   render/RemoteReview.h render/RemoteReview.cpp render/WebRtcReview.h render/WebRtcReview.cpp render/WebRtcReviewPage.cpp
   render/HeadlessBrowser.h
   render/RemoteGrade.h render/RemoteGrade.cpp

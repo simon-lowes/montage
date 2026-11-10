@@ -1,5 +1,7 @@
 #include "St2110Receive.h"
 
+#include "media/JpegXs.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -38,6 +40,7 @@ struct Media {
     std::map<std::string, std::string> fmtp;
     std::string rtpmap;
     double ptimeMs = 1;
+    int64_t kbps = 0;  // (b=AS)
 };
 
 // An RTP timestamp at `rate` as a whole count of its ticks since the PTP epoch, taken to be the one nearest now.
@@ -93,6 +96,8 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             n.address = sessionAddress;
             n.source = sessionSource;
             media.push_back(n);
+        } else if (line[0] == 'b' && m && v.rfind("AS:", 0) == 0) {
+            m->kbps = std::max<int64_t>(0, std::atoll(v.c_str() + 3));
         } else if (line[0] == 'c') {
             std::istringstream cs(v);
             std::string net, type, addr;
@@ -161,6 +166,33 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             s.fullRange = m.fmtp["RANGE"].rfind("FULL", 0) == 0;
             std::string why;
             if (!videoFormatOk(f, &why)) return fail(why);
+        } else if (s.encoding == "jxsv") {
+            // ST 2110-22's JPEG XS (RFC 9134): progressive here, its packetization mode required.
+            VideoFormat& f = s.video;
+            f.codec = "jxsv";
+            if (!m.fmtp.count("packetmode")) return fail("The JPEG XS stream's SDP gives no packetmode");
+            f.packetMode = std::atoi(m.fmtp["packetmode"].c_str());
+            if (m.fmtp.count("transmode") && m.fmtp["transmode"] != "1")
+                return fail("Montage receives JPEG XS sent in order (RFC 9134's transmode 1)");
+            if (!parseSampling(m.fmtp["sampling"], f.sampling))
+                return fail("Montage receives JPEG XS at YCbCr-4:2:2, YCbCr-4:4:4 and RGB, not " + m.fmtp["sampling"]);
+            f.width = std::atoi(m.fmtp["width"].c_str());
+            f.height = std::atoi(m.fmtp["height"].c_str());
+            f.depth = m.fmtp.count("depth") ? std::atoi(m.fmtp["depth"].c_str()) : 10;
+            f.interlaced = m.fmtp.count("interlace") > 0;
+            if (!rational(m.fmtp["exactframerate"], f.fps)) return fail("The video's SDP gives no exactframerate");
+            if (m.fmtp.count("TCS")) f.tcs = m.fmtp["TCS"];
+            if (m.fmtp.count("colorimetry")) f.colorimetry = m.fmtp["colorimetry"];
+            f.profile = m.fmtp["profile"];
+            f.level = m.fmtp["level"];
+            f.sublevel = m.fmtp["sublevel"];
+            f.bandwidthKbps = m.kbps;
+            // (bits a pixel from the bandwidth, which counts the packets' headers too: near enough to size buffers)
+            if (m.kbps > 0 && f.width > 0 && f.height > 0 && f.fps.valid())
+                f.bpp = std::clamp(double(m.kbps) * 1000 / f.fps.toDouble() / (double(f.width) * f.height), 0.5, 24.0);
+            s.fullRange = m.fmtp["RANGE"].rfind("FULL", 0) == 0;
+            std::string why;
+            if (!videoFormatOk(f, &why)) return fail(why);
         } else if (s.encoding == "smpte291") {
             if (m.fmtp.count("exactframerate")) rational(m.fmtp["exactframerate"], s.video.fps);
         } else if (s.encoding == "ST2110-41") {
@@ -188,7 +220,7 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
             if (a.rate != 44100 && a.rate != 48000 && a.rate != 96000) return fail("ST 2110-30 here is at 44.1, 48 or 96 kHz");
             if (a.packetUs > 20000) return fail("The audio's packets are at most 20 ms here");
         } else {
-            return fail("Montage receives ST 2110-20, -30, -31, -40 and -41 streams, not " + m.rtpmap);
+            return fail("Montage receives ST 2110-20, -22 (JPEG XS), -30, -31, -40 and -41 streams, not " + m.rtpmap);
         }
     }
     // ST 2022-7: a group's second description is its first's other path.
@@ -381,11 +413,14 @@ struct Input::Stream {
     std::mutex m;
     PathMerger merger{true};
     std::unique_ptr<VideoAssembler> assembler;
+    std::unique_ptr<JxsvAssembler> jxsv;  // (ST 2110-22's, and its decoder)
+    std::unique_ptr<JxsDecoder> decoder;
     std::chrono::steady_clock::time_point last[2];  // when each path last brought a packet
     // Ancillary data and metadata: the latest RTP timestamp this stream brought (the input's lock held).
     bool dataSeen = false;
     uint32_t dataLatest = 0;
-    Stream(int k, const SdpStream& s) : kind(k), sdp(s), merger(k == 0) {}
+    // (RFC 4175's extended sequence numbers for ST 2110-20; RFC 9134's are RTP's own)
+    Stream(int k, const SdpStream& s) : kind(k), sdp(s), merger(k == 0 && !s.video.jpegXs()) {}
 };
 
 Input::Input() = default;
@@ -402,7 +437,7 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
     stop_ = false;
     int channels = 0;
     for (const SdpStream& s : streams) {
-        const int kind = s.encoding == "raw" ? 0 : s.encoding == "smpte291" ? 2 : s.encoding == "ST2110-41" ? 3 : 1;
+        const int kind = s.encoding == "raw" || s.encoding == "jxsv" ? 0 : s.encoding == "smpte291" ? 2 : s.encoding == "ST2110-41" ? 3 : 1;
         if (kind == 0)
             for (const auto& have : streams_)
                 if (have->kind == 0) return fail("Montage takes one video stream at a time (with any number of sound and data streams)");
@@ -412,12 +447,20 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
             std::string why;
             if (!videoFormatOk(s.video, &why)) return fail(why);
             video_ = s.video;
-            st->assembler = std::make_unique<VideoAssembler>(s.video.width, s.video.height, s.video.sampling, s.video.depth, s.video.interlaced);
+            double frameBytes = 0;
+            if (s.video.jpegXs()) {
+                if (!jpegXsAvailable()) return fail("This build of Montage has no JPEG XS (SVT-JPEG-XS) to receive ST 2110-22 with");
+                st->jxsv = std::make_unique<JxsvAssembler>();
+                st->decoder = std::make_unique<JxsDecoder>();
+                frameBytes = double(s.video.width) * s.video.height * s.video.bpp / 8;
+            } else {
+                st->assembler = std::make_unique<VideoAssembler>(s.video.width, s.video.height, s.video.sampling, s.video.depth, s.video.interlaced);
+                const Pgroup pg = pgroup(s.video.sampling, s.video.depth);
+                frameBytes = double(s.video.width) * s.video.height * pg.bytes / pg.pixels;
+            }
             // ST 2022-7's paths may be some milliseconds apart: a gap is waited on for 30 ms of the stream's packets
             // (from its bytes a second; packets carry at most about 1,400 bytes of pixels), and fewer large pictures
             // are held for a reader that falls behind.
-            const Pgroup pg = pgroup(s.video.sampling, s.video.depth);
-            const double frameBytes = double(s.video.width) * s.video.height * pg.bytes / pg.pixels;
             st->merger.setWindow(std::max<size_t>(512, size_t(frameBytes * s.video.fps.toDouble() * 0.03 / 1000)));
             // (each held as a raster of 16-bit samples)
             const double rasterBytes = double(s.video.width) * s.video.height * (s.video.sampling == Sampling::Ycc422 ? 2 : 3) * 2;
@@ -453,7 +496,7 @@ bool Input::open(const std::vector<SdpStream>& streams, const InputOptions& o, s
     }
     bool video = false;
     for (const auto& s : streams_) video = video || s->kind == 0;
-    if (!video) return fail("The SDP has no video stream (ST 2110-20)");
+    if (!video) return fail("The SDP has no video stream (ST 2110-20 or -22)");
     for (const auto& s : streams_)
         for (int p = 0; p < (s->sdp.redundant() ? 2 : 1); ++p) threads_.emplace_back([this, st = s.get(), p] { receive(st, p); });
     return true;
@@ -529,7 +572,27 @@ void Input::receive(Stream* s, int path) {
 void Input::take(Stream& s, const std::vector<uint8_t>& packet) {
     RtpPacket p;
     if (!parseRtp(packet.data(), packet.size(), p)) return;  // (the merger took RTP of the stream's payload type alone)
-    if (s.kind == 0) {
+    if (s.kind == 0 && s.jxsv) {
+        // ST 2110-22: the codestream rebuilt, decoded to the stream's sampling and depth.
+        if (!s.jxsv->add(p)) return;
+        JxsPicture pic;
+        const JxsSampling s444 = s.sdp.video.sampling == Sampling::Rgb ? JxsSampling::Rgb : JxsSampling::Ycc444;
+        const std::vector<uint8_t>& cs = s.jxsv->codestream();
+        const JxsSampling want = video_.sampling == Sampling::Ycc422 ? JxsSampling::Ycc422 : s444;
+        const bool ok = s.decoder->decode(cs.data(), cs.size(), pic, nullptr, s444) && pic.width == video_.width && pic.height == video_.height &&
+                        pic.depth == video_.depth && pic.sampling == want;
+        std::lock_guard lock(m_);
+        if (!ok) {
+            ++stats_.incomplete;
+            return;
+        }
+        while (pending_.size() >= pendingLimit_) pending_.pop_front(), ++stats_.dropped;
+        pending_.push_back({rasterOf(pic), s.jxsv->timestamp(), s.jxsv->lostInFrame(), std::chrono::steady_clock::now()});
+        pending_.back().codestream = cs;
+        if (s.jxsv->lostInFrame()) ++stats_.incomplete;
+        stats_.concealedSlices += s.jxsv->concealedSlices();
+        cv_.notify_all();
+    } else if (s.kind == 0) {
         if (!s.assembler->add(p)) return;
         std::lock_guard lock(m_);
         // (a reader that falls behind loses the oldest frames, not the newest)
@@ -657,6 +720,7 @@ bool Input::ready(const Pending& p, std::chrono::steady_clock::time_point now) {
 void Input::build(Pending& p, InputFrame& out) {
     const Span sp = spanOf(p.ts, video_.fps, hasAudio_ ? audio_.rate : 48000);
     out.picture = std::move(p.picture);
+    out.codestream = std::move(p.codestream);
     out.rtpTimestamp = p.ts;
     out.number = sp.number;
     out.ptpNs = sp.startNs;
