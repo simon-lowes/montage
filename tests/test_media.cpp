@@ -21208,6 +21208,47 @@ if __name__ == '__main__':
         QVERIFY(QFileInfo(dir.path() + "/py.mp4").size() > 1000);
     }
 
+    // Nightly 10 Nov: a record that cannot be written fails at once (it is not tried again for two seconds, which froze
+    // the GUI that saves its jobs every second), and job folders without a readable record are pruned once a day old.
+    void jobStoreFailuresAndOrphans() {
+        QTemporaryDir store;
+        jobs::Record r;
+        r.id = "stuck";
+        r.owner = "test";
+        r.status = "running";
+        QVERIFY(QDir().mkpath(store.filePath("stuck/job.json/in-the-way")));  // (job.json a folder: it cannot be put in place)
+        QElapsedTimer t;
+        t.start();
+        QVERIFY(!jobs::save(r, store.path()));
+#ifndef Q_OS_WIN
+        QVERIFY2(t.elapsed() < 500, qPrintable(QString::number(t.elapsed())));
+#endif
+        // Orphans: no record, a damaged one, both two days old, and a fresh one with no record yet; a finished job.
+        const auto age = [&](const QString& path) {
+            std::filesystem::last_write_time(std::filesystem::path(path.toStdString()),
+                                             std::filesystem::file_time_type::clock::now() - std::chrono::hours(48));
+        };
+        QVERIFY(QDir().mkpath(store.filePath("empty")));
+        QVERIFY(QDir().mkpath(store.filePath("damaged")));
+        QVERIFY(QDir().mkpath(store.filePath("fresh")));
+        {
+            QFile f(store.filePath("damaged/job.json"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("{ not json");
+        }
+        age(store.filePath("damaged/job.json"));
+        age(store.filePath("damaged"));
+        age(store.filePath("empty"));
+        jobs::Record done;
+        done.id = "done";
+        done.owner = "test";
+        done.status = "done";
+        QVERIFY(jobs::save(done, store.path()));
+        QCOMPARE(jobs::prune("test", 10, store.path()), 2);
+        QVERIFY(!QFileInfo::exists(store.filePath("empty")) && !QFileInfo::exists(store.filePath("damaged")));
+        QVERIFY(QFileInfo::exists(store.filePath("fresh")) && QFileInfo::exists(store.filePath("done/job.json")));
+    }
+
     void backgroundJobsSideBySideAndKept() {
         // Ten seconds of colour bars at 320x180.
         QTemporaryDir dir;
@@ -21270,6 +21311,23 @@ if __name__ == '__main__':
             // A call that changes the project still waits for them: it runs alone.
             const QJsonArray mine = rpc(server, "montage_job", {{"action", "list"}}).value("structuredContent").toObject().value("jobs").toArray();
             QCOMPARE(mine.size(), 2);
+            // Two in the background to one file: the second waits for the first (never both writing it), and the file
+            // is whole.
+            QStringList same;
+            for (int i = 0; i < 2; ++i)
+                same << rpc(server, "montage_render", {{"project", project}, {"output", dir.path() + "/same.mp4"}, {"async", true}}).value("structuredContent").toObject().value("job").toString();
+            bool both = false;
+            t.restart();
+            while (t.elapsed() < 120000) {
+                const QString a = job(server, same[0]).value("status").toString(), b = job(server, same[1]).value("status").toString();
+                if (a == "running" && b == "running") both = true;
+                if ((a == "done" || a == "failed") && (b == "done" || b == "failed")) break;
+                QThread::msleep(5);
+            }
+            QVERIFY(!both);
+            QCOMPARE(job(server, same[0]).value("status").toString(), QString("done"));
+            QCOMPARE(job(server, same[1]).value("status").toString(), QString("done"));
+            QVERIFY(bytes(dir.path() + "/same.mp4") == bytes(dir.path() + "/serial-1.mp4"));
         }
         // A server after it lists them, as kept on disk, and reads one's result by its stored id.
         QString interrupted, queuedBehind;
@@ -21346,6 +21404,31 @@ if __name__ == '__main__':
             QVERIFY(probeMedia((dir.path() + "/resumed.mp4").toStdString(), m));
             QVERIFY2(std::fabs(m.duration - longSeconds) < 0.5, qPrintable(QString("%1 %2").arg(m.duration).arg(longSeconds)));
             QCOMPARE(job(server, interrupted).value("resumedAs").toString().isEmpty(), false);
+        }
+        {
+            // An edit left waiting before a render by a server that crashed: the render waits with it (it may need the
+            // edit), for montage_job's resume, and is not run by itself without it.
+            const char* tools[2] = {"montage_add_marker", "montage_render"};
+            QString ids[2];
+            for (int k = 0; k < 2; ++k) {
+                jobs::Record e;
+                e.id = ids[k] = QString("mcp-held-%1").arg(k);
+                e.owner = "mcp";
+                e.kind = tools[k];
+                e.status = "waiting";
+                e.order = 900000 + k;
+                e.pid = 0x7ffffff0;
+                e.process = "gone";
+                e.data = QJsonObject{{"session", "a-server-gone"}, {"tool", tools[k]}, {"cwd", QDir::currentPath()},
+                                     {"args", k ? QJsonObject{{"project", project}, {"output", dir.path() + "/held.mp4"}} : QJsonObject{{"project", project}}}};
+                QVERIFY(jobs::save(e));
+            }
+            McpServer server;
+            QCOMPARE(server.resumeStoredJobs(), 0);
+            QVERIFY(!QFile::exists(dir.path() + "/held.mp4"));
+            QVERIFY(jobs::load(ids[1], r));
+            QVERIFY(r.status == "waiting" || r.status == "interrupted");
+            for (const QString& id : ids) QVERIFY(QDir(jobs::jobFolder(id)).removeRecursively());
         }
         // A render queue export is cancelled by its stored id: the queue holding it finds the request in its folder.
         jobs::Record q;
@@ -22334,6 +22417,28 @@ if ui["pressed"] == "add":
                 QVERIFY(result.value("content").toArray().at(0).toObject().value("text").toString().contains("copied from the source as coded"));
                 QFile::remove(QString::fromStdString(path("lg-mcp.mxf")));
             }
+        }
+    }
+
+    // A VCL HRD (a Type I stream) counts the filler data units with the VCL ones: a constant rate stream padded with
+    // filler and stating only a VCL HRD must not read as overflowing.
+    void hrdTypeOneCountsFiller() {
+        for (int codec : {0, 1}) {
+            // (length-prefixed: a slice, an SEI that is not counted, and filler data)
+            const std::vector<std::vector<uint8_t>> nals =
+                codec == 0 ? std::vector<std::vector<uint8_t>>{{0x41, 0x9a, 0x00, 0x11}, {0x06, 0x05, 0x01, 0x00, 0x80}, {0x0c, 0xff, 0xff, 0xff, 0x80}}
+                           : std::vector<std::vector<uint8_t>>{{0x02, 0x01, 0xd0, 0x00}, {0x4e, 0x01, 0x05, 0x01, 0x00, 0x80}, {0x4c, 0x01, 0xff, 0xff, 0x80}};
+            std::vector<uint8_t> au;
+            for (const auto& n : nals) {
+                const uint32_t len = uint32_t(n.size());
+                au.insert(au.end(), {uint8_t(len >> 24), uint8_t(len >> 16), uint8_t(len >> 8), uint8_t(len)});
+                au.insert(au.end(), n.begin(), n.end());
+            }
+            std::map<int, montage::hrd::Sps> sps;
+            std::map<int, montage::hrd::Pps> pps;
+            montage::hrd::AccessUnit u;
+            montage::hrd::readAccessUnit(codec == 0 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC, au.data(), au.size(), 4, sps, pps, u);
+            QCOMPARE(u.vclBits, int((nals[0].size() + nals[2].size()) * 8));
         }
     }
 
@@ -34390,6 +34495,16 @@ if ui["pressed"] == "add":
         }, again, &st));
         QCOMPARE(again.find("x %1") != std::string::npos, true);  // (only "Lost %1" is still open)
         QCOMPARE(st.drafted, 1);
+        // Drafts that lost letters or wrote plus signs for words: garbled in a language of another script, not in one of
+        // Latin letters ("hat" is German, not "That" cut short).
+        QVERIFY(garbledDraft("Render Queue", "调试 + ueue"));
+        QVERIFY(garbledDraft("Render it later from the Render Queue panel", "稍后从 Render ueue 面板上"));
+        QVERIFY(garbledDraft("built without ONNX Runtime.", "بدون أون إكس untime."));
+        QVERIFY(!garbledDraft("Render Queue", "渲染队列"));
+        QVERIFY(!garbledDraft("Open the Render Queue", "打开 Render Queue"));
+        QVERIFY(!garbledDraft("That clip has no sound", "Der Clip hat keinen Ton"));
+        QVERIFY(!garbledDraft("Delay / Echo", "Retard / Écho"));
+        QVERIFY(!garbledDraft("Gain +6 dB", "Усиление +6 дБ"));
         // A draft where the model wrote "<unk>" for a word or sign it did not know is garbled, so it is not kept.
         std::string garbled;
         QVERIFY(draftInterfaceTranslation(out, [](const std::vector<std::string>& in, std::vector<std::string>& o) {
@@ -34473,6 +34588,12 @@ if ui["pressed"] == "add":
                 const QString source = m.captured(1), translation = m.captured(2);
                 if (translation.isEmpty()) continue;
                 QVERIFY2(translation.count('\\') <= source.count('\\'), qPrintable(name + ": " + translation));
+                // (no plus sign the source has not, and no English word kept without its first letter)
+                auto plain = [](QString s) {
+                    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&");
+                    return s.toStdString();
+                };
+                QVERIFY2(!garbledDraft(plain(source), plain(translation)), qPrintable(name + ": " + source + " -> " + translation));
                 if (!source.contains(QStringLiteral("(*"))) continue;
                 QVERIFY2(patternsOf(translation) == patternsOf(source), qPrintable(name + ": " + source + " -> " + translation));
                 for (QString filter : translation.split(QStringLiteral(";;"))) {
@@ -37883,6 +38004,37 @@ if ui["pressed"] == "add":
                 pa.fillRect(QRect(40, 0, 20, 20), QColor(0, 0, 255));
             }
             QVERIFY(compare("css.svg", g, ref));
+        }
+        // @charset and @import end at their semicolons (the rule after them read), and a crafted sheet (tens of
+        // thousands of rules, each tried on thousands of elements) is read to its first 2,000 rules, quickly.
+        {
+            const Effect g = imported("import.svg", "<style>@charset \"utf-8\"; @import url(other.css); rect { fill: #ff0000 }</style>"
+                                                    "<rect x=\"0\" y=\"0\" width=\"20\" height=\"20\"/>");
+            QImage ref = canvas();
+            {
+                QPainter pa(&ref);
+                pa.fillRect(QRect(0, 0, 20, 20), QColor(255, 0, 0));
+            }
+            QVERIFY(compare("import.svg", g, ref));
+            std::string big = "<style>";
+            for (int i = 0; i < 20000; ++i) big += ".c" + std::to_string(i % 97) + " .d rect.k" + std::to_string(i) + " { fill: #00ff00 }\n";
+            big += "</style><g class=\"c1 d\">";
+            for (int i = 0; i < 2000; ++i)
+                big += "<rect class=\"a b c d e f k" + std::to_string(i) + "\" x=\"0\" y=\"0\" width=\"1\" height=\"1\"/>";
+            big += "</g>";
+            {
+                std::ofstream f(path("big.svg"));
+                f << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\">" << big << "</svg>";
+            }
+            Effect e = makeEffect(p, "shape");
+            double w = 0, h = 0;
+            std::vector<std::string> notes;
+            std::string err;
+            QElapsedTimer took;
+            took.start();
+            QVERIFY2(importSvgShapes(path("big.svg"), e, w, h, &notes, &err), err.c_str());
+            QVERIFY2(took.elapsed() < 10000, qPrintable(QString::number(took.elapsed())));
+            QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("2000 rules") != std::string::npos; }));
         }
         // Text: read out (where it is, its font, size and colour) to be made titles, which a layer imported into a
         // sequence gets on the track above it, drawn where the SVG has it.

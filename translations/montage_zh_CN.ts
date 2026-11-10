@@ -9,11 +9,11 @@
     </message>
     <message>
         <source>%1 to %2</source>
-        <translation type="unfinished">+ %1 至 %2</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 in</source>
-        <translation type="unfinished">+ %1 英寸</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 out</source>
@@ -1674,7 +1674,7 @@
     </message>
     <message>
         <source>Evolution Speed (° per frame)</source>
-        <translation type="unfinished">进化速度 ( ++/ / / / / / / / / / / / /</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Expand</source>
@@ -4486,7 +4486,7 @@
     </message>
     <message>
         <source>Speed (° per frame)</source>
-        <translation type="unfinished">速度 ( ++/ // // // / / / / / / /</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Speed Variation</source>
@@ -6608,7 +6608,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Lip Sync redraws the speaker&apos;s mouth to say another track&apos;s sound (a dub) with MuseTalk 1.5 (MIT), whisper-tiny (Apache-2.0) and sd-vae-ft-mse (MIT), which run on this computer. Signed exports&apos; Content Credentials name it as AI-generated. It takes about 4 s a frame on four cores, so the monitors show it once the frames are rendered (Sequence › Render In to Out); exports always include it.</source>
-        <translation type="unfinished">Lip Sync 重新绘制扬声器的嘴,用MuseTalk 1. 5(MIT)、低语(Apache-2.0)和sd-vae-ft-mse(MIT)来表示音轨(a dub) ; 由导出内容证书名称命名为 AI 。 它需要四个核心的框, 显示器在框架完成后显示它( 序列 {{ ender in to Out); 出口总是包含它 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Lens Correction</source>
@@ -6776,7 +6776,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 GB</source>
-        <translation type="unfinished">+ %1 GB 键</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>%1 MB</source>
@@ -7690,7 +7690,7 @@ Download it now?</source>
     </message>
     <message>
         <source>OpenAI-compatible (OpenAI, Ollama, LM Studio, llama.cpp)</source>
-        <translation type="unfinished">OpenAI-兼容性( OpenAI, Ollama, LM 工作室, lama.cpp)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>OPENAI_API_KEY, or none for a local server</source>
@@ -8038,7 +8038,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Left %1, right %2</source>
-        <translation type="unfinished">左 + %1, 右 + %2</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>, clipped</source>
@@ -8737,7 +8737,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 sound(s), %2 sung, %3 with the speaker shown, %4 moved off text</source>
-        <translation type="unfinished">+ %1 声音, %2 唱, %3 显示扬声器, %4 移动到文本中</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
         <source>%n other caption track(s) hidden</source>
@@ -9230,7 +9230,7 @@ Download it now?</source>
     </message>
     <message>
         <source>video=Camera name</source>
-        <translation type="unfinished">视频+ 相机名称</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>omt://host:6400, or HOST (Name)</source>
@@ -9314,7 +9314,7 @@ Download it now?</source>
     </message>
     <message>
         <source>Options are name=value, apart by spaces</source>
-        <translation type="unfinished">选项为名称+++值,除以空格</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Stop</source>
@@ -9352,7 +9352,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 dropped, %2 repeated</source>
-        <translation type="unfinished">+ %1 下降, %2 重复</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>SDP Files</source>
@@ -9511,7 +9511,7 @@ Download it now?</source>
     <name>montage::CleanFeedWindow</name>
     <message>
         <source>Montage — Video Output</source>
-        <translation type="unfinished">调制 + 视频输出</translation>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
@@ -10167,7 +10167,7 @@ Download it now?</source>
     </message>
     <message>
         <source>%1 of %2 shots match; %3. Double-click a shot to go to it.</source>
-        <translation type="unfinished">+ %1 的 %2 相匹配; + %3. 双击一击即可进行它 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Apply Conform Fix</source>
@@ -11996,7 +11996,7 @@ written beside the export as &quot;&lt;name&gt; - &lt;track&gt;.wav&quot;. Toget
     </message>
     <message>
         <source>Render it later from the Render Queue panel, and keep editing</source>
-        <translation type="unfinished">稍后从 Render + ueue 面板上把它发出来, 并不断编辑</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>APV&apos;s quantiser (QP): lower values give higher quality and larger files</source>
@@ -12126,7 +12126,7 @@ The certificate must be issued by a certificate authority (not signed by itself)
     </message>
     <message>
         <source>Add chapter markers (Sequence &gt; Add Chapter Marker) to export chapters</source>
-        <translation type="unfinished">将章节标记( 序列 + + 章标记) 添加到导出章节</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No sequence is open.</source>
@@ -15352,7 +15352,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>; centre %1, %2</source>
-        <translation type="unfinished">; 中心 + %1, + %2</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>; squeeze %1</source>
@@ -15920,7 +15920,7 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Render Queue</source>
-        <translation type="unfinished">调试 + ueue</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Production</source>
@@ -20516,7 +20516,7 @@ Export the stereo bed anyway?</source>
     </message>
     <message>
         <source>A Digital Cinema Package of %1 for cinema servers and festivals (SMPTE, JPEG 2000, 24-bit sound), checked when it is done. Copy the folder it makes to a drive (ext2/3 or NTFS) for the cinema.</source>
-        <translation type="unfinished">用于电影服务器和电影节的 + %1 数字电影包 (SMPTE, JPEG 2000, 24 位音) , 完成时检查。 复制它给电影院的驱动器文件夹( ext2/3 或 NTFS ) 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Rating card</source>
@@ -21535,7 +21535,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>The cut&apos;s media is written as Media Composer keeps its own, MXF OP-Atom files in a new numbered folder of &quot;Avid MediaFiles/MXF&quot; on the drive, with an AAF linked to them: the sequence opens with its media, nothing to link or import. The picture is at the sequence&apos;s size and rate.</source>
-        <translation type="unfinished">剪切的媒体介质是当媒体撰写器在驱动器上保存自己的 MXF OP-Atom 文件时, 在一个新编号的文件夹“ vid MediaFiles/ MXF ” 中, 并有 AAF 链接: 序列会随着媒体打开, 没有任何链接或导入。 图片是按序列大小和速率 。</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Bake grades, effects and titles in (each clip a file of its own)</source>
@@ -28130,7 +28130,7 @@ Neither did I.</source>
     <name>montage::SequenceSettingsDialog</name>
     <message>
         <source>3840 × 2160  UHD</source>
-        <translation type="unfinished">284 + 2160 UHD</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>2560 × 1440  QHD</source>
@@ -28142,15 +28142,15 @@ Neither did I.</source>
     </message>
     <message>
         <source>1280 × 720  HD</source>
-        <translation type="unfinished">1280 + 720 氢氯氟烃</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1080 × 1920  Vertical</source>
-        <translation type="unfinished">1080 + 1920 垂直</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>1080 × 1080  Square</source>
-        <translation type="unfinished">1080 + 1080 广场</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Sequence Settings</source>
@@ -28879,7 +28879,7 @@ Sounds Like: what it sounds like (&quot;a heavy wooden door creaking&quot;), by 
     </message>
     <message>
         <source>%1 to %2</source>
-        <translation type="unfinished">+ %1 至 %2</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>the top</source>
@@ -29847,7 +29847,7 @@ Right-click: width, LFE, height and audio object.</source>
     </message>
     <message>
         <source>%1, %2 download</source>
-        <translation type="unfinished">+ %1, %2 下载</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Model:</source>
@@ -30936,7 +30936,7 @@ so the jump in the picture morphs across instead of cutting</source>
     </message>
     <message>
         <source>%1 (%2 % translated)</source>
-        <translation type="unfinished">+ %1 (%2 _ Q )</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>Test Language (Finds Untranslated Text)</source>

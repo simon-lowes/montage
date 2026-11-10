@@ -1308,8 +1308,10 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
     }
     if (lg->copies_.empty()) return none("no whole GOP of a source is untouched");
 
-    // The decode delay: the most any picture is decoded ahead of where it is shown (the encoders': their B-pictures).
-    lg->depth_ = codec == kMpeg2 ? std::max(0, m->max_b_frames) : codec == kAv1 ? 0 : 3;
+    // The decode delay: the most any picture is decoded ahead of where it is shown, the footage's or the joins'. The
+    // joins' B-pictures reorder no deeper than the footage does (none for footage without, unnested for one deep): an
+    // output delay beyond what the footage's own parameter sets allow would break its output timing.
+    int footage = 0;
     for (const Copy& c : lg->copies_) {
         const Run& r = lg->runs_[size_t(c.run)];
         const Gop& g = r.gops[c.gop];
@@ -1317,10 +1319,14 @@ std::unique_ptr<LongGopCopier> LongGopCopier::plan(const Project& p, const Seque
         int64_t i = 0;
         for (size_t k = g.begin; k < g.end; ++k) {
             if (c.dropRasl && (r.packets[k].kind & kRasl)) continue;
-            lg->depth_ = int(std::max<int64_t>(lg->depth_, i - (r.packets[k].frame - first)));
+            footage = int(std::max<int64_t>(footage, i - (r.packets[k].frame - first)));
             ++i;
         }
     }
+    lg->joinBframes_ = footage == 0 ? 0 : 3;
+    lg->joinPyramid_ = footage >= 2;
+    const int joins = codec == kMpeg2 ? std::max(0, m->max_b_frames) : codec == kAv1 ? 0 : footage == 0 ? 0 : footage == 1 ? 1 : 3;
+    lg->depth_ = std::max(joins, footage);
     // H.264: the encoder's parameter sets under an id no source's has.
     if (codec == kH264) {
         for (int id = 0; id < 32; ++id)
@@ -1616,17 +1622,18 @@ AVCodecContext* LongGopCopier::openEncoder(int64_t bitrate, std::string* error) 
     if (codec_ == kH264) {
         // Closed GOPs (x264's own), the source's profile and level, its parameter sets under their own id, kept out of
         // the pictures (they go in the decoder configuration).
-        c->max_b_frames = 3;
+        c->max_b_frames = joinBframes_;
         c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         if (const char* profile = x264Profile(profile_)) av_dict_set(&opts, "profile", profile, 0);
         if (level_ > 0) c->level = level_;
         if (!enc_.preset.empty()) av_dict_set(&opts, "preset", enc_.preset.c_str(), 0);
-        av_dict_set(&opts, "x264-params", ("sps-id=" + std::to_string(spsId_)).c_str(), 0);
+        av_dict_set(&opts, "x264-params", ("sps-id=" + std::to_string(spsId_) + (joinPyramid_ ? "" : ":b-pyramid=none")).c_str(), 0);
     } else if (codec_ == kHevc) {
-        c->max_b_frames = 3;
+        c->max_b_frames = joinBframes_;
         std::string params = enc_.x265Params.empty() ? std::string("log-level=error") : enc_.x265Params;
         // (closed GOPs; no settings text with each keyframe's repeated headers)
-        params += ":open-gop=0:repeat-headers=1:info=0:bframes=3:keyint=" + std::to_string(gop_);
+        params += ":open-gop=0:repeat-headers=1:info=0:bframes=" + std::to_string(joinBframes_) + (joinPyramid_ ? "" : ":b-pyramid=0") +
+                  ":keyint=" + std::to_string(gop_);
         if (level_ > 0) {
             char lv[32];
             std::snprintf(lv, sizeof lv, ":level-idc=%g", level_ / 30.0);

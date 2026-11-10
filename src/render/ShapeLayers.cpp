@@ -855,10 +855,15 @@ struct SvgNode {
     std::vector<SvgNode> children;
     QString text;
     std::vector<int> childAt;  // where in `text` each child came (for text with tspans in it)
+    QStringList classes;       // its class attribute's names (split once, for the style sheets)
 };
 
 bool readSvgTree(QXmlStreamReader& xr, SvgNode& node, int depth = 0) {
     for (const QXmlStreamAttribute& a : xr.attributes()) node.attrs[a.qualifiedName().toString()] = a.value().toString();
+    if (auto it = node.attrs.find("class"); it != node.attrs.end()) {
+        static const QRegularExpression space(QStringLiteral(R"(\s+)"));
+        node.classes = it->second.split(space, Qt::SkipEmptyParts);
+    }
     while (!xr.atEnd()) {
         xr.readNext();
         if (xr.isStartElement()) {
@@ -908,6 +913,11 @@ struct CssRule {
     Style decls;
 };
 
+// (a drawing's style sheets read to this many rules, each of this many compound selectors at most: every rule is
+// tried on every element, so a crafted sheet cannot hold the import up)
+constexpr size_t kMaxCssRules = 2000;
+constexpr qsizetype kMaxCssCompounds = 16;
+
 std::vector<CssRule> parseCss(QString text, int& order) {
     std::vector<CssRule> out;
     static const QRegularExpression comments(QStringLiteral(R"(/\*.*?\*/)"), QRegularExpression::DotMatchesEverythingOption);
@@ -915,9 +925,18 @@ std::vector<CssRule> parseCss(QString text, int& order) {
     static const QRegularExpression compound(QStringLiteral(R"(^([A-Za-z_][\w-]*|\*)?((?:[.#][\w-]+)*)$)"));
     static const QRegularExpression part(QStringLiteral(R"([.#][\w-]+)"));
     qsizetype at = 0;
-    while (at < text.size()) {
+    while (at < text.size() && out.size() <= kMaxCssRules) {  // (one past: the importer notes what was left)
         const qsizetype open = text.indexOf('{', at);
         if (open < 0) break;
+        // (a statement at-rule, @charset or @import: to its semicolon, never into the rule after it)
+        static const QRegularExpression nonSpace(QStringLiteral(R"(\S)"));
+        if (const qsizetype from = text.indexOf(nonSpace, at); from >= 0 && from < open && text[from] == '@') {
+            const qsizetype semi = text.indexOf(';', from);
+            if (semi >= 0 && semi < open) {
+                at = semi + 1;
+                continue;
+            }
+        }
         // (to its matching brace: an @media or @supports block holds rules of its own)
         qsizetype close = open;
         for (int depth = 0; ++close < text.size();) {
@@ -935,7 +954,9 @@ std::vector<CssRule> parseCss(QString text, int& order) {
             sel.replace(QLatin1String(">"), QLatin1String(" > "));
             CssRule r;
             bool ok = !sel.isEmpty(), nextChild = false;
-            for (const QString& tok : sel.split(' ', Qt::SkipEmptyParts)) {
+            const QStringList toks = sel.split(' ', Qt::SkipEmptyParts);
+            if (toks.size() > kMaxCssCompounds) continue;
+            for (const QString& tok : toks) {
                 if (tok == ">") {
                     nextChild = true;
                     continue;
@@ -969,12 +990,8 @@ std::vector<CssRule> parseCss(QString text, int& order) {
 bool compoundMatches(const CssCompound& c, const SvgNode& n) {
     if (!c.type.isEmpty() && c.type != n.name) return false;
     if (!c.id.isEmpty() && (!n.attrs.count("id") || n.attrs.at("id") != c.id)) return false;
-    if (!c.classes.isEmpty()) {
-        const QStringList have = n.attrs.count("class") ? n.attrs.at("class").split(QRegularExpression(QStringLiteral(R"(\s+)")), Qt::SkipEmptyParts)
-                                                         : QStringList();
-        for (const QString& k : c.classes)
-            if (!have.contains(k)) return false;
-    }
+    for (const QString& k : c.classes)
+        if (!n.classes.contains(k)) return false;
     return true;
 }
 
@@ -1228,6 +1245,10 @@ public:
             const QString type = n.attrs.count("type") ? n.attrs.at("type").trimmed() : QString();
             if (type.isEmpty() || type == "text/css") {
                 std::vector<CssRule> rules = parseCss(n.text, cssOrder_);
+                if (sheet_.size() + rules.size() > kMaxCssRules) {
+                    note("Style sheets past their first " + std::to_string(kMaxCssRules) + " rules (not read)");
+                    rules.resize(kMaxCssRules - std::min(kMaxCssRules, sheet_.size()));
+                }
                 sheet_.insert(sheet_.end(), rules.begin(), rules.end());
             }
         }

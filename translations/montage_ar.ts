@@ -8686,7 +8686,7 @@ Download it now?</source>
     </message>
     <message>
         <source>This build of Montage cannot dub: it was built without ONNX Runtime.</source>
-        <translation type="unfinished">هذا بناء من لا يمكن أن يُدوّر هو هو بدون أون إكس untime.</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>There is no translation from %1 to English</source>
@@ -28064,7 +28064,7 @@ Adaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, 
     </message>
     <message>
         <source>; with FFmpeg: ffplay -fflags nobuffer &quot;%1?passphrase=%2&quot;</source>
-        <translation type="unfinished">; Fmpeg; مع Fpplay - flags novover &quot;%1? expus refraf = %2&quot;</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>. Notes come back as markers over TCP port %1.</source>

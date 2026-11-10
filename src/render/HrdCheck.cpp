@@ -783,6 +783,8 @@ bool readAccessUnit(int codec, const uint8_t* d, size_t n, int lengthSize, std::
                 if (p.id >= 0) pps[p.id] = p;
             } else if (type == 6) {
                 seis.push_back(&u);
+            } else if (type == 12) {
+                au.vclBits += int(u.size() * 8);  // (filler data: counted in a Type I stream, as its VCL units are)
             } else if (type >= 1 && type <= 5) {
                 au.vclBits += int(u.size() * 8);
                 if (firstSlice) {
@@ -807,6 +809,8 @@ bool readAccessUnit(int codec, const uint8_t* d, size_t n, int lengthSize, std::
                 if (p.valid) pps[p.id] = p;
             } else if (type == 39) {
                 seis.push_back(&u);
+            } else if (type == 38) {
+                au.vclBits += int(u.size() * 8);  // (filler data: counted in a Type I stream, as its VCL units are)
             } else if (type <= 31) {
                 au.vclBits += int(u.size() * 8);
                 if (firstSlice && u.size() > 2) {
@@ -1082,7 +1086,7 @@ void checkNal(int codec, AVFormatContext* fmt, int v, HrdReport& r, const std::a
     r.cbr = c.cbr;
     if (p->subPic) r.note = "sub-picture parameters are not modelled: checked by access unit";
     if (p == &model.vcl)
-        for (size_t k = 0; k < units.size(); ++k) bits[k] = units[k].au.vclBits;  // (Type I: VCL units; filler not counted apart)
+        for (size_t k = 0; k < units.size(); ++k) bits[k] = units[k].au.vclBits;  // (Type I: the VCL and filler data units)
     // Start at the first buffering period.
     size_t start = 0;
     while (start < units.size() && !units[start].au.bp.present) ++start;
@@ -1412,7 +1416,10 @@ void HrdSplicer::pad(Held& h, int64_t bytes) {
     // Filler data NAL units (H.264 type 12, HEVC type 38) after the picture's own: start code, header, 0xFF..., 0x80.
     const int hb = headerBytes(codec_);
     const int64_t overhead = 4 + hb + 1;
-    int64_t payload = std::max<int64_t>(0, bytes - overhead);
+    // (fewer bytes than a filler unit's own: none, a few bytes short, rather than a whole unit's more than asked, which
+    // would overflow the buffer, or arrive after the picture's removal)
+    if (bytes < overhead) return;
+    int64_t payload = bytes - overhead;
     Nals nals = splitNals(h.au.data(), h.au.size(), lengthSize_);
     int tid = 1;
     for (const auto& u : nals)
@@ -1420,7 +1427,7 @@ void HrdSplicer::pad(Held& h, int64_t bytes) {
             tid = u[1] & 7;
             break;
         }
-    const int64_t most = lengthSize_ == 1 ? 250 : lengthSize_ == 2 ? 65000 : int64_t(1) << 26;
+    const int64_t most = lengthSize_ == 1 ? 250 : lengthSize_ == 2 ? 65000 : lengthSize_ == 3 ? (int64_t(1) << 24) - 8 : int64_t(1) << 26;
     while (payload >= 0) {
         const int64_t take = std::min(payload, most);
         std::vector<uint8_t> f;

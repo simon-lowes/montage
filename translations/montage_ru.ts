@@ -12991,7 +12991,7 @@ Projects it was inserted into play its pictures from there, so they would need r
     </message>
     <message>
         <source>HDR viewing is available on macOS (EDR displays) and Windows (with HDR switched on)</source>
-        <translation type="unfinished">Ознакомление с докладами о развитии человеческого потенциала можно получить на acOS (показательства ЭДР) и Windows (с включением ДРЧ)</translation>
+        <translation type="unfinished"></translation>
     </message>
     <message>
         <source>No graphics device for HDR viewing</source>

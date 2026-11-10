@@ -152,7 +152,7 @@ struct AccessUnit {
     bool irap = false;  // H.264 IDR; HEVC IRAP
     bool idr = false;
     int64_t bits = 0;   // counted as a byte stream
-    int vclBits = 0;
+    int vclBits = 0;    // its VCL and filler data NAL units' (what a VCL HRD, Type I, counts)
 };
 bool readAccessUnit(int codec, const uint8_t* d, size_t n, int lengthSize, std::map<int, Sps>& sps, std::map<int, Pps>& pps,
                     AccessUnit& au, std::map<int, Sps>* vpsHrd = nullptr);

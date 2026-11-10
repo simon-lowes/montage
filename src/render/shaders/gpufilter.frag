@@ -1206,7 +1206,7 @@ void main() {
             const float streak = exp(-(dy / (0.006 * R)) * (dy / (0.006 * R))) * exp(-abs(dx) / (0.8 * R));
             light += vec3(0.25, 0.45, 0.9) * streak;
         } else {
-            const float a = atan(dy, dx);
+            const float a = dx == 0.0 && dy == 0.0 ? 0.0 : atan(dy, dx);  // (undefined at the light itself: 0, as on the CPU)
             const float ray = pow(abs(cos(float(spokes) * 0.5 * a)), lens == 0 ? 60.0 : 120.0) * exp(-d / (lens == 0 ? 0.25 : 0.35));
             light += 0.5 * ray;
         }
@@ -1257,7 +1257,9 @@ void main() {
                     sat = 1.0 + (sat - 1.0) * w;
                 }
                 const float u = sat * f, start = p[1].z;
-                const float target = u <= start ? u : start + (1.0 - start) * tanh((u - start) / (1.0 - start));
+                // (tanh's argument held to 10, where it is 1 to a float: some drivers compute it as (e^2x - 1) / (e^2x + 1),
+                // NaN once e^2x overflows, as near-black, slightly negative pixels would make it)
+                const float target = u <= start ? u : start + (1.0 - start) * tanh(min((u - start) / (1.0 - start), 10.0));
                 b = Y + (b - Y) * (target / f);
                 rgb = mat3Rows(6, b);
             }

@@ -28,6 +28,11 @@ bool draftInterfaceTranslation(const std::string& ts, const std::function<bool(c
 // How far a .ts file is translated.
 InterfaceDraftStats interfaceTranslationStatus(const std::string& ts);
 
+// Whether a model's draft of `source` is garbled, so it is not kept: an "<unk>" for a word it had no piece for,
+// backslashes or plus signs the source has not (written for words it could not place), or, in a language not written in
+// Latin letters, an English word kept with its first letter lost ("Render Queue" as "+ ueue").
+bool garbledDraft(const std::string& source, const std::string& draft);
+
 // The texts the engine gives the interface to show: effects' names, groups, settings and choices, ready-made titles,
 // colour spaces, export presets and their descriptions, OpenEXR compressions, ADR cue states. Sorted, each once. The
 // interface translates them under the name "Engine" (app/Language.h engine()); app/EngineTexts.cpp lists them for

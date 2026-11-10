@@ -262,6 +262,8 @@ bool readMp4Track(const std::string& file, Mp4Track& t, std::string* error) {
         for (uint32_t r = 0; r < runs && sample < count; ++r) {
             const uint32_t first = rd32(sc + 8 + 12 * size_t(r)), per = rd32(sc + 12 + 12 * size_t(r));
             const uint32_t last = r + 1 < runs ? rd32(sc + 8 + 12 * size_t(r + 1)) : uint32_t(chunks.size()) + 1;
+            // (each run's chunks after the one before's: so the chunks are gone through once, however the table reads)
+            if (last <= first) return fail(error, "The sample table of " + file + " does not add up");
             for (uint32_t c = first; c < last && c >= 1 && c <= chunks.size() && sample < count; ++c) {
                 qint64 at = chunks[c - 1];
                 for (uint32_t k = 0; k < per && sample < count; ++k, ++sample) {
@@ -271,6 +273,10 @@ bool readMp4Track(const std::string& file, Mp4Track& t, std::string* error) {
             }
         }
         if (t.offsets.size() != count) return fail(error, "The sample table of " + file + " does not add up");
+        // (every sample inside the file: a size read from the table is what gets allocated to read it)
+        for (uint32_t i = 0; i < count; ++i)
+            if (t.offsets[i] < 0 || t.offsets[i] > f.size() || qint64(t.sizes[i]) > f.size() - t.offsets[i])
+                return fail(error, "The samples of " + file + " are past its end");
         t.sync.assign(count, stss.size() < 8);
         if (stss.size() >= 8) {
             const auto* s = reinterpret_cast<const uint8_t*>(stss.constData());
@@ -313,8 +319,10 @@ struct Stream {
 bool scanObus(const std::vector<uint8_t>& data, qint64 at, Stream& s, std::string* error, const std::string& file) {
     std::vector<ObuAt> obus;
     if (!splitObus(data.data(), data.size(), obus)) return fail(error, "The OBUs of " + file + " are cut off");
+    bool framed = false;  // (a frame OBU since the last temporal delimiter: noted as it goes, not looked back for)
     for (size_t i = 0; i < obus.size(); ++i) {
         const ObuAt& o = obus[i];
+        if (o.type == kObuTemporalDelimiter) framed = false;
         if (o.type == kObuTemporalDelimiter || s.units.empty()) {
             Unit u;
             u.at = at + qint64(o.at);
@@ -330,10 +338,8 @@ bool scanObus(const std::vector<uint8_t>& data, qint64 at, Stream& s, std::strin
         }
         // (sync: its first frame is a closed-loop key frame; temporal units are looked at once, at their first frame)
         if (codesFrame(o.type)) {
-            bool first = true;
-            for (size_t k = i; k-- > 0 && obus[k].type != kObuTemporalDelimiter;)
-                if (codesFrame(obus[k].type)) first = false;
-            if (first) u.sync = o.type == kObuClosedLoopKey;
+            if (!framed) u.sync = o.type == kObuClosedLoopKey;
+            framed = true;
         }
     }
     return true;

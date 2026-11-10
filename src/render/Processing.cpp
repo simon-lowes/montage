@@ -4428,6 +4428,9 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                 rows3(6, cs.fromBoundary);
                 for (int k = 0; k < 3; ++k) fp.params[32 + k] = float(cs.luma[k]);
             } else if (ty == "hdr_palette") {
+                // (its table a transfer table wide, 4097 texels: on a GPU that takes no texture that wide, the CPU's,
+                // not tried on the GPU each frame first)
+                if (const int most = gpu::maxTextureSize(); most > 0 && TransferTables::kDecode + 1 > most) return false;
                 const HdrPaletteSetup h = hdrPaletteSetup(e, t, space);
                 fp.mode = 15;
                 fp.params[1] = h.toWhite, fp.params[2] = h.blackOffset, fp.params[3] = h.mix;
@@ -4440,6 +4443,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
                     fp.table[2 * row + size_t(i) * 4] = h.bal[2][size_t(i)];
                 }
             } else if (ty == "color_slice") {
+                if (const int most = gpu::maxTextureSize(); most > 0 && TransferTables::kDecode + 1 > most) return false;  // (as above)
                 const ColorSliceSetup cs = colorSliceSetup(e, t);
                 if (cs.any) {
                     fp.mode = 17;

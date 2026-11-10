@@ -8970,6 +8970,26 @@ colorspaces:
                  qPrintable(QStringLiteral("%1 %2").arg(dim.sharpness).arg(sharp.sharpness)));
         const std::vector<float> grey(size_t(W) * H, 0.4f);
         QVERIFY(!measureFocus(grey.data(), W, H).textured);
+        // Dark and grainy (a tenth of the light, the grain over it whatever the focus): the sharp frame still scores
+        // over one 2 px out of focus, at every grain from none to heavy.
+        for (double grain : {0.0, 0.004, 0.01, 0.02}) {
+            uint32_t seed = 777;
+            auto gauss = [&] {
+                auto u = [&] {
+                    seed = seed * 1664525u + 1013904223u;
+                    return (double(seed >> 8) + 0.5) / double(1u << 24);
+                };
+                const double a = u(), b = u();
+                return std::sqrt(-2 * std::log(a)) * std::cos(2 * M_PI * b);
+            };
+            auto grained = [&](std::vector<float> v) {
+                for (float& x : v) x = float(0.02 + 0.1 * x + grain * gauss());
+                return v;
+            };
+            const std::vector<float> a = grained(chart), b = grained(blurred(chart, W, H, 2));
+            const double sa = measureFocus(a.data(), W, H).sharpness, sb = measureFocus(b.data(), W, H).sharpness;
+            QVERIFY2(sa > 1.2 * sb, qPrintable(QStringLiteral("grain %1: sharp %2, soft %3").arg(grain).arg(sa).arg(sb)));
+        }
         // Motion blur: detail lost one way, and which way.
         for (bool across : {true, false}) {
             const std::vector<float> smear = blurred(chart, W, H, 0, 15, across);
@@ -11128,7 +11148,7 @@ colorspaces:
             for (int n = 1; n <= counts[c]; ++n) {
                 Screen sc;
                 sc.name = std::to_string(n);
-                QVERIFY(dcp::makeCertificateChain("Server " + std::to_string(c) + std::to_string(n), sc.server, &err));
+                QVERIFY(dcp::makeCertificateChain("Server " + std::to_string(c) + std::to_string(n), sc.server, &err, "SM"));
                 QVERIFY(dcp::makeCertificateChain("Projector " + std::to_string(c) + std::to_string(n), sc.projector, &err));
                 cinemas[size_t(c)].screens.push_back(sc);
             }
@@ -11202,15 +11222,77 @@ colorspaces:
                 QCOMPARE(sc.devices[0].thumbprint, thumb(cinemas[c].screens[n].projector.certificates.back()));
             }
             QVERIFY2(f.notes.empty(), f.notes.empty() ? "" : f.notes.front().c_str());
-            mergeFacility(list, std::move(f));
+            // Taken only from trusted roots: none are at first (a root is not trusted for being in the FLM), so the
+            // FLM is refused and its roots named; once they are trusted, it is taken.
+            const std::string trustFile = dir.filePath("trust/facilities.json").toStdString();
+            std::vector<std::string> trusted, untrusted;
+            QVERIFY(loadTrustedRoots(trusted, &err, trustFile) && trusted.empty());
+            QVERIFY(!takeFlm(list, f, trusted, &err, &untrusted) && err.find("not trusted") != std::string::npos);
+            QCOMPARE(untrusted.size(), cinemas[c].screens.size() * 2);  // (each server's and projector's own root)
+            QVERIFY(err.find(thumb(cinemas[c].screens[0].server.certificates.front())) != std::string::npos);
+            QVERIFY(!trustRoots({cinemas[c].screens[0].server.certificates.back()}, &err, trustFile));  // (a leaf is no root)
+            QVERIFY2(trustRoots(untrusted, &err, trustFile), err.c_str());
+            QVERIFY(loadTrustedRoots(trusted, &err, trustFile) && trusted.size() == untrusted.size());
+            const size_t before = list.size();
+            QVERIFY2(takeFlm(list, std::move(f), trusted, &err), err.c_str());
+            QCOMPARE(list.size(), before + 1);
+            QVERIFY(QFile::remove(QString::fromStdString(trustedRootsFile(trustFile))));
         }
         QCOMPARE(list.size(), size_t(3));
-        // Read again (a newer FLM of a cinema): in place of the old.
+        // Read again (a newer FLM of a cinema): in place of the old, its certificates already trusted.
         {
             Facility again;
             QVERIFY(readFlmFile(flms[1].toStdString(), again, &err));
+            std::vector<std::string> changes;
+            QVERIFY2(takeFlm(list, again, {}, &err, nullptr, &changes), err.c_str());
+            QVERIFY(changes.empty());
+            QCOMPARE(list.size(), size_t(3));
             QCOMPARE(mergeFacility(list, again), size_t(1));
             QCOMPARE(list.size(), size_t(3));
+        }
+        // A forged FLM of a known cinema (its id, another server for screen 1 from a root of its own): refused, the
+        // cinema's server kept; from a root the user trusts, taken, the change said.
+        {
+            QFile in(flms[1]);
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            std::string forged = in.readAll().toStdString();
+            dcp::CertificateChain other;
+            QVERIFY(dcp::makeCertificateChain("Elsewhere", other, &err, "SM"));
+            for (size_t i = 0; i < 3; ++i) {
+                const std::string was = body(cinemas[1].screens[0].server.certificates[i]);
+                const size_t at = forged.find(was);
+                QVERIFY(at != std::string::npos);
+                forged.replace(at, was.size(), body(other.certificates[i]));
+            }
+            Facility f;
+            QVERIFY2(readFlm(forged, f, &err), err.c_str());  // (the chain itself checks)
+            std::vector<std::string> untrusted, changes;
+            QVERIFY(!takeFlm(list, f, {}, &err, &untrusted) && untrusted == std::vector<std::string>{other.certificates.front()});
+            QCOMPARE(list[1].screens[0].server.thumbprint, thumb(cinemas[1].screens[0].server.certificates.back()));
+            std::vector<Facility> copy = list;
+            QVERIFY(takeFlm(copy, f, {other.certificates.front()}, &err, nullptr, &changes));
+            QVERIFY(changes.size() == 1 && changes[0].find("screen 1") != std::string::npos && changes[0].find("changed") != std::string::npos);
+        }
+        // A security manager known by the chain whose leaf names it one: a link encryptor's chain listed first is
+        // passed over; a server with only another device's certificate is refused.
+        {
+            QFile in(flms[0]);
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            const std::string original = in.readAll().toStdString();
+            dcp::CertificateChain encryptor;
+            QVERIFY(dcp::makeCertificateChain("Encryptor", encryptor, &err, "LE"));
+            const std::string serverKeys = keyInfo(cinemas[0].screens[0].server, false), le = keyInfo(encryptor, false);
+            std::string two = original;
+            const size_t at = two.find(serverKeys);
+            QVERIFY(at != std::string::npos);
+            two.replace(at, serverKeys.size(), le.substr(0, le.size() - std::string("</KeyInfoList>").size()) +
+                                                   serverKeys.substr(std::string("<KeyInfoList>").size()));
+            Facility f;
+            QVERIFY2(readFlm(two, f, &err), err.c_str());
+            QCOMPARE(f.screens[0].server.thumbprint, thumb(cinemas[0].screens[0].server.certificates.back()));
+            std::string only = original;
+            only.replace(only.find(serverKeys), serverKeys.size(), le);
+            QVERIFY(!readFlm(only, f, &err) && err.find("not a security manager") != std::string::npos);
         }
         // (a base64 letter at or before `at` changed: a different certificate of the same length)
         auto flip = [](std::string& text, size_t at) {
@@ -11373,7 +11455,7 @@ colorspaces:
         // takes the other devices; two: they are kept apart (the FLM does not say whose they are).
         dcp::CertificateChain facility, extraServer;
         QVERIFY(dcp::makeCertificateChain("Lakeside", facility, &err));
-        QVERIFY(dcp::makeCertificateChain("Lakeside Two", extraServer, &err));
+        QVERIFY(dcp::makeCertificateChain("Lakeside Two", extraServer, &err, "SM"));
         auto etmKeyInfo = [&](const dcp::CertificateChain& chain) {
             std::string x = "<ds:KeyInfo>";
             for (auto it = chain.certificates.rbegin(); it != chain.certificates.rend(); ++it)
@@ -11406,6 +11488,38 @@ colorspaces:
         QVERIFY(lake.screens[0].name == "Screen One" && lake.screens[0].server.thumbprint == thumb(cinemas[0].screens[0].server.certificates.back()));
         QVERIFY(lake.screens[0].devices.size() == 1 && lake.screens[0].devices[0].type == "PR" && lake.otherDevices.empty());
         QVERIFY(QTimeZone(QByteArray::fromStdString(lake.timeZone)).isValid());
+        // Its signer's root must be trusted too (the devices' alone are not enough), and is kept with the cinema.
+        {
+            QCOMPARE(lake.signer, facility.certificates);
+            const std::vector<std::string> devices{cinemas[0].screens[0].server.certificates.front(), cinemas[0].screens[0].projector.certificates.front()};
+            std::vector<Facility> none;
+            std::vector<std::string> untrusted;
+            QVERIFY(!takeFlm(none, lake, devices, &err, &untrusted) && untrusted == std::vector<std::string>{facility.certificates.front()});
+            std::vector<std::string> all = devices;
+            all.push_back(facility.certificates.front());
+            QVERIFY2(takeFlm(none, lake, all, &err), err.c_str());
+            const std::string lakeFile = dir.filePath("lake.json").toStdString();
+            QVERIFY(saveFacilities(none, &err, lakeFile) && loadFacilities(none, &err, lakeFile) && none[0].signer == facility.certificates);
+            // Signed again by another certificate: said.
+            dcp::CertificateChain otherSigner;
+            QVERIFY(dcp::makeCertificateChain("Not Lakeside", otherSigner, &err));
+            std::string resigned = etm(false);
+            QVERIFY(dcp::signXml(resigned, otherSigner, &err));
+            Facility again;
+            QVERIFY(readFlm(resigned, again, &err));
+            std::vector<std::string> changes;
+            all.push_back(otherSigner.certificates.front());
+            QVERIFY(takeFlm(none, again, all, &err, nullptr, &changes) && changes.size() == 1 && changes[0].find("signed by another") != std::string::npos);
+        }
+        // A second ds:Signature (whose references would be read with the first's) is refused.
+        {
+            std::string twice = old;
+            const size_t sig = twice.find("<dsig:Signature");
+            const size_t end = twice.find("</dsig:Signature>") + std::string("</dsig:Signature>").size();
+            QVERIFY(sig != std::string::npos && end > sig);
+            twice.insert(end, twice.substr(sig, end - sig));
+            QVERIFY(!dcp::verifyXmlSignature(twice, &err) && err.find("more than one signature") != std::string::npos);
+        }
         std::string changedFlm = old;
         changedFlm.replace(changedFlm.find("Lakeside Screens"), 16, "Lakeside Cinemas");
         QVERIFY(!readFlm(changedFlm, lake, &err) && err.find("signature") != std::string::npos);
@@ -16638,6 +16752,23 @@ colorspaces:
             QCOMPARE(int(out.size()), 300 + 100 - 16);
             for (size_t k = 300; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(20016 + k - 300));
         }
+        // The same with twelve strays trickling on leg B (more than the eight counted at a time): the sender that
+        // starts there is never the one let go, so it is still taken after a window.
+        {
+            st::PathMerger merger(false, 16);
+            std::vector<std::vector<uint8_t>> out;
+            for (uint32_t i = 0; i < 300; ++i) {
+                if (i % 4 == 1) merger.push(sent(9000 + i, 500 + (i / 4) % 12), 1, out);
+                merger.push(sent(100 + i, 6), 0, out);
+            }
+            QCOMPARE(int(out.size()), 300);
+            for (uint32_t i = 0; i < 100; ++i) {
+                if (i % 2 == 1) merger.push(sent(9500 + i, 500 + (i / 2) % 12), 1, out);
+                merger.push(sent(20000 + i, 60), 1, out);
+            }
+            QCOMPARE(int(out.size()), 300 + 100 - 16);
+            for (size_t k = 300; k < out.size(); ++k) QCOMPARE(seqOf(out[k], false), uint32_t(20016 + k - 300));
+        }
         // ST 2022-7 legs from senders with SSRCs of their own: merged by number, each leg's losses filled by the other;
         // and when both legs' senders start again with new SSRCs, the count starts again once, nothing given out twice.
         {
@@ -17387,6 +17518,37 @@ colorspaces:
         QCOMPARE(announced.registries()[0].url, QStringLiteral("http://127.0.0.1:18235"));
         QCOMPARE(announced.registries()[0].priority, 10);
         announced.stop();
+    }
+
+    // Nightly 10 Nov: a multicast DNS name is held to 255 octets however its compression pointers make it (a chain of
+    // pointers each re-reading a long run of labels made one datagram cost ~1.6M strings on the GUI thread).
+    void mdnsNamesBounded() {
+        QByteArray m(12, '\0');
+        // "a.b.local" at 12.
+        for (const char* l : {"a", "b", "local"}) m.append(char(std::strlen(l))).append(l);
+        m.append('\0');
+        int at = 12;
+        QString name;
+        QVERIFY(montage::nmos::readDnsName(m, at, name) && name == "a.b.local" && at == m.size());
+        // Four labels of 63 (256 octets with their lengths and the root): one too many.
+        QByteArray longName(12, '\0');
+        for (int i = 0; i < 4; ++i) longName.append(char(63)).append(QByteArray(63, 'x'));
+        longName.append('\0');
+        at = 12;
+        QVERIFY(!montage::nmos::readDnsName(longName, at, name));
+        // Labels then a pointer back to their start: a loop that would grow the name with each jump.
+        QByteArray loop(12, '\0');
+        loop.append(char(63)).append(QByteArray(63, 'y')).append(char(0xC0)).append(char(12));
+        at = 12;
+        QVERIFY(!montage::nmos::readDnsName(loop, at, name));
+        // A name of 32 one-letter labels each reached by its own pointer, 64 octets: still read.
+        QByteArray chain(12, '\0');
+        const int start = chain.size();
+        for (int i = 0; i < 31; ++i) chain.append(char(1)).append('z').append(char(0xC0)).append(char(start + 4 * (i + 1)));
+        chain.append(char(1)).append('z').append('\0');
+        at = start;
+        QVERIFY(montage::nmos::readDnsName(chain, at, name));
+        QCOMPARE(name.count('z'), 32);
     }
 
     // The NMOS Node: its IS-04 resources registered with a registry in order and kept there by heartbeats, and IS-05
@@ -19607,6 +19769,65 @@ colorspaces:
         QCOMPARE(review->receivers(), 1);
         // A wrong passphrase to the endpoint is refused too.
         QCOMPARE(js("fetch('/whep', { method: 'POST', headers: { Authorization: 'Bearer wrong', 'Content-Type': 'application/sdp' }, body: 'v=0' }).then(r => r.status)").toInt(), 401);
+    }
+
+    // The simulcast ladder's steering, report by report: a link that always loses a little still climbs back, and a
+    // try whose loss comes late (a link that buffers a long way) still counts as failed.
+    void rungSteering() {
+        using montage::output::RungSteering;
+        using namespace std::chrono_literals;
+        auto never = [](int) { return false; };
+        auto always = [](int) { return true; };
+        const auto t0 = RungSteering::Clock::now();
+        {
+            // Down to the smallest of three by a burst, then 5% lost steadily, a report a second for two minutes.
+            RungSteering s;
+            s.movedAt = t0 - 10s;
+            int rung = s.report(0, 2, 0.30, t0, t0, always, always);
+            QCOMPARE(rung, 2);
+            s.switched(t0);
+            int climbs = 0;
+            for (int k = 1; k <= 120; ++k) {
+                const auto now = t0 + std::chrono::seconds(k);
+                const int to = s.report(rung, 2, 0.05, now, now, never, always);
+                if (to < rung) ++climbs;
+                if (to != rung) s.switched(now);
+                rung = to;
+            }
+            QCOMPARE(rung, 0);
+            QCOMPARE(climbs, 2);
+        }
+        {
+            // A try's heavy loss 8 s after it: the try failed, so the next is twice as far off, then twice again.
+            RungSteering s;
+            s.movedAt = t0 - 10s;
+            s.nextTry = t0;
+            int rung = 1;
+            std::vector<double> tries;
+            for (int k = 0; k <= 120; ++k) {
+                const auto now = t0 + std::chrono::seconds(k);
+                const bool late = rung == 0 && !tries.empty() && now - (t0 + std::chrono::seconds(int(tries.back()))) >= 8s;
+                const int to = s.report(rung, 1, late ? 0.30 : 0.0, now, now, never, always);
+                if (to < rung) tries.push_back(k);
+                if (to != rung) s.switched(now);
+                rung = to;
+            }
+            QVERIFY(tries.size() >= 3);
+            QVERIFY(tries.size() <= 5);  // (every ~16 s when a late loss passed for a success)
+            QVERIFY(tries[2] - tries[1] > tries[1] - tries[0]);
+        }
+        {
+            // A try that holds 20 s fits: a later loss moves down without doubling the wait.
+            RungSteering s;
+            s.movedAt = t0 - 10s;
+            s.nextTry = t0;
+            QCOMPARE(s.report(1, 1, 0.0, t0, t0, never, always), 0);
+            s.switched(t0);
+            for (int k = 1; k <= 25; ++k) QCOMPARE(s.report(0, 1, 0.0, t0 + std::chrono::seconds(k), t0 + std::chrono::seconds(k), never, always), 0);
+            QVERIFY(!s.trying);
+            QCOMPARE(s.report(0, 1, 0.30, t0 + 26s, t0 + 26s, never, always), 1);
+            QVERIFY(s.hold == 8000ms);
+        }
     }
 
     // Live review in a browser through the network's hard places: a viewer on a slow link moved down the ladder and
@@ -23596,6 +23817,110 @@ colorspaces:
 #endif
     }
 
+    // Segments none of whose pictures came (a jump in the recording's time): listed as gaps, so the numbering a
+    // player counts from MEDIA-SEQUENCE stays each segment's own.
+    void livePackageGaps() {
+        QTemporaryDir dir;
+        LiveSettings ls;
+        ls.folder = dir.filePath("live").toStdString();
+        ls.rungs = {{320, 180, 300000, "libx264"}};
+        ls.segmentSeconds = 1;
+        ls.window = 6;
+        ls.segmentFormat = "ts";
+        ls.audioCodec = "none";
+        ls.preset = "ultrafast";
+        std::string err;
+        LivePackager packager;
+        QVERIFY2(packager.start(ls, &err), err.c_str());
+        AVFrame* pic = av_frame_alloc();
+        pic->format = AV_PIX_FMT_YUV420P, pic->width = 320, pic->height = 180;
+        QVERIFY(av_frame_get_buffer(pic, 0) >= 0);
+        // Segments 1 and 2, nothing for 3 and 4, then 5 to 7.
+        for (int f = 0; f < 25 * 7; ++f) {
+            if (f >= 50 && f < 100) continue;
+            QVERIFY(av_frame_make_writable(pic) >= 0);
+            for (int y = 0; y < 180; ++y) memset(pic->data[0] + y * pic->linesize[0], (f * 7 + y) & 0xff, 320);
+            for (int c = 1; c < 3; ++c)
+                for (int y = 0; y < 90; ++y) memset(pic->data[c] + y * pic->linesize[c], 128, 160);
+            pic->pts = f;
+            packager.picture(pic, 25, 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        av_frame_free(&pic);
+        packager.finish();
+        QVERIFY2(packager.status().error.empty(), packager.status().error.c_str());
+        QFile pl(dir.filePath("live/v1_180p_h264/playlist.m3u8"));
+        QVERIFY(pl.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(pl.readAll());
+        QVERIFY2(text.contains("#EXT-X-VERSION:8"), qPrintable(text));
+        const QStringList lines = text.split('\n');
+        int64_t sequence = -1;
+        QStringList uris;
+        QList<bool> gap;
+        bool nextGap = false;
+        for (const QString& l : lines) {
+            if (l.startsWith("#EXT-X-MEDIA-SEQUENCE:")) sequence = l.mid(22).toLongLong();
+            else if (l == "#EXT-X-GAP") nextGap = true;
+            else if (!l.isEmpty() && !l.startsWith('#')) {
+                uris << l;
+                gap << nextGap;
+                nextGap = false;
+            }
+        }
+        QCOMPARE(uris.size(), 6);  // (the window: 2 to 7)
+        QCOMPARE(sequence, int64_t(2));
+        for (int i = 0; i < uris.size(); ++i) {
+            QCOMPARE(uris[i], QString("seg%1.ts").arg(sequence + i, 5, 10, QChar('0')));
+            QCOMPARE(gap[i], i == 1 || i == 2);
+        }
+    }
+
+    // The origin against connections that never finish a request: each let go after 10 s, and a full house makes room
+    // for a player; a missing file that is not one the packager writes is answered at once.
+    void liveOriginSlowRequests() {
+        QTemporaryDir dir;
+        LiveOrigin origin;
+        std::string err;
+        QVERIFY2(origin.start(dir.path().toStdString(), 0, nullptr, &err), err.c_str());
+        auto get = [&](const QByteArray& path, int* ms) {
+            QTcpSocket s;
+            QElapsedTimer t;
+            t.start();
+            s.connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            if (!s.waitForConnected(5000)) return QByteArray();
+            s.write("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n");
+            QByteArray in;
+            while (!in.contains("\r\n\r\n") && s.waitForReadyRead(15000)) in += s.readAll();
+            if (ms) *ms = int(t.elapsed());
+            return in.left(in.indexOf("\r\n"));
+        };
+        int ms = 0;
+        QVERIFY(get("/notes.txt", &ms).contains("404"));
+        QVERIFY2(ms < 2000, qPrintable(QString::number(ms)));
+        std::vector<std::unique_ptr<QTcpSocket>> idle;
+        for (int i = 0; i < 300; ++i) {
+            auto s = std::make_unique<QTcpSocket>();
+            s->connectToHost(QHostAddress::LocalHost, quint16(origin.port()));
+            QVERIFY(s->waitForConnected(5000));
+            s->write("GET /time HTTP/1.1\r\n");  // (and never the rest)
+            s->flush();
+            idle.push_back(std::move(s));
+        }
+        QTest::qWait(500);
+        QVERIFY(get("/time", nullptr).contains("200"));
+        // (all that never finished closed by the origin within a few seconds of 10)
+        QElapsedTimer t;
+        t.start();
+        for (auto& s : idle) {
+            while (s->state() == QAbstractSocket::ConnectedState && t.elapsed() < 20000) {
+                s->waitForDisconnected(100);
+                QCoreApplication::processEvents();
+            }
+            QVERIFY(s->state() != QAbstractSocket::ConnectedState);
+        }
+        QVERIFY(t.elapsed() < 15000);
+    }
+
     void livePackageWindowAndTs() {
         // Without a browser: pictures and sound handed to the packager as a recording would, in real time, packaged
         // as HLS in MPEG-TS segments (and DASH in CMAF): the window slides, its segments start on keyframes, and the
@@ -23652,7 +23977,7 @@ colorspaces:
         const QString base = QStringLiteral("http://127.0.0.1:%1/").arg(origin.port());
         std::unique_ptr<QNetworkReply> held;
         const auto t0 = std::chrono::steady_clock::now();
-        for (int f = 0; f < 25 * 7; ++f) {
+        for (int f = 0; f < 25 * 9; ++f) {
             for (int y = 0; y < 180; ++y)
                 for (int x = 0; x < 320; ++x) reinterpret_cast<uint16_t*>(pic->data[0] + y * pic->linesize[0])[x] = uint16_t(64 + ((x + f * 4) % 320) * 2);
             for (int c = 1; c < 3; ++c)
@@ -23682,17 +24007,17 @@ colorspaces:
         av_frame_free(&snd);
         const LiveStatus st = packager.status();
         QVERIFY2(st.error.empty(), st.error.c_str());
-        QCOMPARE(st.segments, int64_t(7));
+        QCOMPARE(st.segments, int64_t(9));
         const QDir v(QString::fromStdString(ls.folder + "/" + st.renditions.front()));
         QFile list(v.filePath("playlist.m3u8"));
         QVERIFY(list.open(QIODevice::ReadOnly));
         const QString text = QString::fromUtf8(list.readAll());
         QCOMPARE(text.count("#EXTINF:"), 3);
-        QVERIFY2(text.contains("#EXT-X-MEDIA-SEQUENCE:5") && text.contains("seg00007.ts") && text.contains("#EXT-X-ENDLIST") && !text.contains("EXT-X-MAP"),
+        QVERIFY2(text.contains("#EXT-X-MEDIA-SEQUENCE:7") && text.contains("seg00009.ts") && text.contains("#EXT-X-ENDLIST") && !text.contains("EXT-X-MAP"),
                  qPrintable(text));
         // Each listed segment: the tables, then a keyframe at its own time; the counters on from one to the next.
         std::map<int, int> last;
-        for (int k = 5; k <= 7; ++k) {
+        for (int k = 7; k <= 9; ++k) {
             QFile f(v.filePath(QString("seg%1.ts").arg(k, 5, 10, QChar('0'))));
             QVERIFY(f.open(QIODevice::ReadOnly));
             const TsRead t = readTs(f.readAll());
@@ -23709,10 +24034,12 @@ colorspaces:
                 last[id] = cc;
             }
         }
+        // A segment out of the playlist stays for its own length and the playlist's (RFC 8216 6.2.2: here 4 s), then goes.
         QVERIFY(!v.exists("seg00001.ts"));
+        QVERIFY(v.exists("seg00002.ts") && v.exists("seg00003.ts"));
         // (and the sound: AC-3 stating the loudness measured so far)
         if (ls.audioCodec == "ac3") {
-            QFile f(QString::fromStdString(ls.folder + "/" + st.renditions.back() + "/seg00007.ts"));
+            QFile f(QString::fromStdString(ls.folder + "/" + st.renditions.back() + "/seg00009.ts"));
             QVERIFY(f.open(QIODevice::ReadOnly));
             QVERIFY(st.dialnorm < -1 && st.dialnorm > -31);
         }
@@ -23720,6 +24047,9 @@ colorspaces:
         QVERIFY(mpd.open(QIODevice::ReadOnly));
         const QByteArray x = mpd.readAll();
         QVERIFY2(x.contains("type=\"dynamic\"") && x.contains("mediaPresentationDuration") && x.contains("seg$Number%05d$.m4s"), x.constData());
+        // (AC-3's channels in the scheme DASH-IF and DVB-DASH ask for)
+        if (ls.audioCodec == "ac3")
+            QVERIFY2(x.contains("schemeIdUri=\"tag:dolby.com,2014:dash:audio_channel_configuration:2011\" value=\"A000\"") && !x.contains("mpegB:cicp"), x.constData());
         origin.stop();
     }
 

@@ -130,6 +130,8 @@ private:
     bool dropFrame_ = false;
     int gop_ = 12;
     int depth_ = 0;  // the stream's decode delay, in frames
+    int joinBframes_ = 3;  // (H.264, HEVC) the joins' B-pictures, and whether they nest (so they reorder no deeper than the footage)
+    bool joinPyramid_ = true;
     int64_t decoded_ = 0;
     // The encoded part in progress.
     AVCodecContext* ctx_ = nullptr;
