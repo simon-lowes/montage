@@ -8,6 +8,7 @@
 #include "media/Jxl.h"
 #include "media/Av2.h"
 #include "render/SegmentedExport.h"
+#include "render/ExportScaler.h"
 
 #include "core/ColorGroups.h"
 #include "core/Expression.h"
@@ -2419,38 +2420,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + videoError(o, rc));
             } else {
             toRgba16(img, rgba16);
-            AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
-            const int swsFlags = SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INP;
-            if (!o.sws && (o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT || o.vctx->chroma_sample_location == AVCHROMA_LOC_LEFT)) {
-                // Chroma made where the encoder's format sites it (otherwise FFmpeg's scaler centres it, as the
-                // decoder reads untagged 4:2:0 pictures). The cached context below keeps this one, as it matches.
-                o.sws = sws_alloc_context();
-                if (o.sws) {
-                    av_opt_set_int(o.sws, "srcw", img.width, 0);
-                    av_opt_set_int(o.sws, "srch", img.height, 0);
-                    av_opt_set_int(o.sws, "src_format", srcFmt, 0);
-                    av_opt_set_int(o.sws, "dstw", W, 0);
-                    av_opt_set_int(o.sws, "dsth", H, 0);
-                    av_opt_set_int(o.sws, "dst_format", o.vctx->pix_fmt, 0);
-                    av_opt_set_int(o.sws, "sws_flags", swsFlags, 0);
-                    av_opt_set_int(o.sws, "dst_h_chr_pos", 0, 0);
-                    // (in 1/256 luma pixels: left, and top or centred between the lines it spans, as the decoder takes it)
-                    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
-                    const int spans = d ? 1 << d->log2_chroma_h : 1;
-                    av_opt_set_int(o.sws, "dst_v_chr_pos", o.vctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT ? 0 : (spans - 1) * 128, 0);
-                    if (sws_init_context(o.sws, nullptr, nullptr) < 0) {
-                        sws_freeContext(o.sws);
-                        o.sws = nullptr;
-                    }
-                }
-            }
-            o.sws = sws_getCachedContext(o.sws, img.width, img.height, srcFmt, W, H, o.vctx->pix_fmt, swsFlags, nullptr, nullptr, nullptr);
+            // (render/ExportScaler: Compare Encode makes the sequence's chroma with the same scaler)
+            o.sws = exportPictureScaler(o.sws, img.width, img.height, W, H, o.vctx->pix_fmt, o.vctx->chroma_sample_location,
+                                        o.vctx->colorspace, o.vctx->color_range);
             if (!o.sws) return fail("Cannot convert to the encoder pixel format");
-            const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(o.vctx->pix_fmt);
-            if (desc && !(desc->flags & AV_PIX_FMT_FLAG_RGB))
-                sws_setColorspaceDetails(o.sws, sws_getCoefficients(SWS_CS_DEFAULT), 1,
-                                         sws_getCoefficients(o.vctx->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_ITU709),
-                                         o.vctx->color_range == AVCOL_RANGE_JPEG ? 1 : 0, 0, 1 << 16, 1 << 16);
             if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
             const uint8_t* srcData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};
             int srcStride[4] = {img.width * 8, 0, 0, 0};

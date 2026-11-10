@@ -6367,7 +6367,7 @@ void McpServer::Impl::addTools() {
         "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
         "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's). `compare` sets a delivered "
         "file against the sequence's own render (or against `reference`, another file), aligned over ±12 frames, frame by "
-        "frame: PSNR, SSIM, MS-SSIM, ΔICtCp (BT.2124) and, where Montage is built with libvmaf, VMAF (`metrics` picks "
+        "frame: PSNR, SSIM, MS-SSIM, ΔICtCp (BT.2124) and VMAF (libvmaf's v1 model; `metrics` picks "
         "them); frames past `min_psnr`, `min_vmaf` or `max_delta_ictcp` are problems, the worst frames get orange markers "
         "with `markers`, and `report` also writes report-quality.csv and report-quality.pdf.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
@@ -6398,7 +6398,7 @@ void McpServer::Impl::addTools() {
             "reference":{"type":"string","description":"Compare against this file instead of the sequence"},
             "hrd":{"type":"string","description":"An H.264, HEVC or MPEG-2 file to check against its buffer model (H.264/H.265 Annex C HRD, MPEG-2 VBV; CBR and VBR): each underflow and overflow at the frame it falls on, and a summary line (taken as an export of the range)"},
             "metrics":{"type":"array","items":{"type":"string","enum":["psnr","ssim","ms_ssim","delta_ictcp","vmaf"]},
-                "description":"What to measure (default all but vmaf)"},
+                "description":"What to measure (default all; VMAF of HDR only where libvmaf has an HDR model)"},
             "min_psnr":{"type":"number","description":"Frames with luma PSNR under this (dB) are problems"},
             "min_vmaf":{"type":"number","description":"Frames with VMAF under this are problems"},
             "max_delta_ictcp":{"type":"number","description":"Frames whose mean ΔE_ITP is over this are problems"}},"required":["project"]})json",
@@ -6420,8 +6420,8 @@ void McpServer::Impl::addTools() {
                         if (!bit) throw ArgError{"Unknown metric " + m.toString()};
                         q.compareMetrics |= bit;
                     }
+                    if ((q.compareMetrics & MetricVmaf) && !vmafAvailable()) throw ArgError{"This Montage was built without libvmaf, so it cannot measure VMAF"};
                 }
-                if ((q.compareMetrics & MetricVmaf) && !vmafAvailable()) throw ArgError{"This Montage was built without libvmaf, so it cannot measure VMAF"};
                 q.qualityLimits.minPsnr = std::max(0.0, a.value("min_psnr").toDouble(0));
                 q.qualityLimits.minVmaf = std::max(0.0, a.value("min_vmaf").toDouble(0));
                 q.qualityLimits.maxDeltaItp = std::max(0.0, a.value("max_delta_ictcp").toDouble(0));

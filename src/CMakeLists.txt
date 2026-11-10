@@ -287,7 +287,7 @@ add_library(montage_engine STATIC
   render/SurfaceTrack.h render/SurfaceTrack.cpp
   render/TemporalFx.h render/TemporalFx.cpp
   render/Deconvolve.h render/Deconvolve.cpp
-  render/Exporter.h render/Exporter.cpp
+  render/Exporter.h render/Exporter.cpp render/ExportScaler.h render/ExportScaler.cpp
   render/RenderFarm.h render/RenderFarm.cpp
   render/BackgroundJobs.h render/BackgroundJobs.cpp
   render/SegmentedExport.h render/SegmentedExport.cpp
@@ -489,14 +489,9 @@ if(MONTAGE_WITH_AV2)
   endif()
 endif()
 if(MONTAGE_WITH_VMAF)
-  pkg_check_modules(LIBVMAF IMPORTED_TARGET GLOBAL libvmaf>=3.0)
-  if(LIBVMAF_FOUND)
-    message(STATUS "libvmaf ${LIBVMAF_VERSION}: VMAF in Compare Encode enabled")
-    target_link_libraries(montage_engine PRIVATE PkgConfig::LIBVMAF)
-    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_VMAF)
-  else()
-    message(STATUS "libvmaf not found: Compare Encode measures without VMAF")
-  endif()
+  # (libvmaf as CMakeLists.txt builds it, with its models compiled in; only Compare Encode calls it)
+  target_link_libraries(montage_engine PRIVATE montage_vmaf)
+  set_property(SOURCE render/EncodeCompare.cpp APPEND PROPERTY COMPILE_DEFINITIONS MONTAGE_WITH_VMAF)
 endif()
 if(MONTAGE_WITH_MYSOFA)
   # (Not as an imported target: MSYS2's libmysofa.pc names "/ucrt64/include", a path CMake cannot see.)

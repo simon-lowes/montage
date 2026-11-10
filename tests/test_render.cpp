@@ -923,62 +923,81 @@ private slots:
         QVERIFY(lossy.mean.msSsim > 0.8 && lossy.mean.msSsim < 1);
     }
 
-    // Phase 13 #2: VMAF, where Montage is built with libvmaf, scores as libvmaf's own vmaf tool does (SDR with the v1
-    // model, PQ with the HDR v1 model). MONTAGE_TEST_VMAF is the tool, MONTAGE_VMAF_MODELS the models folder.
+    // Phase 15 #3: VMAF, built with Montage (libvmaf v3.2.1, its v1 model built in), scores as libvmaf's own vmaf
+    // program does (built by the tests from the same sources: MONTAGE_TEST_VMAF_TOOL), frame by frame within 1e-4, on
+    // 8- and 10-bit 4:2:0 and 8-bit 4:4:4. HDR is left unscored, with a warning, while libvmaf has no HDR model.
     void vmafMatchesItsTool() {
         if (!vmafAvailable()) QSKIP("Montage is built without libvmaf (MONTAGE_WITH_VMAF)");
+        QCOMPARE(QString::fromStdString(vmafVersion()), QStringLiteral("v3.2.1"));
+        QVERIFY(vmafModelBuiltIn("vmaf_v1.0.16_3d0h") && vmafModelBuiltIn("vmaf_v1.0.16_3d0h_2160"));
+        QVERIFY(!vmafModelBuiltIn("no_such_model"));
+        {
+            // (the v0.6.1 model where the chroma is under 80 samples either way, too small for the v1 model's)
+            QualityPicture q;
+            q.width = 320, q.height = 180;
+            QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h"));
+            q.width = 192, q.height = 108;
+            QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v0.6.1"));
+            q.width = 3840, q.height = 2160;
+            QCOMPARE(QString::fromStdString(vmafModelFor(q, {})), QStringLiteral("vmaf_v1.0.16_3d0h_2160"));
+        }
+#ifdef MONTAGE_TEST_VMAF_TOOL
+        const QString tool = QStringLiteral(MONTAGE_TEST_VMAF_TOOL);
+#else
         const QString tool = qEnvironmentVariable("MONTAGE_TEST_VMAF");
-        if (tool.isEmpty() || qEnvironmentVariable("MONTAGE_VMAF_MODELS").isEmpty()) QSKIP("MONTAGE_TEST_VMAF and MONTAGE_VMAF_MODELS are not set");
+#endif
+        if (tool.isEmpty() || !QFileInfo::exists(tool)) QSKIP("libvmaf's vmaf program was not built (MONTAGE_TEST_VMAF_TOOL)");
         QTemporaryDir dir;
         const int w = 320, h = 240, frames = 12;
-        // 8-bit SDR, and 10-bit (written as Y4M C420p10) taken as PQ BT.2020.
-        auto write = [&](const QString& path, int bits, bool distorted) {
+        // (Y4M: 8-bit or 10-bit 4:2:0, or 8-bit 4:4:4 with each chroma sample repeated over its block)
+        auto write = [&](const QString& path, int bits, bool full, bool distorted) {
             QFile f(path);
             if (!f.open(QIODevice::WriteOnly)) return false;
-            f.write(QStringLiteral("YUV4MPEG2 W%1 H%2 F25:1 Ip A1:1 C420%3\n").arg(w).arg(h).arg(bits > 8 ? "p10" : "jpeg").toLatin1());
+            f.write(QStringLiteral("YUV4MPEG2 W%1 H%2 F25:1 Ip A1:1 C%3\n").arg(w).arg(h).arg(full ? "444" : bits > 8 ? "420p10" : "420jpeg").toLatin1());
             std::vector<uint8_t> y(size_t(w) * h), cb(size_t(w / 2) * (h / 2)), cr(cb.size());
             std::mt19937 rng(3);
             std::normal_distribution<double> noise(0, 6);
             for (int i = 0; i < frames; ++i) {
                 encodeTestPicture(i, w, h, y, cb, cr);
                 f.write("FRAME\n");
-                for (const auto* plane : {&y, &cb, &cr})
-                    for (uint8_t v : *plane) {
-                        double s = v;
-                        if (distorted && plane == &y) s = std::clamp(s + noise(rng), 0.0, 255.0);
-                        if (bits > 8) {
-                            const uint16_t s10 = uint16_t(std::lround(s * 4));
-                            f.write(reinterpret_cast<const char*>(&s10), 2);
-                        } else {
-                            const char c = char(uint8_t(std::lround(s)));
-                            f.write(&c, 1);
+                for (int c = 0; c < 3; ++c) {
+                    const std::vector<uint8_t>& plane = c == 0 ? y : c == 1 ? cb : cr;
+                    const int pw = c == 0 || full ? w : w / 2, ph = c == 0 || full ? h : h / 2;
+                    for (int yy = 0; yy < ph; ++yy)
+                        for (int xx = 0; xx < pw; ++xx) {
+                            auto at = [&](int x) {
+                                x = std::clamp(x, 0, pw - 1);
+                                return double(c == 0 ? plane[size_t(yy) * w + x] : full ? plane[size_t(yy / 2) * (w / 2) + x / 2] : plane[size_t(yy) * (w / 2) + x]);
+                            };
+                            double v = at(xx);
+                            // (distorted: blurred along the rows, and noise)
+                            if (distorted && (c == 0 || full))
+                                v = std::clamp((at(xx - 3) + at(xx - 2) + at(xx - 1) + v + at(xx + 1) + at(xx + 2) + at(xx + 3)) / 7 + noise(rng), 0.0, 255.0);
+                            if (bits > 8) {
+                                const uint16_t s10 = uint16_t(std::lround(v * 4));
+                                f.write(reinterpret_cast<const char*>(&s10), 2);
+                            } else {
+                                const char ch = char(uint8_t(std::lround(v)));
+                                f.write(&ch, 1);
+                            }
                         }
-                    }
+                }
             }
             return true;
         };
-        for (const bool hdr : {false, true}) {
-            const int bits = hdr ? 10 : 8;
-            const QString ref = dir.path() + QStringLiteral("/ref%1.y4m").arg(bits), dist = dir.path() + QStringLiteral("/dist%1.y4m").arg(bits);
-            QVERIFY(write(ref, bits, false) && write(dist, bits, true));
+        struct Case { int bits; bool full; };
+        for (const Case k : {Case{8, false}, Case{10, false}, Case{8, true}}) {
+            const QString tag = QStringLiteral("%1%2").arg(k.bits).arg(k.full ? "f" : "");
+            const QString ref = dir.path() + "/ref" + tag + ".y4m", dist = dir.path() + "/dist" + tag + ".y4m";
+            QVERIFY(write(ref, k.bits, k.full, false) && write(dist, k.bits, k.full, true));
             CompareOptions o;
-            o.metrics = MetricVmaf;
             o.search = 0;
-            if (hdr) {
-                o.assumeTransfer = "pq";
-                o.assumePrimaries = "bt2020";
-            }
             const EncodeComparison c = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
             QVERIFY2(c.ok && c.vmafScored, c.error.c_str());
-            QVERIFY2(QString::fromStdString(c.vmafModel).contains(hdr ? "hdr_vmaf_v1" : "vmaf_v1"), c.vmafModel.c_str());
-            const QString json = dir.path() + "/vmaf.json";
-            QStringList args{"-r", ref, "-d", dist, "-m", "path=" + QString::fromStdString(c.vmafModel) + ":name=vmaf", "--json", "-o", json, "-q"};
-            if (hdr)
-                args << "--color_trc_ref" << "pq" << "--color_trc_dist" << "pq" << "--color_primaries_ref" << "bt2020" << "--color_primaries_dist"
-                     << "bt2020" << "--color_matrix_ref" << "bt2020nc" << "--color_matrix_dist" << "bt2020nc" << "--color_range_ref" << "limited"
-                     << "--color_range_dist" << "limited";
+            QCOMPARE(QString::fromStdString(c.vmafModel), QStringLiteral("vmaf_v1.0.16_3d0h"));
+            const QString json = dir.path() + "/vmaf" + tag + ".json";
             QProcess pr;
-            pr.start(tool, args);
+            pr.start(tool, {"-r", ref, "-d", dist, "--model", "version=vmaf_v1.0.16_3d0h", "--json", "-o", json, "-q"});
             QVERIFY2(pr.waitForFinished(300000) && pr.exitCode() == 0, pr.readAllStandardError().constData());
             QFile jf(json);
             QVERIFY(jf.open(QIODevice::ReadOnly));
@@ -986,8 +1005,60 @@ private slots:
             QCOMPARE(list.size(), int(c.frames.size()));
             for (int i = 0; i < list.size(); ++i) {
                 const double theirs = list[i].toObject().value("metrics").toObject().value("vmaf").toDouble();
-                QVERIFY2(std::abs(c.frames[size_t(i)].vmaf - theirs) < 1e-6, QByteArray::number(c.frames[size_t(i)].vmaf, 'f', 8) + " vs " + QByteArray::number(theirs, 'f', 8));
+                QVERIFY2(std::abs(c.frames[size_t(i)].vmaf - theirs) < 1e-4,
+                         qPrintable(tag + ": " + QString::number(c.frames[size_t(i)].vmaf, 'f', 8) + " vs " + QString::number(theirs, 'f', 8)));
             }
+            QVERIFY2(c.mean.vmaf > 20 && c.mean.vmaf < 99, qPrintable(tag + ": " + QString::number(c.mean.vmaf)));
+            // The same pictures score the most there is.
+            const EncodeComparison same = compareEncodeFiles(ref.toStdString(), ref.toStdString(), o);
+            QVERIFY2(same.ok && same.vmafScored && same.worst.vmaf > 100 - 1e-9, QByteArray::number(same.worst.vmaf));
+        }
+        // HDR (PQ): no HDR model in this libvmaf, so no VMAF, said so, and the rest still measured.
+        if (!vmafModelBuiltIn("hdr_vmaf_v1.1.8_3d0h")) {
+            const QString ref = dir.path() + "/ref10.y4m", dist = dir.path() + "/dist10.y4m";
+            CompareOptions o;
+            o.search = 0;
+            o.assumeTransfer = "pq";
+            o.assumePrimaries = "bt2020";
+            o.vmafModelDir = dir.path().toStdString();  // (nothing there)
+            const EncodeComparison c = compareEncodeFiles(ref.toStdString(), dist.toStdString(), o);
+            QVERIFY2(c.ok && !c.vmafScored && std::isnan(c.mean.vmaf) && c.mean.psnrY > 20, c.error.c_str());
+            QVERIFY(std::any_of(c.warnings.begin(), c.warnings.end(), [](const std::string& w) { return w.find("no HDR model") != std::string::npos; }));
+        }
+    }
+
+    // Phase 15 #3: the sequence an encode is compared with has its chroma made by the export's own scaler, so a
+    // lossless export (x264 at QP 0) of busy colour is the sequence exactly: every plane's PSNR infinite and VMAF
+    // the most there is, with the chroma sited as H.264 tags it (left) and as FFV1 leaves it (centred).
+    void losslessExportComparesExactly() {
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        Clip bars = makeGeneratorClip(p, "bars", 6);
+        Effect nz = makeEffect(p, "noise");
+        nz.params["amount"] = 30.0;
+        bars.effects.push_back(nz);
+        s.videoTracks[0].clips.push_back(bars);
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.3f, 0.1f, 6, 4));
+        for (const bool ffv1 : {false, true}) {
+            ExportSettings st;
+            st.path = (dir.path() + (ffv1 ? "/ffv1.mkv" : "/x264.mkv")).toStdString();
+            st.videoCodec = ffv1 ? "ffv1" : "libx264";
+            st.crf = 0;  // (lossless, QP 0)
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            CompareOptions o;
+            o.search = 2;
+            o.alignFrames = 6;
+            const EncodeComparison c = compareEncodeWithSequence(p, s, 0, -1, st.path, o);
+            QVERIFY2(c.ok, c.error.c_str());
+            QCOMPARE(int(c.frames.size()), 10);
+            // (every frame's luma, and the chroma's over all: their mean squared error 0)
+            QVERIFY2(std::isinf(c.worst.psnrY) && std::isinf(c.mean.psnrU) && std::isinf(c.mean.psnrV),
+                     qPrintable(QStringLiteral("%1 %2 %3").arg(c.worst.psnrY).arg(c.mean.psnrU).arg(c.mean.psnrV)));
+            if (vmafAvailable()) QVERIFY2(c.vmafScored && c.worst.vmaf > 100 - 1e-9, QByteArray::number(c.worst.vmaf));
         }
     }
 

@@ -226,6 +226,8 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
         minVmaf_ = spin("qcMinVmaf", tr("VMAF ≥ "), 100, 1, QString());
         vmaf_ = new QCheckBox(tr("VMAF"), lw);
         vmaf_->setObjectName(QStringLiteral("qcVmaf"));
+        vmaf_->setChecked(vmafAvailable());
+        vmaf_->setToolTip(tr("VMAF (libvmaf %1, its v1 model) as well; HDR encodes only where libvmaf has an HDR model").arg(QString::fromStdString(vmafVersion())));
         if (!vmafAvailable()) {
             vmaf_->setEnabled(false);
             minVmaf_->setEnabled(false);
@@ -314,7 +316,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.titleLanguage = titleSpellingLanguage().toStdString();
     q.compareFile = compareFile_->text().trimmed().toStdString();
     q.hrdFile = hrdFile_->text().trimmed().toStdString();
-    if (vmaf_->isChecked() && vmafAvailable()) q.compareMetrics |= MetricVmaf;
+    if (!vmaf_->isChecked() || !vmafAvailable()) q.compareMetrics &= ~unsigned(MetricVmaf);
     q.qualityLimits.minPsnr = minPsnr_->value();
     q.qualityLimits.maxDeltaItp = maxDeltaItp_->value();
     q.qualityLimits.minVmaf = vmafAvailable() ? minVmaf_->value() : 0;
