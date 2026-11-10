@@ -129,7 +129,7 @@ std::shared_ptr<const DiskSound> decodeToDisk(const std::string& path, int rate,
         return nullptr;
     }
     const auto stamp = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-    const std::string id = path + "|" + std::to_string(size) + "|" + std::to_string(stamp) + "|" + std::to_string(rate);
+    const std::string id = path + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(stamp)) + "|" + std::to_string(rate);
     const std::filesystem::path file = cacheFolder(o) / ("sound-" + std::to_string(std::hash<std::string>{}(id)) + ".f32");
     auto d = std::make_shared<DiskSound>();
     d->file = file.string();
