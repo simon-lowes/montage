@@ -656,7 +656,8 @@ struct SamplerPass {
     Id lane = 0;
     uint32_t seed = 1;  // the hits' random variation
     std::vector<SamplerNote> notes;
-    Id track = 0;  // the track the lane is on, for the slots sent to another (SamplerSlot::output); 0 the sampler's own
+    // A part sent here by another track's slots (SamplerSlot::output): the sampler track that played it; 0 this one's.
+    Id track = 0;
     bool operator==(const SamplerPass&) const = default;
 };
 struct SamplerSettings {

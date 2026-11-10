@@ -886,7 +886,7 @@ void MainWindow::buildPanels() {
     }
     // 1–9 cut to an angle of the bank of nine they reach (live while playing); Shift cuts at the playhead when stopped;
     // Alt+1–9 picks the bank (angles 1–9, 10–18, 19–27...).
-    std::vector<QShortcut*> banks;
+    std::vector<QPointer<QShortcut>> banks;  // (guarded: focus moves while the window's children are being deleted)
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
         connect(sw, &QShortcut::activated, this, [this, i] { multicam_->switchKey(i, false); });
@@ -902,7 +902,8 @@ void MainWindow::buildPanels() {
     connect(qApp, &QApplication::focusChanged, this, [this, banks](QWidget*, QWidget* now) {
         const bool typing = qobject_cast<QLineEdit*>(now) || qobject_cast<QTextEdit*>(now) || qobject_cast<QPlainTextEdit*>(now) ||
                             qobject_cast<QAbstractSpinBox*>(now) || qobject_cast<QKeySequenceEdit*>(now);
-        for (QShortcut* b : banks) b->setEnabled(!typing && !keymap::conflict(this, b->key()));
+        if (std::any_of(banks.begin(), banks.end(), [](const QPointer<QShortcut>& b) { return b.isNull(); })) return;  // (closing)
+        for (const QPointer<QShortcut>& b : banks) b->setEnabled(!typing && !keymap::conflict(this, b->key()));
     });
     // In the Colour workspace the numeric keypad sets printer lights, as on a timer's console: 7, 8, 9 add a point of
     // red, green or blue, 4, 5, 6 take one away, + and - move all three. Elsewhere its keys do what they did: digits cut

@@ -6099,6 +6099,14 @@ void McpServer::Impl::addTools() {
             };
             const Track& t0 = *trackAt(s, track);
             const QString trackName = t0.name.empty() ? QStringLiteral("A%1").arg(track.index + 1) : QString::fromStdString(t0.name);
+            // This track's passes: its own, and the parts its slots sent to other tracks (kept there with their lanes).
+            auto ownPasses = [&]() {
+                std::vector<std::pair<const SamplerPass*, const Track*>> out;
+                for (const Track& t : s.audioTracks)
+                    for (const SamplerPass& ps : t.sampler.passes)
+                        if (&t == &t0 ? !ps.track || ps.track == t0.id : ps.track == t0.id) out.push_back({&ps, &t});
+                return out;
+            };
             static const char* const curveNames[] = {"linear", "soft", "hard", "drawn"};
             auto points = [](const SamplerSlot& sl) {
                 QJsonArray out;
@@ -6125,8 +6133,9 @@ void McpServer::Impl::addTools() {
                     text += QStringLiteral("Key %1 %2: %3 sound(s)%4\n").arg(sl.key).arg(QString::fromStdString(sl.name)).arg(sl.sounds.size())
                                 .arg(sl.choke ? QStringLiteral(", choke group %1").arg(sl.choke) : QString());
                 }
-                for (const SamplerPass& ps : t0.sampler.passes) {
-                    const TakeLane* ln = edit::findTakeLane(t0, ps.lane);
+                for (const auto& [pp, on] : ownPasses()) {
+                    const SamplerPass& ps = *pp;
+                    const TakeLane* ln = edit::findTakeLane(*on, ps.lane);
                     QJsonArray notes;
                     for (const SamplerNote& n : ps.notes)
                         notes.append(QJsonObject{{"key", n.key}, {"velocity", n.velocity}, {"at", double(n.at) / s.sampleRate}, {"length", double(n.length) / s.sampleRate}});
@@ -6242,12 +6251,11 @@ void McpServer::Impl::addTools() {
                 const QJsonValue v = a.value("lane");
                 Id lane = 0;
                 // (this track's passes: their lanes here, or on the tracks its slots send to)
-                for (const SamplerPass& ps : t0.sampler.passes)
-                    for (const Track& t : s.audioTracks)
-                        if (const TakeLane* ln = edit::findTakeLane(t, ps.lane))
-                            if ((v.isDouble() && ln->id == Id(v.toDouble())) ||
-                                (v.isString() && QString::fromStdString(ln->name).compare(v.toString(), Qt::CaseInsensitive) == 0))
-                                lane = ln->id;
+                for (const auto& [ps, on] : ownPasses())
+                    if (const TakeLane* ln = edit::findTakeLane(*on, ps->lane))
+                        if ((v.isDouble() && ln->id == Id(v.toDouble())) ||
+                            (v.isString() && QString::fromStdString(ln->name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                            lane = ln->id;
                 if (!lane) throw ArgError{QStringLiteral("No such lane on that track (see action show)")};
                 const QString file = passFile(trackName + QStringLiteral(" Sampler Pass"));
                 check(sampler::revoicePass(l.project, s, track, lane, kit(), file.toStdString()));
@@ -6487,9 +6495,8 @@ void McpServer::Impl::addTools() {
                 }
                 std::vector<std::vector<Id>> media;
                 for (size_t t = 0; t < tracks.size(); ++t) {
-                    const Track& tr = *trackAt(s, tracks[t]);
                     const std::string stem = QFileInfo(file).completeBaseName().toStdString() +
-                                             (tracks.size() > 1 ? " " + (tr.name.empty() ? "A" + std::to_string(tracks[t].index + 1) : tr.name) : std::string()) + " pass ";
+                                             (tracks.size() > 1 ? " A" + std::to_string(tracks[t].index + 1) : std::string()) + " pass ";
                     const std::vector<std::string> passes = splitLoopRecording(
                         file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
                         (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), stem, &complete, &err,

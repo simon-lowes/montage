@@ -10928,12 +10928,16 @@ private slots:
         const Track& a1 = q.active()->audioTracks[0];
         const Track& a2 = q.active()->audioTracks[1];
         QVERIFY(a1.sampler.clipPerHit);
-        QCOMPARE(a1.sampler.passes.size(), size_t(2));
         QCOMPARE(a1.lanes.size(), size_t(1));
         QCOMPARE(a2.lanes.size(), size_t(1));
+        // Each part kept with its lane: A2's saying A1 played it.
+        QCOMPARE(a1.sampler.passes.size(), size_t(1));
         QCOMPARE(a1.sampler.passes[0].lane, a1.lanes[0].id);
-        QCOMPARE(a1.sampler.passes[1].lane, a2.lanes[0].id);
-        QCOMPARE(a1.sampler.passes[1].track, a2.id);
+        QCOMPARE(a2.sampler.passes.size(), size_t(1));
+        QCOMPARE(a2.sampler.passes[0].lane, a2.lanes[0].id);
+        QCOMPARE(a2.sampler.passes[0].track, a1.id);
+        r = call({{"action", "show"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("passes").toArray().size(), qsizetype(2));
         QCOMPARE(a1.lanes[0].start, a2.lanes[0].start);  // (the parts of one pass, at the same samples)
         // A clip a hit: A1's two kicks at 1.0 and 1.6 s, A2's three hats from 1.2 s (frames at 30 fps).
         QCOMPARE(a1.clips.size(), size_t(2));
@@ -10946,7 +10950,7 @@ private slots:
         for (const Clip& c : a2.clips) QCOMPARE(c.mediaId, a2.lanes[0].mediaId);
         // Each part heard on its own track: the kicks' render on A1's lane, the hats' on A2's, nothing of the other.
         const sampler::KitPtr kit = sampler::loadKit(a1.sampler, rate);
-        const SamplerPass& hats = a1.sampler.passes[1];
+        const SamplerPass& hats = a2.sampler.passes[0];
         const int64_t from = std::llround(double(a1.lanes[0].start) * rate / q.active()->fpsValue());
         const std::vector<float> wantHats = sampler::renderNotes(sampler::kitFor(kit, a2.id), hats.notes, hats.seed, from, 2 * rate);
         const std::vector<float> wantKicks = sampler::renderNotes(sampler::kitFor(kit, 0), hats.notes, hats.seed, from, 2 * rate);
@@ -10968,6 +10972,17 @@ private slots:
         QCOMPARE(v.active()->audioTracks[0].lanes[0].mediaId, a1.lanes[0].mediaId);
         for (const Clip& c : v.active()->audioTracks[1].clips) QCOMPARE(c.mediaId, v.active()->audioTracks[1].lanes[0].mediaId);
         QCOMPARE(v.active()->audioTracks[1].clips.size(), size_t(3));
+        // A copy of the sequence: the slot's output and the part's player are the copy's own tracks.
+        {
+            const Id copy = edit::duplicateSequence(v, v.activeSequence);
+            const Sequence& c = *v.findSequence(copy);
+            QCOMPARE(c.audioTracks[0].sampler.pads[1].output, c.audioTracks[1].id);
+            QCOMPARE(c.audioTracks[1].sampler.passes.size(), size_t(1));
+            QCOMPARE(c.audioTracks[1].sampler.passes[0].track, c.audioTracks[0].id);
+            QCOMPARE(c.audioTracks[1].sampler.passes[0].lane, c.audioTracks[1].lanes[0].id);
+        }
+        // (A2's part is not voiced again from A2: A1's slots played it.)
+        QVERIFY(call({{"action", "revoice"}, {"track", "A2"}, {"lane", double(a2.lanes[0].id)}}).value("isError").toBool());
 
         // A long file (25 seconds) streamed by default: decoded in blocks to a cache file, played from it, the same
         // sound sample for sample as the media pool's whole decode of it.

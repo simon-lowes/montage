@@ -170,8 +170,9 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         }
         QAudioFormat fmt;
         fmt.setSampleRate(48000);
-        fmt.setChannelCount(1);
+        fmt.setChannelCount(channels_);  // (a grouped take: a channel a track, as many as the input has)
         fmt.setSampleFormat(QAudioFormat::Float);
+        if (!device.isFormatSupported(fmt) && channels_ > 1) fmt.setChannelCount(std::min(channels_, device.maximumChannelCount()));
         if (!device.isFormatSupported(fmt)) fmt = device.preferredFormat();
         rate_ = fmt.sampleRate();
         channels_ = std::max(1, fmt.channelCount());
@@ -412,8 +413,8 @@ QStringList VoiceoverRecorder::splitGroupTake(const std::vector<int>& grouped) {
     std::vector<float> mono(size_t(std::max<qint64>(0, frames)));
     for (size_t t = 0; t < grouped.size(); ++t) {
         const int ch = int(t) % channels_;
-        const QString name = grouped[t] < int(s->audioTracks.size()) ? QString::fromStdString(s->audioTracks[size_t(grouped[t])].name) : QString();
-        const QString file = stem + (name.isEmpty() ? QStringLiteral("A%1").arg(grouped[t] + 1) : name) + QStringLiteral(".wav");
+        // (by the track's place, "A2": unique, and safe in a file name whatever the track is called)
+        const QString file = stem + QStringLiteral("A%1").arg(grouped[t] + 1) + QStringLiteral(".wav");
         for (qint64 i = 0; i < frames; ++i) mono[size_t(i)] = samples[i * channels_ + ch];
         WavWriter w;
         if (!w.open(file, rate_, 1) || (w.write(mono.data(), frames), !w.close())) {

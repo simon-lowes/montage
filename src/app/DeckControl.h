@@ -128,9 +128,11 @@ private:
     double chaseRate_ = 48000;
     std::chrono::steady_clock::time_point chaseFed_;
     // Through the audio device: its input's channel, queued on the audio thread and drained here.
+    // The device's LTC input, from the audio thread to this one: a ring (four seconds, made before it starts) the
+    // audio thread writes without a lock or an allocation.
     struct ChaseQueue {
-        std::mutex m;
-        std::vector<float> samples;
+        std::vector<float> ring = std::vector<float>(size_t(48000) * 4);
+        std::atomic<int64_t> written{0}, read{0};
         std::atomic<int64_t> taken{0};
     };
     std::shared_ptr<ChaseQueue> chaseQueue_;

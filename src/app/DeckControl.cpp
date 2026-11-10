@@ -392,9 +392,12 @@ bool DeckController::startChase(const QString& input, int channel, int64_t offse
         std::string why;
         const int id = engine.addInput(nullptr, 48000, [queue, k](const float* in, int channels, int frames, int64_t) {
             if (k >= channels || frames <= 0) return;
-            std::lock_guard<std::mutex> lock(queue->m);
-            if (queue->samples.size() > 48000 * 4) return;  // (not drained for seconds: let go)
-            for (int i = 0; i < frames; ++i) queue->samples.push_back(in[size_t(i) * size_t(channels) + size_t(k)]);
+            const int64_t cap = int64_t(queue->ring.size());
+            const int64_t w = queue->written.load(std::memory_order_relaxed);
+            // (not drained for seconds: what does not fit is let go)
+            const int64_t n = std::min<int64_t>(frames, cap - (w - queue->read.load(std::memory_order_acquire)));
+            for (int64_t i = 0; i < n; ++i) queue->ring[size_t((w + i) % cap)] = in[size_t(i) * size_t(channels) + size_t(k)];
+            if (n > 0) queue->written.store(w + n, std::memory_order_release);
         }, &why);
         if (id < 0) {
             chase_.reset();
@@ -506,12 +509,13 @@ QString DeckController::chaseStatus() const {
 
 void DeckController::drainChase() {
     if (!chaseQueue_ || !chase_) return;
-    std::vector<float> got;
-    {
-        std::lock_guard<std::mutex> lock(chaseQueue_->m);
-        got.swap(chaseQueue_->samples);
-    }
-    if (got.empty()) return;
+    ChaseQueue& q = *chaseQueue_;
+    const int64_t r = q.read.load(std::memory_order_relaxed), w = q.written.load(std::memory_order_acquire);
+    if (w <= r) return;
+    const int64_t cap = int64_t(q.ring.size());
+    std::vector<float> got(size_t(w - r));
+    for (int64_t i = r; i < w; ++i) got[size_t(i - r)] = q.ring[size_t(i % cap)];
+    q.read.store(w, std::memory_order_release);
     chaseQueue_->taken += int64_t(got.size());
     feedChase(got.data(), int(got.size()), 1);
 }

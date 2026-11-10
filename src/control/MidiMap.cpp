@@ -277,9 +277,9 @@ void Learner::add(const Event& e) {
                (e.key.number == key_.number || e.key.number + 32 == key_.number)) {
         key_ = e.key;  // the controller turned out to be a 14-bit pair
         values_.clear();
-    } else if (key_.kind == Kind::Note && !values_.empty() && values_.back() > 0 && e.key.channel == key_.channel &&
+    } else if (key_.kind == Kind::Note && !values_.empty() && values_.back() > 0 && e.key.channel == key_.channel && e.value >= 8 &&
                (e.key.kind == Kind::Aftertouch || (e.key.kind == Kind::PolyAftertouch && e.key.number == key_.number))) {
-        key_ = e.key;  // a key pressed into: its aftertouch is what is learnt
+        key_ = e.key;  // a key pressed into (not the light pressure some pads send with every hit): its aftertouch is learnt
         values_.clear();
     } else if (e.key != key_) {
         return;  // the first control touched is the one learnt
@@ -411,6 +411,11 @@ void Mapper::resetTakeover() {
 
 void Mapper::reshow() {
     for (size_t i = 0; i < mappings_.size(); ++i) run(i).shown = -1;
+}
+
+void Mapper::reshow(const std::string& output) {
+    for (size_t i = 0; i < mappings_.size(); ++i)
+        if (mappings_[i].output == output) run(i).shown = -1;
 }
 
 bool Mapper::active(size_t index) const {

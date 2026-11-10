@@ -313,11 +313,20 @@ void SamplerPanel::refreshPasses() {
     const QSignalBlocker block(passBox_);
     passBox_->clear();
     if (!t) return;
-    for (const SamplerPass& ps : t->sampler.passes)
-        if (const TakeLane* ln = edit::findTakeLane(*t, ps.lane)) {
-            passBox_->addItem(tr("%1 (%2 notes)").arg(QString::fromStdString(ln->name)).arg(ps.notes.size()), qlonglong(ps.lane));
+    // Its own passes, then the parts its slots sent to other tracks (kept there, by the track's name).
+    const Sequence* sq = state_->sequence();
+    for (size_t i = 0; sq && i < sq->audioTracks.size(); ++i) {
+        const Track& on = sq->audioTracks[i];
+        for (const SamplerPass& ps : on.sampler.passes) {
+            const bool mine = &on == t ? !ps.track || ps.track == t->id : ps.track == t->id;
+            const TakeLane* ln = mine ? edit::findTakeLane(on, ps.lane) : nullptr;
+            if (!ln) continue;
+            QString label = tr("%1 (%2 notes)").arg(QString::fromStdString(ln->name)).arg(ps.notes.size());
+            if (&on != t) label = QStringLiteral("A%1: %2").arg(i + 1).arg(label);
+            passBox_->addItem(label, qlonglong(ps.lane));
             if (ps.lane == was) passBox_->setCurrentIndex(passBox_->count() - 1);
         }
+    }
     if (!was && passBox_->count()) passBox_->setCurrentIndex(passBox_->count() - 1);
 }
 

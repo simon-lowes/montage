@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <thread>
 
 #include "ElasticAudio.h"
@@ -211,7 +212,9 @@ KitPtr loadKit(const SamplerSettings& settings, int sampleRate, std::vector<std:
             // A long file is read in blocks into its cache file, never held whole.
             if (!load && streamOver > 0) {
                 MediaItem probed;
-                if (probeMedia(sd.path, probed, &why) && probed.duration * sampleRate > double(streamOver)) {
+                // (by the part of the file the slot plays: a short slice of a long recording is held in memory)
+                auto played = [&] { return (sd.end > sd.start ? std::min(sd.end, probed.duration) : probed.duration) - sd.start; };
+                if (probeMedia(sd.path, probed, &why) && played() * sampleRate > double(streamOver)) {
                     if (auto disk = decodeToDisk(sd.path, sampleRate, stream, &why)) {
                         Kit::Sound s;
                         s.disk = disk;
@@ -312,6 +315,14 @@ struct Engine::Disk {
                 Window& w = *wp;
                 const int st = w.state.load(std::memory_order_acquire);
                 if (st == 2) {
+                    // (its file closed once no other window reads it, so a kit's cache file can go when the kit does)
+                    // (closed before the window lets its sound go, which may remove the file)
+                    const std::string name = w.disk ? w.disk->file : std::string();
+                    if (auto f = files.find(name); f != files.end() &&
+                        std::none_of(windows.begin(), windows.end(), [&](const auto& o) { return o->state.load() == 1 && o->disk && o->disk->file == name; })) {
+                        if (f->second) std::fclose(f->second);
+                        files.erase(f);
+                    }
                     w.disk.reset();
                     w.state.store(0, std::memory_order_release);
                     continue;
@@ -487,8 +498,9 @@ void Engine::startVoice(const Event& e, const KitPtr& kit) {
         letGo(*oldest);
         voices_.erase(oldest);
     }
-    // A streamed sound: a window the disk thread fills from where its head ends (none free: the head alone plays).
-    if (sound.disk && disk_)
+    // A streamed sound longer than its head: a window the disk thread fills from where its head ends (none free: the
+    // head alone plays).
+    auto claim = [&] {
         for (const auto& w : disk_->windows)
             if (w->state.load(std::memory_order_acquire) == 0) {
                 w->disk = sound.disk;  // (the window held none: nothing is freed here)
@@ -498,8 +510,18 @@ void Engine::startVoice(const Event& e, const KitPtr& kit) {
                 w->want.store(0, std::memory_order_relaxed);
                 w->state.store(1, std::memory_order_release);
                 v.window = w.get();
-                break;
+                return true;
             }
+        return false;
+    };
+    if (sound.disk && disk_ && sound.end - sound.start > sound.head && !claim() && blocking_) {
+        // (offline: a window the disk thread is still freeing is waited for)
+        auto freeing = [&] {
+            return std::any_of(disk_->windows.begin(), disk_->windows.end(), [](const auto& w) { return w->state.load(std::memory_order_acquire) == 2; });
+        };
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (freeing() && !claim() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
     voices_.push_back(std::move(v));
 }
 
@@ -522,7 +544,10 @@ void Engine::renderVoices(float* out, int frames) {
         auto frame = [&](int64_t rel) -> const float* {
             if (!streamed) return src + size_t(s.start + rel) * 2;
             if (rel < s.head) return src + size_t(rel) * 2;
-            if (!win) return silence;
+            if (!win) {
+                ++gUnderruns;  // (no window was free for it)
+                return silence;
+            }
             // (told again as it goes in a long block, so the disk thread reads on past where the block began)
             if (rel - told >= win->capacity / 4) win->want.store(told = rel, std::memory_order_release);
             int64_t f = win->filled.load(std::memory_order_acquire);
@@ -894,7 +919,8 @@ edit::Result addPass(Project& p, Sequence& s, TrackRef track, const KitPtr& kit,
             const TrackRef dst = *audioTrackRef(s, o);
             edit::Result r = placePart(p, s, dst, part, notes, seed, partFile(file, o), first, noteFrame, name, clipPerHit);
             if (!r.ok) return r;
-            trackAt(s, track)->sampler.passes.push_back({r.created.front(), seed, notes, o});
+            // (kept on that track with its lane, saying which track played it)
+            trackAt(s, dst)->sampler.passes.push_back({r.created.front(), seed, notes, ownId});
             all.created.insert(all.created.end(), r.created.begin(), r.created.end());
             any = true;
         }
@@ -912,23 +938,31 @@ edit::Result revoicePass(Project& p, Sequence& s, TrackRef track, Id lane, const
     Track* t = samplerTrack(s, track, why);
     if (!t) return edit::Result::fail(why);
     if (!kit) return edit::Result::fail("No sounds loaded");
-    auto pass = std::find_if(t->sampler.passes.begin(), t->sampler.passes.end(), [&](const SamplerPass& ps) { return ps.lane == lane; });
-    if (pass == t->sampler.passes.end()) return edit::Result::fail("That lane is not a sampler pass");
-    const SamplerPass ps = *pass;
     const Id ownId = t->id;
-    // The part of a pass sent to another track: its lane is there, voiced by the slots sent to it.
+    // This track's own pass, or the part of one of its passes sent to another track (kept there, with its lane,
+    // saying it was played here), voiced by the slots sent to it.
     TrackRef where = track;
-    if (ps.track) {
-        const auto ref = audioTrackRef(s, ps.track);
-        if (!ref) return edit::Result::fail("The track that pass was sent to is not there");
-        where = *ref;
-    }
+    std::optional<SamplerPass> found;
+    for (const SamplerPass& ps : t->sampler.passes)
+        if (ps.lane == lane) {
+            if (ps.track && ps.track != ownId) return edit::Result::fail("That pass was played by another track's sampler: voice it again from there");
+            found = ps;
+        }
+    for (size_t i = 0; !found && i < s.audioTracks.size(); ++i)
+        for (const SamplerPass& ps : s.audioTracks[i].sampler.passes)
+            if (ps.lane == lane && ps.track == ownId && int(i) != track.index) {
+                found = ps;
+                where = {TrackKind::Audio, int(i)};
+            }
+    if (!found) return edit::Result::fail("That lane is not a sampler pass");
+    const SamplerPass ps = *found;
+    const Id partId = where == track ? 0 : trackAt(s, where)->id;
     KitPtr part = kit;
-    if (ps.track || std::any_of(kit->pads.begin(), kit->pads.end(), [&](const Kit::Slot& sl) { return sl.settings.output != 0; })) {
+    if (partId || std::any_of(kit->pads.begin(), kit->pads.end(), [&](const Kit::Slot& sl) { return sl.settings.output != 0; })) {
         auto mine = std::make_shared<Kit>(*kit);
         for (Kit::Slot& sl : mine->pads)
             if (sl.settings.output == ownId || (sl.settings.output && !audioTrackRef(s, sl.settings.output))) sl.settings.output = 0;
-        part = kitFor(mine, ps.track);
+        part = kitFor(mine, partId);
     }
     t = trackAt(s, where);
     auto ln = std::find_if(t->lanes.begin(), t->lanes.end(), [&](const TakeLane& l) { return l.id == lane; });

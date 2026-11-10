@@ -189,6 +189,8 @@ public:
     std::vector<Out> refreshAll(const std::function<double(const Mapping&)>& get);
     // Everything shown again (a controller plugged back in, the layer changed).
     void reshow();
+    // What is shown on that output port sent again next time (the port could not be opened just now).
+    void reshow(const std::string& output);
 
     // A target value and a control position (0-1), through the mapping's range, curve and inversion.
     static double toTarget(const Mapping& m, double position);

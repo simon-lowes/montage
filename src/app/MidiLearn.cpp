@@ -31,6 +31,7 @@
 #include <QToolButton>
 #include <QJsonDocument>
 #include <algorithm>
+#include <set>
 #include <cmath>
 
 #include "ColorWheel.h"
@@ -234,7 +235,8 @@ void MidiLearn::handle(const MidiMessage& m) {
                         m.key = e.key;
                         m.encoding = Encoding::Absolute;
                         m.toggle = false;
-                        mapper_.add(m);
+                        if (learnAdds_) mapper_.add(m);
+                        else mapper_.map(m);
                         saveMap();
                         emit mapChanged();
                         state_->message(tr("MIDI Learn: %1 controls %2").arg(QString::fromStdString(midimap::keyLabel(m.key)), targetLabel(justLearntTarget_)), 6000);
@@ -275,9 +277,13 @@ void MidiLearn::handle(const MidiMessage& m) {
 void MidiLearn::refresh() {
     if (!connection_) return;
     // (in order, each to its port: the controller's own, or a mapping's own output)
+    std::set<std::string> missing;
     for (const midimap::Mapper::Out& o : mapper_.refreshAll([this](const Mapping& map) { return targetValue(QString::fromStdString(map.target)); }))
         if (o.port.empty()) connection_->send(o.message);
         else if (MidiConnection* port = outputPort(o.port)) port->send(o.message);
+        else missing.insert(o.port);
+    // (not there yet, or unplugged: shown once it can be opened, not only when the value next changes)
+    for (const std::string& port : missing) mapper_.reshow(port);
 }
 
 void MidiLearn::setOutputOpener(OutputOpener opener) {
@@ -716,8 +722,10 @@ void MidiLearn::setMapping(size_t index, const Mapping& m) {
     if (old.key == m.key && old.layer == m.layer) {
         mapper_.setMappingOptions(index, m);
     } else {
+        // (onto another control: its mappings kept only when learning adds to a control's targets)
         mapper_.remove(index);
-        mapper_.add(m);
+        if (learnAdds_) mapper_.add(m);
+        else mapper_.map(m);
     }
     saveMap();
     emit mapChanged();

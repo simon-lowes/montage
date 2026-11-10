@@ -2179,7 +2179,7 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     Sequence s = *src;
     s.id = p.newId();
     s.name = name.empty() ? src->name + " Copy" : name;
-    std::map<Id, Id> clips, groups, buses;
+    std::map<Id, Id> clips, groups, buses, trackIds;
     // Effect ids are not unique within a sequence (a split clip's halves share them), so a clip's are found by both.
     std::map<std::pair<Id, Id>, Id> effects;
     Id owner = 0;  // the clip (its old id) whose effects are being renewed, 0 for others
@@ -2224,7 +2224,11 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
     };
     for (auto* tracks : {&s.videoTracks, &s.audioTracks})
         for (Track& t : *tracks) {
-            t.id = p.newId();
+            {
+                const Id fresh = p.newId();
+                trackIds[t.id] = fresh;
+                t.id = fresh;
+            }
             if (t.output) t.output = buses.count(t.output) ? buses[t.output] : 0;
             // Sends go to the copy's buses (none to a bus that was not copied).
             for (Send& sd : t.sends) sd.bus = buses.count(sd.bus) ? buses[sd.bus] : 0;
@@ -2263,6 +2267,13 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
             for (SamplerPass& ps : t.sampler.passes) ps.lane = lanes.count(ps.lane) ? lanes[ps.lane] : 0;
             std::erase_if(t.sampler.passes, [](const SamplerPass& ps) { return !ps.lane; });
         }
+    // A sampler's slots sent to other tracks, and the parts they recorded there, follow the tracks to their copies.
+    for (Track& t : s.audioTracks) {
+        for (SamplerSlot& sl : t.sampler.pads)
+            if (sl.output) sl.output = trackIds.count(sl.output) ? trackIds[sl.output] : 0;
+        for (SamplerPass& ps : t.sampler.passes)
+            if (ps.track) ps.track = trackIds.count(ps.track) ? trackIds[ps.track] : 0;
+    }
     for (AdrCue& q : s.adrCues) {
         q.id = p.newId();
         q.clip = clips.count(q.clip) ? clips[q.clip] : 0;
