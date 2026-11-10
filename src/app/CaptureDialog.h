@@ -61,10 +61,18 @@ public:
         QString sound = QStringLiteral("aac");      // aac, libopus, ac3, eac3 or none
         bool serve = false, network = false;
         int port = 0;
+        bool languages = false;                     // every sound stream of the feed, each a rendition in its language
+        QString captions = QStringLiteral("auto");  // the feed's captions: auto (when it has them), always or none
     };
     void setLive(const LiveOptions& o);
     LiveOptions live() const;
     QString liveUrl() const;  // where the package is served ("" not served)
+    // While a live package is made: an ad break from the next picture recorded (its length in seconds, 0 not known,
+    // below 0 the dialog's),
+    // placed on a keyframe made there, and a chapter from there (titled "Chapter N" when no title is given). False
+    // with why when none is being made.
+    bool liveCue(double duration, QString* error = nullptr);
+    bool liveChapter(const QString& title = QString(), QString* error = nullptr);
 
     // Starts recording (false with the reason in the status line); stops it.
     bool record();
@@ -135,6 +143,12 @@ private:
     QCheckBox* liveServe_;
     QSpinBox* livePort_;
     QCheckBox* liveNetwork_;
+    QCheckBox* liveLanguages_;
+    QComboBox* liveCaptions_;
+    QPushButton* liveCue_;
+    QDoubleSpinBox* liveBreak_;
+    QPushButton* liveChapter_;
+    int liveChapters_ = 0;
     QPushButton* record_;
     QLabel* status_;
     QTimer* tick_;

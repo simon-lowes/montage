@@ -2535,6 +2535,80 @@ private slots:
         dlg->hide();
     }
 
+    void captureLiveMarks() {
+        // A live package of a feed with two sound streams, both packaged; an ad break placed with the dialog's button
+        // (its length the dialog's), another and a chapter over montage_capture, a chapter from File > Live Chapter:
+        // each break on a keyframe, the chapters in chapters.vtt; none placed when no package is being made.
+        const std::vector<std::string> kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build has no capture devices");
+        state()->newProject();
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 4}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_capture"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QVERIFY(call({{"action", "cue"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "chapter"}, {"title", "Early"}}).value("isError").toBool());
+        QTemporaryDir dir;
+        const QString folder = dir.filePath("live");
+        const QString feed = "testsrc2=size=320x180:rate=25,realtime[out0];sine=f=500:sample_rate=48000,arealtime[out1];"
+                             "sine=f=800:sample_rate=48000,arealtime[out2]";
+        QVERIFY(call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Marks 01"}, {"seconds", 7},
+                      {"live", QJsonObject{{"folder", folder}, {"captions", "sometimes"}}}})
+                    .value("isError")
+                    .toBool());
+        QJsonObject r = call({{"action", "record"}, {"kind", "lavfi"}, {"url", feed}, {"folder", dir.path()}, {"name", "Marks 01"}, {"seconds", 7},
+                              {"codec", "prores_proxy"}, {"watch", false},
+                              {"live", QJsonObject{{"folder", folder}, {"languages", true}, {"captions", "none"}, {"low_latency", true}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        CaptureDialog* dlg = win_->captureDialog();
+        auto stopped = qScopeGuard([&] {
+            dlg->stop();
+            dlg->setLive({});
+            dlg->hide();
+        });
+        auto* breakLength = dlg->findChild<QDoubleSpinBox*>("captureLiveBreak");
+        auto* adBreak = dlg->findChild<QPushButton*>("captureLiveCue");
+        QVERIFY(breakLength && adBreak && dlg->findChild<QCheckBox*>("captureLiveLanguages")->isChecked());
+        breakLength->setValue(1.5);
+        QTRY_VERIFY_WITH_TIMEOUT(adBreak->isEnabled() && dlg->statusText().contains("Live: "), 15000);
+        QTest::qWait(1500);
+        adBreak->click();
+        QTest::qWait(1200);
+        r = call({{"action", "cue"}, {"duration", 0.8}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "chapter"}, {"title", "Second half"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QAction* chapter = win_->findChild<QAction*>("liveChapter");
+        QVERIFY(chapter && win_->findChild<QAction*>("liveAdBreak"));
+        QTest::qWait(600);
+        chapter->trigger();
+        auto liveNow = [&] { return call({{"action", "status"}}).value("structuredContent").toObject().value("live").toObject(); };
+        QTRY_COMPARE_WITH_TIMEOUT(liveNow().value("cues").toInt(), 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(liveNow().value("chapters").toInt(), 2, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->statusText().contains("Live package ended"), 20000);
+        QVERIFY2(dlg->statusText().contains("2 ad cue") && dlg->statusText().contains("2 sound stream"), qPrintable(dlg->statusText()));
+        const QJsonObject live = liveNow();
+        QCOMPARE(live.value("sound_renditions").toInt(), 2);
+        QVERIFY(!live.value("captioned").toBool());
+        auto readFile = [](const QString& f) {
+            QFile file(f);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
+        const QString master = readFile(folder + "/master.m3u8");
+        QCOMPARE(int(master.count("TYPE=AUDIO")), 2);
+        QVERIFY(!master.contains("TYPE=SUBTITLES"));
+        const QString video = master.split('\n').filter(QRegularExpression("^v\\d.*playlist\\.m3u8$")).value(0);
+        const QString list = readFile(folder + "/" + video);
+        QVERIFY2(list.contains("ID=\"cue-1\"") && list.contains("ID=\"cue-2\"") && list.contains("PLANNED-DURATION=1.500"), qPrintable(list));
+        const QString chapters = readFile(folder + "/chapters.vtt");
+        QVERIFY2(chapters.contains("Second half") && chapters.contains("Chapter 2"), qPrintable(chapters));
+    }
+
     // ST 2110 streams recorded by an agent (montage_capture), their SDPs given as text: in the Captures bin with the
     // streams' time code.
     void captureSt2110OverTheAgentLink() {

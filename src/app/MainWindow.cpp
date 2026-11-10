@@ -626,6 +626,11 @@ void MainWindow::buildPanels() {
     surface_->setCommand(QStringLiteral("monitorMute"), [this] { monitoring_->toggleMute(); });
     surface_->setCommand(QStringLiteral("talkbackOn"), [this] { program_->setTalkback(program_->monitoring().cue.on); });
     surface_->setCommand(QStringLiteral("talkbackOff"), [this] { program_->setTalkback(false); });
+    // (F5 and F6: a live package's ad break and chapter)
+    for (const char* name : {"liveAdBreak", "liveChapter"})
+        surface_->setCommand(QString::fromLatin1(name), [this, name] {
+            if (QAction* a = findChild<QAction*>(QString::fromLatin1(name))) a->trigger();
+        });
     osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
     osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
     if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
@@ -1434,6 +1439,16 @@ void MainWindow::buildMenus() {
         d->raise();
         d->activateWindow();
     })->setObjectName(QStringLiteral("capture"));
+    // While File > Capture packages its feed live: an ad break (the dialog's length) or a chapter from the next
+    // picture, from a key, OSC's /montage/command/file/... or a control surface's F5 and F6.
+    for (const bool cue : {true, false})
+        add(file, cue ? Name(QT_TR_NOOP("Live Ad &Break")) : Name(QT_TR_NOOP("Live C&hapter")), QKeySequence(), [this, cue] {
+            QString why;
+            if (!(capture_ && (cue ? capture_->liveCue(-1, &why) : capture_->liveChapter(QString(), &why))))
+                statusBar()->showMessage(why.isEmpty() ? tr("No live package is being made") : why, 4000);
+            else
+                statusBar()->showMessage(cue ? tr("Ad break placed") : tr("Chapter placed"), 2000);
+        })->setObjectName(cue ? QStringLiteral("liveAdBreak") : QStringLiteral("liveChapter"));
     add(file, QT_TR_NOOP("&Multiviewer…"), QKeySequence(), [this] {
         Multiviewer* m = multiviewer();
         m->show();
