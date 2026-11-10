@@ -39,7 +39,7 @@ option(MONTAGE_WITH_WEBRTC "Live review in any web browser over WebRTC (libdatac
 option(MONTAGE_WITH_BMX "Broadcast MXF by the book: AS-11, RDD 9 and ST 436 ancillary data (the EBU's bmx with libMXF, BSD, fetched at configure time)" ON)
 option(MONTAGE_WITH_AV2 "AV2 in and out: dav2d (VideoLAN, BSD-2-Clause) reads it and AVM (the AV2 reference encoder, BSD-3-Clause-Clear with the AOM patent licence) writes it, when both are installed (AV2_ROOT, as scripts/build-av2.sh builds them, or pkg-config); off: both licences are flagged and packages leave AV2 out" OFF)
 set(AV2_ROOT "" CACHE PATH "Where dav2d and AVM are installed (scripts/build-av2.sh <prefix>), for MONTAGE_WITH_AV2")
-option(MONTAGE_WITH_VMAF "VMAF scores in Compare Encode, when libvmaf 3+ is installed (Netflix, BSD-2-Clause-Patent; off until its licence is settled)" OFF)
+option(MONTAGE_WITH_VMAF "VMAF scores in Compare Encode, Quality Check and per-shot streaming ladders (libvmaf 3.2.1 with its models, Netflix, BSD-2-Clause-Patent, fetched at configure time)" ON)
 option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or later" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
@@ -580,6 +580,112 @@ if(MONTAGE_WITH_OMT)
 endif()
 
 list(LENGTH CMAKE_OSX_ARCHITECTURES MONTAGE_OSX_ARCH_COUNT)
+if(MONTAGE_WITH_VMAF)
+  # libvmaf (Netflix, BSD-2-Clause-Patent) v3.2.1, pinned by its commit, built here by CMake from its own sources as
+  # its Meson build would build it (no Meson, NASM or xxd needed): the integer features, its x86-64 AVX2 and AVX-512
+  # code or its AArch64 NEON code (chosen at run time), and its VMAF models compiled in (third_party/libvmaf has the
+  # config.h, version stamp and CPUID queries its build would generate or assemble).
+  include(FetchContent)
+  enable_language(C)
+  FetchContent_Declare(vmaf
+    GIT_REPOSITORY https://github.com/Netflix/vmaf.git
+    GIT_TAG f85a853692a8c730d0270cd733c8bb30b5b93b7c  # v3.2.1, pinned by its commit (a tag can be moved)
+    SOURCE_SUBDIR no-cmake)
+  FetchContent_MakeAvailable(vmaf)
+  set(MONTAGE_VMAF_SRC ${vmaf_SOURCE_DIR}/libvmaf/src)
+  set(MONTAGE_VMAF_FEATURE ${MONTAGE_VMAF_SRC}/feature)
+  set(MONTAGE_VMAF_GEN ${CMAKE_BINARY_DIR}/vmaf-generated)
+  # Its built-in models, as C arrays (those its build compiles in; model.c lists them).
+  set(MONTAGE_VMAF_MODELS
+    vmaf_v0.6.1.json vmaf_b_v0.6.3.json vmaf_v0.6.1neg.json vmaf_4k_v0.6.1.json vmaf_4k_v0.6.1neg.json
+    vmaf_v1.0.16/vmaf_v1.0.16_3d0h.json vmaf_v1.0.16/vmaf_v1.0.16_3d0h_2160.json vmaf_v1.0.16/vmaf_v1.0.16_5d0h.json
+    vmaf_v1.0.16/vmaf_v1.0.16_1d5h_2160.json
+    vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_3d0h.json vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_3d0h_2160.json
+    vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_5d0h.json vmaf_v1.0.16_hfr/vmaf_v1.0.16_hfr_1d5h_2160.json)
+  set(MONTAGE_VMAF_MODEL_SOURCES "")
+  foreach(model ${MONTAGE_VMAF_MODELS})
+    get_filename_component(name ${model} NAME)
+    set(out ${MONTAGE_VMAF_GEN}/${name}.c)
+    add_custom_command(OUTPUT ${out}
+      COMMAND ${CMAKE_COMMAND} -DIN=${vmaf_SOURCE_DIR}/model/${model} -DOUT=${out} -P ${CMAKE_SOURCE_DIR}/third_party/libvmaf/embed-model.cmake
+      DEPENDS ${vmaf_SOURCE_DIR}/model/${model} ${CMAKE_SOURCE_DIR}/third_party/libvmaf/embed-model.cmake
+      COMMENT "Embedding VMAF model ${name}" VERBATIM)
+    list(APPEND MONTAGE_VMAF_MODEL_SOURCES ${out})
+  endforeach()
+  file(READ ${vmaf_SOURCE_DIR}/libvmaf/include/libvmaf/version.h.in MONTAGE_VMAF_VERSION_H)
+  string(REPLACE "@VMAF_API_VERSION_MAJOR@" 3 MONTAGE_VMAF_VERSION_H "${MONTAGE_VMAF_VERSION_H}")
+  string(REPLACE "@VMAF_API_VERSION_MINOR@" 2 MONTAGE_VMAF_VERSION_H "${MONTAGE_VMAF_VERSION_H}")
+  string(REPLACE "@VMAF_API_VERSION_PATCH@" 0 MONTAGE_VMAF_VERSION_H "${MONTAGE_VMAF_VERSION_H}")
+  file(WRITE ${MONTAGE_VMAF_GEN}/include/libvmaf/version.h.new "${MONTAGE_VMAF_VERSION_H}")
+  file(COPY_FILE ${MONTAGE_VMAF_GEN}/include/libvmaf/version.h.new ${MONTAGE_VMAF_GEN}/include/libvmaf/version.h ONLY_IF_DIFFERENT)
+  set(MONTAGE_VMAF_SOURCES
+    ${MONTAGE_VMAF_SRC}/libvmaf.c ${MONTAGE_VMAF_SRC}/predict.c ${MONTAGE_VMAF_SRC}/model.c ${MONTAGE_VMAF_SRC}/picture.c
+    ${MONTAGE_VMAF_SRC}/mem.c ${MONTAGE_VMAF_SRC}/output.c ${MONTAGE_VMAF_SRC}/fex_ctx_vector.c ${MONTAGE_VMAF_SRC}/thread_pool.c
+    ${MONTAGE_VMAF_SRC}/dict.c ${MONTAGE_VMAF_SRC}/opt.c ${MONTAGE_VMAF_SRC}/ref.c ${MONTAGE_VMAF_SRC}/read_json_model.c
+    ${MONTAGE_VMAF_SRC}/pdjson.c ${MONTAGE_VMAF_SRC}/log.c ${MONTAGE_VMAF_SRC}/framesync.c ${MONTAGE_VMAF_SRC}/metadata_handler.c
+    ${MONTAGE_VMAF_SRC}/picture_pool.c ${MONTAGE_VMAF_SRC}/cpu.c ${MONTAGE_VMAF_SRC}/svm.cpp
+    ${MONTAGE_VMAF_FEATURE}/picture_copy.c ${MONTAGE_VMAF_FEATURE}/integer_psnr.c ${MONTAGE_VMAF_FEATURE}/third_party/xiph/psnr_hvs.c
+    ${MONTAGE_VMAF_FEATURE}/feature_extractor.c ${MONTAGE_VMAF_FEATURE}/feature_name.c ${MONTAGE_VMAF_FEATURE}/alias.c
+    ${MONTAGE_VMAF_FEATURE}/integer_adm.c ${MONTAGE_VMAF_FEATURE}/feature_collector.c ${MONTAGE_VMAF_FEATURE}/integer_motion.c
+    ${MONTAGE_VMAF_FEATURE}/integer_vif.c ${MONTAGE_VMAF_FEATURE}/ciede.c ${MONTAGE_VMAF_FEATURE}/common/alignment.c
+    ${MONTAGE_VMAF_FEATURE}/mkdirp.c ${MONTAGE_VMAF_FEATURE}/float_ssim.c ${MONTAGE_VMAF_FEATURE}/float_ms_ssim.c
+    ${MONTAGE_VMAF_FEATURE}/ssim.c ${MONTAGE_VMAF_FEATURE}/ms_ssim.c ${MONTAGE_VMAF_FEATURE}/iqa/decimate.c
+    ${MONTAGE_VMAF_FEATURE}/iqa/ssim_tools.c ${MONTAGE_VMAF_FEATURE}/iqa/math_utils.c ${MONTAGE_VMAF_FEATURE}/iqa/convolve.c
+    ${MONTAGE_VMAF_FEATURE}/cambi.c ${MONTAGE_VMAF_FEATURE}/luminance_tools.c ${MONTAGE_VMAF_FEATURE}/null.c
+    ${MONTAGE_VMAF_FEATURE}/common/convolution.c ${MONTAGE_VMAF_FEATURE}/vif_tools.c ${MONTAGE_VMAF_FEATURE}/speed.c
+    ${MONTAGE_VMAF_MODEL_SOURCES})
+  # Its SIMD code, for the processor the compiler targets (none in a universal macOS build).
+  set(MONTAGE_VMAF_AVX2 ${MONTAGE_VMAF_FEATURE}/common/convolution_avx.c ${MONTAGE_VMAF_FEATURE}/x86/motion_avx2.c
+      ${MONTAGE_VMAF_FEATURE}/x86/vif_avx2.c ${MONTAGE_VMAF_FEATURE}/x86/adm_avx2.c ${MONTAGE_VMAF_FEATURE}/x86/cambi_avx2.c
+      ${MONTAGE_VMAF_FEATURE}/x86/speed_avx2.c)
+  set(MONTAGE_VMAF_AVX512 ${MONTAGE_VMAF_FEATURE}/x86/motion_avx512.c ${MONTAGE_VMAF_FEATURE}/x86/vif_avx512.c
+      ${MONTAGE_VMAF_FEATURE}/x86/adm_avx512.c ${MONTAGE_VMAF_FEATURE}/x86/speed_avx512.c)
+  set(MONTAGE_VMAF_NEON ${MONTAGE_VMAF_FEATURE}/arm64/vif_neon.c ${MONTAGE_VMAF_FEATURE}/arm64/adm_neon.c
+      ${MONTAGE_VMAF_FEATURE}/arm64/motion_neon.c ${MONTAGE_VMAF_SRC}/arm/cpu.c)
+  set(MONTAGE_VMAF_SIMD "")
+  if(MONTAGE_OSX_ARCH_COUNT GREATER 1)
+    set(MONTAGE_VMAF_SIMD none)
+  elseif(CMAKE_OSX_ARCHITECTURES)
+    set(MONTAGE_VMAF_SIMD ${CMAKE_OSX_ARCHITECTURES})
+  else()
+    set(MONTAGE_VMAF_SIMD ${CMAKE_SYSTEM_PROCESSOR})
+  endif()
+  if(MONTAGE_VMAF_SIMD MATCHES "^(x86_64|AMD64|amd64)$" AND NOT MSVC)
+    set(MONTAGE_VMAF_SIMD_FLAGS "")
+    if(MINGW)
+      # (MinGW's GCC does not align its stack for 32- and 64-byte spills: unaligned moves keep them safe)
+      set(MONTAGE_VMAF_SIMD_FLAGS " -Wa,-muse-unaligned-vector-move")
+    endif()
+    set_source_files_properties(${MONTAGE_VMAF_AVX2} PROPERTIES COMPILE_FLAGS "-mavx -mavx2 -mfma${MONTAGE_VMAF_SIMD_FLAGS}")
+    set_source_files_properties(${MONTAGE_VMAF_AVX512} PROPERTIES
+      COMPILE_FLAGS "-mavx512f -mavx512dq -mavx512bw -mavx512cd -mavx512vl${MONTAGE_VMAF_SIMD_FLAGS}")
+    list(APPEND MONTAGE_VMAF_SOURCES ${MONTAGE_VMAF_AVX2} ${MONTAGE_VMAF_AVX512} ${MONTAGE_VMAF_SRC}/x86/cpu.c
+         ${CMAKE_SOURCE_DIR}/third_party/libvmaf/montage-cpuid.c)
+  elseif(MONTAGE_VMAF_SIMD MATCHES "^(aarch64|arm64|ARM64)$")
+    list(APPEND MONTAGE_VMAF_SOURCES ${MONTAGE_VMAF_NEON})
+  else()
+    set(MONTAGE_VMAF_NO_SIMD ON)
+  endif()
+  add_library(montage_vmaf STATIC ${MONTAGE_VMAF_SOURCES})
+  target_include_directories(montage_vmaf PRIVATE ${CMAKE_SOURCE_DIR}/third_party/libvmaf ${MONTAGE_VMAF_SRC}
+                             ${MONTAGE_VMAF_FEATURE} ${MONTAGE_VMAF_FEATURE}/common)
+  target_include_directories(montage_vmaf SYSTEM PUBLIC ${vmaf_SOURCE_DIR}/libvmaf/include ${MONTAGE_VMAF_GEN}/include)
+  target_compile_definitions(montage_vmaf PRIVATE OC_NEW_STYLE_INCLUDES $<$<BOOL:${MONTAGE_VMAF_NO_SIMD}>:MONTAGE_VMAF_NO_SIMD>
+                             $<IF:$<BOOL:${APPLE}>,_DARWIN_C_SOURCE,_GNU_SOURCE>)
+  set_target_properties(montage_vmaf PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON
+                        C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  if(NOT MSVC)
+    target_compile_options(montage_vmaf PRIVATE -O3 -w)
+  endif()
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set_source_files_properties(${MONTAGE_VMAF_SRC}/svm.cpp PROPERTIES COMPILE_OPTIONS -U_LIBCPP_ENABLE_ASSERTIONS)
+  endif()
+  find_package(Threads REQUIRED)
+  target_link_libraries(montage_vmaf PRIVATE Threads::Threads)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(montage_vmaf PRIVATE m)
+  endif()
+endif()
 if(MONTAGE_WITH_SPATIAL_VIDEO AND MONTAGE_OSX_ARCH_COUNT GREATER 1)
   message(WARNING "Spatial video is left out of a universal build (x265 builds for one architecture at a time)")
   set(MONTAGE_WITH_SPATIAL_VIDEO OFF)

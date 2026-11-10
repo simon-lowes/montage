@@ -82,6 +82,23 @@ endif()
 if(MONTAGE_WITH_FDL)
   target_compile_definitions(test_render PRIVATE MONTAGE_TEST_FDL_DIR="${ascfdl_SOURCE_DIR}/resources/FDL")
 endif()
+if(MONTAGE_WITH_VMAF)
+  # libvmaf's own `vmaf` program, built from the same sources (a test tool, never shipped): test_render checks that
+  # Montage's VMAF is the one it measures.
+  set(vmaf_tools ${vmaf_SOURCE_DIR}/libvmaf/tools)
+  add_executable(montage_test_vmaf ${vmaf_tools}/vmaf.c ${vmaf_tools}/cli_parse.c ${vmaf_tools}/y4m_input.c
+                 ${vmaf_tools}/vidinput.c ${vmaf_tools}/yuv_input.c)
+  target_link_libraries(montage_test_vmaf PRIVATE montage_vmaf)
+  target_include_directories(montage_test_vmaf PRIVATE ${PROJECT_SOURCE_DIR}/third_party/libvmaf ${vmaf_tools})
+  target_compile_definitions(montage_test_vmaf PRIVATE OC_NEW_STYLE_INCLUDES $<$<NOT:$<BOOL:${WIN32}>>:HAVE_STRSEP>
+                             $<IF:$<BOOL:${APPLE}>,_DARWIN_C_SOURCE,_GNU_SOURCE>)
+  set_target_properties(montage_test_vmaf PROPERTIES C_STANDARD 11 AUTOMOC OFF)
+  if(NOT MSVC)
+    target_compile_options(montage_test_vmaf PRIVATE -w)
+  endif()
+  add_dependencies(test_render montage_test_vmaf)
+  target_compile_definitions(test_render PRIVATE MONTAGE_TEST_VMAF_TOOL="$<TARGET_FILE:montage_test_vmaf>")
+endif()
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)
