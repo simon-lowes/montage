@@ -122,6 +122,8 @@ struct SvgTextLayout {
     QTransform pathMatrix;
     double start = 0;     // startOffset: along the path (the text's units), or a percentage of it
     bool startPercent = false;
+    // The title's Position when it was laid out: moved from there, the text moves with it (output pixels).
+    double atX = 0, atY = 0;
     bool empty() const { return matrix.isIdentity() && x.empty() && y.empty() && rotate.empty() && dx.empty() && dy.empty() && anchor == 0 && path.empty(); }
 };
 std::string svgTextLayoutJson(const SvgTextLayout& l);

@@ -38629,6 +38629,14 @@ if ui["pressed"] == "add":
             QVERIFY2(std::abs(moved[0] - (100 + (at[0] - 100) / 2 + 30)) < 0.5 && std::abs(moved[1] - (100 + (at[1] - 100) / 2)) < 0.5 &&
                          std::abs(moved[2] / at[2] - 0.25) < 0.02,
                      qPrintable(QString("%1,%2 (%3) from %4,%5 (%6)").arg(moved[0]).arg(moved[1]).arg(moved[2]).arg(at[0]).arg(at[1]).arg(at[2])));
+            // The title's own Position moves it from there (its frame's pixels).
+            {
+                Effect& title = s.videoTracks[1].clips[0].generator;
+                title.params["pos_x"] = Param(title.p("pos_x", 0) + 10);
+                const std::array<double, 3> nudged = inkBox(renderSequenceFrame(p, s, 0, o));
+                QVERIFY2(std::abs(nudged[0] - moved[0] - 10) < 0.5 && std::abs(nudged[1] - moved[1]) < 0.5,
+                         qPrintable(QString("%1,%2 from %3,%4").arg(nudged[0]).arg(nudged[1]).arg(moved[0]).arg(moved[1])));
+            }
             // Imported again: the titles it made before are replaced, not added to.
             QCOMPARE(placeSvgTexts(p, s, layer.id, texts), 1);
             int titles = 0;

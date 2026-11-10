@@ -1564,13 +1564,19 @@ public:
         std::vector<double> DX, DY;
         std::vector<Lists> stack;
         const SvgNode* onPath = nullptr;
+        int chars = 0;  // characters so far, as SVG counts them (code points: the lists' entries)
         auto add = [&](const QString& chunk) {
             for (QChar ch : chunk) {
                 if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
                 if (ch == ' ' && (str.isEmpty() || str.back() == ' ')) continue;
                 if (str.size() >= 4096) return;
+                const bool second = ch.isLowSurrogate() && !str.isEmpty() && str.back().isHighSurrogate();
                 str += ch;
-                const int i = int(str.size()) - 1;
+                if (second) {  // (the rest of the character before: its entries again)
+                    X.push_back(X.back()), Y.push_back(Y.back()), R.push_back(R.back()), DX.push_back(DX.back()), DY.push_back(DY.back());
+                    continue;
+                }
+                const int i = chars++;
                 std::optional<double> x, y, r;
                 double dx = 0, dy = 0;
                 bool hdx = false, hdy = false;
@@ -1587,7 +1593,7 @@ public:
         };
         std::function<void(const SvgNode&, int)> walk = [&](const SvgNode& e, int depth) {
             Lists l;
-            l.start = int(str.size());
+            l.start = chars;
             auto read = [&](const char* k, std::vector<double>& v) {
                 if (e.attrs.count(k)) v = numbersIn(e.attrs.at(k));
             };
@@ -1821,6 +1827,7 @@ Effect svgTextTitle(const SvgText& t, double scale) {
     // Laid out letter by letter as the SVG has it (render/Titles.h): its own coordinates to the layer's, at `scale`.
     SvgTextLayout lay = t.layout;
     lay.matrix = lay.matrix * QTransform::fromScale(scale, scale);
+    lay.atX = e.p("pos_x", 0), lay.atY = e.p("pos_y", 0);
     e.strings["svg_text"] = svgTextLayoutJson(lay);
     return e;
 }
@@ -1831,8 +1838,12 @@ int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>&
     const Clip base = s.videoTracks[size_t(at->track.index)].clips[at->index];
     // (imported again: the titles it made before go)
     const std::string linked = std::to_string(layer);
-    for (Track& tr : s.videoTracks)
-        std::erase_if(tr.clips, [&](const Clip& k) { return k.isGenerator() && k.generator.type == "title" && k.generator.s("svg_layer") == linked; });
+    std::vector<Id> earlier;
+    for (const Track& tr : s.videoTracks)
+        for (const Clip& k : tr.clips)
+            if (k.isGenerator() && k.generator.type == "title" && k.generator.s("svg_layer") == linked) earlier.push_back(k.id);
+    if (!earlier.empty() && !edit::removeClips(p, s, earlier, false).ok && notes)
+        notes->push_back("Titles from the earlier import kept (on a locked track)");
     int placed = 0;
     for (const SvgText& t : texts) {
         if (placed >= 32) {
@@ -1845,6 +1856,10 @@ int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>&
         c.generator.id = id;
         c.generator.params["pos_x"] = Param(c.generator.p("pos_x", 0) + base.generator.p("pos_x", 0));
         c.generator.params["pos_y"] = Param(c.generator.p("pos_y", 0) + base.generator.p("pos_y", 0));
+        if (std::optional<SvgTextLayout> lay = parseSvgTextLayout(c.generator.s("svg_text"))) {
+            lay->atX = c.generator.p("pos_x", 0), lay->atY = c.generator.p("pos_y", 0);
+            c.generator.strings["svg_text"] = svgTextLayoutJson(*lay);
+        }
         c.generator.strings["svg_layer"] = linked;
         c.start = base.start;
         c.name = QString::fromStdString(t.text).left(40).toStdString();

@@ -974,13 +974,15 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
                 }
                 if (out.segments.empty() || !ok) return std::nullopt;
                 // Set off by the mask's expansion, and across its feather (centred on the expanded edge) as far as On
-                // the Feather says: its pixels (sequence pixels on the clip's frame) as many of the title's as the
-                // clip's frame takes of them there.
+                // the Feather says: its pixels (as the clip's effects count them on its frame) as many of the title's
+                // as the clip's frame takes of them there.
                 const double feather = std::max(0.0, e.pAt("mask.feather", ot, 20)), expand = e.pAt("mask.expansion", ot);
                 const double across = std::clamp(c.generator.pAt("path_feather", t), -100.0, 100.0) / 100;
                 const double at = expand + across * feather / 2;
+                double ew = seq.width, eh = seq.height;  // (the clip's effects' pixels)
+                if (at != 0 && (!clipEffectFrameSize(p, seq, src, st, ew, eh) || ew <= 0 || eh <= 0)) ew = seq.width, eh = seq.height;
                 if (at != 0) {
-                    const QPointF o = frameTo(b.x, b.y), ux = frameTo(b.x + 1.0 / seq.width, b.y), uy = frameTo(b.x, b.y + 1.0 / seq.height);
+                    const QPointF o = frameTo(b.x, b.y), ux = frameTo(b.x + 1.0 / ew, b.y), uy = frameTo(b.x, b.y + 1.0 / eh);
                     const QPointF a = ux - o, d = uy - o;
                     out.offset = at * std::sqrt(std::abs(a.x() * d.y() - a.y() * d.x()));
                 }
@@ -1007,7 +1009,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
                 }
         if (!layer) return std::nullopt;
         const std::string id = shapePathItem(layer->generator, c.generator.s("path_item"));
-        const FrameTime slt = st - layer->start;
+        const FrameTime slt = std::clamp<FrameTime>(st - layer->start, 0, std::max<FrameTime>(0, layer->duration - 1));
         QTransform toFrame;
         if (id.empty() || !shapePathToFrame(layer->generator, id, slt, seq.width, seq.height, toFrame)) return std::nullopt;
         const std::vector<PathPoint> pts = shapePathPoints(layer->generator, id, slt);
@@ -1020,7 +1022,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
         pathSegments(pts, closed, [&](double x, double y) {
             const QPointF f = toFrame.map(QPointF(x, y));
             double sx = 0, sy = 0, u = 0, v = 0;
-            ok = ok && clipFrameToSequence(p, seq, *layer, st, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+            ok = ok && clipFrameToSequence(p, seq, *layer, layer->start + slt, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
                  sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
             return QPointF(u * w, v * h);
         });
@@ -1068,7 +1070,7 @@ TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip&
         auto to = [&](double x, double y) {
             const QPointF f = own.map(QPointF(x, y));
             double sx = 0, sy = 0, u = 0, v = 0;
-            ok = ok && clipFrameToSequence(p, seq, *layer, st, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+            ok = ok && clipFrameToSequence(p, seq, *layer, layer->start + slt, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
                  sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
             return QPointF(u * w, v * h);
         };

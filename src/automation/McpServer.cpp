@@ -3569,10 +3569,15 @@ void McpServer::Impl::addTools() {
                 if (pa.contains("clip")) {
                     if (sh != 4 && sh != 5) throw ArgError{"A path's clip is for the mask and shape paths"};
                     const QString who = pa.value("clip").toString().trimmed();
-                    bool found = false;
+                    bool found = false, fits = false;
                     for (const Track& tr : s.videoTracks)
-                        for (const Clip& k : tr.clips) found = found || k.name == who.toStdString() || QString::number(k.id) == who;
+                        for (const Clip& k : tr.clips)
+                            if (k.name == who.toStdString() || QString::number(k.id) == who) {
+                                found = true;
+                                fits = fits || sh == 4 || (k.isGenerator() && k.generator.type == "shape");
+                            }
                     if (who.isEmpty() || !found) throw ArgError{QStringLiteral("No clip \"%1\" for the path").arg(who)};
+                    if (!fits) throw ArgError{QStringLiteral("\"%1\" is not a shape layer").arg(who)};
                     c.generator.strings["path_clip"] = who.toStdString();
                 }
                 if (pa.contains("feather")) {

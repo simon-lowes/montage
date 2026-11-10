@@ -1,5 +1,6 @@
 #include "Titles.h"
 
+#include <QByteArray>
 #include <QFont>
 #include <QFontMetricsF>
 #include <QGlyphRun>
@@ -345,11 +346,29 @@ TitlePathCurve svgPathCurve(const std::string& d) {
     auto number = [&](double& v) {
         skip();
         if (i >= d.size()) return false;
-        const char* begin = d.c_str() + i;
-        char* end = nullptr;
-        v = std::strtod(begin, &end);
-        if (end == begin || !std::isfinite(v)) return false;
-        i += size_t(end - begin);
+        // (an SVG number, its decimal point a point in every locale)
+        size_t j = i;
+        auto digits = [&] {
+            const size_t from = j;
+            while (j < d.size() && std::isdigit(static_cast<unsigned char>(d[j]))) ++j;
+            return j > from;
+        };
+        if (j < d.size() && (d[j] == '+' || d[j] == '-')) ++j;
+        bool any = digits();
+        if (j < d.size() && d[j] == '.') ++j, any = digits() || any;
+        if (!any) return false;
+        if (j < d.size() && (d[j] == 'e' || d[j] == 'E')) {
+            size_t e = j + 1;
+            if (e < d.size() && (d[e] == '+' || d[e] == '-')) ++e;
+            if (e < d.size() && std::isdigit(static_cast<unsigned char>(d[e]))) {
+                j = e;
+                digits();
+            }
+        }
+        bool ok = false;
+        v = QByteArray(d.data() + i, qsizetype(j - i)).toDouble(&ok);
+        if (!ok || !std::isfinite(v)) return false;
+        i = j;
         return true;
     };
     // (an arc's flags may be written without spaces: "a 10 10 0 01 20 0")
@@ -803,6 +822,8 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
     if (svg) {
         const std::optional<QTransform> at = layerFn ? layerFn(t) : std::nullopt;
         layerTo = at ? *at : QTransform::fromScale(scale, scale) * QTransform::fromTranslate(w / 2.0, h / 2.0);
+        // (and moved as far as the title's Position has been from where it was laid out)
+        layerTo = layerTo * QTransform::fromTranslate((g.pAt("pos_x", t) - svg->atX) * scale, (g.pAt("pos_y", t) - svg->atY) * scale);
     }
     const double layoutPx = svg ? std::max(1e-6, std::sqrt(std::abs(layerTo.determinant()))) : scale;
 
@@ -1052,11 +1073,11 @@ TitleScene buildTitle(const Effect& g, double t, int w, int h, double scale, Fra
                 for (const Cluster& cl : rich[i].clusters) {
                     const size_t q = gi++;
                     adv[q] = (cl.x1 - cl.x0) / k;
-                    if (q < svg->x.size() && svg->x[q]) {
-                        pen.setX(*svg->x[q]);
-                        if (q > 0) ++chunks;  // (an absolute x starts a chunk of text, anchored on its own)
-                    }
-                    if (!alongPath && q < svg->y.size() && svg->y[q]) pen.setY(*svg->y[q]);
+                    // (an absolute x or y starts a chunk of text, anchored on its own)
+                    const bool hasX = q < svg->x.size() && svg->x[q], hasY = !alongPath && q < svg->y.size() && svg->y[q];
+                    if (hasX) pen.setX(*svg->x[q]);
+                    if (hasY) pen.setY(*svg->y[q]);
+                    if (q > 0 && (hasX || hasY)) ++chunks;
                     pen += QPointF(q < svg->dx.size() ? svg->dx[q] : 0.0, q < svg->dy.size() ? svg->dy[q] : 0.0);
                     pos[q] = pen;
                     chunk[q] = chunks;
@@ -1577,6 +1598,7 @@ std::string svgTextLayoutJson(const SvgTextLayout& l) {
         o["start"] = l.start;
         if (l.startPercent) o["start_pct"] = true;
     }
+    if (l.atX != 0 || l.atY != 0) o["at"] = QJsonArray{l.atX, l.atY};
     return QJsonDocument(o).toJson(QJsonDocument::Compact).toStdString();
 }
 
@@ -1618,6 +1640,8 @@ std::optional<SvgTextLayout> parseSvgTextLayout(const std::string& json) {
     matrix(o.value("pm"), l.pathMatrix);
     l.start = finite(o.value("start").toDouble());
     l.startPercent = o.value("start_pct").toBool();
+    const QJsonArray at = o.value("at").toArray();
+    if (at.size() == 2) l.atX = finite(at[0].toDouble()), l.atY = finite(at[1].toDouble());
     return l;
 }
 
@@ -1754,11 +1778,14 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
     // of them is drawn once.
     std::vector<double> times;
     for (int i = 0; i < n; ++i) times.push_back(double(t) + ((i + 0.5) / n - 0.5) * shutter);
-    std::vector<TitleScene> scenes;
-    scenes.reserve(times.size());
-    for (const double at : times) scenes.push_back(buildTitle(g, at, w, h, scale, duration, fps, path, layer));
-    const TitleScene now = buildTitle(g, double(t), w, h, scale, duration, fps, path, layer);
-    if (sameScene(scenes.front(), scenes.back()) && sameScene(scenes.front(), now)) return drawScene(g, double(t), now, w, h, scale, nullptr, QRect(0, 0, w, h));
+    std::vector<TitleScene> scenes(times.size());
+    scenes.front() = buildTitle(g, times.front(), w, h, scale, duration, fps, path, layer);
+    scenes.back() = buildTitle(g, times.back(), w, h, scale, duration, fps, path, layer);
+    {
+        const TitleScene now = buildTitle(g, double(t), w, h, scale, duration, fps, path, layer);
+        if (sameScene(scenes.front(), scenes.back()) && sameScene(scenes.front(), now)) return drawScene(g, double(t), now, w, h, scale, nullptr, QRect(0, 0, w, h));
+    }
+    for (size_t k = 1; k + 1 < times.size(); ++k) scenes[k] = buildTitle(g, times[k], w, h, scale, duration, fps, path, layer);
     // The letters that draw the same at every time are drawn once, and the frame is drawn again at every time only
     // over the part of it the moving ones reach, with whatever else reaches that part. (Outside it every time draws
     // the same pixels, and inside it each time draws them as the whole title would, so the average is unchanged.)
@@ -1820,10 +1847,19 @@ Image renderTitle(const Effect& g, FrameTime t, int w, int h, double scale, Fram
     stillArea = stillArea.intersected(QRect(0, 0, w, h));
     if (!stillArea.isEmpty()) lay(drawScene(g, times.front(), s0, w, h, scale, &still, stillArea), stillArea, 1.0f, false);
     if (area.isEmpty()) return out;
+    // Drawn over all of any blurred letter reaching that part (its blur needs the whole of it), kept only there.
+    QRect drawn = area;
+    for (size_t i = 0; i < near.size(); ++i)
+        if (near[i] && s0.pieces[i].styled && s0.pieces[i].blur > 0.05) drawn |= reach[i];
+    drawn = drawn.intersected(QRect(0, 0, w, h));
     Image sum(area.width(), area.height());
     for (size_t k = 0; k < scenes.size(); ++k) {
-        const Image one = drawScene(g, times[k], scenes[k], w, h, scale, &near, area);
-        for (size_t i = 0; i < sum.px.size(); ++i) sum.px[i] += one.px[i];
+        const Image one = drawScene(g, times[k], scenes[k], w, h, scale, &near, drawn);
+        for (int y = 0; y < area.height(); ++y) {
+            const float* src = one.row(area.top() - drawn.top() + y) + size_t(area.left() - drawn.left()) * 4;
+            float* d = sum.row(y);
+            for (int x = 0; x < area.width() * 4; ++x) d[x] += src[x];
+        }
     }
     lay(sum, area, 1.0f / float(n), false);
     return out;
