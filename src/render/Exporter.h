@@ -328,8 +328,6 @@ struct BroadcastMxfOptions;
 // OP1a): its checks and the options to rewrap it with. False with `error` for what the delivery refuses.
 bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, BroadcastMxfOptions& o, std::string* error = nullptr);
 
-// Renders an audio clip's sound with its effects (not its volume, pan or
-// fades) to a 24-bit WAV, from its first frame to its last.
 // Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444 at
 // 12 bits (Montage's own encoder; or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error = nullptr,
@@ -344,8 +342,18 @@ bool bakeCompositeClips(Project& p, Id seq, const std::string& output, std::stri
 // Whether FFmpeg here has APV's encoder (OpenAPV's liboapv, FFmpeg 8 and later) and decoder.
 bool apvEncoderAvailable();
 bool apvDecoderAvailable();
+// Renders an audio clip's sound with its effects (not its volume, pan or fades) to a 24-bit WAV, from its first frame
+// to its last, stamped (Broadcast Wave's bext and iXML, media/FieldRecorder.h) with its source's timecode there.
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+// Extract Sound to Files: the same without its effects (the sound as its source has it, at the clip's speed).
+bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+// What such a WAV is stamped with: the source's timecode at the clip's first frame (its media's start timecode, or
+// midnight without one, plus the clip's in-point), the source's frame rate, the clip's name as its description and the
+// media's project, scene, take and tape.
+struct BroadcastStamp;
+BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip& c);
 
 // Export Frame's choices. `rendition`: "" the frame as SDR screens show it (an HDR sequence through its first SDR trim
 // target, else mapped to Rec.709 as the viewer maps it; other sequences as they are), "master" the sequence's own

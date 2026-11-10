@@ -2385,6 +2385,74 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Removed %1 clip(s)").arg(ids.size()), projectJson(l.project));
         });
 
+    add("montage_nest_range", "Nest a range in place",
+        "Replace a stretch of the timeline with one compound clip: every unlocked track (or just `tracks`) is cut at "
+        "`in` and `out` and what lies between, linked sound with its picture and gaps kept, moves into a new sequence "
+        "named `name`, played by one compound clip from `in` on the lowest video and audio tracks that had any. Its "
+        "picture and sound are the range's as they were. Default `in` and `out`: the sequence's In and Out. One undo step.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "in":{"type":["number","string"],"description":"Timeline time the range starts; default the sequence's In"},
+            "out":{"type":["number","string"],"description":"Timeline time it ends (the first frame after it); default after the sequence's Out"},
+            "tracks":{"type":"array","items":{"type":"string"},"description":"Tracks taking part (V1, A2...); default every one"},
+            "name":{"type":"string","default":"Nested Sequence"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const FrameTime in = a.contains("in") ? timeArg(a.value("in"), s, "in") : s.inPoint;
+            const FrameTime out = a.contains("out") ? timeArg(a.value("out"), s, "out") : s.outPoint >= 0 ? s.outPoint + 1 : -1;
+            if (in < 0 || out <= in) throw ArgError{"Give \"in\" and \"out\" (or mark the sequence's In and Out), out after in"};
+            std::vector<TrackRef> tracks;
+            for (const QJsonValue& v : a.value("tracks").toArray()) tracks.push_back(trackArg(v.toString(), s, false));
+            if (!a.contains("tracks")) tracks = allTracks(s);
+            if (tracks.empty()) throw ArgError{"\"tracks\" must list tracks"};
+            const std::string name = str(a, "name", "Nested Sequence").toStdString();
+            const edit::Result r = edit::nestRange(l.project, s, in, out, tracks, name);
+            check(r);
+            save(l);
+            Sequence& after = l.seq();
+            QJsonArray made;
+            for (Id id : r.created)
+                if (const Clip* c = edit::clipById(after, id)) made.append(clipJson(l.project, after, *c));
+            QJsonObject outJson = projectJson(l.project);
+            outJson["clips"] = made;
+            return ok(QStringLiteral("Nested %1 to %2 as \"%3\"").arg(tc(in, after), tc(out, after), QString::fromStdString(name)), outJson);
+        });
+
+    add("montage_replace_source", "Point clips at another bin item",
+        "Repoint several timeline clips (and the clips linked to them) at one media item: the online file, a VFX "
+        "version, a render with the grade baked in. Each keeps its place, length and effects; with by \"source_time\" "
+        "(the default) it shows the same source times of the new item, with \"timecode\" the frames whose timecode "
+        "matches what it showed (for an item whose start differs; both need timecode). All or nothing: fails naming "
+        "the clip the item does not cover. One undo step.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
+            "media":{"type":"string","description":"The media item's name or file in the project, or a file to bring in"},
+            "by":{"type":"string","enum":["source_time","timecode"],"default":"source_time"}},"required":["project","clips","media"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(Id(v.toDouble()));
+            if (ids.empty()) throw ArgError{"\"clips\" must list clip ids"};
+            const QString by = str(a, "by", "source_time");
+            if (by != QLatin1String("source_time") && by != QLatin1String("timecode")) throw ArgError{"\"by\" is source_time or timecode"};
+            const QString ref = need(a, "media");
+            Id media = 0;
+            const std::string abs = absolute(ref).toStdString();
+            for (const MediaItem& m : l.project.media)
+                if (!media && ((!m.path.empty() && m.path == abs) || m.name == ref.toStdString())) media = m.id;
+            if (!media) media = mediaFor(l.project, ref);
+            Sequence& s = l.seq();
+            const edit::Result r = edit::replaceSources(l.project, s, ids, media, by == QLatin1String("timecode"));
+            check(r);
+            save(l);
+            Sequence& after = l.seq();
+            QJsonArray clips;
+            for (Id id : r.created)
+                if (const Clip* c = edit::clipById(after, id)) clips.append(clipJson(l.project, after, *c));
+            QJsonObject out = projectJson(l.project);
+            out["clips"] = clips;
+            return ok(QStringLiteral("Repointed %1 clip(s)").arg(r.created.size()), out);
+        });
+
     add("montage_strip_silence", "Strip silence",
         "Cut audio clips to their sound (Pro Tools' Strip Silence): where every channel stays under threshold_db for at "
         "least min_silence seconds is removed, the rest kept with pad_before and pad_after seconds either side, leaving "

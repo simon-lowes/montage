@@ -1,6 +1,7 @@
 #include "Exporter.h"
 #include "TrimPasses.h"
 #include "media/SpatialAudio.h"
+#include "media/FieldRecorder.h"
 #include "render/SpatialVideo.h"
 #include "core/AudioDescription.h"
 #include "core/Provenance.h"
@@ -3577,8 +3578,29 @@ bool bakeCompositeClips(Project& p, Id seqId, const std::string& output, std::st
     return true;
 }
 
-bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
-                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip& c) {
+    BroadcastStamp st;
+    const MediaItem* m = p.findMedia(c.mediaId);
+    // The source's timecode where the clip starts: its media's start (midnight without one) plus the clip's offset.
+    st.seconds = std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + c.sourceAt(0) / seq.fpsValue());
+    st.timecodeRate = m && m->fps.valid() ? m->fps : seq.fps;
+    st.description = c.name;
+    if (m) {
+        auto meta = [&](const char* key) {
+            const auto it = m->metadata.find(key);
+            return it == m->metadata.end() ? std::string() : it->second;
+        };
+        st.project = meta("project");
+        st.scene = meta("scene");
+        st.take = meta("take");
+        st.tape = meta("tape");
+    }
+    return st;
+}
+
+namespace {
+bool writeClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                    const ExportProgress& progress, const std::atomic<bool>* cancel, bool effects) {
     const Clip* c = edit::clipById(seq, clip);
     if (!c) {
         if (error) *error = "No such clip";
@@ -3601,6 +3623,7 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
     Clip copy = *c;
     copy.linkGroup = 0;
     copy.audio.params.clear();  // volume and pan stay live on the clip
+    if (!effects) copy.effects.clear();
     own.clips.push_back(copy);
     bool placed = false;
     for (Track& t : alone.audioTracks)
@@ -3616,7 +3639,20 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
     st.audioCodec = "pcm_s24le";
     st.in = copy.start;
     st.out = copy.start + copy.duration;
-    return exportSequence(p, alone, st, progress, cancel, error);
+    if (!exportSequence(p, alone, st, progress, cancel, error)) return false;
+    // Stamped with the source's timecode where the clip starts.
+    return writeBroadcastStamp(path, clipSoundStamp(p, seq, *c), error);
+}
+}  // namespace
+
+bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+    return writeClipSound(p, seq, clip, path, error, progress, cancel, true);
+}
+
+bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
+                      const ExportProgress& progress, const std::atomic<bool>* cancel) {
+    return writeClipSound(p, seq, clip, path, error, progress, cancel, false);
 }
 
 bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,

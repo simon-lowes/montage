@@ -20503,6 +20503,195 @@ if __name__ == '__main__':
         QVERIFY(std::fabs(baked->samples[48000 * 2] - 0.2512f) < 0.005f);
     }
 
+    void clipSoundKeepsSourceTimecode() {
+        // A recorder's take: 4 s of a rising tone, stamped 10:00:00 and 12345 samples, scene 12A take 3, tape T7.
+        constexpr int sr = 48000;
+        AudioBuffer take;
+        take.sampleRate = sr;
+        for (int i = 0; i < sr * 4; ++i) {
+            const float v = float(0.4 * std::sin(2 * M_PI * (200.0 + i / 400.0) * double(i) / sr));
+            take.samples.push_back(v);
+            take.samples.push_back(-v);
+        }
+        const uint64_t stamped = uint64_t(36000) * sr + 12345;
+        const std::string src = path("tc-take.wav");
+        writeBwf(src, take, stamped, "sSCENE=12A\r\nsTAKE=3\r\nsTAPE=T7\r\n", "<BWFXML><PROJECT>Pier</PROJECT></BWFXML>");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, src);
+        QVERIFY(m.timecode > 0);
+        p.media.push_back(m);
+        // The clip plays from 17 frames (0.68 s, 32640 samples) into the take, at timeline frame 30.
+        const auto r = edit::placeMedia(p, s, m.id, 30, 17, 67, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY(r.ok && r.created.size() == 1);
+        Clip* c = edit::clipById(s, r.created[0]);
+        Effect lim = makeEffect(p, "limiter");
+        lim.params["ceiling_db"] = -20.0;
+        c->effects.push_back(lim);
+        const int64_t expected = int64_t(stamped) + 32640;
+        // The stamp in a file: bext's time reference and iXML's, both to the sample; the take's fields too.
+        auto chunks = [](const std::string& file) {
+            QFile f(QString::fromStdString(file));
+            std::map<std::string, std::vector<QByteArray>> out;
+            if (!f.open(QIODevice::ReadOnly)) return out;
+            const QByteArray all = f.readAll();
+            for (qsizetype at = 12; at + 8 <= all.size();) {
+                const uint32_t size = qFromLittleEndian<quint32>(all.constData() + at + 4);
+                out[all.mid(at, 4).toStdString()].push_back(all.mid(at + 8, size));
+                at += 8 + qsizetype(size) + (size & 1);
+            }
+            return out;
+        };
+        auto checkStamp = [&](const std::string& file) {
+            const auto ch = chunks(file);
+            QVERIFY(ch.count("bext") && ch.at("bext").size() == 1 && ch.count("iXML") && ch.at("iXML").size() == 1);
+            const QByteArray& bext = ch.at("bext")[0];
+            QVERIFY(bext.size() >= 602);
+            QCOMPARE(int64_t(qFromLittleEndian<quint64>(bext.constData() + 338)), expected);
+            QCOMPARE(QByteArray(bext.constData() + 256, 7), QByteArray("Montage"));
+            const QString ixml = QString::fromUtf8(ch.at("iXML")[0]);
+            QVERIFY2(ixml.contains(QStringLiteral("<TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_LO>%1<").arg(expected)), qPrintable(ixml));
+            QVERIFY(ixml.contains(QStringLiteral("<TIMESTAMP_SAMPLE_RATE>48000<")));
+            QVERIFY(ixml.contains(QStringLiteral("<TIMECODE_RATE>25/1<")));
+            FieldRecording f;
+            QVERIFY(readFieldRecording(file, f));
+            QCOMPARE(std::llround(f.startSeconds * sr), (long long)expected);
+            QCOMPARE(f.scene, std::string("12A"));
+            QCOMPARE(f.take, std::string("3"));
+            QCOMPARE(f.tape, std::string("T7"));
+            QCOMPARE(f.project, std::string("Pier"));
+            QCOMPARE(f.timecodeRate, (Rational{25, 1}));
+            // Brought back in, it lines up by timecode with the take.
+            Project q;
+            const MediaItem back = probeOrFail(q, file);
+            QCOMPARE(std::llround(back.timecode * sr), (long long)expected);
+        };
+        std::string err;
+        // Render and Replace's render: with its effects, stamped.
+        const std::string rendered = path("tc-rendered.wav");
+        QVERIFY2(renderClipAudio(p, s, c->id, rendered, &err), err.c_str());
+        checkStamp(rendered);
+        // Extract Sound to Files: without its effects, the take's own samples from the clip's offset.
+        const std::string extracted = path("tc-extracted.wav");
+        QVERIFY2(extractClipSound(p, s, c->id, extracted, &err), err.c_str());
+        checkStamp(extracted);
+        AudioBufferPtr raw = decodeAudio(extracted, sr, &err), baked = decodeAudio(rendered, sr, &err);
+        QVERIFY(raw && baked);
+        QVERIFY(std::abs(raw->frames() - 2 * sr) < 100);  // 50 frames at 25 fps
+        float worst = 0, peakRaw = 0, peakBaked = 0;
+        for (int64_t i = 0; i < sr; ++i) {
+            worst = std::max(worst, std::fabs(raw->samples[size_t(i) * 2] - take.samples[size_t(i + 32640) * 2]));
+            peakRaw = std::max(peakRaw, std::fabs(raw->samples[size_t(i) * 2]));
+            peakBaked = std::max(peakBaked, std::fabs(baked->samples[size_t(i) * 2]));
+        }
+        QVERIFY2(worst < 1e-3f, qPrintable(QString::number(worst)));
+        QVERIFY2(peakRaw > 0.35f && peakBaked < 0.11f, qPrintable(QString("%1 %2").arg(peakRaw).arg(peakBaked)));
+
+        // Stamping again replaces the chunks (one of each), and leaves the sound as it was.
+        const QByteArray soundBefore = chunks(extracted).at("data")[0];
+        BroadcastStamp again;
+        again.seconds = 3600;
+        QVERIFY2(writeBroadcastStamp(extracted, again, &err), err.c_str());
+        auto ch = chunks(extracted);
+        QCOMPARE(ch.at("bext").size(), size_t(1));
+        QCOMPARE(int64_t(qFromLittleEndian<quint64>(ch.at("bext")[0].constData() + 338)), int64_t(3600) * sr);
+        QVERIFY(ch.at("data")[0] == soundBefore);
+        QCOMPARE(QFileInfo(QString::fromStdString(extracted)).size(), qint64(12) + [&] {
+            qint64 n = 0;
+            for (const auto& [id, list] : ch)
+                for (const QByteArray& b : list) n += 8 + b.size() + (b.size() & 1);
+            return n;
+        }());
+
+        // An RF64 file: its ds64's RIFF size is kept right.
+        {
+            auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+            auto u64 = [](uint64_t v) { return std::string(reinterpret_cast<const char*>(&v), 8); };
+            auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+            const std::string data(4800 * 4, '\x01');
+            const std::string fmt = u16(1) + u16(2) + u32(sr) + u32(sr * 4) + u16(4) + u16(16);
+            std::string body = "WAVEds64" + u32(28) + u64(0) + u64(data.size()) + u64(4800) + u32(0) + "fmt " + u32(16) + fmt + "data" +
+                               u32(0xFFFFFFFFu) + data;
+            const std::string file = path("tc-rf64.wav");
+            std::ofstream(file, std::ios::binary) << "RF64" << u32(0xFFFFFFFFu) << body;
+            QVERIFY2(writeBroadcastStamp(file, again, &err), err.c_str());
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray all = f.readAll();
+            QVERIFY(all.startsWith("RF64") && all.mid(12, 4) == "ds64");
+            QCOMPARE(qint64(qFromLittleEndian<quint64>(all.constData() + 20)), qint64(all.size() - 8));
+            QVERIFY(all.endsWith(QByteArray::fromStdString(data)));
+            FieldRecording fr;
+            QVERIFY(readFieldRecording(file, fr));
+            QCOMPARE(std::llround(fr.startSeconds), 3600LL);
+        }
+        QVERIFY(!writeBroadcastStamp(path("no-such.wav"), again, &err));
+    }
+
+    void mcpNestRangeAndReplaceSource() {
+        const std::string a = path("repoint-a.wav"), b = path("repoint-b.wav");
+        writeWav(a, 48000, 4.0, 0.2f, 0.2f);
+        writeWav(b, 48000, 8.0, 0.4f, 0.4f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, a);
+        p.media.push_back(m);
+        std::vector<Id> clips;
+        for (int i = 0; i < 3; ++i) {
+            const auto r = edit::placeMedia(p, s, m.id, i * 30, i * 25, i * 25 + 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            QVERIFY(r.ok);
+            clips.push_back(r.created[0]);
+        }
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 90)).ok);
+        const QString project = QString::fromStdString(path("repoint.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonArray ids;
+        for (Id id : clips) ids.append(double(id));
+        QJsonObject r = call("montage_replace_source", {{"project", project}, {"clips", ids}, {"media", QString::fromStdString(b)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 3);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        Id bId = 0;
+        for (const MediaItem& x : back.media)
+            if (x.path == b) bId = x.id;
+        QVERIFY(bId);
+        for (int i = 0; i < 3; ++i) {
+            const Clip* c = edit::clipById(*back.active(), clips[size_t(i)]);
+            QVERIFY(c && c->mediaId == bId);
+            QCOMPARE(c->sourceIn, double(i * 25));
+        }
+        // Neither file has timecode to match by.
+        r = call("montage_replace_source", {{"project", project}, {"clips", ids}, {"media", QString::fromStdString(a)}, {"by", "timecode"}});
+        QVERIFY(r.value("isError").toBool());
+        // The second second, every track, nested in place.
+        r = call("montage_nest_range", {{"project", project}, {"in", "00:00:01:00"}, {"out", "00:00:02:00"}, {"name", "Middle"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toArray().size(), 2);  // its picture and its sound
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Track& v1 = back.active()->videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[1].start, FrameTime(25));
+        QCOMPARE(v1.clips[1].duration, FrameTime(25));
+        const MediaItem* nest = back.findMedia(v1.clips[1].mediaId);
+        QVERIFY(nest && nest->kind == MediaKind::Sequence && nest->name == "Middle");
+        QCOMPARE(back.active()->audioTracks[0].clips[1].mediaId, nest->id);
+        // Out before In is refused.
+        r = call("montage_nest_range", {{"project", project}, {"in", "00:00:02:00"}, {"out", "00:00:01:00"}});
+        QVERIFY(r.value("isError").toBool());
+    }
+
     void mixerGainPanMuteAndFades() {
         std::string wav = path("mix.wav");
         writeWav(wav, 48000, 2.0, 0.5f, 0.5f);
