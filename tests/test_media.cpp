@@ -2742,7 +2742,9 @@ private slots:
                  err.c_str());
         QCOMPARE(rolls, 1);
         QVERIFY2(toIn > 0 && toIn <= 25, std::to_string(toIn).c_str());
-        QVERIFY2(off >= 0 && off < 3, std::to_string(off).c_str());
+        // (the Program starts on the nearest whole frame to where the deck's run puts it, so the deck can be a part of
+        // a frame behind that as well as ahead: a Mac run came to -0.03)
+        QVERIFY2(off > -1 && off < 3, std::to_string(off).c_str());
         QVERIFY(lockedThen);
         {
             std::lock_guard lock(sim.m);
@@ -2773,7 +2775,7 @@ private slots:
         }
         QVERIFY2(jittered, err.c_str());
         QCOMPARE(rolls, 1);
-        QVERIFY2(off >= 0 && off < 3, std::to_string(off).c_str());
+        QVERIFY2(off > -1 && off < 3, std::to_string(off).c_str());
         {
             std::lock_guard lock(sim.m);
             QCOMPARE(sim.recordedFrom, ej.in);
