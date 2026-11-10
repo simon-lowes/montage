@@ -95,6 +95,7 @@ private:
     double whiteNits_ = 0;
     bool encoded_ = false;  // Linux: drawn as linear light, then written as PQ or HLG into a 10-bit swap chain
     std::unique_ptr<WaylandColor> wayland_;
+    QPointer<QObject> waylandWindow_;  // (Qt's Wayland window, whose surfaceDestroyed lets the description go)
     int frames_ = 0;
     QString problem_;
     QElapsedTimer displayRead_;  // since the display's HDR range was last asked

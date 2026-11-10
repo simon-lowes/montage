@@ -46,8 +46,6 @@ public:
     // Why a BT.2100 surface cannot be described (empty if it can): parametric descriptions, PQ, BT.2020.
     std::string unsupported() const;
     bool supportsHlg() const;
-    // The protocol's features as it lists them, for the log.
-    std::string features() const;
 
     // Starts on a surface (Qt's wl_surface for the window): its colour management and feedback objects, and the
     // preferred description read at once. A surface made again (the window hidden and shown) is attached again; the

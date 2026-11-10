@@ -67,6 +67,9 @@ EOF
   if [ ! -S "$XDG_RUNTIME_DIR/$socket" ]; then
     echo "Weston did not start ($name):" >&2
     tail -50 "$dir/weston.log" >&2 || true
+    kill "$weston" 2> /dev/null || true
+    wait "$weston" 2> /dev/null || true
+    weston=""
     failed=1
     return
   fi

@@ -18,6 +18,10 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(MONTAGE_WAYLAND_COLOR)
+#include "WaylandColor.h"  // (the class, whether or not it is used here)
+#define MONTAGE_WAYLAND_COLOR_CLASS
+#endif
 #if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS) && QT_CONFIG(opengl)
 #define MONTAGE_HDR_ENCODED  // (Linux: OpenGL, the picture written as BT.2100 PQ or HLG)
 #include <QColorSpace>
@@ -26,10 +30,15 @@
 #include <qpa/qplatformnativeinterface.h>
 // Wayland's colour management: Montage's binding where it was built, else Qt's own (6.10.2 and later; 6.10.1's is
 // the protocol's experimental forerunner).
-#if defined(MONTAGE_WAYLAND_COLOR)
-#include "WaylandColor.h"
-#elif QT_VERSION >= QT_VERSION_CHECK(6, 10, 2)
+#if !defined(MONTAGE_WAYLAND_COLOR) && QT_VERSION >= QT_VERSION_CHECK(6, 10, 2)
 #define MONTAGE_QT_WAYLAND_COLOR
+#endif
+// Qt's word that it let a window's wl_surface go (made again when a window changes role, without a hide).
+#if defined(MONTAGE_WAYLAND_COLOR) && __has_include(<qpa/qplatformwindow_p.h>)
+#include <qpa/qplatformwindow_p.h>
+#if QT_CONFIG(wayland)  // (the header has Qt's Wayland window only then)
+#define MONTAGE_WAYLAND_SURFACE_SIGNALS
+#endif
 #endif
 #else
 #undef MONTAGE_WAYLAND_COLOR  // (no OpenGL: no surface to describe)
@@ -51,7 +60,7 @@ namespace {
 
 namespace montage {
 
-#if defined(MONTAGE_HDR_VIEWER) && !defined(MONTAGE_WAYLAND_COLOR)
+#if defined(MONTAGE_HDR_VIEWER) && !defined(MONTAGE_WAYLAND_COLOR_CLASS)
 class WaylandColor {};  // (not built: never made)
 #endif
 
@@ -302,7 +311,13 @@ public:
         } else {
             linearRt->setDescription(QRhiTextureRenderTargetDescription(QRhiColorAttachment(t)));
         }
-        if (!linearRt->create()) return false;
+        if (!linearRt->create()) {
+            // (the target keeps the texture it was described with; the caller stops HDR)
+            if (linear) linear.release()->deleteLater();
+            linear.reset(t);
+            linearSize = QSize();
+            return false;
+        }
         if (srbEncode) {
             srbEncode->setBindings({QRhiShaderResourceBinding::uniformBuffer(0, QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage, ubufEncode.get()),
                                     QRhiShaderResourceBinding::sampledTexture(1, QRhiShaderResourceBinding::FragmentStage, t, sampler.get())});
@@ -413,6 +428,10 @@ bool HdrSurface::probe(QString* why) {
 #if defined(MONTAGE_QT_WAYLAND_COLOR)
         // Qt describes the window (BT.2100 PQ, the protocol's default luminances; no mastering light).
         format.setColorSpace(QColorSpace(QColorSpace::Primaries::Bt2020, QColorSpace::TransferFunction::St2084));
+#else
+        // The window's format asks for no colour space, so Qt's own colour management (6.10.2 and later) leaves the
+        // surface to Montage's: the protocol allows one colour management surface for each wl_surface.
+        format.setColorSpace(QColorSpace());
 #endif
         setSurfaceType(QSurface::OpenGLSurface);
         setFormat(format);
@@ -615,6 +634,15 @@ void HdrSurface::describeSurface() {
     if (surface != wayland_->surface()) {
         // A new wl_surface (the first, or made again when the window was shown again): its objects, and what the
         // compositor prefers for it.
+#if defined(MONTAGE_WAYLAND_SURFACE_SIGNALS)
+        // (let go when Qt lets the wl_surface go, so one made again at the same address is attached afresh)
+        if (auto* w = nativeInterface<QNativeInterface::Private::QWaylandWindow>(); w && static_cast<QObject*>(w) != waylandWindow_.data()) {
+            waylandWindow_ = w;
+            connect(w, &QNativeInterface::Private::QWaylandWindow::surfaceDestroyed, this, [this] {
+                if (wayland_) wayland_->detach();
+            });
+        }
+#endif
         if (!wayland_->attach(surface)) {
             stopHdr(tr("The connection to the Wayland compositor failed"));
             return;

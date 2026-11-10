@@ -6,6 +6,7 @@
 #include <wayland-client.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -20,8 +21,14 @@ namespace {
 // code was generated from.
 constexpr uint32_t kVersion = 1;
 
-// The mastering display Montage's HDR10 files state (render/Exporter): P3-D65, in millionths.
-constexpr int32_t kP3D65[8] = {680000, 320000, 265000, 690000, 150000, 60000, 312700, 329000};
+// Primaries' chromaticities (red, green, blue, white) in millionths, as the protocol takes them.
+std::array<int32_t, 8> millionths(Primaries p) {
+    double xy[8] = {};
+    primariesChromaticities(p, xy);
+    std::array<int32_t, 8> out{};
+    for (size_t i = 0; i < 8; ++i) out[i] = int32_t(std::lround(xy[i] * 1e6));
+    return out;
+}
 
 }  // namespace
 
@@ -60,6 +67,8 @@ struct WaylandColor::State {
         return p.ready;
     }
 
+    // Reads what the compositor prefers for the surface; what was known is kept if it cannot say just now (an
+    // output going or coming).
     void readPreferred();
 };
 
@@ -139,7 +148,6 @@ const wp_color_management_surface_feedback_v1_listener kFeedbackListener = [] {
 }  // namespace
 
 void WaylandColor::State::readPreferred() {
-    preferred = Preferred();
     if (!feedback) return;
     Pending p;
     wp_image_description_v1* d = wp_color_management_surface_feedback_v1_get_preferred(feedback);
@@ -199,21 +207,6 @@ std::string WaylandColor::unsupported() const {
 
 bool WaylandColor::supportsHlg() const { return s_->has(s_->tfs, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG); }
 
-std::string WaylandColor::features() const {
-    const State& s = *s_;
-    if (!available()) return "none";
-    std::string out = "features";
-    for (uint32_t i = 0; i < 32; ++i)
-        if (s.has(s.features, i)) out += " " + std::to_string(i);
-    out += ", transfer functions";
-    for (uint32_t i = 0; i < 32; ++i)
-        if (s.has(s.tfs, i)) out += " " + std::to_string(i);
-    out += ", primaries";
-    for (uint32_t i = 0; i < 32; ++i)
-        if (s.has(s.primaries, i)) out += " " + std::to_string(i);
-    return out;
-}
-
 bool WaylandColor::attach(wl_surface* surface) {
     State& s = *s_;
     if (surface == s.surface && s.cmSurface) return true;
@@ -257,12 +250,15 @@ bool WaylandColor::describe(const Description& d, std::string* error) {
         c, hlg ? WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_HLG : WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
     if (s.has(s.primaries, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020))
         wp_image_description_creator_params_v1_set_primaries_named(c, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
-    else  // BT.2020's chromaticities (red, green, blue, D65), in millionths
-        wp_image_description_creator_params_v1_set_primaries(c, 708000, 292000, 170000, 797000, 131000, 46000, 312700, 329000);
+    else {
+        const std::array<int32_t, 8> p = millionths(Primaries::Bt2020);
+        wp_image_description_creator_params_v1_set_primaries(c, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
     // (the luminances are PQ's and HLG's defaults: 0.005 nits, 10 000 or 1000, and reference white at 203)
     if (s.has(s.features, WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES)) {
-        wp_image_description_creator_params_v1_set_mastering_display_primaries(c, kP3D65[0], kP3D65[1], kP3D65[2], kP3D65[3], kP3D65[4],
-                                                                               kP3D65[5], kP3D65[6], kP3D65[7]);
+        // (P3-D65, as Montage's HDR10 files state it: render/Exporter)
+        const std::array<int32_t, 8> m = millionths(Primaries::P3D65);
+        wp_image_description_creator_params_v1_set_mastering_display_primaries(c, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
         wp_image_description_creator_params_v1_set_mastering_luminance(c, uint32_t(std::lround(d.light.masteringMinNits * 10000)),
                                                                        uint32_t(std::lround(d.light.masteringMaxNits)));
     }
