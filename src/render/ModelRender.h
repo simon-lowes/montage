@@ -14,7 +14,9 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "media/Image.h"
@@ -78,6 +80,34 @@ struct ModelShadowCaster {
     bool onGround = true;  // its shadow falls on the ground too (off: it is on a ground of its own, drawn elsewhere)
 };
 
+// Everything that casts shadows in one scene (models, other 3D layers' cards), so that one shadow map a light is made
+// for them all and each surface drawn in that scene, and each ground, samples it: each takes the others' shadows and
+// casts its own onto them, made once a light however many there are. Casters as ModelShadowCaster's are (coverage
+// over the triangles of `coverageMaterial`, -1 all); the maps cover them all (`reach` widens the bounds).
+struct ModelShadowMap;
+struct ModelShadowWorld {
+    struct Caster {
+        PosedTriangles triangles;
+        std::shared_ptr<const ModelTexture> coverage;
+        int coverageMaterial = -1;
+    };
+    std::vector<Caster> casters;
+    std::array<double, 3> lo{0, 0, 0}, hi{0, 0, 0};
+    bool bounded = false;
+    // Widens the bounds the maps cover to the triangles'.
+    void reach(const PosedTriangles& t);
+    // The map for `light` (made the first time it is asked for, the same light asking again given the same one; null
+    // for a point light or with nothing casting). Each texel knows which caster is nearest the light there.
+    std::shared_ptr<const ModelShadowMap> map(const ModelLight& light, int size, bool serial = false) const;
+
+private:
+    mutable std::mutex mutex_;
+    struct Made;
+    mutable std::vector<std::shared_ptr<Made>> made_;
+};
+// How many shadow maps have been made since the program started (each a pass over the casters for one light).
+uint64_t modelShadowPasses();
+
 struct ModelScene {
     PosedTriangles triangles;  // in the world
     const Model* model = nullptr;  // their materials and textures (null: the default material)
@@ -101,6 +131,11 @@ struct ModelScene {
     // Surfaces casting shadows onto these (and the ground) without being drawn.
     std::vector<ModelShadowCaster> casters;
     bool castsShadows = true;  // these triangles cast shadows (off: they only take the casters')
+    // A shared scene of casters (in place of `casters` and these triangles' own: they are among its casters when they
+    // cast): every light but a point light takes its map from it, and the ground takes the shadows of only the casters
+    // in `groundCasters` (indices into it), those whose shadows fall on this ground.
+    std::shared_ptr<const ModelShadowWorld> shadowWorld;
+    std::vector<int> groundCasters;
 };
 
 struct ModelRenderOptions {

@@ -1,6 +1,7 @@
 #include "ModelRender.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -268,17 +269,22 @@ void environmentBrdf(double roughness, double NdotV, double& A, double& B) {
 
 // ---- Shadow maps ---------------------------------------------------------------------------------------------------
 
-struct ShadowMap {
+}  // namespace
+
+struct ModelShadowMap {
+    using V3 = std::array<double, 3>;
     bool perspective = false;
     V3 origin, right, up, forward;
     double extent = 1;  // orthographic: half the width covered; perspective: tan of half the angle
     int size = 0;
     std::vector<float> depth;  // nearest along `forward`; +inf where nothing
+    std::vector<uint16_t> who; // which source is nearest there
     double texelWorld = 0;     // orthographic: a texel's width
     bool map(const V3& P, double& u, double& v, double& d) const {
-        const V3 q = P - origin;
-        d = dot(q, forward);
-        double x = dot(q, right), y = dot(q, up);
+        const V3 q{P[0] - origin[0], P[1] - origin[1], P[2] - origin[2]};
+        auto dt = [](const V3& a, const V3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        d = dt(q, forward);
+        double x = dt(q, right), y = dt(q, up);
         if (perspective) {
             if (d <= 1e-6) return false;
             x /= d * extent, y /= d * extent;
@@ -290,11 +296,26 @@ struct ShadowMap {
     }
 };
 
+namespace {
+
+using ShadowMap = ModelShadowMap;
+std::atomic<uint64_t> gShadowPasses{0};
+
 V3 basisUp(const V3& f) { return std::fabs(f[1]) < 0.99 ? V3{0, 1, 0} : V3{1, 0, 0}; }
 
-// `own`: the scene's own triangles cast too. `forGround`: only the casters whose shadows fall on the ground.
-ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& centre, double radius, int size, bool serial, bool own = true,
-                      bool forGround = false) {
+// What casts into a map: triangles, the picture whose alpha (at least a half) is where they cast over those of one
+// material (-1: all; null: they cast whole), and the id the map's texels record.
+struct ShadowSource {
+    const PosedTriangles* t;
+    const ModelTexture* coverage;
+    int material;
+    uint16_t id;
+};
+
+// One pass over the sources for a light: the map over a sphere (centre, radius) for a sun, from the light for a spot.
+ShadowMap buildShadowFrom(const std::vector<ShadowSource>& sources, const ModelLight& light, const V3& centre, double radius, int size,
+                          bool serial) {
+    ++gShadowPasses;
     ShadowMap m;
     m.size = size;
     m.forward = unit(light.direction);
@@ -310,19 +331,9 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
         m.texelWorld = 2 * m.extent / size;
     }
     m.depth.assign(size_t(size) * size_t(size), std::numeric_limits<float>::infinity());
-    // The triangles in the map's pixels, both sides, the nearest kept: the scene's (a picture laid over them casting
-    // where its alpha is at least a half), then the casters'.
-    struct Source {
-        const PosedTriangles* t;
-        const ModelTexture* coverage;
-        int material;  // the triangles the coverage is on (-1: all)
-    };
-    std::vector<Source> sources;
-    if (own) sources.push_back({&s.triangles, s.picture && !s.picture->levels.empty() ? s.picture.get() : nullptr, s.pictureMaterial});
-    for (const ModelShadowCaster& c : s.casters)
-        if (!forGround || c.onGround)
-            sources.push_back({&c.triangles, c.coverage && !c.coverage->levels.empty() ? c.coverage.get() : nullptr, -1});
-    for (const Source& src : sources) {
+    m.who.assign(size_t(size) * size_t(size), uint16_t(0));
+    // The triangles in the map's pixels, both sides, the nearest kept.
+    for (const ShadowSource& src : sources) {
     const PosedTriangles& t = *src.t;
     struct P {
         double u, v, d;
@@ -360,7 +371,8 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
                     if (w0 < 0 || w1 < 0 || w2 < 0) continue;
                     // (depth along the light: straight across an orthographic map, its reciprocal across a perspective one)
                     const float d = float(m.perspective ? 1 / (w0 / a.d + w1 / bb.d + w2 / c.d) : w0 * a.d + w1 * bb.d + w2 * c.d);
-                    float& z = m.depth[size_t(y) * size_t(size) + size_t(x)];
+                    const size_t at = size_t(y) * size_t(size) + size_t(x);
+                    float& z = m.depth[at];
                     if (!(d < z)) continue;
                     if (cover) {
                         // (the picture's alpha there, its uvs perspective-correct across a perspective map)
@@ -378,6 +390,7 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
                         if (cv[3] < 0.5f) continue;
                     }
                     z = d;
+                    m.who[at] = src.id;
                 }
         }
     });
@@ -385,8 +398,20 @@ ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& ce
     return m;
 }
 
+// `own`: the scene's own triangles cast too. `forGround`: only the casters whose shadows fall on the ground.
+ShadowMap buildShadow(const ModelScene& s, const ModelLight& light, const V3& centre, double radius, int size, bool serial, bool own = true,
+                      bool forGround = false) {
+    std::vector<ShadowSource> sources;
+    if (own) sources.push_back({&s.triangles, s.picture && !s.picture->levels.empty() ? s.picture.get() : nullptr, s.pictureMaterial, 0});
+    for (const ModelShadowCaster& c : s.casters)
+        if (!forGround || c.onGround)
+            sources.push_back({&c.triangles, c.coverage && !c.coverage->levels.empty() ? c.coverage.get() : nullptr, -1, 0});
+    return buildShadowFrom(sources, light, centre, radius, size, serial);
+}
+
 // How much of the light reaches P (0..1), over 3 x 3 texels, with a bias against the surface's own shadow.
-double lightVisible(const ShadowMap& m, const V3& P, double NdotL) {
+// `only` (when given): only the sources it marks shadow P.
+double lightVisible(const ShadowMap& m, const V3& P, double NdotL, const std::vector<char>* only = nullptr) {
     double u, v, d;
     if (!m.map(P, u, v, d)) return 1;
     const double texel = m.perspective ? 2 * m.extent * d / m.size : m.texelWorld;
@@ -400,7 +425,8 @@ double lightVisible(const ShadowMap& m, const V3& P, double NdotL) {
                 lit += 1;
                 continue;
             }
-            lit += m.depth[size_t(y) * size_t(m.size) + size_t(x)] + bias >= d ? 1 : 0;
+            const size_t at = size_t(y) * size_t(m.size) + size_t(x);
+            lit += m.depth[at] + bias >= d || (only && (m.who[at] >= only->size() || !(*only)[m.who[at]])) ? 1 : 0;
         }
     return lit / 9;
 }
@@ -717,21 +743,30 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             radius = std::max(1e-6, std::sqrt(dot(V3{hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]}, V3{hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]})) / 2);
         }
     }
-    std::vector<std::unique_ptr<ShadowMap>> shadows(s.lights.size());
-    for (size_t i = 0; i < s.lights.size(); ++i)
-        if (s.lights[i].shadows && s.lights[i].kind != ModelLight::Kind::Point && nt > 0)
-            shadows[i] = std::make_unique<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial, s.castsShadows));
-    // The ground's, when some casters' shadows stay off it (cards whose own grounds take them, so two grounds don't
-    // darken the same shadow twice).
-    const bool someOff = s.ground && std::any_of(s.casters.begin(), s.casters.end(), [](const ModelShadowCaster& c) { return !c.onGround; });
-    std::vector<std::unique_ptr<ShadowMap>> groundShadows;
-    if (someOff) {
-        groundShadows.resize(s.lights.size());
+    std::vector<std::shared_ptr<const ShadowMap>> shadows(s.lights.size()), groundMaps;
+    std::vector<char> onGround;  // (with a shared world: the casters whose shadows fall on this ground)
+    if (s.shadowWorld) {
+        // One map a light for every caster in the scene, shared with the rest of it.
         for (size_t i = 0; i < s.lights.size(); ++i)
-            if (shadows[i])
-                groundShadows[i] = std::make_unique<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial, s.castsShadows, true));
+            if (s.lights[i].kind != ModelLight::Kind::Point && nt > 0) shadows[i] = s.shadowWorld->map(s.lights[i], std::max(64, o.shadowSize), o.serial);
+        onGround.assign(s.shadowWorld->casters.size(), 0);
+        for (const int k : s.groundCasters)
+            if (k >= 0 && size_t(k) < onGround.size()) onGround[size_t(k)] = 1;
+        groundMaps = shadows;
+    } else {
+        for (size_t i = 0; i < s.lights.size(); ++i)
+            if (s.lights[i].shadows && s.lights[i].kind != ModelLight::Kind::Point && nt > 0)
+                shadows[i] = std::make_shared<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial, s.castsShadows));
+        // The ground's, when some casters' shadows stay off it (cards whose own grounds take them, so two grounds don't
+        // darken the same shadow twice).
+        const bool someOff = s.ground && std::any_of(s.casters.begin(), s.casters.end(), [](const ModelShadowCaster& c) { return !c.onGround; });
+        groundMaps = shadows;
+        if (someOff)
+            for (size_t i = 0; i < s.lights.size(); ++i)
+                if (shadows[i])
+                    groundMaps[i] = std::make_shared<ShadowMap>(buildShadow(s, s.lights[i], centre, radius, std::max(64, o.shadowSize), o.serial, s.castsShadows, true));
     }
-    const auto& groundMaps = someOff ? groundShadows : shadows;
+    const std::vector<char>* groundOnly = s.shadowWorld ? &onGround : nullptr;
     const std::shared_ptr<const ModelEnvironment::Prepared> env =
         s.environment ? prepare(*s.environment, o.serial) : nullptr;
     const V3 eye = cam.C;
@@ -909,7 +944,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
             const float Ef[3] = {float(E[0]), float(E[1]), float(E[2])};
             const double e = luma(Ef) * NdotL;
             all += e;
-            lit += e * (groundMaps[li] ? lightVisible(*groundMaps[li], P, NdotL) : 1);
+            lit += e * (groundMaps[li] ? lightVisible(*groundMaps[li], P, NdotL, groundOnly) : 1);
         }
         float amb[3];
         if (env) {
@@ -1016,5 +1051,59 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
     });
     return out;
 }
+
+// ---- A shared scene of casters -------------------------------------------------------------------------------------
+
+struct ModelShadowWorld::Made {
+    ModelLight::Kind kind;
+    std::array<double, 3> direction, position;
+    double cone;
+    int size;
+    std::once_flag once;
+    std::shared_ptr<const ModelShadowMap> map;
+};
+
+void ModelShadowWorld::reach(const PosedTriangles& t) {
+    std::array<double, 3> a, b;
+    if (!modelBounds(t, a, b)) return;
+    for (size_t k = 0; k < 3; ++k) {
+        lo[k] = bounded ? std::min(lo[k], a[k]) : a[k];
+        hi[k] = bounded ? std::max(hi[k], b[k]) : b[k];
+    }
+    bounded = true;
+}
+
+std::shared_ptr<const ModelShadowMap> ModelShadowWorld::map(const ModelLight& light, int size, bool serial) const {
+    if (light.kind == ModelLight::Kind::Point || casters.empty() || !bounded) return nullptr;
+    std::shared_ptr<Made> m;
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        // (a sun's map depends only on its direction; a spot's on where it is and its cone too)
+        const bool spot = light.kind == ModelLight::Kind::Spot;
+        for (const std::shared_ptr<Made>& x : made_)
+            if (x->kind == light.kind && x->direction == light.direction && x->size == size &&
+                (!spot || (x->position == light.position && x->cone == light.outerCone)))
+                m = x;
+        if (!m) {
+            m = std::make_shared<Made>();
+            m->kind = light.kind, m->direction = light.direction, m->position = light.position, m->cone = light.outerCone, m->size = size;
+            made_.push_back(m);
+        }
+    }
+    std::call_once(m->once, [&] {
+        std::vector<ShadowSource> sources;
+        for (size_t i = 0; i < casters.size() && i < 65535; ++i) {
+            const Caster& c = casters[i];
+            sources.push_back({&c.triangles, c.coverage && !c.coverage->levels.empty() ? c.coverage.get() : nullptr, c.coverageMaterial, uint16_t(i)});
+        }
+        const V3 centre{(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2};
+        const V3 span{hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]};
+        const double radius = std::max(1e-6, std::sqrt(dot(span, span)) / 2);
+        m->map = std::make_shared<const ModelShadowMap>(buildShadowFrom(sources, light, centre, radius, size, serial));
+    });
+    return m->map;
+}
+
+uint64_t modelShadowPasses() { return gShadowPasses.load(); }
 
 }  // namespace montage
