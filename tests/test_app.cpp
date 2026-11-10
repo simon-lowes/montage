@@ -5116,7 +5116,7 @@ private slots:
         whenModal<QDialog>(this, [](QDialog* d) {
             QCOMPARE(d->objectName(), QString("pluginHostingDialog"));
             auto* isolation = d->findChild<QComboBox*>("hostingIsolation");
-            QVERIFY(isolation && isolation->count() == 4);
+            QVERIFY(isolation && isolation->count() == 5 && isolation->findData(int(plugins::Isolation::PerInstance)) >= 0);
             isolation->setCurrentIndex(isolation->findData(int(plugins::Isolation::PerVendor)));
             d->findChild<QSpinBox*>("hostingMissedBlocks")->setValue(40);
             d->findChild<QComboBox*>("hostingBypass")->setCurrentIndex(1);
