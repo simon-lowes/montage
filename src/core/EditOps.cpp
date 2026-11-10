@@ -2025,6 +2025,7 @@ Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id me
     const MediaItem* m = p.findMedia(mediaId);
     if (!m) return Result::fail("Unknown media");
     if (ids.empty()) return Result::fail("Select the clips to repoint");
+    if (m->kind == MediaKind::Sequence && sequenceUses(p, m->sequenceId, s.id)) return Result::fail("A sequence cannot be placed inside itself");
     if (byTimecode && m->timecode < 0) return Result::fail("\"" + m->name + "\" has no timecode");
     const double fps = s.fpsValue();
     Sequence work = s;  // (the sequence changes only when every clip can be repointed)
@@ -2032,21 +2033,40 @@ Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id me
     std::set<Id> done;
     for (Id id : ids) {
         if (done.count(id)) continue;
-        const Clip* c = clipById(work, id);
-        if (!c) return Result::fail("Unknown clip");
-        for (Id l : linkedClips(work, id)) done.insert(l);  // (replaceClip takes the clips linked to it along)
-        if (c->isGenerator()) continue;
-        double align = c->sourceIn;
-        if (byTimecode) {
-            const MediaItem* was = p.findMedia(c->mediaId);
-            if (!was || was->timecode < 0) return Result::fail("\"" + c->name + "\" has no timecode to match");
-            // The same moment of the day: the new file's frame showing what the old one showed at the clip's start.
-            align += (was->timecode - m->timecode) * fps;
+        const Clip* picked = clipById(work, id);
+        if (!picked) return Result::fail("Unknown clip");
+        const Id from = picked->mediaId;
+        // The clip and those linked to it that play the same media (not a separate recorder's sound), each from its
+        // own source time (an L-cut's sound keeps its lead).
+        for (Id l : linkedClips(work, id)) {
+            if (!done.insert(l).second) continue;
+            const auto loc = locate(work, l);
+            if (!loc) continue;
+            Track* t = trackAt(work, loc->track);
+            Clip& c = t->clips[loc->index];
+            if (c.isGenerator() || c.mediaId != from || !editable(t)) continue;
+            const bool video = loc->track.kind == TrackKind::Video;
+            if (video ? !(m->hasVideo || m->kind == MediaKind::Image || m->kind == MediaKind::Sequence) : !m->hasAudio) continue;
+            double sourceIn = c.sourceIn;
+            if (byTimecode) {
+                const MediaItem* was = p.findMedia(c.mediaId);
+                if (!was || was->timecode < 0) return Result::fail("\"" + c.name + "\" has no timecode to match");
+                // The same moment of the day: the new file's frame showing what the old one showed.
+                sourceIn += (was->timecode - m->timecode) * fps;
+            }
+            if (sourceIn < -1e-6) return Result::fail("\"" + c.name + "\": the source does not reach back to the clip's start");
+            const std::string name = c.name;
+            const Clip fresh = makeClip(p, *m, loc->track.kind, work);
+            if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
+            c.mediaId = mediaId;
+            c.name = fresh.name;
+            c.sourceIn = std::max(0.0, sourceIn);
+            c.unrendered.clear();
+            const FrameTime limit = sourceLimit(p, work, c);
+            if (limit < kInfiniteFrames && srcHigh(c) > double(limit) + 1e-6)
+                return Result::fail("\"" + name + "\": the source is too short for the clip");
+            res.created.push_back(l);
         }
-        const std::string name = c->name;
-        const Result r = replaceClip(p, work, id, mediaId, align, c->start);
-        if (!r.ok) return Result::fail("\"" + name + "\": " + r.error);
-        res.created.insert(res.created.end(), r.created.begin(), r.created.end());
     }
     if (res.created.empty()) return Result::fail("Select clips that show media");
     s = std::move(work);
@@ -2688,15 +2708,25 @@ Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::v
     if (b <= a) return Result::fail("Set In and Out points first");
     // Cut at In and Out on each track taking part; the pieces between get link groups of their own (so the clips
     // left outside are not pulled in with them).
-    std::map<Id, Id> regroup;
+    // The pieces after Out get theirs too, so they are not linked to those before In across the compound.
+    std::map<Id, Id> regroup, regroupTail;
     std::vector<Id> inside;
+    std::vector<TrackRef> seen;
     for (TrackRef r : tracks) {
         Track* t = trackAt(s, r);
-        if (!editable(t)) continue;
+        if (!editable(t) || std::find(seen.begin(), seen.end(), r) != seen.end()) continue;
+        seen.push_back(r);
         for (FrameTime at : {a, b})
             for (size_t i = 0; i < t->clips.size(); ++i)
                 if (t->clips[i].start < at && t->clips[i].end() > at) {
-                    splitClip(p, *t, i, at);
+                    const Id group = t->clips[i].linkGroup;
+                    const Id right = splitClip(p, *t, i, at);
+                    if (at == b && group) {
+                        auto it = regroupTail.find(group);
+                        if (it == regroupTail.end()) it = regroupTail.emplace(group, p.newId()).first;
+                        for (Clip& c : t->clips)
+                            if (c.id == right) c.linkGroup = it->second;
+                    }
                     break;
                 }
         normalize(*t);

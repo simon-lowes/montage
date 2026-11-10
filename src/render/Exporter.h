@@ -343,15 +343,18 @@ bool bakeCompositeClips(Project& p, Id seq, const std::string& output, std::stri
 bool apvEncoderAvailable();
 bool apvDecoderAvailable();
 // Renders an audio clip's sound with its effects (not its volume, pan or fades) to a 24-bit WAV, from its first frame
-// to its last, stamped (Broadcast Wave's bext and iXML, media/FieldRecorder.h) with its source's timecode there.
+// to its last, stamped (Broadcast Wave's bext and iXML, media/FieldRecorder.h) with its source's timecode there (a file
+// that cannot be stamped, a RIFF past 4 GB, is kept without it).
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
-// Extract Sound to Files: the same without its effects (the sound as its source has it, at the clip's speed).
+// Extract Sound to Files: the same without its effects (the sound as its source has it, at the clip's speed); failing
+// when it cannot be stamped.
 bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                       const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
 // What such a WAV is stamped with: the source's timecode at the clip's first frame (its media's start timecode, or
-// midnight without one, plus the clip's in-point), the source's frame rate, the clip's name as its description and the
-// media's project, scene, take and tape.
+// midnight without one, plus the clip's in-point; round again past midnight), the recording's timecode rate (its own,
+// else its frame rate, else the sequence's), the clip's name as its description and the media's project, scene, take
+// and tape.
 struct BroadcastStamp;
 BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip& c);
 

@@ -5105,6 +5105,8 @@ private slots:
         QVERIFY(a1.clips[1].linkGroup && a1.clips[1].linkGroup == v1.clips[1].linkGroup);
         // The pieces left outside stay linked to each other, not to the compound.
         QVERIFY(v1.clips[0].linkGroup && v1.clips[0].linkGroup == a1.clips[0].linkGroup && v1.clips[0].linkGroup != v1.clips[1].linkGroup);
+        QVERIFY(v1.clips[2].linkGroup && v1.clips[2].linkGroup == a1.clips[2].linkGroup);
+        QVERIFY(v1.clips[2].linkGroup != v1.clips[0].linkGroup && v1.clips[2].linkGroup != v1.clips[1].linkGroup);
         // V2: the clip inside went, the one across Out was cut there; V3 untouched.
         const Track& v2 = *trackAt(outer, V2);
         QCOMPARE(v2.clips.size(), size_t(1));
@@ -5125,6 +5127,12 @@ private slots:
         QVERIFY(clipById(*nested, v2b));
         QCOMPARE(trackAt(*nested, V2)->clips[1].sourceIn, 100.0);
         QCOMPARE(trackAt(*nested, A1)->clips.size(), size_t(1));
+        // A track given twice is nested once.
+        Fixture fw;
+        fw.put(V1, 0, 30);
+        QVERIFY(nestRange(fw.p, *fw.p.active(), 5, 20, {V1, V1}, "Twice").ok);
+        const MediaItem* twice = fw.p.findMedia(trackAt(*fw.p.active(), V1)->clips[1].mediaId);
+        QCOMPARE(trackAt(*fw.p.findSequence(twice->sequenceId), V1)->clips.size(), size_t(1));
         // A locked track is left as it is; nothing in the range fails.
         Fixture fy;
         fy.put(V1, 0, 30);
@@ -5180,6 +5188,45 @@ private slots:
         for (int i = 0; i < 5; ++i) {
             QCOMPARE(trackAt(fx.s(), V1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
             QCOMPARE(trackAt(fx.s(), A1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+        }
+        // An L-cut (the sound leading the picture by 12 frames) keeps its lead; a separate recorder's sound linked to
+        // the picture is left on its own file.
+        {
+            Fixture fl;
+            MediaItem on = online;
+            on.id = fl.p.newId();
+            fl.p.media.push_back(on);
+            MediaItem recorder = *fl.p.findMedia(fl.media);
+            recorder.id = fl.p.newId();
+            recorder.name = "recorder.wav";
+            recorder.hasVideo = false;
+            fl.p.media.push_back(recorder);
+            const Result placed = placeMedia(fl.p, fl.s(), fl.media, 40, 30, 90, V1, A1, false);
+            QVERIFY(placed.ok);
+            Clip* sound = clipById(fl.s(), placed.created[1]);
+            sound->start = 28;
+            sound->sourceIn = 18;
+            sound->duration = 72;
+            Clip rec = makeClip(fl.p, recorder, TrackKind::Audio, fl.s());
+            rec.start = 40;
+            rec.duration = 60;
+            rec.sourceIn = 200;
+            rec.linkGroup = clipById(fl.s(), placed.created[0])->linkGroup;
+            QVERIFY(overwrite(fl.p, fl.s(), {TrackKind::Audio, 1}, rec).ok);
+            QVERIFY(replaceSources(fl.p, fl.s(), {placed.created[0]}, on.id, false).ok);
+            QCOMPARE(clipById(fl.s(), placed.created[0])->sourceIn, 30.0);
+            QCOMPARE(clipById(fl.s(), placed.created[1])->sourceIn, 18.0);
+            QCOMPARE(clipById(fl.s(), placed.created[1])->mediaId, on.id);
+            QCOMPARE(trackAt(fl.s(), {TrackKind::Audio, 1})->clips[0].mediaId, recorder.id);
+            QCOMPARE(trackAt(fl.s(), {TrackKind::Audio, 1})->clips[0].sourceIn, 200.0);
+            // A sequence cannot be pointed at itself (or at a compound of it).
+            MediaItem self;
+            self.id = fl.p.newId();
+            self.kind = MediaKind::Sequence;
+            self.sequenceId = fl.s().id;
+            self.hasVideo = true;
+            fl.p.media.push_back(self);
+            QVERIFY(!replaceSources(fl.p, fl.s(), {placed.created[0]}, self.id, false).ok);
         }
         // All or nothing: a file too short for the last clip changes none, and names it.
         fx.p = before;

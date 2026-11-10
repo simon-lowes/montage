@@ -3582,7 +3582,8 @@ BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip&
     BroadcastStamp st;
     const MediaItem* m = p.findMedia(c.mediaId);
     // The source's timecode where the clip starts: its media's start (midnight without one) plus the clip's offset.
-    st.seconds = std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + c.sourceAt(0) / seq.fpsValue());
+    // Samples since midnight: past 24:00:00 it goes round.
+    st.seconds = std::fmod(std::max(0.0, (m && m->timecode >= 0 ? m->timecode : 0.0) + c.sourceAt(0) / seq.fpsValue()), 86400.0);
     st.timecodeRate = m && m->fps.valid() ? m->fps : seq.fps;
     st.description = c.name;
     if (m) {
@@ -3590,6 +3591,13 @@ BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip&
             const auto it = m->metadata.find(key);
             return it == m->metadata.end() ? std::string() : it->second;
         };
+        // A recording's own timecode rate ("30000/1001 DF", as applyFieldRecording keeps it) where it has one.
+        const std::string rate = meta("timecode_rate");
+        int num = 0, den = 0;
+        if (std::sscanf(rate.c_str(), "%d/%d", &num, &den) == 2 && num > 0 && den > 0) {
+            st.timecodeRate = Rational{num, den};
+            st.dropFrame = rate.find("DF") != std::string::npos;
+        }
         st.project = meta("project");
         st.scene = meta("scene");
         st.take = meta("take");
@@ -3600,7 +3608,7 @@ BroadcastStamp clipSoundStamp(const Project& p, const Sequence& seq, const Clip&
 
 namespace {
 bool writeClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
-                    const ExportProgress& progress, const std::atomic<bool>* cancel, bool effects) {
+                    const ExportProgress& progress, const std::atomic<bool>* cancel, bool effects, bool stamp) {
     const Clip* c = edit::clipById(seq, clip);
     if (!c) {
         if (error) *error = "No such clip";
@@ -3640,19 +3648,25 @@ bool writeClipSound(const Project& p, const Sequence& seq, Id clip, const std::s
     st.in = copy.start;
     st.out = copy.start + copy.duration;
     if (!exportSequence(p, alone, st, progress, cancel, error)) return false;
-    // Stamped with the source's timecode where the clip starts.
-    return writeBroadcastStamp(path, clipSoundStamp(p, seq, *c), error);
+    // Stamped with the source's timecode where the clip starts: what extracting is for, a courtesy for a render (whose
+    // sound stands without it).
+    std::string why;
+    if (!writeBroadcastStamp(path, clipSoundStamp(p, seq, *c), &why) && stamp) {
+        if (error) *error = why;
+        return false;
+    }
+    return true;
 }
 }  // namespace
 
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress, const std::atomic<bool>* cancel) {
-    return writeClipSound(p, seq, clip, path, error, progress, cancel, true);
+    return writeClipSound(p, seq, clip, path, error, progress, cancel, true, false);
 }
 
 bool extractClipSound(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                       const ExportProgress& progress, const std::atomic<bool>* cancel) {
-    return writeClipSound(p, seq, clip, path, error, progress, cancel, false);
+    return writeClipSound(p, seq, clip, path, error, progress, cancel, false, true);
 }
 
 bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,

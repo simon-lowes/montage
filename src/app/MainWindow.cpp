@@ -355,9 +355,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::selectionChanged, this, &MainWindow::updateActions);
     // Clicking another clip ends Trim mode (its edit points remembered for Reselect Last Edit Points).
     connect(state_, &EditorState::selectionChanged, this, [this] {
-        if (!trimEdit_) return;
+        if (!trimEdit_ || trimShuttle_ || !state_->sequence()) return;
+        // (the clips either side of the edit, and those linked to them, are not another clip)
+        std::vector<Id> own = trimSelection_;
+        for (Id id : edit::expandLinks(*state_->sequence(), {trimEdit_->outgoing, trimEdit_->incoming})) own.push_back(id);
         for (Id id : state_->selectedClips())
-            if (std::find(trimSelection_.begin(), trimSelection_.end(), id) == trimSelection_.end()) {
+            if (std::find(own.begin(), own.end(), id) == own.end()) {
                 endTrimMode();
                 return;
             }
@@ -4845,9 +4848,20 @@ bool MainWindow::stopTrimShuttle(bool keep) {
     return true;
 }
 
-void MainWindow::selectTrimEdit(const TrimEdit& e) {
-    if (trimEdit_ && (trimEdit_->outgoing != e.outgoing || trimEdit_->incoming != e.incoming)) trimHistory_.push_back(*trimEdit_);
+namespace {
+bool sameEdit(const MainWindow::TrimEdit& a, const MainWindow::TrimEdit& b) { return a.outgoing == b.outgoing && a.incoming == b.incoming; }
+}  // namespace
+
+void MainWindow::rememberTrimEdit(const TrimEdit& e) {
+    // Once each, the latest last.
+    trimHistory_.erase(std::remove_if(trimHistory_.begin(), trimHistory_.end(), [&](const TrimEdit& o) { return sameEdit(o, e); }),
+                       trimHistory_.end());
+    trimHistory_.push_back(e);
     if (trimHistory_.size() > 32) trimHistory_.erase(trimHistory_.begin());
+}
+
+void MainWindow::selectTrimEdit(const TrimEdit& e) {
+    if (trimEdit_ && !sameEdit(*trimEdit_, e)) rememberTrimEdit(*trimEdit_);
     trimEdit_ = e;
     trimSelection_ = state_->selectedClips();
 }
@@ -4864,7 +4878,7 @@ bool MainWindow::reselectLastEditPoints() {
     while (!trimHistory_.empty()) {
         const TrimEdit e = trimHistory_.back();
         trimHistory_.pop_back();
-        if (!usable(e)) continue;
+        if (!usable(e) || (trimEdit_ && sameEdit(*trimEdit_, e))) continue;
         stopTrimShuttle(true);
         selectTrimEdit(e);
         showTrimEdit();
@@ -4877,8 +4891,7 @@ bool MainWindow::reselectLastEditPoints() {
 void MainWindow::endTrimMode() {
     stopTrimShuttle(false);
     if (!trimEdit_) return;
-    trimHistory_.push_back(*trimEdit_);
-    if (trimHistory_.size() > 32) trimHistory_.erase(trimHistory_.begin());
+    rememberTrimEdit(*trimEdit_);
     trimEdit_.reset();
     timeline_->clearTrimEdit();
     programPanel_->endTrimView();

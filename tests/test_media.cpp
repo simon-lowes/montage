@@ -20695,6 +20695,16 @@ if __name__ == '__main__':
             QCOMPARE(std::llround(fr.startSeconds), 3600LL);
         }
         QVERIFY(!writeBroadcastStamp(path("no-such.wav"), again, &err));
+        // A take near midnight goes round to the next day; a recording's own drop-frame rate is kept.
+        p.findMedia(m.id)->timecode = 86399.5;
+        p.findMedia(m.id)->metadata["timecode_rate"] = "30000/1001 DF";
+        const BroadcastStamp late = clipSoundStamp(p, s, *edit::clipById(s, c->id));
+        QVERIFY2(std::fabs(late.seconds - 0.18) < 1e-6, qPrintable(QString::number(late.seconds)));
+        QCOMPARE(late.timecodeRate, (Rational{30000, 1001}));
+        QVERIFY(late.dropFrame);
+        QVERIFY2(writeBroadcastStamp(extracted, late, &err), err.c_str());
+        const QString lateXml = QString::fromUtf8(chunks(extracted).at("iXML")[0]);
+        QVERIFY(lateXml.contains(QStringLiteral("<TIMECODE_FLAG>DF<")) && lateXml.contains(QStringLiteral("<TIMECODE_RATE>30000/1001<")));
     }
 
     void mcpNestRangeAndReplaceSource() {

@@ -5680,6 +5680,8 @@ private slots:
         state()->setPlayhead(55);
         QVERIFY(win_->selectNearestEdit());
         QVERIFY(win_->trimEdit() && win_->trimEdit()->side == 0);
+        QTest::mouseClick(viewport(), Qt::LeftButton, {}, timeline()->clipBounds(blue()->id).center());
+        QVERIFY(win_->trimEdit());  // a clip of the edit itself is not another clip
         QTest::mouseClick(viewport(), Qt::LeftButton, {}, timeline()->clipBounds(title).center());
         QCOMPARE(state()->selectedClips(), std::vector<Id>{title});
         QVERIFY(!win_->trimEdit());

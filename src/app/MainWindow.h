@@ -661,6 +661,7 @@ private:
     std::vector<TrimEdit> trimHistory_;  // edit points selected before, the latest last
     std::vector<Id> trimSelection_;      // the clips selected when the edit was
     void selectTrimEdit(const TrimEdit& e);  // trimEdit_ set, the one it replaces remembered
+    void rememberTrimEdit(const TrimEdit& e);
     struct TrimShuttle {
         int speed = 0;        // frames per frame of playback, signed
         double played = 0;    // frames played since it started
