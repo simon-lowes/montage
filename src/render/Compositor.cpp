@@ -877,6 +877,27 @@ int ofxInputTrack(const Sequence& seq, const std::string& connection) {
 
 }  // namespace
 
+namespace {
+// The clip a title's Path From Clip names (its id, or its name: of several so named, the one playing at sequence frame
+// st, else the first in the sequence); null when it names none, or none is there.
+const Clip* namedPathClip(const Sequence& seq, const Clip& title, FrameTime st) {
+    const std::string name = title.generator.s("path_clip");
+    if (name.empty()) return nullptr;
+    const Clip* found = nullptr;
+    bool digits = !name.empty() && name.size() < 20 && std::all_of(name.begin(), name.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+    const Id id = digits ? Id(std::strtoull(name.c_str(), nullptr, 10)) : 0;
+    for (const Track& tr : seq.videoTracks)
+        for (const Clip& k : tr.clips) {
+            if (k.id == title.id) continue;
+            if (id != 0 && k.id == id) return &k;
+            if (k.name != name) continue;
+            if (k.contains(st)) return &k;
+            if (!found) found = &k;
+        }
+    return found;
+}
+}  // namespace
+
 TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h) {
     const int shape = int(std::lround(c.generator.p("path_shape", 0)));
     const auto ps = c.generator.params.find("path_shape");
@@ -885,6 +906,10 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
     auto atFrame = [&p, &seq, &c, w, h](FrameTime lt) -> std::optional<TitlePathCurve> {
         const double t = double(lt);
         const int kind = int(std::lround(c.generator.pAt("path_shape", t)));
+        const FrameTime st = c.start + lt;
+        // Another clip's (named by Path From Clip), else the title's own.
+        const Clip* named = namedPathClip(seq, c, st);
+        if (!named && !c.generator.s("path_clip").empty()) return std::nullopt;
         using Seg = TitlePathCurve::Segment;
         TitlePathCurve out;
         auto cubic = [&](QPointF a, QPointF b, QPointF cc, QPointF d) {
@@ -904,45 +929,77 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
             out.closed = closed;
         };
         if (kind == 4) {
-            // The clip's effects' masks drawn as shapes (ellipses, rectangles, Bézier paths), the Mask Number-th.
+            // The clip's effects' masks drawn as shapes (ellipses, rectangles, Bézier paths), the Mask Number-th; on
+            // another clip, at its own time and carried through its transform into the title's frame.
+            const Clip& src = named ? *named : c;
+            const FrameTime olt = named ? std::clamp<FrameTime>(st - src.start, 0, std::max<FrameTime>(0, src.duration - 1)) : lt;
+            const double ot = named ? double(olt) : t;
+            // Its frame (u, v as fractions) to the title's (pixels).
+            bool ok = true;
+            auto frameTo = [&](double u, double v) {
+                if (!named) return QPointF(u * w, v * h);
+                double sx = 0, sy = 0, tu = 0, tv = 0;
+                ok = ok && clipFrameToSequence(p, seq, src, st, u, v, sx, sy) && sequenceToClipFrame(p, seq, c, st, sx, sy, tu, tv);
+                return QPointF(tu * w, tv * h);
+            };
+            // (the frame's shape, for a turned mask's box)
+            double fw = w, fh = h;
+            if (named && !clipFrameSize(p, seq, src, fw, fh)) return std::nullopt;
             const int want = std::max(1, int(std::lround(c.generator.pAt("path_mask", t, 1))));
             int k = 0;
-            for (const Effect& e : c.effects) {
-                const int ms = int(std::lround(e.p("mask.shape", lt)));
+            for (const Effect& e : src.effects) {
+                const int ms = int(std::lround(e.p("mask.shape", olt)));
                 if (!e.enabled || (ms != 1 && ms != 2 && ms != 5) || ++k != want) continue;  // (as the monitor shows them)
-                const MaskBox b = maskBox(e, lt);
+                const MaskBox b = maskBox(e, olt);
+                auto to = [&](double bx, double by) {
+                    double u = 0, v = 0;
+                    boxToFrame(b, fw, fh, bx, by, u, v);
+                    return frameTo(u, v);
+                };
                 if (ms == 1) {
-                    // From the top, clockwise on screen (as the Circle path runs).
+                    // From the top, clockwise on screen (as the Circle path runs): its middle and the ends of its
+                    // axes carried over (an ellipse still, the clip's transform being affine).
                     Seg g;
-                    g.kind = 2;
-                    g.p[0] = QPointF(b.x * w, b.y * h);
-                    g.p[1] = QPointF(b.w * w / 2, b.h * h / 2);
-                    g.rotation = b.rotation * M_PI / 180;
+                    g.kind = 3;
+                    g.p[0] = to(0, 0);
+                    g.p[1] = to(0.5, 0) - g.p[0];
+                    g.p[2] = to(0, 0.5) - g.p[0];
                     g.from = -M_PI / 2, g.to = 1.5 * M_PI;
                     out.segments.push_back(g);
                     out.closed = true;
-                    return out;
+                } else if (ms == 2) {
+                    pathSegments({{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}}, true, to);
+                } else if (maskPathCount(e) >= 2) {
+                    pathSegments(maskPath(e, olt), e.p("mask.open", olt) <= 0.5, to);
                 }
-                auto to = [&](double bx, double by) {
-                    double u = 0, v = 0;
-                    boxToFrame(b, w, h, bx, by, u, v);
-                    return QPointF(u * w, v * h);
-                };
-                if (ms == 2) pathSegments({{-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}}, true, to);
-                else if (maskPathCount(e) >= 2) pathSegments(maskPath(e, lt), e.p("mask.open", lt) <= 0.5, to);
-                if (out.segments.empty()) return std::nullopt;
-                return out;
+                if (out.segments.empty() || !ok) return std::nullopt;
+                // Set off by the mask's expansion, and across its feather (centred on the expanded edge) as far as On
+                // the Feather says: its pixels (sequence pixels on the clip's frame) as many of the title's as the
+                // clip's frame takes of them there.
+                const double feather = std::max(0.0, e.pAt("mask.feather", ot, 20)), expand = e.pAt("mask.expansion", ot);
+                const double across = std::clamp(c.generator.pAt("path_feather", t), -100.0, 100.0) / 100;
+                const double at = expand + across * feather / 2;
+                if (at != 0) {
+                    const QPointF o = frameTo(b.x, b.y), ux = frameTo(b.x + 1.0 / seq.width, b.y), uy = frameTo(b.x, b.y + 1.0 / seq.height);
+                    const QPointF a = ux - o, d = uy - o;
+                    out.offset = at * std::sqrt(std::abs(a.x() * d.y() - a.y() * d.x()));
+                }
+                return ok ? std::optional<TitlePathCurve>(out) : std::nullopt;
             }
             return std::nullopt;
         }
         if (kind != 5) return std::nullopt;
-        // A shape layer under the title (on Shape Track, or the nearest below it) at this time, and its path.
+        // A shape layer under the title (on Shape Track, or the nearest below it; or the clip named) at this time, and
+        // its path.
         const auto loc = edit::locate(seq, c.id);
         if (!loc || loc->track.kind != TrackKind::Video) return std::nullopt;
-        const FrameTime st = c.start + lt;
         const int track = int(std::lround(c.generator.pAt("path_track", t)));
         const Clip* layer = nullptr;
-        for (int i = track > 0 ? track - 1 : loc->track.index - 1; i >= 0 && i < int(seq.videoTracks.size()) && !layer; i = track > 0 ? -1 : i - 1)
+        if (named) {
+            if (!named->isGenerator() || named->generator.type != "shape") return std::nullopt;
+            layer = named;
+        }
+        for (int i = track > 0 ? track - 1 : loc->track.index - 1; !named && i >= 0 && i < int(seq.videoTracks.size()) && !layer; i = track > 0 ? -1 : i - 1)
             for (const Clip& k : seq.videoTracks[size_t(i)].clips)
                 if (k.isGenerator() && k.generator.type == "shape" && k.contains(st) && k.id != c.id) {
                     layer = &k;
@@ -980,6 +1037,7 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
         if (!a || f < 1e-9 || lt >= last) return a;
         const std::optional<TitlePathCurve> b = atFrame(lt + 1);
         if (!b || b->segments.size() != a->segments.size() || b->closed != a->closed) return a;
+        a->offset += (b->offset - a->offset) * f;
         for (size_t i = 0; i < a->segments.size(); ++i) {
             TitlePathCurve::Segment& sa = a->segments[i];
             const TitlePathCurve::Segment& sb = b->segments[i];
@@ -990,6 +1048,46 @@ TitlePathFn titlePathSource(const Project& p, const Sequence& seq, const Clip& c
             sa.to += (sb.to - sa.to) * f;
         }
         return a;
+    };
+}
+
+TitleLayerFn titleLayerSource(const Project& p, const Sequence& seq, const Clip& c, int w, int h) {
+    const std::string id = c.generator.s("svg_layer");
+    if (id.empty() || c.generator.s("svg_text").empty()) return {};
+    const Id layerId = Id(std::strtoull(id.c_str(), nullptr, 10));
+    // The layer's pixels (from its middle) to the title's at a frame: through the layer's own position and turn, its
+    // clip's transform to the sequence, and back through the title's.
+    auto atFrame = [&p, &seq, &c, w, h, layerId](FrameTime lt) -> std::optional<QTransform> {
+        const Clip* layer = edit::clipById(seq, layerId);
+        if (!layer || !layer->isGenerator() || layer->generator.type != "shape") return std::nullopt;
+        const FrameTime st = c.start + lt, slt = std::clamp<FrameTime>(st - layer->start, 0, std::max<FrameTime>(0, layer->duration - 1));
+        QTransform own;
+        own.translate(seq.width / 2.0 + layer->generator.p("pos_x", slt), seq.height / 2.0 + layer->generator.p("pos_y", slt));
+        own.rotate(layer->generator.p("rotation", slt));
+        bool ok = true;
+        auto to = [&](double x, double y) {
+            const QPointF f = own.map(QPointF(x, y));
+            double sx = 0, sy = 0, u = 0, v = 0;
+            ok = ok && clipFrameToSequence(p, seq, *layer, st, f.x() / seq.width, f.y() / seq.height, sx, sy) &&
+                 sequenceToClipFrame(p, seq, c, st, sx, sy, u, v);
+            return QPointF(u * w, v * h);
+        };
+        const QPointF o = to(0, 0), a = to(100, 0), b = to(0, 100);
+        if (!ok) return std::nullopt;
+        return QTransform((a.x() - o.x()) / 100, (a.y() - o.y()) / 100, (b.x() - o.x()) / 100, (b.y() - o.y()) / 100, o.x(), o.y());
+    };
+    // Between frames (motion blur's samples) the frames either side mixed.
+    return [atFrame, last = std::max<FrameTime>(0, c.duration - 1)](double t) -> std::optional<QTransform> {
+        const double ct = std::clamp(t, 0.0, double(last));
+        const FrameTime lt = FrameTime(std::floor(ct + 1e-9));
+        const std::optional<QTransform> a = atFrame(lt);
+        const double f = ct - double(lt);
+        if (!a || f < 1e-9 || lt >= last) return a;
+        const std::optional<QTransform> b = atFrame(lt + 1);
+        if (!b) return a;
+        auto mix = [f](double x, double y) { return x + (y - x) * f; };
+        return QTransform(mix(a->m11(), b->m11()), mix(a->m12(), b->m12()), mix(a->m21(), b->m21()), mix(a->m22(), b->m22()), mix(a->dx(), b->dx()),
+                          mix(a->dy(), b->dy()));
     };
 }
 
@@ -1064,7 +1162,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
-              : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h))
+              : c.generator.type == "title" ? renderTitle(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue(), titlePathSource(p, seq, c, w, h),
+                                                          titleLayerSource(p, seq, c, w, h))
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back

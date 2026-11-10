@@ -22,6 +22,9 @@
 #include <filesystem>
 #include <fstream>
 #include <QFontMetricsF>
+#include <QGlyphRun>
+#include <QRawFont>
+#include <QTextLayout>
 #include <functional>
 #include <limits>
 #include <array>
@@ -16680,7 +16683,16 @@ private slots:
         r = call("montage_add_title", {{"project", project}, {"text", "Deep"}, {"at", 0}, {"template", "3d"}, {"depth", 20},
                                        {"animations", QJsonArray{QJsonObject{{"start", 50}, {"depth", 60}}}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
-        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}, {"animations", QJsonArray{QJsonObject{{"x", 5}}}}})
+        // A 3D title's letters move, turn and take side colours; those are refused for a flat title, as an outline
+        // colour is for a 3D one.
+        r = call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"},
+                                       {"animations", QJsonArray{QJsonObject{{"x", 5}, {"z", -40}, {"rot_y", 90}, {"side", QJsonArray{1, 0, 0}}, {"side_amount", 100}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"animations", QJsonArray{QJsonObject{{"z", 5}}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"animations", QJsonArray{QJsonObject{{"side", QJsonArray{1, 0, 0}}}}}})
+                    .value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"},
+                                           {"animations", QJsonArray{QJsonObject{{"outline_color", QJsonArray{1, 0, 0}}}}}})
                     .value("isError").toBool());
         QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"animations", QJsonArray{QJsonObject{{"depth", 5}}}}}).value("isError").toBool());
         QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"path", QJsonObject{{"shape", "mask"}, {"align", "sideways"}}}})
@@ -38388,6 +38400,241 @@ if ui["pressed"] == "add":
             std::string err;
             QVERIFY(importSvgShapes(path("text.svg"), plain, w, h, &notes, &err));
             QVERIFY(std::any_of(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Text") != std::string::npos; }));
+        }
+    }
+
+    void svgTextOnPathsAndGlyphPositions() {
+        // SVG text the test writes, made a title and drawn within 1/255 of a reference the test paints with QPainter
+        // where the SVG puts each letter: per-glyph x, y and rotate; a textPath round a circle (two arcs, through the
+        // path's own transform) with per-glyph x along it, dy across it and rotate; text through a transform (moved,
+        // turned and scaled) with dx and dy. Then the titles follow their layer when it is moved and scaled, and
+        // importing into it again replaces them.
+        Project p = makeDefaultProject();
+        auto write = [&](const char* name, const std::string& body) {
+            const std::string file = path(name);
+            std::ofstream f(file);
+            f << "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"200\" height=\"200\">" << body << "</svg>";
+            return file;
+        };
+        auto textsOf = [&](const std::string& file, Effect* layer = nullptr) {
+            Effect g = makeEffect(p, "shape");
+            double w = 0, h = 0;
+            std::vector<std::string> notes;
+            std::string err;
+            std::vector<SvgText> texts;
+            if (!importSvgShapes(file, g, w, h, &notes, &err, &texts)) qWarning("%s", err.c_str());
+            for (const std::string& n : notes) qInfo("note: %s", n.c_str());
+            if (layer) *layer = g;
+            return texts;
+        };
+        auto font = [](int px) {
+            QFont f(QStringLiteral("DejaVu Sans"));
+            f.setPixelSize(px);
+            f.setBold(false);
+            f.setItalic(false);
+            f.setHintingPreference(QFont::PreferNoHinting);
+            return f;
+        };
+        // Each letter's outline at the origin (its baseline's start) and its advance, as a line of the text lays them
+        // out (kerning and all).
+        struct Letter {
+            QPainterPath path;
+            double advance = 0;
+        };
+        auto letters = [](const QString& text, const QFont& f) {
+            QTextLayout layout(text, f);
+            layout.beginLayout();
+            QTextLine line = layout.createLine();
+            line.setLineWidth(1e7);
+            layout.endLayout();
+            std::vector<Letter> out;
+            for (int i = 0; i < text.size(); ++i) {
+                Letter l;
+                l.advance = line.cursorToX(i + 1) - line.cursorToX(i);
+                for (const QGlyphRun& run : layout.glyphRuns(i, 1)) {
+                    const QRawFont rf = run.rawFont();
+                    for (int g = 0; g < run.glyphIndexes().size(); ++g) {
+                        QPainterPath gp = rf.pathForGlyph(run.glyphIndexes()[g]);
+                        gp.translate(run.positions()[g].x() - line.cursorToX(i), run.positions()[g].y() - line.ascent());
+                        l.path.addPath(gp);
+                    }
+                }
+                out.push_back(l);
+            }
+            return out;
+        };
+        // The reference painted where the letters go, and (as QPainter puts a path's points on a 1/64 px grid, so a
+        // point a rounding error away can move a whole step) 1/64 px each way: the lowest and highest of those.
+        auto paint = [](const QPainterPath& all) {
+            std::pair<Image, Image> range{Image(200, 200), Image(200, 200)};
+            bool first = true;
+            for (int sx = -1; sx <= 1; ++sx)
+                for (int sy = -1; sy <= 1; ++sy) {
+                    QImage q(200, 200, QImage::Format_RGBA8888_Premultiplied);
+                    q.fill(Qt::transparent);
+                    QPainter pa(&q);
+                    pa.setRenderHint(QPainter::Antialiasing);
+                    QPainterPath path = all.translated(sx / 64.0, sy / 64.0);
+                    path.setFillRule(Qt::WindingFill);
+                    pa.fillPath(path, QColor(255, 255, 255));
+                    pa.end();
+                    for (int y = 0; y < 200; ++y)
+                        for (int x = 0; x < 800; ++x) {
+                            const float v = q.constScanLine(y)[x] / 255.0f;
+                            float &lo = range.first.row(y)[x], &hi = range.second.row(y)[x];
+                            lo = first ? v : std::min(lo, v), hi = first ? v : std::max(hi, v);
+                        }
+                    first = false;
+                }
+            return range;
+        };
+        auto same = [](const char* what, const Image& ours, const std::pair<Image, Image>& want) {
+            float worst = 0;
+            int at = 0;
+            double ink = 0;
+            for (size_t i = 0; i < ours.px.size(); ++i) {
+                ink += want.first.px[i];
+                const float d = std::max({0.0f, want.first.px[i] - ours.px[i], ours.px[i] - want.second.px[i]});
+                if (d > worst) worst = d, at = int(i);
+            }
+            if (worst > 1.0f / 255 + 1e-6f)
+                qWarning("%s: pixel %d,%d is %g, wants %g to %g", what, (at / 4) % 200, (at / 4) / 200, ours.px[size_t(at)], want.first.px[size_t(at)],
+                         want.second.px[size_t(at)]);
+            return worst <= 1.0f / 255 + 1e-6f && ink > 100;
+        };
+        auto drawn = [&](const SvgText& t) { return renderGenerator(svgTextTitle(t), 0, 200, 200, 1.0, 30, 30); };
+
+        // Per-glyph positions and rotations: each letter at its own x and y, turned about its baseline's start.
+        {
+            const std::vector<SvgText> texts =
+                textsOf(write("glyphs.svg", "<text x=\"20 60 100 140\" y=\"80 70 60 50\" rotate=\"0 15 -30 45\" font-family=\"DejaVu Sans\" "
+                                            "font-size=\"30\" fill=\"#ffffff\">ABCD</text>"));
+            QCOMPARE(int(texts.size()), 1);
+            const std::vector<Letter> ls = letters(QStringLiteral("ABCD"), font(30));
+            const double xs[] = {20, 60, 100, 140}, ys[] = {80, 70, 60, 50}, rs[] = {0, 15, -30, 45};
+            QPainterPath all;
+            for (int i = 0; i < 4; ++i) {
+                QTransform m;
+                m.translate(xs[i], ys[i]);
+                m.rotate(rs[i]);
+                all.addPath(m.map(ls[size_t(i)].path));
+            }
+            QVERIFY(same("per-glyph positions", drawn(texts[0]), paint(all)));
+        }
+        // On a path: a circle of radius 60 round (100, 90) (two arcs, moved 10 px down by the path's transform), the
+        // letters from startOffset 10 at the x the tspan gives each along it, 5 px out (dy -5) and each turned 10
+        // degrees more: each letter's middle at its distance round, turned to the circle's tangent there.
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "ring.svg", "<defs><path id=\"ring\" transform=\"translate(0 10)\" d=\"M 100 20 A 60 60 0 0 1 100 140 A 60 60 0 0 1 100 20 Z\"/></defs>"
+                            "<text font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\"><textPath xlink:href=\"#ring\" startOffset=\"10\">"
+                            "<tspan x=\"0 25 50 75 100\" dy=\"-5\" rotate=\"10\">ROUND</tspan></textPath></text>"));
+            QCOMPARE(int(texts.size()), 1);
+            QCOMPARE(texts[0].text, std::string("ROUND"));
+            QVERIFY(!texts[0].layout.path.empty());
+            const std::vector<Letter> ls = letters(QStringLiteral("ROUND"), font(20));
+            QPainterPath all;
+            for (int i = 0; i < 5; ++i) {
+                const double adv = ls[size_t(i)].advance, along = 10 + 25 * i + adv / 2, th = -M_PI / 2 + along / 60;
+                QTransform m;
+                m.translate(100 + 60 * std::cos(th), 90 + 60 * std::sin(th));
+                m.rotateRadians(th + M_PI / 2);
+                m.translate(-adv / 2, -5);
+                m.rotate(10);
+                all.addPath(m.map(ls[size_t(i)].path));
+            }
+            QVERIFY(same("text on a path", drawn(texts[0]), paint(all)));
+            // A percentage startOffset: from half way round, at the bottom.
+            const std::vector<SvgText> half = textsOf(write(
+                "half.svg", "<path id=\"c\" d=\"M 100 30 A 60 60 0 0 1 100 150 A 60 60 0 0 1 100 30\" fill=\"none\"/>"
+                            "<text font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\"><textPath href=\"#c\" startOffset=\"50%\">I</textPath></text>"));
+            QCOMPARE(int(half.size()), 1);
+            const std::vector<TitleGlyph> hg = titleGlyphs(svgTextTitle(half[0]), 0, 200, 200, 1.0, 30, 30);
+            QCOMPARE(int(hg.size()), 1);
+            const double adv = letters(QStringLiteral("I"), font(20))[0].advance, th = M_PI / 2 + adv / 2 / 60;
+            QVERIFY2(QLineF(hg[0].baselineMid, QPointF(100 + 60 * std::cos(th), 90 + 60 * std::sin(th))).length() < 0.05,
+                     qPrintable(QString("%1,%2").arg(hg[0].baselineMid.x()).arg(hg[0].baselineMid.y())));
+            QVERIFY(std::abs(std::remainder(hg[0].angle - (th * 180 / M_PI + 90), 360.0)) < 0.05);
+        }
+        // Through a transform: moved to the middle, turned 30 degrees and scaled 1.5 times, from x -40 with dx and dy
+        // per letter: the letters laid out at 20 px in the text's units (30 px on the frame), drawn there.
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "turned.svg", "<g transform=\"translate(100 100)\"><text transform=\"rotate(30) scale(1.5)\" x=\"-40\" y=\"0\" dx=\"0 5 5\" dy=\"0 -3 3\" "
+                              "font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\">XYZ</text></g>"));
+            QCOMPARE(int(texts.size()), 1);
+            QVERIFY(std::abs(texts[0].size - 30) < 1e-9);
+            const std::vector<Letter> ls = letters(QStringLiteral("XYZ"), font(30));
+            QTransform text;
+            text.translate(100, 100);
+            text.rotate(30);
+            text.scale(1.5, 1.5);
+            QPainterPath all;
+            double x = -40, y = 0;
+            const double dx[] = {0, 5, 5}, dy[] = {0, -3, 3};
+            for (int i = 0; i < 3; ++i) {
+                x += dx[i], y += dy[i];
+                QTransform m;
+                m.translate(x, y);
+                m.scale(1 / 1.5, 1 / 1.5);
+                all.addPath((m * text).map(ls[size_t(i)].path));
+                x += ls[size_t(i)].advance / 1.5;
+            }
+            QVERIFY(same("transformed text", drawn(texts[0]), paint(all)));
+        }
+        // text-anchor middle over two chunks (each absolute x starts one): each centred on its x.
+        {
+            const std::vector<SvgText> texts = textsOf(write(
+                "chunks.svg", "<text x=\"50 150\" y=\"100\" text-anchor=\"middle\" font-family=\"DejaVu Sans\" font-size=\"20\" fill=\"#ffffff\">"
+                              "<tspan>AB</tspan></text>"));
+            QCOMPARE(int(texts.size()), 1);
+            const std::vector<Letter> ls = letters(QStringLiteral("AB"), font(20));
+            QPainterPath all;
+            all.addPath(QTransform::fromTranslate(50 - ls[0].advance / 2, 100).map(ls[0].path));
+            all.addPath(QTransform::fromTranslate(150 - ls[1].advance / 2, 100).map(ls[1].path));
+            QVERIFY(same("anchored chunks", drawn(texts[0]), paint(all)));
+        }
+
+        // Linked: the layer imported into a sequence gets its text as titles that follow it. Moved 30 px right and
+        // scaled to half (its clip's transform) the text is drawn moved and scaled with it.
+        {
+            Sequence& s = *p.active();
+            s.width = 200, s.height = 200;
+            for (Track& tr : s.videoTracks) tr.clips.clear();
+            Effect g;
+            const std::vector<SvgText> texts = textsOf(path("glyphs.svg"), &g);
+            Clip layer = makeGeneratorClip(p, "shape", 30);
+            layer.generator = g;
+            s.videoTracks[0].clips.push_back(layer);
+            QCOMPARE(placeSvgTexts(p, s, layer.id, texts), 1);
+            QCOMPARE(s.videoTracks[1].clips[0].generator.s("svg_layer"), std::to_string(layer.id));
+            RenderOptions o;
+            auto inkBox = [](const Image& img) {
+                QRectF r;
+                double sx = 0, sy = 0, sum = 0;
+                for (int y = 0; y < img.height; ++y)
+                    for (int x = 0; x < img.width; ++x) {
+                        const double a = img.at(x, y)[0];
+                        sum += a, sx += a * (x + 0.5), sy += a * (y + 0.5);
+                    }
+                return std::array<double, 3>{sx / sum, sy / sum, sum};
+            };
+            const std::array<double, 3> at = inkBox(renderSequenceFrame(p, s, 0, o));
+            QVERIFY(at[2] > 100);
+            Clip& placed = s.videoTracks[0].clips[0];
+            placed.motion.params["pos_x"] = 30.0;
+            placed.motion.params["scale"] = 50.0;
+            const std::array<double, 3> moved = inkBox(renderSequenceFrame(p, s, 0, o));
+            // (its ink's middle half as far from the frame's middle, then 30 px right; a quarter of the ink)
+            QVERIFY2(std::abs(moved[0] - (100 + (at[0] - 100) / 2 + 30)) < 0.5 && std::abs(moved[1] - (100 + (at[1] - 100) / 2)) < 0.5 &&
+                         std::abs(moved[2] / at[2] - 0.25) < 0.02,
+                     qPrintable(QString("%1,%2 (%3) from %4,%5 (%6)").arg(moved[0]).arg(moved[1]).arg(moved[2]).arg(at[0]).arg(at[1]).arg(at[2])));
+            // Imported again: the titles it made before are replaced, not added to.
+            QCOMPARE(placeSvgTexts(p, s, layer.id, texts), 1);
+            int titles = 0;
+            for (const Track& tr : s.videoTracks)
+                for (const Clip& c : tr.clips) titles += c.isGenerator() && c.generator.type == "title";
+            QCOMPARE(titles, 1);
         }
     }
 

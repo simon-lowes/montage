@@ -14,6 +14,7 @@
 
 #include "core/ShapeContents.h"
 #include "media/Image.h"
+#include "render/Titles.h"
 
 namespace montage {
 
@@ -44,14 +45,16 @@ std::string shapePathItem(const Effect& g, const std::string& nameOrId);
 std::vector<ShapeItem> plainShapeAsContents(Effect& g);
 
 // An SVG drawing's text, to be a title over its shapes: where its first line starts (or its middle or end, as
-// text-anchor says) on the layer (pixels from its middle, y down, at the size the drawing is made), its font, size,
-// weight, slant, fill and opacity.
+// text-anchor says) on the layer (pixels from its middle, y down, at the size the drawing is made), its font, size
+// (on the layer), weight, slant, fill and opacity, and its layout (render/Titles.h): its transform to the layer, its
+// letters' x, y, dx, dy and rotate, and the path a textPath sets it on.
 struct SvgText {
     std::string text, font;
     double x = 0, y = 0, size = 16, opacity = 1;
     int anchor = 0;  // 0 start, 1 middle, 2 end
     bool bold = false, italic = false;
     std::array<double, 3> fill{0, 0, 0};
+    SvgTextLayout layout;
 };
 
 // An SVG file as a Shape layer's contents: its groups, paths, rectangles, circles, ellipses, lines and polygons,
@@ -63,12 +66,13 @@ struct SvgText {
 // `error` when it cannot be read or holds nothing to draw.
 bool importSvgShapes(const std::string& file, Effect& g, double& width, double& height, std::vector<std::string>* notes = nullptr,
                      std::string* error = nullptr, std::vector<SvgText>* texts = nullptr);
-// A title generator ("title") showing an SVG's text where it was on a shape layer placed as imported (its middle at
-// the frame's middle), at `scale` sequence pixels a layer pixel.
+// A title generator ("title") showing an SVG's text laid out as the SVG has it on a shape layer (its middle at the
+// frame's middle unless the title follows a layer), at `scale` sequence pixels a layer pixel.
 Effect svgTextTitle(const SvgText& t, double scale = 1);
 // Titles for an SVG's text over the shape layer clip `layer` it was imported into, for as long as it, each on the
-// first track above it free then (a track added on top when none is); the first 32 (more are noted). Returns how
-// many were placed.
+// first track above it free then (a track added on top when none is); the first 32 (more are noted). They follow the
+// layer (svg_layer), moved, turned and scaled with it; the titles an earlier import into it made are taken out first.
+// Returns how many were placed.
 int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>& texts, std::vector<std::string>* notes = nullptr);
 
 }  // namespace montage

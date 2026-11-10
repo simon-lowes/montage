@@ -11,6 +11,7 @@
 #include <QPainterPathStroker>
 #include <QRadialGradient>
 #include <QRegularExpression>
+#include <QTextBoundaryFinder>
 #include <QXmlStreamReader>
 #include <algorithm>
 #include <cmath>
@@ -1038,22 +1039,6 @@ Style styleOf(const SvgNode& n, const std::vector<CssRule>* sheet = nullptr, con
     return s;
 }
 
-// All the character data in an element and the elements in it (tspans), in order, its runs of white space made
-// single spaces.
-QString textIn(const SvgNode& n) {
-    QString t;
-    int from = 0;
-    for (size_t i = 0; i < n.children.size(); ++i) {
-        const int at = std::clamp(i < n.childAt.size() ? n.childAt[i] : int(n.text.size()), from, int(n.text.size()));
-        t += n.text.mid(from, at - from);
-        from = at;
-        const SvgNode& c = n.children[i];
-        if (c.name == "tspan" || c.name == "textPath" || c.name == "a") t += textIn(c);
-    }
-    t += n.text.mid(from);
-    return t.simplified();
-}
-
 std::vector<double> numbersIn(const QString& s) {
     static const QRegularExpression re(QStringLiteral(R"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"));
     std::vector<double> out;
@@ -1238,8 +1223,14 @@ class SvgImporter {
 public:
     SvgImporter(Effect& g, std::vector<std::string>* notes) : g_(g), notes_(notes) {}
 
-    void gather(const SvgNode& n) {
+    void gather(const SvgNode& n, const QTransform& parent = QTransform()) {
         if (auto it = n.attrs.find("id"); it != n.attrs.end()) ids_[it->second] = &n;
+        // (where each element's own coordinates sit in the drawing's, for a textPath's path)
+        QTransform m = n.attrs.count("transform") ? transformOf(n.attrs.at("transform")) : QTransform();
+        if (n.name == "svg" && &n != root_)
+            m = QTransform::fromTranslate(lengthOf(n.attrs.count("x") ? n.attrs.at("x") : QString()), lengthOf(n.attrs.count("y") ? n.attrs.at("y") : QString())) * m;
+        const QTransform ctm = m * parent;
+        ctms_[&n] = ctm;
         // (style sheets apply to the whole drawing, wherever they are in it)
         if (n.name == "style") {
             const QString type = n.attrs.count("type") ? n.attrs.at("type").trimmed() : QString();
@@ -1252,7 +1243,7 @@ public:
                 sheet_.insert(sheet_.end(), rules.begin(), rules.end());
             }
         }
-        for (const SvgNode& c : n.children) gather(c);
+        for (const SvgNode& c : n.children) gather(c, ctm);
     }
 
     void note(const std::string& what) {
@@ -1560,25 +1551,108 @@ public:
     // the layer comes after), its size there.
     void text(const SvgNode& n, const Style& st, const Style& own) {
         if (!texts_) return note("Text (add a title for it)");
-        const QString str = textIn(n);
-        if (str.isEmpty()) return;
         if (st.count("visibility") && (st.at("visibility") == "hidden" || st.at("visibility") == "collapse")) return;
         const QTransform m = (n.attrs.count("transform") ? transformOf(n.attrs.at("transform")) : QTransform()) * ctm_;
-        if (std::abs(m.m12()) > 1e-9 || std::abs(m.m21()) > 1e-9) note("Turned or slanted text (made a title upright)");
-        auto first = [&](const SvgNode& e, const char* k, double& v) {
-            if (!e.attrs.count(k)) return false;
-            const std::vector<double> ns = numbersIn(e.attrs.at(k));
-            if (ns.empty()) return false;
-            v = ns[0];
-            return true;
+        // Its characters (white space collapsed, as SVG lays it out) and each one's x, y, dx, dy and rotate: the
+        // innermost element giving one for it (a rotate list's last value going on for the rest of its element).
+        struct Lists {
+            std::vector<double> x, y, dx, dy, rotate;
+            int start = 0;
         };
-        double x = 0, y = 0;
-        bool hx = first(n, "x", x), hy = first(n, "y", y);
-        for (const SvgNode& c : n.children)
-            if (c.name == "tspan") {
-                if (!hx) hx = first(c, "x", x);
-                if (!hy) hy = first(c, "y", y);
+        QString str;
+        std::vector<std::optional<double>> X, Y, R;
+        std::vector<double> DX, DY;
+        std::vector<Lists> stack;
+        const SvgNode* onPath = nullptr;
+        auto add = [&](const QString& chunk) {
+            for (QChar ch : chunk) {
+                if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+                if (ch == ' ' && (str.isEmpty() || str.back() == ' ')) continue;
+                if (str.size() >= 4096) return;
+                str += ch;
+                const int i = int(str.size()) - 1;
+                std::optional<double> x, y, r;
+                double dx = 0, dy = 0;
+                bool hdx = false, hdy = false;
+                for (auto l = stack.rbegin(); l != stack.rend(); ++l) {
+                    const size_t k = size_t(i - l->start);
+                    if (!x && k < l->x.size()) x = l->x[k];
+                    if (!y && k < l->y.size()) y = l->y[k];
+                    if (!hdx && k < l->dx.size()) dx = l->dx[k], hdx = true;
+                    if (!hdy && k < l->dy.size()) dy = l->dy[k], hdy = true;
+                    if (!r && !l->rotate.empty()) r = k < l->rotate.size() ? l->rotate[k] : l->rotate.back();
+                }
+                X.push_back(x), Y.push_back(y), R.push_back(r), DX.push_back(dx), DY.push_back(dy);
             }
+        };
+        std::function<void(const SvgNode&, int)> walk = [&](const SvgNode& e, int depth) {
+            Lists l;
+            l.start = int(str.size());
+            auto read = [&](const char* k, std::vector<double>& v) {
+                if (e.attrs.count(k)) v = numbersIn(e.attrs.at(k));
+            };
+            if (e.name != "textPath") read("x", l.x), read("y", l.y);
+            read("dx", l.dx), read("dy", l.dy), read("rotate", l.rotate);
+            stack.push_back(std::move(l));
+            int from = 0;
+            for (size_t i = 0; i < e.children.size(); ++i) {
+                const int at = std::clamp(i < e.childAt.size() ? e.childAt[i] : int(e.text.size()), from, int(e.text.size()));
+                add(e.text.mid(from, at - from));
+                from = at;
+                const SvgNode& c = e.children[i];
+                if (depth < 32 && (c.name == "tspan" || c.name == "textPath" || c.name == "a")) {
+                    if (c.name == "textPath" && !onPath) onPath = &c;
+                    walk(c, depth + 1);
+                }
+            }
+            add(e.text.mid(from));
+            stack.pop_back();
+        };
+        walk(n, 0);
+        if (str.endsWith(' ')) {
+            str.chop(1);
+            X.pop_back(), Y.pop_back(), R.pop_back(), DX.pop_back(), DY.pop_back();
+        }
+        if (str.isEmpty()) return;
+        // A character each for every letter as the title lays it out (its first UTF-16 unit's).
+        SvgTextLayout lay;
+        lay.matrix = m;
+        {
+            QTextBoundaryFinder bf(QTextBoundaryFinder::Grapheme, str);
+            bool anyX = false, anyY = false, anyR = false, anyD = false;
+            for (int a = 0; a < str.size();) {
+                bf.setPosition(a);
+                int b = bf.toNextBoundary();
+                if (b <= a) b = a + 1;
+                const size_t i = size_t(a);
+                lay.x.push_back(X[i]), lay.y.push_back(Y[i]), lay.rotate.push_back(R[i]), lay.dx.push_back(DX[i]), lay.dy.push_back(DY[i]);
+                anyX |= bool(X[i]), anyY |= bool(Y[i]), anyR |= bool(R[i]) && *R[i] != 0, anyD |= DX[i] != 0 || DY[i] != 0;
+                a = b;
+            }
+            if (!anyX) lay.x.clear();
+            if (!anyY) lay.y.clear();
+            if (!anyR) lay.rotate.clear();
+            if (!anyD) lay.dx.clear(), lay.dy.clear();
+        }
+        // On a path: the path its href names (its data, and its coordinates to the text's), from startOffset.
+        if (onPath) {
+            const QString href = onPath->attrs.count("href") ? onPath->attrs.at("href") : onPath->attrs.count("xlink:href") ? onPath->attrs.at("xlink:href") : QString();
+            const auto target = href.startsWith('#') ? ids_.find(href.mid(1)) : ids_.end();
+            if (target != ids_.end() && target->second->name == "path" && target->second->attrs.count("d")) {
+                lay.path = target->second->attrs.at("d").toStdString();
+                const auto ctm = ctms_.find(target->second);
+                bool invertible = false;
+                const QTransform back = m.inverted(&invertible);
+                lay.pathMatrix = (ctm != ctms_.end() ? ctm->second : QTransform()) * (invertible ? back : QTransform());
+                const QString so = onPath->attrs.count("startOffset") ? onPath->attrs.at("startOffset").trimmed() : QString();
+                lay.startPercent = so.endsWith('%');
+                const std::vector<double> v = numbersIn(so);
+                lay.start = v.empty() ? 0.0 : v[0];
+            } else {
+                note("Text on a path that is not there (laid out straight)");
+            }
+        }
+        double x = lay.x.empty() || !lay.x[0] ? 0 : *lay.x[0], y = lay.y.empty() || !lay.y[0] ? 0 : *lay.y[0];
         SvgText t;
         t.text = str.toStdString();
         const QPointF at = m.map(QPointF(x, y));
@@ -1594,6 +1668,8 @@ public:
         t.italic = st.count("font-style") && (st.at("font-style") == "italic" || st.at("font-style") == "oblique");
         const QString anchor = st.count("text-anchor") ? st.at("text-anchor") : QString();
         t.anchor = anchor == "middle" ? 1 : anchor == "end" ? 2 : 0;
+        lay.anchor = t.anchor;
+        t.layout = std::move(lay);
         const QColor c = parseColour(st.count("fill") ? st.at("fill") : QString("black"));
         if (st.count("fill") && (st.at("fill") == "none" || st.at("fill").startsWith("url("))) {
             if (st.at("fill") == "none") return;
@@ -1624,6 +1700,12 @@ private:
     Effect& g_;
     std::vector<std::string>* notes_;
     std::map<QString, const SvgNode*> ids_;
+    std::map<const SvgNode*, QTransform> ctms_;
+
+public:
+    const SvgNode* root_ = nullptr;
+
+private:
     std::set<std::string> seen_, used_;
     int counter_ = 0;
 };
@@ -1668,6 +1750,7 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
     im.viewW_ = vw, im.viewH_ = vh;
     std::vector<SvgText> found;
     im.texts_ = texts ? &found : nullptr;
+    im.root_ = &root;
     im.gather(root);
     std::vector<ShapeItem> items;
     Style none;
@@ -1687,6 +1770,7 @@ bool importSvgShapes(const std::string& file, Effect& g, double& width, double& 
         for (SvgText& t : found) {
             const QPointF at = fit.map(QPointF(t.x, t.y));
             t.x = at.x(), t.y = at.y(), t.size *= k;
+            t.layout.matrix = t.layout.matrix * fit;
         }
         *texts = std::move(found);
     }
@@ -1734,6 +1818,10 @@ Effect svgTextTitle(const SvgText& t, double scale) {
     const double start = t.x * scale - (t.anchor == 1 ? width / 2 : t.anchor == 2 ? width : 0.0);
     e.params["pos_x"] = Param(start + width / 2);
     e.params["pos_y"] = Param(t.y * scale - fm.ascent() + fm.height() / 2);
+    // Laid out letter by letter as the SVG has it (render/Titles.h): its own coordinates to the layer's, at `scale`.
+    SvgTextLayout lay = t.layout;
+    lay.matrix = lay.matrix * QTransform::fromScale(scale, scale);
+    e.strings["svg_text"] = svgTextLayoutJson(lay);
     return e;
 }
 
@@ -1741,6 +1829,10 @@ int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>&
     const auto at = edit::locate(s, layer);
     if (!at || at->track.kind != TrackKind::Video) return 0;
     const Clip base = s.videoTracks[size_t(at->track.index)].clips[at->index];
+    // (imported again: the titles it made before go)
+    const std::string linked = std::to_string(layer);
+    for (Track& tr : s.videoTracks)
+        std::erase_if(tr.clips, [&](const Clip& k) { return k.isGenerator() && k.generator.type == "title" && k.generator.s("svg_layer") == linked; });
     int placed = 0;
     for (const SvgText& t : texts) {
         if (placed >= 32) {
@@ -1753,6 +1845,7 @@ int placeSvgTexts(Project& p, Sequence& s, Id layer, const std::vector<SvgText>&
         c.generator.id = id;
         c.generator.params["pos_x"] = Param(c.generator.p("pos_x", 0) + base.generator.p("pos_x", 0));
         c.generator.params["pos_y"] = Param(c.generator.p("pos_y", 0) + base.generator.p("pos_y", 0));
+        c.generator.strings["svg_layer"] = linked;
         c.start = base.start;
         c.name = QString::fromStdString(t.text).left(40).toStdString();
         // The first track above the layer free for its length.

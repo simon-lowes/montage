@@ -15918,6 +15918,172 @@ colorspaces:
         QVERIFY(!titlePathSource(p, s, s.videoTracks[1].clips[0], 800, 600)(0));
     }
 
+    void textOnAnotherClipsMask() {
+        // A title on another clip's mask: an ellipse mask on a colour matte named "Ring" (a circle of radius 200 on an
+        // 800 x 600 frame), its centre keyed from 320 to 480 px across over 30 frames. The title, on the track above,
+        // follows it: at each frame every letter's baseline middle on the circle (0.1 px) and its baseline along the
+        // circle's tangent there (0.1 degrees). A 10 px expansion sets the baseline 10 px further out, and On the
+        // Feather at 100 % half the 20 px feather more; with the matte scaled to half by its transform, the circle and
+        // the expansion and feather with it are half as big.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 800, s.height = 600;
+        for (Track& tr : s.videoTracks) tr.clips.clear();
+        Clip ring = makeGeneratorClip(p, "color", 60);
+        ring.name = "Ring";
+        Effect m = makeEffect(p, "invert");
+        m.params["mask.shape"] = 1.0;
+        Param mx;
+        mx.addKey(0, 0.4);
+        mx.addKey(30, 0.6);
+        m.params["mask.x"] = mx;
+        m.params["mask.y"] = 0.5, m.params["mask.w"] = 400.0 / 800, m.params["mask.h"] = 400.0 / 600;
+        m.params["mask.feather"] = 20.0;
+        ring.effects.push_back(m);
+        s.videoTracks[0].clips = {ring};
+        Clip c = makeGeneratorClip(p, "title", 60);
+        Effect& t = c.generator;
+        t.strings["text"] = "AROUND THE WORLD AND BACK AGAIN";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 36.0;
+        t.params["path_shape"] = 4.0;
+        t.strings["path_clip"] = "Ring";
+        QVERIFY(s.videoTracks.size() >= 2);
+        s.videoTracks[1].clips = {c};
+        auto wrap = [](double deg) { return std::remainder(deg, 360.0); };
+        auto check = [&](FrameTime f, QPointF mid, double R, const char* what) {
+            const Clip& placed = s.videoTracks[1].clips[0];
+            const std::vector<TitleGlyph> gl = titleGlyphs(placed.generator, f, 800, 600, 1.0, 60, 30, titlePathSource(p, s, placed, 800, 600));
+            if (gl.size() != 31) return false;
+            for (const TitleGlyph& g : gl) {
+                const double r = QLineF(mid, g.baselineMid).length();
+                const double phi = std::atan2(g.baselineMid.y() - mid.y(), g.baselineMid.x() - mid.x()) * 180 / M_PI;
+                if (std::abs(r - R) >= 0.1 || std::abs(wrap(g.angle - (phi + 90))) >= 0.1) {
+                    qWarning("%s, frame %lld: radius %.4f for %.1f, baseline at %.4f for %.4f", what, (long long)f, r, R, g.angle, phi + 90);
+                    return false;
+                }
+            }
+            return true;
+        };
+        for (FrameTime f : {0, 9, 15, 30, 45}) QVERIFY(check(f, QPointF(320 + 160 * std::min<FrameTime>(f, 30) / 30.0, 300), 200, "on the ring"));
+        // Set off by the expansion, and across the feather.
+        s.videoTracks[0].clips[0].effects[0].params["mask.expansion"] = 10.0;
+        QVERIFY(check(15, QPointF(400, 300), 210, "expanded 10 px"));
+        s.videoTracks[1].clips[0].generator.params["path_feather"] = 100.0;
+        QVERIFY(check(15, QPointF(400, 300), 220, "at the feather's outer edge"));
+        s.videoTracks[1].clips[0].generator.params["path_feather"] = -100.0;
+        QVERIFY(check(15, QPointF(400, 300), 200, "at the feather's inner edge"));
+        s.videoTracks[1].clips[0].generator.params["path_feather"] = 100.0;
+        // The matte scaled to half about the frame's middle: everything on it half as far from there.
+        s.videoTracks[0].clips[0].motion.params["scale"] = 50.0;
+        QVERIFY(check(30, QPointF(400 + (480 - 400) * 0.5, 300), 110, "on the matte at half size"));
+        // Named by its id as well; and a name no clip has gives no path.
+        s.videoTracks[1].clips[0].generator.strings["path_clip"] = std::to_string(s.videoTracks[0].clips[0].id);
+        QVERIFY(check(30, QPointF(440, 300), 110, "named by id"));
+        s.videoTracks[1].clips[0].generator.strings["path_clip"] = "Nothing";
+        QVERIFY(!titlePathSource(p, s, s.videoTracks[1].clips[0], 800, 600)(0));
+        // Drawn in the sequence along the ring: ink just outside the circle at the frame's top middle at frame 15.
+        s.videoTracks[1].clips[0].generator.strings["path_clip"] = "Ring";
+        s.videoTracks[0].clips[0].motion.params["scale"] = 100.0;
+        s.videoTracks[0].clips[0].effects[0].params["mask.expansion"] = 0.0;
+        s.videoTracks[1].clips[0].generator.params["path_feather"] = 0.0;
+        RenderOptions ro;
+        const Image frame = renderSequenceFrame(p, s, 15, ro);
+        const Image matte = [&] {
+            Sequence only = s;
+            only.videoTracks[1].clips.clear();
+            return renderSequenceFrame(p, only, 15, ro);
+        }();
+        float above = 0, inside = 0;
+        for (int y = 0; y < 600; ++y)
+            for (int x = 0; x < 800; ++x) {
+                const float d = std::abs(frame.at(x, y)[0] - matte.at(x, y)[0]) + std::abs(frame.at(x, y)[1] - matte.at(x, y)[1]);
+                if (y >= 60 && y <= 100 && std::abs(x - 400) < 60) above = std::max(above, d);
+                if (QLineF(QPointF(x, y), QPointF(400, 300)).length() < 150) inside = std::max(inside, d);
+            }
+        QVERIFY2(above > 0.5f && inside == 0.0f, qPrintable(QString("%1 %2").arg(above).arg(inside)));
+    }
+
+    void titleBlurMovesOnlyMovingLetters() {
+        // A 40-letter title on a 1920 x 1080 frame with one letter moving (an animation selecting its 20th, Position X
+        // keyed -200 to 200 px over 10 frames: 40 px a frame), blurred with a 360 degree shutter and 16 samples. The
+        // letters that do not move are drawn once and only the moving one (and its neighbours its smear reaches) at
+        // every sample: the frame is the average of the 16 whole renders within 1/255, and made at least four times
+        // as fast as rendering the whole title 16 times, as the blur did before.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCD";
+        QCOMPARE(QString::fromStdString(t.s("text")).size(), 40);
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        const int k = addTextAnimator(t);
+        const std::string pre = "ta" + std::to_string(k) + ".";
+        t.params[pre + "start"] = Param(47.5);
+        t.params[pre + "end"] = Param(50.0);
+        Param move;
+        move.addKey(0, -200.0);
+        move.addKey(10, 200.0);
+        t.params[pre + "x"] = move;
+        t.params["letter_blur"] = 1.0;
+        t.params["letter_shutter"] = 360.0;
+        t.params["letter_samples"] = 16.0;
+        const int w = 1920, h = 1080;
+        // Only the 20th letter moves.
+        {
+            const std::vector<TitleGlyph> a = titleGlyphs(t, 4, w, h, 1.0, 30, 30), b = titleGlyphs(t, 6, w, h, 1.0, 30, 30);
+            QCOMPARE(int(a.size()), 40);
+            int moved = 0;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (!(a[i].path == b[i].path)) {
+                    ++moved;
+                    QCOMPARE(int(i), 19);
+                }
+            QCOMPARE(moved, 1);
+        }
+        auto whole = [&] {
+            // The blur as it was: every sample the whole title, averaged.
+            Image sum(w, h);
+            for (int i = 0; i < 16; ++i) {
+                const Image one = renderTitleAt(t, 5 + ((i + 0.5) / 16 - 0.5), w, h, 1.0, 30, 30);
+                for (size_t j = 0; j < sum.px.size(); ++j) sum.px[j] += one.px[j];
+            }
+            for (float& v : sum.px) v /= 16;
+            return sum;
+        };
+        QElapsedTimer clock;
+        qint64 before = std::numeric_limits<qint64>::max(), now = before;
+        Image ref, got;
+        for (int run = 0; run < 3; ++run) {
+            clock.start();
+            ref = whole();
+            before = std::min(before, clock.nsecsElapsed());
+            clock.start();
+            got = renderTitle(t, 5, w, h, 1.0, 30, 30);
+            now = std::min(now, clock.nsecsElapsed());
+        }
+        QCOMPARE(got.px.size(), ref.px.size());
+        double worst = 0;
+        for (size_t j = 0; j < ref.px.size(); ++j) worst = std::max(worst, double(std::abs(got.px[j] - ref.px[j])));
+        qInfo("Motion blur on a 40-letter title with one moving: %.1f ms, against %.1f ms drawing the whole title at every sample (%.1f times as "
+              "fast), %.3f of 255 apart",
+              now / 1e6, before / 1e6, double(before) / double(std::max<qint64>(1, now)), worst * 255);
+        QVERIFY2(worst <= 1.0 / 255, qPrintable(QString("%1 of 255 off").arg(worst * 255)));
+        QVERIFY2(before >= 4 * now, qPrintable(QString("%1 ms against %2 ms").arg(now / 1e6).arg(before / 1e6)));
+        // Blurred indeed (the moving letter smeared), and with a box behind the text (which every sample draws) the
+        // whole title is drawn at every sample, as before.
+        Effect sharp = t;
+        sharp.params["letter_blur"] = 0.0;
+        const Image one = renderTitle(sharp, 5, w, h, 1.0, 30, 30);
+        double changed = 0;
+        for (size_t j = 0; j < one.px.size(); ++j) changed = std::max(changed, double(std::abs(one.px[j] - got.px[j])));
+        QVERIFY(changed > 0.2);
+        t.params["box_opacity"] = 60.0;
+        const Image boxed = renderTitle(t, 5, w, h, 1.0, 30, 30), boxedRef = whole();
+        worst = 0;
+        for (size_t j = 0; j < boxed.px.size(); ++j) worst = std::max(worst, double(std::abs(boxed.px[j] - boxedRef.px[j])));
+        QVERIFY2(worst <= 1.0 / 255, qPrintable(QString("boxed: %1 of 255 off").arg(worst * 255)));
+    }
+
     void titleLetterMotionBlur() {
         // A letter moving 40 px a frame (a text animator's Position X keyed 0 to 400 over 10 frames), blurred with a
         // 360 degree shutter and 16 samples: the frame is the average of the 16 renders at the subframes, within 1/255.

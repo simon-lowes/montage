@@ -3439,12 +3439,16 @@ void McpServer::Impl::addTools() {
         "(from and len count UTF-16 characters, newlines included): font, size, bold, italic, color and outline_color as "
         "[r, g, b] in 0..1, outline width, tracking, baseline shift (pixels up) and a variable font's axes ({\"wght\": 650}). "
         "path sets the text along a circle (radius), a wave, SVG path data from the title's position, one of the title "
-        "clip's masks (mask; add one with montage_add_effect) or a shape layer's path below it (shape: track, item), from "
+        "clip's masks (mask; add one with montage_add_effect) or a shape layer's path below it (shape: track, item), or "
+        "another clip's mask or shape path (clip: its name or id), set off by the mask's expansion and, with feather, "
+        "across its feather (-100 its inner edge, 100 its outer), from "
         "offset % along it (offset_keys animate it), aligned at its start, middle or end or spread over it, the letters "
         "at right angles to it unless perpendicular is false. axes sets a variable font's axes for the whole title; "
         "motion_blur blurs moving letters (shutter angle, samples). animations move "
         "the text a letter, word or line at a time: a range (start, end and offset in % of the text; shape) selects "
-        "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour) "
+        "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour; "
+        "a 3D title's: depth, x, y, z towards the camera, rot_x, rot_y and rotation about its middle, scale, and its face "
+        "(fill) and side colours) "
         "goes as far as it selects them; sweep runs the range across the text from the start (in_across) or to the end "
         "(out_across), or takes the whole change away (in_together) or brings it on (out_together), over sweep_seconds.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
@@ -3466,7 +3470,9 @@ void McpServer::Impl::addTools() {
                 "item":{"type":"string","description":"shape: the path item's name or id (the first path when not given)"},
                 "perpendicular":{"type":"boolean","default":true,"description":"letters stand at right angles to the path (false: upright)"},
                 "upright":{"type":"boolean"},"reverse":{"type":"boolean","description":"run the other way (inside a circle)"},
-                "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"}},"required":["shape"]},
+                "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"},
+                "clip":{"type":"string","description":"mask or shape: the clip (name or id) whose mask or shape layer it follows, not the title's own"},
+                "feather":{"type":"number","description":"mask: how far across the mask's feather (-100 inner edge, 0 middle, 100 outer)"}},"required":["shape"]},
             "animations":{"type":"array","items":{"type":"object","properties":{
                 "by":{"type":"string","enum":["letters","letters_not_spaces","words","lines"],"default":"letters"},
                 "shape":{"type":"string","enum":["square","ramp_up","ramp_down","triangle","round","smooth"],"default":"square"},
@@ -3476,7 +3482,9 @@ void McpServer::Impl::addTools() {
                 "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"rotation":{"type":"number"},"opacity":{"type":"number"},
                 "blur":{"type":"number"},"tracking":{"type":"number"},"fill":{"type":"array","items":{"type":"number"}},"fill_amount":{"type":"number"},
                 "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"},
-                "depth":{"type":"number","description":"3d: extrusion added where it selects (pixels)"}}}},
+                "depth":{"type":"number","description":"3d: extrusion added where it selects (pixels)"},
+                "z":{"type":"number","description":"3d: moved towards the camera (pixels)"},"rot_x":{"type":"number"},"rot_y":{"type":"number"},
+                "side":{"type":"array","items":{"type":"number"},"description":"3d: the sides' colour"},"side_amount":{"type":"number"}}}},
             "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels); an animation's depth adds to it letter by letter"},
             "axes":{"type":"object","additionalProperties":{"type":"number"},"description":"A variable font's axes for the whole title ({\"wght\": 650})"},
             "motion_blur":{"type":"boolean","description":"Blur letters as they move"},
@@ -3558,6 +3566,19 @@ void McpServer::Impl::addTools() {
                 if (pa.contains("mask")) c.generator.params["path_mask"] = Param(double(std::clamp(pa.value("mask").toInt(1), 1, 64)));
                 if (pa.contains("track")) c.generator.params["path_track"] = Param(double(std::clamp(pa.value("track").toInt(0), 0, 99)));
                 if (pa.contains("item")) c.generator.strings["path_item"] = pa.value("item").toString().toStdString();
+                if (pa.contains("clip")) {
+                    if (sh != 4 && sh != 5) throw ArgError{"A path's clip is for the mask and shape paths"};
+                    const QString who = pa.value("clip").toString().trimmed();
+                    bool found = false;
+                    for (const Track& tr : s.videoTracks)
+                        for (const Clip& k : tr.clips) found = found || k.name == who.toStdString() || QString::number(k.id) == who;
+                    if (who.isEmpty() || !found) throw ArgError{QStringLiteral("No clip \"%1\" for the path").arg(who)};
+                    c.generator.strings["path_clip"] = who.toStdString();
+                }
+                if (pa.contains("feather")) {
+                    if (sh != 4 || !pa.value("feather").isDouble()) throw ArgError{"A path's feather is a number, for a mask path"};
+                    c.generator.params["path_feather"] = Param(std::clamp(pa.value("feather").toDouble(), -100.0, 100.0));
+                }
                 if (pa.contains("align")) {
                     const QStringList aligns{"as_text", "start", "middle", "end", "spread"};
                     const int al = int(aligns.indexOf(pa.value("align").toString()));
@@ -3606,17 +3627,23 @@ void McpServer::Impl::addTools() {
                              {"start", "start"}, {"end", "end"}, {"offset", "offset"}, {"ease", "ease"}, {"amount", "amount"},
                              {"sweep_seconds", "sweep_dur"}, {"random", "random"}, {"seed", "seed"}, {"x", "x"}, {"y", "y"},
                              {"scale", "scale"}, {"rotation", "rotation"}, {"opacity", "opacity"}, {"blur", "blur"},
-                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}, {"depth", "depth"}})
+                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}, {"depth", "depth"},
+                             {"z", "z"}, {"rot_x", "rot_x"}, {"rot_y", "rot_y"}, {"side_amount", "side_mix"}})
                         if (o.contains(key)) {
-                            if (std::string(name) == "depth" && type != "title3d") throw ArgError{"An animation's depth is for the 3d template"};
-                            if (type == "title3d" && std::string(name) != "depth" && std::string(" start end offset ease amount sweep_dur random seed ").find(" " + std::string(name) + " ") == std::string::npos)
-                                throw ArgError{QStringLiteral("A 3D title's animations select letters and set depth; \"%1\" is for flat titles").arg(key)};
+                            const std::string pn = " " + std::string(name) + " ";
+                            if (std::string(" depth z rot_x rot_y side_mix ").find(pn) != std::string::npos && type != "title3d")
+                                throw ArgError{QStringLiteral("An animation's %1 is for the 3d template").arg(key)};
+                            if (type == "title3d" &&
+                                std::string(" start end offset ease amount sweep_dur random seed depth x y z rot_x rot_y rotation scale fill_mix side_mix ").find(pn) == std::string::npos)
+                                throw ArgError{QStringLiteral("A 3D title's animations select letters, extrude, move, turn, scale and colour them; \"%1\" is for flat titles").arg(key)};
                             if (!o.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
                             set(name, o.value(key).toDouble());
                         }
                     if (o.value("random_order").toBool()) set("shuffle", 1);
-                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{{"fill", "fill"}, {"outline_color", "outline_color"}})
+                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{{"fill", "fill"}, {"outline_color", "outline_color"}, {"side", "side"}})
                         if (o.contains(key)) {
+                            if (std::string(key) == "side" && type != "title3d") throw ArgError{"An animation's side colour is for the 3d template"};
+                            if (std::string(key) == "outline_color" && type == "title3d") throw ArgError{"A 3D title's letters have no outline"};
                             const QJsonArray rgb = o.value(key).toArray();
                             if (rgb.size() != 3) throw ArgError{QStringLiteral("\"%1\" is [r, g, b] in 0..1").arg(key)};
                             for (int ch = 0; ch < 3; ++ch) set((std::string(name) + "." + "rgb"[ch]).c_str(), std::clamp(rgb[ch].toDouble(), 0.0, 1.0));

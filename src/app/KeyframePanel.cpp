@@ -9,6 +9,7 @@
 #include <QPainterPath>
 #include <QToolButton>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <map>
 
@@ -19,12 +20,28 @@
 #include "core/Effects.h"
 #include "core/History.h"
 #include "core/MaskPath.h"
+#include "core/ShapeContents.h"
 
 namespace montage {
 
 namespace {
-// A drawn mask's path is keyed as a whole, shown as one row: its first coordinate.
-bool isPathRow(const ParamAddress& a) { return a.slot == ParamSlot::Effect && a.param == kMaskPathParam; }
+// A drawn mask's path, and a shape layer's path item, is keyed as a whole, shown as one row: its first coordinate.
+bool isShapePathRowParam(const std::string& name) {
+    return name.size() > 5 && name.compare(name.size() - 5, 5, ".p0.x") == 0 && isShapePathParam(name) && !isMaskPathParam(name);
+}
+bool isPathRow(const ParamAddress& a) {
+    return (a.slot == ParamSlot::Effect && a.param == kMaskPathParam) || (a.slot == ParamSlot::Generator && isShapePathRowParam(a.param));
+}
+// Every param of the path a path row stands for.
+std::vector<std::string> pathRowParams(const Effect& e, const std::string& row) {
+    if (row == kMaskPathParam) return maskPathParams(e);
+    std::vector<std::string> out;
+    const std::string prefix = row.substr(0, row.size() - 3);  // "<id>.p"
+    for (auto it = e.params.lower_bound(prefix); it != e.params.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it)
+        if (isShapePathParam(it->first) && it->first.size() > prefix.size() && std::isdigit(static_cast<unsigned char>(it->first[prefix.size()])))
+            out.push_back(it->first);
+    return out;
+}
 
 std::vector<int> graphRowsAll(size_t n) {
     std::vector<int> all(n);
@@ -107,10 +124,19 @@ void KeyframePanel::rebuild() {
             const std::vector<ParamInfo> infos = !info ? std::vector<ParamInfo>{} : builtIn ? effectParams(*effect) : info->params;
             for (const auto& [name, param] : effect->params) {
                 if (!param.varies() || (isMaskPathParam(name) && name != kMaskPathParam)) continue;
+                // (a shape layer's path: its first point's x, for the whole path)
+                const bool shapePath = addr.slot == ParamSlot::Generator && effect->type == "shape" && isShapePathParam(name) && !isMaskPathParam(name);
+                if (shapePath && !isShapePathRowParam(name)) continue;
                 QString label = QString::fromStdString(name);
                 for (const ParamInfo& pi : infos)
                     if (pi.name == name) label = language::engine(pi.label);
                 if (name == kMaskPathParam) label = tr("Mask Path");
+                if (shapePath) {
+                    const std::string id = name.substr(0, name.size() - 5);
+                    const std::vector<ShapeItem> items = shapeContents(*effect);
+                    const ShapeItem* it = findShapeItem(items, id);
+                    label = tr("%1 Path").arg(QString::fromStdString(it && !it->name.empty() ? it->name : id));
+                }
                 if (!param.expr.empty()) label += QStringLiteral(" =");  // (driven by an expression: its curve in the graph)
                 ParamAddress a = addr;
                 a.param = name;
@@ -198,7 +224,7 @@ std::set<KeyframePanel::Key> KeyframePanel::linked(const std::set<Key>& keys) co
     for (const Key& k : keys) {
         if (!isPathRow(k.address)) continue;
         if (const Effect* e = paramOwner(*c, k.address))
-            for (const std::string& name : maskPathParams(*e)) {
+            for (const std::string& name : pathRowParams(*e, k.address.param)) {
                 ParamAddress a = k.address;
                 a.param = name;
                 out.insert({a, k.t});
@@ -753,8 +779,15 @@ bool KeyframePanel::addKeyAt(int row, FrameTime t) {
         if (isPathRow(addr)) {
             // The whole path, as it is there.
             Effect* e = cc ? paramOwner(*cc, addr) : nullptr;
-            if (!e || e->params[kMaskPathParam].keyAt(t)) return false;
-            setMaskPathAnimated(*e, t, true);
+            if (!e || e->params[addr.param].keyAt(t)) return false;
+            if (addr.param == kMaskPathParam) {
+                setMaskPathAnimated(*e, t, true);
+                return true;
+            }
+            for (const std::string& name : pathRowParams(*e, addr.param)) {
+                Param& p = e->params[name];
+                if (!p.keyAt(t)) p.addKey(t, p.at(t));
+            }
             return true;
         }
         Param* p = cc ? findParam(*cc, addr) : nullptr;

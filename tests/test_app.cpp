@@ -18705,6 +18705,27 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(std::abs(pathPoints(gen(), 0, "path1.")[1].x) < 3);
         QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, top.toPoint());
         QCOMPARE(pathPointCount(gen(), "path1."), 4);
+        // The keyframe panel shows the keyed path as one row, as a mask's, named for its item; moving its key moves
+        // every point's coordinates, one undo step.
+        {
+            auto* panel = win_->findChild<KeyframePanel*>();
+            QVERIFY(panel);
+            int pathRows = 0;
+            for (const auto& row : panel->rows()) {
+                QVERIFY2(row.address.param.rfind("path1.p", 0) != 0 || row.address.param == "path1.p0.x", row.address.param.c_str());
+                if (row.address.param != "path1.p0.x") continue;
+                ++pathRows;
+                QCOMPARE(row.label.section(QStringLiteral(" · "), 1), QStringLiteral("path1 Path"));
+                panel->select({{row.address, 0}});
+                QVERIFY(panel->shiftSelected(4));
+            }
+            QCOMPARE(pathRows, 1);
+            QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{4}));
+            for (const auto& [name, param] : gen().params)
+                if (name.rfind("path1.p", 0) == 0) QVERIFY2(param.keyAt(4) && param.keys.size() == 1, name.c_str());
+            state()->undo();
+            QCOMPARE(pathKeyTimes(gen(), "path1."), (std::vector<FrameTime>{0}));
+        }
         // The fill picked in the Inspector: Add Gradient Stop makes its two colours a list of stops and adds one
         // between them, each stop's place, colour and opacity a setting of its own.
         auto* inspector = win_->findChild<InspectorWidget*>();
