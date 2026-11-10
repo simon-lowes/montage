@@ -311,6 +311,9 @@ extern "C" {
 
 using namespace montage;
 
+// (tests/FileAge.cpp) A file's or folder's modification time set `hours` back.
+bool makeOlder(const QString& path, int hours);
+
 // The 4-stem graph compiled into the engine (media/StemSeparation.cpp).
 extern const unsigned char kSpleeter4Graph[];
 extern const size_t kSpleeter4GraphSize;
@@ -21242,10 +21245,7 @@ if __name__ == '__main__':
         QVERIFY2(t.elapsed() < 500, qPrintable(QString::number(t.elapsed())));
 #endif
         // Orphans: no record, a damaged one, both two days old, and a fresh one with no record yet; a finished job.
-        const auto age = [&](const QString& path) {
-            std::filesystem::last_write_time(std::filesystem::path(path.toStdString()),
-                                             std::filesystem::file_time_type::clock::now() - std::chrono::hours(48));
-        };
+        const auto age = [&](const QString& path) { QVERIFY2(makeOlder(path, 48), qPrintable(path)); };
         QVERIFY(QDir().mkpath(store.filePath("empty")));
         QVERIFY(QDir().mkpath(store.filePath("damaged")));
         QVERIFY(QDir().mkpath(store.filePath("fresh")));
