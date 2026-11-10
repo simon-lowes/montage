@@ -134,6 +134,13 @@ struct Item {
     // luma, or the reverse (render/Compositor's applyTrackMatte).
     std::optional<Layer> matte;
     bool matteLuma = false, matteReverse = false;
+    // Displace by Layer (render/PaintFx's displaceByMap, before the track matte): the clip, placed on the canvas, moved
+    // by the channels of a map, another track's picture (displaceMap, placed at the canvas's size) or its own
+    // (displaceSelf), through displaceBlur's filters first; gpumix.frag's 31 with displaceParams.
+    bool displace = false, displaceSelf = false;
+    std::optional<Layer> displaceMap;
+    std::vector<ColorOp> displaceBlur;
+    float displaceParams[24] = {};
     int blendMode = 0;       // render/Processing's blendModeIndex
 };
 

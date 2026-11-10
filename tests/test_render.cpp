@@ -21566,12 +21566,12 @@ colorspaces:
         QVERIFY(edit::clipById(s, maskedId));
         // An adjustment layer with an effect only the CPU draws needs the canvas beneath it there: the frame falls back.
         Clip adj = makeGeneratorClip(p, "adjustment", 30);
-        adj.effects.push_back(makeEffect(p, "depth_blur"));
+        adj.effects.push_back(makeEffect(p, "texture_pop"));
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
         gpu::resetStats();
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
-        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Lens Blur (Depth)") == 0, gpu::stats().lastFallback.c_str());
+        QVERIFY2(gpu::stats().lastFallback.find("an adjustment layer with its effect Local Contrast") == 0, gpu::stats().lastFallback.c_str());
     }
 
     // The filters, transitions, adjustment layers and track mattes the GPU draws, each at three settings, against the
@@ -24272,6 +24272,87 @@ colorspaces:
                 compare(6, "contents through a feathered mask");
             }
         }
+    }
+    void gpuDisplaceByLayer() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        // A picture (V1) moved by a map (V2, hidden): fine stripes and rings over a soft ramp, and a map of slow waves
+        // in each channel, clear in places.
+        QTemporaryDir dir;
+        QImage pic(320, 180, QImage::Format_ARGB32), map(320, 180, QImage::Format_ARGB32);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                const bool stripe = (x / 4 + y / 6) % 2 != 0, ring = int(std::hypot(x - 150, y - 80) / 7) % 2 != 0;
+                pic.setPixel(x, y, qRgba(stripe ? 230 : 30 + x / 2, ring ? 200 : 40, 60 + y, 255));
+                const int r = int(127.5 + 120 * std::sin(x * 0.05 + y * 0.02)), g = int(127.5 + 120 * std::cos(y * 0.07 - x * 0.01));
+                const int b = int(127.5 + 120 * std::sin((x + y) * 0.03)), a = x > 250 && y < 50 ? 0 : 255 - (x * y) % 97;
+                map.setPixel(x, y, qRgba(r * a / 255, g * a / 255, b * a / 255, a));
+            }
+        const QString picPng = dir.filePath("picture.png"), mapPng = dir.filePath("map.png");
+        QVERIFY(pic.save(picPng) && map.save(mapPng));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180;
+        while (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        for (const auto& [png, track] : {std::pair{picPng, 0}, std::pair{mapPng, 1}}) {
+            MediaItem m;
+            QVERIFY(probeMedia(png.toStdString(), m));
+            m.id = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, size_t(track)}, {}, false).ok);
+        }
+        Clip& c = s.videoTracks[0].clips[0];
+        auto compare = [&](FrameTime t, const QString& what) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            c.effects.front().enabled = false;
+            const Image still = renderProgramFrame(p, s, t, o);
+            c.effects.front().enabled = true;
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QVERIFY2(after.mixPasses > before.mixPasses, qPrintable(what + ": not moved on the GPU"));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0, moved = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int k = 0; k < 4; ++k) {
+                        if (const double d = std::fabs(double(cpu.at(x, y)[k]) - onGpu.at(x, y)[k]); d > worst) worst = d, wx = x, wy = y;
+                        moved += std::fabs(cpu.at(x, y)[k] - still.at(x, y)[k]);
+                    }
+            QVERIFY2(moved > 50, qPrintable(what + ": nothing moved"));
+            QVERIFY2(worst <= 1.0 / 1023,
+                     qPrintable(QString("%1: off by %2 at %3,%4 (cpu %5 %6 %7 %8, gpu %9 %10 %11 %12)").arg(what).arg(worst).arg(wx).arg(wy)
+                                    .arg(cpu.at(wx, wy)[0]).arg(cpu.at(wx, wy)[1]).arg(cpu.at(wx, wy)[2]).arg(cpu.at(wx, wy)[3])
+                                    .arg(onGpu.at(wx, wy)[0]).arg(onGpu.at(wx, wy)[1]).arg(onGpu.at(wx, wy)[2]).arg(onGpu.at(wx, wy)[3])));
+        };
+        // Three settings (channels, amounts, edges, sampling, the map's blur), each on the picture placed square and
+        // turned; then the picture as its own map.
+        const std::vector<std::map<std::string, double>> settings = {
+            {{"h_amount", 12}, {"v_amount", -9}},
+            {{"h_channel", 0}, {"v_channel", 4}, {"h_amount", 25}, {"v_amount", 15}, {"edges", 0}, {"sampling", 1}, {"map_blur", 4}},
+            {{"h_channel", 3}, {"v_channel", 5}, {"h_amount", -30}, {"edges", 2}, {"sampling", 1}, {"map_blur", 16}},
+        };
+        for (int self = 0; self < 2; ++self)
+            for (size_t k = 0; k < settings.size(); ++k) {
+                if (self && k == 2) continue;
+                for (int turned = 0; turned < 2; ++turned) {
+                    Effect fx = makeEffect(p, "displace_by_layer");
+                    for (const auto& [key, v] : settings[k]) fx.params[key] = v;
+                    if (self) fx.params["source"] = 1.0;
+                    c.effects = {fx};
+                    c.motion.params = {};
+                    c.motion.params["scale"] = turned ? 80.0 : 70.0;
+                    c.motion.params["pos_x"] = turned ? -20.0 : 31.0;
+                    if (turned) c.motion.params["rotation"] = 25.0;
+                    compare(2, QString("%1 #%2%3").arg(self ? "its own map" : "V2's map").arg(k + 1).arg(turned ? ", turned" : ""));
+                }
+            }
     }
     void gpuApertureGlareUhd() {
         std::string why;

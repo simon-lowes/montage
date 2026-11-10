@@ -250,13 +250,18 @@ void displaceTurned(Image& img, const Image& m, const DisplaceSettings& s, bool 
     const double* o = s.origin;
     const double* A = s.across;
     const double* D = s.down;
-    const double det = A[0] * D[1] - A[1] * D[0];
-    if (!(std::fabs(det) > 1e-9)) return;
-    // (a frame point in the picture's own axes: 0 to 1 across and down it)
+    if (!(std::fabs(A[0] * D[1] - A[1] * D[0]) > 1e-9)) return;
+    // (a frame point in the picture's own axes, 0 to 1 across and down it, and whether it lies in [0, 1) both ways:
+    // told from the cross products in floats, as the GPU works them out, so a pixel on the picture's edge is in or out
+    // on both)
+    const float o0 = float(o[0]), o1 = float(o[1]), a0 = float(A[0]), a1 = float(A[1]), d0 = float(D[0]), d1 = float(D[1]);
+    const float det = a0 * d1 - a1 * d0, sg = det < 0 ? -1.0f : 1.0f, ad = std::fabs(det);
+    if (!(ad > 0)) return;
     auto local = [&](double x, double y, double& a, double& b) {
-        const double rx = x - o[0], ry = y - o[1];
-        a = (rx * D[1] - ry * D[0]) / det;
-        b = (A[0] * ry - A[1] * rx) / det;
+        const float rx = float(x) - o0, ry = float(y) - o1;
+        const float na = (rx * d1 - ry * d0) * sg, nb = (a0 * ry - a1 * rx) * sg;
+        a = double(na) / double(ad), b = double(nb) / double(ad);
+        return na >= 0 && na < ad && nb >= 0 && nb < ad;
     };
     const double reach = s.bicubic ? 3.0 : 1.5;  // (frame pixels a sample reads about it, turned)
     const double ia = std::min(0.5, reach / std::max(1e-9, std::hypot(A[0], A[1])));
@@ -276,24 +281,27 @@ void displaceTurned(Image& img, const Image& m, const DisplaceSettings& s, bool 
         for (int y = r0 + q0; y < r0 + q1; ++y)
             for (int x = c0; x < c1; ++x) {
                 double a, b;
-                local(x + 0.5, y + 0.5, a, b);
-                if (a < 0 || a >= 1 || b < 0 || b >= 1) continue;  // (not the picture's: left as it is)
+                if (!local(x + 0.5, y + 0.5, a, b)) continue;  // (not the picture's: left as it is)
                 const float* mp = m.at(x, y);
                 const double dx = h ? s.horizontalAmount * (2.0 * channelOf(mp, s.horizontal) - 1) : 0;
                 const double dy = v ? s.verticalAmount * (2.0 * channelOf(mp, s.vertical) - 1) : 0;
                 if (dx == 0 && dy == 0) continue;
-                local(x + 0.5 + dx, y + 0.5 + dy, a, b);
+                const bool inside = local(x + 0.5 + dx, y + 0.5 + dy, a, b);
                 float* out = img.at(x, y);
+                // (where it is moved to, or, wrapped or held, the place within the picture that comes to)
+                double sx = x + 0.5 + dx, sy = y + 0.5 + dy;
                 if (s.edge == DisplaceEdge::Transparent) {
-                    if (a < 0 || a >= 1 || b < 0 || b >= 1) {
+                    if (!inside) {
                         out[0] = out[1] = out[2] = out[3] = 0;
                         continue;
                     }
                 } else {
-                    if (s.edge == DisplaceEdge::Wrap) a -= std::floor(a), b -= std::floor(b);
-                    a = std::clamp(a, ia, 1 - ia), b = std::clamp(b, ib, 1 - ib);
+                    double wa = a, wb = b;
+                    if (s.edge == DisplaceEdge::Wrap) wa -= std::floor(wa), wb -= std::floor(wb);
+                    wa = std::clamp(wa, ia, 1 - ia), wb = std::clamp(wb, ib, 1 - ib);
+                    if (wa != a || wb != b) sx = o[0] + wa * A[0] + wb * D[0], sy = o[1] + wa * A[1] + wb * D[1];
                 }
-                sampleAt(src, whole, o[0] + a * A[0] + b * D[0], o[1] + a * A[1] + b * D[1], DisplaceEdge::Clamp, s.bicubic, out);
+                sampleAt(src, whole, sx, sy, DisplaceEdge::Clamp, s.bicubic, out);
             }
     });
 }

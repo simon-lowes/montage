@@ -2068,6 +2068,48 @@ std::vector<float> effectMaskOnCanvas(const Project& p, const Sequence& seq, con
     return mask;
 }
 
+// Displace by Layer's settings on clip `c` at t, with the edges of the clip's picture on a W x H canvas: false when
+// none of it is there to move.
+bool displaceGeometry(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime t, const RenderOptions& o, int W, int H,
+                      DisplaceSettings& ds) {
+    ds = displaceSettings(e, t - c.start, o.scale);
+    // The edges are the clip's picture's (scaled, moved, letterboxed, cropped, turned): where it lies square on the
+    // canvas (at quarter turns), the pixels whose centres it covers; turned at any other angle, the parallelogram its
+    // corners make.
+    if (Geometry g; clipGeometry(p, seq, c, t, g) && g.sx != 0 && g.sy != 0) {
+        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+        if (u1 <= u0 || v1 <= v0) return false;  // (cropped away)
+        // (a point of the picture, on the canvas in the layer's pixels)
+        auto canvas = [&](double u, double v, double& X, double& Y) {
+            const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
+            X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
+        };
+        if (std::min(std::fabs(cr), std::fabs(sn)) < 1e-9) {
+            double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+            for (double u : {u0, u1})
+                for (double v : {v0, v1}) {
+                    double X, Y;
+                    canvas(u, v, X, Y);
+                    x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
+                }
+            auto edge = [](double at, int n) { return int(std::clamp(std::ceil(at - 0.5 - 1e-6), 0.0, double(n))); };
+            ds.left = edge(x0, W), ds.right = edge(x1, W);
+            ds.top = edge(y0, H), ds.bottom = edge(y1, H);
+            if (ds.right <= ds.left || ds.bottom <= ds.top) return false;  // (none of its picture on the canvas)
+        } else {
+            double X, Y;
+            ds.turned = true;
+            canvas(u0, v0, ds.origin[0], ds.origin[1]);
+            canvas(u1, v0, X, Y);
+            ds.across[0] = X - ds.origin[0], ds.across[1] = Y - ds.origin[1];
+            canvas(u0, v1, X, Y);
+            ds.down[0] = X - ds.origin[0], ds.down[1] = Y - ds.origin[1];
+        }
+    }
+    return true;
+}
+
 // Displace by Layer on clip `c` (on track `ti`) at t: its layer's pixels moved by a channel of another track's picture
 // or of the layer itself (render/PaintFx.h), the map's values as shown. Amounts are in the sequence's pixels.
 void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
@@ -2089,41 +2131,8 @@ void displaceLayer(const Project& p, const Sequence& seq, size_t ti, const Clip&
     // (a mask on the effect: moved within it, as it was outside)
     const std::vector<float> mask = effectMaskOnCanvas(p, seq, c, t, o, *e, layer, W, H);
     const Image before = mask.empty() ? Image() : layer;
-    DisplaceSettings ds = displaceSettings(*e, lt, o.scale);
-    // The edges are the clip's picture's (scaled, moved, letterboxed, cropped, turned): where it lies square on the
-    // canvas (at quarter turns), the pixels whose centres it covers; turned at any other angle, the parallelogram its
-    // corners make.
-    if (Geometry g; clipGeometry(p, seq, c, t, g) && g.sx != 0 && g.sy != 0) {
-        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
-        const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
-        if (u1 <= u0 || v1 <= v0) return;  // (cropped away)
-        // (a point of the picture, on the canvas in the layer's pixels)
-        auto canvas = [&](double u, double v, double& X, double& Y) {
-            const double rx = (u - g.mw / 2 - g.ax) * g.sx, ry = (v - g.mh / 2 - g.ay) * g.sy;
-            X = (seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale, Y = (seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale;
-        };
-        if (std::min(std::fabs(cr), std::fabs(sn)) < 1e-9) {
-            double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
-            for (double u : {u0, u1})
-                for (double v : {v0, v1}) {
-                    double X, Y;
-                    canvas(u, v, X, Y);
-                    x0 = std::min(x0, X), x1 = std::max(x1, X), y0 = std::min(y0, Y), y1 = std::max(y1, Y);
-                }
-            auto edge = [](double at, int n) { return int(std::clamp(std::ceil(at - 0.5 - 1e-6), 0.0, double(n))); };
-            ds.left = edge(x0, layer.width), ds.right = edge(x1, layer.width);
-            ds.top = edge(y0, layer.height), ds.bottom = edge(y1, layer.height);
-            if (ds.right <= ds.left || ds.bottom <= ds.top) return;  // (none of its picture on the canvas)
-        } else {
-            double X, Y;
-            ds.turned = true;
-            canvas(u0, v0, ds.origin[0], ds.origin[1]);
-            canvas(u1, v0, X, Y);
-            ds.across[0] = X - ds.origin[0], ds.across[1] = Y - ds.origin[1];
-            canvas(u0, v1, X, Y);
-            ds.down[0] = X - ds.origin[0], ds.down[1] = Y - ds.origin[1];
-        }
-    }
+    DisplaceSettings ds;
+    if (!displaceGeometry(p, seq, c, *e, t, o, layer.width, layer.height, ds)) return;
     displaceByMap(layer, map, ds);
     if (mask.size() == size_t(layer.width) * size_t(layer.height))
         for (size_t i = 0; i < mask.size(); ++i)
@@ -3017,7 +3026,16 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 }
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
-                if (enabledEffect(seq, *c, "displace_by_layer")) return fallback("Displace by Layer");
+                if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
+                    // (drawn there alone, with another track's picture as it is, or its own; not through a mask)
+                    if (tr) return fallback("Displace by Layer in a transition");
+                    if (c->isGenerator() && c->generator.type == "adjustment") return fallback("Displace by Layer on an adjustment layer");
+                    if (hasMask(*e, t - c->start)) return fallback("Displace by Layer through a mask");
+                    FrameTime mf = 0, mt = 0;
+                    if (const int m = std::lround(e->p("source", t - c->start, 0)) == 0 ? matteTrack(seq, ti, *c, *e, t) : -1;
+                        m >= 0 && activeTransition(seq.videoTracks[size_t(m)], t, mf, mt))
+                        return fallback("Displace by Layer's map in a transition");
+                }
                 if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }
@@ -3094,6 +3112,70 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
             gpu::Item item;
             item.blendMode = blendModeIndex(c->blendMode);
             if (!layerOf(*c, item.a)) continue;
+            if (const Effect* e = enabledEffect(seq, *c, "displace_by_layer")) {
+                // Moved by a map (displaceLayer's): another track's picture now (none there, or no track: nothing
+                // moves), or its own; the edges its picture's, the map blurred first.
+                DisplaceSettings ds;
+                const bool self = std::lround(e->p("source", t - c->start, 0)) != 0;
+                if (displaceGeometry(p, seq, *c, *e, t, o, W, H, ds)) {
+                    const bool across = ds.horizontal != DisplaceChannel::Off && ds.horizontalAmount != 0;
+                    const bool down = ds.vertical != DisplaceChannel::Off && ds.verticalAmount != 0;
+                    bool mapped = self;
+                    if (!self && (across || down))
+                        if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0)
+                            if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t);
+                                mc && mc->enabled && !(mc->isGenerator() && mc->generator.type == "adjustment")) {
+                                item.displaceMap.emplace();
+                                mapped = layerOf(*mc, *item.displaceMap);
+                            }
+                    if (mapped && (across || down)) {
+                        item.displace = true;
+                        item.displaceSelf = self;
+                        float* q = item.displaceParams;
+                        q[0] = 31, q[1] = float(ds.horizontal), q[2] = float(ds.vertical), q[3] = float(ds.edge);
+                        q[4] = float(ds.horizontalAmount), q[5] = float(ds.verticalAmount), q[6] = ds.bicubic ? 1 : 0, q[7] = ds.turned ? 1 : 0;
+                        if (ds.right > ds.left && ds.bottom > ds.top)
+                            q[8] = float(std::clamp(ds.left, 0, W)), q[9] = float(std::clamp(ds.top, 0, H)), q[10] = float(std::clamp(ds.right, 0, W)),
+                            q[11] = float(std::clamp(ds.bottom, 0, H));
+                        else
+                            q[10] = float(W), q[11] = float(H);
+                        // (as displaceTurned works them out, in floats)
+                        const float a0 = float(ds.across[0]), a1 = float(ds.across[1]), d0 = float(ds.down[0]), d1 = float(ds.down[1]);
+                        const float det = a0 * d1 - a1 * d0;
+                        q[12] = float(ds.origin[0]), q[13] = float(ds.origin[1]), q[14] = a0, q[15] = a1;
+                        q[16] = d0, q[17] = d1, q[18] = det < 0 ? -1.0f : 1.0f, q[19] = std::fabs(det);
+                        const double reach = ds.bicubic ? 3.0 : 1.5;
+                        q[20] = float(std::min(0.5, reach / std::max(1e-9, std::hypot(ds.across[0], ds.across[1]))));
+                        q[21] = float(std::min(0.5, reach / std::max(1e-9, std::hypot(ds.down[0], ds.down[1]))));
+                        q[22] = across ? 1 : 0, q[23] = down ? 1 : 0;
+                        if (ds.turned && !(std::fabs(ds.across[0] * ds.down[1] - ds.across[1] * ds.down[0]) > 1e-9 && q[19] > 0)) item.displace = false;
+                        // (the map's blur: gaussian's passes, as Painterly's)
+                        if (const GaussianPlan plan = gaussianPlan(ds.mapBlur / 2); ds.mapBlur > 0 && (plan.byBoxes || !plan.kernel.empty())) {
+                            gpu::ColorOp f;
+                            f.kind = gpu::ColorOp::Filter;
+                            for (int dim = 0; dim < 2; ++dim) {
+                                if (plan.byBoxes) {
+                                    for (int r : plan.boxes) {
+                                        gpu::ColorOp::FilterPass fp;
+                                        fp.mode = 1;
+                                        fp.params[0] = float(r), fp.params[1] = float(dim);
+                                        fp.params[4] = fp.params[5] = fp.params[6] = fp.params[7] = 1;
+                                        f.passes.push_back(fp);
+                                    }
+                                } else {
+                                    gpu::ColorOp::FilterPass fp;
+                                    fp.mode = 48;
+                                    fp.params[0] = float(plan.kernel.size() - 1), fp.params[1] = float(dim);
+                                    std::copy(plan.kernel.begin(), plan.kernel.begin() + std::min<size_t>(plan.kernel.size(), 56), fp.params + 4);
+                                    f.passes.push_back(fp);
+                                }
+                            }
+                            item.displaceBlur.push_back(std::move(f));
+                        }
+                    }
+                    if (!item.displace) item.displaceMap.reset();
+                }
+            }
             if (const Effect* e = trackMatteOf(*c)) {
                 // Seen through the matte track's picture (none there now: an empty matte; no track: no matte).
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {

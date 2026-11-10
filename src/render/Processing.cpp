@@ -3804,8 +3804,8 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             }
         }
         for (int k = 0; k < 3; ++k) op.params[16 + k] = sk[k];
-    } else if (e.type == "track_matte") {
-        return true;  // (the compositor applies it, render/Compositor)
+    } else if (e.type == "track_matte" || e.type == "displace_by_layer") {
+        return true;  // (the compositor applies them, render/Compositor)
     } else if (isGpuFilter(e.type)) {
         // gpufilter.frag's passes, as the effect runs on the CPU; through its mask, marked before and mixed after.
         gpu::ColorOp f;

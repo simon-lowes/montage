@@ -296,7 +296,7 @@ jobs:
           MONTAGE_GPU_LOG: "1"
         run: |
           # Every GPU test must run on both: a skip (no device, no shader compiler) fails the step.
-          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuYcbcrPlanes gpuHardwareFrames gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers ofxControlsAndOpenGl"
+          tests="gpuCompositorMatchesCpu gpuFallback gpuEffectsMatchCpu gpuYcbcrPlanes gpuHardwareFrames gpuExportMatchesCpu gpuOcioMatchesCpu gpuShapeLayers gpuDisplaceByLayer ofxControlsAndOpenGl"
           for backend in opengl vulkan; do
             echo "::group::$backend"
             MONTAGE_GPU=$backend xvfb-run -a build/tests/test_render $tests -o "$RUNNER_TEMP/$backend.txt,txt" -o -,txt || failed=1

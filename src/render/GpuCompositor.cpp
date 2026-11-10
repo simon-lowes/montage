@@ -1401,15 +1401,42 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
             break;
         }
         const Layer* la = &it.a;
-        if ((it.b && it.transition >= 0) || it.matte) {
-            // Placed on the canvas, then mixed: a transition, then a track matte.
+        if ((it.b && it.transition >= 0) || it.matte || it.displace) {
+            // Placed on the canvas, then mixed: a transition, then a displacement, then a track matte.
             QRhiTexture* m = placed(&it.a, a);
+            QRhiTexture* self = it.displace && it.displaceSelf ? placed(&it.a, a) : nullptr;  // (its own map, as it was)
             if (a && a != canvas) release(a);
             if (m && it.b && it.transition >= 0) {
                 QRhiTexture* mb = placed(&*it.b, b);
                 if (b && b != canvas) release(b);
                 b = nullptr;
                 m = mixed(m, mb, it.transitionParams, 44, &it.transitionTable, it.transitionTableWidth);
+            }
+            if (m && it.displace) {
+                QRhiTexture* map = self;
+                if (!it.displaceSelf) {
+                    QRhiTexture* mt = it.displaceMap ? layer(*it.displaceMap, u) : nullptr;
+                    if (!mt && it.displaceMap && !absent(*it.displaceMap)) {
+                        release(m);
+                        ok = false;
+                        break;
+                    }
+                    map = placed(it.displaceMap ? &*it.displaceMap : nullptr, mt);
+                    if (mt) release(mt);
+                }
+                if (map && !it.displaceBlur.empty()) {
+                    // (its blur run over it at the canvas's size, as an adjustment layer's filters are)
+                    Layer blur;
+                    blur.canvas = true;
+                    blur.ops = it.displaceBlur;
+                    QRhiTexture* blurred = layer(blur, u, map);
+                    if (blurred != map) release(map);
+                    map = blurred;
+                }
+                if (!map) release(m);
+                m = map ? mixed(m, map, it.displaceParams, 24) : nullptr;
+            } else if (self) {
+                release(self);
             }
             if (m && it.matte) {
                 QRhiTexture* matte = layer(*it.matte, u);
