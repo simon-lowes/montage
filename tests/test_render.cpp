@@ -75,6 +75,8 @@
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
 #include "render/ProRes.h"
+#include "media/ProResEncoder.h"
+#include "render/RateConversion.h"
 #include "render/Iab.h"
 #include "render/ImageSubtitles.h"
 #include "media/TextReader.h"
@@ -659,6 +661,90 @@ QImage greyImage(const std::vector<float>& v, int w, int h) {
             q.setPixel(x, y, qRgb(g, g, g));
         }
     return q;
+}
+
+// A ProRes frame as FFmpeg's decoder gives it (4:4:4 at the 12 bits its tag names), or null.
+AVFrame* ffmpegProResFrame(const std::vector<uint8_t>& frame, bool fourFourFour) {
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_PRORES);
+    AVCodecContext* c = codec ? avcodec_alloc_context3(codec) : nullptr;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* f = av_frame_alloc();
+    bool ok = false;
+    if (c && pkt && f) {
+        c->thread_count = 1;
+        c->codec_tag = fourFourFour ? MKTAG('a', 'p', '4', 'h') : MKTAG('a', 'p', 'c', 'h');
+        if (avcodec_open2(c, codec, nullptr) >= 0 && av_new_packet(pkt, int(frame.size())) >= 0) {
+            std::memcpy(pkt->data, frame.data(), frame.size());
+            ok = avcodec_send_packet(c, pkt) >= 0 &&
+                 (avcodec_receive_frame(c, f) >= 0 || (avcodec_send_packet(c, nullptr) >= 0 && avcodec_receive_frame(c, f) >= 0));
+        }
+    }
+    av_packet_free(&pkt);
+    avcodec_free_context(&c);
+    if (!ok) av_frame_free(&f);
+    return f;
+}
+
+// The largest difference between an FFmpeg-decoded plane (16-bit samples, at `depth` bits) and one of Montage's
+// 12-bit planes, at 12 bits; and how many samples differ by more than `within`.
+int proresPlaneDifference(const AVFrame* f, int plane, int depth, const std::vector<uint16_t>& own, int width, int height, int within = 1,
+                          int64_t* over = nullptr) {
+    int worst = 0;
+    for (int y = 0; y < height; ++y) {
+        const auto* row = reinterpret_cast<const uint16_t*>(f->data[plane] + size_t(y) * size_t(f->linesize[plane]));
+        for (int x = 0; x < width; ++x) {
+            const int d = std::abs((int(row[x]) << (12 - depth)) - int(own[size_t(y) * size_t(width) + size_t(x)]));
+            worst = std::max(worst, d);
+            if (over && d > within) ++*over;
+        }
+    }
+    return worst;
+}
+
+// A test picture for Montage's ProRes encoder at 12 bits: ramps across and down, a patch of noise, fine stripes and
+// sharp edges, alpha from clear to opaque with a hole in it.
+struct ProResTestPicture {
+    int width = 0, height = 0, chromaWidth = 0;
+    std::vector<uint16_t> y, cb, cr, alpha;
+    ProResTestPicture(int w, int h, bool full, uint32_t seed = 7) : width(w), height(h), chromaWidth(full ? w : (w + 1) / 2) {
+        std::mt19937 rng(seed);
+        y.resize(size_t(w) * size_t(h));
+        alpha.resize(size_t(w) * size_t(h));
+        cb.resize(size_t(chromaWidth) * size_t(h));
+        cr.resize(size_t(chromaWidth) * size_t(h));
+        for (int j = 0; j < h; ++j)
+            for (int i = 0; i < w; ++i) {
+                int v = 256 + int(int64_t(i) * 3504 / std::max(1, w - 1));
+                if (i > w / 2 && j > h / 2) v = 300 + int(rng() % 3400);       // noise
+                else if (j < h / 8) v = (i / 2) % 2 ? 3700 : 400;              // stripes
+                else if (j > h - h / 8) v = i < w / 3 ? 256 : 3760;            // an edge
+                y[size_t(j) * size_t(w) + size_t(i)] = uint16_t(v);
+                alpha[size_t(j) * size_t(w) + size_t(i)] = std::abs(i - w / 4) < w / 16 ? 0 : uint16_t(int64_t(j) * 65535 / std::max(1, h - 1));
+            }
+        for (int j = 0; j < h; ++j)
+            for (int i = 0; i < chromaWidth; ++i) {
+                cb[size_t(j) * size_t(chromaWidth) + size_t(i)] = uint16_t(512 + int64_t(j) * 3072 / std::max(1, h - 1));
+                cr[size_t(j) * size_t(chromaWidth) + size_t(i)] = uint16_t(3584 - int64_t(i) * 3072 / std::max(1, chromaWidth - 1) + int(rng() % 16));
+            }
+    }
+    prores::PlanarPicture planes(bool withAlpha) const {
+        prores::PlanarPicture p;
+        p.y = y.data();
+        p.cb = cb.data();
+        p.cr = cr.data();
+        p.yStride = width;
+        p.cStride = chromaWidth;
+        p.alpha = withAlpha ? alpha.data() : nullptr;
+        p.aStride = width;
+        return p;
+    }
+};
+
+// The left edge (first column brighter than mid grey) of a bright bar on line y of a 16-bit R'G'B' picture.
+int barEdge(const std::vector<uint16_t>& rgb, int width, int y) {
+    for (int x = 0; x < width; ++x)
+        if (rgb[(size_t(y) * size_t(width) + size_t(x)) * 3 + 1] > 32768) return x;
+    return -1;
 }
 
 }  // namespace
@@ -10639,10 +10725,11 @@ colorspaces:
             QVERIFY(readImfComposition(rh.cpl, hc, &err) && hc.application == 59 && hc.colour == "rec2020-hlg" && hc.contentKind == "commercial");
         }
 
-        // Refused: 4444 (12 bits, which FFmpeg's encoder does not code), 422 LT, a picture neither HD nor UHD, P3-D65 PQ,
+        // Refused: 4444 at 10 bits (Application DPP's 4:4:4 is 12), 422 LT, a picture neither HD nor UHD, P3-D65 PQ,
         // fields, a DPP kind outside Application DPP.
         ImfSettings bad = st;
         bad.prores = "4444";
+        bad.bits = 10;
         QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("12 bits") != std::string::npos);
         bad.prores = "lt";
         QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("422 HQ") != std::string::npos);
@@ -10673,6 +10760,536 @@ colorspaces:
                 return std::any_of(issues.begin(), issues.end(), [&](const std::string& i) { return i.find(what) != std::string::npos; });
             };
             QVERIFY(named("has no ContentKind") && named("more than one application"));
+        }
+    }
+
+    void ownProResBitstream() {
+        // Montage's ProRes encoder against FFmpeg's decoder and Montage's own: 4444 and 4444 XQ with alpha and without,
+        // progressive and as fields either way round, at 1280 x 720, at sizes that leave part macroblocks and short
+        // slices, and a 422 HQ picture. FFmpeg decodes 4:4:4 to yuv444p12 (yuva444p12 with alpha) within a code of
+        // Montage's decoder, and alpha exactly as it went in.
+        struct Case {
+            int w, h, profile, fields;
+            bool alpha;
+        };
+        for (const Case& k : {Case{1280, 720, 5, 0, false}, Case{1280, 720, 6, 0, true}, Case{1280, 720, 5, 1, true}, Case{1280, 720, 6, 2, false},
+                              Case{721, 487, 5, 0, true}, Case{200, 30, 6, 2, true}, Case{8, 8, 5, 0, false}, Case{720, 486, 4, 1, false}}) {
+            const QString what = QStringLiteral("%1 x %2, profile %3, fields %4, alpha %5").arg(k.w).arg(k.h).arg(k.profile).arg(k.fields).arg(k.alpha);
+            const bool full = k.profile >= 5;
+            const ProResTestPicture pic(k.w, k.h, full);
+            prores::OwnSettings os;
+            os.width = k.w;
+            os.height = k.h;
+            os.profile = k.profile;
+            os.fields = k.fields;
+            os.alpha = k.alpha;
+            os.primaries = os.transfer = os.matrix = 1;
+            os.frameRateCode = prores::frameRateCode(25);
+            prores::OwnEncoder enc;
+            std::string err;
+            QVERIFY2(enc.open(os, &err), err.c_str());
+            std::vector<uint8_t> frame;
+            QVERIFY2(enc.encode(pic.planes(k.alpha), frame, &err), err.c_str());
+            prores::FrameHeader h;
+            QVERIFY(prores::parseFrameHeader(frame.data(), frame.size(), h));
+            QVERIFY2(h.frameSize == frame.size() && h.width == k.w && h.height == k.h && h.chroma == (full ? 3 : 2) && h.interlace == k.fields &&
+                         h.alpha == (k.alpha ? 2 : 0) && h.primaries == 1 && h.transfer == 1 && h.matrix == 1,
+                     qPrintable(what));
+            prores::OwnDecoded own;
+            QVERIFY2(prores::decodeOwn(frame.data(), frame.size(), own, &err), qPrintable(what + ": " + QString::fromStdString(err)));
+            QVERIFY(own.width == k.w && own.height == k.h && own.interlace == k.fields && own.alphaType == (k.alpha ? 2 : 0));
+            AVFrame* f = ffmpegProResFrame(frame, full);
+            QVERIFY2(f, qPrintable(what));
+            const AVPixelFormat want = !full ? AV_PIX_FMT_YUV422P10 : k.alpha ? AV_PIX_FMT_YUVA444P12 : AV_PIX_FMT_YUV444P12;
+            const bool right = f->format == want && f->width == k.w && f->height == k.h;
+            const int depth = full ? 12 : 10;
+            // (4:2:2 decodes at 10 bits: within one of its codes, four of Montage's)
+            const int within = full ? 1 : 4;
+            const int dy = right ? proresPlaneDifference(f, 0, depth, own.y, k.w, k.h) : 9999;
+            const int dcb = right ? proresPlaneDifference(f, 1, depth, own.cb, own.chromaWidth(), k.h) : 9999;
+            const int dcr = right ? proresPlaneDifference(f, 2, depth, own.cr, own.chromaWidth(), k.h) : 9999;
+            bool alphaKept = true;
+            if (k.alpha && right)
+                for (int y = 0; y < k.h; ++y) {
+                    const auto* row = reinterpret_cast<const uint16_t*>(f->data[3] + size_t(y) * size_t(f->linesize[3]));
+                    for (int x = 0; x < k.w; ++x) {
+                        const size_t i = size_t(y) * size_t(k.w) + size_t(x);
+                        alphaKept = alphaKept && own.alpha[i] == pic.alpha[i] && row[x] == pic.alpha[i] >> 4;
+                    }
+                }
+            av_frame_free(&f);
+            QVERIFY2(right && dy <= within && dcb <= within && dcr <= within && alphaKept,
+                     qPrintable(what + QStringLiteral(": differences %1 %2 %3, alpha %4").arg(dy).arg(dcb).arg(dcr).arg(alphaKept)));
+            // And the picture coded closely at this rate (outside the noise, which takes most of the bits).
+            if (k.w * k.h >= 300000) {
+                double worst = 0;
+                for (int y = 0; y < k.h / 2; ++y)
+                    for (int x = 0; x < k.w; ++x) {
+                        const size_t i = size_t(y) * size_t(k.w) + size_t(x);
+                        worst = std::max(worst, std::fabs(double(own.y[i]) - double(pic.y[i])));
+                    }
+                QVERIFY2(worst <= 24, qPrintable(what + QStringLiteral(": %1 codes off").arg(worst)));
+            }
+        }
+        // Refused: alpha in 4:2:2, an odd height in fields.
+        prores::OwnEncoder enc;
+        prores::OwnSettings bad;
+        bad.width = 64, bad.height = 64, bad.profile = 4, bad.alpha = true;
+        QVERIFY(!enc.open(bad));
+        bad.profile = 5, bad.alpha = false, bad.height = 63, bad.fields = 1;
+        QVERIFY(!enc.open(bad));
+    }
+
+    void ownProResSizesAndThreads() {
+        // Noise, the hardest picture: each 4:4:4 profile's frames kept within its target size (the colour: alpha,
+        // lossless, comes on top) and near it, 4444 XQ's larger than 4444's, and the same bytes on 1 thread and on 8.
+        const int W = 1920, H = 1080;
+        QCOMPARE(prores::targetFrameBytes(5, W, H), size_t(std::floor(330e6 / (30000.0 / 1001.0) / 8)));
+        QCOMPARE(prores::targetFrameBytes(6, W, H), size_t(std::floor(500e6 / (30000.0 / 1001.0) / 8)));
+        std::mt19937 rng(11);
+        std::vector<uint16_t> y(size_t(W) * H), cb(y.size()), cr(y.size()), a(y.size());
+        for (size_t i = 0; i < y.size(); ++i) {
+            y[i] = uint16_t(256 + rng() % 3505);
+            cb[i] = uint16_t(256 + rng() % 3585);
+            cr[i] = uint16_t(256 + rng() % 3585);
+            a[i] = uint16_t(rng() % 4 ? 65535 : rng());
+        }
+        prores::PlanarPicture pic;
+        pic.y = y.data(), pic.cb = cb.data(), pic.cr = cr.data(), pic.alpha = a.data();
+        pic.yStride = pic.cStride = pic.aStride = W;
+        size_t colour[7] = {};
+        for (int profile : {5, 6})
+            for (bool alpha : {false, true}) {
+                std::vector<uint8_t> frames[2];
+                size_t alphaBytes = 0;
+                for (int t = 0; t < 2; ++t) {
+                    prores::OwnSettings os;
+                    os.width = W, os.height = H, os.profile = profile, os.alpha = alpha, os.threads = t ? 8 : 1;
+                    prores::OwnEncoder enc;
+                    QVERIFY(enc.open(os));
+                    prores::PlanarPicture p = pic;
+                    if (!alpha) p.alpha = nullptr;
+                    QVERIFY(enc.encode(p, frames[t]));
+                    alphaBytes = enc.lastAlphaBytes();
+                    QVERIFY(alpha == (alphaBytes > 0));
+                }
+                QVERIFY2(frames[0] == frames[1], qPrintable(QStringLiteral("profile %1 alpha %2").arg(profile).arg(alpha)));
+                const size_t target = prores::targetFrameBytes(profile, W, H), c = frames[0].size() - alphaBytes;
+                QVERIFY2(c <= target && double(c) > 0.9 * double(target), qPrintable(QStringLiteral("profile %1: %2 of %3").arg(profile).arg(c).arg(target)));
+                colour[profile] = c;
+            }
+        QVERIFY(colour[6] > colour[5]);
+        // A flat picture: far under the target, at the finest quantization.
+        std::fill(y.begin(), y.end(), uint16_t(2000));
+        std::fill(cb.begin(), cb.end(), uint16_t(2048));
+        std::fill(cr.begin(), cr.end(), uint16_t(2048));
+        prores::OwnSettings os;
+        os.width = W, os.height = H, os.profile = 5;
+        prores::OwnEncoder enc;
+        std::vector<uint8_t> flat;
+        pic.alpha = nullptr;
+        QVERIFY(enc.open(os) && enc.encode(pic, flat));
+        QVERIFY(flat.size() < prores::targetFrameBytes(5, W, H) / 20);
+        const auto& q = enc.lastQuantization();
+        QVERIFY(!q.empty() && std::all_of(q.begin(), q.end(), [](uint8_t v) { return v == 1; }));
+    }
+
+    void proRes12BitRamp() {
+        // A grey ramp across 2048 pixels, from a quarter to three quarters: coded at 12 bits it keeps four times the
+        // distinct codes it keeps at 10 (FFmpeg's encoder), each decoded by FFmpeg (at 12 bits, rounded to 10 for the
+        // 10-bit file).
+        const int W = 2048, H = 32;
+        std::vector<uint16_t> rgb(size_t(W) * H * 3);
+        for (int yy = 0; yy < H; ++yy)
+            for (int x = 0; x < W; ++x)
+                for (int c = 0; c < 3; ++c) rgb[(size_t(yy) * W + size_t(x)) * 3 + size_t(c)] = uint16_t(std::lround((0.25 + 0.5 * x / (W - 1.0)) * 65535));
+        auto distinct = [&](int bits) -> int {
+            prores::Encoder e;
+            prores::Coding coding;
+            coding.bits = bits;
+            std::vector<uint8_t> frame;
+            if (!e.open(W, H, 5, "rec709", coding) || !e.encode(rgb.data(), frame)) return -1;
+            AVFrame* f = ffmpegProResFrame(frame, true);
+            if (!f || f->format != AV_PIX_FMT_YUV444P12) {
+                av_frame_free(&f);
+                return -2;
+            }
+            std::set<int> codes;
+            const auto* row = reinterpret_cast<const uint16_t*>(f->data[0] + size_t(16) * size_t(f->linesize[0]));
+            for (int x = 0; x < W; ++x) codes.insert(bits == 12 ? row[x] : (row[x] + 2) >> 2);
+            av_frame_free(&f);
+            return int(codes.size());
+        };
+        const int twelve = distinct(12);
+        QVERIFY2(twelve >= 1600, qPrintable(QString::number(twelve)));
+        if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder for the 10-bit side");
+        const int ten = distinct(10);
+        QVERIFY2(ten > 0 && twelve >= 3.5 * ten, qPrintable(QStringLiteral("12 bits: %1 codes, 10 bits: %2").arg(twelve).arg(ten)));
+    }
+
+    void exportsImfProRes12() {
+        QTemporaryDir dir;
+        std::string err;
+        auto photonFindings = [](const std::string& folder) {
+            QStringList found = photonErrors(QString::fromStdString(folder));
+            found.removeIf([](const QString& e) { return e.contains("has both index table and essence"); });  // (RDD 44's layout, as exportsImfProRes)
+            return found;
+        };
+        RenderOptions ro;
+        ro.highQuality = true;
+        // Every frame of a track file: 4:4:4 at 12 bits as FFmpeg decodes it, within a code of Montage's own decoder, and
+        // the picture rendered (greys: frames told apart by lightness).
+        auto framesRight = [&](const std::string& folder, const Project& p, const Sequence& seq, bool fullRange, int64_t frames) {
+            const QDir out(QString::fromStdString(folder));
+            const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+            int64_t k = 0;
+            const int64_t decoded = decodeMxfPictures(video, [&](const AVFrame* f, const AVPacket* pkt) {
+                prores::FrameHeader h;
+                if (!prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) || h.chroma != 3 || h.alpha != 0) return false;
+                if (f->width != seq.width || f->height != seq.height || f->format != AV_PIX_FMT_YUV444P12) return false;
+                prores::OwnDecoded own;
+                const std::vector<uint8_t> bytes(pkt->data, pkt->data + pkt->size);
+                if (!prores::decodeOwn(bytes.data(), bytes.size(), own) || proresPlaneDifference(f, 0, 12, own.y, f->width, f->height) > 1 ||
+                    proresPlaneDifference(f, 1, 12, own.cb, f->width, f->height) > 1 || proresPlaneDifference(f, 2, 12, own.cr, f->width, f->height) > 1)
+                    return false;
+                std::vector<uint16_t> rgb;
+                int w = 0, hh = 0;
+                if (!prores::decode(pkt->data, size_t(pkt->size), fullRange, rgb, nullptr, w, hh)) return false;
+                const Image want = renderProgramFrame(p, seq, k++, ro);
+                const int cx = seq.width / 2, cy = seq.height / 2;
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(rgb[(size_t(cy) * size_t(w) + size_t(cx)) * 3 + size_t(c)] / 65535.0 - want.at(cx, cy)[c]) > 1.0 / 255) return false;
+                return true;
+            });
+            return decoded == frames;
+        };
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1280, s.height = 720, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0.7f, 0.7f, 0.7f, 0, 2), colorClip(p, 0.3f, 0.3f, 0.3f, 2, 2)};
+        // Application ProRes at 12 bits: 4444 in narrow range (QE.1, 256 to 3760), 4444 XQ over the full range (QE.2).
+        for (const char* profile : {"4444", "4444xq"}) {
+            const bool xq = std::string(profile) == "4444xq";
+            ImfSettings st;
+            st.title = xq ? "ProRes 12 XQ" : "ProRes 12";
+            st.captions = false;
+            st.application = 45;
+            st.prores = profile;
+            st.bits = 12;
+            st.fullRange = xq;
+            ImfResult r;
+            QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+            QVERIFY(r.application == 45 && r.bits == 12 && r.prores == profile && r.frames == 4);
+            std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QStringList photon = photonFindings(r.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            const QDir out(QString::fromStdString(r.folder));
+            dcp::ImfTrackReader reader;
+            QVERIFY2(reader.open(out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), &err), err.c_str());
+            QVERIFY(reader.imfProRes() && reader.rgba() && reader.proresProfile() == (xq ? 6 : 5) && reader.componentBits() == 12);
+            QVERIFY2(reader.componentLow() == (xq ? 0 : 256) && reader.componentHigh() == (xq ? 4095 : 3760),
+                     qPrintable(QStringLiteral("%1 to %2").arg(reader.componentLow()).arg(reader.componentHigh())));
+            QVERIFY2(framesRight(r.folder, p, s, xq, 4), profile);
+        }
+        // Application DPP's 4:4:4 (RDD 59-1 Table 2): 4444 and 4444 XQ R'G'B' at 12 bits, HD at 25; then a supplemental
+        // of the 4444 package with one shot changed codes only that shot's frames (the rest found the same by coding
+        // them again, byte for byte).
+        s.width = 1920, s.height = 1080, s.fps = Rational{25, 1};
+        Sequence cut1 = s;
+        cut1.id = p.newId();
+        cut1.name = "Cut 1";
+        p.sequences.push_back(cut1);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "DPP 12";
+        st.captions = false;
+        st.application = 59;
+        st.prores = "4444";
+        st.kind = "programme";
+        ImfResult r;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.application == 59 && r.bits == 12 && r.prores == "4444" && r.frames == 4);
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonFindings(r.folder);
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        QVERIFY(framesRight(r.folder, p, now, false, 4));
+        now.videoTracks[0].clips[1].generator.params["color.r"] = 0.4;
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.4;
+        now.videoTracks[0].clips[1].generator.params["color.b"] = 0.4;
+        ImfSettings sup = st;
+        sup.supplementOf = r.folder;
+        sup.originalSequence = cut1.id;
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY2(r2.supplemental && r2.bits == 12 && r2.codedFrames == 2 && r2.prores == "4444", qPrintable(QString::number(r2.codedFrames)));
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        photon = photonFindings(r2.folder);
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        {
+            ImfSettings xq = st;
+            xq.title = "DPP 12 XQ";
+            xq.prores = "4444xq";
+            xq.colour = "rec2020-pq";
+            xq.masteringPeak = 1000;
+            ImfResult rx;
+            QVERIFY2(exportImf(p, cut1, xq, dir.path().toStdString(), &rx, {}, &err), err.c_str());
+            QVERIFY(rx.application == 59 && rx.bits == 12 && rx.prores == "4444xq" && rx.colour == "rec2020-pq");
+            issues = verifyImf(rx.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            photon = photonFindings(rx.folder);
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        }
+        // Refused: DPP's 4:4:4 at 10 bits, its 422 HQ at 12, its 4:4:4 as Y'CbCr, and 12-bit 4:2:2 in Application ProRes.
+        ImfSettings bad = st;
+        bad.bits = 10;
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("12 bits") != std::string::npos);
+        bad = st;
+        bad.prores = "hq";
+        bad.bits = 12;
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("10 bits") != std::string::npos);
+        bad = st;
+        bad.ycbcr444 = true;
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("R'G'B'") != std::string::npos);
+        bad = st;
+        bad.application = 45;
+        bad.kind = "feature";
+        bad.prores = "hq";
+        bad.bits = 12;
+        QVERIFY(!exportImf(p, cut1, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("4444 or 4444 XQ") != std::string::npos);
+    }
+
+    void exportsProRes12Bit() {
+        // The ProRes 4444 and 4444 XQ presets: 12 bits by Montage's encoder, in MOV as ap4h and ap4x, a half-transparent
+        // clip's alpha kept; FFmpeg decodes them to yuva444p12.
+        QTemporaryDir dir;
+        std::string err;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1280, s.height = 720, s.fps = Rational{25, 1};
+        Clip c = colorClip(p, 0.2f, 0.6f, 0.9f, 0, 3);
+        c.motion.params["opacity"] = 50.0;
+        s.videoTracks[0].clips = {c};
+        for (const char* name : {"ProRes 4444 (alpha)", "ProRes 4444 XQ (alpha)"}) {
+            const auto& presets = exportPresets();
+            const auto it = std::find_if(presets.begin(), presets.end(), [&](const ExportPreset& e) { return e.name == name; });
+            QVERIFY2(it != presets.end(), name);
+            ExportSettings st = it->settings;
+            QCOMPARE(st.pixFmt, std::string("yuva444p12le"));
+            st.path = dir.filePath(QStringLiteral("%1.mov").arg(it->settings.profile.c_str())).toStdString();
+            st.audioCodec = "none";
+            std::string used;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), err.c_str());
+            QVERIFY2(used.find("Montage") != std::string::npos, used.c_str());
+            const bool xq = st.profile == "4444xq";
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr) >= 0 && avformat_find_stream_info(fmt, nullptr) >= 0);
+            const AVCodecParameters* par = fmt->streams[0]->codecpar;
+            const bool tagged = par->codec_id == AV_CODEC_ID_PRORES && par->codec_tag == (xq ? MKTAG('a', 'p', '4', 'x') : MKTAG('a', 'p', '4', 'h'));
+            const int64_t frames = fmt->streams[0]->nb_frames;
+            avformat_close_input(&fmt);
+            QVERIFY2(tagged && frames == 3, name);
+            int64_t k = 0;
+            QCOMPARE(decodeMxfPictures(st.path, [&](const AVFrame* f, const AVPacket* pkt) {
+                         prores::FrameHeader h;
+                         if (!prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) || h.chroma != 3 || h.alpha != 2 || h.interlace != 0) return false;
+                         if (f->format != AV_PIX_FMT_YUVA444P12 || f->width != 1280 || f->height != 720) return false;
+                         const uint16_t a = reinterpret_cast<const uint16_t*>(f->data[3] + size_t(360) * size_t(f->linesize[3]))[640];
+                         ++k;
+                         return std::abs(int(a) - 2048) <= 8;
+                     }),
+                     int64_t(3));
+        }
+        // Interlaced at 12 bits: two fields a frame, the top first.
+        {
+            const auto& presets = exportPresets();
+            ExportSettings st = std::find_if(presets.begin(), presets.end(), [](const ExportPreset& e) { return e.name == "ProRes 4444 (alpha)"; })->settings;
+            st.path = dir.filePath("fields.mov").toStdString();
+            st.audioCodec = "none";
+            st.interlaced = true;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            QCOMPARE(decodeMxfPictures(st.path, [&](const AVFrame* f, const AVPacket* pkt) {
+                         prores::FrameHeader h;
+                         return prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) && h.interlace == 1 && f->format == AV_PIX_FMT_YUVA444P12;
+                     }),
+                     int64_t(3));
+        }
+        // Render and Replace: the clip as 12-bit ProRes 4444 with its alpha.
+        {
+            const std::string path = dir.filePath("rendered.mov").toStdString();
+            QVERIFY2(renderClipVideo(p, s, s.videoTracks[0].clips[0].id, path, &err), err.c_str());
+            QCOMPARE(decodeMxfPictures(path, [&](const AVFrame* f, const AVPacket* pkt) {
+                         prores::FrameHeader h;
+                         return prores::parseFrameHeader(pkt->data, size_t(pkt->size), h) && h.alpha == 2 && f->format == AV_PIX_FMT_YUVA444P12;
+                     }),
+                     int64_t(3));
+        }
+#ifdef Q_OS_MACOS
+        // AVFoundation decodes the same frames, within a code of Montage's own decoder (no more than one sample in a
+        // thousand two codes apart): a busy picture through the 4444 XQ preset, read back by AVAssetReader as 16-bit
+        // A Y'CbCr (y416) by a Swift script.
+        {
+            Project q = makeDefaultProject();
+            Sequence& busy = *q.active();
+            busy.width = 1280, busy.height = 720, busy.fps = Rational{25, 1};
+            Clip bars = makeGeneratorClip(q, "bars", 2);
+            bars.motion.params["opacity"] = 75.0;
+            busy.videoTracks[0].clips = {bars};
+            const auto& presets = exportPresets();
+            ExportSettings st = std::find_if(presets.begin(), presets.end(), [](const ExportPreset& e) { return e.name == "ProRes 4444 XQ (alpha)"; })->settings;
+            st.path = dir.filePath("busy.mov").toStdString();
+            st.audioCodec = "none";
+            QVERIFY2(exportSequence(q, busy, st, nullptr, nullptr, &err), err.c_str());
+            QFile script(dir.filePath("read.swift"));
+            QVERIFY(script.open(QIODevice::WriteOnly));
+            script.write("import AVFoundation\n"
+                         "import CoreVideo\n"
+                         "let args = CommandLine.arguments\n"
+                         "let asset = AVURLAsset(url: URL(fileURLWithPath: args[1]))\n"
+                         "guard let track = asset.tracks(withMediaType: .video).first else { exit(2) }\n"
+                         "guard let reader = try? AVAssetReader(asset: asset) else { exit(3) }\n"
+                         "let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: "
+                         "NSNumber(value: kCVPixelFormatType_4444AYpCbCr16)])\n"
+                         "reader.add(output)\n"
+                         "if !reader.startReading() { exit(4) }\n"
+                         "var data = Data()\n"
+                         "var frames = 0\n"
+                         "while let sample = output.copyNextSampleBuffer() {\n"
+                         "    guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }\n"
+                         "    CVPixelBufferLockBaseAddress(buffer, .readOnly)\n"
+                         "    let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer), stride = CVPixelBufferGetBytesPerRow(buffer)\n"
+                         "    let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)\n"
+                         "    for y in 0..<h { data.append(base.advanced(by: y * stride), count: w * 8) }\n"
+                         "    CVPixelBufferUnlockBaseAddress(buffer, .readOnly)\n"
+                         "    frames += 1\n"
+                         "}\n"
+                         "try! data.write(to: URL(fileURLWithPath: args[2]))\n"
+                         "print(frames)\n");
+            script.close();
+            QProcess swift;
+            swift.start("xcrun", {"swift", script.fileName(), QString::fromStdString(st.path), dir.filePath("frames.y416")});
+            QVERIFY(swift.waitForFinished(600000));
+            QVERIFY2(swift.exitCode() == 0, swift.readAllStandardError().constData());
+            QCOMPARE(swift.readAllStandardOutput().trimmed(), QByteArray("2"));
+            QFile raw(dir.filePath("frames.y416"));
+            QVERIFY(raw.open(QIODevice::ReadOnly));
+            const QByteArray theirs = raw.readAll();
+            QCOMPARE(theirs.size(), qsizetype(1280) * 720 * 8 * 2);
+            int64_t k = 0, over = 0, total = 0;
+            int worst = 0;
+            QCOMPARE(decodeMxfPictures(st.path, [&](const AVFrame*, const AVPacket* pkt) {
+                         prores::OwnDecoded own;
+                         const std::vector<uint8_t> bytes(pkt->data, pkt->data + pkt->size);
+                         if (!prores::decodeOwn(bytes.data(), bytes.size(), own)) return false;
+                         const auto* px = reinterpret_cast<const uint16_t*>(theirs.constData()) + size_t(k++) * 1280 * 720 * 4;
+                         for (size_t i = 0; i < size_t(1280) * 720; ++i) {
+                             // (A, Y', Cb, Cr, each 16 bits; Y'CbCr to 12 bits, alpha to 12 as well)
+                             const int d[4] = {std::abs(((px[i * 4 + 1] + 8) >> 4) - own.y[i]), std::abs(((px[i * 4 + 2] + 8) >> 4) - own.cb[i]),
+                                               std::abs(((px[i * 4 + 3] + 8) >> 4) - own.cr[i]), std::abs(((px[i * 4] + 8) >> 4) - ((own.alpha[i] + 8) >> 4))};
+                             for (int v : d) {
+                                 worst = std::max(worst, v);
+                                 over += v > 1;
+                                 ++total;
+                             }
+                         }
+                         return true;
+                     }),
+                     int64_t(2));
+            QVERIFY2(worst <= 2 && over * 1000 <= total, qPrintable(QStringLiteral("worst %1, %2 of %3 more than a code apart").arg(worst).arg(over).arg(total)));
+        }
+#endif
+    }
+
+    void interlacedFieldsAtTheirOwnMoments() {
+        // A white bar moving 16 px a frame across black: in an interlaced export each frame's second field shows it 8 px
+        // further on than its first, where half a frame's time puts it (rendered from the sequence at twice its rate);
+        // segmented (PsF), both fields show the frame's. Through ProRes exports (10 and 12 bits) and IMF Application
+        // ProRes with the top field first and with the bottom first.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        Clip bar = colorClip(p, 1, 1, 1, 0, 6);
+        bar.motion.params["scale_x"] = 10.0;
+        bar.motion.params["pos_x"].addKey(0, -100);
+        bar.motion.params["pos_x"].addKey(10, 60);
+        s.videoTracks[0].clips = {bar};
+        // (the bar's left edge: 160 - 100 + 16 t - 16 at time t)
+        RenderOptions ro;
+        ro.highQuality = true;
+        auto edgeOf = [](const Image& img, int y) {
+            for (int x = 0; x < img.width; ++x)
+                if (img.at(x, y)[1] > 0.5f) return x;
+            return -1;
+        };
+        const Sequence twice = fieldRateSequence(s);
+        QCOMPARE(twice.fps, (Rational{50, 1}));
+        for (int k = 0; k < 6; ++k) {
+            QCOMPARE(edgeOf(renderProgramFrame(p, s, k, ro), 90), 44 + 16 * k);
+            QCOMPARE(edgeOf(renderProgramFrame(p, twice, 2 * k, ro), 90), 44 + 16 * k);
+            QCOMPARE(edgeOf(renderProgramFrame(p, twice, 2 * k + 1, ro), 90), 52 + 16 * k);
+        }
+        // The bar's edge on a line of a decoded frame (Y' over mid grey).
+        auto lineEdge = [](const AVFrame* f, int y) {
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+            const int mid = 1 << (d->comp[0].depth - 1);
+            const auto* row = reinterpret_cast<const uint16_t*>(f->data[0] + size_t(y) * size_t(f->linesize[0]));
+            for (int x = 0; x < f->width; ++x)
+                if (row[x] > mid) return x;
+            return -1;
+        };
+        // first: the line of the first field (in time) looked at, second: the other's.
+        auto fieldsRight = [&](const std::string& path, int firstLine, int secondLine, int secondShift) {
+            int64_t k = 0;
+            return decodeMxfPictures(path, [&](const AVFrame* f, const AVPacket*) {
+                       const int a = lineEdge(f, firstLine), b = lineEdge(f, secondLine);
+                       const int want = 44 + 16 * int(k++);
+                       return std::abs(a - want) <= 1 && std::abs(b - (want + secondShift)) <= 1;
+                   }) == 6;
+        };
+        QTemporaryDir dir;
+        std::string err;
+        for (bool twelve : {false, true}) {
+            if (!twelve && !prores::encoderAvailable()) continue;
+            for (bool segmented : {false, true}) {
+                ExportSettings st;
+                st.videoCodec = "prores_ks";
+                st.profile = twelve ? "4444" : "hq";
+                if (twelve) st.pixFmt = "yuv444p12le";
+                st.audioCodec = "none";
+                st.interlaced = true;
+                st.segmentedFields = segmented;
+                st.path = dir.filePath(QStringLiteral("bar%1%2.mov").arg(twelve).arg(segmented)).toStdString();
+                QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+                // (the top field first: line 90's, then line 91's half a frame on)
+                QVERIFY2(fieldsRight(st.path, 90, 91, segmented ? 0 : 8), qPrintable(QStringLiteral("12 bits %1, segmented %2").arg(twelve).arg(segmented)));
+            }
+        }
+        if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder for IMF's interlaced 422");
+        for (const char* order : {"tff", "bff"}) {
+            ImfSettings st;
+            st.title = std::string("Fields ") + order;
+            st.captions = false;
+            st.application = 45;
+            st.prores = "hq";
+            st.fields = order;
+            ImfResult r;
+            QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+            QVERIFY(r.frames >= 6);
+            const std::vector<std::string> issues = verifyImf(r.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QDir out(QString::fromStdString(r.folder));
+            const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+            int64_t k = 0;
+            const bool top = std::string(order) == "tff";
+            const int64_t n = decodeMxfPictures(video, [&](const AVFrame* f, const AVPacket*) {
+                if (k >= 6) return true;  // (black after the programme)
+                const int first = lineEdge(f, top ? 90 : 91), second = lineEdge(f, top ? 91 : 90);
+                const int want = 44 + 16 * int(k++);
+                return std::abs(first - want) <= 1 && std::abs(second - (want + 8)) <= 1;
+            });
+            QVERIFY2(n == r.frames && k == 6, order);
         }
     }
 

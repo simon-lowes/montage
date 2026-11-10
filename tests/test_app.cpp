@@ -131,6 +131,8 @@
 #include "render/Titles.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
+#include "render/OfxRemote.h"
+#include "OfxOverlay.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
 #include "PanFollowDialog.h"
@@ -9240,7 +9242,7 @@ private slots:
             QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-prores")}, {"application", "prores"},
                                                 {"prores_profile", "4444"}, {"fields", "bff"}})
                         .value("isError").toBool());
-            // Application DPP: 422 HQ in HD, a programme unless asked; its 4:4:4 (12 bits) refused.
+            // Application DPP: 422 HQ in HD, a programme unless asked.
             r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"title", "DPP"},
                                             {"application", "dpp_prores"}, {"size", "hd"}});
             QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
@@ -9251,8 +9253,15 @@ private slots:
             ImfComposition dc;
             std::string why;
             QVERIFY(readImfComposition(dpp.value("cpl").toString().toStdString(), dc, &why) && dc.application == 59 && dc.contentKind == "programme");
-            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"application", "dpp_prores"},
+            // Its 4:4:4 at 12 bits (Montage's own ProRes encoder); at 10 refused.
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp444")}, {"application", "dpp_prores"},
                                             {"size", "hd"}, {"prores_profile", "4444"}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject dpp444 = r.value("structuredContent").toObject();
+            QVERIFY2(dpp444.value("problems").toArray().isEmpty() && dpp444.value("prores_profile").toString() == "4444" && dpp444.value("bits").toInt() == 12,
+                     QJsonDocument(dpp444).toJson().constData());
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-dpp")}, {"application", "dpp_prores"},
+                                            {"size", "hd"}, {"prores_profile", "4444"}, {"bits", 10}});
             QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("12 bits"));
         }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
@@ -9314,8 +9323,8 @@ private slots:
                           !dlg->findChild<QComboBox*>("imfColour")->isEnabled();
                 application->setCurrentIndex(application->findData(2));
             }
-            // Application ProRes: fields for 4:2:2, Y'CbCr and full range for 4:4:4. Application DPP: 422 HQ, progressive, HD
-            // or UHD, its own content kinds, the ProRes choices fixed.
+            // Application ProRes: fields for 4:2:2, Y'CbCr, full range and 12 bits for 4:4:4. Application DPP: 422 HQ, 4444
+            // or 4444 XQ, progressive, HD or UHD, its own content kinds, the other ProRes choices fixed.
             if (offered && prores::encoderAvailable()) {
                 auto* profile = dlg->findChild<QComboBox*>("imfProResProfile");
                 auto* fieldsBox = dlg->findChild<QComboBox*>("imfFields");
@@ -9323,23 +9332,29 @@ private slots:
                 auto* full = dlg->findChild<QCheckBox*>("imfFullRange");
                 auto* kindBox = dlg->findChild<QComboBox*>("imfKind");
                 auto* sizeBox = dlg->findChild<QComboBox*>("imfSize");
-                application->setCurrentIndex(application->findData(45));
-                profile->setCurrentIndex(profile->findData("hq"));
-                offered = fieldsBox->isEnabled() && !ycbcr->isEnabled() && !full->isEnabled();
-                profile->setCurrentIndex(profile->findData("4444"));
-                offered = offered && !fieldsBox->isEnabled() && ycbcr->isEnabled() && full->isEnabled();
-                ycbcr->setChecked(true);
-                offered = offered && !full->isEnabled();
-                application->setCurrentIndex(application->findData(59));
-                offered = offered && profile->currentData().toString() == "hq" && !profile->isEnabled() && !fieldsBox->isEnabled() &&
-                          !ycbcr->isChecked() && kindBox->findData("programme") >= 0 && kindBox->findData("feature") < 0 &&
-                          (sizeBox->currentData().toString() == "hd" || sizeBox->currentData().toString() == "uhd");
-                // (4K and P3-D65 PQ not offered; the ProRes choices given back on leaving)
-                auto* colourBox = dlg->findChild<QComboBox*>("imfColour");
+                auto* depth = dlg->findChild<QComboBox*>("imfBits");
                 auto enabled = [](QComboBox* box, const char* value) {
                     auto* m = qobject_cast<QStandardItemModel*>(box->model());
                     return m && m->item(box->findData(QString::fromLatin1(value)))->isEnabled();
                 };
+                application->setCurrentIndex(application->findData(45));
+                profile->setCurrentIndex(profile->findData("hq"));
+                offered = fieldsBox->isEnabled() && !ycbcr->isEnabled() && !full->isEnabled() && !depth->isEnabled();
+                // (4:4:4 at 10 or 12 bits)
+                profile->setCurrentIndex(profile->findData("4444"));
+                offered = offered && !fieldsBox->isEnabled() && ycbcr->isEnabled() && full->isEnabled() && depth->isEnabled();
+                ycbcr->setChecked(true);
+                offered = offered && !full->isEnabled();
+                application->setCurrentIndex(application->findData(59));
+                offered = offered && profile->currentData().toString() == "hq" && profile->isEnabled() && !enabled(profile, "lt") &&
+                          !enabled(profile, "422") && enabled(profile, "4444xq") && !fieldsBox->isEnabled() && !ycbcr->isChecked() &&
+                          !depth->isEnabled() && kindBox->findData("programme") >= 0 && kindBox->findData("feature") < 0 &&
+                          (sizeBox->currentData().toString() == "hd" || sizeBox->currentData().toString() == "uhd");
+                // (DPP's 4:4:4, at 12 bits, chosen and kept)
+                profile->setCurrentIndex(profile->findData("4444xq"));
+                offered = offered && profile->currentData().toString() == "4444xq" && !ycbcr->isEnabled() && !full->isEnabled() && !depth->isEnabled();
+                // (4K and P3-D65 PQ not offered; the ProRes choices given back on leaving)
+                auto* colourBox = dlg->findChild<QComboBox*>("imfColour");
                 offered = offered && !enabled(sizeBox, "4k") && enabled(sizeBox, "uhd") && !enabled(colourBox, "p3d65-pq") && enabled(colourBox, "rec2020-hlg");
                 application->setCurrentIndex(application->findData(45));
                 offered = offered && profile->currentData().toString() == "4444" && ycbcr->isChecked() && enabled(sizeBox, "4k");
@@ -14371,6 +14386,50 @@ const auto seq = [this] { return state()->sequence(); };
         // A press away from the square is left to the monitor (no step).
         QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.1, 0.1));
         QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
+        // With plug-ins in hosts of their own the control runs in the probe's host, which draws it there: the same
+        // drag is the same one undo step, and one undo puts it back.
+        {
+            const plugins::HostingSettings was = plugins::hosting();
+            plugins::setHostExecutable(MONTAGE_PLUGIN_HOST);
+            plugins::HostingSettings hosted = was;
+            hosted.isolation = plugins::Isolation::PerPlugin;
+            plugins::setHosting(hosted);
+            plugins::clearHostFailures();
+            Id probeInHost = 0;
+            QVERIFY(state()->edit("Probe in a host", [&](Project& p, Sequence& s) {
+                ofx::PluginDesc d;
+                if (!reg.find("org.montage.test.probe/1", d)) return false;
+                Effect e = ofx::makeEffect(p, d);
+                e.params["param.centre.x"].addKey(0, 0.5);
+                e.params["param.centre.y"].addKey(0, 0.25);
+                probeInHost = e.id;
+                auto& fx = edit::clipById(s, clip)->effects;
+                fx.clear();
+                fx.push_back(e);
+                return true;
+            }));
+            auto* overlay = viewer->findChild<OfxOverlay*>();
+            QVERIFY(overlay);
+            viewer->update();
+            QTRY_VERIFY_WITH_TIMEOUT(overlay->inHost(clip, probeInHost), 20000);
+            QVERIFY(!overlay->unresponsive(clip, probeInHost));
+            const size_t hostedSteps = state()->history().undoCount();
+            QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.75));
+            QTest::mouseMove(viewer, at(0.55, 0.6));
+            QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.6, 0.5));
+            QCOMPARE(state()->history().undoCount(), hostedSteps + 1);
+            QCOMPARE(state()->undoText(), QString("Adjust Test Probe"));
+            QVERIFY2(std::fabs(centre().at("param.centre.x").at(10) - 0.6) < px, qPrintable(QString::number(centre().at("param.centre.x").at(10))));
+            QVERIFY(std::fabs(centre().at("param.centre.y").at(10) - 0.5) < px * 2);
+            state()->undo();
+            QCOMPARE(centre().at("param.centre.x").keys.size(), size_t(1));
+            QCOMPARE(centre().at("param.centre.x").at(10), 0.5);
+            state()->newProject();
+            QCoreApplication::processEvents();
+            ofx::remote::releaseIdle();
+            plugins::setHosting(was);
+            plugins::clearHostFailures();
+        }
         state()->newProject();
     }
 
