@@ -8686,8 +8686,8 @@ void MainWindow::exportImfDialog() {
         const bool proresApp = application->currentData().toInt() == 45 || dpp;
         size->setEnabled(!supplemental->isChecked());
         colour->setEnabled(!supplemental->isChecked() && !aces);
-        for (QWidget* w : {static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)}) w->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
-        // (Application DPP: 422 HQ here, progressive, narrow range; its 4:4:4 is 12 bits, which no encoder here makes)
+        coding->setEnabled(!supplemental->isChecked() && !aces && !proresApp);
+        // (Application DPP: 422 HQ at 10 bits or 4444 and 4444 XQ R'G'B' at 12, progressive, narrow range)
         // Application DPP takes HD or UHD and no P3-D65 PQ: the others greyed out while it is chosen.
         auto offer = [](QComboBox* box, const char* value, bool on) {
             if (auto* m = qobject_cast<QStandardItemModel*>(box->model()))
@@ -8695,7 +8695,10 @@ void MainWindow::exportImfDialog() {
         };
         for (const char* v : {"sequence", "4k"}) offer(size, v, !dpp);
         offer(colour, "p3d65-pq", !dpp);
-        if (dpp && !beforeDpp->kept) *beforeDpp = {true, proresProfile->currentIndex(), fields->currentIndex(), ycbcr444->isChecked(), fullRange->isChecked()};
+        offer(proresProfile, "422", !dpp);
+        offer(proresProfile, "lt", !dpp);
+        const bool enteringDpp = dpp && !beforeDpp->kept;
+        if (enteringDpp) *beforeDpp = {true, proresProfile->currentIndex(), fields->currentIndex(), ycbcr444->isChecked(), fullRange->isChecked()};
         if (!dpp && beforeDpp->kept) {
             const BeforeDpp was = *beforeDpp;
             beforeDpp->kept = false;
@@ -8706,15 +8709,18 @@ void MainWindow::exportImfDialog() {
         }
         if (dpp) {
             if (colour->currentData().toString() == "p3d65-pq") colour->setCurrentIndex(colour->findData("rec2020-pq"));
-            proresProfile->setCurrentIndex(proresProfile->findData("hq"));
+            const QString chosen = proresProfile->currentData().toString();
+            if (enteringDpp || (chosen != "hq" && chosen != "4444" && chosen != "4444xq")) proresProfile->setCurrentIndex(proresProfile->findData("hq"));
             fields->setCurrentIndex(0);
             ycbcr444->setChecked(false);
             fullRange->setChecked(false);
             if (size->currentData().toString() != "hd" && size->currentData().toString() != "uhd")
                 size->setCurrentIndex(size->findData(s->width > 1920 || s->height > 1080 ? "uhd" : "hd"));
         }
-        proresProfile->setEnabled(!supplemental->isChecked() && proresApp && !dpp);
+        proresProfile->setEnabled(!supplemental->isChecked() && proresApp);
         const bool fourFourFour = prores::fourFourFour(prores::profileOf(proresProfile->currentData().toString().toStdString()));
+        // (the depth: JPEG 2000's choice; Application ProRes's 4:4:4 at 10 or 12 bits, its 4:2:2 at 10; DPP's by profile)
+        bits->setEnabled(!supplemental->isChecked() && !aces && (!proresApp || (!dpp && fourFourFour)));
         fields->setEnabled(!supplemental->isChecked() && proresApp && !dpp && !fourFourFour);
         ycbcr444->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour);
         fullRange->setEnabled(!supplemental->isChecked() && proresApp && !dpp && fourFourFour && !ycbcr444->isChecked());
@@ -8785,7 +8791,10 @@ void MainWindow::exportImfDialog() {
     }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
-    st.bits = st.application == 45 || st.application == 59 ? 10 : bits->currentData().toInt();
+    // (Application ProRes: 10 bits unless 12 are chosen for 4:4:4; Application DPP: 10 for 422 HQ, 12 for 4:4:4)
+    if (st.application == 59) st.bits = 0;
+    else if (st.application == 45) st.bits = bits->isEnabled() && bits->currentData().toInt() == 12 ? 12 : 10;
+    else st.bits = bits->currentData().toInt();
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();

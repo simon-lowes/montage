@@ -1,6 +1,8 @@
 // Montage — ProRes pictures one at a time (render/ProRes.h).
 #include "render/ProRes.h"
 
+#include "media/ProResEncoder.h"
+
 #include <algorithm>
 #include <cstring>
 #include <thread>
@@ -78,7 +80,37 @@ bool colourCodes(const std::string& c, ColourCodes& out) {
 
 bool encoderAvailable() { return avcodec_find_encoder_by_name("prores_ks") != nullptr; }
 
+// R'G'B' (16 bits, full range) to Y'CbCr at 12 bits through a matrix_coefficients code's matrix, narrow range (Y' 256
+// to 3760, the colour differences 256 to 3840) or full (0 to 4095, the differences about 2048), as ITU-T H.273 has it.
+void toYCbCr12(const uint16_t* rgb, int width, int height, int matrix, bool fullRange, std::vector<uint16_t>& y, std::vector<uint16_t>& cb,
+               std::vector<uint16_t>& cr) {
+    const double kr = matrix == 9 || matrix == 10 ? 0.2627 : matrix == 5 || matrix == 6 ? 0.299 : 0.2126;
+    const double kb = matrix == 9 || matrix == 10 ? 0.0593 : matrix == 5 || matrix == 6 ? 0.114 : 0.0722;
+    const double kg = 1 - kr - kb;
+    const double ys = fullRange ? 4095 : 3504, yo = fullRange ? 0 : 256, cs = fullRange ? 4095 : 3584;
+    const size_t n = size_t(width) * size_t(height);
+    y.resize(n);
+    cb.resize(n);
+    cr.resize(n);
+    const int threads = std::max(1, std::min(int(std::thread::hardware_concurrency()), height / 64 + 1));
+    std::vector<std::thread> pool;
+    for (int t = 0; t < threads; ++t)
+        pool.emplace_back([&, t] {
+            for (size_t i = n * size_t(t) / size_t(threads), end = n * size_t(t + 1) / size_t(threads); i < end; ++i) {
+                const double r = rgb[i * 3] / 65535.0, g = rgb[i * 3 + 1] / 65535.0, b = rgb[i * 3 + 2] / 65535.0;
+                const double l = kr * r + kg * g + kb * b;
+                y[i] = uint16_t(std::clamp(std::lround(yo + ys * l), 0L, 4095L));
+                cb[i] = uint16_t(std::clamp(std::lround(2048 + cs * (b - l) / (2 * (1 - kb))), 0L, 4095L));
+                cr[i] = uint16_t(std::clamp(std::lround(2048 + cs * (r - l) / (2 * (1 - kr))), 0L, 4095L));
+            }
+        });
+    for (std::thread& t : pool) t.join();
+}
+
 struct Encoder::Impl {
+    std::unique_ptr<OwnEncoder> own;  // (12 bits)
+    int matrix = 1;
+    std::vector<uint16_t> y, cb, cr;
     AVCodecContext* ctx = nullptr;
     AVFrame* frame = nullptr;
     AVPacket* packet = nullptr;
@@ -105,6 +137,31 @@ bool Encoder::open(int width, int height, int profile, const std::string& imfCol
     if (coding.fields < 0 || coding.fields > 2) return failWith(error, "Fields are 0 (progressive), 1 (the top first) or 2 (the bottom first)");
     if (coding.fields && height % 2) return failWith(error, "Interlaced ProRes pictures here have an even height");
     if (coding.alpha && !fourFourFour(profile)) return failWith(error, "Only ProRes 4444 and 4444 XQ carry alpha");
+    if (coding.bits != 10 && coding.bits != 12) return failWith(error, "ProRes pictures here are 10 or 12 bits");
+    if (coding.bits == 12) {
+        // Montage's own encoder: 4444 and 4444 XQ at 12 bits.
+        if (!fourFourFour(profile)) return failWith(error, "12-bit ProRes is 4444 or 4444 XQ");
+        auto d = std::make_unique<Impl>();
+        d->width = width;
+        d->height = height;
+        d->coding = coding;
+        d->matrix = codes.matrix;
+        OwnSettings os;
+        os.width = width;
+        os.height = height;
+        os.profile = profile;
+        os.fields = coding.fields;
+        os.primaries = codes.primaries;
+        os.transfer = codes.transfer;
+        os.matrix = codes.matrix;
+        os.alpha = coding.alpha;
+        os.frameRateCode = frameRateCode(coding.fps);
+        os.threads = coding.threads;
+        d->own = std::make_unique<OwnEncoder>();
+        if (!d->own->open(os, error)) return false;
+        d_ = std::move(d);
+        return true;
+    }
     const AVCodec* codec = avcodec_find_encoder_by_name("prores_ks");
     if (!codec) return failWith(error, "This build of FFmpeg has no ProRes encoder");
     auto d = std::make_unique<Impl>();
@@ -165,6 +222,17 @@ bool Encoder::open(int width, int height, int profile, const std::string& imfCol
 bool Encoder::encode(const uint16_t* rgb, const uint16_t* alpha, std::vector<uint8_t>& out, std::string* error) {
     if (!d_) return failWith(error, "The ProRes encoder is not open");
     if (alpha && !d_->coding.alpha) return failWith(error, "The ProRes encoder was opened without alpha");
+    if (d_->own) {
+        toYCbCr12(rgb, d_->width, d_->height, d_->matrix, d_->coding.fullRange, d_->y, d_->cb, d_->cr);
+        PlanarPicture pic;
+        pic.y = d_->y.data();
+        pic.cb = d_->cb.data();
+        pic.cr = d_->cr.data();
+        pic.yStride = pic.cStride = d_->width;
+        pic.alpha = alpha;
+        pic.aStride = d_->width;
+        return d_->own->encode(pic, out, error);
+    }
     if (av_frame_make_writable(d_->frame) < 0) return failWith(error, "Out of memory");
     const uint8_t* src[4] = {reinterpret_cast<const uint8_t*>(rgb), nullptr, nullptr, nullptr};
     const int stride[4] = {d_->width * 6, 0, 0, 0};
@@ -186,6 +254,32 @@ bool Encoder::encode(const uint16_t* rgb, const uint16_t* alpha, std::vector<uin
     av_packet_unref(d_->packet);
     return true;
 }
+
+bool Encoder::encodeFields(const uint16_t* first, const uint16_t* firstAlpha, const uint16_t* second, const uint16_t* secondAlpha,
+                           std::vector<uint8_t>& out, std::string* error) {
+    if (!d_) return failWith(error, "The ProRes encoder is not open");
+    if (!d_->coding.fields) return failWith(error, "The ProRes encoder was opened for progressive frames");
+    // (the first field's lines, the top ones when the top comes first, from the first picture; the others from the second)
+    const int W = d_->width, H = d_->height;
+    const int firstParity = d_->coding.fields == 1 ? 0 : 1;
+    std::vector<uint16_t> rgb(size_t(W) * size_t(H) * 3), alpha;
+    const bool withAlpha = d_->coding.alpha && (firstAlpha || secondAlpha);
+    if (withAlpha) alpha.resize(size_t(W) * size_t(H));
+    for (int y = 0; y < H; ++y) {
+        const bool fromFirst = (y & 1) == firstParity;
+        const uint16_t* src = (fromFirst ? first : second) + size_t(y) * size_t(W) * 3;
+        std::copy(src, src + size_t(W) * 3, rgb.begin() + std::ptrdiff_t(size_t(y) * size_t(W) * 3));
+        if (withAlpha) {
+            const uint16_t* a = fromFirst ? firstAlpha : secondAlpha;
+            uint16_t* dst = alpha.data() + size_t(y) * size_t(W);
+            if (a) std::copy(a + size_t(y) * size_t(W), a + size_t(y + 1) * size_t(W), dst);
+            else std::fill(dst, dst + W, uint16_t(65535));
+        }
+    }
+    return encode(rgb.data(), withAlpha ? alpha.data() : nullptr, out, error);
+}
+
+std::vector<uint8_t> Encoder::lastQuantization() const { return d_ && d_->own ? d_->own->lastQuantization() : std::vector<uint8_t>{}; }
 
 bool decode(const uint8_t* data, size_t size, std::vector<uint16_t>& rgb, int& width, int& height, std::string* error) {
     return decode(data, size, false, rgb, nullptr, width, height, error);

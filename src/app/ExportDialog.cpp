@@ -300,7 +300,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     }
     interlaced_ = new QCheckBox(tr("Interlaced, top field first"), form_);
     interlaced_->setObjectName(QStringLiteral("exportInterlaced"));
-    interlaced_->setToolTip(tr("Coded as two fields, the top first (each picture as both fields: PsF), as 1080i deliveries ask"));
+    interlaced_->setToolTip(tr("Coded as two fields, the top first, each rendered at its own moment half a frame apart, as 1080i deliveries ask"));
     interlaced_->setChecked(appSettings().value("export/interlaced", false).toBool());
     form->addRow(QString(), interlaced_);
     {

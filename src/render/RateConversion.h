@@ -58,6 +58,12 @@ DeliveredPicture deliveredPicture(const RateConversion& c, int64_t o, int64_t fr
 // on the delivered frames too, for where its cuts fall (it is rendered and mixed as the programme, not as this).
 Sequence deliveredSequence(const Sequence& seq, const RateConversion& c, FrameTime in, FrameTime out);
 
+// The sequence at twice its frame rate, every time in it on the new frames (its clips, their sources, keyframes and
+// expressions' starts, its transitions, markers, captions and grades' keys): its frame 2f is the sequence's frame f,
+// 2f + 1 the moment half a frame after it. An interlaced delivery's second fields are rendered from it, each at its
+// own time. (Effects that count in frames rather than keys, such as an echo's, count fields there.)
+Sequence fieldRateSequence(const Sequence& seq);
+
 // Whether programme frames f - 1 and f are either side of an edit: a clip starting or ending there on a video track
 // that is shown, with no transition across it.
 bool editBetween(const Sequence& seq, FrameTime f);

@@ -78,7 +78,7 @@ struct ImfSettings {
     std::string language = "en";   // the sound's and the annotations' (RFC 5646)
     std::string colour;            // "rec709", "p3d65-pq", "rec2020-pq", "rec2020-hlg"; empty: as the sequence is
     std::string size = "sequence";  // "sequence", "hd" (1920 x 1080), "uhd" (3840 x 2160), "4k" (4096 x 2160)
-    int bits = 0;                  // 10 or 12 (0: 10 for SDR, 12 for HDR)
+    int bits = 0;                  // 10 or 12 (0: 10 for SDR, 12 for HDR; ProRes 10, but Application DPP's 4:4:4 12)
     bool lossless = true;          // the reversible profiles; else lossy within megabitsPerSecond
     bool htj2k = false;            // High-Throughput JPEG 2000 (ST 2067-21:2023; lossless only): far faster to code and decode
     double megabitsPerSecond = 400;
@@ -96,21 +96,24 @@ struct ImfSettings {
     Id originalSequence = 0;
     // The IMF application: 2 (#2E, JPEG 2000 in the colour above), 5 (#5, an archival master in ACES 2065-1, where the
     // colour, depth and coding above do not apply), 45 (Application ProRes, SMPTE RDD 45: ProRes pictures in the colour
-    // above, 10 bits, in the profile below) or 59 (Application DPP (ProRes), SMPTE RDD 59-1: 422 HQ at 1920 x 1080 or
-    // 3840 x 2160, progressive, Rec.709, Rec.2020 PQ or HLG; its 4:4:4 is 12 bits, which FFmpeg's encoder does not make).
+    // above, in the profile below: 10 bits, or 12 with 4444 and 4444 XQ, which Montage's own encoder codes) or 59
+    // (Application DPP (ProRes), SMPTE RDD 59-1: 422 HQ at 10 bits, or 4444 or 4444 XQ R'G'B' at 12, at 1920 x 1080 or
+    // 3840 x 2160, progressive, Rec.709, Rec.2020 PQ or HLG).
     int application = 2;
     // Application ProRes: the profile ("lt", "422", "hq" as 4:2:2 Y'CbCr; "4444", "4444xq" as 4:4:4 R'G'B'). 4:2:2
     // takes pictures to 3840 x 2160 in Rec.709, Rec.2020 PQ or HLG at up to 60 fps; 4:4:4 to 4096 x 3112 in any of the
     // colours, at up to 120.
     std::string prores = "hq";
     // Application ProRes: "" progressive, or interlaced as two fields of each picture, "tff" the top field first or "bff"
-    // the bottom first (4:2:2 to 1920 x 1080 at 25, 29.97 or 30 in Rec.709, RDD 45 Table 1). The fields are the halves
-    // of the frame rendered (segmented, as 1080i deliveries of progressive programmes are), not two moments.
+    // the bottom first (4:2:2 to 1920 x 1080 at 25, 29.97 or 30 in Rec.709, RDD 45 Table 1). Each field is rendered at
+    // its own moment, the second half a frame after the first; with `segmentedFields`, both are the halves of one
+    // picture (as 1080i deliveries of progressive programmes are).
     std::string fields;
+    bool segmentedFields = false;
     // Application ProRes: 4444 or 4444 XQ described as Y'CbCr 4:4:4 (a CDCI descriptor) rather than R'G'B' (to 1920 x
     // 1080, progressive, Rec.709, narrow range).
     bool ycbcr444 = false;
-    // Application ProRes: 4:4:4 R'G'B' over the full range (QE.2: 0 to 1023) rather than 64 to 940 (QE.1).
+    // Application ProRes: 4:4:4 R'G'B' over the full range (QE.2: 0 to the top code) rather than 64 to 940 (QE.1, scaled).
     bool fullRange = false;
     // Application #5: the grade in the pictures; false leaves it off.
     bool graded = true;

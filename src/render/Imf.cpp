@@ -57,6 +57,9 @@ namespace montage {
 
 namespace {
 
+// A code of `bits` bits widened to 16, its top bits repeated below it.
+uint16_t widened(uint16_t v, int bits) { return uint16_t(v << (16 - bits) | v >> (2 * bits - 16)); }
+
 QString urn(const dcp::Uuid& u) { return QStringLiteral("urn:uuid:") + QString::fromStdString(dcp::uuidString(u)); }
 
 // "060e2b34040101..." as "urn:smpte:ul:060e2b34.04010101....".
@@ -1088,7 +1091,6 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     const bool dpp = settings.application == 59;
     const bool proresApp = settings.application == 45 || dpp;
     if (settings.application == 2 && !openJpegAvailable()) return fail("This build of Montage has no OpenJPEG, which IMF masters are coded with");
-    if (proresApp && !prores::encoderAvailable()) return fail("This build of FFmpeg has no ProRes encoder");
     if (aces && !exrAvailable()) return fail("This build of Montage has no OpenEXR library, which archival masters are written with");
     if (!validKind(settings.kind) && !(dpp && dppKind(settings.kind))) return fail("Unknown content kind " + settings.kind);
     std::string err;
@@ -1114,7 +1116,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             return fail("The earlier package is " + appName(old.application) + "; a supplemental keeps its application");
         if (!oldPicture || old.width <= 0 || old.height <= 0 ||
             (aces        ? old.colour != "aces2065-1"
-             : proresApp ? old.bits != 10 || prores::profileOf(old.prores) < 2 || old.colour.empty()  // (12 bits: no encoder makes them)
+             : proresApp ? (old.bits != 10 && !(old.bits == 12 && prores::fourFourFour(prores::profileOf(old.prores)))) ||
+                               prores::profileOf(old.prores) < 2 || old.colour.empty()
                          : (old.bits != 10 && old.bits != 12) || !old.rsiz || old.colour.empty()))
             return fail("The earlier package's picture is not one Montage makes supplementals of");
         oldPaths = imfTrackFiles(settings.supplementOf);
@@ -1145,9 +1148,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         target = findColorSpace(spec->space);
         if (!target) return fail("Missing colour space " + std::string(spec->space));
         const bool hdrOut = target->hdr();
-        bits = supplemental ? old.bits : settings.bits ? settings.bits : (hdrOut && !proresApp ? 12 : 10);
+        // (Application DPP's 4:4:4 is 12 bits, its 4:2:2 10; Application ProRes is 10 unless 12 are asked for)
+        const bool dpp444 = dpp && prores::fourFourFour(prores::profileOf(settings.prores));
+        bits = supplemental ? old.bits : settings.bits ? settings.bits : dpp444 ? 12 : (hdrOut && !proresApp ? 12 : 10);
         if (bits != 10 && bits != 12) return fail("IMF pictures here are 10 or 12 bits");
-        if (proresApp && bits != 10) return fail("ProRes masters here are 10 bits");
         htj2k = !proresApp && (supplemental ? old.rsiz == kHtj2kRsiz : settings.htj2k);
         lossless = !proresApp && (supplemental ? htj2k || (old.rsiz & 0xff00) >= 0x0700 : settings.lossless);
         if (!proresApp && !lossless && !supplemental && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
@@ -1171,17 +1175,21 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         const double rateValue = double(canonical.num) / double(canonical.den);
         if (dpp) {
             if (proresProfile != 4 && !full) return fail("Application DPP takes ProRes 422 HQ, 4444 or 4444 XQ (RDD 59-1 Table 4)");
-            if (full)
-                return fail("Application DPP's 4:4:4 pictures are 12 bits (RDD 59-1 Table 2) and FFmpeg's ProRes encoder codes 10: DPP masters here are "
-                            "422 HQ");
+            if (full && bits != 12) return fail("Application DPP's 4:4:4 pictures are 12 bits (RDD 59-1 Table 2)");
+            if (!full && bits != 10) return fail("Application DPP's 422 HQ pictures are 10 bits (RDD 59-1 Table 2)");
             if (!((W == 1920 && H == 1080) || (W == 3840 && H == 2160)))
                 return fail("Application DPP pictures are 1920 x 1080 or 3840 x 2160 (choose HD or UHD)");
             if (colourId == "p3d65-pq") return fail("Application DPP has Rec.709, Rec.2020 PQ and HLG, not P3-D65 PQ");
             if (fields) return fail("Application DPP pictures are progressive");
-            if (ycbcr444 || fullRange) return fail("Application DPP's 422 HQ is Y'CbCr 4:2:2 in narrow range (QE.1)");
+            if (!full && (ycbcr444 || fullRange)) return fail("Application DPP's 422 HQ is Y'CbCr 4:2:2 in narrow range (QE.1)");
+            if (full && ycbcr444) return fail("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 2), not Y'CbCr");
+            if (fullRange && colourId == "rec2020-hlg") return fail("Application DPP's HLG is in narrow range only (QE.1, RDD 59-1 5.2.2)");
             if (rateValue > 61) return fail("Application DPP masters run at up to 60 fps");
         }
         if (proresProfile < 2) return fail("Application ProRes takes ProRes 422 LT, 422, 422 HQ, 4444 or 4444 XQ (lt, 422, hq, 4444 or 4444xq)");
+        // (12 bits: 4444 and 4444 XQ, by Montage's own encoder; 10 by FFmpeg's)
+        if (bits == 12 && !full) return fail("12-bit ProRes masters are 4444 or 4444 XQ (4:2:2 ProRes is 10 bits)");
+        if (bits == 10 && !prores::encoderAvailable()) return fail("This build of FFmpeg has no ProRes encoder");
         if (W % 2) return fail("ProRes masters here have an even width");
         if (!full && (W > 3840 || H > 2160)) return fail("ProRes 4:2:2 masters are at most 3840 x 2160 (4444 goes to 4096 x 3112)");
         if (full && (W > 4096 || H > 3112)) return fail("ProRes masters are at most 4096 x 3112");
@@ -1291,12 +1299,17 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     o.scale = scale;
     o.highQuality = true;
     const double maxCode = double((1 << bits) - 1);
-    // The picture of composition frame k: fitted inside the frame on black (black after the programme).
-    auto pictureAt = [&](int64_t k) {
+    // Interlaced: each frame's second field at its own moment, half a frame after the first, from the sequence at twice
+    // its rate (render/RateConversion.h); segmented, both fields are the halves of one picture.
+    const bool fieldsApart = fields && !settings.segmentedFields;
+    const Sequence fieldSeq = fieldsApart ? fieldRateSequence(s) : Sequence{};
+    // The picture of composition frame k (or, with `second`, of its second field): fitted inside the frame on black
+    // (black after the programme).
+    auto pictureAt = [&](int64_t k, bool second = false) {
         std::vector<uint16_t> rgb(size_t(W) * size_t(H) * 3, 0);
         Image frame;
         if (k < programme) {
-            frame = renderProgramFrame(p, s, first + k, o);
+            frame = second ? renderProgramFrame(p, fieldSeq, 2 * (first + k) + 1, o) : renderProgramFrame(p, s, first + k, o);
             if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
             if (target != &seqSpace) convertColor(frame, seqSpace, *target, peakNits);
         }
@@ -1477,9 +1490,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             }
             std::vector<uint16_t> mine = pictureAt(k);
             if (proresApp) {
+                std::vector<uint16_t> mine2 = fieldsApart ? pictureAt(k, true) : std::vector<uint16_t>{};
                 // (decoded to 16-bit R'G'B', compared at the master's 10 bits)
-                checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, fullRange, fields, proresProfile, colourId, mine = std::move(mine),
-                                                                   cs = std::move(cs)] {
+                checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, bits, fullRange, fields, proresProfile, colourId, fps,
+                                                                   mine = std::move(mine), mine2 = std::move(mine2), cs = std::move(cs)] {
                     try {
                         if (cs.empty()) return false;
                         {
@@ -1490,15 +1504,31 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                             prores::Coding coding;
                             coding.fields = fields;
                             coding.fullRange = fullRange;
-                            std::vector<uint16_t> rgb = mine;
-                            for (uint16_t& v : rgb) v = uint16_t(v << 6 | v >> 4);  // (10 bits to 16)
+                            coding.bits = bits;
+                            coding.fps = fps;
+                            coding.threads = 1;  // (one of several checks at once)
+                            std::vector<uint16_t> rgb = mine, rgb2 = mine2;
+                            for (uint16_t& v : rgb) v = widened(v, bits);
+                            for (uint16_t& v : rgb2) v = widened(v, bits);
                             std::vector<uint8_t> again;
-                            if (encoder.open(W, H, proresProfile, colourId, coding) && encoder.encode(rgb.data(), again) && again == cs) return true;
+                            if (encoder.open(W, H, proresProfile, colourId, coding) &&
+                                (rgb2.empty() ? encoder.encode(rgb.data(), again) : encoder.encodeFields(rgb.data(), nullptr, rgb2.data(), nullptr, again)) &&
+                                again == cs)
+                                return true;
                         }
                         std::vector<uint16_t> theirs;
                         int w = 0, h = 0;
                         if (!prores::decode(cs.data(), cs.size(), fullRange, theirs, nullptr, w, h) || w != W || h != H) return false;
-                        for (uint16_t& v : theirs) v = uint16_t(v >> 6);
+                        for (uint16_t& v : theirs) v = uint16_t(v >> (16 - bits));
+                        if (!mine2.empty()) {
+                            // (the second field's lines are the second picture's)
+                            std::vector<uint16_t> woven = mine;
+                            const int secondParity = fields == 1 ? 1 : 0;
+                            for (int y = secondParity; y < H; y += 2)
+                                std::copy(mine2.begin() + std::ptrdiff_t(size_t(y) * size_t(W) * 3), mine2.begin() + std::ptrdiff_t(size_t(y + 1) * size_t(W) * 3),
+                                          woven.begin() + std::ptrdiff_t(size_t(y) * size_t(W) * 3));
+                            return alikeTo(woven, theirs);
+                        }
                         return alikeTo(mine, theirs);
                     } catch (...) {
                         return false;
@@ -2052,7 +2082,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         pf.height = H;
         pf.profile = proresProfile;
         pf.rgb = prores::fourFourFour(proresProfile) && !ycbcr444;
-        pf.bits = 10;
+        pf.bits = bits;
         pf.fields = fields;
         pf.fullRange = fullRange;
         pf.colour = colour;
@@ -2064,6 +2094,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         prores::Coding coding;
         coding.fields = fields;
         coding.fullRange = fullRange;
+        coding.bits = bits;
+        coding.fps = fps;
         if (!encoder.open(W, H, proresProfile, colourId, coding, &err) ||
             !writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, pf, &err))
             return fail(err);
@@ -2071,8 +2103,15 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         std::vector<uint8_t> frame;
         for (int64_t j = 0; j < count; ++j) {
             std::vector<uint16_t> rgb = pictureAt(toCode[size_t(j)]);
-            for (uint16_t& v : rgb) v = uint16_t(v << 6 | v >> 4);  // (10 bits to 16)
-            if (!encoder.encode(rgb.data(), frame, &err) || !writer.write(frame.data(), frame.size(), &err)) return fail(err);
+            for (uint16_t& v : rgb) v = widened(v, bits);
+            std::vector<uint16_t> rgb2;
+            if (fieldsApart) {
+                rgb2 = pictureAt(toCode[size_t(j)], true);
+                for (uint16_t& v : rgb2) v = widened(v, bits);
+            }
+            if (!(fieldsApart ? encoder.encodeFields(rgb.data(), nullptr, rgb2.data(), nullptr, frame, &err) : encoder.encode(rgb.data(), frame, &err)) ||
+                !writer.write(frame.data(), frame.size(), &err))
+                return fail(err);
             if (progress && !progress(0.1 + 0.85 * double(j + 1) / double(count))) return fail("Stopped");
         }
         if (!writer.close(&err)) return fail(err);

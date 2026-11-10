@@ -205,9 +205,11 @@ struct ExportSettings {
     Rational rate{0, 1};          // the rate delivered (pulldown: 0 = 29.97 or 30 interlaced)
     std::string cadence = "2:3";  // pulldown: "2:3" or "2:2:2:4"
     bool rateKeepPitch = true;    // a speed change's sound keeps its pitch
-    // Coded as interlaced fields, the top first (each picture's two halves: PsF), as 1080i deliveries ask: MPEG-2,
-    // H.264 (AVC-Intra), ProRes and DNxHD.
+    // Coded as interlaced fields, the top first, as 1080i deliveries ask: MPEG-2, H.264 (AVC-Intra), ProRes and FFV1.
+    // Each field is rendered at its own moment, the second half a frame after the first (render/RateConversion.h
+    // fieldRateSequence); with `segmentedFields`, both are the halves of one picture (PsF).
     bool interlaced = false;
+    bool segmentedFields = false;
     // Broadcast MXF by the book (render/BroadcastMxf.h), for an .mxf in XDCAM HD422 (MPEG-2) or AVC-Intra, rewrapped
     // after the render with the EBU's bmx: "" = FFmpeg's OP1a as it writes it; "rdd9" = RDD 9 (XDCAM HD422);
     // AS-11 "as11-dpp" (UK DPP HD: AVC-Intra 100, 1080i25, coded interlaced whatever `interlaced` says), "as11-x2"
@@ -328,13 +330,13 @@ bool broadcastMxfJoinOptions(const Sequence& seq, const ExportSettings& s, Broad
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.
-// Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444
-// (or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
+// Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444 at
+// 12 bits (Montage's own encoder; or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error = nullptr,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, bool apv = false);
 // Interchange formats (EDL, OpenTimelineIO, FCP XML, AAF) get a compositing graph's clip as its rendered picture: each
 // clip of sequence `seq` in `p` with a graph (core/CompositeGraph.h) rendered, as the timeline shows its layer, to ProRes
-// 4444 with its transparency (the frame's size, its place in it baked in) in a folder beside `output` ("name
+// 4444 at 12 bits with its transparency (the frame's size, its place in it baked in) in a folder beside `output` ("name
 // Composites"), and replaced in `p` by that file, its blend mode kept. `p` is the export's own copy. `baked` gets how
 // many; false with `error` when one cannot be rendered.
 bool bakeCompositeClips(Project& p, Id seq, const std::string& output, std::string* error = nullptr, int* baked = nullptr,
