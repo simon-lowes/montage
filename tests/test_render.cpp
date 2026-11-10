@@ -747,6 +747,227 @@ int barEdge(const std::vector<uint16_t>& rgb, int width, int y) {
     return -1;
 }
 
+
+// A live MPEG-TS feed sent over SRT, as an encoder at a broadcast sends one: H.264 pictures (a bar moving on grey,
+// CEA-608 captions in their user data), two AAC sound streams in their languages (eng a 500 Hz tone, fra 800 Hz) and
+// a SCTE 35 stream (stream type 0x86, registered CUEI) carrying one splice_insert ahead of its splice, all in real time
+// from the stream's 10 s on. FFmpeg's muxer writes the pictures and sound; the cue's PID is added to its PMT and its
+// section sent between them, as FFmpeg's muxer does not carry SCTE 35.
+class LiveTsSender {
+public:
+    static constexpr int kCuePid = 0x1f0;
+    static constexpr int64_t kStart = 900000;  // (the first picture's PTS)
+    std::vector<Caption> captions;             // (frames at 25 fps)
+    double spliceSeconds = 8, cueAhead = 3, breakSeconds = 4;  // (from the first picture)
+    uint32_t eventId = 77;
+    std::string error;
+
+    bool start(const std::string& url, double seconds) {
+        if (!avcodec_find_encoder_by_name("libx264") || !avcodec_find_encoder(AV_CODEC_ID_AAC)) return error = "no libx264 or AAC encoder", false;
+        url_ = url, seconds_ = seconds;
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+    void stop() {
+        stopping_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+    ~LiveTsSender() { stop(); }
+    int64_t splicePts() const { return kStart + int64_t(std::llround(spliceSeconds * 90000)); }
+
+private:
+    std::string url_;
+    double seconds_ = 60;
+    std::thread thread_;
+    std::atomic<bool> stopping_{false};
+    AVIOContext* srt_ = nullptr;
+    int pmtPid_ = -1;
+    uint8_t cueCounter_ = 0;
+    std::vector<uint8_t> pending_;  // (the cue's TS packets, sent with the next write)
+
+    static uint32_t crc32(const uint8_t* d, size_t n) {
+        uint32_t crc = 0xffffffff;
+        for (size_t i = 0; i < n; ++i) {
+            crc ^= uint32_t(d[i]) << 24;
+            for (int b = 0; b < 8; ++b) crc = crc & 0x80000000u ? (crc << 1) ^ 0x04c11db7u : crc << 1;
+        }
+        return crc;
+    }
+    // A PMT packet with the cue's stream (and the CUEI registration) added.
+    void patchPmt(uint8_t* p) {
+        if (!(p[1] & 0x40)) return;  // (only a section's first packet)
+        int at = 4;
+        if (p[3] & 0x20) at += 1 + p[4];
+        at += 1 + p[at];  // (the pointer field)
+        uint8_t* sec = p + at;
+        if (sec[0] != 0x02) return;
+        const int length = ((sec[1] & 0x0f) << 8) | sec[2];
+        const int programInfo = ((sec[10] & 0x0f) << 8) | sec[11];
+        if (at + 3 + length + 11 > 188) return;
+        std::vector<uint8_t> s(sec, sec + 3 + length - 4);  // (without its CRC)
+        const uint8_t cuei[] = {0x05, 0x04, 'C', 'U', 'E', 'I'};
+        s.insert(s.begin() + 12 + programInfo, cuei, cuei + 6);
+        const int pi = programInfo + 6;
+        s[10] = uint8_t((s[10] & 0xf0) | (pi >> 8)), s[11] = uint8_t(pi);
+        const uint8_t es[] = {0x86, uint8_t(0xe0 | (kCuePid >> 8)), uint8_t(kCuePid), 0xf0, 0x00};
+        s.insert(s.end(), es, es + 5);
+        const int newLength = int(s.size()) - 3 + 4;
+        s[1] = uint8_t((s[1] & 0xf0) | (newLength >> 8)), s[2] = uint8_t(newLength);
+        const uint32_t crc = crc32(s.data(), s.size());
+        for (int i = 3; i >= 0; --i) s.push_back(uint8_t(crc >> (8 * i)));
+        std::memcpy(sec, s.data(), s.size());
+        std::memset(sec + s.size(), 0xff, size_t(188 - at - int(s.size())));
+    }
+#if LIBAVFORMAT_VERSION_MAJOR >= 61
+    using WriteBuffer = const uint8_t*;
+#else
+    using WriteBuffer = uint8_t*;
+#endif
+    static int onWrite(void* opaque, WriteBuffer buf, int size) {
+        auto* self = static_cast<LiveTsSender*>(opaque);
+        std::vector<uint8_t> b(buf, buf + size);
+        for (int i = 0; i + 188 <= size; i += 188) {
+            const int pid = ((b[size_t(i) + 1] & 0x1f) << 8) | b[size_t(i) + 2];
+            if (pid == 0 && self->pmtPid_ < 0) {  // (the PAT: where the PMT is)
+                const int at = i + 5 + b[size_t(i) + 4];
+                self->pmtPid_ = ((b[size_t(at) + 10] & 0x1f) << 8) | b[size_t(at) + 11];
+            }
+            if (pid == self->pmtPid_) self->patchPmt(b.data() + i);
+        }
+        b.insert(b.end(), self->pending_.begin(), self->pending_.end());
+        self->pending_.clear();
+        avio_write(self->srt_, b.data(), int(b.size()));
+        return size;
+    }
+    void queueCue(const std::vector<uint8_t>& section) {
+        uint8_t p[188];
+        std::memset(p, 0xff, sizeof p);
+        p[0] = 0x47, p[1] = uint8_t(0x40 | (kCuePid >> 8)), p[2] = uint8_t(kCuePid), p[3] = uint8_t(0x10 | (cueCounter_++ & 0x0f));
+        p[4] = 0;  // (pointer field)
+        std::memcpy(p + 5, section.data(), std::min<size_t>(section.size(), 183));
+        pending_.insert(pending_.end(), p, p + 188);
+    }
+
+    void run() {
+        AVFormatContext* oc = nullptr;
+        AVCodecContext* venc = nullptr;
+        AVCodecContext* aenc[2] = {nullptr, nullptr};
+        AVFrame* pic = av_frame_alloc();
+        AVFrame* snd = av_frame_alloc();
+        AVPacket* pkt = av_packet_alloc();
+        uint8_t* iobuf = nullptr;
+        auto cleanup = qScopeGuard([&] {
+            if (oc) {
+                if (oc->pb) {
+                    avio_flush(oc->pb);
+                    av_freep(&oc->pb->buffer);
+                    avio_context_free(&oc->pb);
+                }
+                avformat_free_context(oc);
+            }
+            avcodec_free_context(&venc);
+            avcodec_free_context(&aenc[0]);
+            avcodec_free_context(&aenc[1]);
+            av_frame_free(&pic);
+            av_frame_free(&snd);
+            av_packet_free(&pkt);
+            if (srt_) avio_closep(&srt_);
+        });
+        AVDictionary* o = nullptr;
+        if (avio_open2(&srt_, url_.c_str(), AVIO_FLAG_WRITE, nullptr, &o) < 0) return void(error = "cannot open " + url_);
+        av_dict_free(&o);
+        avformat_alloc_output_context2(&oc, nullptr, "mpegts", nullptr);
+        iobuf = static_cast<uint8_t*>(av_malloc(188 * 7));
+        oc->pb = avio_alloc_context(iobuf, 188 * 7, 1, this, nullptr, &LiveTsSender::onWrite, nullptr);
+        const AVCodec* x264 = avcodec_find_encoder_by_name("libx264");
+        venc = avcodec_alloc_context3(x264);
+        venc->width = 320, venc->height = 180, venc->pix_fmt = AV_PIX_FMT_YUV420P;
+        venc->time_base = {1, 25}, venc->framerate = {25, 1};
+        venc->gop_size = 25, venc->max_b_frames = 0, venc->bit_rate = 600000;
+        av_opt_set(venc->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(venc->priv_data, "tune", "zerolatency", 0);
+        av_opt_set_int(venc->priv_data, "a53cc", 1, 0);
+        if (avcodec_open2(venc, x264, nullptr) < 0) return void(error = "cannot open libx264");
+        AVStream* vs = avformat_new_stream(oc, nullptr);
+        avcodec_parameters_from_context(vs->codecpar, venc);
+        vs->time_base = {1, 90000};
+        AVStream* as[2];
+        for (int k = 0; k < 2; ++k) {
+            aenc[k] = avcodec_alloc_context3(avcodec_find_encoder(AV_CODEC_ID_AAC));
+            aenc[k]->sample_rate = 48000, aenc[k]->sample_fmt = AV_SAMPLE_FMT_FLTP, aenc[k]->bit_rate = 96000;
+            av_channel_layout_default(&aenc[k]->ch_layout, 2);
+            aenc[k]->time_base = {1, 48000};
+            if (avcodec_open2(aenc[k], avcodec_find_encoder(AV_CODEC_ID_AAC), nullptr) < 0) return void(error = "cannot open AAC");
+            as[k] = avformat_new_stream(oc, nullptr);
+            avcodec_parameters_from_context(as[k]->codecpar, aenc[k]);
+            as[k]->time_base = {1, 90000};
+            av_dict_set(&as[k]->metadata, "language", k == 0 ? "eng" : "fra", 0);
+        }
+        AVDictionary* mo = nullptr;
+        av_dict_set(&mo, "mpegts_copyts", "1", 0);
+        av_dict_set(&mo, "mpegts_flags", "resend_headers", 0);
+        if (avformat_write_header(oc, &mo) < 0) {
+            av_dict_free(&mo);
+            return void(error = "cannot start the transport stream");
+        }
+        av_dict_free(&mo);
+        const int64_t frames = int64_t(seconds_ * 25);
+        const std::vector<std::vector<CcTriplet>> cc = captionCcData(captions, Rational{25, 1}, frames, true, false);
+        const auto t0 = std::chrono::steady_clock::now();
+        int64_t samples[2] = {0, 0};
+        bool cueSent = false;
+        auto send = [&](AVCodecContext* e, AVStream* st, AVFrame* f) {
+            if (avcodec_send_frame(e, f) < 0) return;
+            while (avcodec_receive_packet(e, pkt) >= 0) {
+                av_packet_rescale_ts(pkt, e->time_base, st->time_base);
+                pkt->pts += kStart, pkt->dts += kStart;
+                pkt->stream_index = st->index;
+                av_interleaved_write_frame(oc, pkt);
+            }
+        };
+        for (int64_t i = 0; i < frames && !stopping_; ++i) {
+            std::this_thread::sleep_until(t0 + std::chrono::microseconds(i * 40000));
+            // (the cue, a few seconds ahead of its splice)
+            if (!cueSent && double(i) / 25 >= spliceSeconds - cueAhead) {
+                scte35::Cue c;
+                c.eventId = eventId, c.outOfNetwork = true, c.ptsTime = splicePts(), c.breakDuration = int64_t(breakSeconds * 90000);
+                queueCue(scte35::encode(c));
+                cueSent = true;
+            }
+            av_frame_unref(pic);
+            pic->format = AV_PIX_FMT_YUV420P, pic->width = 320, pic->height = 180;
+            av_frame_get_buffer(pic, 0);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) pic->data[0][y * pic->linesize[0] + x] = uint8_t(std::abs(x - int(i * 4 % 320)) < 8 ? 235 : 100);
+            for (int y = 0; y < 90; ++y) {
+                std::memset(pic->data[1] + y * pic->linesize[1], 128, 160);
+                std::memset(pic->data[2] + y * pic->linesize[2], 128, 160);
+            }
+            pic->pts = i;
+            if (size_t(i) < cc.size() && !cc[size_t(i)].empty())
+                if (AVFrameSideData* sd = av_frame_new_side_data(pic, AV_FRAME_DATA_A53_CC, cc[size_t(i)].size() * 3))
+                    for (size_t k = 0; k < cc[size_t(i)].size(); ++k) std::memcpy(sd->data + k * 3, cc[size_t(i)][k].data(), 3);
+            send(venc, vs, pic);
+            for (int k = 0; k < 2; ++k)
+                while (samples[k] < (i + 1) * 48000 / 25) {
+                    av_frame_unref(snd);
+                    snd->format = AV_SAMPLE_FMT_FLTP, snd->sample_rate = 48000, snd->nb_samples = aenc[k]->frame_size;
+                    av_channel_layout_default(&snd->ch_layout, 2);
+                    av_frame_get_buffer(snd, 0);
+                    for (int c = 0; c < 2; ++c)
+                        for (int n = 0; n < snd->nb_samples; ++n)
+                            reinterpret_cast<float*>(snd->data[c])[n] = 0.3f * float(std::sin(2 * M_PI * (k == 0 ? 500 : 800) * double(samples[k] + n) / 48000));
+                    snd->pts = samples[k];
+                    samples[k] += snd->nb_samples;
+                    send(aenc[k], as[k], snd);
+                }
+            avio_flush(oc->pb);
+            avio_flush(srt_);
+        }
+        av_write_trailer(oc);
+    }
+};
+
 }  // namespace
 
 class TestRender : public QObject {
@@ -24807,6 +25028,374 @@ colorspaces:
             QVERIFY(s->state() != QAbstractSocket::ConnectedState);
         }
         QVERIFY(t.elapsed() < 15000);
+    }
+
+    void livePackageCarries() {
+        // What a channel carries, packaged live: FFmpeg-encoded H.264 with CEA-608 captions in its user data, two AAC
+        // sound streams (eng, fra) and a SCTE 35 splice_insert three seconds ahead of its splice, sent as MPEG-TS over
+        // SRT on loopback, recorded by Capture (every sound stream, the captions and the cues) and packaged as it comes
+        // with low latency, two rungs, served by the origin. hls.js and dash.js in headless Chromium list both
+        // languages and the captions, show the captions, and raise the cue within a frame of its splice, on a
+        // keyframe; a cue placed by hand lands on a keyframe too. Delta updates skip what is past their boundary, each
+        // rendition report names the other rung's last part, and a blocking reload for the next part returns with it.
+#ifndef MONTAGE_TEST_STREAMING_PLAYERS
+        QSKIP("hls.js and dash.js were not fetched when the build was configured");
+#else
+        const std::string exe = ografBrowser();
+        if (exe.empty()) QSKIP("Needs Chrome, Chromium or Edge (or MONTAGE_CHROMIUM)");
+        {
+            bool srt = false;
+            void* opaque = nullptr;
+            while (const char* name = avio_enum_protocols(&opaque, 1)) srt = srt || std::strcmp(name, "srt") == 0;
+            if (!srt) QSKIP("This FFmpeg has no SRT");
+        }
+        if (!avcodec_find_encoder_by_name("libx264")) QSKIP("No libx264 to send the feed");
+        auto readFile = [](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) : QString();
+        };
+        QTemporaryDir dir;
+        const QString folder = dir.filePath("live");
+        QVERIFY(QDir().mkpath(folder));
+        const QDir players(QStringLiteral(MONTAGE_TEST_STREAMING_PLAYERS));
+        for (const char* f : {"hls.min.js", "dash.all.min.js"}) QVERIFY(QFile::copy(players.filePath(f), folder + "/" + f));
+        {
+            QFile page(folder + "/harness.html");
+            QVERIFY(page.open(QIODevice::WriteOnly));
+            page.write("<!doctype html><html><body><video width=\"320\" height=\"180\" muted playsinline></video></body></html>");
+        }
+        bool sandbox = true;
+#ifndef _WIN32
+        sandbox = geteuid() != 0;
+#endif
+        HeadlessBrowser::Options options;
+        options.offline = false;
+        options.extraArgs = {"--autoplay-policy=no-user-gesture-required", "--no-proxy-server"};
+        auto browser = std::make_unique<HeadlessBrowser>();
+        std::string err;
+        if (!browser->start(exe, 640, 360, sandbox, &err, options)) {
+            if (!sandbox) QFAIL(err.c_str());
+            browser = std::make_unique<HeadlessBrowser>();
+            QVERIFY2(browser->start(exe, 640, 360, false, &err, options), err.c_str());
+        }
+        HeadlessBrowser& b = *browser;
+        auto js = [&](const QString& expression) {
+            QJsonObject r;
+            std::string e;
+            if (!b.call("Runtime.evaluate", {{"expression", expression}, {"awaitPromise", true}, {"returnByValue", true}}, &r, &e, true, 30000)) {
+                qWarning("%s", e.c_str());
+                return QJsonValue();
+            }
+            if (r.contains("exceptionDetails")) qWarning("%s", QJsonDocument(r.value("exceptionDetails").toObject()).toJson().constData());
+            return r.value("result").toObject().value("value");
+        };
+        auto until = [&](const QString& expression, int seconds) {
+            QElapsedTimer t;
+            t.start();
+            while (t.elapsed() < seconds * 1000) {
+                if (js(expression).toBool()) return true;
+                QThread::msleep(100);
+            }
+            return false;
+        };
+        QJsonObject nav;
+        QVERIFY2(b.call("Page.navigate", {{"url", "about:blank"}}, &nav, &err), err.c_str());
+        auto plays = [&](const QString& c) { return js(QString("MediaSource.isTypeSupported('video/mp4; codecs=\"%1\"')").arg(c)).toBool(); };
+        LiveSettings ls;
+        ls.folder = folder.toStdString();
+        ls.rungs = {{320, 180, 400000, "libx264"}, {160, 90, 150000, "libx264"}};
+        ls.audioCodec = "aac";
+        if (!plays("avc1.640015,mp4a.40.2")) {
+            if (!plays("av01.0.04M.08,opus") || !avcodec_find_encoder_by_name("libsvtav1") || !avcodec_find_encoder_by_name("libopus"))
+                QSKIP("This browser plays neither H.264 and AAC nor AV1 and Opus");
+            for (StreamingRung& r : ls.rungs) r.codec = "libsvtav1";
+            ls.audioCodec = "libopus";
+        }
+        ls.segmentSeconds = 1;
+        ls.window = 10;
+        ls.lowLatency = true;
+        ls.partSeconds = 0.2;
+        ls.preset = "ultrafast";
+        ls.captionLanguage = "en";
+        LivePackager packager;
+        QVERIFY2(packager.start(ls, &err), err.c_str());
+        LiveOrigin origin;
+        QVERIFY2(origin.start(ls.folder, 0, [&](const std::string& rel) { return packager.growing(rel); }, &err), err.c_str());
+        const QString base = QStringLiteral("http://127.0.0.1:%1/").arg(origin.port());
+
+        quint16 port = 0;
+        for (int tries = 0; tries < 50 && !port; ++tries) {
+            const quint16 c = quint16(20000 + QRandomGenerator::global()->bounded(10000));
+            QUdpSocket u;
+            if (u.bind(QHostAddress::LocalHost, c)) port = c;
+        }
+        QVERIFY(port > 0);
+        std::atomic<double> feedZero{std::nan("")};
+        std::atomic<int> tracksNamed{0};
+        CaptureSettings cs;
+        cs.video.url = QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port).toStdString();
+        cs.path = dir.filePath("live.mov").toStdString();
+        cs.codec = "prores_proxy";
+        cs.openTimeout = 20;
+        cs.allSound = true;
+        cs.onPicture = [&](const AVFrame* f, int num, int den) { packager.picture(f, num, den); };
+        cs.onSound = [&](const AVFrame* f) { packager.sound(f); };
+        cs.onTrackSound = [&](int track, const AVFrame* f) { packager.sound(f, track); };
+        cs.onSoundTracks = [&](const std::vector<CaptureSettings::SoundTrack>& tracks) {
+            std::vector<LiveSoundTrack> named;
+            for (const auto& t : tracks) named.push_back({t.language, t.title, t.channels});
+            tracksNamed = int(tracks.size());
+            packager.soundTracks(named);
+        };
+        cs.onCue = [&](const std::vector<uint8_t>& section, double zero, double at) {
+            feedZero = zero;
+            packager.cueFromFeed(section, zero, at);
+        };
+        Recorder recorder;
+        QVERIFY2(recorder.start(cs, &err), err.c_str());
+        QThread::msleep(300);
+        LiveTsSender sender;
+        for (int k = 0; k < 15; ++k) {  // (a caption every two seconds, up for one and a half)
+            Caption c;
+            c.start = 25 + k * 50, c.end = c.start + 37, c.text = "Caption " + std::to_string(k + 1);
+            sender.captions.push_back(c);
+        }
+        QVERIFY2(sender.start(QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live&pkt_size=1316").arg(port).toStdString(), 40),
+                 sender.error.c_str());
+        QTRY_VERIFY2_WITH_TIMEOUT(packager.status().segments >= 3 || !packager.status().error.empty() || !recorder.status().error.empty() || !sender.error.empty(),
+                                  qPrintable(QString::fromStdString(packager.status().error + recorder.status().error + sender.error)), 30000);
+        QCOMPARE(QString::fromStdString(sender.error), QString());
+        QCOMPARE(QString::fromStdString(recorder.status().error), QString());
+        QCOMPARE(QString::fromStdString(packager.status().error), QString());
+        QCOMPARE(tracksNamed.load(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(!packager.status().hls.empty(), 10000);
+        {
+            const LiveStatus st = packager.status();
+            QCOMPARE(st.soundRenditions, 2);
+            QVERIFY(st.captioned);
+        }
+
+        // HLS (low latency): both languages and the captions listed, the captions shown, the cue's date range at its
+        // splice.
+        QVERIFY2(b.call("Page.navigate", {{"url", base + "harness.html"}}, &nav, &err), err.c_str());
+        QVERIFY(until("document.readyState === 'complete'", 20));
+        QVERIFY(js(R"js((async () => {
+            await new Promise((ok, bad) => { const s = document.createElement('script'); s.src = 'hls.min.js'; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+            window.r = {error: '', audio: [], subs: 0, fired: {}, skips: 0};
+            const v = document.querySelector('video');
+            const h = new Hls({lowLatencyMode: true, renderTextTracksNatively: true});
+            window.h = h;
+            h.on(Hls.Events.ERROR, (e, d) => { if (d.fatal) r.error = d.type + ' ' + d.details; });
+            h.on(Hls.Events.AUDIO_TRACKS_UPDATED, (e, d) => { r.audio = d.audioTracks.map(t => t.lang); });
+            h.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (e, d) => { r.subs = d.subtitleTracks.length; if (h.subtitleTrack < 0) h.subtitleTrack = 0; h.subtitleDisplay = true; });
+            h.on(Hls.Events.LEVEL_UPDATED, (e, d) => { if (d.details.skippedSegments > 0) r.skips++; });
+            v.textTracks.addEventListener('addtrack', e => {
+                const t = e.track;
+                t.addEventListener('cuechange', () => { for (const c of (t.activeCues || [])) if (c.id && !(c.id in r.fired)) r.fired[c.id] = [c.startTime, v.currentTime]; });
+            });
+            h.loadSource('master.m3u8');
+            h.attachMedia(v);
+            v.muted = true;
+            v.play().catch(e => r.error = String(e));
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 2", 40), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QVERIFY2(js("JSON.stringify(r.audio)").toString() == QString("[\"en\",\"fr\"]"), qPrintable(js("JSON.stringify(r.audio)").toString() + "\n" + readFile(folder + "/master.m3u8")));
+        QCOMPARE(js("r.subs").toInt(), 1);
+        // (a caption's text shown)
+        QVERIFY2(until("(() => { for (const t of document.querySelector('video').textTracks) if (t.kind !== 'metadata') for (const c of (t.cues || [])) "
+                       "if (c.text.startsWith('Caption ')) return true; return false; })()", 30),
+                 qPrintable(js("JSON.stringify(r)").toString()));
+        // The cue: where the feed put the splice, by the feed's clock at the recording's first picture.
+        QTRY_VERIFY_WITH_TIMEOUT(!packager.status().cues.empty(), 20000);
+        QVERIFY(!std::isnan(feedZero.load()));
+        const double splice = double(sender.splicePts()) / 90000 - feedZero.load();
+        const LiveCueStatus fed = packager.status().cues.front();
+        qInfo("The feed's cue at %.3f s (splice %.3f s): frame %lld", fed.seconds, splice, (long long)fed.frame);
+        QVERIFY(fed.fromFeed && !fed.late);
+        QCOMPARE(fed.frame, int64_t(std::llround(splice * 25)));
+        QVERIFY2(std::fabs(fed.duration - 4) < 1e-6, qPrintable(QString::number(fed.duration)));
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().cues.front().keyframe, 20000);
+        const QString hlsCue = QString("(() => { for (const t of document.querySelector('video').textTracks) if (t.kind === 'metadata') for (const c of (t.cues || [])) "
+                                       "if (c.id === 'cue-%1' && c.value && c.value.key === 'SCTE35-OUT') return c.startTime; return -1; })()").arg(fed.id);
+        QVERIFY2(until(hlsCue + " >= 0", 30), qPrintable(js("JSON.stringify(r)").toString()));
+        const double hlsAt = js(hlsCue).toDouble();
+        qInfo("hls.js: the cue at %.3f s", hlsAt);
+        QVERIFY2(std::fabs(hlsAt - double(fed.frame) / 25) <= 1.0 / 25, qPrintable(QString::number(hlsAt)));
+        // (and raised as playback reaches it)
+        QVERIFY2(until(QString("r.error !== '' || ('cue-%1' in r.fired)").arg(fed.id), 30), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        const double firedAt = js(QString("r.fired['cue-%1'][1]").arg(fed.id)).toDouble();
+        qInfo("hls.js raised it at %.3f s of playback", firedAt);
+        QVERIFY2(firedAt >= hlsAt - 0.05 && firedAt < hlsAt + 1, qPrintable(QString::number(firedAt)));
+        // (delta updates, as hls.js asks for them)
+        QVERIFY2(until("r.skips > 0", 20), qPrintable(js("JSON.stringify(r)").toString()));
+
+        // A cue placed by hand: on the next picture, made a keyframe.
+        LiveCue placed;
+        placed.duration = 2;
+        packager.cue(placed);
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().cues.size() >= 2 && packager.status().cues.back().keyframe, 20000);
+        const LiveCueStatus manual = packager.status().cues.back();
+        QVERIFY(!manual.fromFeed && manual.frame > fed.frame);
+
+        // The rungs' segments: a keyframe at each splice (decoded from the segment that holds it).
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().segments > manual.frame / 25 + 1, 20000);
+        const LiveStatus mid = packager.status();
+        for (const LiveCueStatus& c : {fed, manual})
+            for (int rung = 0; rung < 2; ++rung) {
+                const QString rdir = folder + "/" + QString::fromStdString(mid.renditions[size_t(rung)]);
+                const QString seg = rdir + QStringLiteral("/seg%1.m4s").arg(c.frame / 25 + 1, 5, 10, QChar('0'));
+                QFile init(rdir + "/init.mp4"), media(seg);
+                QVERIFY(init.open(QIODevice::ReadOnly) && media.open(QIODevice::ReadOnly));
+                const QString joined = dir.filePath(QStringLiteral("probe%1.mp4").arg(rung));
+                QFile out(joined);
+                QVERIFY(out.open(QIODevice::WriteOnly));
+                out.write(init.readAll());
+                const QByteArray m = media.readAll();
+                out.write(m);
+                out.close();
+                // (the cue's event message, in the chunk made when it was asked for: the feed's three seconds ahead,
+                // the one by hand with its picture)
+                bool told = false;
+                const int64_t at = c.frame / 25 + 1;
+                for (int64_t k = c.fromFeed ? at - 4 : at - 1; k <= at && !told; ++k) {
+                    QFile g(rdir + QStringLiteral("/seg%1.m4s").arg(k, 5, 10, QChar('0')));
+                    if (!g.open(QIODevice::ReadOnly)) continue;
+                    const QByteArray bytes = g.readAll();
+                    told = bytes.contains("emsg") && bytes.contains("urn:scte:scte35:2013:bin");
+                }
+                QVERIFY2(told, qPrintable(seg));
+                AVFormatContext* fc = nullptr;
+                QVERIFY(avformat_open_input(&fc, joined.toUtf8().constData(), nullptr, nullptr) >= 0);
+                avformat_find_stream_info(fc, nullptr);
+                AVPacket* p = av_packet_alloc();
+                bool found = false, key = false;
+                const AVRational tb = fc->streams[0]->time_base;
+                while (av_read_frame(fc, p) >= 0) {
+                    if (av_rescale_q(p->pts, tb, AVRational{1, 25}) == c.frame) found = true, key = (p->flags & AV_PKT_FLAG_KEY) != 0;
+                    av_packet_unref(p);
+                }
+                av_packet_free(&p);
+                avformat_close_input(&fc);
+                QVERIFY2(found && key, qPrintable(QString("%1 frame %2").arg(seg).arg(c.frame)));
+            }
+
+        // The playlists: delta updates skip what is past the boundary, reports name the other rung's last part.
+        const QString list0 = folder + "/" + QString::fromStdString(mid.renditions[0]) + "/playlist.m3u8";
+        const QString list1 = folder + "/" + QString::fromStdString(mid.renditions[1]) + "/playlist.m3u8";
+        QString p0, p1;
+        for (int n = 0; n < 50; ++n) {  // (both read alike twice running: none written between)
+            const QString a0 = readFile(list0), a1 = readFile(list1);
+            QThread::msleep(15);
+            if (a0 == readFile(list0) && a1 == readFile(list1)) {
+                p0 = a0, p1 = a1;
+                break;
+            }
+        }
+        QVERIFY(!p0.isEmpty() && !p1.isEmpty());
+        auto lastPartOf = [](const QString& text) {
+            QString last;
+            for (const QRegularExpressionMatch& m : QRegularExpression("#EXT-X-PART:[^\\n]*URI=\"seg(\\d+)\\.(\\d+)\\.m4s\"").globalMatch(text))
+                last = QString("LAST-MSN=%1,LAST-PART=%2").arg(m.captured(1).toInt()).arg(m.captured(2).toInt() - 1);
+            return last;
+        };
+        auto reportIn = [](const QString& text, const QString& rendition) {
+            return QRegularExpression("#EXT-X-RENDITION-REPORT:URI=\"\\.\\./" + QRegularExpression::escape(rendition) + "/playlist\\.m3u8\",(LAST-MSN=\\d+,LAST-PART=\\d+)")
+                .match(text).captured(1);
+        };
+        QCOMPARE(reportIn(p0, QString::fromStdString(mid.renditions[1])), lastPartOf(p1));
+        QCOMPARE(reportIn(p1, QString::fromStdString(mid.renditions[0])), lastPartOf(p0));
+        QVERIFY(p0.contains("CAN-SKIP-UNTIL=6.0") && p0.contains("CAN-BLOCK-RELOAD=YES"));
+        {
+            int skipped = 0;
+            const QString delta = QString::fromStdString(playlistDeltaUpdate(p0.toStdString(), &skipped));
+            // (the segments wholly six seconds or more before the end, parts made since the last whole one counted)
+            double total = 0;
+            std::vector<double> ends;
+            for (const QRegularExpressionMatch& m : QRegularExpression("#EXTINF:([0-9.]+),").globalMatch(p0)) ends.push_back(total += m.captured(1).toDouble());
+            double trailing = 0;
+            const QString tail = p0.mid(p0.lastIndexOf(".m4s\n#") + 5);
+            for (const QRegularExpressionMatch& m : QRegularExpression("#EXT-X-PART:DURATION=([0-9.]+)").globalMatch(tail)) trailing += m.captured(1).toDouble();
+            int expect = 0;
+            while (expect < int(ends.size()) && total + trailing - ends[size_t(expect)] >= 6) ++expect;
+            QVERIFY2(expect > 0 && skipped == expect, qPrintable(QString("%1 %2\n%3").arg(skipped).arg(expect).arg(p0)));
+            QVERIFY(delta.contains(QStringLiteral("#EXT-X-SKIP:SKIPPED-SEGMENTS=%1\n").arg(expect)));
+            QCOMPARE(int(delta.count("#EXTINF:")), int(ends.size()) - expect);
+            QCOMPARE(QRegularExpression("MEDIA-SEQUENCE:(\\d+)").match(delta).captured(1), QRegularExpression("MEDIA-SEQUENCE:(\\d+)").match(p0).captured(1));
+            // (and from the origin)
+            const QString got = js(QString("fetch('%1/playlist.m3u8?_HLS_skip=YES').then(r => r.text())").arg(QString::fromStdString(mid.renditions[0]))).toString();
+            QVERIFY2(got.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS="), qPrintable(got));
+        }
+        // A blocking reload for the part the playlist hints at: answered once it is made, with it.
+        {
+            const QRegularExpressionMatch hint = QRegularExpression("PRELOAD-HINT:TYPE=PART,URI=\"seg(\\d+)\\.(\\d+)\\.m4s\"").match(readFile(list0));
+            QVERIFY(hint.hasMatch());
+            const int msn = hint.captured(1).toInt(), part = hint.captured(2).toInt() - 1;
+            const QJsonArray got = js(QString("(async () => { const t = performance.now(); const x = await (await fetch('%1/playlist.m3u8?_HLS_msn=%2&_HLS_part=%3')).text(); "
+                                              "return [performance.now() - t, x]; })()")
+                                          .arg(QString::fromStdString(mid.renditions[0]))
+                                          .arg(msn)
+                                          .arg(part))
+                                       .toArray();
+            QCOMPARE(got.size(), 2);
+            qInfo("A blocking reload answered in %.0f ms", got[0].toDouble());
+            QVERIFY2(got[1].toString().contains(QStringLiteral("#EXT-X-PART:DURATION=")) && got[1].toString().contains(QStringLiteral("URI=\"seg%1.%2.m4s\"").arg(hint.captured(1)).arg(part + 1)),
+                     qPrintable(got[1].toString()));
+            QVERIFY2(got[0].toDouble() < 3 * 0.24 * 1000 + 1000, qPrintable(QString::number(got[0].toDouble())));
+        }
+
+        // DASH (low latency): both languages and the captions, and the feed's cue raised within a frame of its splice.
+        js("h.destroy()");
+        const QString other = QStringLiteral("http://localhost:%1/").arg(origin.port());
+        QVERIFY2(b.call("Page.navigate", {{"url", other + "harness.html"}}, &nav, &err), err.c_str());
+        QVERIFY(until("document.readyState === 'complete'", 20));
+        QVERIFY(js(R"js((async () => {
+            await new Promise((ok, bad) => { const s = document.createElement('script'); s.src = 'dash.all.min.js'; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+            window.r = {error: '', events: [], audio: [], texts: 0};
+            const v = document.querySelector('video');
+            const p = dashjs.MediaPlayer().create();
+            window.p = p;
+            p.updateSettings({debug: {logLevel: 0}});
+            p.on(dashjs.MediaPlayer.events.ERROR, e => r.error = JSON.stringify(e.error && (e.error.message || e.error.code) || e));
+            p.on('urn:scte:scte35:2013:bin', e => r.events.push([e.event.calculatedPresentationTime, e.event.id]), null, {mode: 'eventModeOnStart'});
+            p.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+                r.audio = p.getTracksFor('audio').map(t => t.lang);
+                r.texts = p.getTracksFor('text').length;
+            });
+            v.muted = true;
+            p.initialize(v, 'manifest.mpd', true);
+            return true; })())js").toBool());
+        QVERIFY2(until("r.error !== '' || document.querySelector('video').currentTime > 1", 40), qPrintable(js("JSON.stringify(r)").toString()));
+        QCOMPARE(js("r.error").toString(), QString());
+        QCOMPARE(js("JSON.stringify(r.audio)").toString(), QString("[\"en\",\"fr\"]"));
+        QCOMPARE(js("r.texts").toInt(), 1);
+        // (a cue placed ahead of what the player has reached, so it sees it before it plays there)
+        LiveCue ahead;
+        ahead.at = (double(packager.status().frames) + 50) / 25;
+        ahead.duration = 1;
+        packager.cue(ahead);
+        QTRY_VERIFY_WITH_TIMEOUT(packager.status().cues.size() >= 3, 20000);
+        const LiveCueStatus third = packager.status().cues.back();
+        QVERIFY2(until(QString("r.events.some(e => e[1] === %1)").arg(third.id * 2), 40), qPrintable(js("JSON.stringify(r)").toString()));
+        const double dashAt = js(QString("r.events.find(e => e[1] === %1)[0]").arg(third.id * 2)).toDouble();
+        qInfo("dash.js raised the cue at %.3f s (splice %.3f s)", dashAt, third.seconds);
+        QVERIFY2(std::fabs(dashAt - third.seconds) <= 1.0 / 25, qPrintable(QString::number(dashAt)));
+        QCOMPARE(js("r.error").toString(), QString());
+
+        // Stopped: every playlist ends, the captions' too.
+        sender.stop();
+        recorder.stop();
+        packager.finish();
+        const LiveStatus end = packager.status();
+        QVERIFY(end.captionSegments > 3 && end.captionCues > 0);
+        for (const std::string& name : end.renditions) {
+            const QString text = readFile(folder + "/" + QString::fromStdString(name) + "/playlist.m3u8");
+            QVERIFY2(text.contains("#EXT-X-ENDLIST"), qPrintable(QString::fromStdString(name)));
+        }
+        const QString master = readFile(folder + "/master.m3u8");
+        QVERIFY(master.contains("LANGUAGE=\"en\"") && master.contains("LANGUAGE=\"fr\"") && master.contains("TYPE=SUBTITLES"));
+#endif
     }
 
     void livePackageWindowAndTs() {

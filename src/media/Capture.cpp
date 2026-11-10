@@ -282,6 +282,16 @@ struct Input {
     AVCodecContext* video = nullptr;
     AVCodecContext* audio = nullptr;
     int videoStream = -1, audioStream = -1;
+    // (CaptureSettings::allSound: its other sound streams, each with its decoder and time base; onCue: its SCTE 35)
+    struct Extra {
+        int stream = -1;
+        AVCodecContext* dec = nullptr;
+        AVRational tb{1, 1};
+        std::string language, title;
+    };
+    std::vector<Extra> extras;
+    int cueStream = -1;
+    AVRational cueTb{1, 90000};
     Interrupt irq{};
     AVRational videoTb{1, 1}, audioTb{1, 1}, rate{0, 1};
 #ifdef MONTAGE_WITH_OMT
@@ -307,6 +317,7 @@ struct Input {
     ~Input() {
         avcodec_free_context(&video);
         avcodec_free_context(&audio);
+        for (Extra& e : extras) avcodec_free_context(&e.dec);
         if (fmt) avformat_close_input(&fmt);
     }
 };
@@ -476,6 +487,18 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
     }
     if (wantVideo) in.videoStream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (wantAudio) in.audioStream = av_find_best_stream(in.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    // (with every sound stream wanted, the first is track 0, or the first marked default: the programme's own sound,
+    // as a broadcast lists it, the other languages after)
+    if (wantAudio && in.audioStream >= 0 && s->settings.allSound) {
+        int first = -1, marked = -1;
+        for (unsigned i = 0; i < in.fmt->nb_streams; ++i) {
+            const AVStream* st = in.fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || !avcodec_find_decoder(st->codecpar->codec_id)) continue;
+            if (first < 0) first = int(i);
+            if (marked < 0 && (st->disposition & AV_DISPOSITION_DEFAULT)) marked = int(i);
+        }
+        if (marked >= 0 || first >= 0) in.audioStream = marked >= 0 ? marked : first;
+    }
     if (wantVideo && in.videoStream < 0) {
         if (error) *error = src.url + " has no picture";
         return false;
@@ -491,8 +514,25 @@ bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wan
         if (!(in.audio = openDecoder(st, nullptr))) in.audioStream = -1;
         else in.audioTb = st->time_base;
     }
-    for (unsigned i = 0; i < in.fmt->nb_streams; ++i)
-        if (int(i) != in.videoStream && int(i) != in.audioStream) in.fmt->streams[i]->discard = AVDISCARD_ALL;
+    for (unsigned i = 0; i < in.fmt->nb_streams; ++i) {
+        AVStream* st = in.fmt->streams[i];
+        if (int(i) == in.videoStream || int(i) == in.audioStream) continue;
+        // (the other sound streams, when all are wanted, and the cue messages, when they are)
+        if (wantAudio && in.audioStream >= 0 && s->settings.allSound && st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && in.extras.size() < 15)
+            if (AVCodecContext* dec = openDecoder(st, nullptr)) {
+                Input::Extra e;
+                e.stream = int(i), e.dec = dec, e.tb = st->time_base;
+                if (const AVDictionaryEntry* l = av_dict_get(st->metadata, "language", nullptr, 0)) e.language = l->value;
+                if (const AVDictionaryEntry* t = av_dict_get(st->metadata, "title", nullptr, 0)) e.title = t->value;
+                in.extras.push_back(std::move(e));
+                continue;
+            }
+        if (wantVideo && s->settings.onCue && st->codecpar->codec_id == AV_CODEC_ID_SCTE_35 && in.cueStream < 0) {
+            in.cueStream = int(i), in.cueTb = st->time_base;
+            continue;
+        }
+        st->discard = AVDISCARD_ALL;
+    }
     return true;
 }
 
@@ -752,6 +792,21 @@ void Recorder::run() {
     int width = 0, height = 0;
     int colorSpace = AVCOL_SPC_BT709;
     bool interlaced = false, topFirst = true;
+    std::vector<uint8_t> ccCarried;  // (a dropped picture's caption data, for the next one)
+    // The feed's other sound streams (allSound): each converted and placed as the recorded one is.
+    struct ExtraPlace {
+        SwrContext* swr = nullptr;
+        AVChannelLayout in{}, out{};
+        int format = -1, rate = 0;
+        int64_t next = 0, skip = 0;
+        bool started = false;
+    };
+    std::vector<ExtraPlace> extraPlaces;
+    struct CueHeld {
+        std::vector<uint8_t> section;
+        double time = std::nan("");  // (its stream time, seconds)
+    };
+    std::vector<CueHeld> cuesHeld;  // (before the first picture)
 
     auto write = [&](AVCodecContext* enc, AVStream* st, AVFrame* f) -> bool {
         if (f && enc == venc) {
@@ -972,6 +1027,22 @@ void Recorder::run() {
                 ast->time_base = aenc->time_base;
             }
         }
+        // The sound streams named (the recorded one first), before the first picture is given.
+        if (cs.onSoundTracks && aenc) {
+            std::vector<CaptureSettings::SoundTrack> tracks(1);
+            tracks[0].channels = aenc->ch_layout.nb_channels;
+            if (ain.fmt && ain.audioStream >= 0) {
+                const AVDictionary* md = ain.fmt->streams[ain.audioStream]->metadata;
+                if (const AVDictionaryEntry* l = av_dict_get(md, "language", nullptr, 0)) tracks[0].language = l->value;
+                if (const AVDictionaryEntry* t = av_dict_get(md, "title", nullptr, 0)) tracks[0].title = t->value;
+            }
+            if (&ain == &inputs[0])
+                for (size_t k = 0; k < inputs[0].extras.size(); ++k) {
+                    const Input::Extra& e = inputs[0].extras[k];
+                    tracks.push_back({int(k + 1), e.language, e.title, std::min(8, std::max(1, e.dec->ch_layout.nb_channels))});
+                }
+            cs.onSoundTracks(tracks);
+        }
         if (watchOnly) {
             headerWritten = true;  // (begun)
             if (cs.live) cs.live->begin(tc, fps.num, fps.den);
@@ -1036,6 +1107,9 @@ void Recorder::run() {
             if (f->decode_error_flags || (f->flags & AV_FRAME_FLAG_CORRUPT)) return true;
             if (!begin(f, in)) return false;
             t0 = ts != AV_NOPTS_VALUE ? double(ts) * av_q2d(in.videoTb) : 0;
+            if (cs.onCue)
+                for (const CueHeld& c : cuesHeld) cs.onCue(c.section, t0, c.time - t0);
+            cuesHeld.clear();
         }
         if (frameLimit > 0 && nextFrame >= frameLimit) {
             timedOut = true;
@@ -1047,7 +1121,10 @@ void Recorder::run() {
         if (late > 2 || late < -1) t0 = t - double(nextFrame) / av_q2d(fps);
         int64_t at = int64_t(std::llround((t - t0) * av_q2d(fps)));
         if (ranged && exact) at = label - firstLabel;  // (placed by its label)
+        const AVFrameSideData* cc = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC);
         if (at < nextFrame) {
+            // (its caption data goes with the next picture: CEA-608 loses characters otherwise)
+            if (cc && ccCarried.size() < 4096) ccCarried.insert(ccCarried.end(), cc->data, cc->data + cc->size);
             std::lock_guard lock(s->m);
             ++s->st.dropped;
             return true;
@@ -1082,6 +1159,15 @@ void Recorder::run() {
             return false;
         }
         sws_scale(sws, f->data, f->linesize, 0, f->height, pic->data, pic->linesize);
+        // (its captions, with any a dropped picture had)
+        if ((cc && cc->size > 0) || !ccCarried.empty()) {
+            const size_t n = ccCarried.size() + (cc ? cc->size : 0);
+            if (AVFrameSideData* d = av_frame_new_side_data(pic, AV_FRAME_DATA_A53_CC, n)) {
+                if (!ccCarried.empty()) std::memcpy(d->data, ccCarried.data(), ccCarried.size());
+                if (cc && cc->size > 0) std::memcpy(d->data + ccCarried.size(), cc->data, cc->size);
+            }
+            ccCarried.clear();
+        }
         if (interlaced) {
 #ifdef AV_FRAME_FLAG_INTERLACED
             pic->flags |= AV_FRAME_FLAG_INTERLACED | (topFirst ? AV_FRAME_FLAG_TOP_FIELD_FIRST : 0);
@@ -1093,6 +1179,7 @@ void Recorder::run() {
         // Missing pictures: the last one again (a second at most at a time; no further than a set length).
         for (int64_t gap = 0; nextFrame < at && gap < int64_t(av_q2d(fps)) + 1 && last && (frameLimit == 0 || nextFrame < frameLimit); ++gap) {
             AVFrame* again = av_frame_clone(last);
+            av_frame_remove_side_data(again, AV_FRAME_DATA_A53_CC);  // (its captions were given once)
             again->pts = nextFrame++;
             const bool ok = write(venc, vst, again);
             av_frame_free(&again);
@@ -1223,6 +1310,109 @@ void Recorder::run() {
         av_frame_free(&trimmed);
         av_frame_unref(sound);
         return ok;
+    };
+
+    // One of the feed's other sound streams (allSound): converted to 48 kHz planar float and placed by its time
+    // against the pictures', as putSound places the recorded one (silence where it is missing, trimmed where it runs
+    // early; jitter under a tenth of a second left be), then given to onTrackSound.
+    auto putExtra = [&](size_t k, AVFrame* f) -> bool {
+        if (!headerWritten || !cs.onTrackSound || k >= extraPlaces.size()) return true;
+        ExtraPlace& x = extraPlaces[k];
+        const int64_t endSample = std::min(soundEnd, frameLimit > 0 ? int64_t(std::llround(double(frameLimit) / av_q2d(fps) * 48000)) : INT64_MAX);
+        if (x.next >= endSample || f->sample_rate <= 0) return true;
+        AVChannelLayout layout{};
+        if (f->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC || f->ch_layout.nb_channels <= 0)
+            av_channel_layout_default(&layout, std::max(1, f->ch_layout.nb_channels));
+        else
+            av_channel_layout_copy(&layout, &f->ch_layout);
+        if (!x.swr || f->format != x.format || f->sample_rate != x.rate || av_channel_layout_compare(&layout, &x.in) != 0) {
+            swr_free(&x.swr);
+            av_channel_layout_uninit(&x.in);
+            av_channel_layout_uninit(&x.out);
+            av_channel_layout_copy(&x.in, &layout);
+            if (layout.nb_channels <= 8) av_channel_layout_copy(&x.out, &layout);
+            else av_channel_layout_default(&x.out, 8);
+            x.format = f->format, x.rate = f->sample_rate;
+            swr_alloc_set_opts2(&x.swr, &x.out, AV_SAMPLE_FMT_FLTP, 48000, &layout, AVSampleFormat(f->format), f->sample_rate, 0, nullptr);
+            if (x.swr && layout.nb_channels > 8) {
+                std::vector<double> matrix(size_t(8) * size_t(layout.nb_channels), 0.0);
+                for (int c = 0; c < 8; ++c) matrix[size_t(c) * size_t(layout.nb_channels) + size_t(c)] = 1.0;
+                swr_set_matrix(x.swr, matrix.data(), layout.nb_channels);
+            }
+            if (x.swr && swr_init(x.swr) < 0) swr_free(&x.swr);
+        }
+        av_channel_layout_uninit(&layout);
+        if (!x.swr) return true;
+        auto give = [&](AVFrame* g) {
+            g->pts = x.next;
+            x.next += g->nb_samples;
+            cs.onTrackSound(int(k + 1), g);
+        };
+        auto frameOf = [&](int n) {
+            AVFrame* g = av_frame_alloc();
+            g->format = AV_SAMPLE_FMT_FLTP;
+            g->sample_rate = 48000;
+            av_channel_layout_copy(&g->ch_layout, &x.out);
+            g->nb_samples = n;
+            if (av_frame_get_buffer(g, 0) < 0) av_frame_free(&g);
+            return g;
+        };
+        const int most = swr_get_out_samples(x.swr, f->nb_samples);
+        if (most <= 0) return true;
+        AVFrame* g = frameOf(most);
+        if (!g) return true;
+        const int n = swr_convert(x.swr, g->data, most, const_cast<const uint8_t**>(f->extended_data), f->nb_samples);
+        if (n <= 0) {
+            av_frame_free(&g);
+            return true;
+        }
+        g->nb_samples = n;
+        const int64_t ts = f->best_effort_timestamp != AV_NOPTS_VALUE ? f->best_effort_timestamp : f->pts;
+        const double tb = k < inputs[0].extras.size() ? av_q2d(inputs[0].extras[k].tb) : 0;
+        const int64_t expected = ts != AV_NOPTS_VALUE ? int64_t(std::llround((double(ts) * tb - t0) * 48000)) : x.next;
+        const int64_t diff = expected - x.next;
+        if (!x.started || (std::llabs(diff) > 4800 && std::llabs(diff) < 96000)) {
+            for (int64_t gap = std::min<int64_t>(diff, std::min<int64_t>(48000 * 10, endSample - x.next)); gap > 0;) {
+                AVFrame* quiet = frameOf(int(std::min<int64_t>(gap, 48000)));
+                if (!quiet) break;
+                av_samples_set_silence(quiet->data, 0, quiet->nb_samples, quiet->ch_layout.nb_channels, AV_SAMPLE_FMT_FLTP);
+                gap -= quiet->nb_samples;
+                give(quiet);
+                av_frame_free(&quiet);
+            }
+            if (diff < 0) x.skip += -diff;
+        }
+        x.started = true;
+        const int skip = int(std::min<int64_t>(x.skip, n));
+        x.skip -= skip;
+        if (skip >= n || x.next >= endSample) {
+            av_frame_free(&g);
+            return true;
+        }
+        if (skip > 0) {
+            for (int c = 0; c < g->ch_layout.nb_channels; ++c) {
+                float* d = reinterpret_cast<float*>(g->extended_data[c]);
+                std::memmove(d, d + skip, size_t(n - skip) * sizeof(float));
+            }
+            g->nb_samples = n - skip;
+        }
+        g->nb_samples = int(std::min<int64_t>(g->nb_samples, endSample - x.next));
+        give(g);
+        av_frame_free(&g);
+        return true;
+    };
+    // A cue message from the feed, given once the recording has begun (its clock known).
+    auto putCue = [&](const AVPacket* p, AVRational tb) {
+        if (!cs.onCue || !p->data || p->size <= 0) return;
+        CueHeld c;
+        c.section.assign(p->data, p->data + p->size);
+        const int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+        if (ts != AV_NOPTS_VALUE) c.time = double(ts) * av_q2d(tb);
+        if (!headerWritten) {
+            if (cuesHeld.size() < 64) cuesHeld.push_back(std::move(c));
+            return;
+        }
+        cs.onCue(c.section, t0, c.time - t0);
     };
 
 #ifdef MONTAGE_WITH_OMT
@@ -1367,6 +1557,22 @@ void Recorder::run() {
         Input& in = inputs[item.input];
         const bool isVideo = item.packet->stream_index == in.videoStream;
         if (isVideo && soundOnly) return true;
+        if (item.packet->stream_index == in.cueStream) {
+            putCue(item.packet, in.cueTb);
+            return true;
+        }
+        for (size_t k = 0; k < in.extras.size(); ++k) {
+            if (in.extras[k].stream != item.packet->stream_index) continue;
+            if (item.input != 0 || avcodec_send_packet(in.extras[k].dec, item.packet) < 0) return true;
+            bool ok = true;
+            while (ok && avcodec_receive_frame(in.extras[k].dec, sound) >= 0) {
+                AVFrame* a = av_frame_clone(sound);
+                av_frame_unref(sound);
+                ok = putExtra(k, a);
+                av_frame_free(&a);
+            }
+            return ok;
+        }
         AVCodecContext* dec = isVideo ? in.video : in.audio;
         bool ok = true;
         if (dec && avcodec_send_packet(dec, item.packet) >= 0)
@@ -1388,6 +1594,7 @@ void Recorder::run() {
     // Opens the feed (and a sound device of its own), then reads each on a thread of its own.
     bool opened = openInput(s, 0, cs.video, true, !cs.audio, inputs[0], &fatal);
     if (opened && cs.audio) opened = openInput(s, 1, *cs.audio, false, true, inputs[1], &fatal);
+    extraPlaces.resize(inputs[0].extras.size());
     if (opened) {
         for (int i = 0; i < 2; ++i) {
             if (inputs[i].st2110) {
@@ -1497,7 +1704,9 @@ void Recorder::run() {
                         return;
                     }
                     heard = nowMs();
-                    if (p->stream_index != in.videoStream && p->stream_index != in.audioStream) {
+                    const bool extra = p->stream_index == in.cueStream ||
+                                       std::any_of(in.extras.begin(), in.extras.end(), [&](const Input::Extra& e) { return e.stream == p->stream_index; });
+                    if (p->stream_index != in.videoStream && p->stream_index != in.audioStream && !extra) {
                         av_packet_free(&p);
                         continue;
                     }
@@ -1604,6 +1813,11 @@ void Recorder::run() {
     sws_freeContext(sws);
     swr_free(&swr);
     av_channel_layout_uninit(&swrLayout);
+    for (ExtraPlace& x : extraPlaces) {
+        swr_free(&x.swr);
+        av_channel_layout_uninit(&x.in);
+        av_channel_layout_uninit(&x.out);
+    }
     av_frame_free(&last);
     av_frame_free(&decoded);
     av_frame_free(&sound);

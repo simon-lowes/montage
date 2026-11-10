@@ -65,8 +65,28 @@ struct CaptureSettings {
     // Each picture and each stretch of sound as it is recorded, on the recording thread (so kept brief: a live package
     // copies them, render/LivePackage.h): the picture as coded into the file, its pts the frame's number there at
     // fpsNum/fpsDen frames a second; the sound at 48 kHz, its pts the first sample's number.
+    // The picture keeps the feed's CEA-608 and CTA-708 caption data (AV_FRAME_DATA_A53_CC, as its decoder read it from
+    // the video's user data; a repeated picture has none, and a dropped one's is carried to the next).
     std::function<void(const AVFrame* picture, int fpsNum, int fpsDen)> onPicture;
     std::function<void(const AVFrame* sound)> onSound;
+    // Every sound stream of the feed, not only the one recorded (a network stream's or file's: each language of a
+    // broadcast, its commentary, its descriptions): the others given apart, track 1 on, placed against the pictures as
+    // the recorded one is, at 48 kHz in planar float with their own channels (at most 8). `onSoundTracks` names them
+    // all (track 0 the recorded one) before the first picture is given. The file records track 0 only.
+    bool allSound = false;
+    std::function<void(int track, const AVFrame* sound)> onTrackSound;
+    struct SoundTrack {
+        int track = 0;
+        std::string language;  // the stream's (ISO 639-2, as MPEG-TS and MP4 state it), "" when not said
+        std::string title;
+        int channels = 0;
+    };
+    std::function<void(const std::vector<SoundTrack>& tracks)> onSoundTracks;
+    // SCTE 35 cue messages in the feed (an MPEG transport stream's splice_info_sections, over SRT, RIST or UDP), each
+    // as it came: its bytes, the feed's clock (seconds, the 90 kHz clock of the stream's times) at the recording's first
+    // picture (its times, pts_time, are on that clock), and when it came (seconds into the recording, by its own
+    // stream time; NaN when it had none). Given once the recording has begun (those before, then).
+    std::function<void(const std::vector<uint8_t>& section, double feedZero, double at)> onCue;
     // Watched live as it records (or, with no path, instead of recording).
     std::shared_ptr<LiveFeed> live;
 };
