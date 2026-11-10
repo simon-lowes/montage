@@ -1,6 +1,8 @@
 #include "ModelClip.h"
 
+#include <QBuffer>
 #include <QCryptographicHash>
+#include <QImage>
 #include <algorithm>
 #include <cmath>
 #include <list>
@@ -746,6 +748,41 @@ bool splatClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     return true;
 }
 
+namespace {
+
+// A card's picture at t as a PNG (sRGB, straight alpha, 8 bits): its clip's picture on the sequence's frame as its own
+// transform leaves it, before its 3D layer (drawn alone, the 3D layers on it turned off).
+std::string cardPicturePng(const Project& p, const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
+    Sequence alone = seq;
+    if (track >= alone.videoTracks.size()) return {};
+    for (Clip& k : alone.videoTracks[track].clips)
+        if (k.id == c.id)
+            for (Effect& e : k.effects)
+                if (e.type == "layer_3d") e.enabled = false;
+    RenderOptions o;
+    o.highQuality = true;
+    o.soloVideoTrack = int(track);
+    const Image img = renderSequenceFrame(p, alone, t, o);
+    if (img.empty()) return {};
+    QImage q(img.width, img.height, QImage::Format_RGBA8888);
+    for (int y = 0; y < img.height; ++y) {
+        uchar* row = q.scanLine(y);
+        for (int x = 0; x < img.width; ++x) {
+            const float* v = img.at(x, y);
+            const float a = std::clamp(v[3], 0.0f, 1.0f);
+            for (int k = 0; k < 3; ++k) row[x * 4 + k] = uchar(std::lround(std::clamp(a > 0 ? v[k] / a : 0.0f, 0.0f, 1.0f) * 255));
+            row[x * 4 + 3] = uchar(std::lround(a * 255));
+        }
+    }
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    buffer.open(QIODevice::WriteOnly);
+    if (!q.save(&buffer, "PNG")) return {};
+    return bytes.toStdString();
+}
+
+}  // namespace
+
 std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence& seq, size_t track, const Clip& footage) {
     std::vector<SolvedSceneMesh> out;
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
@@ -793,10 +830,26 @@ std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence&
                 if (!e && x.enabled && x.type == "layer_3d") e = &x;  // (its first, as the card is drawn by)
             if (!e || std::lround(e->p("camera", 0, 3)) != 1) continue;
             if (cameraTrackOf(seq, ti, *e, 0, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
-            std::shared_ptr<const Model> plane;
-            const PosedTriangles tr =
-                layer3dTriangles(layer3dPlace(*e, 0, seq.width, seq.height), plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
+            // Where it stands at each of the solve's frames it plays over (its matrix's rows its axes and middle), its
+            // plane then in its own space.
             SolvedSceneMesh m;
+            const std::shared_ptr<const CameraSolve> solve = parsedSolve(footage);
+            const FrameTime from = std::max(c.start, footage.start), to = std::min(c.end(), footage.end());
+            for (FrameTime t = from; solve && t < to; ++t) {
+                const int frame = cameraSolveFrame(seq, footage, *solve, t - footage.start);
+                if (frame < 0 || (!m.motion.empty() && m.motion.back().first >= frame)) continue;
+                const Layer3DPlace at = layer3dPlace(*e, t - c.start, seq.width, seq.height);
+                m.motion.push_back({double(frame), {at.axisU[0], at.axisU[1], at.axisU[2], 0, at.axisV[0], at.axisV[1], at.axisV[2], 0,
+                                                    at.normal[0], at.normal[1], at.normal[2], 0, at.origin[0], at.origin[1], at.origin[2], 1}});
+            }
+            Layer3DPlace place = layer3dPlace(*e, 0, seq.width, seq.height);
+            if (!m.motion.empty()) {
+                place.origin = {0, 0, 0}, place.axisU = {1, 0, 0}, place.axisV = {0, 1, 0}, place.normal = {0, 0, 1};
+                place.unit = layer3dPlace(*e, from - c.start, seq.width, seq.height).unit;
+            }
+            std::shared_ptr<const Model> plane;
+            const PosedTriangles tr = layer3dTriangles(place, plane, float(std::clamp(e->p("rough", 0, 50) / 100, 0.0, 1.0)));
+            m.picture = cardPicturePng(p, seq, ti, c, from < to ? from : c.start);
             m.card = true;
             m.name = c.name;
             m.color = {1, 1, 1, 1};

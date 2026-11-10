@@ -122,11 +122,19 @@ struct SolvedSceneMesh {
     float metallic = 0, roughness = 0.5f;
     bool doubleSided = false;
     bool card = false;  // a 3D layer's card (Card_N), not a model (Model_N)
+    // Its picture (PNG: sRGB, straight alpha) on its uvs as the material's colour and opacity (empty: none).
+    std::string picture;
+    // Its place by time code (the solve's frames): the matrix from its own space (positions and normals then in it)
+    // to the scene's, row vectors as USD writes them (its first three rows the axes, the fourth where it is). Empty:
+    // it stands still, its positions in the scene's space.
+    std::vector<std::pair<double, std::array<double, 16>>> motion;
 };
 // The camera, its points and the models placed in its scene as a USD scene (USDA): a camera moving through time codes
 // 0, 1, 2... (one a frame, at the footage's frame rate; a 36 mm wide film back), the points as a point cloud and each
-// model and 3D layer's card as a mesh with a plain material (a card with its uvs as primvars:st). Turned as
-// writeNukeChan turns a scene with no ground.
+// model and 3D layer's card as a mesh with a plain material (a card with its uvs as primvars:st), a card's picture as
+// its UsdPreviewSurface's texture and its motion as its transform's time samples. Turned as writeNukeChan turns a scene
+// with no ground. To a .usdz path, a USDZ package: the layer first, then the pictures (each aligned to 64 bytes); to
+// a .usda path, the pictures beside it as <name>_Card_N.png.
 bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::vector<SolvedSceneMesh>& models = {},
                     std::string* error = nullptr);
 

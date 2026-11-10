@@ -1,5 +1,6 @@
 #include "CameraSolve.h"
 
+#include <QFileInfo>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -8,6 +9,7 @@
 
 #include "Decoder.h"
 #include "Usd.h"
+#include "core/Zip.h"
 #include "core/LinearSolve.h"
 
 namespace montage {
@@ -1295,6 +1297,11 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
         for (size_t i = 0; i <= m; ++i) n += models[i].card == models[m].card;
         return (models[m].card ? "Card_" : "Model_") + std::to_string(n);
     };
+    // A package (.usdz) or a layer with its pictures beside it, named after it.
+    const QFileInfo info(QString::fromStdString(path));
+    const bool package = info.suffix().compare("usdz", Qt::CaseInsensitive) == 0;
+    const std::string stem = info.completeBaseName().toStdString();
+    auto pictureName = [&](size_t m) { return (package ? std::string() : stem + "_") + meshName(m) + ".png"; };
     if (!models.empty()) {
         o << "\n    def Scope \"Models\"\n    {\n";
         for (size_t m = 0; m < models.size(); ++m) {
@@ -1307,15 +1314,31 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
             for (size_t t = 0; t < mesh.indices.size() / 3; ++t) o << (t ? ", 3" : "3");
             o << "]\n            int[] faceVertexIndices = [";
             for (size_t i = 0; i < mesh.indices.size() / 3 * 3; ++i) o << (i ? ", " : "") << mesh.indices[i];
+            // (moving, in its own space, which its transform turns as the scene is turned)
+            const double km = mesh.motion.empty() ? k : 1;
             o << "]\n            point3f[] points = [";
             for (size_t i = 0; i + 2 < mesh.positions.size(); i += 3)
-                o << (i ? ", " : "") << f3(mesh.positions[i], k * mesh.positions[i + 1], k * mesh.positions[i + 2], true);
+                o << (i ? ", " : "") << f3(mesh.positions[i], km * mesh.positions[i + 1], km * mesh.positions[i + 2], true);
             o << "]\n";
             if (!mesh.normals.empty() && mesh.normals.size() == mesh.positions.size()) {
                 o << "            normal3f[] normals = [";
                 for (size_t i = 0; i + 2 < mesh.normals.size(); i += 3)
-                    o << (i ? ", " : "") << f3(mesh.normals[i], k * mesh.normals[i + 1], k * mesh.normals[i + 2], true);
+                    o << (i ? ", " : "") << f3(mesh.normals[i], km * mesh.normals[i + 1], km * mesh.normals[i + 2], true);
                 o << "] (\n                interpolation = \"vertex\"\n            )\n";
+            }
+            if (!mesh.motion.empty()) {
+                o << "            matrix4d xformOp:transform.timeSamples = {\n";
+                for (const auto& [tc, m] : mesh.motion) {
+                    o << "                " << formatNumber(tc) << ": (";
+                    for (int r = 0; r < 4; ++r) {
+                        o << (r ? ", (" : "(");
+                        for (int c = 0; c < 4; ++c)
+                            o << (c ? ", " : "") << formatNumber(m[size_t(r * 4 + c)] * (c == 1 || c == 2 ? k : 1));
+                        o << ")";
+                    }
+                    o << "),\n";
+                }
+                o << "            }\n            uniform token[] xformOpOrder = [\"xformOp:transform\"]\n";
             }
             if (!mesh.uvs.empty() && mesh.uvs.size() / 2 == mesh.positions.size() / 3) {
                 // (USD's st runs up from the bottom left)
@@ -1333,22 +1356,56 @@ bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::ve
             const std::string name = meshName(m);
             o << "        def Material \"" << name << "\"\n        {\n            token outputs:surface.connect = </Solve/Looks/" << name
               << "/Surface.outputs:surface>\n\n            def Shader \"Surface\"\n            {\n"
-              << "                uniform token info:id = \"UsdPreviewSurface\"\n"
-              << "                color3f inputs:diffuseColor = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
-              << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n"
-              << "                float inputs:metallic = " << formatNumber(mesh.metallic, true) << "\n"
+              << "                uniform token info:id = \"UsdPreviewSurface\"\n";
+            const std::string look = "</Solve/Looks/" + name;
+            if (!mesh.picture.empty()) {
+                o << "                color3f inputs:diffuseColor.connect = " << look << "/Picture.outputs:rgb>\n"
+                  << "                float inputs:opacity.connect = " << look << "/Picture.outputs:a>\n";
+            } else {
+                o << "                color3f inputs:diffuseColor = " << f3(mesh.color[0], mesh.color[1], mesh.color[2], true) << "\n"
+                  << "                float inputs:opacity = " << formatNumber(mesh.color[3], true) << "\n";
+            }
+            o << "                float inputs:metallic = " << formatNumber(mesh.metallic, true) << "\n"
               << "                float inputs:roughness = " << formatNumber(mesh.roughness, true) << "\n"
-              << "                token outputs:surface\n            }\n        }\n";
+              << "                token outputs:surface\n            }\n";
+            if (!mesh.picture.empty()) {
+                o << "\n            def Shader \"Picture\"\n            {\n"
+                  << "                uniform token info:id = \"UsdUVTexture\"\n"
+                  << "                asset inputs:file = @./" << pictureName(m) << "@\n"
+                  << "                token inputs:sourceColorSpace = \"sRGB\"\n"
+                  << "                float2 inputs:st.connect = " << look << "/Uvs.outputs:result>\n"
+                  << "                token inputs:wrapS = \"clamp\"\n                token inputs:wrapT = \"clamp\"\n"
+                  << "                float3 outputs:rgb\n                float outputs:a\n            }\n"
+                  << "\n            def Shader \"Uvs\"\n            {\n"
+                  << "                uniform token info:id = \"UsdPrimvarReader_float2\"\n"
+                  << "                string inputs:varname = \"st\"\n"
+                  << "                float2 outputs:result\n            }\n";
+            }
+            o << "        }\n";
         }
         o << "    }\n";
     }
     o << "}\n";
-    std::ofstream f(path, std::ios::binary);
-    if (!(f << o.str()) || !f.flush()) {
-        if (error) *error = "Cannot write " + path;
-        return false;
+    auto write = [&](const std::string& file, const std::string& bytes) {
+        std::ofstream f(file, std::ios::binary);
+        if (!(f << bytes) || !f.flush()) {
+            if (error) *error = "Cannot write " + file;
+            return false;
+        }
+        return true;
+    };
+    if (package) {
+        // (the layer first, as USDZ wants, then the pictures; each entry's data 64-byte aligned)
+        ZipWriter zip;
+        zip.add(stem + ".usda", o.str(), 64);
+        for (size_t m = 0; m < models.size(); ++m)
+            if (!models[m].picture.empty()) zip.add(pictureName(m), models[m].picture, 64);
+        return write(path, zip.finish());
     }
-    return true;
+    const std::string dir = info.absolutePath().toStdString() + "/";
+    for (size_t m = 0; m < models.size(); ++m)
+        if (!models[m].picture.empty() && !write(dir + pictureName(m), models[m].picture)) return false;
+    return write(path, o.str());
 }
 
 }  // namespace montage
