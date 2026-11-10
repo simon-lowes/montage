@@ -10586,6 +10586,7 @@ private slots:
         QFile playlist(folder + "/" + out.value("renditions").toArray().at(0).toString() + "/playlist.m3u8");
         QVERIFY(playlist.open(QIODevice::ReadOnly));
         const QByteArray m3u = playlist.readAll();
+        playlist.close();  // (on Windows a file held open keeps its folder from being moved aside by the next render)
         QVERIFY(m3u.contains("SCTE35-OUT=0xFC") && m3u.contains("SCTE35-IN=0xFC"));
         // Set per shot (one shot here) to a VMAF target: each rung's shots and the ladder's report; a target without
         // per_shot, or past 100, refused.
