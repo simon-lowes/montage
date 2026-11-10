@@ -248,6 +248,11 @@ SceneShadows makeSceneShadows(const Project& p, const Sequence& seq, FrameTime t
         }
         if (best) out.ground[best->id].push_back(ci);
     }
+    int index = 0;
+    for (const auto& [id, cs] : out.ground) {
+        for (const int ci : cs) w->casters[size_t(ci)].ground = index;
+        ++index;
+    }
     out.world = std::move(w);
     return out;
 }
@@ -326,7 +331,7 @@ Image renderLitLayer3D(const Sequence& seq, const Effect& e, FrameTime lt, const
     } else if (scene.castsShadows) {
         // (alone, it casts onto its own ground)
         auto w = std::make_shared<ModelShadowWorld>();
-        w->casters.push_back({scene.triangles, scene.picture, -1});
+        w->casters.push_back({scene.triangles, scene.picture, -1, 0});
         w->reach(scene.triangles);
         scene.shadowWorld = std::move(w);
         scene.groundCasters = {0};
@@ -445,13 +450,18 @@ bool cameraFocus(const Clip& camera, FrameTime t, CameraFocus& f) {
 }
 
 void cameraDepthOfField(const Project& p, const Sequence& seq, const Clip& camera, FrameTime t, double scale, Image& img,
-                        std::vector<float>& depth) {
+                        std::vector<float>& depth, const std::vector<char>* sharp) {
     CameraFocus f;
     const int W = img.width, H = img.height;
     if (!cameraFocus(camera, t, f) || img.empty() || depth.size() != size_t(W) * size_t(H)) return;
     ModelCamera cam;
     sceneCamera(p, seq, camera, t, scale, cam);
     double focus = f.focus;
+    const size_t N = size_t(W) * size_t(H);
+    const bool masked = sharp && sharp->size() == N;
+    if (masked)
+        for (size_t i = 0; i < N; ++i)
+            if ((*sharp)[i]) depth[i] = 0;
     if (!(focus > 0)) {
         // (what is at the picture's middle: the median depth of what is there round about it, else of everything)
         std::vector<float> around;
@@ -466,18 +476,23 @@ void cameraDepthOfField(const Project& p, const Sequence& seq, const Clip& camer
         std::nth_element(around.begin(), around.begin() + long(around.size() / 2), around.end());
         focus = around[around.size() / 2];
     }
+    if (masked)
+        for (size_t i = 0; i < N; ++i)
+            if ((*sharp)[i]) depth[i] = float(focus);
     layer3dDepthOfField(img, depth, cam, focus, f.fstop, f.unitsPerMetre, f.aperture);
 }
 
-namespace {
-// The Camera clip a 3D layer or model seeing through the scene's camera ("camera" 3) looks through at t (null: none).
-const Clip* sceneCameraFor(const Sequence& seq, const Effect& e, FrameTime lt, FrameTime t) {
+const Clip* lensCamera(const Sequence& seq, const Clip& c, const Effect& e, FrameTime t) {
+    const FrameTime lt = t - c.start;
+    // (a 3D model's own camera is its front one by default, a 3D layer's the scene's)
+    const bool model = &e == &c.generator;
+    if (std::lround(e.p("camera", lt, model ? 0 : 3)) != 3) return nullptr;
     const int named = int(std::lround(e.p("camera_track", lt, 0))) - 1;
     const Clip* cc = sceneCameraClip(seq, t, named);
     if (!cc && named >= 0) cc = sceneCameraClip(seq, t, -1);
-    return cc;
+    CameraFocus f;
+    return cc && cameraFocus(*cc, t, f) ? cc : nullptr;
 }
-}  // namespace
 
 bool renderClipLayer3D(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime t, const Image& layer, double scale,
                        Image& out, std::vector<float>* depth, std::string* error, const std::function<Image(const Clip&)>& cardLayer) {
@@ -488,17 +503,18 @@ bool renderClipLayer3D(const Project& p, const Sequence& seq, const Clip& c, con
     const long mode = std::lround(e.p("camera", lt, 3));
     // Through the scene's Camera clip with its lens's depth of field on, the camera's blurs it (here when the card is
     // used flat; else where the deep pictures are merged), not its own.
-    const Clip* camera = mode == 3 ? sceneCameraFor(seq, e, lt, t) : nullptr;
-    CameraFocus lens;
-    const bool cameraDof = camera && cameraFocus(*camera, t, lens);
+    const Clip* camera = lensCamera(seq, c, e, t);
+    const bool cameraDof = camera != nullptr;
     const bool dof = !cameraDof && e.p("depth_of_field", lt, 0) > 0.5;
     std::vector<float> own;
     std::vector<float>* d = depth ? depth : dof || cameraDof ? &own : nullptr;
     if (e.p("lit", lt, 0) > 0.5 && !layer.empty() && scale > 0) {
         // Its scene of shadows: the cards (their pictures before their 3D layers; its own, this) and models at t.
-        const SceneShadows shadows = sceneShadows(
-            p, seq, t, shadowWorldOf(seq, c, e, t),
-            [&](const Clip& k) { return k.id == c.id ? layer : cardLayer ? cardLayer(k) : Image(); }, {}, &c);
+        // (none when its light is off: nothing to take shadows from)
+        const SceneShadows shadows = e.p("light_strength", lt, 100) > 0
+                                         ? sceneShadows(p, seq, t, shadowWorldOf(seq, c, e, t),
+                                                        [&](const Clip& k) { return k.id == c.id ? layer : cardLayer ? cardLayer(k) : Image(); }, {}, &c)
+                                         : SceneShadows{};
         out = renderLitLayer3D(seq, e, lt, layer, pl, cam, shadows.world ? &shadows : nullptr, c.id, d);
     } else {
         out = renderLayer3D(layer, pl, cam, scale, d);

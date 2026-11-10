@@ -1376,7 +1376,8 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
                      {"name", qs(p.name)},
                      {"activeSequence", double(p.activeSequence)},
                      {"nextId", double(p.nextId)},
-                     {"mediaStereo", 2}};  // the media's stereo packing is recorded (2: MV-HEVC's too)
+                     {"mediaStereo", 2},  // the media's stereo packing is recorded (2: MV-HEVC's too)
+                     {"cameraLens", 1}};  // depth of field through the scene's camera is the Camera clip's
     QJsonArray media;
     for (const auto& m : p.media) {
         QJsonObject o{{"id", double(m.id)},
@@ -1774,14 +1775,17 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     // A compositing node shared between clips (saved so) given a fresh owner id.
     for (Sequence& s : p.sequences) separateCompositeIds(p, s);
-    // Depth of field through the scene's camera is the Camera clip's (its lens's): a card seen through it with its own
-    // on gives the camera its settings (when the camera's is not on already) and leaves its own off.
+    // Depth of field through the scene's camera is the Camera clip's (its lens's): in a project saved before that, a card
+    // seen through it with its own on gives the camera its settings (when the camera's is not on already) and leaves its
+    // own off.
+    const bool cardLenses = root.value("cameraLens").toInt() < 1;
     for (Sequence& s : p.sequences)
         for (Track& t : s.videoTracks)
             for (Clip& c : t.clips)
                 for (Effect& e : c.effects) {
-                    if (e.type != "layer_3d" || std::lround(e.p("camera", 0, 3)) != 3 || e.p("depth_of_field", 0, 0) <= 0.5) continue;
+                    if (!cardLenses || e.type != "layer_3d" || std::lround(e.p("camera", 0, 3)) != 3 || e.p("depth_of_field", 0, 0) <= 0.5) continue;
                     auto cameraOn = [&](Track& k) -> Clip* {
+                        if (k.muted) return nullptr;  // (as the renderer finds it)
                         for (Clip& x : k.clips)
                             if (x.enabled && x.isGenerator() && x.generator.type == "camera3d" && c.start >= x.start && c.start < x.end()) return &x;
                         return nullptr;

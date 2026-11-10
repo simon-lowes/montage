@@ -38115,6 +38115,77 @@ if ui["pressed"] == "add":
             QCOMPARE(passes, uint64_t(1));
         }
 
+        // ---- A ground takes its own casters' shadows where another ground's caster is nearer the light: a copy of the
+        // card further towards the sun (shading the card, its shadow falling where the card's does) leaves the card's
+        // shadow on its own ground as it was.
+        {
+            Clip card = whiteCard(100);
+            Effect& e = card.effects[0];
+            e.params["lit"] = 1.0, e.params["shadows"] = 1.0, e.params["ground_y"] = -60.0;
+            ModelCamera cam;
+            std::string err;
+            QVERIFY(effectCamera(p, s, card, e, 3, 1, cam, &err));
+            const Layer3DPlace place = layer3dPlace(e, 3, W, H);
+            // (the clip's picture as its transform leaves it: white over the middle 30 % of the frame, which its caster's
+            // triangles cover)
+            Image white(W, H);
+            const int x0 = int(W * 0.35), x1 = int(W * 0.65), y0 = int(H * 0.35), y1 = int(H * 0.65);
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x) std::fill(white.at(x, y), white.at(x, y) + 4, 1.0f);
+            std::shared_ptr<const Model> plane;
+            PosedTriangles own = layer3dTriangles(place, plane);
+            {
+                const size_t nv = own.positions.size() / 3;
+                V mid{0, 0, 0};
+                for (size_t i = 0; i < nv; ++i)
+                    for (size_t a = 0; a < 3; ++a) mid[a] += own.positions[i * 3 + a] / double(nv);
+                for (size_t i = 0; i < nv; ++i)
+                    for (size_t a = 0; a < 3; ++a) own.positions[i * 3 + a] = float(mid[a] + (own.positions[i * 3 + a] - mid[a]) * 0.3);
+            }
+            PosedTriangles nearer = own;
+            for (size_t i = 0; i + 2 < nearer.positions.size(); i += 3)
+                for (size_t a = 0; a < 3; ++a) nearer.positions[i + a] += float(150 * towards[a]);
+            auto render = [&](bool withNearer, bool ground) {
+                Effect g = e;
+                g.params["ground"] = ground ? 1.0 : 0.0;
+                auto w = std::make_shared<ModelShadowWorld>();
+                w->casters.push_back({own, nullptr, -1, 0});
+                w->reach(own);
+                w->reach(nearer);  // (the same bounds either way)
+                if (withNearer) w->casters.push_back({nearer, nullptr, -1, 1});
+                SceneShadows sh;
+                sh.world = w;
+                sh.ground[card.id] = {0};
+                return renderLitLayer3D(s, g, 3, white, place, cam, &sh, card.id, nullptr, false);
+            };
+            const Image alone = render(false, true), shaded = render(true, true), cardOnly = render(false, false);
+            // (off the card, a pixel's breadth clear of its edge)
+            auto offCard = [&](int x, int y) {
+                for (int dy = -2; dy <= 2; ++dy)
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        const int u = std::clamp(x + dx, 0, W - 1), v = std::clamp(y + dy, 0, H - 1);
+                        if (cardOnly.at(u, v)[3] > 0.001f) return false;
+                    }
+                return true;
+            };
+            int groundShadow = 0;
+            float off = 0, cardAlone = 0, cardShaded = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (offCard(x, y)) {
+                        if (alone.at(x, y)[3] > 0.2f) ++groundShadow;
+                        off = std::max(off, std::fabs(alone.at(x, y)[3] - shaded.at(x, y)[3]));
+                    } else if (cardOnly.at(x, y)[3] > 0.99f) {
+                        cardAlone += alone.at(x, y)[0], cardShaded += shaded.at(x, y)[0];
+                    }
+                }
+            qInfo("own ground: %d shadow pixels, %.5f off with a nearer caster of another ground; the card %.1f lit, %.1f shaded",
+                  groundShadow, off, cardAlone, cardShaded);
+            QVERIFY(groundShadow > 100);
+            QVERIFY(off <= 1e-4f);
+            QVERIFY(cardShaded < cardAlone * 0.9f);  // (the nearer one does shade the card)
+        }
+
         // ---- The Camera clip's depth of field: a small bright card twice as far as the focus opens into the aperture's
         // shape, a hexagon of the thin lens's circle (corner to corner across, flat to flat down, to a pixel), and
         // twice as tall with an anamorphic squeeze of 2.
@@ -38203,13 +38274,21 @@ if ui["pressed"] == "add":
             qs.videoTracks[1].clips[0].generator.params["dof"] = 0.0;
             Effect& own = qs.videoTracks[0].clips[0].effects[0];
             own.params["depth_of_field"] = 1.0, own.params["fstop"] = 4.0, own.params["focus_distance"] = 900.0;
+            // (saved before the camera's lens took it: without the project's mark)
+            QJsonObject saved = QJsonDocument::fromJson(QByteArray::fromStdString(projectToJson(q))).object();
+            saved.remove("cameraLens");
             Project back;
             std::string err;
-            QVERIFY2(projectFromJson(projectToJson(q), back, &err), err.c_str());
+            QVERIFY2(projectFromJson(QJsonDocument(saved).toJson().toStdString(), back, &err), err.c_str());
             const Effect& bg = back.active()->videoTracks[1].clips[0].generator;
             const Effect& be = back.active()->videoTracks[0].clips[0].effects[0];
             QVERIFY(bg.p("dof", 0, 0) == 1.0 && bg.p("fstop", 0, 0) == 4.0 && bg.p("focus_distance", 0, 0) == 900.0 && bg.p("units_m", 0, 0) == 1000.0);
             QVERIFY(be.p("depth_of_field", 0, 1) == 0.0);
+            // Saved since, a card's own is kept as it is.
+            Project kept;
+            QVERIFY2(projectFromJson(projectToJson(q), kept, &err), err.c_str());
+            QVERIFY(kept.active()->videoTracks[1].clips[0].generator.p("dof", 0, 1) == 0.0);
+            QVERIFY(kept.active()->videoTracks[0].clips[0].effects[0].p("depth_of_field", 0, 0) == 1.0);
         }
 
         // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at

@@ -885,26 +885,20 @@ Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, Fram
         return Image(std::max(1, w), std::max(1, h));
     }
     // Its scene of shadows: the cards and other models seen through the same kind of camera (its settings' light takes
-    // their shadows even when it casts none itself).
-    {
+    // their shadows even when it casts none itself), when a light of it can take them.
+    const bool settingsLight = std::lround(c.generator.p("light_kind", t - c.start, 0)) != 3;
+    if (std::any_of(scene.lights.begin(), scene.lights.end(),
+                    [&](const ModelLight& l) { return l.kind != ModelLight::Kind::Point && l.intensity > 0 && (l.shadows || settingsLight); })) {
         const SceneShadows sh = sceneShadows(p, seq, t, shadowWorldOf(seq, c, c.generator, t), {}, trackLayer, &c);
         if (sh.world) {
             scene.shadowWorld = sh.world;
             if (auto it = sh.ground.find(c.id); it != sh.ground.end()) scene.groundCasters = it->second;
-            if (std::lround(c.generator.p("light_kind", t - c.start, 0)) != 3)
+            if (settingsLight)
                 for (ModelLight& l : scene.lights) l.shadows = true;
         }
     }
     std::vector<float> own;
-    const FrameTime lt = t - c.start;
-    const Clip* camera = nullptr;
-    if (std::lround(c.generator.p("camera", lt, 0)) == 3 && !depth) {
-        const int named = int(std::lround(c.generator.p("camera_track", lt, 0))) - 1;
-        camera = sceneCameraClip(seq, t, named);
-        if (!camera && named >= 0) camera = sceneCameraClip(seq, t, -1);
-        CameraFocus lens;
-        if (camera && !cameraFocus(*camera, t, lens)) camera = nullptr;
-    }
+    const Clip* camera = depth ? nullptr : lensCamera(seq, c, c.generator, t);
     Image img = renderModel(scene, cam, w, h, depth ? depth : camera ? &own : nullptr);
     if (camera) {
         // Used flat through the scene's camera with its depth of field on: blurred by its lens here, in the linear

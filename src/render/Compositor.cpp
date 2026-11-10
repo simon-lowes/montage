@@ -2478,6 +2478,49 @@ Image deepLayer(const DeepFrame& f) {
     return img;
 }
 
+// The Camera clip whose lens blurs track ti's deep frame at t (render/Layer3D.h lensCamera): a card's or a 3D model's
+// drawn at its depths (a model made deep from its flat picture was blurred as it was drawn).
+const Clip* deepLensCamera(const Sequence& seq, size_t ti, FrameTime t) {
+    const Clip* c = ti < seq.videoTracks.size() ? clipAt(seq.videoTracks[ti], t) : nullptr;
+    if (!c) return nullptr;
+    if (c->isGenerator() && c->generator.type == "model3d")
+        return enabledEffect(seq, *c, "make_deep") ? nullptr : lensCamera(seq, *c, c->generator, t);
+    const Effect* l3 = enabledEffect(seq, *c, "layer_3d");
+    return l3 ? lensCamera(seq, *c, *l3, t) : nullptr;
+}
+
+// `img`, flattened from deep frames (with the Camera clip each is seen through with its depth of field on, or null),
+// blurred by each of those cameras' lenses by the depth of each pixel's nearest sample: where that sample is from a
+// frame seen through it (the rest kept in focus).
+void deepLensBlur(const Project& p, const Sequence& seq, FrameTime t, const std::vector<std::pair<const DeepFrame*, const Clip*>>& frames,
+                  Image& img) {
+    std::vector<const Clip*> cameras;
+    for (const auto& [f, cam] : frames)
+        if (cam && std::find(cameras.begin(), cameras.end(), cam) == cameras.end()) cameras.push_back(cam);
+    const int W = img.width, H = img.height;
+    if (cameras.empty() || W <= 0 || H <= 0) return;
+    const size_t N = size_t(W) * size_t(H);
+    std::vector<float> nearest(N, 0.0f);
+    std::vector<int> from(N, -1);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const DeepFrame& f = *frames[i].first;
+        if (f.width != W || f.height != H) continue;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t at = size_t(y) * size_t(W) + size_t(x);
+                const DeepSample* smp = f.at(x, y);
+                for (size_t k = 0; k < f.count(x, y); ++k)
+                    if (smp[k].a > 0 && smp[k].z > 0 && (nearest[at] <= 0 || smp[k].z < nearest[at])) nearest[at] = smp[k].z, from[at] = int(i);
+            }
+    }
+    for (const Clip* cam : cameras) {
+        std::vector<float> depth = nearest;
+        std::vector<char> sharp(N, 0);
+        for (size_t at = 0; at < N; ++at) sharp[at] = from[at] >= 0 && frames[size_t(from[at])].second != cam;
+        cameraDepthOfField(p, seq, *cam, t, double(W) / seq.width, img, depth, &sharp);
+    }
+}
+
 // The deep layers on screen at t: every deep clip's frame (held out where asked), the merge of those not flattened on
 // their own, and the lowest track among them.
 struct DeepLayers {
@@ -2537,22 +2580,13 @@ DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const 
             if (out.lowest < 0) out.lowest = int(ti);
         }
     if (!merge.empty()) {
-        const DeepFrame merged = mergeDeep(merge);
-        out.merged = deepLayer(merged);
-        // Through the scene's Camera clip with its lens's depth of field on: the merged scene blurred by it, by each
-        // pixel's nearest sample's depth.
-        if (const Clip* camera = sceneCameraClip(seq, t); camera && camera->generator.p("dof", t - camera->start, 0) > 0.5) {
-            std::vector<float> depth(size_t(W) * size_t(H), 0.0f);
-            for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    float nearest = 0;
-                    const DeepSample* smp = merged.at(x, y);
-                    for (size_t k = 0; k < merged.count(x, y); ++k)
-                        if (smp[k].a > 0 && smp[k].z > 0 && (nearest <= 0 || smp[k].z < nearest)) nearest = smp[k].z;
-                    depth[size_t(y) * size_t(W) + size_t(x)] = nearest;
-                }
-            cameraDepthOfField(p, seq, *camera, t, double(W) / seq.width, out.merged, depth);
-        }
+        out.merged = deepLayer(mergeDeep(merge));
+        // Through the Camera clips the cards and models look through with their lenses' depth of field on: the merged
+        // scene blurred by them.
+        std::vector<std::pair<const DeepFrame*, const Clip*>> lensed;
+        for (const auto& [ti, f] : out.frames)
+            if (!out.flattened[ti]) lensed.push_back({&f, deepLensCamera(seq, ti, t)});
+        deepLensBlur(p, seq, t, lensed, out.merged);
     }
     return out;
 }
@@ -2669,7 +2703,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         if (auto it = deep.frames.find(ti); it != deep.frames.end()) {
             if (deep.flattened[ti]) {
                 const Clip* c = clipAt(track, t);
-                composite(deepLayer(it->second), c ? c->blendMode : "normal");
+                Image flat = deepLayer(it->second);
+                deepLensBlur(p, seq, t, {{&it->second, deepLensCamera(seq, ti, t)}}, flat);  // (on its own, by its own camera's lens)
+                composite(std::move(flat), c ? c->blendMode : "normal");
             } else if (int(ti) == deep.lowest) {
                 composite(std::move(deep.merged), "normal");
             }

@@ -128,8 +128,14 @@ struct CameraFocus {
 bool cameraFocus(const Clip& camera, FrameTime t, CameraFocus& focus);
 // The scene seen through Camera clip `camera` at t (img and its depth, as layer3dDepthOfField takes them, on the
 // sequence's picture scaled by `scale`) blurred by its lens; nothing when its depth of field is off.
+// Pixels marked in `sharp` (when given) are kept in focus (what is not seen through it), and left out of finding
+// what is at the middle.
 void cameraDepthOfField(const Project& p, const Sequence& seq, const Clip& camera, FrameTime t, double scale, Image& img,
-                        std::vector<float>& depth);
+                        std::vector<float>& depth, const std::vector<char>* sharp = nullptr);
+// The Camera clip whose lens blurs what card or model c shows at sequence frame t through `e` (its 3D layer, or a 3D
+// model's own settings): the scene's camera it sees through ("camera" 3) when that camera's depth of field is on; null
+// otherwise.
+const Clip* lensCamera(const Sequence& seq, const Clip& c, const Effect& e, FrameTime t);
 
 // Clip c's picture `layer` through its 3D layer `e` at sequence frame t: false (with `error`) when its camera is not
 // there (a solve missing, a file without a camera). Lit, it takes the shadows of its scene of shadows (sceneShadows,

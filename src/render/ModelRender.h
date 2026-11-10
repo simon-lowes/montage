@@ -72,24 +72,18 @@ struct ModelProjection {
     bool lit = false;   // as base colour, lit as the surface is (else shown as it is)
 };
 
-// A surface that casts shadows but is not drawn (another 3D layer's card, say): its triangles in the world, casting
-// where its picture's alpha (`coverage`, the triangles' uvs into it; null: everywhere) is at least a half.
-struct ModelShadowCaster {
-    PosedTriangles triangles;
-    std::shared_ptr<const ModelTexture> coverage;
-    bool onGround = true;  // its shadow falls on the ground too (off: it is on a ground of its own, drawn elsewhere)
-};
-
 // Everything that casts shadows in one scene (models, other 3D layers' cards), so that one shadow map a light is made
 // for them all and each surface drawn in that scene, and each ground, samples it: each takes the others' shadows and
-// casts its own onto them, made once a light however many there are. Casters as ModelShadowCaster's are (coverage
-// over the triangles of `coverageMaterial`, -1 all); the maps cover them all (`reach` widens the bounds).
+// casts its own onto them, made once a light however many there are. A caster's triangles are in the world and cast
+// where its picture's alpha (`coverage`, the triangles' uvs into it, over those of `coverageMaterial`, -1 all; null:
+// everywhere) is at least a half; the maps cover them all (`reach` widens the bounds).
 struct ModelShadowMap;
 struct ModelShadowWorld {
     struct Caster {
         PosedTriangles triangles;
         std::shared_ptr<const ModelTexture> coverage;
         int coverageMaterial = -1;
+        int ground = -1;  // the ground its shadow falls on (an index the scene gives its grounds; -1: none)
     };
     std::vector<Caster> casters;
     std::array<double, 3> lo{0, 0, 0}, hi{0, 0, 0};
@@ -97,7 +91,8 @@ struct ModelShadowWorld {
     // Widens the bounds the maps cover to the triangles'.
     void reach(const PosedTriangles& t);
     // The map for `light` (made the first time it is asked for, the same light asking again given the same one; null
-    // for a point light or with nothing casting). Each texel knows which caster is nearest the light there.
+    // for a point light or with nothing casting). Besides the nearest of all, it keeps, from the same pass, the nearest
+    // of each ground's casters, so a ground is shadowed by its own casters even where another is nearer the light.
     std::shared_ptr<const ModelShadowMap> map(const ModelLight& light, int size, bool serial = false) const;
 
 private:
@@ -128,11 +123,8 @@ struct ModelScene {
     int pictureMaterial = -1;
     bool pictureAsIs = false;
     std::shared_ptr<const ModelProjection> projection;
-    // Surfaces casting shadows onto these (and the ground) without being drawn.
-    std::vector<ModelShadowCaster> casters;
-    bool castsShadows = true;  // these triangles cast shadows (off: they only take the casters')
-    // A shared scene of casters (in place of `casters` and these triangles' own: they are among its casters when they
-    // cast): every light but a point light takes its map from it, and the ground takes the shadows of only the casters
+    bool castsShadows = true;  // these triangles cast shadows (off: they only take the shared scene's)
+    // A shared scene of casters (in place of these triangles' own: they are among its casters when they cast): every light but a point light takes its map from it, and the ground takes the shadows of only the casters
     // in `groundCasters` (indices into it), those whose shadows fall on this ground.
     std::shared_ptr<const ModelShadowWorld> shadowWorld;
     std::vector<int> groundCasters;
