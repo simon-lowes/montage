@@ -16,7 +16,7 @@
 namespace montage::plugins::wire {
 
 constexpr uint32_t kMagic = 0x3148504d;  // "MPH1"
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr int kMaxChannels = 32;
 constexpr int kMaxFrames = 8192;
 constexpr int kMaxParamChanges = 1024;
@@ -48,6 +48,16 @@ enum Command : uint32_t {
     // On an OpenFX channel.
     OfxRender,      // payload "<effect JSON>\0<plug-in JSON>\0<colour space id>"; images in the arena
     CallbackReply,  // Montage's answer to the host's question (a frame at another time, an input)
+    // An OpenFX channel's on-screen controls (overlay interact): payload an OverlayArgs, then "<effect JSON>\0<plug-in
+    // JSON>\0<key text>". Draw's reply: the overlay as premultiplied RGBA (8 bits a channel, top row first) at the
+    // arena's start, resultI x resultI2 pixels (0 x 0 when it drew nothing). Pen and Key: status 1 when the control
+    // took it, resultFlags kEdited when it set parameters, the edited effect's JSON then in the reply (resultI bytes;
+    // FetchBlob for the rest).
+    OfxOverlayOpen,
+    OfxOverlayDraw,
+    OfxOverlayPen,
+    OfxOverlayKey,
+    OfxOverlayFocus,
 };
 
 // What the host's reply is (replyKind).
@@ -64,8 +74,23 @@ enum : uint32_t {
     kHasMask = 32,       // (OpenFX) the effect's own mask follows the pictures in the arena
 };
 
-// Bits of `resultFlags` (Attach).
-enum : uint32_t { kHasSidechain = 1, kHasEditor = 2, kEditorResizable = 4, kOwnWindow = 8 };
+// Bits of `resultFlags` (Attach; kEdited: an overlay's Pen or Key set parameters; kControlFailed: the overlay said it
+// failed, and is closed).
+enum : uint32_t { kHasSidechain = 1, kHasEditor = 2, kEditorResizable = 4, kOwnWindow = 8, kEdited = 16, kControlFailed = 32 };
+
+// What an overlay message says beyond the effect: the view (render/Ofx.h View), the clip frame, the pen or key.
+struct OverlayArgs {
+    int32_t width, height;  // the view, in the monitor's own (device-independent) pixels
+    double m[6];
+    double renderScale, frameW, frameH;
+    double pixelRatio;  // device pixels to one of the view's (the image drawn is that much larger)
+    double time;
+    int32_t pen;  // 0 down, 1 move, 2 up
+    int32_t keysym;
+    double x, y, pressure;
+    int32_t down;  // Key: pressed (1) or let go; Focus: gained (1) or lost
+    int32_t pad;
+};
 
 // Editor events in a reply's payload: one byte of kind, then id (4), value (8), width (4), height (4).
 enum EventKind : uint8_t { EvParameter = 1, EvGestureBegin = 2, EvGestureEnd = 3, EvResize = 4, EvClosed = 5 };
@@ -112,6 +137,9 @@ struct Header {
     uint32_t resultFlags;
     uint32_t pad2;
     uint64_t payloadBytes;  // in the payload, either way
+    // (control channel) The plug-in the host is loading now ("" between loads), written before each load: when the
+    // host ends during a load, that plug-in alone is blamed, whatever else the host held.
+    char loading[256];
 };
 
 constexpr size_t alignUp(size_t v, size_t a) { return (v + a - 1) / a * a; }

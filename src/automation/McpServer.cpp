@@ -4232,8 +4232,10 @@ void McpServer::Impl::addTools() {
     add("montage_plugins", "Plug-in hosting",
         "How plug-ins are hosted, and how they have failed. Audio plug-ins (CLAP, VST3, LV2, Audio Units) and OpenFX video "
         "plug-ins run in plug-in host processes of their own, so one that crashes, hangs or uses too much memory is bypassed "
-        "(playback carries on; an export stops, naming it) and started again with its last settings. `isolation` reads or "
-        "sets the grouping: \"plugin\" (each plug-in in a host of its own, the default), \"vendor\" (one host for each maker), "
+        "(playback carries on; an export stops, naming it) and started again with its last settings; OpenFX on-screen "
+        "controls are drawn in the host too. `isolation` reads or "
+        "sets the grouping: \"plugin\" (each plug-in in a host of its own, the default), \"instance\" (each instance in a "
+        "host of its own), \"vendor\" (one host for each maker), "
         "\"shared\" (all plug-ins in one host) or \"off\" (in Montage's own process). ARA plug-ins always run in Montage's "
         "process. Also sets missed_blocks (audio blocks a host may be late with in a row before it counts as hung), bypass "
         "(\"input\" or \"silence\"), memory_limit_mb (0: none), export_timeout_s and auto_restarts (a session, for each "
@@ -4241,13 +4243,13 @@ void McpServer::Impl::addTools() {
         "memory or load; when first and last, how many times, restarts, whether it is bypassed now). `restart` starts a "
         "failed plug-in again; `disable` keeps it bypassed and turns it off in the plug-in list; `clear_failures` empties "
         "the list.",
-        R"json({"type":"object","properties":{"isolation":{"type":"string","enum":["plugin","vendor","shared","off"]},"missed_blocks":{"type":"integer","minimum":1,"maximum":1000},"bypass":{"type":"string","enum":["input","silence"]},"memory_limit_mb":{"type":"integer","minimum":0},"export_timeout_s":{"type":"number","minimum":1},"auto_restarts":{"type":"integer","minimum":0,"maximum":100},"restart":{"type":"string","description":"the plug-in id of a failure to start again"},"disable":{"type":"string","description":"the plug-in id of a failure to keep bypassed"},"clear_failures":{"type":"boolean"}}})json",
+        R"json({"type":"object","properties":{"isolation":{"type":"string","enum":["plugin","instance","vendor","shared","off"]},"missed_blocks":{"type":"integer","minimum":1,"maximum":1000},"bypass":{"type":"string","enum":["input","silence"]},"memory_limit_mb":{"type":"integer","minimum":0},"export_timeout_s":{"type":"number","minimum":1},"auto_restarts":{"type":"integer","minimum":0,"maximum":100},"restart":{"type":"string","description":"the plug-in id of a failure to start again"},"disable":{"type":"string","description":"the plug-in id of a failure to keep bypassed"},"clear_failures":{"type":"boolean"}}})json",
         false, [](const QJsonObject& a) {
             plugins::HostingSettings h = plugins::hosting();
             bool changed = false;
             if (a.contains("isolation")) {
                 const auto i = plugins::isolationFromName(str(a, "isolation").toStdString());
-                if (!i) return fail("isolation is plugin, vendor, shared or off");
+                if (!i) return fail("isolation is plugin, instance, vendor, shared or off");
                 h.isolation = *i;
                 changed = true;
             }
@@ -4298,6 +4300,7 @@ void McpServer::Impl::addTools() {
                                 {"hosts", hosts},
                                 {"failures", failures}};
             QString text = QStringLiteral("Plug-ins: %1").arg(h.isolation == plugins::Isolation::PerPlugin  ? "each in a host of its own"
+                                                              : h.isolation == plugins::Isolation::PerInstance ? "each instance in a host of its own"
                                                               : h.isolation == plugins::Isolation::PerVendor ? "one host for each maker"
                                                               : h.isolation == plugins::Isolation::Shared    ? "all in one host"
                                                                                                              : "in Montage's own process");

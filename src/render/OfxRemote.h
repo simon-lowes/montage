@@ -3,6 +3,10 @@
 // frames at other times and connected inputs are asked back from Montage while it renders. Internal to Ofx.cpp.
 #pragma once
 
+#include <QImage>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 
 #include "render/Ofx.h"
@@ -22,5 +26,50 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
 // Lets go of the channels kept for the next render, so hosts with nothing else in them end (and new ones start with
 // the settings as they are then).
 void releaseIdle();
+
+// An effect's on-screen controls in its host: a channel of their own beside its renders', the overlay drawn there into
+// the channel's shared block. Calls come from the GUI thread and wait at most kDeadlineMs; a reply later than that
+// leaves the last picture up (unresponsive()) and is collected at the next call, and one that has not come after
+// kHangMs ends the host as hung.
+class Controls {
+public:
+    static constexpr int kDeadlineMs = 200;
+    static constexpr int kHangMs = 5000;
+    // Null, with why, when the controls cannot start (the plug-in has none: null, no error).
+    static std::unique_ptr<Controls> open(const Effect& e, const PluginDesc& d, std::string* error);
+    ~Controls();
+    Controls(const Controls&) = delete;
+    Controls& operator=(const Controls&) = delete;
+    bool draw(const Effect& e, double t, const View& v, Overlay& out);
+    bool pen(int kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed);
+    bool key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed);
+    void focus(bool gained, const Effect& e, double t, const View& v);
+    bool failed() const { return failed_; }
+    bool unresponsive() const;
+    const std::string& failure() const { return failure_; }
+    struct Link;
+
+private:
+    Controls() = default;
+    // Sends `cmd` with the view and effect (`args` fills in the rest of its OverlayArgs) and waits up to the deadline
+    // (`timeoutUs`, when given); a Result as an int (0: the reply came in time).
+    int send(uint32_t cmd, const Effect& e, double t, const View& v, const std::function<void(void*)>& args, const std::string& text = {},
+             int64_t timeoutUs = 0);
+    // A reply to an earlier message that missed its deadline: taken now if it has come (false: still waiting).
+    bool settle();
+    void fail(int result);
+    bool takeImage(double pixelRatio);
+    bool readEdited(Effect& edited, bool& changed);
+    std::unique_ptr<Link> link_;
+    PluginDesc desc_;
+    std::string bypass_;  // what a failure past its restarts bypasses (render/OfxRemote.cpp bypassKey)
+    Effect sent_;  // the effect as the last message gave it
+    QImage last_;  // the last picture drawn
+    int64_t sentUs_ = 0;  // when the message still out went
+    uint32_t pendingCmd_ = 0;  // which (0: none)
+    double pendingRatio_ = 1;
+    bool failed_ = false;
+    std::string failure_;
+};
 
 }  // namespace montage::ofx::remote

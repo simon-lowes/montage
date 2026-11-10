@@ -48,6 +48,8 @@ public:
     std::atomic<int> instances{0};
     // Set by the first to report this host's end (renders on several threads see it end together; one failure).
     std::atomic<bool> failureTaken{false};
+    // The plug-in it was loading when it ended ("" when it was loading none): that one alone is to blame.
+    std::string loading() const;
 
 private:
     std::atomic<bool> dead_{false}, killed_{false};
@@ -73,15 +75,18 @@ struct Attached {
     int latency = 0;
     std::string error;
 };
-Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json);
+// `id` is the plug-in's: a host that ends while loading it (as its control block says) is its doing, whatever else the
+// host held; one that ends while loading another plug-in is not.
+Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json, const std::string& id);
 
 // Puts `data` in the channel's payload, through PutBlob when longer (true when it fits or went).
 bool sendPayload(Channel& c, Host& host, const std::string& data, int64_t timeoutUs, Result* r);
 // Reads a reply's blob of `size` bytes (the first part already in the payload).
 bool receiveBlob(Channel& c, Host& host, int64_t size, std::string& out, int64_t timeoutUs, Result* r);
 
-// The host key for a plug-in under a grouping ("ofx:" in front for OpenFX: video plug-ins have hosts of their own).
-std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx);
+// The host key for a plug-in under a grouping ("ofx:" in front for OpenFX: video plug-ins have hosts of their own);
+// `instance` names the instance for a host of its own (PerInstance).
+std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx, const std::string& instance = {});
 Isolation currentIsolation();
 
 // Records a failure (any thread but the audio thread).
@@ -94,7 +99,8 @@ void noteRestart(const std::string& id);
 bool pluginHeldBypassed(const std::string& id);  // disabled after failing
 int autoRestartsLeft(const std::string& id);
 void useAutoRestart(const std::string& id);
-// (OpenFX, which has no stand-in to hold) failed past its restarts: bypassed until Restart.
+// (OpenFX, which has no stand-in to hold) failed past its restarts: bypassed until Restart. `id` is the plug-in's, or
+// "<id>#<effect id>" for an instance in a host of its own (Restart of the plug-in brings those back too).
 void markExhausted(const std::string& id);
 bool exhausted(const std::string& id);
 

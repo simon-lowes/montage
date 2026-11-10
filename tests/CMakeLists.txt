@@ -109,11 +109,12 @@ if(MONTAGE_BUILD_APP)
   montage_test_command(test_app command)
   add_test(NAME test_app COMMAND ${command})
   set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 600)
-  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe)
+  add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe montage-pluginhost)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"
     MONTAGE_TEST_OFX_DIR="${CMAKE_CURRENT_BINARY_DIR}/ofx"
     MONTAGE_PLUGIN_PROBE="$<TARGET_FILE:montage-plugin-probe>"
+    MONTAGE_PLUGIN_HOST="$<TARGET_FILE:montage-pluginhost>"
     MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     MONTAGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
   # Qt's lupdate, to check it finds every tr() text (everyTranslatableTextIsFound).

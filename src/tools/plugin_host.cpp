@@ -5,7 +5,9 @@
 // plug-in instance then gets a channel of its own, served by a thread here. Editors and their windows are looked
 // after on the main thread, which runs Qt's event loop. It ends when Montage does.
 #include <QGuiApplication>
+#include <QImage>
 #include <QMetaObject>
+#include <QPainter>
 #include <QTimer>
 #include <QWindow>
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -148,6 +151,26 @@ void catchCrashes() {
     sa.sa_flags = SA_ONSTACK | SA_NODEFER;
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP, SIGSYS}) sigaction(sig, &sa, nullptr);
 #endif
+}
+
+// The control channel's header, where the plug-in being loaded is noted (Montage reads it if the host ends then).
+std::atomic<wire::Header*> gControl{nullptr};
+
+void noteLoading(const std::string& id, bool loading) {
+    wire::Header* h = gControl.load(std::memory_order_acquire);
+    if (!h) return;
+    if (!loading) {
+        h->loading[0] = '\0';
+        return;
+    }
+    const size_t n = std::min(id.size(), sizeof h->loading - 1);
+    if (n == 0) return;
+    // (the first byte last: Montage, reading after the host ended, never sees half a name)
+    h->loading[0] = '\0';
+    std::memcpy(h->loading + 1, id.data() + 1, n - 1);
+    h->loading[n] = '\0';
+    std::atomic_thread_fence(std::memory_order_release);
+    h->loading[0] = id[0];
 }
 
 // The host's end of a channel.
@@ -528,6 +551,8 @@ struct OfxChannel {
     std::unique_ptr<ipc::SharedMemory> arena;
     uint32_t arenaGen = 0;
     std::string blob;
+    std::string out;  // a reply longer than the payload, fetched in parts
+    std::unique_ptr<ofx::Interact> controls;  // (an overlay's channel) its on-screen controls
     std::mutex questions;  // (one question to Montage at a time, whichever render thread asks)
     bool mapArena() {
         wire::Header* h = chan.h;
@@ -563,6 +588,115 @@ bool ask(OfxChannel& o, int32_t kind, double t, const std::string& connection, I
     return true;
 }
 
+// A V1 (OpenGL) overlay drawn in a host started without --gpu: its OpenGL is started then, on the main thread, for
+// drawing only (renders stay on the CPU, as asked).
+void ensureOpenGl() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (!ofx::gpuAvailable()) QMetaObject::invokeMethod(qApp, [] { ofx::initializeGpu(); }, Qt::BlockingQueuedConnection);
+    });
+}
+
+// The on-screen controls' messages (wire::OfxOverlayOpen...): the view and effect, then the control's answer. A draw
+// leaves the overlay in the arena as one premultiplied picture at the device's pixels.
+void serveOverlay(OfxChannel& o, uint32_t cmd) {
+    Channel& c = o.chan;
+    wire::Header* h = c.h;
+    const std::string msg = (h->flags & wire::kPayloadInBlob) ? o.blob : std::string(c.payload(), size_t(h->payloadBytes));
+    o.mapArena();  // (at every message: Montage lets go of a new arena's name once this has answered)
+    h->resultFlags = 0;
+    h->resultI = h->resultI2 = 0;
+    wire::OverlayArgs a{};
+    const size_t at = sizeof a;
+    const size_t s1 = msg.size() > at ? msg.find('\0', at) : std::string::npos;
+    const size_t s2 = s1 == std::string::npos ? s1 : msg.find('\0', s1 + 1);
+    Effect e;
+    if (s2 == std::string::npos || !effectFromJsonString(msg.substr(at, s1 - at), e)) {
+        c.replyText(false, "the on-screen controls' message did not come through");
+        return;
+    }
+    std::memcpy(&a, msg.data(), sizeof a);
+    for (const ofx::PluginDesc& d : ofx::descriptionsFromJson(msg.substr(s1 + 1, s2 - s1 - 1))) {
+        ofx::Registry::instance().adopt(d);
+        if (cmd == wire::OfxOverlayOpen && d.overlay == 1) ensureOpenGl();
+    }
+    const std::string text = msg.substr(s2 + 1);
+    ofx::View v;
+    v.width = std::clamp(a.width, 0, 16384);
+    v.height = std::clamp(a.height, 0, 16384);
+    for (int k = 0; k < 6; ++k) v.m[k] = std::isfinite(a.m[k]) ? a.m[k] : 0;
+    v.renderScale = std::isfinite(a.renderScale) && a.renderScale > 0 ? a.renderScale : 1;
+    v.frameW = std::isfinite(a.frameW) ? a.frameW : 0;
+    v.frameH = std::isfinite(a.frameH) ? a.frameH : 0;
+    v.pixelRatio = std::isfinite(a.pixelRatio) ? std::clamp(a.pixelRatio, 0.25, 8.0) : 1;
+    const double t = std::isfinite(a.time) ? a.time : 0;
+    if (cmd == wire::OfxOverlayOpen) {
+        std::string error;
+        o.controls = ofx::Interact::open(e, &error);
+        if (!o.controls && error.empty()) error = "the plug-in has no on-screen controls";
+        c.replyText(o.controls != nullptr, error);
+        return;
+    }
+    if (!o.controls || o.controls->failed()) {
+        h->resultFlags = wire::kControlFailed;
+        c.replyText(false, "the on-screen controls are not open");
+        return;
+    }
+    bool ok = false;
+    std::string error;
+    Effect edited;
+    bool changed = false;
+    if (cmd == wire::OfxOverlayDraw) {
+        ofx::Overlay drawn;
+        ok = o.controls->draw(e, t, v, drawn);
+        if (ok && drawn.ops.empty() && drawn.gl.isNull()) {
+            // Nothing drawn (an OpenGL control where the host has no OpenGL draws nothing, as in Montage): no picture.
+        } else if (ok) {
+            const int pw = std::clamp(int(std::lround(v.width * v.pixelRatio)), 1, 16384);
+            const int ph = std::clamp(int(std::lround(v.height * v.pixelRatio)), 1, 16384);
+            const size_t bytes = size_t(pw) * size_t(ph) * 4;
+            if (!o.mapArena() || bytes > o.arena->size()) {
+                ok = false;
+                error = "the overlay is larger than Montage made room for";
+            } else {
+                // Painted as Montage paints a control in its own process, into the shared block itself.
+                QImage img(static_cast<uchar*>(o.arena->data()), pw, ph, pw * 4, QImage::Format_RGBA8888_Premultiplied);
+                img.fill(Qt::transparent);
+                img.setDevicePixelRatio(v.pixelRatio);
+                {
+                    QPainter p(&img);
+                    ofx::paintOverlay(p, drawn, v);
+                }
+                h->resultI = pw;
+                h->resultI2 = ph;
+            }
+        }
+    } else if (cmd == wire::OfxOverlayPen) {
+        const auto kind = a.pen == 0 ? ofx::Interact::Pen::Down : a.pen == 2 ? ofx::Interact::Pen::Up : ofx::Interact::Pen::Move;
+        const double px = std::isfinite(a.x) ? a.x : 0, py = std::isfinite(a.y) ? a.y : 0;
+        ok = o.controls->pen(kind, e, t, v, px, py, std::isfinite(a.pressure) ? a.pressure : 1, edited, changed);
+    } else if (cmd == wire::OfxOverlayKey) {
+        ok = o.controls->key(a.down != 0, a.keysym, text, e, t, v, edited, changed);
+    } else if (cmd == wire::OfxOverlayFocus) {
+        o.controls->focus(a.down != 0, e, t, v);
+        ok = true;
+    }
+    if (o.controls->failed()) h->resultFlags |= wire::kControlFailed;
+    if (changed) {
+        // The edited effect back (Montage takes from it what the control set).
+        o.out = effectToJsonString(edited);
+        const size_t n = std::min(o.out.size(), wire::kPayload);
+        std::memcpy(c.payload(), o.out.data(), n);
+        h->payloadBytes = n;
+        h->resultI = int64_t(o.out.size());
+        h->resultFlags |= wire::kEdited;
+        h->status = ok ? 1 : 0;
+        c.reply();
+        return;
+    }
+    c.replyText(ok, error);
+}
+
 void serveOfx(std::shared_ptr<OfxChannel> o) {
 #ifndef _WIN32
     AltStack alt;
@@ -583,9 +717,24 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
             continue;
         }
         if (cmd == wire::Destroy) {
+            o->controls.reset();
             h->status = 1;
             c.reply();
             return;
+        }
+        if (cmd == wire::FetchBlob) {
+            const size_t off = size_t(std::max<int64_t>(0, h->argI));
+            const size_t n = off < o->out.size() ? std::min(o->out.size() - off, wire::kPayload) : 0;
+            std::memcpy(c.payload(), o->out.data() + off, n);
+            h->payloadBytes = n;
+            h->status = 1;
+            c.reply();
+            continue;
+        }
+        if (cmd >= wire::OfxOverlayOpen && cmd <= wire::OfxOverlayFocus) {
+            serveOverlay(*o, cmd);
+            checkMemory();
+            continue;
         }
         if (cmd != wire::OfxRender) {
             h->status = 1;
@@ -673,6 +822,7 @@ void serveControl(std::string name) {
         std::_Exit(2);
     }
     wire::Header* h = c.h;
+    gControl.store(h, std::memory_order_release);
     for (;;) {
         c.next();
         switch (h->command) {
@@ -712,7 +862,9 @@ void serveControl(std::string name) {
                     c.replyText(false, err);
                     break;
                 }
+                noteLoading(descs[0].id, true);
                 inst->inst = instantiateHere(descs[0], &err);
+                noteLoading({}, false);
                 if (!inst->inst) {
                     c.replyText(false, err.empty() ? "the plug-in could not be loaded" : err);
                     break;
@@ -757,8 +909,10 @@ int main(int argc, char** argv) {
     catchCrashes();
     if (!ipc::processRunning(parent)) return wire::kExitLostMontage;
     setRunningInHost(true);
+    ofx::setLoadWatcher(noteLoading);
     QGuiApplication app(argc, argv);
     if (gpu) ofx::initializeGpu();
+    else ofx::setGpuRendering(false);  // (OpenGL may start later for drawing controls: renders stay on the CPU)
     // Montage gone, or too much memory: end.
     std::thread([parent] {
         for (;;) {

@@ -54,12 +54,13 @@ const char* isolationName(Isolation i) {
         case Isolation::PerVendor: return "vendor";
         case Isolation::Shared: return "shared";
         case Isolation::InProcess: return "off";
+        case Isolation::PerInstance: return "instance";
     }
     return "plugin";
 }
 
 std::optional<Isolation> isolationFromName(std::string_view name) {
-    for (Isolation i : {Isolation::PerPlugin, Isolation::PerVendor, Isolation::Shared, Isolation::InProcess})
+    for (Isolation i : {Isolation::PerPlugin, Isolation::PerVendor, Isolation::Shared, Isolation::InProcess, Isolation::PerInstance})
         if (name == isolationName(i)) return i;
     return std::nullopt;
 }
@@ -143,11 +144,14 @@ namespace remote {
 
 Isolation currentIsolation() { return Isolation(gIsolation.load()); }
 
-std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx) {
+std::string hostKey(Isolation grouping, const std::string& id, const std::string& maker, bool ofx, const std::string& instance) {
     const std::string prefix = ofx ? "ofx:" : "";
     switch (grouping) {
         case Isolation::PerVendor: return prefix + "vendor:" + maker;
         case Isolation::Shared: return prefix + "all";
+        case Isolation::PerInstance:
+            if (!instance.empty()) return prefix + "instance:" + id + "#" + instance;
+            return prefix + "plugin:" + id;
         default: return prefix + "plugin:" + id;
     }
 }
@@ -176,6 +180,12 @@ void Channel::unlinkNames() {
 }
 
 uint32_t Host::crashCode() const { return control.h ? control.h->crashed.load(std::memory_order_acquire) : 0; }
+
+std::string Host::loading() const {
+    if (!control.h) return {};
+    // (written by the host, so read only as far as its field goes)
+    return std::string(control.h->loading, strnlen(control.h->loading, sizeof control.h->loading));
+}
 
 bool Host::alive() {
     if (dead_.load(std::memory_order_acquire)) return false;
@@ -317,7 +327,7 @@ Result call(Channel& c, Host& host, int64_t timeoutUs, const std::function<void(
     }
 }
 
-Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json) {
+Attached attach(Host& host, Channel& chan, const std::string& kind, const std::string& json, const std::string& id) {
     Attached a;
     std::lock_guard lock(host.controlM);
     const bool alone = host.instances == 0;  // (a shared host may end for another plug-in's doing)
@@ -332,8 +342,10 @@ Attached attach(Host& host, Channel& chan, const std::string& kind, const std::s
     k.h->command = wire::Attach;
     const Result r = call(k, host, kLoadTimeoutUs);
     if (r == Result::Dead) {
-        a.hostDied = alone;
-        a.error = "its host " + host.howItEnded() + " while loading it";
+        // (the host says which plug-in it was loading; one that says none and held nothing else had only this one)
+        const std::string blamed = host.loading();
+        a.hostDied = blamed == id || (blamed.empty() && alone);
+        a.error = "its host " + host.howItEnded() + " while loading " + (blamed.empty() || blamed == id ? std::string("it") : blamed);
         return a;
     }
     if (r == Result::Timeout) {
@@ -521,6 +533,7 @@ enum Failure { NoFailure = 0, Crashed = 1, Hung = 2 };
 struct Core {
     Descriptor d;
     Isolation grouping = Isolation::PerPlugin;
+    std::string instance;  // (its own name, for a host of its own)
     std::atomic<Link*> next{nullptr};
     std::atomic<Link*> retired{nullptr};
     // 0 running, 1 bypassed, 2 a restart being made, 3 failing (bypassed, its failure not yet handed to the supervisor)
@@ -607,13 +620,13 @@ int64_t timeoutFor(int frames, double rate) {
 // Builds a link for `core` in a (new) host and gives it what the instance had: offline mode, channels, activation,
 // state and parameters.
 std::unique_ptr<Link> buildLink(Core& core, std::string* error) {
-    std::string key = hostKey(core.grouping, core.d.id, core.d.vendor.empty() ? core.d.path : core.d.vendor, false);
+    std::string key = hostKey(core.grouping, core.d.id, core.d.vendor.empty() ? core.d.path : core.d.vendor, false, core.instance);
     auto host = hostFor(key, false, error);
     if (!host) return nullptr;
     auto link = std::make_unique<Link>();
     link->host = host;
     if (!link->chan.create(error)) return nullptr;
-    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({core.d}));
+    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({core.d}), core.d.id);
     if (!a.ok) {
         if (error) *error = a.error;
         return nullptr;
@@ -694,8 +707,9 @@ void reportFailure(Core& core, bool same) {
         std::lock_guard lock(core.memM);
         host = core.host.lock();
     }
-    // (a host Montage stopped for another instance's failure, recorded by that one: this one was only in it)
-    if (core.failure == Crashed && host && host->stoppedByMontage()) {
+    // (a host Montage stopped for another instance's failure, recorded by that one, or one that crashed while loading
+    // another plug-in, which is blocked for it: this one was only in it)
+    if (core.failure == Crashed && host && (host->stoppedByMontage() || (!host->loading().empty() && host->loading() != core.d.id))) {
         core.innocent = true;
         return;
     }
@@ -1273,7 +1287,9 @@ std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation gro
     auto core = std::make_shared<Core>();
     core->d = d;
     core->grouping = grouping;
-    const std::string key = hostKey(grouping, d.id, d.vendor.empty() ? d.path : d.vendor, false);
+    static std::atomic<uint64_t> instances{0};
+    core->instance = std::to_string(++instances);
+    const std::string key = hostKey(grouping, d.id, d.vendor.empty() ? d.path : d.vendor, false, core->instance);
     std::string err;
     auto host = hostFor(key, false, &err);
     if (!host) {
@@ -1286,7 +1302,7 @@ std::unique_ptr<Instance> instantiateIsolated(const Descriptor& d, Isolation gro
         if (error) *error = err;
         return nullptr;
     }
-    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({d}));
+    const Attached a = attach(*host, link->chan, "audio", descriptorsToJson({d}), d.id);
     if (!a.ok) {
         if (a.hostDied) {
             // As a crash while scanning: blocked until the file changes or the user tries it again.
@@ -1334,6 +1350,8 @@ std::vector<HostFailure> hostFailures() {
     std::vector<HostFailure> out;
     {
         std::lock_guard lock(book().m);
+        for (const std::string& x : book().exhausted)
+            if (const size_t hash = x.rfind('#'); hash != std::string::npos) ++bypassedNow[x.substr(0, hash)];
         for (auto [id, f] : book().byId) {
             f.bypassedNow = std::max(bypassedNow[id], book().exhausted.count(id) || book().held.count(id) ? 1 : 0);
             f.disabled = book().held.count(id) > 0;
@@ -1357,7 +1375,16 @@ bool restartPlugin(const std::string& id) {
     {
         std::lock_guard lock(book().m);
         wasHeld = book().held.erase(id) > 0;
-        any = book().exhausted.erase(id) > 0 || wasHeld;
+        any = wasHeld;
+        // (an OpenFX instance in a host of its own is bypassed by itself: "<id>#<effect>")
+        for (auto it = book().exhausted.begin(); it != book().exhausted.end();) {
+            if (*it == id || it->rfind(id + "#", 0) == 0) {
+                it = book().exhausted.erase(it);
+                any = true;
+            } else {
+                ++it;
+            }
+        }
         book().autoUsed[id] = 0;
     }
     // (disabled from the failure bar: Restart is the user taking it back, so it is offered for new effects again)

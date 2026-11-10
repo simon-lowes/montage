@@ -9,8 +9,10 @@
 // for bit, as the plug-in gives in Montage's own process.
 //
 // How plug-ins are grouped into hosts is a setting: each plug-in in a host of its own (the default: the instances of
-// one plug-in share it, and a fault in one plug-in reaches no other), one host for each maker, all plug-ins in one host,
-// or none (in Montage's own process). ARA plug-ins always run in Montage's process, as ARA shares the document.
+// one plug-in share it, and a fault in one plug-in reaches no other), each instance in a host of its own, one host for
+// each maker, all plug-ins in one host, or none (in Montage's own process). ARA plug-ins always run in Montage's
+// process, as ARA shares the document. A host notes which plug-in it is loading, so one that crashes while loading in
+// a shared host is blocked alone, and the others in that host are started again as if nothing of theirs failed.
 //
 // When a host fails — it crashes, it does not answer for a set number of audio blocks in a row during playback, or it
 // uses more memory than the limit — every instance in it is bypassed (its input passes, delayed by its latency, or
@@ -33,8 +35,10 @@
 
 namespace montage::plugins {
 
-enum class Isolation { PerPlugin, PerVendor, Shared, InProcess };
-const char* isolationName(Isolation i);  // "plugin", "vendor", "shared", "off"
+// (PerInstance: each instance in a host of its own, so a fault in one reaches not even another instance of the same
+// plug-in; the most memory.)
+enum class Isolation { PerPlugin, PerVendor, Shared, InProcess, PerInstance };
+const char* isolationName(Isolation i);  // "plugin", "vendor", "shared", "off", "instance"
 std::optional<Isolation> isolationFromName(std::string_view name);
 
 struct HostingSettings {

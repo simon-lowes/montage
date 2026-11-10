@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "audio/DynLib.h"
+#include "audio/PluginHost.h"
 #include "core/Effects.h"
 #include "core/Expression.h"
 #include "core/ProjectLock.h"
@@ -1673,6 +1674,11 @@ std::map<std::string, std::string>& failedLoads() {
 }
 
 // The plug-in for `d`, loaded and described in this process.
+std::function<void(const std::string&, bool)>& loadWatcher() {
+    static auto* w = new std::function<void(const std::string&, bool)>;
+    return *w;
+}
+
 Loaded* loadPlugin(const PluginDesc& d, std::string* error) {
     std::lock_guard<std::mutex> lock(gLoadMutex);
     auto& all = loadedPlugins();
@@ -1681,6 +1687,16 @@ Loaded* loadPlugin(const PluginDesc& d, std::string* error) {
         if (error) *error = f->second;
         return nullptr;
     }
+    // (told before its code first runs, and after: a crash between is this plug-in's)
+    struct Watch {
+        const std::string& id;
+        explicit Watch(const std::string& i) : id(i) {
+            if (loadWatcher()) loadWatcher()(id, true);
+        }
+        ~Watch() {
+            if (loadWatcher()) loadWatcher()(id, false);
+        }
+    } watch(d.id);
     auto failed = [&](const std::string& why) -> Loaded* {
         failedLoads()[d.id] = why;
         if (error) *error = why;
@@ -2103,6 +2119,33 @@ std::string Registry::guardPath() const {
     return (QFileInfo(QString::fromStdString(cachePath_)).absolutePath() + "/ofx-interact-" +
             QString::number(QCoreApplication::applicationPid()) + ".guard")
         .toStdString();
+}
+
+void Registry::blockAfterCrash(const std::string& binary, const std::string& reason) {
+    std::string cachePath;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cachePath = cachePath_;
+        plugins_.erase(std::remove_if(plugins_.begin(), plugins_.end(), [&](const PluginDesc& d) { return d.binary == binary; }), plugins_.end());
+        blocked_.erase(std::remove_if(blocked_.begin(), blocked_.end(), [&](const auto& b) { return b.first == binary; }), blocked_.end());
+        blocked_.push_back({binary, reason});
+    }
+    // Kept in the cache with the file's stamp, so the next scan keeps it blocked until the file changes.
+    std::lock_guard<std::mutex> scanning(scanMutex_);
+    if (cachePath.empty()) return;
+    QFile f(QString::fromStdString(cachePath));
+    if (!f.open(QIODevice::ReadOnly)) return;
+    QJsonObject cache = QJsonDocument::fromJson(f.readAll()).object();
+    f.close();
+    const QString key = QString::fromStdString(binary);
+    QJsonObject entry = cache.value(key).toObject();
+    if (!entry.contains("stamp")) return;
+    cache[key] = QJsonObject{{"stamp", entry.value("stamp")}, {"error", QString::fromStdString(reason)}};
+    QSaveFile out(QString::fromStdString(cachePath));
+    if (out.open(QIODevice::WriteOnly)) {
+        out.write(QJsonDocument(cache).toJson());
+        out.commit();
+    }
 }
 
 void Registry::adopt(const PluginDesc& d) {
@@ -2859,7 +2902,8 @@ struct GuardFile {
 struct CrashGuard {
     bool on = false;
     explicit CrashGuard(const std::string& binary) {
-        if (tGuardDepth++ > 0) return;
+        // (in a plug-in host a crash ends only the host, and Montage blames the plug-in itself)
+        if (tGuardDepth++ > 0 || plugins::runningInHost()) return;
         GuardFile::instance().mark(binary);
         on = true;
     }
@@ -2917,7 +2961,17 @@ struct Interact::Impl {
 };
 
 Interact::Interact(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Interact::Interact(std::unique_ptr<remote::Controls> r) : remote_(std::move(r)) {}
 Interact::~Interact() = default;
+
+bool Interact::failed() const { return failed_ || (remote_ && remote_->failed()); }
+bool Interact::unresponsive() const { return remote_ && !remote_->failed() && remote_->unresponsive(); }
+std::string Interact::failure() const { return remote_ ? remote_->failure() : std::string(); }
+
+void setLoadWatcher(std::function<void(const std::string&, bool)> watch) {
+    std::lock_guard<std::mutex> lock(gLoadMutex);
+    loadWatcher() = std::move(watch);
+}
 
 std::unique_ptr<Interact> Interact::open(const Effect& e, std::string* error) {
     if (e.type != "ofx") return nullptr;
@@ -2925,6 +2979,10 @@ std::unique_ptr<Interact> Interact::open(const Effect& e, std::string* error) {
     registry.ensureScanned();
     PluginDesc d;
     if (!registry.find(e.s("ofx_id"), d) || d.overlay == 0) return nullptr;
+    if (remote::isolated()) {
+        auto controls = remote::Controls::open(e, d, error);
+        return controls ? std::unique_ptr<Interact>(new Interact(std::move(controls))) : nullptr;
+    }
     Loaded* l = loadPlugin(d, error);
     if (!l || !l->overlay) return nullptr;
     auto impl = std::make_unique<Impl>();
@@ -2959,7 +3017,8 @@ std::unique_ptr<Interact> Interact::open(const Effect& e, std::string* error) {
 
 bool Interact::draw(const Effect& e, double t, const View& v, Overlay& out) {
     out = Overlay{};
-    if (failed_ || v.width <= 0 || v.height <= 0) return false;
+    if (failed() || v.width <= 0 || v.height <= 0) return false;
+    if (remote_) return remote_->draw(e, t, v, out);
     Impl& d = *impl_;
     d.prepare(e, t, v);
     DrawCtx ctx;
@@ -2999,7 +3058,8 @@ bool Interact::draw(const Effect& e, double t, const View& v, Overlay& out) {
 
 bool Interact::pen(Pen kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed) {
     changed = false;
-    if (failed_) return false;
+    if (failed()) return false;
+    if (remote_) return remote_->pen(int(kind), e, t, v, vx, vy, pressure, edited, changed);
     Impl& d = *impl_;
     CrashGuard guard(d.desc.binary);
     d.prepare(e, t, v);
@@ -3022,7 +3082,8 @@ bool Interact::pen(Pen kind, const Effect& e, double t, const View& v, double vx
 
 bool Interact::key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed) {
     changed = false;
-    if (failed_) return false;
+    if (failed()) return false;
+    if (remote_) return remote_->key(down, keysym, text, e, t, v, edited, changed);
     Impl& d = *impl_;
     CrashGuard guard(d.desc.binary);
     d.prepare(e, t, v);
@@ -3038,6 +3099,21 @@ bool Interact::key(bool down, int keysym, const std::string& text, const Effect&
     d.done();
     if (st == kOfxStatFailed || st == kOfxStatErrFatal) failed_ = true;
     return st == kOfxStatOK;
+}
+
+void Interact::focus(bool gained, const Effect& e, double t, const View& v) {
+    if (failed()) return;
+    if (remote_) {
+        remote_->focus(gained, e, t, v);
+        return;
+    }
+    Impl& d = *impl_;
+    CrashGuard guard(d.desc.binary);
+    d.prepare(e, t, v);
+    PropertySet a = d.args(v, t);
+    const OfxStatus st = d.plugin->overlay(gained ? kOfxInteractActionGainFocus : kOfxInteractActionLoseFocus, &d.obj, handle(&a), nullptr);
+    d.done();
+    if (st == kOfxStatFailed || st == kOfxStatErrFatal) failed_ = true;
 }
 
 int instancesCreated() { return gInstances.load(); }

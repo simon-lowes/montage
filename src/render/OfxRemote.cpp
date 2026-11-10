@@ -1,6 +1,7 @@
 #include "OfxRemote.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -24,8 +25,9 @@ struct Link {
     Channel chan;
     std::unique_ptr<ipc::SharedMemory> arena;
     bool attached = false;
+    bool hung = false;  // (a message still out that will not be answered: no Destroy is waited for)
     ~Link() {
-        if (attached && host && host->alive()) {
+        if (attached && host && host->alive() && !hung) {
             chan.h->command = wire::Destroy;
             call(chan, *host, 1'000'000);
         }
@@ -56,7 +58,24 @@ std::map<std::string, std::vector<std::unique_ptr<Link>>>& idleLinks() {
     return *m;
 }
 
-std::unique_ptr<Link> takeLink(const std::string& key, std::string* error) {
+// A new channel to the host for `key` (started when none runs), for plug-in `id`.
+template <typename L>
+std::unique_ptr<L> newLink(const std::string& key, bool gpu, const std::string& id, std::string* error) {
+    auto host = hostFor(key, gpu, error);
+    if (!host) return nullptr;
+    auto link = std::make_unique<L>();
+    link->host = host;
+    if (!link->chan.create(error)) return nullptr;
+    const Attached a = attach(*host, link->chan, "ofx", {}, id);
+    if (!a.ok) {
+        if (error) *error = a.error;
+        return nullptr;
+    }
+    link->attached = true;
+    return link;
+}
+
+std::unique_ptr<Link> takeLink(const std::string& key, const std::string& id, std::string* error) {
     const bool gpu = gpuRendering() && gpuAvailable();
     {
         std::lock_guard lock(gLinksM);
@@ -67,18 +86,7 @@ std::unique_ptr<Link> takeLink(const std::string& key, std::string* error) {
             if (l->host->alive() && l->host->gpu == gpu) return l;
         }
     }
-    auto host = hostFor(key, gpu, error);
-    if (!host) return nullptr;
-    auto link = std::make_unique<Link>();
-    link->host = host;
-    if (!link->chan.create(error)) return nullptr;
-    const Attached a = attach(*host, link->chan, "ofx", {});
-    if (!a.ok) {
-        if (error) *error = a.error;
-        return nullptr;
-    }
-    link->attached = true;
-    return link;
+    return newLink<Link>(key, gpu, id, error);
 }
 
 void giveBack(const std::string& key, std::unique_ptr<Link> l) {
@@ -97,6 +105,67 @@ Effect baked(const Effect& e, double t) {
     return out;
 }
 
+// The host key for an effect's plug-in under the grouping now (its own host, for one each instance).
+std::string keyFor(const Effect& e, const PluginDesc& d) {
+    return hostKey(currentIsolation(), d.id, d.bundle.empty() ? d.binary : d.bundle, true, std::to_string(e.id));
+}
+
+// How long playback waits for a picture: 5 s for a plug-in not yet seen to render in a host (loading and a first
+// render may be slow), then eight times the slowest render it has given, at least 1 s: a plug-in that renders in
+// milliseconds and then hangs holds the viewer for a second, not five, each time. (An export waits as it is set to.)
+std::mutex gSlowestM;
+std::map<std::string, int64_t>& slowest() {
+    static auto* m = new std::map<std::string, int64_t>;
+    return *m;
+}
+int64_t playbackWaitUs(const std::string& id, int64_t limitUs) {
+    std::lock_guard lock(gSlowestM);
+    const auto it = slowest().find(id);
+    if (it == slowest().end()) return limitUs;
+    return std::clamp<int64_t>(8 * it->second, 1'000'000, limitUs);
+}
+void noteRender(const std::string& id, int64_t us) {
+    std::lock_guard lock(gSlowestM);
+    int64_t& s = slowest()[id];
+    s = std::max(s, us);
+}
+
+// What is bypassed past its restarts: the plug-in, or with a host for each instance, that instance alone.
+std::string bypassKey(const Effect& e, const PluginDesc& d) {
+    return currentIsolation() == Isolation::PerInstance ? d.id + "#" + std::to_string(e.id) : d.id;
+}
+bool bypassedNow(const Effect& e, const PluginDesc& d) { return pluginHeldBypassed(d.id) || exhausted(d.id) || exhausted(bypassKey(e, d)); }
+
+// A host that crashed or did not answer while working for plug-in `d`: ended, the failure recorded once (renders on
+// several threads lose a host together) against the plug-in to blame, and a restart used (bypassed past them). What
+// happened, in words, after the plug-in's name.
+std::string hostFailed(Host& host, const PluginDesc& d, const std::string& bypass, Result r, int64_t timeoutUs) {
+    const bool hung = r == Result::Timeout;
+    std::string how = hung ? "did not answer within " + std::to_string(std::max<int64_t>(1, timeoutUs / 1'000'000)) + " s and was stopped"
+                           : host.howItEnded();
+    if (how.empty()) how = "stopped answering";
+    // (the plug-in the host was loading when it ended, as it said: that one alone is blamed and blocked)
+    const std::string loading = hung ? std::string() : host.loading();
+    host.kill();
+    PluginDesc blamed = d;
+    const bool other = !loading.empty() && loading != d.id;
+    if (other && !ofx::Registry::instance().find(loading, blamed)) blamed = PluginDesc{}, blamed.id = loading, blamed.label = loading;
+    const std::string words = other ? "was stopped with its plug-in host, which " + how + " while loading " + blamed.label : how;
+    if (host.failureTaken.exchange(true)) return words;
+    if (!loading.empty()) {
+        if (!blamed.binary.empty()) ofx::Registry::instance().blockAfterCrash(blamed.binary, "Crashed its plug-in host while loading");
+        recordFailure(blamed.id, blamed.label, std::string(), "load", how + " while loading it; blocked", !renderingRealtime());
+        return words;
+    }
+    const bool restart = autoRestartsLeft(d.id) > 0;
+    if (restart) useAutoRestart(d.id);
+    else markExhausted(bypass);
+    const std::string kindName = hung ? "hang" : how.rfind("used more memory", 0) == 0 ? "memory" : "crash";
+    recordFailure(d.id, d.label, std::string(), kindName, how + "; bypassed", !renderingRealtime());
+    if (restart) noteRestart(d.id);
+    return words;
+}
+
 }  // namespace
 
 bool isolated() { return plugins::isolating(); }
@@ -111,13 +180,13 @@ void releaseIdle() {
 
 bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double progress, double scale, int w, int h, const Image* a,
             const Image* b, Image& out, const FrameFetch* fetch, std::string* error, const ColorSpace* working) {
-    if (pluginHeldBypassed(d.id) || exhausted(d.id)) {
+    if (bypassedNow(e, d)) {
         if (error) *error = d.label + " is bypassed after failing in its plug-in host (Restart brings it back)";
         return false;
     }
-    const std::string key = hostKey(currentIsolation(), d.id, d.bundle.empty() ? d.binary : d.bundle, true);
+    const std::string key = keyFor(e, d);
     std::string err;
-    std::unique_ptr<Link> link = takeLink(key, &err);
+    std::unique_ptr<Link> link = takeLink(key, d.id, &err);
     if (!link) {
         if (error) *error = d.label + " could not start in a plug-in host: " + err;
         return false;
@@ -142,9 +211,11 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     if (withMask) std::memcpy(link->at(size_t(images) * slot), mask->data(), maskBytes);
     const std::string msg = effectToJsonString(baked(e, t)) + std::string(1, '\0') + descriptionsToJson({d}) + std::string(1, '\0') +
                             (working ? working->id : std::string());
-    // (during playback a picture is waited for 5 s at most, not an export's 30: a hung plug-in holds the viewer no
-    // longer than that, each time)
-    const int64_t timeout = int64_t(renderingRealtime() ? std::min(hosting().exportTimeoutMs, 5000) : hosting().exportTimeoutMs) * 1000;
+    // (during playback a picture is waited for 5 s at most, not an export's 30, and once the plug-in has rendered, a
+    // few times its slowest: a hung plug-in holds the viewer no longer than that, each time)
+    const int64_t exportUs = int64_t(hosting().exportTimeoutMs) * 1000;
+    const int64_t timeout = renderingRealtime() ? playbackWaitUs(d.id, std::min<int64_t>(exportUs, 5'000'000)) : exportUs;
+    const int64_t began = ipc::nowUs();
     Result r = Result::Ok;
     if (sendPayload(c, *link->host, msg, timeout, &r)) {
         const InputResolver& inputs = currentInputs();
@@ -184,6 +255,7 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     if (r == Result::Ok) {
         hd->flags = 0;
         link->arena->unlinkName();  // (the host has it mapped now)
+        if (hd->status) noteRender(d.id, ipc::nowUs() - began);
         if (!hd->status) {
             if (error) *error = std::string(wire::payload(c.base()), size_t(std::min<uint64_t>(hd->payloadBytes, wire::kPayload)));
             giveBack(key, std::move(link));
@@ -204,23 +276,233 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
         return true;
     }
     // It crashed or did not answer: bypassed this time, named, and started again for the next render (a few times).
-    const bool hung = r == Result::Timeout;
-    std::string how = hung ? "did not answer within " + std::to_string(timeout / 1'000'000) + " s and was stopped" : link->host->howItEnded();
-    if (how.empty()) how = "stopped answering";
-    link->host->kill();
-    // (Renders on other threads lost the same host: the first of them counts the failure and uses the restart.)
-    if (link->host->failureTaken.exchange(true)) {
-        if (error) *error = d.label + " " + how;
-        return false;
-    }
-    const bool restart = autoRestartsLeft(d.id) > 0;
-    if (restart) useAutoRestart(d.id);
-    else markExhausted(d.id);
-    const std::string kindName = hung ? "hang" : how.rfind("used more memory", 0) == 0 ? "memory" : "crash";
-    recordFailure(d.id, d.label, std::string(), kindName, how + "; bypassed", !renderingRealtime());
-    if (restart) noteRestart(d.id);
+    const std::string how = hostFailed(*link->host, d, bypassKey(e, d), r, timeout);
     if (error) *error = d.label + " " + how;
     return false;
+}
+
+// ---- On-screen controls ----
+
+struct Controls::Link : remote::Link {};
+
+namespace {
+constexpr int64_t kDeadlineUs = int64_t(Controls::kDeadlineMs) * 1000;
+constexpr int64_t kHangUs = int64_t(Controls::kHangMs) * 1000;
+int devicePixels(int size, double ratio) { return std::clamp(int(std::lround(size * ratio)), 1, 16384); }
+}  // namespace
+
+std::unique_ptr<Controls> Controls::open(const Effect& e, const PluginDesc& d, std::string* error) {
+    if (d.overlay == 0) return nullptr;
+    if (bypassedNow(e, d)) {
+        if (error) *error = d.label + " is bypassed after failing in its plug-in host (Restart brings it back)";
+        return nullptr;
+    }
+    std::string err;
+    // (the host the effect renders in: its controls are one more channel to it)
+    auto link = newLink<Link>(keyFor(e, d), gpuRendering() && gpuAvailable(), d.id, &err);
+    if (!link || !link->room(16 << 20, &err)) {
+        if (error) *error = d.label + "'s on-screen controls could not start in its plug-in host: " + err;
+        return nullptr;
+    }
+    std::unique_ptr<Controls> c(new Controls);
+    c->link_ = std::move(link);
+    c->desc_ = d;
+    c->bypass_ = bypassKey(e, d);
+    const int r = c->send(wire::OfxOverlayOpen, e, 0, View{}, {}, {}, kHangUs);
+    if (r != int(Result::Ok) || !c->link_->chan.h->status) {
+        if (error) {
+            if (r != int(Result::Ok)) *error = d.label + "'s on-screen controls " + c->failure_;
+            else *error = std::string(wire::payload(c->link_->chan.base()), size_t(std::min<uint64_t>(c->link_->chan.h->payloadBytes, wire::kPayload)));
+            if (error->empty()) *error = d.label + "'s on-screen controls could not start";
+        }
+        return nullptr;
+    }
+    return c;
+}
+
+Controls::~Controls() {
+    if (link_ && pendingCmd_) link_->hung = true;  // (not waited for again on the way out)
+}
+
+bool Controls::unresponsive() const { return pendingCmd_ != 0; }
+
+int Controls::send(uint32_t cmd, const Effect& e, double t, const View& v, const std::function<void(void*)>& args, const std::string& text,
+                   int64_t timeoutUs) {
+    if (failed_) return int(Result::Dead);
+    Channel& c = link_->chan;
+    Host& host = *link_->host;
+    wire::OverlayArgs a{};
+    a.width = v.width, a.height = v.height;
+    for (int k = 0; k < 6; ++k) a.m[k] = v.m[k];
+    a.renderScale = v.renderScale, a.frameW = v.frameW, a.frameH = v.frameH;
+    a.pixelRatio = v.pixelRatio > 0 ? v.pixelRatio : 1;
+    a.time = t;
+    if (args) args(&a);
+    sent_ = baked(e, t);
+    std::string msg(reinterpret_cast<const char*>(&a), sizeof a);
+    msg += effectToJsonString(sent_);
+    msg += '\0';
+    msg += descriptionsToJson({desc_});
+    msg += '\0';
+    msg += text;
+    if (cmd == wire::OfxOverlayDraw) {
+        // Room for the picture back, at the device's pixels.
+        std::string why;
+        const size_t bytes = size_t(devicePixels(v.width, a.pixelRatio)) * size_t(devicePixels(v.height, a.pixelRatio)) * 4;
+        if (!link_->room(bytes, &why)) {
+            failure_ = "could not share their picture: " + why;
+            return int(Result::Dead);
+        }
+    }
+    Result r = Result::Ok;
+    const int64_t wait = timeoutUs > 0 ? timeoutUs : kDeadlineUs;
+    if (sendPayload(c, host, msg, wait, &r)) {
+        c.h->command = cmd;
+        c.h->paramCount = 0;
+        r = call(c, host, wait);
+    }
+    if (r == Result::Timeout) {
+        // (its last picture stays up; the reply is taken when it comes, or the host is ended as hung)
+        pendingCmd_ = cmd;
+        pendingRatio_ = a.pixelRatio;
+        sentUs_ = ipc::nowUs() - wait;
+        if (timeoutUs >= kHangUs) fail(int(r));
+        return int(r);
+    }
+    if (r == Result::Dead) {
+        fail(int(r));
+        return int(r);
+    }
+    link_->arena->unlinkName();  // (the host has it mapped now)
+    if (c.h->resultFlags & wire::kControlFailed) {
+        failed_ = true;
+        failure_ = "stopped working";
+    }
+    return int(r);
+}
+
+void Controls::fail(int result) {
+    failed_ = true;
+    const std::string how = hostFailed(*link_->host, desc_, bypass_, Result(result), kHangUs);
+    failure_ = how;
+    link_->hung = true;
+}
+
+bool Controls::settle() {
+    if (failed_) return false;
+    if (!pendingCmd_) return true;
+    Channel& c = link_->chan;
+    if (c.h->crashed.load(std::memory_order_acquire) || !link_->host->alive()) {
+        fail(int(Result::Dead));
+        return false;
+    }
+    if (!collectPending(c)) {
+        if (ipc::nowUs() - sentUs_ > kHangUs) fail(int(Result::Timeout));
+        return false;
+    }
+    const uint32_t cmd = std::exchange(pendingCmd_, 0u);
+    if (cmd == wire::OfxOverlayDraw && c.h->status) takeImage(pendingRatio_);
+    return true;
+}
+
+bool Controls::takeImage(double ratio) {
+    const wire::Header* h = link_->chan.h;
+    // (what the host says is not trusted: a size outside the arena is refused)
+    const int64_t w = h->resultI, hh = h->resultI2;
+    if (w == 0 && hh == 0) {  // (the control drew nothing)
+        last_ = QImage();
+        return true;
+    }
+    if (w <= 0 || hh <= 0 || w > 16384 || hh > 16384 || size_t(w) * size_t(hh) * 4 > link_->arena->size()) return false;
+    QImage img(int(w), int(hh), QImage::Format_RGBA8888_Premultiplied);
+    if (img.isNull()) return false;
+    const auto* src = static_cast<const uchar*>(link_->arena->data());
+    for (int y = 0; y < int(hh); ++y) std::memcpy(img.scanLine(y), src + size_t(y) * size_t(w) * 4, size_t(w) * 4);
+    img.setDevicePixelRatio(ratio);
+    last_ = std::move(img);
+    return true;
+}
+
+bool Controls::draw(const Effect& e, double t, const View& v, Overlay& out) {
+    out = Overlay{};
+    if (!settle()) {
+        if (!failed_) out.gl = last_;
+        return !failed_;
+    }
+    const int r = send(wire::OfxOverlayDraw, e, t, v, {}, {});
+    if (r == int(Result::Ok)) {
+        if (link_->chan.h->status) takeImage(v.pixelRatio > 0 ? v.pixelRatio : 1);
+        else if (!failed_) last_ = QImage();
+    }
+    if (!failed_) out.gl = last_;
+    return !failed_;
+}
+
+bool Controls::readEdited(Effect& edited, bool& changed) {
+    Channel& c = link_->chan;
+    if (!(c.h->resultFlags & wire::kEdited)) return true;
+    std::string json;
+    Result r = Result::Ok;
+    if (!receiveBlob(c, *link_->host, c.h->resultI, json, kDeadlineUs, &r)) {
+        if (r == Result::Dead) fail(int(r));
+        return false;
+    }
+    Effect back;
+    if (!effectFromJsonString(json, back)) return false;
+    // Only what the control set is taken: a parameter driven by an expression went as its value at the frame, and
+    // keeps its expression unless the control changed it. (Both sides compared as JSON gives them back.)
+    Effect sent;
+    if (!effectFromJsonString(effectToJsonString(sent_), sent)) return false;
+    for (const auto& [key, p] : back.params) {
+        const auto it = sent.params.find(key);
+        if (it == sent.params.end() || !(it->second == p)) {
+            edited.params[key] = p;
+            changed = true;
+        }
+    }
+    for (const auto& [key, v] : back.strings) {
+        const auto it = sent.strings.find(key);
+        if (it == sent.strings.end() || it->second != v) {
+            edited.strings[key] = v;
+            changed = true;
+        }
+    }
+    return true;
+}
+
+bool Controls::pen(int kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed) {
+    changed = false;
+    edited = e;
+    if (!settle()) return false;  // (not responding: the pen is not sent)
+    const int r = send(wire::OfxOverlayPen, e, t, v, [&](void* p) {
+        auto* a = static_cast<wire::OverlayArgs*>(p);
+        a->pen = kind;
+        a->x = vx, a->y = vy, a->pressure = pressure;
+    });
+    if (r != int(Result::Ok)) return false;
+    const bool took = link_->chan.h->status == 1;
+    readEdited(edited, changed);
+    return took;
+}
+
+bool Controls::key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed) {
+    changed = false;
+    edited = e;
+    if (!settle()) return false;
+    const int r = send(wire::OfxOverlayKey, e, t, v, [&](void* p) {
+        auto* a = static_cast<wire::OverlayArgs*>(p);
+        a->keysym = keysym;
+        a->down = down ? 1 : 0;
+    }, text);
+    if (r != int(Result::Ok)) return false;
+    const bool took = link_->chan.h->status == 1;
+    readEdited(edited, changed);
+    return took;
+}
+
+void Controls::focus(bool gained, const Effect& e, double t, const View& v) {
+    if (!settle()) return;
+    send(wire::OfxOverlayFocus, e, t, v, [&](void* p) { static_cast<wire::OverlayArgs*>(p)->down = gained ? 1 : 0; });
 }
 
 }  // namespace montage::ofx::remote

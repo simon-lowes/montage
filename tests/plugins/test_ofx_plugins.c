@@ -16,7 +16,8 @@
  * Test Invert also renders with OpenGL (the same formula in a shader) and has OpenGL on-screen controls: a green
  * square from canonical (100, 100) to (200, 200).
  * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist.
- * Test Invert misbehaves on request when rendering (test_fault.h, call "render"). */
+ * Test Invert misbehaves on request when rendering (test_fault.h, call "render"), Test Probe's controls when drawing
+ * (call "draw"). */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -311,6 +312,7 @@ static OfxStatus probeOverlay(const char* action, const void* handle, OfxPropert
     gParam->paramGetValueAtTime(centre, time, &cx, &cy);
     const double hx = 10 * ps[0], hy = 10 * ps[1];
     if (draw) {
+        montage_test_fault("draw", NULL, 0);
         void* ctx = NULL;
         if (!gDraw || gProp->propGetPointer(in, kOfxInteractPropDrawContext, 0, &ctx) != kOfxStatOK || !ctx) return kOfxStatFailed;
         const OfxRGBAColourF red = {1, 0, 0, 1}, yellow = {1, 1, 0, 1};
