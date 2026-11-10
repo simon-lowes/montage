@@ -24047,7 +24047,9 @@ colorspaces:
         const int sequence = QRegularExpression("#EXT-X-MEDIA-SEQUENCE:(\\d+)").match(text).captured(1).toInt();
         QVERIFY2(sequence >= 5, qPrintable(text));
         QVERIFY(text.contains("#EXT-X-PART:") && text.contains("#EXT-X-PRELOAD-HINT:TYPE=PART") && text.contains("CAN-BLOCK-RELOAD=YES"));
-        QVERIFY(!QFile::exists(folder + "/" + QString::fromStdString(st.renditions.front()) + "/seg00001.m4s"));
+        // (a segment's files kept for the window and one more segment after it leaves the playlist: the first gone by
+        // the eleventh segment)
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(folder + "/" + QString::fromStdString(st.renditions.front()) + "/seg00001.m4s"), 30000);
         QFile mpd(folder + "/manifest.mpd");
         QVERIFY(mpd.open(QIODevice::ReadOnly));
         const QString x = QString::fromUtf8(mpd.readAll());
