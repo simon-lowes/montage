@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "Processing.h"
+#include "ShapeRaster.h"
 #include "media/HwAccel.h"
 
 namespace montage::gpu {
@@ -159,6 +160,7 @@ public:
     bool draw(const Frame& frame, Image* out, QImage* out8);
     long filterPasses = 0, mixPasses = 0;  // (the last frame's)
     long shaderBuilds = 0;                 // (shader steps built, the last frame)
+    long shapeLayers = 0;                  // (Shape layers drawn, the last frame)
     long hwMapped = 0, hwGpuCopies = 0;    // (its hardware frames: mapped, and copied on the GPU)
     std::string hwFallback;                // (why the last of them that could not be mapped was copied back)
     std::atomic<bool> lose{false};         // (tests: the next frame finds the device lost)
@@ -973,6 +975,25 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u, QRhiText
         pass(colorPs_, cur, u, textures, ub);
         u = rhi_->nextResourceUpdateBatch();
         release(raw);
+    } else if (l.shapes) {
+        // A Shape layer's paints, each pixel from its tile's commands in the table (render/ShapeRaster).
+        const ShapeRaster& sr = *l.shapes;
+        const int rows = int(sr.table.size() / (size_t(kShapeTableWidth) * 4));
+        cur = texture(T::RGBA32F, sr.width, sr.height, true);
+        QRhiTexture* table = rows > 0 ? texture(T::RGBA32F, kShapeTableWidth, rows, false) : nullptr;
+        if (!cur || !table) {
+            if (cur) release(cur);
+            if (table) release(table);
+            return nullptr;
+        }
+        QRhiTextureSubresourceUploadDescription d(sr.table.data(), quint32(sr.table.size() * sizeof(float)));
+        u->uploadTexture(table, QRhiTextureUploadEntry(0, 0, d));
+        p[0] = 56, p[4] = float(sr.tilesX);
+        pass(filterPs_, cur, u, {{5, table}}, uniforms(u, p));
+        u = rhi_->nextResourceUpdateBatch();
+        release(table);
+        ++filterPasses;
+        ++shapeLayers;
     } else {
         const int w = l.image.width, h = l.image.height;
         if (w <= 0 || h <= 0) return nullptr;
@@ -1285,7 +1306,7 @@ void Device::endFrame() {
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
-    filterPasses = mixPasses = shaderBuilds = 0;
+    filterPasses = mixPasses = shaderBuilds = shapeLayers = 0;
     hwMapped = hwGpuCopies = 0;
     hwFallback.clear();
     if (!rhi_) return false;  // (lost, and not set up again)
@@ -1368,7 +1389,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         return to;
     };
     // (Nothing to draw, transparent: no picture, or an adjustment layer over nothing.)
-    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty(); };
+    auto absent = [&](const Layer& l) { return l.canvas ? !canvas : !l.frame && l.image.empty() && !l.shapes; };
     Layer full;  // (a picture the canvas's size already)
     full.place.full = true;
     for (const Item& it : frame.items) {
@@ -1536,11 +1557,11 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     std::shared_lock lock(gDeviceMutex);
     if (!gDevice || !gDevice->ready()) return false;
     Device* d = gDevice.get();
-    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0;
+    long filters = 0, mixes = 0, mapped = 0, copied = 0, builds = 0, shapes = 0;
     std::string hwFallback;
     const bool ok = d->run([&] {
         const bool drawn = d->draw(frame, out, out8);
-        filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds;
+        filters = d->filterPasses, mixes = d->mixPasses, builds = d->shaderBuilds, shapes = d->shapeLayers;
         mapped = d->hwMapped, copied = d->hwGpuCopies, hwFallback = d->hwFallback;
         return drawn;
     });
@@ -1549,6 +1570,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
         ++gStats.gpuFrames;
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
+        gStats.shapeLayers += shapes;
     }
     gStats.shaderBuilds += builds;
     gStats.hwMapped += mapped;

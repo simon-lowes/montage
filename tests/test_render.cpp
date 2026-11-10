@@ -24145,6 +24145,124 @@ colorspaces:
     }
     // Aperture Glare's FFTs on the GPU at UHD, in tiles as the CPU makes them, against the CPU's: within 1/1023, at its
     // own size and on a layer with more pixels than the sequence (shrunk and drawn back up).
+    // Shape layers drawn on the GPU (render/ShapeRaster's table, gpufilter.frag's 56): plain shapes with their fills,
+    // gradients, strokes, dashes and trims, and contents with groups seen through their opacity, repeaters, radial
+    // gradients with a focal point and reflected stops, even-odd fills and groups inside groups, placed, scaled and
+    // turned, faded, and one through a feathered mask; each frame within 1/1023 of the CPU, drawn there, not uploaded.
+    void gpuShapeLayers() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.15f, 0.3f, 0.45f, 0, 60)).ok);
+        while (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        Clip shapeClip = makeGeneratorClip(p, "shape", 60);
+        const Id id = shapeClip.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, shapeClip).ok);
+        auto compare = [&](FrameTime t, const QString& what) {
+            RenderOptions o;
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats before = gpu::stats();
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            const gpu::Stats after = gpu::stats();
+            QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+            QVERIFY2(after.cpuLayers == before.cpuLayers, qPrintable(what + ": made on the CPU: " + QString::fromStdString(after.lastCpuLayer)));
+            QVERIFY2(after.shapeLayers == before.shapeLayers + 1, qPrintable(what + ": the shape was not drawn on the GPU"));
+            QCOMPARE(onGpu.width, cpu.width);
+            double worst = 0, moved = 0;
+            int wx = 0, wy = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        if (const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]); d > worst) worst = d, wx = x, wy = y;
+                        moved += std::fabs(cpu.at(x, y)[c] - (c == 3 ? 1.0f : c == 0 ? 0.15f : c == 1 ? 0.3f : 0.45f));
+                    }
+            QVERIFY2(moved > 50, qPrintable(what + ": nothing drawn"));
+            QVERIFY2(worst <= 1.0 / 1023,
+                     qPrintable(QString("%1: off by %2 at %3,%4 (cpu %5 %6 %7 %8, gpu %9 %10 %11 %12)").arg(what).arg(worst).arg(wx).arg(wy)
+                                    .arg(cpu.at(wx, wy)[0]).arg(cpu.at(wx, wy)[1]).arg(cpu.at(wx, wy)[2]).arg(cpu.at(wx, wy)[3])
+                                    .arg(onGpu.at(wx, wy)[0]).arg(onGpu.at(wx, wy)[1]).arg(onGpu.at(wx, wy)[2]).arg(onGpu.at(wx, wy)[3])));
+        };
+        auto reset = [&](const std::map<std::string, double>& params) {
+            Clip* c = edit::clipById(s, id);
+            c->generator = makeEffect(p, "shape");
+            c->effects.clear();
+            c->motion.params = {};
+            for (const auto& [k, v] : params) c->generator.params[k] = Param(v);
+            return c;
+        };
+        // Plain shapes, three settings each.
+        const std::vector<std::pair<const char*, std::vector<std::map<std::string, double>>>> plain = {
+            {"rectangle",
+             {{{"width", 150}, {"height", 80}, {"rotation", 12}, {"stroke", 6}},
+              {{"width", 200}, {"height", 60}, {"roundness", 20}, {"gradient", 1}, {"gradient_angle", 30}, {"stroke", 3}, {"join", 1}},
+              {{"width", 90}, {"height", 120}, {"fill_opacity", 60}, {"stroke", 10}, {"join", 2}, {"stroke_opacity", 70}, {"opacity", 80}}}},
+            {"ellipse",
+             {{{"shape", 1}, {"width", 140}, {"height", 100}, {"gradient", 2}},
+              {{"shape", 1}, {"width", 61.3}, {"height", 33.7}, {"pos_x", 40.25}, {"stroke", 2.5}, {"dash", 7}, {"gap", 4}},
+              {{"shape", 1}, {"width", 140}, {"height", 140}, {"fill", 0}, {"stroke", 9}, {"trim_end", 70}, {"trim_offset", 40}}}},
+            {"star",
+             {{{"shape", 3}, {"width", 160}, {"height", 160}, {"points", 7}, {"inner", 40}},
+              {{"shape", 3}, {"width", 120}, {"height", 90}, {"points", 5}, {"gradient", 1}, {"gradient_angle", 120}, {"stroke", 4}, {"dash", 12}, {"gap", 6}, {"join", 1}},
+              {{"shape", 2}, {"width", 130}, {"height", 130}, {"points", 6}, {"roundness", 15}, {"rotation", -20}, {"trim_start", 10}, {"trim_end", 80}}}},
+            {"line and arrow",
+             {{{"shape", 4}, {"width", 200}, {"height", 40}, {"stroke", 5}},
+              {{"shape", 5}, {"width", 180}, {"height", 70}, {"stroke", 3}},
+              {{"shape", 4}, {"width", 250}, {"height", 10}, {"rotation", 33}, {"stroke", 14}, {"join", 2}, {"dash", 20}, {"gap", 10}}}},
+        };
+        for (const auto& [what, settings] : plain)
+            for (size_t k = 0; k < settings.size(); ++k) {
+                Clip* c = reset(settings[k]);
+                if (k == 2) c->motion.params["scale"] = 130.0, c->motion.params["rotation"] = 20.0, c->motion.params["pos_x"] = -17.5;
+                compare(3, QString("%1 #%2").arg(what).arg(k + 1));
+            }
+        // Contents: shapes, paints and operators, groups with opacity, nested.
+        auto item = [](const char* type, const char* itemId, std::vector<ShapeItem> items = {}) {
+            ShapeItem it;
+            it.type = type, it.id = itemId, it.items = std::move(items);
+            return it;
+        };
+        ShapeItem radial = item("fill", "rf");
+        radial.stops = {{0, 1, 0.9, 0.2, 1}, {0.4, 0.9, 0.2, 0.4, 0.8}, {1, 0.1, 0.5, 1, 1}};
+        radial.spread = 1;
+        radial.hasFocal = true, radial.focalX = 15, radial.focalY = -10;
+        ShapeItem banded = item("stroke", "bs");
+        banded.stops = {{0, 1, 1, 1, 1}, {0.5, 0, 0, 0, 0.5}, {1, 1, 0.3, 0.1, 1}};
+        banded.spread = 2;
+        const std::vector<std::pair<std::vector<ShapeItem>, std::map<std::string, double>>> contents = {
+            {{item("group", "g", {item("star", "st"), item("ellipse", "el"), radial}), item("rect", "bg"), item("fill", "bf")},
+             {{"g.opacity", 55}, {"g.rotation", 15}, {"g.pos_x", 30}, {"st.outer", 70}, {"el.width", 90}, {"el.height", 50}, {"el.pos_x", -60},
+              {"rf.gradient", 2}, {"rf.start_x", 0}, {"rf.end_x", 60}, {"bg.width", 260}, {"bg.height", 120}, {"bf.color.r", 0.2}}},
+            {{item("ellipse", "e"), banded, item("repeater", "rep"), item("rect", "r"), item("rect", "r2"), item("fill", "eo")},
+             {{"e.width", 40}, {"e.height", 40}, {"bs.width", 5}, {"bs.gradient", 1}, {"bs.start_x", -20}, {"bs.end_x", 0}, {"rep.copies", 5},
+              {"rep.pos_x", 45}, {"rep.rotation", 10}, {"rep.end_opacity", 30}, {"r.width", 200}, {"r.height", 100}, {"r2.width", 120},
+              {"r2.height", 60}, {"eo.rule", 1}, {"pos_x", -60}}},
+            {{item("group", "a", {item("group", "b", {item("group", "c", {item("polygon", "pg"), item("fill", "pf")}), item("star", "s2"), item("stroke", "sk")}),
+                                  item("ellipse", "big"), item("fill", "bigf")})},
+             {{"a.opacity", 80}, {"b.opacity", 60}, {"b.scale_x", 140}, {"c.opacity", 70}, {"c.rotation", 30}, {"pg.radius", 50}, {"pf.color.g", 0.1},
+              {"s2.outer", 80}, {"sk.width", 7}, {"sk.join", 1}, {"sk.cap", 1}, {"sk.dash", 15}, {"sk.gap", 5}, {"big.width", 280}, {"big.height", 150},
+              {"bigf.opacity", 50}, {"rotation", -7}}},
+        };
+        for (size_t k = 0; k < contents.size(); ++k) {
+            Clip* c = reset(contents[k].second);
+            setShapeContents(c->generator, contents[k].first);
+            compare(4, QString("contents #%1").arg(k + 1));
+            if (k == 2) {
+                c->motion.params["scale"] = 75.0, c->motion.params["opacity"] = 70.0, c->motion.params["rotation"] = -12.0;
+                compare(5, "contents, placed and faded");
+                // Through a feathered mask: a blur on part of it.
+                Effect blur = makeEffect(p, "gaussian_blur");
+                blur.params["radius"] = 6.0;
+                blur.params["mask.shape"] = 2.0, blur.params["mask.w"] = 0.5, blur.params["mask.h"] = 0.6, blur.params["mask.feather"] = 12.0;
+                c->effects = {blur};
+                compare(6, "contents through a feathered mask");
+            }
+        }
+    }
     void gpuApertureGlareUhd() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());

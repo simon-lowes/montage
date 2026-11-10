@@ -57,6 +57,7 @@
 #include "Shapes.h"
 #include "Title3D.h"
 #include "ShapeLayers.h"
+#include "ShapeRaster.h"
 #include "Titles.h"
 #include "Layer3D.h"
 #include "ModelClip.h"
@@ -731,7 +732,9 @@ void sourceSize(const Geometry& g, double scale, int nativeW, int nativeH, int& 
 struct ClipSource {
     FrameTime t = 0, lt = 0;  // (Stop Motion holds frames)
     Image src;
-    // Or, when asked to leave it (`deferFrame`), the decoded frame and the space it is in: nothing ran on it yet.
+    // Or, when asked to leave it (`deferFrame`), a Shape layer's paints for the GPU to draw (render/ShapeRaster) ...
+    std::shared_ptr<const ShapeRaster> shapes;
+    // ... or the decoded frame and the space it is in: nothing ran on it yet.
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
     // The frame's adaptive HDR metadata (render/AdaptiveHdr.h) when it changes how the frame enters the sequence.
@@ -1043,6 +1046,19 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         std::string modelError;
+        // A Shape layer the GPU draws itself (in Rec.709, the space graphics are made in, as the sequence is; within
+        // the groups its shader keeps, and a table it takes).
+        if (deferFrame && c.generator.type == "shape" && !currentSceneGrading() && sameColorSpace(rec709Space(), sequenceColorSpace(seq))) {
+            ShapeRaster raster = shapeLayerRaster(c.generator, lt, w, h, double(w) / SW, seq.fpsValue());
+            const int most = gpu::maxTextureSize();
+            if (raster.depth <= kShapeGpuGroups && raster.table.size() / (size_t(kShapeTableWidth) * 4) <= size_t(most) && w <= most && h <= most &&
+                kShapeTableWidth <= most) {
+                out.shapes = std::make_shared<const ShapeRaster>(std::move(raster));
+                return true;
+            }
+            src = drawShapeRaster(raster);
+            return true;
+        }
         src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError,
                                                                       modelLayerAt(p, seq, o))
               : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
@@ -2875,6 +2891,9 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
                                 : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
         w = cs.frame->width, h = cs.frame->height;
+    } else if (cs.shapes) {
+        out.shapes = cs.shapes;
+        w = cs.shapes->width, h = cs.shapes->height;
     } else {
         out.image = std::move(cs.src);
         w = out.image.width, h = out.image.height;
@@ -2900,6 +2919,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
                    std::to_string(planes->bits) + "-bit" + (planes->hw ? std::string(" in ") + planes->hwType + "'s memory" : std::string()) +
                    ", converted there" + (w != planes->width || h != planes->height ? " and resampled" : "");
         else if (cs.frame) *why = "16-bit RGBA from the decoder";
+        else if (cs.shapes) *why = "a Shape layer, drawn there";
         else *why = "a picture made on the CPU before its effects";
     }
     // Placed as transformLayer places it (worked out here in double).
@@ -2915,6 +2935,7 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
         out.canvas = false;
         out.frame.reset();
+        out.shapes.reset();
         out.image = Image();
         out.ops.clear();
         return GpuLayerResult::Drawn;

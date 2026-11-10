@@ -22,6 +22,7 @@ class QImage;
 namespace montage {
 
 struct Lut3D;
+struct ShapeRaster;
 
 namespace gpu {
 
@@ -113,6 +114,7 @@ struct Layer {
     Frame16Ptr frame;                    // or a decoded frame, RGBA or Y′CbCr planes (premultiplied on the GPU) ...
     std::shared_ptr<const Lut3D> input;  // ... and its input transform, if any
     Image image;                         // or a picture made on the CPU (premultiplied, working space)
+    std::shared_ptr<const ShapeRaster> shapes;  // or a Shape layer's paints, drawn here (gpufilter.frag's 56) at their size
     std::vector<ColorOp> ops;
     Placement place;
 };
@@ -151,6 +153,7 @@ struct Stats {
     long gpuLayers = 0, cpuLayers = 0;  // their layers: drawn from the source, or made on the CPU and uploaded
     long filterPasses = 0, mixPasses = 0;  // passes of filters (gpufilter.frag) and of transitions and mattes (gpumix.frag)
     long shaderBuilds = 0;                 // shader steps built (ShaderStep, once a key), since resetStats
+    long shapeLayers = 0;                  // Shape layers drawn on the GPU (Layer::shapes)
     std::string lastFallback;
     std::string lastCpuLayer;  // the last layer made on the CPU, and why (as MONTAGE_GPU_LOG says it)
     // Hardware-decoded frames (render/GpuHardware): drawn from the decoding device's memory (hwGpuCopies of them

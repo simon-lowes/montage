@@ -53,6 +53,8 @@
 // Painterly (render/PaintFx): 49 the structure tensor, smoothed by 1's boxes or 48's kernel, 50 its flow; then 52 the
 // anisotropic Kuwahara filter (a wide brush on 55 the picture and 51 its squares, each through 1's boxes) or 53 the
 // smear along the flow.
+// 56 a Shape layer's paints (render/ShapeRaster): each pixel's tile's commands, each path's coverage from its backdrop and
+// lines, its paint laid down over what is below, groups through their opacity; p[1].x the tiles across.
 // The modes that take light read the working space's transfer tables (render/TransferTables) from the table's row 0
 // (decoding in x, encoding in y) where the CPU does.
 layout(location = 0) out vec4 fragColor;
@@ -344,6 +346,76 @@ vec4 warpSample(ivec2 size, float x, float y) {
     const vec4 c = texelFetch(srcTex, ivec2(x0, y1), 0), e = texelFetch(srcTex, ivec2(x1, y1), 0);
     const vec4 top = a + (b - a) * fx, bottom = c + (e - c) * fx;
     return top + (bottom - top) * fy;
+}
+
+// render/ShapeRaster's lineCover: the signed area of the pixel (lx, ly) (the tile's pixels) right of the line, down its
+// height, in up to three straight pieces each worked out at its middle.
+float shapeLineCover(vec4 e, float lx, float ly) {
+    const float ya = min(e.y, e.w), yb = max(e.y, e.w);
+    const float t0 = max(ya, ly), t1 = min(yb, ly + 1.0);
+    if (!(t1 > t0)) return 0.0;
+    const float k = (e.z - e.x) / (e.w - e.y);
+    const float xa = e.x + k * (t0 - e.y), xb = e.x + k * (t1 - e.y);
+    const float ga = lx + 1.0 - xa, d = (lx + 1.0 - xb) - ga;
+    float s1 = 0.0, s2 = 0.0;
+    if (d != 0.0) {
+        s1 = clamp01(-ga / d);
+        s2 = clamp01((1.0 - ga) / d);
+        if (s1 > s2) {
+            const float sw = s1;
+            s1 = s2;
+            s2 = sw;
+        }
+    }
+    const float sum = s1 * clamp01(ga + d * (s1 * 0.5)) + (s2 - s1) * clamp01(ga + d * ((s1 + s2) * 0.5)) +
+                      (1.0 - s2) * clamp01(ga + d * ((s2 + 1.0) * 0.5));
+    return (e.w > e.y ? 1.0 : -1.0) * (t1 - t0) * sum;
+}
+// render/ShapeRaster's paintAt: a paint's colour (premultiplied) at (x, y) in the frame's pixels.
+vec4 shapePaint(int at, float x, float y) {
+    const vec4 h = tableTexel(at);
+    const int kind = int(h.x);
+    if (kind == 0) return tableTexel(at + 1);
+    const vec4 m1 = tableTexel(at + 1), m2 = tableTexel(at + 2), pts = tableTexel(at + 3), k = tableTexel(at + 4);
+    const float gx = m1.x * x + m1.y * y + m1.z, gy = m2.x * x + m2.y * y + m2.z;
+    float t;
+    if (kind == 1) {
+        t = ((gx - pts.x) * pts.z + (gy - pts.y) * pts.w) * k.x;
+    } else {
+        const float qx = gx - pts.x, qy = gy - pts.y, A = k.y, B = qx * pts.z + qy * pts.w, C = qx * qx + qy * qy;
+        bool none = false;
+        if (A == 0.0) {
+            none = !(B > 0.0);
+            t = none ? 0.0 : C / (2.0 * B);
+        } else {
+            const float disc = B * B - A * C;
+            none = disc < 0.0;
+            const float s = sqrt(max(disc, 0.0));
+            t = A < 0.0 ? (B - s) / A : (B + s) / A;
+            none = none || t < 0.0;
+        }
+        if (none) return vec4(0.0);
+    }
+    const int spread = int(h.y);
+    if (spread == 0) {
+        t = clamp01(t);
+    } else if (spread == 2) {
+        t = t - floor(t);
+    } else {
+        t = t - 2.0 * floor(t * 0.5);
+        t = t > 1.0 ? 2.0 - t : t;
+    }
+    const int n = int(h.z), s0 = int(h.w);
+    if (!(t > tableTexel(s0).x)) return tableTexel(s0 + 1);
+    for (int i = 1; i < n; ++i) {
+        const float p0 = tableTexel(s0 + 2 * (i - 1)).x, p1 = tableTexel(s0 + 2 * i).x;
+        if (t < p1) {
+            const float f = (t - p0) / (p1 - p0);
+            const vec4 a = tableTexel(s0 + 2 * (i - 1) + 1), b = tableTexel(s0 + 2 * i + 1);
+            return a + (b - a) * f;
+        }
+    }
+    return tableTexel(s0 + 2 * (n - 1) + 1);
 }
 
 void main() {
@@ -1306,6 +1378,57 @@ void main() {
             o[c] = grainEncoded(tf, l[c] + p[1].y * grainAmplitude(c, light) * gn) * a;
         }
         fragColor = vec4(o, a);
+        return;
+    }
+    if (mode == 56) {
+        const int tilesX = int(p[1].x);
+        const ivec2 tc = xy / 16;
+        const vec4 hd = tableTexel(tc.y * tilesX + tc.x);
+        int i = int(hd.x) * 4096 + int(hd.y);
+        const int end = int(hd.z) * 4096 + int(hd.w);
+        const float lx = float(xy.x - tc.x * 16), ly = float(xy.y - tc.y * 16);
+        const float cx = float(xy.x) + 0.5, cy = float(xy.y) + 0.5;
+        const int row = xy.y - tc.y * 16;
+        vec4 acc = vec4(0.0);
+        vec4 stack[8];
+        int sp = 0;
+        while (i < end) {
+            const vec4 c = tableTexel(i);
+            const int type = int(c.x);
+            if (type == 1) {
+                if (sp < 8) stack[sp] = acc;
+                ++sp;
+                acc = vec4(0.0);
+                ++i;
+                continue;
+            }
+            if (type == 2) {
+                const vec4 g = acc * c.y;
+                --sp;
+                acc = sp >= 0 && sp < 8 ? stack[sp] : vec4(0.0);
+                acc = g + acc * (1.0 - g.a);
+                ++i;
+                continue;
+            }
+            const int lines = int(c.z);
+            float wind = tableTexel(i + 1 + row / 4)[row % 4];
+            for (int l = 0; l < lines; ++l) wind += shapeLineCover(tableTexel(i + 5 + l), lx, ly);
+            float cov;
+            if (c.w > 0.5) {
+                float a = abs(wind);
+                a = a - 2.0 * floor(a * 0.5);
+                cov = a > 1.0 ? 2.0 - a : a;
+            } else {
+                cov = min(1.0, abs(wind));
+            }
+            if (cov > 0.0) {
+                const vec4 col = shapePaint(int(c.y), cx, cy);
+                const float sa = col.a * cov;
+                acc = col * cov + acc * (1.0 - sa);
+            }
+            i += 5 + lines;
+        }
+        fragColor = acc;
         return;
     }
     fragColor = px;
