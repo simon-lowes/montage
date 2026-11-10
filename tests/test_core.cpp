@@ -5077,6 +5077,127 @@ private slots:
         QCOMPARE(trackAt(outer, A1)->clips.size(), size_t(1));  // nested audio gets its own clip
     }
 
+    void nestInToOutAcrossTracks() {
+        Fixture fx;
+        const TrackRef V3{TrackKind::Video, 2};
+        // V1 0-60 with its sound on A1, V2 20-30 and 40-90, V3 70-80 (after Out: stays).
+        const Result r1 = placeMedia(fx.p, fx.s(), fx.media, 0, 0, 60, V1, A1, false);
+        QVERIFY(r1.ok && r1.created.size() == 2);
+        const Id v2a = fx.put(V2, 20, 10, 5), v2b = fx.put(V2, 40, 50, 100);
+        const Id v3 = fx.put(V3, 70, 10);
+        const Id seqId = fx.s().id;
+        const Result r = nestRange(fx.p, fx.s(), 10, 50, allTracks(fx.s()), "Range");
+        QVERIFY2(r.ok, r.error.c_str());
+        Sequence& outer = *fx.p.findSequence(seqId);
+        // V1: 0-10 left, the compound 10-50, 50-60 right; A1 the same, the compound's sound linked to its picture.
+        const Track& v1 = *trackAt(outer, V1);
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[0].end(), FrameTime(10));
+        QCOMPARE(v1.clips[1].start, FrameTime(10));
+        QCOMPARE(v1.clips[1].duration, FrameTime(40));
+        QCOMPARE(v1.clips[2].start, FrameTime(50));
+        QCOMPARE(v1.clips[2].sourceIn, 50.0);
+        const MediaItem* m = fx.p.findMedia(v1.clips[1].mediaId);
+        QVERIFY(m && m->kind == MediaKind::Sequence && m->name == "Range");
+        const Track& a1 = *trackAt(outer, A1);
+        QCOMPARE(a1.clips.size(), size_t(3));
+        QCOMPARE(a1.clips[1].mediaId, m->id);
+        QVERIFY(a1.clips[1].linkGroup && a1.clips[1].linkGroup == v1.clips[1].linkGroup);
+        // The pieces left outside stay linked to each other, not to the compound.
+        QVERIFY(v1.clips[0].linkGroup && v1.clips[0].linkGroup == a1.clips[0].linkGroup && v1.clips[0].linkGroup != v1.clips[1].linkGroup);
+        // V2: the clip inside went, the one across Out was cut there; V3 untouched.
+        const Track& v2 = *trackAt(outer, V2);
+        QCOMPARE(v2.clips.size(), size_t(1));
+        QCOMPARE(v2.clips[0].start, FrameTime(50));
+        QCOMPARE(v2.clips[0].sourceIn, 110.0);
+        QVERIFY(clipById(outer, v3));
+        QVERIFY(!clipById(outer, v2a));
+        // The nested sequence: the range from 0, on the same tracks, gaps kept.
+        const Sequence* nested = fx.p.findSequence(m->sequenceId);
+        QVERIFY(nested);
+        QCOMPARE(trackAt(*nested, V1)->clips.size(), size_t(1));
+        QCOMPARE(trackAt(*nested, V1)->clips[0].start, FrameTime(0));
+        QCOMPARE(trackAt(*nested, V1)->clips[0].sourceIn, 10.0);
+        QCOMPARE(trackAt(*nested, V2)->clips.size(), size_t(2));
+        QCOMPARE(trackAt(*nested, V2)->clips[0].start, FrameTime(10));
+        QCOMPARE(trackAt(*nested, V2)->clips[1].start, FrameTime(30));
+        QCOMPARE(trackAt(*nested, V2)->clips[1].duration, FrameTime(10));
+        QVERIFY(clipById(*nested, v2b));
+        QCOMPARE(trackAt(*nested, V2)->clips[1].sourceIn, 100.0);
+        QCOMPARE(trackAt(*nested, A1)->clips.size(), size_t(1));
+        // A locked track is left as it is; nothing in the range fails.
+        Fixture fy;
+        fy.put(V1, 0, 30);
+        trackAt(fy.s(), V1)->locked = true;
+        QVERIFY(!nestRange(fy.p, fy.s(), 5, 20, allTracks(fy.s()), "N").ok);
+        QCOMPARE(trackAt(fy.s(), V1)->clips.size(), size_t(1));
+        QVERIFY(!nestRange(fy.p, fy.s(), 20, 20, allTracks(fy.s()), "N").ok);
+        // Sound alone nests as sound.
+        Fixture fz;
+        Clip snd = makeClip(fz.p, *fz.p.findMedia(fz.media), TrackKind::Audio, fz.s());
+        snd.start = 0;
+        snd.duration = 40;
+        QVERIFY(overwrite(fz.p, fz.s(), A1, snd).ok);
+        QVERIFY(nestRange(fz.p, fz.s(), 10, 20, allTracks(fz.s()), "Sound").ok);
+        QVERIFY(trackAt(*fz.p.active(), V1)->clips.empty());
+        QCOMPARE(trackAt(*fz.p.active(), A1)->clips.size(), size_t(3));
+    }
+
+    void replaceSourceOfSeveralClips() {
+        Fixture fx;
+        // A longer file of the same take (the online), starting two seconds earlier by timecode.
+        MediaItem online = *fx.p.findMedia(fx.media);
+        online.id = fx.p.newId();
+        online.name = "online.mov";
+        online.path = "/nonexistent/online.mov";
+        online.duration = 30;
+        online.timecode = 3600 - 2;
+        fx.p.media.push_back(online);
+        fx.p.findMedia(fx.media)->timecode = 3600;
+        std::vector<Id> clips;
+        for (int i = 0; i < 5; ++i) {
+            const Result r = placeMedia(fx.p, fx.s(), fx.media, i * 40, i * 30, i * 30 + 30, V1, A1, false);
+            QVERIFY(r.ok);
+            clips.push_back(r.created[0]);  // the picture (its sound follows)
+        }
+        Project before = fx.p;
+        Result r = replaceSources(fx.p, fx.s(), clips, online.id, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(10));
+        for (int i = 0; i < 5; ++i) {
+            const Clip& v = trackAt(fx.s(), V1)->clips[size_t(i)];
+            const Clip& a = trackAt(fx.s(), A1)->clips[size_t(i)];
+            QCOMPARE(v.mediaId, online.id);
+            QCOMPARE(a.mediaId, online.id);
+            QCOMPARE(v.sourceIn, double(i * 30));
+            QCOMPARE(v.start, FrameTime(i * 40));
+            QCOMPARE(v.duration, FrameTime(30));
+        }
+        // By timecode: two seconds (60 frames) later in the new file.
+        fx.p = before;
+        r = replaceSources(fx.p, fx.s(), clips, online.id, true);
+        QVERIFY2(r.ok, r.error.c_str());
+        for (int i = 0; i < 5; ++i) {
+            QCOMPARE(trackAt(fx.s(), V1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+            QCOMPARE(trackAt(fx.s(), A1)->clips[size_t(i)].sourceIn, double(i * 30 + 60));
+        }
+        // All or nothing: a file too short for the last clip changes none, and names it.
+        fx.p = before;
+        MediaItem shorter = online;
+        shorter.id = fx.p.newId();
+        shorter.name = "short.mov";
+        shorter.duration = 4;  // 120 frames: the last clip (120-150) is past its end
+        fx.p.media.push_back(shorter);
+        const Sequence unchanged = fx.s();
+        r = replaceSources(fx.p, fx.s(), clips, shorter.id, false);
+        QVERIFY(!r.ok);
+        QVERIFY2(r.error.find("too short") != std::string::npos, r.error.c_str());
+        QVERIFY(fx.s() == unchanged);
+        // A file without timecode cannot be matched by it.
+        fx.p.findMedia(shorter.id)->timecode = -1;
+        QVERIFY(!replaceSources(fx.p, fx.s(), clips, shorter.id, true).ok);
+    }
+
     void undoRedo() {
         Fixture fx;
         History h;

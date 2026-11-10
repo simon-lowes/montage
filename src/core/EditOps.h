@@ -242,6 +242,11 @@ Result applySpeedRamp(Project& p, Sequence& s, Id clipId, const std::string& pre
 // and length with its effects and transform, the media's frame `srcAlign`
 // (sequence frames) landing on timeline frame `at`. Linked clips follow.
 Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAlign, FrameTime at);
+// Replace Source of Selected: each of the clips (and the clips linked to them) shows media `mediaId` instead, in the
+// same place and length with its effects: at the same source time (its in-point kept), or with `byTimecode` at the
+// frame of the new media whose timecode matches the one it showed (both must have timecode). Generators are left. All
+// or nothing: fails, naming the clip, where the new media does not cover one. `created` lists the clips repointed.
+Result replaceSources(Project& p, Sequence& s, const std::vector<Id>& ids, Id mediaId, bool byTimecode);
 // Fit to Fill: overwrites timeline frames [tlIn, tlOut] with source frames
 // [srcIn, srcOut] (both inclusive, sequence frames), the speed changed to fit.
 Result fitToFill(Project& p, Sequence& s, Id mediaId, double srcIn, double srcOut, FrameTime tlIn, FrameTime tlOut,
@@ -398,6 +403,11 @@ Result replaceWithRender(Sequence& s, Id clip, Id media);
 Result restoreUnrendered(Sequence& s, Id clip);
 
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name);
+// Nest In to Out: each unlocked track of `tracks` cut at frames `a` and `b`, and what lies between (linked sound with
+// its picture) moved into a new sequence of the same tracks, gaps kept, and replaced by one compound clip from `a`
+// on the lowest video and audio tracks that had any (a range of sound alone nests as sound). Its picture and sound
+// are the range's as they were.
+Result nestRange(Project& p, Sequence& s, FrameTime a, FrameTime b, const std::vector<TrackRef>& tracks, const std::string& name);
 
 // ---- Sound to the sample ------------------------------------------------------------------
 // An audio clip's sound moved (picture and linked clips left where they are), its start or end trimmed (positive
