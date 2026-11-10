@@ -26,12 +26,16 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
 // Lets go of the channels kept for the next render, so hosts with nothing else in them end (and new ones start with
 // the settings as they are then).
 void releaseIdle();
+// Controls closed with an answer still out: each let go once its answer comes (or its host ended as hung after
+// Controls::kHangMs). True while some still wait.
+bool drainClosedControls();
 
 // An effect's on-screen controls in its host: a channel of their own beside its renders', the overlay drawn there into
 // the channel's shared block. Calls come from the GUI thread and wait at most kDeadlineMs; a reply later than that
 // leaves the last picture up (unresponsive()) and is collected at the next call, and one that has not come after
-// kHangMs ends the host as hung. Once a draw has been late, draws are not waited for until one comes in time again
-// (each paint shows the picture the one before asked for). What a late pen or key reply set is handed on with the
+// kHangMs ends the host as hung. Once a draw has been late, draws are not waited for until the host draws in time
+// again (each paint shows the picture the one before asked for, and an unchanged one is not asked for again). A pen
+// or key event waits up to the deadline for what is still out. What a late pen or key reply set is handed on with the
 // next event, or by lateEdits().
 class Controls {
 public:
@@ -61,8 +65,9 @@ private:
     // (`timeoutUs`, when given); a Result as an int (0: the reply came in time).
     int send(uint32_t cmd, const Effect& e, double t, const View& v, const std::function<void(void*)>& args, const std::string& text = {},
              int64_t timeoutUs = 0);
-    // A reply to an earlier message that missed its deadline: taken now if it has come (false: still waiting).
-    bool settle();
+    // A reply to an earlier message that missed its deadline: taken if it comes within `waitUs` (false: still waiting).
+    bool settle(int64_t waitUs = 0);
+    void noteBlobOut();
     void fail(int result);
     bool takeImage(double pixelRatio);
     bool readEdited(Effect& edited, bool& changed);
@@ -76,6 +81,8 @@ private:
     uint32_t pendingCmd_ = 0;  // which (0: none)
     double pendingRatio_ = 1;
     bool slowDraws_ = false;  // (a draw was late: draws are not waited for)
+    std::string drawnMsg_;    // the draw whose picture last_ is (not asked again while drawing without waiting)
+    std::string pendingDraw_;
     Effect late_;             // what late pen and key replies set
     bool lateEdits_ = false;
     bool failed_ = false;

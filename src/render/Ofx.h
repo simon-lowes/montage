@@ -273,6 +273,9 @@ public:
     // (in a host) What the control set in a reply that came after its deadline and that no pen or key event has handed
     // on: only those parameters and strings. False when there is none.
     bool lateEdits(Effect& changes);
+    // Controls in hosts closed with an answer still out are let go as their answers come: true while some still wait
+    // (to be asked again a little later, from the GUI thread).
+    static bool tidyClosed();
     // In a plug-in host (not this process).
     bool remote() const { return remote_ != nullptr; }
     // Why it failed, when it failed in a host ("crashed (signal 11)"...); "" otherwise.

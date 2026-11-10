@@ -162,16 +162,18 @@ std::atomic<wire::Header*> gControl{nullptr};
 std::atomic<int> gLoader{0};
 std::atomic<int> gThreads{0};
 thread_local int tThread = 0;
+thread_local bool tServing = false;  // (one of the host's own threads serving a channel)
 int thisThread() {
     if (!tThread) tThread = ++gThreads;
     return tThread;
 }
 
-// A crash on another thread than the one loading (a render of a plug-in already loaded) is not the loading one's:
-// its name is taken back. (In the crash handler, on the crashing thread: atomics and its own thread-local only.)
+// A crash on another of the host's channel threads than the one loading (a render of a plug-in already loaded) is
+// not the loading one's: its name is taken back. A crash on a thread of the plug-ins' own (or the main thread, which
+// a load may hand work to) leaves it. (In the crash handler, on the crashing thread: atomics and its thread-locals.)
 void forgetLoadingUnlessHere() {
     wire::Header* h = gControl.load(std::memory_order_acquire);
-    if (h && (tThread == 0 || gLoader.load(std::memory_order_acquire) != tThread)) h->loading[0] = '\0';
+    if (h && tServing && (tThread == 0 || gLoader.load(std::memory_order_acquire) != tThread)) h->loading[0] = '\0';
 }
 
 void noteLoading(const std::string& id, bool loading) {
@@ -422,6 +424,7 @@ void process(AudioInstance& a) {
 }
 
 void serveAudio(std::shared_ptr<AudioInstance> a) {
+    tServing = true;
 #ifndef _WIN32
     AltStack alt;
 #endif
@@ -627,6 +630,7 @@ void serveOverlay(OfxChannel& o, uint32_t cmd) {
     o.mapArena();  // (at every message: Montage lets go of a new arena's name once this has answered)
     h->resultFlags = 0;
     h->resultI = h->resultI2 = 0;
+    h->resultD = -1;  // (a draw: how long the control took, in seconds)
     wire::OverlayArgs a{};
     const size_t at = sizeof a;
     const size_t s1 = msg.size() > at ? msg.find('\0', at) : std::string::npos;
@@ -669,7 +673,9 @@ void serveOverlay(OfxChannel& o, uint32_t cmd) {
     bool changed = false;
     if (cmd == wire::OfxOverlayDraw) {
         ofx::Overlay drawn;
+        const int64_t began = ipc::nowUs();
         ok = o.controls->draw(e, t, v, drawn);
+        h->resultD = double(ipc::nowUs() - began) / 1e6;
         if (ok && drawn.ops.empty() && drawn.gl.isNull()) {
             // Nothing drawn (an OpenGL control where the host has no OpenGL draws nothing, as in Montage): no picture.
         } else if (ok) {
@@ -719,6 +725,7 @@ void serveOverlay(OfxChannel& o, uint32_t cmd) {
 }
 
 void serveOfx(std::shared_ptr<OfxChannel> o) {
+    tServing = true;
 #ifndef _WIN32
     AltStack alt;
 #endif
@@ -833,6 +840,7 @@ void serveOfx(std::shared_ptr<OfxChannel> o) {
 
 // The control channel: Montage asks for instances here.
 void serveControl(std::string name) {
+    tServing = true;
 #ifndef _WIN32
     AltStack alt;
 #endif

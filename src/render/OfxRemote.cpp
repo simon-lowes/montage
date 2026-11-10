@@ -111,25 +111,25 @@ std::string keyFor(const Effect& e, const PluginDesc& d) {
     return hostKey(currentIsolation(), d.id, d.bundle.empty() ? d.binary : d.bundle, true, std::to_string(e.id));
 }
 
-// How long playback waits for a picture: 5 s for a plug-in not yet seen to render at that size, or on a channel that
-// has not rendered yet (a host just started loads it first), then eight times the slowest render it has given at that
-// size, at least 1 s: a plug-in that renders in milliseconds and then hangs holds the viewer for a second, not five,
-// each time. (An export waits as it is set to.)
+// How long playback waits for a picture: 5 s for a plug-in not yet seen to render, or on a channel that has not rendered
+// yet (a host just started loads it first), then eight times its slowest render seen, scaled to this picture's size,
+// at least 1 s: a plug-in that renders in milliseconds and then hangs holds the viewer for a second, not five, each
+// time. (An export waits as it is set to.)
 std::mutex gSlowestM;
-std::map<std::string, int64_t>& slowest() {
-    static auto* m = new std::map<std::string, int64_t>;
+std::map<std::string, double>& slowest() {  // (microseconds a pixel, by plug-in)
+    static auto* m = new std::map<std::string, double>;
     return *m;
 }
-int64_t playbackWaitUs(const std::string& id, int64_t limitUs) {
+int64_t playbackWaitUs(const std::string& id, int64_t pixels, int64_t limitUs) {
     std::lock_guard lock(gSlowestM);
     const auto it = slowest().find(id);
     if (it == slowest().end()) return limitUs;
-    return std::clamp<int64_t>(8 * it->second, 1'000'000, limitUs);
+    return std::clamp<int64_t>(int64_t(8 * it->second * double(std::max<int64_t>(1, pixels))), 1'000'000, limitUs);
 }
-void noteRender(const std::string& id, int64_t us) {
+void noteRender(const std::string& id, int64_t pixels, int64_t us) {
     std::lock_guard lock(gSlowestM);
-    int64_t& s = slowest()[id];
-    s = std::max(s, us);
+    double& s = slowest()[id];
+    s = std::max(s, double(us) / double(std::max<int64_t>(1, pixels)));
 }
 
 // What is bypassed past its restarts: the plug-in, or with a host for each instance, that instance alone.
@@ -171,8 +171,6 @@ std::string hostFailed(Host& host, const PluginDesc& d, const std::string& bypas
 }  // namespace
 
 bool isolated() { return plugins::isolating(); }
-
-void drainClosedControls();
 
 void releaseIdle() {
     drainClosedControls();
@@ -219,9 +217,9 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
     // (during playback a picture is waited for 5 s at most, not an export's 30, and once the plug-in has rendered, a
     // few times its slowest: a hung plug-in holds the viewer no longer than that, each time)
     const int64_t exportUs = int64_t(hosting().exportTimeoutMs) * 1000;
-    const std::string sized = d.id + "@" + std::to_string(w) + "x" + std::to_string(h);
+    const int64_t pixels = int64_t(w) * int64_t(h);
     const int64_t playbackUs = std::min<int64_t>(exportUs, 5'000'000);
-    const int64_t timeout = !renderingRealtime() ? exportUs : link->rendered ? playbackWaitUs(sized, playbackUs) : playbackUs;
+    const int64_t timeout = !renderingRealtime() ? exportUs : link->rendered ? playbackWaitUs(d.id, pixels, playbackUs) : playbackUs;
     const int64_t began = ipc::nowUs();
     Result r = Result::Ok;
     if (sendPayload(c, *link->host, msg, timeout, &r)) {
@@ -263,7 +261,7 @@ bool render(Kind kind, const Effect& e, const PluginDesc& d, double t, double pr
         hd->flags = 0;
         link->arena->unlinkName();  // (the host has it mapped now)
         if (hd->status) {
-            noteRender(sized, ipc::nowUs() - began);
+            noteRender(d.id, pixels, ipc::nowUs() - began);
             link->rendered = true;
         }
         if (!hd->status) {
@@ -304,6 +302,7 @@ namespace {
 constexpr int64_t kDeadlineUs = int64_t(Controls::kDeadlineMs) * 1000;
 constexpr int64_t kHangUs = int64_t(Controls::kHangMs) * 1000;
 constexpr uint32_t kPartOut = 0xffffffffu;  // (pending: a part of a long message; the command itself never went)
+constexpr int kUnchanged = 100;              // (send: a draw not sent, its picture the last one)
 int devicePixels(int size, double ratio) { return std::clamp(int(std::lround(size * ratio)), 1, 16384); }
 
 // Channels of controls closed while a reply was still out. Each is let go once the reply comes (the host's controls
@@ -315,8 +314,9 @@ std::vector<std::unique_ptr<Controls::Link>>& closedControls() {
 }
 }  // namespace
 
-void drainClosedControls() {
+bool drainClosedControls() {
     std::vector<std::unique_ptr<Controls::Link>> done;
+    bool left = false;
     {
         std::lock_guard lock(gClosedM);
         auto& v = closedControls();
@@ -334,8 +334,10 @@ void drainClosedControls() {
             done.push_back(std::move(*it));
             it = v.erase(it);
         }
+        left = !v.empty();
     }
     // (let go here, outside the lock: one that answered waits for its Destroy)
+    return left;
 }
 
 std::unique_ptr<Controls> Controls::open(const Effect& e, const PluginDesc& d, std::string* error) {
@@ -393,13 +395,16 @@ int Controls::send(uint32_t cmd, const Effect& e, double t, const View& v, const
     a.pixelRatio = v.pixelRatio > 0 ? v.pixelRatio : 1;
     a.time = t;
     if (args) args(&a);
-    sent_ = baked(e, t);
+    const Effect baking = baked(e, t);
     std::string msg(reinterpret_cast<const char*>(&a), sizeof a);
-    msg += effectToJsonString(sent_);
+    msg += effectToJsonString(baking);
     msg += '\0';
     if (cmd == wire::OfxOverlayOpen) msg += descriptionsToJson({desc_});  // (the host keeps it from then on)
     msg += '\0';
     msg += text;
+    // (controls drawn without waiting are not asked again for the picture they gave last: nothing has changed)
+    if (cmd == wire::OfxOverlayDraw && slowDraws_ && msg == drawnMsg_) return kUnchanged;
+    sent_ = baking;
     if (cmd == wire::OfxOverlayDraw) {
         // Room for the picture back, at the device's pixels.
         std::string why;
@@ -428,6 +433,7 @@ int Controls::send(uint32_t cmd, const Effect& e, double t, const View& v, const
         // (its last picture stays up; the reply is taken when it comes, or the host is ended as hung)
         pendingCmd_ = sent ? cmd : kPartOut;
         pendingRatio_ = a.pixelRatio;
+        if (pendingCmd_ == wire::OfxOverlayDraw) pendingDraw_ = msg;
         sentUs_ = began;
         if (sent && cmd == wire::OfxOverlayDraw) slowDraws_ = true;
         if (timeoutUs >= kHangUs) fail(int(r));
@@ -438,6 +444,7 @@ int Controls::send(uint32_t cmd, const Effect& e, double t, const View& v, const
         return int(r);
     }
     link_->arena->unlinkName();  // (the host has it mapped now)
+    if (cmd == wire::OfxOverlayDraw) drawnMsg_ = std::move(msg);
     if (c.h->resultFlags & wire::kControlFailed) {
         failed_ = true;
         failure_ = "stopped working";
@@ -452,17 +459,23 @@ void Controls::fail(int result) {
     link_->hung = true;
 }
 
-bool Controls::settle() {
+bool Controls::settle(int64_t waitUs) {
     if (failed_) return false;
     if (!pendingCmd_) return true;
     Channel& c = link_->chan;
-    if (c.h->crashed.load(std::memory_order_acquire) || !link_->host->alive()) {
-        fail(int(Result::Dead));
-        return false;
-    }
-    if (!collectPending(c)) {
-        if (ipc::nowUs() - sentUs_ > kHangUs) fail(int(Result::Timeout));
-        return false;
+    const int64_t end = ipc::nowUs() + waitUs;
+    while (!collectPending(c)) {
+        if (c.h->crashed.load(std::memory_order_acquire) || !link_->host->alive()) {
+            fail(int(Result::Dead));
+            return false;
+        }
+        const int64_t now = ipc::nowUs();
+        if (now - sentUs_ > kHangUs) {
+            fail(int(Result::Timeout));
+            return false;
+        }
+        if (now >= end) return false;
+        c.toClient->wait(&c.h->toClient, c.h->toClient.load(std::memory_order_acquire), std::min<int64_t>(end - now, 2000));
     }
     const uint32_t cmd = std::exchange(pendingCmd_, 0u);
     if (cmd == kPartOut) return true;
@@ -474,7 +487,9 @@ bool Controls::settle() {
     }
     if (cmd == wire::OfxOverlayDraw) {
         if (!c.h->status || !takeImage(pendingRatio_)) last_ = QImage();
-        if (ipc::nowUs() - sentUs_ <= kDeadlineUs) slowDraws_ = false;  // (in time again: drawn while waited for)
+        drawnMsg_ = std::move(pendingDraw_);
+        // (drawn in time again, as the host timed it: draws are waited for again)
+        if (c.h->resultD >= 0 && c.h->resultD * 1e6 < double(kDeadlineUs) / 2) slowDraws_ = false;
     } else if (cmd == wire::OfxOverlayPen || cmd == wire::OfxOverlayKey) {
         // What the control set in a late reply, kept for the next event (or lateEdits) to hand on.
         Effect set;
@@ -484,8 +499,16 @@ bool Controls::settle() {
             for (auto& [key, v] : set.strings) late_.strings[key] = v;
             lateEdits_ = true;
         }
+        noteBlobOut();
     }
     return !failed_;
+}
+
+void Controls::noteBlobOut() {
+    // (a part of a long answer still out: waited for as any message is, and the host ended if it never comes)
+    if (failed_ || pendingCmd_ || !link_->chan.pending) return;
+    pendingCmd_ = kPartOut;
+    sentUs_ = ipc::nowUs();
 }
 
 bool Controls::takeLate(Effect& into) {
@@ -567,7 +590,7 @@ bool Controls::readEdited(Effect& edited, bool& changed) {
 bool Controls::pen(int kind, const Effect& e, double t, const View& v, double vx, double vy, double pressure, Effect& edited, bool& changed) {
     edited = e;
     changed = false;
-    if (!settle()) return false;  // (not responding: the pen is not sent)
+    if (!settle(kDeadlineUs)) return false;  // (not responding: the pen is not sent)
     changed = takeLate(edited);  // (what a late reply set goes first, and with the effect the control is sent)
     const int r = send(wire::OfxOverlayPen, edited, t, v, [&](void* p) {
         auto* a = static_cast<wire::OverlayArgs*>(p);
@@ -578,6 +601,7 @@ bool Controls::pen(int kind, const Effect& e, double t, const View& v, double vx
     const bool took = link_->chan.h->status == 1;
     bool more = false;
     readEdited(edited, more);
+    noteBlobOut();
     changed = changed || more;
     return took;
 }
@@ -585,7 +609,7 @@ bool Controls::pen(int kind, const Effect& e, double t, const View& v, double vx
 bool Controls::key(bool down, int keysym, const std::string& text, const Effect& e, double t, const View& v, Effect& edited, bool& changed) {
     edited = e;
     changed = false;
-    if (!settle()) return false;
+    if (!settle(kDeadlineUs)) return false;
     changed = takeLate(edited);
     const int r = send(wire::OfxOverlayKey, edited, t, v, [&](void* p) {
         auto* a = static_cast<wire::OverlayArgs*>(p);
@@ -596,6 +620,7 @@ bool Controls::key(bool down, int keysym, const std::string& text, const Effect&
     const bool took = link_->chan.h->status == 1;
     bool more = false;
     readEdited(edited, more);
+    noteBlobOut();
     changed = changed || more;
     return took;
 }

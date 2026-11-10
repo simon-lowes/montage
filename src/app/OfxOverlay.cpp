@@ -129,6 +129,7 @@ const Effect* OfxOverlay::effectOf(const Target& t) const {
 
 ofx::Interact* OfxOverlay::interactFor(const Target& t, const Effect& e) {
     Open& o = open_[{t.clip, t.effect}];
+    o.target = t;
     // (one that failed is left alone from then on, as OpenFX asks; one that will not open is not tried again either)
     if (o.interact && o.interact->failed()) {
         o.interact.reset();
@@ -161,9 +162,17 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
     for (auto it = open_.begin(); it != open_.end();) {
         bool shown = false;
         for (const Target& t : ts) shown = shown || (t.clip == it->first.first && t.effect == it->first.second);
-        if (!shown && !(down_ && pressed_.clip == it->first.first && pressed_.effect == it->first.second)) it = open_.erase(it);
-        else ++it;
+        if (!shown && !(down_ && pressed_.clip == it->first.first && pressed_.effect == it->first.second)) {
+            // (what a late answer set is still written, if it has come)
+            Effect late;
+            if (it->second.interact && it->second.interact->lateEdits(late)) applyLate(it->second.target, late);
+            it = open_.erase(it);
+        } else {
+            ++it;
+        }
     }
+    // (controls closed with an answer out are let go as it comes)
+    if (ofx::Interact::tidyClosed() && !poll_->isActive()) poll_->start();
     int notes = 0;
     for (const Target& t : ts) {
         const Effect* e = effectOf(t);
@@ -176,18 +185,9 @@ void OfxOverlay::paint(QPainter& p, const QRectF&) {
         const QString name = QString::fromStdString(e->s("ofx_name"));
         // (controls in a host that did not answer in time keep their last picture up, marked)
         if (drew || !o.gl.isNull()) ofx::paintOverlay(p, o, v);
-        // What a late reply set once the pen was up: written as its own step, after this paint.
+        // What a late reply set once the pen was up: written as its own step (not while a drag is going on).
         Effect late;
-        if (!(down_ && pressed_.clip == t.clip && pressed_.effect == t.effect) && in->lateEdits(late)) {
-            QTimer::singleShot(0, this, [this, t, late] {
-                const Effect* now = effectOf(t);
-                if (!now) return;
-                Effect edited = *now;
-                for (const auto& [key, param] : late.params) edited.params[key] = param;
-                for (const auto& [key, value] : late.strings) edited.strings[key] = value;
-                apply(t, edited, false);
-            });
-        }
+        if (!down_ && !state_->inGesture() && in->lateEdits(late)) applyLate(t, late);
         if (in->waiting() && !poll_->isActive()) poll_->start();
         if (!drew) {
             const std::string why = in->failure();
@@ -227,6 +227,22 @@ void OfxOverlay::apply(const Target& t, const Effect& edited, bool gesture) {
     };
     if (gesture) state_->updateGesture([fn](Project& p, Sequence& s) { fn(p, s); });
     else state_->edit(tr("Change %1").arg(QString::fromStdString(edited.s("ofx_name"))), fn);
+}
+
+void OfxOverlay::applyLate(const Target& t, const Effect& changes) {
+    // (after the paint it was found in, and after any drag going on then)
+    QTimer::singleShot(state_->inGesture() ? 100 : 0, this, [this, t, changes] {
+        if (state_->inGesture()) {
+            applyLate(t, changes);
+            return;
+        }
+        const Effect* now = effectOf(t);
+        if (!now) return;
+        Effect edited = *now;
+        for (const auto& [key, param] : changes.params) edited.params[key] = param;
+        for (const auto& [key, value] : changes.strings) edited.strings[key] = value;
+        apply(t, edited, false);
+    });
 }
 
 bool OfxOverlay::pen(ofx::Interact::Pen kind, QEvent* ev) {
@@ -330,8 +346,9 @@ bool OfxOverlay::eventFilter(QObject* obj, QEvent* e) {
             if (!in) continue;
             Effect edited = *ef;
             bool changed = false;
-            if (in->key(e->type() == QEvent::KeyPress, sym, k->text().toStdString(), *ef, double(t.lt), v, edited, changed)) {
-                if (changed) apply(t, edited, false);
+            const bool took = in->key(e->type() == QEvent::KeyPress, sym, k->text().toStdString(), *ef, double(t.lt), v, edited, changed);
+            if (changed) apply(t, edited, false);  // (what a late answer set comes with a key not taken too)
+            if (took) {
                 viewer_->update();
                 return true;
             }

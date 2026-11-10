@@ -53,12 +53,15 @@ private:
     ofx::Interact* interactFor(const Target& t, const Effect& e);
     // Writes what the plugin set into the effect (inside the open gesture, or as its own undo step).
     void apply(const Target& t, const Effect& edited, bool gesture);
+    // What a late answer from controls in a host set (`changes`: those parameters and strings), as its own step.
+    void applyLate(const Target& t, const Effect& changes);
     bool pen(ofx::Interact::Pen kind, QEvent* e);
 
     EditorState* state_;
     ViewerWidget* viewer_;
     struct Open {
         std::string plugin;  // ofx_id it was opened for
+        Target target;
         std::unique_ptr<ofx::Interact> interact;
     };
     std::map<std::pair<Id, Id>, Open> open_;

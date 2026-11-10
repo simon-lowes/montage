@@ -2731,12 +2731,22 @@ private slots:
             return !o.gl.isNull();
         }, 10000));
         QVERIFY(qAlpha(o.gl.pixel(120, 80)) > 0);
+        QVERIFY(c->draw(slow, 0, v, o) && !o.gl.isNull() && !c->waiting());  // (unchanged: not asked again)
+        // Moved: asked without waiting, the last picture shown meanwhile and the new one at a later call.
+        Effect moved = slow;
+        moved.params["param.centre.x"] = Param(0.6);
         QElapsedTimer clock;
         clock.start();
-        QVERIFY(c->draw(slow, 0, v, o) && !o.gl.isNull());
+        QVERIFY(c->draw(moved, 0, v, o) && !o.gl.isNull() && qAlpha(o.gl.pixel(120, 80)) > 0);
         QVERIFY2(clock.elapsed() < 100, qPrintable(QString::number(clock.elapsed())));  // (not waited for)
-        QVERIFY(!c->failed() && c->waiting());
-        c.reset();
+        QVERIFY(c->waiting());
+        QVERIFY(eventually([&] {
+            c->draw(moved, 0, v, o);
+            return !o.gl.isNull() && qAlpha(o.gl.pixel(240, 80)) > 0 && qAlpha(o.gl.pixel(120, 80)) == 0;
+        }, 10000));
+        QVERIFY(!c->failed());
+        QVERIFY(c->draw(slow, 0, v, o) && c->waiting());
+        c.reset();  // (closed with a draw out)
         // A release answered late: the Centre it set comes as a late edit.
         Effect late = slow;
         late.id = p.newId();

@@ -2969,6 +2969,7 @@ bool Interact::unresponsive() const { return remote_ && !remote_->failed() && re
 std::string Interact::failure() const { return remote_ ? remote_->failure() : std::string(); }
 bool Interact::waiting() const { return remote_ && remote_->waiting(); }
 bool Interact::lateEdits(Effect& changes) { return remote_ && remote_->lateEdits(changes); }
+bool Interact::tidyClosed() { return remote::drainClosedControls(); }
 
 void setLoadWatcher(std::function<void(const std::string&, bool)> watch) {
     std::lock_guard<std::mutex> lock(gLoadMutex);
