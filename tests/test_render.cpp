@@ -24299,7 +24299,7 @@ colorspaces:
             QVERIFY(probeMedia(png.toStdString(), m));
             m.id = p.newId();
             p.media.push_back(m);
-            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, size_t(track)}, {}, false).ok);
+            QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, track}, {}, false).ok);
         }
         Clip& c = s.videoTracks[0].clips[0];
         auto compare = [&](FrameTime t, const QString& what) {
