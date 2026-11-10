@@ -82,8 +82,8 @@ bool encoderAvailable() { return avcodec_find_encoder_by_name("prores_ks") != nu
 
 // R'G'B' (16 bits, full range) to Y'CbCr at 12 bits through a matrix_coefficients code's matrix, narrow range (Y' 256
 // to 3760, the colour differences 256 to 3840) or full (0 to 4095, the differences about 2048), as ITU-T H.273 has it.
-void toYCbCr12(const uint16_t* rgb, int width, int height, int matrix, bool fullRange, std::vector<uint16_t>& y, std::vector<uint16_t>& cb,
-               std::vector<uint16_t>& cr) {
+void toYCbCr12(const uint16_t* rgb, int width, int height, int matrix, bool fullRange, int maxThreads, std::vector<uint16_t>& y,
+               std::vector<uint16_t>& cb, std::vector<uint16_t>& cr) {
     const double kr = matrix == 9 || matrix == 10 ? 0.2627 : matrix == 5 || matrix == 6 ? 0.299 : 0.2126;
     const double kb = matrix == 9 || matrix == 10 ? 0.0593 : matrix == 5 || matrix == 6 ? 0.114 : 0.0722;
     const double kg = 1 - kr - kb;
@@ -92,7 +92,9 @@ void toYCbCr12(const uint16_t* rgb, int width, int height, int matrix, bool full
     y.resize(n);
     cb.resize(n);
     cr.resize(n);
-    const int threads = std::max(1, std::min(int(std::thread::hardware_concurrency()), height / 64 + 1));
+    // (as many threads as the encoder is given: one, when several frames are being coded at once)
+    const int cores = maxThreads > 0 ? maxThreads : int(std::thread::hardware_concurrency());
+    const int threads = std::max(1, std::min(cores, height / 64 + 1));
     std::vector<std::thread> pool;
     for (int t = 0; t < threads; ++t)
         pool.emplace_back([&, t] {
@@ -223,7 +225,7 @@ bool Encoder::encode(const uint16_t* rgb, const uint16_t* alpha, std::vector<uin
     if (!d_) return failWith(error, "The ProRes encoder is not open");
     if (alpha && !d_->coding.alpha) return failWith(error, "The ProRes encoder was opened without alpha");
     if (d_->own) {
-        toYCbCr12(rgb, d_->width, d_->height, d_->matrix, d_->coding.fullRange, d_->y, d_->cb, d_->cr);
+        toYCbCr12(rgb, d_->width, d_->height, d_->matrix, d_->coding.fullRange, d_->coding.threads, d_->y, d_->cb, d_->cr);
         PlanarPicture pic;
         pic.y = d_->y.data();
         pic.cb = d_->cb.data();

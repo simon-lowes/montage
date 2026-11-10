@@ -280,6 +280,7 @@ void twice(Clip& c) {
     for (auto& [id, trim] : c.trims) twice(trim);
     for (GradeVersion& g : c.gradeVersions) twice(g.effects);
     for (CompositeNode& n : c.composite.nodes) {
+        n.offset *= 2;  // (a media input's frame, in sequence frames)
         twice(n.generator);
         twice(n.effects);
     }
@@ -318,6 +319,12 @@ Sequence fieldRateSequence(const Sequence& seq) {
     if (d.inPoint >= 0) d.inPoint *= 2;
     if (d.outPoint >= 0) d.outPoint = d.outPoint * 2 + 1;
     d.playhead *= 2;
+    return d;
+}
+
+Project fieldRateProject(const Project& p) {
+    Project d = p;
+    for (Sequence& s : d.sequences) s = fieldRateSequence(s);
     return d;
 }
 

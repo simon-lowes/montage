@@ -303,6 +303,12 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     interlaced_->setToolTip(tr("Coded as two fields, the top first, each rendered at its own moment half a frame apart, as 1080i deliveries ask"));
     interlaced_->setChecked(appSettings().value("export/interlaced", false).toBool());
     form->addRow(QString(), interlaced_);
+    segmentedFields_ = new QCheckBox(tr("Both fields from one picture (PsF)"), form_);
+    segmentedFields_->setObjectName(QStringLiteral("exportSegmentedFields"));
+    segmentedFields_->setToolTip(tr("Each frame's two halves as its fields, as progressive pictures are carried in 1080i, instead of each field rendered at its own moment"));
+    segmentedFields_->setChecked(appSettings().value("export/segmentedFields", false).toBool());
+    form->addRow(QString(), segmentedFields_);
+    connect(interlaced_, &QCheckBox::toggled, this, [this] { updateControls(); });
     {
         auto* row = new QWidget(form_);
         auto* h = new QHBoxLayout(row);
@@ -933,6 +939,7 @@ void ExportDialog::updateControls() {
         const bool fields = r.size() == 3 && r[0] == QLatin1String("pulldown") && nd.size() == 2 && nd[1].toDouble() > 0 &&
                             nd[0].toDouble() / nd[1].toDouble() < 40;
         interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks" || vc == "ffv1") && d != "as11-dpp" && !fields);
+        if (segmentedFields_) segmentedFields_->setEnabled((interlaced_->isEnabled() && interlaced_->isChecked()) || (video && d == "as11-dpp"));
     }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};
@@ -1167,6 +1174,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/startTimecode", startTc_->text().trimmed());
     s.interlaced = interlaced_->isEnabled() && interlaced_->isChecked();
     settings.setValue("export/interlaced", interlaced_->isChecked());
+    s.segmentedFields = segmentedFields_->isEnabled() && segmentedFields_->isChecked();
+    settings.setValue("export/segmentedFields", segmentedFields_->isChecked());
     if (const QStringList r = rate_->currentData().toString().split(QLatin1Char('|')); rate_->isEnabled() && r.size() == 3) {
         s.rateChange = r[0].toStdString();
         const QStringList nd = r[1].split(QLatin1Char('/'));

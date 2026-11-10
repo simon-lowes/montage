@@ -1303,13 +1303,14 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     // its rate (render/RateConversion.h); segmented, both fields are the halves of one picture.
     const bool fieldsApart = fields && !settings.segmentedFields;
     const Sequence fieldSeq = fieldsApart ? fieldRateSequence(s) : Sequence{};
+    const Project fieldProject = fieldsApart ? fieldRateProject(p) : Project{};
     // The picture of composition frame k (or, with `second`, of its second field): fitted inside the frame on black
     // (black after the programme).
     auto pictureAt = [&](int64_t k, bool second = false) {
         std::vector<uint16_t> rgb(size_t(W) * size_t(H) * 3, 0);
         Image frame;
         if (k < programme) {
-            frame = second ? renderProgramFrame(p, fieldSeq, 2 * (first + k) + 1, o) : renderProgramFrame(p, s, first + k, o);
+            frame = second ? renderProgramFrame(fieldProject, fieldSeq, 2 * (first + k) + 1, o) : renderProgramFrame(p, s, first + k, o);
             if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
             if (target != &seqSpace) convertColor(frame, seqSpace, *target, peakNits);
         }

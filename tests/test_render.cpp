@@ -11205,8 +11205,8 @@ colorspaces:
     void interlacedFieldsAtTheirOwnMoments() {
         // A white bar moving 16 px a frame across black: in an interlaced export each frame's second field shows it 8 px
         // further on than its first, where half a frame's time puts it (rendered from the sequence at twice its rate);
-        // segmented (PsF), both fields show the frame's. Through ProRes exports (10 and 12 bits) and IMF Application
-        // ProRes with the top field first and with the bottom first.
+        // segmented (PsF), both fields show the frame's. Through ProRes exports (10 and 12 bits, and the bar in a compound
+        // clip) and IMF Application ProRes with the top field first and with the bottom first.
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         s.width = 320, s.height = 180, s.fps = Rational{25, 1};
@@ -11265,6 +11265,24 @@ colorspaces:
                 // (the top field first: line 90's, then line 91's half a frame on)
                 QVERIFY2(fieldsRight(st.path, 90, 91, segmented ? 0 : 8), qPrintable(QStringLiteral("12 bits %1, segmented %2").arg(twelve).arg(segmented)));
             }
+        }
+        // The bar inside a compound clip: its second fields half a frame on too (the nested sequence at twice its rate).
+        {
+            Project q = p;
+            Sequence& outer = *q.active();
+            const Id outerId = outer.id;
+            QVERIFY(edit::makeCompound(q, outer, {outer.videoTracks[0].clips[0].id}, "Nested").ok);
+            Sequence& top = *q.findSequence(outerId);
+            QVERIFY(q.findMedia(top.videoTracks[0].clips.at(0).mediaId)->sequenceId != outerId);
+            ExportSettings st;
+            st.videoCodec = "prores_ks";
+            st.profile = "4444";
+            st.pixFmt = "yuv444p12le";
+            st.audioCodec = "none";
+            st.interlaced = true;
+            st.path = dir.filePath("nested.mov").toStdString();
+            QVERIFY2(exportSequence(q, top, st, nullptr, nullptr, &err), err.c_str());
+            QVERIFY(fieldsRight(st.path, 90, 91, 8));
         }
         if (!prores::encoderAvailable()) QSKIP("This build of FFmpeg has no ProRes encoder for IMF's interlaced 422");
         for (const char* order : {"tff", "bff"}) {

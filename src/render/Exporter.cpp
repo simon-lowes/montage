@@ -2245,9 +2245,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (trim) applyTrimPass(img, seq, f, *trim, sceneLight, true);
         return img;
     };
+    // Interlaced at the programme's rate: each picture's second field at its own moment, half a frame after the first,
+    // from the project with its sequences at twice their rate (its captions and burn-ins those of the frame).
+    // Stereoscopic sequences, and PsF when asked, keep each picture's two halves.
+    const bool fieldsApart = interlacedOut && !conv.active() && !seq.stereo3d && !s.segmentedFields;
+    const Sequence fieldSeq = fieldsApart ? fieldRateSequence(seq) : Sequence{};
+    const Project fieldProject = fieldsApart ? fieldRateProject(p) : Project{};
     // A frame of the programme, in the output space: rendered, with captions and burn-ins unless they go on the
-    // delivered frames; `eye` 1 or 2 is the left or right eye alone.
-    auto programmeFrame = [&](FrameTime f, int eye = 0) {
+    // delivered frames; `eye` 1 or 2 is the left or right eye alone; `secondField`, the moment of its second field.
+    auto programmeFrame = [&](FrameTime f, int eye = 0, bool secondField = false) {
         auto burn = [&](Image& img) {
             if (burnCaptions) drawCaption(img, *burnCaptions, f, &frameSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &frameSpace);
@@ -2263,29 +2269,18 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             burn(right);
             img = combineStereo(left, right, stereoView);
         } else {
-            img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-            if (trim) applyTrimPass(img, seq, f, *trim, sceneLight, true);
+            const Project& from = secondField ? fieldProject : p;
+            const Sequence& on = secondField ? fieldSeq : seq;
+            const FrameTime at = secondField ? 2 * f + 1 : f;
+            img = s.alpha && !on.stereo3d ? renderSequenceFrame(from, on, at, ro) : renderProgramFrame(from, on, at, ro);
+            if (trim) applyTrimPass(img, on, at, *trim, sceneLight, true);
             if (!burnDelivered) burn(img);
         }
         convertColor(img, frameSpace, outSpace, peakNits);
         return img;
     };
-    // Interlaced at the programme's rate: each picture's second field at its own moment, half a frame after the first,
-    // from the sequence at twice its rate (its captions and burn-ins those of the frame). Stereoscopic sequences, and
-    // PsF when asked, keep each picture's two halves.
-    const bool fieldsApart = interlacedOut && !conv.active() && !seq.stereo3d && !s.segmentedFields;
-    const Sequence fieldSeq = fieldsApart ? fieldRateSequence(seq) : Sequence{};
-    auto secondFieldPicture = [&](FrameTime f) {
-        const FrameTime t = 2 * f + 1;
-        Image img = s.alpha ? renderSequenceFrame(p, fieldSeq, t, ro) : renderProgramFrame(p, fieldSeq, t, ro);
-        if (trim) applyTrimPass(img, fieldSeq, t, *trim, sceneLight, true);
-        if (!burnDelivered) {
-            if (burnCaptions) drawCaption(img, *burnCaptions, f, &frameSpace);
-            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &frameSpace);
-        }
-        convertColor(img, frameSpace, outSpace, peakNits);
-        return img;
-    };
+    // Interlaced at the programme's rate: each picture's second field (programmeFrame's `secondField`) at its own moment.
+    auto secondFieldPicture = [&](FrameTime f) { return programmeFrame(f, 0, true); };
     // Delivered at another rate: the programme's pictures kept while the frames round them use them again (a standards
     // conversion's in-betweens and its cut test, pulldown's fields), each with its look.
     static std::atomic<uint64_t> exportRuns{0};
