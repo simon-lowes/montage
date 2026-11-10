@@ -121,3 +121,8 @@ The streaming package test plays packages with [hls.js](https://github.com/video
 
 The tests also build libvmaf's own `vmaf` program from the same sources (`montage_test_vmaf`), to check Montage's VMAF
 scores against it; it is not part of Montage or its packages.
+
+The 3D compositing test reads Montage's USD exports back with [tinyusdz](https://github.com/lighttransport/tinyusdz)
+(Apache-2.0, Copyright (c) 2020-2023 Syoyo Fujita), which only the Linux CI job builds, at a pinned commit, with
+`scripts/build-tinyusdz.sh`, into a small reader of Montage's own (`tests/tools/usd_readback.cc`); it is not part of
+Montage or its packages.
