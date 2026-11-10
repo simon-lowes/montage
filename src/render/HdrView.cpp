@@ -144,6 +144,25 @@ HdrSurfaceLight hdrSurfaceLight(const HdrPicture& picture, double headroom) {
     return out;
 }
 
+HdrSurfaceLightArgs hdrSurfaceLightArgs(const HdrSurfaceLight& light, Transfer transfer, bool masteringRange) {
+    const double volumeMin = 0.005, volumeMax = transfer == Transfer::Hlg ? kHlgPeak : 10000;
+    double minNits = volumeMin, maxNits = volumeMax;
+    if (masteringRange) {
+        if (std::isfinite(light.masteringMaxNits)) maxNits = std::clamp(std::round(light.masteringMaxNits), 1.0, volumeMax);
+        // (half a nit under the whole maximum at most, so the maximum stays above it once both are whole numbers)
+        if (std::isfinite(light.masteringMinNits)) minNits = std::clamp(light.masteringMinNits, volumeMin, maxNits - 0.5);
+    }
+    HdrSurfaceLightArgs out;
+    out.masteringMin10k = uint32_t(std::lround(minNits * 10000));
+    out.masteringMax = uint32_t(maxNits);
+    const double lowest = std::floor(out.masteringMin10k / 10000.0) + 1;  // the first whole nit above the minimum
+    // (a NaN is not above 0, so it is not sent; an infinity clamps to the maximum)
+    if (light.maxCll > 0) out.maxCll = uint32_t(std::clamp(std::round(light.maxCll), lowest, maxNits));
+    if (light.maxFall > 0)
+        out.maxFall = uint32_t(std::clamp(std::round(light.maxFall), lowest, out.maxCll ? double(out.maxCll) : maxNits));
+    return out;
+}
+
 double hdrHeadroomFromDescription(double referenceNits, double maxNits, double targetMaxNits) {
     const double peak = targetMaxNits > 0 ? targetMaxNits : maxNits;
     if (!(referenceNits > 0) || !(peak > 0) || !std::isfinite(peak / referenceNits)) return 1;

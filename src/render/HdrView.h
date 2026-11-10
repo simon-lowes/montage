@@ -57,6 +57,18 @@ struct HdrSurfaceLight {
 };
 HdrSurfaceLight hdrSurfaceLight(const HdrPicture& picture, double headroom);
 
+// That light as wp_image_description_creator_params_v1 takes it: whole nits, the mastering minimum in 1/10000 nit,
+// and 0 for a MaxCLL or MaxFALL that is not sent. Whatever it is given, the result is inside what the protocol
+// allows, because a value outside it is a protocol error, which ends the whole connection: the mastering range
+// inside the signal's own (0.005 nits to PQ's 10 000 or HLG's 1000) with its maximum above its minimum, MaxCLL and
+// MaxFALL above that minimum and no more than that maximum, and MaxFALL no more than MaxCLL. For a compositor that
+// takes no mastering range (`masteringRange` false) the signal's own range is the bound, as the protocol has it.
+struct HdrSurfaceLightArgs {
+    uint32_t masteringMin10k = 50, masteringMax = 10000, maxCll = 0, maxFall = 0;
+    bool operator==(const HdrSurfaceLightArgs&) const = default;
+};
+HdrSurfaceLightArgs hdrSurfaceLightArgs(const HdrSurfaceLight& light, Transfer transfer, bool masteringRange);
+
 // A display's headroom (its peak over SDR white) from the image description its compositor prefers for a surface:
 // the target volume's peak (else the primary volume's) over the reference white, at least 1.
 double hdrHeadroomFromDescription(double referenceNits, double maxNits, double targetMaxNits);

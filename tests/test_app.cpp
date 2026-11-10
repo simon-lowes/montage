@@ -21107,6 +21107,49 @@ print("added " + ui["name"])
         pic.maxCll = pic.maxFall = 0;
         QCOMPARE(hdrSurfaceLight(pic, 8).maxCll, 0.0);
         QCOMPARE(hdrSurfaceLight(pic, 8).maxFall, 0.0);
+        // As the protocol takes it, and inside what it allows whatever comes in (outside is a protocol error, which
+        // ends the connection): whole nits, the minimum in 1/10000 nit, nothing unmeasured sent.
+        QCOMPARE(hdrSurfaceLightArgs(full, Transfer::Pq, true), (HdrSurfaceLightArgs{50, 1000, 1000, 300}));
+        QCOMPARE(hdrSurfaceLightArgs(HdrSurfaceLight(), Transfer::Pq, true), (HdrSurfaceLightArgs{50, 1000, 0, 0}));
+        // No mastering range for the compositor: the signal's own range bounds the levels (HLG's ends at 1000).
+        HdrSurfaceLight odd;
+        odd.masteringMaxNits = 4000, odd.maxCll = 5000, odd.maxFall = 6000;
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Pq, false), (HdrSurfaceLightArgs{50, 10000, 5000, 5000}));
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Hlg, false), (HdrSurfaceLightArgs{50, 1000, 1000, 1000}));
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Pq, true), (HdrSurfaceLightArgs{50, 4000, 4000, 4000}));
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Hlg, true), (HdrSurfaceLightArgs{50, 1000, 1000, 1000}));
+        // A maximum at or under the minimum, a minimum under the signal's, levels under the minimum, MaxFALL alone.
+        odd = HdrSurfaceLight();
+        odd.masteringMinNits = 3, odd.masteringMaxNits = 0.2, odd.maxCll = 0.3;
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Pq, true), (HdrSurfaceLightArgs{5000, 1, 1, 0}));
+        odd.masteringMinNits = 0, odd.masteringMaxNits = 600, odd.maxCll = 0, odd.maxFall = 700;
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Pq, true), (HdrSurfaceLightArgs{50, 600, 0, 600}));
+        odd.masteringMinNits = 2.4, odd.maxCll = 2, odd.maxFall = 1;
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Pq, true), (HdrSurfaceLightArgs{24000, 600, 3, 3}));
+        // Not numbers at all: the signal's range, nothing sent for a NaN, the maximum for an infinity.
+        const double nan = std::numeric_limits<double>::quiet_NaN(), inf = std::numeric_limits<double>::infinity();
+        odd.masteringMinNits = nan, odd.masteringMaxNits = inf, odd.maxCll = nan, odd.maxFall = inf;
+        QCOMPARE(hdrSurfaceLightArgs(odd, Transfer::Pq, true), (HdrSurfaceLightArgs{50, 10000, 0, 10000}));
+        // Every result keeps the protocol's rules.
+        for (double lo : {0.0, 0.005, 0.9, 1.0, 37.5, 999.6, 20000.0})
+            for (double hi : {0.0, 0.4, 1.0, 38.0, 1000.0, 10000.0, 1e9})
+                for (double cll : {0.0, 0.2, 1.0, 38.0, 400.0, 1e7})
+                    for (double fall : {0.0, 0.2, 39.0, 500.0, 1e7})
+                        for (Transfer t : {Transfer::Pq, Transfer::Hlg})
+                            for (bool range : {true, false}) {
+                                HdrSurfaceLight l;
+                                l.masteringMinNits = lo, l.masteringMaxNits = hi, l.maxCll = cll, l.maxFall = fall;
+                                const HdrSurfaceLightArgs a = hdrSurfaceLightArgs(l, t, range);
+                                const double peak = t == Transfer::Hlg ? 1000 : 10000;
+                                QVERIFY(a.masteringMin10k >= 50 && a.masteringMax <= peak);
+                                QVERIFY(double(a.masteringMax) * 10000 > a.masteringMin10k);
+                                if (!range) QVERIFY(a.masteringMin10k == 50 && a.masteringMax == peak);
+                                QCOMPARE(a.maxCll != 0, cll > 0);
+                                QCOMPARE(a.maxFall != 0, fall > 0);
+                                for (uint32_t level : {a.maxCll, a.maxFall})
+                                    if (level) QVERIFY(double(level) * 10000 > a.masteringMin10k && level <= a.masteringMax);
+                                if (a.maxCll && a.maxFall) QVERIFY(a.maxFall <= a.maxCll);
+                            }
         // The display's headroom from the description the compositor prefers: the target peak over reference white.
         QVERIFY(std::fabs(hdrHeadroomFromDescription(203, 10000, 1000) - 1000.0 / 203) < 1e-9);
         QVERIFY(std::fabs(hdrHeadroomFromDescription(203, 10000, 0) - 10000.0 / 203) < 1e-9);

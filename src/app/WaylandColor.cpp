@@ -255,15 +255,17 @@ bool WaylandColor::describe(const Description& d, std::string* error) {
         wp_image_description_creator_params_v1_set_primaries(c, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
     }
     // (the luminances are PQ's and HLG's defaults: 0.005 nits, 10 000 or 1000, and reference white at 203)
-    if (s.has(s.features, WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES)) {
+    const bool mastering = s.has(s.features, WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES);
+    // (kept inside what the protocol allows whatever the caller gave: a light outside it is a protocol error)
+    const HdrSurfaceLightArgs light = hdrSurfaceLightArgs(d.light, hlg ? Transfer::Hlg : Transfer::Pq, mastering);
+    if (mastering) {
         // (P3-D65, as Montage's HDR10 files state it: render/Exporter)
         const std::array<int32_t, 8> m = millionths(Primaries::P3D65);
         wp_image_description_creator_params_v1_set_mastering_display_primaries(c, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
-        wp_image_description_creator_params_v1_set_mastering_luminance(c, uint32_t(std::lround(d.light.masteringMinNits * 10000)),
-                                                                       uint32_t(std::lround(d.light.masteringMaxNits)));
+        wp_image_description_creator_params_v1_set_mastering_luminance(c, light.masteringMin10k, light.masteringMax);
     }
-    if (d.light.maxCll > 0) wp_image_description_creator_params_v1_set_max_cll(c, uint32_t(std::lround(d.light.maxCll)));
-    if (d.light.maxFall > 0) wp_image_description_creator_params_v1_set_max_fall(c, uint32_t(std::lround(d.light.maxFall)));
+    if (light.maxCll) wp_image_description_creator_params_v1_set_max_cll(c, light.maxCll);
+    if (light.maxFall) wp_image_description_creator_params_v1_set_max_fall(c, light.maxFall);
     State::Pending p;
     wp_image_description_v1* desc = wp_image_description_creator_params_v1_create(c);  // (the creator goes with it)
     wp_image_description_v1_add_listener(desc, &kDescriptionListener, &p);
