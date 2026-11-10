@@ -44,6 +44,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QComboBox>
+#include <QRadioButton>
 #include <QEventLoop>
 #include <QFontDatabase>
 #include <QFormLayout>
@@ -267,6 +268,7 @@ extern "C" {
 #include "render/VoiceMatch.h"
 #include "render/EncodeCompare.h"
 #include "render/Exporter.h"
+#include "media/FieldRecorder.h"
 #include "render/StreamingPackage.h"
 #include "render/Processing.h"
 #include "render/FrameRepair.h"
@@ -351,6 +353,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::sourceChanged, this, &MainWindow::rebuildSourceProject);
     connect(state_, &EditorState::historyChanged, this, &MainWindow::updateActions);
     connect(state_, &EditorState::selectionChanged, this, &MainWindow::updateActions);
+    // Clicking another clip ends Trim mode (its edit points remembered for Reselect Last Edit Points).
+    connect(state_, &EditorState::selectionChanged, this, [this] {
+        if (!trimEdit_) return;
+        for (Id id : state_->selectedClips())
+            if (std::find(trimSelection_.begin(), trimSelection_.end(), id) == trimSelection_.end()) {
+                endTrimMode();
+                return;
+            }
+    });
     connect(state_, &EditorState::fileStateChanged, this, &MainWindow::updateTitle);
     connect(state_, &EditorState::statusMessage, this, [this](const QString& text, int ms) {
         statusBar()->showMessage(text, ms);
@@ -1647,6 +1658,16 @@ void MainWindow::buildMenus() {
         if (!ok || name.isEmpty()) return;
         state_->apply(tr("Nest"), [sel, name](Project& p, Sequence& s) { return edit::makeCompound(p, s, sel, name.toStdString()); });
     });
+    add(clipM, QT_TR_NOOP("Nest In to Out…"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        if (!s || s->inPoint < 0 || s->outPoint < 0) {
+            state_->message(tr("Mark In and Out on the timeline first"));
+            return;
+        }
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("Nest In to Out"), tr("Compound clip name:"), QLineEdit::Normal, tr("Nested Sequence"), &ok);
+        if (ok && !name.isEmpty()) nestInToOut(name);
+    })->setObjectName(QStringLiteral("nestInToOut"));
     add(clipM, QT_TR_NOOP("Detect &Scene Cuts"), QKeySequence(), [this] { detectScenes(); });
     add(clipM, QT_TR_NOOP("Export &LUT from Grade…"), QKeySequence(), [this] {
         if (!clipForCommand()) {
@@ -2104,6 +2125,17 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("previousVfxVersion"));
     add(clipM, QT_TR_NOOP("Replace with Source Clip"), QKeySequence(), [this] { replaceWithSource(); })
         ->setObjectName(QStringLiteral("replaceWithSource"));
+    add(clipM, QT_TR_NOOP("Replace Source of Selected…"), QKeySequence(), [this] {
+        if (QDialog* d = replaceSourceDialog()) d->open();
+    })->setObjectName(QStringLiteral("replaceSourceOfSelected"));
+    add(clipM, QT_TR_NOOP("Extract Sound to Files…"), QKeySequence(), [this] {
+        if (state_->selectedClips().empty()) {
+            state_->message(tr("Select the clips whose sound to write out"));
+            return;
+        }
+        const QString folder = QFileDialog::getExistingDirectory(this, tr("Extract Sound to Files"));
+        if (!folder.isEmpty()) extractSoundToFiles(folder);
+    })->setObjectName(QStringLiteral("extractSound"));
     add(clipM, QT_TR_NOOP("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, QT_TR_NOOP("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, QT_TR_NOOP("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
@@ -2401,6 +2433,8 @@ void MainWindow::buildMenus() {
     seqM->addSeparator();
     add(seqM, QT_TR_NOOP("Select Nearest Edit (Trim Mode)"), QKeySequence("Shift+T"), [this] { selectNearestEdit(); })->setObjectName(QStringLiteral("selectEdit"));
     add(seqM, QT_TR_NOOP("Cycle Trim Side"), QKeySequence("Alt+T"), [this] { cycleTrimSide(); })->setObjectName(QStringLiteral("cycleTrimSide"));
+    add(seqM, QT_TR_NOOP("Reselect Last Edit Points"), QKeySequence("Alt+Shift+T"), [this] { reselectLastEditPoints(); })
+        ->setObjectName(QStringLiteral("reselectEditPoints"));
     add(seqM, QT_TR_NOOP("Extend Edit"), QKeySequence("E"), [this] { extendEdit(); })->setObjectName(QStringLiteral("extendEdit"));
     add(seqM, QT_TR_NOOP("Trim Backward"), QKeySequence("Ctrl+Left"), [this] { trimSelectedEdit(-1); })->setObjectName(QStringLiteral("trimBackward"));
     add(seqM, QT_TR_NOOP("Trim Forward"), QKeySequence("Ctrl+Right"), [this] { trimSelectedEdit(1); })->setObjectName(QStringLiteral("trimForward"));
@@ -4657,7 +4691,7 @@ bool MainWindow::selectNearestEdit() {
         if (c.start == best) e.incoming = c.id;
     }
     e.side = e.outgoing && e.incoming ? 0 : e.outgoing ? 1 : 2;
-    trimEdit_ = e;
+    selectTrimEdit(e);
     state_->setPlayhead(best);
     showTrimEdit();
     return true;
@@ -4811,9 +4845,40 @@ bool MainWindow::stopTrimShuttle(bool keep) {
     return true;
 }
 
+void MainWindow::selectTrimEdit(const TrimEdit& e) {
+    if (trimEdit_ && (trimEdit_->outgoing != e.outgoing || trimEdit_->incoming != e.incoming)) trimHistory_.push_back(*trimEdit_);
+    if (trimHistory_.size() > 32) trimHistory_.erase(trimHistory_.begin());
+    trimEdit_ = e;
+    trimSelection_ = state_->selectedClips();
+}
+
+bool MainWindow::reselectLastEditPoints() {
+    const Sequence* s = state_->sequence();
+    // Its clips still there, and a roll's still meeting.
+    auto usable = [&](const TrimEdit& e) {
+        const Clip* out = s && e.outgoing ? edit::clipById(*s, e.outgoing) : nullptr;
+        const Clip* in = s && e.incoming ? edit::clipById(*s, e.incoming) : nullptr;
+        if ((e.outgoing && !out) || (e.incoming && !in) || (!out && !in)) return false;
+        return !(out && in) || out->end() == in->start;
+    };
+    while (!trimHistory_.empty()) {
+        const TrimEdit e = trimHistory_.back();
+        trimHistory_.pop_back();
+        if (!usable(e)) continue;
+        stopTrimShuttle(true);
+        selectTrimEdit(e);
+        showTrimEdit();
+        return true;
+    }
+    statusBar()->showMessage(tr("No edit points to reselect"), 4000);
+    return false;
+}
+
 void MainWindow::endTrimMode() {
     stopTrimShuttle(false);
     if (!trimEdit_) return;
+    trimHistory_.push_back(*trimEdit_);
+    if (trimHistory_.size() > 32) trimHistory_.erase(trimHistory_.begin());
     trimEdit_.reset();
     timeline_->clearTrimEdit();
     programPanel_->endTrimView();
@@ -10468,6 +10533,99 @@ bool MainWindow::replaceWithSource() {
     const Id id = target->id, media = m->id;
     return state_->apply(tr("Replace with Source Clip"),
                          [=](Project& p, Sequence& sq) { return edit::replaceClip(p, sq, id, media, align, at); });
+}
+
+bool MainWindow::replaceSourceOfSelected(Id media, bool byTimecode) {
+    const std::vector<Id> sel = state_->selectedClips();
+    if (sel.empty()) {
+        state_->message(tr("Select the clips to repoint"));
+        return false;
+    }
+    return state_->apply(tr("Replace Source of Selected"),
+                         [=](Project& p, Sequence& sq) { return edit::replaceSources(p, sq, sel, media, byTimecode); });
+}
+
+QDialog* MainWindow::replaceSourceDialog() {
+    if (state_->selectedClips().empty() || state_->project().media.empty()) {
+        state_->message(tr("Select the clips to repoint"));
+        return nullptr;
+    }
+    auto* dlg = new QDialog(this);
+    dlg->setObjectName(QStringLiteral("replaceSourceDialog"));
+    dlg->setWindowTitle(tr("Replace Source of Selected"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* v = new QVBoxLayout(dlg);
+    v->addWidget(new QLabel(tr("Point the %n selected clip(s) at:", "", int(state_->selectedClips().size())), dlg));
+    auto* item = new QComboBox(dlg);
+    item->setObjectName(QStringLiteral("replaceSourceItem"));
+    for (const MediaItem& m : state_->project().media) {
+        QString label = QString::fromStdString(m.name);
+        if (!m.bin.empty()) label += QStringLiteral("  (%1)").arg(QString::fromStdString(m.bin));
+        item->addItem(label, QVariant::fromValue(qulonglong(m.id)));
+    }
+    if (const int at = item->findData(QVariant::fromValue(qulonglong(state_->sourceMedia()))); at >= 0) item->setCurrentIndex(at);
+    v->addWidget(item);
+    auto* same = new QRadioButton(tr("Keep each clip's source times"), dlg);
+    same->setObjectName(QStringLiteral("replaceSourceTimes"));
+    auto* tc = new QRadioButton(tr("Match by timecode"), dlg);
+    tc->setObjectName(QStringLiteral("replaceSourceTimecode"));
+    same->setChecked(true);
+    v->addWidget(same);
+    v->addWidget(tc);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dlg);
+    v->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, dlg, [this, dlg, item, tc] {
+        if (replaceSourceOfSelected(Id(item->currentData().toULongLong()), tc->isChecked())) dlg->accept();
+    });
+    return dlg;
+}
+
+bool MainWindow::nestInToOut(const QString& name) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->inPoint < 0 || s->outPoint < 0) {
+        state_->message(tr("Mark In and Out on the timeline first"));
+        return false;
+    }
+    const FrameTime a = s->inPoint, b = s->outPoint + 1;  // (Out is the last frame in)
+    const std::string n = name.toStdString();
+    return state_->apply(tr("Nest In to Out"), [=](Project& p, Sequence& sq) { return edit::nestRange(p, sq, a, b, allTracks(sq), n); });
+}
+
+int MainWindow::extractSoundToFiles(const QString& folder) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> clips;
+    for (Id id : edit::expandLinks(*s, state_->selectedClips()))
+        if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select clips with sound"));
+        return 0;
+    }
+    QDir().mkpath(folder);
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    int written = 0;
+    QString failure;
+    for (Id id : clips) {
+        const Clip* c = edit::clipById(*s, id);
+        QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^\\w\\- ]")), QStringLiteral("_"));
+        if (base.isEmpty()) base = tr("Clip");
+        QString path = QDir(folder).filePath(base + QStringLiteral(".wav"));
+        for (int n = 2; QFileInfo::exists(path); ++n) path = QDir(folder).filePath(QStringLiteral("%1 %2.wav").arg(base).arg(n));
+        std::string err;
+        if (!extractClipSound(state_->project(), *s, id, path.toStdString(), &err)) {
+            failure = QString::fromStdString(err);
+            break;
+        }
+        ++written;
+    }
+    QApplication::restoreOverrideCursor();
+    if (!failure.isEmpty()) {
+        state_->message(tr("Extracting the sound failed: %1").arg(failure), 6000);
+        return -1;
+    }
+    state_->message(tr("Wrote %n sound file(s) to %1", "", written).arg(QDir::toNativeSeparators(folder)), 5000);
+    return written;
 }
 
 bool MainWindow::fitToFill() {

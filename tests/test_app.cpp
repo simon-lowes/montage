@@ -309,6 +309,8 @@
 #include "render/RenderCache.h"
 #include "render/BroadcastMxf.h"
 #include "render/Exporter.h"
+#include "media/FieldRecorder.h"
+#include "audio/Sampler.h"
 #include "render/SpatialVideo.h"
 #include "render/Ocio.h"
 #include "render/SurfaceTrack.h"
@@ -5661,6 +5663,116 @@ private slots:
         state()->apply("Restore", [red](Project&, Sequence& s) { return edit::restoreUnrendered(s, red); });
         c = edit::clipById(*state()->sequence(), red);
         QVERIFY(c->isGenerator() && c->effects.size() == 1);
+    }
+
+    void editingTouches() {
+        loadDemo();
+        auto act = [&](const char* name) {
+            QAction* a = win_->findChild<QAction*>(name);
+            QVERIFY2(a, name);
+            a->trigger();
+        };
+        auto red = [&] { return clipNamed(*state()->sequence(), "Red"); };
+        auto blue = [&] { return clipNamed(*state()->sequence(), "Blue"); };
+        const Id title = trackAt(*state()->sequence(), {TrackKind::Video, 1})->clips.at(0).id;
+        // Reselect Last Edit Points: a roll chosen, then another clip clicked (Trim mode ends), and the roll comes back.
+        state()->setSelection({}, false);
+        state()->setPlayhead(55);
+        QVERIFY(win_->selectNearestEdit());
+        QVERIFY(win_->trimEdit() && win_->trimEdit()->side == 0);
+        QTest::mouseClick(viewport(), Qt::LeftButton, {}, timeline()->clipBounds(title).center());
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{title});
+        QVERIFY(!win_->trimEdit());
+        state()->setPlayhead(10);
+        act("reselectEditPoints");
+        QVERIFY(win_->trimEdit());
+        QCOMPARE(win_->trimEdit()->outgoing, red()->id);
+        QCOMPARE(win_->trimEdit()->incoming, blue()->id);
+        QCOMPARE(win_->trimEdit()->side, 0);
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        act("trimForward");  // and it trims as the roll it was
+        QCOMPARE(red()->end(), FrameTime(61));
+        state()->undo();
+        // Another edit (Blue's end): Reselect goes back to the roll, and again to Blue's end.
+        state()->setPlayhead(118);
+        QVERIFY(win_->selectNearestEdit());
+        QCOMPARE(win_->trimEdit()->outgoing, blue()->id);
+        QVERIFY(win_->reselectLastEditPoints());
+        QCOMPARE(win_->trimEdit()->incoming, blue()->id);
+        QVERIFY(win_->reselectLastEditPoints());
+        QCOMPARE(win_->trimEdit()->outgoing, blue()->id);
+        QCOMPARE(win_->trimEdit()->incoming, Id(0));
+        act("endTrim");
+
+        // Nest In to Out: 30 to 89 on V1 and V2 becomes one compound clip in place; one undo step puts it back.
+        state()->setSelection({}, false);
+        QVERIFY(state()->edit("Marks", [](Project&, Sequence& sq) {
+            sq.inPoint = 30;
+            sq.outPoint = 89;
+            return true;
+        }));
+        const Project before = state()->project();
+        const size_t undos = state()->history().undoCount();
+        QVERIFY(win_->nestInToOut(QStringLiteral("Middle")));
+        QCOMPARE(state()->history().undoCount(), undos + 1);
+        const Track& v1 = state()->sequence()->videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[1].start, FrameTime(30));
+        QCOMPARE(v1.clips[1].duration, FrameTime(60));
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(v1.clips[1].mediaId)->name), QStringLiteral("Middle"));
+        QCOMPARE(state()->sequence()->videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(state()->sequence()->videoTracks[1].clips[0].end(), FrameTime(30));
+        state()->undo();
+        QVERIFY(state()->project() == before);
+
+        // Replace Source of Selected: two clips of a sound file pointed at a longer one through the dialog, keeping
+        // their source times; Extract Sound to Files writes each, stamped with its source time.
+        std::vector<float> longer(size_t(48000) * 2 * 20, 0.1f);
+        const QString longPath = dir_.filePath(QStringLiteral("repoint-long.wav"));
+        QVERIFY(sampler::writeWav(longPath.toStdString(), longer, 48000));
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), longPath});
+        QCOMPARE(ids.size(), size_t(2));
+        std::vector<Id> clips;
+        for (int i = 0; i < 2; ++i) {
+            const Id media = ids[0];
+            QVERIFY(state()->apply("Place", [media, i](Project& p, Sequence& sq) {
+                return edit::placeMedia(p, sq, media, 130 + i * 40, i * 50, i * 50 + 30, V1, {TrackKind::Audio, 0}, false);
+            }));
+            clips.push_back(trackAt(*state()->sequence(), {TrackKind::Audio, 0})->clips.back().id);
+        }
+        state()->setSelection(clips, false);
+        state()->setSourceMedia(ids[1]);
+        QPointer<QDialog> dlg = win_->replaceSourceDialog();
+        QVERIFY(dlg);
+        auto* item = dlg->findChild<QComboBox*>("replaceSourceItem");
+        QVERIFY(item && item->currentData().toULongLong() == ids[1]);  // the Source monitor's by default
+        dlg->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Ok)->click();
+        QTRY_VERIFY(!dlg);
+        for (int i = 0; i < 2; ++i) {
+            const Clip* c = edit::clipById(*state()->sequence(), clips[size_t(i)]);
+            QCOMPARE(c->mediaId, ids[1]);
+            QCOMPARE(c->sourceIn, double(i * 50));
+        }
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), clips[1])->mediaId, ids[0]);
+        // By timecode: jfk.wav has none, so it is refused and nothing changes.
+        QVERIFY(!win_->replaceSourceOfSelected(ids[1], true));
+        QCOMPARE(edit::clipById(*state()->sequence(), clips[1])->mediaId, ids[0]);
+        const QString out = dir_.filePath(QStringLiteral("extracted"));
+        QCOMPARE(win_->extractSoundToFiles(out), 2);
+        const QStringList files = QDir(out).entryList({QStringLiteral("*.wav")}, QDir::Files, QDir::Name);
+        QCOMPARE(files.size(), 2);
+        std::vector<double> starts;
+        for (const QString& f : files) {
+            FieldRecording rec;
+            QVERIFY(readFieldRecording(QDir(out).filePath(f).toStdString(), rec));
+            starts.push_back(rec.startSeconds);
+        }
+        std::sort(starts.begin(), starts.end());
+        const double fps = state()->sequence()->fpsValue();
+        QVERIFY2(std::fabs(starts[0]) < 1e-4 && std::fabs(starts[1] - 50 / fps) < 1e-4,
+                 qPrintable(QStringLiteral("%1 %2").arg(starts[0]).arg(starts[1])));
+        state()->setSelection({}, false);
     }
 
     void renderAndReplaceInTheTimeline() {

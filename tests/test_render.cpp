@@ -1339,6 +1339,77 @@ private slots:
     // Phase 15 #3: the sequence an encode is compared with has its chroma made by the export's own scaler, so a
     // lossless export (x264 at QP 0) of busy colour is the sequence exactly: every plane's PSNR infinite and VMAF
     // the most there is, with the chroma sited as H.264 tags it (left) and as FFV1 leaves it (centred).
+    void nestInToOutRendersTheSame() {
+        // Three video tracks (a matte, a half-transparent smaller one over it, bars at the top) and sound on two tracks,
+        // with edits inside the range and across In and Out.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", m, &err), err.c_str());
+        m.id = p.newId();
+        p.media.push_back(m);
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.8f, 0.2f, 0.1f, 0, 30));
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.1f, 0.3f, 0.9f, 30, 60));
+        Clip over = colorClip(p, 0.2f, 0.9f, 0.3f, 10, 50);
+        over.motion.params["opacity"] = 50.0;
+        over.motion.params["scale"] = 60.0;
+        s.videoTracks[1].clips.push_back(over);
+        Clip bars = makeGeneratorClip(p, "bars", 20);
+        bars.start = 35;
+        bars.motion.params["scale"] = 30.0;
+        s.videoTracks[2].clips.push_back(bars);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 70, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false, false, true).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 22, 100, 150, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false, false, true).ok);
+        const Id seqId = s.id;
+        const FrameTime a = 20, b = 60;
+        const size_t spf = 48000 / 25;
+        RenderOptions ro;
+        auto frames = [&](const Sequence& q) {
+            std::vector<Image> out;
+            for (FrameTime t = a - 2; t < b + 2; ++t) out.push_back(renderProgramFrame(p, q, t, ro));
+            return out;
+        };
+        auto sound = [&](const Sequence& q) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(b - a + 4) * spf * 2);
+            mixer.mix(p, q, int64_t(a - 2) * int64_t(spf), int((b - a + 4) * FrameTime(spf)), out.data());
+            return out;
+        };
+        const std::vector<Image> before = frames(s);
+        const std::vector<float> heard = sound(s);
+        QVERIFY(edit::nestRange(p, *p.findSequence(seqId), a, b, allTracks(*p.findSequence(seqId)), "Range").ok);
+        const Sequence& after = *p.findSequence(seqId);
+        // One compound clip (its picture on V1, its sound on A1) from In to Out, nothing else there.
+        int compounds = 0;
+        for (const auto* list : {&after.videoTracks, &after.audioTracks})
+            for (const Track& t : *list)
+                for (const Clip& c : t.clips) {
+                    if (c.end() <= a || c.start >= b) continue;
+                    const MediaItem* cm = p.findMedia(c.mediaId);
+                    QVERIFY(cm && cm->kind == MediaKind::Sequence && c.start == a && c.end() == b);
+                    ++compounds;
+                }
+        QCOMPARE(compounds, 2);
+        const std::vector<Image> now = frames(after);
+        QCOMPARE(now.size(), before.size());
+        float worst = 0;
+        for (size_t f = 0; f < now.size(); ++f) {
+            QCOMPARE(now[f].px.size(), before[f].px.size());
+            for (size_t i = 0; i < now[f].px.size(); ++i) worst = std::max(worst, std::fabs(now[f].px[i] - before[f].px[i]));
+        }
+        QVERIFY2(worst < 1e-4f, qPrintable(QString::number(worst)));
+        const std::vector<float> nowHeard = sound(after);
+        float worstSample = 0, loud = 0;
+        for (size_t i = 0; i < heard.size(); ++i) {
+            worstSample = std::max(worstSample, std::fabs(nowHeard[i] - heard[i]));
+            loud = std::max(loud, std::fabs(heard[i]));
+        }
+        QVERIFY(loud > 0.05f);
+        QVERIFY2(worstSample < 1e-5f, qPrintable(QString::number(worstSample)));
+    }
+
     void losslessExportComparesExactly() {
         QTemporaryDir dir;
         Project p = makeDefaultProject();

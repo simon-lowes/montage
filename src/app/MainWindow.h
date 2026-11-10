@@ -408,6 +408,10 @@ public:
     bool extendEdit();
     void endTrimMode();
     const std::optional<TrimEdit>& trimEdit() const { return trimEdit_; }
+    // Reselect Last Edit Points (Alt+Shift+T): every edit selected for trimming is remembered when another is selected,
+    // Trim mode ends or a clip is clicked; this brings back the one before (again, the one before that came back from:
+    // it goes back and forth between the last two). False when none is left whose clips are still there.
+    bool reselectLastEditPoints();
     // Dynamic trimming (Avid's dynamic trim, Resolve's dynamic trim mode, Premiere's JKL in Trim mode): with an edit
     // selected, L plays its side forward through the edit and J back (again for faster, the other way at 1x), the
     // edit following live; K stops and keeps the trim as one undo step (Esc puts it back). The shuttle's clock is a
@@ -457,6 +461,18 @@ public:
     int joinThroughEdits();  // the selected clips' through edits, else all of the sequence's; how many (one undo step)
     bool swapClip(bool withNext);                     // the selected clip (or the one under the playhead) with its neighbour
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
+    // Clip › Replace Source of Selected…: the selected clips (with their linked clips) repointed at bin item `media`,
+    // keeping their source times or (`byTimecode`) matching by timecode; one undo step. The dialog asks which item
+    // (the Source monitor's by default) and how; the dialog shown, or null when nothing is selected.
+    bool replaceSourceOfSelected(Id media, bool byTimecode);
+    QDialog* replaceSourceDialog();
+    // Clip › Nest In to Out…: the sequence's In to Out on every unlocked track replaced by one compound clip named
+    // `name` (edit::nestRange); one undo step.
+    bool nestInToOut(const QString& name);
+    // Clip › Extract Sound to Files…: each selected clip's sound (audio clips, and those linked to selected pictures)
+    // written as a 24-bit Broadcast Wave in `folder`, without its effects, stamped with its source's timecode
+    // (render/Exporter.h extractClipSound). How many were written; -1 on a failure (with a message).
+    int extractSoundToFiles(const QString& folder);
     bool fitToFill();
     int selectForward(bool allTracks);
     // The keyboard's way round the timeline (each says what it selected to a screen reader): the clip before or after
@@ -642,6 +658,9 @@ private:
     // Open sequences as tabs above the timeline (Premiere's and Resolve's timeline tabs).
     QTabBar* sequenceTabs_ = nullptr;
     std::optional<TrimEdit> trimEdit_;
+    std::vector<TrimEdit> trimHistory_;  // edit points selected before, the latest last
+    std::vector<Id> trimSelection_;      // the clips selected when the edit was
+    void selectTrimEdit(const TrimEdit& e);  // trimEdit_ set, the one it replaces remembered
     struct TrimShuttle {
         int speed = 0;        // frames per frame of playback, signed
         double played = 0;    // frames played since it started
