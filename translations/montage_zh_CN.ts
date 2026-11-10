@@ -6404,6 +6404,30 @@
         <source>Transport stream for broadcast: H.264 with AC-3 sound to 5.1, its dialogue level measured</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Aperture Blades (0: round)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Blade Rotation (°)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Depth of Field (through the scene&apos;s camera: the Camera clip&apos;s)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focal Length (mm on a 36 mm sensor; 0: from the field of view)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Focus Distance (0: what is at the middle)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Scene Units a Metre</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>InterpretFootageDialog</name>
@@ -10891,6 +10915,14 @@ Download it now?</source>
         <source>Unknown action</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>The audio device has no input %1 to read LTC from</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The audio device is not open: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>montage::DeckDialog</name>
@@ -14031,10 +14063,6 @@ Put its Position on what it should follow first; Anchor then offsets it from tha
         <translation type="unfinished">导出相机</translation>
     </message>
     <message>
-        <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda)</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
         <source>Wrote %1</source>
         <translation type="unfinished">写了 %1</translation>
     </message>
@@ -15107,6 +15135,10 @@ Drag the corners onto it in the Program monitor first; the clip beneath this one
     </message>
     <message>
         <source>Add a stop between the gradient&apos;s last two, its place, colour and opacity to key</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Nuke camera (*.chan);;USD scene with the placed models (*.usda);;USD package with the placed models (*.usdz)</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -24502,6 +24534,22 @@ Trust a root only once the cinema or the device&apos;s maker has confirmed its t
     <message>
         <source>Remove</source>
         <translation type="unfinished">删除</translation>
+    </message>
+    <message>
+        <source>Add to its targets</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>A control learnt again also drives the new parameter (one fader on several), each with its own range</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Shown on</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The MIDI output its value is sent to (motor faders, LED rings); empty: the controller&apos;s own</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
