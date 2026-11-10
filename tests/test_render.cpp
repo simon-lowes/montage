@@ -24354,6 +24354,72 @@ colorspaces:
                 }
             }
     }
+    void gpuAdjustmentLayersInTransitions() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        // V1 a picture; on V2 two adjustment layers, a Smooth Cut between them (mixed on the CPU over the canvas drawn so
+        // far, read back), and a picture over them on V3.
+        QTemporaryDir dir;
+        QImage pic(320, 180, QImage::Format_RGB32);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x)
+                pic.setPixel(x, y, qRgb((x / 5 + y / 7) % 2 ? 220 : 40 + x / 2, int(std::hypot(x - 140, y - 90) / 6) % 2 ? 190 : 50, 70 + y / 2));
+        const QString png = dir.filePath("picture.png");
+        QVERIFY(pic.save(png));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180;
+        MediaItem m;
+        QVERIFY(probeMedia(png.toStdString(), m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok);
+        while (s.videoTracks.size() < 3) edit::addTrack(p, s, TrackKind::Video);
+        Clip a1 = makeGeneratorClip(p, "adjustment", 30), a2 = makeGeneratorClip(p, "adjustment", 30);
+        a2.start = 30;
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["saturation"] = 0.3, cc.params["exposure"] = 0.4;
+        a1.effects = {cc};
+        Effect blur = makeEffect(p, "gaussian_blur");
+        blur.params["radius"] = 5.0;
+        Effect warm = makeEffect(p, "color_correct");
+        warm.params["contrast"] = 1.3, warm.params["saturation"] = 1.4;
+        a2.effects = {blur, warm};
+        const Id first = a1.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, a1).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, a2).ok);
+        Clip top = colorClip(p, 0.9f, 0.2f, 0.1f, 0, 60);
+        top.motion.params["scale"] = 30.0, top.motion.params["opacity"] = 70.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, top).ok);
+        QVERIFY(edit::addTransition(p, s, first, edit::Edge::Out, "smooth_cut", 16).ok);
+        FrameTime from = 0, to = 0;
+        QVERIFY(edit::transitionRange(s.videoTracks[1], s.videoTracks[1].transitions.at(0), from, to));
+        for (const char* type : {"smooth_cut", "cross_dissolve"})
+            for (FrameTime at : {from + 2, from + 8, to - 3}) {
+                Transition& tr = s.videoTracks[1].transitions.at(0);
+                tr.type = type;
+                tr.params = makeEffect(p, type);
+                const QString what = QString("%1 at %2").arg(type).arg(at - from);
+                RenderOptions o;
+                o.gpu = false;
+                const Image cpu = renderProgramFrame(p, s, at, o);
+                const gpu::Stats before = gpu::stats();
+                o.gpu = true;
+                const Image onGpu = renderProgramFrame(p, s, at, o);
+                const gpu::Stats after = gpu::stats();
+                QVERIFY2(after.gpuFrames == before.gpuFrames + 1, qPrintable(what + ": fell back: " + QString::fromStdString(after.lastFallback)));
+                // (a Smooth Cut's mix made on the CPU; a dissolve's here)
+                QVERIFY2((after.cpuLayers > before.cpuLayers) == (std::string(type) == "smooth_cut"), qPrintable(what));
+                QCOMPARE(onGpu.width, cpu.width);
+                double worst = 0;
+                int wx = 0, wy = 0;
+                for (int y = 0; y < cpu.height; ++y)
+                    for (int x = 0; x < cpu.width; ++x)
+                        for (int k = 0; k < 4; ++k)
+                            if (const double d = std::fabs(double(cpu.at(x, y)[k]) - onGpu.at(x, y)[k]); d > worst) worst = d, wx = x, wy = y;
+                QVERIFY2(worst <= 1.0 / 1023, qPrintable(QString("%1: off by %2 at %3,%4").arg(what).arg(worst).arg(wx).arg(wy)));
+            }
+    }
     void gpuApertureGlareUhd() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());

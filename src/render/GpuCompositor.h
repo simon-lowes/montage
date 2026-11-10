@@ -148,6 +148,7 @@ struct Frame {
     int width = 0, height = 0;
     std::vector<Item> items;  // bottom first
     bool flatten = true;      // over black
+    bool part = false;        // the canvas so far, read back part way through a frame (not counted as a frame)
     std::shared_ptr<const Lut3D> display;  // the display transform, if any
 };
 

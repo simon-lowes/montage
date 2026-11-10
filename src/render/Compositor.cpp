@@ -3022,7 +3022,8 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                     std::vector<gpu::ColorOp> unused;
                     if (compositeShown(*c) || !gpuChainOps(seq, *c, t - c->start, runOnSource, unused, 0, 0, 1))
                         return fallback("an adjustment layer with " + cpuEffectReason(*c, t - c->start));
-                    if (tr && !gpuMixesTransition(seq, track, *tr)) return fallback("an adjustment layer in a " + tr->type + " transition");
+                    // (in a transition the GPU does not mix, a Smooth Cut or an OpenFX one, mixed on the CPU over the canvas
+                    // drawn so far, read back)
                 }
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
@@ -3102,7 +3103,23 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 item.dissolve = float(std::clamp(u, 0.0, 1.0));
                 if (active->type != "cross_dissolve") item.transition = kind;
             } else {
-                item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
+                // Mixed on the CPU; from or to an adjustment layer, over the canvas beneath it, drawn here so far and read
+                // back, which then goes on from there.
+                Image below;
+                bool over = false;
+                for (const Clip* k : {A, B}) over |= k && k->enabled && k->isGenerator() && k->generator.type == "adjustment";
+                if (over && !frame.items.empty()) {
+                    if (!adjustmentOnCpu.empty()) return fallback("an adjustment layer: " + adjustmentOnCpu);
+                    gpu::Frame part;
+                    part.width = W, part.height = H, part.flatten = false, part.part = true;
+                    part.items = std::move(frame.items);
+                    if (!gpu::execute(part, &below)) return fallback("the GPU could not draw it");
+                    frame.items.clear();
+                    gpu::Item canvasItem;
+                    canvasItem.a = cpuLayer(Image(below));
+                    frame.items.push_back(std::move(canvasItem));
+                }
+                item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, below.empty() ? nullptr : &below, W, H));
                 gpu::countLayer(false, "a " + active->type + " transition");
             }
             frame.items.push_back(std::move(item));

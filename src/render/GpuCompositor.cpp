@@ -1594,7 +1594,7 @@ bool execute(const Frame& frame, Image* out, QImage* out8) {
     });
     std::lock_guard statsLock(gStatsMutex);
     if (ok) {
-        ++gStats.gpuFrames;
+        if (!frame.part) ++gStats.gpuFrames;
         gStats.filterPasses += filters;
         gStats.mixPasses += mixes;
         gStats.shapeLayers += shapes;
