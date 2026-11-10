@@ -196,13 +196,15 @@ std::vector<SdpStream> parseSdp(const std::string& sdp, std::string* error) {
         } else if (s.encoding == "smpte291") {
             if (m.fmtp.count("exactframerate")) rational(m.fmtp["exactframerate"], s.video.fps);
         } else if (s.encoding == "ST2110-41") {
-            // (DIT: the data item types, apart by commas)
+            // (DIT: the data item types in hexadecimal, apart by commas; "0x" before each, as ST 2110-41's first
+            // edition's senders may write them, taken too)
             std::istringstream types(m.fmtp["DIT"]);
             for (std::string t; std::getline(types, t, ',');) {
                 t = trim(t);
+                if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) t = t.substr(2);
                 if (t.empty()) continue;
                 char* end = nullptr;
-                const unsigned long v = std::strtoul(t.c_str(), &end, 0);
+                const unsigned long v = std::strtoul(t.c_str(), &end, 16);
                 if (end && *end == 0 && v <= 0x3FFFFF) s.metadataTypes.push_back(uint32_t(v));
             }
         } else if (s.encoding == "L24" || s.encoding == "L16" || s.encoding == "AM824") {

@@ -18619,7 +18619,8 @@ colorspaces:
             QVERIFY(((w[0] >> 28) & 1) && !((w[1] >> 28) & 1));  // (the frame's first subframe marked)
             QVERIFY(st::am824C(w[0]) && st::am824C(w[1]));        // (professional: byte 0's bit 0)
         }
-        // Fast metadata packed and read back, several items to a packet and the frame's last packet marked.
+        // Fast metadata packed and read back, several items to a packet, none marked (ST 2110-41:2026), each packet
+        // within the UDP size limit; an empty item, or one longer than a packet takes, refused.
         {
             std::vector<st::FastMetadata> items;
             for (uint32_t i = 0; i < 6; ++i) items.push_back({0x12345u + i, i % 2 == 1, std::vector<uint32_t>(100 + i * 50, 0xA5000000u | i)});
@@ -18633,13 +18634,39 @@ colorspaces:
             std::vector<st::FastMetadata> back;
             for (size_t i = 0; i < packets.size(); ++i) {
                 st::RtpPacket p;
-                QVERIFY(st::parseRtp(packets[i].data(), packets[i].size(), p) && p.marker == (i + 1 == packets.size()));
+                QVERIFY(st::parseRtp(packets[i].data(), packets[i].size(), p) && !p.marker);
                 const size_t had = back.size();
                 QVERIFY(st::unpackFastMetadata(p.payload, p.size, back));
-                // (within the payload a packet may have, unless one item alone is bigger)
+                // (within the payload a packet may have, unless one item alone is longer; the UDP datagram at most
+                // 1,460 bytes)
                 QVERIFY2(p.size <= 1200 || back.size() == had + 1, qPrintable(QString::number(p.size)));
+                QVERIFY(packets[i].size() + 8 <= 1460);
             }
             QVERIFY(back == items);
+            auto refused = [&](const st::FastMetadata& m) {
+                return !st::packFastMetadata({m}, 0, rtp, [](const uint8_t*, size_t) { return true; });
+            };
+            QVERIFY(refused({1, false, {}}) && refused({1, false, std::vector<uint32_t>(st::kMaxMetadataWords + 1, 1)}) &&
+                    refused({0x400000, false, {1}}) && !refused({1, false, std::vector<uint32_t>(st::kMaxMetadataWords, 1)}));
+            // Annex A: an object of 3,001 bytes in segments, each an offset and its words (the last marked by K, its
+            // last word padded with zeros), each item within a packet; put together again from the items as they come
+            // among others, and not before its last segment.
+            std::vector<uint8_t> object(3001);
+            for (size_t i = 0; i < object.size(); ++i) object[i] = uint8_t(i * 31 + 7);
+            const std::vector<st::FastMetadata> parts = st::segmentObject(0x1013FC, object.data(), object.size(), 200);
+            QCOMPARE(int(parts.size()), (751 + 198) / 199);
+            QVERIFY(parts[0].words[0] == 0 && parts[1].words[0] == 199 && !parts[0].k && parts.back().k);
+            QVERIFY(parts.back().words.back() == uint32_t(object[3000]) << 24);
+            std::vector<st::FastMetadata> mixed;
+            std::vector<uint32_t> joined;
+            for (const auto& m : parts) {
+                QVERIFY(!st::joinObject(mixed, 0x1013FC, joined));
+                mixed.push_back({0x100, false, {7}});
+                mixed.push_back(m);
+            }
+            QVERIFY(st::joinObject(mixed, 0x1013FC, joined) && joined.size() == 751);
+            for (size_t i = 0; i < object.size(); ++i) QCOMPARE(uint8_t(joined[i / 4] >> (24 - 8 * (i % 4))), object[i]);
+            QVERIFY(st::packFastMetadata(parts, 0, rtp, [](const uint8_t* d, size_t n) { return n + 8 <= 1460 && d; }));
             std::vector<st::FastMetadata> none;
             const uint8_t cut[8] = {0, 0, 0x04, 0x05, 1, 2, 3, 4};  // (an item of 5 words, 1 there)
             QVERIFY(!st::unpackFastMetadata(cut, 8, none));
@@ -18667,7 +18694,15 @@ colorspaces:
         std::string err;
         QVERIFY2(a.open(oa, v, aes, &err), err.c_str());
         QVERIFY(a.sdpAudio().find("AM824/48000/2") != std::string::npos && a.sdpMetadata().find("ST2110-41/90000") != std::string::npos);
-        QVERIFY(a.sdpMetadata().find("DIT=0x000123,0x3FFFFF") != std::string::npos);
+        // (ST 2110-41:2026's SDP: an application stream, its SSN, DIT in capitals without "0x"; a first edition's "0x"
+        // read too)
+        QVERIFY2(a.sdpMetadata().find("a=fmtp:101 SSN=ST2110-41:2024; DIT=123,3FFFFF\r\n") != std::string::npos, a.sdpMetadata().c_str());
+        QVERIFY(a.sdpMetadata().find("m=application ") != std::string::npos);
+        {
+            std::string old = a.sdpMetadata();
+            old.replace(old.find("DIT=123,3FFFFF"), 14, "DIT=0x000123,0x3FFFFF");
+            QVERIFY(st::parseSdp(old)[0].metadataTypes == std::vector<uint32_t>({0x123, 0x3FFFFF}));
+        }
         // Sender B: sound alone, L24 in four channels.
         st::SenderOptions ob;
         ob.audio = {"127.0.0.1", ports[4]};
@@ -18708,7 +18743,7 @@ colorspaces:
             for (int k = 0; k < frames && !stop; ++k) {
                 const Timecode t = timecodeOf(FrameTime(36000 * 25 + k), v.fps);
                 a.queueAes3(words.data() + size_t(k) * perFrame * 2, perFrame);
-                a.setNextMetadata({{0x123, false, {uint32_t(k), 0xDEADBEEF}}, {0x3FFFFF, true, {}}});
+                a.setNextMetadata({{0x123, false, {uint32_t(k), 0xDEADBEEF}}, {0x3FFFFF, true, {1}}});
                 if (!a.send(pic, nullptr, 0, &t, {}, &stop)) break;
             }
         });
@@ -18742,7 +18777,7 @@ colorspaces:
                 if (f.metadata.size() == 2) {
                     ++withMeta;
                     if (!(f.metadata[0].type == 0x123 && f.metadata[0].words == std::vector<uint32_t>({uint32_t(k), 0xDEADBEEF}) &&
-                          f.metadata[1].type == 0x3FFFFF && f.metadata[1].k && f.metadata[1].words.empty()))
+                          f.metadata[1].type == 0x3FFFFF && f.metadata[1].k && f.metadata[1].words == std::vector<uint32_t>({1})))
                         error = "metadata of frame " + std::to_string(k);
                 }
             }

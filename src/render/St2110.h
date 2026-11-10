@@ -9,7 +9,8 @@
 //  - ST 2110-22 constant bit-rate compressed video: JPEG XS (media/JpegXs.h, through SVT-JPEG-XS) as RFC 9134
 //    carries it, in its codestream or slice packetisation mode, each frame the same number of bytes in the same number
 //    of packets, paced evenly over the frame as ST 2110-21's wide senders send.
-//  - ST 2110-41 fast metadata: data items (a 22-bit type, its K bit and contents in 32-bit words) with each frame.
+//  - ST 2110-41 fast metadata (as its 2026 edition has it): data items (a 22-bit type, its K bit and contents in 32-bit
+//    words) with each frame, and objects too big for a packet in segments (its Annex A).
 //  - ST 2022-7: each stream sent on two paths at once (and merged again by RTP sequence number where received).
 //  - ST 2110-40 ancillary data (RFC 8331): ancillary time code (ST 12-2), CEA-608/708 captions in a CDP (ST 334) and
 //    HDR static metadata (ST 2108-1), a packet each frame or field even with none.
@@ -97,7 +98,7 @@ std::string audioSdp(const AudioFormat& f, const Endpoint& to, int payloadType, 
 // (`ids`: the DID/SDID pairs it carries)
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int payloadType, const SdpOptions& o,
                    const std::vector<std::pair<int, int>>& ids = {{0x60, 0x60}, {0x61, 0x01}}, const Endpoint* to2 = nullptr);
-// ST 2110-41 fast metadata's stream (`types`: the data item types it carries, its fmtp's DIT).
+// ST 2110-41 fast metadata's stream (`types`: the data item types it carries, its fmtp's DIT, in hexadecimal).
 std::string metadataSdp(const Endpoint& to, int payloadType, const SdpOptions& o, const std::vector<uint32_t>& types, const Endpoint* to2 = nullptr);
 // An SDP's media format parameters (its a=fmtp line's "name=value;" pairs) and rtpmap encoding ("raw/90000").
 std::map<std::string, std::string> sdpParameters(const std::string& sdp, std::string* encoding = nullptr);
@@ -266,16 +267,27 @@ bool packAm824(const uint32_t* words, int frames, int channels, uint32_t timesta
 std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int channels);
 
 // ---- ST 2110-41 fast metadata: data items, each a 32-bit header (its type, 22 bits; the K bit; its length in 32-bit
-// words, 9 bits) and its contents, as many as fit in a packet, the frame's last packet marked.
+// words, 9 bits, never 0) and its contents, as many as fit in a packet, no packet marked; every packet within
+// ST 2110-10's standard UDP size limit, so an item is at most kMaxMetadataWords words.
 struct FastMetadata {
     uint32_t type = 0;  // (22 bits)
     bool k = false;
-    std::vector<uint32_t> words;  // (at most 511)
+    std::vector<uint32_t> words;  // (1 to kMaxMetadataWords)
     bool operator==(const FastMetadata& o) const = default;
 };
+// (1,460 bytes a UDP datagram: its 8-byte header, RTP's 12 and an item's 4 leave 359 words)
+constexpr size_t kMaxMetadataPayload = 1460 - 8 - 12;
+constexpr size_t kMaxMetadataWords = (kMaxMetadataPayload - 4) / 4;
+// (false when an item is empty, too long or of a type past 22 bits: nothing is sent then)
 bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload = 1200);
 // (false when an item runs past the payload)
 bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMetadata>& out);
+// Annex A's simple object segmentation: an object of `size` bytes (zeros after it to a whole word) as items of `type`,
+// each its segment's offset in words and then at most `maxWords` - 1 of its words, the last with K set.
+std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size_t size, size_t maxWords = kMaxMetadataWords);
+// And back: the object's words from a stream's items of `type` in the order they came (the segments from offset 0 to
+// the one with K set, each where the one before ended); false while it is not whole.
+bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out);
 
 // ---- Ancillary data (ST 291 packets), as RFC 8331 carries them.
 struct AncPacket {

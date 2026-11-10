@@ -449,19 +449,21 @@ std::string audioSdp(const AudioFormat& f, const Endpoint& to, int pt, const Sdp
 }
 
 std::string metadataSdp(const Endpoint& to, int pt, const SdpOptions& o, const std::vector<uint32_t>& types, const Endpoint* to2) {
+    // (ST 2110-41:2026: an "application" media type; SSN as its 2024 edition, which it keeps; DIT in hexadecimal,
+    // capitals without "0x" or spaces)
     std::ostringstream s;
-    s << "a=rtpmap:" << pt << " ST2110-41/90000\r\n";
+    s << "a=rtpmap:" << pt << " ST2110-41/90000\r\n"
+      << "a=fmtp:" << pt << " SSN=ST2110-41:2024";
     if (!types.empty()) {
-        s << "a=fmtp:" << pt << " DIT=";
+        s << "; DIT=";
         char t[16];
         for (size_t i = 0; i < types.size(); ++i) {
-            std::snprintf(t, sizeof t, "%s0x%06X", i ? "," : "", unsigned(types[i] & 0x3FFFFF));
+            std::snprintf(t, sizeof t, "%s%X", i ? "," : "", unsigned(types[i] & 0x3FFFFF));
             s << t;
         }
-        s << "\r\n";
     }
-    s << sdpClock(o);
-    return sdpStreams(to, o, to2, "video", pt, s.str());
+    s << "\r\n" << sdpClock(o);
+    return sdpStreams(to, o, to2, "application", pt, s.str());
 }
 
 std::string ancSdp(const VideoFormat& f, const Endpoint& to, int pt, const SdpOptions& o, const std::vector<std::pair<int, int>>& ids,
@@ -791,8 +793,9 @@ std::vector<uint32_t> unpackAm824(const uint8_t* payload, size_t size, int chann
 // ---- ST 2110-41.
 
 bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp, RtpState& rtp, const PacketSink& send, int maxPayload) {
+    const size_t room = std::clamp<size_t>(size_t(std::max(maxPayload, 8)), 8, kMaxMetadataPayload);
     for (const FastMetadata& m : items)
-        if (m.words.size() > 511 || m.type > 0x3FFFFF) return false;
+        if (m.words.empty() || m.words.size() > kMaxMetadataWords || 4 + m.words.size() * 4 > kMaxMetadataPayload || m.type > 0x3FFFFF) return false;
     std::vector<uint8_t> packet;
     bool ok = true;
     size_t i = 0;
@@ -801,19 +804,59 @@ bool packFastMetadata(const std::vector<FastMetadata>& items, uint32_t timestamp
         packet.assign(12, 0);
         while (i < items.size()) {
             const size_t bytes = 4 + items[i].words.size() * 4;
-            // (items a packet holds; one alone bigger than that still goes, a packet of its own)
-            if (packet.size() > 12 && packet.size() - 12 + bytes > size_t(std::max(maxPayload, 4))) break;
+            // (items a packet holds; one alone longer than `maxPayload` still goes, a packet of its own within the
+            // UDP size limit)
+            if (packet.size() > 12 && packet.size() - 12 + bytes > room) break;
             const size_t at = packet.size();
             packet.resize(at + bytes);
             put32(packet.data() + at, items[i].type << 10 | uint32_t(items[i].k) << 9 | uint32_t(items[i].words.size()));
             for (size_t w = 0; w < items[i].words.size(); ++w) put32(packet.data() + at + 4 + w * 4, items[i].words[w]);
             ++i;
         }
-        rtpHeader(packet.data(), i >= items.size(), rtp, timestamp);
+        // (ST 2110-41:2026: the marker bit 0 on every packet)
+        rtpHeader(packet.data(), false, rtp, timestamp);
         ++rtp.sequence;
         ok = send(packet.data(), packet.size()) && ok;
     } while (ok && i < items.size());
     return ok;
+}
+
+std::vector<FastMetadata> segmentObject(uint32_t type, const uint8_t* data, size_t size, size_t maxWords) {
+    std::vector<FastMetadata> out;
+    const size_t per = std::clamp<size_t>(maxWords, 2, kMaxMetadataWords) - 1;
+    const size_t words = (size + 3) / 4;
+    for (size_t at = 0; at < words || (words == 0 && out.empty()); at += per) {
+        FastMetadata m;
+        m.type = type & 0x3FFFFF;
+        const size_t n = std::min(per, words - at);
+        m.k = at + n >= words;
+        m.words.reserve(n + 1);
+        m.words.push_back(uint32_t(at));
+        for (size_t w = 0; w < n; ++w) {
+            uint32_t v = 0;
+            for (size_t b = 0; b < 4; ++b) {
+                const size_t k = (at + w) * 4 + b;
+                v = v << 8 | (k < size ? data[k] : 0);
+            }
+            m.words.push_back(v);
+        }
+        out.push_back(std::move(m));
+        if (words == 0) break;
+    }
+    return out;
+}
+
+bool joinObject(const std::vector<FastMetadata>& items, uint32_t type, std::vector<uint32_t>& out) {
+    out.clear();
+    for (const FastMetadata& m : items) {
+        if (m.type != type || m.words.empty()) continue;
+        // (a segment from offset 0 starts the object again)
+        if (m.words[0] == 0) out.clear();
+        else if (m.words[0] != out.size()) continue;
+        out.insert(out.end(), m.words.begin() + 1, m.words.end());
+        if (m.k) return true;
+    }
+    return false;
 }
 
 bool unpackFastMetadata(const uint8_t* payload, size_t size, std::vector<FastMetadata>& out) {
@@ -1489,6 +1532,11 @@ bool Sender::sendFrame(const std::function<bool(int field, uint32_t ts, const Pa
                 if (stopped()) return false;
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
+        }
+        if (ok && o_.sendMetadata && f == 0 && end - start > second / 2) {
+            // (ST 2110-41: a packet at least every 500 ms, so below two frames a second an empty one between)
+            if (!waitUntil(start + (end - start) / 2)) return false;
+            ok = packFastMetadata({}, ts, rtpMeta_, [&](const uint8_t* p, size_t n) { return s_->to(3, p, n); }, o_.maxPayload);
         }
     }
     if (!ok) return false;
