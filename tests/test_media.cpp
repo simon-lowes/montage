@@ -37599,8 +37599,8 @@ if ui["pressed"] == "add":
             std::string err;
             QVERIFY(effectCamera(p, s, card, lit, 3, 1, cam, &err));
             const Layer3DPlace place = layer3dPlace(lit, 3, W, H);
-            const Image one = renderLitLayer3D(s, lit, 3, flat, place, cam, {}, nullptr, true);
-            const Image all = renderLitLayer3D(s, lit, 3, flat, place, cam, {}, nullptr, false);
+            const Image one = renderLitLayer3D(s, lit, 3, flat, place, cam, nullptr, 0, nullptr, true);
+            const Image all = renderLitLayer3D(s, lit, 3, flat, place, cam, nullptr, 0, nullptr, false);
             QVERIFY(one.px == all.px);
         }
 
@@ -37802,16 +37802,351 @@ if ui["pressed"] == "add":
             const std::vector<double> pts = prim->attribute("points")->value.numbers;
             const Layer3DPlace place = layer3dPlace(e, 0, W, H);
             QCOMPARE(pts.size(), meshes[0].positions.size());
+            // (its plane in its own space, put in place by its transform: row vectors)
+            QVERIFY(prim->attribute("xformOp:transform"));
+            const usd::Value m = prim->attribute("xformOp:transform")->at(0);
+            QCOMPARE(m.numbers.size(), size_t(16));
             double worst = 0;
             for (size_t i = 0; i < pts.size() / 3; ++i) {
                 // (each corner where the card's frame puts it)
                 const double u = meshes[0].uvs[i * 2], v = meshes[0].uvs[i * 2 + 1];
                 const std::array<double, 3> want = place.point(u * W, v * H);
-                for (int a = 0; a < 3; ++a) worst = std::max(worst, std::fabs(pts[i * 3 + size_t(a)] - want[size_t(a)]));
+                for (int a = 0; a < 3; ++a) {
+                    const double got = pts[i * 3] * m.number(size_t(a)) + pts[i * 3 + 1] * m.number(size_t(4 + a)) +
+                                       pts[i * 3 + 2] * m.number(size_t(8 + a)) + m.number(size_t(12 + a));
+                    worst = std::max(worst, std::fabs(got - want[size_t(a)]));
+                }
             }
             QVERIFY2(worst <= 1e-6, qPrintable(QString("card corners %1 off").arg(worst)));
             Model back;
             QVERIFY2(loadModel(file, back, &err), err.c_str());
+        }
+    }
+
+    // Phase 15 #9: cards and models in one scene of shadows (one shadow pass a light, each shadowing the other within
+    // a pixel of a ray-traced reference), cards' pictures and motion in USD exports read back by tinyusdz and by
+    // Montage, and the Camera clip's depth of field with a shaped aperture.
+    void sharedShadowsCardPicturesAndBokeh() {
+        const int W = 320, H = 180;
+        using V = std::array<double, 3>;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        while (s.videoTracks.size() < 13) edit::addTrack(p, s, TrackKind::Video);
+        RenderOptions o;
+        auto clearTracks = [&] {
+            for (Track& t : s.videoTracks) t.clips.clear();
+        };
+        // A white card through its own camera (a pixel a unit about the frame), its picture `scale` % of the frame.
+        auto whiteCard = [&](double scale) {
+            Clip c;
+            c.id = p.newId();
+            c.duration = 10;
+            c.generator = makeEffect(p, "color");
+            c.generator.params["color.r"] = 1.0, c.generator.params["color.g"] = 1.0, c.generator.params["color.b"] = 1.0;
+            c.motion.params["scale"] = scale;
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 0.0;
+            e.params["light_angle"] = 50.0, e.params["light_height"] = 15.0;
+            c.effects.push_back(e);
+            return c;
+        };
+        // A shape model (2 box, 1 plane) `size` across through its own camera, no ground, lit by the same sun.
+        auto shape = [&](int kind, double size, double z) {
+            Clip c;
+            c.id = p.newId();
+            c.duration = 10;
+            c.generator = makeEffect(p, "model3d");
+            c.generator.params["shape"] = double(kind);
+            c.generator.params["size"] = size;
+            c.generator.params["pos_z"] = z;
+            c.generator.params["ground"] = 0.0;
+            c.generator.params["light_angle"] = 50.0, c.generator.params["light_height"] = 15.0;
+            return c;
+        };
+        const double az = 50 * M_PI / 180, el = 15 * M_PI / 180;
+        const V towards{std::cos(el) * std::sin(az), std::sin(el), std::cos(el) * std::cos(az)};
+        // Where a ray meets a box (lo..hi) first, or -1.
+        auto hitBox = [](const V& o0, const V& d, const V& lo, const V& hi) {
+            double t0 = 1e-9, t1 = 1e300;
+            for (int a = 0; a < 3; ++a) {
+                if (std::fabs(d[size_t(a)]) < 1e-15) {
+                    if (o0[size_t(a)] < lo[size_t(a)] || o0[size_t(a)] > hi[size_t(a)]) return -1.0;
+                    continue;
+                }
+                double u = (lo[size_t(a)] - o0[size_t(a)]) / d[size_t(a)], v = (hi[size_t(a)] - o0[size_t(a)]) / d[size_t(a)];
+                if (u > v) std::swap(u, v);
+                t0 = std::max(t0, u), t1 = std::min(t1, v);
+                if (t0 > t1) return -1.0;
+            }
+            return t0;
+        };
+        // The shadow's middle in `img` (pixels of `receiver` darker than halfway between its lit and its shadowed
+        // brightness) against the reference's (`shadowed`), over the pixels the reference sees the receiver at.
+        auto compare = [&](const Image& img, const std::function<int(int, int)>& reference, const char* what) {
+            double lo = 1e9, hi = -1e9;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (reference(x, y) >= 0) lo = std::min(lo, double(img.at(x, y)[0])), hi = std::max(hi, double(img.at(x, y)[0]));
+            const double mid = (lo + hi) / 2;
+            double wx = 0, wy = 0, wn = 0, gx = 0, gy = 0, gn = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int r = reference(x, y);
+                    if (r < 0) continue;
+                    if (r == 1) wx += x, wy += y, ++wn;
+                    if (img.at(x, y)[0] < mid) gx += x, gy += y, ++gn;
+                }
+            const double off = gn > 0 && wn > 0 ? std::hypot(gx / gn - wx / wn, gy / gn - wy / wn) : 1e9;
+            qInfo("%s: the shadow's middle %.3f px from the ray-traced one (%g and %g pixels; lit %.3f, shadowed %.3f)", what, off, gn, wn, hi, lo);
+            return wn > 50 && hi - lo > 0.1 && off <= 1;
+        };
+
+        // ---- A box model's shadow on a lit card behind it.
+        {
+            clearTracks();
+            Clip card = whiteCard(100);
+            card.effects[0].params["lit"] = 1.0, card.effects[0].params["pos_z"] = -100.0;
+            s.videoTracks[0].clips = {card};
+            s.videoTracks[1].clips = {shape(2, 60, 0)};
+            const uint64_t before = modelShadowPasses();
+            const Image img = renderSequenceFrame(p, s, 3, o);
+            QCOMPARE(modelShadowPasses() - before, uint64_t(1));  // (one sun: one map for the card and the box)
+            ModelCamera cam;
+            std::string err;
+            QVERIFY(effectCamera(p, s, s.videoTracks[0].clips[0], s.videoTracks[0].clips[0].effects[0], 3, 1, cam, &err));
+            const V boxLo{-30, -30, -30}, boxHi{30, 30, 30};
+            auto reference = [&](int x, int y) {
+                const V d = cam.ray(x + 0.5, y + 0.5);
+                const double t = (-100 - cam.C[2]) / d[2];
+                const V X{cam.C[0] + d[0] * t, cam.C[1] + d[1] * t, -100};
+                if (!(t > 0) || std::fabs(X[0]) > W / 2.0 - 1 || std::fabs(X[1]) > H / 2.0 - 1) return -1;
+                if (const double b = hitBox(cam.C, d, boxLo, boxHi); b > 0 && b < t) return -1;  // (the box in front)
+                return hitBox(X, towards, boxLo, boxHi) > 0 ? 1 : 0;
+            };
+            QVERIFY(compare(img, reference, "a model's shadow on a card"));
+        }
+
+        // ---- A card's shadow on a plane model behind it.
+        {
+            clearTracks();
+            Clip card = whiteCard(20);
+            card.effects[0].params["shadows"] = 1.0;
+            s.videoTracks[0].clips = {shape(1, W, -100)};
+            s.videoTracks[1].clips = {card};
+            const uint64_t before = modelShadowPasses();
+            const Image img = renderSequenceFrame(p, s, 3, o);
+            QCOMPARE(modelShadowPasses() - before, uint64_t(1));
+            ModelCamera cam;
+            std::string err;
+            QVERIFY(effectCamera(p, s, s.videoTracks[1].clips[0], s.videoTracks[1].clips[0].effects[0], 3, 1, cam, &err));
+            const double hw = W * 0.2 / 2, hh = H * 0.2 / 2;
+            auto inSquare = [&](const V& o0, const V& d, double& t) {
+                t = -o0[2] / d[2];
+                return t > 0 && std::fabs(o0[0] + d[0] * t) <= hw && std::fabs(o0[1] + d[1] * t) <= hh;
+            };
+            auto reference = [&](int x, int y) {
+                const V d = cam.ray(x + 0.5, y + 0.5);
+                const double t = (-100 - cam.C[2]) / d[2];
+                const V X{cam.C[0] + d[0] * t, cam.C[1] + d[1] * t, -100};
+                if (!(t > 0) || std::fabs(X[0]) > W / 2.0 - 1 || std::fabs(X[1]) > H / 2.0 - 1) return -1;
+                double tc;
+                if (inSquare(cam.C, d, tc) && tc < t) return -1;  // (the card in front)
+                return inSquare(X, towards, tc) ? 1 : 0;
+            };
+            QVERIFY(compare(img, reference, "a card's shadow on a model"));
+        }
+
+        // ---- One shadow pass a light for a frame of 1 and of 12 lit cards with grounds, casting on each other.
+        for (const int n : {1, 12}) {
+            clearTracks();
+            for (int i = 0; i < n; ++i) {
+                Clip c = whiteCard(15);
+                c.effects[0].params["lit"] = 1.0, c.effects[0].params["shadows"] = 1.0, c.effects[0].params["ground"] = 1.0;
+                c.effects[0].params["ground_y"] = -60.0;
+                c.effects[0].params["pos_x"] = -120.0 + 22.0 * i, c.effects[0].params["pos_z"] = -10.0 * i;
+                s.videoTracks[size_t(i)].clips = {c};
+            }
+            const uint64_t before = modelShadowPasses();
+            const Image img = renderSequenceFrame(p, s, 3, o);
+            QVERIFY(!img.empty());
+            const uint64_t passes = modelShadowPasses() - before;
+            qInfo("%d cards: %llu shadow passes", n, (unsigned long long)passes);
+            QCOMPARE(passes, uint64_t(1));
+        }
+
+        // ---- The Camera clip's depth of field: a small bright card twice as far as the focus opens into the aperture's
+        // shape, a hexagon of the thin lens's circle (corner to corner across, flat to flat down, to a pixel), and
+        // twice as tall with an anamorphic squeeze of 2.
+        {
+            clearTracks();
+            Clip point;
+            point.id = p.newId();
+            point.duration = 10;
+            point.generator = makeEffect(p, "color");
+            point.generator.params["color.r"] = 1.0, point.generator.params["color.g"] = 1.0, point.generator.params["color.b"] = 1.0;
+            point.motion.params["scale"] = 1.0;
+            point.effects.push_back(makeEffect(p, "layer_3d"));  // (through the scene's camera)
+            Clip camera;
+            camera.id = p.newId();
+            camera.duration = 10;
+            camera.generator = makeEffect(p, "camera3d");
+            s.videoTracks[0].clips = {point};
+            s.videoTracks[1].clips = {camera};
+            ModelCamera cam;
+            montage::sceneCamera(p, s, s.videoTracks[1].clips[0], 3, 1, cam);
+            const double F = cam.C[2];
+            s.videoTracks[0].clips[0].effects[0].params["pos_z"] = -F;
+            Effect& g = s.videoTracks[1].clips[0].generator;
+            g.params["dof"] = 1.0, g.params["focus_distance"] = F, g.params["fstop"] = 1.4, g.params["blades"] = 6.0;
+            const double r = -layer3dCoc(cam, W, 2 * F, F, 1.4, 1000);
+            QVERIFY(r > 8 && r < 0.05 * W);
+            for (const double squeeze : {1.0, 2.0}) {
+                s.videoTracks[1].clips[0].generator.params["squeeze"] = squeeze;
+                const Image img = renderSequenceFrame(p, s, 3, o);
+                double peak = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) peak = std::max(peak, double(img.at(x, y)[3]));
+                QVERIFY(peak > 0);
+                // (its extent each way: the columns' and rows' most alpha against the whole's, summed)
+                double across = 0, down = 0;
+                for (int x = 0; x < W; ++x) {
+                    double m = 0;
+                    for (int y = 0; y < H; ++y) m = std::max(m, double(img.at(x, y)[3]));
+                    across += m / peak;
+                }
+                for (int y = 0; y < H; ++y) {
+                    double m = 0;
+                    for (int x = 0; x < W; ++x) m = std::max(m, double(img.at(x, y)[3]));
+                    down += m / peak;
+                }
+                const double wantAcross = 2 * r, wantDown = 2 * r * std::cos(M_PI / 6) * squeeze;
+                qInfo("bokeh, squeeze %g: %.2f px across (a hexagon's %.2f), %.2f down (%.2f)", squeeze, across, wantAcross, down, wantDown);
+                QVERIFY(std::fabs(across - wantAcross) <= 1);
+                QVERIFY(std::fabs(down - wantDown) <= 1);
+            }
+            // Its own depth of field on a card seen through the camera is read into the camera when opened.
+            Project q = p;
+            Sequence& qs = *q.active();
+            qs.videoTracks[1].clips[0].generator.params["dof"] = 0.0;
+            Effect& own = qs.videoTracks[0].clips[0].effects[0];
+            own.params["depth_of_field"] = 1.0, own.params["fstop"] = 4.0, own.params["focus_distance"] = 900.0;
+            Project back;
+            std::string err;
+            QVERIFY2(projectFromJson(projectToJson(q), back, &err), err.c_str());
+            const Effect& bg = back.active()->videoTracks[1].clips[0].generator;
+            const Effect& be = back.active()->videoTracks[0].clips[0].effects[0];
+            QVERIFY(bg.p("dof", 0, 0) == 1.0 && bg.p("fstop", 0, 0) == 4.0 && bg.p("focus_distance", 0, 0) == 900.0 && bg.p("units_m", 0, 0) == 1000.0);
+            QVERIFY(be.p("depth_of_field", 0, 1) == 0.0);
+        }
+
+        // ---- A moving card in a solved scene's USD and USDZ exports: its picture byte for byte and its transform at
+        // each frame (to 1e-6), read back by Montage and by tinyusdz.
+        {
+            clearTracks();
+            CameraSolve solve;
+            solve.width = W, solve.height = H, solve.focal = 250, solve.fps = 25, solve.oriented = true;
+            for (int i = 0; i < 10; ++i) {
+                const ModelCamera c = lookAt({-1 + 0.08 * i, 1.6, 6}, {0, 0.5, 0}, 1, 1, 1);
+                SolvedCamera sc;
+                sc.valid = true;
+                std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+                sc.C = {c.C[0], c.C[1], c.C[2]};
+                solve.cameras.push_back(sc);
+            }
+            Clip plate;
+            plate.id = p.newId();
+            plate.duration = 10;
+            plate.generator = makeEffect(p, "gradient");
+            Effect track = makeEffect(p, "camera_track");
+            track.strings["solve"] = cameraSolveToString(solve);
+            plate.effects = {track};
+            Clip sign;
+            sign.id = p.newId();
+            sign.duration = 10;
+            sign.name = "Sign";
+            sign.generator = makeEffect(p, "gradient");
+            sign.motion.params["scale"] = 60.0;  // (clear round its edges)
+            Effect e = makeEffect(p, "layer_3d");
+            e.params["camera"] = 1.0, e.params["width"] = 1.5;
+            e.params["pos_x"].keys = {{0, 0.3}, {9, 0.9}};
+            e.params["pos_y"] = 0.6, e.params["pos_z"] = -0.4;
+            e.params["rot_y"].keys = {{0, 20.0}, {9, -35.0}};
+            sign.effects = {e};
+            s.videoTracks[0].clips = {plate};
+            s.videoTracks[1].clips = {sign};
+            const std::vector<SolvedSceneMesh> meshes = solvedSceneModels(p, s, 0, s.videoTracks[0].clips[0]);
+            QVERIFY(meshes.size() == 1 && meshes[0].card && meshes[0].motion.size() == 10);
+            QVERIFY(meshes[0].picture.size() > 8 && meshes[0].picture.compare(1, 3, "PNG") == 0);
+            QImage png;
+            QVERIFY(png.loadFromData(QByteArray::fromStdString(meshes[0].picture), "PNG"));
+            png = png.convertToFormat(QImage::Format_RGBA8888);
+            QVERIFY(png.width() == W && png.height() == H && png.pixelColor(0, 0).alpha() == 0 && png.pixelColor(W / 2, H / 2).alpha() == 255);
+            // (the place each frame: rows its axes and middle)
+            auto placeAt = [&](int frame) {
+                const Layer3DPlace pl = layer3dPlace(e, frame, W, H);
+                return std::array<double, 16>{pl.axisU[0], pl.axisU[1], pl.axisU[2], 0, pl.axisV[0], pl.axisV[1], pl.axisV[2], 0,
+                                              pl.normal[0], pl.normal[1], pl.normal[2], 0, pl.origin[0], pl.origin[1], pl.origin[2], 1};
+            };
+            const QByteArray tinyusdz = qgetenv("MONTAGE_TEST_TINYUSDZ");
+            if (tinyusdz.isEmpty()) qInfo("MONTAGE_TEST_TINYUSDZ is not set: tinyusdz's read-back is left out");
+            for (const char* name : {"moving.usda", "moving.usdz"}) {
+                const std::string file = path(name);
+                std::string err;
+                QVERIFY2(writeSolveUsda(solve, file, meshes, &err), err.c_str());
+                usd::Stage stage;
+                QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+                const auto* prim = stage.prim("/Solve/Models/Card_1");
+                QVERIFY(prim && prim->attribute("xformOp:transform") && prim->attribute("xformOp:transform")->samples.size() == 10);
+                double worst = 0;
+                for (int i = 0; i < 10; ++i) {
+                    const usd::Value m = prim->attribute("xformOp:transform")->at(i);
+                    const std::array<double, 16> want = placeAt(i);
+                    for (size_t k = 0; k < 16; ++k) worst = std::max(worst, std::fabs(m.number(k) - want[k]));
+                }
+                QVERIFY2(worst <= 1e-6, qPrintable(QString("%1: Montage reads its transforms %2 off").arg(name).arg(worst)));
+                const auto* tex = stage.prim("/Solve/Looks/Card_1/Picture");
+                QVERIFY(tex && tex->attribute("inputs:file"));
+                std::string bytes;
+                QVERIFY(stage.readAsset(tex->attribute("inputs:file")->value.text(0), bytes));
+                QVERIFY2(bytes == meshes[0].picture, name);
+                Model model;
+                QVERIFY2(loadModel(file, model, &err), err.c_str());
+                if (tinyusdz.isEmpty()) continue;
+                QProcess run;
+                const QString out = QString::fromStdString(path(""));
+                run.start(QString::fromLocal8Bit(tinyusdz), {QString::fromStdString(file), out, "0", "4", "9"});
+                QVERIFY(run.waitForFinished(120000));
+                const QString said = QString::fromLocal8Bit(run.readAllStandardOutput());
+                QVERIFY2(run.exitCode() == 0, qPrintable(said + QString::fromLocal8Bit(run.readAllStandardError())));
+                int xforms = 0;
+                bool picture = false;
+                for (const QString& line : said.split('\n', Qt::SkipEmptyParts)) {
+                    const QStringList w = line.split(' ', Qt::SkipEmptyParts);
+                    if (w.size() == 19 && w[0] == "xform" && w[1] == "Card_1") {
+                        const std::array<double, 16> want = placeAt(w[2].toInt());
+                        double off = 0;
+                        for (size_t k = 0; k < 16; ++k) off = std::max(off, std::fabs(w[int(3 + k)].toDouble() - want[k]));
+                        QVERIFY2(off <= 1e-6, qPrintable(QString("%1: tinyusdz reads its transform at %2 %3 off").arg(name).arg(w[2]).arg(off)));
+                        ++xforms;
+                    } else if (w.size() == 6 && w[0] == "picture" && w[1] == "Card_1") {
+                        QVERIFY(w[2].toInt() == W && w[3].toInt() == H && (w[4] == "4" || w[4] == "3"));
+                        QFile f(w[5]);
+                        QVERIFY(f.open(QIODevice::ReadOnly));
+                        const QByteArray texels = f.readAll();
+                        const int ch = w[4].toInt();
+                        QCOMPARE(texels.size(), W * H * ch);
+                        int differ = 0;
+                        for (int y = 0; y < H; ++y)
+                            for (int x = 0; x < W; ++x)
+                                for (int k = 0; k < ch; ++k)
+                                    differ += uchar(texels[(y * W + x) * ch + k]) != png.constScanLine(y)[x * 4 + k];
+                        QVERIFY2(differ == 0, qPrintable(QString("%1: tinyusdz decodes %2 of the picture's bytes otherwise").arg(name).arg(differ)));
+                        picture = true;
+                    }
+                }
+                QVERIFY2(xforms == 3 && picture, qPrintable(said));
+            }
         }
     }
 
