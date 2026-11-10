@@ -8,6 +8,7 @@
 #include <limits>
 #include <set>
 
+#include "DcpMxf.h"
 #include "core/MediaLog.h"
 
 namespace montage {
@@ -90,15 +91,11 @@ std::string imfEventsDocument(const std::vector<ImfEvent>& events, uint32_t num,
         writeEvents(x);
     }
     const QByteArray hash = QCryptographicHash::hash(body + QByteArray::number(num) + ' ' + QByteArray::number(den), QCryptographicHash::Md5);
-    uint8_t id[16];
-    std::copy(hash.begin(), hash.begin() + 16, id);
+    dcp::Uuid id{};
+    std::copy(hash.begin(), hash.begin() + 16, id.begin());
     id[6] = uint8_t((id[6] & 0x0f) | 0x30);
     id[8] = uint8_t((id[8] & 0x3f) | 0x80);
-    QString uuid;
-    for (int i = 0; i < 16; ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) uuid += '-';
-        uuid += QStringLiteral("%1").arg(id[i], 2, 16, QLatin1Char('0'));
-    }
+    const QString uuid = QString::fromStdString(dcp::uuidString(id));
     QByteArray out;
     QXmlStreamWriter x(&out);
     x.setAutoFormatting(true);

@@ -8806,7 +8806,7 @@ void MainWindow::exportImfDialog() {
         const bool eightK = app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026);
         offer(size, "8k", eightK);
         if (!eightK && size->currentData().toString() == "8k") size->setCurrentIndex(size->findData("uhd"));
-        events->setEnabled(!app2 || supplemental->isChecked() || edition->currentData().toInt() == 2026);
+        events->setEnabled(app2 && (supplemental->isChecked() || edition->currentData().toInt() == 2026));
         offer(colour, "p3d65-pq", !dpp);
         offer(proresProfile, "422", !dpp);
         offer(proresProfile, "lt", !dpp);

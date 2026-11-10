@@ -996,6 +996,10 @@ bool playedEvents(const ImfVirtualTrack& t, TrackFiles& files, dcp::EditRate com
         const int64_t played = unitsAt(r.duration, r.rateNum, r.rateDen, comp.num, comp.den);
         for (int64_t k = 0; k < std::max<int64_t>(1, r.repeat); ++k, at += played) {
             const int64_t from = r.entry, to = r.entry + r.duration;  // the stretch, in the resource's edit units
+            if (out.size() + doc->second.first.size() > 1000000) {
+                if (error) *error = "The timed events track plays more than a million events";
+                return false;
+            }
             for (ImfEvent e : doc->second.first) {
                 // (the document's counts in the resource's edit units; no start: from the timeline's start, no end: on)
                 int64_t a = e.start == std::numeric_limits<int64_t>::min() ? from : unitsAt(e.start, docRate.num, docRate.den, r.rateNum, r.rateDen);
@@ -1286,7 +1290,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             if (fields) return fail("Application DPP pictures are progressive");
             if (!full && (ycbcr444 || fullRange)) return fail("Application DPP's 422 HQ is Y'CbCr 4:2:2 in narrow range (QE.1)");
             if (full && ycbcr444) return fail("Application DPP's 4:4:4 is R'G'B' (RDD 59-1 Table 1), not Y'CbCr");
-            if (full && colourId == "rec709") return fail("Application DPP's 4:4:4 is Rec.2020 PQ or HLG (RDD 59-1 Table 1 has no Rec.709 for it)");
+            if (full && colourId == "rec709" && !supplemental) return fail("Application DPP's 4:4:4 is Rec.2020 PQ or HLG (RDD 59-1 Table 1 has no Rec.709 for it)");
             if (fullRange && colourId == "rec2020-hlg") return fail("Application DPP's HLG is in narrow range only (QE.1, RDD 59-1 5.2.2)");
             if (rateValue > 61) return fail("Application DPP masters run at up to 60 fps");
         }
@@ -2075,12 +2079,16 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     // timeline is the composition's. A supplemental plays the earlier package's events again where they are the same,
     // and carries only the stretches where they changed (an empty document where they were taken away).
     int eventCount = 0, newEventCount = 0;
-    if (settings.events && (settings.application != 2 || edition >= 2026)) {
+    if (settings.events && settings.application == 2 && edition >= 2026) {
         const std::vector<ImfEvent> events = imfEventsOfMarkers(s.markers, first, programme, frames);
         eventCount = int(events.size());
+        // (the earlier package's markers: a media events track whose files list Montage's markers scheme)
         const ImfVirtualTrack* was = nullptr;
-        for (const ImfVirtualTrack& t : old.tracks)
-            if (!was && isEventsSequence(t.kind)) was = &t;
+        for (const ImfVirtualTrack& t : old.tracks) {
+            if (was || t.kind != kEventsSequence || t.resources.empty()) continue;
+            const dcp::ImfTrackReader* f = oldFiles.get(t.resources.front().trackFile);
+            if (f && QString::fromStdString(f->eventSchemes()).split(' ', Qt::SkipEmptyParts).contains(QLatin1String(kImfMarkerScheme))) was = &t;
+        }
         if (!events.empty() || was) {
             Virtual vt;
             vt.kind = QString::fromLatin1(kEventsSequence);
@@ -2089,15 +2097,21 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             // Where the events differ from the earlier track's: all of it, unless that is at this edit rate and read.
             std::vector<std::pair<int64_t, int64_t>> stretches{{0, frames}};
             std::vector<ImfEvent> before;
-            if (was && was->kind == kEventsSequence && was->length() > 0 &&
+            if (was && was->length() > 0 &&
                 std::all_of(was->resources.begin(), was->resources.end(),
                             [&](const ImfResource& r) { return r.rateNum == rate.num && r.rateDen == rate.den; }) &&
                 playedEvents(*was, oldFiles, rate, before)) {
                 stretches = imfChangedEventStretches(before, events, frames);
                 if (was->length() < frames) {
-                    // (past the earlier track's end: carried here)
-                    if (!stretches.empty() && stretches.back().second >= was->length()) stretches.back().second = frames;
-                    else stretches.emplace_back(was->length(), frames);
+                    // (past the earlier track's end: carried here, joined with the stretches it meets)
+                    stretches.emplace_back(was->length(), frames);
+                    std::sort(stretches.begin(), stretches.end());
+                    std::vector<std::pair<int64_t, int64_t>> joined;
+                    for (const auto& x : stretches) {
+                        if (!joined.empty() && x.first <= joined.back().second) joined.back().second = std::max(joined.back().second, x.second);
+                        else joined.push_back(x);
+                    }
+                    stretches = std::move(joined);
                 }
                 vt.old = was;
             }
@@ -3044,12 +3058,15 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     if (!uris.contains(QLatin1String(kImfSimpleScheme)))
                         issue(QStringLiteral("%1 does not list the Simple Scheme among its event schemes").arg(name));
                     if (QSet<QString>(uris.begin(), uris.end()).size() != uris.size()) issue(QStringLiteral("%1 lists an event scheme twice").arg(name));
-                    if (reader.textMime() != "text/xml" || reader.textEncoding() != "UTF-8")
-                        issue(QStringLiteral("%1 is not a Simple Scheme XML document (text/xml, UTF-8), which Montage reads").arg(name));
+                    // (a Simple Scheme document is XML or JSON, Annex A; Montage reads the XML ones)
+                    const bool xmlDocument = reader.textMime() == "text/xml" || reader.textMime() == "application/xml";
+                    if (!xmlDocument && reader.textMime() != "application/json")
+                        issue(QStringLiteral("%1's document is %2, neither XML nor JSON (ST 2067-206 Annex A)").arg(name, QString::fromStdString(reader.textMime())));
                     if (!firstFile && (reader.textEncoding() != encoding || reader.textMime() != mime || reader.eventSchemes() != schemes))
                         issue(QStringLiteral("%1's encoding, type or schemes differ from the rest of its %2's (ST 2067-206 9.2.2)").arg(name, kind));
                     firstFile = false;
                     encoding = reader.textEncoding(), mime = reader.textMime(), schemes = reader.eventSchemes();
+                    if (!xmlDocument) continue;
                     if (!reader.text(xml, &err)) {
                         issue(QStringLiteral("%1 holds no document Montage reads: %2").arg(name, QString::fromStdString(err)));
                         continue;

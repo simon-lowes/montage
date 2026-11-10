@@ -26,11 +26,12 @@
 // (http://www.smpte-ra.org/ns/2067-21/2021, ST 2067-21:2023's Table 15; pictures to 4096 x 3112), made as before but
 // that HTJ2K pictures now go under it too (Montage wrote /2023, which no edition defines).
 //
-// Markers (ST 2067-206:2026): the sequence's markers within the master travel as event-based, text-based metadata
+// Markers (ST 2067-206:2026): in Application #2E to the 2026 edition, the sequence's markers within the master travel
+// as event-based, text-based metadata
 // (render/ImfEvents.h), a Simple Scheme document in a Timed Events Track File on a SimpleSchemeMediaTimedEventsSequence
 // whose parameter set relates it to the picture; a supplemental carries only the events that changed (its composition
-// plays the earlier track file around them), and opening a package brings them back as markers. Application #2E to
-// the 2021 edition carries none.
+// plays the earlier track file around them), and opening any package brings a Simple Scheme XML events track back as
+// markers.
 //
 // Archival masters (Application #5, ST 2067-50): the programme as ACES 2065-1, half-float OpenEXR frames (ST 2065-4)
 // wrapped frame by frame (ST 2065-5), graded (the grade in the pictures, in the working space's light) or ungraded (each
@@ -130,7 +131,8 @@ struct ImfSettings {
     bool fullRange = false;
     // Application #2E: the edition of ST 2067-21 followed, 2026 or 2021 (a supplemental keeps the earlier package's).
     int edition = 2026;
-    // The sequence's markers as ST 2067-206 timed events (not with Application #2E to the 2021 edition).
+    // The sequence's markers as ST 2067-206 timed events: Application #2E to the 2026 edition (the other applications,
+    // and the 2021 edition, are made as before).
     bool events = true;
     // Application #5: the grade in the pictures; false leaves it off.
     bool graded = true;

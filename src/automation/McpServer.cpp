@@ -12845,8 +12845,8 @@ void McpServer::Impl::addTools() {
         "composition playlist with the essence descriptors, packing list with hashes and asset map, in a new folder under "
         "`folder`. The package is checked when done (as montage_verify_imf). `htj2k` codes the pictures as High-Throughput "
         "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode; the 2026 edition takes pictures to "
-        "8192 x 6224 (`size` 8k: 7680 x 4320) in its 8K profiles. The sequence's markers (`events`, on by default; not "
-        "with edition 2021) go in as event-based metadata (ST 2067-206: a Simple Scheme timed events track related to "
+        "8192 x 6224 (`size` 8k: 7680 x 4320) in its 8K profiles. With it the sequence's markers (`events`, on by default; "
+        "Application #2E to the 2026 edition only) go in as event-based metadata (ST 2067-206: a Simple Scheme timed events track related to "
         "the picture), each with its frame, duration, name, comment, colour and kind, and come back as markers when the "
         "package is imported; a supplemental carries only the events that changed. Versions: `sounds` makes a sound "
         "track per language and kind (each mixed from the roles it hears), the caption tracks become IMSC 1.1 subtitles, "
@@ -12873,7 +12873,7 @@ void McpServer::Impl::addTools() {
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
             "size":{"type":"string","enum":["sequence","hd","uhd","4k","8k"],"default":"sequence","description":"8k (7680 x 4320): Application #2E to the 2026 edition"},
             "edition":{"type":"integer","enum":[2026,2021],"default":2026,"description":"Application #2E: ST 2067-21:2026's identification (8K, timed events), or the 2021 one, the package as before (a supplemental keeps the earlier package's)"},
-            "events":{"type":"boolean","default":true,"description":"The sequence's markers as ST 2067-206 timed events (not with edition 2021)"},
+            "events":{"type":"boolean","default":true,"description":"The sequence's markers as ST 2067-206 timed events (Application #2E to the 2026 edition)"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
             "lossless":{"type":"boolean","default":true},"htj2k":{"type":"boolean","default":false},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
             "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
@@ -12946,7 +12946,7 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
-            st.edition = a.value("edition").toInt(2026);
+            st.edition = a.contains("edition") && !a.value("edition").isDouble() ? 0 : a.value("edition").toInt(2026);
             if (st.edition != 2026 && st.edition != 2021) throw ArgError{"\"edition\" is 2026 or 2021"};
             st.events = a.value("events").toBool(true);
             if (a.value("application").isString()) {

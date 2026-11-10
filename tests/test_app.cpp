@@ -9539,7 +9539,7 @@ private slots:
             if (offered && exrAvailable()) {
                 application->setCurrentIndex(application->findData(5));
                 offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
-                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && eventsBox->isEnabled() && !offeredIn(sizes, "8k");
+                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled() && !edition->isEnabled() && !eventsBox->isEnabled() && !offeredIn(sizes, "8k");
                 application->setCurrentIndex(application->findData(2));
             }
             // Application ProRes: fields for 4:2:2, Y'CbCr, full range and 12 bits for 4:4:4. Application DPP: 422 HQ, 4444

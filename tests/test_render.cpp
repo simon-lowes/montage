@@ -9938,6 +9938,27 @@ colorspaces:
             QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("8K profile") != std::string::npos; }));
         }
 
+        // A supplemental longer than the earlier package, with markers past its end: the new frames' stretch carried
+        // with them, the earlier events played before it.
+        {
+            Sequence before = s, longer = s;
+            before.id = p.newId();
+            before.name = "Before";
+            longer.videoTracks[0].clips[0].duration = 60;
+            longer.markers.push_back(marker(50, 0, "Fifty", "", 3));
+            longer.markers.push_back(marker(55, 3, "Fifty-five", "", 4));
+            p.sequences.push_back(before);  // (s no longer used: the list may have moved)
+            ImfSettings sup4 = st;
+            sup4.supplementOf = r.folder;
+            sup4.originalSequence = before.id;
+            ImfResult r4;
+            QVERIFY2(exportImf(p, longer, sup4, dir.path().toStdString(), &r4, {}, &err), err.c_str());
+            QVERIFY2(r4.frames == 60 && r4.events == 6 && r4.newEvents == 2, qPrintable(QStringLiteral("%1 %2 %3").arg(r4.frames).arg(r4.events).arg(r4.newEvents)));
+            issues = verifyImf(r4.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            QCOMPARE(describe(readBack(r4.folder)), describe(expected(longer)));
+        }
+
         // Montage's check: a media events track that relates to no virtual track is named.
         {
             QString c = QString::fromUtf8(cpl);
