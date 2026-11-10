@@ -12,6 +12,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
 #include "render/Layer3D.h"
+#include "render/Processing.h"
 #include "render/Compositor.h"
 
 namespace montage {
@@ -490,7 +491,9 @@ void sceneCamera(const Project& p, const Sequence& seq, const Clip& camera, Fram
     const Effect& g = camera.generator;
     const FrameTime lt = t - camera.start;
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
-    frontCamera(seq, P("fov", 35), scale, cam);
+    // (a focal length, on a 36 mm wide sensor, in place of the field of view when it is given)
+    const double focal = P("focal_length", 0);
+    frontCamera(seq, focal > 0 ? 2 * std::atan(18 / focal) / kDeg : P("fov", 35), scale, cam);
     // Moved from where the frame fills its view, and turned (or aimed at a point, then rolled).
     const std::array<double, 3> at{P("pos_x", 0), P("pos_y", 0), cam.C[2] + P("pos_z", 0)};
     std::array<double, 3> right, up, back;
@@ -514,6 +517,18 @@ void sceneCamera(const Project& p, const Sequence& seq, const Clip& camera, Fram
     }
     cam.R = {right[0], right[1], right[2], -up[0], -up[1], -up[2], -back[0], -back[1], -back[2]};
     cam.C = at;
+}
+
+std::string shadowWorldOf(const Sequence& seq, const Clip& c, const Effect& g, FrameTime t) {
+    const bool model = &g == &c.generator;
+    const FrameTime lt = t - c.start;
+    const long mode = std::lround(g.p("camera", lt, model ? 0 : 3));
+    if (mode == 1) {
+        const int ti = trackOf(seq, c);
+        return "solve:" + std::to_string(ti >= 0 ? cameraTrackOf(seq, size_t(ti), g, lt, t) : -1);
+    }
+    if (mode == 2) return "file:" + (g.s("camera_file").empty() && model ? g.s("file") : g.s("camera_file"));
+    return "front";  // (its own camera and the scene's: the frame at z = 0, a unit a pixel)
 }
 
 bool effectCamera(const Project& p, const Sequence& seq, const Clip& c, const Effect& g, FrameTime t, double scale, ModelCamera& cam,
@@ -816,7 +831,35 @@ Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, Fram
         if (depth) depth->assign(size_t(std::max(0, w)) * size_t(std::max(0, h)), 0.0f);
         return Image(std::max(1, w), std::max(1, h));
     }
-    Image img = renderModel(scene, cam, w, h, depth);
+    // Its scene of shadows: the cards and other models seen through the same kind of camera (its settings' light takes
+    // their shadows even when it casts none itself).
+    {
+        const SceneShadows sh = sceneShadows(p, seq, t, shadowWorldOf(seq, c, c.generator, t), {}, trackLayer, &c);
+        if (sh.world) {
+            scene.shadowWorld = sh.world;
+            if (auto it = sh.ground.find(c.id); it != sh.ground.end()) scene.groundCasters = it->second;
+            if (std::lround(c.generator.p("light_kind", t - c.start, 0)) != 3)
+                for (ModelLight& l : scene.lights) l.shadows = true;
+        }
+    }
+    std::vector<float> own;
+    const FrameTime lt = t - c.start;
+    const Clip* camera = nullptr;
+    if (std::lround(c.generator.p("camera", lt, 0)) == 3 && !depth) {
+        const int named = int(std::lround(c.generator.p("camera_track", lt, 0))) - 1;
+        camera = sceneCameraClip(seq, t, named);
+        if (!camera && named >= 0) camera = sceneCameraClip(seq, t, -1);
+        CameraFocus lens;
+        if (camera && !cameraFocus(*camera, t, lens)) camera = nullptr;
+    }
+    Image img = renderModel(scene, cam, w, h, depth ? depth : camera ? &own : nullptr);
+    if (camera) {
+        // Used flat through the scene's camera with its depth of field on: blurred by its lens here, in the linear
+        // light it was drawn in (merged by depth, it is blurred with the rest where they are merged).
+        const WorkingSpaceScope linear(&linearColorSpace(Primaries::Bt709));
+        const SceneGradingScope ungraded(nullptr);
+        cameraDepthOfField(p, seq, *camera, t, scale, img, own);
+    }
     // Linear light into Rec.709 (as the other generators draw), straight then premultiplied again.
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y)

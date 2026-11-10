@@ -17,6 +17,7 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <utility>
 
@@ -1755,6 +1756,32 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     // A compositing node shared between clips (saved so) given a fresh owner id.
     for (Sequence& s : p.sequences) separateCompositeIds(p, s);
+    // Depth of field through the scene's camera is the Camera clip's (its lens's): a card seen through it with its own
+    // on gives the camera its settings (when the camera's is not on already) and leaves its own off.
+    for (Sequence& s : p.sequences)
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips)
+                for (Effect& e : c.effects) {
+                    if (e.type != "layer_3d" || std::lround(e.p("camera", 0, 3)) != 3 || e.p("depth_of_field", 0, 0) <= 0.5) continue;
+                    auto cameraOn = [&](Track& k) -> Clip* {
+                        for (Clip& x : k.clips)
+                            if (x.enabled && x.isGenerator() && x.generator.type == "camera3d" && c.start >= x.start && c.start < x.end()) return &x;
+                        return nullptr;
+                    };
+                    const long named = std::lround(e.p("camera_track", 0, 0)) - 1;
+                    Clip* camera = named >= 0 && size_t(named) < s.videoTracks.size() ? cameraOn(s.videoTracks[size_t(named)]) : nullptr;
+                    for (size_t k = s.videoTracks.size(); !camera && k-- > 0;) camera = cameraOn(s.videoTracks[k]);
+                    if (!camera) continue;
+                    Effect& g = camera->generator;
+                    if (g.p("dof", 0, 0) <= 0.5) {
+                        const double units = e.p("units_m", 0, 0);
+                        g.params["dof"] = 1.0;
+                        g.params["fstop"] = e.p("fstop", 0, 2.8);
+                        g.params["focus_distance"] = e.p("focus_distance", 0, 0);
+                        g.params["units_m"] = units > 0 ? units : 1000.0;
+                    }
+                    e.params["depth_of_field"] = 0.0;
+                }
     out = std::move(p);
     return true;
 }

@@ -730,7 +730,7 @@ std::vector<EffectInfo> buildCatalog() {
                   boolean("ground", "Shadows on a Ground", false),
                   num("ground_y", "Ground Height (y)", -100000, 100000, 0, 0.01),
                   pct("ground_strength", "Ground Shadow Strength", 0, 100, 80),
-                  boolean("depth_of_field", "Depth of Field", false),
+                  boolean("depth_of_field", "Depth of Field (through the scene's camera: the Camera clip's)", false),
                   num("focus_distance", "Focus Distance (0: the card's middle)", 0, 10000000, 0, 0.01),
                   num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
                   num("units_m", "Scene Units a Metre (0: 1000 for its own or the scene's camera, else 1)", 0, 1000000, 0, 0.001)},
@@ -1441,6 +1441,16 @@ std::vector<EffectInfo> buildCatalog() {
                          num("aim_x", "Aim X", -100000, 100000, 0, 0.01),
                          num("aim_y", "Aim Y (up)", -100000, 100000, 0, 0.01),
                          num("aim_z", "Aim Z", -100000, 100000, 0, 0.01),
+                         // Its lens's depth of field over the whole scene seen through it (render/Layer3D.h
+                         // cameraDepthOfField): a thin lens on a 36 mm wide sensor, through an aperture of blades.
+                         num("focal_length", "Focal Length (mm on a 36 mm sensor; 0: from the field of view)", 0, 2000, 0, 0.1),
+                         boolean("dof", "Depth of Field", false),
+                         num("focus_distance", "Focus Distance (0: what is at the middle)", 0, 10000000, 0, 0.01),
+                         num("fstop", "F-Stop", 0.7, 64, 2.8, 0.1),
+                         num("units_m", "Scene Units a Metre", 0.001, 1000000, 1000, 0.001),
+                         num("blades", "Aperture Blades (0: round)", 0, 12, 0, 1),
+                         num("blade_rotation", "Blade Rotation (°)", -180, 180, 0, 0.5),
+                         num("squeeze", "Anamorphic Squeeze", 1, 4, 1, 0.01),
                      },
                      {}});
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").

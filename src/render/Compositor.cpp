@@ -2536,7 +2536,24 @@ DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const 
             merge.push_back(&f);
             if (out.lowest < 0) out.lowest = int(ti);
         }
-    if (!merge.empty()) out.merged = deepLayer(mergeDeep(merge));
+    if (!merge.empty()) {
+        const DeepFrame merged = mergeDeep(merge);
+        out.merged = deepLayer(merged);
+        // Through the scene's Camera clip with its lens's depth of field on: the merged scene blurred by it, by each
+        // pixel's nearest sample's depth.
+        if (const Clip* camera = sceneCameraClip(seq, t); camera && camera->generator.p("dof", t - camera->start, 0) > 0.5) {
+            std::vector<float> depth(size_t(W) * size_t(H), 0.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float nearest = 0;
+                    const DeepSample* smp = merged.at(x, y);
+                    for (size_t k = 0; k < merged.count(x, y); ++k)
+                        if (smp[k].a > 0 && smp[k].z > 0 && (nearest <= 0 || smp[k].z < nearest)) nearest = smp[k].z;
+                    depth[size_t(y) * size_t(W) + size_t(x)] = nearest;
+                }
+            cameraDepthOfField(p, seq, *camera, t, double(W) / seq.width, out.merged, depth);
+        }
+    }
     return out;
 }
 
@@ -2631,6 +2648,10 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
     Image canvas(W, H);
     const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
+    // The cards' and models' scenes of shadows, made once for this frame (render/Layer3D.h).
+    const SceneShadowScope shadows(
+        p, seq, [&p, &seq, o](const Clip& k, FrameTime at) { return clipLayer(p, seq, k, at, o, nullptr); },
+        [&p, &seq, o](int track, FrameTime at) { return modelLayerAt(p, seq, o)(track, at); });
     bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
     auto composite = [&](Image&& layer, const std::string& mode, bool displayReferred = false) {
         if (layer.empty()) return;

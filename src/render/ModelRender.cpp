@@ -748,7 +748,7 @@ Image renderModel(const ModelScene& s, const ModelCamera& cam, int w, int h, std
     if (s.shadowWorld) {
         // One map a light for every caster in the scene, shared with the rest of it.
         for (size_t i = 0; i < s.lights.size(); ++i)
-            if (s.lights[i].kind != ModelLight::Kind::Point && nt > 0) shadows[i] = s.shadowWorld->map(s.lights[i], std::max(64, o.shadowSize), o.serial);
+            if (s.lights[i].shadows && s.lights[i].kind != ModelLight::Kind::Point && nt > 0) shadows[i] = s.shadowWorld->map(s.lights[i], std::max(64, o.shadowSize), o.serial);
         onGround.assign(s.shadowWorld->casters.size(), 0);
         for (const int k : s.groundCasters)
             if (k >= 0 && size_t(k) < onGround.size()) onGround[size_t(k)] = 1;
