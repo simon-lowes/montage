@@ -80,8 +80,9 @@ int64_t findClick(const float* samples, int64_t n, int stride = 1, float floor =
 
 // Places a recording's blocks on the timeline. Clocked (a playback to follow): blocks are passed over until one knows
 // its timeline sample, and the take starts at `start` from there (silence first where that block is later, the frames
-// before `start` passed over where it is earlier), and a later block more than a block away from where the one before
-// ended (frames lost to an input overflow) is placed by its own sample again. Unclocked: the first `fallback` frames
+// before `start` passed over where it is earlier), and a later block more than a block (and at most two seconds) past
+// where the take has reached (frames lost to an input overflow) is placed by its own sample again; a jump back, or
+// further on, carries the take on from there. Unclocked: the first `fallback` frames
 // (what arrived late from before the take began) are passed over and the rest kept as they come.
 class TakeAligner {
 public:
@@ -94,7 +95,7 @@ public:
     bool started() const { return started_; }
 
 private:
-    int64_t start_, fallback_, skip_ = 0, next_ = 0;  // (next_: where the block after the last one placed should start)
+    int64_t start_, fallback_, skip_ = 0, next_ = 0;  // (next_: the timeline sample the take has reached)
     bool clocked_, started_ = false, placed_ = false;
 };
 

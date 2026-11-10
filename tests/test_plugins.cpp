@@ -2574,15 +2574,27 @@ private slots:
         QCOMPARE(st.silence, int64_t(0));
         QCOMPARE(early.next(1212, 256).skip, 0);
         // After an input overflow (a kilosample lost), the rest lands where its blocks say, not early; a few samples'
-        // jitter is kept as it comes; frames come twice are passed over.
+        // jitter is kept as it comes.
         QCOMPARE(early.next(1468 + 1024, 256).silence, int64_t(1024));
         st = early.next(2748 + 10, 256);
         QCOMPARE(st.silence, int64_t(0));
         QCOMPARE(st.skip, 0);
+        // A jump back (the playback looped, or frames came twice) carries the take on from there: nothing passed over.
         st = early.next(3014 - 600, 256);
-        QCOMPARE(st.skip, 256);
-        QCOMPARE(early.next(2670, 256).skip, 256);
-        QCOMPARE(early.next(2926, 256).skip, 88);
+        QCOMPARE(st.skip, 0);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(early.next(2670, 256).skip, 0);
+        QCOMPARE(early.next(2926, 256).silence, int64_t(0));
+        // A hundred frames lost a block add up: kept twice (within a block), made up on the third.
+        QCOMPARE(early.next(3182 + 100, 256).silence, int64_t(0));
+        QCOMPARE(early.next(3538 + 100, 256).silence, int64_t(0));
+        QCOMPARE(early.next(3894 + 100, 256).silence, int64_t(300));
+        QCOMPARE(early.next(4250, 256).silence, int64_t(0));
+        // Moved on by more than two seconds (a seek): no minute of silence, the take goes on from there.
+        st = early.next(4506 + 480000, 256);
+        QCOMPARE(st.silence, int64_t(0));
+        QCOMPARE(st.skip, 0);
+        QCOMPARE(early.next(4762 + 480000, 256).silence, int64_t(0));
         // Unclocked, the input's latency is taken off its start.
         audiodev::TakeAligner loose(0, false, 300);
         QCOMPARE(loose.next(-1, 256).skip, 256);

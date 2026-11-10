@@ -893,11 +893,26 @@ struct McpServer::Impl {
     std::mutex outputsMutex;
     std::condition_variable outputsFree;
     std::multiset<QString> outputsInUse;
-    static QStringList outputsOf(const QJsonObject& a) {
+    // The paths a call's arguments name (path, file, folder, output, report, any *_path, *_file, *_folder, *_dir,
+    // *_output or *_report, and lists of them): of a read-only tool only what it writes (output and report), so
+    // read-only calls on one project or file still run side by side.
+    static QStringList outputsOf(const QJsonObject& a, bool writesOnly = false) {
         QStringList out;
-        for (const char* key : {"path", "output", "file", "report", "folder"}) {
-            const QString v = a.value(QLatin1String(key)).toString();
-            if (!v.isEmpty()) out << QDir::cleanPath(absolute(v));
+        const auto named = [writesOnly](const QString& k) {
+            static const char* const writes[] = {"output", "report"};
+            static const char* const reads[] = {"path", "file", "folder", "files", "paths", "dir"};
+            for (const char* w : writes)
+                if (k == QLatin1String(w) || k.endsWith(QLatin1Char('_') + QLatin1String(w))) return true;
+            if (writesOnly) return false;
+            for (const char* r : reads)
+                if (k == QLatin1String(r) || k.endsWith(QLatin1Char('_') + QLatin1String(r))) return true;
+            return false;
+        };
+        for (auto it = a.begin(); it != a.end(); ++it) {
+            if (!named(it.key())) continue;
+            const QJsonArray list = it.value().isArray() ? it.value().toArray() : QJsonArray{it.value()};
+            for (const QJsonValue& v : list)
+                if (v.isString() && !v.toString().isEmpty()) out << QDir::cleanPath(absolute(v.toString()));
         }
         out.removeDuplicates();
         return out;
@@ -1054,6 +1069,7 @@ struct McpServer::Impl {
         job->args = args;
         job->sideBySide = runsSideBySide(tool);
         job->resumedFrom = resumedFrom;
+        bool prune = false;
         {
             std::lock_guard l(jobsMutex);
             if (jobQueue.size() >= kMaxQueuedJobs) return nullptr;
@@ -1064,8 +1080,12 @@ struct McpServer::Impl {
             jobQueue.push_back(job);
             spawnWorkers();
             jobsWake.notify_all();
-            if (jobsMade % 64 == 0) pruneJobs();
+            prune = jobsMade % 64 == 0;
+            if (prune) pruneJobs();
         }
+        // (and the store's finished calls, as montage-cli mcp prunes them when it starts: the GUI's link never starts
+        // so. Outside the lock: it reads every job's folder.)
+        if (prune) jobs::prune(QStringLiteral("mcp"), 200);
         persist(*job, true);
         return job;
     }
@@ -1089,8 +1109,6 @@ struct McpServer::Impl {
         std::sort(unread.begin(), unread.end(), byAge);
         for (size_t i = 0; i + 200 < read.size(); ++i) jobs.erase(read[i]);
         for (size_t i = 0; i + 10000 < unread.size(); ++i) jobs.erase(unread[i]);
-        // (and the store's finished calls, as montage-cli mcp prunes them when it starts: the GUI's link never starts so)
-        jobs::prune(QStringLiteral("mcp"), 200);
     }
 
     // Worker `index` (of atOnce): takes the next call when its turn has come. One that runs side by side holds the tool
@@ -1126,7 +1144,8 @@ struct McpServer::Impl {
             if (job->sideBySide) shared.lock();
             else alone.lock();
             OutputClaim outputs;
-            const bool claimed = !job->sideBySide || claimOutputs(outputs, outputsOf(job->args), job->cancel);
+            const bool claimed = !job->sideBySide || tool == tools.end() ||
+                                 claimOutputs(outputs, outputsOf(job->args, tool->readOnly), job->cancel);
             {
                 std::lock_guard jl(job->m);
                 if (!claimed || job->cancel || tool == tools.end()) {

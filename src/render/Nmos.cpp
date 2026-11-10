@@ -1590,9 +1590,10 @@ struct Node::Mdns {
     int queries = 0;
     std::function<void(std::vector<Registry>)> browsed;
     // The local links (RFC 6762 11: only a sender on one of them is heard), and when the Node last answered to the
-    // group (once a second at most, as 6.2 has it).
+    // group (once a second at most, as 6.2 has it; a query sooner has its answer due when the second is up).
     std::vector<std::pair<QHostAddress, int>> links;
     QElapsedTimer answered;
+    bool answerDue = false;
     bool onLink(const QHostAddress& from) const {
         QHostAddress a = from;
         bool v4 = false;
@@ -1699,9 +1700,21 @@ void Node::startMdns() {
                 // A query for the Node: answered to the group, and straight back to a querier not on port 5353 (a
                 // one-shot query, RFC 6762's legacy unicast: its id and questions with the answer).
                 if (d.senderPort() == kMdnsPort) {
-                    if (md.answered.isValid() && md.answered.elapsed() < 1000) continue;
-                    md.answered.start();
-                    announceNode();
+                    // (once a second at most: a query sooner is answered when the second is up, one answer for all
+                    // asked meanwhile)
+                    const qint64 wait = md.answered.isValid() ? 1000 - md.answered.elapsed() : 0;
+                    if (wait <= 0) {
+                        md.answered.start();
+                        announceNode();
+                    } else if (!md.answerDue) {
+                        md.answerDue = true;
+                        QTimer::singleShot(std::chrono::milliseconds(wait), md.socket, [this] {
+                            if (!mdns_ || !mdns_->socket || stopping_) return;
+                            mdns_->answerDue = false;
+                            mdns_->answered.start();
+                            announceNode();
+                        });
+                    }
                 } else {
                     QByteArray srv;
                     put16(srv, 0), put16(srv, 0), put16(srv, quint16(md.port));

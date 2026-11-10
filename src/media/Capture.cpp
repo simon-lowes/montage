@@ -244,10 +244,13 @@ namespace {
 
 // Packets waiting beyond this many bytes: pictures are dropped (whole runs, to the next keyframe) until it halves.
 // A recording waits a long way behind before it lets a picture go; a feed only watched (a multiviewer tile) keeps up
-// with the feed instead, a few seconds of it at most.
+// with the feed instead, a few seconds of it at most (and never fewer than four of its pictures: an uncompressed UHD
+// picture alone is more than the 32 MB).
 constexpr int64_t kQueueBytes = int64_t(512) << 20;
 constexpr int64_t kWatchQueueBytes = int64_t(32) << 20;
-int64_t queueLimit(const Recorder::State* s) { return s->settings.path.empty() ? kWatchQueueBytes : kQueueBytes; }
+int64_t queueLimit(const Recorder::State* s, int64_t picture = 0) {
+    return s->settings.path.empty() ? std::max(kWatchQueueBytes, 4 * picture) : kQueueBytes;
+}
 
 struct Interrupt {
     Recorder::State* s;
@@ -317,10 +320,10 @@ AVCodecContext* openDecoder(AVStream* st, std::string* error, bool watchOnly = f
     AVCodecContext* c = avcodec_alloc_context3(dec);
     avcodec_parameters_to_context(c, st->codecpar);
     c->pkt_timebase = st->time_base;
-    // As many threads as there are cores, so HD and UHD feeds keep up; a watched feed (one tile of many) takes a few,
-    // and only slice threads, which add no delay.
+    // As many threads as there are cores, so HD and UHD feeds keep up; a watched feed (one tile of many) takes a few.
+    // (Frame threads too: most feeds are coded without slices, and a UHD one on one thread falls behind.)
     c->thread_count = watchOnly ? 4 : 0;
-    c->thread_type = watchOnly ? FF_THREAD_SLICE : FF_THREAD_FRAME | FF_THREAD_SLICE;
+    c->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     if (const int err = avcodec_open2(c, dec, nullptr); err < 0) {
         if (error) *error = "Cannot decode the feed: " + avError(err);
         avcodec_free_context(&c);
@@ -1414,7 +1417,7 @@ void Recorder::run() {
                         item.st2110 = f;
                         item.arrived = captureClockNow();
                         std::lock_guard lock(s->qm);
-                        if (s->queuedBytes > queueLimit(s)) {
+                        if (s->queuedBytes > queueLimit(s, itemBytes(item))) {
                             // (the sound kept, as for other feeds: the picture let go)
                             f->picture = {};
                             if (f->audio.empty()) continue;
@@ -1455,7 +1458,7 @@ void Recorder::run() {
                         item.omt = f;
                         item.arrived = captureClockNow();
                         std::lock_guard lock(s->qm);
-                        if (f->header.type == omt::Video && s->queuedBytes > queueLimit(s)) continue;
+                        if (f->header.type == omt::Video && s->queuedBytes > queueLimit(s, itemBytes(item))) continue;
                         s->queuedBytes += itemBytes(item);
                         s->queue.push_back(item);
                         s->qc.notify_all();
@@ -1503,8 +1506,9 @@ void Recorder::run() {
                     std::lock_guard lock(s->qm);
                     if (p->stream_index == in.videoStream) {
                         // Falling behind: pictures dropped, whole runs to the next keyframe (sound never).
-                        if (s->queuedBytes > queueLimit(s)) dropping = true;
-                        else if (dropping && s->queuedBytes < queueLimit(s) / 2 && (p->flags & AV_PKT_FLAG_KEY)) dropping = false;
+                        const int64_t limit = queueLimit(s, p->size);
+                        if (s->queuedBytes > limit) dropping = true;
+                        else if (dropping && s->queuedBytes < limit / 2 && (p->flags & AV_PKT_FLAG_KEY)) dropping = false;
                         if (dropping) {
                             av_packet_free(&item.packet);
                             continue;

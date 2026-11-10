@@ -17517,6 +17517,31 @@ colorspaces:
         QVERIFY(!announced.registries().empty());
         QCOMPARE(announced.registries()[0].url, QStringLiteral("http://127.0.0.1:18235"));
         QCOMPARE(announced.registries()[0].priority, 10);
+
+        // Queries from port 5353 a moment apart, answered to the group: the first at once, the next ones together
+        // when the second is up (RFC 6762 6.2), not dropped.
+        QTest::qWait(2500);  // (the start's announcements over)
+        while (registry.hasPendingDatagrams()) registry.receiveDatagram();
+        const auto answers = [&](int ms) {
+            int n = 0;
+            QElapsedTimer w;
+            w.start();
+            while (w.elapsed() < ms) {
+                QTest::qWait(20);
+                while (registry.hasPendingDatagrams()) {
+                    const QByteArray d = registry.receiveDatagram().data();
+                    if (d.size() >= 12 && (uchar(d[2]) & 0x80) && d.contains(name)) ++n;
+                }
+            }
+            return n;
+        };
+        const QHostAddress group(QStringLiteral("224.0.0.251"));
+        registry.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
+        QCOMPARE(answers(300), 1);
+        registry.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
+        registry.writeDatagram(query(QStringLiteral("_nmos-node._tcp.local"), 12), group, 5353);
+        QCOMPARE(answers(250), 0);
+        QCOMPARE(answers(1200), 1);
         announced.stop();
     }
 

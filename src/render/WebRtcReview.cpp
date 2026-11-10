@@ -79,38 +79,6 @@ std::vector<std::string> reviewCertificateHosts() {
     return out;
 }
 
-#ifndef MONTAGE_WITH_WEBRTC
-
-bool makeReviewCertificate(const std::vector<std::string>&, std::string&, std::string&, std::string* error) {
-    if (error) *error = "This build of Montage has no WebRTC (libdatachannel and OpenSSL)";
-    return false;
-}
-
-struct BrowserReviewBackend::Impl {
-    StreamSettings settings;
-};
-
-BrowserReviewBackend::BrowserReviewBackend() : d_(std::make_unique<Impl>()) {}
-BrowserReviewBackend::~BrowserReviewBackend() = default;
-bool BrowserReviewBackend::available(std::string* why) {
-    if (why) *why = "This build of Montage has no WebRTC (libdatachannel and OpenSSL)";
-    return false;
-}
-std::vector<Device> BrowserReviewBackend::devices() { return {}; }
-void BrowserReviewBackend::setSettings(const StreamSettings& s) { d_->settings = s; }
-StreamSettings BrowserReviewBackend::settings() const { return d_->settings; }
-void BrowserReviewBackend::setSequence(Id) {}
-bool BrowserReviewBackend::open(const Device&, const Mode&, const Signal&, int, int, std::string* error) { return available(error); }
-bool BrowserReviewBackend::send(const VideoFrame&, const Audio&) { return false; }
-void BrowserReviewBackend::close() {}
-void BrowserReviewBackend::wake() {}
-int BrowserReviewBackend::receivers() { return 0; }
-ReviewStats BrowserReviewBackend::stats() const { return {}; }
-std::vector<RemoteMarker> BrowserReviewBackend::takeMarkers() { return {}; }
-std::vector<ReviewPointer> BrowserReviewBackend::pointers() const { return {}; }
-
-#else
-
 int RungSteering::report(int rung, int last, double loss, Clock::time_point at, Clock::time_point now,
                          const std::function<bool(int)>& tooBig, const std::function<bool(int)>& usable) {
     using std::chrono::milliseconds;
@@ -153,6 +121,38 @@ void RungSteering::switched(Clock::time_point now) {
     nextTry = std::max(nextTry, now + hold);
     if (trying) triedAt = now;
 }
+
+#ifndef MONTAGE_WITH_WEBRTC
+
+bool makeReviewCertificate(const std::vector<std::string>&, std::string&, std::string&, std::string* error) {
+    if (error) *error = "This build of Montage has no WebRTC (libdatachannel and OpenSSL)";
+    return false;
+}
+
+struct BrowserReviewBackend::Impl {
+    StreamSettings settings;
+};
+
+BrowserReviewBackend::BrowserReviewBackend() : d_(std::make_unique<Impl>()) {}
+BrowserReviewBackend::~BrowserReviewBackend() = default;
+bool BrowserReviewBackend::available(std::string* why) {
+    if (why) *why = "This build of Montage has no WebRTC (libdatachannel and OpenSSL)";
+    return false;
+}
+std::vector<Device> BrowserReviewBackend::devices() { return {}; }
+void BrowserReviewBackend::setSettings(const StreamSettings& s) { d_->settings = s; }
+StreamSettings BrowserReviewBackend::settings() const { return d_->settings; }
+void BrowserReviewBackend::setSequence(Id) {}
+bool BrowserReviewBackend::open(const Device&, const Mode&, const Signal&, int, int, std::string* error) { return available(error); }
+bool BrowserReviewBackend::send(const VideoFrame&, const Audio&) { return false; }
+void BrowserReviewBackend::close() {}
+void BrowserReviewBackend::wake() {}
+int BrowserReviewBackend::receivers() { return 0; }
+ReviewStats BrowserReviewBackend::stats() const { return {}; }
+std::vector<RemoteMarker> BrowserReviewBackend::takeMarkers() { return {}; }
+std::vector<ReviewPointer> BrowserReviewBackend::pointers() const { return {}; }
+
+#else
 
 namespace {
 

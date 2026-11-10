@@ -31,10 +31,12 @@ struct Link {
         }
         if (attached && host) --host->instances;
     }
-    // Room for `bytes` in the arena (a new, larger block when needed; the host maps it at its next look).
+    // Room for `bytes` in the arena (a new, larger block when needed; the host maps it at its next look). A quarter
+    // more than asked, not twice: the block's pages are all reserved when it is made, the old one's until it goes.
     bool room(size_t bytes, std::string* error = nullptr) {
         if (arena && arena->size() >= bytes) return true;
-        const size_t size = std::max(bytes, arena ? arena->size() * 2 : size_t(16) << 20);
+        const size_t ahead = std::max(bytes + bytes / 4, arena ? arena->size() + arena->size() / 4 : size_t(0));
+        const size_t size = std::max(ahead, size_t(16) << 20);
         auto next = ipc::SharedMemory::create(ipc::uniqueName("a"), size, error);
         if (!next && size > bytes) next = ipc::SharedMemory::create(ipc::uniqueName("a"), bytes, error);  // (no room to grow ahead)
         if (!next) return false;
