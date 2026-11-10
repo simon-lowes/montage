@@ -3,7 +3,7 @@
 # shell. Twice: with colour management on and the output driven as BT.2100 PQ (BT.2020, reference white 203 nits, a
 # 1000-nit target), where test_app's hdrViewerOnWayland checks the surface's description in Weston's protocol log,
 # its 10-bit buffers and the PQ codes in Weston's screenshot; then with colour management off, where the viewer stays
-# SDR and says why. A skipped test fails the check.
+# SDR and says why. A skipped test fails the check, and so does a Weston that died or did not stop cleanly.
 #
 #   scripts/wayland-hdr-check.sh <weston prefix> <test_app> <work directory>
 set -euo pipefail
@@ -54,9 +54,13 @@ EOF
   fi
   local socket="montage-hdr-$name"
   # (Weston's own libraries from its prefix; the test runs with the system's)
+  # --fake-seat: the headless backend has no seat without it, and Weston 16.0.2's kiosk shell forgets a closed window
+  # only through its seat's focus: with none, the output keeps pointing at the freed window (desktop_surface_removed
+  # in kiosk-shell.c) and Weston crashes when the next window is mapped, as the test's viewer is after the main window
+  # is hidden. Desktops always have a seat.
   LD_LIBRARY_PATH="$weston_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$weston_prefix/bin/weston" \
-    --backend=headless --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" --config="$dir/weston.ini" \
-    --debug --log="$dir/weston.log" --logger-scopes=log,proto &
+    --backend=headless --fake-seat --renderer=gl --width=1280 --height=720 --shell=kiosk --socket="$socket" \
+    --config="$dir/weston.ini" --debug --log="$dir/weston.log" --logger-scopes=log,proto &
   weston=$!
   local i
   for i in $(seq 100); do
@@ -84,15 +88,31 @@ EOF
     grep '^SKIP' -A1 "$dir/result.txt"
     status=1
   fi
+  # Weston must have lived through the test (a test that passes beside a dead compositor proved nothing), and stop
+  # when asked, with nothing wrong to report.
+  local ended=0
+  sleep 1  # (the test's connection closed and taken in: Weston says itself that it stops badly with windows open)
+  if kill -0 "$weston" 2> /dev/null; then
+    kill "$weston" 2> /dev/null || true
+    wait "$weston" 2> /dev/null || ended=$?
+    if [ "$ended" != 0 ]; then
+      echo "Weston did not stop cleanly with colour management $cm (status $ended)" >&2
+      status=1
+    fi
+  else
+    wait "$weston" 2> /dev/null || ended=$?
+    echo "Weston died during the test with colour management $cm (status $ended)" >&2
+    status=1
+  fi
+  weston=""
   if [ "$status" != 0 ]; then
     echo "hdrViewerOnWayland failed with colour management $cm; Weston's log:" >&2
     grep -v ' -> \| client ' "$dir/weston.log" | tail -80 >&2 || true
     grep -E 'color|image_description|create_buffer|create_immed|\.create\(' "$dir/weston.log" | tail -60 >&2 || true
+    echo "The last of Weston's protocol log:" >&2
+    grep -v 'wl_registry@.*global(\|wl_shm@.*format(' "$dir/weston.log" | tail -40 >&2 || true
     failed=1
   fi
-  kill "$weston" 2> /dev/null || true
-  wait "$weston" 2> /dev/null || true
-  weston=""
 }
 
 run on true

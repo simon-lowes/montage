@@ -21159,7 +21159,7 @@ print("added " + ui["name"])
             QCOMPARE(viewer.hdrHeadroom(), 1.0);
             return;
         }
-        QTRY_VERIFY_WITH_TIMEOUT(viewer.hdrShowing(), 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(viewer.hdrShowing(), qPrintable(viewer.hdrStatus()), 10000);  // (why not, if it is not)
         QVERIFY2(viewer.hdrStatus().isEmpty(), qPrintable(viewer.hdrStatus()));
         HdrSurface* surface = viewer.hdrSurface();
         QVERIFY(surface);
