@@ -1115,7 +1115,7 @@ private slots:
             QVERIFY(here->activate(48000, 512) && there->activate(48000, 512));
             QCOMPARE(there->latencySamples(), here->latencySamples());
             // A short delay (AUDelay's time, in seconds), so its echoes fall inside the test.
-            for (const ParamInfo& p : here->parameters())
+            for (const auto& p : here->parameters())
                 if (QString::fromStdString(p.name).contains("time", Qt::CaseInsensitive)) {
                     here->setParameter(p.id, 0.02);
                     there->setParameter(p.id, 0.02);
