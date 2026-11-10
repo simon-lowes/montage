@@ -13166,6 +13166,70 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void groupPunchInRecordsEveryTrack() {
+        // A punch-in on a grouped track records every track of the group (record switch on): one input channel each,
+        // a mono file each, placed at the same frame and the same samples, in one undo step.
+        state()->newProject();
+        QVERIFY(QDir().mkpath(dir_.path() + "/grouppunch"));  // (its takes in a folder of their own)
+        QVERIFY(state()->save(dir_.path() + "/grouppunch/grouppunch.montage"));
+        QVERIFY(state()->apply("Group", [](Project& p, Sequence& s) {
+            return edit::createTrackGroup(p, s, "Choir", {{TrackKind::Audio, 0}, {TrackKind::Audio, 1}, {TrackKind::Audio, 2}});
+        }));
+        const size_t before = state()->sequence()->audioTracks[0].clips.size() + state()->sequence()->audioTracks[1].clips.size() +
+                              state()->sequence()->audioTracks[2].clips.size();
+        auto value = [](qint64 i, int ch) { return float(i % 4801) / 4801.0f * 0.25f + 0.2f * float(ch); };
+        VoiceoverRecorder rec(state());
+        QVERIFY(rec.start(100, 1, 130, {}, false, 48000, 1));  // (from A2, the group's middle track)
+        std::vector<float> block(4800 * 3);
+        qint64 at = 0;
+        for (int b = 0; b < 15; ++b, at += 4800) {
+            for (qint64 i = 0; i < 4800; ++i)
+                for (int ch = 0; ch < 3; ++ch) block[size_t(i * 3 + ch)] = value(at + i, ch);
+            rec.feed(block.data(), 4800);
+        }
+        QTRY_VERIFY(!rec.isRecording());
+        const Sequence& s = *state()->sequence();
+        // A2 (the target) takes the first channel, then A1 and A3 in order.
+        const int channelOf[3] = {1, 0, 2};
+        std::vector<QString> files;
+        for (int t = 0; t < 3; ++t) {
+            const Clip* c = edit::clipAt(s, {TrackKind::Audio, t}, 110);
+            QVERIFY2(c, qPrintable(QStringLiteral("no clip on A%1").arg(t + 1)));
+            QCOMPARE(c->start, FrameTime(100));
+            QVERIFY(std::abs(c->duration - 30) <= 1);
+            const MediaItem* m = state()->project().findMedia(c->mediaId);
+            QVERIFY(m && m->bin == "Voiceover");
+            files.push_back(QString::fromStdString(m->path));
+            QFile f(files.back());
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            f.seek(44);
+            const QByteArray data = f.readAll();
+            QCOMPARE(qint64(data.size() / 4), qint64(48000));  // (mono: a second, Out included, on every track)
+            const float* x = reinterpret_cast<const float*>(data.constData());
+            for (qint64 i : {qint64(0), qint64(1), qint64(24000), qint64(47999)}) QCOMPARE(x[i], value(i, channelOf[t]));
+        }
+        QCOMPARE(QFileInfo(files[1]).fileName(), QString("Sequence 1 VO 1 A2.wav"));
+        QVERIFY(!QFileInfo::exists(dir_.path() + "/grouppunch/Voiceover/Sequence 1 VO 1.wav"));  // (the take's channels are in the three)
+        QCOMPARE(rec.lastTake(), files[1]);
+        // One undo takes all three away.
+        state()->undo();
+        size_t after = 0;
+        for (int t = 0; t < 3; ++t) after += state()->sequence()->audioTracks[size_t(t)].clips.size();
+        QCOMPARE(after, before);
+        // A track out of the group records alone.
+        QVERIFY(state()->apply("Ungroup", [](Project&, Sequence& s) {
+            s.audioTracks[2].group = 0;
+            return edit::Result{};
+        }));
+        QVERIFY(rec.start(200, 2, -1, {}, false, 48000, 1));
+        std::vector<float> mono(4800, 0.25f);
+        for (int b = 0; b < 10; ++b) rec.feed(mono.data(), 4800);
+        QVERIFY(rec.stop());
+        QVERIFY(edit::clipAt(*state()->sequence(), {TrackKind::Audio, 2}, 205));
+        QVERIFY(!edit::clipAt(*state()->sequence(), {TrackKind::Audio, 0}, 205) && !edit::clipAt(*state()->sequence(), {TrackKind::Audio, 1}, 205));
+        state()->newProject();
+    }
+
     void groupLoopRecordingComp() {
         state()->newProject();
         QVERIFY(state()->save(dir_.path() + "/grouploop.montage"));

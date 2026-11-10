@@ -140,7 +140,7 @@ bool writeFloatWav(const std::string& path, const float* interleaved, int64_t fr
 
 std::vector<std::string> splitLoopRecording(const std::string& path, double preroll, double length, int sampleRate,
                                             const std::string& folder, const std::string& stem, std::vector<bool>* complete,
-                                            std::string* error) {
+                                            std::string* error, int channel) {
     std::vector<std::string> out;
     if (complete) complete->clear();
     auto fail = [&](const std::string& why) {
@@ -149,8 +149,17 @@ std::vector<std::string> splitLoopRecording(const std::string& path, double prer
     };
     if (!(length > 0)) return fail("The loop needs an In and an Out");
     std::string err;
-    const AudioBufferPtr sound = decodeAudio(path, sampleRate, &err);
+    AudioBufferPtr sound = channel >= 0 ? decodeAudio(path, sampleRate, &err, nullptr, {channel}) : decodeAudio(path, sampleRate, &err);
     if (!sound) return fail(err.empty() ? "Cannot read " + path : err);
+    if (channel >= 0 && sound->channels > 1) {
+        // (one channel alone comes as both sides: its left kept)
+        auto mono = std::make_shared<AudioBuffer>();
+        mono->sampleRate = sound->sampleRate;
+        mono->channels = 1;
+        mono->samples.resize(size_t(sound->frames()));
+        for (int64_t i = 0; i < sound->frames(); ++i) mono->samples[size_t(i)] = sound->samples[size_t(i) * size_t(sound->channels)];
+        sound = mono;
+    }
     const std::vector<LoopPass> passes =
         loopPasses(sound->frames(), std::llround(preroll * sampleRate), length * sampleRate, sampleRate);
     if (std::none_of(passes.begin(), passes.end(), [](const LoopPass& p) { return p.complete; }))

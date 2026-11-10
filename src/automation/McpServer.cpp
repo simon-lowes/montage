@@ -6378,7 +6378,7 @@ void McpServer::Impl::addTools() {
             "rating":{"type":"integer"},"name":{"type":"string"},"shown":{"type":"boolean"},
             "version":{"type":"string","enum":["new","switch","rename","delete"]},"index":{"type":"integer"},"empty":{"type":"boolean"},
             "line":{"type":"string","description":"suggest: the words the take should say"},
-            "group":{"type":"boolean","default":true,"description":"comp, rate and suggest act on the track's group (montage_track) when its comp switch is on; false for this track alone"},
+            "group":{"type":"boolean","default":true,"description":"comp, rate and suggest act on the track's group (montage_track) when its comp switch is on, record when its record switch is on (a channel of the file a track); false for this track alone"},
             "apply":{"type":"boolean","default":false,"description":"suggest: give the suggested take's from..to to the comp (on the group)"}},"required":["project","action"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -6471,14 +6471,35 @@ void McpServer::Impl::addTools() {
                 if (in < 0 || out <= in) return fail(QStringLiteral("record needs in and out (or the sequence's In and Out)"));
                 std::vector<bool> complete;
                 std::string err;
-                const std::vector<std::string> passes = splitLoopRecording(
-                    file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
-                    (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), QFileInfo(file).completeBaseName().toStdString() + " pass ",
-                    &complete, &err);
-                if (passes.empty()) return fail(QString::fromStdString(err));
-                std::vector<Id> media;
-                for (const std::string& f : passes) media.push_back(mediaFor(l.project, QString::fromStdString(f)));
-                r = edit::addLoopTakes(l.project, s, track, media, complete, in, out);
+                // Record arming through the track's group: every grouped track records, a channel of the file each
+                // (this track the first, the others in order), their passes recorded together.
+                std::vector<TrackRef> tracks;
+                if (grouped)
+                    for (TrackRef t : groupTracks(s, track, GroupSwitch::Record))
+                        if (t.kind == TrackKind::Audio) tracks.push_back(t);
+                if (tracks.size() < 2) tracks = {track};
+                int channels = 1;
+                if (tracks.size() > 1) {
+                    MediaItem probed;
+                    std::string why;
+                    if (!probeMedia(file.toStdString(), probed, &why)) return fail(QString::fromStdString(why));
+                    channels = std::max(1, probed.channels);
+                }
+                std::vector<std::vector<Id>> media;
+                for (size_t t = 0; t < tracks.size(); ++t) {
+                    const Track& tr = *trackAt(s, tracks[t]);
+                    const std::string stem = QFileInfo(file).completeBaseName().toStdString() +
+                                             (tracks.size() > 1 ? " " + (tr.name.empty() ? "A" + std::to_string(tracks[t].index + 1) : tr.name) : std::string()) + " pass ";
+                    const std::vector<std::string> passes = splitLoopRecording(
+                        file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
+                        (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), stem, &complete, &err,
+                        tracks.size() > 1 ? int(t) % channels : -1);
+                    if (passes.empty()) return fail(QString::fromStdString(err));
+                    media.emplace_back();
+                    for (const std::string& f : passes) media.back().push_back(mediaFor(l.project, QString::fromStdString(f)));
+                }
+                r = tracks.size() > 1 ? edit::addGroupLoopTakes(l.project, s, tracks, media, complete, in, out)
+                                      : edit::addLoopTakes(l.project, s, track, media.front(), complete, in, out);
             } else if (action == "comp") {
                 // On the grouped tracks too (their lanes of the same pass, over the same frames).
                 const FrameTime from = timeArg(a.value("from"), s, "from"), to = timeArg(a.value("to"), s, "to");

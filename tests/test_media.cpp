@@ -36,6 +36,7 @@
 #include <QMatrix4x4>
 #include <QTextStream>
 #include <QVector3D>
+#include <QDataStream>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
@@ -15178,6 +15179,86 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
         QVERIFY(loadProject(project.toStdString(), back));
         QVERIFY(back.active()->audioTracks[0].effects.empty());
+    }
+
+    void mcpGroupRecordTakesEveryTrack() {
+        // montage_takes record on a track whose group records together: a three-channel loop recording gives each
+        // grouped track its own channel's passes (mono, at the same samples, one pass id across the tracks); with
+        // group false the track records alone.
+        const int rate = 48000;
+        Project p = makeDefaultProject();
+        while (p.active()->audioTracks.size() < 3) edit::addTrack(p, *p.active(), TrackKind::Audio);
+        const QString project = QString::fromStdString(path("grouprecord.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        auto value = [](int64_t i, int ch) { return float(i % 9001) / 9001.0f * 0.25f + 0.2f * float(ch); };
+        const int64_t frames = int64_t(rate) * 9 / 2 + rate * 3 / 10;  // (half a second's preroll, two passes of 2 s, a little more)
+        const std::string file = path("trio-loop.wav");
+        {
+            std::vector<float> x(size_t(frames) * 3);
+            for (int64_t i = 0; i < frames; ++i)
+                for (int ch = 0; ch < 3; ++ch) x[size_t(i * 3 + ch)] = value(i, ch);
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QDataStream out(&f);
+            out.setByteOrder(QDataStream::LittleEndian);
+            const quint32 bytes = quint32(x.size() * 4);
+            f.write("RIFF");
+            out << quint32(36 + bytes);
+            f.write("WAVEfmt ");
+            out << quint32(16) << quint16(3) << quint16(3) << quint32(rate) << quint32(rate * 12) << quint16(12) << quint16(32);
+            f.write("data");
+            out << bytes;
+            f.write(reinterpret_cast<const char*>(x.data()), qint64(bytes));
+        }
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call("montage_track", {{"project", project}, {"tracks", QJsonArray{"A1", "A2", "A3"}}, {"group", "Trio"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_takes", {{"project", project}, {"track", "A3"}, {"action", "record"}, {"file", QString::fromStdString(file)},
+                                   {"in", 1}, {"out", 3}, {"preroll", 0.5}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        // A3 (the target) takes the first channel, then A1 and A2.
+        const int channelOf[3] = {1, 2, 0};
+        for (int t = 0; t < 3; ++t) {
+            const Track& tr = q.active()->audioTracks[size_t(t)];
+            QCOMPARE(tr.lanes.size(), size_t(2));
+            QCOMPARE(tr.clips.size(), size_t(1));  // (the last whole pass comped)
+            for (size_t k = 0; k < 2; ++k) {
+                QCOMPARE(tr.lanes[k].pass, q.active()->audioTracks[0].lanes[k].pass);
+                QCOMPARE(tr.lanes[k].start, FrameTime(30));
+                const MediaItem* m = q.findMedia(tr.lanes[k].mediaId);
+                QVERIFY(m);
+                // (read as written, a mono float WAV: its 44-byte header, then the samples)
+                QFile f(QString::fromStdString(m->path));
+                QVERIFY(f.open(QIODevice::ReadOnly));
+                QCOMPARE(m->channels, 1);
+                f.seek(44);
+                const QByteArray data = f.readAll();
+                QCOMPARE(qint64(data.size() / 4), qint64(2 * rate));
+                const float* got = reinterpret_cast<const float*>(data.constData());
+                const int64_t first = rate / 2 + int64_t(k) * 2 * rate;
+                for (int64_t i : {int64_t(0), int64_t(1), int64_t(rate), int64_t(2 * rate - 1)}) QCOMPARE(got[i], value(first + i, channelOf[t]));
+            }
+        }
+        QVERIFY(q.active()->audioTracks[0].lanes[0].pass != q.active()->audioTracks[0].lanes[1].pass);
+        // With group false: A3 alone (its two new lanes the file's stereo mix).
+        r = call("montage_takes", {{"project", project}, {"track", "A3"}, {"action", "record"}, {"file", QString::fromStdString(file)},
+                                   {"in", 1}, {"out", 3}, {"preroll", 0.5}, {"group", false}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        QCOMPARE(q.active()->audioTracks[2].lanes.size(), size_t(4));
+        QCOMPARE(q.active()->audioTracks[0].lanes.size(), size_t(2));
+        QCOMPARE(q.active()->audioTracks[1].lanes.size(), size_t(2));
     }
 
     void mcpTrackGroupsAndColours() {
