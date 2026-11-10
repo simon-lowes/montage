@@ -73,6 +73,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [OpenFX](https://github.com/AcademySoftwareFoundation/openfx) headers | BSD-3-Clause | [third_party/openfx/LICENSE](third_party/openfx/LICENSE) |
 | Blackmagic DeckLink SDK 12.0 headers | Blackmagic Design's header licence | [third_party/decklink/LICENSE](third_party/decklink/LICENSE) |
 | NDI SDK 6 headers | MIT (these files only) | [third_party/ndi/LICENSE](third_party/ndi/LICENSE) |
+| [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols)' color-management-v1 (1.41 or later; CI uses 1.46), compiled in as the client code wayland-scanner generates from it (Copyright 2019 Sebastian Wick, 2019 Erwin Burema, 2020 AMD, 2020-2024 Collabora, Ltd., 2024 Xaver Hugl, 2022-2025 Red Hat, Inc.), and [libwayland-client](https://gitlab.freedesktop.org/wayland/wayland) (Copyright © 2008-2012 Kristian Høgsberg, 2010-2012 Intel Corporation, 2011 Benjamin Franzke, 2012 Collabora, Ltd.), linked from the system: the HDR viewer on Linux (`src/app/WaylandColor.cpp`), where both are found | MIT, MIT | the copyright and permission notice in the protocol's XML; the source's `COPYING` |
 
 ## Libraries bundled in the packages
 
@@ -127,3 +128,8 @@ The 3D compositing test reads Montage's USD exports back with [tinyusdz](https:/
 (Apache-2.0, Copyright (c) 2020-2023 Syoyo Fujita), which only the Linux CI job builds, at a pinned commit, with
 `scripts/build-tinyusdz.sh`, into a small reader of Montage's own (`tests/tools/usd_readback.cc`); it is not part of
 Montage or its packages.
+
+The HDR viewer's Linux test runs it under [Weston](https://gitlab.freedesktop.org/wayland/weston) 16.0.2 (MIT,
+Copyright © 2008-2012 Kristian Høgsberg, 2010-2012 Intel Corporation and others, as its `COPYING` lists), the Wayland
+reference compositor, with its colour management, which only a Linux CI job builds, from pinned tags, with
+`scripts/build-weston.sh` (and the libdisplay-info, MIT, its build fetches); it is not part of Montage or its packages.
