@@ -12761,8 +12761,9 @@ void McpServer::Impl::addTools() {
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
             "application":{"enum":[2,5,"prores","dpp_prores"],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master; \"prores\": Application ProRes (RDD 45); \"dpp_prores\": Application DPP (ProRes, RDD 59-1)"},
-            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's; DPP: hq)"},
-            "fields":{"type":"string","enum":["progressive","tff","bff"],"default":"progressive","description":"Application ProRes: two fields a picture, the top (tff) or the bottom (bff) first"},
+            "prores_profile":{"type":"string","enum":["lt","422","hq","4444","4444xq"],"default":"hq","description":"Application ProRes: the ProRes profile (a supplemental keeps the earlier package's; DPP: hq at 10 bits, or 4444 or 4444xq at 12)"},
+            "fields":{"type":"string","enum":["progressive","tff","bff"],"default":"progressive","description":"Application ProRes: two fields a picture, the top (tff) or the bottom (bff) first, each rendered at its own moment"},
+            "segmented_fields":{"type":"boolean","default":false,"description":"With fields: both fields the halves of one picture (PsF), as a progressive programme delivered interlaced"},
             "ycbcr444":{"type":"boolean","default":false,"description":"Application ProRes: 4444 described as Y'CbCr 4:4:4, not R'G'B'"},
             "full_range":{"type":"boolean","default":false,"description":"Application ProRes: 4:4:4 R'G'B' over the full range (QE.2)"},
             "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
@@ -12829,6 +12830,7 @@ void McpServer::Impl::addTools() {
             const QString fields = str(a, "fields", "progressive");
             if (fields != "progressive" && fields != "tff" && fields != "bff") throw ArgError{"\"fields\" is progressive, tff or bff"};
             st.fields = fields == "progressive" ? std::string() : fields.toStdString();
+            st.segmentedFields = a.value("segmented_fields").toBool();
             st.ycbcr444 = a.value("ycbcr444").toBool();
             st.fullRange = a.value("full_range").toBool();
             st.graded = a.value("graded").toBool(true);
@@ -12993,7 +12995,8 @@ void McpServer::Impl::addTools() {
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
-            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first (each picture as both fields: PsF), as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes"},
+            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first, as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes; each field rendered at its own moment"},
+            "segmented_fields":{"type":"boolean","default":false,"description":"With interlaced: both fields the halves of one picture (PsF), as a progressive programme delivered interlaced"},
             "rate_change":{"type":"string","enum":["none","pulldown","speed","convert"],"default":"none","description":"Deliver at another frame rate: pulldown (a 23.976 or 24 sequence with 2:3 or 2:2:2:4 pulldown, into fields at 29.97 or 30, coded interlaced: MPEG-2, AVC-Intra or H.264, ProRes, FFV1; or as repeated frames at 59.94 or 60); speed (each frame shown once at frame_rate, the programme faster or slower, as PAL's 25 from 24 is 4 % shorter, its sound sped with it, captions and markers with it); convert (a standards conversion to frame_rate, keeping its length: each new frame made from the two nearest by optical flow, or RIFE where installed, never blended across a cut)"},
             "frame_rate":{"type":["number","string"],"description":"With rate_change: the rate delivered (23.976, 24, 25, 29.97, 30, 50, 59.94, 60...); pulldown's default is 29.97 (30 from 24)"},
             "pulldown_cadence":{"type":"string","enum":["2:3","2:2:2:4"],"default":"2:3","description":"With pulldown: 2:3 (A A, B B, B C, C D, D D) or 2:2:2:4 (no frame of mixed fields)"},
@@ -13104,6 +13107,7 @@ void McpServer::Impl::addTools() {
             if (st.twoPass && ((st.videoCodec != "libx264" && st.videoCodec != "libx265") || st.videoBitrate <= 0))
                 throw ArgError{"\"two_pass\" is for H.264 and H.265 (software) with a \"bitrate\""};
             st.interlaced = a.value("interlaced").toBool(st.interlaced);
+            st.segmentedFields = a.value("segmented_fields").toBool(st.segmentedFields);
             if (a.contains("mxf_delivery")) {
                 const std::string d = str(a, "mxf_delivery").toStdString();
                 if (d != "op1a" && d != "rdd9" && d != "as11-dpp" && d != "as11-x2" && d != "as11-x8")
